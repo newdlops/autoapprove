@@ -13,6 +13,7 @@ import Combine
     private let questionTransport: CodexReplyTransport
     private var replyingQuestions = Set<String>()
     private var sessions: [String: AgentSession] = [:]
+    private var sessionOrder: [String] = []
     private var records: [ProcessRecord] = []
     private var server: SocketServer?
     private var pollTask: Task<Void, Never>?
@@ -47,6 +48,11 @@ import Combine
         self.questionTransport = questionTransport
         try paths.prepare()
         store = try AuditStore(path: paths.database)
+        if let saved = store.value("sessionOrder"),
+           let ids = try? JSONDecoder().decode([String].self, from: Data(saved.utf8)) {
+            var seen = Set<String>()
+            sessionOrder = ids.filter { seen.insert($0).inserted }
+        }
         snapshot = EngineSnapshot(sessions: [], events: store.recent(), paused: store.value("paused") == "true", health: ConnectionHealth())
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
         // Restore only a connection the user explicitly enabled from the app.
@@ -78,11 +84,39 @@ import Combine
     }
 
     private func publish() {
+        let ranks = Dictionary(uniqueKeysWithValues: sessionOrder.enumerated().map { ($0.element, $0.offset) })
         snapshot.sessions = sessions.values.sorted {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
+            let left = ranks[$0.id] ?? Int.max, right = ranks[$1.id] ?? Int.max
+            if left != right { return left < right }
             if $0.project != $1.project { return $0.project.localizedStandardCompare($1.project) == .orderedAscending }
             return $0.id < $1.id
         }
+    }
+
+    /// Reorder only the visible slots; filtered-out sessions keep their positions.
+    /// IDs bind a native List move to the exact rows shown when it was requested.
+    public func moveSessions(fromOffsets offsets: IndexSet, toOffset destination: Int, visibleIDs: [String]) throws {
+        guard !offsets.isEmpty else { return }
+        let current = snapshot.sessions.filter { $0.phase != .ended }.map(\.id)
+        let visible = Set(visibleIDs)
+        guard visible.count == visibleIDs.count,
+              current.filter({ visible.contains($0) }) == visibleIDs,
+              (0...visibleIDs.count).contains(destination),
+              offsets.allSatisfy({ visibleIDs.indices.contains($0) }) else {
+            throw AppError.message("터미널 목록이 변경되었습니다. 현재 목록에서 다시 이동해주세요.")
+        }
+        let moved = offsets.map { visibleIDs[$0] }
+        var reordered = visibleIDs.enumerated().filter { !offsets.contains($0.offset) }.map(\.element)
+        reordered.insert(contentsOf: moved, at: destination - offsets.filter { $0 < destination }.count)
+        guard reordered != visibleIDs else { return }
+        var iterator = reordered.makeIterator()
+        let next = current.map { visible.contains($0) ? iterator.next()! : $0 }
+        let json = String(decoding: try JSONEncoder().encode(next), as: UTF8.self)
+        // Commit the preference before publishing so a failed save cannot look successful.
+        try store.set("sessionOrder", json)
+        sessionOrder = next
+        publish()
     }
 
     public func refresh() async {

@@ -123,20 +123,32 @@ struct SessionWindow: View {
                                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
+                        let displayed = visible
                         List(selection: $selection) {
-                            ForEach(visible) { session in
+                            ForEach(displayed) { session in
                                 SessionRow(session: session, paused: engine.snapshot.paused,
                                     setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
                                     reveal: { reveal(session) })
                                     .tag(session.id)
                                     .padding(.vertical, 6)
-                                    .help(session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false))
+                                    .help("드래그하면 목록 순서를 바꿉니다.\n" + (session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false)))
+                            }.onMove { offsets, destination in
+                                perform { try engine.moveSessions(fromOffsets: offsets, toOffset: destination, visibleIDs: displayed.map(\.id)) }
                             }
                         }.listStyle(.inset)
                         .contextMenu(forSelectionType: String.self) { ids in
                             if let session = singleSession(ids) {
                                 Button("터미널 열기") { reveal(session) }
                                     .disabled(!session.canReveal || openingTerminal)
+                                if let index = displayed.firstIndex(where: { $0.id == session.id }) {
+                                    Divider()
+                                    Button("위로 이동", systemImage: "arrow.up") {
+                                        perform { try engine.moveSessions(fromOffsets: IndexSet(integer: index), toOffset: index - 1, visibleIDs: displayed.map(\.id)) }
+                                    }.disabled(index == 0)
+                                    Button("아래로 이동", systemImage: "arrow.down") {
+                                        perform { try engine.moveSessions(fromOffsets: IndexSet(integer: index), toOffset: index + 2, visibleIDs: displayed.map(\.id)) }
+                                    }.disabled(index == displayed.count - 1)
+                                }
                             }
                         } primaryAction: { ids in
                             if let session = primaryActionSession(ids) { reveal(session) }
@@ -147,7 +159,8 @@ struct SessionWindow: View {
                         Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
                         Text("이 Mac의 터미널").foregroundStyle(.secondary)
                         Spacer()
-                        Text("로컬 연결").foregroundStyle(.secondary)
+                        Text("드래그로 순서 변경").foregroundStyle(.secondary)
+                            .help("행을 위아래로 드래그하면 순서를 저장합니다. 앱을 다시 열어도 유지됩니다. 검색·필터에서는 보이는 항목끼리만 이동합니다. 우클릭으로 위·아래 이동도 할 수 있습니다.")
                     }.font(.caption).padding(12)
                 }.frame(minWidth: 300, idealWidth: 380, maxWidth: 500)
                 detail.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)

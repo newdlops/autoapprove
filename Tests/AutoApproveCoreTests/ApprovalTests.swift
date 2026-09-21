@@ -348,6 +348,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Session order, identity, discovery and restart persistence", tests.testSessionOrderPersistsAcrossDiscoveryAndRestart),
+            ("Filtered and multiple session moves preserve hidden slots", tests.testFilteredAndMultipleSessionMoves),
+            ("Session moves reject stale, exited and invalid rows", tests.testSessionMoveRejectsStaleAndInvalidRows),
+            ("Session order save failure and damaged preferences", tests.testSessionOrderSaveFailureAndDamagedPreference),
             ("Git unborn, nested, linked worktree, branch switch and detached HEAD", tests.testGitBranchWorktreeAndRefresh),
             ("Git non-repository, missing directory and inherited environment isolation", tests.testGitBranchNonRepositoryAndEnvironmentIsolation),
             ("Git metadata binds to live sessions and their current directories", tests.testGitBranchesBindToCurrentSessionDirectory),
