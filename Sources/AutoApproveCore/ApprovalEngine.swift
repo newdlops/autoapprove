@@ -25,7 +25,7 @@ import Combine
     private var screenObservedAt: [String: Date] = [:]
     private var handledHookIDs: Set<String> = []
     private var hookIDOrder: [String] = []
-    private var pendingActions: [String: (sessionID: String, event: AuditEvent, peerID: String, dispatchID: UUID, generation: String, identity: String)] = [:]
+    private var pendingActions: [String: (sessionID: String, event: AuditEvent, peerID: String, dispatchID: UUID, generation: String, requestIdentity: String)] = [:]
     private var terminalEnabled = false
     private var terminalPolling = false
     private var terminalPermissionBlocked = false
@@ -599,7 +599,7 @@ import Combine
                     pendingActions.removeValue(forKey: id)
                     let succeeded = params["success"] as? Bool == true
                     if !succeeded { retryUnsentApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation) }
-                    if succeeded { watchDeliveredApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, identity: action.identity) }
+                    if succeeded { watchDeliveredApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, requestIdentity: action.requestIdentity) }
                     var event = action.event
                     event.outcome = succeeded ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인"
                     log(event)
@@ -705,12 +705,19 @@ import Combine
             scheduleScreenApproval(sessionID)
             return
         }
-        // Once sent, do not retry merely because terminal rendering or whitespace changes.
-        let previous = screens[sessionID].flatMap { $0.generation == generation ? $0 : nil }
+        // Codex can replace one permission dialog with the next between screen polls.
+        // A new command must not inherit the preceding command's single-use reservation.
+        // Formatting or choice-hint changes alone still cannot replay a sent input.
+        let previous = screens[sessionID].flatMap {
+            $0.generation == generation && (session.agent != .codex || $0.prompt.requestIdentity == prompt.requestIdentity) ? $0 : nil
+        }
         screens[sessionID] = ScreenState(raw: raw, prompt: prompt, attempted: previous?.attempted ?? false, generation: generation, validationFailures: previous?.validationFailures ?? 0, dispatchID: previous?.dispatchID)
-        sessions[sessionID]?.setPhase(.approval, detail: "터미널에서 실행 권한에 대한 응답을 기다리고 있습니다.", at: now); sessions[sessionID]?.pendingSummary = prompt.summary
-        sessions[sessionID]?.pendingInTerminal = false
-        sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.identity)"
+        if previous?.attempted != true {
+            sessions[sessionID]?.setPhase(.approval, detail: "터미널에서 실행 권한에 대한 응답을 기다리고 있습니다.", at: now)
+        }
+        sessions[sessionID]?.pendingSummary = prompt.summary
+        sessions[sessionID]?.pendingInTerminal = previous != nil && session.pendingInTerminal
+        sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.requestIdentity)"
         sessions[sessionID]?.lastActivity = Date()
         scheduleScreenApproval(sessionID)
     }
@@ -729,21 +736,21 @@ import Combine
         }
     }
 
-    private func requireApprovalReview(_ id: String, dispatchID: UUID, generation: String, identity: String, detail: String) {
+    private func requireApprovalReview(_ id: String, dispatchID: UUID, generation: String, requestIdentity: String, detail: String) {
         guard let state = screens[id], state.generation == generation, state.dispatchID == dispatchID,
-              state.prompt.identity == identity, sessions[id]?.phase == .approval else { return }
+              state.prompt.requestIdentity == requestIdentity, sessions[id]?.phase == .approval else { return }
         sessions[id]?.pendingInTerminal = true
         sessions[id]?.activityDetail = detail
     }
 
-    private func watchDeliveredApproval(_ id: String, dispatchID: UUID, generation: String, identity: String) {
+    private func watchDeliveredApproval(_ id: String, dispatchID: UUID, generation: String, requestIdentity: String) {
         let deliveredAt = Date()
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 8_000_000_000)
-            guard let self, self.screens[id]?.prompt.identity == identity,
+            guard let self, self.screens[id]?.prompt.requestIdentity == requestIdentity,
                   let observed = self.screenObservedAt[id], observed > deliveredAt,
                   Date().timeIntervalSince(observed) < 6 else { return }
-            self.requireApprovalReview(id, dispatchID: dispatchID, generation: generation, identity: identity,
+            self.requireApprovalReview(id, dispatchID: dispatchID, generation: generation, requestIdentity: requestIdentity,
                 detail: "승인 입력을 전달했지만 같은 요청이 계속 표시됩니다. 터미널에서 입력 상태를 확인해주세요.")
             self.publish()
         }
@@ -753,7 +760,7 @@ import Combine
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 8_000_000_000)
             guard let self, let action = self.pendingActions.removeValue(forKey: actionID) else { return }
-            self.requireApprovalReview(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, identity: action.identity,
+            self.requireApprovalReview(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, requestIdentity: action.requestIdentity,
                 detail: "VS Code의 승인 입력 전달 확인이 8초 안에 오지 않았습니다. 터미널에서 입력 상태를 확인해주세요.")
             var event = action.event
             event.outcome = "전달 확인 시간 초과 · 터미널 확인 필요"
@@ -798,24 +805,24 @@ import Combine
                 do {
                     let delivery = try await Task.detached { try TerminalAdapter.approve(tty: session.tty, expectedScreen: state.raw, agent: session.agent) }.value
                     if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
-                    if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, identity: state.prompt.identity) }
+                    if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
                     event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     self.log(event)
                 } catch {
                     // A transport error can occur after dispatch; never blindly repeat an uncertain write.
-                    self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, identity: state.prompt.identity,
+                    self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity,
                         detail: "승인 입력 결과를 확인하지 못했습니다. 터미널을 확인해주세요.")
                     event.outcome = "입력 확인 필요: \(error.localizedDescription)"; self.log(event)
                 }
             } else if session.channel == .vscodeScreen, let peerID = session.bridgeID, let peer = self.peers[peerID], let terminalID = session.terminalID {
                 let actionID = UUID().uuidString
-                self.pendingActions[actionID] = (id, event, peerID, scheduledID, state.generation, state.prompt.identity)
+                self.pendingActions[actionID] = (id, event, peerID, scheduledID, state.generation, state.prompt.requestIdentity)
                 let current = self.screens[id] ?? state
                 let sent = peer.send(["method": "approve", "id": actionID, "terminalID": terminalID, "fingerprint": current.prompt.fingerprint, "dialog": current.prompt.dialog, "agent": session.agent.rawValue, "answer": current.prompt.answer, "generation": String(state.generation.dropFirst(peerID.count + 1)), "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000])
                 if sent { self.watchApprovalAcknowledgement(actionID) }
                 else {
                     self.pendingActions.removeValue(forKey: actionID)
-                    self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, identity: state.prompt.identity,
+                    self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity,
                         detail: "VS Code로 승인 입력을 전달하지 못했습니다. 터미널 연결을 확인해주세요.")
                     event.outcome = "연결 끊김 · 입력 확인 필요"; self.log(event)
                 }

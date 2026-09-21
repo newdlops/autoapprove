@@ -5,8 +5,44 @@ import AutoApproveCore
 private let permissionFixture = "Would you like to run the following command?\n\n  $ echo 한글\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nEnter to confirm or esc to cancel"
 private let claudePermissionFixture = "Bash command\n  echo 한글\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel"
 private let questionFixture = "어떤 환경을 사용할까요?\n❯ 1. 개발 환경\n  2. 테스트 환경\nEnter to select · Esc to cancel"
+private let reportedCodexPermissionFixture = """
+Would you like to run the following command?
+
+Environment: local
+
+$ rg -n 'lora|adapter|error|warn' .cache/product-evaluation/server-clean.log
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `rg -n 'lora|adapter|error|warn' .cache/product-evaluation/server-clean.log` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+Press enter to confirm or esc to cancel
+"""
 
 extension ApprovalTests {
+    func testCodexRequestIdentitySeparatesCommandsFromRendering() throws {
+        let original = PromptDetector.detect(reportedCodexPermissionFixture, agent: .codex)!
+        for rendering in ["Earlier output\n" + reportedCodexPermissionFixture,
+                          reportedCodexPermissionFixture.replacingOccurrences(of: "product-evaluation", with: "product-\n    evaluation"),
+                          reportedCodexPermissionFixture.replacingOccurrences(of: " (p)", with: " (a)"),
+                          reportedCodexPermissionFixture.replacingOccurrences(of: "$ rg -n", with: "$  rg  -n")] {
+            let prompt = PromptDetector.detect(rendering, agent: .codex)!
+            try expectEqual(prompt.requestIdentity, original.requestIdentity, "Rendering and choice shortcuts do not create another permission")
+            try expectEqual(prompt.dialog, rendering.hasPrefix("Earlier output") ? reportedCodexPermissionFixture : rendering,
+                "Final delivery must still check original whitespace, choices and complete command")
+        }
+        for changed in [reportedCodexPermissionFixture.replacingOccurrences(of: "server-clean.log", with: "other.log"),
+                        reportedCodexPermissionFixture.replacingOccurrences(of: "Environment: local", with: "Environment: remote")] {
+            try expect(PromptDetector.detect(changed, agent: .codex)?.requestIdentity != original.requestIdentity)
+        }
+        let long = reportedCodexPermissionFixture.replacingOccurrences(of: "$ rg -n", with: "$ echo FIRST " + String(repeating: "long-command ", count: 450) + "; rg -n")
+        let nextLong = long.replacingOccurrences(of: "echo FIRST", with: "echo SECOND")
+        let first = PromptDetector.detect(long, agent: .codex)!
+        let second = PromptDetector.detect(nextLong, agent: .codex)!
+        try expectEqual(first.summary, second.summary, "The UI summary may be truncated")
+        try expect(first.requestIdentity != second.requestIdentity, "Request identity must include command text outside the summary limit")
+    }
+
     func testWrappedPermissionOptionsAndFooter() throws {
         for agent in [AgentKind.claude, .codex] {
             let heading = agent == .claude ? "Do you want to proceed?" : "Would you like to run the following command?"
@@ -35,6 +71,7 @@ extension ApprovalTests {
     }
 
     func testLongPermissionAndCanonicalUnicode() throws {
+        try expectEqual(PromptDetector.detect(reportedCodexPermissionFixture, agent: .codex)?.answer, "1", "Reported Codex-only Terminal screenshot")
         let long = permissionFixture.replacingOccurrences(of: "  $ echo 한글", with: "  $ python <<'PY'\n" + String(repeating: "    print('한글')\n", count: 70) + "PY")
         try expectNotNil(PromptDetector.detect(long, agent: .codex))
         try expectEqual(PromptDetector.detect(permissionFixture, agent: .codex)?.dialog, PromptDetector.detect(permissionFixture.decomposedStringWithCanonicalMapping, agent: .codex)?.dialog)
@@ -87,6 +124,7 @@ extension ApprovalTests {
             if writes > 0 { try expectEqual(context.evaluateScript("writes[0]")?.toString(), "1") }
         }
         try check("Changed history\n" + permissionFixture.decomposedStringWithCanonicalMapping + "\n\n", expected: "Old history\n" + permissionFixture, delivery: "sent", writes: 1)
+        try check(reportedCodexPermissionFixture, expected: reportedCodexPermissionFixture, delivery: "sent", writes: 1)
         for changed in [permissionFixture.replacingOccurrences(of: "echo 한글", with: "echo changed"), permissionFixture.replacingOccurrences(of: "  $", with: " $"), permissionFixture.replacingOccurrences(of: "› 1.", with: "  1."), permissionFixture + "\n› Next input"] {
             try check(changed, delivery: "screenChanged", writes: 0)
         }

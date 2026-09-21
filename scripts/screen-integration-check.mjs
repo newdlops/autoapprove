@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 const exec = promisify(execFile);
 const root = await mkdtemp('/private/tmp/aa-screen-');
 const binary = path.resolve(process.argv[2] || '.build/debug/autoapprove');
+const codexOnly = process.argv.includes('--codex-only');
 const home = path.join(root, 'state');
 const children = [];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -66,7 +67,7 @@ try {
   const holder = path.join(root, 'pty-holder');
   await exec('/usr/bin/cc', ['Tests/fixtures/pty-holder.c', '-o', holder]);
   const fixtures = [];
-  for (const [index, agent] of ['codex', 'codex', 'claude'].entries()) {
+  for (const [index, agent] of (codexOnly ? ['codex', 'codex'] : ['codex', 'codex', 'claude']).entries()) {
     const directory = path.join(root, `fixture-${index}`);
     await mkdir(directory);
     if (index === 0) await exec('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', 'init', '--quiet', '--initial-branch=fixture-main', directory]);
@@ -93,6 +94,63 @@ try {
     const found = fixtures.map(fixture => status.sessions.find(session => session.cwd === fixture.directory));
     return found.every(Boolean) ? found : undefined;
   }, 'PTY discovery');
+  if (codexOnly) {
+    await bridge.request('register', { terminals: fixtures });
+    for (const session of sessions) await bridge.request('automatic', { sessionID: session.id, enabled: true });
+    const reportedCommand = "rg -n 'lora|adapter|error|warn' .cache/product-evaluation/server-clean.log";
+    const dialog = command => 'Would you like to run the following command?\n\nEnvironment: local\n\n$ ' + command
+      + "\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `" + command
+      + '` (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel';
+    const show = (index, screen) => bridge.request('screen', { terminalID: fixtures[index].id, screen, generation: 'same-cli-process' });
+    await show(0, dialog('cat .cache/product-training-clean/ablation.py'));
+    await until(() => actions.length === 1, 'first Codex-only permission');
+    await until(async () => (await bridge.request('status')).events.some(event => event.outcome === '승인 입력 전달'), 'first input acknowledgement');
+    await show(0, dialog(reportedCommand));
+    await until(() => actions.length === 2, 'next Codex permission without an intervening working frame');
+    assert.equal(actions[1].dialog, dialog(reportedCommand));
+    assert.equal(actions[1].answer, '1');
+    for (const rendering of [dialog(reportedCommand), 'Changed history\n' + dialog(reportedCommand),
+      dialog(reportedCommand).replaceAll('product-evaluation', 'product-\n    evaluation'),
+      dialog(reportedCommand).replaceAll(' (p)', ' (a)'), dialog(reportedCommand)]) {
+      await show(0, rendering);
+    }
+    await sleep(250); assert.equal(actions.length, 2, 'Wrapping, history and shortcut changes cannot replay a sent input');
+    const third = dialog('rg -n completed .cache/product-evaluation/server-clean.log');
+    await show(0, third);
+    await until(() => actions.length === 3, 'third distinct permission in the same process');
+    await show(1, third);
+    await until(() => actions.length === 4, 'identical request in another Codex terminal remains independent');
+    await bridge.request('pause', { paused: true });
+    const fourth = dialog('cat .cache/product-evaluation/summary.json');
+    await show(0, fourth);
+    await sleep(150); assert.equal(actions.length, 4, 'Pause also blocks an immediately following permission');
+    await bridge.request('pause', { paused: false });
+    await until(() => actions.length === 5, 'resume dispatches the distinct pending permission');
+    const manual = dialog('choose task').replace("Yes, and don't ask again for commands that start with `choose task` (p)", 'Yes, deploy to production (p)');
+    await show(0, manual);
+    await sleep(150); assert.equal(actions.length, 5, 'A three-way task choice remains manual');
+    assert.equal((await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).pendingInTerminal, true);
+
+    bridge.unacknowledged.add(fixtures[0].id);
+    await show(0, dialog('cat first-pending.txt'));
+    await until(() => actions.length === 6, 'first unacknowledged permission');
+    await show(0, dialog('cat second-pending.txt'));
+    await until(() => actions.length === 7, 'new permission can progress before the previous acknowledgement');
+    await bridge.request('actionResult', { actionID: actions[5].id, success: false });
+    await bridge.request('actionResult', { actionID: actions[6].id, success: true });
+    await show(0, dialog('cat second-pending.txt'));
+    await sleep(200); assert.equal(actions.length, 7, 'Late failure for the previous command cannot reopen the current command');
+    bridge.unacknowledged.clear();
+
+    bridge.rejections = 10;
+    const rejected = dialog('cat rejected.txt');
+    await until(async () => { await show(0, rejected); return actions.length === 11; }, 'bounded failure fixture');
+    await until(async () => (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).pendingInTerminal, 'bounded failure requests review');
+    bridge.rejections = 0;
+    await show(0, dialog('cat following-request.txt'));
+    await until(() => actions.length === 12, 'next command does not inherit the previous command retry limit');
+    console.log('PASS Codex-only consecutive permissions in one process, reported screenshot, wrapping/history/shortcut deduplication, terminal isolation, pause/resume and manual choices');
+  } else {
   await until(async () => {
     const status = await bridge.request('status');
     return status.sessions.find(session => session.id === sessions[0].id)?.gitBranch?.name === 'fixture-main'
@@ -244,6 +302,7 @@ try {
     assert.equal(english.find(value => value.pid === session.pid)?.id, korean.find(value => value.pid === session.pid)?.id, 'Process identity must be locale independent');
   }
   console.log('PASS real PTY discovery, periodic Git branch refresh, exact target, wrapped three-choice approval, single-use screen, pause/resume, idle/background monitoring/work transitions, hook takeover, manual questions, confirmed-unsent retry, bounded retries, missing acknowledgement timeout, unchanged delivered dialog attention, late result isolation, disconnected off, locale-independent identity');
+  }
 } catch (error) {
   const processes = await exec('/bin/ps', ['-axo', 'pid=,ppid=,tty=,lstart=,comm=']);
   console.error(processes.stdout.split('\n').filter(line => line.includes(root)).join('\n'));

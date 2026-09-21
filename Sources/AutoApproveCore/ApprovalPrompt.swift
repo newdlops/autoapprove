@@ -7,6 +7,9 @@ public struct ApprovalPrompt: Equatable {
     public var fingerprint: String
     public var dialog: String
     public var identity: String { PromptDetector.fingerprint(dialog) }
+    /// Request content before the choices, independent of terminal wrapping and shortcut labels.
+    /// Used only to suppress duplicates; delivery still validates the complete original dialog.
+    public var requestIdentity: String
 }
 
 public enum PromptDetector {
@@ -46,7 +49,8 @@ public enum PromptDetector {
         // Claude prints the command/edit before its confirmation heading. Keep that context in validation.
         let start = agent == .claude ? 0 : promptIndex
         let context = rawLines[start..<(promptIndex + selectedYes)].joined(separator: "\n")
-        return ApprovalPrompt(summary: String(context.suffix(4000)), answer: "1", fingerprint: fingerprint(screen), dialog: rawLines[start...].joined(separator: "\n"))
+        return ApprovalPrompt(summary: String(context.suffix(4000)), answer: "1", fingerprint: fingerprint(screen),
+            dialog: rawLines[start...].joined(separator: "\n"), requestIdentity: fingerprint(context.filter { !$0.isWhitespace }))
     }
 
     public static func normalizedLines(_ screen: String) -> [String] {

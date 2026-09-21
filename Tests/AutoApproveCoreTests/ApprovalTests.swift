@@ -374,6 +374,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Codex request identity separates commands from wrapping, history and shortcuts", tests.testCodexRequestIdentitySeparatesCommandsFromRendering),
             ("Wrapped final permission options and keyboard hints retain active-dialog validation", tests.testWrappedPermissionOptionsAndFooter),
             ("Claude and Codex ready composers with background monitoring", tests.testMonitoringRequiresReadyComposer),
             ("Changing monitor output, new generations and foreground work", tests.testMonitoringTracksReadinessAcrossOutputChanges),
