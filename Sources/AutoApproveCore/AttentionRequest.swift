@@ -1,11 +1,24 @@
 import Foundation
 
 public struct AttentionRequest: Equatable, Identifiable {
+    public enum Kind: Equatable { case question, completion }
     public let id: String
     public let sessionID: String
     public let project: String
     public let agent: String
     public let summary: String
+    public var kind: Kind = .question
+    public var title: String { project + (kind == .completion ? " · 작업 완료" : " · 응답 필요") }
+
+    public static func completions(_ snapshot: EngineSnapshot, at now: Date = Date()) -> [AttentionRequest] {
+        snapshot.sessions.compactMap { session in
+            guard session.agent != .shell, session.phase != .ended, let completion = session.completion,
+                  now.timeIntervalSince(completion.date) <= 300 else { return nil }
+            return AttentionRequest(id: "completion-" + PromptDetector.fingerprint(session.id + "\n" + completion.id),
+                sessionID: session.id, project: session.project, agent: session.agent.title,
+                summary: completion.summary, kind: .completion)
+        }
+    }
 
     public static func needsAttention(_ session: AgentSession, paused: Bool) -> Bool {
         !candidates(session, paused: paused).isEmpty

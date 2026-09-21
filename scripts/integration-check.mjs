@@ -87,9 +87,24 @@ try {
   assert.equal(waiting.phase, 'input');
   assert.ok(waiting.pendingSummary.includes('3. 지정해 주시는 일'));
   assert.ok(waiting.pendingRequestID.endsWith(':choose-three'));
+  await request('hook', { ...base, hook_event_name: 'PostToolUse', requestID: 'answered' });
+  const stop = { ...base, hook_event_name: 'Stop', requestID: 'final', last_assistant_message: 'Integration final response', background_tasks: [], session_crons: [] };
+  const stopHook = spawn(binary, ['hook', '--home', home], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let stopOutput = '';
+  stopHook.stdout.on('data', data => { stopOutput += data; });
+  stopHook.stdin.end(JSON.stringify(stop));
+  assert.equal(await new Promise(resolve => stopHook.on('close', resolve)), 0);
+  assert.deepEqual(JSON.parse(stopOutput), {});
+  const finished = (await request('status')).sessions.find(session => session.id === 'claude:integration-only');
+  assert.equal(finished.phase, 'idle');
+  assert.equal(finished.completion.summary, stop.last_assistant_message);
+  await request('hook', { ...stop, requestID: 'duplicate-stop' });
+  assert.equal((await request('status')).sessions.find(session => session.id === finished.id).completion.id, finished.completion.id);
+  await request('hook', { ...base, hook_event_name: 'UserPromptSubmit', requestID: 'next-work' });
+  assert.equal((await request('status')).sessions.find(session => session.id === finished.id).completion, undefined);
   const cli = await exec(binary, ['status', '--home', home], { timeout: 5000 });
   assert.ok(JSON.parse(cli.stdout).sessions.some(session => session.id === 'claude:integration-only'));
-  console.log('PASS Unix socket framing, opt-in, deduplication, pause/resume, CLI permission and question hook round trips, saved answers, CLI status');
+  console.log('PASS Unix socket framing, opt-in, deduplication, pause/resume, CLI permission/question/completion hook round trips, completion cleanup, saved answers, CLI status');
 } finally {
   server.kill('SIGTERM');
   await new Promise(resolve => { if (server.exitCode !== null) resolve(); else server.once('close', resolve); });

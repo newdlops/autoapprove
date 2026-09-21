@@ -10,6 +10,7 @@ import AutoApproveCore
 struct SessionWindow: View {
     @ObservedObject var engine: ApprovalEngine
     @ObservedObject var notifications: QuestionNotifications
+    var openTerminal: (AgentSession, ApprovalEngine) async throws -> Void = TerminalNavigator.open
     @Environment(\.openWindow) private var openWindow
     @State private var selection: Set<String> = []
     @State private var search = ""
@@ -55,10 +56,10 @@ struct SessionWindow: View {
             if notifications.authorization == .denied || notifications.error != nil {
                 HStack(spacing: 10) {
                     Image(systemName: "bell.slash")
-                    Text(notifications.error ?? "응답 알림이 꺼져 있습니다. 질문을 놓치지 않도록 알림을 허용해주세요.")
+                    Text(notifications.error ?? "알림이 꺼져 있습니다. 질문과 작업 완료를 놓치지 않도록 알림을 허용해주세요.")
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
-                    Button("알림 설정") { settings = true }.help("응답 알림 권한과 시스템 설정을 확인합니다.")
+                    Button("알림 설정") { settings = true }.help("질문·작업 완료 알림 권한과 시스템 설정을 확인합니다.")
                 }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10).background(Color.orange.opacity(0.10))
             }
             if disconnectedAutomaticCount > 0 {
@@ -124,11 +125,22 @@ struct SessionWindow: View {
                     } else {
                         List(selection: $selection) {
                             ForEach(visible) { session in
-                                SessionRow(session: session, paused: engine.snapshot.paused) { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } }
+                                SessionRow(session: session, paused: engine.snapshot.paused,
+                                    setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
+                                    reveal: { reveal(session) })
                                     .tag(session.id)
                                     .padding(.vertical, 6)
+                                    .help(session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false))
                             }
                         }.listStyle(.inset)
+                        .contextMenu(forSelectionType: String.self) { ids in
+                            if let session = singleSession(ids) {
+                                Button("터미널 열기") { reveal(session) }
+                                    .disabled(!session.canReveal || openingTerminal)
+                            }
+                        } primaryAction: { ids in
+                            if let session = primaryActionSession(ids) { reveal(session) }
+                        }
                     }
                     Divider()
                     HStack {
@@ -194,14 +206,37 @@ struct SessionWindow: View {
             } actions: { Button("연결 설정 열기") { settings = true }.help(AppHelp.connections) }
         }
     }
+    private func singleSession(_ ids: Set<String>) -> AgentSession? {
+        guard ids.count == 1, let id = ids.first else { return nil }
+        return engine.snapshot.sessions.first { $0.id == id }
+    }
+    private func primaryActionSession(_ ids: Set<String>) -> AgentSession? {
+        // SwiftUI passes the entire selection on a double-click. Resolve the row
+        // under that mouse event so a multi-selection opens only the clicked tab.
+        if let event = NSApp.currentEvent, event.type == .leftMouseUp || event.type == .leftMouseDown,
+           let content = event.window?.contentView {
+            func clickedRow(in view: NSView) -> Int? {
+                if let table = view as? NSTableView, table.numberOfRows == visible.count {
+                    let point = table.convert(event.locationInWindow, from: nil)
+                    let row = table.row(at: point)
+                    if table.visibleRect.contains(point), visible.indices.contains(row) { return row }
+                }
+                for child in view.subviews { if let row = clickedRow(in: child) { return row } }
+                return nil
+            }
+            if let row = clickedRow(in: content), ids.contains(visible[row].id) { return visible[row] }
+        }
+        return singleSession(ids)
+    }
     private func perform(_ operation: () throws -> Void) { do { try operation() } catch { self.error = error.localizedDescription } }
     private func reveal(_ session: AgentSession) {
         guard !openingTerminal else { return }
+        guard session.canReveal else { error = AppHelp.reveal(session, opening: false); return }
         openingTerminal = true
         Task {
             defer { openingTerminal = false }
             do {
-                try await TerminalNavigator.open(session, engine: engine)
+                try await openTerminal(session, engine)
             } catch { self.error = error.localizedDescription }
         }
     }
@@ -211,6 +246,7 @@ private struct SessionRow: View {
     let session: AgentSession
     let paused: Bool
     let setAutomatic: (Bool) -> Void
+    let reveal: () -> Void
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
@@ -243,6 +279,7 @@ private struct SessionRow: View {
                     .disabled(!session.canApprove && !session.automatic).help(AppHelp.automatic(session, paused: paused))
             }
         }.accessibilityElement(children: .contain)
+            .accessibilityAction(named: Text("터미널 열기"), reveal)
     }
 }
 
@@ -307,6 +344,10 @@ private struct SessionDetail: View {
                     }
                     Text(session.activityDetail ?? "연결 후 작업 상태를 확인할 수 있습니다.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if let error = session.completionError {
+                        Label(error, systemImage: "bell.slash").font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Divider()
                 if session.agent == .codex {

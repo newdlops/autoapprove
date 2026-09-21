@@ -348,6 +348,14 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Codex locked database, preserved questions and automatic recovery", tests.testCodexHistoryContentionAndRecovery),
+            ("Codex temporary, missing, invalid and unsupported history distinction", tests.testCodexHistoryFailureClassification),
+            ("Codex question and completion errors recover independently", tests.testCodexQuestionAndCompletionErrorsStayIndependent),
+            ("Claude final response, duplicate Stop, new work and pause", tests.testClaudeCompletionLifecycle),
+            ("Claude background work, scheduled follow-ups and unanswered questions", tests.testClaudeIncompleteStopDoesNotNotify),
+            ("Codex completion baseline, short turns and failed or interrupted outcomes", tests.testCodexCompletionBaselineAndOutcomes),
+            ("completion lifecycle, question isolation and history recovery", tests.testCodexCompletionEngineAndRecovery),
+            ("Codex latest root turn and read-only completion history", tests.testCodexCompletionReadOnlyHistory),
             ("question reply text, shell literals and exact receipt", tests.testReplyMessageAndReceipt),
             ("explicit question response, durable audit and duplicate prevention", tests.testQuestionReplyAuditAndDuplicateProtection),
             ("uncertain question response and restart reservation", tests.testQuestionReplyUncertainAndPreflightFailure),

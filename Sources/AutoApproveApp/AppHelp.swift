@@ -2,7 +2,7 @@ import AutoApproveCore
 
 /// Shared wording keeps the list, detail view and menu consistent.
 enum AppHelp {
-    static let connections = "응답 알림 권한과 Terminal 연결, Claude 훅, VS Code 확장의 연결 상태를 확인합니다."
+    static let connections = "질문·작업 완료 알림 권한과 Terminal 연결, Claude 훅, VS Code 확장의 연결 상태를 확인합니다."
     static let history = "종료된 세션을 포함한 전체 승인 내역을 검색하고 요청 내용과 전달 결과를 확인합니다."
     static let search = "프로젝트 이름·전체 경로, 터미널 제목, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."

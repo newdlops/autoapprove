@@ -8,6 +8,8 @@ import Combine
     private let store: AuditStore
     private let terminalReader: @Sendable ([String]) throws -> TerminalSnapshot
     private let codexQuestions = CodexQuestionCollector()
+    private var codexCompletions = CodexCompletionTracker()
+    private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private var replyingQuestions = Set<String>()
     private var sessions: [String: AgentSession] = [:]
@@ -105,8 +107,18 @@ import Combine
         for update in updates {
             guard var session = sessions[update.sessionID], session.agent == .codex, session.phase != .ended else { continue }
             session.codexQuestionsError = update.error
-            if update.error == nil {
-                session.queuedQuestions = update.questions.filter { store.value("dismissedQuestion:\($0.id)") != "true" }.map { question in
+            session.completionError = update.completionError ?? (update.turn == nil && !update.completionReadPending ? update.error : nil)
+            if let turn = update.turn {
+                let completed = codexCompletions.observe(turn, sessionID: session.id, at: date)
+                if turn.status != "completed" || session.completion?.id != "codex:\(turn.threadID):\(turn.turnID ?? "")" {
+                    session.completion = nil
+                }
+                if let completed { session.completion = completed }
+            } else if update.completionReadPending || update.error != nil || update.completionError != nil {
+                session.completion = nil
+            }
+            if update.error == nil, let questions = update.questions {
+                session.queuedQuestions = questions.filter { store.value("dismissedQuestion:\($0.id)") != "true" }.map { question in
                     var question = question
                     question.reply = session.questions.first(where: { $0.id == question.id })?.reply ?? savedReply(question.id)
                     return question
@@ -200,6 +212,7 @@ import Combine
         // Ordinary terminals do not belong in the inventory or its status counts.
         let managed = found.filter { $0.agent == .claude || $0.agent == .codex }
         let live = Set(managed.map(\.id))
+        codexCompletions.retain(sessionIDs: live)
         for var session in managed {
             if var existing = sessions[session.id] {
                 existing.tty = session.tty
@@ -217,6 +230,7 @@ import Combine
         for key in Array(sessions.keys) where key.hasPrefix("process:") && !live.contains(key) {
             sessions[key]?.setPhase(.ended, detail: "프로세스가 종료되었습니다."); sessions[key]?.channel = .none; sessions[key]?.automatic = false
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
+            claudeWorkIDs.removeValue(forKey: key)
             clearScreen(key)
         }
         for (bridge, terminals) in bridges { matchBridge(bridge, terminals: terminals) }
@@ -380,6 +394,12 @@ import Combine
         let summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
         let request = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
         let needsAnswer = ["AskUserQuestion", "ExitPlanMode", "EnterPlanMode"].contains(tool)
+        if ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest"].contains(event) {
+            if event == "UserPromptSubmit" || claudeWorkIDs[key] == nil { claudeWorkIDs[key] = UUID().uuidString }
+            session.completion = nil
+        } else if event == "SessionStart" || event == "SessionEnd" {
+            claudeWorkIDs.removeValue(forKey: key); session.completion = nil
+        }
         var response: JSONObject = [:]
         if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event),
            let confirmation = YesNoConfirmation.detect(input) {
@@ -431,7 +451,19 @@ import Combine
                 log(AuditEvent(sessionID: key, summary: summary, outcome: "터미널에서 확인", source: "Claude 훅", tool: tool, request: request), session: session)
             }
         case "SessionEnd": session.setPhase(.ended, detail: "Claude 세션 종료 이벤트를 받았습니다."); session.automatic = false; session.pendingSummary = nil; session.pendingInTerminal = false
-        case "Stop": session.setPhase(.idle, detail: "Claude의 응답 완료 이벤트를 받았습니다. 다음 지시를 기다리고 있습니다."); session.pendingSummary = nil; session.pendingInTerminal = false
+        case "Stop":
+            guard !session.pendingInTerminal else { break }
+            let background = payload["background_tasks"] as? [Any] ?? []
+            let scheduled = payload["session_crons"] as? [Any] ?? []
+            if !background.isEmpty || !scheduled.isEmpty {
+                session.completion = nil
+                session.setPhase(.working, detail: "Claude 응답은 끝났지만 백그라운드 작업 또는 예약된 후속 작업이 남아 있습니다.")
+            } else {
+                if let workID = claudeWorkIDs.removeValue(forKey: key) ?? (session.phase == .working ? UUID().uuidString : nil) {
+                    session.completion = WorkCompletion(id: "claude:\(providerID):\(workID)", summary: payload["last_assistant_message"] as? String)
+                }
+                session.setPhase(.idle, detail: "Claude의 응답 완료 이벤트를 받았습니다. 다음 지시를 기다리고 있습니다."); session.pendingSummary = nil
+            }
         case "Notification":
             let type = payload["notification_type"] as? String ?? ""
             // Generic reminders must not erase the actual question and its choices.

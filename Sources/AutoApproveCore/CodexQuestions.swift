@@ -18,10 +18,16 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
 
 public struct CodexQuestionUpdate {
     public var sessionID: String
-    public var questions: [QueuedQuestion]
+    /// nil means the read did not succeed; [] is a successfully observed empty queue.
+    public var questions: [QueuedQuestion]?
     public var error: String?
-    public init(sessionID: String, questions: [QueuedQuestion] = [], error: String? = nil) {
+    public var turn: CodexTurnState?
+    public var completionError: String?
+    public var completionReadPending: Bool
+    public init(sessionID: String, questions: [QueuedQuestion]? = [], error: String? = nil, turn: CodexTurnState? = nil, completionError: String? = nil, completionReadPending: Bool = false) {
         self.sessionID = sessionID; self.questions = questions; self.error = error
+        self.turn = turn; self.completionError = completionError
+        self.completionReadPending = completionReadPending
     }
 }
 
@@ -124,24 +130,23 @@ public final class CodexHistoryReader {
     private var location: CodexThreadLocation?
     public init() {}
     public func read(_ location: CodexThreadLocation) throws -> [QueuedQuestion] {
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(location.database, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
-            sqlite3_close(db)
-            throw AppError.message("Codex 질문 기록을 열지 못했습니다. 이 버전의 로컬 기록이 필요합니다.")
-        }
+        let db = try CodexHistoryAccess.open(location.database, subject: "질문")
         defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 250)
-        guard sqlite3_exec(db, "BEGIN", nil, nil, nil) == SQLITE_OK else { throw failure() }
+        let begin = sqlite3_exec(db, "BEGIN", nil, nil, nil)
+        guard begin == SQLITE_OK else { throw CodexHistoryAccess.failure(db, subject: "질문", result: begin) }
         defer { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
         func prepare(_ sql: String) throws -> OpaquePointer? {
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw failure() }
+            let result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+            guard result == SQLITE_OK else { throw CodexHistoryAccess.failure(db, subject: "질문", result: result) }
             sqlite3_bind_text(statement, 1, location.threadID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             return statement
         }
         let state = try prepare("SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?")
         defer { sqlite3_finalize(state) }
-        guard sqlite3_step(state) == SQLITE_ROW else { throw AppError.message("Codex가 질문 기록을 준비 중입니다. 잠시 후 다시 확인합니다.") }
+        let stateResult = sqlite3_step(state)
+        if stateResult == SQLITE_DONE { throw CodexHistoryReadError(.notReady, subject: "질문") }
+        guard stateResult == SQLITE_ROW else { throw CodexHistoryAccess.failure(db, subject: "질문", result: stateResult) }
         let next = sqlite3_column_int64(state, 0)
         let reset = self.location != location || next < cursor
         let from: Int64 = reset ? 0 : cursor
@@ -157,19 +162,20 @@ public final class CodexHistoryReader {
         var status = sqlite3_step(statement)
         while status == SQLITE_ROW {
             guard let rawID = sqlite3_column_text(statement, 0), let raw = sqlite3_column_text(statement, 2),
-                  let json = try JSONSerialization.jsonObject(with: Data(String(cString: raw).utf8)) as? JSONObject else { throw failure() }
+                  let json = try? JSONSerialization.jsonObject(with: Data(String(cString: raw).utf8)) as? JSONObject else {
+                throw CodexHistoryReadError(.invalidData, subject: "질문")
+            }
             updated[String(cString: rawID)] = CodexQuestionHistory.Item(ordinal: sqlite3_column_int64(statement, 1), json: json)
             status = sqlite3_step(statement)
         }
-        guard status == SQLITE_DONE else { throw failure() }
+        guard status == SQLITE_DONE else { throw CodexHistoryAccess.failure(db, subject: "질문", result: status) }
         items = updated; cursor = next; self.location = location
         return CodexQuestionHistory.pending(threadID: location.threadID, items: Array(items.values))
     }
-    private func failure() -> AppError { .message("Codex 질문 기록을 읽지 못했습니다. 기록 형식 또는 연결 상태를 확인해주세요.") }
 }
 
 public actor CodexQuestionCollector {
-    private var readers: [String: CodexHistoryReader] = [:]
+    private var readers: [String: CodexSessionHistoryReader] = [:]
     public init() {}
     public func collect(_ sessions: [AgentSession]) -> [CodexQuestionUpdate] {
         let targets = sessions.filter { $0.agent == .codex && $0.phase != .ended }
@@ -184,9 +190,9 @@ public actor CodexQuestionCollector {
         return targets.map { session in
             do {
                 let location = try CodexThreadLocation.locate(paths: files[session.pid] ?? [])
-                let reader = readers[session.id] ?? CodexHistoryReader()
+                let reader = readers[session.id] ?? CodexSessionHistoryReader()
                 readers[session.id] = reader
-                return CodexQuestionUpdate(sessionID: session.id, questions: try reader.read(location))
+                return reader.read(sessionID: session.id, location: location)
             } catch { return CodexQuestionUpdate(sessionID: session.id, error: error.localizedDescription) }
         }
     }

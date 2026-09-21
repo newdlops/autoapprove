@@ -9,7 +9,10 @@ import UserNotifications
     private(set) var notifications: QuestionNotifications!
     @Published var notificationResult = "알림 검증 대기"
     @Published var opened = 0
+    private var openedTerminals = 0
+    @Published var terminalOpenResult = "세션 관리 · 열기 0회"
     private var questionID = UUID().uuidString
+    private var completionTurn = UUID().uuidString
     init() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-ui-preview-" + UUID().uuidString)
         let paths = AppPaths(directory: directory)
@@ -37,11 +40,15 @@ import UserNotifications
         }))
         var session = AgentSession(id: "preview-0", agent: .codex, pid: 1200, started: "preview", tty: "/dev/ttys-test", cwd: "/tmp/자동 승인 기록 검증용 긴 프로젝트 이름", terminal: .vscode)
         session.phase = .working
+        session.bridgeID = "preview"; session.terminalID = "preview-0"; session.channel = .vscodeScreen
         session.terminalTitle = "미커밋 변경 정리 · 여러 워크트리의 상태를 확인하는 아주 긴 터미널 제목"
-        engine.updateDiscovery([session], records: [])
+        var second = AgentSession(id: "preview-1", agent: .claude, pid: 1201, started: "preview", tty: "/dev/ttys-second", cwd: "/tmp/두 번째 터미널", terminal: .terminal)
+        second.phase = .idle; second.channel = .terminalScreen; second.terminalTitle = "두 번째 창 · 더블클릭 검증"
+        let disconnected = AgentSession(id: "preview-disconnected", agent: .codex, pid: 1202, started: "preview", tty: "/dev/ttys-disconnected", cwd: "/tmp/연결 전 터미널", terminal: .vscode)
+        engine.updateDiscovery([session, second, disconnected], records: [])
         queueQuestions()
         notifications = QuestionNotifications(engine: engine, openSession: { [weak self] id in
-            guard let self, id == "claude:notification-preview",
+            guard let self, ["claude:notification-preview", "preview-0"].contains(id),
                   let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "preview" }) else {
                 throw AppError.message("검증 창을 찾지 못했습니다.")
             }
@@ -51,6 +58,17 @@ import UserNotifications
             TerminalHighlighter.shared.show(frame: window.frame, project: "알림 검증 프로젝트",
                 detail: "검증용 창 · 실제 터미널 아님", ownerBundleID: Bundle.main.bundleIdentifier!)
         })
+    }
+
+    func openTerminal(_ session: AgentSession, engine: ApprovalEngine) async throws {
+        guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "queue" }) else {
+            throw AppError.message("세션 검증 창을 찾지 못했습니다.")
+        }
+        openedTerminals += 1
+        terminalOpenResult = "세션 관리 · 열기 \(openedTerminals)회 · \(session.id)"
+        window.makeKeyAndOrderFront(nil)
+        TerminalHighlighter.shared.show(frame: window.frame, project: session.project,
+            detail: "\(session.id) · 실제 터미널 아님", ownerBundleID: Bundle.main.bundleIdentifier!)
     }
 
     func queueQuestions() {
@@ -72,11 +90,43 @@ import UserNotifications
         _ = engine.handleHook(["session_id": "notification-preview", "requestID": UUID().uuidString, "hook_event_name": "PostToolUse"])
     }
 
+    func startWork(codex: Bool = false) {
+        if codex {
+            completionTurn = UUID().uuidString
+            engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: "preview-0",
+                questions: engine.snapshot.sessions.first(where: { $0.id == "preview-0" })?.questions ?? [],
+                turn: CodexTurnState(threadID: "preview", turnID: completionTurn, status: "inProgress"))])
+        } else {
+            _ = engine.handleHook(["session_id": "notification-preview", "requestID": UUID().uuidString,
+                "cwd": "/tmp/알림 검증 프로젝트", "hook_event_name": "UserPromptSubmit"])
+        }
+    }
+
+    func finishWork(codex: Bool = false) {
+        if codex {
+            engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: "preview-0",
+                questions: engine.snapshot.sessions.first(where: { $0.id == "preview-0" })?.questions ?? [],
+                turn: CodexTurnState(threadID: "preview", turnID: completionTurn, status: "completed", completedAt: Date(),
+                    summary: "검증용 Codex 최종 응답: 요청한 작업과 검증을 마쳤습니다."))])
+        } else {
+            _ = engine.handleHook(["session_id": "notification-preview", "requestID": UUID().uuidString,
+                "hook_event_name": "Stop", "background_tasks": [], "session_crons": [],
+                "last_assistant_message": "검증용 Claude 최종 응답: 작업과 검증을 마쳤습니다."])
+        }
+    }
+
+    func brieflyFinishWork() {
+        startWork(); finishWork()
+        Task { try? await Task.sleep(nanoseconds: 500_000_000); startWork() }
+    }
+
     func inspectNotifications() {
         Task {
             let delivered = await UNUserNotificationCenter.current().deliveredNotifications()
             let pending = await UNUserNotificationCenter.current().pendingNotificationRequests()
-            notificationResult = "전달 \(delivered.count)개 · 예약 \(pending.count)개 · 알림 클릭 \(opened)회"
+            let completions = delivered.filter { $0.request.content.categoryIdentifier == "WORK_COMPLETED" }
+            notificationResult = "전달 \(delivered.count)개 · 완료 \(completions.count)개 · 예약 \(pending.count)개 · 알림 클릭 \(opened)회"
+                + completions.map { "\n\($0.request.content.title) · \($0.request.content.subtitle)" }.joined()
         }
     }
 }
@@ -91,7 +141,8 @@ import UserNotifications
             AuditHistoryWindow(engine: fixture.engine)
         }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize)
         Window("세션 관리 · 검증용 데이터", id: "queue") {
-            SessionWindow(engine: fixture.engine, notifications: fixture.notifications)
+            SessionWindow(engine: fixture.engine, notifications: fixture.notifications, openTerminal: fixture.openTerminal)
+                .navigationTitle(fixture.terminalOpenResult)
         }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize)
     }
 }
@@ -127,6 +178,15 @@ private struct HighlightPreview: View {
                 Button("삼지선다 알림 보내기") { fixture.question(new: true) }
                 Button("같은 질문 다시 관찰") { fixture.question(new: false) }
                 Button("질문 해결") { fixture.resolve() }
+            }
+            HStack {
+                Button("Claude 작업 시작") { fixture.startWork() }
+                Button("Claude 최종 완료 / 반복") { fixture.finishWork() }
+                Button("완료 직후 작업 재개") { fixture.brieflyFinishWork() }
+            }
+            HStack {
+                Button("Codex 작업 시작") { fixture.startWork(codex: true) }
+                Button("Codex 최종 완료 / 반복") { fixture.finishWork(codex: true) }
             }
             Button("알림 상태 확인") { fixture.inspectNotifications() }
             Text(fixture.notificationResult).font(.caption)

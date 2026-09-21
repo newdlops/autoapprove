@@ -18,13 +18,14 @@ import AutoApproveCore
     private var failed = Set<String>()
     private var deliveries: [String: Task<Void, Never>] = [:]
     private static let category = "MANUAL_ANSWER"
+    private static let completionCategory = "WORK_COMPLETED"
     private static let openAction = "OPEN_TERMINAL"
 
     var allowed: Bool { authorization == .authorized || authorization == .provisional }
     var status: String {
         if busy { return "macOS 권한 창에서 알림을 허용해주세요" }
         switch authorization {
-        case .authorized, .provisional: return "허용됨 · 응답이 필요한 질문을 알립니다"
+        case .authorized, .provisional: return "허용됨 · 응답이 필요한 질문과 작업 완료를 알립니다"
         case .denied: return "알림 꺼짐 · 시스템 설정에서 허용해주세요"
         default: return "알림 허용 필요"
         }
@@ -46,7 +47,9 @@ import AutoApproveCore
         super.init()
         center.delegate = self
         let action = UNNotificationAction(identifier: Self.openAction, title: "터미널 열기", options: [.foreground])
-        center.setNotificationCategories([UNNotificationCategory(identifier: Self.category, actions: [action], intentIdentifiers: [])])
+        center.setNotificationCategories(Set([Self.category, Self.completionCategory].map {
+            UNNotificationCategory(identifier: $0, actions: [action], intentIdentifiers: [])
+        }))
         subscription = engine.$snapshot.sink { [weak self] snapshot in self?.update(snapshot) }
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
             guard (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == Bundle.main.bundleIdentifier else { return }
@@ -85,7 +88,7 @@ import AutoApproveCore
     }
 
     private func update(_ snapshot: EngineSnapshot) {
-        let requests = tracker.update(snapshot)
+        let requests = tracker.update(snapshot) + AttentionRequest.completions(snapshot)
         let next = Dictionary(uniqueKeysWithValues: requests.map { ($0.id, $0) })
         let removed = Set(active.keys).subtracting(next.keys)
         for id in removed { deliveries.removeValue(forKey: id)?.cancel(); submitted.remove(id); failed.remove(id) }
@@ -95,15 +98,16 @@ import AutoApproveCore
         guard allowed else { return }
         for request in requests where !submitted.contains(request.id) && deliveries[request.id] == nil {
             deliveries[request.id] = Task { [weak self] in
-                // Let a successful automatic response or transient screen settle first.
-                do { try await Task.sleep(nanoseconds: 800_000_000) } catch { return }
+                // A follow-up hook or queued turn can resume work just after a final response.
+                let delay: UInt64 = request.kind == .completion ? 3_000_000_000 : 800_000_000
+                do { try await Task.sleep(nanoseconds: delay) } catch { return }
                 guard let self, self.active[request.id] != nil, self.allowed else { return }
                 let content = UNMutableNotificationContent()
-                content.title = "\(request.project) · 응답 필요"
+                content.title = request.title
                 content.subtitle = request.agent
                 content.body = String(request.summary.prefix(600))
                 content.sound = .default
-                content.categoryIdentifier = Self.category
+                content.categoryIdentifier = request.kind == .completion ? Self.completionCategory : Self.category
                 content.threadIdentifier = request.sessionID
                 content.userInfo = ["sessionID": request.sessionID]
                 do {
@@ -116,7 +120,7 @@ import AutoApproveCore
                     // Avoid retrying on every two-second poll; expose an explicit retry.
                     self.submitted.insert(request.id)
                     self.failed.insert(request.id)
-                    self.error = "응답 알림을 보내지 못했습니다. \(error.localizedDescription)"
+                    self.error = "\(request.kind == .completion ? "작업 완료" : "응답") 알림을 보내지 못했습니다. \(error.localizedDescription)"
                 }
                 self.deliveries.removeValue(forKey: request.id)
             }

@@ -2,6 +2,31 @@
 
 검증일: 2026-09-21. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.9 DMG 배포
+
+- 검증된 앱 **0.2.9 (12)**와 내장 VS Code 확장 **0.2.3**을 `AutoApprove-0.2.9-macOS-arm64.dmg`로 패키징했다. 이전 배포 0.2.7 이후의 완료 알림·Codex 기록 조회 복구·터미널 더블클릭을 함께 포함한다.
+- `node scripts/package-dmg.mjs`의 `hdiutil verify`, 읽기 전용 마운트, 포함 앱의 엄격한 코드 서명 검증이 통과했다. 앱·Applications 바로가기·설치 안내 세 항목과 링크 대상·안내 원문 일치를 확인하고 정상 추출했다.
+- SHA-256: `74fdd1d5b173b291c0dd2fdd05f49eeb54389fa0da139e5be6ebd0b9cafc0be9`. DMG와 `.dmg.sha256`을 [v0.2.9 Release](https://github.com/newdlops/autoapprove/releases/tag/v0.2.9)의 배포 파일로 사용한다. 소스는 같은 버전 태그로 고정한다. 아래 기능 검증은 해당 앱 빌드에서 수행했다.
+
+## 0.2.9 Codex 기록 조회 복구·터미널 더블클릭
+
+- 격리된 SQLite DB에 `BEGIN EXCLUSIVE` 잠금을 걸어 기존 질문 조회 오류와 ‘작업 완료 기록 형식을 지원하지 않습니다’가 함께 발생하는 것을 재현했다. 잠금을 풀면 같은 형식을 정상 조회했다. 실제 imgflash 세션의 스키마도 지원 형식이며 재확인 때 정상 조회됐다. 사용자 스크린샷 시점의 원시 SQLite 오류 코드는 확보하지 못했으므로 당시 원인이 반드시 잠금이었다고 단정하지 않는다.
+- SQLite BUSY/LOCKED/SCHEMA, 기록 준비 중, 실제 테이블·열 누락, 파일 접근 실패와 잘못된 내용을 구분한다. 일시적 오류는 첫 두 조회까지 경고 없이 다시 확인하고 세 번 연속 실패하면 정확한 안내를 표시한다. 실패한 조회는 빈 목록과 구분해 기존 질문·질문 알림·증분 커서를 보존한다. 질문과 완료 조회는 각각 복구하며 확인되지 않은 완료 상태를 알림으로 보내지 않는다. 실제 스키마 오류는 즉시 표시하고 정상 조회가 되면 오류를 해제한다.
+- 릴리스 빌드, 핵심 검사 **51/51**, `node scripts/integration-check.mjs .build/release/autoapprove`, `node scripts/screen-integration-check.mjs .build/release/autoapprove` 통과. 새 검증은 실제 SQLite 잠금·해제, 잠금 중 새 질문 기록의 복구, 기존 질문 알림·관찰 시각 보존, 성공한 빈 대기열 반영, 실제 스키마 오류의 즉시 표시, 질문/완료 오류 분리, 읽기 전용으로 없는 DB를 생성하지 않는 동작을 포함한다.
+- `$ui-design-workflow`를 적용하고 기존 SwiftUI 목록·선택·스위치·터미널 강조 경로를 유지했다. 생산 `SessionWindow`를 사용하는 격리 앱에서 한 번 클릭은 선택만, 더블클릭은 정확한 세션의 열기 콜백 1회, 다중 선택 중에는 클릭한 세션만 전달됨을 확인했다. 검색 후 대상 식별, 우클릭 열기, 자동 승인 스위치의 독립 동작, 연결 전 안내, **999×670** 및 **784×612**의 긴 제목·질문·버튼 배치와 작은 창 더블클릭을 확인했다. [기본 창](dist/qa/double-click-desktop.jpg), [작은 창](dist/qa/double-click-compact.jpg). 검증 질문은 종료 전 목록에서 정리했다.
+- 앱 **0.2.9 (12)**를 패키징하고 `codesign --verify --deep --strict --verbose=2 dist/AutoApprove.app` 통과 후 실행했다. 재시작 직후 세 차례 상태 조회에서 활성 **9개**, 자동 승인 **8개**, Terminal 연결 **8개**, 기존 세션 설정 변경 **0개**, 전체 일시정지 꺼짐을 확인했다. Codex 두 세션의 질문·완료 오류는 없고 관찰 시각이 갱신됐다. 실제 앱의 imgflash 상세에서도 두 주황색 기록 오류가 사라진 것을 확인했다. [imgflash 상세](dist/qa/0.2.9-imgflash.jpg).
+- 범위: 더블클릭의 UI 입력·정확한 세션 전달은 실제 네이티브 검증 앱에서 확인했지만, Computer Use가 Terminal 접근을 차단하므로 실제 사용자 Terminal 창 이동은 이번에 직접 실행하지 않았다. 기존 이동 코드의 정확한 TTY·최소화 복원·닫힌 탭 검사는 통과했다. 전체 VoiceOver 및 모든 macOS 버전은 별도 검증하지 않았으며, 웹·모바일 화면 검증은 해당하지 않는다.
+
+## 0.2.8 최종 응답 완료 알림
+
+- Claude 루트 `Stop`과 Codex 최신 루트 턴의 `completed`를 기존 macOS 알림 경로에 추가했다. 프로젝트·도구·최종 응답 요약을 표시하며 알림 클릭은 기존 세션 ID 검증·터미널 이동·강조를 사용한다. 자동 승인 설정·일시정지와 독립적이다. 3초 확인 중 새 작업이 관찰되면 전송을 취소한다.
+- 최초 관찰의 과거 완료, 단순 idle, 도구 하나·하위 에이전트 종료, Codex failed/interrupted, 세션 종료는 완료 알림을 만들지 않는다. Claude 훅이 보고하는 백그라운드·예약 작업과 미응답 질문도 제외한다. Codex 완료 조회는 질문 수집과 오류를 분리하고 기존 읽기 전용 루트 매핑을 재사용한다. 실제 설치된 Codex 0.155.1의 `thread_turns` 상태·초 단위 시간·최종 응답 연결 스키마를 확인했다.
+- `swift build --disable-sandbox --cache-path .build/cache -c release`, 핵심 검사 **48/48**, `node scripts/integration-check.mjs .build/release/autoapprove`, `node scripts/screen-integration-check.mjs .build/release/autoapprove` 통과. 새 검증은 첫 기준선, 짧은 턴, 중복 Stop/완료, 작업 재개, 백그라운드·예약·질문 보존, 읽기 오류 복구, 최신 턴과 정확한 최종 응답 연결, 프로세스 종료 후 늦은 결과를 포함한다. helper→소켓→상태에서 실제 Stop JSON과 새 작업의 완료 상태 제거도 검사했다.
+- 격리된 네이티브 앱에서 실제 `UNUserNotificationCenter` 전달 내역을 확인했다. 기존 질문 알림 2개와 공존하면서 초기 완료 **0개 → Claude 완료 1개 → Codex까지 완료 2개**, 같은 완료 반복 후 **2개 유지**, 새 작업과 완료 직후 0.5초 재개 후 **완료 0개·예약 0개**를 확인했다. 종료 전 검증 질문도 정리해 검증 앱 알림을 **0개**로 만들었다. [전달 결과](dist/qa/completion-delivered.jpg), [재개·취소 결과](dist/qa/completion-resumed.jpg). 검증용 이벤트만 사용했으며 사용자 대화에 시험 응답을 보내지 않았다.
+- `$ui-design-workflow`를 적용해 기존 설정·폰트·상태색·툴팁을 유지했다. **600×660** 설정에서 새 안내 줄바꿈·허용 상태·시스템 설정 버튼과 아래 연결 항목까지 스크롤을 확인했다. 검증 창 캡처는 **1040×672**이다. [알림 설정](dist/qa/completion-settings.jpg). 전체 VoiceOver·키보드 흐름, 오류/권한 거부 상태의 새 화면은 이번에 별도로 시각 검증하지 않았다. 네이티브 앱이므로 웹·모바일 검증은 해당하지 않는다.
+- 앱 **0.2.8 (11)** 패키징·`codesign --verify --deep --strict --verbose=2 dist/AutoApprove.app` 통과 후 실행했다. 활성 **9개**, Terminal 연결 **8개**, 자동 승인 **8개**, 일시정지 해제와 기존 세션별 자동 승인 설정 일치를 확인했다. 실제 Codex 두 세션의 질문·완료 기록 읽기 오류는 없고 재실행 직후 과거 완료 알림 후보는 0개였다. 실제 앱 알림 권한은 **허용됨**이다.
+- 이번 검증은 실제 사용자 TUI의 최종 응답→배너 클릭→터미널 이동 전체를 검증한 것은 아니다. Computer Use의 Terminal·알림 센터 접근 제한을 우회하지 않았다. Claude의 이전 버전에서 생략되는 백그라운드 정보나 다른 훅의 지연된 재개에는 감지 한계가 있다. 완료는 응답 종료이며 의미상 목표 달성이나 모든 명령의 성공을 보증하지 않는다.
+
 ## 0.2.7 DMG 배포
 
 - release 빌드 스크립트로 앱 **0.2.7 (10)**과 내장 VS Code 확장 **0.2.3**을 생성했다. 앱·helper 모두 **arm64**, Mach-O의 최소 macOS 버전 **14.0**을 확인했다. 확장에는 `@xterm/headless 5.5.0`의 저작권·MIT 라이선스 안내를 포함했다.

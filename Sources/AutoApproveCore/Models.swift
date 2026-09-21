@@ -65,6 +65,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var queuedQuestions: [QueuedQuestion]?
     public var codexQuestionsObservedAt: Date?
     public var codexQuestionsError: String?
+    public var completion: WorkCompletion?
+    public var completionError: String?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var needsReview: Bool { phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending }) }
@@ -84,6 +86,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
         if self.phase != phase { lastActivity = date }
         idleSince = phase == .idle ? (self.phase == .idle ? idleSince ?? date : date) : nil
         self.phase = phase; activityDetail = detail
+        if phase == .ended { completion = nil; completionError = nil }
     }
 }
 

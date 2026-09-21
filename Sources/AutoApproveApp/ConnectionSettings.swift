@@ -15,13 +15,14 @@ struct ConnectionSettings: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    section("응답 알림", icon: "bell", status: notifications.status) {
-                        Text("자동으로 답할 수 없는 질문을 macOS 알림으로 알려줍니다. 알림을 누르면 해당 터미널을 열고 강조합니다. 같은 질문은 한 번만 알리며, 답한 질문의 알림은 정리합니다.")
+                    section("질문 · 작업 완료 알림", icon: "bell", status: notifications.status) {
+                        Text("직접 답해야 하는 질문과 최종 응답이 끝난 작업을 macOS 알림으로 알려줍니다. 알림을 누르면 해당 터미널을 열고 강조합니다. 같은 질문·완료는 한 번만 알리며, 답변하거나 새 작업을 시작하면 알림을 정리합니다.")
+                        Text("완료 알림은 Claude 훅과 Codex 완료 기록을 사용합니다. 처음부터 대기 중인 세션·중단·프로세스 종료는 완료로 알리지 않습니다.").font(.caption)
                         HStack {
                             if notifications.authorization == .notDetermined {
                                 Button("알림 허용") { Task { await notifications.requestAuthorization() } }
                                     .disabled(notifications.busy)
-                                    .help("질문 알림과 소리를 허용하는 macOS 권한 창을 엽니다.")
+                                    .help("질문·작업 완료 알림과 소리를 허용하는 macOS 권한 창을 엽니다.")
                             }
                             Button("시스템 알림 설정") { notifications.openSettings() }
                                 .help("macOS 알림 설정에서 AutoApprove의 배너·소리·미리보기를 변경합니다.")
@@ -30,7 +31,7 @@ struct ConnectionSettings: View {
                         if let error = notifications.error {
                             Text(error).foregroundStyle(.red)
                             Button("알림 다시 확인") { Task { await notifications.retryDelivery() } }
-                                .disabled(notifications.busy).help("알림 권한을 확인하고 전송에 실패한 질문 알림을 다시 보냅니다.")
+                                .disabled(notifications.busy).help("알림 권한을 확인하고 전송에 실패한 알림을 다시 보냅니다.")
                         }
                     }
                     Divider()
