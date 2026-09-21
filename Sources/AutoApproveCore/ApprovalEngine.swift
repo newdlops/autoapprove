@@ -37,9 +37,12 @@ import Combine
         var prompt: ApprovalPrompt
         var attempted = false
         var generation: String
+        var isCurrent = true
         var scheduledID: UUID?
         var validationFailures = 0
+        var retryAfter: Date?
         var dispatchID: UUID?
+        var reviewDetail: String?
     }
 
     public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live) throws {
@@ -595,9 +598,10 @@ import Combine
                 }
                 publish()
             case "actionResult":
-                if let id = params["actionID"] as? String, let action = pendingActions[id], action.peerID == peer.id {
+                if let id = params["actionID"] as? String, let action = pendingActions[id], action.peerID == peer.id,
+                   let receipt = params["success"] as? NSNumber, CFGetTypeID(receipt) == CFBooleanGetTypeID() {
                     pendingActions.removeValue(forKey: id)
-                    let succeeded = params["success"] as? Bool == true
+                    let succeeded = receipt.boolValue
                     if !succeeded { retryUnsentApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation) }
                     if succeeded { watchDeliveredApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, requestIdentity: action.requestIdentity) }
                     var event = action.event
@@ -680,10 +684,20 @@ import Combine
         defer { publish() }
         screenObservedAt[sessionID] = now
         guard let prompt else {
-            screens.removeValue(forKey: sessionID)
+            let request = QuestionDetector.detect(raw, agent: session.agent)
+            let observation = ActivityDetector.detect(raw, agent: session.agent)
+            // An incomplete repaint is not evidence that a dispatched request finished.
+            // Keep its reservation, but never dispatch from this unverified frame.
+            if screens[sessionID]?.generation == generation, request?.phase != .input,
+               observation.phase == .unknown || request?.phase == .approval {
+                screens[sessionID]?.isCurrent = false
+                screens[sessionID]?.scheduledID = nil
+            } else {
+                screens.removeValue(forKey: sessionID)
+            }
             sessions[sessionID]?.pendingSummary = nil; sessions[sessionID]?.pendingInTerminal = false
             sessions[sessionID]?.pendingRequestID = nil
-            if let request = QuestionDetector.detect(raw, agent: session.agent) {
+            if let request {
                 activityTrackers.removeValue(forKey: sessionID)
                 sessions[sessionID]?.setPhase(request.phase, detail: "터미널에서 요청에 응답해주세요.", at: now)
                 sessions[sessionID]?.pendingSummary = request.summary; sessions[sessionID]?.pendingInTerminal = true
@@ -700,7 +714,7 @@ import Combine
             return
         }
         activityTrackers.removeValue(forKey: sessionID)
-        if let existing = screens[sessionID], existing.generation == generation, existing.prompt.identity == prompt.identity {
+        if let existing = screens[sessionID], existing.isCurrent, existing.generation == generation, existing.prompt.identity == prompt.identity {
             screens[sessionID]?.raw = raw; screens[sessionID]?.prompt = prompt
             scheduleScreenApproval(sessionID)
             return
@@ -711,12 +725,15 @@ import Combine
         let previous = screens[sessionID].flatMap {
             $0.generation == generation && (session.agent != .codex || $0.prompt.requestIdentity == prompt.requestIdentity) ? $0 : nil
         }
-        screens[sessionID] = ScreenState(raw: raw, prompt: prompt, attempted: previous?.attempted ?? false, generation: generation, validationFailures: previous?.validationFailures ?? 0, dispatchID: previous?.dispatchID)
-        if previous?.attempted != true {
-            sessions[sessionID]?.setPhase(.approval, detail: "터미널에서 실행 권한에 대한 응답을 기다리고 있습니다.", at: now)
-        }
+        var current = previous ?? ScreenState(raw: raw, prompt: prompt, generation: generation)
+        // Coalesce render changes while process validation is in flight. The adapter
+        // still receives the latest complete original dialog for its final check.
+        if current.prompt.requestIdentity != prompt.requestIdentity { current.scheduledID = nil }
+        current.raw = raw; current.prompt = prompt; current.isCurrent = true
+        screens[sessionID] = current
+        sessions[sessionID]?.setPhase(.approval, detail: current.reviewDetail ?? "터미널에서 실행 권한에 대한 응답을 기다리고 있습니다.", at: now)
         sessions[sessionID]?.pendingSummary = prompt.summary
-        sessions[sessionID]?.pendingInTerminal = previous != nil && session.pendingInTerminal
+        sessions[sessionID]?.pendingInTerminal = current.reviewDetail != nil
         sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.requestIdentity)"
         sessions[sessionID]?.lastActivity = Date()
         scheduleScreenApproval(sessionID)
@@ -726,19 +743,23 @@ import Combine
         guard let state = screens[id], state.generation == generation, state.dispatchID == dispatchID else { return }
         screens[id]?.dispatchID = nil
         screens[id]?.validationFailures += 1
-        if state.validationFailures < 3 {
-            // The adapter confirms no input was sent. Wait for the next screen observation before retrying.
-            screens[id]?.attempted = false
+        // Only a definitive non-write enters this path. A fast repaint must not
+        // permanently exhaust a retry budget; back off and require a fresh frame.
+        let delay = min(4, 0.25 * pow(2, Double(min(state.validationFailures, 4))))
+        screens[id]?.retryAfter = Date().addingTimeInterval(delay)
+        screens[id]?.attempted = false
+        screens[id]?.reviewDetail = nil
+        if state.isCurrent {
+            sessions[id]?.pendingInTerminal = false
             sessions[id]?.activityDetail = "화면이 바뀌어 승인 요청을 다시 확인하고 있습니다."
-        } else {
-            sessions[id]?.pendingInTerminal = true
-            sessions[id]?.activityDetail = "화면 확인이 반복해서 실패했습니다. 터미널에서 요청을 확인해주세요."
         }
     }
 
     private func requireApprovalReview(_ id: String, dispatchID: UUID, generation: String, requestIdentity: String, detail: String) {
         guard let state = screens[id], state.generation == generation, state.dispatchID == dispatchID,
-              state.prompt.requestIdentity == requestIdentity, sessions[id]?.phase == .approval else { return }
+              state.prompt.requestIdentity == requestIdentity else { return }
+        screens[id]?.reviewDetail = detail
+        guard state.isCurrent, sessions[id]?.phase == .approval else { return }
         sessions[id]?.pendingInTerminal = true
         sessions[id]?.activityDetail = detail
     }
@@ -772,7 +793,8 @@ import Combine
     private func scheduleScreenApproval(_ id: String) {
         guard let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel == .terminalScreen || session.channel == .vscodeScreen, !snapshot.paused,
-              let state = screens[id], !state.attempted, state.scheduledID == nil else { return }
+              let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
+              state.retryAfter.map({ Date() >= $0 }) ?? true else { return }
         let scheduledRevision = revision
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
@@ -783,9 +805,10 @@ import Combine
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,
-                  self.screens[id]?.scheduledID == scheduledID,
-                  self.screens[id]?.generation == state.generation,
-                  self.screens[id]?.prompt.identity == state.prompt.identity,
+                  let current = self.screens[id], current.isCurrent, !current.attempted,
+                  current.scheduledID == scheduledID,
+                  current.generation == state.generation,
+                  current.prompt.requestIdentity == state.prompt.requestIdentity,
                   live?.contains(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent
                       && "/dev/" + $0.tty == session.tty && $0.isForeground }) == true else {
                 if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }
@@ -793,17 +816,18 @@ import Combine
             }
             // Commit dispatch on the main actor. Pause cancels queued approvals, not an input already dispatched.
             self.screens[id]?.attempted = true; self.screens[id]?.scheduledID = nil; self.screens[id]?.dispatchID = scheduledID
-            var event = AuditEvent(sessionID: id, summary: state.prompt.summary, outcome: "승인 시도 · 결과 미확인", source: session.channel == .terminalScreen ? "Terminal 화면" : "VS Code 화면",
-                context: AuditContext(session: session), request: session.agent == .codex ? state.prompt.dialog : state.prompt.summary)
+            var event = AuditEvent(sessionID: id, summary: current.prompt.summary, outcome: "승인 시도 · 결과 미확인", source: session.channel == .terminalScreen ? "Terminal 화면" : "VS Code 화면",
+                context: AuditContext(session: session), request: session.agent == .codex ? current.prompt.dialog : current.prompt.summary)
             // Persist the attempt before dispatch; a crash or missing acknowledgement remains traceable.
             guard self.log(event) else {
                 self.sessions[id]?.pendingInTerminal = true
                 self.sessions[id]?.activityDetail = "승인 내역을 저장하지 못했습니다. 터미널에서 요청을 확인해주세요."
+                self.screens[id]?.reviewDetail = self.sessions[id]?.activityDetail
                 self.publish(); return
             }
             if session.channel == .terminalScreen {
                 do {
-                    let delivery = try await Task.detached { try TerminalAdapter.approve(tty: session.tty, expectedScreen: state.raw, agent: session.agent) }.value
+                    let delivery = try await Task.detached { try TerminalAdapter.approve(tty: session.tty, expectedScreen: current.raw, agent: session.agent) }.value
                     if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
                     if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
                     event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
@@ -817,7 +841,6 @@ import Combine
             } else if session.channel == .vscodeScreen, let peerID = session.bridgeID, let peer = self.peers[peerID], let terminalID = session.terminalID {
                 let actionID = UUID().uuidString
                 self.pendingActions[actionID] = (id, event, peerID, scheduledID, state.generation, state.prompt.requestIdentity)
-                let current = self.screens[id] ?? state
                 let sent = peer.send(["method": "approve", "id": actionID, "terminalID": terminalID, "fingerprint": current.prompt.fingerprint, "dialog": current.prompt.dialog, "agent": session.agent.rawValue, "answer": current.prompt.answer, "generation": String(state.generation.dropFirst(peerID.count + 1)), "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000])
                 if sent { self.watchApprovalAcknowledgement(actionID) }
                 else {

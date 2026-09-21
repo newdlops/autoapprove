@@ -6,11 +6,24 @@ import path from 'node:path';
 import net from 'node:net';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { runApprovalStress } from './approval-stress-check.mjs';
+import { runApprovalRace } from './approval-race-check.mjs';
 
 const exec = promisify(execFile);
-const root = await mkdtemp('/private/tmp/aa-screen-');
 const binary = path.resolve(process.argv[2] || '.build/debug/autoapprove');
 const codexOnly = process.argv.includes('--codex-only');
+const race = process.argv.includes('--race') || process.argv.includes('--race-retry');
+const stressIndex = process.argv.indexOf('--stress');
+const stressCount = stressIndex < 0 ? 0 : Number(process.argv[stressIndex + 1]);
+const lanesIndex = process.argv.indexOf('--stress-terminals');
+const stressTerminals = lanesIndex < 0 ? 1 : Number(process.argv[lanesIndex + 1]);
+const reportIndex = process.argv.indexOf('--stress-report');
+const stressReport = reportIndex < 0 ? undefined : process.argv[reportIndex + 1];
+if (stressIndex >= 0 && (!Number.isInteger(stressCount) || stressCount < 1 || stressCount > 100_000
+    || !Number.isInteger(stressTerminals) || stressTerminals < 1 || stressTerminals > 16)) {
+  throw Error('Expected --stress 1..100000 and --stress-terminals 1..16');
+}
+const root = await mkdtemp('/private/tmp/aa-screen-');
 const home = path.join(root, 'state');
 const children = [];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -44,6 +57,7 @@ class Bridge {
           const success = this.rejections <= 0;
           if (!success) this.rejections--;
           if (!this.unacknowledged.has(message.terminalID)) void this.request('actionResult', { actionID: message.id, success });
+          this.onApproval?.(message);
         } else {
           const callback = this.waiting.get(message.id);
           this.waiting.delete(message.id);
@@ -67,7 +81,8 @@ try {
   const holder = path.join(root, 'pty-holder');
   await exec('/usr/bin/cc', ['Tests/fixtures/pty-holder.c', '-o', holder]);
   const fixtures = [];
-  for (const [index, agent] of (codexOnly ? ['codex', 'codex'] : ['codex', 'codex', 'claude']).entries()) {
+  const agents = stressCount ? Array(stressTerminals).fill('codex') : race ? ['codex'] : codexOnly ? ['codex', 'codex'] : ['codex', 'codex', 'claude'];
+  for (const [index, agent] of agents.entries()) {
     const directory = path.join(root, `fixture-${index}`);
     await mkdir(directory);
     if (index === 0) await exec('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', 'init', '--quiet', '--initial-branch=fixture-main', directory]);
@@ -94,7 +109,12 @@ try {
     const found = fixtures.map(fixture => status.sessions.find(session => session.cwd === fixture.directory));
     return found.every(Boolean) ? found : undefined;
   }, 'PTY discovery');
-  if (codexOnly) {
+  if (race) {
+    await runApprovalRace({ bridge, fixtures, sessions, actions, retryOnly: process.argv.includes('--race-retry') });
+  } else if (stressCount) {
+    await runApprovalStress({ bridge, fixtures, sessions, actions, serverPID: server.pid, home,
+      count: stressCount, reportPath: stressReport, binary });
+  } else if (codexOnly) {
     await bridge.request('register', { terminals: fixtures });
     for (const session of sessions) await bridge.request('automatic', { sessionID: session.id, enabled: true });
     const reportedCommand = "rg -n 'lora|adapter|error|warn' .cache/product-evaluation/server-clean.log";
@@ -144,11 +164,13 @@ try {
 
     bridge.rejections = 10;
     const rejected = dialog('cat rejected.txt');
-    await until(async () => { await show(0, rejected); return actions.length === 11; }, 'bounded failure fixture');
-    await until(async () => (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).pendingInTerminal, 'bounded failure requests review');
+    await until(async () => { await show(0, rejected); return actions.length === 11; }, 'repeated non-write fixture');
+    await sleep(150);
+    assert.equal(actions.length, 11, 'Confirmed non-writes wait for a fresh frame and backoff');
+    assert.equal((await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).pendingInTerminal, false);
     bridge.rejections = 0;
     await show(0, dialog('cat following-request.txt'));
-    await until(() => actions.length === 12, 'next command does not inherit the previous command retry limit');
+    await until(() => actions.length === 12, 'next command does not inherit the previous command backoff');
     console.log('PASS Codex-only consecutive permissions in one process, reported screenshot, wrapping/history/shortcut deduplication, terminal isolation, pause/resume and manual choices');
   } else {
   await until(async () => {
@@ -245,10 +267,10 @@ try {
   await until(async () => {
     await bridge.request('screen', { terminalID: fixtures[0].id, screen: prompt, generation: 'bounded-retry' });
     return actions.length === 9;
-  }, 'initial attempt plus at most three retries');
+  }, 'initial attempt plus three confirmed-unsent retries');
   for (let n = 0; n < 5; n++) await bridge.request('screen', { terminalID: fixtures[0].id, screen: prompt, generation: 'bounded-retry' });
-  await sleep(150); assert.equal(actions.length, 9, 'Repeated validation failures stop for manual review');
-  assert.equal((await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).pendingInTerminal, true);
+  await sleep(150); assert.equal(actions.length, 9, 'Backoff prevents rapid retry loops');
+  assert.equal((await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).pendingInTerminal, false);
   bridge.rejections = 0;
 
   await bridge.request('hook', { session_id: 'fixture-claude', agentPID: claude.pid, agentStarted: claude.started, requestID: 'network-prompt', hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Network approval pending' });
@@ -263,6 +285,9 @@ try {
   }
   await until(() => actions.length === 12, 'missing acknowledgement and delivered-but-still-waiting fixtures');
   const missingAck = actions.find(action => action.generation === 'timeout' && action.terminalID === fixtures[0].id);
+  for (const success of [undefined, null, 0, 'false']) {
+    await bridge.request('actionResult', { actionID: missingAck.id, success });
+  }
   await until(async () => {
     for (let index = 0; index < 2; index++) {
       await bridge.request('screen', { terminalID: fixtures[index].id, screen: prompt, generation: 'timeout' });
@@ -274,6 +299,11 @@ try {
   assert.ok(status.sessions.find(session => session.id === sessions[0].id).activityDetail.includes('8초'));
   assert.ok(status.sessions.find(session => session.id === sessions[1].id).activityDetail.includes('같은 요청'));
   assert.equal(status.events.filter(event => event.outcome === '전달 확인 시간 초과 · 터미널 확인 필요').length, 1);
+  await bridge.request('screen', { terminalID: fixtures[0].id, screen: '', generation: 'timeout' });
+  await bridge.request('screen', { terminalID: fixtures[0].id, screen: prompt, generation: 'timeout' });
+  const afterRedraw = (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id);
+  assert.equal(afterRedraw.pendingInTerminal, true, 'Incomplete redraw cannot erase an uncertain delivery warning');
+  assert.ok(afterRedraw.activityDetail.includes('8초'));
   await bridge.request('actionResult', { actionID: missingAck.id, success: true });
   status = await bridge.request('status');
   assert.equal(status.events.filter(event => event.outcome === '전달 확인 시간 초과 · 터미널 확인 필요').length, 1, 'Late acknowledgement cannot erase the timeout');
@@ -301,7 +331,7 @@ try {
   for (const session of sessions) {
     assert.equal(english.find(value => value.pid === session.pid)?.id, korean.find(value => value.pid === session.pid)?.id, 'Process identity must be locale independent');
   }
-  console.log('PASS real PTY discovery, periodic Git branch refresh, exact target, wrapped three-choice approval, single-use screen, pause/resume, idle/background monitoring/work transitions, hook takeover, manual questions, confirmed-unsent retry, bounded retries, missing acknowledgement timeout, unchanged delivered dialog attention, late result isolation, disconnected off, locale-independent identity');
+  console.log('PASS real PTY discovery, periodic Git branch refresh, exact target, wrapped three-choice approval, single-use screen, pause/resume, idle/background monitoring/work transitions, hook takeover, manual questions, confirmed-unsent retry with backoff, missing acknowledgement timeout, unchanged delivered dialog attention, late result isolation, disconnected off, locale-independent identity');
   }
 } catch (error) {
   const processes = await exec('/bin/ps', ['-axo', 'pid=,ppid=,tty=,lstart=,comm=']);
