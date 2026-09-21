@@ -60,6 +60,7 @@ enum AppHelp {
         case .delivered: return "승인 또는 질문 응답을 전달한 기록입니다. 명령 실행이 성공했다는 뜻은 아닙니다."
         case .review: return "승인 전달에 실패했거나 결과를 확인하지 못했습니다. 상세 내역의 사유를 확인하세요."
         case .manual: return "자동으로 답하지 않고 원래 터미널에서 직접 확인하도록 넘긴 요청입니다."
+        case .queued: return "답변을 Codex 메시지 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달되며, 처리 완료를 뜻하지 않습니다."
         }
     }
 }

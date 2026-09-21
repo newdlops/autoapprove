@@ -348,6 +348,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("question reply text, shell literals and exact receipt", tests.testReplyMessageAndReceipt),
+            ("explicit question response, durable audit and duplicate prevention", tests.testQuestionReplyAuditAndDuplicateProtection),
+            ("uncertain question response and restart reservation", tests.testQuestionReplyUncertainAndPreflightFailure),
+            ("question response requires correct thread and saved audit", tests.testQuestionReplyRequiresCorrectThreadAndSavedAudit),
             ("Codex async queue and exact, partial, ambiguous answer resolution", tests.testCodexQuestionResolution),
             ("Codex read-only history, incremental updates and restart", tests.testCodexHistoryReadOnlyAndIncremental),
             ("Codex root-thread binding excludes children and ambiguous processes", tests.testCodexThreadBinding),

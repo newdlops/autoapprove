@@ -6,6 +6,8 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
     public var threadID: String
     public var title: String
     public var options: [String]
+    public var reply: QuestionReply?
+    public var needsAnswer: Bool { reply?.phase != .queued && reply?.phase != .sending }
     public var summary: String {
         ([title] + options.enumerated().map { "\($0.offset + 1). \($0.element)" }).joined(separator: "\n")
     }

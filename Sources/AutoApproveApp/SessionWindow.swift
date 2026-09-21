@@ -186,7 +186,8 @@ struct SessionWindow: View {
             SessionDetail(session: session, events: engine.snapshot.events.filter { $0.sessionID == id }, paused: engine.snapshot.paused, openingTerminal: openingTerminal,
                           setAutomatic: { enabled in perform { try engine.setAutomatic(id, enabled: enabled) } },
                           reveal: { reveal(session) }, connect: { settings = true }, showHistory: { openWindow(id: "history") },
-                          dismissQuestion: { questionID in perform { try engine.dismissQuestion(sessionID: id, questionID: questionID) } })
+                          dismissQuestion: { questionID in perform { try engine.dismissQuestion(sessionID: id, questionID: questionID) } },
+                          replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) })
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal") } description: {
                 Text("세션을 선택해 상태를 확인하고 자동 승인을 켜세요.\n처음 사용하는 경우 연결 설정부터 시작하세요.")
@@ -215,7 +216,7 @@ private struct SessionRow: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text(session.project).font(.body.weight(.medium)).lineLimit(1)
                     .help(session.cwd.isEmpty ? "프로젝트 경로를 확인하고 있습니다." : session.cwd)
-                Text(session.terminalTitle ?? "터미널 제목 확인 중")
+                Text(session.terminalTitle ?? "터미널 제목 미확인")
                     .font(.callout).foregroundStyle(.secondary).lineLimit(1)
                     .help(session.terminalTitle ?? "터미널을 연결하면 창 또는 탭의 제목을 표시합니다.")
                 HStack(spacing: 6) {
@@ -227,10 +228,12 @@ private struct SessionRow: View {
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                     .help("\(session.tty) · PID \(String(session.pid))\n같은 프로젝트의 여러 터미널을 구분하는 식별자입니다.")
                 PhaseLabel(session: session).font(.caption)
-                if !session.questions.isEmpty {
-                    Label("질문 대기 \(session.questions.count)건", systemImage: "bubble.left.and.bubble.right")
-                        .font(.caption).foregroundStyle(.orange)
+                if !session.unansweredQuestions.isEmpty {
+                    Label("질문 대기 \(session.unansweredQuestions.count)건", systemImage: "bubble.left.and.bubble.right")
+                        .font(.caption.weight(.medium))
                         .help("작업 중에도 답변을 기다리는 Codex 질문입니다. 세션 상세에서 모두 확인할 수 있습니다.")
+                } else if session.questions.contains(where: { $0.reply?.phase == .sending }) {
+                    Label("답변 전송 중", systemImage: "arrow.up.circle").font(.caption)
                 }
             }
             Spacer(minLength: 4)
@@ -269,6 +272,7 @@ private struct SessionDetail: View {
     let connect: () -> Void
     let showHistory: () -> Void
     let dismissQuestion: (String) -> Void
+    let replyQuestion: (String, String) async throws -> Void
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -282,7 +286,7 @@ private struct SessionDetail: View {
                     }
                     Text(session.project).font(.title.weight(.semibold)).lineLimit(2).textSelection(.enabled)
                         .help(session.cwd.isEmpty ? "프로젝트 경로 미확인" : session.cwd)
-                    Text(session.terminalTitle ?? "터미널 제목 확인 중")
+                    Text(session.terminalTitle ?? "터미널 제목 미확인")
                         .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(session.cwd.isEmpty ? "프로젝트 경로를 확인하지 못했습니다." : session.cwd)
@@ -306,7 +310,8 @@ private struct SessionDetail: View {
                 }
                 Divider()
                 if session.agent == .codex {
-                    CodexQuestionList(session: session, dismiss: dismissQuestion)
+                    CodexQuestionList(session: session, openingTerminal: openingTerminal, dismiss: dismissQuestion,
+                        reply: replyQuestion, reveal: reveal)
                     Divider()
                 }
                 if session.agent == .shell {
@@ -341,6 +346,8 @@ private struct SessionDetail: View {
                             Text(session.phase == .input ? "터미널에서 질문에 답해주세요." : "현재 요청은 터미널에서 확인해주세요.")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else if !session.automatic || paused { Text("원래 터미널에서 응답할 수 있습니다.").font(.caption).foregroundStyle(.secondary) }
+                        Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app") }
+                            .disabled(!session.canReveal || openingTerminal).help(AppHelp.reveal(session, opening: openingTerminal))
                     }
                 }
                 Divider()
@@ -403,12 +410,19 @@ struct ApprovalEventDisclosure: View {
 
 struct CodexQuestionList: View {
     let session: AgentSession
+    let openingTerminal: Bool
     let dismiss: (String) -> Void
+    let reply: (String, String) async throws -> Void
+    let reveal: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("질문 대기열").font(.headline)
-                Text("\(session.questions.count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                Text("응답 대기 \(session.unansweredQuestions.count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                if session.questions.contains(where: { $0.reply?.phase == .queued }) {
+                    Text("전달 대기 \(session.questions.filter { $0.reply?.phase == .queued }.count)건")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
             }
             if let error = session.codexQuestionsError {
                 Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
@@ -422,23 +436,98 @@ struct CodexQuestionList: View {
                 Text("답변을 기다리는 질문이 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
             if !session.questions.isEmpty {
-                Text("터미널에서 답해주세요. 이미 처리한 질문이 남아 있으면 ‘확인 완료’로 목록에서 정리할 수 있습니다.")
+                if !session.unansweredQuestions.isEmpty {
+                Text("선택지를 고르거나 직접 답변을 입력하세요. 답변은 Codex가 받을 차례가 되면 전달됩니다.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     .help("Codex 기록에서 비동기 질문과 그 질문을 인용한 답변을 수집합니다. 일반 메시지나 작업 재개만으로 질문을 지우지 않습니다.")
+                }
                 ForEach(session.questions) { question in
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(question.title).font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
-                            Text("\(index + 1). \(option)").font(.callout).foregroundStyle(.secondary)
-                                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        }
-                        Button("확인 완료") { dismiss(question.id) }.controlSize(.small)
-                            .accessibilityLabel("확인 완료: \(question.title)")
-                            .help("AutoApprove의 대기 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
-                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    QuestionReplyEditor(question: question, connectionError: session.codexQuestionsError,
+                        canReveal: session.canReveal, openingTerminal: openingTerminal,
+                        send: { answer in try await reply(question.id, answer) }, dismiss: { dismiss(question.id) }, reveal: reveal)
                     if question.id != session.questions.last?.id { Divider() }
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct QuestionReplyEditor: View {
+    let question: QueuedQuestion
+    let connectionError: String?
+    let canReveal: Bool
+    let openingTerminal: Bool
+    let send: (String) async throws -> Void
+    let dismiss: () -> Void
+    let reveal: () -> Void
+    @State private var selected = Set<Int>()
+    @State private var customAnswer = ""
+    @State private var submitting = false
+    @State private var error: String?
+    private var answer: String {
+        (question.options.enumerated().filter { selected.contains($0.offset) }.map(\.element)
+            + [customAnswer.trimmingCharacters(in: .whitespacesAndNewlines)]).filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+    private var editing: Bool { question.reply == nil || question.reply?.canRetry == true }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(question.title).font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            if editing && connectionError == nil {
+                ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                    Toggle(isOn: Binding(get: { selected.contains(index) }, set: { if $0 { selected.insert(index) } else { selected.remove(index) } })) {
+                        Text(option).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    }.toggleStyle(.checkbox).disabled(submitting)
+                }
+                if question.options.count > 1 {
+                    Text("여러 항목을 함께 선택할 수 있습니다.").font(.caption).foregroundStyle(.secondary)
+                }
+                TextField(question.options.isEmpty ? "답변을 입력하세요" : "직접 답변하거나 설명을 덧붙이세요", text: $customAnswer, axis: .vertical)
+                    .textFieldStyle(.roundedBorder).lineLimit(2...5).disabled(submitting)
+                    .accessibilityLabel("\(question.title) 직접 답변")
+            } else if connectionError != nil && editing {
+                ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                    Text("\(index + 1). \(option)").font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let reply = question.reply {
+                if reply.phase == .sending {
+                    HStack { ProgressView().controlSize(.small); Text("답변을 보내고 있습니다…").font(.callout) }
+                } else {
+                    Label(reply.message, systemImage: reply.phase == .queued ? "clock.badge.checkmark" : "exclamationmark.triangle")
+                        .font(.callout).foregroundStyle(reply.phase == .queued ? Color.primary : .orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !editing { Text("답변: \(reply.answer)").font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+            } else if let error {
+                Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { actions }
+                VStack(alignment: .leading, spacing: 8) { actions }
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    @ViewBuilder private var actions: some View {
+        if editing && connectionError == nil {
+            Button("답변 보내기") {
+                guard !submitting else { return }
+                submitting = true; error = nil
+                let text = answer
+                Task {
+                    defer { submitting = false }
+                    do { try await send(text) } catch { self.error = error.localizedDescription }
+                }
+            }.buttonStyle(.borderedProminent).controlSize(.small)
+                .disabled(answer.isEmpty || submitting)
+                .help("선택한 항목과 입력한 답변을 이 Codex 대화에 보냅니다. 전송 내용을 승인 내역에 저장합니다.")
+        }
+        Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app") }
+            .controlSize(.small).disabled(!canReveal || openingTerminal || submitting)
+            .help(canReveal ? "해당 터미널을 열고 강조 표시합니다." : "터미널 연결이 필요합니다. 연결 설정을 확인해주세요.")
+        Button("목록에서 정리", action: dismiss).controlSize(.small)
+            .disabled(submitting || question.reply?.phase == .sending)
+            .help("이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
     }
 }

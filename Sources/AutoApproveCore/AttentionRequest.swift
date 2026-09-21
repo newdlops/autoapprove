@@ -13,7 +13,7 @@ public struct AttentionRequest: Equatable, Identifiable {
 
     public static func candidates(_ session: AgentSession, paused: Bool) -> [(key: String, summary: String)] {
         guard session.agent != .shell, session.phase != .ended else { return [] }
-        var result = session.questions.map { (key: $0.id, summary: $0.summary) }
+        var result = session.unansweredQuestions.map { (key: $0.id, summary: $0.summary) }
         if let summary = session.pendingSummary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            session.phase == .input || (session.phase == .approval && (session.pendingInTerminal || !session.automatic || paused)) {
             let normalized = summary.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")

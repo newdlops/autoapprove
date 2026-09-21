@@ -66,7 +66,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var codexQuestionsObservedAt: Date?
     public var codexQuestionsError: String?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
-    public var needsReview: Bool { phase != .ended && (phase == .approval || phase == .input || !questions.isEmpty) }
+    public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
+    public var needsReview: Bool { phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending }) }
     public var canApprove: Bool { agent != .shell && channel != .none && phase != .ended }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
     public var canReveal: Bool {
@@ -96,9 +97,9 @@ public struct AuditContext: Codable, Equatable {
 }
 
 public enum AuditResult: String, CaseIterable, Codable {
-    case delivered, review, manual
+    case delivered, review, manual, queued
     public var title: String {
-        switch self { case .delivered: return "응답 전달"; case .review: return "확인 필요"; case .manual: return "터미널 응답" }
+        switch self { case .delivered: return "응답 전달"; case .review: return "확인 필요"; case .manual: return "터미널 응답"; case .queued: return "전달 대기" }
     }
 }
 
@@ -116,6 +117,7 @@ public struct AuditEvent: Identifiable, Codable, Equatable {
     public var result: AuditResult {
         if ["승인 전달", "승인 입력 전달", "질문 응답 전달"].contains(outcome) { return .delivered }
         if outcome == "터미널에서 확인" { return .manual }
+        if outcome == "답변 대기열 등록" { return .queued }
         return .review
     }
     public var requestText: String { request ?? summary }

@@ -28,7 +28,13 @@ import UserNotifications
             }
             try! store.append(event)
         }
-        engine = try! ApprovalEngine(paths: paths)
+        engine = try! ApprovalEngine(paths: paths, questionTransport: CodexReplyTransport(prepare: { _, question in
+            CodexReplyTarget(executable: "/unused-preview", home: "/unused-preview", threadID: question.threadID)
+        }, send: { _, text in
+            try await Task.sleep(nanoseconds: 700_000_000)
+            if text.contains("fixture failure") { throw AppError.message("검증용: 접수 결과를 확인하지 못했습니다. 터미널에서 확인해주세요.") }
+            return UUID().uuidString
+        }))
         var session = AgentSession(id: "preview-0", agent: .codex, pid: 1200, started: "preview", tty: "/dev/ttys-test", cwd: "/tmp/자동 승인 기록 검증용 긴 프로젝트 이름", terminal: .vscode)
         session.phase = .working
         session.terminalTitle = "미커밋 변경 정리 · 여러 워크트리의 상태를 확인하는 아주 긴 터미널 제목"
