@@ -149,7 +149,7 @@ import AutoApproveCore
                 let alert = NSAlert()
                 alert.messageText = "터미널을 열지 못했습니다"
                 alert.informativeText = error.localizedDescription
-                alert.addButton(withTitle: "확인")
+                alert.addButton(withTitle: "확인").toolTip = "터미널 이동 오류 안내를 닫습니다."
                 alert.runModal()
             }
         }

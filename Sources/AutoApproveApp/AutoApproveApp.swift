@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 ContentUnavailableView {
                     Label("앱을 시작하지 못했습니다", systemImage: "exclamationmark.triangle")
+                        .help(container.error ?? "앱을 다시 실행해주세요.")
                 } description: { Text(container.error ?? "앱을 다시 실행해주세요.") }
                 .frame(minWidth: 560, minHeight: 320)
             }
@@ -44,10 +45,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         MenuBarExtra {
             if let engine = container.engine { StatusMenu(engine: engine) }
-            else { Text(container.error ?? "연결 오류"); Button("종료") { NSApp.terminate(nil) } }
+            else { Text(container.error ?? "연결 오류"); Button("종료") { NSApp.terminate(nil) }.help(AppHelp.quit) }
         } label: {
             if let engine = container.engine { StatusMenuLabel(engine: engine) }
-            else { Image(systemName: "exclamationmark.bubble") }
+            else { Image(systemName: "exclamationmark.bubble").help(container.error ?? "AutoApprove를 시작하지 못했습니다. 메뉴에서 오류를 확인하세요.") }
         }
     }
 }
@@ -57,7 +58,7 @@ private struct StatusMenuLabel: View {
     var body: some View {
         let count = engine.snapshot.attentionCount
         Label(count > 0 ? "\(count)" : "", systemImage: engine.snapshot.paused ? "pause.circle" : "checkmark.bubble")
-            .help("AutoApprove · 대기 중 \(engine.snapshot.idleCount)개 · 응답 필요 \(count)개")
+            .help("AutoApprove\(engine.snapshot.paused ? " · 자동 승인 일시정지" : "") · 대기 중 \(engine.snapshot.idleCount)개 · 응답 필요 \(count)개\n눌러서 관리 창·승인 내역을 열거나 자동 승인을 일시정지합니다.")
     }
 }
 
@@ -85,6 +86,6 @@ private struct StatusMenu: View {
         }
         Divider()
         Button("AutoApprove 종료") { engine.stop(); NSApp.terminate(nil) }.keyboardShortcut("q")
-            .help("AutoApprove와 자동 승인을 종료합니다. Claude Code·Codex 터미널은 계속 실행됩니다.")
+            .help(AppHelp.quit)
     }
 }

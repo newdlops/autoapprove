@@ -9,6 +9,63 @@ private func startInput(_ question: String = startQuestion, labels: [String] = [
 }
 
 extension ApprovalTests {
+    func testRepeatedPermissionChoicesPreferCurrentRequest() throws {
+        let cases = [
+            ["Yes", "Yes, don't ask again", "No"],
+            ["Yes (y)", "Yes, don't ask again (a)", "No (esc)"],
+            ["Yes (Recommended) [y]", "Yes, don't ask again [a]", "No [esc]"],
+            ["Yes, proceed (y)", "Yes, and don't ask again for commands that start with `npm test` (p)", "No (esc)"],
+            ["No", "Yes, don’t ask again", "Yes (Recommended)"],
+            ["Yes, allow once", "Yes, do not ask me for approval again", "No"],
+            ["Yes", "Yes, don't ask\nagain (a)", "No"],
+            ["Yes", "Yes, approve for this session", "Yes, allow all edits during this session", "No"],
+            ["예", "예, 앞으로 묻지 않기", "아니오"],
+            ["아니오", "예, 이 세션에서는 항상 허용", "예, 이번 요청만 허용"],
+            ["네", "네, 이후에도 허용", "네, 항상 승인", "아니요"].map(\.decomposedStringWithCanonicalMapping)
+        ]
+        let expected = [0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0]
+        for (index, labels) in cases.enumerated() {
+            let input = startInput(labels: labels)
+            let answer = YesNoConfirmation.detect(input)
+            try expectEqual(answer?.answer, labels[expected[index]], "Preserve the current-request label: \(labels)")
+            try expectEqual((answer?.updatedInput(input)["answers"] as? [String: String])?[startQuestion], labels[expected[index]])
+        }
+        let described: JSONObject = ["questions": [["question": startQuestion, "options": [
+            ["label": "Yes", "description": "Allow all edits during this session."],
+            ["label": "No", "description": "Cancel"],
+            ["label": "Yes, proceed", "description": "Allow this request"]
+        ]]]]
+        try expectEqual(YesNoConfirmation.detect(described)?.answer, "Yes, proceed")
+    }
+
+    func testRepeatedPermissionChoicesRejectDifferentDecisions() throws {
+        for labels in [
+            ["Yes, use staging", "Yes, use production", "No"],
+            ["Yes", "Yes, also deploy", "No"],
+            ["Yes", "Yes", "No"],
+            ["Yes", "Yes, don't ask again", "Choose another project", "No"],
+            ["Yes, don't ask again", "Yes, always allow", "No"],
+            ["Yes", "Yes, don't ask again", "Yes, always allow"],
+            ["Yes", "Yes, don't ask again", "No", "No, choose another task"]
+        ] {
+            try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "Keep distinct/ambiguous choices manual: \(labels)")
+        }
+        var input = startInput(labels: ["Yes", "Yes, don't ask again", "No"])
+        var questions = input["questions"] as! [JSONObject]
+        questions[0]["multiSelect"] = true; input["questions"] = questions
+        try expectNil(YesNoConfirmation.detect(input))
+        questions[0]["multiSelect"] = false; input["questions"] = [questions[0], questions[0]]
+        try expectNil(YesNoConfirmation.detect(input))
+        input["questions"] = questions; input["answers"] = [startQuestion: "No"]
+        try expectNil(YesNoConfirmation.detect(input))
+        let duplicateLabels: JSONObject = ["questions": [["question": startQuestion, "options": [
+            ["label": "Yes", "description": "Allow once"],
+            ["label": "Yes", "description": "Don't ask again"],
+            ["label": "No", "description": "Cancel"]
+        ]]]]
+        try expect(YesNoConfirmation.detect(duplicateLabels) == nil, "A hook cannot disambiguate identical answer labels")
+    }
+
     func testYesNoConfirmationSelection() throws {
         for question in [startQuestion, startQuestion.decomposedStringWithCanonicalMapping,
                          "계속 진행할까요?", "Should I start the work here?", "Can we continue the implementation?",
@@ -24,7 +81,7 @@ extension ApprovalTests {
         }
         for labels in [["예 — git 상태·브랜치·미커밋 변경을 훑습니다.", "아니오 — 기다립니다."],
                        ["네, 진행해주세요", "아니요, 기다려주세요"], ["YES!", "NO."], ["예 (권장)", "아니오"],
-                       ["Yes (Recommended)", "No"], ["네".decomposedStringWithCanonicalMapping, "아니요"]] {
+                       ["Yes (Recommended)", "No"], ["Yes (y)", "No (esc)"], ["네".decomposedStringWithCanonicalMapping, "아니요"]] {
             try expectEqual(YesNoConfirmation.detect(startInput(labels: labels))?.answer, labels[0])
         }
         for input in [startInput("  \n"), startInput(labels: ["예시", "아니오"]),
@@ -63,6 +120,7 @@ extension ApprovalTests {
         try expect(engine.handleHook(payload).isEmpty, "One tool call cannot answer twice across hook events")
         try expectEqual(engine.snapshot.events.count, 1)
         payload["tool_use_id"] = "question-two"; payload["requestID"] = "permission-new"
+        payload["tool_input"] = startInput(labels: ["아니오", "예", "예, 앞으로 묻지 않기"])
         let fallback = engine.handleHook(payload)["hookSpecificOutput"] as? JSONObject
         let decision = fallback?["decision"] as? JSONObject
         try expectEqual(decision?["behavior"] as? String, "allow")

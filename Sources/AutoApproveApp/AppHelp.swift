@@ -7,6 +7,9 @@ enum AppHelp {
     static let search = "프로젝트 이름·전체 경로, 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."
     static let pid = "실행 중인 Claude Code·Codex 프로세스의 번호입니다."
+    static let automaticDescription = "Claude Code·Codex의 권한 요청과 Claude 훅의 예·아니오 질문을 자동 승인합니다. 반복 허가 선택지가 있어도 이번 요청만 허용하며, 그 밖의 질문은 직접 답해주세요."
+    static let sendingAnswer = "답변을 보내고 있습니다. 중복 전송을 막기 위해 완료될 때까지 기다려주세요."
+    static let quit = "AutoApprove와 자동 승인을 종료합니다. Claude Code·Codex 터미널은 계속 실행됩니다."
 
     static func gitBranch(_ session: AgentSession) -> String {
         guard !session.cwd.isEmpty else { return "세션의 현재 폴더를 확인한 뒤 Git 브랜치를 표시합니다." }
@@ -32,7 +35,7 @@ enum AppHelp {
         }
         if paused { return "전체 일시정지 중입니다. 이 스위치로 세션 설정을 정하고 전체 재개 후 적용합니다." }
         return session.automatic ? "이 세션의 자동 승인을 끕니다. 이후 권한 요청은 터미널에서 직접 확인합니다."
-            : "실행·파일 변경 권한을 자동 승인하고, Claude 훅의 명확한 예·아니오 질문에는 ‘예’로 답합니다. 그 밖의 선택 질문은 알림을 눌러 직접 답해주세요."
+            : automaticDescription
     }
 
     static func phase(_ session: AgentSession) -> String {

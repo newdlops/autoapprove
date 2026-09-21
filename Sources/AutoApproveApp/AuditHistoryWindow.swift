@@ -24,6 +24,7 @@ struct AuditHistoryWindow: View {
             if let error = engine.snapshot.health.auditError ?? error {
                 HStack {
                     Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
+                        .help("승인 내역을 읽거나 저장하지 못했습니다. 다시 불러오기로 확인하세요.\n" + error)
                     Spacer()
                     Button("다시 불러오기") { reload() }
                         .help("승인 내역을 다시 조회합니다. 저장 오류가 계속되면 새 승인 전달을 진행하지 않습니다.")
@@ -35,7 +36,7 @@ struct AuditHistoryWindow: View {
                     HStack {
                         Text("승인 내역").font(.title2.weight(.semibold))
                         Spacer()
-                        if loading { ProgressView().controlSize(.small).accessibilityLabel("내역 불러오는 중") }
+                        if loading { ProgressView().controlSize(.small).accessibilityLabel("내역 불러오는 중").help("저장된 승인 내역을 불러오고 있습니다.") }
                         Text("\(total)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                     }.padding(.top, 20)
                     TextField("프로젝트, 명령, 도구, TTY 검색", text: $search)
@@ -50,6 +51,7 @@ struct AuditHistoryWindow: View {
                     if events.isEmpty {
                         VStack(spacing: 12) {
                             Image(systemName: "clock.arrow.circlepath").font(.system(size: 28)).foregroundStyle(.secondary)
+                                .help(loading ? "저장된 승인 내역을 불러오고 있습니다." : "자동 승인과 질문 응답의 요청 내용·선택한 답·전달 결과를 이곳에서 확인합니다.")
                             Text(loading ? "승인 내역을 불러오고 있습니다…" : (search.isEmpty && filter == nil ? "저장된 승인 내역이 없습니다" : "일치하는 내역이 없습니다")).font(.headline)
                             Text(search.isEmpty && filter == nil ? "자동 승인이 발생하면 이곳에 저장됩니다.\n세션이 종료돼도 계속 확인할 수 있습니다." : "검색어나 결과 필터를 변경해보세요.")
                                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
@@ -88,7 +90,7 @@ struct AuditHistoryWindow: View {
                 }.padding(.horizontal, 16).frame(minWidth: 300, idealWidth: 380, maxWidth: 480)
                 Group {
                     if let selected { detail(selected) }
-                    else { ContentUnavailableView("승인 내역을 선택하세요", systemImage: "doc.text.magnifyingglass", description: Text("요청 내용과 처리 시각, 프로젝트, 전달 결과를 확인할 수 있습니다.")) }
+                    else { ContentUnavailableView("승인 내역을 선택하세요", systemImage: "doc.text.magnifyingglass", description: Text("요청 내용과 처리 시각, 프로젝트, 전달 결과를 확인할 수 있습니다.")).help("왼쪽 목록에서 내역을 선택하면 전체 요청과 전달한 답변을 볼 수 있습니다.") }
                 }.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -119,7 +121,7 @@ struct AuditHistoryWindow: View {
                     Text(event.outcome).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     if let answer = event.answer {
                         Text("선택한 답: \(answer)").font(.headline).textSelection(.enabled)
-                            .help("이 질문에 AutoApprove가 자동으로 전달한 선택지입니다.")
+                            .help("AutoApprove가 자동 승인하거나 사용자가 선택·입력해 전달한 답변 원문입니다.")
                     }
                 }
                 Divider()

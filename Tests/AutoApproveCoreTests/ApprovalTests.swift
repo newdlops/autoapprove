@@ -28,6 +28,32 @@ import AutoApproveCore
         try expectNotNil(PromptDetector.detect(prompt, agent: .claude))
         try expectNil(PromptDetector.detect(prompt.replacingOccurrences(of: "❯ 1. Yes", with: "  1. Yes"), agent: .claude))
     }
+    func testBothAgentsRecognizeRepeatedPermissionVariants() throws {
+        for agent in [AgentKind.claude, .codex] {
+            let heading = agent == .claude ? "Do you want to proceed?" : "Would you like to run the following command?"
+            for repeated in ["Yes, don't ask again", "Yes, don't ask again (a)", "Yes, don’t ask again (a)",
+                             "Yes, and don't ask again for commands that start with `npm test` (p)",
+                             "Yes, don't ask\n     again for this session (a)",
+                             "Yes, allow all edits during this session", "예, 이 세션에서는 항상 허용"] {
+                let screen = heading + "\n› 1. Yes, proceed (y)\n  2. \(repeated)\n  3. No (esc)\nPress enter to confirm or esc to cancel"
+                let prompt = PromptDetector.detect(screen, agent: agent)
+                try expectEqual(prompt?.answer, "1", "\(agent): \(repeated)")
+                try expectEqual(prompt?.dialog, screen, "Validation must retain original wrapping and scope")
+                try expectNil(PromptDetector.detect(screen.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "  2.", with: "› 2."), agent: agent))
+                try expectNil(PromptDetector.detect(screen.replacingOccurrences(of: "  2.", with: "› 2."), agent: agent))
+                try expectNil(PromptDetector.detect(screen + "\n› New input", agent: agent))
+            }
+            for alternate in ["Yes, use production", "Yes, also deploy", "Yes", "Pick another task"] {
+                let screen = heading + "\n› 1. Yes\n  2. \(alternate)\n  3. No\nEsc to cancel"
+                try expectNil(PromptDetector.detect(screen, agent: agent))
+            }
+            let four = heading + "\n› 1. Yes\n  2. Yes, don't ask again\n  3. Yes, always allow\n  4. No\nEsc to cancel"
+            try expectEqual(PromptDetector.detect(four, agent: agent)?.answer, "1")
+            try expectNil(PromptDetector.detect(four.replacingOccurrences(of: "  3.", with: "  5."), agent: agent))
+            let shortcuts = heading + "\n› 1. Yes [y]\n  2. Yes, don't ask again [a]\n  3. No [esc]\nPress enter to confirm or esc to cancel"
+            try expectEqual(PromptDetector.detect(shortcuts, agent: agent)?.answer, "1")
+        }
+    }
     func testDiscoveryKeepsIdentityAndFiltersSubprocesses() throws {
         let records = ProcessDiscovery.parse("""
         1 0 ?? 1 0 Mon Sep 21 09:00:00 2026 /sbin/launchd
@@ -373,6 +399,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("concurrent question alerts, errors, dismissal and session exit", tests.testConcurrentCodexAttentionAndDismissal),
             ("Terminal custom and window titles with isolated failures", tests.testTerminalTitleContract),
             ("varied yes/no questions, exact labels and ambiguous alternatives", tests.testYesNoConfirmationSelection),
+            ("repeated permission variants preserve the current-request answer", tests.testRepeatedPermissionChoicesPreferCurrentRequest),
+            ("repeated permissions never select different tasks or ambiguous answers", tests.testRepeatedPermissionChoicesRejectDifferentDecisions),
+            ("Claude and Codex permission variants, wrapped labels and active selection", tests.testBothAgentsRecognizeRepeatedPermissionVariants),
             ("Claude question hook output, cross-event deduplication and saved answer", tests.testYesNoConfirmationHookAndAudit),
             ("question responses require enrollment, resume and the correct session", tests.testYesNoConfirmationOptInAndPause),
             ("question response requires a durable audit", tests.testYesNoConfirmationRequiresSavedAudit),

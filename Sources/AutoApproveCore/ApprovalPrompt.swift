@@ -22,13 +22,22 @@ public enum PromptDetector {
         // A long command can push its title beyond the old 32-line window.
         guard lines.count - promptIndex <= 300 else { return nil }
         let dialog = Array(lines[promptIndex...])
-        let selectedYes = dialog.firstIndex { line in
-            let pattern = agent == .codex ? #"^[›❯»>]\s*1\.\s*Yes, proceed(?: \(y\))?$"# : #"^[›❯»>]\s*1\.\s*Yes(?: \(y\))?$"#
-            return line.range(of: pattern, options: .regularExpression) != nil
-        }
-        guard let selectedYes,
-              dialog.dropFirst(selectedYes + 1).contains(where: { $0.range(of: #"^[2-9]\.\s*No(?:[,. ]|$)"#, options: .regularExpression) != nil }) else { return nil }
+        guard let selectedYes = dialog.firstIndex(where: { $0.range(of: #"^[›❯»>]\s*1\.\s+"#, options: .regularExpression) != nil }) else { return nil }
         let lastOption = dialog.lastIndex(where: isOption) ?? selectedYes
+        let optionLines = dialog[selectedYes...lastOption].filter(isOption)
+        guard optionLines.filter({ $0.range(of: #"^[›❯»>]"#, options: .regularExpression) != nil }).count == 1 else { return nil }
+        var labels: [String] = []
+        for line in dialog[selectedYes...lastOption] {
+            if isOption(line) {
+                let prefix = "^[›❯»>]?\\s*" + String(labels.count + 1) + #"\.\s+"#
+                guard let range = line.range(of: prefix, options: .regularExpression) else { return nil }
+                labels.append(String(line[range.upperBound...]))
+            } else if !line.isEmpty {
+                // Narrow terminal windows can wrap a permission scope onto another line.
+                labels[labels.count - 1] += " " + line
+            }
+        }
+        guard YesNoConfirmation.singleApprovalIndex(labels) == 0 else { return nil }
         let footer = dialog.dropFirst(lastOption + 1).filter { !$0.isEmpty }
         guard !footer.isEmpty, footer.allSatisfy(isDialogFooter) else { return nil }
         let summary = dialog.prefix(selectedYes).filter { !$0.isEmpty }.joined(separator: "\n")

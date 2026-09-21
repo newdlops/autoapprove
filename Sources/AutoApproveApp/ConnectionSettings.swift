@@ -22,7 +22,7 @@ struct ConnectionSettings: View {
                             if notifications.authorization == .notDetermined {
                                 Button("알림 허용") { Task { await notifications.requestAuthorization() } }
                                     .disabled(notifications.busy)
-                                    .help("질문·작업 완료 알림과 소리를 허용하는 macOS 권한 창을 엽니다.")
+                                    .help(notifications.busy ? "알림 권한을 확인하고 있습니다. macOS 권한 창이 열렸다면 응답해주세요." : "질문·작업 완료 알림과 소리를 허용하는 macOS 권한 창을 엽니다.")
                             }
                             Button("시스템 알림 설정") { notifications.openSettings() }
                                 .help("macOS 알림 설정에서 AutoApprove의 배너·소리·미리보기를 변경합니다.")
@@ -31,7 +31,7 @@ struct ConnectionSettings: View {
                         if let error = notifications.error {
                             Text(error).foregroundStyle(.red)
                             Button("알림 다시 확인") { Task { await notifications.retryDelivery() } }
-                                .disabled(notifications.busy).help("알림 권한을 확인하고 전송에 실패한 알림을 다시 보냅니다.")
+                                .disabled(notifications.busy).help(notifications.busy ? "알림 권한과 전송 상태를 확인하고 있습니다." : "알림 권한을 확인하고 전송에 실패한 알림을 다시 보냅니다.")
                         }
                     }
                     Divider()
@@ -70,6 +70,7 @@ struct ConnectionSettings: View {
                     }
                     if let notice {
                         Label(notice, systemImage: "info.circle").font(.callout).foregroundStyle(.primary).textSelection(.enabled)
+                            .help(notice)
                     }
                 }.padding(24)
             }
@@ -78,6 +79,7 @@ struct ConnectionSettings: View {
     @ViewBuilder private func section<Content: View>(_ title: String, icon: String, status: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: icon).font(.headline)
+                .help("\(title) 연결 상태: \(status)")
             Text(status).font(.callout.weight(.medium)).textSelection(.enabled)
             content().font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.frame(maxWidth: .infinity, alignment: .leading)

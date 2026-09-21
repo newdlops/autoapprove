@@ -2,6 +2,15 @@
 
 검증일: 2026-09-21. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.12 Yes 변형·단축키·툴팁
+
+- Claude Code·Codex 승인 화면과 Claude 단일 훅 질문에서 같은 허가의 반복 범위만 다른 3개 이상 선택지를 인식한다. 일반 Yes를 우선하며 `don't ask again`/`don’t`, 세션 내 허용, `y / a / esc`·`y / p / esc`, 괄호·대괄호, 추천 표시와 줄바꿈을 검사했다. 원래 답 라벨과 검증용 화면 원문을 보존하고 서로 다른 작업·모호한 Yes·다중 질문·다중 선택·다른 현재 선택·이전 화면은 자동 처리하지 않는다.
+- 릴리스 빌드, 핵심 검사 **61/61**, `node scripts/integration-check.mjs .build/release/autoapprove`, `node scripts/screen-integration-check.mjs .build/release/autoapprove`가 통과했다. 훅/소켓 검사에서 반복 허가가 첫 항목인 질문도 이번 요청의 원래 Yes 라벨로 답하고 중복 이벤트에 재응답하지 않았다. 실제 PTY 검사에 Codex의 줄바꿈된 `don’t ask again (a)`와 Claude의 `don't ask again`을 포함했다. 사용자 터미널에 시험 입력을 보내지 않았다.
+- `$ui-design-workflow`를 적용해 기존 SwiftUI `.help`를 보완했다. 격리 앱의 실제 **1040×700**, **784×612** 관리 창에서 선택지 체크·직접 입력·전송 버튼 활성화·모의 응답 접수·질문 정리를 확인했다. 접근성 Help에서 체크 전후 문구, 빈 답변·연결 끊김·미설치·페이지 끝의 비활성 이유를 확인했다. **600×660** 연결 설정과 작은 승인 내역 창도 확인했다. [기본 창](dist/qa/tooltips-0.2.12-desktop.jpg), [작은 창](dist/qa/tooltips-0.2.12-compact.jpg), [설정](dist/qa/tooltips-0.2.12-settings.jpg), [내역](dist/qa/tooltips-0.2.12-history.jpg). 검증 질문은 종료 전에 정리했다.
+- Computer Use에 hover 전용 동작이 없어 모든 툴팁 팝업의 실제 표시를 확인한 것은 아니다. 네이티브 툴바·메뉴는 접근성 트리에 Help가 노출되지 않아 코드 연결과 열기 동작까지만 확인했다. 전체 VoiceOver, 사용자 Terminal·알림 센터의 직접 입력은 검사하지 않았다. 브라우저·모바일 뷰포트는 네이티브 macOS 앱에 해당하지 않는다.
+- 앱 **0.2.12 (15)**를 패키징·엄격한 코드 서명 검증 후 실행했다. 활성 **10개**, 자동 승인 **9개**, 동일 세션의 설정 변경 **0개**이며 사용자가 정한 순서·일시정지·Terminal 연결 설정을 보존했다. [실행 앱](dist/qa/tooltips-0.2.12-production.jpg). 내장 VS Code 확장은 **0.2.3**을 유지한다.
+- 최종 DMG의 체크섬·읽기 전용 마운트·포함 앱 서명·Applications 링크·설치 안내를 검증하고 정상 추출했다. `AutoApprove-0.2.12-macOS-arm64.dmg`의 SHA-256은 `21d48261069940d79c6b747295e7274f5565c04014ca48e2578ad602929f234c`이다. DMG와 `.dmg.sha256`을 [v0.2.12 Release](https://github.com/newdlops/autoapprove/releases/tag/v0.2.12)의 배포 파일로 사용한다.
+
 ## 0.2.11 터미널 순서 저장·이동
 
 - 기존 SwiftUI `List` / `ForEach.onMove`에 순서 저장을 연결하고 우클릭에 위·아래 이동을 추가했다. 현재 보이는 행의 ID와 순서를 확인한 뒤 해당 행이 차지한 자리만 재배치한다. 숨겨진 행·자동 승인·세션 ID·브랜치를 변경하지 않으며, 저장에 성공한 뒤 화면에 반영한다. 기존 설정 DB의 `sessionOrder`에 저장하고 앱 시작 시 복원한다.

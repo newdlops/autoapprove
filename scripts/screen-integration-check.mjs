@@ -16,8 +16,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let bridge;
 let diagnostics = '';
 const actions = [];
-const prompt = 'Would you like to run the following command?\n\n$ printf fixture\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel';
-const claudePrompt = 'Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel';
+const prompt = 'Would you like to run the following command?\n\n$ printf fixture\n\n› 1. Yes, proceed (y)\n  2. Yes, don’t ask\n     again for this session (a)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel';
+const claudePrompt = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, don't ask again\n  3. No\nEsc to cancel";
 
 async function until(check, label, timeout = 8000) {
   const deadline = Date.now() + timeout;

@@ -71,6 +71,15 @@ try {
   assert.equal(answered.permissionDecision, 'allow');
   assert.deepEqual(answered.updatedInput, { questions, answers: { [question]: '예' } });
   assert.deepEqual(await request('hook', { ...ask, hook_event_name: 'PermissionRequest', requestID: 'ask-again' }), {});
+  const repeatedQuestions = [{ question: 'Allow this command?', multiSelect: false, options: [
+    { label: 'Yes, don’t ask again', description: 'Allow for this session' },
+    { label: 'No', description: 'Cancel' },
+    { label: 'Yes, proceed', description: 'Allow once' }
+  ] }];
+  const repeatAsk = { ...ask, requestID: 'repeat-permission', tool_use_id: 'repeat-permission', tool_input: { questions: repeatedQuestions } };
+  const repeatAnswer = (await request('hook', repeatAsk)).hookSpecificOutput;
+  assert.deepEqual(repeatAnswer.updatedInput, { questions: repeatedQuestions, answers: { 'Allow this command?': 'Yes, proceed' } });
+  assert.deepEqual(await request('hook', { ...repeatAsk, hook_event_name: 'PermissionRequest', requestID: 'repeat-again' }), {});
   const choose = { ...ask, tool_use_id: 'choose-three', requestID: 'choose', tool_input: { questions: [{
     question: '지금 제가 뭐부터 하면 될까요?', options: [
       { label: '미커물 현황 훑기', description: '워크트리 상태를 정리합니다.' },
@@ -83,6 +92,7 @@ try {
   const status = await request('status');
   assert.equal(status.events.filter(event => event.outcome === '승인 전달').length, 2);
   assert.equal(status.events.filter(event => event.outcome === '질문 응답 전달' && event.answer === '예').length, 1);
+  assert.equal(status.events.filter(event => event.outcome === '질문 응답 전달' && event.answer === 'Yes, proceed').length, 1);
   const waiting = status.sessions.find(session => session.id === 'claude:integration-only');
   assert.equal(waiting.phase, 'input');
   assert.ok(waiting.pendingSummary.includes('3. 지정해 주시는 일'));

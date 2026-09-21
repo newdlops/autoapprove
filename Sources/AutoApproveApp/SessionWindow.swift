@@ -56,6 +56,7 @@ struct SessionWindow: View {
             if notifications.authorization == .denied || notifications.error != nil {
                 HStack(spacing: 10) {
                     Image(systemName: "bell.slash")
+                        .help(notifications.error ?? "질문·작업 완료 알림이 꺼져 있습니다. 알림 설정에서 권한을 확인하세요.")
                     Text(notifications.error ?? "알림이 꺼져 있습니다. 질문과 작업 완료를 놓치지 않도록 알림을 허용해주세요.")
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
@@ -65,6 +66,7 @@ struct SessionWindow: View {
             if disconnectedAutomaticCount > 0 {
                 HStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle")
+                        .help("자동 승인을 켰지만 연결이 끊긴 세션이 있습니다. 연결 설정을 확인하세요.")
                     Text("자동 승인을 켠 \(disconnectedAutomaticCount)개 세션이 연결되지 않아 요청을 감지할 수 없습니다.")
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
@@ -75,6 +77,7 @@ struct SessionWindow: View {
             if engine.snapshot.paused {
                 HStack(spacing: 8) {
                     Image(systemName: "pause.circle.fill")
+                        .help(AppHelp.pause(true))
                     Text("새 자동 승인을 멈췄습니다. 이미 전달 중인 입력과 터미널 작업은 계속됩니다.")
                     Spacer()
                     Button("재개") { perform { try engine.setPaused(false) } }
@@ -84,10 +87,12 @@ struct SessionWindow: View {
             if let error = engine.snapshot.health.discoveryError {
                 Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.red)
                     .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                    .help("세션을 찾지 못했습니다. 새로고침으로 다시 확인할 수 있습니다.\n" + error)
             }
             if let error = engine.snapshot.health.auditError {
                 Label("승인 내역 저장 오류: \(error)", systemImage: "exclamationmark.triangle")
                     .font(.callout).foregroundStyle(.red).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                    .help("승인 내역을 저장하지 못해 새 승인 전달을 진행할 수 없습니다.\n" + error)
             }
             HSplitView {
                 VStack(spacing: 0) {
@@ -115,9 +120,11 @@ struct SessionWindow: View {
                         .help(AppHelp.search)
                     if !engine.initialDiscoveryComplete && engine.snapshot.sessions.isEmpty {
                         ProgressView("실행 중인 세션을 찾고 있습니다…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .help("이 Mac에서 실행 중인 Claude Code·Codex 세션과 연결 상태를 확인하고 있습니다.")
                     } else if visible.isEmpty {
                         VStack(spacing: 12) {
                             Image(systemName: search.isEmpty ? "terminal" : "magnifyingglass").font(.system(size: 30)).foregroundStyle(.secondary)
+                                .help(emptyMessage)
                             Text(emptyTitle).font(.headline)
                             Text(emptyMessage)
                                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
@@ -140,14 +147,17 @@ struct SessionWindow: View {
                             if let session = singleSession(ids) {
                                 Button("터미널 열기") { reveal(session) }
                                     .disabled(!session.canReveal || openingTerminal)
+                                    .help(AppHelp.reveal(session, opening: openingTerminal))
                                 if let index = displayed.firstIndex(where: { $0.id == session.id }) {
                                     Divider()
                                     Button("위로 이동", systemImage: "arrow.up") {
                                         perform { try engine.moveSessions(fromOffsets: IndexSet(integer: index), toOffset: index - 1, visibleIDs: displayed.map(\.id)) }
                                     }.disabled(index == 0)
+                                        .help(index == 0 ? "현재 목록의 첫 번째 세션입니다." : "이 세션을 한 칸 위로 이동하고 순서를 저장합니다.")
                                     Button("아래로 이동", systemImage: "arrow.down") {
                                         perform { try engine.moveSessions(fromOffsets: IndexSet(integer: index), toOffset: index + 2, visibleIDs: displayed.map(\.id)) }
                                     }.disabled(index == displayed.count - 1)
+                                        .help(index == displayed.count - 1 ? "현재 목록의 마지막 세션입니다." : "이 세션을 한 칸 아래로 이동하고 순서를 저장합니다.")
                                 }
                             }
                         } primaryAction: { ids in
@@ -157,6 +167,7 @@ struct SessionWindow: View {
                     Divider()
                     HStack {
                         Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
+                            .help("이 Mac의 Terminal·VS Code에서 실행 중인 Claude Code·Codex만 표시합니다.")
                         Text("이 Mac의 터미널").foregroundStyle(.secondary)
                         Spacer()
                         Text("드래그로 순서 변경").foregroundStyle(.secondary)
@@ -186,6 +197,7 @@ struct SessionWindow: View {
         .sheet(isPresented: $settings) { ConnectionSettings(engine: engine, notifications: notifications) }
         .alert("요청을 처리하지 못했습니다", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("확인") { error = nil }
+                .help("오류 안내를 닫고 세션 목록으로 돌아갑니다.")
         } message: { Text(error ?? "") }
         .onChange(of: visible.map(\.id)) { _, ids in
             selection.formIntersection(ids)
@@ -194,16 +206,18 @@ struct SessionWindow: View {
     }
     @ViewBuilder private var detail: some View {
         if selection.count > 1 {
+            let canEnable = engine.snapshot.sessions.contains { selection.contains($0.id) && $0.canApprove }
+            let canDisable = engine.snapshot.sessions.contains { selection.contains($0.id) && $0.automatic }
             VStack(alignment: .leading, spacing: 16) {
                 Text("\(selection.count)개 세션 선택됨").font(.title2.weight(.semibold))
                 Text("연결된 세션의 자동 승인을 함께 변경합니다.").foregroundStyle(.secondary)
                 HStack {
                     Button("자동 승인 켜기") { for id in selection where engine.snapshot.sessions.first(where: { $0.id == id })?.canApprove == true { perform { try engine.setAutomatic(id, enabled: true) } } }
-                        .disabled(!engine.snapshot.sessions.contains { selection.contains($0.id) && $0.canApprove })
-                        .help("선택한 연결 세션의 자동 승인을 켭니다. Claude 훅의 명확한 예·아니오 질문에는 ‘예’로 답하며, 그 밖의 선택 질문은 알림으로 알려줍니다.")
+                        .disabled(!canEnable)
+                        .help(canEnable ? "선택한 연결 세션의 자동 승인을 켭니다.\n" + AppHelp.automaticDescription : "선택한 세션 중 연결된 세션이 없습니다. 연결 설정을 먼저 확인하세요.")
                     Button("자동 승인 끄기") { for id in selection { perform { try engine.setAutomatic(id, enabled: false) } } }
-                        .disabled(!engine.snapshot.sessions.contains { selection.contains($0.id) && $0.automatic })
-                        .help("선택한 모든 세션의 자동 승인을 끕니다. 진행 중인 작업은 계속됩니다.")
+                        .disabled(!canDisable)
+                        .help(canDisable ? "선택한 모든 세션의 자동 승인을 끕니다. 진행 중인 작업은 계속됩니다." : "선택한 세션의 자동 승인이 모두 꺼져 있습니다.")
                 }
                 Spacer()
             }.padding(24)
@@ -214,7 +228,7 @@ struct SessionWindow: View {
                           dismissQuestion: { questionID in perform { try engine.dismissQuestion(sessionID: id, questionID: questionID) } },
                           replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) })
         } else {
-            ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal") } description: {
+            ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
                 Text("세션을 선택해 상태를 확인하고 자동 승인을 켜세요.\n처음 사용하는 경우 연결 설정부터 시작하세요.")
             } actions: { Button("연결 설정 열기") { settings = true }.help(AppHelp.connections) }
         }
@@ -284,6 +298,7 @@ private struct SessionRow: View {
                         .help("작업 중에도 답변을 기다리는 Codex 질문입니다. 세션 상세에서 모두 확인할 수 있습니다.")
                 } else if session.questions.contains(where: { $0.reply?.phase == .sending }) {
                     Label("답변 전송 중", systemImage: "arrow.up.circle").font(.caption)
+                        .help(AppHelp.sendingAnswer)
                 }
             }
             Spacer(minLength: 4)
@@ -378,6 +393,7 @@ private struct SessionDetail: View {
                     if let error = session.completionError {
                         Label(error, systemImage: "bell.slash").font(.caption).foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
+                            .help("이 세션의 작업 완료를 확인하지 못했습니다. 기록을 다시 읽으면 자동으로 갱신합니다.\n" + error)
                     }
                 }
                 Divider()
@@ -401,7 +417,7 @@ private struct SessionDetail: View {
                     Toggle("자동 승인", isOn: Binding(get: { session.automatic }, set: setAutomatic))
                         .font(.headline).toggleStyle(.switch).disabled(!session.canApprove && !session.automatic)
                         .help(AppHelp.automatic(session, paused: paused))
-                    Text(session.canApprove ? (paused ? "전체 일시정지 중입니다. 재개하면 자동 승인이 적용됩니다." : "실행·파일 변경 권한과 Claude 훅의 예·아니오 질문을 자동 승인합니다. 그 밖의 선택 질문은 알림을 눌러 답해주세요.") : "승인 요청을 처리하려면 연결이 필요합니다.")
+                    Text(session.canApprove ? (paused ? "전체 일시정지 중입니다. 재개하면 자동 승인이 적용됩니다." : AppHelp.automaticDescription) : "승인 요청을 처리하려면 연결이 필요합니다.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Label(session.channel.title, systemImage: session.canApprove ? "link" : "link.badge.plus")
                         .font(.callout.weight(.medium))
@@ -491,19 +507,23 @@ struct CodexQuestionList: View {
             HStack {
                 Text("질문 대기열").font(.headline)
                 Text("응답 대기 \(session.unansweredQuestions.count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    .help("아직 답변을 보내지 않은 Codex 질문 수입니다. 작업 진행 상태와 별도로 유지됩니다.")
                 if session.questions.contains(where: { $0.reply?.phase == .queued }) {
                     Text("전달 대기 \(session.questions.filter { $0.reply?.phase == .queued }.count)건")
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .help("답변을 Codex 메시지 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달됩니다.")
                 }
             }
             if let error = session.codexQuestionsError {
                 Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
+                    .help("질문 기록을 읽지 못했습니다. 연결 복구 후 자동 갱신하며, 터미널에서 직접 답할 수 있습니다.\n" + error)
                 if !session.questions.isEmpty {
                     Text("마지막으로 수집한 질문입니다. 연결이 복구되면 갱신합니다.").font(.caption).foregroundStyle(.secondary)
                 }
             } else if session.codexQuestionsObservedAt == nil {
                 HStack { ProgressView().controlSize(.small); Text("Codex 질문 기록을 확인하고 있습니다…").font(.callout).foregroundStyle(.secondary) }
+                    .help("이 Codex 대화에서 답변을 기다리는 질문을 불러오고 있습니다.")
             } else if session.questions.isEmpty {
                 Text("답변을 기다리는 질문이 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
@@ -549,6 +569,7 @@ struct QuestionReplyEditor: View {
                     Toggle(isOn: Binding(get: { selected.contains(index) }, set: { if $0 { selected.insert(index) } else { selected.remove(index) } })) {
                         Text(option).font(.callout).fixedSize(horizontal: false, vertical: true)
                     }.toggleStyle(.checkbox).disabled(submitting)
+                        .help(submitting ? AppHelp.sendingAnswer : (selected.contains(index) ? "이 항목을 답변에서 뺍니다. 답변 보내기를 눌러야 전송됩니다." : "이 항목을 답변에 포함합니다. 여러 항목을 선택하거나 설명을 덧붙일 수 있습니다."))
                 }
                 if question.options.count > 1 {
                     Text("여러 항목을 함께 선택할 수 있습니다.").font(.caption).foregroundStyle(.secondary)
@@ -556,6 +577,7 @@ struct QuestionReplyEditor: View {
                 TextField(question.options.isEmpty ? "답변을 입력하세요" : "직접 답변하거나 설명을 덧붙이세요", text: $customAnswer, axis: .vertical)
                     .textFieldStyle(.roundedBorder).lineLimit(2...5).disabled(submitting)
                     .accessibilityLabel("\(question.title) 직접 답변")
+                    .help(submitting ? AppHelp.sendingAnswer : "답변을 직접 쓰거나 선택한 항목에 설명을 덧붙입니다. 답변 보내기를 눌러야 전송됩니다.")
             } else if connectionError != nil && editing {
                 ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
                     Text("\(index + 1). \(option)").font(.callout).foregroundStyle(.secondary)
@@ -565,15 +587,18 @@ struct QuestionReplyEditor: View {
             if let reply = question.reply {
                 if reply.phase == .sending {
                     HStack { ProgressView().controlSize(.small); Text("답변을 보내고 있습니다…").font(.callout) }
+                        .help(AppHelp.sendingAnswer)
                 } else {
                     Label(reply.message, systemImage: reply.phase == .queued ? "clock.badge.checkmark" : "exclamationmark.triangle")
                         .font(.callout).foregroundStyle(reply.phase == .queued ? Color.primary : .orange)
                         .fixedSize(horizontal: false, vertical: true)
+                        .help(reply.message)
                 }
                 if !editing { Text("답변: \(reply.answer)").font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
             } else if let error {
                 Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
+                    .help(error)
             }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) { actions }
@@ -593,13 +618,13 @@ struct QuestionReplyEditor: View {
                 }
             }.buttonStyle(.borderedProminent).controlSize(.small)
                 .disabled(answer.isEmpty || submitting)
-                .help("선택한 항목과 입력한 답변을 이 Codex 대화에 보냅니다. 전송 내용을 승인 내역에 저장합니다.")
+                .help(submitting ? AppHelp.sendingAnswer : (answer.isEmpty ? "선택지를 고르거나 답변을 입력하면 보낼 수 있습니다." : "선택한 항목과 입력한 답변을 이 Codex 대화에 보냅니다. 전송 내용을 승인 내역에 저장합니다."))
         }
         Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app") }
             .controlSize(.small).disabled(!canReveal || openingTerminal || submitting)
-            .help(canReveal ? "해당 터미널을 열고 강조 표시합니다." : "터미널 연결이 필요합니다. 연결 설정을 확인해주세요.")
+            .help(submitting ? AppHelp.sendingAnswer : (openingTerminal ? "해당 터미널을 열고 있습니다. 잠시 기다려주세요." : (canReveal ? "해당 터미널을 열고 강조 표시합니다." : "터미널 연결이 필요합니다. 연결 설정을 확인해주세요.")))
         Button("목록에서 정리", action: dismiss).controlSize(.small)
             .disabled(submitting || question.reply?.phase == .sending)
-            .help("이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
+            .help(submitting || question.reply?.phase == .sending ? AppHelp.sendingAnswer : "이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
     }
 }
