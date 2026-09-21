@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+dist/
+.runtime/
+node_modules/
+extensions/vscode/out/
+*.vsix
+.DS_Store
