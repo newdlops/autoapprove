@@ -1,0 +1,36 @@
+{
+  "name": "autoapprove-bridge",
+  "displayName": "AutoApprove Bridge",
+  "description": "Connect local VS Code terminals to the AutoApprove macOS app.",
+  "version": "0.2.3",
+  "publisher": "autoapprove-local",
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.95.0" },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "contributes": {
+    "commands": [
+      { "command": "autoapprove.reconnect", "title": "AutoApprove: Reconnect" },
+      { "command": "autoapprove.showStatus", "title": "AutoApprove: Show Connection Status" }
+    ],
+    "configuration": {
+      "title": "AutoApprove",
+      "properties": {
+        "autoapprove.socketPath": {
+          "type": "string", "default": "", "scope": "application",
+          "description": "Optional local AutoApprove Unix socket path. Empty uses the macOS app's default."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "npm run compile && node --test out/screen.test.js",
+    "package": "npm run compile && vsce package --allow-missing-repository --out ../../dist/autoapprove-bridge.vsix"
+  },
+  "dependencies": { "@xterm/headless": "^5.5.0" },
+  "devDependencies": { "@types/node": "^22.0.0", "@types/vscode": "^1.95.0", "typescript": "^5.9.0", "@vscode/vsce": "^3.6.0" }
+}
