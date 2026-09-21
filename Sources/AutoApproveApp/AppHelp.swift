@@ -4,9 +4,20 @@ import AutoApproveCore
 enum AppHelp {
     static let connections = "질문·작업 완료 알림 권한과 Terminal 연결, Claude 훅, VS Code 확장의 연결 상태를 확인합니다."
     static let history = "종료된 세션을 포함한 전체 승인 내역을 검색하고 요청 내용과 전달 결과를 확인합니다."
-    static let search = "프로젝트 이름·전체 경로, 터미널 제목, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
+    static let search = "프로젝트 이름·전체 경로, 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."
     static let pid = "실행 중인 Claude Code·Codex 프로세스의 번호입니다."
+
+    static func gitBranch(_ session: AgentSession) -> String {
+        guard !session.cwd.isEmpty else { return "세션의 현재 폴더를 확인한 뒤 Git 브랜치를 표시합니다." }
+        guard let state = session.gitBranch else { return "현재 폴더의 Git 브랜치를 확인하고 있습니다.\n\(session.cwd)" }
+        switch state.kind {
+        case .branch: return "현재 폴더의 Git 브랜치: \(state.name ?? "")\n\(session.cwd)\n브랜치를 바꾸면 자동으로 갱신합니다."
+        case .detached: return "브랜치에 연결되지 않은 커밋을 보고 있습니다.\n커밋: \(state.name ?? "")\n\(session.cwd)"
+        case .notRepository: return "이 폴더와 상위 폴더에 Git 저장소가 없습니다.\n\(session.cwd)"
+        case .unavailable: return "현재 폴더의 Git 브랜치를 확인하지 못했습니다. 자동으로 다시 확인합니다.\n\(state.detail ?? session.cwd)"
+        }
+    }
 
     static func pause(_ paused: Bool) -> String {
         paused ? "자동 승인을 켜 둔 세션의 새 권한 요청 처리를 재개합니다."

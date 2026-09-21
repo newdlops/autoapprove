@@ -22,7 +22,7 @@ struct SessionWindow: View {
     private var disconnectedAutomaticCount: Int { engine.snapshot.sessions.filter(\.automaticWaitingForConnection).count }
     private var visible: [AgentSession] {
         engine.snapshot.sessions.filter { session in
-            let match = search.isEmpty || "\(session.project) \(session.terminalTitle ?? "") \(session.cwd) \(session.agent.title) \(session.pid) \(session.tty)".localizedCaseInsensitiveContains(search)
+            let match = search.isEmpty || "\(session.project) \(session.terminalTitle ?? "") \(session.gitBranch?.name ?? "") \(session.cwd) \(session.agent.title) \(session.pid) \(session.tty)".localizedCaseInsensitiveContains(search)
             let state: Bool
             switch filter {
             case "대기 중": state = session.phase == .idle
@@ -109,7 +109,7 @@ struct SessionWindow: View {
                             .help("현재 작업을 진행 중인 것으로 감지한 Claude Code·Codex 세션 수입니다.")
                         Spacer(minLength: 0)
                     }.font(.caption).padding(.horizontal, 16).padding(.bottom, 12)
-                    TextField("프로젝트, 터미널 제목, TTY, PID 검색", text: $search)
+                    TextField("프로젝트, 제목, 브랜치 검색", text: $search)
                         .textFieldStyle(.roundedBorder).padding(.horizontal, 16).padding(.bottom, 12)
                         .accessibilityLabel("세션 검색")
                         .help(AppHelp.search)
@@ -255,6 +255,7 @@ private struct SessionRow: View {
                 Text(session.terminalTitle ?? "터미널 제목 미확인")
                     .font(.callout).foregroundStyle(.secondary).lineLimit(1)
                     .help(session.terminalTitle ?? "터미널을 연결하면 창 또는 탭의 제목을 표시합니다.")
+                GitBranchLabel(session: session, compact: true)
                 HStack(spacing: 6) {
                     Text(session.agent.title)
                     Text("·")
@@ -280,6 +281,22 @@ private struct SessionRow: View {
             }
         }.accessibilityElement(children: .contain)
             .accessibilityAction(named: Text("터미널 열기"), reveal)
+    }
+}
+
+private struct GitBranchLabel: View {
+    let session: AgentSession
+    var compact = false
+    private var title: String {
+        session.gitBranch?.label ?? (session.cwd.isEmpty ? "폴더 확인 중…" : "브랜치 확인 중…")
+    }
+    var body: some View {
+        Label(title, systemImage: "arrow.triangle.branch")
+            .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+            .lineLimit(compact ? 1 : nil).truncationMode(.middle)
+            .fixedSize(horizontal: false, vertical: !compact)
+            .accessibilityLabel("Git 브랜치: \(title)")
+            .help(AppHelp.gitBranch(session))
     }
 }
 
@@ -328,6 +345,7 @@ private struct SessionDetail: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Text(session.cwd.isEmpty ? "프로젝트 경로를 확인하지 못했습니다." : session.cwd)
                         .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    GitBranchLabel(session: session).textSelection(.enabled)
                     HStack(spacing: 16) { PhaseLabel(session: session); Text("PID \(session.pid)").monospacedDigit().foregroundStyle(.secondary).help(AppHelp.pid); Text(session.terminal.title).foregroundStyle(.secondary) }.font(.callout)
                     if !session.tty.isEmpty {
                         Text(session.tty).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)

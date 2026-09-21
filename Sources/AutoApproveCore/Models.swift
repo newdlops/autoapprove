@@ -49,6 +49,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var cwd: String
     public var terminal: TerminalKind
     public var terminalTitle: String?
+    public var gitBranch: GitBranchState?
     public var phase: SessionPhase = .unknown
     public var channel: ApprovalChannel = .none
     public var automatic = false
@@ -86,7 +87,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
         if self.phase != phase { lastActivity = date }
         idleSince = phase == .idle ? (self.phase == .idle ? idleSince ?? date : date) : nil
         self.phase = phase; activityDetail = detail
-        if phase == .ended { completion = nil; completionError = nil }
+        if phase == .ended { completion = nil; completionError = nil; gitBranch = nil }
     }
 }
 

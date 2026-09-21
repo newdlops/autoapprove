@@ -8,11 +8,11 @@ public struct CommandResult {
 }
 
 public enum CommandRunner {
-    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:]) throws -> CommandResult {
+    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:], inheritEnvironment: Bool = true) throws -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, value in value }
+        process.environment = (inheritEnvironment ? ProcessInfo.processInfo.environment : [:]).merging(environment) { _, value in value }
         let stdout = Pipe(), stderr = Pipe()
         process.standardOutput = stdout; process.standardError = stderr
         try process.run()

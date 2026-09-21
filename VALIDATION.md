@@ -2,6 +2,14 @@
 
 검증일: 2026-09-21. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.10 현재 폴더의 Git 브랜치·DMG
+
+- 목록의 터미널 제목 아래와 상세의 폴더 경로 아래에 현재 Git 브랜치를 추가했다. 긴 이름은 목록에서 가운데를 줄이고 상세에서 줄바꿈하며, 브랜치명·detached HEAD 커밋 검색과 전체 이름 툴팁을 제공한다. 최초 조회·비저장소·읽기 실패를 구분한다. 현재 폴더를 매번 다시 확인하고, 승인 처리와 독립된 배경 작업에서 최대 네 폴더씩 조회한다.
+- 릴리스 빌드와 핵심 검사 **54/54**, 훅/소켓 통합 검사, PTY 화면 통합 검사가 통과했다. 임시 실제 Git 저장소에서 최초 커밋 전 브랜치·하위 폴더·연결된 워크트리·브랜치 전환·detached HEAD·비저장소·없는 폴더·상속된 Git 환경 격리를 확인했다. 폴더 변경·종료 후 늦은 결과를 무시하며, 검증용 PTY의 브랜치 전환이 수동 새로고침 없이 반영됨을 확인했다.
+- `$ui-design-workflow`를 적용하고 생산 SwiftUI 화면을 사용하는 격리 앱에서 **1040×700**, **784×612**의 긴 이름·조회 중·실패·비저장소·detached HEAD를 확인했다. 브랜치 일부로 검색하면 해당 세션만 남고, 한 번 클릭은 선택만, 더블클릭은 정확한 세션의 모의 열기 콜백을 한 번 호출했다. [긴 브랜치 작은 창](dist/qa/git-branch-long-compact.jpg), [기본 창](dist/qa/git-branch-desktop.jpg), [조회 상태](dist/qa/git-branch-error-desktop.jpg). 검증 질문은 종료 전에 정리했다. 실제 Terminal 열기 입력과 전체 VoiceOver 검사는 이번 변경 범위에 포함하지 않았다.
+- 앱 **0.2.10 (13)**를 패키징하고 엄격한 코드 서명 검증 후 실행했다. 실행 중인 **10개 세션**의 표시값을 각 폴더의 실제 Git 결과와 읽기 전용으로 대조해 불일치 **0개**를 확인했다. 기존 자동 승인 **9개**, 동일 세션 설정 변경 **0개**, 전체 일시정지 해제 상태를 보존했다. [실행 중인 앱](dist/qa/git-branch-production.jpg).
+- 내장 VS Code 확장은 **0.2.3**이다. `node scripts/package-dmg.mjs`의 DMG 체크섬·읽기 전용 마운트·포함 앱 코드 서명 검증이 통과했으며 앱·Applications 바로가기·설치 안내를 확인하고 정상 추출했다. `AutoApprove-0.2.10-macOS-arm64.dmg`의 SHA-256은 `4d78e92f7b6f4143d86cd0a9641130511e0d48a3bb0b3e3cf5a17cfaeebbfaa3`이다. DMG와 `.dmg.sha256`을 [v0.2.10 Release](https://github.com/newdlops/autoapprove/releases/tag/v0.2.10)의 배포 파일로 사용한다.
+
 ## 0.2.9 DMG 배포
 
 - 검증된 앱 **0.2.9 (12)**와 내장 VS Code 확장 **0.2.3**을 `AutoApprove-0.2.9-macOS-arm64.dmg`로 패키징했다. 이전 배포 0.2.7 이후의 완료 알림·Codex 기록 조회 복구·터미널 더블클릭을 함께 포함한다.

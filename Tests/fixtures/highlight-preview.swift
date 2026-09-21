@@ -42,10 +42,16 @@ import UserNotifications
         session.phase = .working
         session.bridgeID = "preview"; session.terminalID = "preview-0"; session.channel = .vscodeScreen
         session.terminalTitle = "미커밋 변경 정리 · 여러 워크트리의 상태를 확인하는 아주 긴 터미널 제목"
+        session.gitBranch = .init(kind: .branch, name: "feature/terminal-session-git-branch-display-with-worktree-aware-background-refresh")
         var second = AgentSession(id: "preview-1", agent: .claude, pid: 1201, started: "preview", tty: "/dev/ttys-second", cwd: "/tmp/두 번째 터미널", terminal: .terminal)
         second.phase = .idle; second.channel = .terminalScreen; second.terminalTitle = "두 번째 창 · 더블클릭 검증"
-        let disconnected = AgentSession(id: "preview-disconnected", agent: .codex, pid: 1202, started: "preview", tty: "/dev/ttys-disconnected", cwd: "/tmp/연결 전 터미널", terminal: .vscode)
-        engine.updateDiscovery([session, second, disconnected], records: [])
+        second.gitBranch = .init(kind: .detached, name: "a1b2c3d4")
+        var disconnected = AgentSession(id: "preview-disconnected", agent: .codex, pid: 1202, started: "preview", tty: "/dev/ttys-disconnected", cwd: "/tmp/연결 전 터미널", terminal: .vscode)
+        disconnected.gitBranch = .init(kind: .notRepository)
+        let loading = AgentSession(id: "preview-git-loading", agent: .claude, pid: 1203, started: "preview", tty: "/dev/ttys-loading", cwd: "/tmp/브랜치 조회 중", terminal: .terminal)
+        var unavailable = AgentSession(id: "preview-git-unavailable", agent: .codex, pid: 1204, started: "preview", tty: "/dev/ttys-unavailable", cwd: "/tmp/브랜치 조회 실패", terminal: .terminal)
+        unavailable.gitBranch = .init(kind: .unavailable, detail: "검증용: 폴더 접근 권한을 확인하지 못했습니다.")
+        engine.updateDiscovery([session, second, disconnected, loading, unavailable], records: [])
         queueQuestions()
         notifications = QuestionNotifications(engine: engine, openSession: { [weak self] id in
             guard let self, ["claude:notification-preview", "preview-0"].contains(id),

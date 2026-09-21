@@ -68,6 +68,7 @@ try {
   for (const [index, agent] of ['codex', 'codex', 'claude'].entries()) {
     const directory = path.join(root, `fixture-${index}`);
     await mkdir(directory);
+    if (index === 0) await exec('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', 'init', '--quiet', '--initial-branch=fixture-main', directory]);
     const executable = path.join(directory, agent);
     await copyFile(holder, executable);
     const child = spawn(holder, [executable], { cwd: directory, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -91,6 +92,16 @@ try {
     const found = fixtures.map(fixture => status.sessions.find(session => session.cwd === fixture.directory));
     return found.every(Boolean) ? found : undefined;
   }, 'PTY discovery');
+  await until(async () => {
+    const status = await bridge.request('status');
+    return status.sessions.find(session => session.id === sessions[0].id)?.gitBranch?.name === 'fixture-main'
+      && status.sessions.find(session => session.id === sessions[1].id)?.gitBranch?.kind === 'notRepository';
+  }, 'current folder Git metadata');
+  await exec('/usr/bin/git', ['-C', fixtures[0].directory, 'symbolic-ref', 'HEAD', 'refs/heads/fixture-switched']);
+  await until(async () => {
+    const status = await bridge.request('status');
+    return status.sessions.find(session => session.id === sessions[0].id)?.gitBranch?.name === 'fixture-switched';
+  }, 'branch change refreshes without manual reload');
   await bridge.request('register', { terminals: fixtures });
   assert.equal((await bridge.request('status')).sessions.find(session => session.id === sessions[0].id).terminalTitle, '검증 터미널 0');
   fixtures[0].name = '바뀐 제목';
@@ -192,7 +203,7 @@ try {
   for (const session of sessions) {
     assert.equal(english.find(value => value.pid === session.pid)?.id, korean.find(value => value.pid === session.pid)?.id, 'Process identity must be locale independent');
   }
-  console.log('PASS real PTY discovery, exact target, bulk enable, single-use screen, pause/resume, idle/work transitions, hook takeover, question display, confirmed-unsent retry, bounded retries, hook screen fallback, disconnected off, locale-independent identity');
+  console.log('PASS real PTY discovery, periodic Git branch refresh, non-repository state, exact target, bulk enable, single-use screen, pause/resume, idle/work transitions, hook takeover, question display, confirmed-unsent retry, bounded retries, hook screen fallback, disconnected off, locale-independent identity');
 } catch (error) {
   const processes = await exec('/bin/ps', ['-axo', 'pid=,ppid=,tty=,lstart=,comm=']);
   console.error(processes.stdout.split('\n').filter(line => line.includes(root)).join('\n'));

@@ -348,6 +348,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Git unborn, nested, linked worktree, branch switch and detached HEAD", tests.testGitBranchWorktreeAndRefresh),
+            ("Git non-repository, missing directory and inherited environment isolation", tests.testGitBranchNonRepositoryAndEnvironmentIsolation),
+            ("Git metadata binds to live sessions and their current directories", tests.testGitBranchesBindToCurrentSessionDirectory),
             ("Codex locked database, preserved questions and automatic recovery", tests.testCodexHistoryContentionAndRecovery),
             ("Codex temporary, missing, invalid and unsupported history distinction", tests.testCodexHistoryFailureClassification),
             ("Codex question and completion errors recover independently", tests.testCodexQuestionAndCompletionErrorsStayIndependent),

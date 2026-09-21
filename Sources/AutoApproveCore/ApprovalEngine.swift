@@ -16,6 +16,7 @@ import Combine
     private var records: [ProcessRecord] = []
     private var server: SocketServer?
     private var pollTask: Task<Void, Never>?
+    private var gitBranchTask: Task<Void, Never>?
     private var peers: [String: SocketConnection] = [:]
     private var bridges: [String: [JSONObject]] = [:]
     private var screens: [String: ScreenState] = [:]
@@ -70,7 +71,11 @@ import Combine
             }
         }
     }
-    public func stop() { revision &+= 1; pollTask?.cancel(); pollTask = nil; server?.stop(); server = nil }
+    public func stop() {
+        revision &+= 1; pollTask?.cancel(); pollTask = nil
+        gitBranchTask?.cancel(); gitBranchTask = nil
+        server?.stop(); server = nil
+    }
 
     private func publish() {
         snapshot.sessions = sessions.values.sorted {
@@ -86,21 +91,43 @@ import Combine
         defer { discovering = false; initialDiscoveryComplete = true }
         do {
             let discovered = try await Task.detached(priority: .utility) { try ProcessDiscovery.read() }.value
-            let oldIDs = Set(sessions.keys)
             let found = ProcessDiscovery.sessions(discovered)
-            let new = found.filter { !oldIDs.contains($0.id) || sessions[$0.id]?.cwd.isEmpty == true }
             let directories = await Task.detached(priority: .utility) {
-                let paths = ProcessDiscovery.workingDirectories(pids: new.map(\.pid))
-                return Dictionary(new.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
+                let paths = ProcessDiscovery.workingDirectories(pids: found.map(\.pid))
+                return Dictionary(found.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
             }.value
             updateDiscovery(found, records: discovered, directories: directories)
             snapshot.health.discoveryError = nil
         } catch { snapshot.health.discoveryError = error.localizedDescription }
+        refreshGitBranches()
         let codexTargets = Array(sessions.values).filter { $0.agent == .codex && $0.phase != .ended }
         async let questions = codexQuestions.collect(codexTargets)
         await refreshTerminal()
         updateCodexQuestions(await questions)
         publish()
+    }
+
+    private func refreshGitBranches() {
+        guard gitBranchTask == nil else { return }
+        let targets = Array(sessions.values)
+        gitBranchTask = Task { [weak self] in
+            let updates = await GitBranchReader.collect(targets)
+            guard !Task.isCancelled, let self else { return }
+            self.updateGitBranches(updates)
+            self.gitBranchTask = nil
+        }
+    }
+
+    public func updateGitBranches(_ updates: [GitBranchUpdate]) {
+        var changed = false
+        for update in updates {
+            guard let session = sessions[update.sessionID], session.agent != .shell,
+                  session.phase != .ended, session.cwd == update.cwd,
+                  session.gitBranch != update.state else { continue }
+            sessions[session.id]?.gitBranch = update.state
+            changed = true
+        }
+        if changed { publish() }
     }
 
     public func updateCodexQuestions(_ updates: [CodexQuestionUpdate], at date: Date = Date()) {
@@ -219,7 +246,9 @@ import Combine
                 if existing.bridgeID == nil { existing.terminal = session.terminal }
                 session = existing
             }
-            if let cwd = directories[session.id], !cwd.isEmpty { session.cwd = cwd }
+            if let cwd = directories[session.id], !cwd.isEmpty, session.cwd != cwd {
+                session.cwd = cwd; session.gitBranch = nil
+            }
             if session.phase == .ended { session.setPhase(.unknown, detail: "새 상태를 확인하고 있습니다."); session.channel = .none; session.automatic = false }
             if sessions[session.id] == nil {
                 session.automatic = store.value("automatic:\(session.id)") == "true"
@@ -383,7 +412,9 @@ import Combine
         guard session.agent == .claude else { return [:] }
         // Hooks can arrive before the first process scan after an app restart.
         if sessions[key] == nil { session.automatic = store.value("automatic:\(key)") == "true" }
-        if let cwd = payload["cwd"] as? String, !cwd.isEmpty { session.cwd = cwd }
+        if let cwd = payload["cwd"] as? String, !cwd.isEmpty, session.cwd != cwd {
+            session.cwd = cwd; session.gitBranch = nil
+        }
         session.providerID = providerID; session.lastActivity = Date()
         // A hook owns this session now; any queued screen approval is obsolete.
         clearScreen(key)
