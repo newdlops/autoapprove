@@ -69,6 +69,10 @@ private struct StatusMenu: View {
         let active = engine.snapshot.sessions.filter { $0.phase != .ended }
         Text("세션 \(active.count)개 · 자동 승인 \(active.filter { $0.automatic && $0.canApprove }.count)개")
         Text("대기 중 \(engine.snapshot.idleCount)개 · 작업 중 \(active.filter { $0.phase == .working }.count)개")
+        if engine.snapshot.monitoringCount > 0 {
+            Text("대기 중인 세션 중 모니터링 \(engine.snapshot.monitoringCount)개")
+                .help("다음 지시를 받을 수 있지만 백그라운드 작업이 남아 있는 세션입니다.")
+        }
         Text("응답 필요 \(engine.snapshot.attentionCount)건")
         if engine.snapshot.paused { Text("자동 승인 일시정지됨") }
         Divider()

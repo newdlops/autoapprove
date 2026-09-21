@@ -25,7 +25,7 @@ import Combine
     private var screenObservedAt: [String: Date] = [:]
     private var handledHookIDs: Set<String> = []
     private var hookIDOrder: [String] = []
-    private var pendingActions: [String: (sessionID: String, event: AuditEvent, peerID: String, dispatchID: UUID, generation: String)] = [:]
+    private var pendingActions: [String: (sessionID: String, event: AuditEvent, peerID: String, dispatchID: UUID, generation: String, identity: String)] = [:]
     private var terminalEnabled = false
     private var terminalPolling = false
     private var terminalPermissionBlocked = false
@@ -522,18 +522,19 @@ import Combine
             let scheduled = payload["session_crons"] as? [Any] ?? []
             if !background.isEmpty || !scheduled.isEmpty {
                 session.completion = nil
-                session.setPhase(.working, detail: "Claude 응답은 끝났지만 백그라운드 작업 또는 예약된 후속 작업이 남아 있습니다.")
+                session.setPhase(.idle, detail: "Claude 응답은 끝났고 다음 지시를 받을 수 있습니다. 백그라운드 작업 또는 예약된 후속 작업을 모니터링 중입니다.", monitoring: true)
+                session.pendingSummary = nil
             } else {
                 if let workID = claudeWorkIDs.removeValue(forKey: key) ?? (session.phase == .working ? UUID().uuidString : nil) {
                     session.completion = WorkCompletion(id: "claude:\(providerID):\(workID)", summary: payload["last_assistant_message"] as? String)
                 }
-                session.setPhase(.idle, detail: "Claude의 응답 완료 이벤트를 받았습니다. 다음 지시를 기다리고 있습니다."); session.pendingSummary = nil
+                session.setPhase(.idle, detail: "Claude의 응답 완료 이벤트를 받았습니다. 다음 지시를 기다리고 있습니다.", monitoring: false); session.pendingSummary = nil
             }
         case "Notification":
             let type = payload["notification_type"] as? String ?? ""
             // Generic reminders must not erase the actual question and its choices.
             if type == "permission_prompt", !(session.phase == .input && session.pendingInTerminal) { session.setPhase(.approval, detail: "Claude가 실행 권한에 대한 응답을 기다리고 있습니다."); session.pendingInTerminal = true; if session.pendingSummary == nil, !summary.isEmpty { session.pendingSummary = summary } }
-            else if type == "idle_prompt", !session.pendingInTerminal { session.setPhase(.idle, detail: "Claude의 입력 대기 알림을 받았습니다."); session.pendingSummary = nil }
+            else if type == "idle_prompt", !session.pendingInTerminal { session.setPhase(.idle, detail: session.backgroundMonitoring == true ? "Claude는 다음 지시를 기다리며 백그라운드 작업을 모니터링하고 있습니다." : "Claude의 입력 대기 알림을 받았습니다."); session.pendingSummary = nil }
             else if type == "elicitation_dialog" { session.setPhase(.input, detail: "Claude가 질문에 대한 응답을 기다리고 있습니다."); session.pendingSummary = summary; session.pendingInTerminal = true }
         case "PreToolUse":
             session.setPhase(needsAnswer ? .input : .working, detail: needsAnswer ? "Claude가 질문에 대한 응답을 기다리고 있습니다." : "Claude의 도구 실행 이벤트를 받았습니다.")
@@ -598,6 +599,7 @@ import Combine
                     pendingActions.removeValue(forKey: id)
                     let succeeded = params["success"] as? Bool == true
                     if !succeeded { retryUnsentApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation) }
+                    if succeeded { watchDeliveredApproval(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, identity: action.identity) }
                     var event = action.event
                     event.outcome = succeeded ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인"
                     log(event)
@@ -694,7 +696,7 @@ import Combine
                 return
             }
             let activity = activityTrackers[sessionID, default: ActivityTracker()].observe(raw, agent: session.agent, generation: generation, at: now)
-            sessions[sessionID]?.setPhase(activity.phase, detail: activity.detail, at: now)
+            sessions[sessionID]?.setPhase(activity.phase, detail: activity.detail, at: now, monitoring: activity.monitoring)
             return
         }
         activityTrackers.removeValue(forKey: sessionID)
@@ -724,6 +726,39 @@ import Combine
         } else {
             sessions[id]?.pendingInTerminal = true
             sessions[id]?.activityDetail = "화면 확인이 반복해서 실패했습니다. 터미널에서 요청을 확인해주세요."
+        }
+    }
+
+    private func requireApprovalReview(_ id: String, dispatchID: UUID, generation: String, identity: String, detail: String) {
+        guard let state = screens[id], state.generation == generation, state.dispatchID == dispatchID,
+              state.prompt.identity == identity, sessions[id]?.phase == .approval else { return }
+        sessions[id]?.pendingInTerminal = true
+        sessions[id]?.activityDetail = detail
+    }
+
+    private func watchDeliveredApproval(_ id: String, dispatchID: UUID, generation: String, identity: String) {
+        let deliveredAt = Date()
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self, self.screens[id]?.prompt.identity == identity,
+                  let observed = self.screenObservedAt[id], observed > deliveredAt,
+                  Date().timeIntervalSince(observed) < 6 else { return }
+            self.requireApprovalReview(id, dispatchID: dispatchID, generation: generation, identity: identity,
+                detail: "승인 입력을 전달했지만 같은 요청이 계속 표시됩니다. 터미널에서 입력 상태를 확인해주세요.")
+            self.publish()
+        }
+    }
+
+    private func watchApprovalAcknowledgement(_ actionID: String) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self, let action = self.pendingActions.removeValue(forKey: actionID) else { return }
+            self.requireApprovalReview(action.sessionID, dispatchID: action.dispatchID, generation: action.generation, identity: action.identity,
+                detail: "VS Code의 승인 입력 전달 확인이 8초 안에 오지 않았습니다. 터미널에서 입력 상태를 확인해주세요.")
+            var event = action.event
+            event.outcome = "전달 확인 시간 초과 · 터미널 확인 필요"
+            self.log(event)
+            self.publish()
         }
     }
 
@@ -763,22 +798,27 @@ import Combine
                 do {
                     let delivery = try await Task.detached { try TerminalAdapter.approve(tty: session.tty, expectedScreen: state.raw, agent: session.agent) }.value
                     if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
+                    if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, identity: state.prompt.identity) }
                     event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     self.log(event)
                 } catch {
                     // A transport error can occur after dispatch; never blindly repeat an uncertain write.
-                    if self.screens[id]?.prompt.identity == state.prompt.identity {
-                        self.sessions[id]?.pendingInTerminal = true
-                        self.sessions[id]?.activityDetail = "승인 입력 결과를 확인하지 못했습니다. 터미널을 확인해주세요."
-                    }
+                    self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, identity: state.prompt.identity,
+                        detail: "승인 입력 결과를 확인하지 못했습니다. 터미널을 확인해주세요.")
                     event.outcome = "입력 확인 필요: \(error.localizedDescription)"; self.log(event)
                 }
             } else if session.channel == .vscodeScreen, let peerID = session.bridgeID, let peer = self.peers[peerID], let terminalID = session.terminalID {
                 let actionID = UUID().uuidString
-                self.pendingActions[actionID] = (id, event, peerID, scheduledID, state.generation)
+                self.pendingActions[actionID] = (id, event, peerID, scheduledID, state.generation, state.prompt.identity)
                 let current = self.screens[id] ?? state
                 let sent = peer.send(["method": "approve", "id": actionID, "terminalID": terminalID, "fingerprint": current.prompt.fingerprint, "dialog": current.prompt.dialog, "agent": session.agent.rawValue, "answer": current.prompt.answer, "generation": String(state.generation.dropFirst(peerID.count + 1)), "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000])
-                if !sent { self.pendingActions.removeValue(forKey: actionID); event.outcome = "연결 끊김 · 입력 확인 필요"; self.log(event) }
+                if sent { self.watchApprovalAcknowledgement(actionID) }
+                else {
+                    self.pendingActions.removeValue(forKey: actionID)
+                    self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, identity: state.prompt.identity,
+                        detail: "VS Code로 승인 입력을 전달하지 못했습니다. 터미널 연결을 확인해주세요.")
+                    event.outcome = "연결 끊김 · 입력 확인 필요"; self.log(event)
+                }
             }
             self.publish()
         }

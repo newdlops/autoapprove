@@ -40,6 +40,7 @@ enum AppHelp {
 
     static func phase(_ session: AgentSession) -> String {
         if session.automaticWaitingForConnection { return "자동 승인 설정은 켜져 있지만 요청을 받을 연결이 없습니다. 연결 설정을 확인하세요." }
+        if session.isMonitoring { return "다음 지시를 받을 수 있지만 백그라운드 작업 또는 예약된 후속 작업이 남아 있습니다. 대기 중 개수에 포함하며 모든 작업이 끝났다는 뜻은 아닙니다." }
         switch session.phase {
         case .working: return "Claude Code·Codex가 작업을 진행 중인 것으로 감지했습니다."
         case .idle: return "다음 지시를 기다리는 입력 대기 상태로 감지했습니다. 출력이 조용하다는 이유만으로 대기로 판단하지 않습니다."

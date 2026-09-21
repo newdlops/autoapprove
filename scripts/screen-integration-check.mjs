@@ -16,7 +16,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let bridge;
 let diagnostics = '';
 const actions = [];
-const prompt = 'Would you like to run the following command?\n\n$ printf fixture\n\n› 1. Yes, proceed (y)\n  2. Yes, don’t ask\n     again for this session (a)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel';
+const prompt = 'Would you like to run the following command?\n\n$ printf fixture\n\n› 1. Yes, proceed (y)\n  2. Yes, don’t ask\n     again for this session (a)\n  3. No, and tell Codex what\n     to do differently (esc)\n\nPress enter to\nconfirm or esc to cancel';
 const claudePrompt = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, don't ask again\n  3. No\nEsc to cancel";
 
 async function until(check, label, timeout = 8000) {
@@ -27,6 +27,7 @@ async function until(check, label, timeout = 8000) {
 class Bridge {
   waiting = new Map();
   rejections = 0;
+  unacknowledged = new Set();
   constructor(socket) {
     this.socket = socket;
     let buffer = '';
@@ -41,7 +42,7 @@ class Bridge {
           // This fake extension acknowledges the intended terminal only; no UI input is sent.
           const success = this.rejections <= 0;
           if (!success) this.rejections--;
-          void this.request('actionResult', { actionID: message.id, success });
+          if (!this.unacknowledged.has(message.terminalID)) void this.request('actionResult', { actionID: message.id, success });
         } else {
           const callback = this.waiting.get(message.id);
           this.waiting.delete(message.id);
@@ -141,9 +142,17 @@ try {
   }, 'idle composer confirmation');
   let idle = (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id);
   assert.equal(typeof idle.idleSince, 'number');
+  const monitoringScreen = 'Watching fixture logs\n›\n1 background terminal running · /ps to view\n? for shortcuts';
+  let monitorPoll = 0;
+  await until(async () => {
+    await bridge.request('screen', { terminalID: fixtures[0].id, screen: monitoringScreen.replace('fixture logs', `fixture logs ${monitorPoll++}`), generation: 'activity' });
+    const session = (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id);
+    return session.phase === 'idle' && session.backgroundMonitoring === true;
+  }, 'ready composer remains idle while background output changes');
   await bridge.request('screen', { terminalID: fixtures[0].id, screen: '• Working (esc to interrupt)\n' + idleScreen, generation: 'activity' });
   idle = (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id);
   assert.equal(idle.phase, 'working'); assert.equal(idle.idleSince, undefined, 'New work clears the idle timer');
+  assert.equal(idle.backgroundMonitoring, undefined, 'Foreground work removes the idle monitoring marker');
   assert.equal(actions.length, 3, 'Idle detection never sends approval input');
 
   const claude = sessions[2];
@@ -190,6 +199,37 @@ try {
   assert.equal(actions[9].terminalID, fixtures[2].id);
   assert.equal(actions[9].agent, 'claude');
 
+  bridge.unacknowledged.add(fixtures[0].id);
+  for (let index = 0; index < 2; index++) {
+    await bridge.request('screen', { terminalID: fixtures[index].id, screen: prompt, generation: 'timeout' });
+  }
+  await until(() => actions.length === 12, 'missing acknowledgement and delivered-but-still-waiting fixtures');
+  const missingAck = actions.find(action => action.generation === 'timeout' && action.terminalID === fixtures[0].id);
+  await until(async () => {
+    for (let index = 0; index < 2; index++) {
+      await bridge.request('screen', { terminalID: fixtures[index].id, screen: prompt, generation: 'timeout' });
+    }
+    const current = await bridge.request('status');
+    return sessions.slice(0, 2).every(session => current.sessions.find(value => value.id === session.id).pendingInTerminal);
+  }, 'both stalled approvals request user attention within a bounded time', 12000);
+  status = await bridge.request('status');
+  assert.ok(status.sessions.find(session => session.id === sessions[0].id).activityDetail.includes('8초'));
+  assert.ok(status.sessions.find(session => session.id === sessions[1].id).activityDetail.includes('같은 요청'));
+  assert.equal(status.events.filter(event => event.outcome === '전달 확인 시간 초과 · 터미널 확인 필요').length, 1);
+  await bridge.request('actionResult', { actionID: missingAck.id, success: true });
+  status = await bridge.request('status');
+  assert.equal(status.events.filter(event => event.outcome === '전달 확인 시간 초과 · 터미널 확인 필요').length, 1, 'Late acknowledgement cannot erase the timeout');
+  assert.equal(actions.length, 12, 'Uncertain delivery must not duplicate terminal input');
+
+  await bridge.request('screen', { terminalID: fixtures[0].id, screen: prompt, generation: 'obsolete-timeout' });
+  await until(() => actions.length === 13, 'obsolete acknowledgement fixture dispatched');
+  await bridge.request('screen', { terminalID: fixtures[0].id, screen: 'Working (esc to interrupt)', generation: 'obsolete-timeout' });
+  await until(async () => (await bridge.request('status')).events.filter(event => event.outcome === '전달 확인 시간 초과 · 터미널 확인 필요').length === 2,
+    'obsolete attempt still receives a final audit result', 12000);
+  const resumed = (await bridge.request('status')).sessions.find(session => session.id === sessions[0].id);
+  assert.equal(resumed.phase, 'working'); assert.equal(resumed.pendingInTerminal, false, 'A late timeout cannot mark subsequent work as pending');
+  bridge.unacknowledged.clear();
+
   await bridge.request('register', { terminals: fixtures.map(fixture => ({ ...fixture, streamAttached: false })) });
   status = await bridge.request('status');
   const disconnected = status.sessions.find(session => session.id === sessions[0].id);
@@ -203,7 +243,7 @@ try {
   for (const session of sessions) {
     assert.equal(english.find(value => value.pid === session.pid)?.id, korean.find(value => value.pid === session.pid)?.id, 'Process identity must be locale independent');
   }
-  console.log('PASS real PTY discovery, periodic Git branch refresh, non-repository state, exact target, bulk enable, single-use screen, pause/resume, idle/work transitions, hook takeover, question display, confirmed-unsent retry, bounded retries, hook screen fallback, disconnected off, locale-independent identity');
+  console.log('PASS real PTY discovery, periodic Git branch refresh, exact target, wrapped three-choice approval, single-use screen, pause/resume, idle/background monitoring/work transitions, hook takeover, manual questions, confirmed-unsent retry, bounded retries, missing acknowledgement timeout, unchanged delivered dialog attention, late result isolation, disconnected off, locale-independent identity');
 } catch (error) {
   const processes = await exec('/bin/ps', ['-axo', 'pid=,ppid=,tty=,lstart=,comm=']);
   console.error(processes.stdout.split('\n').filter(line => line.includes(root)).join('\n'));

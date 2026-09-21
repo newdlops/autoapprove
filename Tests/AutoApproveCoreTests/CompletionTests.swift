@@ -51,7 +51,8 @@ extension ApprovalTests {
         for extra: JSONObject in [["background_tasks": [["id": "child", "status": "running"]]], ["session_crons": [["id": "wakeup"]]]] {
             hook("Stop", extra: extra)
             try expect(AttentionRequest.completions(engine.snapshot).isEmpty)
-            try expectEqual(engine.snapshot.sessions[0].phase, .working)
+            try expectEqual(engine.snapshot.sessions[0].phase, .idle)
+            try expect(engine.snapshot.sessions[0].isMonitoring)
         }
         hook("PreToolUse", extra: ["tool_name": "AskUserQuestion", "tool_input": ["questions": [["question": "어느 작업?", "options": [["label": "하나"], ["label": "둘"], ["label": "셋"]]]]]])
         hook("Stop")

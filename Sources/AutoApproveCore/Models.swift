@@ -55,6 +55,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var automatic = false
     public var lastActivity = Date()
     public var idleSince: Date?
+    /// Last observed background activity; optional for older bridge snapshots.
+    public var backgroundMonitoring: Bool?
     public var activityDetail: String?
     public var providerID: String?
     public var terminalID: String?
@@ -70,6 +72,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var completionError: String?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
+    public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
+    public var phaseTitle: String { isMonitoring ? "대기 중 · 모니터링" : phase.title }
     public var needsReview: Bool { phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending }) }
     public var canApprove: Bool { agent != .shell && channel != .none && phase != .ended }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
@@ -83,9 +87,11 @@ public struct AgentSession: Identifiable, Codable, Equatable {
         self.tty = tty; self.cwd = cwd; self.terminal = terminal
     }
 
-    public mutating func setPhase(_ phase: SessionPhase, detail: String, at date: Date = Date()) {
+    public mutating func setPhase(_ phase: SessionPhase, detail: String, at date: Date = Date(), monitoring: Bool? = nil) {
         if self.phase != phase { lastActivity = date }
         idleSince = phase == .idle ? (self.phase == .idle ? idleSince ?? date : date) : nil
+        if let monitoring { backgroundMonitoring = monitoring ? true : nil }
+        if phase == .unknown || phase == .ended { backgroundMonitoring = nil }
         self.phase = phase; activityDetail = detail
         if phase == .ended { completion = nil; completionError = nil; gitBranch = nil }
     }
@@ -154,6 +160,7 @@ public struct EngineSnapshot: Codable {
     public var paused: Bool
     public var health: ConnectionHealth
     public var idleCount: Int { sessions.filter { $0.phase == .idle }.count }
+    public var monitoringCount: Int { sessions.filter(\.isMonitoring).count }
     public var attentionCount: Int { sessions.reduce(0) { $0 + AttentionRequest.candidates($1, paused: paused).count } }
 }
 

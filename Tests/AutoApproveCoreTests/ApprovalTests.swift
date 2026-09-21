@@ -183,7 +183,7 @@ import AutoApproveCore
         for screen in ["", "Build running…", "›", "Done.\n›\nunknown footer", idle + "Downloading…", "```\n" + idle + "```"] {
             try expectEqual(ActivityDetector.detect(screen, agent: .codex).phase, .unknown)
         }
-        for screen in ["• Working (0s • esc to interrupt)\n" + idle, idle + "tab to queue", "1 background task\n" + claudeIdle] {
+        for screen in ["• Working (0s • esc to interrupt)\n" + idle, idle + "tab to queue"] {
             try expectEqual(ActivityDetector.detect(screen, agent: screen.contains("❯") ? .claude : .codex).phase, .working)
         }
         try expectEqual(ActivityDetector.detect(codex, agent: .codex).phase, .approval)
@@ -374,6 +374,11 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Wrapped final permission options and keyboard hints retain active-dialog validation", tests.testWrappedPermissionOptionsAndFooter),
+            ("Claude and Codex ready composers with background monitoring", tests.testMonitoringRequiresReadyComposer),
+            ("Changing monitor output, new generations and foreground work", tests.testMonitoringTracksReadinessAcrossOutputChanges),
+            ("Monitoring counts, ordinary idle, connection loss and snapshot compatibility", tests.testMonitoringSessionLifecycleAndCompatibility),
+            ("Claude background stop, reminders, new work and final completion", tests.testClaudeMonitoringHookLifecycle),
             ("Session order, identity, discovery and restart persistence", tests.testSessionOrderPersistsAcrossDiscoveryAndRestart),
             ("Filtered and multiple session moves preserve hidden slots", tests.testFilteredAndMultipleSessionMoves),
             ("Session moves reject stale, exited and invalid rows", tests.testSessionMoveRejectsStaleAndInvalidRows),

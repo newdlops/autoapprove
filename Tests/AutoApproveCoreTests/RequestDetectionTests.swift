@@ -7,6 +7,33 @@ private let claudePermissionFixture = "Bash command\n  echo 한글\nDo you want 
 private let questionFixture = "어떤 환경을 사용할까요?\n❯ 1. 개발 환경\n  2. 테스트 환경\nEnter to select · Esc to cancel"
 
 extension ApprovalTests {
+    func testWrappedPermissionOptionsAndFooter() throws {
+        for agent in [AgentKind.claude, .codex] {
+            let heading = agent == .claude ? "Do you want to proceed?" : "Would you like to run the following command?"
+            let options = "\n› 1. Yes, proceed\n     (y)\n  2. Yes, don't ask\n     again for this session (p)\n  3. No, and tell the agent\n     what to do differently (esc)\n\n"
+            for footer in ["Press enter to confirm or esc to cancel", "Press enter to\nconfirm or esc to cancel", "Press enter\nto confirm or\nesc to cancel", "Enter to select\n· Esc to cancel", "Esc to\ncancel"] {
+                let screen = heading + options + footer
+                try expectEqual(PromptDetector.detect(screen, agent: agent)?.answer, "1", "\(agent): \(footer)")
+                try expectEqual(PromptDetector.detect(screen, agent: agent)?.dialog, screen)
+                try expectEqual(PromptDetector.detect(screen.replacingOccurrences(of: "\n", with: "\r\n"), agent: agent)?.dialog, screen)
+                let selectedNo = screen.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "  3.", with: "› 3.")
+                try expectNil(PromptDetector.detect(selectedNo, agent: agent))
+                try expectEqual(QuestionDetector.detect(selectedNo, agent: agent)?.phase, .approval)
+                for suffix in ["\n› New input", "\nUnrelated output", "\nAnother instruction\nEsc to cancel"] {
+                    try expectNil(PromptDetector.detect(screen + suffix, agent: agent))
+                    try expectNil(QuestionDetector.detect(screen + suffix, agent: agent))
+                }
+            }
+            try expectNil(PromptDetector.detect(heading + options, agent: agent))
+            let differentTasks = heading + options.replacingOccurrences(of: "Yes, don't ask\n     again for this session (p)", with: "Yes, deploy to production (p)") + "Enter to\nselect"
+            try expectNil(PromptDetector.detect(differentTasks, agent: agent))
+            try expectNotNil(QuestionDetector.detect(differentTasks, agent: agent))
+        }
+        let question = "어떤 작업을 할까요?\n› 1. 미커밋 현황\n  2. PR 상태\n  3. 지정할\n     다른 작업\nEnter to select\n· Esc to cancel"
+        try expectEqual(QuestionDetector.detect(question, agent: .claude)?.phase, .input)
+        try expectNil(PromptDetector.detect(question, agent: .claude))
+    }
+
     func testLongPermissionAndCanonicalUnicode() throws {
         let long = permissionFixture.replacingOccurrences(of: "  $ echo 한글", with: "  $ python <<'PY'\n" + String(repeating: "    print('한글')\n", count: 70) + "PY")
         try expectNotNil(PromptDetector.detect(long, agent: .codex))

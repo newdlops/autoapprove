@@ -11,8 +11,7 @@ public enum QuestionDetector {
         guard agent != .shell else { return nil }
         let lines = Array(PromptDetector.normalizedLines(screen).suffix(300)).map { $0.trimmingCharacters(in: .whitespaces) }
         guard let last = lines.lastIndex(where: PromptDetector.isOption) else { return nil }
-        let footer = lines.dropFirst(last + 1).filter { !$0.isEmpty }
-        guard !footer.isEmpty, footer.allSatisfy(PromptDetector.isDialogFooter) else { return nil }
+        guard PromptDetector.dialogFooterStart(in: lines, after: last) != nil else { return nil }
         let selected = lines[...last].lastIndex {
             $0.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) != nil
         }

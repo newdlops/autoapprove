@@ -109,7 +109,7 @@ struct SessionWindow: View {
                     HStack(spacing: 12) {
                         Button { filter = "대기 중" } label: {
                             Label("대기 중 \(engine.snapshot.idleCount)개", systemImage: "checkmark.circle")
-                        }.buttonStyle(.borderless).help("다음 지시를 기다리는 Claude Code·Codex 보기")
+                        }.buttonStyle(.borderless).help("다음 지시를 기다리는 Claude Code·Codex를 봅니다. 백그라운드를 모니터링 중인 \(engine.snapshot.monitoringCount)개도 포함합니다.")
                         Text("작업 중 \(engine.snapshot.sessions.filter { $0.phase == .working }.count)개").foregroundStyle(.secondary)
                             .help("현재 작업을 진행 중인 것으로 감지한 Claude Code·Codex 세션 수입니다.")
                         Spacer(minLength: 0)
@@ -133,7 +133,7 @@ struct SessionWindow: View {
                         let displayed = visible
                         List(selection: $selection) {
                             ForEach(displayed) { session in
-                                SessionRow(session: session, paused: engine.snapshot.paused,
+                                SessionRow(session: session, paused: engine.snapshot.paused, selected: selection.contains(session.id),
                                     setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
                                     reveal: { reveal(session) })
                                     .tag(session.id)
@@ -272,6 +272,7 @@ struct SessionWindow: View {
 private struct SessionRow: View {
     let session: AgentSession
     let paused: Bool
+    let selected: Bool
     let setAutomatic: (Bool) -> Void
     let reveal: () -> Void
     var body: some View {
@@ -291,7 +292,7 @@ private struct SessionRow: View {
                 Text("\(session.tty.replacingOccurrences(of: "/dev/", with: "")) · PID \(String(session.pid))")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                     .help("\(session.tty) · PID \(String(session.pid))\n같은 프로젝트의 여러 터미널을 구분하는 식별자입니다.")
-                PhaseLabel(session: session).font(.caption)
+                PhaseLabel(session: session, highlighted: selected).font(.caption)
                 if !session.unansweredQuestions.isEmpty {
                     Label("질문 대기 \(session.unansweredQuestions.count)건", systemImage: "bubble.left.and.bubble.right")
                         .font(.caption.weight(.medium))
@@ -330,12 +331,14 @@ private struct GitBranchLabel: View {
 
 struct PhaseLabel: View {
     let session: AgentSession
+    var highlighted = false
     var body: some View {
-        Label(session.automaticWaitingForConnection ? "연결 필요 · 자동 승인 대기" : session.phase.title, systemImage: symbol).foregroundStyle(color)
+        Label(session.automaticWaitingForConnection ? "연결 필요 · 자동 승인 대기" : session.phaseTitle, systemImage: symbol).foregroundStyle(highlighted ? Color.primary : color)
             .help(AppHelp.phase(session))
     }
     private var symbol: String {
         if session.automaticWaitingForConnection { return "exclamationmark.triangle" }
+        if session.isMonitoring { return "antenna.radiowaves.left.and.right" }
         switch session.phase { case .approval, .input: return "hand.raised"; case .working: return "bolt"; case .idle: return "checkmark.circle"; case .ended: return "stop.circle"; case .unknown: return "circle.dashed" }
     }
     private var color: Color {

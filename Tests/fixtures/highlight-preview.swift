@@ -51,7 +51,10 @@ import UserNotifications
         let loading = AgentSession(id: "preview-git-loading", agent: .claude, pid: 1203, started: "preview", tty: "/dev/ttys-loading", cwd: "/tmp/브랜치 조회 중", terminal: .terminal)
         var unavailable = AgentSession(id: "preview-git-unavailable", agent: .codex, pid: 1204, started: "preview", tty: "/dev/ttys-unavailable", cwd: "/tmp/브랜치 조회 실패", terminal: .terminal)
         unavailable.gitBranch = .init(kind: .unavailable, detail: "검증용: 폴더 접근 권한을 확인하지 못했습니다.")
-        engine.updateDiscovery([session, second, disconnected, loading, unavailable], records: [])
+        var monitoring = AgentSession(id: "preview-monitoring", agent: .codex, pid: 1205, started: "preview", tty: "/dev/ttys-monitoring", cwd: "/tmp/모니터링 터미널", terminal: .terminal)
+        monitoring.channel = .terminalScreen; monitoring.terminalTitle = "CI·로그 모니터만 남은 세션"
+        monitoring.setPhase(.idle, detail: "다음 지시를 받을 수 있습니다. 백그라운드 작업이 남아 있어 모니터링 중으로 표시합니다.", at: Date().addingTimeInterval(-180), monitoring: true)
+        engine.updateDiscovery([session, second, monitoring, disconnected, loading, unavailable], records: [])
         queueQuestions()
         notifications = QuestionNotifications(engine: engine, openSession: { [weak self] id in
             guard let self, ["claude:notification-preview", "preview-0"].contains(id),
