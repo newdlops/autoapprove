@@ -112,7 +112,7 @@ extension ApprovalTests {
         engine.updateCodexQuestions([update]); try expectEqual(tracker.update(engine.snapshot), remaining)
         let reopened = try ApprovalEngine(paths: paths)
         reopened.updateDiscovery([session], records: []); reopened.updateCodexQuestions([update])
-        try expectEqual(reopened.snapshot.sessions[0].questions, [questions[1]])
+        try expectEqual(reopened.snapshot.sessions[0].questions.map(\.summary), [questions[1].summary])
         engine.updateDiscovery([], records: []); engine.updateCodexQuestions([update])
         try expect(tracker.update(engine.snapshot).isEmpty, "A late collector result cannot resurrect an ended session")
         session.queuedQuestions = questions; session.phase = .input; session.pendingSummary = questions[0].summary

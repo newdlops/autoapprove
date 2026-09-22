@@ -9,6 +9,40 @@ private func startInput(_ question: String = startQuestion, labels: [String] = [
 }
 
 extension ApprovalTests {
+    func testAllowConfirmationLabels() throws {
+        let cases: [([String], Int)] = [
+            (["Deny", "Allow"], 1), (["allow (Recommended)", "Don't allow"], 0),
+            (["Do not allow", "ALLOW!"], 1), (["Don’t allow (esc)", "Allow (a)"], 1),
+            (["Allow — 이번 작업을 진행합니다.", "No"], 0),
+            (["Allow once", "Deny"], 0), (["Allow this request only", "Don't allow"], 0),
+            (["Always allow", "Deny", "Allow once (Recommended)"], 2),
+            (["Allow for this session", "Allow", "Don't allow"], 1),
+            (["No", "Allow this time", "Yes, don't ask again"], 1)
+        ]
+        for (labels, index) in cases {
+            let input = startInput(labels: labels)
+            let confirmation = YesNoConfirmation.detect(input)
+            try expectEqual(confirmation?.answer, labels[index], "Preserve the one-time Allow label: \(labels)")
+            try expectEqual((confirmation?.updatedInput(input)["answers"] as? [String: String])?[startQuestion], labels[index])
+            try expectEqual(YesNoConfirmation.detect(QueuedQuestion(id: "allow", threadID: "fixture", title: startQuestion, options: labels))?.answer, labels[index])
+        }
+        for labels in [["Don't allow", "Deny"], ["Allowance", "No"], ["Allowed", "No"],
+                       ["Allow", "Yes", "Deny"], ["Always allow", "Deny"],
+                       ["Allow for this session", "Deny"], ["Allow, don't ask again", "No"],
+                       ["Allow", "Allow another project", "Deny"], ["Allow once", "Allow this time", "Deny"]] {
+            try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "Do not guess an Allow choice: \(labels)")
+        }
+        let scoped: JSONObject = ["questions": [["question": startQuestion, "options": [
+            ["label": "Allow", "description": "Always allow"], ["label": "Deny"]
+        ]]]]
+        try expectNil(YesNoConfirmation.detect(scoped))
+        for agent: AgentKind in [.claude, .codex] {
+            let title = agent == .codex ? "Would you like to run the following command?\n\n$ printf fixture" : "Do you want to proceed?"
+            let screen = title + "\n› 1. Allow once\n  2. Always allow\n  3. Don't allow\nPress enter to confirm or esc to cancel"
+            try expectEqual(PromptDetector.detect(screen, agent: agent)?.answer, "1")
+        }
+    }
+
     func testRepeatedPermissionChoicesPreferCurrentRequest() throws {
         let cases = [
             ["Yes", "Yes, don't ask again", "No"],

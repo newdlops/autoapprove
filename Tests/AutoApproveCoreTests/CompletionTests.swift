@@ -107,7 +107,7 @@ extension ApprovalTests {
         engine.updateCodexQuestions([.init(sessionID: session.id, questions: [question], turn: completed)])
         try expect(AttentionRequest.completions(engine.snapshot).isEmpty, "Recovery must not replay the same completion")
         engine.updateCodexQuestions([.init(sessionID: session.id, questions: [question], completionError: "unsupported turns")])
-        try expectEqual(engine.snapshot.sessions[0].questions, [question], "Completion errors must not break question collection")
+        try expectEqual(engine.snapshot.sessions[0].questions.map(\.summary), [question.summary], "Completion errors must not break question collection")
         try expectEqual(engine.snapshot.sessions[0].completionError, "unsupported turns")
         engine.updateDiscovery([], records: [])
         engine.updateCodexQuestions([.init(sessionID: session.id, turn: completed)])

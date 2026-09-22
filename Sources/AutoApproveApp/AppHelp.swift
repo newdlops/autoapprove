@@ -7,7 +7,7 @@ enum AppHelp {
     static let search = "프로젝트 이름·전체 경로, 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."
     static let pid = "실행 중인 Claude Code·Codex 프로세스의 번호입니다."
-    static let automaticDescription = "Claude Code·Codex의 권한 요청과 Claude 훅의 예·아니오 질문을 자동 승인합니다. 반복 허가 선택지가 있어도 이번 요청만 허용하며, 그 밖의 질문은 직접 답해주세요."
+    static let automaticDescription = "Claude Code·Codex의 권한 요청과 Claude 훅의 예·아니오 질문을 자동 승인합니다. 새 Codex 확인 질문에는 5초 후 Yes·Allow로 답하며 이번 요청만 허용합니다. 선택·입력을 시작하면 멈추며, 과거·중복 질문은 직접 확인해주세요."
     static let sendingAnswer = "답변을 보내고 있습니다. 중복 전송을 막기 위해 완료될 때까지 기다려주세요."
     static let quit = "AutoApprove와 자동 승인을 종료합니다. Claude Code·Codex 터미널은 계속 실행됩니다."
 
@@ -23,7 +23,7 @@ enum AppHelp {
     }
 
     static func pause(_ paused: Bool) -> String {
-        paused ? "자동 승인을 켜 둔 세션의 새 권한 요청 처리를 재개합니다."
+        paused ? "자동 승인을 재개합니다. 처리 가능한 Codex 질문은 다시 5초를 기다린 뒤 자동 응답합니다."
             : "모든 세션의 새 자동 승인을 멈춥니다. 이미 시작된 터미널 작업은 계속됩니다."
     }
 

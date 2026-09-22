@@ -1,12 +1,27 @@
 import Foundation
 import CSQLite
 
+public struct QuestionAutomation: Codable, Equatable {
+    public enum Phase: String, Codable { case scheduled, paused, editing, cancelled, restored, duplicate, needsReview, unavailable }
+    public var phase: Phase
+    public var deadline: Date?
+    public var answer: String?
+    public init(phase: Phase, deadline: Date? = nil, answer: String? = nil) {
+        self.phase = phase; self.deadline = deadline; self.answer = answer
+    }
+    public var canCancel: Bool { [.scheduled, .paused, .unavailable].contains(phase) }
+}
+
 public struct QueuedQuestion: Identifiable, Codable, Equatable {
     public var id: String
     public var threadID: String
     public var title: String
     public var options: [String]
     public var reply: QuestionReply?
+    public var automation: QuestionAutomation?
+    /// A later unquoted message may already answer this question; keep it visible,
+    /// but require a person to resolve it instead of guessing another answer.
+    public var hasLaterUserMessage: Bool?
     public var needsAnswer: Bool { reply?.phase != .queued && reply?.phase != .sending }
     public var summary: String {
         ([title] + options.enumerated().map { "\($0.offset + 1). \($0.element)" }).joined(separator: "\n")
@@ -14,18 +29,25 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
     public init(id: String, threadID: String, title: String, options: [String] = []) {
         self.id = id; self.threadID = threadID; self.title = title; self.options = options
     }
+    func isSameRequest(as other: QueuedQuestion) -> Bool {
+        id == other.id && threadID == other.threadID && title == other.title && options == other.options
+    }
+    var titleIdentity: String {
+        title.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
 }
 
 public struct CodexQuestionUpdate {
     public var sessionID: String
+    public var threadID: String?
     /// nil means the read did not succeed; [] is a successfully observed empty queue.
     public var questions: [QueuedQuestion]?
     public var error: String?
     public var turn: CodexTurnState?
     public var completionError: String?
     public var completionReadPending: Bool
-    public init(sessionID: String, questions: [QueuedQuestion]? = [], error: String? = nil, turn: CodexTurnState? = nil, completionError: String? = nil, completionReadPending: Bool = false) {
-        self.sessionID = sessionID; self.questions = questions; self.error = error
+    public init(sessionID: String, questions: [QueuedQuestion]? = [], error: String? = nil, turn: CodexTurnState? = nil, completionError: String? = nil, completionReadPending: Bool = false, threadID: String? = nil) {
+        self.sessionID = sessionID; self.threadID = threadID; self.questions = questions; self.error = error
         self.turn = turn; self.completionError = completionError
         self.completionReadPending = completionReadPending
     }
@@ -55,7 +77,11 @@ public enum CodexQuestionHistory {
                 }
             } else if item["type"] as? String == "userMessage", let content = item["content"] as? [JSONObject] {
                 let text = content.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                for quote in answeredQuotes(text) {
+                let quotes = answeredQuotes(text)
+                if quotes.isEmpty, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    for index in pending.indices { pending[index].hasLaterUserMessage = true }
+                }
+                for quote in quotes {
                     let matches = pending.indices.filter { normalized(pending[$0].title) == quote }
                     // The transcript does not identify which copy was answered.
                     if matches.count == 1 { pending.remove(at: matches[0]) }

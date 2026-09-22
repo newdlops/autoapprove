@@ -2,12 +2,12 @@ import Foundation
 import Darwin
 
 public struct QuestionReply: Codable, Equatable {
-    public enum Phase: String, Codable { case sending, queued, failed, uncertain }
+    public enum Phase: String, Codable { case sending, queued, failed, uncertain, cancelled }
     public var phase: Phase
     public var answer: String
     public var message: String
     public var queueID: String?
-    public var canRetry: Bool { phase == .failed }
+    public var canRetry: Bool { phase == .failed || phase == .cancelled }
     public init(phase: Phase, answer: String, message: String, queueID: String? = nil) {
         self.phase = phase; self.answer = answer; self.message = message; self.queueID = queueID
     }
@@ -17,8 +17,10 @@ public struct CodexReplyTarget: Sendable {
     public var executable: String
     public var home: String
     public var threadID: String
-    public init(executable: String, home: String, threadID: String) {
+    public var automaticReplyUnavailableReason: String?
+    public init(executable: String, home: String, threadID: String, automaticReplyUnavailableReason: String? = nil) {
         self.executable = executable; self.home = home; self.threadID = threadID
+        self.automaticReplyUnavailableReason = automaticReplyUnavailableReason
     }
 }
 
@@ -37,10 +39,17 @@ public struct CodexReplyTransport: Sendable {
             }
             let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
             let location = try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[session.pid] ?? [])
+            let questions = try CodexHistoryReader().read(location)
             guard location.threadID == question.threadID,
-                  try CodexHistoryReader().read(location).contains(where: { $0.id == question.id && $0.title == question.title && $0.options == question.options }) else {
+                  let current = questions.first(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("질문이 이미 처리됐거나 대화가 바뀌었습니다. 목록을 새로고침해주세요.")
             }
+            let automaticReplyUnavailableReason: String?
+            if questions.filter({ $0.titleIdentity == question.titleIdentity }).count > 1 {
+                automaticReplyUnavailableReason = "같은 문구의 질문이 여러 개여서 자동 응답을 멈췄습니다. 직접 확인해주세요."
+            } else if current.hasLaterUserMessage == true {
+                automaticReplyUnavailableReason = "질문 이후 사용자 메시지가 있어 자동 응답을 멈췄습니다. 이미 답했는지 확인해주세요."
+            } else { automaticReplyUnavailableReason = nil }
             var buffer = [CChar](repeating: 0, count: 4096)
             guard proc_pidpath(session.pid, &buffer, UInt32(buffer.count)) > 0 else {
                 throw AppError.message("이 세션의 Codex 실행 파일을 찾지 못했습니다. 터미널에서 답해주세요.")
@@ -51,12 +60,13 @@ public struct CodexReplyTransport: Sendable {
                 throw AppError.message("Codex 응답 경로를 확인하지 못했습니다. 터미널에서 답해주세요.")
             }
             return CodexReplyTarget(executable: executable,
-                home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: question.threadID)
+                home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: question.threadID,
+                automaticReplyUnavailableReason: automaticReplyUnavailableReason)
         }.value
     }, send: { target, message in
         try await Task.detached(priority: .utility) {
-            // Arguments are passed directly, never through a shell. Only the user-authored
-            // reply is queued; the running turn and terminal composer are left alone.
+            // Arguments are passed directly, never through a shell. Queue only the
+            // answer; leave the running turn and terminal composer alone.
             let result = try CommandRunner.run(target.executable,
                 ["queue", "--thread", target.threadID, "--message", message], timeout: 12,
                 environment: ["CODEX_HOME": target.home])

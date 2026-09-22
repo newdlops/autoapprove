@@ -5,6 +5,15 @@ import Foundation
 public struct YesNoConfirmation {
     public let question: String
     public let answer: String
+    private static let affirmativeWords = "예|네|yes|allow"
+    private static let denialWords = "아니오|아니요|no|deny|don't allow|do not allow"
+
+    public static func detect(_ question: QueuedQuestion) -> YesNoConfirmation? {
+        detect(["questions": [[
+            "question": question.title,
+            "options": question.options.map { ["label": $0] }
+        ]]])
+    }
 
     public static func detect(_ input: JSONObject) -> YesNoConfirmation? {
         if let answers = input["answers"] {
@@ -26,8 +35,14 @@ public struct YesNoConfirmation {
             guard labels.filter({ $0.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == answer }).count == 1 else { return nil }
             return YesNoConfirmation(question: question, answer: labels[index])
         }
-        let yes = labels.indices.filter { hasAnswer(cleaned(labels[$0]), words: "예|네|yes") }
-        let no = labels.indices.filter { hasAnswer(cleaned(labels[$0]), words: "아니오|아니요|no") }
+        let yes = labels.indices.filter { index in
+            let label = cleaned(labels[index])
+            guard let tail = affirmativeTail(label),
+                  !isRepeatedPermission(tail), !isRepeatedPermission("allow " + tail),
+                  !isRepeatedPermission(options[index]["description"] as? String ?? "") else { return false }
+            return hasAnswer(label, words: affirmativeWords) || isCurrentPermission(tail) || isCurrentPermission("allow " + tail)
+        }
+        let no = labels.indices.filter { hasAnswer(cleaned(labels[$0]), words: denialWords) }
         guard yes.count == 1, no.count == 1, yes[0] != no[0] else { return nil }
         return YesNoConfirmation(question: question, answer: labels[yes[0]])
     }
@@ -47,9 +62,9 @@ public struct YesNoConfirmation {
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!。！")))
     }
 
-    private static func yesTail(_ label: String) -> String? {
+    private static func affirmativeTail(_ label: String) -> String? {
         let text = cleaned(label)
-        guard let prefix = text.range(of: #"(?i)^(?:yes|예|네)(?=$|[\s,，:：—–-])[\s,，:：—–-]*"#, options: .regularExpression) else { return nil }
+        guard let prefix = text.range(of: #"(?i)^(?:yes|예|네|allow)(?=$|[\s,，:：—–-])[\s,，:：—–-]*"#, options: .regularExpression) else { return nil }
         return String(text[prefix.upperBound...])
     }
 
@@ -72,10 +87,11 @@ public struct YesNoConfirmation {
         guard labels.count >= 2 else { return nil }
         var current: [Int] = [], denials = 0
         for (index, label) in labels.enumerated() {
-            if hasAnswer(cleaned(label), words: "아니오|아니요|no") { denials += 1; continue }
-            guard let tail = yesTail(label) else { return nil }
-            if isRepeatedPermission(tail) { continue }
-            guard isCurrentPermission(tail) else { return nil }
+            if hasAnswer(cleaned(label), words: denialWords) { denials += 1; continue }
+            if isRepeatedPermission(label) { continue }
+            guard let tail = affirmativeTail(label) else { return nil }
+            if isRepeatedPermission(tail) || isRepeatedPermission("allow " + tail) { continue }
+            guard isCurrentPermission(tail) || isCurrentPermission("allow " + tail) else { return nil }
             // Claude may put the scope in the description beneath a plain Yes label.
             if descriptions.indices.contains(index), isRepeatedPermission(descriptions[index]) { continue }
             current.append(index)

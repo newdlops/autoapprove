@@ -12,6 +12,20 @@ import Combine
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private var replyingQuestions = Set<String>()
+    private var readableQuestionSessions = Set<String>()
+    private var questionThreadBySession: [String: String] = [:]
+    private var restoredQuestionIDs = Set<String>()
+    private var questionAutomationOverrides: [String: QuestionAutomation.Phase] = [:]
+    private var automaticQuestionReplies: [String: AutomaticQuestionReply] = [:]
+    private var questionAutomationStopped = false
+    private struct AutomaticQuestionReply {
+        var token: UUID
+        var sessionID: String
+        var question: QueuedQuestion
+        var sending = false
+        var deadline: Date
+        var task: Task<Void, Never>
+    }
     private var sessions: [String: AgentSession] = [:]
     private var sessionOrder: [String] = []
     private var records: [ProcessRecord] = []
@@ -71,6 +85,8 @@ import Combine
             Task { @MainActor in self?.disconnect(id) }
         })
         try socket.start(); server = socket
+        questionAutomationStopped = false
+        reconcileAutomaticQuestionReplies()
         if poll {
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
@@ -83,10 +99,14 @@ import Combine
     public func stop() {
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
+        questionAutomationStopped = true
+        for id in Array(automaticQuestionReplies.keys) { cancelAutomaticQuestionReply(id) }
         server?.stop(); server = nil
     }
 
     private func publish() {
+        reconcileAutomaticQuestionReplies()
+        updateQuestionAutomationStates()
         let ranks = Dictionary(uniqueKeysWithValues: sessionOrder.enumerated().map { ($0.element, $0.offset) })
         snapshot.sessions = sessions.values.sorted {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
@@ -182,12 +202,30 @@ import Combine
                 session.completion = nil
             }
             if update.error == nil, let questions = update.questions {
+                let threadID = update.threadID ?? update.turn?.threadID ?? questions.first?.threadID
+                    ?? questionThreadBySession[session.id] ?? session.id
+                if questionThreadBySession[session.id] != threadID {
+                    restoredQuestionIDs.formUnion(questions.map(\.id))
+                    questionThreadBySession[session.id] = threadID
+                }
                 session.queuedQuestions = questions.filter { store.value("dismissedQuestion:\($0.id)") != "true" }.map { question in
                     var question = question
-                    question.reply = session.questions.first(where: { $0.id == question.id })?.reply ?? savedReply(question.id)
+                    if questionAutomationOverrides[question.id] == nil,
+                       let saved = store.value("questionAutomation:\(question.id)"),
+                       let phase = QuestionAutomation.Phase(rawValue: saved), [.editing, .cancelled].contains(phase) {
+                        questionAutomationOverrides[question.id] = phase
+                    }
+                    if let previous = session.questions.first(where: { $0.id == question.id }) {
+                        question.reply = previous.isSameRequest(as: question) ? previous.reply : nil
+                    } else {
+                        question.reply = savedReply(question.id)
+                    }
                     return question
                 }
                 session.codexQuestionsObservedAt = date
+                readableQuestionSessions.insert(session.id)
+            } else {
+                readableQuestionSessions.remove(session.id)
             }
             sessions[session.id] = session
         }
@@ -212,59 +250,179 @@ import Combine
         return reply
     }
 
-    private func setReply(_ reply: QuestionReply, sessionID: String, questionID: String, persist: Bool) throws {
+    private func setReply(_ reply: QuestionReply, sessionID: String, question: QueuedQuestion, persist: Bool) throws {
+        guard let index = sessions[sessionID]?.queuedQuestions?.firstIndex(where: { $0.isSameRequest(as: question) }) else { return }
         if persist {
-            try store.set("questionReply:\(questionID)", String(decoding: JSONEncoder().encode(reply), as: UTF8.self))
+            try store.set("questionReply:\(question.id)", String(decoding: JSONEncoder().encode(reply), as: UTF8.self))
         }
-        if let index = sessions[sessionID]?.queuedQuestions?.firstIndex(where: { $0.id == questionID }) {
-            sessions[sessionID]?.queuedQuestions?[index].reply = reply
-        }
+        sessions[sessionID]?.queuedQuestions?[index].reply = reply
         publish()
     }
 
-    /// Explicit user action only. Queuing is an acknowledgement, not proof the
-    /// running turn has received the answer. Uncertain submissions are not retried.
+    private func cancelAutomaticQuestionReply(_ questionID: String) {
+        automaticQuestionReplies.removeValue(forKey: questionID)?.task.cancel()
+    }
+
+    public func beginQuestionReply(sessionID: String, questionID: String) throws {
+        try holdQuestionAutomaticReply(sessionID: sessionID, questionID: questionID, phase: .editing)
+    }
+
+    public func cancelQuestionAutomaticReply(sessionID: String, questionID: String) throws {
+        try holdQuestionAutomaticReply(sessionID: sessionID, questionID: questionID, phase: .cancelled)
+    }
+
+    private func holdQuestionAutomaticReply(sessionID: String, questionID: String, phase: QuestionAutomation.Phase) throws {
+        guard let session = sessions[sessionID], session.phase != .ended,
+              session.questions.contains(where: { $0.id == questionID }),
+              questionAutomationOverrides[questionID] == nil else { return }
+        // Stop the timer synchronously with the edit, even if saving fails.
+        questionAutomationOverrides[questionID] = phase
+        cancelAutomaticQuestionReply(questionID)
+        publish()
+        try store.set("questionAutomation:\(questionID)", phase.rawValue)
+    }
+
+    private func questionAutomationBlock(_ question: QueuedQuestion, in session: AgentSession) -> QuestionAutomation.Phase? {
+        if let override = questionAutomationOverrides[question.id] { return override }
+        if session.questions.filter({ $0.threadID == question.threadID && $0.titleIdentity == question.titleIdentity }).count > 1 { return .duplicate }
+        if question.hasLaterUserMessage == true { return .needsReview }
+        if restoredQuestionIDs.contains(question.id) { return .restored }
+        return nil
+    }
+
+    private func updateQuestionAutomationStates() {
+        for (id, session) in sessions {
+            guard let questions = session.queuedQuestions else { continue }
+            sessions[id]?.queuedQuestions = questions.map { question in
+                var question = question
+                question.automation = nil
+                guard session.phase != .ended, question.reply == nil || question.reply?.phase == .cancelled else { return question }
+                if let block = questionAutomationBlock(question, in: session) {
+                    question.automation = QuestionAutomation(phase: block)
+                } else if let confirmation = YesNoConfirmation.detect(question), session.automatic {
+                    if snapshot.paused {
+                        question.automation = QuestionAutomation(phase: .paused, answer: confirmation.answer)
+                    } else if let pending = automaticQuestionReplies[question.id] {
+                        question.automation = QuestionAutomation(phase: .scheduled, deadline: pending.deadline, answer: confirmation.answer)
+                    } else if !session.canApprove || session.codexQuestionsError != nil || !readableQuestionSessions.contains(id) {
+                        question.automation = QuestionAutomation(phase: .unavailable, answer: confirmation.answer)
+                    }
+                }
+                return question
+            }
+        }
+    }
+
+    private func reconcileAutomaticQuestionReplies() {
+        var candidates: [String: (sessionID: String, question: QueuedQuestion, answer: String)] = [:]
+        if !questionAutomationStopped, !snapshot.paused {
+            for session in sessions.values where session.agent == .codex && session.automatic && session.canApprove
+                && session.codexQuestionsError == nil && readableQuestionSessions.contains(session.id) {
+                for var question in session.questions {
+                    let pending = automaticQuestionReplies[question.id]
+                    // Keep our reservation during preflight, but never automatically retry
+                    // a failed, uncertain, queued, or manually submitted response.
+                    guard questionAutomationBlock(question, in: session) == nil,
+                          question.reply == nil || question.reply?.phase == .cancelled || (question.reply?.phase == .sending && pending?.sending == true),
+                          let confirmation = YesNoConfirmation.detect(question) else { continue }
+                    question.reply = nil; question.automation = nil
+                    candidates[question.id] = (session.id, question, confirmation.answer)
+                }
+            }
+        }
+        for (id, pending) in automaticQuestionReplies {
+            guard let candidate = candidates[id], candidate.sessionID == pending.sessionID,
+                  candidate.question.isSameRequest(as: pending.question) else {
+                cancelAutomaticQuestionReply(id)
+                continue
+            }
+        }
+        for (id, candidate) in candidates where automaticQuestionReplies[id] == nil && !replyingQuestions.contains(id) {
+            let token = UUID()
+            let deadline = Date().addingTimeInterval(5)
+            let task = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+                guard let self, self.automaticQuestionReplies[id]?.token == token else { return }
+                self.automaticQuestionReplies[id]?.sending = true
+                defer {
+                    if self.automaticQuestionReplies[id]?.token == token {
+                        self.automaticQuestionReplies.removeValue(forKey: id)
+                    }
+                    self.publish()
+                }
+                // The shared reply path publishes failures and reserves every dispatch.
+                try? await self.sendQuestionReply(sessionID: candidate.sessionID, questionID: id,
+                    answer: candidate.answer, automaticToken: token)
+            }
+            automaticQuestionReplies[id] = AutomaticQuestionReply(token: token, sessionID: candidate.sessionID,
+                question: candidate.question, deadline: deadline, task: task)
+        }
+    }
+
+    /// Manual replies remain available while automatic approval is paused.
     public func replyToQuestion(sessionID: String, questionID: String, answer: String) async throws {
+        if automaticQuestionReplies[questionID]?.sessionID == sessionID {
+            cancelAutomaticQuestionReply(questionID)
+        }
+        try await sendQuestionReply(sessionID: sessionID, questionID: questionID, answer: answer)
+    }
+
+    /// Queuing acknowledges receipt, not delivery to the running turn.
+    /// Uncertain submissions are not retried, including after an app restart.
+    private func sendQuestionReply(sessionID: String, questionID: String, answer: String, automaticToken: UUID? = nil) async throws {
         guard let session = sessions[sessionID], session.agent == .codex, session.phase != .ended,
               let question = session.questions.first(where: { $0.id == questionID }),
               question.reply == nil || question.reply?.canRetry == true,
               replyingQuestions.insert(questionID).inserted else {
             throw AppError.message("이미 전송 중이거나 처리한 질문입니다. 현재 상태를 확인해주세요.")
         }
-        defer { replyingQuestions.remove(questionID) }
+        defer {
+            replyingQuestions.remove(questionID)
+            publish()
+        }
         let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let message = try CodexReplyTransport.message(question: question, answer: answer)
         let sending = QuestionReply(phase: .sending, answer: answer, message: "Codex 응답 경로를 확인하고 있습니다…")
-        try setReply(sending, sessionID: sessionID, questionID: questionID, persist: false)
         var launched = false
         var audit: AuditEvent?
         do {
+            let message = try CodexReplyTransport.message(question: question, answer: answer)
+            try setReply(sending, sessionID: sessionID, question: question, persist: false)
             let target = try await questionTransport.prepare(session, question)
             guard target.threadID == question.threadID, let current = sessions[sessionID], current.phase != .ended,
-                  current.questions.contains(where: { $0.id == questionID }) else {
+                  current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌었습니다. 목록을 새로고침해주세요.")
             }
+            if let automaticToken {
+                guard !Task.isCancelled, !snapshot.paused, current.automatic, current.canApprove,
+                      automaticQuestionReplies[questionID]?.token == automaticToken else {
+                    throw AppError.message("자동 응답이 취소되었습니다. 필요하면 직접 답변을 보내주세요.")
+                }
+                if let reason = target.automaticReplyUnavailableReason { throw AppError.message(reason) }
+            }
             let event = AuditEvent(sessionID: sessionID, summary: question.summary, outcome: "답변 전송 준비",
-                source: "Codex 질문 응답", context: AuditContext(session: session), tool: "request_user_input_async", request: question.summary, answer: answer)
+                source: automaticToken == nil ? "Codex 질문 응답" : "Codex 질문 자동 응답", context: AuditContext(session: session),
+                tool: "request_user_input_async", request: question.summary, answer: answer)
             guard log(event, session: session) else { throw AppError.message("답변 내역을 저장하지 못해 전송하지 않았습니다.") }
             audit = event
             // A crash after this reservation requires verification, never an automatic resend.
-            try setReply(sending, sessionID: sessionID, questionID: questionID, persist: true)
+            try setReply(sending, sessionID: sessionID, question: question, persist: true)
             launched = true
             let queueID = try await questionTransport.send(target, message)
             let reply = QuestionReply(phase: .queued, answer: answer,
                 message: "답변을 Codex 대기열에 넣었습니다. Codex가 받을 차례가 되면 전달됩니다.", queueID: queueID)
-            do { try setReply(reply, sessionID: sessionID, questionID: questionID, persist: true) }
+            do { try setReply(reply, sessionID: sessionID, question: question, persist: true) }
             catch {
                 snapshot.health.auditError = error.localizedDescription
-                try setReply(reply, sessionID: sessionID, questionID: questionID, persist: false)
+                try setReply(reply, sessionID: sessionID, question: question, persist: false)
             }
             audit?.outcome = "답변 대기열 등록"
             if let audit { log(audit, session: session) }
         } catch {
-            let reply = QuestionReply(phase: launched ? .uncertain : .failed, answer: answer, message: error.localizedDescription)
-            do { try setReply(reply, sessionID: sessionID, questionID: questionID, persist: true) }
-            catch { try? setReply(reply, sessionID: sessionID, questionID: questionID, persist: false) }
+            let cancelled = automaticToken.map { !launched && (Task.isCancelled || automaticQuestionReplies[questionID]?.token != $0) } ?? false
+            let reply = QuestionReply(phase: cancelled ? .cancelled : (launched ? .uncertain : .failed), answer: answer,
+                message: cancelled ? "전송 전에 자동 응답을 멈췄습니다." : error.localizedDescription)
+            do { try setReply(reply, sessionID: sessionID, question: question, persist: true) }
+            catch { try? setReply(reply, sessionID: sessionID, question: question, persist: false) }
             audit?.outcome = launched ? "답변 접수 확인 필요" : "답변 전송 전 중단"
             if let audit { log(audit, session: session) }
             throw error
@@ -322,6 +480,7 @@ import Combine
         for id in screens.keys { screens[id]?.scheduledID = nil }
         try store.set("paused", paused ? "true" : "false")
         if !paused { for id in screens.keys { scheduleScreenApproval(id) } }
+        publish()
     }
     public func connectTerminal() async {
         do { try store.set("terminalEnabled", "true") }

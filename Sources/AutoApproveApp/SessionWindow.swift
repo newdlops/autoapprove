@@ -226,7 +226,9 @@ struct SessionWindow: View {
                           setAutomatic: { enabled in perform { try engine.setAutomatic(id, enabled: enabled) } },
                           reveal: { reveal(session) }, connect: { settings = true }, showHistory: { openWindow(id: "history") },
                           dismissQuestion: { questionID in perform { try engine.dismissQuestion(sessionID: id, questionID: questionID) } },
-                          replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) })
+                          replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) },
+                          beginReply: { questionID in perform { try engine.beginQuestionReply(sessionID: id, questionID: questionID) } },
+                          cancelAutomaticReply: { questionID in perform { try engine.cancelQuestionAutomaticReply(sessionID: id, questionID: questionID) } })
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
                 Text("세션을 선택해 상태를 확인하고 자동 승인을 켜세요.\n처음 사용하는 경우 연결 설정부터 시작하세요.")
@@ -358,6 +360,8 @@ private struct SessionDetail: View {
     let showHistory: () -> Void
     let dismissQuestion: (String) -> Void
     let replyQuestion: (String, String) async throws -> Void
+    let beginReply: (String) -> Void
+    let cancelAutomaticReply: (String) -> Void
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -402,7 +406,7 @@ private struct SessionDetail: View {
                 Divider()
                 if session.agent == .codex {
                     CodexQuestionList(session: session, openingTerminal: openingTerminal, dismiss: dismissQuestion,
-                        reply: replyQuestion, reveal: reveal)
+                        reply: replyQuestion, reveal: reveal, beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply)
                     Divider()
                 }
                 if session.agent == .shell {
@@ -505,17 +509,13 @@ struct CodexQuestionList: View {
     let dismiss: (String) -> Void
     let reply: (String, String) async throws -> Void
     let reveal: () -> Void
+    let beginReply: (String) -> Void
+    let cancelAutomaticReply: (String) -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("질문 대기열").font(.headline)
-                Text("응답 대기 \(session.unansweredQuestions.count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
-                    .help("아직 답변을 보내지 않은 Codex 질문 수입니다. 작업 진행 상태와 별도로 유지됩니다.")
-                if session.questions.contains(where: { $0.reply?.phase == .queued }) {
-                    Text("전달 대기 \(session.questions.filter { $0.reply?.phase == .queued }.count)건")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        .help("답변을 Codex 메시지 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달됩니다.")
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack { queueHeading }.fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 4) { queueHeading }
             }
             if let error = session.codexQuestionsError {
                 Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
@@ -531,19 +531,29 @@ struct CodexQuestionList: View {
                 Text("답변을 기다리는 질문이 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
             if !session.questions.isEmpty {
-                if !session.unansweredQuestions.isEmpty {
-                Text("선택지를 고르거나 직접 답변을 입력하세요. 답변은 Codex가 받을 차례가 되면 전달됩니다.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    .help("Codex 기록에서 비동기 질문과 그 질문을 인용한 답변을 수집합니다. 일반 메시지나 작업 재개만으로 질문을 지우지 않습니다.")
+                if !session.unansweredQuestions.isEmpty && session.codexQuestionsError == nil {
+                    Text("직접 선택하거나 입력하면 해당 질문의 자동 응답을 멈춥니다. 작성한 답변은 ‘답변 보내기’를 눌러 전달하세요.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 ForEach(session.questions) { question in
                     QuestionReplyEditor(question: question, connectionError: session.codexQuestionsError,
                         canReveal: session.canReveal, openingTerminal: openingTerminal,
-                        send: { answer in try await reply(question.id, answer) }, dismiss: { dismiss(question.id) }, reveal: reveal)
+                        send: { answer in try await reply(question.id, answer) }, dismiss: { dismiss(question.id) }, reveal: reveal,
+                        beginReply: { beginReply(question.id) }, cancelAutomaticReply: { cancelAutomaticReply(question.id) })
                     if question.id != session.questions.last?.id { Divider() }
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    @ViewBuilder private var queueHeading: some View {
+        Text("질문 대기열").font(.headline)
+        Text("응답 대기 \(session.unansweredQuestions.count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+            .help("아직 답변을 보내지 않은 Codex 질문 수입니다. 작업 진행 상태와 별도로 유지됩니다.")
+        if session.questions.contains(where: { $0.reply?.phase == .queued }) {
+            Text("전달 대기 \(session.questions.filter { $0.reply?.phase == .queued }.count)건")
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                .help("답변을 Codex 메시지 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달됩니다.")
+        }
     }
 }
 
@@ -555,10 +565,13 @@ struct QuestionReplyEditor: View {
     let send: (String) async throws -> Void
     let dismiss: () -> Void
     let reveal: () -> Void
+    let beginReply: () -> Void
+    let cancelAutomaticReply: () -> Void
     @State private var selected = Set<Int>()
     @State private var customAnswer = ""
     @State private var submitting = false
     @State private var error: String?
+    @FocusState private var answerFocused: Bool
     private var answer: String {
         (question.options.enumerated().filter { selected.contains($0.offset) }.map(\.element)
             + [customAnswer.trimmingCharacters(in: .whitespacesAndNewlines)]).filter { !$0.isEmpty }.joined(separator: "\n")
@@ -567,9 +580,12 @@ struct QuestionReplyEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(question.title).font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            if let automation = question.automation {
+                QuestionAutomationStatus(automation: automation, questionTitle: question.title, cancel: cancelAutomaticReply)
+            }
             if editing && connectionError == nil {
                 ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
-                    Toggle(isOn: Binding(get: { selected.contains(index) }, set: { if $0 { selected.insert(index) } else { selected.remove(index) } })) {
+                    Toggle(isOn: Binding(get: { selected.contains(index) }, set: { beginReply(); if $0 { selected.insert(index) } else { selected.remove(index) } })) {
                         Text(option).font(.callout).fixedSize(horizontal: false, vertical: true)
                     }.toggleStyle(.checkbox).disabled(submitting)
                         .help(submitting ? AppHelp.sendingAnswer : (selected.contains(index) ? "이 항목을 답변에서 뺍니다. 답변 보내기를 눌러야 전송됩니다." : "이 항목을 답변에 포함합니다. 여러 항목을 선택하거나 설명을 덧붙일 수 있습니다."))
@@ -577,8 +593,10 @@ struct QuestionReplyEditor: View {
                 if question.options.count > 1 {
                     Text("여러 항목을 함께 선택할 수 있습니다.").font(.caption).foregroundStyle(.secondary)
                 }
-                TextField(question.options.isEmpty ? "답변을 입력하세요" : "직접 답변하거나 설명을 덧붙이세요", text: $customAnswer, axis: .vertical)
+                TextField(question.options.isEmpty ? "답변을 입력하세요" : "직접 답변하거나 설명을 덧붙이세요", text: Binding(get: { customAnswer }, set: { beginReply(); customAnswer = $0 }), axis: .vertical)
                     .textFieldStyle(.roundedBorder).lineLimit(2...5).disabled(submitting)
+                    .focused($answerFocused)
+                    .onChange(of: answerFocused) { _, focused in if focused { beginReply() } }
                     .accessibilityLabel("\(question.title) 직접 답변")
                     .help(submitting ? AppHelp.sendingAnswer : "답변을 직접 쓰거나 선택한 항목에 설명을 덧붙입니다. 답변 보내기를 눌러야 전송됩니다.")
             } else if connectionError != nil && editing {
@@ -591,9 +609,9 @@ struct QuestionReplyEditor: View {
                 if reply.phase == .sending {
                     HStack { ProgressView().controlSize(.small); Text("답변을 보내고 있습니다…").font(.callout) }
                         .help(AppHelp.sendingAnswer)
-                } else {
-                    Label(reply.message, systemImage: reply.phase == .queued ? "clock.badge.checkmark" : "exclamationmark.triangle")
-                        .font(.callout).foregroundStyle(reply.phase == .queued ? Color.primary : .orange)
+                } else if reply.phase != .cancelled || question.automation == nil {
+                    Label(reply.message, systemImage: reply.phase == .queued ? "clock.badge.checkmark" : (reply.phase == .cancelled ? "pause.circle" : "exclamationmark.triangle"))
+                        .font(.callout).foregroundStyle(reply.phase == .cancelled ? Color.secondary : (reply.phase == .queued ? Color.primary : .orange))
                         .fixedSize(horizontal: false, vertical: true)
                         .help(reply.message)
                 }
@@ -629,5 +647,53 @@ struct QuestionReplyEditor: View {
         Button("목록에서 정리", action: dismiss).controlSize(.small)
             .disabled(submitting || question.reply?.phase == .sending)
             .help(submitting || question.reply?.phase == .sending ? AppHelp.sendingAnswer : "이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
+    }
+}
+
+struct QuestionAutomationStatus: View {
+    let automation: QuestionAutomation
+    let questionTitle: String
+    let cancel: () -> Void
+    var body: some View {
+        if automation.phase == .scheduled {
+            TimelineView(.periodic(from: .now, by: 0.25)) { context in
+                content(at: context.date)
+            }
+        } else {
+            content(at: .now)
+        }
+    }
+    private func content(at date: Date) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) { status(at: date); cancelButton }
+                .fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .leading, spacing: 6) { status(at: date); cancelButton }
+        }
+    }
+    private func status(at date: Date) -> some View {
+        Label(message(at: date), systemImage: automation.phase == .scheduled ? "clock" : "pause.circle")
+            .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+    @ViewBuilder private var cancelButton: some View {
+        if automation.canCancel {
+            Button("자동 응답 취소", action: cancel).controlSize(.small)
+                .accessibilityLabel("\(questionTitle) 자동 응답 취소")
+                .help("이 질문의 자동 응답을 취소합니다. 다른 질문의 자동 응답은 계속되며, 이 질문에는 직접 답할 수 있습니다.")
+        }
+    }
+    private func message(at date: Date) -> String {
+        switch automation.phase {
+        case .scheduled:
+            let seconds = max(0, Int(ceil((automation.deadline ?? date).timeIntervalSince(date))))
+            return seconds > 0 ? "\(seconds)초 후 자동 응답: \(automation.answer ?? "Yes")" : "자동 응답을 준비하고 있습니다…"
+        case .paused: return "일시정지 중 · 재개하면 5초 후 자동 응답"
+        case .editing: return "직접 답변 · 자동 응답 중지"
+        case .cancelled: return "이번 질문의 자동 응답을 취소했습니다"
+        case .restored: return "이전에 받은 질문 · 직접 확인해주세요"
+        case .duplicate: return "같은 문구의 질문이 여러 개입니다 · 직접 확인해주세요"
+        case .needsReview: return "질문 이후 메시지가 있습니다 · 이미 답했는지 확인해주세요"
+        case .unavailable: return "연결 확인 중 · 자동 응답 대기"
+        }
     }
 }

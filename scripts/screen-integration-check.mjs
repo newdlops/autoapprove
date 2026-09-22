@@ -11,6 +11,11 @@ import { runApprovalRace } from './approval-race-check.mjs';
 
 const exec = promisify(execFile);
 const binary = path.resolve(process.argv[2] || '.build/debug/autoapprove');
+const timeoutIndex = process.argv.indexOf('--poll-timeout');
+const pollTimeout = timeoutIndex < 0 ? 8000 : Number(process.argv[timeoutIndex + 1]);
+if (!Number.isInteger(pollTimeout) || pollTimeout < 1000 || pollTimeout > 60_000) {
+  throw Error('Expected --poll-timeout 1000..60000 milliseconds');
+}
 const codexOnly = process.argv.includes('--codex-only');
 const race = process.argv.includes('--race') || process.argv.includes('--race-retry');
 const stressIndex = process.argv.indexOf('--stress');
@@ -33,7 +38,7 @@ const actions = [];
 const prompt = 'Would you like to run the following command?\n\n$ printf fixture\n\n› 1. Yes, proceed (y)\n  2. Yes, don’t ask\n     again for this session (a)\n  3. No, and tell Codex what\n     to do differently (esc)\n\nPress enter to\nconfirm or esc to cancel';
 const claudePrompt = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, don't ask again\n  3. No\nEsc to cancel";
 
-async function until(check, label, timeout = 8000) {
+async function until(check, label, timeout = pollTimeout) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const value = await check(); if (value) return value; await sleep(30); }
   throw new Error(`Timed out: ${label}\n${diagnostics}`);

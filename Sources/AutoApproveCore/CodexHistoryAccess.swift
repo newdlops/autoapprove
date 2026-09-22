@@ -86,7 +86,7 @@ public final class CodexSessionHistoryReader {
             questionRecovery = CodexReadRecovery(); completionRecovery = CodexReadRecovery()
             self.location = location
         }
-        var update = CodexQuestionUpdate(sessionID: sessionID, questions: nil)
+        var update = CodexQuestionUpdate(sessionID: sessionID, questions: nil, threadID: location.threadID)
         do {
             update.questions = try questions.read(location)
             questionRecovery.succeeded()
