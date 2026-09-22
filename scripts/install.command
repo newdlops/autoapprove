@@ -17,11 +17,11 @@ usage() {
   cat <<'HELP'
 AutoApprove 설치 및 실행
 
-DMG 안에서 실행하면 AutoApprove를 응용 프로그램 폴더에 설치하고,
+터미널에서 /bin/bash로 실행하면 AutoApprove를 응용 프로그램 폴더에 설치하고,
 해당 앱의 다운로드 차단 표시를 제거한 뒤 실행합니다.
 관리자 권한이 필요한 경우에만 Mac 로그인 암호를 요청합니다.
 
-사용법: /bin/bash "설치 및 실행.command" [옵션]
+사용법: /bin/bash "/Volumes/AutoApprove 버전/install.sh" [옵션]
   --destination 폴더  다른 응용 프로그램 폴더에 설치 (기본: /Applications)
   --no-open          설치 후 앱을 실행하지 않음
   --help             이 도움말 표시

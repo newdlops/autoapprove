@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dist = path.join(root, 'dist');
-const app = path.join(dist, 'AutoApprove.app');
+const app = path.resolve(process.argv[2] ?? path.join(dist, 'AutoApprove.app'));
 const plist = path.join(app, 'Contents/Info.plist');
 const readPlist = key => execFileSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, plist], { encoding: 'utf8' }).trim();
 const version = readPlist('CFBundleShortVersionString');
@@ -22,7 +22,13 @@ const platform = architecture === 'arm64-x86_64' ? 'universal' : architecture;
 const filename = `AutoApprove-${version}-macOS-${platform}.dmg`;
 const output = path.join(dist, filename);
 const installer = path.join(root, 'scripts/install.command');
-const installerName = '설치 및 실행.command';
+// Finder can block a downloaded .command before its own xattr step runs.
+// Distribute it as data for an explicit /bin/bash invocation, not a launcher.
+const installerName = 'install.sh';
+const guideName = '1. 설치 안내.txt';
+const installCommand = `/bin/bash "/Volumes/AutoApprove ${version}/${installerName}"`;
+const guide = (await readFile(path.join(root, 'docs/INSTALL.txt'), 'utf8'))
+  .replaceAll('{{INSTALL_COMMAND}}', installCommand);
 execFileSync('/bin/bash', ['-n', installer], { stdio: 'inherit' });
 execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app], { stdio: 'inherit' });
 
@@ -36,21 +42,21 @@ try {
   await mkdir(mounted);
   execFileSync('/usr/bin/ditto', ['--noqtn', app, path.join(staging, 'AutoApprove.app')], { stdio: 'inherit' });
   await symlink('/Applications', path.join(staging, 'Applications'));
-  await copyFile(path.join(root, 'docs/INSTALL.txt'), path.join(staging, '설치 안내.txt'));
+  await writeFile(path.join(staging, guideName), guide);
   await copyFile(installer, path.join(staging, installerName));
-  await chmod(path.join(staging, installerName), 0o755);
+  await chmod(path.join(staging, installerName), 0o644);
   execFileSync('/usr/bin/hdiutil', ['create', '-volname', `AutoApprove ${version}`, '-srcfolder', staging, '-fs', 'HFS+', '-format', 'UDZO', '-imagekey', 'zlib-level=9', image], { stdio: 'inherit' });
   execFileSync('/usr/bin/hdiutil', ['verify', image], { stdio: 'inherit' });
   execFileSync('/usr/bin/hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mounted, image], { stdio: 'inherit' });
   attached = true;
   execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', path.join(mounted, 'AutoApprove.app')], { stdio: 'inherit' });
   if (await readlink(path.join(mounted, 'Applications')) !== '/Applications') throw new Error('Invalid Applications shortcut');
-  if (!(await readFile(path.join(mounted, '설치 안내.txt'))).equals(await readFile(path.join(root, 'docs/INSTALL.txt')))) {
+  if ((await readFile(path.join(mounted, guideName), 'utf8')) !== guide || !guide.includes(installCommand)) {
     throw new Error('Installation instructions differ from source');
   }
   if (!(await readFile(path.join(mounted, installerName))).equals(await readFile(installer)) ||
-      ((await stat(path.join(mounted, installerName))).mode & 0o111) !== 0o111) {
-    throw new Error('Installer differs from source or is not executable');
+      ((await stat(path.join(mounted, installerName))).mode & 0o111) !== 0) {
+    throw new Error('Installer differs from source or is unexpectedly executable');
   }
   console.log(`Contents: ${(await readdir(mounted)).join(', ')}`);
   execFileSync('/usr/bin/hdiutil', ['detach', mounted], { stdio: 'inherit' });

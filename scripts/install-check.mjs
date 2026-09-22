@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -34,7 +34,7 @@ async function makeCase(name, replacements = {}) {
   const app = path.join(directory, 'AutoApprove.app');
   const destination = path.join(directory, "Applications '테스트'");
   const target = path.join(destination, 'AutoApprove.app');
-  const script = path.join(directory, '설치 및 실행.command');
+  const script = path.join(directory, 'install.sh');
   await mkdir(destination);
   exec('/usr/bin/ditto', [fixture, app]);
   let source = installer;
@@ -48,6 +48,7 @@ async function makeCase(name, replacements = {}) {
     source = source.replaceAll(command, shellQuote(shim));
   }
   await writeFile(script, source);
+  await chmod(script, 0o644);
   const run = (options = ['--no-open']) => spawnSync('/bin/bash', [script, '--destination', destination, ...options], { encoding: 'utf8', timeout: 20_000 });
   const old = () => {
     exec('/usr/bin/ditto', [fixture, target]);
@@ -69,6 +70,19 @@ async function preserved(context) {
 
 await test('AutoApprove installer', async t => {
   t.after(() => rm(root, { recursive: true, force: true }));
+
+  await t.test('downloaded non-executable script installs through explicit bash while its own quarantine stays intact', async () => {
+    const c = await makeCase('quarantined-script');
+    setAttr(c.script, 'com.apple.quarantine', quarantine);
+    setAttr(c.app, 'com.apple.quarantine', quarantine);
+    assert.equal((await stat(c.script)).mode & 0o111, 0);
+    passed(c.run());
+    assert.equal(attr(c.script, 'com.apple.quarantine'), quarantine);
+    assert.equal(attr(c.app, 'com.apple.quarantine'), quarantine);
+    assert.doesNotMatch(exec('/usr/bin/xattr', ['-r', '-s', c.target]), /com\.apple\.quarantine/);
+    exec('/usr/bin/codesign', ['--verify', '--deep', '--strict', c.target]);
+    await onlyApp(c);
+  });
 
   await t.test('quarantined app installs; nested quarantine is removed and other attributes and apps remain', async () => {
     const c = await makeCase('quarantine');
