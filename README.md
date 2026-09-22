@@ -2,9 +2,9 @@
 
 macOS Terminal과 VS Code 통합 터미널의 Claude Code·Codex 세션을 관리하는 로컬 앱입니다. 메뉴 막대와 관리 창에서 세션별 자동 승인, 전체 일시정지, 승인 내역, 원래 터미널로 이동을 제공합니다.
 
-현재는 **0.2.24 연결 시제품**입니다. 세션을 발견하는 기능과 자동 승인 가능한 연결을 구분하며, 실제 설치 환경에 따라 지원 범위가 달라집니다.
+현재는 **0.2.25 연결 시제품**입니다. 세션을 발견하는 기능과 자동 승인 가능한 연결을 구분하며, 실제 설치 환경에 따라 지원 범위가 달라집니다.
 
-0.2.24는 설치 파일 자체가 macOS에서 차단되는 경우를 반영해, **DMG의 설치 안내에서 터미널 명령을 복사해 실행하는 방식**으로 바꿨습니다. 설치 스크립트는 `install.sh`로 제공하며, 해당 앱의 다운로드 차단 해제와 필요한 경우의 관리자 인증을 처리합니다.
+0.2.25는 **터미널 명령 없이 더블클릭으로 여는 macOS 설치 패키지(.pkg)**를 제공합니다. 시스템 설치 창에서 인증하고, 응용 프로그램 폴더에 설치한 뒤 로그인한 사용자 권한으로 앱을 엽니다. 최초 실행의 개발자 확인 경고는 아래의 시스템 설정 절차로 허용합니다.
 
 0.2.23은 여러 VS Code 창의 반복 등록과 일반 터미널 출력으로 발생하던 전체 재계산·화면 갱신을 줄입니다. 실제 세션 변경은 즉시 반영하고, 긴 질문 목록의 중복 검사를 한 번씩 순회하도록 개선했습니다. 격리 성능 검사는 릴리스 빌드 후 `node scripts/performance-check.mjs --assert-quiet`로 재현할 수 있습니다.
 
@@ -44,20 +44,18 @@ Codex의 `Allow / Allow for this session / Always allow / Cancel` 도구 승인�
 
 ## 설치
 
-[GitHub Releases](https://github.com/newdlops/autoapprove/releases/latest)에서 DMG를 받습니다. **macOS 14 이상, Apple Silicon(arm64)**용이며 Claude Code·Codex는 별도로 설치해야 합니다.
+[GitHub Releases](https://github.com/newdlops/autoapprove/releases/latest)에서 **.pkg 설치 파일**을 받습니다. **macOS 14 이상, Apple Silicon(arm64)**용이며 Claude Code·Codex는 별도로 설치해야 합니다. DMG를 받았다면 안의 **AutoApprove 설치.pkg**를 사용합니다.
 
 1. 실행 중인 AutoApprove가 있으면 메뉴 막대에서 종료합니다.
-2. DMG를 열고 **1. 설치 안내.txt**를 엽니다.
-3. **터미널** 앱에 안내문의 `/bin/bash`로 시작하는 한 줄을 복사하고 Return을 누릅니다. 앱 검사·복사·실행 허용·앱 실행이 이어집니다.
-4. 관리자 권한이 필요하면 Mac 로그인 암호를 입력합니다. 입력 중 글자가 표시되지 않는 것은 정상입니다. 앱이 열리면 DMG를 추출합니다.
+2. **.pkg를 더블클릭**하고 macOS 설치 프로그램에서 **계속 → 설치**를 누릅니다.
+3. 시스템 인증 창이 나타나면 Mac 로그인 암호를 입력합니다.
+4. 설치가 끝나면 앱이 열립니다. 열리지 않으면 Finder의 **응용 프로그램 → AutoApprove**를 여세요.
 
-파일을 찾지 못하면 터미널에 `/bin/bash `를 입력한 뒤, 현재 DMG 안의 **install.sh**를 터미널 창으로 드래그하고 Return을 누릅니다. 같은 DMG를 여러 번 열어 디스크 이름이 달라진 경우에도 이 방법을 사용할 수 있습니다.
+터미널을 열거나 명령어를 입력할 필요가 없습니다. 실행 중인 앱은 설치 프로그램이 종료 여부를 확인하며, 취소하면 기존 앱을 계속 사용할 수 있습니다. 기존 설정과 승인 내역은 유지됩니다.
 
-**0.2.23 이하에서 설치 및 실행.command를 휴지통에 버리라고 나오는 경우**에는 `/bin/bash ` 뒤에 그 파일을 드래그해 실행하세요. 스크립트 안의 차단 해제는 스크립트가 시작된 뒤에만 동작하므로, 더블클릭 실행을 기본 절차로 안내하지 않습니다. DMG를 여는 것만으로 설치가 자동 실행되지는 않습니다.
+**처음 열 때 개발자 확인 경고나 ‘휴지통으로 이동’이 표시되는 경우:** 공식 배포 파일임을 확인한 뒤 경고를 닫고 **시스템 설정 → 개인정보 보호 및 보안 → 해당 AutoApprove 설치 파일의 ‘그래도 열기’ → 열기**를 선택하세요. 현재 설치 패키지는 **Developer ID 서명·Apple 공증을 받지 않았으므로**, macOS의 최초 허용을 자동으로 생략할 수 없습니다. 관리형 Mac은 관리자 정책에 따라 허용이 제한될 수 있습니다. [Apple의 실행 허용 안내](https://support.apple.com/ko-kr/102445).
 
-설치 과정에서 복사한 AutoApprove의 `com.apple.quarantine` 속성만 하위 파일까지 제거하며, 권한이 부족할 때 `sudo`를 사용합니다. 비밀번호는 `sudo`가 직접 받고 저장하지 않습니다. 앱 파일을 검사하고 실행 중인 앱의 교체를 중단하며, 설치 실패 시 기존 앱을 보존합니다. 앱 교체 후에도 기존 설정과 승인 내역은 유지됩니다.
-
-현재 배포본은 ad-hoc 서명이며 **Developer ID 서명·Apple 공증은 포함하지 않습니다**. 앱을 Applications로 직접 드래그해 설치할 수도 있습니다. 이 경우 개발자 확인 경고가 표시되면 출처를 확인한 뒤 [Apple의 실행 허용 안내](https://support.apple.com/ko-kr/102445)를 따르거나 설치 스크립트를 실행해주세요.
+설치 프로그램은 `/Applications/AutoApprove.app`만 교체하고 해당 앱의 코드 서명을 검사한 뒤 `com.apple.quarantine` 속성을 하위 파일까지 제거합니다. 비밀번호는 macOS가 직접 받으며, 다른 앱이나 시스템 전체의 보안 설정은 변경하지 않습니다. 앱 번들은 ad-hoc 서명입니다.
 
 ## 실행
 
@@ -194,13 +192,15 @@ AUTOAPPROVE_BUILD=debug bash scripts/build.sh
 
 확장 패키지는 `dist/autoapprove-bridge.vsix`에 생성되어 앱에도 포함됩니다. 네이티브 앱은 로컬 개발용 ad-hoc 서명을 사용합니다. 외부 배포용 Developer ID 서명·공증은 포함하지 않습니다.
 
-release 빌드 후 설치용 DMG와 SHA-256 파일을 만듭니다.
+release 빌드 후 설치용 PKG·DMG와 각각의 SHA-256 파일을 만듭니다.
 
 ```sh
 node scripts/package-dmg.mjs
 ```
 
-앱의 버전·아키텍처를 읽어 `dist/AutoApprove-<version>-macOS-<arch>.dmg`를 생성합니다. 앱과 Applications 바로가기·`install.sh`·버전에 맞는 터미널 명령이 든 설치 안내를 포함하며, 이미지 검증과 읽기 전용 마운트 후 앱 서명·스크립트 원문·파일 권한을 검사합니다. `node scripts/package-dmg.mjs /path/to/AutoApprove.app`으로 별도 준비한 앱을 패키징할 수도 있습니다. GitHub Release에는 해당 소스 커밋의 버전 태그와 DMG·`.dmg.sha256`을 함께 게시합니다.
+앱의 버전·아키텍처를 읽어 `dist/AutoApprove-<version>-macOS-<arch>.pkg`와 `.dmg`를 생성합니다. PKG는 표준 `pkgbuild`·`productbuild`로 만들며 설치 위치를 `/Applications`로 고정하고 기존 번들을 원자적으로 교체하도록 지정합니다. 패키지를 다시 풀어 앱 서명·실행 파일·설치 스크립트·안내를 검사하고, DMG의 이미지 검증과 읽기 전용 마운트 후 내장 PKG가 같은 파일인지 확인합니다. DMG에는 PKG와 설치 안내만 포함합니다.
+
+`node scripts/package-dmg.mjs /path/to/AutoApprove.app`으로 별도 준비한 앱을 패키징하거나, `node scripts/package-pkg.mjs /path/to/AutoApprove.app`으로 PKG만 만들 수 있습니다. `node scripts/pkg-install-check.mjs /path/to/AutoApprove.pkg`는 실제 패키지의 설치 스크립트를 임시 경로와 장애 주입 도구로 검사하며 시스템 설치는 수행하지 않습니다. GitHub Release에는 해당 소스 커밋의 버전 태그와 PKG·DMG·각 `.sha256`을 게시합니다.
 
 macOS의 신뢰 저장소를 사용하는 네트워크 환경에서 npm 인증서 오류가 발생하면, TLS 검증을 끄지 말고 다음과 같이 시스템 인증서를 사용합니다.
 

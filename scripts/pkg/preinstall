@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+source "$(/usr/bin/dirname "$0")/common.sh"
+check_volume "$@"
+if [[ -e "$target_app" || -L "$target_app" ]]; then check_bundle; fi
+
+processes=$(/bin/ps -axo comm=) || fail '실행 중인 앱을 확인하지 못했습니다. 설치를 다시 시도해주세요.'
+while IFS= read -r executable; do
+  if [[ "$executable" == */AutoApprove.app/Contents/MacOS/AutoApproveApp ]]; then
+    fail 'AutoApprove를 메뉴에서 종료한 뒤 설치를 다시 시도해주세요.'
+  fi
+done <<< "$processes"

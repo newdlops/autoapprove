@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+source "$(/usr/bin/dirname "$0")/common.sh"
+check_volume "$@"
+check_bundle
+/usr/bin/codesign --verify --deep --strict "$target_app" || fail '설치된 앱 검사에 실패했습니다. 설치 파일을 다시 받아주세요.'
+/usr/bin/xattr -r -s -d com.apple.quarantine "$target_app" || fail '앱 실행 허용에 실패했습니다. 설치를 다시 시도해주세요.'
+/usr/bin/codesign --verify --deep --strict "$target_app" || fail '설치된 앱 검사에 실패했습니다.'
+
+# LaunchServices must run as the desktop user, never as the privileged installer.
+# A remote/headless install still succeeds without opening a GUI.
+console_uid=$(/usr/bin/stat -f %u /dev/console) || console_uid=0
+case "$console_uid" in ''|*[!0-9]*) console_uid=0 ;; esac
+if [[ "$console_uid" -ge 501 ]]; then
+  /bin/launchctl asuser "$console_uid" /usr/bin/sudo -H -u "#$console_uid" -- /usr/bin/open "$target_app" ||
+    printf 'AutoApprove 설치 완료. 응용 프로그램 폴더에서 AutoApprove를 열어주세요.\n'
+fi
+exit 0
