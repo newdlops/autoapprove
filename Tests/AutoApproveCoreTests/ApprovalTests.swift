@@ -402,6 +402,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Unchanged observations stay quiet while changes publish immediately", tests.testUnchangedObservationsDoNotPublishSnapshots),
+            ("Duplicate indexing preserves Unicode, thread identity and manual overrides", tests.testQuestionDuplicateIndexPreservesCanonicalAndThreadIdentity),
             ("Claude app approval continues through thirty separately timed requests", tests.testClaudeAppApprovalThenThirtySequentialQuestions),
             ("Automatic Claude questions stay quiet while manual fallback still alerts", tests.testClaudeAutomaticAttentionAndManualFallback),
             ("Claude hook restart, lost response replay and exact identity", tests.testClaudeHookRestartAndExactResponseReplay),

@@ -67,6 +67,9 @@ public enum ProcessDiscovery {
     }
     public static func ancestors(of pid: Int32, records: [ProcessRecord]) -> [ProcessRecord] {
         let byID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        return ancestors(of: pid, byPID: byID)
+    }
+    static func ancestors(of pid: Int32, byPID byID: [Int32: ProcessRecord]) -> [ProcessRecord] {
         var current = pid, seen: Set<Int32> = [], result: [ProcessRecord] = []
         while let record = byID[current], seen.insert(current).inserted, result.count < 60 {
             result.append(record); current = record.parent

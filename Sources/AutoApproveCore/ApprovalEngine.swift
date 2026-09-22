@@ -261,13 +261,16 @@ import Combine
         updateQuestionAutomationStates()
         updateInboxes()
         let ranks = Dictionary(uniqueKeysWithValues: sessionOrder.enumerated().map { ($0.element, $0.offset) })
-        snapshot.sessions = presentedSessions().sorted {
+        let presented = presentedSessions().sorted {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
             let left = ranks[$0.id] ?? Int.max, right = ranks[$1.id] ?? Int.max
             if left != right { return left < right }
             if $0.project != $1.project { return $0.project.localizedStandardCompare($1.project) == .orderedAscending }
             return $0.id < $1.id
         }
+        // Heartbeats still reconcile timers and notices, but identical state must
+        // not invalidate every SwiftUI window and notification subscription.
+        if snapshot.sessions != presented { snapshot.sessions = presented }
     }
 
     /// Reorder only the visible slots; filtered-out sessions keep their positions.
@@ -381,7 +384,10 @@ import Combine
     public func refresh() async {
         guard !discovering else { return }
         discovering = true
-        defer { discovering = false; initialDiscoveryComplete = true }
+        defer {
+            discovering = false
+            if !initialDiscoveryComplete { initialDiscoveryComplete = true }
+        }
         do {
             let reader = processReader
             let discovered = try await Task.detached(priority: .utility) { try reader() }.value
@@ -519,9 +525,20 @@ import Combine
         try store.set("questionAutomation:\(questionID)", phase.rawValue)
     }
 
-    private func questionAutomationBlock(_ question: QueuedQuestion, in session: AgentSession) -> QuestionAutomation.Phase? {
+    private func duplicateQuestionIDs(_ questions: [QueuedQuestion]) -> Set<String> {
+        var firstIDs: [String: [String: String]] = [:], duplicates = Set<String>()
+        for question in questions {
+            let title = question.titleIdentity
+            if let first = firstIDs[question.threadID]?[title] {
+                duplicates.insert(first); duplicates.insert(question.id)
+            } else { firstIDs[question.threadID, default: [:]][title] = question.id }
+        }
+        return duplicates
+    }
+
+    private func questionAutomationBlock(_ question: QueuedQuestion, duplicates: Set<String>) -> QuestionAutomation.Phase? {
         if let override = questionAutomationOverrides[question.id] { return override }
-        if session.questions.filter({ $0.threadID == question.threadID && $0.titleIdentity == question.titleIdentity }).count > 1 { return .duplicate }
+        if duplicates.contains(question.id) { return .duplicate }
         if question.hasLaterUserMessage == true { return .needsReview }
         if restoredQuestionIDs.contains(question.id) { return .restored }
         return nil
@@ -530,11 +547,12 @@ import Combine
     private func updateQuestionAutomationStates() {
         for (id, session) in sessions {
             guard let questions = session.queuedQuestions else { continue }
+            let duplicates = duplicateQuestionIDs(questions)
             sessions[id]?.queuedQuestions = questions.map { question in
                 var question = question
                 question.automation = nil
                 guard session.phase != .ended, question.reply == nil || question.reply?.phase == .cancelled else { return question }
-                if let block = questionAutomationBlock(question, in: session) {
+                if let block = questionAutomationBlock(question, duplicates: duplicates) {
                     question.automation = QuestionAutomation(phase: block)
                 } else if let confirmation = YesNoConfirmation.detect(question), session.automatic {
                     if snapshot.paused {
@@ -555,11 +573,12 @@ import Combine
         if !questionAutomationStopped, !snapshot.paused {
             for session in sessions.values where session.agent == .codex && session.automatic && session.canApprove
                 && session.codexQuestionsError == nil && readableQuestionSessions.contains(session.id) {
+                let duplicates = duplicateQuestionIDs(session.questions)
                 for var question in session.questions {
                     let pending = automaticQuestionReplies[question.id]
                     // Keep our reservation during preflight, but never automatically retry
                     // a failed, uncertain, queued, or manually submitted response.
-                    guard questionAutomationBlock(question, in: session) == nil,
+                    guard questionAutomationBlock(question, duplicates: duplicates) == nil,
                           question.reply == nil || question.reply?.phase == .cancelled || (question.reply?.phase == .sending && pending?.sending == true),
                           let confirmation = YesNoConfirmation.detect(question) else { continue }
                     question.reply = nil; question.automation = nil
@@ -1196,8 +1215,17 @@ import Combine
                 try releaseClaudeApproval(sessionID: id, requestID: request)
             case "register":
                 guard let terminals = params["terminals"] as? [JSONObject], terminals.count <= 200 else { throw AppError.message("잘못된 터미널 등록입니다.") }
-                peers[peer.id] = peer; bridges[peer.id] = terminals
-                matchBridge(peer.id, terminals: terminals); snapshot.health.vscode = "연결됨 · \(bridges.count)개 창"; publish()
+                peers[peer.id] = peer
+                // Each VS Code window sends this every two seconds, including
+                // windows without a managed CLI. Discovery separately rematches
+                // saved registrations when a new process appears.
+                if bridges[peer.id].map({ NSArray(array: $0).isEqual(to: terminals) }) != true {
+                    bridges[peer.id] = terminals
+                    matchBridge(peer.id, terminals: terminals)
+                    let status = "연결됨 · \(bridges.count)개 창"
+                    if snapshot.health.vscode != status { snapshot.health.vscode = status }
+                    publish()
+                }
                 var sizes: JSONObject = [:]
                 for session in sessions.values where session.bridgeID == peer.id {
                     if let terminalID = session.terminalID, let size = ProcessDiscovery.terminalSize(tty: session.tty) {
@@ -1209,11 +1237,15 @@ import Combine
                 guard peers[peer.id] != nil, let terminalID = params["terminalID"] as? String,
                       let screen = params["screen"] as? String, screen.utf8.count <= 200_000,
                       let generation = params["generation"] as? String else { throw AppError.message("등록되지 않은 터미널 화면입니다.") }
+                var channelChanged = false
                 for id in Array(sessions.keys) where sessions[id]?.agent != .shell && sessions[id]?.phase != .ended && sessions[id]?.bridgeID == peer.id && sessions[id]?.terminalID == terminalID {
+                    channelChanged = channelChanged || (sessions[id]?.channel != .hook && sessions[id]?.channel != .vscodeScreen)
                     if sessions[id]?.channel != .hook { sessions[id]?.channel = .vscodeScreen }
                     receiveScreen(sessionID: id, raw: screen, generation: peer.id + ":" + generation, source: .vscodeScreen)
                 }
-                publish()
+                // receiveScreen publishes accepted observations itself. Ordinary
+                // terminal output must not recalculate unrelated CLI questions.
+                if channelChanged { publish() }
             case "actionResult":
                 if let id = params["actionID"] as? String, let action = pendingActions[id], action.peerID == peer.id,
                    let receipt = params["success"] as? NSNumber, CFGetTypeID(receipt) == CFBooleanGetTypeID() {
@@ -1239,10 +1271,12 @@ import Combine
     }
 
     private func matchBridge(_ peerID: String, terminals: [JSONObject]) {
+        guard !terminals.isEmpty else { return }
+        let byPID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
         for id in Array(sessions.keys) where sessions[id]?.phase != .ended {
             guard let session = sessions[id] else { continue }
             let tty = session.tty.replacingOccurrences(of: "/dev/", with: "")
-            let ancestry = Set(ProcessDiscovery.ancestors(of: session.pid, records: records).prefix { $0.tty == "??" || $0.tty == tty }.map(\.pid))
+            let ancestry = Set(ProcessDiscovery.ancestors(of: session.pid, byPID: byPID).prefix { $0.tty == "??" || $0.tty == tty }.map(\.pid))
             let matches = terminals.filter { terminal in
                 guard let shellPID = (terminal["shellPID"] as? NSNumber)?.int32Value else { return false }
                 return ancestry.contains(shellPID)
@@ -1268,7 +1302,10 @@ import Combine
     }
 
     private func disconnect(_ peerID: String) {
-        peers.removeValue(forKey: peerID); bridges.removeValue(forKey: peerID)
+        // Status clients and Claude helpers are short-lived socket connections,
+        // not VS Code bridges. Their close cannot change bridge/session state.
+        guard peers.removeValue(forKey: peerID) != nil else { return }
+        bridges.removeValue(forKey: peerID)
         for id in Array(pendingActions.keys) where pendingActions[id]?.peerID == peerID {
             if var event = pendingActions.removeValue(forKey: id)?.event {
                 event.outcome = "연결 끊김 · 입력 확인 필요"; log(event)
