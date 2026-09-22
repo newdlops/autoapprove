@@ -2,6 +2,34 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testQuestionNotificationDelayPersistenceAndValidation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-notification-delay-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let paths = AppPaths(directory: directory), engine = try ApprovalEngine(paths: AppPaths(directory: directory))
+        try expectEqual(engine.snapshot.questionNotificationDelay, 10)
+        for seconds in [1, 3600, 17] {
+            try engine.setQuestionNotificationDelay(seconds)
+            try expectEqual(engine.snapshot.questionNotificationDelay, seconds)
+            try expectEqual(try ApprovalEngine(paths: paths).snapshot.questionNotificationDelay, seconds, "The delay survives app restart")
+        }
+        for invalid in [-1, 0, 3601, Int.max] {
+            try expectThrows(try engine.setQuestionNotificationDelay(invalid))
+            try expectEqual(engine.snapshot.questionNotificationDelay, 17)
+        }
+        var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(engine.snapshot)) as! JSONObject
+        legacy.removeValue(forKey: "questionNotificationDelaySeconds")
+        try expectEqual(try JSONDecoder().decode(EngineSnapshot.self, from: JSONSerialization.data(withJSONObject: legacy)).questionNotificationDelay, 10)
+        let store = try AuditStore(path: paths.database)
+        for invalid in ["0", "-1", "3601", "damaged"] {
+            try store.set("questionNotificationDelaySeconds", invalid)
+            try expectEqual(try ApprovalEngine(paths: paths).snapshot.questionNotificationDelay, 10, "Invalid persisted values use the default")
+        }
+        try engine.setQuestionNotificationDelay(17)
+        _ = try CommandRunner.run("/usr/bin/sqlite3", [paths.database, "DROP TABLE settings"])
+        try expectThrows(try engine.setQuestionNotificationDelay(30))
+        try expectEqual(engine.snapshot.questionNotificationDelay, 17, "A failed save must not change the running timer setting")
+    }
+
     func testAttentionLifecycle() throws {
         var session = AgentSession(id: "live", agent: .codex, pid: 42, started: "one", tty: "/dev/fixture", cwd: "/tmp/project", terminal: .terminal)
         session.channel = .terminalScreen; session.automatic = true

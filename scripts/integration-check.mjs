@@ -57,7 +57,7 @@ try {
   hook.stdin.end(JSON.stringify({ ...permission, requestID: undefined }));
   const code = await new Promise(resolve => hook.on('close', resolve));
   assert.equal(code, 0);
-  assert.equal(JSON.parse(output).hookSpecificOutput.decision.behavior, 'allow');
+  assert.deepEqual(JSON.parse(output), {}, 'A new helper without a verified Claude PID must preserve the original permission flow');
   const question = '지금 이 워크트리의 미커밋·브랜치 현황을 먼자 훑어볼까요?';
   const questions = [{ question, header: '작업 위치', multiSelect: false, options: [{ label: '아니오', description: '다른 위치' }, { label: '예', description: '현재 위치에서 진행' }] }];
   const ask = { ...base, hook_event_name: 'PreToolUse', requestID: 'ask', tool_use_id: 'ask-one', tool_name: 'AskUserQuestion', tool_input: { questions } };
@@ -66,7 +66,8 @@ try {
   answerHook.stdout.on('data', data => { answerOutput += data; });
   answerHook.stdin.end(JSON.stringify(ask));
   assert.equal(await new Promise(resolve => answerHook.on('close', resolve)), 0);
-  const answered = JSON.parse(answerOutput).hookSpecificOutput;
+  assert.deepEqual(JSON.parse(answerOutput), {}, 'An unverified helper cannot create an app approval');
+  const answered = (await request('hook', { ...ask, requestID: 'ask-legacy', tool_use_id: 'ask-legacy' })).hookSpecificOutput;
   assert.equal(answered.hookEventName, 'PreToolUse');
   assert.equal(answered.permissionDecision, 'allow');
   assert.deepEqual(answered.updatedInput, { questions, answers: { [question]: '예' } });
@@ -80,6 +81,16 @@ try {
   const repeatAnswer = (await request('hook', repeatAsk)).hookSpecificOutput;
   assert.deepEqual(repeatAnswer.updatedInput, { questions: repeatedQuestions, answers: { 'Allow this command?': 'Yes, proceed' } });
   assert.deepEqual(await request('hook', { ...repeatAsk, hook_event_name: 'PermissionRequest', requestID: 'repeat-again' }), {});
+  const koreanQuestions = [{ question: '이 요청을 허용할까요?', header: '권한', multiSelect: false, options: [
+    { label: '허용', description: '이번 요청만 허용합니다.' },
+    { label: '항상 허용', description: '이후에도 허용합니다.' },
+    { label: '거부', description: '진행하지 않습니다.' }
+  ] }];
+  const koreanAsk = { ...ask, requestID: 'korean-permission', tool_use_id: 'korean-permission', tool_input: { questions: koreanQuestions } };
+  const koreanAnswer = (await request('hook', koreanAsk)).hookSpecificOutput;
+  assert.equal(koreanAnswer.permissionDecision, 'allow');
+  assert.deepEqual(koreanAnswer.updatedInput, { questions: koreanQuestions, answers: { '이 요청을 허용할까요?': '허용' } });
+  assert.deepEqual(await request('hook', { ...koreanAsk, hook_event_name: 'PermissionRequest', requestID: 'korean-again' }), {});
   const choose = { ...ask, tool_use_id: 'choose-three', requestID: 'choose', tool_input: { questions: [{
     question: '지금 제가 뭐부터 하면 될까요?', options: [
       { label: '미커물 현황 훑기', description: '워크트리 상태를 정리합니다.' },
@@ -90,9 +101,10 @@ try {
   assert.deepEqual(await request('hook', choose), {});
   await request('hook', { ...base, hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission', requestID: 'reminder' });
   const status = await request('status');
-  assert.equal(status.events.filter(event => event.outcome === '승인 전달').length, 2);
+  assert.equal(status.events.filter(event => event.outcome === '승인 전달').length, 1);
   assert.equal(status.events.filter(event => event.outcome === '질문 응답 전달' && event.answer === '예').length, 1);
   assert.equal(status.events.filter(event => event.outcome === '질문 응답 전달' && event.answer === 'Yes, proceed').length, 1);
+  assert.equal(status.events.filter(event => event.outcome === '질문 응답 전달' && event.answer === '허용').length, 1);
   const waiting = status.sessions.find(session => session.id === 'claude:integration-only');
   assert.equal(waiting.phase, 'input');
   assert.ok(waiting.pendingSummary.includes('3. 지정해 주시는 일'));
@@ -114,7 +126,7 @@ try {
   assert.equal((await request('status')).sessions.find(session => session.id === finished.id).completion, undefined);
   const cli = await exec(binary, ['status', '--home', home], { timeout: 5000 });
   assert.ok(JSON.parse(cli.stdout).sessions.some(session => session.id === 'claude:integration-only'));
-  console.log('PASS Unix socket framing, opt-in, deduplication, pause/resume, CLI permission/question/completion hook round trips, completion cleanup, saved answers, CLI status');
+  console.log('PASS Unix socket framing, legacy opt-in/deduplication/pause, unverified helper fallback, question answers, CLI completion round trip, completion cleanup and CLI status');
 } finally {
   server.kill('SIGTERM');
   await new Promise(resolve => { if (server.exitCode !== null) resolve(); else server.once('close', resolve); });

@@ -7,6 +7,18 @@ import Combine
     public let paths: AppPaths
     private let store: AuditStore
     private let terminalReader: @Sendable ([String]) throws -> TerminalSnapshot
+    private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
+    private let processReader: @Sendable () throws -> [ProcessRecord]
+    private var claudeParents: [String: String] = [:]
+    private var recoveredClaudeStates = Set<String>()
+    private var claudeHookObservedAt: [String: Date] = [:]
+    private struct LiveClaudeHook {
+        var request: ClaudeHookRequest
+        var receipt: ClaudeHookReceipt
+        var lastContact: Date
+    }
+    private var liveClaudeHooks: [String: LiveClaudeHook] = [:]
+    private var parentSaveFailed = false
     private let codexQuestions = CodexQuestionCollector()
     private var codexCompletions = CodexCompletionTracker()
     private var claudeWorkIDs: [String: String] = [:]
@@ -28,6 +40,7 @@ import Combine
     }
     private var sessions: [String: AgentSession] = [:]
     private var sessionOrder: [String] = []
+    private var inboxes: [String: SessionInbox] = [:]
     private var records: [ProcessRecord] = []
     private var server: SocketServer?
     private var pollTask: Task<Void, Never>?
@@ -59,18 +72,24 @@ import Combine
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live) throws {
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }) throws {
         self.paths = paths
         self.terminalReader = terminalReader
         self.questionTransport = questionTransport
+        self.claudeRegistryReader = claudeRegistryReader
+        self.processReader = processReader
         try paths.prepare()
         store = try AuditStore(path: paths.database)
+        if let saved = store.value("claudeParents"), let parents = try? JSONDecoder().decode([String: String].self, from: Data(saved.utf8)) {
+            claudeParents = parents
+        }
         if let saved = store.value("sessionOrder"),
            let ids = try? JSONDecoder().decode([String].self, from: Data(saved.utf8)) {
             var seen = Set<String>()
             sessionOrder = ids.filter { seen.insert($0).inserted }
         }
         snapshot = EngineSnapshot(sessions: [], events: store.recent(), paused: store.value("paused") == "true", health: ConnectionHealth())
+        snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
         // Restore only a connection the user explicitly enabled from the app.
         terminalEnabled = store.value("terminalEnabled") == "true"
@@ -104,11 +123,145 @@ import Combine
         server?.stop(); server = nil
     }
 
+    private func ownerID(_ id: String) -> String? {
+        var current = id, seen = Set<String>()
+        while seen.insert(current).inserted {
+            guard let session = sessions[current], session.phase != .ended else { return nil }
+            guard let parent = claudeParents[current] else { return current }
+            current = parent
+        }
+        return nil
+    }
+
+    private func effectiveAutomatic(_ id: String, fallback: AgentSession? = nil) -> Bool {
+        if claudeParents[id] != nil {
+            guard !parentSaveFailed, let owner = ownerID(id) else { return false }
+            return sessions[owner]?.automatic == true
+        }
+        return (sessions[id] ?? fallback)?.automatic == true
+    }
+
+    private func groupIDs(_ id: String) -> [String] {
+        guard let root = ownerID(id) else { return sessions[id] == nil ? [] : [id] }
+        return sessions.keys.filter { $0 == root || ownerID($0) == root }.sorted()
+    }
+
+    private func hasBackgroundChildren(_ id: String) -> Bool {
+        sessions.keys.contains { $0 != id && ownerID($0) == id }
+    }
+
+    private func reconcileClaudeParents(registrations: [ClaudeSessionRegistration]) {
+        let found = ClaudeSessionRegistry.parents(sessions: Array(sessions.values), records: records, registrations: registrations)
+        let next = claudeParents.merging(found) { _, new in new }
+        guard next != claudeParents || parentSaveFailed else { return }
+        claudeParents = next
+        for parent in Set(found.values) where screens[parent] != nil {
+            if sessions[parent]?.channel != .hook {
+                clearScreen(parent)
+                sessions[parent]?.setPhase(.unknown, detail: "메인·백그라운드 상태를 함께 확인합니다.")
+            } else { screens.removeValue(forKey: parent) }
+        }
+        do {
+            try store.set("claudeParents", String(decoding: try JSONEncoder().encode(next), as: UTF8.self))
+            parentSaveFailed = false
+        } catch { parentSaveFailed = true }
+    }
+
+    private func presentedSessions() -> [AgentSession] {
+        let raw = sessions.values.map { value -> AgentSession in
+            var session = value
+            session.automatic = effectiveAutomatic(value.id)
+            if claudeParents[value.id] != nil && ownerID(value.id) == nil && value.phase != .ended {
+                session.detail = "메인 세션이 종료되었거나 연결을 확인할 수 없어 자동 승인을 멈췄습니다. 독립적으로 처리하려면 이 세션의 자동 승인을 다시 켜세요."
+            }
+            return session
+        }
+        func priority(_ phase: SessionPhase) -> Int {
+            switch phase { case .input: return 6; case .approval: return 5; case .working: return 4; case .unknown: return 3; case .idle: return 2; case .ended: return 0 }
+        }
+        return raw.compactMap { value in
+            if let root = ownerID(value.id), root != value.id { return nil }
+            var parent = value
+            let children = raw.filter { $0.id != value.id && ownerID($0.id) == value.id }.sorted {
+                if priority($0.phase) != priority($1.phase) { return priority($0.phase) > priority($1.phase) }
+                return $0.id < $1.id
+            }
+            guard !children.isEmpty else { return parent }
+            parent.backgroundSessions = children; parent.ownPhase = value.phase
+            parent.detail = "메인과 백그라운드의 질문·알림을 함께 표시합니다. 백그라운드 질문은 연결된 Claude 훅으로 처리합니다."
+            if let lead = children.first, value.phase == .unknown || priority(lead.phase) > priority(value.phase) {
+                parent.phase = lead.phase; parent.idleSince = lead.idleSince
+                parent.backgroundMonitoring = lead.backgroundMonitoring
+                parent.activityDetail = lead.activityDetail
+            }
+            parent.lastActivity = ([value] + children).map(\.lastActivity).max() ?? value.lastActivity
+            parent.notices = ([value] + children).flatMap { $0.notices ?? [] }.sorted { $0.date > $1.date }
+            if parentSaveFailed {
+                parent.detail = "메인·백그라운드 연결을 저장하지 못해 백그라운드 자동 승인을 멈췄습니다. 저장 상태를 확인해주세요."
+            }
+            return parent
+        }
+    }
+
+    private func reconcileClaudeActivities(_ registrations: [ClaudeSessionRegistration]) {
+        var observed = Set<String>()
+        for entry in registrations where entry.kind == "bg" {
+            let id = entry.processID
+            // While a synchronous hook waits here, Claude may still report the previous disk state.
+            if liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { continue }
+            guard var session = sessions[id], session.agent == .claude, session.phase != .ended,
+                  let activity = entry.activity else { continue }
+            observed.insert(id)
+            // A delayed disk update must not reopen a request just answered by a hook.
+            guard activity.changedAt > (claudeHookObservedAt[id] ?? .distantPast) else { continue }
+            let phase: SessionPhase
+            let detail: String
+            switch activity.status {
+            case "waiting":
+                phase = activity.waitingFor == "permission prompt" ? .approval : .input
+                // The registry is updated after PreToolUse returns. Keep a current
+                // hook's fuller question and identity instead of creating a second
+                // notification (or replacing it with incomplete job metadata).
+                if session.providerID == activity.providerID, session.pendingInTerminal,
+                   session.pendingRequestID?.hasPrefix("hook:") == true,
+                   session.phase == phase,
+                   activity.questionSummary == nil || activity.questionSummary == session.pendingSummary { continue }
+                detail = "이미 열려 있는 요청을 복원했습니다. 이번 요청은 터미널에서 답해주세요. 자동 승인이 켜져 있으면 다음 지원 질문부터 훅으로 응답합니다."
+                session.pendingSummary = activity.questionSummary ?? (phase == .approval
+                    ? "Claude가 실행 권한 확인을 기다리고 있습니다. 터미널에서 요청 내용을 확인해주세요."
+                    : "Claude가 입력을 기다리고 있습니다. 질문 전문은 터미널에서 확인해주세요.")
+                session.pendingRequestID = activity.requestID
+                session.pendingInTerminal = true
+            case "busy":
+                phase = .working; detail = "Claude 백그라운드 작업이 진행 중입니다."
+                session.pendingSummary = nil; session.pendingRequestID = nil; session.pendingInTerminal = false
+            case "idle":
+                phase = .idle; detail = "Claude 백그라운드 세션이 다음 지시를 기다리고 있습니다."
+                session.pendingSummary = nil; session.pendingRequestID = nil; session.pendingInTerminal = false
+            default: continue
+            }
+            session.providerID = activity.providerID
+            session.setPhase(phase, detail: detail, at: activity.changedAt)
+            sessions[id] = session
+            recoveredClaudeStates.insert(id)
+        }
+        for id in recoveredClaudeStates.subtracting(observed) {
+            if sessions[id]?.phase != .ended {
+                sessions[id]?.setPhase(.unknown, detail: "Claude의 현재 상태를 다시 확인하고 있습니다.")
+                sessions[id]?.pendingSummary = nil; sessions[id]?.pendingRequestID = nil
+                sessions[id]?.pendingInTerminal = false
+            }
+            recoveredClaudeStates.remove(id)
+        }
+    }
+
     private func publish() {
+        projectClaudeApprovals()
         reconcileAutomaticQuestionReplies()
         updateQuestionAutomationStates()
+        updateInboxes()
         let ranks = Dictionary(uniqueKeysWithValues: sessionOrder.enumerated().map { ($0.element, $0.offset) })
-        snapshot.sessions = sessions.values.sorted {
+        snapshot.sessions = presentedSessions().sorted {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
             let left = ranks[$0.id] ?? Int.max, right = ranks[$1.id] ?? Int.max
             if left != right { return left < right }
@@ -142,12 +295,96 @@ import Combine
         publish()
     }
 
+    public func setCustomization(_ id: String, value: SessionCustomization) throws {
+        guard var session = sessions[id], session.phase != .ended else {
+            throw AppError.message("이 세션이 종료되어 표시 설정을 저장할 수 없습니다. 현재 목록에서 세션을 다시 선택해주세요.")
+        }
+        let value = try value.normalized()
+        let json = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+        try store.set("customization:\(id)", json)
+        session.customization = value.isEmpty ? nil : value
+        sessions[id] = session
+        publish()
+    }
+
+    public func markNotificationsRead(_ id: String) throws {
+        var updated: [String: SessionInbox] = [:], values: [String: String] = [:]
+        for member in groupIDs(id) {
+            guard var inbox = inboxes[member], inbox.markRead() else { continue }
+            values["inbox:\(member)"] = String(decoding: try JSONEncoder().encode(inbox), as: UTF8.self)
+            updated[member] = inbox
+        }
+        guard !values.isEmpty else { return }
+        try store.setValues(values)
+        for (member, inbox) in updated {
+            inboxes[member] = inbox
+            sessions[member]?.notices = inbox.entries.isEmpty ? nil : inbox.entries
+        }
+        publish()
+    }
+
+    public func isNotificationRead(sessionID: String, sourceKey: String) -> Bool {
+        inboxes[sessionID]?.isRead(sourceKey) ?? false
+    }
+
+    /// Refresh delayed badges without process discovery; used by native previews as well.
+    public func refreshNotices() { publish() }
+
+    public func setQuestionNotificationDelay(_ seconds: Int) throws {
+        guard EngineSnapshot.questionNotificationDelayRange.contains(seconds) else {
+            throw AppError.message("질문 알림 대기 시간은 1~3600초로 입력해주세요.")
+        }
+        try store.set("questionNotificationDelaySeconds", String(seconds))
+        snapshot.questionNotificationDelaySeconds = seconds
+    }
+
+    private func restorePreferences(_ session: inout AgentSession) {
+        session.automatic = store.value("automatic:\(session.id)") == "true"
+        session.customization = nil
+        if let saved = store.value("customization:\(session.id)"),
+           let decoded = try? JSONDecoder().decode(SessionCustomization.self, from: Data(saved.utf8)),
+           let value = try? decoded.normalized(), !value.isEmpty {
+            session.customization = value
+        }
+        if let saved = store.value("inbox:\(session.id)"),
+           let inbox = try? JSONDecoder().decode(SessionInbox.self, from: Data(saved.utf8)) {
+            inboxes[session.id] = inbox
+            session.notices = inbox.entries.isEmpty ? nil : inbox.entries
+        } else { session.notices = nil }
+    }
+
+    private func updateInboxes() {
+        var saveError: String?
+        let now = Date()
+        for id in Array(sessions.keys) {
+            guard var session = sessions[id] else { continue }
+            session.automatic = effectiveAutomatic(id)
+            var candidates = AttentionRequest.candidates(session, paused: snapshot.paused).map {
+                SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary)
+            }
+            if session.phase != .ended, let completion = session.completion, now.timeIntervalSince(completion.date) <= 300 {
+                candidates.append(.init(key: SessionNotice.key(.completion, completion.id), kind: .completion, summary: completion.summary))
+            }
+            var inbox = inboxes[id] ?? SessionInbox()
+            let observed = session.phase == .ended || (session.phase != .unknown &&
+                (session.agent != .codex || (session.codexQuestionsObservedAt != nil && session.codexQuestionsError == nil)))
+            guard inbox.update(candidates, at: now, reconcilesAbsence: observed) else { continue }
+            do {
+                try store.set("inbox:\(id)", String(decoding: try JSONEncoder().encode(inbox), as: UTF8.self))
+                inboxes[id] = inbox
+                sessions[id]?.notices = inbox.entries.isEmpty ? nil : inbox.entries
+            } catch { saveError = "알림 배지를 저장하지 못했습니다. \(error.localizedDescription)" }
+        }
+        if snapshot.health.noticeError != saveError { snapshot.health.noticeError = saveError }
+    }
+
     public func refresh() async {
         guard !discovering else { return }
         discovering = true
         defer { discovering = false; initialDiscoveryComplete = true }
         do {
-            let discovered = try await Task.detached(priority: .utility) { try ProcessDiscovery.read() }.value
+            let reader = processReader
+            let discovered = try await Task.detached(priority: .utility) { try reader() }.value
             let found = ProcessDiscovery.sessions(discovered)
             let directories = await Task.detached(priority: .utility) {
                 let paths = ProcessDiscovery.workingDirectories(pids: found.map(\.pid))
@@ -429,7 +666,7 @@ import Combine
         }
     }
 
-    public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:]) {
+    public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil) {
         self.records = records
         // Ordinary terminals do not belong in the inventory or its status counts.
         let managed = found.filter { $0.agent == .claude || $0.agent == .codex }
@@ -446,7 +683,7 @@ import Combine
             }
             if session.phase == .ended { session.setPhase(.unknown, detail: "새 상태를 확인하고 있습니다."); session.channel = .none; session.automatic = false }
             if sessions[session.id] == nil {
-                session.automatic = store.value("automatic:\(session.id)") == "true"
+                restorePreferences(&session)
                 session.detail = session.terminal == .vscode ? "VS Code 확장을 연결하세요. 이미 실행 중인 Claude는 훅으로도 연결할 수 있습니다." : "연결 설정에서 Terminal 연결 또는 Claude 훅을 설정하세요."
             }
             sessions[session.id] = session
@@ -457,6 +694,9 @@ import Combine
             claudeWorkIDs.removeValue(forKey: key)
             clearScreen(key)
         }
+        let registrations = claudeRegistrations ?? claudeRegistryReader(records)
+        reconcileClaudeParents(registrations: registrations)
+        reconcileClaudeActivities(registrations)
         for (bridge, terminals) in bridges { matchBridge(bridge, terminals: terminals) }
         for (id, observed) in screenObservedAt where Date().timeIntervalSince(observed) > 10 {
             if sessions[id]?.channel != .hook {
@@ -468,12 +708,17 @@ import Combine
     }
 
     public func setAutomatic(_ id: String, enabled: Bool) throws {
-        guard var session = sessions[id], session.canApprove || !enabled else { throw AppError.message("이 세션의 승인 연결을 먼저 설정해주세요.") }
-        try store.set("automatic:\(id)", enabled ? "true" : "false")
-        session.automatic = enabled; sessions[id] = session
-        screens[id]?.scheduledID = nil
+        let target = ownerID(id) ?? id
+        guard var session = sessions[target], presentedSessions().first(where: { $0.id == target })?.canApprove == true || !enabled else { throw AppError.message("이 세션의 승인 연결을 먼저 설정해주세요.") }
+        var nextParents = claudeParents
+        // Explicit control of an orphan starts a new, independent opt-in.
+        if ownerID(id) == nil { nextParents.removeValue(forKey: id) }
+        try store.setValues(["automatic:\(target)": enabled ? "true" : "false", "claudeParents": String(decoding: try JSONEncoder().encode(nextParents), as: UTF8.self)])
+        claudeParents = nextParents
+        session.automatic = enabled; sessions[target] = session
+        for member in groupIDs(target) { screens[member]?.scheduledID = nil }
         publish()
-        if enabled { scheduleScreenApproval(id) }
+        if enabled { scheduleScreenApproval(target) }
     }
     public func setPaused(_ paused: Bool) throws {
         snapshot.paused = paused; revision &+= 1
@@ -568,10 +813,21 @@ import Combine
         _ = try HookInstaller.install(executable: executable, home: paths.directory.path)
         snapshot.health.claude = "설치됨 · 다음 세션 이벤트 대기"
     }
-    public func removeClaude() throws {
-        _ = try HookInstaller.install(executable: nil)
+    public func upgradeClaudeHooks(executable: String) {
+        do { try HookInstaller.upgradeTimeouts(executable: executable) }
+        catch { snapshot.health.claude = "훅 응답 대기 설정을 갱신하지 못했습니다. 연결 설정에서 Claude 훅을 다시 설치해주세요." }
+    }
+    public func removeClaude(settingsURL: URL = HookInstaller.settingsURL) throws {
+        let targets = sessions.values.filter { $0.channel == .hook }.map(\.id)
+        // Disconnecting also turns these sessions off. Persist that decision before
+        // removing the hooks so a restart cannot revive an old enabled preference.
+        for id in targets { try setAutomatic(id, enabled: false) }
+        for pending in Array(liveClaudeHooks.values) where pending.receipt.response == nil {
+            try releaseClaudeApproval(sessionID: pending.request.sessionID, requestID: pending.request.id)
+        }
+        _ = try HookInstaller.install(executable: nil, url: settingsURL)
         snapshot.health.claude = "훅 연결 해제됨"
-        for id in Array(sessions.keys) where sessions[id]?.channel == .hook {
+        for id in targets {
             sessions[id]?.channel = .none; sessions[id]?.automatic = false
             sessions[id]?.setPhase(.unknown, detail: "Claude 훅 연결이 해제되었습니다.")
         }
@@ -585,9 +841,19 @@ import Combine
         }.value
     }
 
-    @discardableResult private func log(_ event: AuditEvent, session: AgentSession? = nil) -> Bool {
+    private func contextualEvent(_ event: AuditEvent, session: AgentSession? = nil) -> AuditEvent {
         var event = event
         if event.context == nil, let current = session ?? sessions[event.sessionID] { event.context = AuditContext(session: current) }
+        if let parent = ownerID(event.sessionID), parent != event.sessionID {
+            event.originSessionID = event.sessionID
+            event.sessionID = parent
+            if event.source == "Claude 훅" { event.source = "Claude 백그라운드 훅" }
+        }
+        return event
+    }
+
+    @discardableResult private func log(_ event: AuditEvent, session: AgentSession? = nil) -> Bool {
+        let event = contextualEvent(event, session: session)
         do { try store.append(event); snapshot.health.auditError = nil }
         catch { snapshot.health.auditError = error.localizedDescription; return false }
         if let index = snapshot.events.firstIndex(where: { $0.id == event.id }) { snapshot.events[index] = event }
@@ -596,18 +862,31 @@ import Combine
         return true
     }
 
-    /// The helper never retries. Duplicate or stale permission messages are passed to the original UI.
-    public func handleHook(_ payload: JSONObject) -> JSONObject {
+    /// Legacy helpers pass unanswered requests back to Claude. New helpers use the durable bridge below.
+    public func handleHook(_ payload: JSONObject, deferApproval: Bool = false) -> JSONObject {
         guard let event = payload["hook_event_name"] as? String,
               let providerID = payload["session_id"] as? String, !providerID.isEmpty,
               let requestID = payload["requestID"] as? String else { return [:] }
         let pid = (payload["agentPID"] as? NSNumber)?.int32Value ?? 0
         let started = payload["agentStarted"] as? String ?? ""
         let key = pid > 0 && !started.isEmpty ? "process:\(pid):\(started)" : "claude:\(providerID)"
+        // A new child may call its hook before the polling loop has discovered it.
+        var lineageVerified = true
+        if pid > 0, !records.contains(where: { $0.key == key }) || claudeParents[key] != nil || sessions[key]?.terminal == .claudeBackground {
+            if let current = try? processReader(), current.contains(where: { $0.key == key }) {
+                updateDiscovery(ProcessDiscovery.sessions(current), records: current)
+            } else if claudeParents[key] != nil { lineageVerified = false }
+        } else {
+            reconcileClaudeParents(registrations: claudeRegistryReader(records))
+        }
         var session = sessions[key] ?? AgentSession(id: key, agent: .claude, pid: pid, started: started, tty: payload["tty"] as? String ?? "", cwd: payload["cwd"] as? String ?? "", terminal: .unknown)
         guard session.agent == .claude else { return [:] }
+        if event != "Notification" {
+            claudeHookObservedAt[key] = Date()
+            recoveredClaudeStates.remove(key)
+        }
         // Hooks can arrive before the first process scan after an app restart.
-        if sessions[key] == nil { session.automatic = store.value("automatic:\(key)") == "true" }
+        if sessions[key] == nil { restorePreferences(&session) }
         if let cwd = payload["cwd"] as? String, !cwd.isEmpty, session.cwd != cwd {
             session.cwd = cwd; session.gitBranch = nil
         }
@@ -616,6 +895,7 @@ import Combine
         clearScreen(key)
         session.channel = event == "SessionEnd" ? .none : .hook
         session.detail = "Claude의 권한 요청을 직접 받습니다. 네트워크 확인 등 일부 요청은 터미널에서 처리합니다."
+        if !lineageVerified { session.detail = "메인 세션의 실행 상태를 확인하지 못해 백그라운드 자동 승인을 멈췄습니다." }
         let tool = payload["tool_name"] as? String ?? ""
         let input = payload["tool_input"] as? JSONObject ?? [:]
         let summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
@@ -637,7 +917,7 @@ import Combine
                 session.setPhase(.input, detail: "Claude가 예·아니오 확인을 기다리고 있습니다.")
                 session.pendingSummary = summary; session.pendingInTerminal = true
                 session.pendingRequestID = "hook:\(providerID):\(toolID)"
-                if session.automatic, !snapshot.paused {
+                if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused {
                     let audit = AuditEvent(sessionID: key, summary: summary, outcome: "질문 응답 전달", source: "Claude 훅",
                         tool: tool, request: request, answer: confirmation.answer)
                     if log(audit, session: session) {
@@ -653,7 +933,10 @@ import Combine
                     } else {
                         session.activityDetail = "응답 내역을 저장하지 못했습니다. 터미널에서 질문에 답해주세요."
                     }
-                } else {
+                } else if !deferApproval {
+                    session.activityDetail = snapshot.paused
+                        ? "전체 자동 승인이 일시정지되어 ‘예’로 응답하지 않았습니다. 현재 질문은 원래 세션에서 답해주세요."
+                        : "이 세션의 자동 승인이 꺼져 있어 ‘예’로 응답하지 않았습니다. 켜면 다음 예·아니오 질문부터 응답합니다."
                     log(AuditEvent(sessionID: key, summary: summary, outcome: "터미널에서 확인", source: "Claude 훅", tool: tool, request: request), session: session)
                 }
             }
@@ -666,7 +949,7 @@ import Combine
             session.setPhase(needsAnswer ? .input : .approval, detail: needsAnswer ? "Claude가 질문에 대한 응답을 기다리고 있습니다." : "Claude가 실행 권한에 대한 응답을 기다리고 있습니다."); session.pendingSummary = summary; session.pendingInTerminal = true
             let fingerprint = key + ":" + requestID
             let first = rememberHook(fingerprint)
-            if session.automatic, !snapshot.paused, first, !needsAnswer {
+            if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused, first, !needsAnswer {
                 response = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": ["behavior": "allow"]]]
                 session.setPhase(.working, detail: "권한을 승인해 작업을 계속합니다."); session.pendingSummary = nil; session.pendingInTerminal = false
                 if !log(AuditEvent(sessionID: key, summary: summary, outcome: "승인 전달", source: "Claude 훅", tool: tool, request: request), session: session) {
@@ -674,7 +957,7 @@ import Combine
                     session.setPhase(.approval, detail: "승인 내역을 저장하지 못했습니다. 터미널에서 요청을 확인해주세요.")
                     session.pendingSummary = summary; session.pendingInTerminal = true
                 }
-            } else if first {
+            } else if first && !deferApproval {
                 log(AuditEvent(sessionID: key, summary: summary, outcome: "터미널에서 확인", source: "Claude 훅", tool: tool, request: request), session: session)
             }
         case "SessionEnd": session.setPhase(.ended, detail: "Claude 세션 종료 이벤트를 받았습니다."); session.automatic = false; session.pendingSummary = nil; session.pendingInTerminal = false
@@ -724,6 +1007,174 @@ import Combine
         return true
     }
 
+    private func bridgeResponse(_ response: JSONObject? = nil) -> JSONObject {
+        if let response { return ["autoapproveBridge": ["response": response]] }
+        return ["autoapproveBridge": ["waiting": true]]
+    }
+
+    private func saveClaudeReceipt(_ receipt: ClaudeHookReceipt) throws {
+        do {
+            try store.saveClaudeHook(receipt)
+            snapshot.health.auditError = nil
+            if receipt.audit != nil { snapshot.events = store.recent() }
+        } catch { snapshot.health.auditError = error.localizedDescription; throw error }
+    }
+
+    /// Polls carry the original UUID and full input, so a restarted app can resume the exact hook.
+    public func handleClaudeHook(_ payload: JSONObject, at now: Date = Date()) throws -> JSONObject {
+        guard let request = ClaudeHookRequest(payload, at: now) else { return bridgeResponse([:]) }
+        var receipt: ClaudeHookReceipt
+        if let saved = try store.claudeHook(id: request.id) {
+            guard saved.fingerprint == request.fingerprint else { throw AppError.message("같은 요청 ID의 내용이 달라 응답하지 않았습니다.") }
+            receipt = saved
+            if let response = saved.response {
+                removeLiveClaudeHook(request.id)
+                publish()
+                return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
+            }
+        } else {
+            receipt = ClaudeHookReceipt(id: request.id, fingerprint: request.fingerprint, sessionID: request.sessionID,
+                logicalID: request.logicalID, createdAt: now, expiresAt: request.expiresAt)
+            if let logicalID = request.logicalID, let previous = try store.claudeHook(logicalID: logicalID), previous.expiresAt > now {
+                // PreToolUse -> PermissionRequest is the same tool call, not another approval.
+                receipt.response = "{}"
+                try saveClaudeReceipt(receipt)
+                return bridgeResponse([:])
+            }
+        }
+        if request.response == nil {
+            invalidateClaudeHooks(for: payload, sessionID: request.sessionID)
+            let response = handleHook(payload)
+            receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+            try saveClaudeReceipt(receipt)
+            return bridgeResponse(response)
+        }
+        if liveClaudeHooks[request.id] == nil {
+            _ = handleHook(payload, deferApproval: true)
+            // Never offer a button for a guessed process or an already-ended session.
+            guard sessions[request.sessionID]?.phase != .ended,
+                  records.contains(where: { $0.key == request.sessionID && $0.agent == .claude }) else {
+                receipt.response = "{}"; try saveClaudeReceipt(receipt)
+                return bridgeResponse([:])
+            }
+            try saveClaudeReceipt(receipt)
+        }
+        liveClaudeHooks[request.id] = LiveClaudeHook(request: request, receipt: receipt, lastContact: now)
+        if now.timeIntervalSince(receipt.createdAt) >= 5, effectiveAutomatic(request.sessionID), !snapshot.paused {
+            try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
+            if let response = liveClaudeHooks[request.id]?.receipt.response {
+                removeLiveClaudeHook(request.id)
+                publish()
+                return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
+            }
+        }
+        publish()
+        return bridgeResponse()
+    }
+
+    public func answerClaudeApproval(sessionID: String, requestID: String, enableAutomatic: Bool = false, automatically: Bool = false, at now: Date = Date()) throws {
+        guard let pending = liveClaudeHooks[requestID], pending.request.sessionID == sessionID,
+              pending.receipt.response == nil, pending.receipt.expiresAt > now,
+              now.timeIntervalSince(pending.lastContact) < 25, let response = pending.request.response else {
+            throw AppError.message("이 요청은 이미 처리되었거나 연결이 끝났습니다. 현재 요청을 확인해주세요.")
+        }
+        // A click cannot target a reused PID/TTY or a stale parent association.
+        let current = try processReader()
+        guard current.contains(where: { $0.key == sessionID && $0.agent == .claude }) else {
+            throw AppError.message("질문을 보낸 Claude 실행이 종료되었습니다.")
+        }
+        updateDiscovery(ProcessDiscovery.sessions(current), records: current)
+        guard sessions[sessionID]?.phase != .ended, liveClaudeHooks[requestID]?.receipt.response == nil else {
+            throw AppError.message("요청 상태가 변경되어 응답하지 않았습니다.")
+        }
+        if automatically, snapshot.paused || !effectiveAutomatic(sessionID) { return }
+        if enableAutomatic { try setAutomatic(sessionID, enabled: true) }
+        var receipt = pending.receipt
+        receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+        receipt.audit = contextualEvent(AuditEvent(sessionID: sessionID, summary: pending.request.summary,
+            outcome: "답변 대기열 등록", source: "Claude 훅", tool: pending.request.tool,
+            request: pending.request.inputJSON, answer: pending.request.answer))
+        try saveClaudeReceipt(receipt)
+        liveClaudeHooks[requestID]?.receipt = receipt
+        claudeHookObservedAt[sessionID] = now
+        publish()
+    }
+
+    public func releaseClaudeApproval(sessionID: String, requestID: String) throws {
+        guard let pending = liveClaudeHooks[requestID], pending.request.sessionID == sessionID,
+              pending.receipt.response == nil else { throw AppError.message("이 요청은 이미 처리되었습니다.") }
+        var receipt = pending.receipt
+        receipt.response = "{}"
+        receipt.audit = contextualEvent(AuditEvent(sessionID: sessionID, summary: pending.request.summary,
+            outcome: "터미널에서 확인", source: "Claude 훅", tool: pending.request.tool, request: pending.request.inputJSON))
+        try saveClaudeReceipt(receipt)
+        removeLiveClaudeHook(requestID, terminal: true)
+        publish()
+    }
+
+    public func acknowledgeClaudeHook(_ payload: JSONObject, at now: Date = Date()) throws {
+        guard let request = ClaudeHookRequest(payload, at: now), var receipt = try store.claudeHook(id: request.id),
+              receipt.fingerprint == request.fingerprint, receipt.response != nil, !receipt.acknowledged else { return }
+        receipt.acknowledged = true
+        if receipt.audit?.outcome == "답변 대기열 등록" {
+            receipt.audit?.outcome = request.isQuestion ? "질문 응답 전달" : "승인 전달"
+        }
+        try saveClaudeReceipt(receipt)
+        removeLiveClaudeHook(request.id)
+        publish()
+    }
+
+    private func removeLiveClaudeHook(_ id: String, terminal: Bool = false) {
+        guard let pending = liveClaudeHooks.removeValue(forKey: id) else { return }
+        let key = pending.request.sessionID
+        if sessions[key]?.phase == .ended { return }
+        if terminal {
+            sessions[key]?.pendingSummary = pending.request.summary
+            sessions[key]?.pendingRequestID = "hook:" + (pending.request.logicalID ?? id)
+            sessions[key]?.pendingInTerminal = true
+            sessions[key]?.setPhase(pending.request.isQuestion ? .input : .approval, detail: "이 요청은 터미널에서 답해주세요. 다음 지원 요청은 앱에서 처리할 수 있습니다.")
+        } else if sessions[key]?.pendingRequestID == "bridge:" + id {
+            sessions[key]?.pendingSummary = nil; sessions[key]?.pendingRequestID = nil; sessions[key]?.pendingInTerminal = false
+            sessions[key]?.setPhase(.working, detail: "응답을 전달해 Claude 작업을 계속합니다.")
+        }
+    }
+
+    private func invalidateClaudeHooks(for payload: JSONObject, sessionID: String) {
+        let event = payload["hook_event_name"] as? String
+        for (id, pending) in liveClaudeHooks where pending.request.sessionID == sessionID {
+            let sameTool = payload["tool_use_id"] as? String != nil && payload["tool_use_id"] as? String == pending.request.payload["tool_use_id"] as? String
+            guard event == "SessionEnd" || event == "UserPromptSubmit" || (event == "PostToolUse" && sameTool) else { continue }
+            var receipt = pending.receipt
+            if receipt.response == nil { receipt.response = "{}"; try? saveClaudeReceipt(receipt) }
+            removeLiveClaudeHook(id)
+        }
+    }
+
+    private func projectClaudeApprovals(at now: Date = Date()) {
+        for (id, pending) in liveClaudeHooks where pending.receipt.expiresAt <= now || now.timeIntervalSince(pending.lastContact) >= 25 || sessions[pending.request.sessionID]?.phase == .ended {
+            var receipt = pending.receipt
+            if receipt.response == nil { receipt.response = "{}" }
+            try? saveClaudeReceipt(receipt)
+            removeLiveClaudeHook(id, terminal: true)
+        }
+        for id in Array(sessions.keys) {
+            let pending = liveClaudeHooks.values.filter { $0.request.sessionID == id }.sorted { $0.receipt.createdAt < $1.receipt.createdAt }
+            let automatic = effectiveAutomatic(id) && !snapshot.paused
+            sessions[id]?.claudeApprovals = pending.isEmpty ? nil : pending.map { item in
+                ClaudeApproval(id: item.request.id, summary: item.request.summary, answer: item.request.answer,
+                    isQuestion: item.request.isQuestion, sending: item.receipt.response != nil, expiresAt: item.receipt.expiresAt,
+                    automaticAt: automatic ? item.receipt.createdAt.addingTimeInterval(5) : nil)
+            }
+            if let first = pending.first, sessions[id]?.phase != .ended {
+                sessions[id]?.pendingSummary = first.request.summary
+                sessions[id]?.pendingRequestID = "bridge:" + first.request.id
+                sessions[id]?.pendingInTerminal = true
+                let detail = first.receipt.response != nil ? "Claude에 응답을 전달하는 중입니다…" : "AutoApprove에서 이번 요청을 허용할 수 있습니다."
+                sessions[id]?.setPhase(first.request.isQuestion ? .input : .approval, detail: detail)
+            }
+        }
+    }
+
     private func receive(_ message: JSONObject, from peer: SocketConnection) {
         let method = message["method"] as? String ?? ""
         let params = message["params"] as? JSONObject ?? [:]
@@ -735,7 +1186,14 @@ import Combine
             case "automatic":
                 guard let id = params["sessionID"] as? String, let enabled = params["enabled"] as? Bool else { throw AppError.message("세션 ID와 설정값이 필요합니다.") }
                 try setAutomatic(id, enabled: enabled); result = ["enabled": enabled]
-            case "hook": result = handleHook(params)
+            case "hook": result = params["autoapproveProtocol"] as? Int == 1 ? try handleClaudeHook(params) : handleHook(params)
+            case "hookAck": try acknowledgeClaudeHook(params)
+            case "claudeApprove":
+                guard let id = params["sessionID"] as? String, let request = params["requestID"] as? String else { throw AppError.message("세션과 요청 ID가 필요합니다.") }
+                try answerClaudeApproval(sessionID: id, requestID: request, enableAutomatic: params["enableAutomatic"] as? Bool ?? false)
+            case "claudeRelease":
+                guard let id = params["sessionID"] as? String, let request = params["requestID"] as? String else { throw AppError.message("세션과 요청 ID가 필요합니다.") }
+                try releaseClaudeApproval(sessionID: id, requestID: request)
             case "register":
                 guard let terminals = params["terminals"] as? [JSONObject], terminals.count <= 200 else { throw AppError.message("잘못된 터미널 등록입니다.") }
                 peers[peer.id] = peer; bridges[peer.id] = terminals
@@ -833,6 +1291,11 @@ import Combine
 
     public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date()) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
+        // The original hook is still waiting in this app; screen input would be a second response path.
+        guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
+        // A parked main terminal renders the child PTY. Its pixels cannot identify
+        // which child owns the prompt; the child's hook is the response channel.
+        guard !hasBackgroundChildren(sessionID), claudeParents[sessionID] == nil else { return }
         let prompt = PromptDetector.detect(raw, agent: session.agent)
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
@@ -950,7 +1413,8 @@ import Combine
     }
 
     private func scheduleScreenApproval(_ id: String) {
-        guard let session = sessions[id], session.agent != .shell, session.automatic,
+        guard !hasBackgroundChildren(id), claudeParents[id] == nil,
+              let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel == .terminalScreen || session.channel == .vscodeScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
               state.retryAfter.map({ Date() >= $0 }) ?? true else { return }

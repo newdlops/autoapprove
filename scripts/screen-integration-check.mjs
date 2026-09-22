@@ -323,6 +323,25 @@ try {
   assert.equal(resumed.phase, 'working'); assert.equal(resumed.pendingInTerminal, false, 'A late timeout cannot mark subsequent work as pending');
   bridge.unacknowledged.clear();
 
+  const koreanPermission = 'Bash command\n  printf fixture\nDo you want to proceed?\n❯ 1. 허용\n  2. 항상 허용\n  3. 거부\nEsc to cancel';
+  await bridge.request('screen', { terminalID: fixtures[2].id, screen: 'Working (esc to interrupt)', generation: 'korean-permission' });
+  await bridge.request('screen', { terminalID: fixtures[2].id, screen: koreanPermission.normalize('NFD'), generation: 'korean-permission' });
+  await until(() => actions.length === 14, 'Korean Allow / Always Allow / Deny permission');
+  assert.equal(actions[13].terminalID, fixtures[2].id);
+  assert.equal(actions[13].answer, '1');
+  assert.equal(actions[13].dialog, koreanPermission);
+  await bridge.request('screen', { terminalID: fixtures[2].id, screen: koreanPermission, generation: 'korean-permission' });
+  await sleep(150); assert.equal(actions.length, 14, 'Unicode normalization cannot resend Korean permission input');
+
+  const toolPermission = 'Allow Computer Use to use "HighlightPreview"?\n\nApp: HighlightPreview\n\n› 1. Allow                   Run the tool and continue.\n  2. Allow for this session  Run the tool and remember this choice for this session.\n  3. Always allow            Run the tool and remember this choice for future tool calls.\n  4. Cancel                  Cancel this tool call\nenter to submit | esc to cancel';
+  await bridge.request('screen', { terminalID: fixtures[0].id, screen: toolPermission, generation: 'tool-permission' });
+  await until(() => actions.length === 15, 'Codex four-choice Allow tool permission with descriptions');
+  assert.equal(actions[14].terminalID, fixtures[0].id);
+  assert.equal(actions[14].answer, '1');
+  assert.equal(actions[14].dialog, toolPermission);
+  await bridge.request('screen', { terminalID: fixtures[0].id, screen: toolPermission, generation: 'tool-permission' });
+  await sleep(150); assert.equal(actions.length, 15, 'Repeated tool permission observation cannot resend Allow');
+
   await bridge.request('register', { terminals: fixtures.map(fixture => ({ ...fixture, streamAttached: false })) });
   status = await bridge.request('status');
   const disconnected = status.sessions.find(session => session.id === sessions[0].id);

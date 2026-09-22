@@ -8,7 +8,7 @@ public final class AuditStore {
         guard sqlite3_open_v2(path, &db, flags | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else { throw AppError.message("승인 기록 데이터베이스를 열지 못했습니다.") }
         sqlite3_busy_timeout(db, 250)
         if !readOnly {
-            try execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, date REAL NOT NULL, json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_date ON events(date DESC, id DESC);")
+            try execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, date REAL NOT NULL, json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_date ON events(date DESC, id DESC); CREATE TABLE IF NOT EXISTS claude_hooks (id TEXT PRIMARY KEY, logical_id TEXT, expires REAL NOT NULL, json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS claude_hooks_logical ON claude_hooks(logical_id);")
         }
     }
     deinit { sqlite3_close(db) }
@@ -33,6 +33,13 @@ public final class AuditStore {
         bind(key, to: statement, at: 1); bind(value, to: statement, at: 2)
         guard sqlite3_step(statement) == SQLITE_DONE else { throw AppError.message("설정을 저장하지 못했습니다.") }
     }
+    public func setValues(_ values: [String: String]) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for (key, value) in values { try set(key, value) }
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
     public func append(_ event: AuditEvent) throws {
         let data = try JSONEncoder().encode(event)
         var statement: OpaquePointer?
@@ -41,6 +48,37 @@ public final class AuditStore {
         bind(event.id, to: statement, at: 1); sqlite3_bind_double(statement, 2, event.date.timeIntervalSince1970)
         bind(String(decoding: data, as: UTF8.self), to: statement, at: 3)
         guard sqlite3_step(statement) == SQLITE_DONE else { throw AppError.message("승인 내역을 저장하지 못했습니다.") }
+    }
+    func claudeHook(id: String? = nil, logicalID: String? = nil) throws -> ClaudeHookReceipt? {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let column = id != nil ? "id" : "logical_id"
+        guard sqlite3_prepare_v2(db, "SELECT json FROM claude_hooks WHERE \(column) = ? ORDER BY expires DESC LIMIT 1", -1, &statement, nil) == SQLITE_OK else {
+            throw AppError.message("Claude 응답 기록을 읽지 못했습니다.")
+        }
+        bind(id ?? logicalID ?? "", to: statement, at: 1)
+        let status = sqlite3_step(statement)
+        if status == SQLITE_DONE { return nil }
+        guard status == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) else { throw AppError.message("Claude 응답 기록을 읽지 못했습니다.") }
+        return try JSONDecoder().decode(ClaudeHookReceipt.self, from: Data(String(cString: value).utf8))
+    }
+    /// The decision and its audit commit together before either is exposed to the helper.
+    func saveClaudeHook(_ receipt: ClaudeHookReceipt) throws {
+        let json = String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
+        try execute("BEGIN IMMEDIATE")
+        do {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO claude_hooks VALUES (?, ?, ?, ?)", -1, &statement, nil) == SQLITE_OK else { throw AppError.message("Claude 응답을 저장하지 못했습니다.") }
+            bind(receipt.id, to: statement, at: 1)
+            if let logicalID = receipt.logicalID { bind(logicalID, to: statement, at: 2) } else { sqlite3_bind_null(statement, 2) }
+            sqlite3_bind_double(statement, 3, receipt.expiresAt.timeIntervalSince1970)
+            bind(json, to: statement, at: 4)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw AppError.message("Claude 응답을 저장하지 못했습니다.") }
+            if let audit = receipt.audit { try append(audit) }
+            try execute("DELETE FROM claude_hooks WHERE expires < \(Date().addingTimeInterval(-60).timeIntervalSince1970)")
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
     }
     public func recent(limit: Int = 200) -> [AuditEvent] {
         var statement: OpaquePointer?

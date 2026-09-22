@@ -12,6 +12,7 @@ import UserNotifications
     private var openedTerminals = 0
     @Published var terminalOpenResult = "세션 관리 · 열기 0회"
     private var questionID = UUID().uuidString
+    private var questionObservedAt: Date?
     private var completionTurn = UUID().uuidString
     init() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-ui-preview-" + UUID().uuidString)
@@ -88,7 +89,7 @@ import UserNotifications
     }
 
     func question(new: Bool) {
-        if new { questionID = UUID().uuidString }
+        if new { questionID = UUID().uuidString; questionObservedAt = Date() }
         _ = engine.handleHook(["session_id": "notification-preview", "requestID": UUID().uuidString,
             "cwd": "/tmp/알림 검증 프로젝트", "hook_event_name": "PreToolUse", "tool_use_id": questionID,
             "tool_name": "AskUserQuestion", "tool_input": ["questions": [["question": "검증용 질문: 어느 작업부터 할까요?",
@@ -136,6 +137,11 @@ import UserNotifications
             let completions = delivered.filter { $0.request.content.categoryIdentifier == "WORK_COMPLETED" }
             notificationResult = "전달 \(delivered.count)개 · 완료 \(completions.count)개 · 예약 \(pending.count)개 · 알림 클릭 \(opened)회"
                 + completions.map { "\n\($0.request.content.title) · \($0.request.content.subtitle)" }.joined()
+            if let started = questionObservedAt {
+                let questions = delivered.filter { $0.request.content.userInfo["sessionID"] as? String == "claude:notification-preview" && $0.request.content.categoryIdentifier == "MANUAL_ANSWER" }
+                notificationResult += "\nClaude 질문 전달 \(questions.count)개"
+                for question in questions { notificationResult += " · \(String(format: "%.1f", question.date.timeIntervalSince(started)))초 후" }
+            }
         }
     }
 }
@@ -153,6 +159,9 @@ import UserNotifications
             SessionWindow(engine: fixture.engine, notifications: fixture.notifications, openTerminal: fixture.openTerminal)
                 .navigationTitle(fixture.terminalOpenResult)
         }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize)
+        Window("연결 설정", id: "settings") {
+            ConnectionSettings(engine: fixture.engine, notifications: fixture.notifications)
+        }.windowResizability(.contentSize)
     }
 }
 
@@ -198,6 +207,7 @@ private struct HighlightPreview: View {
                 Button("Codex 최종 완료 / 반복") { fixture.finishWork(codex: true) }
             }
             Button("알림 상태 확인") { fixture.inspectNotifications() }
+            Button("알림 설정") { openWindow(id: "settings") }
             Text(fixture.notificationResult).font(.caption)
             Text("알림 클릭 \(fixture.opened)회").font(.caption)
             Button("표시 패널 확인") {

@@ -42,6 +42,9 @@ public enum PromptDetector {
                 labels[labels.count - 1] += " " + line
             }
         }
+        if agent == .codex, dialog[0].hasPrefix("Allow ") || dialog[0].hasPrefix("Approve app tool call?") {
+            guard YesNoConfirmation.isToolPermissionMenu(labels) else { return nil }
+        }
         guard YesNoConfirmation.singleApprovalIndex(labels) == 0 else { return nil }
         let summary = dialog.prefix(selectedYes).filter { !$0.isEmpty }.joined(separator: "\n")
         guard !dialog.contains(where: { $0.contains("```") }), !summary.isEmpty,
@@ -60,7 +63,7 @@ public enum PromptDetector {
     }
     static func permissionMarkers(_ agent: AgentKind) -> [String] {
         agent == .codex
-            ? ["Would you like to run the following command?", "Would you like to make the following edits?"]
+            ? ["Would you like to run the following command?", "Would you like to make the following edits?", "Approve app tool call?", "Allow "]
             : ["Do you want to proceed?", "Do you want to make this edit", "Do you want to create", "Do you want to allow"]
     }
     static func isOption(_ line: String) -> Bool {

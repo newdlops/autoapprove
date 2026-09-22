@@ -2,10 +2,6 @@ import SwiftUI
 import AppKit
 import AutoApproveCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-}
-
 @MainActor final class AppContainer: ObservableObject {
     let engine: ApprovalEngine?
     let notifications: QuestionNotifications?
@@ -13,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     init() {
         do {
             let engine = try ApprovalEngine()
+            engine.upgradeClaudeHooks(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path)
             try engine.start()
             self.engine = engine; self.error = nil
             self.notifications = QuestionNotifications(engine: engine)
@@ -37,15 +34,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         .defaultSize(width: 1040, height: 700)
         .windowResizability(.contentMinSize)
-        .commands { CommandGroup(replacing: .newItem) {} }
+        .commands { AppCommands(connectionsAvailable: container.engine != nil) }
 
         Window("승인 내역", id: "history") {
             if let engine = container.engine { AuditHistoryWindow(engine: engine) }
-        }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize)
+        }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize).commandsRemoved()
+
+        Window("연결 설정", id: "settings") {
+            if let engine = container.engine, let notifications = container.notifications {
+                ConnectionSettings(engine: engine, notifications: notifications)
+            }
+        }.windowResizability(.contentSize).commandsRemoved()
+
+        Window("AutoApprove 도움말", id: "help") {
+            HelpWindow(connectionsAvailable: container.engine != nil)
+        }.defaultSize(width: 620, height: 660).windowResizability(.contentMinSize).commandsRemoved()
 
         MenuBarExtra {
             if let engine = container.engine { StatusMenu(engine: engine) }
-            else { Text(container.error ?? "연결 오류"); Button("종료") { NSApp.terminate(nil) }.help(AppHelp.quit) }
+            else {
+                Text(container.error ?? "연결 오류")
+                Divider()
+                SupportMenuItems()
+                Divider()
+                Button("종료") { NSApp.terminate(nil) }.help(AppHelp.quit)
+            }
         } label: {
             if let engine = container.engine { StatusMenuLabel(engine: engine) }
             else { Image(systemName: "exclamationmark.bubble").help(container.error ?? "AutoApprove를 시작하지 못했습니다. 메뉴에서 오류를 확인하세요.") }
@@ -82,6 +95,8 @@ private struct StatusMenu: View {
         Button("승인 내역 보기") { openWindow(id: "history"); NSApp.activate(ignoringOtherApps: true) }
             .keyboardShortcut("h", modifiers: [.command, .shift])
             .help(AppHelp.history)
+        Button("연결 설정…") { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
+            .help(AppHelp.connections)
         Button(engine.snapshot.paused ? "자동 승인 재개" : "자동 승인 일시정지") { try? engine.setPaused(!engine.snapshot.paused) }
             .help(AppHelp.pause(engine.snapshot.paused))
         Divider()
@@ -89,7 +104,19 @@ private struct StatusMenu: View {
             Text("\(event.outcome) · \(event.summary.replacingOccurrences(of: "\n", with: " ").prefix(48))")
         }
         Divider()
+        SupportMenuItems()
+        Divider()
         Button("AutoApprove 종료") { engine.stop(); NSApp.terminate(nil) }.keyboardShortcut("q")
             .help(AppHelp.quit)
+    }
+}
+
+private struct SupportMenuItems: View {
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Button("AutoApprove 도움말") { openWindow(id: "help"); NSApp.activate(ignoringOtherApps: true) }
+            .help(AppHelp.guide)
+        Button("AutoApprove 정보 · \(AppInformation.version)") { AppInformation.showAbout() }
+            .help("현재 앱의 버전과 빌드 번호를 확인합니다.")
     }
 }

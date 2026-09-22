@@ -8,9 +8,14 @@ public enum AgentKind: String, Codable, CaseIterable {
 }
 
 public enum TerminalKind: String, Codable {
-    case terminal, vscode, unknown
+    case terminal, vscode, claudeBackground, unknown
     public var title: String {
-        switch self { case .terminal: return "Terminal"; case .vscode: return "VS Code"; case .unknown: return "터미널 미확인" }
+        switch self {
+        case .terminal: return "Terminal"
+        case .vscode: return "VS Code"
+        case .claudeBackground: return "Claude 백그라운드"
+        case .unknown: return "터미널 미확인"
+        }
     }
 }
 
@@ -49,6 +54,13 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var cwd: String
     public var terminal: TerminalKind
     public var terminalTitle: String?
+    public var customization: SessionCustomization?
+    public var notices: [SessionNotice]?
+    /// A presentation-only group; hook routing always retains the original process session.
+    public var backgroundSessions: [AgentSession]?
+    public var ownPhase: SessionPhase?
+    public var backgroundChildren: [AgentSession] { backgroundSessions ?? [] }
+    public var unreadNoticeCount: Int { notices?.filter { !$0.isRead }.count ?? 0 }
     public var gitBranch: GitBranchState?
     public var phase: SessionPhase = .unknown
     public var channel: ApprovalChannel = .none
@@ -65,6 +77,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var pendingSummary: String?
     public var pendingRequestID: String?
     public var pendingInTerminal = false
+    public var claudeApprovals: [ClaudeApproval]?
     public var queuedQuestions: [QueuedQuestion]?
     public var codexQuestionsObservedAt: Date?
     public var codexQuestionsError: String?
@@ -75,7 +88,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
     public var phaseTitle: String { isMonitoring ? "대기 중 · 모니터링" : phase.title }
     public var needsReview: Bool { phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending }) }
-    public var canApprove: Bool { agent != .shell && channel != .none && phase != .ended }
+    public var canApprove: Bool { agent != .shell && phase != .ended && (channel != .none || backgroundChildren.contains(where: \.canApprove)) }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
     public var canReveal: Bool {
         phase != .ended && (terminal == .terminal || (terminal == .vscode && bridgeID != nil && terminalID != nil))
@@ -116,6 +129,7 @@ public enum AuditResult: String, CaseIterable, Codable {
 public struct AuditEvent: Identifiable, Codable, Equatable {
     public var id: String = UUID().uuidString
     public var sessionID: String
+    public var originSessionID: String?
     public var date = Date()
     public var summary: String
     public var outcome: String
@@ -152,13 +166,21 @@ public struct ConnectionHealth: Codable {
     public var codex = "기존 CLI는 터미널 연결 사용"
     public var discoveryError: String?
     public var auditError: String?
+    public var noticeError: String?
 }
 
 public struct EngineSnapshot: Codable {
+    public static let questionNotificationDelayRange = 1...3600
     public var sessions: [AgentSession]
     public var events: [AuditEvent]
     public var paused: Bool
     public var health: ConnectionHealth
+    /// Optional so snapshots from older versions retain the ten-second default.
+    public var questionNotificationDelaySeconds: Int?
+    public var questionNotificationDelay: Int {
+        guard let value = questionNotificationDelaySeconds, Self.questionNotificationDelayRange.contains(value) else { return 10 }
+        return value
+    }
     public var idleCount: Int { sessions.filter { $0.phase == .idle }.count }
     public var monitoringCount: Int { sessions.filter(\.isMonitoring).count }
     public var attentionCount: Int { sessions.reduce(0) { $0 + AttentionRequest.candidates($1, paused: paused).count } }

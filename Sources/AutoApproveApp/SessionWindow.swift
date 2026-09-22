@@ -15,14 +15,24 @@ struct SessionWindow: View {
     @State private var selection: Set<String> = []
     @State private var search = ""
     @State private var filter = "전체"
-    @State private var settings = false
     @State private var error: String?
     @State private var refreshing = false
     @State private var openingTerminal = false
+    @State private var editingSession: AgentSession?
+    @State private var showing = false
+    private var selectedUnreadIDs: [String] {
+        engine.snapshot.sessions.filter { selection.contains($0.id) }.flatMap { ($0.notices ?? []).filter { !$0.isRead }.map(\.id) }
+    }
+    private var selectedNotificationKeys: [String] {
+        engine.snapshot.sessions.filter { selection.contains($0.id) }.flatMap {
+            AttentionRequest.candidates($0, paused: engine.snapshot.paused).map(\.key) + ([$0] + $0.backgroundChildren).compactMap { $0.completion?.id }
+        }
+    }
     private var disconnectedAutomaticCount: Int { engine.snapshot.sessions.filter(\.automaticWaitingForConnection).count }
+    private var workingCount: Int { engine.snapshot.sessions.filter { $0.phase == SessionPhase.working }.count }
     private var visible: [AgentSession] {
         engine.snapshot.sessions.filter { session in
-            let match = search.isEmpty || "\(session.project) \(session.terminalTitle ?? "") \(session.gitBranch?.name ?? "") \(session.cwd) \(session.agent.title) \(session.pid) \(session.tty)".localizedCaseInsensitiveContains(search)
+            let match = session.matchesSearch(search)
             let state: Bool
             switch filter {
             case "대기 중": state = session.phase == .idle
@@ -51,7 +61,7 @@ struct SessionWindow: View {
         if filter != "전체" { return "전체 필터에서 다른 세션을 확인할 수 있습니다." }
         return "Terminal 또는 VS Code에서 Claude Code나 Codex를 실행하면 여기에 나타납니다."
     }
-    var body: some View {
+    private var content: some View {
         VStack(spacing: 0) {
             if notifications.authorization == .denied || notifications.error != nil {
                 HStack(spacing: 10) {
@@ -60,7 +70,7 @@ struct SessionWindow: View {
                     Text(notifications.error ?? "알림이 꺼져 있습니다. 질문과 작업 완료를 놓치지 않도록 알림을 허용해주세요.")
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
-                    Button("알림 설정") { settings = true }.help("질문·작업 완료 알림 권한과 시스템 설정을 확인합니다.")
+                    Button("알림 설정") { openWindow(id: "settings") }.help("질문·작업 완료 알림 권한과 시스템 설정을 확인합니다.")
                 }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10).background(Color.orange.opacity(0.10))
             }
             if disconnectedAutomaticCount > 0 {
@@ -70,7 +80,7 @@ struct SessionWindow: View {
                     Text("자동 승인을 켠 \(disconnectedAutomaticCount)개 세션이 연결되지 않아 요청을 감지할 수 없습니다.")
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
-                    Button("연결 설정") { settings = true }
+                    Button("연결 설정") { openWindow(id: "settings") }
                         .help(AppHelp.connections)
                 }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10).background(Color.orange.opacity(0.10))
             }
@@ -94,6 +104,10 @@ struct SessionWindow: View {
                     .font(.callout).foregroundStyle(.red).padding(12).frame(maxWidth: .infinity, alignment: .leading)
                     .help("승인 내역을 저장하지 못해 새 승인 전달을 진행할 수 없습니다.\n" + error)
             }
+            if let error = engine.snapshot.health.noticeError {
+                Label(error, systemImage: "bell.badge").font(.callout).foregroundStyle(.red)
+                    .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            }
             HSplitView {
                 VStack(spacing: 0) {
                     HStack {
@@ -110,11 +124,11 @@ struct SessionWindow: View {
                         Button { filter = "대기 중" } label: {
                             Label("대기 중 \(engine.snapshot.idleCount)개", systemImage: "checkmark.circle")
                         }.buttonStyle(.borderless).help("다음 지시를 기다리는 Claude Code·Codex를 봅니다. 백그라운드를 모니터링 중인 \(engine.snapshot.monitoringCount)개도 포함합니다.")
-                        Text("작업 중 \(engine.snapshot.sessions.filter { $0.phase == .working }.count)개").foregroundStyle(.secondary)
+                        Text("작업 중 \(workingCount)개").foregroundStyle(.secondary)
                             .help("현재 작업을 진행 중인 것으로 감지한 Claude Code·Codex 세션 수입니다.")
                         Spacer(minLength: 0)
                     }.font(.caption).padding(.horizontal, 16).padding(.bottom, 12)
-                    TextField("프로젝트, 제목, 브랜치 검색", text: $search)
+                    TextField("프로젝트, 이름, 메모 검색", text: $search)
                         .textFieldStyle(.roundedBorder).padding(.horizontal, 16).padding(.bottom, 12)
                         .accessibilityLabel("세션 검색")
                         .help(AppHelp.search)
@@ -148,6 +162,12 @@ struct SessionWindow: View {
                                 Button("터미널 열기") { reveal(session) }
                                     .disabled(!session.canReveal || openingTerminal)
                                     .help(AppHelp.reveal(session, opening: openingTerminal))
+                                Button("표시 이름·메모·색상 편집", systemImage: "pencil") { editingSession = session }
+                                    .help("이 세션의 표시 이름, 메모와 식별 색상을 편집합니다.")
+                                Button("알림 읽음으로 표시", systemImage: "checkmark.circle") {
+                                    perform { try engine.markNotificationsRead(session.id) }
+                                }.disabled(session.unreadNoticeCount == 0)
+                                    .help("알림 배지를 지웁니다. 답변이 필요한 질문은 그대로 남습니다.")
                                 if let index = displayed.firstIndex(where: { $0.id == session.id }) {
                                     Divider()
                                     Button("위로 이동", systemImage: "arrow.up") {
@@ -177,12 +197,16 @@ struct SessionWindow: View {
                 detail.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(minWidth: 780, minHeight: 560)
+    }
+    var body: some View {
+        content.frame(minWidth: 780, minHeight: 560)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button { openWindow(id: "help") } label: { Label("도움말", systemImage: "questionmark.circle") }
+                    .help(AppHelp.guide)
                 Button { openWindow(id: "history") } label: { Label("승인 내역", systemImage: "clock.arrow.circlepath") }
                     .help(AppHelp.history)
-                Button { settings = true } label: { Label("연결 설정", systemImage: "point.3.connected.trianglepath.dotted") }
+                Button { openWindow(id: "settings") } label: { Label("연결 설정", systemImage: "point.3.connected.trianglepath.dotted") }
                     .help(AppHelp.connections)
                 Button {
                     refreshing = true
@@ -194,15 +218,26 @@ struct SessionWindow: View {
                 }.help(AppHelp.pause(engine.snapshot.paused))
             }
         }
-        .sheet(isPresented: $settings) { ConnectionSettings(engine: engine, notifications: notifications) }
         .alert("요청을 처리하지 못했습니다", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("확인") { error = nil }
                 .help("오류 안내를 닫고 세션 목록으로 돌아갑니다.")
         } message: { Text(error ?? "") }
+        .sheet(item: $editingSession) { session in
+            SessionCustomizationEditor(session: session,
+                isAvailable: engine.snapshot.sessions.contains { $0.id == session.id && $0.phase != .ended },
+                save: { try engine.setCustomization(session.id, value: $0) })
+        }
         .onChange(of: visible.map(\.id)) { _, ids in
             selection.formIntersection(ids)
             if selection.isEmpty, let first = ids.first { selection = [first] }
         }
+        .onAppear { showing = true; readVisibleNotifications() }
+        .onDisappear { showing = false }
+        .onChange(of: selection) { _, _ in readVisibleNotifications() }
+        .onChange(of: selectedUnreadIDs) { _, _ in readVisibleNotifications() }
+        .onChange(of: selectedNotificationKeys) { _, _ in readVisibleNotifications() }
+        .onChange(of: editingSession?.id) { _, id in if id == nil { readVisibleNotifications() } }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in readVisibleNotifications() }
     }
     @ViewBuilder private var detail: some View {
         if selection.count > 1 {
@@ -222,17 +257,19 @@ struct SessionWindow: View {
                 Spacer()
             }.padding(24)
         } else if let id = selection.first, let session = engine.snapshot.sessions.first(where: { $0.id == id }) {
-            SessionDetail(session: session, events: engine.snapshot.events.filter { $0.sessionID == id }, paused: engine.snapshot.paused, openingTerminal: openingTerminal,
+            SessionDetail(session: session, events: engine.snapshot.events.filter { event in event.sessionID == id || session.backgroundChildren.contains(where: { $0.id == event.sessionID }) }, paused: engine.snapshot.paused, openingTerminal: openingTerminal,
                           setAutomatic: { enabled in perform { try engine.setAutomatic(id, enabled: enabled) } },
-                          reveal: { reveal(session) }, connect: { settings = true }, showHistory: { openWindow(id: "history") },
+                          reveal: { reveal(session) }, edit: { editingSession = session }, connect: { openWindow(id: "settings") }, showHistory: { openWindow(id: "history") },
                           dismissQuestion: { questionID in perform { try engine.dismissQuestion(sessionID: id, questionID: questionID) } },
                           replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) },
                           beginReply: { questionID in perform { try engine.beginQuestionReply(sessionID: id, questionID: questionID) } },
-                          cancelAutomaticReply: { questionID in perform { try engine.cancelQuestionAutomaticReply(sessionID: id, questionID: questionID) } })
+                          cancelAutomaticReply: { questionID in perform { try engine.cancelQuestionAutomaticReply(sessionID: id, questionID: questionID) } },
+                          approveClaude: { sourceID, requestID, automatic in try engine.answerClaudeApproval(sessionID: sourceID, requestID: requestID, enableAutomatic: automatic) },
+                          releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) })
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
                 Text("세션을 선택해 상태를 확인하고 자동 승인을 켜세요.\n처음 사용하는 경우 연결 설정부터 시작하세요.")
-            } actions: { Button("연결 설정 열기") { settings = true }.help(AppHelp.connections) }
+            } actions: { Button("연결 설정 열기") { openWindow(id: "settings") }.help(AppHelp.connections) }
         }
     }
     private func singleSession(_ ids: Set<String>) -> AgentSession? {
@@ -258,6 +295,15 @@ struct SessionWindow: View {
         return singleSession(ids)
     }
     private func perform(_ operation: () throws -> Void) { do { try operation() } catch { self.error = error.localizedDescription } }
+    private func readVisibleNotifications() {
+        Task { @MainActor in
+            await Task.yield()
+            guard showing, editingSession == nil, error == nil, NSApp.isActive,
+                  NSApp.keyWindow?.identifier?.rawValue == "main", selection.count == 1,
+                  let id = selection.first else { return }
+            perform { try engine.markNotificationsRead(id) }
+        }
+    }
     private func reveal(_ session: AgentSession) {
         guard !openingTerminal else { return }
         guard session.canReveal else { error = AppHelp.reveal(session, opening: false); return }
@@ -266,6 +312,7 @@ struct SessionWindow: View {
             defer { openingTerminal = false }
             do {
                 try await openTerminal(session, engine)
+                try engine.markNotificationsRead(session.id)
             } catch { self.error = error.localizedDescription }
         }
     }
@@ -280,11 +327,29 @@ private struct SessionRow: View {
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(session.project).font(.body.weight(.medium)).lineLimit(1)
-                    .help(session.cwd.isEmpty ? "프로젝트 경로를 확인하고 있습니다." : session.cwd)
-                Text(session.terminalTitle ?? "터미널 제목 미확인")
-                    .font(.callout).foregroundStyle(.secondary).lineLimit(1)
-                    .help(session.terminalTitle ?? "터미널을 연결하면 창 또는 탭의 제목을 표시합니다.")
+                HStack(spacing: 8) {
+                    Text(session.project).font(.body.weight(.medium)).lineLimit(1)
+                        .help(session.cwd.isEmpty ? "프로젝트 경로를 확인하고 있습니다." : session.cwd)
+                    if session.unreadNoticeCount > 0 {
+                        Label("\(session.unreadNoticeCount)", systemImage: "bell.fill")
+                            .font(.caption.weight(.semibold)).monospacedDigit().fixedSize()
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(.quaternary, in: Capsule())
+                            .accessibilityLabel("읽지 않은 알림 \(session.unreadNoticeCount)개")
+                            .help("새 질문·작업 완료 알림 \(session.unreadNoticeCount)개. 세션을 열람하면 배지가 사라집니다.")
+                    }
+                }
+                HStack(spacing: 6) {
+                    if let color = session.customization?.color { SessionColorTag(color: color, selected: selected) }
+                    Text(session.displayedTerminalTitle)
+                        .font(.callout.weight(session.customization?.title.isEmpty == false ? .medium : .regular))
+                        .lineLimit(1)
+                }.foregroundStyle(.secondary)
+                    .help(session.displayedTerminalTitle)
+                if let note = session.customization?.note, !note.isEmpty {
+                    Label(note, systemImage: "note.text").font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).help(note)
+                }
                 GitBranchLabel(session: session, compact: true)
                 HStack(spacing: 6) {
                     Text(session.agent.title)
@@ -295,6 +360,11 @@ private struct SessionRow: View {
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                     .help("\(session.tty) · PID \(String(session.pid))\n같은 프로젝트의 여러 터미널을 구분하는 식별자입니다.")
                 PhaseLabel(session: session, highlighted: selected).font(.caption)
+                if !session.backgroundChildren.isEmpty {
+                    Text("백그라운드 \(session.backgroundChildren.count)개 포함")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .help("이 메인 세션에서 시작한 백그라운드 질문과 알림을 함께 표시하며, 자동 승인 설정도 공유합니다.")
+                }
                 if !session.unansweredQuestions.isEmpty {
                     Label("질문 대기 \(session.unansweredQuestions.count)건", systemImage: "bubble.left.and.bubble.right")
                         .font(.caption.weight(.medium))
@@ -356,12 +426,15 @@ private struct SessionDetail: View {
     let openingTerminal: Bool
     let setAutomatic: (Bool) -> Void
     let reveal: () -> Void
+    let edit: () -> Void
     let connect: () -> Void
     let showHistory: () -> Void
     let dismissQuestion: (String) -> Void
     let replyQuestion: (String, String) async throws -> Void
     let beginReply: (String) -> Void
     let cancelAutomaticReply: (String) -> Void
+    let approveClaude: (String, String, Bool) throws -> Void
+    let releaseClaude: (String, String) throws -> Void
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -369,15 +442,25 @@ private struct SessionDetail: View {
                     HStack {
                         Text(session.agent.title).font(.callout.weight(.medium)).foregroundStyle(.secondary)
                         Spacer()
+                        Button(action: edit) { Label("표시 편집", systemImage: "pencil") }.controlSize(.small)
+                            .help("이 세션의 표시 이름, 메모와 식별 색상을 편집합니다.")
                         Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널 열기", systemImage: "arrow.up.forward.app") }.controlSize(.small)
                             .disabled(!session.canReveal || openingTerminal)
                             .help(AppHelp.reveal(session, opening: openingTerminal))
                     }
                     Text(session.project).font(.title.weight(.semibold)).lineLimit(2).textSelection(.enabled)
                         .help(session.cwd.isEmpty ? "프로젝트 경로 미확인" : session.cwd)
-                    Text(session.terminalTitle ?? "터미널 제목 미확인")
-                        .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        if let color = session.customization?.color { SessionColorTag(color: color) }
+                        Text(session.displayedTerminalTitle)
+                            .font(.callout.weight(session.customization?.title.isEmpty == false ? .medium : .regular))
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }.foregroundStyle(.secondary)
+                    if session.customization?.title.isEmpty == false {
+                        Text("원래 제목: \(session.terminalTitle ?? "터미널 제목 미확인")")
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     Text(session.cwd.isEmpty ? "프로젝트 경로를 확인하지 못했습니다." : session.cwd)
                         .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     GitBranchLabel(session: session).textSelection(.enabled)
@@ -385,6 +468,16 @@ private struct SessionDetail: View {
                     if !session.tty.isEmpty {
                         Text(session.tty).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                             .help(AppHelp.tty)
+                    }
+                    if session.terminal == .claudeBackground {
+                        Text("Claude가 만든 백그라운드 가상 터미널입니다. 독립된 Terminal 탭으로 열 수 없으며, 원래 Claude 세션에서 확인할 수 있습니다.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let note = session.customization?.note, !note.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("메모", systemImage: "note.text").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                            Text(note).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        }.padding(.top, 8)
                     }
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -404,6 +497,59 @@ private struct SessionDetail: View {
                     }
                 }
                 Divider()
+                if ([session] + session.backgroundChildren).contains(where: { $0.pendingSummary != nil && $0.phase != .ended }) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("현재 요청").font(.headline)
+                        ForEach(([session] + session.backgroundChildren).filter { $0.pendingSummary != nil && $0.phase != .ended }) { source in
+                            VStack(alignment: .leading, spacing: 8) {
+                                if source.id != session.id {
+                                    Label("백그라운드 작업", systemImage: "terminal")
+                                        .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                                        .help("질문을 보낸 실행: \(source.tty) · PID \(source.pid)")
+                                }
+                                if let approvals = source.claudeApprovals, !approvals.isEmpty {
+                                    ForEach(approvals) { approval in
+                                        ClaudeApprovalControls(approval: approval, automatic: session.automatic, paused: paused,
+                                            canReveal: session.canReveal, openingTerminal: openingTerminal,
+                                            approve: { enabled in try approveClaude(source.id, approval.id, enabled) },
+                                            release: { try releaseClaude(source.id, approval.id); reveal() })
+                                            .id(approval.id)
+                                    }
+                                } else {
+                                    Text(source.pendingSummary ?? "")
+                                        .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+                                    Text("이 요청은 터미널에서 답할 수 있습니다.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app") }
+                                        .disabled(!session.canReveal || openingTerminal).help(AppHelp.reveal(session, opening: openingTerminal))
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                }
+                if let notices = session.notices, !notices.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("최근 알림").font(.headline)
+                        ForEach(notices.prefix(5)) { notice in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Label(notice.title, systemImage: notice.kind == .completion ? "checkmark.circle" : "bubble.left")
+                                        .font(.callout.weight(.medium))
+                                    Spacer(minLength: 4)
+                                    Text(notice.date, style: .time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                        .help(notice.date.formatted(date: .complete, time: .standard))
+                                }
+                                Text(notice.summary).font(.callout).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                            }
+                        }
+                        Text("이 화면을 열람하면 읽음으로 표시됩니다. 질문에 대한 답변은 별도로 진행해주세요.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Divider()
+                }
                 if session.agent == .codex {
                     CodexQuestionList(session: session, openingTerminal: openingTerminal, dismiss: dismissQuestion,
                         reply: replyQuestion, reveal: reveal, beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply)
@@ -426,24 +572,15 @@ private struct SessionDetail: View {
                         .help(AppHelp.automatic(session, paused: paused))
                     Text(session.canApprove ? (paused ? "전체 일시정지 중입니다. 재개하면 자동 승인이 적용됩니다." : AppHelp.automaticDescription) : "승인 요청을 처리하려면 연결이 필요합니다.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Label(session.channel.title, systemImage: session.canApprove ? "link" : "link.badge.plus")
+                    if !session.backgroundChildren.isEmpty {
+                        Text("이 터미널의 백그라운드 \(session.backgroundChildren.count)개에도 같은 자동 승인 설정이 적용됩니다.")
+                            .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Label(session.channel == .none && session.canApprove ? "백그라운드 훅 연결됨" : session.channel.title, systemImage: session.canApprove ? "link" : "link.badge.plus")
                         .font(.callout.weight(.medium))
                         .help(AppHelp.channel(session.channel))
                     Text(session.detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     if !session.canApprove { Button("연결 설정") { connect() }.help(AppHelp.connections) }
-                }
-                if let pending = session.pendingSummary {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("현재 요청").font(.headline)
-                        Text(pending).font(.system(.callout, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        if session.pendingInTerminal {
-                            Text(session.phase == .input ? "터미널에서 질문에 답해주세요." : "현재 요청은 터미널에서 확인해주세요.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        } else if !session.automatic || paused { Text("원래 터미널에서 응답할 수 있습니다.").font(.caption).foregroundStyle(.secondary) }
-                        Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app") }
-                            .disabled(!session.canReveal || openingTerminal).help(AppHelp.reveal(session, opening: openingTerminal))
-                    }
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 14) {
@@ -464,6 +601,63 @@ private struct SessionDetail: View {
                 }
             }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
         }.background(Color(nsColor: .textBackgroundColor))
+    }
+}
+
+private struct ClaudeApprovalControls: View {
+    let approval: ClaudeApproval
+    let automatic: Bool
+    let paused: Bool
+    let canReveal: Bool
+    let openingTerminal: Bool
+    let approve: (Bool) throws -> Void
+    let release: () throws -> Void
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(approval.summary).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+            if approval.sending {
+                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Claude에 응답 전달 중…") }
+                    .font(.callout).accessibilityElement(children: .combine)
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { approvalButtons }
+                    VStack(alignment: .leading, spacing: 8) { approvalButtons }
+                }
+                if let deadline = approval.automaticAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        let seconds = max(0, Int(ceil(deadline.timeIntervalSince(context.date))))
+                        Text(seconds > 0 ? "\(seconds)초 후 자동 응답: \(approval.answer)" : "자동 응답을 준비하고 있습니다…")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text(paused ? "전체 일시정지 중입니다. 이번 요청만 직접 응답할 수 있습니다." : "이번 요청에만 응답합니다. 자동 승인을 켜면 다음 지원 요청도 처리합니다.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Button(action: { perform(release) }) {
+                    Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app")
+                }.disabled(!canReveal || openingTerminal)
+                    .help("앱의 응답 대기를 끝내고 메인 터미널에서 이 질문에 답합니다.")
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
+        }
+    }
+    @ViewBuilder private var approvalButtons: some View {
+        Button(approval.buttonTitle) { perform { try approve(false) } }
+            .buttonStyle(.borderedProminent)
+            .help("이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
+        if !automatic && !paused {
+            Button("허용하고 자동 승인 켜기") { perform { try approve(true) } }
+                .help("현재 요청에 응답하고 이 메인 세션과 연결된 백그라운드의 자동 승인을 켭니다.")
+        }
+    }
+    private func perform(_ action: () throws -> Void) {
+        do { try action(); error = nil } catch { self.error = error.localizedDescription }
     }
 }
 

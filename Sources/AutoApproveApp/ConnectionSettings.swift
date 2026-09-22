@@ -8,15 +8,39 @@ struct ConnectionSettings: View {
     @Environment(\.dismiss) private var dismiss
     @State private var busy = false
     @State private var notice: String?
+    @State private var questionDelayText = ""
+    @State private var questionDelayError: String?
+    private var questionDelayValue: Int? { Int(questionDelayText.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    private var validQuestionDelay: Bool { questionDelayValue.map(EngineSnapshot.questionNotificationDelayRange.contains) ?? false }
     private var helper: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack { Text("연결 설정").font(.title2.weight(.semibold)); Spacer(); Button("완료") { dismiss() }.keyboardShortcut(.defaultAction).help("연결 설정을 닫고 세션 목록으로 돌아갑니다.") }.padding(24)
+            HStack { Text("연결 설정").font(.title2.weight(.semibold)); Spacer(); Button("완료") { dismiss() }.keyboardShortcut(.defaultAction).help("연결 설정 창을 닫습니다. ⌘W로도 닫을 수 있습니다.") }.padding(24)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     section("질문 · 작업 완료 알림", icon: "bell", status: notifications.status) {
-                        Text("직접 답해야 하는 질문과 최종 응답이 끝난 작업을 macOS 알림으로 알려줍니다. 알림을 누르면 해당 터미널을 열고 강조합니다. 같은 질문·완료는 한 번만 알리며, 답변하거나 새 작업을 시작하면 알림을 정리합니다.")
+                        Text("질문이 설정한 시간 동안 미응답 상태로 남거나 작업이 끝나면 알립니다. 그 전에 처리된 질문은 알리지 않습니다. 같은 질문·완료는 한 번만 알리며, 알림을 누르면 해당 터미널을 엽니다.")
+                        HStack(spacing: 8) {
+                            Text("질문 대기 시간").foregroundStyle(.primary)
+                            Spacer()
+                            TextField("초", text: $questionDelayText)
+                                .textFieldStyle(.roundedBorder).frame(width: 72)
+                                .accessibilityLabel("질문 알림 대기 시간(초)")
+                                .help("1~3600초로 입력하고 적용하세요. 기본값은 10초입니다.")
+                                .onSubmit { saveQuestionDelay() }
+                            Text("초")
+                            Button("적용") { saveQuestionDelay() }
+                                .disabled(!validQuestionDelay || questionDelayValue == engine.snapshot.questionNotificationDelay)
+                                .help("대기 중인 질문과 새 질문에 적용하고 앱 재실행 후에도 유지합니다.")
+                        }
+                        if let questionDelayError {
+                            Label(questionDelayError, systemImage: "exclamationmark.circle").foregroundStyle(.red)
+                        } else if !questionDelayText.isEmpty && !validQuestionDelay {
+                            Label("1~3600초의 숫자로 입력해주세요.", systemImage: "exclamationmark.circle").foregroundStyle(.red)
+                        } else {
+                            Text("현재 \(engine.snapshot.questionNotificationDelay)초 · 기본 10초 · 작업 완료 알림은 별도로 유지합니다.").font(.caption)
+                        }
                         Text("완료 알림은 Claude 훅과 Codex 완료 기록을 사용합니다. 처음부터 대기 중인 세션·중단·프로세스 종료는 완료로 알리지 않습니다.").font(.caption)
                         HStack {
                             if notifications.authorization == .notDetermined {
@@ -75,6 +99,18 @@ struct ConnectionSettings: View {
                 }.padding(24)
             }
         }.frame(width: 600, height: 660)
+            .onAppear { questionDelayText = String(engine.snapshot.questionNotificationDelay) }
+            .onChange(of: questionDelayText) { _, _ in questionDelayError = nil }
+    }
+    private func saveQuestionDelay() {
+        guard let seconds = questionDelayValue, validQuestionDelay else {
+            questionDelayError = "질문 알림 대기 시간은 1~3600초로 입력해주세요."
+            return
+        }
+        do {
+            try engine.setQuestionNotificationDelay(seconds)
+            questionDelayText = String(seconds); questionDelayError = nil
+        } catch { questionDelayError = "저장하지 못했습니다. \(error.localizedDescription)" }
     }
     @ViewBuilder private func section<Content: View>(_ title: String, icon: String, status: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {

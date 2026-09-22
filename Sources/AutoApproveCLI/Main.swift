@@ -46,12 +46,11 @@ import AutoApproveCore
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()
                     guard input.count <= 1_000_000, var payload = try JSONSerialization.jsonObject(with: input) as? JSONObject else { print("{}"); return }
-                    payload["requestID"] = UUID().uuidString
                     if let records = try? ProcessDiscovery.read(), let agent = ProcessDiscovery.ancestors(of: getppid(), records: records).first(where: { $0.agent == .claude }) {
                         payload["agentPID"] = agent.pid; payload["agentStarted"] = agent.started
                         payload["tty"] = agent.tty == "??" ? "" : "/dev/" + agent.tty
                     }
-                    let response = try SocketClient.request(path: paths.socket, message: ["method": "hook", "params": payload], timeout: 2)
+                    let response = ClaudeHookClient.run(payload: payload, path: paths.socket)
                     try printJSON(response)
                 } catch { print("{}") } // A missing app or timed-out bridge preserves Claude's original permission flow.
             case "install-claude", "remove-claude":

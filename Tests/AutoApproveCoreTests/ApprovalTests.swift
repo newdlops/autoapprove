@@ -91,7 +91,7 @@ import AutoApproveCore
         try expectEqual(records.first(where: { $0.pid == 12 })?.executable, "claude")
         try expectEqual(sessions.first(where: { $0.pid == 12 })?.terminal, .terminal)
         try expectEqual(sessions.first(where: { $0.pid == 22 })?.terminal, .vscode)
-        try expectEqual(sessions.first(where: { $0.pid == 14 })?.terminal, .unknown, "A background PTY is not the ancestor's Terminal tab")
+        try expectEqual(sessions.first(where: { $0.pid == 14 })?.terminal, .claudeBackground, "A background PTY is not the ancestor's Terminal tab")
     }
     func testTerminalScriptingContractAndPartialFailure() throws {
         let context = JSContext()!
@@ -319,6 +319,34 @@ import AutoApproveCore
         let removed = HookInstaller.merged(twice, executable: nil)
         try expectEqual(try JSONSerialization.data(withJSONObject: original, options: .sortedKeys), try JSONSerialization.data(withJSONObject: removed, options: .sortedKeys))
         try expectEqual(HookInstaller.quote("a'b"), "'a'\\''b'")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-upgrade-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("settings.json")
+        var old = once, oldHooks = once["hooks"] as! [String: [JSONObject]]
+        for event in HookInstaller.events {
+            oldHooks[event] = oldHooks[event]!.map { original in
+                var group = original
+                group["hooks"] = (group["hooks"] as! [JSONObject]).map { original in
+                    var handler = original
+                    if (handler["command"] as? String)?.hasSuffix(" hook --autoapprove-managed") == true { handler["timeout"] = 4 }
+                    return handler
+                }
+                return group
+            }
+        }
+        old["hooks"] = oldHooks
+        try JSONSerialization.data(withJSONObject: old).write(to: url)
+        try expectNil(try HookInstaller.upgradeTimeouts(executable: "/tmp/other-app/autoapprove", url: url))
+        try expectNotNil(try HookInstaller.upgradeTimeouts(executable: "/tmp/space name/autoapprove", url: url))
+        let upgraded = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+        try expectEqual(try JSONSerialization.data(withJSONObject: upgraded, options: .sortedKeys), try JSONSerialization.data(withJSONObject: once, options: .sortedKeys))
+        try expectNil(try HookInstaller.upgradeTimeouts(executable: "/tmp/space name/autoapprove", url: url))
+        old["disableAllHooks"] = true
+        try JSONSerialization.data(withJSONObject: old).write(to: url)
+        try expectNil(try HookInstaller.upgradeTimeouts(executable: "/tmp/space name/autoapprove", url: url))
+        try JSONSerialization.data(withJSONObject: original).write(to: url)
+        try expectNil(try HookInstaller.upgradeTimeouts(executable: "/tmp/space name/autoapprove", url: url))
     }
     func testAuditPersistsSettingsAndEvents() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-test-" + UUID().uuidString)
@@ -374,6 +402,29 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Claude app approval continues through thirty separately timed requests", tests.testClaudeAppApprovalThenThirtySequentialQuestions),
+            ("Automatic Claude questions stay quiet while manual fallback still alerts", tests.testClaudeAutomaticAttentionAndManualFallback),
+            ("Claude hook restart, lost response replay and exact identity", tests.testClaudeHookRestartAndExactResponseReplay),
+            ("Claude hook pause, manual response and concurrent isolation", tests.testClaudeHookPauseManualAndConcurrentIsolation),
+            ("Claude hook terminal handoff, expiry and PID reuse", tests.testClaudeHookHandoffExpiryAndPIDReuse),
+            ("Claude decision and audit rollback together before retry", tests.testClaudeHookDurableSaveFailureAndRetry),
+            ("Claude general permission and unsupported question fallback", tests.testClaudeHookGeneralPermissionAndUnsupportedQuestion),
+            ("Live Claude hook excludes screen input and rechecks parent exit", tests.testClaudeLiveHookOwnsScreenAndRechecksParent),
+            ("Claude registry verifies process identity and exact background parent", tests.testClaudeRegistryIdentityAndExactParent),
+            ("Claude restores existing background questions without replaying old hooks", tests.testClaudeRestoresWaitingBackgroundWithoutAHook),
+            ("Claude recovered waiting transitions and unavailable metadata", tests.testClaudeRecoveredWaitingTransitionsAndUnavailableMetadata),
+            ("Claude recovered question metadata identity and staleness", tests.testClaudeRecoveryMetadataIdentityAndStaleness),
+            ("Background hooks inherit main policy and retain original audit context", tests.testBackgroundHookInheritsMainAndAuditsOrigin),
+            ("Grouped concurrent questions, notifications, completions and read persistence", tests.testGroupedQuestionsNoticesAndReadPersistence),
+            ("Background first hook, restart, orphan and PID reuse", tests.testBackgroundFirstHookRestartAndParentExit),
+            ("Main screen cannot duplicate a background hook response", tests.testParentScreenCannotDuplicateChildHook),
+            ("Parent relationship and grouped read failures stop without partial success", tests.testParentGroupingAndReadSaveFailures),
+            ("Claude disconnection persists disabled approval and stops on save failure", tests.testClaudeDisconnectionPersistsOffAndRejectsFailedSave),
+            ("Unread notice debounce, reading and repeated occurrences", tests.testInboxDebounceReadAndNewOccurrences),
+            ("Read receipts survive incomplete initial discovery and history stays bounded", tests.testInboxRestoresReadReceiptsBeforeObservation),
+            ("Exact Korean JSON, independent badges, early-hook preferences and opt-in answer", tests.testKoreanSampleAndPerSessionReadPersistence),
+            ("Failed read receipt keeps the unread badge", tests.testInboxReadFailurePreservesBadge),
+            ("Claude daemon virtual TTY is distinct from Terminal and VS Code", tests.testClaudeDaemonPTYHasDistinctHost),
             ("Codex request identity separates commands from wrapping, history and shortcuts", tests.testCodexRequestIdentitySeparatesCommandsFromRendering),
             ("Wrapped final permission options and keyboard hints retain active-dialog validation", tests.testWrappedPermissionOptionsAndFooter),
             ("Claude and Codex ready composers with background monitoring", tests.testMonitoringRequiresReadyComposer),
@@ -384,6 +435,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Filtered and multiple session moves preserve hidden slots", tests.testFilteredAndMultipleSessionMoves),
             ("Session moves reject stale, exited and invalid rows", tests.testSessionMoveRejectsStaleAndInvalidRows),
             ("Session order save failure and damaged preferences", tests.testSessionOrderSaveFailureAndDamagedPreference),
+            ("Session names, notes and colors persist without crossing session identities", tests.testCustomizationPersistsAndStaysInItsSession),
+            ("Session customization reset and original/name/note search", tests.testCustomizationResetAndSearch),
+            ("Session customization validation and old snapshot compatibility", tests.testCustomizationValidationAndCompatibility),
+            ("Session customization save failure and ended-session rejection", tests.testCustomizationFailureDoesNotPublishOrReviveSessions),
             ("Git unborn, nested, linked worktree, branch switch and detached HEAD", tests.testGitBranchWorktreeAndRefresh),
             ("Git non-repository, missing directory and inherited environment isolation", tests.testGitBranchNonRepositoryAndEnvironmentIsolation),
             ("Git metadata binds to live sessions and their current directories", tests.testGitBranchesBindToCurrentSessionDirectory),
@@ -400,7 +455,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("uncertain question response and restart reservation", tests.testQuestionReplyUncertainAndPreflightFailure),
             ("question response requires correct thread and saved audit", tests.testQuestionReplyRequiresCorrectThreadAndSavedAudit),
             ("automatic Yes waits five seconds per question and survives repeated reads without resending", tests.testAutomaticQuestionReplyWaitsFiveSecondsPerQuestion),
-            ("automatic Allow preserves the one-time label after five seconds", tests.testAutomaticAllowQuestionReply),
+            ("automatic English/Korean Allow preserves the one-time label after five seconds", tests.testAutomaticAllowQuestionReply),
             ("automatic question response cancellation, manual answer, new content and resume", tests.testAutomaticQuestionReplyCancellationAndResume),
             ("automatic question responses revalidate authorization and content after preflight", tests.testAutomaticQuestionReplyRevalidatesAfterPreparation),
             ("automatic question response failures, durable audit and restart protection", tests.testAutomaticQuestionReplyFailuresAreNotRetried),
@@ -414,6 +469,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Terminal custom and window titles with isolated failures", tests.testTerminalTitleContract),
             ("varied yes/no questions, exact labels and ambiguous alternatives", tests.testYesNoConfirmationSelection),
             ("Allow, Deny and Don't allow labels preserve one-time scope", tests.testAllowConfirmationLabels),
+            ("Codex tool permission columns, Cancel, wrapping and active-dialog guards", tests.testCodexToolPermissionColumnsAndCancellation),
+            ("Korean Allow, Always Allow and Deny retain one-time scope and exact labels", tests.testKoreanPermissionLabels),
+            ("Korean permission question hook responses, opt-in, deduplication and audit", tests.testKoreanPermissionHookResponseAndAudit),
             ("repeated permission variants preserve the current-request answer", tests.testRepeatedPermissionChoicesPreferCurrentRequest),
             ("repeated permissions never select different tasks or ambiguous answers", tests.testRepeatedPermissionChoicesRejectDifferentDecisions),
             ("Claude and Codex permission variants, wrapped labels and active selection", tests.testBothAgentsRecognizeRepeatedPermissionVariants),
@@ -421,6 +479,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("question responses require enrollment, resume and the correct session", tests.testYesNoConfirmationOptInAndPause),
             ("question response requires a durable audit", tests.testYesNoConfirmationRequiresSavedAudit),
             ("manual attention, duplicate polling, resolution and repeated questions", tests.testAttentionLifecycle),
+            ("Question notification delay default, persistence, bounds and failed save", tests.testQuestionNotificationDelayPersistenceAndValidation),
             ("notification opens exact live session only", tests.testAttentionTarget),
             ("three-choice question survives Claude reminders and notifies once", tests.testThreeChoiceAttention),
             ("durable audit history, filtering, pagination and result updates", tests.testAuditHistoryQueries),

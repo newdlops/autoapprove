@@ -2,12 +2,13 @@ import AutoApproveCore
 
 /// Shared wording keeps the list, detail view and menu consistent.
 enum AppHelp {
+    static let guide = "앱 버전, 시작 방법, 자동 응답 규칙과 문제 해결 안내를 엽니다. ⌘/"
     static let connections = "질문·작업 완료 알림 권한과 Terminal 연결, Claude 훅, VS Code 확장의 연결 상태를 확인합니다."
     static let history = "종료된 세션을 포함한 전체 승인 내역을 검색하고 요청 내용과 전달 결과를 확인합니다."
-    static let search = "프로젝트 이름·전체 경로, 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
+    static let search = "프로젝트 이름·전체 경로, 표시 이름·메모·원래 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."
     static let pid = "실행 중인 Claude Code·Codex 프로세스의 번호입니다."
-    static let automaticDescription = "Claude Code·Codex의 권한 요청과 Claude 훅의 예·아니오 질문을 자동 승인합니다. 새 Codex 확인 질문에는 5초 후 Yes·Allow로 답하며 이번 요청만 허용합니다. 선택·입력을 시작하면 멈추며, 과거·중복 질문은 직접 확인해주세요."
+    static let automaticDescription = "Claude Code·Codex의 지원 권한 요청과 예·아니오 확인에 이번 요청만 허용합니다. 새 Claude 요청과 Codex 확인 질문에는 5초 후 Yes·Allow·예·허용으로 답합니다. Claude 요청은 앱에서도 직접 허용할 수 있습니다. 과거·중복 질문은 직접 확인해주세요."
     static let sendingAnswer = "답변을 보내고 있습니다. 중복 전송을 막기 위해 완료될 때까지 기다려주세요."
     static let quit = "AutoApprove와 자동 승인을 종료합니다. Claude Code·Codex 터미널은 계속 실행됩니다."
 
@@ -33,6 +34,10 @@ enum AppHelp {
             return session.automatic ? "연결이 끊겨 자동 승인이 대기 중입니다. 끄면 연결 복원 후에도 자동 승인하지 않습니다."
                 : "연결 설정에서 Terminal, Claude 훅 또는 VS Code 확장을 먼저 연결하세요."
         }
+        if !session.backgroundChildren.isEmpty {
+            return (paused ? "전체 일시정지 중입니다. 재개 후 적용됩니다.\n" : "")
+                + "메인과 백그라운드 \(session.backgroundChildren.count)개의 자동 승인을 함께 \(session.automatic ? "끕니다" : "켭니다"). 예·아니오·허용 확인에는 이번 요청만 허용합니다."
+        }
         if paused { return "전체 일시정지 중입니다. 이 스위치로 세션 설정을 정하고 전체 재개 후 적용합니다." }
         return session.automatic ? "이 세션의 자동 승인을 끕니다. 이후 권한 요청은 터미널에서 직접 확인합니다."
             : automaticDescription
@@ -45,7 +50,7 @@ enum AppHelp {
         case .working: return "Claude Code·Codex가 작업을 진행 중인 것으로 감지했습니다."
         case .idle: return "다음 지시를 기다리는 입력 대기 상태로 감지했습니다. 출력이 조용하다는 이유만으로 대기로 판단하지 않습니다."
         case .approval: return "실행·파일 변경 등의 권한 요청을 기다리고 있습니다. 자동 승인 설정과 연결을 확인하세요."
-        case .input: return "직접 확인이 필요한 질문입니다. 알림을 누르거나 터미널을 열어 답해주세요. Claude 훅의 명확한 예·아니오 질문은 자동 승인 설정에 따릅니다."
+        case .input: return "응답이 필요한 질문입니다. 지원하는 Claude 질문은 현재 요청에서 직접 허용할 수 있으며 자동 승인 설정도 따릅니다. 다른 질문은 터미널에서 답해주세요."
         case .unknown: return "현재 작업 상태를 판별할 근거가 부족합니다. 작업이 멈췄거나 끝났다는 뜻은 아닙니다."
         case .ended: return "도구 실행이 종료되었습니다. 저장된 승인 내역은 계속 확인할 수 있습니다."
         }
@@ -53,6 +58,9 @@ enum AppHelp {
 
     static func reveal(_ session: AgentSession, opening: Bool) -> String {
         if opening { return "선택한 터미널을 열고 있습니다. 잠시 기다려주세요." }
+        if session.terminal == .claudeBackground, session.phase != .ended {
+            return "Claude의 백그라운드 가상 터미널입니다. 독립된 Terminal 탭이 아니므로 원래 Claude 세션에서 확인해주세요."
+        }
         guard session.canReveal else {
             return session.phase == .ended ? "종료된 세션의 터미널로 이동할 수 없습니다."
                 : "이 세션의 터미널 연결을 먼저 설정하세요. VS Code는 확장이 필요합니다."
@@ -75,7 +83,7 @@ enum AppHelp {
         case .delivered: return "승인 또는 질문 응답을 전달한 기록입니다. 명령 실행이 성공했다는 뜻은 아닙니다."
         case .review: return "승인 전달에 실패했거나 결과를 확인하지 못했습니다. 상세 내역의 사유를 확인하세요."
         case .manual: return "자동으로 답하지 않고 원래 터미널에서 직접 확인하도록 넘긴 요청입니다."
-        case .queued: return "답변을 Codex 메시지 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달되며, 처리 완료를 뜻하지 않습니다."
+        case .queued: return "답변을 저장하고 연결된 도구에 전달할 차례를 기다리고 있습니다. 아직 응답 전달이나 작업 완료를 확인한 상태는 아닙니다."
         }
     }
 }

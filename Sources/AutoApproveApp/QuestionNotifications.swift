@@ -25,7 +25,7 @@ import AutoApproveCore
     var status: String {
         if busy { return "macOS 권한 창에서 알림을 허용해주세요" }
         switch authorization {
-        case .authorized, .provisional: return "허용됨 · 응답이 필요한 질문과 작업 완료를 알립니다"
+        case .authorized, .provisional: return "허용됨 · 작업 완료와 오래 기다리는 질문을 알립니다"
         case .denied: return "알림 꺼짐 · 시스템 설정에서 허용해주세요"
         default: return "알림 허용 필요"
         }
@@ -95,13 +95,30 @@ import AutoApproveCore
         center.removePendingNotificationRequests(withIdentifiers: Array(removed))
         center.removeDeliveredNotifications(withIdentifiers: Array(removed))
         active = next
+        let read = requests.filter { engine.isNotificationRead(sessionID: $0.originSessionID ?? $0.sessionID, sourceKey: $0.notificationKey) }
+        for request in read {
+            deliveries.removeValue(forKey: request.id)?.cancel()
+            submitted.insert(request.id)
+        }
+        center.removePendingNotificationRequests(withIdentifiers: read.map(\.id))
+        center.removeDeliveredNotifications(withIdentifiers: read.map(\.id))
         guard allowed else { return }
         for request in requests where !submitted.contains(request.id) && deliveries[request.id] == nil {
+            let observedAt = Date()
             deliveries[request.id] = Task { [weak self] in
-                // A follow-up hook or queued turn can resume work just after a final response.
-                let delay: UInt64 = request.kind == .completion ? 3_000_000_000 : 800_000_000
-                do { try await Task.sleep(nanoseconds: delay) } catch { return }
-                guard let self, self.active[request.id] != nil, self.allowed else { return }
+                // Only interrupt for a sustained unanswered question. Automatic replies
+                // and short pauses resolve before this delay and cancel the task above.
+                // Re-read the setting without restarting the elapsed wait or redelivering
+                // an existing alert. Completion retains its three-second grace period.
+                while true {
+                    guard let self, self.active[request.id] != nil, self.allowed else { return }
+                    let delay = request.kind == .completion ? 3 : self.engine.snapshot.questionNotificationDelay
+                    let remaining = observedAt.addingTimeInterval(TimeInterval(delay)).timeIntervalSinceNow
+                    if remaining <= 0 { break }
+                    do { try await Task.sleep(nanoseconds: UInt64(min(remaining, 1) * 1_000_000_000)) } catch { return }
+                }
+                guard let self, self.active[request.id] != nil, self.allowed,
+                      !self.engine.isNotificationRead(sessionID: request.originSessionID ?? request.sessionID, sourceKey: request.notificationKey) else { return }
                 let content = UNMutableNotificationContent()
                 content.title = request.title
                 content.subtitle = request.agent
@@ -131,7 +148,11 @@ import AutoApproveCore
                                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let id = notification.request.identifier
         Task { @MainActor [weak self] in
-            completionHandler(self?.active[id] == nil ? [] : [.banner, .list, .sound])
+            guard let self, let request = self.active[id],
+                  !self.engine.isNotificationRead(sessionID: request.originSessionID ?? request.sessionID, sourceKey: request.notificationKey) else {
+                completionHandler([]); return
+            }
+            completionHandler([.banner, .list, .sound])
         }
     }
 
@@ -143,7 +164,7 @@ import AutoApproveCore
             defer { completionHandler() }
             guard let self, let sessionID,
                   action == UNNotificationDefaultActionIdentifier || action == Self.openAction else { return }
-            do { try await self.openSession(sessionID) }
+            do { try await self.openSession(sessionID); try self.engine.markNotificationsRead(sessionID) }
             catch {
                 NSApp.activate(ignoringOtherApps: true)
                 let alert = NSAlert()

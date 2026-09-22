@@ -1,4 +1,4 @@
-import { copyFile, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,9 @@ if (!['arm64', 'x86_64', 'arm64-x86_64'].includes(architecture) || architectures
 const platform = architecture === 'arm64-x86_64' ? 'universal' : architecture;
 const filename = `AutoApprove-${version}-macOS-${platform}.dmg`;
 const output = path.join(dist, filename);
+const installer = path.join(root, 'scripts/install.command');
+const installerName = '설치 및 실행.command';
+execFileSync('/bin/bash', ['-n', installer], { stdio: 'inherit' });
 execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app], { stdio: 'inherit' });
 
 const temporary = await mkdtemp(path.join(tmpdir(), 'autoapprove-dmg-'));
@@ -34,6 +37,8 @@ try {
   execFileSync('/usr/bin/ditto', ['--noqtn', app, path.join(staging, 'AutoApprove.app')], { stdio: 'inherit' });
   await symlink('/Applications', path.join(staging, 'Applications'));
   await copyFile(path.join(root, 'docs/INSTALL.txt'), path.join(staging, '설치 안내.txt'));
+  await copyFile(installer, path.join(staging, installerName));
+  await chmod(path.join(staging, installerName), 0o755);
   execFileSync('/usr/bin/hdiutil', ['create', '-volname', `AutoApprove ${version}`, '-srcfolder', staging, '-fs', 'HFS+', '-format', 'UDZO', '-imagekey', 'zlib-level=9', image], { stdio: 'inherit' });
   execFileSync('/usr/bin/hdiutil', ['verify', image], { stdio: 'inherit' });
   execFileSync('/usr/bin/hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mounted, image], { stdio: 'inherit' });
@@ -42,6 +47,10 @@ try {
   if (await readlink(path.join(mounted, 'Applications')) !== '/Applications') throw new Error('Invalid Applications shortcut');
   if (!(await readFile(path.join(mounted, '설치 안내.txt'))).equals(await readFile(path.join(root, 'docs/INSTALL.txt')))) {
     throw new Error('Installation instructions differ from source');
+  }
+  if (!(await readFile(path.join(mounted, installerName))).equals(await readFile(installer)) ||
+      ((await stat(path.join(mounted, installerName))).mode & 0o111) !== 0o111) {
+    throw new Error('Installer differs from source or is not executable');
   }
   console.log(`Contents: ${(await readdir(mounted)).join(', ')}`);
   execFileSync('/usr/bin/hdiutil', ['detach', mounted], { stdio: 'inherit' });

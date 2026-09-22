@@ -5,8 +5,8 @@ import Foundation
 public struct YesNoConfirmation {
     public let question: String
     public let answer: String
-    private static let affirmativeWords = "예|네|yes|allow"
-    private static let denialWords = "아니오|아니요|no|deny|don't allow|do not allow"
+    private static let affirmativeWords = "예|네|허용|yes|allow"
+    private static let denialWords = "아니오|아니요|거부|취소|no|deny|cancel|don't allow|do not allow"
 
     public static func detect(_ question: QueuedQuestion) -> YesNoConfirmation? {
         detect(["questions": [[
@@ -36,13 +36,13 @@ public struct YesNoConfirmation {
             return YesNoConfirmation(question: question, answer: labels[index])
         }
         let yes = labels.indices.filter { index in
-            let label = cleaned(labels[index])
+            let label = permissionLabel(labels[index])
             guard let tail = affirmativeTail(label),
                   !isRepeatedPermission(tail), !isRepeatedPermission("allow " + tail),
                   !isRepeatedPermission(options[index]["description"] as? String ?? "") else { return false }
             return hasAnswer(label, words: affirmativeWords) || isCurrentPermission(tail) || isCurrentPermission("allow " + tail)
         }
-        let no = labels.indices.filter { hasAnswer(cleaned(labels[$0]), words: denialWords) }
+        let no = labels.indices.filter { hasAnswer(permissionLabel(labels[$0]), words: denialWords) }
         guard yes.count == 1, no.count == 1, yes[0] != no[0] else { return nil }
         return YesNoConfirmation(question: question, answer: labels[yes[0]])
     }
@@ -64,8 +64,31 @@ public struct YesNoConfirmation {
 
     private static func affirmativeTail(_ label: String) -> String? {
         let text = cleaned(label)
-        guard let prefix = text.range(of: #"(?i)^(?:yes|예|네|allow)(?=$|[\s,，:：—–-])[\s,，:：—–-]*"#, options: .regularExpression) else { return nil }
+        guard let prefix = text.range(of: "(?i)^(?:" + affirmativeWords + #")(?=$|[\s,，:：—–-])[\s,，:：—–-]*"#, options: .regularExpression) else { return nil }
         return String(text[prefix.upperBound...])
+    }
+
+    /// Codex renders tool permission labels and descriptions in two columns. Match
+    /// only these complete descriptions, including when a narrow terminal wraps them.
+    private static func permissionLabel(_ value: String) -> String {
+        let text = cleaned(value)
+        let descriptions = [
+            ("Allow", "Run the tool and continue."),
+            ("Allow for this session", "Run the tool and remember this choice for this session."),
+            ("Always allow", "Run the tool and remember this choice for future tool calls."),
+            ("Allow and don't ask me again", "Run the tool and remember this choice for future tool calls."),
+            ("Cancel", "Cancel this tool call.")
+        ]
+        for (label, description) in descriptions where text.caseInsensitiveCompare(cleaned(label + " " + description)) == .orderedSame {
+            return label
+        }
+        return text
+    }
+
+    static func isToolPermissionMenu(_ labels: [String]) -> Bool {
+        let labels = labels.map { permissionLabel($0).lowercased() }
+        return labels.count == 4 && labels[0] == "allow" && labels[1] == "allow for this session"
+            && ["always allow", "allow and don't ask me again"].contains(labels[2]) && labels[3] == "cancel"
     }
 
     private static func isCurrentPermission(_ tail: String) -> Bool {
@@ -87,7 +110,8 @@ public struct YesNoConfirmation {
         guard labels.count >= 2 else { return nil }
         var current: [Int] = [], denials = 0
         for (index, label) in labels.enumerated() {
-            if hasAnswer(cleaned(label), words: denialWords) { denials += 1; continue }
+            let label = permissionLabel(label)
+            if hasAnswer(label, words: denialWords) { denials += 1; continue }
             if isRepeatedPermission(label) { continue }
             guard let tail = affirmativeTail(label) else { return nil }
             if isRepeatedPermission(tail) || isRepeatedPermission("allow " + tail) { continue }

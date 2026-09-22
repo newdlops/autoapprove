@@ -9,6 +9,67 @@ private func startInput(_ question: String = startQuestion, labels: [String] = [
 }
 
 extension ApprovalTests {
+    func testKoreanPermissionLabels() throws {
+        let cases: [([String], Int)] = [
+            (["허용", "항상 허용", "거부"], 0),
+            (["항상 허용", "거부", "허용"], 2),
+            (["거부", "허용 (추천)", "항상 허용"].map(\.decomposedStringWithCanonicalMapping), 1),
+            (["허용 (a)", "항상\n허용 (s)", "거부 (esc)"], 0),
+            (["허용", "거부"], 0), (["거부", "허용, 이번 요청만 허용"], 1),
+            (["허용", "Always allow", "Deny"], 0), (["Allow", "항상 허용", "거부"], 0)
+        ]
+        for (labels, index) in cases {
+            let input = startInput(labels: labels)
+            let confirmation = YesNoConfirmation.detect(input)
+            try expectEqual(confirmation?.answer, labels[index])
+            try expectEqual((confirmation?.updatedInput(input)["answers"] as? [String: String])?[startQuestion], labels[index])
+            try expectEqual(YesNoConfirmation.detect(QueuedQuestion(id: "korean-allow", threadID: "fixture", title: startQuestion, options: labels))?.answer, labels[index])
+        }
+        for labels in [["항상 허용", "거부"], ["허용, 항상 허용", "거부"],
+                       ["허용", "허용", "거부"], ["허용", "예", "거부"],
+                       ["허용", "다른 프로젝트", "거부"], ["허용목록", "항상 허용", "거부"],
+                       ["허용됨", "거부"], ["허용", "거부됨"]] {
+            try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "No unique current-request answer: \(labels)")
+        }
+        let scoped: JSONObject = ["questions": [["question": startQuestion, "options": [
+            ["label": "허용", "description": "이 세션에서는 항상 허용"], ["label": "거부"]
+        ]]]]
+        try expectNil(YesNoConfirmation.detect(scoped))
+        for agent: AgentKind in [.claude, .codex] {
+            let heading = agent == .claude ? "Do you want to proceed?" : "Would you like to run the following command?"
+            let screen = heading + "\n❯ 1. 허용 (a)\n  2. 항상\n     허용 (s)\n  3. 거부 (esc)\nPress enter to confirm or esc to cancel"
+            try expectEqual(PromptDetector.detect(screen, agent: agent)?.answer, "1")
+            try expectNotNil(PromptDetector.detect(screen.decomposedStringWithCanonicalMapping, agent: agent))
+            try expectNil(PromptDetector.detect(screen.replacingOccurrences(of: "❯ 1.", with: "  1.").replacingOccurrences(of: "  2.", with: "❯ 2."), agent: agent))
+            try expectNil(PromptDetector.detect(screen + "\n❯ 새 질문", agent: agent))
+        }
+    }
+
+    func testKoreanPermissionHookResponseAndAudit() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-korean-allow-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory))
+        let input = startInput("이 요청을 허용할까요?", labels: ["항상 허용", "거부", "허용"])
+        var payload: JSONObject = ["session_id": "korean-allow", "requestID": "off", "tool_use_id": "off",
+            "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": input]
+        try expect(engine.handleHook(payload).isEmpty)
+        try engine.setAutomatic("claude:korean-allow", enabled: true)
+        for event in ["PreToolUse", "PermissionRequest"] {
+            payload["hook_event_name"] = event; payload["requestID"] = event; payload["tool_use_id"] = event
+            let output = engine.handleHook(payload)["hookSpecificOutput"] as? JSONObject
+            let decision = event == "PreToolUse" ? output : output?["decision"] as? JSONObject
+            try expectEqual(decision?[event == "PreToolUse" ? "permissionDecision" : "behavior"] as? String, "allow")
+            let updated = decision?["updatedInput"] as? JSONObject
+            try expectEqual((updated?["answers"] as? [String: String])?["이 요청을 허용할까요?"], "허용")
+            try expectEqual(try JSONSerialization.data(withJSONObject: updated?["questions"] ?? [], options: [.sortedKeys]),
+                            try JSONSerialization.data(withJSONObject: input["questions"]!, options: [.sortedKeys]))
+            try expect(engine.handleHook(payload).isEmpty, "Do not answer the same Korean permission question twice")
+        }
+        let delivered = engine.snapshot.events.filter { $0.outcome == "질문 응답 전달" }
+        try expectEqual(delivered.count, 2)
+        try expect(delivered.allSatisfy { $0.answer == "허용" })
+    }
+
     func testAllowConfirmationLabels() throws {
         let cases: [([String], Int)] = [
             (["Deny", "Allow"], 1), (["allow (Recommended)", "Don't allow"], 0),
@@ -17,7 +78,9 @@ extension ApprovalTests {
             (["Allow once", "Deny"], 0), (["Allow this request only", "Don't allow"], 0),
             (["Always allow", "Deny", "Allow once (Recommended)"], 2),
             (["Allow for this session", "Allow", "Don't allow"], 1),
-            (["No", "Allow this time", "Yes, don't ask again"], 1)
+            (["No", "Allow this time", "Yes, don't ask again"], 1),
+            (["Allow", "Cancel"], 0),
+            (["Allow", "Allow for this session", "Always allow", "Cancel"], 0)
         ]
         for (labels, index) in cases {
             let input = startInput(labels: labels)
@@ -40,6 +103,33 @@ extension ApprovalTests {
             let title = agent == .codex ? "Would you like to run the following command?\n\n$ printf fixture" : "Do you want to proceed?"
             let screen = title + "\n› 1. Allow once\n  2. Always allow\n  3. Don't allow\nPress enter to confirm or esc to cancel"
             try expectEqual(PromptDetector.detect(screen, agent: agent)?.answer, "1")
+        }
+    }
+
+    func testCodexToolPermissionColumnsAndCancellation() throws {
+        let options = """
+        › 1. Allow                   Run the tool and continue.
+          2. Allow for this session  Run the tool and remember this choice for this session.
+          3. Always allow            Run the tool and remember this choice for future tool calls.
+          4. Cancel                  Cancel this tool call
+        """
+        for heading in ["Allow preview?", "Allow preview", "Approve app tool call?", "Would you like to run the following command?"] {
+            let screen = heading + "\nTool: preview\nURL: http://localhost:4173\n" + options + "\nPress enter to submit or esc to cancel"
+            let prompt = PromptDetector.detect(screen, agent: .codex)
+            try expectEqual(prompt?.answer, "1", "Recognize the supplied four-choice tool permission")
+            try expectEqual(prompt?.dialog, screen, "Final validation keeps the complete unmodified dialog")
+            let wrapped = screen.replacingOccurrences(of: "remember this choice for", with: "remember this\n                             choice for")
+            try expectEqual(PromptDetector.detect(wrapped, agent: .codex)?.requestIdentity, prompt?.requestIdentity)
+            for invalid in [
+                screen.replacingOccurrences(of: "Run the tool and continue.", with: "Run another tool instead."),
+                screen.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "  2.", with: "› 2."),
+                screen + "\n› Next message", "```\n" + screen,
+                screen.replacingOccurrences(of: "Press enter to submit or esc to cancel", with: "")
+            ] { try expectNil(PromptDetector.detect(invalid, agent: .codex)) }
+        }
+        try expectNil(PromptDetector.detect("Which project should run first?\n" + options + "\nEnter to submit", agent: .codex))
+        for labels in [["Allow preview", "Allow production", "Cancel"], ["Allow", "Run tests", "Always allow", "Cancel"], ["Allow", "Cancel", "Deny"]] {
+            try expectNil(YesNoConfirmation.detect(startInput(labels: labels)))
         }
     }
 

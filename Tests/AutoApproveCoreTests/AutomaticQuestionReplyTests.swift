@@ -67,17 +67,29 @@ extension ApprovalTests {
         let probe = AutomaticReplyProbe()
         let transport = CodexReplyTransport(prepare: { _, question in await probe.prepare(question) },
             send: { target, message in await probe.send(target, message) })
-        var fixture = try AutomaticReplyFixture(root: root, name: "allow", transport: transport)
-        defer { fixture.engine.stop() }
-        fixture.question.options = ["Don’t allow", "Always allow", "Allow once (Recommended)"]
-        let observed = Date()
-        fixture.observe()
-        try expectEqual(fixture.automation?.answer, "Allow once (Recommended)")
-        try await waitForAutomaticReply { await probe.count == 1 }
-        try expect((await probe.deliveries[0].date).timeIntervalSince(observed) >= 5)
-        try expect((await probe.deliveries[0].message).hasSuffix("\n\nAllow once (Recommended)"))
-        try expectEqual(fixture.reply?.phase, .queued)
-        try expectEqual(fixture.engine.snapshot.events.first?.answer, "Allow once (Recommended)")
+        var fixtures: [(AutomaticReplyFixture, Date, String)] = []
+        defer { fixtures.forEach { $0.0.engine.stop() } }
+        for (name, options, answer) in [
+            ("allow", ["Don’t allow", "Always allow", "Allow once (Recommended)"], "Allow once (Recommended)"),
+            ("korean-allow", ["항상 허용", "거부", "허용 (추천)"], "허용 (추천)")
+        ] {
+            var fixture = try AutomaticReplyFixture(root: root, name: name, transport: transport)
+            fixture.question.options = options
+            let observed = Date()
+            fixture.observe()
+            try expectEqual(fixture.automation?.answer, answer)
+            fixtures.append((fixture, observed, answer))
+        }
+        try await waitForAutomaticReply { await probe.count == fixtures.count }
+        let deliveries = await probe.deliveries
+        for (fixture, observed, answer) in fixtures {
+            let delivery = deliveries.first { $0.thread == fixture.question.threadID }
+            try expectNotNil(delivery)
+            try expect((delivery?.date.timeIntervalSince(observed) ?? 0) >= 5)
+            try expect(delivery?.message.hasSuffix("\n\n" + answer) == true)
+            try expectEqual(fixture.reply?.phase, .queued)
+            try expectEqual(fixture.engine.snapshot.events.first?.answer, answer)
+        }
     }
 
     func testAutomaticQuestionReplyWaitsFiveSecondsPerQuestion() async throws {
@@ -98,6 +110,8 @@ extension ApprovalTests {
         defer { fixture.engine.stop() }
         let originalDeadline = fixture.automation?.deadline
         try expectEqual(fixture.automation?.phase, .scheduled)
+        var tracker = AttentionTracker()
+        try expect(tracker.update(fixture.engine.snapshot).isEmpty, "A scheduled Codex reply needs no manual alert")
         try expect((originalDeadline?.timeIntervalSince(firstObserved) ?? 0) >= 5)
         do {
             try await fixture.engine.replyToQuestion(sessionID: "unrelated", questionID: fixture.question.id, answer: "No")
@@ -107,6 +121,8 @@ extension ApprovalTests {
         }
         try await Task.sleep(nanoseconds: 2_000_000_000)
         try expectEqual(await probe.count, 0, "The response must wait five seconds")
+        fixture.engine.refreshNotices()
+        try expectEqual(fixture.engine.snapshot.sessions[0].unreadNoticeCount, 0, "A scheduled Codex reply must not create a badge")
         let secondObserved = Date()
         let second = QueuedQuestion(id: "codex:delay:question:1", threadID: "delay", title: "다음 질문도 진행할까요?",
             options: ["Yes, don’t ask again (a)", "No (esc)", "Yes, proceed (y)"])

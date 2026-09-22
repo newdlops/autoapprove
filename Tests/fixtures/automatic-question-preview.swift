@@ -83,17 +83,24 @@ import AutoApproveCore
         guard let window = NSApp.keyWindow else { return }
         window.setFrame(NSRect(origin: window.frame.origin, size: compact ? NSSize(width: 784, height: 612) : NSSize(width: 1040, height: 700)), display: true)
     }
+
+    func resizeHelp(compact: Bool) {
+        guard let window = NSApp.keyWindow, window.identifier?.rawValue == "help" else { return }
+        window.setContentSize(compact ? NSSize(width: 520, height: 540) : NSSize(width: 620, height: 660))
+    }
 }
 
 @main struct AutomaticQuestionPreviewApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var fixture = AutomaticQuestionPreview()
     var body: some Scene {
-        Window("응답 자동화 · 검증용 데이터", id: "automatic-questions") {
+        Window("응답 자동화 · 검증용 데이터", id: "main") {
             SessionWindow(engine: fixture.engine, notifications: fixture.notifications, openTerminal: { _, _ in })
         }
         .defaultSize(width: 1040, height: 648)
         .windowResizability(.contentMinSize)
         .commands {
+            AppCommands(connectionsAvailable: true)
             CommandMenu("검증") {
                 Button("새 질문 · 5초 후 Yes") { fixture.show("automatic") }.keyboardShortcut("n")
                 Button("새 질문 · 5초 후 Allow") { fixture.show("allow") }.keyboardShortcut("a", modifiers: [.command, .shift])
@@ -106,7 +113,18 @@ import AutoApproveCore
                 Divider()
                 Button("기본 창 1040×700") { fixture.resize(compact: false) }.keyboardShortcut("1")
                 Button("최소 창 784×612") { fixture.resize(compact: true) }.keyboardShortcut("2")
+                Button("도움말 기본 620×660") { fixture.resizeHelp(compact: false) }.keyboardShortcut("3")
+                Button("도움말 최소 520×540") { fixture.resizeHelp(compact: true) }.keyboardShortcut("4")
             }
         }
+        Window("승인 내역", id: "history") {
+            AuditHistoryWindow(engine: fixture.engine)
+        }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize).commandsRemoved()
+        Window("연결 설정", id: "settings") {
+            ConnectionSettings(engine: fixture.engine, notifications: fixture.notifications)
+        }.windowResizability(.contentSize).commandsRemoved()
+        Window("AutoApprove 도움말", id: "help") {
+            HelpWindow()
+        }.defaultSize(width: 620, height: 660).windowResizability(.contentMinSize).commandsRemoved()
     }
 }

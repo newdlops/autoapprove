@@ -24,7 +24,8 @@ public enum HookInstaller {
             }
             if let executable {
                 let prefix = home.map { "AUTOAPPROVE_HOME=" + quote($0) + " " } ?? ""
-                groups.append(["matcher": "", "hooks": [["type": "command", "command": prefix + quote(executable) + " hook --autoapprove-managed", "timeout": 4]]])
+                let timeout = ["PreToolUse", "PermissionRequest"].contains(event) ? 660 : 10
+                groups.append(["matcher": "", "hooks": [["type": "command", "command": prefix + quote(executable) + " hook --autoapprove-managed", "timeout": timeout]]])
             }
             if groups.isEmpty { hooks.removeValue(forKey: event) } else { hooks[event] = groups }
         }
@@ -35,6 +36,38 @@ public enum HookInstaller {
         guard let data = try? Data(contentsOf: url), let settings = (try? JSONSerialization.jsonObject(with: data)) as? JSONObject,
               let hooks = settings["hooks"] as? [String: [JSONObject]] else { return false }
         return (hooks["PermissionRequest"] ?? []).contains { (($0["hooks"] as? [JSONObject]) ?? []).contains(where: owned) }
+    }
+    /// Upgrade only this installed helper's time budget. Never reconnect removed hooks or steal another app's hooks.
+    @discardableResult public static func upgradeTimeouts(executable: String, url: URL = settingsURL) throws -> URL? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        guard var settings = try JSONSerialization.jsonObject(with: data) as? JSONObject,
+              settings["disableAllHooks"] as? Bool != true,
+              var hooks = settings["hooks"] as? [String: [JSONObject]] else { return nil }
+        var changed = false
+        for event in events {
+            guard var groups = hooks[event] else { continue }
+            for index in groups.indices {
+                guard var handlers = groups[index]["hooks"] as? [JSONObject] else { continue }
+                for position in handlers.indices {
+                    guard owned(handlers[position]), let command = handlers[position]["command"] as? String,
+                          command.hasSuffix(quote(executable) + " hook --autoapprove-managed") else { continue }
+                    let timeout = ["PreToolUse", "PermissionRequest"].contains(event) ? 660 : 10
+                    if (handlers[position]["timeout"] as? Int ?? 0) < timeout {
+                        handlers[position]["timeout"] = timeout; changed = true
+                    }
+                }
+                groups[index]["hooks"] = handlers
+            }
+            hooks[event] = groups
+        }
+        guard changed else { return nil }
+        settings["hooks"] = hooks
+        let updated = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        let backup = url.appendingPathExtension("autoapprove-\(UUID().uuidString.prefix(8)).backup")
+        try data.write(to: backup, options: .atomic)
+        try updated.write(to: url, options: .atomic)
+        return backup
     }
     public static func install(executable: String?, url: URL = settingsURL, home: String? = nil) throws -> URL? {
         let exists = FileManager.default.fileExists(atPath: url.path)

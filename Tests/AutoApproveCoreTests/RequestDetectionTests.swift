@@ -125,6 +125,9 @@ extension ApprovalTests {
         }
         try check("Changed history\n" + permissionFixture.decomposedStringWithCanonicalMapping + "\n\n", expected: "Old history\n" + permissionFixture, delivery: "sent", writes: 1)
         try check(reportedCodexPermissionFixture, expected: reportedCodexPermissionFixture, delivery: "sent", writes: 1)
+        let toolPermission = "Allow preview?\nTool: preview\n› 1. Allow                   Run the tool and continue.\n  2. Allow for this session  Run the tool and remember this choice for this session.\n  3. Always allow            Run the tool and remember this choice for future tool calls.\n  4. Cancel                  Cancel this tool call\nEnter to submit or esc to cancel"
+        try check(toolPermission, expected: toolPermission, delivery: "sent", writes: 1)
+        try check(toolPermission.replacingOccurrences(of: "Tool: preview", with: "Tool: changed"), expected: toolPermission, delivery: "screenChanged", writes: 0)
         for changed in [permissionFixture.replacingOccurrences(of: "echo 한글", with: "echo changed"), permissionFixture.replacingOccurrences(of: "  $", with: " $"), permissionFixture.replacingOccurrences(of: "› 1.", with: "  1."), permissionFixture + "\n› Next input"] {
             try check(changed, delivery: "screenChanged", writes: 0)
         }
@@ -132,6 +135,13 @@ extension ApprovalTests {
         try check(permissionFixture, tty: "/dev/another", delivery: "missingTarget", writes: 0)
         try check(claudePermissionFixture.decomposedStringWithCanonicalMapping, expected: claudePermissionFixture, agent: .claude, processes: ["claude"], delivery: "sent", writes: 1)
         try check(claudePermissionFixture.replacingOccurrences(of: "echo 한글", with: "echo changed"), expected: claudePermissionFixture, agent: .claude, processes: ["claude"], delivery: "screenChanged", writes: 0)
+        for agent in [AgentKind.claude, .codex] {
+            let heading = agent == .claude ? "Do you want to proceed?" : "Would you like to run the following command?"
+            let korean = heading + "\n❯ 1. 허용\n  2. 항상 허용\n  3. 거부\nEnter to confirm or esc to cancel"
+            try check(korean.decomposedStringWithCanonicalMapping, expected: korean, agent: agent, processes: [agent.rawValue], delivery: "sent", writes: 1)
+            let changed = korean.replacingOccurrences(of: "❯ 1.", with: "  1.").replacingOccurrences(of: "  2.", with: "❯ 2.")
+            try check(changed, expected: korean, agent: agent, processes: [agent.rawValue], delivery: "screenChanged", writes: 0)
+        }
     }
 
     func testTerminalConnectionLifecycle() async throws {

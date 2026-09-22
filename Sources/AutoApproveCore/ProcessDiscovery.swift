@@ -80,7 +80,11 @@ public enum ProcessDiscovery {
             guard !parents.contains(where: { $0.agent != nil && $0.tty == record.tty }) else { return nil }
             // A nested PTY may belong to a background agent, not the ancestor's Terminal tab.
             let terminalParents = parents.prefix { $0.tty == "??" || $0.tty == record.tty }
-            let terminal: TerminalKind = terminalParents.contains(where: { $0.executable.contains("Visual Studio Code.app/") }) ? .vscode
+            let backgroundClaude = agent == .claude && terminalParents.contains {
+                $0.tty == "??" && ($0.executable.hasSuffix("/ClaudeCode.app/Contents/MacOS/claude") || $0.executable == "claude bg-pty-host")
+            }
+            let terminal: TerminalKind = backgroundClaude ? .claudeBackground
+                : terminalParents.contains(where: { $0.executable.contains("Visual Studio Code.app/") }) ? .vscode
                 : terminalParents.contains(where: { $0.executable.hasSuffix("Terminal.app/Contents/MacOS/Terminal") }) ? .terminal : .unknown
             return AgentSession(id: record.key, agent: agent, pid: record.pid, started: record.started, tty: "/dev/\(record.tty)", cwd: "", terminal: terminal)
         }
