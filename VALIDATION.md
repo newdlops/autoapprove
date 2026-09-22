@@ -2,6 +2,15 @@
 
 최신 검증일: 2026-09-23. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.26 앱을 드래그하는 DMG 배포
+
+- 사용자 요청에 따라 기본 배포를 앱·Applications 바로가기·설치 안내를 담은 DMG로 변경했다. PKG 생성기를 기본 배포 경로에서 제거했고 최신 릴리스에는 DMG와 체크섬만 게시한다. 설치는 Finder에서 앱을 복사하고 응용 프로그램 폴더에서 여는 방식이다. 이 경로에서는 이전 PKG의 quarantine 제거 스크립트가 실행되지 않음을 설치 안내에 명시했다.
+- 기존 GitHub 업로드 후 내려받아 둔 0.2.25 PKG·DMG는 공개한 SHA-256과 일치했고, 0.2.25 앱의 `codesign --verify --deep --strict`도 통과했다. PKG의 `pkgutil --check-signature` 결과는 `no signature`다. 사용자가 경고를 본 원본 파일이나 정확한 경고 문구는 확보하지 못했으므로, 사용자 환경의 ‘손상됨’ 원인을 파일 손상 또는 실행 차단으로 단정하지 않는다.
+- 최종 **0.2.26 · 빌드 30** DMG의 이미지 체크섬, 읽기 전용 마운트, 내장 앱 코드 서명, 원본과 앱 실행 파일·helper·Info.plist의 바이트 일치, Applications 링크, 설치 안내를 확인했다. DMG 최상위의 정확한 세 항목을 검사해 PKG나 실행 스크립트가 섞이지 않게 했다. 한글 파일명은 HFS+ 정규화 차이를 반영해 비교한다.
+- 실제 최종 DMG에서 앱을 별도 임시 폴더로 복사한 뒤 코드 서명·버전·파일 일치를 확인했다. 보고서: `.runtime/releases/0.2.26/verification.json`. Finder 드래그 자체를 수행한 검사는 아니며, 시스템 Applications의 기존 앱을 바꾸거나 새 앱을 실행하지 않았다. Finder 화면 조회가 응답하지 않아 이번 실제 Finder 화면·최초 경고 이후 실행의 시각/동작 검증은 완료하지 못했다.
+- Swift 코드는 변경하지 않고 이전에 검증한 릴리스 바이너리를 패키징했다. 새 설치 방법은 Developer ID 서명·공증을 추가하거나 macOS 실행 경고가 없어졌음을 뜻하지 않는다. 개발자 확인 경고의 최초 허용은 [Apple 안내](https://support.apple.com/ko-kr/102445)를 따르며 ‘손상됨’ 경고는 재다운로드 후 파일 이름과 원문으로 원인을 확인하도록 구분했다.
+- `node --check scripts/package-dmg.mjs`, `git diff --check` 통과. DMG SHA-256: `fd851d7ba044566c87bf47660b1b5e7bb5a8b5084169c7e7f19568ac9fa6f8c9`. [v0.2.26 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.26)의 배포 파일로 사용한다.
+
 ## 0.2.25 터미널 없는 macOS 설치 패키지
 
 - 기본 설치물을 `.pkg`로 변경했다. macOS Installer가 설치 단계·관리자 인증·기존 앱 종료 확인을 제공하고, 설치 스크립트는 해당 앱의 서명을 검증한 뒤 quarantine만 제거한다. 앱 열기는 현재 데스크톱 사용자의 UID로 위임하며 로그인 사용자가 없으면 건너뛴다. 앱 열기 실패는 설치 실패와 구분하고 응용 프로그램 폴더에서 여는 방법을 안내한다. DMG에는 `AutoApprove 설치.pkg`와 `설치 안내.txt`만 제공한다.
