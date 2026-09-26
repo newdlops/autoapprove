@@ -145,9 +145,10 @@ extension ApprovalTests {
             ["Yes", "Yes, approve for this session", "Yes, allow all edits during this session", "No"],
             ["예", "예, 앞으로 묻지 않기", "아니오"],
             ["아니오", "예, 이 세션에서는 항상 허용", "예, 이번 요청만 허용"],
-            ["네", "네, 이후에도 허용", "네, 항상 승인", "아니요"].map(\.decomposedStringWithCanonicalMapping)
+            ["네", "네, 이후에도 허용", "네, 항상 승인", "아니요"].map(\.decomposedStringWithCanonicalMapping),
+            ["Yes", "Yes, and don’t ask again for: npm run *", "Yes, and switch to auto mode · auto mode handles these prompts for you", "No"]
         ]
-        let expected = [0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0]
+        let expected = [0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0]
         for (index, labels) in cases.enumerated() {
             let input = startInput(labels: labels)
             let answer = YesNoConfirmation.detect(input)
@@ -170,7 +171,8 @@ extension ApprovalTests {
             ["Yes", "Yes, don't ask again", "Choose another project", "No"],
             ["Yes, don't ask again", "Yes, always allow", "No"],
             ["Yes", "Yes, don't ask again", "Yes, always allow"],
-            ["Yes", "Yes, don't ask again", "No", "No, choose another task"]
+            ["Yes", "Yes, don't ask again", "No", "No, choose another task"],
+            ["Yes", "Yes, and switch to the production branch for this session", "No"]
         ] {
             try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "Keep distinct/ambiguous choices manual: \(labels)")
         }

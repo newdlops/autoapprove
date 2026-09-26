@@ -97,11 +97,13 @@ public struct YesNoConfirmation {
 
     private static func isRepeatedPermission(_ value: String) -> Bool {
         let text = cleaned(value)
-        let english = #"(?i)^(?:and\s+)?(?:(?:don't|do not) ask(?: me)?(?: for (?:approval|permission))? again(?: (?:for|in|during) .+| this session)?|always allow(?: .+)?|(?:allow|approve) (?:all (?:edits|commands|changes) )?(?:for|during|in) (?:this|the) (?:session|project|folder)|allow all (?:edits|commands|changes))$"#
+        let english = #"(?i)^(?:and\s+)?(?:(?:don't|do not) ask(?: me)?(?: for (?:approval|permission))? again(?: (?:for:?|in|during) .+| this session)?|always allow(?: .+)?|(?:allow|approve) (?:all (?:edits|commands|changes) )?(?:for|during|in) (?:this|the) (?:session|project|folder)|allow all (?:edits|commands|changes)|allow reading from .+ (?:from this project|during this session))$"#
+        // Claude Code also offers its permission modes; each changes only later prompts.
+        let mode = #"(?i)^(?:and\s+)?(?:(?:switch to|use) auto mode(?: · .+)?|switch to (?:default|accept edits|auto|don't ask|plan mode|bypass permissions)(?: \([^)]*\))? for this session)$"#
         let scope = #"(?:앞으로|이후(?:에도|부터)?|이(?:번)?\s*(?:세션|프로젝트|폴더|명령)(?:에서(?:는)?|\s*동안(?:에는)?|에\s*대해서(?:는)?)?)"#
         let korean = "^(?:" + scope + #"\s*)?(?:(?:다시|매번)\s*)?묻지\s*않(?:기|음|습니다|아도\s*됩니다|고\s*(?:허용|승인)(?:하기|합니다)?)$"#
         let allow = "^(?:" + scope + #"\s*(?:(?:항상|자동으로|계속)\s*)?|(?:항상|자동으로|계속)\s*)(?:허용|승인)(?:하기|합니다|해\s*주세요)?$"#
-        return [english, korean, allow].contains { text.range(of: $0, options: .regularExpression) != nil }
+        return [english, mode, korean, allow].contains { text.range(of: $0, options: .regularExpression) != nil }
     }
 
     /// Every extra affirmative option must change only the future permission scope.

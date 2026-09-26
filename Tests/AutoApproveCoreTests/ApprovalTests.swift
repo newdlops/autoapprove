@@ -34,7 +34,10 @@ import AutoApproveCore
             for repeated in ["Yes, don't ask again", "Yes, don't ask again (a)", "Yes, don’t ask again (a)",
                              "Yes, and don't ask again for commands that start with `npm test` (p)",
                              "Yes, don't ask\n     again for this session (a)",
-                             "Yes, allow all edits during this session", "예, 이 세션에서는 항상 허용"] {
+                             "Yes, allow all edits during this session", "예, 이 세션에서는 항상 허용",
+                             "Yes, and don’t ask again for: npm run *", "Yes, allow reading from src/ from this project",
+                             "Yes, and switch to accept edits (auto-approve file edits and\n     common file commands) for this session (shift+tab)",
+                             "Yes, and switch to auto mode · auto mode handles these prompts for you"] {
                 let screen = heading + "\n› 1. Yes, proceed (y)\n  2. \(repeated)\n  3. No (esc)\nPress enter to confirm or esc to cancel"
                 let prompt = PromptDetector.detect(screen, agent: agent)
                 try expectEqual(prompt?.answer, "1", "\(agent): \(repeated)")
@@ -43,7 +46,7 @@ import AutoApproveCore
                 try expectNil(PromptDetector.detect(screen.replacingOccurrences(of: "  2.", with: "› 2."), agent: agent))
                 try expectNil(PromptDetector.detect(screen + "\n› New input", agent: agent))
             }
-            for alternate in ["Yes, use production", "Yes, also deploy", "Yes", "Pick another task"] {
+            for alternate in ["Yes, use production", "Yes, also deploy", "Yes", "Pick another task", "Yes, and switch to the production branch for this session"] {
                 let screen = heading + "\n› 1. Yes\n  2. \(alternate)\n  3. No\nEsc to cancel"
                 try expectNil(PromptDetector.detect(screen, agent: agent))
             }
@@ -429,6 +432,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Claude daemon virtual TTY is distinct from Terminal and VS Code", tests.testClaudeDaemonPTYHasDistinctHost),
             ("Codex request identity separates commands from wrapping, history and shortcuts", tests.testCodexRequestIdentitySeparatesCommandsFromRendering),
             ("Wrapped final permission options and keyboard hints retain active-dialog validation", tests.testWrappedPermissionOptionsAndFooter),
+            ("Wrapped label text that starts with a redirect, arrow or number stays in its option", tests.testWrappedLabelTextMayLookLikeACursorOrAnOption),
+            ("Claude Code 2.1.28x prefix, mode and directory choices with the Tab to amend hint", tests.testClaudeCode2128PermissionMenus),
             ("Claude and Codex ready composers with background monitoring", tests.testMonitoringRequiresReadyComposer),
             ("Changing monitor output, new generations and foreground work", tests.testMonitoringTracksReadinessAcrossOutputChanges),
             ("Monitoring counts, ordinary idle, connection loss and snapshot compatibility", tests.testMonitoringSessionLifecycleAndCompatibility),

@@ -24,21 +24,24 @@ public enum PromptDetector {
         guard let promptIndex = lines.lastIndex(where: { line in permissionMarkers(agent).contains { line.hasPrefix($0) } }) else { return nil }
         // A long command can push its title beyond the old 32-line window.
         guard lines.count - promptIndex <= 300 else { return nil }
-        let dialog = Array(lines[promptIndex...])
+        let dialog = Array(lines[promptIndex...]), indents = rawLines[promptIndex...].map { $0.prefix { $0 == " " }.count }
         guard let selectedYes = dialog.firstIndex(where: { $0.range(of: #"^[›❯»>]\s*1\.\s+"#, options: .regularExpression) != nil }) else { return nil }
-        let lastOption = dialog.lastIndex(where: isOption) ?? selectedYes
+        let rows = optionRows(dialog, indents: indents, from: selectedYes)
+        let lastOption = rows.last ?? selectedYes
         guard let footerStart = dialogFooterStart(in: dialog, after: lastOption) else { return nil }
-        let optionLines = dialog[selectedYes...lastOption].filter(isOption)
-        guard optionLines.filter({ $0.range(of: #"^[›❯»>]"#, options: .regularExpression) != nil }).count == 1 else { return nil }
-        var labels: [String] = []
-        for line in dialog[selectedYes..<footerStart] {
-            if isOption(line) {
+        guard rows.filter({ dialog[$0].range(of: #"^[›❯»>]"#, options: .regularExpression) != nil }).count == 1 else { return nil }
+        var labels: [String] = [], labelColumn = 0
+        for index in selectedYes..<footerStart {
+            let line = dialog[index]
+            if rows.contains(index) {
                 let prefix = "^[›❯»>]?\\s*" + String(labels.count + 1) + #"\.\s+"#
                 guard let range = line.range(of: prefix, options: .regularExpression) else { return nil }
                 labels.append(String(line[range.upperBound...]))
+                labelColumn = indents[index] + line.distance(from: line.startIndex, to: range.upperBound)
             } else if !line.isEmpty {
-                guard line.range(of: #"^[›❯»>]"#, options: .regularExpression) == nil else { return nil }
-                // Narrow terminal windows can wrap a permission scope onto another line.
+                // Narrow terminal windows can wrap a permission scope onto another line. Wrapped
+                // text keeps the label's column and may start with `>`; a selection cursor may not.
+                guard indents[index] >= labelColumn || line.range(of: #"^[›❯»>]"#, options: .regularExpression) == nil else { return nil }
                 labels[labels.count - 1] += " " + line
             }
         }
@@ -66,11 +69,23 @@ public enum PromptDetector {
             ? ["Would you like to run the following command?", "Would you like to make the following edits?", "Approve app tool call?", "Allow "]
             : ["Do you want to proceed?", "Do you want to make this edit", "Do you want to create", "Do you want to allow"]
     }
+    static let optionPrefix = #"^[›❯»>]?\s*[1-9][0-9]?\.\s+"#
     static func isOption(_ line: String) -> Bool {
-        line.range(of: #"^[›❯»>]?\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) != nil
+        line.range(of: optionPrefix, options: .regularExpression) != nil
+    }
+    /// A new option starts left of the previous label. A long label wraps at that label's
+    /// column, where its text can look like a selection cursor (`=>`, `> file`) or `2. …`.
+    static func optionRows(_ lines: [String], indents: [Int], from start: Int) -> [Int] {
+        var rows: [Int] = [], labelColumn = Int.max
+        for index in start..<lines.count where indents[index] < labelColumn {
+            guard let prefix = lines[index].range(of: optionPrefix, options: .regularExpression) else { continue }
+            rows.append(index)
+            labelColumn = indents[index] + lines[index].distance(from: lines[index].startIndex, to: prefix.upperBound)
+        }
+        return rows
     }
     static func isDialogFooter(_ line: String) -> Bool {
-        line.range(of: #"(?i)^(?:(?:press )?enter to (?:confirm|select|submit)|esc to cancel|ctrl-g to edit|tab/arrow keys to navigate)"#, options: .regularExpression) != nil
+        line.range(of: #"(?i)^(?:(?:press )?enter to (?:confirm|select|submit)|esc to cancel|tab to amend|ctrl-g to edit|tab/arrow keys to navigate)"#, options: .regularExpression) != nil
             || line.allSatisfy { "─━╌- ".contains($0) }
     }
 
@@ -78,7 +93,8 @@ public enum PromptDetector {
     /// Require the entire remaining hint so later output cannot revive a stale dialog.
     static func dialogFooterStart(in lines: [String], after lastOption: Int) -> Int? {
         guard lastOption + 1 < lines.count else { return nil }
-        let action = #"(?:(?:press\s+)?enter\s+to\s+(?:confirm|select|submit)|esc\s+to\s+cancel|ctrl-g\s+to\s+edit|tab/arrow\s+keys\s+to\s+navigate)"#
+        // Claude Code 2.1.28x adds `· Tab to amend` while Yes or No is selected.
+        let action = #"(?:(?:press\s+)?enter\s+to\s+(?:confirm|select|submit)|esc\s+to\s+cancel|tab\s+to\s+amend|ctrl-g\s+to\s+edit|tab/arrow\s+keys\s+to\s+navigate)"#
         let pattern = "(?i)^" + action + #"(?:(?:\s*(?:[,·•|/]|or|and)\s*|\s+)"# + action + #")*[.!]?$"#
         guard let start = ((lastOption + 1)..<lines.count).first(where: {
             lines[$0].range(of: #"(?i)^(?:press|enter|esc|ctrl-g|tab/arrow)(?:\s|$)"#, options: .regularExpression) != nil

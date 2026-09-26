@@ -1,6 +1,17 @@
 # AutoApprove 검증 기록
 
-최신 검증일: 2026-09-23. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
+최신 검증일: 2026-09-26. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
+
+## 0.2.27 긴 반복 허가 선택지와 Claude Code 2.1.28x 승인 화면
+
+- 사용자 보고: `1. Yes / 2. Yes… / 3. No`에서 2번 문구가 길면 가끔 승인하지 않고 대기한다. 감지 실패는 승인 내역·알림을 남기지 않아 기존 기록으로 사용자 화면을 특정하지 못했다. 기록상 화면 승인은 Codex 1,041건, Claude 0건이었고, 훅 없이 화면으로 연결된 Claude 세션 5개는 모두 상태 미확인이었다.
+- 원인 1(Codex): 명령 전체를 담은 2번이 줄바꿈되면 다음 줄이 `>`(`> /tmp/out.txt`, `x=>…`)나 `2.`로 시작할 수 있다. 기존 판별은 이 줄을 선택 커서나 새 선택지로 보고 승인 창 전체를 버렸다. 승인 내역의 Codex 화면 1,031개를 44~200열(3열 간격)로 다시 줄바꿈한 55,674개 화면 중 7개 명령의 19개가 미감지였고 수정 후 0개다. 실제 사용자 실패 화면이 아니라 같은 원인을 재현한 결과다.
+- 원인 2(Claude Code 2.1.28x 화면 연결): 2번이 `Yes, and don’t ask again for: <접두어>`로 바뀌었고 `Yes, and switch to auto mode · …`, `Yes, and switch to accept edits (…) for this session (shift+tab)` 선택지와 하단의 `· Tab to amend`가 추가됐다. 격리 PTY(임시 `CLAUDE_CONFIG_DIR`, 로컬 모의 API, xterm headless)에서 실제 2.1.281을 56·60·70·80·100열(80열은 `tui: fullscreen`)로, 2.1.283을 64열로 렌더링했고 Bash·파일 생성 권한 화면을 모두 1번으로 감지했다. WebFetch 권한 화면은 하단 안내가 없어 직접 확인으로 남는다. 훅으로 연결된 Claude 세션은 선택지 문구를 읽지 않으므로 영향이 없다.
+- 음성 검사: 같은 Codex 화면에 선택 이동·뒤따르는 입력창·번호 열의 커서를 넣은 9,273개 화면을 하나도 입력 대상으로 판별하지 않았다. 입력 직전의 전체 화면 비교는 바꾸지 않았다.
+- 릴리스 빌드와 핵심 검사 **111/111**, VS Code 화면 모듈 **5/5**, 일반 훅·메인/백그라운드·실제 helper·PTY 화면·Codex 대기열 통합 검사를 통과했다. 새로 추가·보강한 검사 5개가 수정 전 코드에서 실패함을 확인했다. Claude Code 세션 안에서 통합 검사를 실행하면 helper가 상위 Claude 프로세스를 찾아 최대 600초 기다리므로 해당 프로세스 계보 밖에서 실행했다.
+- 최종 **0.2.27 · 빌드 31** DMG의 이미지 체크섬, 읽기 전용 마운트, 최상위 세 항목, 내장 앱 코드 서명과 원본 파일 일치를 확인했다. DMG에서 임시 폴더로 복사한 앱도 서명·버전·파일 일치 검사를 통과했다. 보고서: `.runtime/releases/0.2.27/verification.json`.
+- 미검증: Claude 화면은 Terminal.app이 아닌 xterm headless 렌더링으로 확인했다. 사용자 Terminal·VS Code 세션에 시험 입력을 보내지 않았고 실행 중인 앱은 교체하지 않았다. 렌더링으로 확인하지 못한 다른 선택지 문구(예: `.claude` 폴더 편집 허용)는 직접 확인으로 남는다.
+- `git diff --check` 통과. DMG SHA-256: `b8fba18fa73d7290bba861f2f27ed91b2de566ee9e215d046581de6213e7006f`. [v0.2.27 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.27)의 배포 파일로 사용한다.
 
 ## 0.2.26 앱을 드래그하는 DMG 배포
 

@@ -18,8 +18,92 @@ $ rg -n 'lora|adapter|error|warn' .cache/product-evaluation/server-clean.log
 
 Press enter to confirm or esc to cancel
 """
+/// A long "don't ask again" command wraps at the label column; its text may begin with `>`.
+private let wrappedRedirectFixture = """
+Would you like to run the following command?
+
+  $ /usr/bin/time -p /bin/ps -axo pid=,tty= > /private/tmp/process-timing.txt
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that
+     start with `/usr/bin/time -p /bin/ps -axo pid=,tty=
+     > /private/tmp/process-timing.txt` (p)
+  3. No, and tell Codex what to do differently
+     (esc)
+
+  Press enter to confirm or esc to cancel
+"""
+/// Claude Code 2.1.281 screens rendered at 56 and 70 columns from an isolated PTY.
+private let claudeBashPermissionFixture = """
+────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose
+ "switch to auto mode" below
+
+   │ ./scripts/some-really-long-deployment-helper-scr
+   │ ipt-name.sh --target staging --verbose
+   Run the fixture command
+
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: ./scripts/some-reall
+      y-long-deployment-helper-script-name.sh *
+   3. Yes, and switch to auto mode · auto mode handles
+      these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+private let claudeCreatePermissionFixture = """
+ Create file
+ notes/fixture-output.md
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 hello
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create fixture-output.md?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and
+      common file commands) for this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend
+"""
 
 extension ApprovalTests {
+    func testWrappedLabelTextMayLookLikeACursorOrAnOption() throws {
+        let wrappedCommand = "start with `/usr/bin/time -p /bin/ps -axo pid=,tty=\n     > /private/tmp/process-timing.txt` (p)"
+        let arrow = wrappedRedirectFixture.replacingOccurrences(of: wrappedCommand, with: "start with `node -e 'live.filter(x=\n     >x.automatic)'` (p)")
+        let numbered = wrappedRedirectFixture.replacingOccurrences(of: wrappedCommand, with: "start with `printf 'step 1. ok\n     2. done'` (p)")
+        for screen in [wrappedRedirectFixture, arrow, numbered] {
+            let prompt = PromptDetector.detect(screen, agent: .codex)
+            try expectEqual(prompt?.answer, "1", screen)
+            try expectEqual(prompt?.dialog, screen, "Delivery still validates the original wrapping")
+        }
+        // At the option column, a cursor is another input rather than wrapped label text.
+        try expectNil(PromptDetector.detect(wrappedRedirectFixture.replacingOccurrences(of: "  3. No", with: "› Explain this codebase\n  3. No"), agent: .codex))
+        try expectNil(PromptDetector.detect(wrappedRedirectFixture.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "  3. No", with: "› 3. No"), agent: .codex))
+        try expectNil(PromptDetector.detect(numbered.replacingOccurrences(of: "\n     2. done", with: "\n  2. done"), agent: .codex))
+    }
+
+    func testClaudeCode2128PermissionMenus() throws {
+        let prefixOnly = claudePermissionFixture.replacingOccurrences(of: "  2. No\nEsc to cancel", with: "  2. Yes, and don’t ask again for: node *\n  3. No\n\nEsc to cancel · Tab to amend")
+        let directory = claudeBashPermissionFixture.replacingOccurrences(of: "Yes, and don’t ask again for: ./scripts/some-reall\n      y-long-deployment-helper-script-name.sh *", with: "Yes, and always allow access to /private/tmp from this project")
+        for screen in [claudeBashPermissionFixture, claudeCreatePermissionFixture, prefixOnly, directory] {
+            let prompt = PromptDetector.detect(screen, agent: .claude)
+            try expectEqual(prompt?.answer, "1", screen)
+            try expectEqual(prompt?.dialog, screen, "Claude validates the complete screen")
+            let selectedNo = screen.replacingOccurrences(of: "❯ 1.", with: "  1.").replacingOccurrences(of: "  2. Yes", with: "❯ 2. Yes")
+            try expectNil(PromptDetector.detect(selectedNo, agent: .claude))
+            try expectEqual(QuestionDetector.detect(selectedNo, agent: .claude)?.phase, .approval, "A manual Claude request is reported, not unknown")
+            try expectNil(PromptDetector.detect(screen + "\n work | main | Opus 4.7 | ctx 3%", agent: .claude))
+        }
+        let differentTask = claudeBashPermissionFixture.replacingOccurrences(of: "Yes, and switch to auto mode · auto mode handles\n      these prompts for you", with: "Yes, and switch to the production branch for this session")
+        try expectNil(PromptDetector.detect(differentTask, agent: .claude))
+        try expectEqual(QuestionDetector.detect(differentTask, agent: .claude)?.phase, .approval)
+    }
+
     func testCodexRequestIdentitySeparatesCommandsFromRendering() throws {
         let original = PromptDetector.detect(reportedCodexPermissionFixture, agent: .codex)!
         for rendering in ["Earlier output\n" + reportedCodexPermissionFixture,
@@ -125,6 +209,8 @@ extension ApprovalTests {
         }
         try check("Changed history\n" + permissionFixture.decomposedStringWithCanonicalMapping + "\n\n", expected: "Old history\n" + permissionFixture, delivery: "sent", writes: 1)
         try check(reportedCodexPermissionFixture, expected: reportedCodexPermissionFixture, delivery: "sent", writes: 1)
+        try check(wrappedRedirectFixture, expected: wrappedRedirectFixture, delivery: "sent", writes: 1)
+        try check(claudeBashPermissionFixture, expected: claudeBashPermissionFixture, agent: .claude, processes: ["claude"], delivery: "sent", writes: 1)
         let toolPermission = "Allow preview?\nTool: preview\n› 1. Allow                   Run the tool and continue.\n  2. Allow for this session  Run the tool and remember this choice for this session.\n  3. Always allow            Run the tool and remember this choice for future tool calls.\n  4. Cancel                  Cancel this tool call\nEnter to submit or esc to cancel"
         try check(toolPermission, expected: toolPermission, delivery: "sent", writes: 1)
         try check(toolPermission.replacingOccurrences(of: "Tool: preview", with: "Tool: changed"), expected: toolPermission, delivery: "screenChanged", writes: 0)
