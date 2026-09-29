@@ -2,6 +2,14 @@
 
 최신 검증일: 2026-09-29. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.29 Codex 하위 에이전트 승인 요청
+
+- 사용자 보고(다른 Mac, Codex 0.159): 하나의 승인 요청이 끝나기 전에 다음 요청이 겹쳐 뜨면 자동 승인이 멈추고 `현재 화면에서 작업 중인지 입력 대기 중인지 확인하지 못했습니다`가 표시된다. No를 누르면 다시 동작한다.
+- 원인: Codex 승인 창은 요청을 대기열에 두고 답한 직후 다음 요청을 같은 자리에 그린다(`approval_overlay.rs` `advance_queue`). 하위 에이전트 요청의 스냅샷(`approval_overlay_cross_thread_prompt`)은 `Thread: Robie [explorer]` 줄과 하단 `… or o to open thread`를 가진다. 이 화면을 기존 판별기에 넣으면 승인 창·질문 모두 아니고 사용자가 본 상태 미확인 문구가 나왔다. 메인 대화의 같은 창은 감지됐다. 0.158과 0.159의 승인 창 소스·스냅샷·실행기는 같다.
+- 수정 후 같은 화면을 1번으로 감지하고 요약에 요청한 대화 이름을 남긴다. 모르는 하단 동작, 하단 안내 뒤의 입력, 2번 선택, Claude 판별에는 여전히 입력하지 않는다. Terminal 최종 비교 스크립트도 같은 창에 `1`을 한 번 전달했다. 긴 요청이 잘린 창(`[… 34 lines] ctrl+g view all`)은 하단 안내가 보일 때만 감지한다.
+- 릴리스: 릴리스 빌드 핵심 검사 **117/117**(새 검사 1개), VS Code 화면 모듈 **5/5**, PTY 화면·Codex 대기열 통합 검사, launchd 아래의 일반·실제 helper·메인/백그라운드 통합 검사, `performance-check --assert-quiet`(발행 29회)를 통과했다. **0.2.29 · 빌드 33** DMG의 이미지 체크섬, 읽기 전용 마운트, 최상위 세 항목, DMG에서 복사한 앱의 코드 서명과 원본 파일 일치를 확인했다. 보고서: `.runtime/releases/0.2.29/verification.json`. DMG SHA-256: `268ecd420da9920f190cb05dc9bd52790a189b34106db393aaf4d21854c0116e`. [v0.2.29 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.29)의 배포 파일로 사용한다.
+- 미검증: 실제 하위 에이전트 승인 요청은 사용자 화면 보고와 Codex 스냅샷으로 확인했으며 이 Mac에서 실제로 띄우지 않았다.
+
 ## 0.2.28 훅 없는 iTerm2·Orca 세션 인지와 화면 연결
 
 - 요청: 기본 Terminal은 동작하지만 iTerm2처럼 다른 터미널, 특히 Orca·VS Code처럼 앱 안에서 PTY를 띄우는 경우 세션을 인지하지 못한다. 훅 없이 Terminal처럼 자동으로 인지하도록 한다. 이슈 #1의 부모 체인 조사와 같이 iTerm2 3.x의 셸은 `iTermServer`(부모 launchd) 아래에 있어 기존 판별이 `터미널 미확인`이었다.

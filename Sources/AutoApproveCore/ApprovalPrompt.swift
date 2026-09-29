@@ -85,7 +85,7 @@ public enum PromptDetector {
         return rows
     }
     static func isDialogFooter(_ line: String) -> Bool {
-        line.range(of: #"(?i)^(?:(?:press )?enter to (?:confirm|select|submit)|esc to cancel|tab to amend|ctrl-g to edit|tab/arrow keys to navigate)"#, options: .regularExpression) != nil
+        line.range(of: #"(?i)^(?:(?:press )?enter to (?:confirm|select|submit)|esc to cancel|tab to amend|ctrl-g to edit|tab/arrow keys to navigate|o to open thread)"#, options: .regularExpression) != nil
             || line.allSatisfy { "─━╌- ".contains($0) }
     }
 
@@ -93,8 +93,9 @@ public enum PromptDetector {
     /// Require the entire remaining hint so later output cannot revive a stale dialog.
     static func dialogFooterStart(in lines: [String], after lastOption: Int) -> Int? {
         guard lastOption + 1 < lines.count else { return nil }
-        // Claude Code 2.1.28x adds `· Tab to amend` while Yes or No is selected.
-        let action = #"(?:(?:press\s+)?enter\s+to\s+(?:confirm|select|submit)|esc\s+to\s+cancel|tab\s+to\s+amend|ctrl-g\s+to\s+edit|tab/arrow\s+keys\s+to\s+navigate)"#
+        // Claude Code 2.1.28x adds `· Tab to amend` while Yes or No is selected. Codex adds
+        // `or o to open thread` when a sub-agent's request is shown in the parent session.
+        let action = #"(?:(?:press\s+)?enter\s+to\s+(?:confirm|select|submit)|esc\s+to\s+cancel|tab\s+to\s+amend|ctrl-g\s+to\s+edit|tab/arrow\s+keys\s+to\s+navigate|o\s+to\s+open\s+thread)"#
         let pattern = "(?i)^" + action + #"(?:(?:\s*(?:[,·•|/]|or|and)\s*|\s+)"# + action + #")*[.!]?$"#
         guard let start = ((lastOption + 1)..<lines.count).first(where: {
             lines[$0].range(of: #"(?i)^(?:press|enter|esc|ctrl-g|tab/arrow)(?:\s|$)"#, options: .regularExpression) != nil

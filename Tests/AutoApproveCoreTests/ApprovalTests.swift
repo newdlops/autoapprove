@@ -497,6 +497,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("iTerm2 visible rows, foreground job check, reveal and permission errors", tests.testITermScriptingContract),
             ("Orca CLI envelope, rendered screen and handle-less refusal", tests.testOrcaCommandContract),
             ("iTerm2 and Orca connections are opt-in, independent and restored", tests.testScreenHostConnectionsAreIndependent),
+            ("Codex sub-agent approvals in the parent overlay and clipped long requests", tests.testCodexSubAgentAndClippedApprovals),
             ("window placement across desktop coordinate systems", tests.testTerminalHighlightCoordinates),
             ("long commands and canonical Unicode dialogs", tests.testLongPermissionAndCanonicalUnicode),
             ("interactive question menus versus approval and stale text", tests.testQuestionMenus),
