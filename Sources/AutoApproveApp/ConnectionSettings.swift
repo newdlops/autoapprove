@@ -59,18 +59,17 @@ struct ConnectionSettings: View {
                         }
                     }
                     Divider()
-                    section("Terminal", icon: "terminal", status: engine.snapshot.health.terminal) {
-                        Text("실행 중인 탭을 연결해 요청을 읽고 해당 탭에만 승인 입력을 전달합니다. 한 번 연결하면 앱을 다시 실행해도 연결을 복원합니다. 처음 연결할 때 macOS의 자동화 권한을 허용해주세요.")
-                        HStack {
-                            Button(engine.snapshot.health.terminalConnected ? "다시 연결" : "Terminal 연결") { busy = true; Task { await engine.connectTerminal(); busy = false } }.disabled(busy || engine.snapshot.health.terminalConnecting)
-                                .help(busy || engine.snapshot.health.terminalConnecting ? "연결 상태를 확인하고 있습니다." : "macOS Terminal의 Claude Code·Codex 탭을 연결합니다. 허용한 연결은 앱 재실행 후 복원됩니다.")
-                            Button("연결 해제") { engine.disconnectTerminal() }.disabled(!engine.snapshot.health.terminalRequested)
-                                .help(engine.snapshot.health.terminalRequested ? "Terminal 화면 감지와 승인 입력을 중단합니다. 다시 연결하기 전까지 해제 상태를 유지합니다." : "현재 Terminal 연결이 꺼져 있습니다.")
-                        }
-                    }
+                    screenSection(.terminal, icon: "terminal",
+                        text: "실행 중인 탭을 연결해 요청을 읽고 해당 탭에만 승인 입력을 전달합니다. 한 번 연결하면 앱을 다시 실행해도 연결을 복원합니다. 처음 연결할 때 macOS의 자동화 권한을 허용해주세요.")
+                    Divider()
+                    screenSection(.iterm, icon: "apple.terminal",
+                        text: "iTerm2 세션을 연결해 요청을 읽고 해당 세션에만 승인 입력을 전달합니다. 분할 창도 세션별로 구분합니다. 한 번 연결하면 앱을 다시 실행해도 연결을 복원합니다. 처음 연결할 때 iTerm2 자동화 권한을 허용해주세요.")
+                    Divider()
+                    screenSection(.orca, icon: "square.grid.2x2",
+                        text: "Orca에 포함된 명령줄 도구로 각 터미널의 현재 화면을 읽고 해당 터미널에만 승인 입력을 전달합니다. 별도 권한은 필요하지 않으며 Orca가 실행 중이어야 합니다. tmux 안에서 실행한 세션은 연결하지 않습니다.")
                     Divider()
                     section("Claude Code", icon: "bolt.horizontal", status: engine.snapshot.health.claude) {
-                        Text("Terminal과 VS Code 모두에서 권한 요청을 직접 받습니다. 기존 설정을 백업하고 AutoApprove 훅만 추가합니다.")
+                        Text("Terminal·iTerm2·Orca·VS Code 등 모든 터미널에서 권한 요청을 직접 받습니다. 기존 설정을 백업하고 AutoApprove 훅만 추가합니다.")
                         HStack {
                             Button("Claude 훅 설치") {
                                 do { try engine.installClaude(executable: helper); notice = "설치했습니다. Claude의 다음 이벤트를 기다립니다. 연결되지 않으면 /hooks에서 설정을 확인하거나 대화를 이어하기 해주세요." }
@@ -111,6 +110,18 @@ struct ConnectionSettings: View {
             try engine.setQuestionNotificationDelay(seconds)
             questionDelayText = String(seconds); questionDelayError = nil
         } catch { questionDelayError = "저장하지 못했습니다. \(error.localizedDescription)" }
+    }
+    @ViewBuilder private func screenSection(_ host: ScreenHost, icon: String, text: String) -> some View {
+        let health = engine.snapshot.health.screen(host)
+        section(host.title, icon: icon, status: health.status) {
+            Text(text)
+            HStack {
+                Button(health.connected ? "다시 연결" : "\(host.title) 연결") { busy = true; Task { await engine.connectScreenHost(host); busy = false } }.disabled(busy || health.connecting)
+                    .help(busy || health.connecting ? "연결 상태를 확인하고 있습니다." : "\(host == .terminal ? "macOS Terminal" : host.title)의 Claude Code·Codex 탭을 연결합니다. 허용한 연결은 앱 재실행 후 복원됩니다.")
+                Button("연결 해제") { engine.disconnectScreenHost(host) }.disabled(!health.requested)
+                    .help(health.requested ? "\(host.title) 화면 감지와 승인 입력을 중단합니다. 다시 연결하기 전까지 해제 상태를 유지합니다." : "현재 \(host.title) 연결이 꺼져 있습니다.")
+            }
+        }
     }
     @ViewBuilder private func section<Content: View>(_ title: String, icon: String, status: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {

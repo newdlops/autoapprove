@@ -21,8 +21,73 @@ public struct TerminalSnapshot: Codable {
 
 public enum TerminalAdapterError: LocalizedError, Equatable {
     case permissionDenied
+    case automationDenied(String)
     public var errorDescription: String? {
-        "Terminal 자동화 권한이 필요합니다. 시스템 설정 → 개인정보 보호 및 보안 → 자동화에서 AutoApprove를 허용한 후 다시 연결해주세요."
+        switch self {
+        case .permissionDenied:
+            return "Terminal 자동화 권한이 필요합니다. 시스템 설정 → 개인정보 보호 및 보안 → 자동화에서 AutoApprove를 허용한 후 다시 연결해주세요."
+        case .automationDenied(let app):
+            return "\(app) 자동화 권한이 필요합니다. 시스템 설정 → 개인정보 보호 및 보안 → 자동화에서 AutoApprove의 \(app) 항목을 허용한 후 다시 연결해주세요."
+        }
+    }
+}
+
+/// One exact screen to read or answer: a tab's tty, and Orca's pane handle when the host needs it.
+public struct ScreenTarget: Equatable, Sendable {
+    public var tty: String
+    public var handle: String?
+    /// Processes of the agent's foreground job. A host that reports its own foreground job
+    /// must name one of these before any input is written.
+    public var jobPIDs: [Int32]
+    public init(tty: String, handle: String? = nil, jobPIDs: [Int32] = []) { self.tty = tty; self.handle = handle; self.jobPIDs = jobPIDs }
+}
+
+/// The per-host channel behind every screen connection. Tests replace these closures.
+public struct ScreenHostAdapter: Sendable {
+    public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
+    public var approve: @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery
+    /// nil means the host revealed the tab but reports no window frame to highlight.
+    public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
+    public init(screens: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot,
+                approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
+                reveal: @escaping @Sendable (ScreenTarget) throws -> TerminalWindowBounds?) {
+        self.screens = screens; self.approve = approve; self.reveal = reveal
+    }
+    public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
+        switch host {
+        case .terminal:
+            return ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty)) },
+                approve: { try TerminalAdapter.approve(tty: $0.tty, expectedScreen: $1, agent: $2) },
+                reveal: { try TerminalAdapter.reveal(tty: $0.tty) })
+        case .iterm:
+            return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
+                approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
+                reveal: { try ITermAdapter.reveal(tty: $0.tty) })
+        case .orca:
+            return ScreenHostAdapter(screens: { try OrcaAdapter.screens(targets: $0) },
+                approve: { try OrcaAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
+                reveal: { try OrcaAdapter.reveal(target: $0); return nil })
+        }
+    }
+}
+
+enum AutomationScript {
+    static func run(_ body: String, app: String, denied: TerminalAdapterError) throws -> String {
+        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript", "-e", body], timeout: 8)
+        guard result.status == 0 else {
+            if result.error.contains("-1743") { throw denied }
+            throw AppError.message("\(app) 연결 실패: \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    static func literal(_ object: Any) throws -> String {
+        String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.fragmentsAllowed]), as: UTF8.self)
+    }
+    /// Scripts compare the dialog exactly as the detector returned it.
+    static func dialogData(tty: String, expectedScreen: String, agent: AgentKind) throws -> JSONObject {
+        guard agent != .shell else { throw AppError.message("일반 셸에는 승인 입력을 전달할 수 없습니다.") }
+        guard let prompt = PromptDetector.detect(expectedScreen, agent: agent) else { throw AppError.message("승인 요청의 내용과 선택지를 확인하지 못했습니다.") }
+        return ["tty": tty, "dialog": prompt.dialog, "agent": agent.rawValue]
     }
 }
 
@@ -45,16 +110,9 @@ public struct TerminalWindowBounds: Codable, Equatable {
 
 public enum TerminalAdapter {
     private static func javascript(_ body: String) throws -> String {
-        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript", "-e", body], timeout: 8)
-        guard result.status == 0 else {
-            if result.error.contains("-1743") { throw TerminalAdapterError.permissionDenied }
-            throw AppError.message("Terminal 연결 실패: \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))")
-        }
-        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        try AutomationScript.run(body, app: "Terminal", denied: .permissionDenied)
     }
-    private static func literal(_ object: Any) throws -> String {
-        String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.fragmentsAllowed]), as: UTF8.self)
-    }
+    private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String]) throws -> TerminalSnapshot {
         let output = try javascript(screenScript(ttys: ttys))
         return try JSONDecoder().decode(TerminalSnapshot.self, from: Data(output.utf8))
@@ -128,10 +186,8 @@ public enum TerminalAdapter {
     }
 
     public static func approvalScript(tty: String, expectedScreen: String, agent: AgentKind) throws -> String {
-        guard agent != .shell else { throw AppError.message("일반 셸에는 승인 입력을 전달할 수 없습니다.") }
-        guard let prompt = PromptDetector.detect(expectedScreen, agent: agent) else { throw AppError.message("승인 요청의 내용과 선택지를 확인하지 못했습니다.") }
         // Compare the complete active dialog, preserving command whitespace. Unrelated history can change.
-        let data = try literal(["tty": tty, "dialog": prompt.dialog, "agent": agent.rawValue])
+        let data = try literal(AutomationScript.dialogData(tty: tty, expectedScreen: expectedScreen, agent: agent))
         return """
         (() => {
         const app = Application('com.apple.Terminal'); const target = \(data);

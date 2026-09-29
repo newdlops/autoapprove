@@ -136,7 +136,7 @@ public enum ClaudeSessionRegistry {
         for child in links.keys {
             var current = child, seen = Set<String>()
             while let parent = links[current], seen.insert(current).inserted { current = parent }
-            if !seen.contains(current), let root = live[current], root.terminal == .terminal || root.terminal == .vscode {
+            if !seen.contains(current), let root = live[current], [.terminal, .vscode, .iterm, .orca].contains(root.terminal) {
                 result[child] = current
             }
         }

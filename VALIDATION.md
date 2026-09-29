@@ -1,6 +1,21 @@
 # AutoApprove 검증 기록
 
-최신 검증일: 2026-09-26. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
+최신 검증일: 2026-09-29. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
+
+## 0.2.28 훅 없는 iTerm2·Orca 세션 인지와 화면 연결
+
+- 요청: 기본 Terminal은 동작하지만 iTerm2처럼 다른 터미널, 특히 Orca·VS Code처럼 앱 안에서 PTY를 띄우는 경우 세션을 인지하지 못한다. 훅 없이 Terminal처럼 자동으로 인지하도록 한다. 이슈 #1의 부모 체인 조사와 같이 iTerm2 3.x의 셸은 `iTermServer`(부모 launchd) 아래에 있어 기존 판별이 `터미널 미확인`이었다.
+- 인지: 프로세스 계보를 먼저 보고, CLI 프로세스의 실행 환경을 `KERN_PROCARGS2`로 읽어 허용한 이름(`TERM_PROGRAM`, `__CFBundleIdentifier`, `ITERM_SESSION_ID`, `ORCA_TERMINAL_HANDLE`, `TMUX`, `STY`, `ZELLIJ`)만 남긴다. Orca PTY 환경에는 `ORCA_AGENT_HOOK_TOKEN`이 함께 있어 허용 목록 밖의 값은 보관하지 않는다. 시작 시각이 스캔 기록과 다르면(재사용 PID·시험 기록) 읽지 않는다. `/bin/zsh` 같은 시스템 바이너리는 환경을 노출하지 않지만 Claude·Codex 프로세스는 읽힌다.
+- 실제 확인한 환경 값: Terminal `TERM_PROGRAM=Apple_Terminal`, Orca 1.4.216 `TERM_PROGRAM=Orca`·`__CFBundleIdentifier=com.stablyai.orca`·`ORCA_TERMINAL_HANDLE=term_<uuid>`. Orca PTY는 `login → Orca Helper → Orca` 아래에 있다. iTerm2 3.7.3 세션 `contents`는 스크롤백을 포함하고 각 행 끝에 공백을 붙여 `rows`만큼 잘라 비교한다. `write text "1"`과 Orca `terminal send --text $'1\r'`은 모두 PTY에 `31 0d`를 전달했다. Orca에서 텍스트와 `--enter`를 함께 보내면 프롬프트 전달 경로를 타므로 사용하지 않는다.
+- 실제 앱 대역 검사: 격리 데이터 폴더의 개발 빌드 엔진(`serve`)과 무동작 대역 프로세스(`codex`·`claude` 이름, 승인 화면만 그리고 받은 바이트를 기록)로 확인했다. iTerm2 단독 창·좌우 분할 창·`셸 → node 래퍼 → codex` 구조, Orca 터미널에서 인지·화면 감지·자동 승인·승인 내역(`iTerm2 화면`·`Orca 화면`)을 확인했다. 자동 승인을 켜지 않은 분할 창에는 입력하지 않았다. 래퍼 구조에서 iTerm2 `jobPid`는 네이티브 CLI PID였고, 엔진이 계산한 같은 TTY·프로세스 그룹 범위에 들어갔다.
+- 탭 이동: iTerm2 스크립트는 창 위치를 반환했고 Orca `terminal switch`는 성공했다. 존재하지 않는 Orca 핸들은 `terminal_handle_stale`로 실패했다. 보조 프로세스에서 보낸 `activate`는 현재 macOS에서 iTerm2를 앞으로 가져오지 못해, 앱이 탭 선택 후 `NSRunningApplication`으로 활성화한다.
+- Orca 재시작: 앱을 종료해도 PTY 보조 프로세스와 CLI는 유지되고 원래 핸들로 계속 접근했다. 재실행 직후 복원된 탭 하나는 `screen-unavailable`을 반환했고 탭 전환·앱 전면화 후에도 같았다. 이 경우 해당 세션을 화면으로 연결하지 않고 이유를 표시한다.
+- 성능: iTerm2 기본 프로필(스크롤백 1,000행)에서 10만 행 출력 후 읽기 0.34초로 빈 세션과 같았다(대부분 `osascript` 실행 비용, 한 번에 모든 세션). Orca CLI 호출은 약 0.13초·최대 87MB이며 연결한 Orca 세션이 없으면 호출하지 않는다. 릴리스 빌드 `performance-check --assert-quiet`는 발행 29회로 이전 기록과 같다.
+- 자동 검사 **116/116**(기존 111개에 새 검사 5개: 환경 파싱·호스트 판별·iTerm2 스크립트 계약·Orca CLI 계약·호스트별 연결 복원), PTY 화면 통합 검사, Codex 대기열 통합 검사를 통과했다. 일반·실제 helper·메인/백그라운드 통합 검사는 Claude Code 세션 안에서 실행하면 helper가 상위 Claude를 찾아 대기하므로 launchd 아래에서 실행해 통과했다.
+- 기존 기능 보호: 부모 체인으로 Terminal·VS Code가 확정된 세션은 실행 환경을 읽지 않는다. 환경 변수만으로는 Terminal·VS Code로 분류하지 않고, iTerm2·Orca 또는 이름만 표시하는 미확인으로만 분류한다. 설치된 0.2.27과 새 빌드의 `scan`을 이 Mac의 실제 세션 12개(모두 Terminal)로 대조해 세션 ID·에이전트·PID·TTY·터미널 종류·작업 폴더가 모두 같았다. 기존 검사 111개는 수정 없이 통과했다.
+- 실제 CLI 확인(사용자 직접 실행): iTerm2와 Orca 1.4.216에서 각각 실제 Codex(`-a on-request -s read-only`)가 읽기 전용 샌드박스에서 막힌 `touch`의 승인 창(`Would you like to run the following command?`, `Environment: local`, `Reason: …`)을 띄웠고, 격리 엔진이 이를 감지해 1번(이번만 허용)을 한 번 전달했다. iTerm2에서는 Codex에 `✔ You approved codex to run … this time`이 표시되고 파일이 생성됐으며 승인 내역은 1건이었다. Orca에서는 승인 창이 뜬 뒤 자동 승인을 켜자 즉시 한 번 응답했고(`Orca 화면 · 승인 입력 전달` 1건) 파일이 생성됐다. Orca 세션은 `TERM_PROGRAM=Orca`와 에이전트 환경의 `ORCA_TERMINAL_HANDLE`로 식별했다. iTerm2에서 훅을 끈 실제 Claude Code 2.1.284(`--settings '{"disableAllHooks":true}' --permission-mode default`)의 Bash 권한 창도 감지했다. 첫 시도는 입력 직전 화면 비교가 달라 입력하지 않았고(`screenChanged`), 새 화면에서 다시 확인해 한 번 전달했다. Claude는 `Ran 1 shell command`로 한 번만 실행했다. Orca에서도 같은 Claude 권한 창을 감지해 한 번 전달했고(`Orca 화면 · 승인 입력 전달` 1건) 파일이 생성됐다. 기본 샌드박스로 실행한 Codex는 승인 없이 실행해 승인 창이 없었다(이 Codex 버전은 `-a untrusted`를 받지 않는다). 훅을 켠 Claude의 여러 질문 탭 창은 규칙대로 직접 확인으로 남았고, 단건 예·아니오는 0.2.27 앱의 훅이 받았다. 창을 여닫는 중 iTerm2 읽기가 한 번 실패해 5초 뒤 자동 재연결됐다.
+- 릴리스: 최종 코드의 릴리스 빌드로 핵심 검사 **116/116**, VS Code 화면 모듈 **5/5**, PTY 화면·Codex 대기열 통합 검사, launchd 아래의 일반·실제 helper·메인/백그라운드 통합 검사, `performance-check --assert-quiet`(발행 29회)를 통과했다. **0.2.28 · 빌드 32** DMG의 이미지 체크섬, 읽기 전용 마운트, 최상위 세 항목, DMG에서 복사한 앱의 코드 서명과 원본 파일 일치를 확인했다. 보고서: `.runtime/releases/0.2.28/verification.json`. DMG SHA-256: `d44ae0d8dfce637875e8fe204e2d13f5631c56e4467c273b0a2ed93d8519e9b1`. [v0.2.28 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.28)의 배포 파일로 사용한다.
+- 미검증: 앱 UI 경로(연결 설정 버튼·탭 이동 후 활성화·알림에서 열기)는 빌드만 확인했다. 무제한 스크롤백 iTerm2 프로필의 읽기 비용, Orca 창 새로고침 후 핸들 변경, Cursor 등 VS Code 계열의 확장 연결은 확인하지 않았다. 승인 입력은 사용자가 이 시험을 위해 직접 연 iTerm2·Orca 세션에만 보냈고, 격리 엔진은 Terminal에 연결하지 않았으며 실행 중인 0.2.27 앱은 교체하지 않았다.
 
 ## 0.2.27 긴 반복 허가 선택지와 Claude Code 2.1.28x 승인 화면
 

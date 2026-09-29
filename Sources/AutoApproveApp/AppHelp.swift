@@ -62,11 +62,15 @@ enum AppHelp {
             return "Claude의 백그라운드 가상 터미널입니다. 독립된 Terminal 탭이 아니므로 원래 Claude 세션에서 확인해주세요."
         }
         guard session.canReveal else {
-            return session.phase == .ended ? "종료된 세션의 터미널로 이동할 수 없습니다."
-                : "이 세션의 터미널 연결을 먼저 설정하세요. VS Code는 확장이 필요합니다."
+            if session.phase == .ended { return "종료된 세션의 터미널로 이동할 수 없습니다." }
+            if session.terminal == .unknown, let host = session.hostName { return "\(host)의 탭 이동은 지원하지 않습니다. 해당 앱에서 직접 확인해주세요." }
+            return "이 세션의 터미널 연결을 먼저 설정하세요. VS Code는 확장이 필요합니다."
         }
-        return session.terminal == .terminal ? "이 세션의 탭을 앞으로 가져오고 창에 3초 동안 파란 테두리와 프로젝트명을 표시합니다."
-            : "VS Code에서 이 세션의 터미널을 선택하고 이름이 포함된 알림을 표시합니다."
+        switch session.terminal {
+        case .terminal, .iterm: return "이 세션의 탭을 앞으로 가져오고 창에 3초 동안 파란 테두리와 프로젝트명을 표시합니다."
+        case .orca: return "Orca에서 이 세션의 터미널 탭으로 전환하고 Orca를 앞으로 가져옵니다."
+        default: return "VS Code에서 이 세션의 터미널을 선택하고 이름이 포함된 알림을 표시합니다."
+        }
     }
 
     static func channel(_ channel: ApprovalChannel) -> String {
@@ -75,6 +79,8 @@ enum AppHelp {
         case .hook: return "Claude가 보내는 권한 요청과 작업 이벤트를 직접 받습니다. 일부 요청은 터미널 연결로 확인합니다."
         case .terminalScreen: return "macOS Terminal 화면에서 지원하는 승인 요청을 감지하고 해당 탭에 응답합니다."
         case .vscodeScreen: return "AutoApprove Bridge가 전달한 VS Code 터미널 출력에서 승인 요청을 감지합니다."
+        case .itermScreen: return "iTerm2 화면에서 지원하는 승인 요청을 감지하고 해당 세션에 응답합니다."
+        case .orcaScreen: return "Orca 명령줄 도구로 해당 터미널의 현재 화면을 읽고, 지원하는 승인 요청에 응답합니다."
         }
     }
 

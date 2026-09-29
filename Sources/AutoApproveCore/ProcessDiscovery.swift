@@ -76,21 +76,29 @@ public enum ProcessDiscovery {
         }
         return result
     }
-    public static func sessions(_ records: [ProcessRecord]) -> [AgentSession] {
-        return records.compactMap { record in
+    static let environmentCache = ProcessEnvironmentCache()
+    /// `environment` replaces the live, cached launch-variable reader (tests pass fixtures).
+    public static func sessions(_ records: [ProcessRecord], environment: ((ProcessRecord) -> [String: String]?)? = nil) -> [AgentSession] {
+        let byID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        let found: [AgentSession] = records.compactMap { record in
             guard let agent = record.agent, record.tty != "??", !record.tty.isEmpty else { return nil }
-            let parents = ancestors(of: record.parent, records: records)
+            let parents = ancestors(of: record.parent, byPID: byID)
             guard !parents.contains(where: { $0.agent != nil && $0.tty == record.tty }) else { return nil }
             // A nested PTY may belong to a background agent, not the ancestor's Terminal tab.
             let terminalParents = parents.prefix { $0.tty == "??" || $0.tty == record.tty }
             let backgroundClaude = agent == .claude && terminalParents.contains {
                 $0.tty == "??" && ($0.executable.hasSuffix("/ClaudeCode.app/Contents/MacOS/claude") || $0.executable == "claude bg-pty-host")
             }
-            let terminal: TerminalKind = backgroundClaude ? .claudeBackground
-                : terminalParents.contains(where: { $0.executable.contains("Visual Studio Code.app/") }) ? .vscode
-                : terminalParents.contains(where: { $0.executable.hasSuffix("Terminal.app/Contents/MacOS/Terminal") }) ? .terminal : .unknown
-            return AgentSession(id: record.key, agent: agent, pid: record.pid, started: record.started, tty: "/dev/\(record.tty)", cwd: "", terminal: terminal)
+            var session = AgentSession(id: record.key, agent: agent, pid: record.pid, started: record.started, tty: "/dev/\(record.tty)", cwd: "", terminal: .claudeBackground)
+            guard !backgroundClaude else { return session }
+            let host = TerminalHost.classify(record: record, parents: parents, environment: {
+                environment.map { $0(record) ?? [:] } ?? environmentCache.environment(record, reader: ProcessEnvironment.read)
+            })
+            session.terminal = host.kind; session.hostName = host.name; session.hostBundleID = host.bundleID; session.orcaHandle = host.orcaHandle
+            return session
         }
+        if environment == nil { environmentCache.retain(Set(found.map(\.id))) }
+        return found
     }
     public static func cwd(pid: Int32) -> String {
         workingDirectories(pids: [pid])[pid] ?? ""

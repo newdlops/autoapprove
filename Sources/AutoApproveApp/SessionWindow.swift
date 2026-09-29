@@ -354,7 +354,7 @@ private struct SessionRow: View {
                 HStack(spacing: 6) {
                     Text(session.agent.title)
                     Text("·")
-                    Text(session.terminal.title)
+                    Text(session.hostTitle)
                 }.font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Text("\(session.tty.replacingOccurrences(of: "/dev/", with: "")) · PID \(String(session.pid))")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)

@@ -6,7 +6,6 @@ import Combine
     @Published public private(set) var initialDiscoveryComplete = false
     public let paths: AppPaths
     private let store: AuditStore
-    private let terminalReader: @Sendable ([String]) throws -> TerminalSnapshot
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
     private var claudeParents: [String: String] = [:]
@@ -53,10 +52,14 @@ import Combine
     private var handledHookIDs: Set<String> = []
     private var hookIDOrder: [String] = []
     private var pendingActions: [String: (sessionID: String, event: AuditEvent, peerID: String, dispatchID: UUID, generation: String, requestIdentity: String)] = [:]
-    private var terminalEnabled = false
-    private var terminalPolling = false
-    private var terminalPermissionBlocked = false
-    private var terminalRetryAfter = Date.distantPast
+    private struct ScreenConnection {
+        var enabled = false
+        var polling = false
+        var permissionBlocked = false
+        var retryAfter = Date.distantPast
+    }
+    private var screenConnections: [ScreenHost: ScreenConnection] = [:]
+    private let screenAdapters: [ScreenHost: ScreenHostAdapter]
     private var discovering = false
     private var revision: UInt64 = 0
     private struct ScreenState {
@@ -72,9 +75,11 @@ import Combine
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }) throws {
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:]) throws {
         self.paths = paths
-        self.terminalReader = terminalReader
+        var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0)) })
+        adapters[.terminal]?.screens = { targets in try terminalReader(targets.map(\.tty)) }
+        self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
         self.questionTransport = questionTransport
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader
@@ -92,9 +97,29 @@ import Combine
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
         // Restore only a connection the user explicitly enabled from the app.
-        terminalEnabled = store.value("terminalEnabled") == "true"
-        snapshot.health.terminalRequested = terminalEnabled
-        if terminalEnabled { snapshot.health.terminal = "저장된 Terminal 연결 복원 중…" }
+        for host in ScreenHost.allCases {
+            let enabled = store.value(Self.enabledKey(host)) == "true"
+            screenConnections[host] = ScreenConnection(enabled: enabled)
+            var health = snapshot.health.screen(host)
+            health.requested = enabled
+            if enabled { health.status = "저장된 \(host.title) 연결 복원 중…" }
+            snapshot.health.setScreen(host, health)
+        }
+    }
+    static func connectionGuide(_ session: AgentSession) -> String {
+        if let host = ScreenHost(kind: session.terminal) { return "연결 설정에서 \(host.title) 연결 또는 Claude 훅을 설정하세요." }
+        switch session.terminal {
+        case .vscode: return "VS Code 확장을 연결하세요. 이미 실행 중인 Claude는 훅으로도 연결할 수 있습니다."
+        case .unknown where session.hostName != nil:
+            return "\(session.hostName!)의 화면은 읽을 수 없습니다. Claude는 훅으로 연결할 수 있습니다."
+        default: return "연결 설정에서 Terminal 연결 또는 Claude 훅을 설정하세요."
+        }
+    }
+    private static func enabledKey(_ host: ScreenHost) -> String { host == .terminal ? "terminalEnabled" : "screenHost.\(host.rawValue).enabled" }
+    private func updateHealth(_ host: ScreenHost, _ change: (inout ScreenHostHealth) -> Void) {
+        var health = snapshot.health.screen(host)
+        change(&health)
+        if health != snapshot.health.screen(host) { snapshot.health.setScreen(host, health) }
     }
 
     public func start(poll: Bool = true) throws {
@@ -402,7 +427,7 @@ import Combine
         refreshGitBranches()
         let codexTargets = Array(sessions.values).filter { $0.agent == .codex && $0.phase != .ended }
         async let questions = codexQuestions.collect(codexTargets)
-        await refreshTerminal()
+        await refreshScreens()
         updateCodexQuestions(await questions)
         publish()
     }
@@ -695,6 +720,7 @@ import Combine
             if var existing = sessions[session.id] {
                 existing.tty = session.tty
                 if existing.bridgeID == nil { existing.terminal = session.terminal }
+                existing.hostName = session.hostName; existing.hostBundleID = session.hostBundleID; existing.orcaHandle = session.orcaHandle
                 session = existing
             }
             if let cwd = directories[session.id], !cwd.isEmpty, session.cwd != cwd {
@@ -703,7 +729,7 @@ import Combine
             if session.phase == .ended { session.setPhase(.unknown, detail: "새 상태를 확인하고 있습니다."); session.channel = .none; session.automatic = false }
             if sessions[session.id] == nil {
                 restorePreferences(&session)
-                session.detail = session.terminal == .vscode ? "VS Code 확장을 연결하세요. 이미 실행 중인 Claude는 훅으로도 연결할 수 있습니다." : "연결 설정에서 Terminal 연결 또는 Claude 훅을 설정하세요."
+                session.detail = Self.connectionGuide(session)
             }
             sessions[session.id] = session
         }
@@ -746,68 +772,84 @@ import Combine
         if !paused { for id in screens.keys { scheduleScreenApproval(id) } }
         publish()
     }
-    public func connectTerminal() async {
-        do { try store.set("terminalEnabled", "true") }
-        catch { snapshot.health.terminal = "연결 설정 저장 실패: \(error.localizedDescription)"; return }
-        terminalEnabled = true; terminalPermissionBlocked = false; terminalRetryAfter = .distantPast
-        snapshot.health.terminalRequested = true; snapshot.health.terminal = "연결 확인 중…"
-        await refreshTerminal(); publish()
+    public func connectTerminal() async { await connectScreenHost(.terminal) }
+    public func disconnectTerminal() { disconnectScreenHost(.terminal) }
+    public func refreshTerminal() async { await refreshScreenHost(.terminal) }
+    /// Hosts poll independently; a slow Orca CLI must not delay Terminal or iTerm2.
+    public func refreshScreens() async {
+        async let terminal: Void = refreshScreenHost(.terminal)
+        async let iterm: Void = refreshScreenHost(.iterm)
+        async let orca: Void = refreshScreenHost(.orca)
+        _ = await (terminal, iterm, orca)
     }
-    public func disconnectTerminal() {
-        terminalEnabled = false; revision &+= 1; snapshot.health.terminal = "연결 해제됨"
-        snapshot.health.terminalRequested = false; snapshot.health.terminalConnected = false
-        do { try store.set("terminalEnabled", "false") }
-        catch { snapshot.health.terminal = "연결은 해제했지만 설정을 저장하지 못했습니다: \(error.localizedDescription)" }
-        for id in Array(sessions.keys) where sessions[id]?.channel == .terminalScreen {
-            sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "Terminal 연결이 해제되어 현재 상태를 확인할 수 없습니다."); clearScreen(id)
+    public func connectScreenHost(_ host: ScreenHost) async {
+        do { try store.set(Self.enabledKey(host), "true") }
+        catch { updateHealth(host) { $0.status = "연결 설정 저장 실패: \(error.localizedDescription)" }; return }
+        screenConnections[host, default: ScreenConnection()].enabled = true
+        screenConnections[host]?.permissionBlocked = false; screenConnections[host]?.retryAfter = .distantPast
+        updateHealth(host) { $0.requested = true; $0.status = "연결 확인 중…" }
+        await refreshScreenHost(host); publish()
+    }
+    public func disconnectScreenHost(_ host: ScreenHost) {
+        screenConnections[host]?.enabled = false; revision &+= 1
+        updateHealth(host) { $0.status = "연결 해제됨"; $0.requested = false; $0.connected = false }
+        do { try store.set(Self.enabledKey(host), "false") }
+        catch { updateHealth(host) { $0.status = "연결은 해제했지만 설정을 저장하지 못했습니다: \(error.localizedDescription)" } }
+        for id in Array(sessions.keys) where sessions[id]?.channel == host.channel {
+            sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(host.title) 연결이 해제되어 현재 상태를 확인할 수 없습니다."); clearScreen(id)
         }
         publish()
     }
-    public func refreshTerminal() async {
-        guard terminalEnabled, !terminalPolling, !terminalPermissionBlocked, Date() >= terminalRetryAfter else { return }
-        terminalPolling = true; snapshot.health.terminalConnecting = true
-        defer { terminalPolling = false; snapshot.health.terminalConnecting = false }
-        let targets = sessions.values.filter { $0.agent != .shell && $0.terminal == .terminal && $0.phase != .ended }
+    public func refreshScreenHost(_ host: ScreenHost) async {
+        guard let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
+              Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return }
+        screenConnections[host]?.polling = true; updateHealth(host) { $0.connecting = true }
+        defer { screenConnections[host]?.polling = false; updateHealth(host) { $0.connecting = false } }
+        let targets = sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
+        let title = host.title
         do {
-            let ttys = targets.map(\.tty)
-            let reader = terminalReader
-            let result = try await Task.detached(priority: .utility) { try reader(ttys) }.value
-            guard terminalEnabled else { return }
+            let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.orcaHandle) }
+            let reader = adapter.screens
+            let result = try await Task.detached(priority: .utility) { try reader(requests) }.value
+            guard screenConnections[host]?.enabled == true else { return }
             let connected = targets.filter { target in result.screens.contains { $0.tty == target.tty } }.count
             let missing = targets.count - connected
-            snapshot.health.terminalConnected = connected > 0 || targets.isEmpty
-            if connected > 0 {
-                snapshot.health.terminal = "연결됨 · \(connected)개 세션" + (missing > 0 ? " · \(missing)개 탭 확인 필요" : "")
-            } else if targets.isEmpty {
-                snapshot.health.terminal = "연결됨 · Terminal에서 실행 중인 CLI 세션 없음"
-            } else {
-                snapshot.health.terminal = "해당 세션의 Terminal 탭을 읽지 못했습니다. " + (result.failures.first?.message ?? "닫힌 탭인지 확인한 후 다시 연결해주세요.")
+            updateHealth(host) { health in
+                health.connected = connected > 0 || targets.isEmpty
+                if connected > 0 {
+                    health.status = "연결됨 · \(connected)개 세션" + (missing > 0 ? " · \(missing)개 탭 확인 필요" : "")
+                } else if targets.isEmpty {
+                    health.status = "연결됨 · \(title)에서 실행 중인 CLI 세션 없음"
+                } else {
+                    health.status = "해당 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first?.message ?? "닫힌 탭인지 확인한 후 다시 연결해주세요.")
+                }
             }
             for target in targets {
                 guard let screen = result.screens.first(where: { $0.tty == target.tty }) else {
                     if sessions[target.id]?.channel != .hook {
                         sessions[target.id]?.channel = .none
-                        sessions[target.id]?.setPhase(.unknown, detail: "현재 Terminal 화면을 읽지 못했습니다.")
+                        sessions[target.id]?.setPhase(.unknown, detail: "현재 \(title) 화면을 읽지 못했습니다.")
                         sessions[target.id]?.pendingSummary = nil
-                        sessions[target.id]?.detail = "이 세션의 Terminal 탭을 읽지 못했습니다. " + (result.failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
+                        sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
                         clearScreen(target.id)
                     }
                     continue
                 }
                 sessions[target.id]?.terminalTitle = screen.title
                 if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
-                    if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = .terminalScreen }
+                    if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
                     sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                    receiveScreen(sessionID: target.id, raw: screen.contents, generation: "terminal:\(target.id)", source: .terminalScreen)
+                    receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel)
                 }
             }
         } catch {
-            snapshot.health.terminalConnected = false
-            terminalPermissionBlocked = (error as? TerminalAdapterError) == .permissionDenied
-            terminalRetryAfter = Date().addingTimeInterval(5)
-            snapshot.health.terminal = error.localizedDescription + (terminalPermissionBlocked ? "" : " · 자동 재연결 대기")
-            for id in Array(sessions.keys) where sessions[id]?.channel == .terminalScreen {
-                sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "Terminal 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id)
+            // Denied Automation stays blocked until the user reconnects; other failures retry.
+            let blocked = error is TerminalAdapterError
+            screenConnections[host]?.permissionBlocked = blocked
+            screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
+            updateHealth(host) { $0.connected = false; $0.status = error.localizedDescription + (blocked ? "" : " · 자동 재연결 대기") }
+            for id in Array(sessions.keys) where sessions[id]?.channel == host.channel {
+                sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id)
             }
         }
     }
@@ -820,8 +862,9 @@ import Combine
                   && "/dev/" + $0.tty == session.tty }) else {
             throw AppError.message("이 세션이 종료되었거나 터미널이 바뀌었습니다. 목록을 새로고침해주세요.")
         }
-        if current.terminal == .terminal {
-            return try await Task.detached { try TerminalAdapter.reveal(tty: current.tty) }.value
+        if let host = ScreenHost(kind: current.terminal), let adapter = screenAdapters[host] {
+            let target = ScreenTarget(tty: current.tty, handle: current.orcaHandle), reveal = adapter.reveal
+            return try await Task.detached { try reveal(target) }.value
         } else if let peerID = current.bridgeID, let terminalID = current.terminalID, let peer = peers[peerID] {
             guard peer.send(["method": "reveal", "terminalID": terminalID, "id": UUID().uuidString, "label": session.project, "detail": "\(session.agent.title) · \(session.tty)"]) else { throw AppError.message("VS Code 연결이 끊겼습니다.") }
             return nil
@@ -1337,9 +1380,9 @@ import Combine
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
             guard session.phase == .approval, session.pendingInTerminal, prompt != nil,
-                  source == .terminalScreen || source == .vscodeScreen else { return }
-            sessions[sessionID]?.channel = source!
-        } else if session.channel != .terminalScreen && session.channel != .vscodeScreen { return }
+                  let source, source.isScreen else { return }
+            sessions[sessionID]?.channel = source
+        } else if !session.channel.isScreen { return }
         defer { publish() }
         screenObservedAt[sessionID] = now
         guard let prompt else {
@@ -1452,7 +1495,7 @@ import Combine
     private func scheduleScreenApproval(_ id: String) {
         guard !hasBackgroundChildren(id), claudeParents[id] == nil,
               let session = sessions[id], session.agent != .shell, session.automatic,
-              session.channel == .terminalScreen || session.channel == .vscodeScreen, !snapshot.paused,
+              session.channel.isScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
               state.retryAfter.map({ Date() >= $0 }) ?? true else { return }
         let scheduledRevision = revision
@@ -1465,6 +1508,7 @@ import Combine
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,
+                  self.sessions[id]?.orcaHandle == session.orcaHandle,
                   let current = self.screens[id], current.isCurrent, !current.attempted,
                   current.scheduledID == scheduledID,
                   current.generation == state.generation,
@@ -1476,7 +1520,8 @@ import Combine
             }
             // Commit dispatch on the main actor. Pause cancels queued approvals, not an input already dispatched.
             self.screens[id]?.attempted = true; self.screens[id]?.scheduledID = nil; self.screens[id]?.dispatchID = scheduledID
-            var event = AuditEvent(sessionID: id, summary: current.prompt.summary, outcome: "승인 시도 · 결과 미확인", source: session.channel == .terminalScreen ? "Terminal 화면" : "VS Code 화면",
+            let host = ScreenHost(channel: session.channel)
+            var event = AuditEvent(sessionID: id, summary: current.prompt.summary, outcome: "승인 시도 · 결과 미확인", source: "\(host?.title ?? "VS Code") 화면",
                 context: AuditContext(session: session), request: session.agent == .codex ? current.prompt.dialog : current.prompt.summary)
             // Persist the attempt before dispatch; a crash or missing acknowledgement remains traceable.
             guard self.log(event) else {
@@ -1485,9 +1530,15 @@ import Combine
                 self.screens[id]?.reviewDetail = self.sessions[id]?.activityDetail
                 self.publish(); return
             }
-            if session.channel == .terminalScreen {
+            if let host, let adapter = self.screenAdapters[host] {
+                // The agent's foreground job, for hosts that can name the process they would type into.
+                let job = live?.first { $0.pid == session.pid && $0.started == session.started }.map { agent in
+                    (live ?? []).filter { $0.tty == agent.tty && $0.processGroup == agent.processGroup }.map(\.pid)
+                } ?? []
+                let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job)
+                let approve = adapter.approve, raw = current.raw, kind = session.agent
                 do {
-                    let delivery = try await Task.detached { try TerminalAdapter.approve(tty: session.tty, expectedScreen: current.raw, agent: session.agent) }.value
+                    let delivery = try await Task.detached { try approve(target, raw, kind) }.value
                     if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
                     if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
                     event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"

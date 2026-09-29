@@ -28,14 +28,14 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>CFBundleIdentifier</key><string>local.autoapprove.mac</string>
   <key>CFBundleExecutable</key><string>AutoApproveApp</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.27</string>
-  <key>CFBundleVersion</key><string>31</string>
+  <key>CFBundleShortVersionString</key><string>0.2.28</string>
+  <key>CFBundleVersion</key><string>32</string>
   <key>CFBundleDevelopmentRegion</key><string>ko</string>
   <key>CFBundleLocalizations</key><array><string>ko</string></array>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSAppleEventsUsageDescription</key><string>선택한 Terminal 세션의 승인 화면을 확인하고 해당 탭에 승인 입력을 전달합니다.</string>
+  <key>NSAppleEventsUsageDescription</key><string>연결한 Terminal·iTerm2 세션의 승인 화면을 확인하고 해당 탭에 승인 입력을 전달합니다.</string>
 </dict></plist>
 `);
 execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', '--identifier', 'local.autoapprove.helper', path.join(macOS, 'autoapprove')], { stdio: 'inherit' });

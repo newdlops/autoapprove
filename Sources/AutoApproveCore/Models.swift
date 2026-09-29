@@ -8,14 +8,37 @@ public enum AgentKind: String, Codable, CaseIterable {
 }
 
 public enum TerminalKind: String, Codable {
-    case terminal, vscode, claudeBackground, unknown
+    case terminal, vscode, iterm, orca, claudeBackground, unknown
     public var title: String {
         switch self {
         case .terminal: return "Terminal"
         case .vscode: return "VS Code"
+        case .iterm: return "iTerm2"
+        case .orca: return "Orca"
         case .claudeBackground: return "Claude 백그라운드"
         case .unknown: return "터미널 미확인"
         }
+    }
+}
+
+/// Terminal apps whose screens AutoApprove reads and answers without the agent's hooks.
+public enum ScreenHost: String, CaseIterable, Codable, Sendable {
+    case terminal, iterm, orca
+    public init?(kind: TerminalKind) {
+        switch kind { case .terminal: self = .terminal; case .iterm: self = .iterm; case .orca: self = .orca; default: return nil }
+    }
+    public init?(channel: ApprovalChannel) {
+        switch channel { case .terminalScreen: self = .terminal; case .itermScreen: self = .iterm; case .orcaScreen: self = .orca; default: return nil }
+    }
+    public var kind: TerminalKind {
+        switch self { case .terminal: return .terminal; case .iterm: return .iterm; case .orca: return .orca }
+    }
+    public var channel: ApprovalChannel {
+        switch self { case .terminal: return .terminalScreen; case .iterm: return .itermScreen; case .orca: return .orcaScreen }
+    }
+    public var title: String { kind.title }
+    public var bundleID: String {
+        switch self { case .terminal: return "com.apple.Terminal"; case .iterm: return "com.googlecode.iterm2"; case .orca: return "com.stablyai.orca" }
     }
 }
 
@@ -34,15 +57,18 @@ public enum SessionPhase: String, Codable {
 }
 
 public enum ApprovalChannel: String, Codable {
-    case none, hook, terminalScreen, vscodeScreen
+    case none, hook, terminalScreen, vscodeScreen, itermScreen, orcaScreen
     public var title: String {
         switch self {
         case .none: return "연결 필요"
         case .hook: return "Claude 훅 연결됨"
         case .terminalScreen: return "Terminal 화면 연결됨"
         case .vscodeScreen: return "VS Code 화면 연결됨"
+        case .itermScreen: return "iTerm2 화면 연결됨"
+        case .orcaScreen: return "Orca 화면 연결됨"
         }
     }
+    public var isScreen: Bool { self == .vscodeScreen || ScreenHost(channel: self) != nil }
 }
 
 public struct AgentSession: Identifiable, Codable, Equatable {
@@ -53,6 +79,11 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var tty: String
     public var cwd: String
     public var terminal: TerminalKind
+    /// The owning app when it is known, including hosts AutoApprove cannot control.
+    public var hostName: String?
+    public var hostBundleID: String?
+    /// Orca's pane handle from the agent's own launch environment.
+    public var orcaHandle: String?
     public var terminalTitle: String?
     public var customization: SessionCustomization?
     public var notices: [SessionNotice]?
@@ -91,7 +122,14 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var canApprove: Bool { agent != .shell && phase != .ended && (channel != .none || backgroundChildren.contains(where: \.canApprove)) }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
     public var canReveal: Bool {
-        phase != .ended && (terminal == .terminal || (terminal == .vscode && bridgeID != nil && terminalID != nil))
+        phase != .ended && (terminal == .terminal || terminal == .iterm || (terminal == .orca && orcaHandle != nil)
+            || (terminal == .vscode && bridgeID != nil && terminalID != nil))
+    }
+    public var hostTitle: String {
+        switch terminal {
+        case .unknown, .vscode: return hostName ?? terminal.title
+        default: return terminal.title
+        }
     }
     public var project: String { cwd.isEmpty ? "프로젝트 확인 중" : URL(fileURLWithPath: cwd).lastPathComponent }
 
@@ -161,12 +199,43 @@ public struct ConnectionHealth: Codable {
     public var terminalRequested = false
     public var terminalConnected = false
     public var terminalConnecting = false
+    /// iTerm2 and Orca; absent from snapshots of older versions.
+    public var screenHosts: [String: ScreenHostHealth]?
     public var vscode = "확장 연결 대기"
     public var claude = "훅 설치 필요"
     public var codex = "기존 CLI는 터미널 연결 사용"
     public var discoveryError: String?
     public var auditError: String?
     public var noticeError: String?
+}
+
+public struct ScreenHostHealth: Codable, Equatable {
+    public var status = "아직 연결하지 않음"
+    public var requested = false
+    public var connected = false
+    public var connecting = false
+    public init() {}
+}
+
+extension ConnectionHealth {
+    /// Terminal keeps its original flat fields for existing snapshot readers.
+    public func screen(_ host: ScreenHost) -> ScreenHostHealth {
+        guard host != .terminal else {
+            var health = ScreenHostHealth()
+            health.status = terminal; health.requested = terminalRequested
+            health.connected = terminalConnected; health.connecting = terminalConnecting
+            return health
+        }
+        return screenHosts?[host.rawValue] ?? ScreenHostHealth()
+    }
+    public mutating func setScreen(_ host: ScreenHost, _ health: ScreenHostHealth) {
+        guard host != .terminal else {
+            terminal = health.status; terminalRequested = health.requested
+            terminalConnected = health.connected; terminalConnecting = health.connecting
+            return
+        }
+        var hosts = screenHosts ?? [:]; hosts[host.rawValue] = health; screenHosts = hosts
+    }
 }
 
 public struct EngineSnapshot: Codable {
