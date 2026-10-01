@@ -201,8 +201,16 @@ public enum TerminalAdapter {
           for (let index = 0; index < lines.length; index++) if (lines[index].trim() === heading) start = index;
           return start < 0 ? null : lines.slice(start).join('\\n');
         }
-        if (app.running()) for (const window of app.windows()) for (const tab of window.tabs()) {
-          if (tab.tty() !== target.tty) continue;
+        // Terminal lists each native tab as a window, and can list one it no longer resolves.
+        // Skip windows and tabs that cannot be read; only the matching tab is compared and written.
+        function skipClosed(read) {
+          try { return read(); } catch (error) {
+            if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
+            return null;
+          }
+        }
+        if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
+          if (skipClosed(() => tab.tty()) !== target.tty) continue;
           if (activeDialog(tab.contents()) !== normalize(target.dialog)) return 'screenChanged';
           if (!tab.processes().some(p => p.toLowerCase().includes(target.agent))) return 'agentMissing';
           app.doScript('1', {in:tab});

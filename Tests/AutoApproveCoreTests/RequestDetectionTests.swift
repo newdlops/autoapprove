@@ -191,7 +191,7 @@ extension ApprovalTests {
     }
 
     func testTerminalApprovalValidation() throws {
-        func check(_ current: String, expected: String = permissionFixture, agent: AgentKind = .codex, processes: [String] = ["codex"], tty: String = "/dev/fixture", delivery: String, writes: Int) throws {
+        func check(_ current: String, expected: String = permissionFixture, agent: AgentKind = .codex, processes: [String] = ["codex"], tty: String = "/dev/fixture", windows: String = "[{tabs: () => [tab, tab]}]", delivery: String, writes: Int) throws {
             let context = JSContext()!
             context.setObject(current, forKeyedSubscript: "current" as NSString)
             context.setObject(processes, forKeyedSubscript: "processes" as NSString)
@@ -199,7 +199,7 @@ extension ApprovalTests {
             context.evaluateScript("""
             var writes = [];
             var tab = {tty: () => tty, contents: () => current, processes: () => processes};
-            function Application(id) { return {running: () => true, windows: () => [{tabs: () => [tab, tab]}], doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
+            function Application(id) { return {running: () => true, windows: () => \(windows), doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
             """)
             let result = context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: expected, agent: agent))
             try expectNil(context.exception)
@@ -227,6 +227,28 @@ extension ApprovalTests {
             try check(korean.decomposedStringWithCanonicalMapping, expected: korean, agent: agent, processes: [agent.rawValue], delivery: "sent", writes: 1)
             let changed = korean.replacingOccurrences(of: "❯ 1.", with: "  1.").replacingOccurrences(of: "  2.", with: "❯ 2.")
             try check(changed, expected: korean, agent: agent, processes: [agent.rawValue], delivery: "screenChanged", writes: 0)
+        }
+        // Terminal lists each native tab as a window and can list one it no longer resolves.
+        // A tab listed behind it must still receive its input; nothing else is written.
+        let unresolved = "{tabs: () => { const error = Error('Can’t get object. (-1728)'); error.errorNumber = -1728; throw error; }}"
+        let closedTab = "{tty: () => { throw Error('closed tab (-1728)'); }}"
+        try check(permissionFixture, windows: "[\(unresolved), {tabs: () => []}, {tabs: () => [\(closedTab), tab]}]", delivery: "sent", writes: 1)
+        try check(permissionFixture, tty: "/dev/another", windows: "[\(unresolved), {tabs: () => [tab]}]", delivery: "missingTarget", writes: 0)
+        // Denied automation still stops the search, and a failed write is never reported as unsent.
+        let denied = "const error = Error('not authorized (-1743)'); error.errorNumber = -1743; throw error;"
+        for (windows, write) in [("[{tabs: () => { \(denied) }}, {tabs: () => [tab]}]", "writes.push(value)"),
+                                 ("[{tabs: () => [{tty: () => { \(denied) }}, tab]}]", "writes.push(value)"),
+                                 ("[\(unresolved), {tabs: () => [tab]}]", "throw Error('write failed')")] {
+            let context = JSContext()!
+            context.setObject(permissionFixture, forKeyedSubscript: "current" as NSString)
+            context.evaluateScript("""
+            var writes = [];
+            var tab = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex']};
+            function Application(id) { return {running: () => true, windows: () => \(windows), doScript: (value) => { \(write); }}; }
+            """)
+            context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: permissionFixture, agent: .codex))
+            try expectNotNil(context.exception)
+            try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 0)
         }
     }
 

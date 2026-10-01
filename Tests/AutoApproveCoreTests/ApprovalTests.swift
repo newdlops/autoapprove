@@ -501,7 +501,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("window placement across desktop coordinate systems", tests.testTerminalHighlightCoordinates),
             ("long commands and canonical Unicode dialogs", tests.testLongPermissionAndCanonicalUnicode),
             ("interactive question menus versus approval and stale text", tests.testQuestionMenus),
-            ("Terminal final validation and exact single input", tests.testTerminalApprovalValidation),
+            ("Terminal final validation, exact single input and unreadable tab windows", tests.testTerminalApprovalValidation),
             ("Terminal opt-in persists and permission denial stops polling", tests.testTerminalConnectionLifecycle),
             ("Claude question content and permission screen fallback", tests.testHookQuestionAndScreenFallback),
             ("permission dialogs and false positives", tests.testCompletePromptAndFalsePositives),
