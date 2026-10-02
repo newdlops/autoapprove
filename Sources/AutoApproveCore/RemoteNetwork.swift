@@ -9,6 +9,14 @@ public struct RemoteNetworkStatus: Codable, Equatable {
     public var port: UInt16?
     public var peerCount = 0
     public var detail = "같은 네트워크에서 웹 접속이 꺼져 있습니다."
+    /// Hotspot hosts may use their cellular resolver and cannot resolve .local.
+    /// Keep named URLs for Bonjour peers, but use a literal address for phone QR codes.
+    public var directURLs: [String] {
+        urls.filter {
+            guard let host = URLComponents(string: $0)?.host else { return false }
+            return IPv4Address(host) != nil || IPv6Address(host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))) != nil
+        }
+    }
     public init() {}
 }
 
@@ -77,10 +85,14 @@ private struct RemoteTerminalUpdate: Encodable {
     public static let serviceType = "_autoapprove._tcp"
     public let nodeID: String
     public let name: String
+    public var directDiscoveryInterval: TimeInterval = 45
     private weak var engine: ApprovalEngine?
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
+    private var discoveryTask: Task<Void, Never>?
+    private let bonjourEnabled: Bool
+    private let discoveryAddresses: () -> [String]
     private var namedAccess: RemoteNamedAccess?
     private var updatingNamedAccess = false
     private var publishedPortal = false
@@ -98,6 +110,9 @@ private struct RemoteTerminalUpdate: Encodable {
         var available: Bool
         var manual: Bool
         var portal = false
+        var bonjour = false
+        var directlySeen: Date?
+        var directAddress: String?
     }
     private var peers: [String: Peer] = [:]
     private var discoveryError: String?
@@ -112,8 +127,10 @@ private struct RemoteTerminalUpdate: Encodable {
     private let manualURL: URL
     private struct ManualPeer: Codable { var id: String; var name: String; var address: String }
     private var manualPeers: [ManualPeer] = []
-    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
+    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
+        self.bonjourEnabled = bonjourEnabled
+        self.discoveryAddresses = discoveryAddresses ?? RemotePeerDiscovery.addresses
         self.name = name ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         self.onStatus = onStatus
         receiptsURL = engine.paths.directory.appendingPathComponent("web-requests.json")
@@ -134,7 +151,9 @@ private struct RemoteTerminalUpdate: Encodable {
         let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
         let epoch = UUID(); generation = epoch; running = true; self.listener = listener
         publishedPortal = false
-        listener.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: NWTXTRecord(["name": String(name.prefix(100)), "version": "1", "portal": "0"]))
+        if bonjourEnabled {
+            listener.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: NWTXTRecord(["name": String(name.prefix(100)), "version": "1", "portal": "0"]))
+        }
         // Keep NWListener's lifetime accept budget unlimited. Concurrent requests are
         // bounded by connections.count below, and each request has a deadline.
         listener.newConnectionHandler = { [weak self] connection in
@@ -180,25 +199,36 @@ private struct RemoteTerminalUpdate: Encodable {
         }
         status.enabled = true; status.detail = "웹 접속과 같은 네트워크의 Mac을 연결하고 있습니다."
         listener.start(queue: queue)
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Self.serviceType, domain: "local."), using: parameters)
-        self.browser = browser
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
-            Task { @MainActor in
-                guard let self, self.running, self.generation == epoch else { return }
-                self.discovered(results)
-            }
-        }
-        browser.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor in
-                guard let self, self.running, self.generation == epoch else { return }
-                switch state {
-                case .ready: self.discoveryError = nil
-                case .waiting, .failed: self.discoveryError = "Mac 자동 발견이 연결되지 않았습니다. 각 Mac의 로컬 네트워크 권한을 확인하거나 주소로 추가하세요."
-                default: break
+        if bonjourEnabled {
+            let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Self.serviceType, domain: "local."), using: parameters)
+            self.browser = browser
+            browser.browseResultsChangedHandler = { [weak self] results, _ in
+                Task { @MainActor in
+                    guard let self, self.running, self.generation == epoch else { return }
+                    self.discovered(results)
                 }
             }
+            browser.stateUpdateHandler = { [weak self] state in
+                Task { @MainActor in
+                    guard let self, self.running, self.generation == epoch else { return }
+                    switch state {
+                    case .ready: self.discoveryError = nil
+                    case .waiting, .failed: self.discoveryError = "이름으로 Mac을 찾지 못해 같은 네트워크 주소에서 직접 찾고 있습니다. 기본 포트가 다르면 주소로 추가하세요."
+                    default: break
+                    }
+                }
+            }
+            browser.start(queue: queue); emitStatus()
         }
-        browser.start(queue: queue); emitStatus()
+        discoveryTask = Task { [weak self] in
+            // Let the listener and Bonjour settle, then supplement with unicast discovery.
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            while !Task.isCancelled {
+                guard let self, self.running, self.generation == epoch else { return }
+                await self.discoverDirectPeers(epoch: epoch)
+                do { try await Task.sleep(for: .seconds(max(1, self.directDiscoveryInterval))) } catch { return }
+            }
+        }
         let monitor = NWPathMonitor(); pathMonitor = monitor
         monitor.pathUpdateHandler = { [weak self] _ in
             Task { @MainActor in
@@ -210,6 +240,7 @@ private struct RemoteTerminalUpdate: Encodable {
     }
     public func stop() {
         running = false; generation = UUID()
+        discoveryTask?.cancel(); discoveryTask = nil
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
         pathMonitor?.cancel(); pathMonitor = nil
@@ -221,6 +252,7 @@ private struct RemoteTerminalUpdate: Encodable {
     private func emitStatus() { status.peerCount = peers.values.filter(\.available).count; onStatus(status) }
     private func updateNamedAddresses() {
         guard running, status.ready, let port = status.port, !updatingNamedAccess else { return }
+        guard bonjourEnabled else { status.urls = Self.addresses(port: port); return }
         updatingNamedAccess = true
         defer { updatingNamedAccess = false }
         if namedAccess == nil {
@@ -243,7 +275,9 @@ private struct RemoteTerminalUpdate: Encodable {
     private func discovered(_ results: Set<NWBrowser.Result>) {
         for id in Array(peers.keys) {
             peers[id]?.portal = false
-            if peers[id]?.manual != true { peers[id]?.available = false }
+            peers[id]?.bonjour = false
+            let recentlySeen = peers[id]?.directlySeen.map { Date().timeIntervalSince($0) < 150 } ?? false
+            if peers[id]?.manual != true { peers[id]?.available = recentlySeen }
         }
         for result in results {
             guard case .service(let id, _, _, _) = result.endpoint, UUID(uuidString: id) != nil, id != nodeID else { continue }
@@ -255,13 +289,48 @@ private struct RemoteTerminalUpdate: Encodable {
             let portal: Bool
             if case .bonjour(let txt) = result.metadata, txt.getEntry(for: "portal") == .string("1") { portal = true }
             else { portal = false }
-            peers[id] = Peer(id: id, name: peerName, endpoint: result.endpoint, available: true, manual: peers[id]?.manual ?? false, portal: portal)
+            let previous = peers[id]
+            let direct = previous?.directlySeen.map { Date().timeIntervalSince($0) < 150 } == true
+                ? previous?.directAddress.flatMap { try? RemoteNetworkAddress.endpoint($0) } : nil
+            peers[id] = Peer(id: id, name: peerName, endpoint: direct ?? result.endpoint, available: true, manual: previous?.manual ?? false, portal: portal, bonjour: true, directlySeen: previous?.directlySeen, directAddress: previous?.directAddress)
         }
         // Keep disconnected machines visible, but bound the history on long-running networks.
         if peers.count > 100 {
             for id in peers.values.filter({ !$0.available && !$0.manual }).prefix(peers.count - 100).map(\.id) { peers.removeValue(forKey: id) }
         }
         updateNamedAddresses(); emitStatus()
+    }
+    private func discoverDirectPeers(epoch: UUID) async {
+        let addresses = Array(discoveryAddresses().prefix(512))
+        // Bound connection count and keep the main actor free while HTTP probes wait.
+        for offset in stride(from: 0, to: addresses.count, by: 8) {
+            guard running, generation == epoch, !Task.isCancelled else { return }
+            let found = await withTaskGroup(of: RemotePeerDiscovery.Found?.self, returning: [RemotePeerDiscovery.Found].self) { group in
+                for address in addresses[offset..<min(offset + 8, addresses.count)] {
+                    group.addTask { await RemotePeerDiscovery.find(address) }
+                }
+                var result: [RemotePeerDiscovery.Found] = []
+                for await peer in group { if let peer { result.append(peer) } }
+                return result
+            }
+            guard running, generation == epoch, !Task.isCancelled else { return }
+            for peer in found where peer.id != nodeID {
+                guard let endpoint = try? RemoteNetworkAddress.endpoint(peer.address) else { continue }
+                if var existing = peers[peer.id] {
+                    existing.directlySeen = Date(); existing.available = true; existing.name = peer.name
+                    existing.directAddress = peer.address; existing.endpoint = endpoint
+                    peers[peer.id] = existing
+                } else if peers.count < 100 {
+                    peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: endpoint, available: true, manual: false, directlySeen: Date(), directAddress: peer.address)
+                }
+            }
+            if !found.isEmpty { emitStatus() }
+        }
+        for id in Array(peers.keys) where peers[id]?.manual == false && peers[id]?.bonjour == false {
+            let recentlySeen = peers[id]?.directlySeen.map { Date().timeIntervalSince($0) < 150 } ?? false
+            peers[id]?.available = recentlySeen
+        }
+        emitStatus()
     }
     private func localState() throws -> RemoteNodeState {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
@@ -306,6 +375,7 @@ private struct RemoteTerminalUpdate: Encodable {
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
                 case "/api/state": return try .json(localState())
+                case "/api/discovery": return try .object(["service": "autoapprove", "version": 1, "id": nodeID, "name": name])
                 case "/api/network": return try await .json(dashboard())
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }

@@ -4,15 +4,19 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 
 const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-network-'));
-const build = path.resolve('.build/debug');
+const build = path.resolve('.build', process.argv.includes('--release') ? 'release' : 'debug');
 const binary = path.resolve('.build/qa/RemotePreview');
 await mkdir(path.dirname(binary), { recursive: true });
 execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/RemotePreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
 const children = [];
+const probeServers = [];
+const extraProbeURLs = [];
+const directOnly = process.argv.includes('--direct-only');
 async function start(label) {
-  const child = spawn(binary, [path.join(root, label), label], { stdio: ['ignore', 'pipe', 'pipe'] }); children.push(child);
+  const child = spawn(binary, [path.join(root, label), label, ...(directOnly ? ['--direct-only'] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }); children.push(child);
   let buffer = '', errors = '';
   child.stderr.on('data', data => { errors += data; });
   return await new Promise((resolve, reject) => {
@@ -34,9 +38,22 @@ async function request(node, route, body, headers = {}) {
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function ready(node) { for (let attempt = 0; attempt < 50; attempt++) { try { const result = await request(node, '/api/state'); if (result.status === 200) return result.data; } catch {} await wait(100); } throw new Error('HTTP listener was not ready'); }
 try {
-  const first = await start('A'), second = await start('B');
+  const [first, second] = await Promise.all([start('A'), start('B')]);
   const firstState = await ready(first), secondState = await ready(second);
-  for (const node of [first, second]) {
+  const legacyID = randomUUID(), foreignID = randomUUID();
+  if (directOnly) {
+    for (const legacy of [true, false]) {
+      const server = createServer((req, res) => {
+        const status = legacy && req.url !== '/api/state' ? 404 : 200;
+        const body = JSON.stringify(legacy ? (status === 200 ? { ...firstState, id: legacyID, name: 'Legacy AutoApprove fixture' } : { error: 'not found' }) : { service: 'unrelated-app', version: 1, id: foreignID, name: 'not AutoApprove' });
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Connection: 'close' }); res.end(body);
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      probeServers.push(server); extraProbeURLs.push('http://127.0.0.1:' + server.address().port);
+    }
+    await writeFile(path.join(root, 'direct-peers.json'), JSON.stringify([first.url, second.url, ...extraProbeURLs]));
+  }
+  for (const node of directOnly ? [] : [first, second]) {
     assert.match(node.namedURL, /^http:\/\/autoapprove-[a-f0-9]{12}\.local:\d+$/);
     const named = await (await fetch(node.namedURL + '/api/state')).json();
     assert.equal(named.id, node.id, 'A Mac-specific Bonjour name must resolve to the exact instance/port');
@@ -44,13 +61,26 @@ try {
   assert.equal(firstState.sessions.length, 6); assert.equal(secondState.sessions.length, 6);
   const html = await fetch(first.url); assert.equal(html.status, 200); assert.ok((await html.text()).includes('터미널 화면'));
   assert.match(html.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  let discovery = false;
-  for (let attempt = 0; attempt < 15; attempt++) {
-    const result = await request(first, '/api/network');
-    if (result.data.nodes.some(node => node.id === second.id && node.online)) { discovery = true; break; }
-    await wait(300);
+  for (const [gateway, peer] of [[first, second], [second, first]]) {
+    const page = await fetch(gateway.url);
+    assert.equal(page.status, 200, 'Every client must publish its own web page');
+    let discovered = false;
+    for (let attempt = 0; attempt < (directOnly ? 180 : 15); attempt++) {
+      const result = await request(gateway, '/api/network');
+      if ([gateway.id, peer.id].every(id => result.data.nodes.some(node => node.id === id && node.online))) { discovered = true; break; }
+      await wait(300);
+    }
+    assert.equal(discovered, true, 'Every client must automatically discover its peer and serve the complete list');
   }
-  assert.equal(discovery, true, 'Bonjour must automatically discover the second isolated instance');
+  console.log(`PASS: ${directOnly ? 'Bonjour disabled, direct HTTP discovery' : 'Bonjour'} — both clients publish pages and discover the same Mac list without manual registration`);
+  if (directOnly) {
+    for (const gateway of [first, second]) {
+      const result = await request(gateway, '/api/network');
+      assert.ok(result.data.nodes.some(node => node.id === legacyID && node.online), 'An old client without /api/discovery must still be found');
+      assert.ok(!result.data.nodes.some(node => node.id === foreignID), 'An unrelated HTTP service must not enter the client list');
+    }
+    console.log('PASS: legacy state-only client discovery and unrelated HTTP service rejection');
+  }
   const manual = await request(first, '/api/peers', { address: second.url }); assert.equal(manual.status, 200);
   const dashboard = await request(first, '/api/network'); assert.ok(dashboard.data.nodes.find(node => node.id === second.id)?.online);
   const wrongMac = await request(second, '/api/action', { action: 'pause', paused: true, requestID: randomUUID() }, { 'X-AutoApprove-Node': first.id });
@@ -79,7 +109,7 @@ try {
   const denied = await request(first, '/api/action', { action: 'pause', paused: true, requestID: randomUUID() }, { Origin: 'https://unrelated.example' }); assert.equal(denied.status, 403);
   const publicAddress = await request(first, '/api/peers', { address: 'http://8.8.8.8:8765' }); assert.equal(publicAddress.status, 400);
   const unsupported = await request(first, '/api/action', { action: 'hook', requestID: randomUUID() }); assert.equal(unsupported.status, 404);
-  console.log('PASS: Bonjour discovery/named URLs, code-free HTTP, cross-Mac pause/automatic/input, exact Mac/terminal, duplicate prevention, origin checks and private addresses');
+  console.log(`PASS: ${directOnly ? 'direct discovery without Bonjour' : 'Bonjour discovery/named URLs'}, code-free HTTP, cross-Mac pause/automatic/input, exact Mac/terminal, duplicate prevention, origin checks and private addresses`);
   const info = { root, first: { id: first.id, url: first.url }, second: { id: second.id, url: second.url } };
   await writeFile(path.join(root, 'preview.json'), JSON.stringify(info, null, 2));
   if (process.argv.includes('--serve')) {
@@ -89,6 +119,7 @@ try {
     second.child.kill(); await wait(200);
     const disconnected = await request(first, '/api/network'); assert.equal(disconnected.data.nodes.find(node => node.id === second.id)?.online, false);
     const restored = await start('B'); await ready(restored);
+    if (directOnly) await writeFile(path.join(root, 'direct-peers.json'), JSON.stringify([first.url, restored.url, ...extraProbeURLs]));
     let restoredPeer, restoredFrame, durable;
     const recoveryDeadline = Date.now() + 60000;
     while (Date.now() < recoveryDeadline) {
@@ -112,5 +143,6 @@ try {
   }
 } finally {
   for (const child of children) child.kill();
+  await Promise.all(probeServers.map(server => new Promise(resolve => server.close(resolve))));
   await wait(100); await rm(root, { recursive: true, force: true });
 }

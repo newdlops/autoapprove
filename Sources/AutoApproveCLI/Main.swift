@@ -38,7 +38,7 @@ import AutoApproveCore
                 try printJSON(SocketClient.request(path: paths.socket, message: ["method": "automatic", "params": ["sessionID": arguments[1], "enabled": command == "enable"]]))
             case "serve":
                 let engine = try ApprovalEngine(paths: paths)
-                try engine.start()
+                try engine.start(webByDefault: true)
                 if arguments.contains("--web") {
                     var port: UInt16?
                     if let index = arguments.firstIndex(of: "--web-port") {
@@ -80,8 +80,8 @@ import AutoApproveCore
                   autoapprove scan          Claude Code·Codex 세션 탐색 (읽기 전용)
                   autoapprove doctor        연결 상태 확인
                   autoapprove status        앱의 세션 및 승인 내역
-                  autoapprove serve         UI 없이 로컬 엔진 실행
-                  autoapprove serve --web   같은 네트워크 웹 관리도 실행 (기본 포트 8765)
+                  autoapprove serve         UI 없이 엔진·웹 관리·Mac 자동 발견 실행
+                  autoapprove serve --web   저장된 OFF 설정에도 웹 관리 켜기 (기본 포트 8765)
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
                   autoapprove enable ID     연결된 세션 자동 승인 켜기
                   autoapprove disable ID    자동 승인 끄기

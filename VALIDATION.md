@@ -2,6 +2,20 @@
 
 최신 검증일: 2026-10-03. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.36 각 Mac의 자동 웹 게시와 핫스팟 휴대폰 접속
+
+- 사용자 보고: 핫스팟을 제공하는 아이폰·안드로이드에서 `autoapprove.local:8765`가 열리지 않았다. 사용자는 숫자 IP 주소로는 열린다고 확인했다. 휴대폰에서 이름 해석을 거치지 않는 접속 경로를 기본 안내로 바꿨다. Android의 [DNS Resolver 문서](https://source.android.com/docs/core/ota/modular-system/dns-resolver)는 모바일 데이터·VPN 연결을 `.local` 해석 대상에서 제외한다고 설명한다.
+- 각 앱 및 CLI `serve`의 첫 실행은 웹 서버와 Bonjour 상호 검색을 자동으로 시작한다. 이미 사용자가 저장한 OFF는 유지한다. 각 Mac이 자기 웹페이지와 발견한 Mac의 전체 목록을 제공하므로 한 대의 고정 중앙 서버를 요구하지 않는다.
+- 직접 발견: `getifaddrs`의 사설 IPv4/넷마스크로 후보를 계산하고 기본 포트 8765의 작은 `/api/discovery` 식별 응답을 확인한다. 구버전의 404 응답에는 기존 `/api/state`로 대체한다. 자기 주소·네트워크·브로드캐스트·공인/루프백 범위·잘못된 마스크를 제외한다. 인터페이스별 최대 /24·전체 512개·동시 8개·기본 45초 간격이다. 비기본 포트는 Bonjour 또는 수동 주소 추가를 사용한다. 이 범위 계산을 iPhone형 /28, Android형 /24와 큰 사설망으로 검증했다.
+- `node scripts/network-integration-check.mjs --release --direct-only` 통과: Bonjour 광고와 검색을 모두 끈 두 서버가 주입한 격리 주소에서 서로 자동 발견하고 전체 목록·상호 제어·재시작 복구를 제공했다. `/api/state`만 제공하는 구버전 대역도 발견했고 다른 HTTP 프로그램은 목록에서 제외했다. 실제 사용자 LAN 전체를 대상으로 한 자동 발견 검사와는 구분한다.
+- 휴대폰 QR·주소 복사·웹 관리 열기는 숫자 IP와 실제 포트를 공유한다. 주소가 여러 개면 선택기를 제공한다. `.local`은 지원되는 네트워크의 보조 주소로 남긴다. 직접 주소가 없으면 QR 대신 연결 안내를 표시한다.
+- `swift build -c release` 통과. `node scripts/network-integration-check.mjs --release` 통과: 두 격리 클라이언트 각각의 페이지 게시·양방향 자동 발견·전체 목록, Mac별 제어·정확한 입력·중복 방지·중단/재발견·재시작 영수증. 서로 다른 물리 Mac의 검증은 아니다.
+- `node scripts/network-package-check.mjs dist/AutoApprove.app` 통과: 실제 패키지의 첫 실행 자동 게시·기본 포트 충돌 대체·이전 주소/ID/ON 복원·즉시 OFF·재실행 후 명시적 OFF 유지·재배치된 리소스와 서명.
+- 네이티브 연결 설정을 실제 SwiftUI/NSHostingView로 600pt 폭의 라이트·다크 이미지로 렌더링하고 직접 확인했다. Vision으로 두 이미지의 QR을 읽어 표시한 숫자 IP와 실제 대체 포트가 일치함을 검증했다. 기존 시스템 서체·여백·컨트롤을 유지했다. Computer Use 런타임을 불러올 수 없어 실제 설정 창의 마우스/키보드 조작은 미검증이다. 웹 본문은 변경하지 않았으며 전체 브라우저 뷰포트 검사와 전체 Core 회귀를 이번에 다시 실행하지 않았다.
+- 로컬 설치: 0.2.36 빌드 41을 `/Applications/AutoApprove.app`에 설치·실행하고 기존 설정과 승인 기록 3,560건, 세션 20개, Terminal 연결 복원을 확인했다. 이전 앱·DB는 `.runtime/releases/0.2.36-final/`에 보관했다.
+- 설치 후 식별 API는 루프백에서 정상 응답했다. 이 Mac에서 자기 Wi-Fi IP로 보내는 HTTP 요청은 간헐적으로 시간 초과가 났으며, 사용자에게 확인받은 휴대폰의 숫자 IP 접속 성공과 구분한다. 새 설치본의 실제 휴대폰 접속과 여러 물리 Mac의 발견은 아직 확인이 필요하다.
+- DMG 생성 중 이미지 체크섬·읽기 전용 마운트·내장 앱 코드 서명·실행 파일과 버전·최상위 세 항목 검증 통과. 버전 **0.2.36 · 빌드 41**, SHA-256 `49aa37101c82a799d532d7983f28725b5150c0ed05b0a748d827e6de75fb8960`.
+
 ## 0.2.35 웹 터미널 원본 ANSI 색상
 
 - 브리지 0.2.5: xterm 셀의 원본 RGB/256색/16색, 배경색, 굵기·흐림·기울임·밑줄·취소선·반전·숨김을 UTF-16 범위로 전달한다. ANSI 리셋, 커서 이동/지우기, 대체 화면 및 한글/이모지를 처리한다. 원본 텍스트에 대한 입력 재검사는 별도로 유지한다. VS Code JSONC 테마의 include와 사용자 지정(테마별/와일드카드 포함), 밝기 유형과 bold-bright 설정을 반영한다. 팔레트 기본값은 [VS Code terminalColorRegistry](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/terminal/common/terminalColorRegistry.ts)를 따른다.

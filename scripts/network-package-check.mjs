@@ -56,9 +56,6 @@ try {
   execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app]);
   await reserveDefaultPort();
   await start();
-  const off = await status(value => !value.enabled);
-  assert.equal(off.ready, false); assert.deepEqual(off.urls, []);
-  await web('on');
   const on = await status(value => value.enabled && value.ready);
   const port = on.port;
   assert.ok(port > 0 && port !== 8765, 'A busy default port must automatically choose an available port');
@@ -82,7 +79,7 @@ try {
   await assert.rejects(fetch(url + '/api/state', { signal: AbortSignal.timeout(1500) }));
   await stop(); await start();
   assert.equal((await status(value => !value.enabled)).ready, false);
-  console.log('PASS: relocated packaged resources/signature, web default OFF, busy-port fallback, persisted port preference/identity/ON, immediate OFF and persisted OFF');
+  console.log('PASS: relocated packaged resources/signature, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
 } finally {
   await stop();
   if (preferredPortBlocker.listening) await new Promise(resolve => preferredPortBlocker.close(resolve));

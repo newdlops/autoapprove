@@ -38,6 +38,7 @@ private final class PreviewScreens: @unchecked Sendable {
     @MainActor static func main() async throws {
         let directory = URL(fileURLWithPath: CommandLine.arguments[1])
         let label = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "A"
+        let directOnly = CommandLine.arguments.contains("--direct-only")
         let state = PreviewScreens()
         let records = ProcessDiscovery.parse((0..<6).map { index in
             "\(82000 + index) 1 ttys0\(80 + index) \(82000 + index) \(82000 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/codex"
@@ -69,7 +70,12 @@ private final class PreviewScreens: @unchecked Sendable {
         let nodeID = (try? String(contentsOf: nodeIDFile, encoding: .utf8)) ?? UUID().uuidString
         try nodeID.write(to: nodeIDFile, atomically: true, encoding: .utf8)
         var status = RemoteNetworkStatus()
-        let web = RemoteNetworkService(engine: engine, nodeID: nodeID, name: "QA Mac \(label) · 검증용", onStatus: { status = $0 })
+        let web = RemoteNetworkService(engine: engine, nodeID: nodeID, name: "QA Mac \(label) · 검증용", bonjourEnabled: !directOnly, discoveryAddresses: {
+            // Test only these isolated endpoints, never scan the user's actual LAN.
+            guard directOnly, let data = try? Data(contentsOf: directory.deletingLastPathComponent().appendingPathComponent("direct-peers.json")) else { return [] }
+            return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+        }, onStatus: { status = $0 })
+        if directOnly { web.directDiscoveryInterval = 1 }
         try web.start(port: 0)
         for _ in 0..<100 {
             if status.ready { break }
@@ -77,7 +83,7 @@ private final class PreviewScreens: @unchecked Sendable {
         }
         guard status.ready, let port = status.port else { throw AppError.message("검증용 웹 서버 포트를 열지 못했습니다: " + status.detail) }
         for _ in 0..<100 {
-            if status.urls.contains(where: { URL(string: $0)?.host?.hasPrefix("autoapprove-") == true }) { break }
+            if directOnly || status.urls.contains(where: { URL(string: $0)?.host?.hasPrefix("autoapprove-") == true }) { break }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         let info: JSONObject = ["id": nodeID, "name": "QA Mac \(label) · 검증용", "url": "http://127.0.0.1:\(port)",

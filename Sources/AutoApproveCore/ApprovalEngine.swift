@@ -191,7 +191,7 @@ import Combine
         if health != snapshot.health.screen(host) { snapshot.health.setScreen(host, health) }
     }
 
-    public func start(poll: Bool = true) throws {
+    public func start(poll: Bool = true, webByDefault: Bool = false) throws {
         let socket = SocketServer(path: paths.socket, handler: { [weak self] message, peer in
             Task { @MainActor in self?.receive(message, from: peer) }
         }, disconnected: { [weak self] id in
@@ -201,7 +201,14 @@ import Combine
         questionAutomationStopped = false
         keepAwakeStopped = false
         reconcileAutomaticQuestionReplies()
-        if store.value("webEnabled") == "true" { try? setWebEnabled(true) }
+        let savedWeb = store.value("webEnabled")
+        if savedWeb == "true" || (savedWeb == nil && webByDefault) {
+            do { try setWebEnabled(true) }
+            catch {
+                webStatus.enabled = true
+                webStatus.detail = "웹 연결을 열지 못했습니다. \(error.localizedDescription)"
+            }
+        }
         if poll {
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {

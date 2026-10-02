@@ -154,6 +154,20 @@ extension ApprovalTests {
     }
 
     func testRemoteHTTPBoundsOriginAndPrivateAddresses() throws {
+        let hotspot = RemoteNetworkAddress.discoveryURLs(address: "172.20.10.2", netmask: "255.255.255.240")
+        try expectEqual(hotspot.count, 13)
+        try expect(hotspot.contains("http://172.20.10.1:8765") && hotspot.contains("http://172.20.10.14:8765"))
+        try expect(!hotspot.contains("http://172.20.10.2:8765") && !hotspot.contains("http://172.20.10.15:8765"))
+        try expectEqual(RemoteNetworkAddress.discoveryURLs(address: "192.168.43.8", netmask: "255.255.255.0").count, 253)
+        try expectEqual(RemoteNetworkAddress.discoveryURLs(address: "10.2.3.4", netmask: "255.0.0.0").count, 253, "Large private networks are bounded to the local /24")
+        for (ip, mask) in [("8.8.8.8", "255.255.255.0"), ("127.0.0.1", "255.0.0.0"), ("10.0.0.2", "255.0.255.0"), ("10.0.0.2", "255.255.255.255")] {
+            try expect(RemoteNetworkAddress.discoveryURLs(address: ip, netmask: mask).isEmpty)
+        }
+        var status = RemoteNetworkStatus()
+        status.urls = ["http://autoapprove.local:8765", "http://autoapprove-example.local:8765", "http://172.20.10.2:8765", "http://192.168.43.2:54321"]
+        try expectEqual(status.directURLs, ["http://172.20.10.2:8765", "http://192.168.43.2:54321"], "Phone QR addresses must bypass .local and preserve the actual port")
+        status.urls = ["http://autoapprove.local:8765"]
+        try expect(status.directURLs.isEmpty, "An unresolved phone address must not silently fall back to Bonjour")
         let bytes = Data("POST /api/action?node=example HTTP/1.1\r\nHost: 192.168.43.2:8765\r\nOrigin: http://192.168.43.2:8765\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}".utf8)
         try expectNil(try RemoteHTTPRequest.parse(bytes.dropLast()))
         let request = try RemoteHTTPRequest.parse(bytes)!

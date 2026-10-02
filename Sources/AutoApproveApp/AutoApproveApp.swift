@@ -10,7 +10,7 @@ import AutoApproveCore
         do {
             let engine = try ApprovalEngine()
             engine.upgradeClaudeHooks(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path)
-            try engine.start()
+            try engine.start(webByDefault: true)
             self.engine = engine; self.error = nil
             self.notifications = QuestionNotifications(engine: engine)
             // Logout, restart and the Dock's Quit end here too; the Mac gets its normal sleep back.

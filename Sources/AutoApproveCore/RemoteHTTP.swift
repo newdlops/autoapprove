@@ -182,9 +182,9 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private var buffer = Data()
     private var continuation: CheckedContinuation<RemoteHTTPResponse, Error>?
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
-    init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil) {
+    init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) {
         connection = NWConnection(to: endpoint, using: .tcp)
-        timeout = method == "GET" && path == "/api/state" ? 4 : 15
+        self.timeout = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
     }
