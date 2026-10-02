@@ -264,6 +264,7 @@ struct SessionWindow: View {
                           replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) },
                           beginReply: { questionID in perform { try engine.beginQuestionReply(sessionID: id, questionID: questionID) } },
                           cancelAutomaticReply: { questionID in perform { try engine.cancelQuestionAutomaticReply(sessionID: id, questionID: questionID) } },
+                          cancelCapacityResume: { engine.cancelCapacityResume(id) },
                           approveClaude: { sourceID, requestID, automatic in try engine.answerClaudeApproval(sessionID: sourceID, requestID: requestID, enableAutomatic: automatic) },
                           releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) })
         } else {
@@ -433,6 +434,7 @@ private struct SessionDetail: View {
     let replyQuestion: (String, String) async throws -> Void
     let beginReply: (String) -> Void
     let cancelAutomaticReply: (String) -> Void
+    let cancelCapacityResume: () -> Void
     let approveClaude: (String, String, Bool) throws -> Void
     let releaseClaude: (String, String) throws -> Void
     var body: some View {
@@ -490,6 +492,9 @@ private struct SessionDetail: View {
                     }
                     Text(session.activityDetail ?? "연결 후 작업 상태를 확인할 수 있습니다.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if let resume = session.capacityResume {
+                        CapacityResumeStatus(resume: resume, cancel: cancelCapacityResume)
+                    }
                     if let error = session.completionError {
                         Label(error, systemImage: "bell.slash").font(.caption).foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
@@ -841,6 +846,62 @@ struct QuestionReplyEditor: View {
         Button("목록에서 정리", action: dismiss).controlSize(.small)
             .disabled(submitting || question.reply?.phase == .sending)
             .help(submitting || question.reply?.phase == .sending ? AppHelp.sendingAnswer : "이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
+    }
+}
+
+/// A Codex turn stopped at model capacity; the session's auto-approval sends the user's usual follow-up.
+struct CapacityResumeStatus: View {
+    let resume: CapacityResume
+    let cancel: () -> Void
+    var body: some View {
+        if resume.phase == .scheduled {
+            TimelineView(.periodic(from: .now, by: 0.25)) { context in content(at: context.date) }
+        } else {
+            content(at: .now)
+        }
+    }
+    private func content(at date: Date) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) { status(at: date); cancelButton }
+                .fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .leading, spacing: 6) { status(at: date); cancelButton }
+        }
+    }
+    private func status(at date: Date) -> some View {
+        Label(message(at: date), systemImage: icon)
+            .font(.caption).monospacedDigit().foregroundStyle(attention ? .orange : .secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .help("Codex가 ‘Selected model is at capacity’로 작업을 멈추면, 자동 승인이 켜진 세션에서 ‘\(resume.message)’를 보냅니다. 실패가 이어지면 30초부터 두 배씩 기다리며 최대 \(resume.limit)회 시도합니다.")
+    }
+    @ViewBuilder private var cancelButton: some View {
+        if resume.canCancel {
+            Button("자동 이어하기 취소", action: cancel).controlSize(.small)
+                .help("이번 멈춤에는 메시지를 보내지 않습니다. 터미널에서 직접 이어서 진행할 수 있습니다.")
+        }
+    }
+    private var attention: Bool { resume.phase == .review || resume.phase == .exhausted }
+    private var icon: String {
+        switch resume.phase {
+        case .scheduled, .sending, .awaiting: return "arrow.clockwise"
+        case .paused: return "pause.circle"
+        case .review, .exhausted: return "exclamationmark.triangle"
+        case .unavailable, .cancelled: return "minus.circle"
+        }
+    }
+    private func message(at date: Date) -> String {
+        let count = "\(resume.attempt)/\(resume.limit)회"
+        switch resume.phase {
+        case .scheduled:
+            let seconds = max(0, Int(ceil((resume.deadline ?? date).timeIntervalSince(date))))
+            return seconds > 0 ? "모델 용량 부족 · \(seconds)초 후 ‘\(resume.message)’ 전송 (\(count))" : "이어서 진행 요청을 준비하고 있습니다…"
+        case .sending: return "이어서 진행 요청을 보내는 중입니다… (\(count))"
+        case .awaiting: return "이어서 진행 요청을 보냈습니다 (\(count))"
+        case .paused: return "전체 일시정지 중 · 재개하면 이어서 진행 요청을 보냅니다"
+        case .unavailable: return "이 터미널에서는 자동 이어하기를 지원하지 않습니다 · 직접 이어서 진행해주세요"
+        case .review: return "이어서 진행 요청의 전송을 확인하지 못했습니다 · 터미널을 확인해주세요"
+        case .exhausted: return "모델 용량 부족이 계속되어 자동 이어하기를 멈췄습니다 · 직접 이어서 진행해주세요"
+        case .cancelled: return "이번 멈춤의 자동 이어하기를 취소했습니다"
+        }
     }
 }
 

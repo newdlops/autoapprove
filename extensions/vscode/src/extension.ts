@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ScreenMirror } from './screen';
+import { readThemeColors, resolveTerminalTheme } from './theme';
 
 type TerminalState = { id: string; terminal: vscode.Terminal; shellPID?: number; mirror?: ScreenMirror; execution?: vscode.TerminalShellExecution; executionActive?: boolean };
 let connection: net.Socket | undefined;
@@ -15,6 +16,8 @@ const terminals = new Map<vscode.Terminal, TerminalState>();
 let status: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
 let revealStatus: vscode.Disposable | undefined;
+let themeColors: Record<string, unknown> = {};
+let themeGeneration = 0;
 
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel('AutoApprove');
@@ -56,7 +59,11 @@ export function activate(context: vscode.ExtensionContext): void {
   }));
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
     if (event.affectsConfiguration('autoapprove.socketPath')) { connection?.destroy(); connect(); }
+    if (event.affectsConfiguration('workbench.colorTheme')) { void refreshThemeColors(); }
   }));
+  context.subscriptions.push(vscode.window.onDidChangeActiveColorTheme(() => { void refreshThemeColors(); }));
+  context.subscriptions.push(vscode.extensions.onDidChange(() => { void refreshThemeColors(); }));
+  void refreshThemeColors();
   for (const terminal of vscode.window.terminals) { void registerTerminal(terminal); }
   status.show(); connect();
   let tick = 0;
@@ -65,10 +72,33 @@ export function activate(context: vscode.ExtensionContext): void {
     if (tick++ % 8 === 0) { sendRegistration(); }
     for (const state of terminals.values()) {
       if (state.mirror?.valid) {
-        send('screen', { terminalID: state.id, screen: state.mirror.snapshot(), generation: state.mirror.generation });
+        const theme = terminalColors();
+        send('screen', { terminalID: state.id, screen: state.mirror.snapshot(), appearance: state.mirror.appearance(theme.palette, theme.defaults, theme.boldIsBright), generation: state.mirror.generation });
       }
     }
   }, 250);
+}
+
+async function refreshThemeColors(): Promise<void> {
+  const generation = ++themeGeneration, name = vscode.workspace.getConfiguration('workbench').get<string>('colorTheme', '');
+  for (const extension of vscode.extensions.all) {
+    const themes = extension.packageJSON.contributes?.themes;
+    if (!Array.isArray(themes)) { continue; }
+    const theme = themes.find((value: any) => value.id === name || value.label === name);
+    if (!theme || typeof theme.path !== 'string') { continue; }
+    const colors = await readThemeColors(path.resolve(extension.extensionPath, theme.path));
+    if (generation === themeGeneration) { themeColors = colors; }
+    return;
+  }
+  if (generation === themeGeneration) { themeColors = {}; }
+}
+function terminalColors() {
+  const config = vscode.workspace.getConfiguration('workbench');
+  const custom = config.get<Record<string, unknown>>('colorCustomizations', {});
+  const name = config.get<string>('colorTheme', '');
+  return resolveTerminalTheme(themeColors, custom, name, vscode.window.activeColorTheme.kind,
+    vscode.workspace.getConfiguration('terminal.integrated').get<string>('defaultLocation') === 'editor',
+    vscode.workspace.getConfiguration('terminal.integrated').get<boolean>('drawBoldTextInBrightColors', true));
 }
 
 function ensureTerminal(terminal: vscode.Terminal): TerminalState {
@@ -83,7 +113,7 @@ async function registerTerminal(terminal: vscode.Terminal): Promise<void> {
 }
 function sendRegistration(): void {
   send('register', { terminals: Array.from(terminals.values()).map(state => ({
-    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive
+    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 1
   })) });
 }
 function send(method: string, params: Record<string, unknown>): void {
@@ -127,6 +157,16 @@ function connect(): void {
 }
 
 function handleMessage(message: Record<string, any>): void {
+  if (message.method === 'remoteInput') {
+    const state = Array.from(terminals.values()).find(state => state.id === message.terminalID);
+    const success = connected && !!state?.execution && !!state.mirror?.consumeInput(message);
+    if (success) {
+      const keys: Record<string, string> = { enter: '\r', escape: '\x1b', interrupt: '\x03', up: '\x1b[A', down: '\x1b[B', tab: '\t' };
+      state!.terminal.sendText(message.kind === 'text' ? message.text : keys[message.kind], false);
+    }
+    send('remoteInputResult', { actionID: message.id, success });
+    return;
+  }
   const sizes = message.result?.terminalSizes;
   if (sizes && typeof sizes === 'object') {
     for (const state of terminals.values()) { const size = sizes[state.id]; if (size) { state.mirror?.resize(size.columns, size.rows); } }

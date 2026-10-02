@@ -1,4 +1,4 @@
-import { mkdir, copyFile, writeFile, chmod, access, unlink } from 'node:fs/promises';
+import { mkdir, copyFile, writeFile, chmod, access, unlink, cp } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
@@ -20,6 +20,7 @@ for (const binary of ['AutoApproveApp', 'autoapprove']) {
 }
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
 await copyFile('dist/AppIcon.icns', path.join(resources, 'AppIcon.icns'));
+await cp(path.resolve('.build', configuration, 'AutoApprove_AutoApproveCore.bundle'), path.join(resources, 'AutoApprove_AutoApproveCore.bundle'), { recursive: true });
 await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -28,14 +29,16 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>CFBundleIdentifier</key><string>local.autoapprove.mac</string>
   <key>CFBundleExecutable</key><string>AutoApproveApp</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.30</string>
-  <key>CFBundleVersion</key><string>34</string>
+  <key>CFBundleShortVersionString</key><string>0.2.35</string>
+  <key>CFBundleVersion</key><string>39</string>
   <key>CFBundleDevelopmentRegion</key><string>ko</string>
   <key>CFBundleLocalizations</key><array><string>ko</string></array>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>연결한 Terminal·iTerm2 세션의 승인 화면을 확인하고 해당 탭에 승인 입력을 전달합니다.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>개인 핫스팟의 다른 AutoApprove Mac을 발견하고 휴대폰에서 세션 상태와 터미널을 관리합니다.</string>
+  <key>NSBonjourServices</key><array><string>_autoapprove._tcp</string></array>
 </dict></plist>
 `);
 execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', '--identifier', 'local.autoapprove.helper', path.join(macOS, 'autoapprove')], { stdio: 'inherit' });

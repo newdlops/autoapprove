@@ -5,7 +5,10 @@ public struct TerminalScreen: Codable {
     public var tty: String
     public var contents: String
     public var title: String?
-    public init(tty: String, contents: String, title: String? = nil) { self.tty = tty; self.contents = contents; self.title = title }
+    public var appearance: TerminalAppearance?
+    public init(tty: String, contents: String, title: String? = nil, appearance: TerminalAppearance? = nil) {
+        self.tty = tty; self.contents = contents; self.title = title; self.appearance = appearance
+    }
 }
 
 public struct TerminalReadFailure: Codable {
@@ -48,32 +51,43 @@ public struct ScreenHostAdapter: Sendable {
     public var approve: @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery
     /// nil means the host revealed the tab but reports no window frame to highlight.
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
+    /// Sends a message into a Codex composer stopped at the given region (see `CodexCapacityStop`).
+    public var resume: @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery
+    public var input: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
     public init(screens: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot,
                 approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
-                reveal: @escaping @Sendable (ScreenTarget) throws -> TerminalWindowBounds?) {
-        self.screens = screens; self.approve = approve; self.reveal = reveal
+                reveal: @escaping @Sendable (ScreenTarget) throws -> TerminalWindowBounds?,
+                resume: @escaping @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery = { _, _, _ in .missingTarget },
+                input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget }) {
+        self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.input = input
     }
     public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
         switch host {
         case .terminal:
             return ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try TerminalAdapter.approve(tty: $0.tty, expectedScreen: $1, agent: $2) },
-                reveal: { try TerminalAdapter.reveal(tty: $0.tty) })
+                reveal: { try TerminalAdapter.reveal(tty: $0.tty) },
+                resume: { try TerminalAdapter.resume(tty: $0.tty, region: $1, text: $2) },
+                input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) })
         case .iterm:
             return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
-                reveal: { try ITermAdapter.reveal(tty: $0.tty) })
+                reveal: { try ITermAdapter.reveal(tty: $0.tty) },
+                resume: { try ITermAdapter.resume(target: $0, region: $1, text: $2) },
+                input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) })
         case .orca:
             return ScreenHostAdapter(screens: { try OrcaAdapter.screens(targets: $0) },
                 approve: { try OrcaAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
-                reveal: { try OrcaAdapter.reveal(target: $0); return nil })
+                reveal: { try OrcaAdapter.reveal(target: $0); return nil },
+                resume: { try OrcaAdapter.resume(target: $0, region: $1, text: $2) },
+                input: { try RemoteTerminalAdapter.input(host: .orca, target: $0, expected: $1, agent: $2, input: $3) })
         }
     }
 }
 
 enum AutomationScript {
-    static func run(_ body: String, app: String, denied: TerminalAdapterError) throws -> String {
-        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript", "-e", body], timeout: 8)
+    static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8) throws -> String {
+        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript", "-e", body], timeout: timeout)
         guard result.status == 0 else {
             if result.error.contains("-1743") { throw denied }
             throw AppError.message("\(app) 연결 실패: \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))")
@@ -122,20 +136,20 @@ public enum TerminalAdapter {
         let allowed = try literal(ttys)
         return """
         const app = Application('com.apple.Terminal');
-        const allowed = \(allowed); const screens = []; const failures = [];
+        const allowed = new Set(\(allowed)); const screens = []; const failures = [];
         function recordFailure(tty, error) {
           if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
           failures.push({tty:tty, message:String(error)});
         }
         if (!app.running()) throw Error('Terminal 앱을 먼저 실행해주세요.');
-        for (const window of app.windows()) {
+        screenWindows: for (const window of app.windows()) {
           let tabs;
           try { tabs = window.tabs(); } catch (error) { recordFailure(null, error); continue; }
           for (const tab of tabs) {
             let tty = null;
             try {
               tty = tab.tty();
-              if (!allowed.includes(tty)) continue;
+              if (!allowed.has(tty)) continue;
               // A tab has customTitle, not name. Window name belongs only to its selected tab.
               let title = null;
               try { title = String(tab.customTitle() || '').trim() || null; } catch (_) {}
@@ -143,6 +157,8 @@ public enum TerminalAdapter {
                 if (tabs.length === 1 || tab.selected()) title = String(window.name() || '').trim() || null;
               } catch (_) {}
               screens.push({tty:tty, contents:tab.contents(), title:title});
+              allowed.delete(tty);
+              if (!allowed.size) break screenWindows;
             } catch (error) { recordFailure(tty, error); }
           }
         }
@@ -215,6 +231,43 @@ public enum TerminalAdapter {
           if (!tab.processes().some(p => p.toLowerCase().includes(target.agent))) return 'agentMissing';
           app.doScript('1', {in:tab});
           return 'sent';
+        }
+        return 'missingTarget';
+        })();
+        """
+    }
+
+    public static func resume(tty: String, region: String, text: String) throws -> ResumeDelivery {
+        let result = try AutomationScript.run(resumeScript(tty: tty, region: region, text: text), app: "Terminal", denied: .permissionDenied, timeout: 40)
+        guard let delivery = ResumeDelivery(rawValue: result) else { throw AppError.message("이어서 진행 요청의 전달 결과를 확인하지 못했습니다.") }
+        return delivery
+    }
+
+    public static func resumeScript(tty: String, region: String, text: String) throws -> String {
+        let data = try literal(["tty": tty, "region": region, "text": text])
+        return """
+        (() => {
+        const app = Application('com.apple.Terminal'); const target = \(data);
+        \(CodexResumeScript.functions)
+        function skipClosed(read) {
+          try { return read(); } catch (error) {
+            if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
+            return null;
+          }
+        }
+        // osascript receives this script as a decomposed (NFD) argument; type and compare composed text.
+        const text = String(target.text).normalize('NFC');
+        if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
+          if (skipClosed(() => tab.tty()) !== target.tty) continue;
+          const before = resumeRows(tab.contents());
+          if (!resumeReady(before, target.region)) return 'screenChanged';
+          if (!tab.processes().some(p => p.toLowerCase().includes('codex'))) return 'agentMissing';
+          // do script types the text and Return in one write, which Codex keeps as a paste.
+          // A separate Return submits it, only while the draft sits in the same stopped composer.
+          app.doScript(text, {in:tab});
+          const state = awaitTypedState(() => tab.contents(), before, target.region, text);
+          if (state === 'draft') { app.doScript('', {in:tab}); return awaitDraftGone(() => tab.contents(), text) ? 'sent' : 'typed'; }
+          return state === 'submitted' ? 'sent' : 'typed';
         }
         return 'missingTarget';
         })();

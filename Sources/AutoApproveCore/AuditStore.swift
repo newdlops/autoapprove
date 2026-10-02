@@ -102,10 +102,10 @@ public final class AuditStore {
         if let result {
             let outcome = "json_extract(json, '$.outcome')"
             switch result {
-            case .delivered: conditions.append("\(outcome) IN ('승인 전달', '승인 입력 전달', '질문 응답 전달')")
+            case .delivered: conditions.append("\(outcome) IN ('승인 전달', '승인 입력 전달', '질문 응답 전달', '이어서 진행 요청 전달')")
             case .manual: conditions.append("\(outcome) = '터미널에서 확인'")
             case .queued: conditions.append("\(outcome) = '답변 대기열 등록'")
-            case .review: conditions.append("\(outcome) NOT IN ('승인 전달', '승인 입력 전달', '질문 응답 전달', '터미널에서 확인', '답변 대기열 등록')")
+            case .review: conditions.append("\(outcome) NOT IN ('승인 전달', '승인 입력 전달', '질문 응답 전달', '이어서 진행 요청 전달', '터미널에서 확인', '답변 대기열 등록')")
             }
         }
         let predicate = conditions.joined(separator: " AND ")

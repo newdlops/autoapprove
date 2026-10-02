@@ -2,7 +2,30 @@
 
 macOS Terminal·iTerm2·Orca와 VS Code 통합 터미널의 Claude Code·Codex 세션을 관리하는 로컬 앱입니다. 메뉴 막대와 관리 창에서 세션별 자동 승인, 전체 일시정지, 승인 내역, 원래 터미널로 이동을 제공합니다.
 
-현재는 **0.2.30 연결 시제품**입니다. 세션을 발견하는 기능과 자동 승인 가능한 연결을 구분하며, 실제 설치 환경에 따라 지원 범위가 달라집니다.
+## 개인 핫스팟에서 휴대폰으로 관리
+
+같은 네트워크의 여러 Mac을 휴대폰 브라우저 하나로 관리할 수 있습니다. **연결 코드나 로그인 없이** 사용하며, 각 Mac의 웹 접속은 기본적으로 꺼져 있습니다.
+
+1. 각 Mac의 **연결 설정 → 같은 네트워크에서 웹 접속**을 켭니다. macOS가 로컬 네트워크 접근을 요청하면 허용합니다.
+2. 핫스팟을 공유하는 휴대폰에서 **`http://autoapprove.local:8765`**를 엽니다. 숫자 IP를 찾을 필요가 없습니다. 연결 설정의 **QR 코드**도 같은 접속 주소를 사용합니다.
+3. Mac들이 서로 자동 발견됩니다. 하나의 주소에서 모든 세션을 검색하고, Mac별 일시정지·재개와 세션별 자동 승인을 조절합니다.
+4. 세션을 선택하면 기존 터미널의 텍스트 화면과 최근 처리 내역을 봅니다. 직접 입력하려면 해당 세션의 자동 승인을 끄거나 해당 Mac을 일시정지합니다. Terminal은 텍스트를 보낼 때 Return도 함께 전달합니다. 다른 터미널은 텍스트 입력 후 **Enter**로 전송합니다.
+
+Terminal은 텍스트·Enter를, iTerm2·Orca와 AutoApprove Bridge **0.2.4** 이상의 VS Code는 Esc·Ctrl C·화살표·Tab도 제공합니다. 새 셸을 만드는 기능은 아닙니다. Mac에서 해당 터미널의 화면 연결이 필요하며, 훅만 연결된 세션은 화면 연결 안내와 지원되는 질문 응답을 제공합니다. 화면 갱신 중 입력 초안과 선택은 유지되고, 전달 결과가 불명확한 입력은 자동으로 재전송하지 않습니다.
+
+자동 발견이 되지 않으면 **Mac 추가**에서 다른 Mac의 연결 설정에 표시된 IP 주소와 포트를 입력합니다. Mac 사이의 통신 자체를 차단하는 핫스팟에서는 기기 간 통신을 허용해야 합니다. 앱의 웹 접속을 끄거나 종료하면 해당 Mac의 접속도 끝납니다. 켜기/끄기와 주소로 추가한 Mac은 재실행 후 유지됩니다. 개인용 폐쇄망 안의 기기가 로그인 없이 제어하는 사용 방식입니다.
+
+기본 포트는 **8765**이며 다른 프로그램이 사용 중이면 macOS가 빈 포트를 배정합니다. 연결 설정의 주소·QR 코드에 실제 포트가 표시되고 재실행 때 저장된 포트를 먼저 사용합니다. 그 포트도 사용 중이면 새 포트를 배정합니다. CLI에서는 `autoapprove serve --web`으로 실행하거나 실행 중인 앱에 `autoapprove web on`, `autoapprove web off`, `autoapprove web`으로 설정·주소를 확인합니다. 별도 검증 인스턴스는 `serve --web --web-port 8766 --home /tmp/autoapprove-web`처럼 포트를 지정할 수 있습니다.
+
+공용 이름은 기본 포트의 Mac 하나가 맡고 다른 Mac은 함께 사용합니다. 담당 Mac이 종료되면 다른 기본 포트 Mac이 이름을 이어받습니다. IP가 바뀌어도 같은 이름을 사용하며 컴퓨터 이름·라우터·hosts 설정을 바꾸지 않습니다. 공용 이름이 충돌하거나 기본 포트를 사용하는 Mac이 없을 때는 연결 설정에 표시되는 Mac별 `autoapprove-<식별자>.local:<포트>` 주소 또는 QR 코드로 접속합니다. `.local` 이름을 해석하지 못하는 기기는 ‘다른 네트워크 주소’의 IP 주소를 사용할 수 있습니다. 휴대폰에서 주소를 **즐겨찾기나 홈 화면에 저장**하면 다음부터 바로 열 수 있습니다.
+
+웹 터미널은 **AutoApprove Bridge 0.2.5 이상으로 연결한 VS Code**에서 Codex·Claude가 출력한 원본 ANSI 색상과 서식을 표시합니다. RGB·256색·테마의 16색, 배경색, 굵기·밑줄 등을 전달하고 문구를 보고 색을 추측하지 않습니다. **원본 색상**을 끄면 단색으로 읽을 수 있으며 설정은 브라우저에 저장됩니다. 확장은 Mac의 **연결 설정 → VS Code 확장 설치**에서 업데이트합니다. 이미 실행 중인 CLI의 지난 ANSI 출력은 읽을 수 없어 확장을 적용한 뒤 새로 실행한 CLI부터 표시합니다.
+
+**기본 Terminal·iTerm2·Orca의 현재 화면 연결은 텍스트만 제공합니다.** 이 연결에서는 원본 색상을 복구할 수 없다는 안내와 단색 화면을 표시합니다. 기존 세션을 종료하거나 바꾸지 않습니다. 출력과 입력 직후의 빠른 갱신, 동일 화면 전송·그리기 생략, **아래로 따라가기** 및 텍스트 선택 보존은 유지합니다.
+
+웹 관리 기능은 [**AutoApprove 0.2.35 릴리스**](https://github.com/newdlops/autoapprove/releases/tag/v0.2.35)의 `AutoApprove-0.2.35-macOS-arm64.dmg`에서 사용할 수 있습니다. 검증 범위와 남은 확인 항목은 [VALIDATION.md](VALIDATION.md)에 기록합니다.
+
+세션을 발견하는 기능과 자동 승인 가능한 연결을 구분하며, 실제 설치 환경에 따라 지원 범위가 달라집니다.
 
 0.2.30은 **Terminal 창을 탭으로 묶은 뒤 일부 탭에서 자동 승인이 되지 않던 문제**를 수정합니다. Terminal은 탭을 묶어도 탭마다 창 하나로 알려 주는데, 이 창 목록에 더 이상 읽을 수 없는 항목이 섞일 수 있습니다. 승인 입력 단계가 그 항목에서 멈춰, 목록상 그 뒤에 있는 탭은 요청을 감지하고도 입력하지 못하고 직접 확인으로 남았습니다. 이제 읽을 수 없는 창과 탭은 건너뛰고 대상 탭에만 1번을 입력합니다. 입력 직전의 화면·CLI 재확인과, 전달 여부를 알 수 없는 입력은 다시 보내지 않는 규칙은 그대로입니다.
 
@@ -235,12 +258,16 @@ node scripts/claude-parent-integration-check.mjs
 node scripts/claude-hook-integration-check.mjs .build/debug/autoapprove
 node scripts/screen-integration-check.mjs
 node scripts/codex-queue-integration-check.mjs
+node scripts/network-integration-check.mjs
+node scripts/network-package-check.mjs dist/AutoApprove.app
 node scripts/install-check.mjs
 ```
 
 `integration-check`는 임시 앱 데이터와 테스트 이벤트만 사용하며 기존 Claude 설정이나 사용자 세션에는 승인을 보내지 않습니다. `screen-integration-check`는 직접 만든 무동작 프로세스를 별도의 PTY에서 실행하고 가짜 확장으로 승인 메시지를 확인합니다. 실제 CLI의 화면 형식이나 VS Code UI 입력 성공을 검증하는 테스트는 아닙니다.
 
 `claude-hook-integration-check`는 비활성 PTY와 격리 소켓에서 실제 helper의 앱 승인·다음 5초 자동 응답·서버 재시작·응답 유실 재전달·중복 방지·터미널 넘기기를 확인합니다. `claude-parent-integration-check`는 메인·백그라운드 연결과 정책 상속을 검사합니다.
+
+`network-integration-check`는 합성 터미널을 가진 두 격리 엔진의 Bonjour 발견·Mac별 제어·화면 조회·입력·중복 방지·끊김과 복구를 검사합니다. `--serve`로 유지한 검증 서버의 `preview.json` 경로를 `network-browser-check.mjs`에 전달하면 Playwright·Chromium이 있는 환경에서 휴대폰·태블릿·데스크톱 화면과 조작을 확인합니다. `--http-lan`을 붙이면 테스트용 `.local` 주소를 루프백에 매핑해 일반 HTTP 환경과 UUID 대체 경로도 확인합니다. `network-package-check`는 먼저 패키징한 앱을 사용하며, 임시 복사본·프로필에서 포트 충돌·웹 설정 복원·웹 끄기와 번들 리소스를 확인합니다.
 
 `install-check`는 별도 서명한 테스트 앱을 임시 폴더에 설치해 다운로드 차단 속성 제거·재설치·실행 중 교체 방지·실패 시 복원을 검사합니다. 관리자 인증과 앱 열기는 대역으로 확인하며 실제 비밀번호를 요청하거나 사용자 앱을 실행하지 않습니다.
 

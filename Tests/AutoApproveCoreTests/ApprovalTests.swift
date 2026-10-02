@@ -405,6 +405,12 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("LAN HTTP bounds, origin checks and private addresses", tests.testRemoteHTTPBoundsOriginAndPrivateAddresses),
+            ("Remote terminal coalesces reads, expires cache and omits unchanged output", tests.testRemoteTerminalCoalescingExpiryAndConditionalPayload),
+            ("Remote original ANSI attributes, bounds and color-only frames", tests.testRemoteOriginalTerminalAttributesAndColorOnlyFrames),
+            ("Remote terminal read stops once the exact target is found", tests.testRemoteTerminalReadStopsAtExactTarget),
+            ("Remote exact terminal, manual input, stale frames and restart receipts", tests.testRemoteTerminalExactTargetStaleFrameAndDurableReceipt),
+            ("Remote Terminal scripts validate screen, agent and supported keys", tests.testRemoteTerminalScriptValidationAndKeys),
             ("Unchanged observations stay quiet while changes publish immediately", tests.testUnchangedObservationsDoNotPublishSnapshots),
             ("Duplicate indexing preserves Unicode, thread identity and manual overrides", tests.testQuestionDuplicateIndexPreservesCanonicalAndThreadIdentity),
             ("Claude app approval continues through thirty separately timed requests", tests.testClaudeAppApprovalThenThirtySequentialQuestions),
@@ -502,6 +508,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("long commands and canonical Unicode dialogs", tests.testLongPermissionAndCanonicalUnicode),
             ("interactive question menus versus approval and stale text", tests.testQuestionMenus),
             ("Terminal final validation, exact single input and unreadable tab windows", tests.testTerminalApprovalValidation),
+            ("Codex capacity stop: real frames, wrapped cell, draft, submission and blocked composers", tests.testCodexCapacityStopDetection),
+            ("Codex continue scripts type, re-read, then submit only a visible draft", tests.testCodexResumeScriptsTypeThenSubmit),
+            ("Codex capacity continue: opt-in, backoff, limit, cancel, pause, drafts and unverified writes", tests.testCodexCapacityResumeRuns),
+            ("Keep-awake counts only auto-approved work that continues without the user", tests.testKeepAwakeWorkingSessions),
+            ("Keep-awake holds while work remains, then releases and sleeps a closed Mac", tests.testKeepAwakeHoldsWhileWorkRemains),
+            ("Keep-awake guard releases after exit, a stopped heartbeat or the battery floor", tests.testKeepAwakeGuardScript),
+            ("Keep-awake rule allows only pmset sleep commands and survives AppleScript quoting", tests.testKeepAwakeRuleAndAdminScripts),
             ("Terminal opt-in persists and permission denial stops polling", tests.testTerminalConnectionLifecycle),
             ("Claude question content and permission screen fallback", tests.testHookQuestionAndScreenFallback),
             ("permission dialogs and false positives", tests.testCompletePromptAndFalsePositives),

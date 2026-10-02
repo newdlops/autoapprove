@@ -114,6 +114,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var codexQuestionsError: String?
     public var completion: WorkCompletion?
     public var completionError: String?
+    /// A Codex turn stopped at model capacity, while this session's auto-approval is on.
+    public var capacityResume: CapacityResume?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
@@ -148,6 +150,20 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     }
 }
 
+public struct CapacityResume: Codable, Equatable {
+    public enum Phase: String, Codable { case scheduled, sending, awaiting, paused, unavailable, review, exhausted, cancelled }
+    public var phase: Phase
+    /// 1-based automatic attempt within the current run of failures.
+    public var attempt: Int
+    public var limit: Int
+    public var deadline: Date?
+    public var message: String
+    public init(phase: Phase, attempt: Int, limit: Int, deadline: Date? = nil, message: String = CodexCapacityStop.resumeText) {
+        self.phase = phase; self.attempt = attempt; self.limit = limit; self.deadline = deadline; self.message = message
+    }
+    public var canCancel: Bool { phase == .scheduled || phase == .paused }
+}
+
 public struct AuditContext: Codable, Equatable {
     public var agent: AgentKind
     public var cwd: String
@@ -177,7 +193,7 @@ public struct AuditEvent: Identifiable, Codable, Equatable {
     public var request: String?
     public var answer: String?
     public var result: AuditResult {
-        if ["승인 전달", "승인 입력 전달", "질문 응답 전달"].contains(outcome) { return .delivered }
+        if ["승인 전달", "승인 입력 전달", "질문 응답 전달", "이어서 진행 요청 전달", "웹 입력 전달"].contains(outcome) { return .delivered }
         if outcome == "터미널에서 확인" { return .manual }
         if outcome == "답변 대기열 등록" { return .queued }
         return .review
@@ -246,6 +262,8 @@ public struct EngineSnapshot: Codable {
     public var health: ConnectionHealth
     /// Optional so snapshots from older versions retain the ten-second default.
     public var questionNotificationDelaySeconds: Int?
+    /// Keeping the Mac awake with the lid closed; absent from snapshots of older versions.
+    public var keepAwake: KeepAwakeStatus?
     public var questionNotificationDelay: Int {
         guard let value = questionNotificationDelaySeconds, Self.questionNotificationDelayRange.contains(value) else { return 10 }
         return value

@@ -13,6 +13,10 @@ import AutoApproveCore
             try engine.start()
             self.engine = engine; self.error = nil
             self.notifications = QuestionNotifications(engine: engine)
+            // Logout, restart and the Dock's Quit end here too; the Mac gets its normal sleep back.
+            NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { engine.stop() }
+            }
         } catch { self.engine = nil; self.notifications = nil; self.error = error.localizedDescription }
     }
 }
@@ -88,6 +92,7 @@ private struct StatusMenu: View {
         }
         Text("응답 필요 \(engine.snapshot.attentionCount)건")
         if engine.snapshot.paused { Text("자동 승인 일시정지됨") }
+        if engine.snapshot.keepAwake?.phase == .holding { Text("덮개를 닫아도 계속 작업 중") }
         Divider()
         Button("관리 창 열기") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
             .keyboardShortcut("o")

@@ -3,12 +3,12 @@ import AutoApproveCore
 /// Shared wording keeps the list, detail view and menu consistent.
 enum AppHelp {
     static let guide = "앱 버전, 시작 방법, 자동 응답 규칙과 문제 해결 안내를 엽니다. ⌘/"
-    static let connections = "질문·작업 완료 알림 권한과 Terminal 연결, Claude 훅, VS Code 확장의 연결 상태를 확인합니다."
+    static let connections = "질문·작업 완료 알림 권한, 덮개를 닫아도 계속 작업, Terminal 연결, Claude 훅, VS Code 확장의 연결 상태를 확인합니다."
     static let history = "종료된 세션을 포함한 전체 승인 내역을 검색하고 요청 내용과 전달 결과를 확인합니다."
     static let search = "프로젝트 이름·전체 경로, 표시 이름·메모·원래 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."
     static let pid = "실행 중인 Claude Code·Codex 프로세스의 번호입니다."
-    static let automaticDescription = "Claude Code·Codex의 지원 권한 요청과 예·아니오 확인에 이번 요청만 허용합니다. 새 Claude 요청과 Codex 확인 질문에는 5초 후 Yes·Allow·예·허용으로 답합니다. Claude 요청은 앱에서도 직접 허용할 수 있습니다. 과거·중복 질문은 직접 확인해주세요."
+    static let automaticDescription = "Claude Code·Codex의 지원 권한 요청과 예·아니오 확인에 이번 요청만 허용합니다. 새 Claude 요청과 Codex 확인 질문에는 5초 후 Yes·Allow·예·허용으로 답합니다. Claude 요청은 앱에서도 직접 허용할 수 있습니다. Codex가 모델 용량 부족으로 멈추면 ‘이어서 진행하자.’를 보냅니다. 과거·중복 질문은 직접 확인해주세요."
     static let sendingAnswer = "답변을 보내고 있습니다. 중복 전송을 막기 위해 완료될 때까지 기다려주세요."
     static let quit = "AutoApprove와 자동 승인을 종료합니다. Claude Code·Codex 터미널은 계속 실행됩니다."
 

@@ -39,9 +39,24 @@ import AutoApproveCore
             case "serve":
                 let engine = try ApprovalEngine(paths: paths)
                 try engine.start()
+                if arguments.contains("--web") {
+                    var port: UInt16?
+                    if let index = arguments.firstIndex(of: "--web-port") {
+                        guard index + 1 < arguments.count, let supplied = UInt16(arguments[index + 1]) else { throw AppError.message("웹 포트는 0~65535의 숫자로 지정해주세요.") }
+                        port = supplied
+                    }
+                    try engine.setWebEnabled(true, port: port)
+                }
                 print("AutoApprove bridge: \(paths.socket)")
                 while !Task.isCancelled { try await Task.sleep(nanoseconds: 1_000_000_000) }
                 engine.stop()
+            case "web":
+                var params: JSONObject = [:]
+                if arguments.count > 1 {
+                    guard ["on", "off"].contains(arguments[1]) else { throw AppError.message("autoapprove web on 또는 off를 사용해주세요.") }
+                    params["enabled"] = arguments[1] == "on"
+                }
+                try printJSON(SocketClient.request(path: paths.socket, message: ["method": "web", "params": params]))
             case "hook":
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()
@@ -66,6 +81,8 @@ import AutoApproveCore
                   autoapprove doctor        연결 상태 확인
                   autoapprove status        앱의 세션 및 승인 내역
                   autoapprove serve         UI 없이 로컬 엔진 실행
+                  autoapprove serve --web   같은 네트워크 웹 관리도 실행 (기본 포트 8765)
+                  autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
                   autoapprove enable ID     연결된 세션 자동 승인 켜기
                   autoapprove disable ID    자동 승인 끄기
                   autoapprove pause         전체 자동 승인 일시정지

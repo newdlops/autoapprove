@@ -8,14 +8,22 @@ public struct CommandResult {
 }
 
 public enum CommandRunner {
-    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:], inheritEnvironment: Bool = true) throws -> CommandResult {
+    /// `input` reaches the child on standard input, which keeps text composed; arguments arrive decomposed (NFD).
+    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:], inheritEnvironment: Bool = true, input: Data? = nil) throws -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.environment = (inheritEnvironment ? ProcessInfo.processInfo.environment : [:]).merging(environment) { _, value in value }
-        let stdout = Pipe(), stderr = Pipe()
+        let stdout = Pipe(), stderr = Pipe(), stdin = input.map { _ in Pipe() }
         process.standardOutput = stdout; process.standardError = stderr
+        if let stdin { process.standardInput = stdin }
         try process.run()
+        if let stdin, let input {
+            DispatchQueue.global().async {
+                try? stdin.fileHandleForWriting.write(contentsOf: input)
+                try? stdin.fileHandleForWriting.close()
+            }
+        }
         let group = DispatchGroup()
         var out = Data(), err = Data()
         group.enter()

@@ -10,6 +10,8 @@ struct ConnectionSettings: View {
     @State private var notice: String?
     @State private var questionDelayText = ""
     @State private var questionDelayError: String?
+    @State private var keepAwakeBusy = false
+    @State private var keepAwakeError: String?
     private var questionDelayValue: Int? { Int(questionDelayText.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private var validQuestionDelay: Bool { questionDelayValue.map(EngineSnapshot.questionNotificationDelayRange.contains) ?? false }
     private var helper: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path }
@@ -19,6 +21,8 @@ struct ConnectionSettings: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
+                    RemoteAccessSettings(engine: engine)
+                    Divider()
                     section("질문 · 작업 완료 알림", icon: "bell", status: notifications.status) {
                         Text("질문이 설정한 시간 동안 미응답 상태로 남거나 작업이 끝나면 알립니다. 그 전에 처리된 질문은 알리지 않습니다. 같은 질문·완료는 한 번만 알리며, 알림을 누르면 해당 터미널을 엽니다.")
                         HStack(spacing: 8) {
@@ -58,6 +62,8 @@ struct ConnectionSettings: View {
                                 .disabled(notifications.busy).help(notifications.busy ? "알림 권한과 전송 상태를 확인하고 있습니다." : "알림 권한을 확인하고 전송에 실패한 알림을 다시 보냅니다.")
                         }
                     }
+                    Divider()
+                    keepAwakeSection
                     Divider()
                     screenSection(.terminal, icon: "terminal",
                         text: "실행 중인 탭을 연결해 요청을 읽고 해당 탭에만 승인 입력을 전달합니다. 한 번 연결하면 앱을 다시 실행해도 연결을 복원합니다. 처음 연결할 때 macOS의 자동화 권한을 허용해주세요.")
@@ -110,6 +116,44 @@ struct ConnectionSettings: View {
             try engine.setQuestionNotificationDelay(seconds)
             questionDelayText = String(seconds); questionDelayError = nil
         } catch { questionDelayError = "저장하지 못했습니다. \(error.localizedDescription)" }
+    }
+    @ViewBuilder private var keepAwakeSection: some View {
+        let status = engine.snapshot.keepAwake
+        section("덮개를 닫아도 계속 작업", icon: "laptopcomputer",
+                status: keepAwakeBusy ? "적용하고 있습니다. 관리자 암호 창이 열리면 입력해주세요." : status?.detail ?? "꺼져 있습니다.") {
+            Text("자동 승인을 켠 세션이 작업 중이면 덮개를 닫아도 Mac이 잠들지 않습니다. 작업이 모두 끝나고 2분이 지나면 원래대로 돌리고, 그때 덮개가 닫혀 있으면 바로 잠재웁니다. 배터리가 20% 이하이거나 Mac이 뜨거우면 작업 중이어도 원래대로 돌립니다.")
+            Toggle("덮개를 닫아도 계속 작업", isOn: Binding(get: { status?.enabled ?? false }, set: { setKeepAwake($0) }))
+                .toggleStyle(.switch).disabled(keepAwakeBusy)
+                .help(status?.enabled == true ? "끄면 잠자기 금지를 바로 해제하고 macOS의 평소 잠자기로 돌아갑니다."
+                    : "켜면 자동 승인 세션이 작업하는 동안 덮개를 닫아도 잠들지 않습니다. 처음에는 관리자 암호를 묻습니다.")
+            if status?.phase == .holding, let releaseAt = status?.releaseAt {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text("\(max(0, Int(releaseAt.timeIntervalSince(context.date).rounded(.up))))초 뒤 평소처럼 잠듭니다.")
+                        .font(.caption).monospacedDigit()
+                }
+            }
+            if let keepAwakeError { Label(keepAwakeError, systemImage: "exclamationmark.circle").foregroundStyle(.red) }
+            Text("처음 켤 때 관리자 암호를 받아, 잠자기 금지(pmset disablesleep)를 켜고 끄는 일과 잠자기만 암호 없이 실행하는 규칙을 설치합니다. 켜 둔 동안에는 Apple 메뉴의 잠자기와 macOS의 배터리 부족 잠자기도 동작하지 않고, AutoApprove의 배터리 하한만 적용됩니다.").font(.caption)
+            Text("‘상태 미확인’ 세션은 작업 중으로 보지 않습니다. 덮개를 닫은 채 가방에 넣지 마세요. 앱이 종료되거나 멈추면 별도 감시 프로세스가 원래대로 돌립니다.").font(.caption)
+            if status?.ruleFile == true && status?.enabled != true {
+                Button("권한 규칙 제거") { removeKeepAwakeRule() }.disabled(keepAwakeBusy)
+                    .help("AutoApprove가 설치한 잠자기 금지 권한 규칙을 지웁니다. 관리자 암호가 필요합니다.")
+            }
+        }
+    }
+    private func setKeepAwake(_ enabled: Bool) {
+        keepAwakeBusy = true; keepAwakeError = nil
+        Task {
+            do { try await engine.setKeepAwake(enabled) } catch { keepAwakeError = error.localizedDescription }
+            keepAwakeBusy = false
+        }
+    }
+    private func removeKeepAwakeRule() {
+        keepAwakeBusy = true; keepAwakeError = nil
+        Task {
+            do { try await engine.removeKeepAwakeRule() } catch { keepAwakeError = error.localizedDescription }
+            keepAwakeBusy = false
+        }
     }
     @ViewBuilder private func screenSection(_ host: ScreenHost, icon: String, text: String) -> some View {
         let health = engine.snapshot.health.screen(host)

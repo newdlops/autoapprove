@@ -131,6 +131,44 @@ public enum ITermAdapter {
         })();
         """
     }
+    public static func resume(target: ScreenTarget, region: String, text: String) throws -> ResumeDelivery {
+        let result = try AutomationScript.run(resumeScript(target: target, region: region, text: text), app: "iTerm2", denied: .automationDenied("iTerm2"), timeout: 40)
+        guard let delivery = ResumeDelivery(rawValue: result) else { throw AppError.message("이어서 진행 요청의 전달 결과를 확인하지 못했습니다.") }
+        return delivery
+    }
+    public static func resumeScript(target: ScreenTarget, region: String, text: String) throws -> String {
+        let literal = try AutomationScript.literal(["tty": target.tty, "region": region, "text": text, "jobPIDs": target.jobPIDs.map(Int.init)] as JSONObject)
+        return """
+        (() => {
+        const app = \(app); const target = \(literal);
+        \(visibleFunction)
+        \(CodexResumeScript.functions)
+        function skipClosed(read) {
+          try { return read(); } catch (error) {
+            if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
+            return null;
+          }
+        }
+        // osascript receives this script as a decomposed (NFD) argument; type and compare composed text.
+        const text = String(target.text).normalize('NFC');
+        if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || [])
+        for (const session of skipClosed(() => tab.sessions()) || []) {
+          if (skipClosed(() => session.tty()) !== target.tty) continue;
+          const before = resumeRows(visible(session));
+          if (!resumeReady(before, target.region)) return 'screenChanged';
+          let job = 0;
+          try { job = Number(session.variable({named: 'jobPid'})) || 0; } catch (_) {}
+          if (job > 0 && !target.jobPIDs.includes(job)) return 'agentMissing';
+          // Text and Return arriving together stay a paste in Codex; Return follows separately.
+          session.write({text, newline: false});
+          const state = awaitTypedState(() => visible(session), before, target.region, text);
+          if (state === 'draft') { session.write({text: ''}); return awaitDraftGone(() => visible(session), text) ? 'sent' : 'typed'; }
+          return state === 'submitted' ? 'sent' : 'typed';
+        }
+        return 'missingTarget';
+        })();
+        """
+    }
 }
 
 public enum OrcaAdapterError: LocalizedError, Equatable {
@@ -248,5 +286,51 @@ public enum OrcaAdapter {
     public static func reveal(target: ScreenTarget) throws {
         guard let handle = target.handle else { throw AppError.message("Orca 터미널 핸들을 확인하지 못했습니다.") }
         _ = try call(["terminal", "switch", "--terminal", handle])
+    }
+    /// Process arguments and environment values reach the child decomposed (NFD). The shell reads the
+    /// text from a private file and passes it on unchanged, so Codex receives composed Korean.
+    static func sendComposed(handle: String, text: String) throws -> JSONObject {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-send-" + UUID().uuidString)
+        guard FileManager.default.createFile(atPath: file.path, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600]) else {
+            throw AppError.message("Orca에 보낼 입력을 준비하지 못했습니다.")
+        }
+        defer { try? FileManager.default.removeItem(at: file) }
+        let result = try CommandRunner.run("/bin/sh", ["-c", #"exec "$0" terminal send --terminal "$1" --text "$(cat "$2")" --json"#,
+            try cliPath(), handle, file.path], timeout: 6)
+        return try parse(result.output)
+    }
+    /// The same order as the Terminal script: re-read, type the text alone, then Return for a visible draft.
+    public static func resume(target: ScreenTarget, region: String, text: String) throws -> ResumeDelivery {
+        guard let handle = target.handle else { return .missingTarget }
+        let before: String
+        do { before = try readScreen(handle: handle) }
+        catch let error as OrcaAdapterError where error.isStaleHandle { return .missingTarget }
+        guard CodexResumeCheck.ready(before, region: region) else { return .screenChanged }
+        let typed: JSONObject
+        do { typed = try sendComposed(handle: handle, text: text) }
+        catch let error as OrcaAdapterError where error.isStaleHandle { return .missingTarget }
+        guard (typed["send"] as? JSONObject)?["accepted"] as? Bool == true else { return .missingTarget }
+        var state = CodexResumeCheck.TypedState.typed, reads = 0
+        let until = Date().addingTimeInterval(8)
+        repeat {
+            Thread.sleep(forTimeInterval: 0.25)
+            state = CodexResumeCheck.state(before: before, after: try readScreen(handle: handle), region: region, text: text)
+            reads += 1
+        } while state == .typed && (Date() < until || reads < 3)
+        switch state {
+        case .draft:
+            let enter = try call(["terminal", "send", "--terminal", handle, "--text", "\r"])
+            guard (enter["send"] as? JSONObject)?["accepted"] as? Bool == true else { return .typed }
+            let gone = Date().addingTimeInterval(4)
+            var checks = 0
+            repeat {
+                Thread.sleep(forTimeInterval: 0.25)
+                if !CodexResumeCheck.draftVisible(try readScreen(handle: handle), text: text) { return .sent }
+                checks += 1
+            } while Date() < gone || checks < 2
+            return .typed
+        case .submitted: return .sent
+        case .typed: return .typed
+        }
     }
 }

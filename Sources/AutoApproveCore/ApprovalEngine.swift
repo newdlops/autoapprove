@@ -4,6 +4,21 @@ import Combine
 @MainActor public final class ApprovalEngine: ObservableObject {
     @Published public private(set) var snapshot: EngineSnapshot
     @Published public private(set) var initialDiscoveryComplete = false
+    @Published public private(set) var webStatus = RemoteNetworkStatus()
+    public private(set) var webService: RemoteNetworkService?
+    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil }
+    private struct RemoteScreenRead {
+        var token: UUID
+        var target: ScreenTarget
+        var generation: String
+        var task: Task<RemoteObservedScreen, Error>
+        var observedAt: Date?
+    }
+    private var remoteScreenReads: [String: RemoteScreenRead] = [:]
+    private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
+    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String)] = [:]
+    private var remoteInputSessions = Set<String>()
+    private var remoteInputReplies: [String: (peerID: String, continuation: CheckedContinuation<Bool, Error>)] = [:]
     public let paths: AppPaths
     private let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
@@ -60,6 +75,55 @@ import Combine
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
+    /// Seconds before each automatic continue within one run of capacity failures; its count is the limit.
+    public var capacityResumeDelays: [TimeInterval] = [30, 60, 120, 240, 480]
+    /// Wait after a final check that typed nothing, before trying the next fresh frame.
+    public var capacityUnsentRetryDelay: TimeInterval = 3
+    /// After a verified send, a frame read before it can still arrive. A stop that looks the same
+    /// as the one answered counts as the next failure only after this long.
+    public var capacityStaleFrameWindow: TimeInterval = 3
+    /// A continued turn that keeps working this long made progress: its next stop starts a new run.
+    public var capacityProgressWindow: TimeInterval = 120
+    private struct CapacityState {
+        enum Phase { case waiting, sending, sent, unavailable, review, exhausted, cancelled }
+        var phase: Phase
+        var stop: CodexCapacityStop
+        var channel: ApprovalChannel
+        var attempt: Int
+        var deadline: Date
+        var observedAt: Date
+        var scheduledID: UUID?
+        var sentAt: Date?
+        var unsent = 0
+    }
+    private var capacityStates: [String: CapacityState] = [:]
+    /// Work must be gone this long before the hold ends. It bridges a turn's end and the next approval or continue.
+    public var keepAwakeGrace: TimeInterval = 120
+    /// On battery at or below this percent the hold ends; macOS's own low-battery sleep is off while it holds.
+    public var keepAwakeBatteryFloor = 20
+    /// After a failed change to macOS sleep, wait this long before the next try.
+    public var keepAwakeRetryDelay: TimeInterval = 60
+    /// After heat ends a hold, the Mac must stay cool this long before it holds again, so a Mac near the limit
+    /// doesn't flip it every few seconds.
+    public var keepAwakeCoolDown: TimeInterval = 300
+    private var keepAwakeCoolUntil: Date?
+    /// Keep-awake checks read the time here; tests move it by hand.
+    public var keepAwakeClock: @MainActor () -> Date = { Date() }
+    private let powerControl: PowerControl
+    private let keepAwakeSwitch: KeepAwakeSwitch
+    private var keepAwakeEnabled = false
+    /// nil: not checked since the last failure, which needs `sudo -n -l`.
+    private var keepAwakeRule: Bool?
+    private var keepAwakeWorkSeen: Date?
+    private var keepAwakeRetryAfter = Date.distantPast
+    private var keepAwakeFailure: String?
+    private var keepAwakeEvaluating = false
+    private var keepAwakeAgain = false
+    private var keepAwakeWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Set by `stop()`: a check that resumes afterwards changes nothing.
+    private var keepAwakeStopped = false
+    private var keepAwakeTask: Task<Void, Never>?
+    private var keepAwakeActivity: NSObjectProtocol?
     private var discovering = false
     private var revision: UInt64 = 0
     private struct ScreenState {
@@ -75,8 +139,10 @@ import Combine
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:]) throws {
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live) throws {
         self.paths = paths
+        self.powerControl = powerControl
+        keepAwakeSwitch = KeepAwakeSwitch(control: powerControl, marker: paths.directory.appendingPathComponent("keep-awake.hold").path)
         var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0)) })
         adapters[.terminal]?.screens = { targets in try terminalReader(targets.map(\.tty)) }
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
@@ -95,6 +161,9 @@ import Combine
         }
         snapshot = EngineSnapshot(sessions: [], events: store.recent(), paused: store.value("paused") == "true", health: ConnectionHealth())
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
+        keepAwakeEnabled = store.value("keepAwake") == "true"
+        snapshot.keepAwake = keepAwakeEnabled ? KeepAwakeStatus(phase: .checking, detail: Self.keepAwakeChecking, enabled: true, ruleFile: powerControl.ruleFile())
+            : KeepAwakeStatus(phase: .off, detail: Self.keepAwakeOff, enabled: false, ruleFile: powerControl.ruleFile())
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
         // Restore only a connection the user explicitly enabled from the app.
         for host in ScreenHost.allCases {
@@ -130,7 +199,9 @@ import Combine
         })
         try socket.start(); server = socket
         questionAutomationStopped = false
+        keepAwakeStopped = false
         reconcileAutomaticQuestionReplies()
+        if store.value("webEnabled") == "true" { try? setWebEnabled(true) }
         if poll {
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
@@ -138,14 +209,239 @@ import Combine
                     do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { break }
                 }
             }
+            // Screen reads can take many seconds; battery, heat and idle checks keep their own pace.
+            keepAwakeTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    await self?.evaluateKeepAwake()
+                    do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { break }
+                }
+            }
         }
     }
     public func stop() {
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
+        keepAwakeTask?.cancel(); keepAwakeTask = nil
         questionAutomationStopped = true
         for id in Array(automaticQuestionReplies.keys) { cancelAutomaticQuestionReply(id) }
         server?.stop(); server = nil
+        webService?.stop(); webService = nil
+        for pending in remoteInputReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 입력 전달 결과를 확인하지 못했습니다.")) }
+        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll()
+        // Quitting gives macOS its normal sleep back, without putting a closed Mac to sleep.
+        keepAwakeStopped = true
+        keepAwakeSwitch.releaseNow()
+        setKeepAwakeActivity(false)
+    }
+
+    public func setWebEnabled(_ enabled: Bool, port: UInt16? = nil) throws {
+        if enabled {
+            if webService != nil {
+                guard port != nil else { return }
+                webService?.stop(); webService = nil
+            }
+            let nodeID = store.value("webNodeID") ?? UUID().uuidString
+            try store.set("webNodeID", nodeID)
+            let service = RemoteNetworkService(engine: self, nodeID: nodeID) { [weak self] status in
+                guard let self else { return }
+                self.webStatus = status
+                if status.ready, let actualPort = status.port { try? self.store.set("webPort", String(actualPort)) }
+            }
+            let preferredPort = port ?? store.value("webPort").flatMap(UInt16.init) ?? 8765
+            try service.start(port: preferredPort, allowPortFallback: port == nil)
+            do { try store.set("webEnabled", "true") }
+            catch { service.stop(); throw error }
+            webService = service
+        } else {
+            try store.set("webEnabled", "false")
+            webService?.stop(); webService = nil
+        }
+    }
+
+    public func remoteSessionViews() -> [RemoteSessionView] {
+        snapshot.sessions.filter { $0.phase != .ended }.map { session in
+            let canRead = remoteCanRead(session)
+            return RemoteSessionView(session: session,
+                title: session.customization?.title.isEmpty == false ? session.customization!.title : session.terminalTitle ?? session.project,
+                phaseTitle: session.phaseTitle, canApprove: session.canApprove, canReveal: session.canReveal,
+                canRead: canRead, inputReason: remoteInputReason(session), keys: canRead ? remoteKeys(session) : [])
+        }
+    }
+    private func remoteCanRead(_ session: AgentSession) -> Bool {
+        guard session.phase != .ended else { return false }
+        if let host = ScreenHost(kind: session.terminal) { return screenConnections[host]?.enabled == true && !session.tty.isEmpty }
+        return session.terminal == .vscode && session.bridgeID != nil && remoteObservedScreens[session.id] != nil
+    }
+    private func remoteKeys(_ session: AgentSession) -> [String] {
+        session.terminal == .terminal ? ["text", "enter"] : ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
+    }
+    private func remoteInputReason(_ session: AgentSession) -> String? {
+        if !remoteCanRead(session) { return "이 세션의 화면 연결이 없습니다. Mac의 연결 설정에서 터미널을 연결해주세요. 훅으로 받은 질문은 아래에서 답할 수 있습니다." }
+        if effectiveAutomatic(session.id, fallback: session) && !snapshot.paused { return "직접 입력하려면 이 세션의 자동 승인을 끄거나 이 Mac을 일시정지하세요." }
+        if capacityStates[session.id]?.phase == .sending { return "Mac에서 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요." }
+        if liveClaudeHooks.values.contains(where: { $0.request.sessionID == session.id }) { return "앱에서 응답을 기다리는 Claude 요청입니다. 아래의 요청 버튼으로 답해주세요." }
+        if session.terminal == .vscode {
+            let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
+            if registration?["remoteInputVersion"] as? Int != 1 { return "Mac에서 AutoApprove Bridge 확장을 업데이트하면 웹에서 입력할 수 있습니다." }
+        }
+        return nil
+    }
+
+    private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter) async throws -> RemoteObservedScreen {
+        let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle)
+        let generation = "\(host.rawValue):\(session.id):\(session.pid):\(session.started):\(session.tty):\(session.orcaHandle ?? "")"
+        let pending: RemoteScreenRead
+        if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
+           existing.observedAt.map({ Date().timeIntervalSince($0) < 0.6 }) ?? true {
+            pending = existing
+        } else {
+            let reader = adapter.screens
+            let task = Task.detached(priority: .userInitiated) {
+                let snapshot = try reader([target])
+                guard let screen = snapshot.screens.first(where: { $0.tty == target.tty }) else {
+                    throw RemoteHTTPError(409, snapshot.failures.first?.message ?? "터미널 화면을 찾지 못했습니다.")
+                }
+                return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents))
+            }
+            pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
+            remoteScreenReads[session.id] = pending
+        }
+        do {
+            let observed = try await pending.task.value
+            guard remoteScreenReads[session.id]?.token == pending.token else {
+                throw RemoteHTTPError(409, "화면 연결이나 입력 상태가 바뀌었습니다. 최신 화면을 다시 확인해주세요.")
+            }
+            remoteScreenReads[session.id]?.observedAt = observed.observedAt
+            return observed
+        } catch {
+            if remoteScreenReads[session.id]?.token == pending.token { remoteScreenReads.removeValue(forKey: session.id) }
+            throw error
+        }
+    }
+
+    public func remoteTerminal(sessionID: String) async throws -> RemoteTerminalFrame {
+        if remoteInputSessions.contains(sessionID) {
+            if let observed = remoteFrames[sessionID] { return observed.frame }
+            throw RemoteHTTPError(409, "입력을 전달하고 있습니다. 잠시 뒤 화면을 다시 확인해주세요.")
+        }
+        guard let session = sessions[sessionID], remoteCanRead(session) else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
+        let raw: String, generation: String, observedAt: Date, appearance: TerminalAppearance?
+        if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
+            let observed = try await readRemoteScreen(session, host: host, adapter: adapter)
+            raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
+            appearance = observed.appearance
+        } else {
+            guard let observed = remoteObservedScreens[sessionID], Date().timeIntervalSince(observed.observedAt) < 10 else { throw RemoteHTTPError(409, "최신 터미널 화면을 받지 못했습니다. VS Code 연결을 확인해주세요.") }
+            raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
+            appearance = observed.appearance
+        }
+        guard let current = sessions[sessionID], current.phase != .ended, current.tty == session.tty,
+              current.pid == session.pid, current.started == session.started, current.terminal == session.terminal,
+              current.orcaHandle == session.orcaHandle, current.bridgeID == session.bridgeID, remoteCanRead(current) else { throw RemoteHTTPError(409, "세션 연결이 바뀌었습니다. 목록을 새로고침해주세요.") }
+        if remoteInputSessions.contains(sessionID) {
+            if let observed = remoteFrames[sessionID] { return observed.frame }
+            throw RemoteHTTPError(409, "입력을 전달하고 있습니다. 잠시 뒤 화면을 다시 확인해주세요.")
+        }
+        // Reading the same screen in another browser must not invalidate an input draft.
+        // An actual screen/generation change or a consumed frame gets a new token.
+        let previous = remoteFrames[sessionID]
+        let screen = String(raw.suffix(160_000)), visibleAppearance = screen == raw ? appearance : nil
+        let token = previous?.raw == raw && previous?.generation == generation && previous?.frame.appearance == visibleAppearance ? previous!.frame.revision : UUID().uuidString
+        let frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
+            observedAt: observedAt, keys: remoteKeys(current), inputReason: remoteInputReason(current), appearance: visibleAppearance)
+        remoteFrames[sessionID] = (frame, raw, generation)
+        return frame
+    }
+
+    public func remoteInput(_ object: JSONObject) async throws -> JSONObject {
+        guard let id = object["sessionID"] as? String, let token = object["revision"] as? String,
+              let kind = (object["kind"] as? String).flatMap(RemoteTerminalInput.Kind.init(rawValue:)),
+              let session = sessions[id], session.phase != .ended,
+              let observed = remoteFrames[id], observed.frame.revision == token,
+              Date().timeIntervalSince(observed.frame.observedAt) < 10 else { throw RemoteHTTPError(409, "화면이 오래되었거나 연결이 바뀌었습니다. 최신 화면을 확인하고 다시 입력해주세요.") }
+        if let reason = remoteInputReason(session) { throw RemoteHTTPError(409, reason) }
+        guard !remoteInputSessions.contains(id), screens[id]?.dispatchID == nil,
+              !pendingActions.values.contains(where: { $0.sessionID == id }), observed.frame.keys.contains(kind.rawValue) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
+        let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? ""); try input.validate()
+        remoteInputSessions.insert(id)
+        defer { remoteInputSessions.remove(id); remoteScreenReads.removeValue(forKey: id) }
+        let reader = processReader
+        let currentRecords = try await Task.detached { try reader() }.value
+        let tty = session.tty.replacingOccurrences(of: "/dev/", with: "")
+        guard let process = currentRecords.first(where: { $0.pid == session.pid && $0.started == session.started && $0.tty == tty && $0.agent == session.agent }),
+              process.isForeground, let current = sessions[id], current.phase != .ended, remoteInputReason(current) == nil,
+              remoteFrames[id]?.frame.revision == token else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
+        // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
+        remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)
+        var event = AuditEvent(sessionID: id, summary: kind == .text ? String(input.text.prefix(200)) : kind.rawValue,
+            outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: kind == .text ? input.text : kind.rawValue)
+        guard log(event) else { throw RemoteHTTPError(409, "입력 내역을 저장하지 못해 전송하지 않았습니다.") }
+        do {
+            let sent: Bool
+            if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
+                let job = currentRecords.filter { $0.tty == tty && $0.processGroup == process.processGroup }.map(\.pid)
+                let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job), write = adapter.input
+                let result = try await Task.detached { try write(target, observed.raw, session.agent, input) }.value
+                sent = result == .sent
+            } else if let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID {
+                let actionID = UUID().uuidString
+                sent = try await withCheckedThrowingContinuation { continuation in
+                    remoteInputReplies[actionID] = (peerID, continuation)
+                    let message: JSONObject = ["method": "remoteInput", "id": actionID, "terminalID": terminalID,
+                        "screen": observed.raw, "generation": String(observed.generation.dropFirst(peerID.count + 1)),
+                        "kind": kind.rawValue, "text": input.text, "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000]
+                    guard peer.send(message) else {
+                        remoteInputReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: AppError.message("VS Code 연결이 끊겨 전달 결과를 확인하지 못했습니다.")); return
+                    }
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        self?.remoteInputReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: AppError.message("입력 전달 결과를 확인하지 못했습니다. 입력을 다시 보내지 말고 화면을 확인해주세요."))
+                    }
+                }
+            } else { sent = false }
+            event.outcome = sent ? "웹 입력 전달" : "웹 입력 미전달 · 화면 변경"; _ = log(event)
+            guard sent else { throw RemoteHTTPError(409, "현재 화면이나 CLI가 바뀌어 입력하지 않았습니다. 최신 화면을 확인해주세요.") }
+            return ["sent": true, "message": "터미널에 입력을 전달했습니다. 화면에서 반영 결과를 확인하세요."]
+        } catch {
+            if event.outcome == "웹 입력 전달 확인 중" { event.outcome = "웹 입력 결과 미확인"; _ = log(event) }
+            throw error
+        }
+    }
+
+    public func remoteAction(_ object: JSONObject) async throws -> JSONObject {
+        guard let action = object["action"] as? String else { throw RemoteHTTPError(400, "동작을 지정해주세요.") }
+        if action == "pause" {
+            guard let paused = object["paused"] as? Bool else { throw RemoteHTTPError(400, "일시정지 값을 지정해주세요.") }
+            try setPaused(paused); return ["paused": snapshot.paused]
+        }
+        if action == "questionDelay" {
+            guard let seconds = object["seconds"] as? Int else { throw RemoteHTTPError(400, "대기 시간을 지정해주세요.") }
+            try setQuestionNotificationDelay(seconds); return ["seconds": snapshot.questionNotificationDelay]
+        }
+        guard let id = object["sessionID"] as? String, let session = sessions[id], session.phase != .ended else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
+        switch action {
+        case "automatic":
+            guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "자동 승인 값을 지정해주세요.") }
+            try setAutomatic(id, enabled: enabled)
+        case "reveal": _ = try await reveal(session)
+        case "read": try markNotificationsRead(id)
+        case "claudeApprove", "claudeRelease":
+            guard let request = object["requestIDForApproval"] as? String else { throw RemoteHTTPError(400, "승인 요청을 지정해주세요.") }
+            if action == "claudeApprove" { try answerClaudeApproval(sessionID: id, requestID: request) }
+            else { try releaseClaudeApproval(sessionID: id, requestID: request) }
+        case "replyQuestion":
+            guard let question = object["questionID"] as? String, let answer = object["answer"] as? String else { throw RemoteHTTPError(400, "질문과 답변을 지정해주세요.") }
+            try await replyToQuestion(sessionID: id, questionID: question, answer: answer)
+        case "cancelQuestion":
+            guard let question = object["questionID"] as? String else { throw RemoteHTTPError(400, "질문을 지정해주세요.") }
+            try cancelQuestionAutomaticReply(sessionID: id, questionID: question)
+        case "beginQuestion":
+            guard let question = object["questionID"] as? String else { throw RemoteHTTPError(400, "질문을 지정해주세요.") }
+            try beginQuestionReply(sessionID: id, questionID: question)
+        case "cancelCapacity": cancelCapacityResume(id)
+        default: throw RemoteHTTPError(400, "지원하지 않는 동작입니다.")
+        }
+        return ["ok": true]
     }
 
     private func ownerID(_ id: String) -> String? {
@@ -282,6 +578,7 @@ import Combine
 
     private func publish() {
         projectClaudeApprovals()
+        projectCapacityResumes()
         reconcileAutomaticQuestionReplies()
         updateQuestionAutomationStates()
         updateInboxes()
@@ -737,7 +1034,7 @@ import Combine
             sessions[key]?.setPhase(.ended, detail: "프로세스가 종료되었습니다."); sessions[key]?.channel = .none; sessions[key]?.automatic = false
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
             claudeWorkIDs.removeValue(forKey: key)
-            clearScreen(key)
+            clearScreen(key); capacityStates.removeValue(forKey: key)
         }
         let registrations = claudeRegistrations ?? claudeRegistryReader(records)
         reconcileClaudeParents(registrations: registrations)
@@ -754,6 +1051,7 @@ import Combine
 
     public func setAutomatic(_ id: String, enabled: Bool) throws {
         let target = ownerID(id) ?? id
+        if enabled && groupIDs(target).contains(where: { remoteInputSessions.contains($0) }) { throw AppError.message("웹에서 입력을 전달하고 있습니다. 전달이 끝난 뒤 자동 승인을 켜주세요.") }
         guard var session = sessions[target], presentedSessions().first(where: { $0.id == target })?.canApprove == true || !enabled else { throw AppError.message("이 세션의 승인 연결을 먼저 설정해주세요.") }
         var nextParents = claudeParents
         // Explicit control of an orphan starts a new, independent opt-in.
@@ -762,15 +1060,27 @@ import Combine
         claudeParents = nextParents
         session.automatic = enabled; sessions[target] = session
         for member in groupIDs(target) { screens[member]?.scheduledID = nil }
+        if !enabled { for member in groupIDs(target) { capacityStates.removeValue(forKey: member) } }
         publish()
         if enabled { scheduleScreenApproval(target) }
+        Task { await evaluateKeepAwake() }
     }
     public func setPaused(_ paused: Bool) throws {
+        if !paused && !remoteInputSessions.isEmpty { throw AppError.message("웹에서 입력을 전달하고 있습니다. 전달이 끝난 뒤 재개해주세요.") }
         snapshot.paused = paused; revision &+= 1
         for id in screens.keys { screens[id]?.scheduledID = nil }
+        for id in Array(capacityStates.keys) { capacityStates[id]?.scheduledID = nil }
         try store.set("paused", paused ? "true" : "false")
-        if !paused { for id in screens.keys { scheduleScreenApproval(id) } }
+        if !paused {
+            for id in screens.keys { scheduleScreenApproval(id) }
+            // A deadline that passed while paused still leaves a moment to cancel.
+            for (id, state) in capacityStates where state.phase == .waiting {
+                capacityStates[id]?.deadline = max(state.deadline, Date().addingTimeInterval(5))
+                scheduleCapacityResume(id)
+            }
+        }
         publish()
+        Task { await evaluateKeepAwake() }
     }
     public func connectTerminal() async { await connectScreenHost(.terminal) }
     public func disconnectTerminal() { disconnectScreenHost(.terminal) }
@@ -792,11 +1102,15 @@ import Combine
     }
     public func disconnectScreenHost(_ host: ScreenHost) {
         screenConnections[host]?.enabled = false; revision &+= 1
+        for id in sessions.keys where sessions[id]?.terminal == host.kind {
+            remoteScreenReads.removeValue(forKey: id); remoteFrames.removeValue(forKey: id)
+        }
         updateHealth(host) { $0.status = "연결 해제됨"; $0.requested = false; $0.connected = false }
         do { try store.set(Self.enabledKey(host), "false") }
         catch { updateHealth(host) { $0.status = "연결은 해제했지만 설정을 저장하지 못했습니다: \(error.localizedDescription)" } }
         for id in Array(sessions.keys) where sessions[id]?.channel == host.channel {
             sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(host.title) 연결이 해제되어 현재 상태를 확인할 수 없습니다."); clearScreen(id)
+            capacityStates.removeValue(forKey: id)
         }
         publish()
     }
@@ -839,7 +1153,7 @@ import Combine
                 if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
                     if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
                     sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                    receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel)
+                    receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance)
                 }
             }
         } catch {
@@ -1248,6 +1562,12 @@ import Combine
             case "automatic":
                 guard let id = params["sessionID"] as? String, let enabled = params["enabled"] as? Bool else { throw AppError.message("세션 ID와 설정값이 필요합니다.") }
                 try setAutomatic(id, enabled: enabled); result = ["enabled": enabled]
+            case "web":
+                if let enabled = params["enabled"] as? Bool {
+                    let port = (params["port"] as? Int).flatMap(UInt16.init(exactly:))
+                    try setWebEnabled(enabled, port: port)
+                }
+                result = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webStatus)) as? JSONObject ?? [:]
             case "hook": result = params["autoapproveProtocol"] as? Int == 1 ? try handleClaudeHook(params) : handleHook(params)
             case "hookAck": try acknowledgeClaudeHook(params)
             case "claudeApprove":
@@ -1281,10 +1601,11 @@ import Combine
                       let screen = params["screen"] as? String, screen.utf8.count <= 200_000,
                       let generation = params["generation"] as? String else { throw AppError.message("등록되지 않은 터미널 화면입니다.") }
                 var channelChanged = false
+                let appearance = TerminalAppearance.decode(params["appearance"], screen: screen)
                 for id in Array(sessions.keys) where sessions[id]?.agent != .shell && sessions[id]?.phase != .ended && sessions[id]?.bridgeID == peer.id && sessions[id]?.terminalID == terminalID {
                     channelChanged = channelChanged || (sessions[id]?.channel != .hook && sessions[id]?.channel != .vscodeScreen)
                     if sessions[id]?.channel != .hook { sessions[id]?.channel = .vscodeScreen }
-                    receiveScreen(sessionID: id, raw: screen, generation: peer.id + ":" + generation, source: .vscodeScreen)
+                    receiveScreen(sessionID: id, raw: screen, generation: peer.id + ":" + generation, source: .vscodeScreen, appearance: appearance)
                 }
                 // receiveScreen publishes accepted observations itself. Ordinary
                 // terminal output must not recalculate unrelated CLI questions.
@@ -1300,6 +1621,11 @@ import Combine
                     event.outcome = succeeded ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인"
                     log(event)
                     publish()
+                }
+            case "remoteInputResult":
+                if let id = params["actionID"] as? String, let pending = remoteInputReplies[id], pending.peerID == peer.id {
+                    remoteInputReplies.removeValue(forKey: id)
+                    pending.continuation.resume(returning: params["success"] as? Bool == true)
                 }
             default: throw AppError.message("지원하지 않는 요청입니다.")
             }
@@ -1349,6 +1675,9 @@ import Combine
         // not VS Code bridges. Their close cannot change bridge/session state.
         guard peers.removeValue(forKey: peerID) != nil else { return }
         bridges.removeValue(forKey: peerID)
+        for id in Array(remoteInputReplies.keys) where remoteInputReplies[id]?.peerID == peerID {
+            remoteInputReplies.removeValue(forKey: id)?.continuation.resume(throwing: AppError.message("VS Code 연결이 끊겼습니다. 입력을 다시 보내지 말고 화면을 확인해주세요."))
+        }
         for id in Array(pendingActions.keys) where pendingActions[id]?.peerID == peerID {
             if var event = pendingActions.removeValue(forKey: id)?.event {
                 event.outcome = "연결 끊김 · 입력 확인 필요"; log(event)
@@ -1364,13 +1693,15 @@ import Combine
     }
 
     private func clearScreen(_ id: String) {
+        remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)
         screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id); screenObservedAt.removeValue(forKey: id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
         sessions[id]?.pendingRequestID = nil
     }
 
-    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date()) {
+    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
+        remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw))
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
         // A parked main terminal renders the child PTY. Its pixels cannot identify
@@ -1385,6 +1716,7 @@ import Combine
         } else if !session.channel.isScreen { return }
         defer { publish() }
         screenObservedAt[sessionID] = now
+        if session.agent == .codex { observeCapacity(sessionID, raw: raw, at: now) }
         guard let prompt else {
             let request = QuestionDetector.detect(raw, agent: session.agent)
             let observation = ActivityDetector.detect(raw, agent: session.agent)
@@ -1412,7 +1744,7 @@ import Combine
                 return
             }
             let activity = activityTrackers[sessionID, default: ActivityTracker()].observe(raw, agent: session.agent, generation: generation, at: now)
-            sessions[sessionID]?.setPhase(activity.phase, detail: activity.detail, at: now, monitoring: activity.monitoring)
+            presentPhase(sessionID, activity, at: now)
             return
         }
         activityTrackers.removeValue(forKey: sessionID)
@@ -1439,6 +1771,350 @@ import Combine
         sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.requestIdentity)"
         sessions[sessionID]?.lastActivity = Date()
         scheduleScreenApproval(sessionID)
+    }
+
+    // MARK: Codex capacity stops
+
+    /// Answers a capacity stop only for a screen-connected Codex session with auto-approval on.
+    /// After a confirmed send, the next stop drawn is the next failure of the same run.
+    private func observeCapacity(_ id: String, raw: String, at now: Date) {
+        guard let session = sessions[id], session.agent == .codex, session.phase != .ended else { return }
+        guard session.automatic, session.channel.isScreen else { capacityStates.removeValue(forKey: id); return }
+        let stop = CodexCapacityStop.detect(raw, agent: .codex)
+        if var state = capacityStates[id] {
+            if let stop {
+                state.observedAt = now
+                switch state.phase {
+                case .sending:
+                    capacityStates[id] = state
+                case .sent:
+                    // The send was verified, so a stop drawn afterwards is the next failure of this run.
+                    // Repeated failures can fill the screen until it looks unchanged.
+                    let elapsed = now.timeIntervalSince(state.sentAt ?? now)
+                    if stop.identity != state.stop.identity || elapsed >= capacityStaleFrameWindow {
+                        let attempt = elapsed >= capacityProgressWindow ? 1 : state.attempt + 1
+                        startCapacityRun(id, stop: stop, channel: session.channel, attempt: attempt, at: now)
+                    } else {
+                        capacityStates[id] = state
+                    }
+                case .waiting, .unavailable, .review, .exhausted, .cancelled:
+                    if stop.identity != state.stop.identity {
+                        // Not ours: someone continued by hand, or the transcript was redrawn.
+                        startCapacityRun(id, stop: stop, channel: session.channel, attempt: 1, at: now)
+                    } else {
+                        state.stop = stop; capacityStates[id] = state
+                        if state.phase == .waiting, state.scheduledID == nil { scheduleCapacityResume(id) }
+                    }
+                }
+            } else {
+                let phase = ActivityDetector.detect(raw, agent: .codex).phase
+                switch state.phase {
+                case .sending: break
+                case .sent:
+                    let elapsed = now.timeIntervalSince(state.sentAt ?? now)
+                    if elapsed > 10, CodexResumeCheck.draftVisible(raw, text: CodexCapacityStop.resumeText) {
+                        capacityStates[id]?.phase = .review
+                    } else if phase == .idle || (phase != .unknown && elapsed >= capacityProgressWindow) {
+                        // Ended normally, or kept working: the run of failures is over.
+                        capacityStates.removeValue(forKey: id)
+                    }
+                case .review where CodexResumeCheck.draftVisible(raw, text: CodexCapacityStop.resumeText):
+                    break // Our unsent text still waits in the composer for the user.
+                case .waiting, .unavailable, .review, .exhausted, .cancelled:
+                    // The user typed or a turn is running. A partial repaint keeps the stop.
+                    if phase != .unknown || CodexResumeCheck.composerChanged(raw, region: state.stop.region) {
+                        capacityStates.removeValue(forKey: id)
+                    }
+                }
+            }
+        } else if let stop {
+            startCapacityRun(id, stop: stop, channel: session.channel, attempt: 1, at: now)
+        }
+    }
+
+    /// One phase per frame: a stopped turn shows as such, and asks for attention only once automation gave up.
+    private func presentPhase(_ id: String, _ activity: ActivityObservation, at now: Date) {
+        guard let state = capacityStates[id], state.phase != .sent else {
+            sessions[id]?.setPhase(activity.phase, detail: activity.detail, at: now, monitoring: activity.monitoring)
+            return
+        }
+        let detail = "모델 용량 부족으로 Codex 작업이 멈췄습니다."
+        guard state.phase == .review || state.phase == .exhausted else {
+            sessions[id]?.setPhase(activity.phase, detail: detail, at: now, monitoring: activity.monitoring)
+            return
+        }
+        sessions[id]?.setPhase(.input, detail: detail, at: now)
+        sessions[id]?.pendingSummary = state.phase == .review
+            ? "이어서 진행 요청을 입력했지만 전송을 확인하지 못했습니다. 터미널에서 Codex 입력창을 확인해주세요."
+            : "모델 용량 부족이 계속되어 자동으로 \(capacityResumeDelays.count)회 이어서 진행한 뒤 멈췄습니다. 터미널에서 이어서 진행해주세요."
+        sessions[id]?.pendingInTerminal = true
+        sessions[id]?.pendingRequestID = "capacity:\(state.phase == .review ? "review" : "exhausted"):\(state.stop.identity)"
+    }
+
+    private func startCapacityRun(_ id: String, stop: CodexCapacityStop, channel: ApprovalChannel, attempt: Int, at now: Date) {
+        let delays = capacityResumeDelays
+        var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: min(attempt, delays.count),
+            deadline: now, observedAt: now)
+        // VS Code sessions have no typing path for this yet.
+        if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil {
+            state.phase = .unavailable
+        } else if attempt > delays.count {
+            state.phase = .exhausted
+        } else {
+            state.deadline = now.addingTimeInterval(delays[attempt - 1])
+        }
+        capacityStates[id] = state
+        if state.phase == .waiting { scheduleCapacityResume(id) }
+    }
+
+    private func scheduleCapacityResume(_ id: String) {
+        guard let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused else { return }
+        let scheduledID = UUID(), scheduledRevision = revision
+        capacityStates[id]?.scheduledID = scheduledID
+        let delay = max(0, state.deadline.timeIntervalSinceNow)
+        Task { [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            await self?.dispatchCapacityResume(id, scheduledID: scheduledID, revision: scheduledRevision)
+        }
+    }
+
+    private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64) async {
+        func current() -> (CapacityState, AgentSession, ScreenHostAdapter, ScreenHost)? {
+            guard let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
+                  revision == scheduledRevision, !snapshot.paused, let session = sessions[id], session.automatic,
+                  session.phase != .ended, session.channel == state.channel, let host = ScreenHost(channel: state.channel),
+                  let adapter = screenAdapters[host], Date() >= state.deadline,
+                  Date().timeIntervalSince(state.observedAt) < 6 else { return nil }
+            return (state, session, adapter, host)
+        }
+        guard current() != nil else {
+            // A later frame reschedules a stop that is still visible.
+            if capacityStates[id]?.scheduledID == scheduledID { capacityStates[id]?.scheduledID = nil }
+            return
+        }
+        let reader = processReader
+        let live = try? await Task.detached(priority: .utility) { try reader() }.value
+        guard let (state, session, adapter, host) = current(),
+              let process = live?.first(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == .codex
+                  && "/dev/" + $0.tty == session.tty }), process.isForeground else {
+            if capacityStates[id]?.scheduledID == scheduledID { capacityStates[id]?.scheduledID = nil }
+            return
+        }
+        capacityStates[id]?.phase = .sending; capacityStates[id]?.scheduledID = nil
+        var event = AuditEvent(sessionID: id, summary: "모델 용량 부족 · 이어서 진행 요청 (\(state.attempt)/\(capacityResumeDelays.count))",
+            outcome: "이어서 진행 요청 · 결과 미확인", source: "\(host.title) 화면", context: AuditContext(session: session),
+            request: state.stop.region, answer: CodexCapacityStop.resumeText)
+        // Persist the attempt before typing; a crash or lost result remains traceable.
+        guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
+        publish()
+        let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
+        let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job)
+        let resume = adapter.resume, region = state.stop.region, text = CodexCapacityStop.resumeText
+        do {
+            let delivery = try await Task.detached { try resume(target, region, text) }.value
+            switch delivery {
+            case .sent:
+                event.outcome = "이어서 진행 요청 전달"
+                capacityStates[id]?.phase = .sent; capacityStates[id]?.sentAt = Date(); capacityStates[id]?.unsent = 0
+            case .typed:
+                // Typed, but neither a draft nor a new message was visible: never type again.
+                event.outcome = "입력 확인 필요 · 이어서 진행 전송 미확인"
+                capacityStates[id]?.phase = .review
+            case .screenChanged, .missingTarget, .agentMissing:
+                // Nothing was typed. Try again on a fresh frame, a few times.
+                event.outcome = "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
+                let unsent = (capacityStates[id]?.unsent ?? 0) + 1
+                capacityStates[id]?.unsent = unsent
+                capacityStates[id]?.phase = unsent >= 3 ? .review : .waiting
+                capacityStates[id]?.deadline = Date().addingTimeInterval(capacityUnsentRetryDelay)
+            }
+        } catch {
+            // The write may have happened; an uncertain input is never repeated.
+            event.outcome = "입력 확인 필요: \(error.localizedDescription)"
+            capacityStates[id]?.phase = .review
+        }
+        log(event)
+        publish()
+    }
+
+    public func cancelCapacityResume(_ id: String) {
+        guard let phase = capacityStates[id]?.phase, phase == .waiting || phase == .unavailable else { return }
+        capacityStates[id]?.phase = .cancelled; capacityStates[id]?.scheduledID = nil
+        publish()
+    }
+
+    // MARK: Keeping the Mac awake with the lid closed
+
+    static let keepAwakeOff = "꺼져 있습니다. 덮개를 닫으면 평소처럼 잠듭니다."
+    static let keepAwakeChecking = "관리자 권한 규칙을 확인하고 있습니다."
+
+    /// Turning it on installs the sudo rule first when it is missing, which asks for an administrator password.
+    public func setKeepAwake(_ enabled: Bool) async throws {
+        if enabled {
+            let control = powerControl
+            if !(await Task.detached(priority: .userInitiated) { control.ruleInstalled() }.value) {
+                try await Task.detached(priority: .userInitiated) { try control.installRule() }.value
+                guard await Task.detached(priority: .userInitiated, operation: { control.ruleInstalled() }).value else {
+                    throw AppError.message("권한 규칙을 설치했지만 확인하지 못했습니다. 다시 시도해주세요.")
+                }
+            }
+            keepAwakeRule = true
+        }
+        try store.set("keepAwake", enabled ? "true" : "false")
+        keepAwakeEnabled = enabled
+        keepAwakeFailure = nil; keepAwakeRetryAfter = .distantPast
+        await evaluateKeepAwake()
+    }
+
+    /// Turns the setting off and releases a hold first, then removes the rule with an administrator password.
+    public func removeKeepAwakeRule() async throws {
+        if keepAwakeEnabled { try await setKeepAwake(false) }
+        guard !keepAwakeSwitch.owned else { throw AppError.message("잠자기 금지를 먼저 해제하지 못했습니다. 잠시 후 다시 시도해주세요.") }
+        let control = powerControl
+        try await Task.detached(priority: .userInitiated) { try control.removeRule() }.value
+        keepAwakeRule = nil
+        await evaluateKeepAwake()
+    }
+
+    /// The keep-awake timer calls this every few seconds, and changes that affect it call it at once.
+    /// A call during a check waits for one more pass, so it returns with its change applied.
+    public func evaluateKeepAwake() async {
+        if keepAwakeEvaluating {
+            keepAwakeAgain = true
+            await withCheckedContinuation { keepAwakeWaiters.append($0) }
+            return
+        }
+        keepAwakeEvaluating = true
+        repeat {
+            keepAwakeAgain = false
+            await evaluateKeepAwakeOnce(at: keepAwakeClock())
+        } while keepAwakeAgain
+        keepAwakeEvaluating = false
+        let waiters = keepAwakeWaiters
+        keepAwakeWaiters = []
+        waiters.forEach { $0.resume() }
+    }
+
+    private func evaluateKeepAwakeOnce(at now: Date) async {
+        guard !keepAwakeStopped else { return }
+        guard keepAwakeEnabled || keepAwakeSwitch.owned else {
+            // Off with nothing held: macOS sleep is neither read nor changed.
+            keepAwakeWorkSeen = nil; setKeepAwakeActivity(false)
+            setKeepAwakeStatus(KeepAwakeStatus(phase: .off, detail: Self.keepAwakeOff, enabled: false, ruleFile: powerControl.ruleFile()))
+            return
+        }
+        // After a restart, sessions are unknown until the first discovery and screen read; a hold from the
+        // earlier run is neither kept nor ended before then.
+        if pollTask != nil && !initialDiscoveryComplete { return }
+        // `sudo -n -l` runs only after turning it on or after a failed change, never on every pass.
+        if keepAwakeRule == nil, now >= keepAwakeRetryAfter {
+            let control = powerControl
+            keepAwakeRule = await Task.detached(priority: .utility) { control.ruleInstalled() }.value
+            guard !keepAwakeStopped else { return }
+        }
+        var reading = powerControl.read()
+        let working = KeepAwake.working(snapshot.sessions, paused: snapshot.paused).count
+        if snapshot.paused { keepAwakeWorkSeen = nil } else if working > 0 { keepAwakeWorkSeen = now }
+        let blocked = keepAwakeBlock(reading, at: now)
+        let releaseAt = keepAwakeWorkSeen.map { $0.addingTimeInterval(keepAwakeGrace) }
+        let wanted = keepAwakeEnabled && keepAwakeRule == true && blocked == nil && releaseAt.map { now < $0 } == true
+        let owned = keepAwakeSwitch.owned
+        if owned && reading.sleepDisabled { keepAwakeSwitch.heartbeat() }
+        if keepAwakeRule != nil, now >= keepAwakeRetryAfter {
+            let floor = keepAwakeBatteryFloor
+            if !reading.sleepDisabled {
+                if wanted { _ = await changeKeepAwake(at: now) { try await $0.hold(floor: floor) } }
+                else if owned { await keepAwakeSwitch.forget() }
+            } else if owned {
+                // A closed lid would have slept the Mac had AutoApprove not held it, so it sleeps now.
+                let sleep = reading.lidClosed && reading.lidCausesSleep
+                if wanted { _ = await changeKeepAwake(at: now) { try await $0.keepWatching(floor: floor) } }
+                else if let failure = await changeKeepAwake(at: now, { try await $0.release(sleep: sleep) }) ?? nil {
+                    keepAwakeFailure = "덮개가 닫혀 있지만 잠자기를 실행하지 못했습니다. \(failure)"
+                }
+            }
+            reading = powerControl.read()
+        }
+        let holding = keepAwakeSwitch.owned && reading.sleepDisabled
+        setKeepAwakeActivity(holding)
+        setKeepAwakeStatus(keepAwakeStatus(reading, holding: holding, working: working, releaseAt: releaseAt, blocked: blocked))
+    }
+
+    private func changeKeepAwake<T: Sendable>(at now: Date, _ change: @escaping @Sendable (KeepAwakeSwitch) async throws -> T) async -> T? {
+        do {
+            let value = try await change(keepAwakeSwitch)
+            keepAwakeFailure = nil
+            return value
+        } catch {
+            keepAwakeFailure = error.localizedDescription
+            keepAwakeRetryAfter = now.addingTimeInterval(keepAwakeRetryDelay)
+            keepAwakeRule = nil
+            return nil
+        }
+    }
+
+    private func keepAwakeBlock(_ reading: PowerReading, at now: Date) -> KeepAwakeStatus.Phase? {
+        if reading.onBattery, let percent = reading.batteryPercent, percent <= keepAwakeBatteryFloor { return .lowBattery }
+        if reading.thermal == .serious || reading.thermal == .critical {
+            keepAwakeCoolUntil = now.addingTimeInterval(keepAwakeCoolDown)
+            return .hot
+        }
+        if let until = keepAwakeCoolUntil, now < until { return .hot }
+        keepAwakeCoolUntil = nil
+        return nil
+    }
+
+    private func keepAwakeStatus(_ reading: PowerReading, holding: Bool, working: Int, releaseAt: Date?, blocked: KeepAwakeStatus.Phase?) -> KeepAwakeStatus {
+        let ruleFile = powerControl.ruleFile()
+        func status(_ phase: KeepAwakeStatus.Phase, _ detail: String, releaseAt: Date? = nil) -> KeepAwakeStatus {
+            KeepAwakeStatus(phase: phase, detail: detail, enabled: keepAwakeEnabled, ruleFile: ruleFile, working: working, releaseAt: releaseAt)
+        }
+        if !keepAwakeEnabled { return holding ? status(.holding, "끄는 중입니다. 잠자기 금지를 해제하고 있습니다.") : status(.off, Self.keepAwakeOff) }
+        if let failure = keepAwakeFailure { return status(.failed, "잠자기 설정을 바꾸지 못했습니다. 잠시 후 다시 시도합니다. \(failure)") }
+        if keepAwakeRule == nil { return status(.checking, Self.keepAwakeChecking) }
+        if keepAwakeRule == false { return status(.setup, "관리자 권한 규칙이 없습니다. 끄고 다시 켜면 관리자 암호를 받아 설치합니다.") }
+        if reading.sleepDisabled && !holding { return status(.external, "macOS 잠자기 금지가 이미 켜져 있습니다. 직접 켠 설정은 AutoApprove가 바꾸지 않습니다.") }
+        if blocked == .lowBattery { return status(.lowBattery, "배터리가 \(keepAwakeBatteryFloor)% 이하라 평소처럼 잠듭니다. 전원을 연결하면 다시 켭니다.") }
+        if blocked == .hot { return status(.hot, "Mac이 뜨거워 평소처럼 잠듭니다. 식은 뒤 5분이 지나면 다시 켭니다.") }
+        if holding {
+            return working > 0 ? status(.holding, "작업 중인 세션 \(working)개 · 덮개를 닫아도 잠들지 않습니다.")
+                : status(.holding, "작업이 모두 끝났습니다. 잠시 뒤 평소처럼 잠듭니다.", releaseAt: releaseAt)
+        }
+        return status(.ready, "자동 승인을 켠 세션이 작업하는 동안 덮개를 닫아도 잠들지 않습니다.")
+    }
+
+    private func setKeepAwakeStatus(_ status: KeepAwakeStatus) {
+        if snapshot.keepAwake != status { snapshot.keepAwake = status }
+    }
+
+    /// While it holds, App Nap must not slow the checks that answer approvals behind a closed lid.
+    private func setKeepAwakeActivity(_ on: Bool) {
+        if on, keepAwakeActivity == nil {
+            keepAwakeActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "덮개를 닫아도 자동 승인과 이어하기를 계속합니다.")
+        } else if !on, let activity = keepAwakeActivity {
+            ProcessInfo.processInfo.endActivity(activity); keepAwakeActivity = nil
+        }
+    }
+
+    private func projectCapacityResumes() {
+        let limit = capacityResumeDelays.count
+        for id in Array(sessions.keys) {
+            var presented: CapacityResume?
+            if let state = capacityStates[id], sessions[id]?.phase != .ended {
+                let phase: CapacityResume.Phase
+                switch state.phase {
+                case .waiting: phase = snapshot.paused ? .paused : .scheduled
+                case .sending: phase = .sending
+                case .sent: phase = .awaiting
+                case .unavailable: phase = .unavailable
+                case .review: phase = .review
+                case .exhausted: phase = .exhausted
+                case .cancelled: phase = .cancelled
+                }
+                presented = CapacityResume(phase: phase, attempt: state.attempt, limit: limit, deadline: phase == .scheduled ? state.deadline : nil)
+            }
+            if sessions[id]?.capacityResume != presented { sessions[id]?.capacityResume = presented }
+        }
     }
 
     private func retryUnsentApproval(_ id: String, dispatchID: UUID, generation: String) {
