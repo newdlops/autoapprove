@@ -1,6 +1,8 @@
 import Foundation
 import JavaScriptCore
 import AutoApproveCore
+import Network
+import Darwin
 
 private final class RemoteTestScreen: @unchecked Sendable {
     private let lock = NSLock()
@@ -154,6 +156,37 @@ extension ApprovalTests {
     }
 
     func testRemoteHTTPBoundsOriginAndPrivateAddresses() throws {
+        let up = UInt32(IFF_UP)
+        try expect(RemoteLAN.isPhysicalInterface(name: "en0", flags: up))
+        try expect(RemoteLAN.isPhysicalInterface(name: "en7", flags: up))
+        for name in ["utun0", "ipsec0", "ppp0", "lo0", "bridge100", "awdl0"] {
+            try expect(!RemoteLAN.isPhysicalInterface(name: name, flags: up), "Exclude tunnel and virtual addresses: " + name)
+        }
+        try expect(!RemoteLAN.isPhysicalInterface(name: "en0", flags: 0))
+        try expect(!RemoteLAN.isPhysicalInterface(name: "en0", flags: up | UInt32(IFF_POINTOPOINT)))
+        let wifi = RemoteLANInterface(name: "en1", address: "172.20.10.2", netmask: "255.255.255.240", kind: .wifi)
+        let ethernet = RemoteLANInterface(name: "en0", address: "10.2.3.4", netmask: "255.255.255.0", kind: .ethernet)
+        let interfaces = [ethernet, wifi]
+        try expectEqual(RemoteLAN.ordered(interfaces).first, wifi, "Wi-Fi is offered before Ethernet regardless of BSD name")
+        try expectEqual(RemoteLAN.route(to: "172.20.10.1", interfaces: interfaces), wifi)
+        try expectEqual(RemoteLAN.route(to: "10.2.3.8", interfaces: interfaces), ethernet)
+        try expectNil(RemoteLAN.route(to: "10.200.1.8", interfaces: interfaces))
+        let broader = RemoteLANInterface(name: "en9", address: "172.20.1.2", netmask: "255.255.0.0", kind: .ethernet)
+        try expectEqual(RemoteLAN.route(to: "172.20.10.1", interfaces: [broader, wifi]), wifi, "Use the most specific connected subnet")
+        let overlap = RemoteLANInterface(name: "en0", address: "172.20.10.3", netmask: wifi.netmask, kind: .ethernet)
+        try expectEqual(RemoteLAN.route(to: "172.20.10.1", interfaces: [overlap, wifi]), wifi, "Prefer Wi-Fi when two LANs overlap")
+        func parameters(_ address: String, _ interfaces: [RemoteLANInterface]) throws -> NWParameters {
+            try RemoteLAN.tcpParameters(to: RemoteNetworkAddress.endpoint(address), interfaces: interfaces)
+        }
+        let wifiParameters = try parameters("172.20.10.1:8765", interfaces)
+        try expectEqual(wifiParameters.requiredInterfaceType, .wifi)
+        try expectEqual(wifiParameters.requiredLocalEndpoint, .hostPort(host: "172.20.10.2", port: .any))
+        try expect(wifiParameters.prohibitedInterfaceTypes?.contains(.other) == true)
+        try expectEqual(try parameters("10.2.3.8:8765", interfaces).requiredInterfaceType, .wiredEthernet)
+        try expectNil(try parameters("127.0.0.1:8765", []).requiredLocalEndpoint)
+        try expectNil(try parameters("172.20.10.2:8765", interfaces).requiredLocalEndpoint)
+        try expectThrows(try parameters("10.200.1.8:8765", interfaces))
+        try expectThrows(try parameters("172.20.10.1:8765", [ethernet]))
         let hotspot = RemoteNetworkAddress.discoveryURLs(address: "172.20.10.2", netmask: "255.255.255.240")
         try expectEqual(hotspot.count, 13)
         try expect(hotspot.contains("http://172.20.10.1:8765") && hotspot.contains("http://172.20.10.14:8765"))
@@ -173,6 +206,18 @@ extension ApprovalTests {
         let request = try RemoteHTTPRequest.parse(bytes)!
         try request.validateOrigin(); try expectEqual(request.path, "/api/action"); try expectEqual(request.parameter("node"), "example")
         try expectEqual(try request.json().count, 0)
+        // A phone still needs DNS to resolve this name; accepting it is only the HTTP step.
+        for host in ["approve:8765", "APPROVE:8765", "approve.:8765"] {
+            let named = String(decoding: bytes, as: UTF8.self).replacingOccurrences(of: "192.168.43.2:8765", with: host)
+            try RemoteHTTPRequest.parse(Data(named.utf8))!.validateOrigin()
+            let foreignOrigin = named.replacingOccurrences(of: "Origin: http://" + host, with: "Origin: https://unrelated.example")
+            try expectThrows(try RemoteHTTPRequest.parse(Data(foreignOrigin.utf8))!.validateOrigin())
+        }
+        for host in ["approve.attacker.example:8765", "other:8765", "approve@attacker.example:8765"] {
+            let named = String(decoding: bytes, as: UTF8.self).replacingOccurrences(of: "192.168.43.2:8765", with: host)
+            try expectThrows(try RemoteHTTPRequest.parse(Data(named.utf8))!.validateOrigin())
+        }
+        try expect(!RemoteNetworkAddress.isLocalHost("approve"), "A permitted HTTP name must not bypass peer address restrictions")
         let browserQuery = try RemoteHTTPRequest.parse(Data("GET /api/terminal?session=process%3Adate+with+spaces%2Band HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8))!
         try expectEqual(browserQuery.parameter("session"), "process:date with spaces+and")
         let invalid = [

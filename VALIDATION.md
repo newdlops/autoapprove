@@ -2,6 +2,20 @@
 
 최신 검증일: 2026-10-03. 환경: macOS 26.4 arm64, Swift 6.3 Command Line Tools, Node.js 22.22.2. ad-hoc 서명을 사용하며 Developer ID 서명·Apple 공증은 포함하지 않는다.
 
+## 0.2.37 핫스팟 LAN 경로와 링크 공유
+
+- 외부 서비스와 휴대폰 설치를 추가하지 않았다. 접속 링크를 macOS 공유 메뉴로 전달하고 같은 주소를 즐겨찾기로 재사용한다. DHCP로 IP가 바뀌면 새 링크가 필요하다. `approve` HTTP Host 허용은 이름 해석 설정을 대신하지 않으며 휴대폰 `localhost` 서버 기능은 제공하지 않는다.
+- 물리 Wi-Fi·Ethernet 주소를 한 곳에서 조회해 게시·직접 탐색·통신에 사용한다. Wi-Fi를 우선하고 터널·가상·비활성·점대점 인터페이스를 제외한다. Mac 간 IPv4 요청은 일치하는 LAN의 출발 IP와 인터페이스 종류로 제한하며 물리 네트워크 변경 때 검색을 다시 시작한다.
+- `testRemoteHTTPBoundsOriginAndPrivateAddresses` 집중 실행 통과: VPN·가상 주소 제외, Wi-Fi 우선, 중첩 서브넷, 출발 주소/인터페이스 바인딩, 루프백/자기 주소, 현재 LAN 밖·연결 해제된 IP 거부, HTTP Host·Origin·사설 주소 제한.
+- 작업 폴더에 동시에 진행 중인 Git 브랜치 최적화 변경이 있어 기준 커밋과 이번 변경만 복사한 별도 소스에서 `swift build -c release`를 수행해 통과했다. 해당 사본으로 앱과 DMG를 생성했다.
+- 분리한 릴리스 빌드에서 `node scripts/network-integration-check.mjs --release` 및 `--direct-only` 통과: 양방향 Mac 발견, 전체 목록, 상태 제어·터미널 입력, 중복 방지, 구버전 식별, 종료·재시작 복구. 실제 사용자 터미널 대신 격리 엔진을 사용했다.
+- 연결 설정은 실제 SwiftUI/NSHostingView로 600pt 폭의 라이트·다크 이미지를 렌더링해 공유 버튼·본문·주소·QR 배치를 확인했다. QR 해독 결과와 선택한 직접 주소의 일치도 통과했다. Impeccable 지침에 따라 기존 네이티브 스타일을 유지했고 기계 검사는 발견 사항이 없었다. 공유 메뉴의 실제 클릭·전송, 여러 주소 선택 조작, 휴대폰 브라우저 실기, 실제 Zscaler 활성 연결은 미검증이다. 웹 화면은 변경하지 않았으며 전체 브라우저 뷰포트·Core 전체 회귀는 다시 실행하지 않았다.
+- 패키지 검사 `node scripts/network-package-check.mjs dist/AutoApprove.app` 통과: 재배치된 리소스·서명, 첫 실행 자동 게시, 포트 충돌 대체, 저장된 포트·노드 ID·ON 복원, 즉시 OFF 및 재실행 후 명시적 OFF 유지.
+- 로컬 설치: **0.2.37 · 빌드 42**를 `/Applications/AutoApprove.app`에 설치·실행했다. 기존 설정과 승인 기록 **3,580건**, 세션 **20개**, Terminal 연결 복원을 확인했다. 이전 앱과 DB는 `.runtime/releases/0.2.37/`에 보관했다.
+- 설치 후 `/api/discovery`는 루프백·실제 Wi-Fi IP에서 HTTP 200과 같은 노드 ID를 반환했다. 샌드박스 내부의 Wi-Fi 요청은 시간 초과됐으나 외부의 읽기 전용 확인은 성공했다. `--resolve`로 로컬 주소에 연결한 `Host: approve:8765`도 통과했으며, 이는 휴대폰 DNS 이름 해석이나 Zscaler 활성 상태의 확인을 뜻하지 않는다.
+- DMG 이미지 체크섬·읽기 전용 마운트·내장 앱 코드 서명·실행 파일/버전 일치·최상위 세 항목 검사 통과. SHA-256: `5dda57212f517fabf965fb07bc9bed466aeedb2b9a478b290de34bcb1ea55ef4`.
+- Zscaler의 LAN 차단 정책이나 시스템 라우트는 변경하지 않는다. LAN이 차단된 구성은 관리자가 해당 핫스팟의 AutoApprove TCP 포트(기본 8765, 충돌 시 앱의 실제 포트)를 허용해야 한다. [Zscaler macOS LAN·방화벽 공식 문서](https://help.zscaler.com/client-connector/blocking-lan-access).
+
 ## 0.2.36 각 Mac의 자동 웹 게시와 핫스팟 휴대폰 접속
 
 - 사용자 보고: 핫스팟을 제공하는 아이폰·안드로이드에서 `autoapprove.local:8765`가 열리지 않았다. 사용자는 숫자 IP 주소로는 열린다고 확인했다. 휴대폰에서 이름 해석을 거치지 않는 접속 경로를 기본 안내로 바꿨다. Android의 [DNS Resolver 문서](https://source.android.com/docs/core/ota/modular-system/dns-resolver)는 모바일 데이터·VPN 연결을 `.local` 해석 대상에서 제외한다고 설명한다.

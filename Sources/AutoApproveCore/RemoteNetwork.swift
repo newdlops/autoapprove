@@ -91,6 +91,7 @@ private struct RemoteTerminalUpdate: Encodable {
     private var browser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
     private var discoveryTask: Task<Void, Never>?
+    private var lanInterfaces: [RemoteLANInterface] = []
     private let bonjourEnabled: Bool
     private let discoveryAddresses: () -> [String]
     private var namedAccess: RemoteNamedAccess?
@@ -146,8 +147,8 @@ private struct RemoteTerminalUpdate: Encodable {
     public func start(port preferredPort: UInt16 = 8765, allowPortFallback: Bool = false) throws {
         guard !running else { return }
         let port = preferredPort
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = false
+        let parameters = RemoteLAN.tcpParameters()
+        lanInterfaces = RemoteLAN.interfaces(refresh: true)
         let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
         let epoch = UUID(); generation = epoch; running = true; self.listener = listener
         publishedPortal = false
@@ -220,8 +221,25 @@ private struct RemoteTerminalUpdate: Encodable {
             }
             browser.start(queue: queue); emitStatus()
         }
+        startDirectDiscovery(epoch: epoch)
+        let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .cellular]); pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.running, self.generation == epoch, self.status.ready, let port = self.port else { return }
+                let interfaces = RemoteLAN.interfaces(refresh: true)
+                if interfaces != self.lanInterfaces {
+                    self.lanInterfaces = interfaces
+                    self.startDirectDiscovery(epoch: epoch)
+                }
+                self.status.port = port; self.updateNamedAddresses(); self.emitStatus()
+            }
+        }
+        monitor.start(queue: queue)
+    }
+    private func startDirectDiscovery(epoch: UUID) {
+        discoveryTask?.cancel()
         discoveryTask = Task { [weak self] in
-            // Let the listener and Bonjour settle, then supplement with unicast discovery.
+            // Debounce interface changes and let the listener and Bonjour settle.
             do { try await Task.sleep(for: .seconds(2)) } catch { return }
             while !Task.isCancelled {
                 guard let self, self.running, self.generation == epoch else { return }
@@ -229,14 +247,6 @@ private struct RemoteTerminalUpdate: Encodable {
                 do { try await Task.sleep(for: .seconds(max(1, self.directDiscoveryInterval))) } catch { return }
             }
         }
-        let monitor = NWPathMonitor(); pathMonitor = monitor
-        monitor.pathUpdateHandler = { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.running, self.generation == epoch, self.status.ready, let port = self.port else { return }
-                self.status.port = port; self.updateNamedAddresses(); self.emitStatus()
-            }
-        }
-        monitor.start(queue: queue)
     }
     public func stop() {
         running = false; generation = UUID()
@@ -454,19 +464,6 @@ private struct RemoteTerminalUpdate: Encodable {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
     static func addresses(port: UInt16) -> [String] {
-        var first: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&first) == 0 else { return [] }; defer { freeifaddrs(first) }
-        var addresses: [(String, String)] = []
-        var cursor = first
-        while let entry = cursor {
-            defer { cursor = entry.pointee.ifa_next }
-            guard let address = entry.pointee.ifa_addr, address.pointee.sa_family == AF_INET,
-                  (entry.pointee.ifa_flags & UInt32(IFF_UP)) != 0, (entry.pointee.ifa_flags & UInt32(IFF_LOOPBACK)) == 0 else { continue }
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let ip = String(cString: host)
-            if RemoteNetworkAddress.isLocalHost(ip) { addresses.append((String(cString: entry.pointee.ifa_name), "http://\(ip):\(port)")) }
-        }
-        return addresses.sorted { ($0.0.hasPrefix("en") ? 0 : 1, $0.0) < ($1.0.hasPrefix("en") ? 0 : 1, $1.0) }.map(\.1)
+        RemoteLAN.interfaces().map { "http://\($0.address):\(port)" }
     }
 }

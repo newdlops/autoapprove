@@ -68,7 +68,8 @@ public struct RemoteHTTPRequest {
     public func validateOrigin() throws {
         guard let host = headers["host"], let authority = URLComponents(string: "http://" + host),
               authority.user == nil, authority.password == nil, let hostname = authority.host,
-              RemoteNetworkAddress.isLocalHost(hostname), authority.path.isEmpty, authority.query == nil, authority.fragment == nil else {
+              (RemoteNetworkAddress.isLocalHost(hostname) || ["approve", "approve."].contains(hostname.lowercased())),
+              authority.path.isEmpty, authority.query == nil, authority.fragment == nil else {
             throw RemoteHTTPError(403, "같은 네트워크의 Mac 주소로 접속해주세요.")
         }
         if let origin = headers["origin"], origin.lowercased() != "http://" + host.lowercased() {
@@ -182,8 +183,8 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private var buffer = Data()
     private var continuation: CheckedContinuation<RemoteHTTPResponse, Error>?
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
-    init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) {
-        connection = NWConnection(to: endpoint, using: .tcp)
+    init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) throws {
+        connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
         self.timeout = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body

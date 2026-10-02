@@ -1,0 +1,101 @@
+import Foundation
+import Network
+import SystemConfiguration
+import Darwin
+
+/// Physical LAN addresses shared by publishing, discovery and peer connections.
+/// Tunnel addresses are never offered to a phone on the Mac's hotspot network.
+public struct RemoteLANInterface: Equatable, Sendable {
+    public enum Kind: Sendable { case wifi, ethernet }
+    public let name: String
+    public let address: String
+    public let netmask: String
+    public let kind: Kind
+    public init(name: String, address: String, netmask: String, kind: Kind) {
+        self.name = name; self.address = address; self.netmask = netmask; self.kind = kind
+    }
+    fileprivate var mask: UInt32? {
+        guard let value = RemoteLAN.ipv4(netmask), value != 0 else { return nil }
+        let inverse = ~value
+        return inverse & (inverse &+ 1) == 0 ? value : nil
+    }
+    fileprivate func contains(_ host: UInt32) -> Bool {
+        guard let own = RemoteLAN.ipv4(address), let mask else { return false }
+        return own & mask == host & mask
+    }
+}
+
+public enum RemoteLAN {
+    private final class Cache: @unchecked Sendable {
+        let lock = NSLock()
+        var until = Date.distantPast
+        var interfaces: [RemoteLANInterface] = []
+    }
+    private static let cache = Cache()
+
+    public static func isPhysicalInterface(name: String, flags: UInt32) -> Bool {
+        name.hasPrefix("en") && flags & UInt32(IFF_UP) != 0 && flags & UInt32(IFF_LOOPBACK | IFF_POINTOPOINT) == 0
+    }
+    public static func interfaces(refresh: Bool = false) -> [RemoteLANInterface] {
+        cache.lock.lock(); defer { cache.lock.unlock() }
+        if !refresh && Date() < cache.until { return cache.interfaces }
+        var kinds: [String: RemoteLANInterface.Kind] = [:]
+        for interface in SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] ?? [] {
+            guard let name = SCNetworkInterfaceGetBSDName(interface) as String?,
+                  let type = SCNetworkInterfaceGetInterfaceType(interface) else { continue }
+            if type == kSCNetworkInterfaceTypeIEEE80211 { kinds[name] = .wifi }
+            else if type == kSCNetworkInterfaceTypeEthernet { kinds[name] = .ethernet }
+        }
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0 else { cache.until = .distantPast; cache.interfaces = []; return [] }
+        defer { freeifaddrs(first) }
+        var result: [RemoteLANInterface] = [], cursor = first
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ifa_next }
+            let name = String(cString: entry.pointee.ifa_name)
+            guard isPhysicalInterface(name: name, flags: entry.pointee.ifa_flags), let kind = kinds[name],
+                  let address = entry.pointee.ifa_addr, address.pointee.sa_family == AF_INET,
+                  let mask = entry.pointee.ifa_netmask else { continue }
+            func numeric(_ value: UnsafeMutablePointer<sockaddr>) -> String? {
+                var text = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                guard getnameinfo(value, socklen_t(value.pointee.sa_len), &text, socklen_t(text.count), nil, 0, NI_NUMERICHOST) == 0 else { return nil }
+                return String(cString: text)
+            }
+            guard let ip = numeric(address), let netmask = numeric(mask), RemoteNetworkAddress.isLocalHost(ip) else { continue }
+            let interface = RemoteLANInterface(name: name, address: ip, netmask: netmask, kind: kind)
+            if interface.mask != nil { result.append(interface) }
+        }
+        cache.interfaces = ordered(result); cache.until = Date().addingTimeInterval(1)
+        return cache.interfaces
+    }
+    public static func ordered(_ interfaces: [RemoteLANInterface]) -> [RemoteLANInterface] {
+        interfaces.sorted { ($0.kind == .wifi ? 0 : 1, $0.name, $0.address) < ($1.kind == .wifi ? 0 : 1, $1.name, $1.address) }
+    }
+    public static func route(to address: String, interfaces: [RemoteLANInterface]) -> RemoteLANInterface? {
+        guard let host = ipv4(address) else { return nil }
+        return ordered(interfaces).filter { $0.contains(host) }.max { ($0.mask ?? 0) < ($1.mask ?? 0) }
+    }
+    public static func tcpParameters() -> NWParameters {
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = false
+        parameters.prohibitedInterfaceTypes = [.other, .cellular]
+        return parameters
+    }
+    public static func tcpParameters(to endpoint: NWEndpoint, interfaces: [RemoteLANInterface]) throws -> NWParameters {
+        let parameters = tcpParameters()
+        guard case .hostPort(let host, _) = endpoint else { return parameters }
+        let address = String(describing: host)
+        guard let number = ipv4(address) else { return parameters }
+        // Local fixtures and a Mac opening its own LAN address use the loopback route.
+        if number >> 24 == 127 || interfaces.contains(where: { $0.address == address }) { return parameters }
+        guard let source = route(to: address, interfaces: interfaces) else {
+            throw RemoteHTTPError(503, "이 Mac은 현재 Wi-Fi·유선 LAN에서 찾을 수 없습니다. 같은 핫스팟에 연결했는지 확인해주세요.")
+        }
+        parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(source.address), port: .any)
+        parameters.requiredInterfaceType = source.kind == .wifi ? .wifi : .wiredEthernet
+        return parameters
+    }
+    fileprivate static func ipv4(_ address: String) -> UInt32? {
+        IPv4Address(address)?.rawValue.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
+}

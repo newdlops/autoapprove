@@ -12,28 +12,10 @@ enum RemotePeerDiscovery {
     }
 
     static func addresses() -> [String] {
-        var first: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&first) == 0 else { return [] }
-        defer { freeifaddrs(first) }
-        var candidates: [(String, [String])] = [], own = Set<String>()
-        var cursor = first
-        while let entry = cursor {
-            defer { cursor = entry.pointee.ifa_next }
-            let flags = entry.pointee.ifa_flags
-            guard flags & UInt32(IFF_UP) != 0, flags & UInt32(IFF_LOOPBACK | IFF_POINTOPOINT) == 0,
-                  let address = entry.pointee.ifa_addr, address.pointee.sa_family == AF_INET,
-                  let mask = entry.pointee.ifa_netmask else { continue }
-            func numeric(_ address: UnsafeMutablePointer<sockaddr>) -> String? {
-                var value = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                guard getnameinfo(address, socklen_t(address.pointee.sa_len), &value, socklen_t(value.count), nil, 0, NI_NUMERICHOST) == 0 else { return nil }
-                return String(cString: value)
-            }
-            guard let ip = numeric(address), let netmask = numeric(mask) else { continue }
-            own.insert("http://\(ip):8765")
-            candidates.append((String(cString: entry.pointee.ifa_name), RemoteNetworkAddress.discoveryURLs(address: ip, netmask: netmask)))
-        }
-        var seen = own
-        return Array(candidates.sorted { $0.0 < $1.0 }.flatMap(\.1).filter { seen.insert($0).inserted }.prefix(512))
+        let interfaces = RemoteLAN.interfaces()
+        var seen = Set(interfaces.map { "http://\($0.address):8765" })
+        return Array(interfaces.flatMap { RemoteNetworkAddress.discoveryURLs(address: $0.address, netmask: $0.netmask) }
+            .filter { seen.insert($0).inserted }.prefix(512))
     }
 
     static func find(_ address: String) async -> Found? {
