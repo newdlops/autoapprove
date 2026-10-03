@@ -49,6 +49,10 @@ try {
   execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app]);
   const cssPath = path.join(app, 'Contents/Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb/app.css');
   const originalCSS = await readFile(cssPath);
+  const versionPath = path.join(app, 'Contents/Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb/web-version.json');
+  const originalVersion = await readFile(versionPath);
+  const versionMarker = {version:'0.0.1',build:2,api:1};
+  await writeFile(versionPath, JSON.stringify(versionMarker));
   const marker = '/* isolated relocated resource probe */';
   await writeFile(cssPath, Buffer.concat([originalCSS, Buffer.from('\n' + marker)]));
   // Re-sign the disposable fixture after adding the resource marker.
@@ -63,10 +67,13 @@ try {
   const css = await fetch(url + '/app.css'); assert.equal(css.status, 200);
   assert.ok((await css.text()).includes(marker), 'Relocated helper must use its packaged resources');
   const first = await (await fetch(url + '/api/state')).json();
+  assert.deepEqual(first.release, versionMarker, 'Relocated helper must read its bundled version, not the build machine resources');
+  assert.deepEqual((await (await fetch(url + '/api/discovery')).json()).release, versionMarker);
   assert.ok(first.sessions.every(view => !view.session.automatic), 'Isolated profile must never enable existing sessions');
   await stop();
   assert.equal(execFileSync('/usr/bin/sqlite3', [path.join(home, 'state.sqlite'), "SELECT value FROM settings WHERE key = 'webPort'"], { encoding: 'utf8' }).trim(), String(port), 'Actual port must be saved as the restart preference');
   await writeFile(cssPath, originalCSS);
+  await writeFile(versionPath, originalVersion);
   execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=identifier,entitlements', app]);
   execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app]);
   await start();
@@ -75,6 +82,7 @@ try {
   url = 'http://127.0.0.1:' + restarted.port;
   const restored = await (await fetch(url + '/api/state')).json();
   assert.equal(restored.id, first.id, 'Mac identity must survive restart');
+  assert.deepEqual(restored.release, JSON.parse(originalVersion), 'Restart must publish the restored bundled web version');
   await web('off'); await status(value => !value.enabled && !value.ready);
   await assert.rejects(fetch(url + '/api/state', { signal: AbortSignal.timeout(1500) }));
   await stop(); await start();

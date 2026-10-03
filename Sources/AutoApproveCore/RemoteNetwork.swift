@@ -36,6 +36,9 @@ public struct RemoteNodeState: Codable {
     public var name: String
     public var snapshot: EngineSnapshot
     public var sessions: [RemoteSessionView]
+    public var release: RemoteWebVersion? = nil
+    public var webURLs: [String]? = nil
+    public var webPort: UInt16? = nil
 }
 
 public struct RemoteNodeView: Codable {
@@ -52,6 +55,8 @@ public struct RemoteDashboard: Codable {
     public var nodes: [RemoteNodeView]
     public var updatedAt: Date
     public var discovery: String?
+    public var gatewayRelease: RemoteWebVersion? = nil
+    public var preferredGateway: RemoteWebGateway? = nil
 }
 
 public struct RemoteTerminalFrame: Codable {
@@ -85,12 +90,14 @@ private struct RemoteTerminalUpdate: Encodable {
     public static let serviceType = "_autoapprove._tcp"
     public let nodeID: String
     public let name: String
+    public let webVersion: RemoteWebVersion?
     public var directDiscoveryInterval: TimeInterval = 45
     private weak var engine: ApprovalEngine?
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
     private var discoveryTask: Task<Void, Never>?
+    private var webPeerTask: Task<Void, Never>?
     private var lanInterfaces: [RemoteLANInterface] = []
     private let bonjourEnabled: Bool
     private let discoveryAddresses: () -> [String]
@@ -114,6 +121,10 @@ private struct RemoteTerminalUpdate: Encodable {
         var bonjour = false
         var directlySeen: Date?
         var directAddress: String?
+        var release: RemoteWebVersion?
+        var webURLs: [String] = []
+        var webPort: UInt16?
+        var webVerifiedAt: Date?
     }
     private var peers: [String: Peer] = [:]
     private var discoveryError: String?
@@ -128,11 +139,12 @@ private struct RemoteTerminalUpdate: Encodable {
     private let manualURL: URL
     private struct ManualPeer: Codable { var id: String; var name: String; var address: String }
     private var manualPeers: [ManualPeer] = []
-    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
+    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
         self.bonjourEnabled = bonjourEnabled
         self.discoveryAddresses = discoveryAddresses ?? RemotePeerDiscovery.addresses
         self.name = name ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        self.webVersion = webVersion?.isCompatible == true ? webVersion : nil
         self.onStatus = onStatus
         receiptsURL = engine.paths.directory.appendingPathComponent("web-requests.json")
         manualURL = engine.paths.directory.appendingPathComponent("web-peers.json")
@@ -140,7 +152,7 @@ private struct RemoteTerminalUpdate: Encodable {
         manualPeers = (try? JSONDecoder().decode([ManualPeer].self, from: Data(contentsOf: manualURL))) ?? []
         for peer in manualPeers {
             if let endpoint = try? RemoteNetworkAddress.endpoint(peer.address), peer.id != nodeID {
-                peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: endpoint, available: true, manual: true)
+                peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: endpoint, available: true, manual: true, directAddress: peer.address)
             }
         }
     }
@@ -153,7 +165,7 @@ private struct RemoteTerminalUpdate: Encodable {
         let epoch = UUID(); generation = epoch; running = true; self.listener = listener
         publishedPortal = false
         if bonjourEnabled {
-            listener.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: NWTXTRecord(["name": String(name.prefix(100)), "version": "1", "portal": "0"]))
+            listener.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: serviceTXT(portal: false))
         }
         // Keep NWListener's lifetime accept budget unlimited. Concurrent requests are
         // bounded by connections.count below, and each request has a deadline.
@@ -251,15 +263,99 @@ private struct RemoteTerminalUpdate: Encodable {
     public func stop() {
         running = false; generation = UUID()
         discoveryTask?.cancel(); discoveryTask = nil
+        webPeerTask?.cancel(); webPeerTask = nil
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
         pathMonitor?.cancel(); pathMonitor = nil
         let clients = Array(connections.values); connections.removeAll(); clients.forEach { $0.close() }
         peers = peers.filter { $0.value.manual }
-        for id in Array(peers.keys) { peers[id]?.portal = false }
+        for id in Array(peers.keys) { peers[id]?.portal = false; peers[id]?.webVerifiedAt = nil }
         status = RemoteNetworkStatus(); emitStatus()
     }
     private func emitStatus() { status.peerCount = peers.values.filter(\.available).count; onStatus(status) }
+    private func serviceTXT(portal: Bool) -> NWTXTRecord {
+        var values = ["name": String(name.prefix(100)), "version": "1", "portal": portal ? "1" : "0"]
+        if let webVersion { values["app-version"] = webVersion.version; values["app-build"] = String(webVersion.build) }
+        return NWTXTRecord(values)
+    }
+    private func verified(_ peer: Peer) -> Bool {
+        peer.available && peer.release?.isCompatible == true && peer.webVerifiedAt.map { Date().timeIntervalSince($0) < 150 } == true
+    }
+    private func acceptWebMetadata(_ found: RemotePeerDiscovery.Found) {
+        guard peers[found.id] != nil else { return }
+        peers[found.id]?.release = found.release?.isCompatible == true ? found.release : nil
+        peers[found.id]?.webURLs = found.urls
+        peers[found.id]?.webPort = found.port
+        peers[found.id]?.webVerifiedAt = Date()
+        peers[found.id]?.portal = found.portal
+    }
+    private func refreshWebPeers() {
+        guard webPeerTask == nil else { return }
+        let epoch = generation
+        let candidates = Array(peers.values.filter { $0.available && ($0.webVerifiedAt.map { Date().timeIntervalSince($0) > 10 } ?? true) }.prefix(100))
+        guard !candidates.isEmpty else { return }
+        webPeerTask = Task { [weak self] in
+            guard let self else { return }
+            for offset in stride(from: 0, to: candidates.count, by: 8) {
+                guard self.running, self.generation == epoch, !Task.isCancelled else { return }
+                let found = await withTaskGroup(of: RemotePeerDiscovery.Found?.self, returning: [RemotePeerDiscovery.Found].self) { group in
+                    for peer in candidates[offset..<min(offset + 8, candidates.count)] {
+                        group.addTask { await RemotePeerDiscovery.probe(peer.endpoint, expectedID: peer.id) }
+                    }
+                    var result: [RemotePeerDiscovery.Found] = []
+                    for await value in group { if let value { result.append(value) } }
+                    return result
+                }
+                guard self.running, self.generation == epoch, !Task.isCancelled else { return }
+                for value in found {
+                    guard let original = candidates.first(where: { $0.id == value.id }), self.peers[value.id]?.endpoint == original.endpoint else { continue }
+                    self.acceptWebMetadata(value)
+                }
+                self.updateNamedAddresses(); self.emitStatus()
+            }
+            self.webPeerTask = nil
+        }
+    }
+    private func newerWebPeers() -> [Peer] {
+        guard let webVersion else { return [] }
+        return peers.values.filter { $0.available && $0.release?.isCompatible == true && $0.release! > webVersion }
+            .sorted { $0.release == $1.release ? $0.id < $1.id : $0.release! > $1.release! }
+    }
+    private func gateway(_ peer: Peer) -> RemoteWebGateway? {
+        guard verified(peer), let release = peer.release, let port = peer.webPort else { return nil }
+        // Use the proven numeric endpoint first, then physical LAN addresses advertised
+        // by the exact Mac. Bonjour names are unsuitable for hotspot-host browsers.
+        for address in [peer.directAddress].compactMap({ $0 }) + peer.webURLs {
+            let supplied = address.contains("://") ? address : "http://" + address
+            guard (try? RemoteNetworkAddress.endpoint(supplied)) != nil, var url = URLComponents(string: supplied),
+                  let host = url.host, let ipv4 = IPv4Address(host), UInt16(exactly: url.port ?? 8765) == port else { continue }
+            let bytes = Array(ipv4.rawValue)
+            guard bytes[0] == 127 || lanInterfaces.contains(where: { $0.address == host }) || RemoteLAN.route(to: host, interfaces: lanInterfaces) != nil else { continue }
+            url.port = Int(port); url.path = "/"; url.queryItems = [URLQueryItem(name: "webNode", value: peer.id)]
+            if let value = url.string { return RemoteWebGateway(id: peer.id, name: peer.name, url: value, release: release) }
+        }
+        return nil
+    }
+    private func preferredGateway() -> RemoteWebGateway? {
+        newerWebPeers().compactMap(gateway).first
+    }
+    private func verifiedGateway() async -> RemoteWebGateway? {
+        let epoch = generation
+        // Never redirect API requests. Recheck only a bounded number of newer web
+        // providers; an offline or reassigned IP must still leave this page usable.
+        for peer in newerWebPeers().prefix(4) {
+            let found = await RemotePeerDiscovery.probe(peer.endpoint, expectedID: peer.id)
+            guard running, generation == epoch else { return nil }
+            guard peers[peer.id]?.endpoint == peer.endpoint else { continue }
+            if let found {
+                acceptWebMetadata(found)
+                if let current = peers[peer.id], let local = webVersion, current.release.map({ $0 > local }) == true, let result = gateway(current) {
+                    updateNamedAddresses(); emitStatus(); return result
+                }
+            } else { peers[peer.id]?.webVerifiedAt = nil }
+        }
+        updateNamedAddresses(); emitStatus(); return nil
+    }
     private func updateNamedAddresses() {
         guard running, status.ready, let port = status.port, !updatingNamedAccess else { return }
         guard bonjourEnabled else { status.urls = Self.addresses(port: port); return }
@@ -271,15 +367,22 @@ private struct RemoteTerminalUpdate: Encodable {
                 self.updateNamedAddresses(); self.emitStatus()
             }
         }
-        let anotherPortal = peers.values.contains { $0.available && $0.portal }
-        namedAccess?.update(port: port, anotherPortal: anotherPortal)
+        let newerPortal = peers.values.contains { peer in
+            gateway(peer) != nil && peer.webPort == 8765 && peer.release.map { release in webVersion.map { release > $0 } ?? false } == true
+        }
+        let anotherPortal = peers.values.contains { peer in
+            guard peer.available && peer.portal else { return false }
+            // Older compatible owners relinquish the name; the DNS probe still
+            // protects unrelated or legacy owners that cannot cooperate.
+            return !(verified(peer) && peer.release.map { release in webVersion.map { release < $0 } ?? false } == true)
+        }
+        namedAccess?.update(port: port, anotherPortal: anotherPortal, preferred: !newerPortal)
         status.urls = (namedAccess?.urls(port: port, anotherPortal: anotherPortal) ?? []) + Self.addresses(port: port)
         // Keep the same service identity while updating gateway availability.
         let ownsPortal = namedAccess?.ownsPortal == true
         if ownsPortal != publishedPortal {
             publishedPortal = ownsPortal
-            let txt = NWTXTRecord(["name": String(name.prefix(100)), "version": "1", "portal": ownsPortal ? "1" : "0"])
-            listener?.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: txt)
+            listener?.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: serviceTXT(portal: ownsPortal))
         }
     }
     private func discovered(_ results: Set<NWBrowser.Result>) {
@@ -300,15 +403,25 @@ private struct RemoteTerminalUpdate: Encodable {
             if case .bonjour(let txt) = result.metadata, txt.getEntry(for: "portal") == .string("1") { portal = true }
             else { portal = false }
             let previous = peers[id]
+            var advertised: RemoteWebVersion?
+            if case .bonjour(let txt) = result.metadata,
+               case .string(let version) = txt.getEntry(for: "app-version"),
+               case .string(let build) = txt.getEntry(for: "app-build"), let number = Int(build) {
+                let value = RemoteWebVersion(version: version, build: number)
+                if value.isCompatible { advertised = value }
+            }
+            let unchanged = previous?.release == advertised
             let direct = previous?.directlySeen.map { Date().timeIntervalSince($0) < 150 } == true
                 ? previous?.directAddress.flatMap { try? RemoteNetworkAddress.endpoint($0) } : nil
-            peers[id] = Peer(id: id, name: peerName, endpoint: direct ?? result.endpoint, available: true, manual: previous?.manual ?? false, portal: portal, bonjour: true, directlySeen: previous?.directlySeen, directAddress: previous?.directAddress)
+            peers[id] = Peer(id: id, name: peerName, endpoint: direct ?? result.endpoint, available: true, manual: previous?.manual ?? false, portal: portal, bonjour: true, directlySeen: previous?.directlySeen, directAddress: previous?.directAddress,
+                release: advertised, webURLs: unchanged ? previous?.webURLs ?? [] : [], webPort: unchanged ? previous?.webPort : nil, webVerifiedAt: unchanged ? previous?.webVerifiedAt : nil)
         }
         // Keep disconnected machines visible, but bound the history on long-running networks.
         if peers.count > 100 {
             for id in peers.values.filter({ !$0.available && !$0.manual }).prefix(peers.count - 100).map(\.id) { peers.removeValue(forKey: id) }
         }
         updateNamedAddresses(); emitStatus()
+        refreshWebPeers()
     }
     private func discoverDirectPeers(epoch: UUID) async {
         let addresses = Array(discoveryAddresses().prefix(512))
@@ -329,22 +442,27 @@ private struct RemoteTerminalUpdate: Encodable {
                 if var existing = peers[peer.id] {
                     existing.directlySeen = Date(); existing.available = true; existing.name = peer.name
                     existing.directAddress = peer.address; existing.endpoint = endpoint
+                    existing.release = peer.release; existing.webURLs = peer.urls; existing.webPort = peer.port
+                    existing.webVerifiedAt = Date(); existing.portal = peer.portal
                     peers[peer.id] = existing
                 } else if peers.count < 100 {
-                    peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: endpoint, available: true, manual: false, directlySeen: Date(), directAddress: peer.address)
+                    peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: endpoint, available: true, manual: false, directlySeen: Date(), directAddress: peer.address,
+                        release: peer.release, webURLs: peer.urls, webPort: peer.port, webVerifiedAt: Date())
+                    peers[peer.id]?.portal = peer.portal
                 }
             }
-            if !found.isEmpty { emitStatus() }
+            if !found.isEmpty { updateNamedAddresses(); emitStatus() }
         }
         for id in Array(peers.keys) where peers[id]?.manual == false && peers[id]?.bonjour == false {
             let recentlySeen = peers[id]?.directlySeen.map { Date().timeIntervalSince($0) < 150 } ?? false
             peers[id]?.available = recentlySeen
         }
-        emitStatus()
+        updateNamedAddresses(); emitStatus()
     }
     private func localState() throws -> RemoteNodeState {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
-        return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews())
+        return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
+            release: webVersion, webURLs: port.map(Self.addresses), webPort: port)
     }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data()) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
@@ -361,6 +479,12 @@ private struct RemoteTerminalUpdate: Encodable {
                         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
                         let state = try decoder.decode(RemoteNodeState.self, from: response.body)
                         guard response.status == 200, state.id == peer.id else { throw RemoteHTTPError(502, "Mac의 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
+                        if let release = state.release, release.isCompatible, let local = self.webVersion, release > local,
+                           peer.release != release || !self.verified(peer) {
+                            let metadata = await RemotePeerDiscovery.probe(peer.endpoint, expectedID: peer.id)
+                            if self.peers[peer.id]?.endpoint == peer.endpoint, let metadata, metadata.release == release { self.acceptWebMetadata(metadata) }
+                            else { self.peers[peer.id]?.webVerifiedAt = nil }
+                        }
                         return RemoteNodeView(id: peer.id, name: state.name, local: false, online: true, state: state)
                     } catch { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription) }
                 }
@@ -369,7 +493,17 @@ private struct RemoteTerminalUpdate: Encodable {
             for await node in group { result.append(node) }
             return result.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
-        return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own)] + other, updatedAt: Date(), discovery: discoveryError)
+        for node in other {
+            guard peers[node.id] != nil else { continue }
+            let confirmed = peers[node.id]?.release == node.state?.release && peers[node.id]?.webVerifiedAt != nil
+            peers[node.id]?.release = node.state?.release?.isCompatible == true ? node.state?.release : nil
+            peers[node.id]?.webURLs = node.state?.webURLs ?? []
+            peers[node.id]?.webPort = node.state?.webPort
+            peers[node.id]?.webVerifiedAt = node.online && confirmed ? Date() : nil
+        }
+        updateNamedAddresses(); emitStatus()
+        return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own)] + other, updatedAt: Date(), discovery: discoveryError,
+            gatewayRelease: webVersion, preferredGateway: preferredGateway())
     }
     public func handle(_ request: RemoteHTTPRequest) async -> RemoteHTTPResponse {
         do {
@@ -380,12 +514,20 @@ private struct RemoteTerminalUpdate: Encodable {
             guard ["GET", "POST"].contains(request.method) else { throw RemoteHTTPError(405, "이 요청 방식은 지원하지 않습니다.") }
             if request.method == "GET" {
                 switch request.path {
-                case "/", "/index.html": return try asset("index.html", type: "text/html; charset=utf-8")
+                case "/", "/index.html":
+                    if let expected = request.parameter("webNode"), expected != nodeID { throw RemoteHTTPError(409, "이 주소의 Mac이 바뀌었습니다. 원래 즐겨찾기나 Mac의 접속 링크로 다시 열어주세요.") }
+                    if let gateway = await verifiedGateway() {
+                        return RemoteHTTPResponse(status: 302, body: Data(), contentType: "text/plain; charset=utf-8", location: gateway.url)
+                    }
+                    return try asset("index.html", type: "text/html; charset=utf-8")
                 case "/app.css": return try asset("app.css", type: "text/css; charset=utf-8")
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
                 case "/api/state": return try .json(localState())
-                case "/api/discovery": return try .object(["service": "autoapprove", "version": 1, "id": nodeID, "name": name])
+                case "/api/discovery":
+                    var object: JSONObject = ["service": "autoapprove", "version": 1, "id": nodeID, "name": name, "urls": port.map(Self.addresses) ?? [], "port": Int(port ?? 0), "portal": namedAccess?.ownsPortal == true]
+                    if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }
+                    return try .object(object)
                 case "/api/network": return try await .json(dashboard())
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
@@ -406,7 +548,9 @@ private struct RemoteTerminalUpdate: Encodable {
                 guard state.id != nodeID else { throw RemoteHTTPError(409, "이 Mac은 이미 연결되어 있습니다.") }
                 manualPeers.removeAll { $0.id == state.id }; manualPeers.append(ManualPeer(id: state.id, name: state.name, address: address))
                 try save(manualPeers, to: manualURL)
-                peers[state.id] = Peer(id: state.id, name: state.name, endpoint: endpoint, available: true, manual: true); emitStatus()
+                peers[state.id] = Peer(id: state.id, name: state.name, endpoint: endpoint, available: true, manual: true, directAddress: address,
+                    release: state.release?.isCompatible == true ? state.release : nil, webURLs: state.webURLs ?? [], webPort: state.webPort)
+                updateNamedAddresses(); emitStatus(); refreshWebPeers()
                 return try .object(["id": state.id, "name": state.name])
             case "/api/action", "/api/input":
                 if let forwarded = try await forward(request) { return forwarded }
@@ -454,10 +598,15 @@ private struct RemoteTerminalUpdate: Encodable {
         let packaged = [Bundle.main.resourceURL?.appendingPathComponent("AutoApprove_AutoApproveCore.bundle/RemoteWeb/" + filename),
             executable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb/" + filename)]
         for candidate in packaged.compactMap({ $0 }) where FileManager.default.fileExists(atPath: candidate.path) {
-            return RemoteHTTPResponse(body: try Data(contentsOf: candidate), contentType: type)
+            return webAsset(try Data(contentsOf: candidate), filename: filename, type: type)
         }
         guard let file = Bundle.module.url(forResource: filename, withExtension: nil, subdirectory: "RemoteWeb") else { throw RemoteHTTPError(500, "웹 화면 파일을 찾지 못했습니다.") }
-        return RemoteHTTPResponse(body: try Data(contentsOf: file), contentType: type)
+        return webAsset(try Data(contentsOf: file), filename: filename, type: type)
+    }
+    private func webAsset(_ data: Data, filename: String, type: String) -> RemoteHTTPResponse {
+        guard filename == "index.html", let webVersion, let html = String(data: data, encoding: .utf8) else { return RemoteHTTPResponse(body: data, contentType: type) }
+        let marked = html.replacingOccurrences(of: "__AUTOAPPROVE_WEB_VERSION__", with: "\(webVersion.version):\(webVersion.build):\(webVersion.api)")
+        return RemoteHTTPResponse(body: Data(marked.utf8), contentType: type)
     }
     private func save<T: Encodable>(_ value: T, to file: URL) throws {
         try JSONEncoder().encode(value).write(to: file, options: .atomic)

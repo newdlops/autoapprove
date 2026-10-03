@@ -44,12 +44,17 @@ import dnssd
         second.update(port: 8765, anotherPortal: true)
         try await wait { second.personalReady }
         try check(!second.ownsPortal && second.urls(port: 8765, anotherPortal: true).first == "http://\(host):8765", "Standby must use discovered owner")
-        first.stop()
-        try check(!first.ownsPortal && !first.personalReady, "OFF did not release registrations")
+        first.update(port: 8765, anotherPortal: true)
+        try check(first.ownsPortal, "Equal-version discovery must not evict the existing owner")
+        first.update(port: 8765, anotherPortal: false, preferred: false)
+        try check(!first.ownsPortal && first.personalReady, "A verified newer owner must release only the shared name")
         second.update(port: 8765, anotherPortal: false)
         try await wait { second.ownsPortal }
+        try check(!first.ownsPortal && first.personalReady, "Older owner must remain available at its own name")
         try await resolve(host)
-        print("PASS: name resolution after handoff"); fflush(stdout)
+        print("PASS: same-version stability and newer-version handoff without stopping the older server"); fflush(stdout)
+        first.stop()
+        try check(!first.ownsPortal && !first.personalReady, "OFF did not release registrations")
         second.stop()
         second.update(port: 45678, anotherPortal: false)
         try await wait { second.personalReady }

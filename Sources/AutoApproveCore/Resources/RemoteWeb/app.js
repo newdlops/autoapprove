@@ -22,9 +22,42 @@ const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-d
 const needsReview = session => ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
 const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
 const byteLength = value => new TextEncoder().encode(value).length;
+let webInteracted = false, firstWebRefresh = true;
+const bundledWebVersion = document.querySelector('meta[name="autoapprove-web-version"]')?.content.split(':');
+const loadedWebVersion = bundledWebVersion?.length === 3 ? { version: bundledWebVersion[0], build: Number(bundledWebVersion[1]), api: Number(bundledWebVersion[2]) } : null;
+const versionNumbers = release => release?.api === 1 && Number.isInteger(release.build) && release.build > 0 && release.build <= 1000000 && /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/.test(release.version) ? [...release.version.split('.').map(Number), release.build] : null;
+const newerVersion = (left, right) => {
+  const a = versionNumbers(left), b = versionNumbers(right);
+  if (!a || !b) return false;
+  for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return a[i] > b[i]; }
+  return false;
+};
+function updateWebVersion(result) {
+  const initial = firstWebRefresh; firstWebRefresh = false;
+  const loaded = versionNumbers(loadedWebVersion) ? loadedWebVersion : result.gatewayRelease;
+  let gateway = result.preferredGateway;
+  if (!gateway && newerVersion(result.gatewayRelease, loaded)) gateway = { id: result.gatewayID, name: '이 Mac', url: location.origin + '/', release: result.gatewayRelease };
+  const online = gateway && result.nodes.some(node => node.id === gateway.id && node.online);
+  if (!online || !newerVersion(gateway.release, loaded)) { show($('web-update'), false); return; }
+  let url;
+  try {
+    url = new URL(gateway.url);
+    const host = url.hostname, parts = host.split('.').map(Number);
+    const privateHost = host === 'localhost' || parts.length === 4 && parts.every(n => Number.isInteger(n) && n >= 0 && n <= 255) && (parts[0] === 127 || parts[0] === 10 || parts[0] === 192 && parts[1] === 168 || parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31 || parts[0] === 169 && parts[1] === 254);
+    if (url.protocol !== 'http:' || !privateHost || url.username || url.password || !['', '/'].includes(url.pathname)) throw new Error('invalid gateway');
+    url.search = new URLSearchParams({ webNode: gateway.id }).toString(); url.hash = location.hash;
+  } catch (_) { show($('web-update'), false); return; }
+  const draftPresent = composing || mutation || inputInFlight || directSending || directQueue.length || $('terminal-input').value || [...drafts.values()].some(Boolean) || [...questionDrafts.values()].some(draft => draft.answer || draft.choices.length);
+  if (initial && !webInteracted && !draftPresent) { location.replace(url.href); return; }
+  text($('web-update-message'), `${gateway.name} · 웹 ${gateway.release.version} (빌드 ${gateway.release.build}). 새 탭에서 열며 초안은 여기에 남습니다.`);
+  $('open-latest-web').href = url.href; show($('web-update'), true);
+}
+for (const event of ['pointerdown', 'keydown', 'input', 'compositionstart']) document.addEventListener(event, () => { webInteracted = true; }, { capture: true, passive: true });
+$('open-latest-web').addEventListener('click', () => { const url = new URL($('open-latest-web').href); url.hash = location.hash; $('open-latest-web').href = url.href; });
 
 function updateViewport() {
   const viewport = window.visualViewport;
+  document.body.classList.toggle('terminal-compact', (viewport?.height || innerHeight) <= 400);
   document.documentElement.style.setProperty('--terminal-viewport-height', `${viewport?.height || innerHeight}px`);
   document.documentElement.style.setProperty('--terminal-viewport-top', `${viewport?.offsetTop || 0}px`);
 }
@@ -185,6 +218,7 @@ async function refreshNetwork() {
     text($('connection'), `${nodes.filter(node => node.online).length}대 연결 · ${nowLabel(lastNetworkUpdate)} 갱신`);
     show($('network-error'), false);
     text($('discovery'), result.discovery || ''); show($('discovery'), !!result.discovery);
+    updateWebVersion(result);
     renderMachines(); renderNodeFilter(); renderList();
     if (selectedKey) {
       const current = allSessions.find(item => item.key === selectedKey);
@@ -194,6 +228,7 @@ async function refreshNetwork() {
     } else restoreSelection();
   } catch (error) {
     connected = false; text($('connection'), lastNetworkUpdate ? `연결 끊김 · 마지막 갱신 ${nowLabel(lastNetworkUpdate)}` : '연결 끊김 · 다시 연결 중');
+    show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
     if (!nodes.length) text($('list-empty'), 'Mac에 연결하면 감지된 세션이 여기에 표시됩니다.');
     latestFrame = null; stopDirect(); terminalState('error', '연결 끊김'); updateControls(); renderMachines();

@@ -156,6 +156,25 @@ extension ApprovalTests {
     }
 
     func testRemoteHTTPBoundsOriginAndPrivateAddresses() throws {
+        let older = RemoteWebVersion(version: "0.2.9", build: 20), newer = RemoteWebVersion(version: "0.2.10", build: 1)
+        try expect(older < newer, "Compare numeric version components, not strings or build alone")
+        try expect(newer < RemoteWebVersion(version: "0.2.10", build: 2))
+        try expect(RemoteWebVersion.current?.isCompatible == true, "Packaged and CLI web resources publish the same release")
+        for version in ["", "v0.2.10", "0.02.10", "0.2", "0.2.10-beta", "99.2.10\r\nLocation: http://example.com", "０.2.10", "1000000.2.10"] {
+            try expect(!RemoteWebVersion(version: version, build: 1).isCompatible, version)
+        }
+        try expect(!RemoteWebVersion(version: "0.2.10", build: 1, api: 2).isCompatible)
+        try expect(!RemoteWebVersion(version: "0.2.10", build: 0).isCompatible)
+        for site in ["same-site", "cross-site"] {
+            let navigation = "GET /?webNode=fixture HTTP/1.1\r\nHost: 192.168.43.2:8765\r\nSec-Fetch-Site: \(site)\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\n\r\n"
+            try RemoteHTTPRequest.parse(Data(navigation.utf8))!.validateOrigin()
+            for denied in [navigation.replacingOccurrences(of: "GET /?webNode=fixture", with: "GET /api/state"),
+                           navigation.replacingOccurrences(of: "Dest: document", with: "Dest: iframe"),
+                           navigation.replacingOccurrences(of: "Mode: navigate", with: "Mode: cors"),
+                           navigation.replacingOccurrences(of: "\r\n\r\n", with: "\r\nOrigin: https://unrelated.example\r\n\r\n")] {
+                try expectThrows(try RemoteHTTPRequest.parse(Data(denied.utf8))!.validateOrigin())
+            }
+        }
         let up = UInt32(IFF_UP)
         try expect(RemoteLAN.isPhysicalInterface(name: "en0", flags: up))
         try expect(RemoteLAN.isPhysicalInterface(name: "en7", flags: up))

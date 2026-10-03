@@ -39,6 +39,11 @@ private final class PreviewScreens: @unchecked Sendable {
         let directory = URL(fileURLWithPath: CommandLine.arguments[1])
         let label = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "A"
         let directOnly = CommandLine.arguments.contains("--direct-only")
+        let releaseOption = CommandLine.arguments.first(where: { $0.hasPrefix("--web-version=") })?.dropFirst("--web-version=".count)
+        let releaseParts = releaseOption?.split(separator: ":")
+        let webVersion = releaseOption == "legacy" ? nil : releaseParts.flatMap { parts in
+            parts.count == 2 ? Int(parts[1]).map { RemoteWebVersion(version: String(parts[0]), build: $0) } : nil
+        } ?? RemoteWebVersion.current
         let state = PreviewScreens()
         let records = ProcessDiscovery.parse((0..<6).map { index in
             "\(82000 + index) 1 ttys0\(80 + index) \(82000 + index) \(82000 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/codex"
@@ -74,7 +79,7 @@ private final class PreviewScreens: @unchecked Sendable {
             // Test only these isolated endpoints, never scan the user's actual LAN.
             guard directOnly, let data = try? Data(contentsOf: directory.deletingLastPathComponent().appendingPathComponent("direct-peers.json")) else { return [] }
             return (try? JSONDecoder().decode([String].self, from: data)) ?? []
-        }, onStatus: { status = $0 })
+        }, webVersion: webVersion, onStatus: { status = $0 })
         if directOnly { web.directDiscoveryInterval = 1 }
         try web.start(port: 0)
         for _ in 0..<100 {

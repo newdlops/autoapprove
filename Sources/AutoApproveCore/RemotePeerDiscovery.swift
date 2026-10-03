@@ -9,6 +9,10 @@ enum RemotePeerDiscovery {
         let id: String
         let name: String
         let address: String
+        var release: RemoteWebVersion? = nil
+        var urls: [String] = []
+        var port: UInt16? = nil
+        var portal = false
     }
 
     static func addresses() -> [String] {
@@ -22,22 +26,37 @@ enum RemotePeerDiscovery {
         guard !Task.isCancelled, let endpoint = try? RemoteNetworkAddress.endpoint(address) else { return nil }
         do {
             let response = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/discovery", method: "GET", body: Data(), timeout: 0.8).run()
-            if response.status == 200,
-               let object = try JSONSerialization.jsonObject(with: response.body) as? JSONObject,
-               object["service"] as? String == "autoapprove", object["version"] as? Int == 1,
-               let id = object["id"] as? String, UUID(uuidString: id) != nil,
-               let name = object["name"] as? String, !name.isEmpty {
-                return Found(id: id, name: String(name.prefix(100)), address: address)
-            }
+            if response.status == 200, let peer = decode(response.body, address: address) { return peer }
             // Older AutoApprove clients expose their identity through /api/state.
             if response.status == 404 && !Task.isCancelled {
                 let legacy = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/state", method: "GET", body: Data(), timeout: 1).run()
                 let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
                 guard legacy.status == 200, let state = try? decoder.decode(RemoteNodeState.self, from: legacy.body), UUID(uuidString: state.id) != nil else { return nil }
-                return Found(id: state.id, name: String(state.name.prefix(100)), address: address)
+                return Found(id: state.id, name: String(state.name.prefix(100)), address: address,
+                    urls: state.webURLs ?? [], port: state.webPort)
             }
         } catch { }
         return nil
+    }
+
+    static func probe(_ endpoint: NWEndpoint, expectedID: String, address: String = "") async -> Found? {
+        do {
+            let response = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/discovery", method: "GET", body: Data(), expectedNodeID: expectedID, timeout: 1).run()
+            guard response.status == 200, let peer = decode(response.body, address: address), peer.id == expectedID else { return nil }
+            return peer
+        } catch { return nil }
+    }
+    private static func decode(_ data: Data, address: String) -> Found? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
+              object["service"] as? String == "autoapprove", object["version"] as? Int == 1,
+              let id = object["id"] as? String, UUID(uuidString: id) != nil,
+              let name = object["name"] as? String, !name.isEmpty else { return nil }
+        var release: RemoteWebVersion?
+        if let value = object["release"], let data = try? JSONSerialization.data(withJSONObject: value),
+           let decoded = try? JSONDecoder().decode(RemoteWebVersion.self, from: data), decoded.isCompatible { release = decoded }
+        let port = (object["port"] as? Int).flatMap(UInt16.init(exactly:)).flatMap { $0 > 0 ? $0 : nil }
+        return Found(id: id, name: String(name.prefix(100)), address: address, release: release,
+            urls: Array((object["urls"] as? [String] ?? []).prefix(16)), port: port, portal: object["portal"] as? Bool ?? false)
     }
 }
 

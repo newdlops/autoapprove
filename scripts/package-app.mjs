@@ -1,9 +1,12 @@
-import { mkdir, copyFile, writeFile, chmod, access, unlink, cp } from 'node:fs/promises';
+import { mkdir, copyFile, writeFile, readFile, chmod, access, unlink, cp } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
 const configuration = process.argv[2] ?? 'debug';
 if (!['debug', 'release'].includes(configuration)) throw new Error('Expected debug or release');
+const webVersion = JSON.parse(await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/web-version.json', 'utf8'));
+const builtVersion = JSON.parse(await readFile(path.resolve('.build', configuration, 'AutoApprove_AutoApproveCore.bundle/RemoteWeb/web-version.json'), 'utf8'));
+if (JSON.stringify(webVersion) !== JSON.stringify(builtVersion) || !/^\d+\.\d+\.\d+$/.test(webVersion.version) || !Number.isInteger(webVersion.build) || webVersion.build < 1) throw new Error('Build the current web resources before packaging');
 await import('./package-icon.mjs');
 const app = path.resolve(process.argv[3] ?? 'dist/AutoApprove.app');
 const macOS = path.join(app, 'Contents/MacOS');
@@ -29,8 +32,8 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>CFBundleIdentifier</key><string>local.autoapprove.mac</string>
   <key>CFBundleExecutable</key><string>AutoApproveApp</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.38</string>
-  <key>CFBundleVersion</key><string>43</string>
+  <key>CFBundleShortVersionString</key><string>${webVersion.version}</string>
+  <key>CFBundleVersion</key><string>${webVersion.build}</string>
   <key>CFBundleDevelopmentRegion</key><string>ko</string>
   <key>CFBundleLocalizations</key><array><string>ko</string></array>
   <key>CFBundleIconFile</key><string>AppIcon</string>

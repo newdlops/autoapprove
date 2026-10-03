@@ -8,7 +8,7 @@ public struct RemoteHTTPError: LocalizedError {
     public var errorDescription: String? { message }
 }
 
-/// A bounded, single-request HTTP connection. No cookies, CORS, redirects or socket-bridge passthrough.
+/// A bounded, single-request HTTP connection. No cookies, CORS or socket-bridge passthrough.
 public struct RemoteHTTPRequest {
     public let method: String
     public let target: String
@@ -76,7 +76,13 @@ public struct RemoteHTTPRequest {
             throw RemoteHTTPError(403, "다른 웹사이트에서 보낸 요청은 처리할 수 없습니다.")
         }
         if let fetchSite = headers["sec-fetch-site"], !["same-origin", "none"].contains(fetchSite) {
-            throw RemoteHTTPError(403, "AutoApprove 페이지에서 직접 요청해주세요.")
+            // A shared phone link and a newer Mac's page are top-level navigation.
+            // Allow only the read-only entry document; API/subresource/iframe and
+            // POST requests still require the exact page origin.
+            guard method == "GET", ["/", "/index.html"].contains(path),
+                  headers["sec-fetch-mode"] == "navigate", headers["sec-fetch-dest"] == "document" else {
+                throw RemoteHTTPError(403, "AutoApprove 페이지에서 직접 요청해주세요.")
+            }
         }
     }
 }
@@ -115,8 +121,9 @@ public struct RemoteHTTPResponse {
     public var status: Int
     public var body: Data
     public var contentType: String
-    public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8") {
-        self.status = status; self.body = body; self.contentType = contentType
+    public var location: String?
+    public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8", location: String? = nil) {
+        self.status = status; self.body = body; self.contentType = contentType; self.location = location
     }
     public static func json<T: Encodable>(_ value: T, status: Int = 200) throws -> Self {
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
@@ -130,8 +137,9 @@ public struct RemoteHTTPResponse {
         return (try? object(["error": error.localizedDescription], status: status)) ?? Self(status: 500, body: Data())
     }
     var wire: Data {
-        let reason = status == 200 ? "OK" : "Error"
-        let headers = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
+        let reason = status == 200 ? "OK" : status == 302 ? "Found" : "Error"
+        let redirect = location.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "Location: \($0)\r\n" } ?? ""
+        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         return Data(headers.utf8) + body
     }
 }

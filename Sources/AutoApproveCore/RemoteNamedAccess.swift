@@ -159,12 +159,13 @@ import dnssd
         personal = personalHost.map { RemoteDNSAlias(hostname: $0, onChange: onChange) }
         portal = RemoteDNSAlias(hostname: portalHost, checkExistingName: true, onChange: onChange)
     }
-    func update(port: UInt16, anotherPortal: Bool) {
+    func update(port: UInt16, anotherPortal: Bool, preferred: Bool = true) {
         let target = (SCDynamicStoreCopyLocalHostName(nil) as String?).map { $0 + ".local." }
         personal?.configure(target: target)
         // One of the standard-port Macs owns the shared address. DNS-SD resolves
-        // simultaneous claims, and a discovered owner lets other Macs stand by.
-        portal.configure(target: port == 8765 && (!anotherPortal || ownsPortal) ? target : nil)
+        // simultaneous claims. An older owner explicitly releases its lease when
+        // a verified newer standard-port Mac can provide the shared address.
+        portal.configure(target: port == 8765 && preferred && (!anotherPortal || ownsPortal) ? target : nil)
     }
     func stop() { personal?.configure(target: nil); portal.configure(target: nil) }
     static func personalHost(_ nodeID: String) -> String? {
