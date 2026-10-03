@@ -9,11 +9,14 @@
 - `testRemoteHTTPBoundsOriginAndPrivateAddresses` 집중 실행 통과: VPN·가상 주소 제외, Wi-Fi 우선, 중첩 서브넷, 출발 주소/인터페이스 바인딩, 루프백/자기 주소, 현재 LAN 밖·연결 해제된 IP 거부, HTTP Host·Origin·사설 주소 제한.
 - 작업 폴더에 동시에 진행 중인 Git 브랜치 최적화 변경이 있어 기준 커밋과 이번 변경만 복사한 별도 소스에서 `swift build -c release`를 수행해 통과했다. 해당 사본으로 앱과 DMG를 생성했다.
 - 분리한 릴리스 빌드에서 `node scripts/network-integration-check.mjs --release` 및 `--direct-only` 통과: 양방향 Mac 발견, 전체 목록, 상태 제어·터미널 입력, 중복 방지, 구버전 식별, 종료·재시작 복구. 실제 사용자 터미널 대신 격리 엔진을 사용했다.
-- 연결 설정은 실제 SwiftUI/NSHostingView로 600pt 폭의 라이트·다크 이미지를 렌더링해 공유 버튼·본문·주소·QR 배치를 확인했다. QR 해독 결과와 선택한 직접 주소의 일치도 통과했다. Impeccable 지침에 따라 기존 네이티브 스타일을 유지했고 기계 검사는 발견 사항이 없었다. 공유 메뉴의 실제 클릭·전송, 여러 주소 선택 조작, 휴대폰 브라우저 실기, 실제 Zscaler 활성 연결은 미검증이다. 웹 화면은 변경하지 않았으며 전체 브라우저 뷰포트·Core 전체 회귀는 다시 실행하지 않았다.
+- 연결 설정은 실제 SwiftUI/NSHostingView로 600pt 폭의 라이트·다크 이미지를 렌더링해 공유 버튼·본문·주소·QR 배치를 확인했다. QR 해독 결과와 선택한 직접 주소의 일치도 통과했다. Impeccable 지침에 따라 기존 네이티브 스타일을 유지했고 기계 검사는 발견 사항이 없었다. 공유 메뉴의 실제 클릭·전송과 여러 주소 선택 조작은 미검증이다. 웹 화면은 변경하지 않았으며 전체 브라우저 뷰포트·Core 전체 회귀는 다시 실행하지 않았다.
 - 패키지 검사 `node scripts/network-package-check.mjs dist/AutoApprove.app` 통과: 재배치된 리소스·서명, 첫 실행 자동 게시, 포트 충돌 대체, 저장된 포트·노드 ID·ON 복원, 즉시 OFF 및 재실행 후 명시적 OFF 유지.
 - 로컬 설치: **0.2.37 · 빌드 42**를 `/Applications/AutoApprove.app`에 설치·실행했다. 기존 설정과 승인 기록 **3,580건**, 세션 **20개**, Terminal 연결 복원을 확인했다. 이전 앱과 DB는 `.runtime/releases/0.2.37/`에 보관했다.
 - 설치 후 `/api/discovery`는 루프백·실제 Wi-Fi IP에서 HTTP 200과 같은 노드 ID를 반환했다. 샌드박스 내부의 Wi-Fi 요청은 시간 초과됐으나 외부의 읽기 전용 확인은 성공했다. `--resolve`로 로컬 주소에 연결한 `Host: approve:8765`도 통과했으며, 이는 휴대폰 DNS 이름 해석이나 Zscaler 활성 상태의 확인을 뜻하지 않는다.
 - DMG 이미지 체크섬·읽기 전용 마운트·내장 앱 코드 서명·실행 파일/버전 일치·최상위 세 항목 검사 통과. SHA-256: `5dda57212f517fabf965fb07bc9bed466aeedb2b9a478b290de34bcb1ea55ef4`.
+- 후속 VPN 검증(2026-10-03): Zscaler **4.7.0.187** 로그에서 터널 `UP`, 인터넷·Private Access의 `TUNNEL_FORWARDING`, `AUTHENTICATED` 상태를 확인했다. 핫스팟 경로는 `en0`이고 VPN의 `utun4` 주소는 접속 목록에서 제외됐다. 설치된 0.2.37의 숫자 Wi-Fi 주소와 Mac의 Bonjour 주소에서 HTTP 200을 확인했다. VPN 연결을 유지한 채 같은 릴리스 소스의 Bonjour·직접 발견 통합 검사도 통과했다. 통합 검사는 격리 클라이언트이며 여러 물리 Mac의 시험은 아니다.
+- 사용자는 해당 VPN 시험에서 **휴대폰 브라우저의 관리 페이지 접속 성공**을 확인했다. 휴대폰 모델·OS는 제공되지 않았으며 휴대폰에서의 터미널 입력·상태 변경은 이번 실기 확인에 포함하지 않는다. 기록은 `.runtime/vpn-check/report.json`에 보관했다.
+- VPN 시험 시작 시 설치 앱은 `ServiceNotRunning (-65563)` 상태로 웹 포트가 닫혀 있었다. AutoApprove 웹 기능만 OFF→ON으로 재시작해 복구했고, VPN 설정·연결과 앱 코드는 변경하지 않았다. 이 오류의 원인이 VPN이라고 단정하지 않으며 자동 복구 동작은 미검증이다.
 - Zscaler의 LAN 차단 정책이나 시스템 라우트는 변경하지 않는다. LAN이 차단된 구성은 관리자가 해당 핫스팟의 AutoApprove TCP 포트(기본 8765, 충돌 시 앱의 실제 포트)를 허용해야 한다. [Zscaler macOS LAN·방화벽 공식 문서](https://help.zscaler.com/client-connector/blocking-lan-access).
 
 ## 0.2.36 각 Mac의 자동 웹 게시와 핫스팟 휴대폰 접속
