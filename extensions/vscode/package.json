@@ -2,7 +2,7 @@
   "name": "autoapprove-bridge",
   "displayName": "AutoApprove Bridge",
   "description": "Connect local VS Code terminals to the AutoApprove macOS app.",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publisher": "autoapprove-local",
   "license": "UNLICENSED",
   "engines": {

@@ -12,11 +12,50 @@ let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
 let terminalValue = null, terminalRows = [], terminalAppearanceKey = null;
 let lastNetworkUpdate = null;
+let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
+let inputGeneration = 0, terminalFontSize = 14;
+const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const keyFor = (node, session) => `${node.id}/${session.id}`;
 const currentNode = () => nodes.find(node => node.id === selectedItem?.node.id);
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const needsReview = session => ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
+const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
+const byteLength = value => new TextEncoder().encode(value).length;
+
+function updateViewport() {
+  const viewport = window.visualViewport;
+  document.documentElement.style.setProperty('--terminal-viewport-height', `${viewport?.height || innerHeight}px`);
+  document.documentElement.style.setProperty('--terminal-viewport-top', `${viewport?.offsetTop || 0}px`);
+}
+function terminalFocus(enabled) {
+  document.body.classList.toggle('terminal-focus', enabled);
+  $('terminal-focus').setAttribute('aria-pressed', String(enabled));
+  text($('terminal-focus'), enabled ? '상세 보기' : '크게 보기');
+  text($('terminal-heading'), enabled && selectedItem ? selectedItem.view.title : '터미널 화면');
+  $('terminal-heading').title = selectedItem?.view.title || '';
+  $('terminal-settings').open = false;
+  updateViewport();
+}
+function sizeInput() {
+  const input = $('terminal-input'); input.style.height = 'auto'; input.style.height = `${Math.min(96, Math.max(48, input.scrollHeight))}px`;
+}
+function setFontSize(value) {
+  terminalFontSize = Math.min(20, Math.max(12, value));
+  $('terminal-screen').style.setProperty('--terminal-font-size', `${terminalFontSize}px`);
+  text($('font-size'), `${terminalFontSize}px`);
+  $('font-smaller').disabled = terminalFontSize === 12; $('font-larger').disabled = terminalFontSize === 20;
+  try { localStorage.setItem('terminal-font-size', String(terminalFontSize)); } catch (_) {}
+}
+function stopDirect(preserve = true) {
+  clearTimeout(directTimer); inputGeneration++;
+  if (preserve && selectedKey) {
+    const pending = directQueue.filter(item => item.key === selectedKey && item.kind === 'characters').map(item => item.value).join('');
+    if (pending) { $('terminal-input').value = pending + $('terminal-input').value; sizeInput(); }
+    drafts.set(selectedKey, $('terminal-input').value);
+  }
+  directQueue.length = 0; directMode = false; $('direct-input').checked = false;
+}
 
 async function api(path, body, signal) {
   const controller = new AbortController();
@@ -150,14 +189,14 @@ async function refreshNetwork() {
     if (selectedKey) {
       const current = allSessions.find(item => item.key === selectedKey);
       if (current) { selectedItem = current; renderDetail(); }
-      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; updateControls(); }
+      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; stopDirect(); terminalState('error', '세션 종료'); updateControls(); }
       else restoreSelection();
     } else restoreSelection();
   } catch (error) {
     connected = false; text($('connection'), lastNetworkUpdate ? `연결 끊김 · 마지막 갱신 ${nowLabel(lastNetworkUpdate)}` : '연결 끊김 · 다시 연결 중');
     text($('network-error'), error.message); show($('network-error'), true);
     if (!nodes.length) text($('list-empty'), 'Mac에 연결하면 감지된 세션이 여기에 표시됩니다.');
-    latestFrame = null; updateControls(); renderMachines();
+    latestFrame = null; stopDirect(); terminalState('error', '연결 끊김'); updateControls(); renderMachines();
   } finally {
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
     if (!document.hidden) networkTimer = setTimeout(refreshNetwork, connected ? 2500 : 5000);
@@ -228,19 +267,21 @@ function renderList() {
 function selectSession(key, focus = false) {
   const item = allSessions.find(item => item.key === key); if (!item) return;
   if (selectedKey !== key) {
+    stopDirect(); inputFailure = ''; composing = false;
     if (selectedKey) drafts.set(selectedKey, $('terminal-input').value);
     selectedKey = key; selectedItem = item; latestFrame = null; detailGeneration++;
     frameController?.abort(); quietFrames = 0; fastFrameUntil = Date.now() + 5000;
     $('detail').scrollTop = 0;
-    $('terminal-input').value = drafts.get(key) || ''; questionSignature = ''; historySignature = '';
+    $('terminal-input').value = drafts.get(key) || ''; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
     $('questions').replaceChildren(); $('history').replaceChildren();
     terminalPlaceholder('화면을 불러오는 중…'); terminalState('pending', '연결 중…'); text($('terminal-time'), '—'); show($('terminal-error'), false); show($('terminal-retry'), false);
   }
   document.body.classList.add('detail-open');
+  if (window.innerWidth < 760) terminalFocus(true);
   const hash = new URLSearchParams({ node: item.node.id, session: item.session.id });
   history.replaceState(null, '', `#${hash}`);
   renderList(); renderDetail(); void refreshFrame();
-  if (focus) { $('session-title').focus({ preventScroll: true }); if (window.innerWidth < 760) window.scrollTo(0, 0); }
+  if (focus) { $(document.body.classList.contains('terminal-focus') ? 'terminal-heading' : 'session-title').focus({ preventScroll: true }); if (window.innerWidth < 760) window.scrollTo(0, 0); }
 }
 function restoreSelection() {
   const hash = new URLSearchParams(location.hash.slice(1));
@@ -256,8 +297,10 @@ function renderDetail() {
   text($('session-branch'), session.gitBranch?.name ? `브랜치 · ${session.gitBranch.name}` : session.customization?.note || '');
   const phase = $('session-phase'); text(phase, view.phaseTitle); phase.dataset.phase = session.phase;
   $('automatic').checked = session.automatic; text($('session-status'), node.state.snapshot.paused ? '이 Mac의 자동 승인이 일시정지되어 있습니다.' : session.activityDetail || session.detail);
-  text($('terminal-host'), session.hostName || hosts[session.terminal]);
-  text($('input-help'), session.terminal === 'terminal' ? 'Terminal은 텍스트와 Return을 함께 입력합니다. 입력창에 내용이 남으면 Enter로 전송하세요.' : '텍스트를 입력한 뒤 Enter로 전송하세요. 터미널에서 실행되는 동작은 현재 화면을 확인하며 선택하세요.');
+  const terminalHost = `${node.name} · ${session.hostName || hosts[session.terminal]}`;
+  text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
+  if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
+  text($('input-help'), 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.');
   if (!view.canRead) {
     latestFrame = null; terminalPlaceholder(view.inputReason || '화면 연결이 없습니다.'); terminalState('error', '화면 연결 필요'); text($('terminal-time'), '—');
   }
@@ -272,14 +315,26 @@ function updateControls() {
   $('reveal').disabled = !enabled || !selectedItem.view.canReveal;
   const reason = !connected || !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : latestFrame?.inputReason || selectedItem.view.inputReason;
   const fresh = latestFrame && Date.now() - new Date(latestFrame.observedAt).getTime() < 10000;
+  const base = connected && current?.online && sessionPresent && !reason;
   const inputEnabled = enabled && fresh && !reason;
-  $('terminal-input').disabled = !inputEnabled;
-  $('send-input').disabled = !inputEnabled || !$('terminal-input').value.trim() || new TextEncoder().encode($('terminal-input').value).length > 8000;
-  text($('send-input'), mutation ? '전달 중…' : '텍스트 입력');
-  text($('input-reason'), reason || (fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
+  // Keep the active editor alive while its own request/refresh runs: disabling it closes mobile keyboards.
+  $('terminal-input').disabled = !(base && (fresh || inputInFlight || directSending));
+  const supported = inputKeys(), canDirect = supported.includes('characters') && supported.includes('backspace');
+  if ((!base || !canDirect) && directMode) stopDirect();
+  $('direct-input').disabled = !inputEnabled || !canDirect;
+  text($('direct-input-help'), !canDirect ? selectedItem.session.terminal === 'terminal'
+    ? '실시간 입력은 Mac의 시스템 설정 → 손쉬운 사용에서 AutoApprove를 허용해야 합니다. Enter 전송은 지금 사용할 수 있습니다.'
+    : '실시간 입력은 Mac의 VS Code 확장을 업데이트하면 사용할 수 있습니다.'
+    : selectedItem.session.terminal === 'terminal' ? '바로 입력을 켜면 Mac의 대상 Terminal 탭을 활성화해 키를 전달합니다.' : '바로 입력을 켜면 키와 완성된 한글을 기존 터미널로 즉시 전달합니다.');
+  $('direct-input-help').dataset.required = String(!canDirect);
+  $('direct-input').title = $('direct-input-help').textContent;
+  $('send-input').disabled = !(inputEnabled || directMode && base && directSending) || composing || byteLength($('terminal-input').value) > 8000;
+  text($('send-input'), inputInFlight && !directMode ? '전달 중' : 'Enter');
+  text($('input-reason'), inputFailure || reason || (fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
+  $('input-reason').dataset.blocked = String(!!inputFailure || !!reason || !fresh);
   for (const button of $('input-form').querySelectorAll('button[data-key]')) {
-    const supported = (latestFrame?.keys || selectedItem.view.keys || []).includes(button.dataset.key);
-    show(button, supported); button.disabled = !inputEnabled; button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
+    const available = supported.includes(button.dataset.key);
+    show(button, available); button.disabled = !(base && (inputEnabled || directMode && directSending)); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
   }
   for (const button of $('questions').querySelectorAll('button')) button.disabled = !enabled || button.dataset.unavailable === 'true';
 }
@@ -297,7 +352,8 @@ async function refreshFrame() {
     const update = await api('/api/terminal?' + query, undefined, controller.signal);
     if (selectedKey !== key || detailGeneration !== generation) return;
     if (typeof update.screen !== 'string' && (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID)) throw new Error('최신 화면을 다시 연결해주세요.');
-    const frame = typeof update.screen === 'string' ? update : { ...previous, ...update }; 
+    // Optional inputReason is omitted when a lock clears, even in an unchanged-screen response.
+    const frame = typeof update.screen === 'string' ? update : { ...previous, ...update, inputReason: update.inputReason };
     latestFrame = frame;
     const changed = renderTerminal(frame.screen || '터미널 화면에 표시된 내용이 없습니다.', frame.appearance);
     quietFrames = changed ? 0 : quietFrames + 1;
@@ -305,7 +361,7 @@ async function refreshFrame() {
     text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
   } catch (error) {
     if (controller.signal.aborted || selectedKey !== key || detailGeneration !== generation) return;
-    latestFrame = null; text($('terminal-error'), error.message); show($('terminal-error'), true); show($('terminal-retry'), true); terminalState('error', '연결 끊김');
+    latestFrame = null; stopDirect(); text($('terminal-error'), error.message); show($('terminal-error'), true); show($('terminal-retry'), true); terminalState('error', '연결 끊김');
   } finally {
     loadingFrame = false; frameController = null; updateControls();
     clearTimeout(frameTimer);
@@ -314,16 +370,79 @@ async function refreshFrame() {
     if (selectedItem && !document.hidden) frameTimer = setTimeout(refreshFrame, controller.signal.aborted ? 0 : Math.max(100, interval - (performance.now() - started)));
   }
 }
-async function sendInput(kind) {
-  if (mutation || !latestFrame || !selectedItem) return;
-  const item = selectedItem, frame = latestFrame, value = kind === 'text' ? $('terminal-input').value : '';
-  mutation = true; detailGeneration++; frameController?.abort(); terminalState('pending', '전달 중…'); updateControls();
+async function freshInputFrame(key) {
+  const until = Date.now() + 6000;
+  while (Date.now() < until && selectedKey === key && connected && currentNode()?.online && selectedItem?.view.canRead && !document.hidden) {
+    if (!mutation && latestFrame && Date.now() - new Date(latestFrame.observedAt).getTime() < 10000) return !latestFrame.inputReason;
+    if (!mutation && !loadingFrame) await refreshFrame();
+    await new Promise(resolve => setTimeout(resolve, 40));
+  }
+  return false;
+}
+async function sendInput(kind, value = '', quiet = false) {
+  if (mutation || !latestFrame || !selectedItem || !inputKeys().includes(kind)) return false;
+  const item = selectedItem, frame = latestFrame;
+  const consumedDraft = ['text', 'submit'].includes(kind) && $('terminal-input').value === value;
+  if (consumedDraft) { $('terminal-input').value = ''; drafts.delete(item.key); sizeInput(); }
+  mutation = true; inputInFlight = true; detailGeneration++; frameController?.abort(); terminalState('pending', '전달 중…'); updateControls();
+  let sent = false;
   try {
     const result = await api(endpoint('/api/input', item.node.id), { sessionID: item.session.id, revision: frame.revision, kind, text: value, requestID: uuid() });
-    feedback(result.message);
-    if (kind === 'text' && selectedKey === item.key && $('terminal-input').value === value) { $('terminal-input').value = ''; drafts.delete(item.key); }
-  } catch (error) { feedback(error.message, true); }
-  finally { latestFrame = null; mutation = false; quietFrames = 0; fastFrameUntil = Date.now() + 8000; updateControls(); void refreshFrame(); }
+    sent = true; if (selectedKey === item.key) inputFailure = ''; if (!quiet) feedback(result.message);
+  } catch (error) {
+    if (selectedKey === item.key) {
+      inputFailure = error.message;
+      if (consumedDraft) { $('terminal-input').value = value + $('terminal-input').value; drafts.set(item.key, $('terminal-input').value); sizeInput(); }
+    }
+    feedback(error.message, true);
+  }
+  finally {
+    if (selectedKey === item.key) latestFrame = null;
+    mutation = false; quietFrames = 0; fastFrameUntil = Date.now() + 8000;
+    await freshInputFrame(item.key); inputInFlight = false; updateControls();
+  }
+  return sent;
+}
+function queueDirect(kind, value = '') {
+  if (!directMode || $('terminal-input').disabled || !inputKeys().includes(kind)) return false;
+  if (directQueue.length >= 64 || byteLength(value) > 8000) { stopDirect(); inputFailure = '입력이 많아 바로 입력을 멈췄습니다. 현재 화면과 작성한 내용을 확인해주세요.'; updateControls(); return false; }
+  const previous = directQueue[directQueue.length - 1];
+  if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value) <= 8000) previous.value += value;
+  else directQueue.push({ key: selectedKey, kind, value });
+  clearTimeout(directTimer); directTimer = setTimeout(pumpDirect, kind === 'characters' ? 80 : 0);
+  return true;
+}
+async function pumpDirect() {
+  if (directSending || !directMode) return;
+  directSending = true;
+  const generation = inputGeneration;
+  try {
+    while (directMode && directQueue.length && inputGeneration === generation) {
+      const item = directQueue[0];
+      if (selectedKey !== item.key || !await freshInputFrame(item.key) || inputGeneration !== generation) { stopDirect(); break; }
+      directQueue.shift();
+      if (!await sendInput(item.kind, item.value, true)) {
+        if (selectedKey === item.key && item.kind === 'characters') $('terminal-input').value = item.value + $('terminal-input').value;
+        stopDirect(); sizeInput(); break;
+      }
+    }
+  } finally { directSending = false; updateControls(); if (directMode && directQueue.length) void pumpDirect(); }
+}
+function captureDirectText() {
+  if (composing || !directMode || !$('terminal-input').value) return;
+  const value = $('terminal-input').value;
+  // Let multiline paste stay editable; a user can send it as one composed Enter action.
+  if (value.includes('\n') || value.includes('\t') || byteLength(value) > 8000) { stopDirect(); drafts.set(selectedKey, value); updateControls(); return; }
+  if (queueDirect('characters', value)) { $('terminal-input').value = ''; drafts.delete(selectedKey); sizeInput(); }
+}
+async function submitInput() {
+  if (composing || $('send-input').disabled) return;
+  if (directMode) { captureDirectText(); if (directMode) { queueDirect('enter'); return; } }
+  const value = $('terminal-input').value, key = selectedKey;
+  if (!value) { await sendInput('enter'); return; }
+  if (inputKeys().includes('submit')) { await sendInput('submit', value); return; }
+  // Old bridges keep their original text contract; send Return only after confirmed delivery and a new frame.
+  if (await sendInput('text', value) && selectedKey === key && selectedItem?.session.terminal !== 'terminal') await sendInput('enter');
 }
 function renderQuestions() {
   const { session, node } = selectedItem;
@@ -420,9 +539,47 @@ for (const button of document.querySelectorAll('[data-filter]')) button.addEvent
 });
 $('automatic').addEventListener('change', () => { const enabled = $('automatic').checked; void action(selectedItem.node.id, { action: 'automatic', sessionID: selectedItem.session.id, enabled }, enabled ? '자동 승인을 켰습니다.' : '자동 승인을 껐습니다.'); });
 $('reveal').addEventListener('click', () => void action(selectedItem.node.id, { action: 'reveal', sessionID: selectedItem.session.id }, 'Mac에서 대상 터미널을 열었습니다.'));
-$('terminal-input').addEventListener('input', () => { drafts.set(selectedKey, $('terminal-input').value); updateControls(); });
-$('input-form').addEventListener('submit', event => { event.preventDefault(); if (!$('send-input').disabled) void sendInput('text'); });
-for (const button of $('input-form').querySelectorAll('button[data-key]')) button.addEventListener('click', () => void sendInput(button.dataset.key));
+$('terminal-input').addEventListener('input', event => { drafts.set(selectedKey, $('terminal-input').value); sizeInput(); if (!event.isComposing) captureDirectText(); updateControls(); });
+$('terminal-input').addEventListener('compositionstart', () => { composing = true; updateControls(); });
+$('terminal-input').addEventListener('compositionend', () => { composing = false; const generation = inputGeneration; setTimeout(() => { if (!composing && generation === inputGeneration) { captureDirectText(); updateControls(); } }, 0); updateControls(); });
+$('terminal-input').addEventListener('beforeinput', event => {
+  if (!directMode || composing || event.isComposing) return;
+  if (event.inputType === 'deleteContentBackward' && !$('terminal-input').value) { event.preventDefault(); queueDirect('backspace'); }
+  if (event.inputType === 'insertLineBreak' && !event.defaultPrevented) { event.preventDefault(); void submitInput(); }
+});
+$('terminal-input').addEventListener('keydown', event => {
+  if (composing || event.isComposing || event.keyCode === 229) return;
+  if (event.key === 'Enter' && event.shiftKey) { if (directMode) { stopDirect(); updateControls(); } return; }
+  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitInput(); return; }
+  const keys = { Escape: 'escape', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Home: 'home', End: 'end', Delete: 'delete', Backspace: 'backspace', Tab: 'tab' };
+  const kind = event.ctrlKey && event.key.toLowerCase() === 'c' && !$('terminal-input').value ? 'interrupt' : keys[event.key];
+  if (kind && !event.shiftKey && inputKeys().includes(kind) && (directMode || !$('terminal-input').value && !['left', 'right', 'home', 'end', 'delete', 'backspace', 'tab'].includes(kind))) {
+    event.preventDefault(); if (directMode) queueDirect(kind); else void sendInput(kind);
+  }
+});
+$('input-form').addEventListener('submit', event => { event.preventDefault(); void submitInput(); });
+for (const button of $('input-form').querySelectorAll('button[data-key]')) button.addEventListener('click', () => {
+  if (directMode) queueDirect(button.dataset.key); else void sendInput(button.dataset.key);
+});
+for (const button of $('input-form').querySelectorAll('button')) button.addEventListener('pointerdown', event => { if (document.activeElement === $('terminal-input') && !$('terminal-input').disabled) event.preventDefault(); });
+$('direct-input').addEventListener('change', () => {
+  const enabled = $('direct-input').checked; stopDirect(); inputFailure = '';
+  directMode = enabled; $('direct-input').checked = enabled;
+  updateControls(); if (enabled) { $('terminal-input').focus({ preventScroll: true }); captureDirectText(); }
+});
+$('terminal-focus').addEventListener('click', () => { terminalFocus(!document.body.classList.contains('terminal-focus')); if (!document.body.classList.contains('terminal-focus')) $('session-title').focus({ preventScroll: true }); });
+$('terminal-back').addEventListener('click', () => $('back').click());
+$('terminal-wrap').addEventListener('change', () => { $('terminal-screen').dataset.wrap = String($('terminal-wrap').checked); });
+$('terminal-screen').dataset.wrap = 'true';
+$('font-smaller').addEventListener('click', () => setFontSize(terminalFontSize - 1));
+$('font-larger').addEventListener('click', () => setFontSize(terminalFontSize + 1));
+try { const saved = Number(localStorage.getItem('terminal-font-size')); if (saved >= 12 && saved <= 20) terminalFontSize = saved; } catch (_) {}
+setFontSize(terminalFontSize);
+window.visualViewport?.addEventListener('resize', updateViewport);
+window.visualViewport?.addEventListener('scroll', updateViewport);
+window.addEventListener('resize', updateViewport); updateViewport();
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && $('terminal-settings').open) { $('terminal-settings').open = false; $('terminal-settings').querySelector('summary').focus(); event.preventDefault(); } });
+document.addEventListener('click', event => { if ($('terminal-settings').open && !$('terminal-settings').contains(event.target)) $('terminal-settings').open = false; });
 $('terminal-retry').addEventListener('click', () => void refreshFrame());
 try { $('terminal-colors').checked = localStorage.getItem('terminal-colors') !== 'false'; } catch (_) {}
 document.querySelector('.terminal').dataset.colored = String($('terminal-colors').checked);
@@ -430,8 +587,11 @@ $('terminal-colors').addEventListener('change', () => {
   document.querySelector('.terminal').dataset.colored = String($('terminal-colors').checked);
   try { localStorage.setItem('terminal-colors', String($('terminal-colors').checked)); } catch (_) {}
 });
-$('follow').addEventListener('change', () => { if ($('follow').checked) $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; });
+$('follow').addEventListener('change', () => { if ($('follow').checked) $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; show($('jump-latest'), !$('follow').checked); });
+$('terminal-screen').addEventListener('scroll', () => { const pre = $('terminal-screen'); if (pre.scrollHeight - pre.scrollTop - pre.clientHeight > 40) $('follow').checked = false; show($('jump-latest'), !$('follow').checked); }, { passive: true });
+$('jump-latest').addEventListener('click', () => { $('follow').checked = true; $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; show($('jump-latest'), false); });
 $('back').addEventListener('click', () => {
+  stopDirect(); composing = false; terminalFocus(false);
   drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.firstChild;
   selectedKey = ''; selectedItem = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
   document.body.classList.remove('detail-open'); history.replaceState(null, '', location.pathname); show($('detail-content'), false); show($('detail-empty'), true); renderList(); previous?.focus();
@@ -448,7 +608,7 @@ $('add-form').addEventListener('submit', async event => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) frameController?.abort();
+  if (document.hidden) { frameController?.abort(); stopDirect(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('hashchange', restoreSelection);

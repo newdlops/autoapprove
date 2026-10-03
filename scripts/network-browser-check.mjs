@@ -41,14 +41,14 @@ try {
   await page.waitForFunction(() => document.getElementById('terminal-screen').textContent.includes('합성 데이터'));
   await capture('desktop-terminal');
   const toggle = page.getByRole('switch', { name: '자동 승인' });
-  await toggle.check(); await page.getByRole('button', { name: '텍스트 입력', exact: true }).waitFor();
+  await toggle.check(); await page.locator('#send-input').waitFor();
   await page.getByText('직접 입력하려면 이 세션의 자동 승인을 끄거나 이 Mac을 일시정지하세요.', { exact: true }).waitFor();
   assert.equal(await page.locator('#terminal-input').isDisabled(), true);
   await toggle.uncheck();
   await page.locator('#terminal-input').waitFor({ state: 'visible' });
   await page.waitForFunction(() => !document.getElementById('terminal-input').disabled);
   await page.locator('#terminal-input').fill('브라우저에서 보낸 한글 · 검증용');
-  await page.getByRole('button', { name: '텍스트 입력', exact: true }).click();
+  await page.locator('#send-input').click();
   await page.waitForFunction(() => document.getElementById('terminal-screen').textContent.includes('브라우저에서 보낸 한글'));
   await capture('desktop-after-input'); checks.push('automatic off/on, disabled manual input, exact terminal text delivery');
   const search = page.getByRole('searchbox', { name: '세션 검색' });
@@ -82,6 +82,7 @@ try {
     await page.getByRole('button', { name: /긴 표시 이름/ }).first().click();
     await page.waitForFunction(() => document.getElementById('terminal-screen').textContent.includes('합성 데이터'));
     await capture(`${size.width}-long-terminal`);
+    if (await page.locator('body').evaluate(body => body.classList.contains('terminal-focus'))) await page.locator('#terminal-focus').click();
     await page.locator('#terminal-input').fill('화면 갱신 중에도 보존할 초안');
     await page.getByRole('button', { name: '상태 새로고침' }).click();
     assert.equal(await page.locator('#terminal-input').inputValue(), '화면 갱신 중에도 보존할 초안');
@@ -90,6 +91,7 @@ try {
   checks.push('768, 390 and 320 widths, long content, mobile back, draft preservation');
   await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' }); await capture('mobile-dark');
   await page.setViewportSize({ width: 1440, height: 900 }); await capture('desktop-dark');
+  if (await page.locator('body').evaluate(body => body.classList.contains('terminal-focus'))) await page.locator('#terminal-focus').click();
   await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
   await page.getByRole('button', { name: 'Mac 추가', exact: true }).click(); await page.keyboard.press('Escape');
   assert.equal(await page.locator('#add-dialog').isVisible(), false);

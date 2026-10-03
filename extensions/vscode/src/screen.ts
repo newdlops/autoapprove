@@ -86,9 +86,10 @@ export class ScreenMirror {
     if (!this.valid || this.pendingWrites !== 0 || typeof action.id !== 'string' || this.attempted.has(action.id)
       || action.generation !== this.generation || typeof action.expiresAt !== 'number' || action.expiresAt < now || action.expiresAt > now + 5000
       || typeof action.screen !== 'string' || action.screen !== this.snapshot() || typeof action.kind !== 'string') { return false; }
-    if (action.kind === 'text') {
-      if (typeof action.text !== 'string' || !action.text || Buffer.byteLength(action.text) > 8000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(action.text)) { return false; }
-    } else if (!['enter', 'escape', 'interrupt', 'up', 'down', 'tab'].includes(action.kind) || action.text !== '') { return false; }
+    if (['text', 'submit', 'characters'].includes(action.kind)) {
+      if (typeof action.text !== 'string' || !action.text || Buffer.byteLength(action.text) > 8000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(action.text)
+        || action.kind === 'characters' && /[\n\t]/.test(action.text)) { return false; }
+    } else if (!['enter', 'escape', 'interrupt', 'up', 'down', 'left', 'right', 'backspace', 'delete', 'home', 'end', 'tab'].includes(action.kind) || action.text !== '') { return false; }
     this.attempted.add(action.id);
     if (this.attempted.size > 512) { this.attempted.delete(this.attempted.values().next().value!); }
     return true;

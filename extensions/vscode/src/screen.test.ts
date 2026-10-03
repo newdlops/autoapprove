@@ -136,6 +136,18 @@ test('remote input requires the exact rendered screen and is never replayed', as
   assert.equal(mirror.consumeInput(action, now), true);
   assert.equal(mirror.consumeInput(action, now), false);
   assert.equal(mirror.consumeInput({ ...action, id: 'key', kind: 'enter', text: '' }, now), true);
+  for (const kind of ['submit', 'characters']) {
+    const input = { ...action, id: kind, kind, text: '한글 🧪' };
+    assert.equal(mirror.consumeInput({ ...input, text: 'bad\x03' }, now), false);
+    assert.equal(mirror.consumeInput(input, now), true);
+    assert.equal(mirror.consumeInput(input, now), false);
+  }
+  assert.equal(mirror.consumeInput({ ...action, id: 'paste', kind: 'submit', text: 'first\nsecond\tline' }, now), true);
+  assert.equal(mirror.consumeInput({ ...action, id: 'raw-newline', kind: 'characters', text: 'first\nsecond' }, now), false);
+  for (const kind of ['left', 'right', 'backspace', 'delete', 'home', 'end', 'escape', 'interrupt', 'up', 'down', 'tab']) {
+    assert.equal(mirror.consumeInput({ ...action, id: kind, kind, text: 'hidden text' }, now), false);
+    assert.equal(mirror.consumeInput({ ...action, id: kind, kind, text: '' }, now), true);
+  }
   assert.equal(mirror.consumeInput({ ...action, id: 'unsupported', kind: 'deleteAll', text: '' }, now), false);
   const pending = mirror.write('\r\nchanged');
   assert.equal(mirror.consumeInput({ ...action, id: 'during-render' }, now), false);

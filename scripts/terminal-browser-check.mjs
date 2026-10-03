@@ -37,20 +37,24 @@ try {
   assert.equal(await page.evaluate(() => window.terminalMutations), 0, 'Unchanged output must not rewrite the console');
   assert.ok(frames.filter(frame => !frame.full).length >= 2, 'Fast polling uses compact unchanged responses');
   const colors = page.getByRole('checkbox', { name: '원본 색상', exact: true });
+  await page.locator('#terminal-settings summary').click();
   await colors.uncheck();
   assert.equal(await page.evaluate(() => window.firstTerminalLine === document.getElementById('terminal-screen').firstChild), true);
   assert.equal(await actualRun.evaluate(element => getComputedStyle(element).color), await page.locator('#terminal-screen').evaluate(element => getComputedStyle(element).color));
   await page.reload(); await page.waitForFunction(() => document.getElementById('terminal-screen').textContent.includes('합성 데이터'));
+  await page.locator('#terminal-settings summary').click();
   assert.equal(await colors.isChecked(), false); await colors.check();
   checks.push('unchanged DOM, compact polling and persistent monochrome switch');
   const echoLabel = '브라우저 입력 속도 검증 · ' + randomUUID();
   await page.locator('#terminal-input').fill(echoLabel + '\n' + Array.from({ length: 70 }, (_, i) => `합성 출력 ${i} · 한글/中文/🧪`).join('\n'));
-  const start = performance.now(); await page.getByRole('button', { name: '텍스트 입력', exact: true }).click();
+  const start = performance.now(); await page.locator('#send-input').click();
   await page.waitForFunction(value => document.getElementById('terminal-screen').textContent.includes(value), echoLabel);
   const echoMS = Math.round(performance.now() - start);
   assert.ok(echoMS < 2000, 'Synthetic input echo refreshes immediately');
   assert.ok(await page.locator('#terminal-screen').evaluate(pre => pre.scrollTop > 0));
+  await page.locator('#terminal-settings summary').click();
   await page.getByRole('checkbox', { name: '아래로 따라가기' }).uncheck();
+  await page.locator('#terminal-settings summary').click();
   await page.evaluate(() => {
     const pre = document.getElementById('terminal-screen'); pre.scrollTop = 40;
     const range = document.createRange(); range.setStart(pre.firstChild.firstChild, 0); range.setEnd(pre.firstChild.firstChild, 11);
@@ -87,9 +91,11 @@ try {
     await capture('terminal-' + width);
   }
   // Source colors may intentionally have low contrast; monochrome is the readable fallback.
+  await page.locator('#terminal-settings summary').click();
   await colors.uncheck(); await contrast(); await colors.check();
+  await page.locator('#terminal-settings summary').click();
   await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
-  await capture('terminal-dark-320'); await colors.uncheck(); await contrast(); await colors.check();
+  await capture('terminal-dark-320'); await page.locator('#terminal-settings summary').click(); await colors.uncheck(); await contrast(); await colors.check(); await page.locator('#terminal-settings summary').click();
   assert.equal(await page.locator('#terminal-live').evaluate(element => getComputedStyle(element, '::before').animationName), 'none');
   await page.setViewportSize({ width: 1440, height: 900 }); await capture('terminal-dark-1440');
   checks.push('1440/768/390/320 layouts, light/dark monochrome contrast and reduced motion');

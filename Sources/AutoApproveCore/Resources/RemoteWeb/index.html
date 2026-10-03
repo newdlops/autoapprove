@@ -37,16 +37,32 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
       <section id="detail" class="detail" aria-label="세션 상세">
         <div id="detail-empty" class="detail-empty"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="m6 9 3 3-3 3m6 0h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><h2>터미널을 선택하세요</h2><p>세션의 현재 화면을 보고<br>자동 승인과 입력을 제어할 수 있습니다.</p></div>
         <div id="detail-content" hidden>
+          <div class="session-summary">
           <div class="detail-heading"><div><p id="session-meta" class="muted small"></p><h2 id="session-title" tabindex="-1"></h2></div><span id="session-phase" class="phase"></span></div>
           <p id="session-path" class="path"></p><p id="session-branch" class="muted small"></p>
           <div class="session-controls"><label class="switch-label"><input id="automatic" type="checkbox" role="switch"><span>자동 승인</span></label><button id="reveal" class="secondary">Mac에서 터미널 열기</button></div>
           <p id="session-status" class="muted small"></p><p id="session-ended" class="notice error" hidden>이 세션이 종료되었거나 Mac 연결이 끊겼습니다. 목록에서 다른 세션을 선택해주세요.</p>
+          </div>
           <section class="terminal-section" aria-labelledby="terminal-heading">
-            <div class="section-heading terminal-heading"><h3 id="terminal-heading">터미널 화면</h3><div class="terminal-options"><label class="small scroll-follow" title="터미널에서 받은 글자색·배경색·굵기·밑줄을 표시합니다."><input id="terminal-colors" name="terminal-colors" type="checkbox" checked disabled aria-describedby="terminal-color-status">원본 색상</label><label class="small scroll-follow"><input id="follow" name="follow" type="checkbox" checked>아래로 따라가기</label></div></div>
-            <div class="terminal" data-colored="true"><div class="terminal-bar"><span id="terminal-host"></span><div class="terminal-connection"><span id="terminal-live" class="terminal-live" data-state="pending">연결 중…</span><span id="terminal-time">—</span></div></div><pre id="terminal-screen" tabindex="0" aria-label="현재 터미널의 텍스트 화면" translate="no">화면을 불러오는 중…</pre></div>
-            <p id="terminal-color-status" class="muted small terminal-color-status"></p>
+            <div class="section-heading terminal-heading">
+              <button id="terminal-back" type="button" class="icon-button focus-only" aria-label="세션 목록으로 돌아가기"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <h3 id="terminal-heading" tabindex="-1">터미널 화면</h3>
+              <button id="terminal-focus" type="button" class="secondary" aria-pressed="false">크게 보기</button>
+              <details class="terminal-settings" id="terminal-settings"><summary>화면 설정</summary><div class="terminal-options">
+                <label class="small scroll-follow"><input id="terminal-wrap" type="checkbox" checked>줄바꿈</label>
+                <label class="small scroll-follow" title="터미널이 보낸 원본 글자색·배경색·서식을 표시합니다."><input id="terminal-colors" name="terminal-colors" type="checkbox" checked disabled aria-describedby="terminal-color-status">원본 색상</label>
+                <label class="small scroll-follow"><input id="follow" name="follow" type="checkbox" checked>아래로 따라가기</label>
+                <div class="terminal-font" role="group" aria-label="터미널 글자 크기"><button id="font-smaller" type="button" class="secondary" aria-label="터미널 글자 작게">A−</button><output id="font-size" aria-live="polite">14px</output><button id="font-larger" type="button" class="secondary" aria-label="터미널 글자 크게">A+</button></div>
+                <p id="terminal-color-status" class="muted small terminal-color-status"></p>
+              </div></details>
+            </div>
+            <div class="terminal" data-colored="true"><div class="terminal-bar"><span id="terminal-host"></span><div class="terminal-connection"><span id="terminal-live" class="terminal-live" data-state="pending">연결 중…</span><span id="terminal-time">—</span></div></div><pre id="terminal-screen" tabindex="0" aria-label="현재 터미널의 텍스트 화면" translate="no">화면을 불러오는 중…</pre><button id="jump-latest" type="button" class="secondary" hidden>최신 출력 ↓</button></div>
             <p id="terminal-error" class="notice error" role="alert" hidden></p><button id="terminal-retry" class="secondary" hidden>화면 다시 연결</button>
-            <form id="input-form" class="input-form"><label for="terminal-input">터미널에 텍스트 입력</label><textarea id="terminal-input" name="terminal-input" rows="3" maxlength="8000" placeholder="기존 터미널에 입력할 내용…" autocomplete="off" spellcheck="false" aria-describedby="input-reason input-help"></textarea><div class="input-actions"><div class="terminal-keys" role="group" aria-label="터미널 키"><button type="button" data-key="enter" class="secondary">Enter</button><button type="button" data-key="escape" class="secondary">Esc</button><button type="button" data-key="interrupt" class="secondary">Ctrl C</button><button type="button" data-key="up" class="secondary" aria-label="위쪽 화살표">↑</button><button type="button" data-key="down" class="secondary" aria-label="아래쪽 화살표">↓</button><button type="button" data-key="tab" class="secondary">Tab</button></div><button id="send-input" type="submit">텍스트 입력</button></div></form>
+            <form id="input-form" class="input-form"><label for="terminal-input">터미널 입력</label>
+              <div class="input-actions"><label class="direct-input-label"><input id="direct-input" type="checkbox" aria-describedby="direct-input-help">바로 입력</label><div class="terminal-keys" role="group" aria-label="터미널 키"><button type="button" data-key="escape" class="secondary">Esc</button><button type="button" data-key="interrupt" class="secondary">Ctrl C</button><button type="button" data-key="tab" class="secondary">Tab</button><button type="button" data-key="up" class="secondary" aria-label="위쪽 화살표">↑</button><button type="button" data-key="down" class="secondary" aria-label="아래쪽 화살표">↓</button><button type="button" data-key="left" class="secondary" aria-label="왼쪽 화살표">←</button><button type="button" data-key="right" class="secondary" aria-label="오른쪽 화살표">→</button><button type="button" data-key="backspace" class="secondary" aria-label="Backspace">⌫</button></div></div>
+              <div class="input-editor"><textarea id="terminal-input" name="terminal-input" rows="1" maxlength="8000" placeholder="입력 후 Enter…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" aria-describedby="input-reason input-help direct-input-help"></textarea><button id="send-input" type="submit" aria-label="터미널에 Enter 전송">Enter</button></div>
+              <p id="direct-input-help" class="muted small"></p>
+            </form>
             <p id="input-reason" class="muted small"></p><p id="input-help" class="muted small"></p>
           </section>
           <section id="questions-section" class="detail-section" hidden><h3>응답이 필요한 요청</h3><div id="questions"></div></section>

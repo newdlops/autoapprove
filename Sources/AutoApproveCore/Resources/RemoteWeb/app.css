@@ -86,7 +86,7 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .terminal-heading { flex-wrap: wrap; gap: 4px 16px; }
 .terminal-options { display: flex; gap: 16px; flex-wrap: wrap; }
 .scroll-follow { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; }
-.terminal { --term-success: #91d9a6; --term-warning: #f4ca83; --term-error: #ffabab; background: var(--terminal); color: var(--terminal-fg); border-radius: var(--radius); overflow: hidden; }
+.terminal { --term-success: #91d9a6; --term-warning: #f4ca83; --term-error: #ffabab; background: var(--terminal); color: var(--terminal-fg); border-radius: var(--radius); overflow: hidden; position: relative; }
 .terminal-bar { display: flex; gap: 8px; justify-content: space-between; align-items: center; flex-wrap: wrap; padding: 10px 14px; font-size: 12px; color: var(--terminal-muted); border-bottom: 1px solid #393d46; }
 #terminal-host { min-width: 0; overflow-wrap: anywhere; }
 .terminal-connection { display: flex; align-items: center; gap: 12px; margin-left: auto; white-space: nowrap; }
@@ -97,7 +97,19 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .terminal-live[data-state=error] { color: var(--term-error); }
 .terminal-live[data-state=changed]::before { animation: terminal-update 450ms ease-out; }
 @keyframes terminal-update { from { opacity: .35; transform: scale(.7); } to { opacity: 1; transform: scale(1); } }
-#terminal-screen { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; min-height: 260px; max-height: 420px; margin: 0; padding: 16px; overflow: auto; tab-size: 4; -webkit-overflow-scrolling: touch; }
+#terminal-screen { font: var(--terminal-font-size, 14px)/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; min-height: 260px; max-height: 420px; margin: 0; padding: 12px; overflow: auto; tab-size: 4; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+#terminal-screen[data-wrap=true] { white-space: pre-wrap; overflow-wrap: anywhere; }
+#jump-latest { position: absolute; right: 12px; bottom: 12px; font-size: 13px; }
+.terminal-heading h3 { flex: 1; min-width: 0; }
+.terminal-heading > button, .terminal-settings { flex-shrink: 0; }
+.terminal-settings { position: relative; }
+.terminal-settings summary { list-style: none; cursor: pointer; padding: 10px 12px; min-height: 44px; font-size: 13px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.terminal-settings summary::-webkit-details-marker { display: none; }
+.terminal-settings[open] summary { color: var(--blue); border-color: var(--blue); }
+.terminal-settings .terminal-options { position: absolute; z-index: 4; right: 0; top: calc(100% + 8px); width: min(280px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 4px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.terminal-font { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
+.terminal-font button { min-width: 48px; }
+.focus-only { display: none; }
 .terminal-color-status { margin: 8px 0 0; }
 .terminal[data-colored=true] #terminal-screen { color: var(--ansi-fg, var(--terminal-fg)); background: var(--ansi-bg, var(--terminal)); }
 .terminal[data-colored=true] .terminal-run { color: var(--run-fg, inherit); background-color: var(--run-bg, transparent); }
@@ -112,9 +124,15 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 #terminal-screen::selection, #terminal-screen *::selection { background: #315782; color: #fff; }
 .input-form { margin-top: 16px; }
 .input-form > label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
-.input-actions { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin: 8px 0; }
-.terminal-keys { display: flex; flex-wrap: wrap; gap: 8px; }
+.input-actions { display: flex; align-items: center; gap: 12px; margin: 8px 0; min-width: 0; }
+.direct-input-label { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+.terminal-keys { display: flex; gap: 8px; overflow-x: auto; min-width: 0; flex: 1; overscroll-behavior-x: contain; }
 .terminal-keys button { min-width: 44px; padding: 8px 10px; font-size: 12px; }
+.terminal-keys button { flex-shrink: 0; white-space: nowrap; }
+.input-editor { display: flex; align-items: flex-end; gap: 8px; }
+.input-editor textarea { flex: 1; resize: none; min-height: 48px; max-height: 96px; font-size: 16px; }
+.input-editor button { min-height: 48px; min-width: 64px; }
+#direct-input-help { margin-top: 6px; }
 #input-help { margin-top: 6px; }
 .detail-section { border-top: 1px solid var(--line); margin-top: 28px; padding-top: 20px; }
 .detail-section h3 { margin-bottom: 12px; }
@@ -162,9 +180,33 @@ dialog input { width: 100%; }
   body.detail-open .back-button { display: grid; }
   body.detail-open .brand > svg, body.detail-open #add-mac { display: none; }
   .detail-heading { gap: 8px; } #session-title { font-size: 20px; }
-  #terminal-screen { min-height: 240px; max-height: 380px; padding: 12px; font-size: 12px; }
+  #terminal-screen { min-height: 240px; max-height: 380px; padding: 12px; }
   .session-controls > button { font-size: 12px; padding: 8px 10px; }
-  .input-actions > button { width: 100%; }
   .terminal-keys { gap: 6px; }
 }
+body.terminal-focus { position: fixed; top: var(--terminal-viewport-top, 0px); left: 0; width: 100%; height: var(--terminal-viewport-height, 100dvh); overflow: hidden; }
+body.terminal-focus .app-header, body.terminal-focus .network, body.terminal-focus .sessions, body.terminal-focus main > .notice { display: none; }
+body.terminal-focus main { width: 100%; max-width: none; height: 100%; padding: 0; margin: 0; display: flex; min-height: 0; }
+body.terminal-focus .workspace { width: 100%; height: 100%; min-height: 0; display: flex; border: 0; border-radius: 0; }
+body.terminal-focus .detail { display: flex; width: 100%; padding: 0; min-height: 0; overflow: hidden; }
+body.terminal-focus #detail-content { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+body.terminal-focus .session-summary, body.terminal-focus .detail-section { display: none; }
+body.terminal-focus .terminal-section { display: flex; flex-direction: column; flex: 1; min-height: 0; margin: 0; }
+body.terminal-focus .terminal-heading { padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px max(8px, env(safe-area-inset-left)); margin: 0; gap: 6px; flex-wrap: nowrap; }
+body.terminal-focus .focus-only { display: grid; }
+body.terminal-focus .terminal-heading h3 { white-space: nowrap; text-overflow: ellipsis; overflow: hidden; font-size: 14px; }
+body.terminal-focus .terminal-heading > button.secondary { font-size: 13px; padding: 8px 10px; }
+body.terminal-focus .terminal { display: flex; flex-direction: column; flex: 1; min-height: 0; border-radius: 0; }
+body.terminal-focus #terminal-screen { flex: 1; min-height: 0; max-height: none; padding: 12px max(12px, env(safe-area-inset-right)) 12px max(12px, env(safe-area-inset-left)); }
+body.terminal-focus .terminal-bar { padding: 6px 12px; min-height: 30px; }
+body.terminal-focus #terminal-host { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body.terminal-focus .input-form { flex-shrink: 0; margin: 0; padding: 0 max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); border-top: 1px solid var(--line); }
+body.terminal-focus .input-form > label, body.terminal-focus #input-help, body.terminal-focus #direct-input-help { display: none; }
+body.terminal-focus #direct-input-help[data-required=true] { display: block; font-size: 12px; }
+body.terminal-focus #input-reason { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
+body.terminal-focus #input-reason[data-blocked=false] { display: none; }
+body.terminal-focus #terminal-error { flex-shrink: 0; margin: 0; padding: 8px 12px; border-radius: 0; }
+body.terminal-focus #terminal-retry { flex-shrink: 0; align-self: flex-start; margin: 4px 12px; }
+body.terminal-focus .feedback { bottom: max(132px, env(safe-area-inset-bottom)); }
+@media (max-height: 400px) { body.terminal-focus #terminal-time { display: none; } body.terminal-focus .terminal-heading { padding-top: 4px; padding-bottom: 4px; } body.terminal-focus .input-actions { margin: 4px 0; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }

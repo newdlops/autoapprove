@@ -11,7 +11,7 @@ private final class PreviewScreens: @unchecked Sendable {
     func input(_ target: ScreenTarget, _ expected: String, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         guard screens[target.tty] == expected else { return .screenChanged }
-        screens[target.tty, default: ""] += "\n[검증용 입력] " + (input.kind == .text ? input.text : input.kind.rawValue)
+        screens[target.tty, default: ""] += "\n[검증용 입력] " + ([.text, .submit, .characters].contains(input.kind) ? input.bytes : input.kind.rawValue)
         return .sent
     }
 }

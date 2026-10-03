@@ -260,7 +260,8 @@ extension ApprovalTests {
         let session = ProcessDiscovery.sessions(records)[0]
         engine.updateDiscovery([session], records: records); await engine.connectTerminal()
         let frame = try await engine.remoteTerminal(sessionID: session.id)
-        try expectEqual(frame.keys, ["text", "enter"])
+        try expect(frame.keys.contains("submit") && frame.keys.contains("enter"))
+        try expectEqual(frame.keys.contains("characters"), TerminalKeyboard.isAvailable)
         let secondViewer = try await engine.remoteTerminal(sessionID: session.id)
         try expectEqual(secondViewer.revision, frame.revision)
         try engine.setAutomatic(session.id, enabled: true)
@@ -281,9 +282,10 @@ extension ApprovalTests {
             return try RemoteHTTPRequest.parse(head + body)!
         }
         let requestID = UUID().uuidString
-        let input = try request(["sessionID": session.id, "revision": latest.revision, "kind": "text", "text": "한글 · exact target", "requestID": requestID])
+        let input = try request(["sessionID": session.id, "revision": latest.revision, "kind": "submit", "text": "한글 · exact target", "requestID": requestID])
         let first = await service.handle(input), duplicate = await service.handle(input)
         try expectEqual(first.status, 200); try expectEqual(duplicate.body, first.body); try expectEqual(screen.count(), 1)
+        try expect(screen.read().hasSuffix("한글 · exact target\r"), "Text and Return must use one target-validated write")
         let restored = RemoteNetworkService(engine: engine, nodeID: service.nodeID, onStatus: { _ in })
         let replay = await restored.handle(input); try expectEqual(replay.status, 200); try expectEqual(screen.count(), 1)
         let conflict = await restored.handle(try request(["sessionID": session.id, "revision": latest.revision, "kind": "text", "text": "different", "requestID": requestID]))
@@ -342,10 +344,43 @@ extension ApprovalTests {
         context.evaluateScript("contents = 'screen'; processes = ['zsh'];")
         try expectEqual(context.evaluateScript(script)?.toString(), "agentMissing")
         try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
-        try expectThrows(try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .interrupt)))
+        context.evaluateScript("processes = ['codex'];")
+        let submit = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .submit, text: "한글"))
+        try expectEqual(context.evaluateScript(submit)?.toString(), "sent")
+        try expectEqual(context.evaluateScript("writes.pop()")?.toString(), "한글", "Terminal doScript supplies its own Return")
         try expectThrows(try RemoteTerminalInput(kind: .text, text: "bad\u{1b}").validate())
         try expectThrows(try RemoteTerminalInput(kind: .text, text: "bad\u{7f}").validate())
         try expectThrows(try RemoteTerminalInput(kind: .text, text: String(repeating: "한", count: 3000)).validate())
+        try expectThrows(try RemoteTerminalInput(kind: .characters, text: "hidden\nReturn").validate())
+        try expectThrows(try RemoteTerminalInput(kind: .backspace, text: "hidden text").validate())
+
+        // Synthetic JXA applications verify exact-tab selection and foreground revalidation.
+        // They do not grant or simulate the Mac's real accessibility permission.
+        let keyboard = JSContext()!
+        keyboard.evaluateScript("""
+        var keys = [], contents = 'screen', front = true, trusted = true, wrongTab = false, changeOnActivate = false;
+        var ObjC = {import:()=>{}}; var $ = {AXIsProcessTrusted:()=>trusted};
+        var tab = {tty:()=>'/dev/ttys081', contents:()=>contents, processes:()=>['codex']};
+        var win = {tabs:()=>[tab]};
+        Object.defineProperty(win, 'selectedTab', {set:()=>{}, get:()=>()=>wrongTab ? {tty:()=>'/dev/other'} : tab});
+        function Application(id) {
+          if (id === 'com.apple.systemevents') return {keystroke:text=>keys.push(text), keyCode:(code,options)=>keys.push([code,options])};
+          return {running:()=>true, windows:()=>[win], frontmost:()=>front, activate:()=>{if(changeOnActivate) contents='changed';}};
+        }
+        """)
+        for input in [RemoteTerminalInput(kind: .characters, text: "한글 🧪"), .init(kind: .backspace), .init(kind: .left), .init(kind: .right), .init(kind: .interrupt)] {
+            let keyScript = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: input)
+            try expectEqual(keyboard.evaluateScript(keyScript)?.toString(), "sent")
+        }
+        try expectEqual(keyboard.evaluateScript("JSON.stringify(keys)")?.toString(), "[\"한글 🧪\",[51,null],[123,null],[124,null],[8,{\"using\":[\"control down\"]}]]")
+        let raw = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .characters, text: "never send"))
+        keyboard.evaluateScript("wrongTab=true;")
+        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
+        keyboard.evaluateScript("wrongTab=false; front=false;")
+        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
+        keyboard.evaluateScript("front=true; changeOnActivate=true;")
+        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "screenChanged")
+        try expectEqual(keyboard.evaluateScript("keys.length")?.toInt32(), 5)
 
         let iterm = JSContext()!
         iterm.evaluateScript("""
@@ -358,7 +393,7 @@ extension ApprovalTests {
           ]}]}
         ]}; }
         """)
-        for input in [RemoteTerminalInput(kind: .text, text: "한글"), .init(kind: .enter), .init(kind: .escape), .init(kind: .interrupt), .init(kind: .up), .init(kind: .down), .init(kind: .tab)] {
+        for input in [RemoteTerminalInput(kind: .text, text: "한글"), .init(kind: .submit, text: "한글"), .init(kind: .characters, text: "완성한 한글"), .init(kind: .enter), .init(kind: .escape), .init(kind: .interrupt), .init(kind: .up), .init(kind: .down), .init(kind: .left), .init(kind: .right), .init(kind: .backspace), .init(kind: .delete), .init(kind: .home), .init(kind: .end), .init(kind: .tab)] {
             let rawKeys = try RemoteTerminalAdapter.script(host: .iterm, target: target, expected: "screen", agent: .codex, input: input)
             try expectEqual(iterm.evaluateScript(rawKeys)?.toString(), "sent")
             try expectFalse(iterm.evaluateScript("writes[0].newline")!.toBool())

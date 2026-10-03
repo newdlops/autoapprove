@@ -280,7 +280,16 @@ import Combine
         return session.terminal == .vscode && session.bridgeID != nil && remoteObservedScreens[session.id] != nil
     }
     private func remoteKeys(_ session: AgentSession) -> [String] {
-        session.terminal == .terminal ? ["text", "enter"] : ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
+        let basic = ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
+        let interactive = ["submit", "characters", "left", "right", "backspace", "delete", "home", "end"]
+        if session.terminal == .terminal {
+            return TerminalKeyboard.isAvailable ? basic + interactive : ["text", "submit", "enter"]
+        }
+        if session.terminal == .vscode {
+            let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
+            return basic + ((registration?["remoteInputVersion"] as? Int ?? 0) >= 2 ? interactive : [])
+        }
+        return basic + interactive
     }
     private func remoteInputReason(_ session: AgentSession) -> String? {
         if !remoteCanRead(session) { return "이 세션의 화면 연결이 없습니다. Mac의 연결 설정에서 터미널을 연결해주세요. 훅으로 받은 질문은 아래에서 답할 수 있습니다." }
@@ -289,7 +298,7 @@ import Combine
         if liveClaudeHooks.values.contains(where: { $0.request.sessionID == session.id }) { return "앱에서 응답을 기다리는 Claude 요청입니다. 아래의 요청 버튼으로 답해주세요." }
         if session.terminal == .vscode {
             let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
-            if registration?["remoteInputVersion"] as? Int != 1 { return "Mac에서 AutoApprove Bridge 확장을 업데이트하면 웹에서 입력할 수 있습니다." }
+            if (registration?["remoteInputVersion"] as? Int ?? 0) < 1 { return "Mac에서 AutoApprove Bridge 확장을 업데이트하면 웹에서 입력할 수 있습니다." }
         }
         return nil
     }
@@ -380,8 +389,9 @@ import Combine
               remoteFrames[id]?.frame.revision == token else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
         // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
         remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)
-        var event = AuditEvent(sessionID: id, summary: kind == .text ? String(input.text.prefix(200)) : kind.rawValue,
-            outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: kind == .text ? input.text : kind.rawValue)
+        let textual = [.text, .submit, .characters].contains(kind)
+        var event = AuditEvent(sessionID: id, summary: textual ? String(input.text.prefix(200)) : kind.rawValue,
+            outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: textual ? input.text : kind.rawValue)
         guard log(event) else { throw RemoteHTTPError(409, "입력 내역을 저장하지 못해 전송하지 않았습니다.") }
         do {
             let sent: Bool

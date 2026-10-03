@@ -113,7 +113,7 @@ async function registerTerminal(terminal: vscode.Terminal): Promise<void> {
 }
 function sendRegistration(): void {
   send('register', { terminals: Array.from(terminals.values()).map(state => ({
-    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 1
+    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 2
   })) });
 }
 function send(method: string, params: Record<string, unknown>): void {
@@ -161,8 +161,8 @@ function handleMessage(message: Record<string, any>): void {
     const state = Array.from(terminals.values()).find(state => state.id === message.terminalID);
     const success = connected && !!state?.execution && !!state.mirror?.consumeInput(message);
     if (success) {
-      const keys: Record<string, string> = { enter: '\r', escape: '\x1b', interrupt: '\x03', up: '\x1b[A', down: '\x1b[B', tab: '\t' };
-      state!.terminal.sendText(message.kind === 'text' ? message.text : keys[message.kind], false);
+      const keys: Record<string, string> = { enter: '\r', escape: '\x1b', interrupt: '\x03', up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', backspace: '\x7f', delete: '\x1b[3~', home: '\x1b[H', end: '\x1b[F', tab: '\t' };
+      state!.terminal.sendText(message.kind === 'submit' ? message.text + '\r' : ['text', 'characters'].includes(message.kind) ? message.text : keys[message.kind], false);
     }
     send('remoteInputResult', { actionID: message.id, success });
     return;
