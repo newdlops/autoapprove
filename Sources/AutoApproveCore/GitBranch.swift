@@ -28,12 +28,32 @@ public struct GitBranchUpdate: Sendable {
 }
 
 public enum GitBranchReader {
+    /// macOS 런처의 추가 exec 대기를 피하고, 개발 도구 Git이 없으면 원래 시스템 경로를 쓴다.
+    private static let gitExecutable = [
+        "/Library/Developer/CommandLineTools/usr/bin/git",
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+        "/usr/bin/git"
+    ].first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/git"
+
     /// Git resolves nested directories and each linked worktree's own HEAD.
     /// These plumbing reads never scan the worktree, refresh the index or fetch.
     public static func read(directory: String) -> GitBranchState {
+        read(directory: directory) { arguments, environment in
+            try CommandRunner.run(gitExecutable, arguments, timeout: 1.5,
+                                  environment: environment, inheritEnvironment: false)
+        }
+    }
+
+    /// 실행기 주입 경계를 공개해 독립 클라이언트와 배포 검사도 동일한 Git 읽기 정책을 사용한다.
+    /// - 작은 메타데이터가 같으면 검증된 브랜치를 재사용해 프로세스를 만들지 않는다.
+    /// - directory는 작업 폴더이고 executeGit은 격리한 인자·환경을 받는 실제 실행 함수다.
+    /// - 반환값은 Git에서 확인한 브랜치·detached 상태 또는 진단 가능한 실패 상태다.
+    public static func read(directory: String, executeGit: ([String], [String: String]) throws -> CommandResult) -> GitBranchState {
         guard directory.hasPrefix("/"), !directory.contains("\0") else {
             return .init(kind: .unavailable, detail: "현재 폴더의 경로를 확인하지 못했습니다.")
         }
+        let fingerprint = GitBranchCache.fingerprint(directory: directory)
+        if let cached = GitBranchCache.value(directory: directory, fingerprint: fingerprint) { return cached }
         // An app launched from a shell must not inherit a different GIT_DIR,
         // GIT_WORK_TREE, namespace or command-scope Git configuration.
         var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("GIT_") }
@@ -41,8 +61,7 @@ public enum GitBranchReader {
         environment["GIT_OPTIONAL_LOCKS"] = "0"
         environment["GIT_TERMINAL_PROMPT"] = "0"
         func git(_ arguments: [String]) throws -> CommandResult {
-            try CommandRunner.run("/usr/bin/git", ["-c", "core.fsmonitor=false", "-C", directory] + arguments,
-                                  timeout: 1.5, environment: environment, inheritEnvironment: false)
+            try executeGit(["-c", "core.fsmonitor=false", "-C", directory] + arguments, environment)
         }
         func failed(_ result: CommandResult) -> GitBranchState {
             let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -53,7 +72,9 @@ public enum GitBranchReader {
             let branch = try git(["symbolic-ref", "--quiet", "HEAD"])
             let ref = branch.output.trimmingCharacters(in: .whitespacesAndNewlines)
             if branch.status == 0, ref.hasPrefix("refs/heads/"), ref.count > "refs/heads/".count {
-                return .init(kind: .branch, name: String(ref.dropFirst("refs/heads/".count)))
+                let state = GitBranchState(kind: .branch, name: String(ref.dropFirst("refs/heads/".count)))
+                GitBranchCache.store(state, directory: directory, before: fingerprint)
+                return state
             }
             guard branch.status == 1 else { return failed(branch) }
             let head = try git(["rev-parse", "--verify", "--short=8", "HEAD"])

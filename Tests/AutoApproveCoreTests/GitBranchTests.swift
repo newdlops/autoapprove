@@ -20,6 +20,38 @@ private final class GitBranchFixture {
 }
 
 extension ApprovalTests {
+    /// 반복 읽기에서 프로세스를 만들지 않으면서 브랜치·간접 참조 변경은 바로 반영하는지 검증한다.
+    func testGitBranchCacheAvoidsProcessLaunchAndTracksReferences() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        try fixture.git(["commit", "--quiet", "--allow-empty", "-m", "fixture"], at: repository)
+        var launches = 0
+        let execute: ([String], [String: String]) throws -> CommandResult = { arguments, environment in
+            launches += 1
+            return try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+        }
+        try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute).name, "main")
+        let initial = launches, warmStart = Date()
+        for _ in 0..<100 {
+            try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute).name, "main")
+        }
+        try expectEqual(launches, initial, "Unchanged branch metadata must not launch another Git process")
+        print("Git warm reads: 100 reads, 0 processes, \(Date().timeIntervalSince(warmStart) * 1000) ms")
+        try fixture.git(["switch", "--quiet", "-c", "feature/new"], at: repository)
+        try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute).name, "feature/new")
+        try expectEqual(launches, initial + 1)
+        try fixture.git(["branch", "feature/alias", "HEAD"], at: repository)
+        try fixture.git(["symbolic-ref", "refs/heads/feature/new", "refs/heads/feature/alias"], at: repository)
+        try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute).name, "feature/alias", "Indirect reference changes must invalidate a cached branch")
+        let detached = fixture.root.appendingPathComponent("cache linked worktree")
+        try fixture.git(["worktree", "add", "--quiet", "-b", "feature/linked", detached.path, "HEAD"], at: repository)
+        try expectEqual(GitBranchReader.read(directory: detached.path, executeGit: execute).name, "feature/linked")
+        let linkedInitial = launches
+        for _ in 0..<10 { try expectEqual(GitBranchReader.read(directory: detached.path, executeGit: execute).name, "feature/linked") }
+        try expectEqual(launches, linkedInitial, "Linked worktree metadata must also avoid repeated Git processes")
+        try fixture.git(["switch", "--quiet", "-c", "feature/linked-new"], at: detached)
+        try expectEqual(GitBranchReader.read(directory: detached.path, executeGit: execute).name, "feature/linked-new")
+    }
+
     func testGitBranchWorktreeAndRefresh() throws {
         let fixture = try GitBranchFixture(), repository = fixture.repository
         try expectEqual(GitBranchReader.read(directory: repository.path), .init(kind: .branch, name: "main"), "An unborn branch still has a name")

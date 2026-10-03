@@ -453,6 +453,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session customization validation and old snapshot compatibility", tests.testCustomizationValidationAndCompatibility),
             ("Session customization save failure and ended-session rejection", tests.testCustomizationFailureDoesNotPublishOrReviveSessions),
             ("Git unborn, nested, linked worktree, branch switch and detached HEAD", tests.testGitBranchWorktreeAndRefresh),
+            ("Git unchanged branch avoids processes and follows reference changes", tests.testGitBranchCacheAvoidsProcessLaunchAndTracksReferences),
             ("Git non-repository, missing directory and inherited environment isolation", tests.testGitBranchNonRepositoryAndEnvironmentIsolation),
             ("Git metadata binds to live sessions and their current directories", tests.testGitBranchesBindToCurrentSessionDirectory),
             ("Codex locked database, preserved questions and automatic recovery", tests.testCodexHistoryContentionAndRecovery),
