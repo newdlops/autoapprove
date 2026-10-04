@@ -6,6 +6,19 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
+test('live terminal cursor follows ANSI movement, wide text and hidden cursor mode', async () => {
+  const mirror = new ScreenMirror(); mirror.resize(80, 12);
+  const cursor = () => (mirror as unknown as { cursor(): { offset: number; padding: number; visible: boolean; style: string; blink: boolean } }).cursor();
+  assert.equal(typeof (mirror as unknown as {cursor?: unknown}).cursor, 'function', 'Relay must expose the actual terminal cursor');
+  await mirror.write('› 한글 🧪abc');
+  assert.equal(cursor().offset, '› 한글 🧪abc'.length);
+  await mirror.write('\x1b[2D'); assert.equal(cursor().offset, '› 한글 🧪a'.length);
+  await mirror.write('\x1b[?25l'); assert.equal(cursor().visible, false);
+  await mirror.write('\x1b[?25h\x1b[5 q'); assert.equal(cursor().visible, true); assert.equal(cursor().style, 'bar'); assert.equal(cursor().blink, true);
+  await mirror.write('\x1b[2;10H'); assert.equal(cursor().offset, mirror.snapshot().indexOf('\n') + 1); assert.equal(cursor().padding, 9);
+  mirror.dispose();
+});
+
 test('terminal themes inherit JSONC colors, apply scoped overrides and preserve light palettes', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'autoapprove-theme-'));
   try {
@@ -155,5 +168,23 @@ test('remote input requires the exact rendered screen and is never replayed', as
   assert.equal(mirror.consumeInput({ ...action, id: 'old-frame' }, now), false);
   mirror.invalidate();
   assert.equal(mirror.consumeInput({ ...action, id: 'invalid', screen: mirror.snapshot() }, now), false);
+  mirror.dispose();
+});
+
+test('live keys accept changing output but stay generation-bound, expiring and single-use', async () => {
+  const mirror = new ScreenMirror();
+  await mirror.write('› ready');
+  const now = Date.now();
+  const action = { id: 'live', screen: mirror.snapshot(), generation: mirror.generation, expiresAt: now + 1000, kind: 'characters', text: '한글 🧪', relay: true };
+  const pending = mirror.write('\r\nnew output');
+  assert.equal(mirror.consumeInput({ ...action, generation: 'different' }, now), false);
+  assert.equal(mirror.consumeInput({ ...action, expiresAt: now - 1 }, now), false);
+  assert.equal(mirror.consumeInput(action, now), true);
+  await pending;
+  assert.equal(mirror.consumeInput(action, now), false);
+  assert.equal(mirror.consumeInput({ ...action, id: 'composed', kind: 'submit' }, now), false, 'Composed messages still require their original screen');
+  assert.equal(mirror.consumeInput({ ...action, id: 'move', kind: 'left', text: '' }, now), true);
+  mirror.invalidate();
+  assert.equal(mirror.consumeInput({ ...action, id: 'disconnected' }, now), false);
   mirror.dispose();
 });

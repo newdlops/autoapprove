@@ -67,6 +67,8 @@ public struct RemoteTerminalFrame: Codable {
     public var keys: [String]
     public var inputReason: String?
     public var appearance: TerminalAppearance? = nil
+    public var cursor: TerminalCursor? = nil
+    public var streamID: String? = nil
 }
 
 /// A browser that already has this revision only needs fresh controls and observation time.
@@ -78,11 +80,14 @@ private struct RemoteTerminalUpdate: Encodable {
     var keys: [String]
     var inputReason: String?
     var appearance: TerminalAppearance?
+    var cursor: TerminalCursor?
+    var streamID: String?
     init(_ frame: RemoteTerminalFrame, knownRevision: String?) {
         sessionID = frame.sessionID; revision = frame.revision; observedAt = frame.observedAt
         keys = frame.keys; inputReason = frame.inputReason
         screen = knownRevision == frame.revision ? nil : frame.screen
         appearance = knownRevision == frame.revision ? nil : frame.appearance
+        cursor = frame.cursor; streamID = frame.streamID
     }
 }
 

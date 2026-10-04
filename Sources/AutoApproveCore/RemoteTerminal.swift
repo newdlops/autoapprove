@@ -9,7 +9,9 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
     public enum Kind: String, Codable, Sendable { case text, submit, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab }
     public var kind: Kind
     public var text: String
-    public init(kind: Kind, text: String = "") { self.kind = kind; self.text = text }
+    public var relay: Bool? = nil
+    public init(kind: Kind, text: String = "", relay: Bool = false) { self.kind = kind; self.text = text; self.relay = relay ? true : nil }
+    public var isRelay: Bool { relay == true && ![.text, .submit].contains(kind) }
     public var bytes: String {
         switch kind {
         case .text, .characters: return text
@@ -43,7 +45,7 @@ public enum RemoteTerminalAdapter {
         }
         if host == .orca {
             guard let handle = target.handle else { return .missingTarget }
-            guard OrcaAdapter.normalize(try OrcaAdapter.readScreen(handle: handle)) == OrcaAdapter.normalize(expected) else { return .screenChanged }
+            if !input.isRelay, OrcaAdapter.normalize(try OrcaAdapter.readScreen(handle: handle)) != OrcaAdapter.normalize(expected) { return .screenChanged }
             let result = try OrcaAdapter.sendComposed(handle: handle, text: input.bytes)
             return (result["send"] as? JSONObject)?["accepted"] as? Bool == true ? .sent : .missingTarget
         }
@@ -55,10 +57,10 @@ public enum RemoteTerminalAdapter {
     public static func script(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput) throws -> String {
         guard agent != .shell, host != .orca else { throw RemoteHTTPError(400, "이 터미널의 입력 방식은 지원하지 않습니다.") }
         try input.validate()
-        let terminalKeyboard = host == .terminal && ![.text, .submit, .enter].contains(input.kind)
+        let terminalKeyboard = host == .terminal && (!([.text, .submit, .enter].contains(input.kind)) || input.isRelay && input.kind == .enter)
         let data = try AutomationScript.literal(["tty": target.tty, "expected": expected, "agent": agent.rawValue,
             "text": host == .terminal && [.text, .submit].contains(input.kind) ? input.text : input.kind == .enter && host == .terminal ? "" : input.bytes,
-            "jobPIDs": target.jobPIDs.map(Int.init)] as JSONObject)
+            "jobPIDs": target.jobPIDs.map(Int.init), "relay": input.isRelay] as JSONObject)
         let helpers = """
         function normalize(text) { return String(text).normalize('NFC').replace(/\\r\\n?/g, '\\n'); }
         function skipClosed(read) {
@@ -78,7 +80,7 @@ public enum RemoteTerminalAdapter {
               if (!$.AXIsProcessTrusted()) throw Error('Mac의 손쉬운 사용 설정에서 AutoApprove를 허용해주세요.');
               window.miniaturized = false; window.selectedTab = tab; window.index = 1; app.activate();
               if (!app.frontmost() || window.selectedTab().tty() !== target.tty) return 'missingTarget';
-              if (normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
+              if (!target.relay && normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
               const events = Application('com.apple.systemevents');
               \(keyboardAction)
             """ : "app.doScript(String(target.text).normalize('NFC'), {in:tab});"
@@ -88,7 +90,7 @@ public enum RemoteTerminalAdapter {
             \(helpers)
             if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
               if (skipClosed(() => tab.tty()) !== target.tty) continue;
-              if (normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
+              if (!target.relay && normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
               if (!tab.processes().some(p => p.toLowerCase().includes(target.agent))) return 'agentMissing';
               \(delivery)
               return 'sent';
@@ -105,7 +107,7 @@ public enum RemoteTerminalAdapter {
         if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || [])
         for (const session of skipClosed(() => tab.sessions()) || []) {
           if (skipClosed(() => session.tty()) !== target.tty) continue;
-          if (normalize(visible(session)) !== normalize(target.expected)) return 'screenChanged';
+          if (!target.relay && normalize(visible(session)) !== normalize(target.expected)) return 'screenChanged';
           let job = 0;
           try { job = Number(session.variable({named: 'jobPid'})) || 0; } catch (_) {}
           if (!target.jobPIDs.includes(job)) return 'agentMissing';

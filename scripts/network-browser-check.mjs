@@ -42,15 +42,20 @@ try {
   await capture('desktop-terminal');
   const toggle = page.getByRole('switch', { name: '자동 승인' });
   await toggle.check(); await page.locator('#send-input').waitFor();
-  await page.getByText('직접 입력하려면 이 세션의 자동 승인을 끄거나 이 Mac을 일시정지하세요.', { exact: true }).waitFor();
-  assert.equal(await page.locator('#terminal-input').isDisabled(), true);
-  await toggle.uncheck();
+  await page.waitForFunction(() => !document.getElementById('terminal-input').disabled);
+  assert.equal(await toggle.isChecked(), true);
+  if (!await page.locator('#terminal-input').isVisible()) {
+    if (!await page.locator('#terminal-settings').evaluate(details => details.open)) await page.locator('#terminal-settings summary').click();
+    await page.locator('#compose-input').check();
+  }
   await page.locator('#terminal-input').waitFor({ state: 'visible' });
   await page.waitForFunction(() => !document.getElementById('terminal-input').disabled);
   await page.locator('#terminal-input').fill('브라우저에서 보낸 한글 · 검증용');
   await page.locator('#send-input').click();
   await page.waitForFunction(() => document.getElementById('terminal-screen').textContent.includes('브라우저에서 보낸 한글'));
-  await capture('desktop-after-input'); checks.push('automatic off/on, disabled manual input, exact terminal text delivery');
+  assert.equal(await toggle.isChecked(), true);
+  await toggle.uncheck();
+  await capture('desktop-after-input'); checks.push('input while automatic approval remains on, exact terminal text delivery');
   const search = page.getByRole('searchbox', { name: '세션 검색' });
   await search.fill('존재하지-않는-세션'); await page.getByText('검색이나 필터에 맞는 세션이 없습니다.').waitFor();
   await capture('desktop-empty-search'); await search.fill('');
@@ -83,6 +88,10 @@ try {
     await page.waitForFunction(() => document.getElementById('terminal-screen').textContent.includes('합성 데이터'));
     await capture(`${size.width}-long-terminal`);
     if (await page.locator('body').evaluate(body => body.classList.contains('terminal-focus'))) await page.locator('#terminal-focus').click();
+    if (!await page.locator('#terminal-input').isVisible()) {
+      if (!await page.locator('#terminal-settings').evaluate(details => details.open)) await page.locator('#terminal-settings summary').click();
+      await page.locator('#compose-input').check();
+    }
     await page.locator('#terminal-input').fill('화면 갱신 중에도 보존할 초안');
     await page.getByRole('button', { name: '상태 새로고침' }).click();
     assert.equal(await page.locator('#terminal-input').inputValue(), '화면 갱신 중에도 보존할 초안');

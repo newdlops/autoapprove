@@ -99,6 +99,17 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 @keyframes terminal-update { from { opacity: .35; transform: scale(.7); } to { opacity: 1; transform: scale(1); } }
 #terminal-screen { font: var(--terminal-font-size, 14px)/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; min-height: 260px; max-height: 420px; margin: 0; padding: 12px; overflow: auto; tab-size: 4; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 #terminal-screen[data-wrap=true] { white-space: pre-wrap; overflow-wrap: anywhere; }
+.terminal[data-input=direct] #terminal-screen { cursor: text; }
+.terminal:has(.terminal-keyboard:focus) { box-shadow: inset 0 0 0 2px var(--blue); }
+.terminal:has(.terminal-keyboard:focus) #terminal-screen { outline: 2px solid var(--blue); outline-offset: -2px; }
+.terminal-keyboard { position: absolute; left: 12px; top: 48px; width: 1px; height: 20px; min-height: 0; max-height: 20px; padding: 0; border: 0; opacity: 0; resize: none; pointer-events: none; font-size: 16px; }
+.terminal-cursor { position: absolute; pointer-events: none; background: var(--terminal-fg); opacity: .55; }
+.terminal-cursor[data-style=bar] { background: linear-gradient(to right, var(--terminal-fg) 2px, transparent 2px); opacity: 1; }
+.terminal-cursor[data-style=underline] { background: linear-gradient(to top, var(--terminal-fg) 2px, transparent 2px); opacity: 1; }
+.terminal-cursor[data-blink=true] { animation: terminal-cursor-blink 1.1s step-end infinite; }
+@keyframes terminal-cursor-blink { 50% { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .terminal-cursor[data-blink=true] { animation: none; } }
+.terminal-composition { position: absolute; top: 48px; left: 12px; width: fit-content; max-width: calc(100% - 24px); margin: 0; border-bottom: 2px solid var(--blue); background: var(--terminal); color: var(--terminal-fg); font: 16px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
 #jump-latest { position: absolute; right: 12px; bottom: 12px; font-size: 13px; }
 .terminal-heading h3 { flex: 1; min-width: 0; }
 .terminal-heading > button, .terminal-settings { flex-shrink: 0; }
@@ -125,13 +136,14 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .input-form { margin-top: 16px; }
 .input-form > label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
 .input-actions { display: flex; align-items: center; gap: 12px; margin: 8px 0; min-width: 0; }
-.direct-input-label { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+#terminal-keyboard-toggle { flex-shrink: 0; padding: 8px 10px; font-size: 13px; }
+#terminal-keyboard-toggle[aria-pressed=true] { color: var(--blue); border-color: var(--blue); background: var(--selected); }
+#send-input { flex-shrink: 0; min-width: 60px; }
 .terminal-keys { display: flex; gap: 8px; overflow-x: auto; min-width: 0; flex: 1; overscroll-behavior-x: contain; }
 .terminal-keys button { min-width: 44px; padding: 8px 10px; font-size: 12px; }
 .terminal-keys button { flex-shrink: 0; white-space: nowrap; }
 .input-editor { display: flex; align-items: flex-end; gap: 8px; }
 .input-editor textarea { flex: 1; resize: none; min-height: 48px; max-height: 96px; font-size: 16px; }
-.input-editor button { min-height: 48px; min-width: 64px; }
 #direct-input-help { margin-top: 6px; }
 #input-help { margin-top: 6px; }
 .detail-section { border-top: 1px solid var(--line); margin-top: 28px; padding-top: 20px; }
@@ -210,7 +222,9 @@ body.terminal-focus #terminal-screen { flex: 1; min-height: 0; max-height: none;
 body.terminal-focus .terminal-bar { padding: 6px 12px; min-height: 30px; }
 body.terminal-focus #terminal-host { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 body.terminal-focus .input-form { flex-shrink: 0; margin: 0; padding: 0 max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); border-top: 1px solid var(--line); }
-body.terminal-focus .input-form > label, body.terminal-focus #input-help, body.terminal-focus #direct-input-help { display: none; }
+body.terminal-focus .input-form > label, body.terminal-focus #input-help { display: none; }
+body.terminal-focus #direct-input-help { font-size: 12px; }
+body.terminal-focus.terminal-compact #direct-input-help[data-required=false] { display: none; }
 body.terminal-focus #direct-input-help[data-required=true] { display: block; font-size: 12px; }
 body.terminal-focus #input-reason { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
 body.terminal-focus #input-reason[data-blocked=false] { display: none; }

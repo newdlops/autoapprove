@@ -6,8 +6,9 @@ public struct TerminalScreen: Codable {
     public var contents: String
     public var title: String?
     public var appearance: TerminalAppearance?
-    public init(tty: String, contents: String, title: String? = nil, appearance: TerminalAppearance? = nil) {
-        self.tty = tty; self.contents = contents; self.title = title; self.appearance = appearance
+    public var cursor: TerminalCursor?
+    public init(tty: String, contents: String, title: String? = nil, appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil) {
+        self.tty = tty; self.contents = contents; self.title = title; self.appearance = appearance; self.cursor = cursor
     }
 }
 
@@ -129,7 +130,17 @@ public enum TerminalAdapter {
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String]) throws -> TerminalSnapshot {
         let output = try javascript(screenScript(ttys: ttys))
-        return try JSONDecoder().decode(TerminalSnapshot.self, from: Data(output.utf8))
+        let data = Data(output.utf8)
+        var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
+        let records = (try? JSONSerialization.jsonObject(with: data) as? JSONObject)?["screens"] as? [JSONObject] ?? []
+        for index in snapshot.screens.indices {
+            guard let metadata = records.first(where: { $0["tty"] as? String == snapshot.screens[index].tty })?["cursorWindow"] as? JSONObject,
+                  let title = metadata["title"] as? String, let boundsObject = metadata["bounds"],
+                  let boundsData = try? JSONSerialization.data(withJSONObject: boundsObject),
+                  let bounds = try? JSONDecoder().decode(TerminalWindowBounds.self, from: boundsData) else { continue }
+            snapshot.screens[index].cursor = TerminalCursorReader.read(screen: snapshot.screens[index].contents, title: title, bounds: bounds)
+        }
+        return snapshot
     }
     /// Exposed for contract tests against Terminal's scripting dictionary, without sending Apple events.
     public static func screenScript(ttys: [String]) throws -> String {
@@ -156,7 +167,9 @@ public enum TerminalAdapter {
               if (!title) try {
                 if (tabs.length === 1 || tab.selected()) title = String(window.name() || '').trim() || null;
               } catch (_) {}
-              screens.push({tty:tty, contents:tab.contents(), title:title});
+              let cursorWindow = null;
+              try { if (tab.selected()) cursorWindow = {title:String(window.name()), bounds:window.bounds()}; } catch (_) {}
+              screens.push({tty:tty, contents:tab.contents(), title:title, cursorWindow:cursorWindow});
               allowed.delete(tty);
               if (!allowed.size) break screenWindows;
             } catch (error) { recordFailure(tty, error); }

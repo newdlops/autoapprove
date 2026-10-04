@@ -46,6 +46,10 @@ try {
   assert.equal(await colors.isChecked(), false); await colors.check();
   checks.push('unchanged DOM, compact polling and persistent monochrome switch');
   const echoLabel = '브라우저 입력 속도 검증 · ' + randomUUID();
+  if (!await page.locator('#terminal-input').isVisible()) {
+    if (!await page.locator('#terminal-settings').evaluate(details => details.open)) await page.locator('#terminal-settings summary').click();
+    await page.locator('#compose-input').check();
+  }
   await page.locator('#terminal-input').fill(echoLabel + '\n' + Array.from({ length: 70 }, (_, i) => `합성 출력 ${i} · 한글/中文/🧪`).join('\n'));
   const start = performance.now(); await page.locator('#send-input').click();
   await page.waitForFunction(value => document.getElementById('terminal-screen').textContent.includes(value), echoLabel);
@@ -132,7 +136,7 @@ try {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   edgeScreen = '';
   await page.getByRole('button', { name: '상태 새로고침' }).click();
-  await page.waitForFunction(() => document.getElementById('terminal-screen').textContent === '터미널 화면에 표시된 내용이 없습니다.');
+  await page.waitForFunction(() => document.getElementById('terminal-screen').textContent === '' && document.getElementById('terminal-live').textContent.includes('빈 화면'));
   checks.push('large output preserves all text with bounded DOM and empty screen recovery');
   assert.deepEqual(errors, []);
   const report = { checks, screenshots, syntheticInputEchoMS: echoMS, frames, javascriptErrors: errors };

@@ -407,6 +407,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         let cases: [(String, () async throws -> Void)] = [
             ("LAN HTTP bounds, origin checks and private addresses", tests.testRemoteHTTPBoundsOriginAndPrivateAddresses),
             ("Remote terminal coalesces reads, expires cache and omits unchanged output", tests.testRemoteTerminalCoalescingExpiryAndConditionalPayload),
+            ("Live relay accepts changing output with automation on and binds the exact target", tests.testRemoteRelayWithAutomaticApprovalAndChangedOutput),
+            ("Native approval writes serialize with live user input", tests.testRemoteInputSerializesNativeApproval),
             ("Remote original ANSI attributes, bounds and color-only frames", tests.testRemoteOriginalTerminalAttributesAndColorOnlyFrames),
             ("Remote terminal read stops once the exact target is found", tests.testRemoteTerminalReadStopsAtExactTarget),
             ("Remote exact terminal, manual input, stale frames and restart receipts", tests.testRemoteTerminalExactTargetStaleFrameAndDurableReceipt),

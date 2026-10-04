@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 // Offsets are UTF-16, as in the browser. Screen text remains the exact input guard.
 export type TerminalRun = { offset: number; length: number; fg?: string; bg?: string; bold?: boolean; dim?: boolean; italic?: boolean; underline?: boolean; strike?: boolean; inverse?: boolean; hidden?: boolean };
 export type TerminalAppearance = { runs: TerminalRun[]; foreground?: string; background?: string };
+export type TerminalCursor = { offset: number; padding: number; visible: boolean; style: 'block' | 'bar' | 'underline'; blink: boolean };
 export const ansiPalette = ['#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5', '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#e5e5e5'];
 const rgb = (value: number) => '#' + value.toString(16).padStart(6, '0');
 function paletteColor(index: number, palette: readonly string[]): string {
@@ -22,6 +23,30 @@ export class ScreenMirror {
   private pendingWrites = 0;
   private revision = 0;
   private appearanceCache?: { revision: number; theme: string; value: TerminalAppearance | undefined };
+  private cursorVisible = true;
+  private cursorStyle: TerminalCursor['style'] = 'block';
+  private cursorBlink = true;
+
+  constructor() {
+    for (const [final, visible] of [['h', true], ['l', false]] as const) {
+      this.terminal.parser.registerCsiHandler({ prefix: '?', final }, params => {
+        if (params.includes(25)) { this.cursorVisible = visible; }
+        return false;
+      });
+    }
+    this.terminal.parser.registerCsiHandler({ intermediates: ' ', final: 'q' }, params => {
+      const value = Number(params[0]) || 1;
+      if (value >= 1 && value <= 6) {
+        this.cursorStyle = value <= 2 ? 'block' : value <= 4 ? 'underline' : 'bar';
+        this.cursorBlink = value % 2 === 1;
+      }
+      return false;
+    });
+    this.terminal.parser.registerEscHandler({ final: 'c' }, () => {
+      this.cursorVisible = true; this.cursorStyle = 'block'; this.cursorBlink = true;
+      return false;
+    });
+  }
 
   write(data: string): Promise<void> {
     this.pendingWrites++;
@@ -41,6 +66,18 @@ export class ScreenMirror {
       lines.push(buffer.getLine(row)?.translateToString(true) ?? '');
     }
     return lines.join('\n');
+  }
+  cursor(): TerminalCursor {
+    const buffer = this.terminal.buffer.active;
+    let offset = 0;
+    for (let row = 0; row < buffer.cursorY; row++) {
+      offset += (buffer.getLine(buffer.baseY + row)?.translateToString(true).length ?? 0) + 1;
+    }
+    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+    const text = line?.translateToString(true) ?? '';
+    const before = line?.translateToString(false, 0, buffer.cursorX) ?? '';
+    return { offset: offset + Math.min(before.length, text.length), padding: Math.max(0, before.length - text.length),
+      visible: this.cursorVisible, style: this.cursorStyle, blink: this.cursorBlink };
   }
   appearance(palette: readonly string[] = ansiPalette, defaults: { foreground?: string; background?: string } = {}, boldIsBright = true): TerminalAppearance | undefined {
     const theme = JSON.stringify([palette, defaults, boldIsBright]);
@@ -83,9 +120,10 @@ export class ScreenMirror {
   }
   fingerprint(): string { return createHash('sha256').update(this.snapshot()).digest('hex'); }
   consumeInput(action: Record<string, unknown>, now = Date.now()): boolean {
-    if (!this.valid || this.pendingWrites !== 0 || typeof action.id !== 'string' || this.attempted.has(action.id)
+    const relay = action.relay === true && !['text', 'submit'].includes(String(action.kind));
+    if (!this.valid || !relay && this.pendingWrites !== 0 || typeof action.id !== 'string' || this.attempted.has(action.id)
       || action.generation !== this.generation || typeof action.expiresAt !== 'number' || action.expiresAt < now || action.expiresAt > now + 5000
-      || typeof action.screen !== 'string' || action.screen !== this.snapshot() || typeof action.kind !== 'string') { return false; }
+      || typeof action.screen !== 'string' || !relay && action.screen !== this.snapshot() || typeof action.kind !== 'string') { return false; }
     if (['text', 'submit', 'characters'].includes(action.kind)) {
       if (typeof action.text !== 'string' || !action.text || Buffer.byteLength(action.text) > 8000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(action.text)
         || action.kind === 'characters' && /[\n\t]/.test(action.text)) { return false; }

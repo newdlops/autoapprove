@@ -13,7 +13,11 @@ let frameController = null, quietFrames = 0, fastFrameUntil = 0;
 let terminalValue = null, terminalRows = [], terminalAppearanceKey = null;
 let lastNetworkUpdate = null;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
+let composePreferred = false, composeMode = false;
+const keyboardMarker = '\u200b';
 let inputGeneration = 0, terminalFontSize = 14;
+let directStreamID = null;
+let cursorLayoutPending = false;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const keyFor = (node, session) => `${node.id}/${session.id}`;
@@ -79,15 +83,96 @@ function setFontSize(value) {
   text($('font-size'), `${terminalFontSize}px`);
   $('font-smaller').disabled = terminalFontSize === 12; $('font-larger').disabled = terminalFontSize === 20;
   try { localStorage.setItem('terminal-font-size', String(terminalFontSize)); } catch (_) {}
+  scheduleCursor();
 }
-function stopDirect(preserve = true) {
+function scheduleCursor() {
+  if (cursorLayoutPending) return;
+  cursorLayoutPending = true;
+  requestAnimationFrame(() => { cursorLayoutPending = false; positionCursor(); });
+}
+function positionCursor() {
+  const pre = $('terminal-screen'), caret = $('terminal-cursor'), cursor = latestFrame?.cursor;
+  show(caret, false);
+  const value = terminalValue;
+  if (!cursor || value === null || !Number.isInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > value.length
+    || !Number.isInteger(cursor.padding) || cursor.padding < 0 || cursor.padding > 500 || !['block', 'bar', 'underline'].includes(cursor.style)
+    || cursor.offset < value.length && /[\udc00-\udfff]/.test(value[cursor.offset])) return;
+  const terminal = pre.parentElement, bounds = pre.getBoundingClientRect(), container = terminal.getBoundingClientRect();
+  if (!bounds.width || !bounds.height) return;
+  const style = getComputedStyle(pre), lineHeight = parseFloat(style.lineHeight);
+  const canvas = document.createElement('canvas'), context = canvas.getContext('2d'); context.font = style.font;
+  const cell = context.measureText(' ').width;
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+  let node, remaining = cursor.offset, rect;
+  while ((node = walker.nextNode())) {
+    // At a line boundary, prefer the next row's start over the previous newline's end.
+    if (remaining === node.length && node.nextSibling === null && walker.nextNode()) { remaining -= node.length; node = walker.currentNode; }
+    if (remaining <= node.length) {
+      const range = document.createRange(); range.setStart(node, remaining); range.collapse(true);
+      rect = range.getBoundingClientRect(); break;
+    }
+    remaining -= node.length;
+  }
+  let x = rect?.height ? rect.left : bounds.left + parseFloat(style.paddingLeft) - pre.scrollLeft;
+  let y = rect?.height ? rect.top : bounds.top + parseFloat(style.paddingTop) - pre.scrollTop;
+  if (cursor.offset === value.length && value.endsWith('\n')) {
+    const range = document.createRange(); range.selectNodeContents(pre.lastChild);
+    const rectangles = range.getClientRects(), last = rectangles[rectangles.length - 1];
+    x = bounds.left + parseFloat(style.paddingLeft) - pre.scrollLeft;
+    if (last?.height) y = last.top + lineHeight;
+  }
+  x += cursor.padding * cell;
+  const inView = x >= bounds.left && x < bounds.right - 1 && y + lineHeight > bounds.top && y < bounds.bottom;
+  caret.style.left = `${x - container.left}px`; caret.style.top = `${y - container.top}px`;
+  caret.style.width = `${Math.max(2, cell)}px`; caret.style.height = `${lineHeight}px`;
+  caret.dataset.style = cursor.style; caret.dataset.blink = String(cursor.blink); caret.dataset.offset = String(cursor.offset);
+  show(caret, cursor.visible === true && inView && !composing && !!latestFrame && connected);
+  // Native phone IME candidate UI uses this same insertion point.
+  if (inView && !composing) {
+    $('terminal-keyboard').style.left = `${x - container.left}px`;
+    $('terminal-keyboard').style.top = `${y - container.top}px`;
+  }
+  const composition = $('terminal-composition');
+  composition.style.left = `${Math.max(12, Math.min(x - container.left, container.width - 48))}px`;
+  composition.style.top = `${Math.max(bounds.top - container.top, Math.min(y - container.top, bounds.bottom - container.top - lineHeight))}px`;
+  composition.style.maxWidth = `${Math.max(36, container.width - parseFloat(composition.style.left) - 12)}px`;
+}
+function keyboardText() {
+  const value = $('terminal-keyboard').value;
+  return value.startsWith(keyboardMarker) ? value.slice(1) : value;
+}
+function resetKeyboard() {
+  // A character before the caret lets phone keyboards emit Backspace even when no draft is present.
+  $('terminal-keyboard').value = keyboardMarker; $('terminal-keyboard').setSelectionRange(1, 1);
+  show($('terminal-composition'), false);
+}
+function restoreDirectDraft(value, key = selectedKey) {
+  if (!value || !key) return;
+  const draft = value + (key === selectedKey ? $('terminal-input').value : drafts.get(key) || '');
+  drafts.set(key, draft);
+  if (key === selectedKey) { $('terminal-input').value = draft; composePreferred = true; sizeInput(); }
+}
+function stopDirect(preserve = true, failedText = '') {
   clearTimeout(directTimer); inputGeneration++;
   if (preserve && selectedKey) {
-    const pending = directQueue.filter(item => item.key === selectedKey && item.kind === 'characters').map(item => item.value).join('');
-    if (pending) { $('terminal-input').value = pending + $('terminal-input').value; sizeInput(); }
+    const pending = failedText + directQueue.filter(item => item.key === selectedKey && item.kind === 'characters').map(item => item.value).join('') + keyboardText();
+    restoreDirectDraft(pending);
     drafts.set(selectedKey, $('terminal-input').value);
   }
-  directQueue.length = 0; directMode = false; $('direct-input').checked = false;
+  directQueue.length = 0; directMode = false; directStreamID = null; composing = false; resetKeyboard();
+  if (document.activeElement === $('terminal-keyboard')) $('terminal-keyboard').blur();
+}
+function armDirect() {
+  if (!directMode) directStreamID = latestFrame?.streamID || null;
+  directMode = true;
+}
+function focusKeyboard() {
+  if (composeMode) { if (!$('terminal-input').disabled) $('terminal-input').focus({ preventScroll: true }); return; }
+  if ($('terminal-keyboard').disabled) return;
+  if (document.activeElement === $('terminal-keyboard')) return;
+  armDirect(); inputFailure = ''; captureDirectText();
+  if (composePreferred) { updateControls(); return; }
+  $('terminal-keyboard').focus({ preventScroll: true }); updateControls();
 }
 
 async function api(path, body, signal) {
@@ -115,6 +200,7 @@ function terminalPlaceholder(value) {
   terminalValue = null; terminalRows = []; terminalAppearanceKey = null; text($('terminal-screen'), value);
   $('terminal-screen').style.removeProperty('--ansi-fg'); $('terminal-screen').style.removeProperty('--ansi-bg');
   $('terminal-colors').disabled = true; text($('terminal-color-status'), '');
+  show($('terminal-cursor'), false);
 }
 function terminalAppearance(value, appearance) {
   const color = value => value === undefined || /^#[\da-f]{6}$/i.test(value);
@@ -307,7 +393,7 @@ function selectSession(key, focus = false) {
     selectedKey = key; selectedItem = item; latestFrame = null; detailGeneration++;
     frameController?.abort(); quietFrames = 0; fastFrameUntil = Date.now() + 5000;
     $('detail').scrollTop = 0;
-    $('terminal-input').value = drafts.get(key) || ''; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
+    $('terminal-input').value = drafts.get(key) || ''; composePreferred = !!$('terminal-input').value; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
     $('questions').replaceChildren(); $('history').replaceChildren();
     terminalPlaceholder('화면을 불러오는 중…'); terminalState('pending', '연결 중…'); text($('terminal-time'), '—'); show($('terminal-error'), false); show($('terminal-retry'), false);
   }
@@ -356,22 +442,35 @@ function updateControls() {
   $('terminal-input').disabled = !(base && (fresh || inputInFlight || directSending));
   const supported = inputKeys(), canDirect = supported.includes('characters') && supported.includes('backspace');
   if ((!base || !canDirect) && directMode) stopDirect();
-  $('direct-input').disabled = !inputEnabled || !canDirect;
+  const wasCompose = composeMode;
+  composeMode = composePreferred || !canDirect || !!$('terminal-input').value;
+  $('terminal-keyboard').disabled = !(base && canDirect && !composeMode && (fresh || inputInFlight || directSending));
+  document.querySelector('.terminal').dataset.input = composeMode ? 'compose' : 'direct';
+  show($('input-editor'), composeMode); show($('compose-input-label'), composeMode);
+  if (composeMode && !wasCompose) sizeInput();
+  $('compose-input').checked = composeMode; $('compose-input').disabled = !canDirect || composing;
+  const keyboardActive = document.activeElement === $('terminal-keyboard') && !$('terminal-keyboard').disabled;
+  $('terminal-keyboard-toggle').disabled = !(base && (fresh || inputInFlight || directSending)) || !canDirect || composeMode;
+  $('terminal-keyboard-toggle').setAttribute('aria-pressed', String(keyboardActive));
+  $('terminal-keyboard-toggle').setAttribute('aria-label', keyboardActive ? '터미널 키보드 닫기' : '터미널 키보드 열기');
   text($('direct-input-help'), !canDirect ? selectedItem.session.terminal === 'terminal'
-    ? '실시간 입력은 Mac의 시스템 설정 → 손쉬운 사용에서 AutoApprove를 허용해야 합니다. Enter 전송은 지금 사용할 수 있습니다.'
-    : '실시간 입력은 Mac의 VS Code 확장을 업데이트하면 사용할 수 있습니다.'
-    : selectedItem.session.terminal === 'terminal' ? '바로 입력을 켜면 Mac의 대상 Terminal 탭을 활성화해 키를 전달합니다.' : '바로 입력을 켜면 키와 완성된 한글을 기존 터미널로 즉시 전달합니다.');
+    ? '화면 직접 입력은 Mac의 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 AutoApprove를 허용해야 합니다. 작성 후 Enter 전송은 사용할 수 있습니다.'
+    : '화면 직접 입력은 Mac의 VS Code 확장을 업데이트하면 사용할 수 있습니다. 지금은 작성 후 Enter로 전송하세요.'
+    : composeMode ? '작성 후 Enter로 전송합니다. 화면 설정에서 직접 입력으로 돌아갈 수 있습니다.'
+    : keyboardActive ? '직접 입력 중 · 키와 완성된 한글을 기존 터미널로 전달합니다.' : '화면을 누르거나 키보드 버튼을 눌러 직접 입력하세요.');
   $('direct-input-help').dataset.required = String(!canDirect);
-  $('direct-input').title = $('direct-input-help').textContent;
-  $('send-input').disabled = !(inputEnabled || directMode && base && directSending) || composing || byteLength($('terminal-input').value) > 8000;
+  $('terminal-keyboard-toggle').title = $('direct-input-help').textContent;
+  text($('input-help'), composeMode ? 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.' : '키보드의 문자·Enter·방향키를 직접 보냅니다. Shift Tab으로 포커스를 빠져나갑니다.');
+  $('send-input').disabled = !(inputEnabled || directMode && base && directSending) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value) > 8000;
   text($('send-input'), inputInFlight && !directMode ? '전달 중' : 'Enter');
   text($('input-reason'), inputFailure || reason || (fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
   $('input-reason').dataset.blocked = String(!!inputFailure || !!reason || !fresh);
   for (const button of $('input-form').querySelectorAll('button[data-key]')) {
     const available = supported.includes(button.dataset.key);
-    show(button, available); button.disabled = !(base && (inputEnabled || directMode && directSending)); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
+    show(button, available); button.disabled = composing || !(base && (inputEnabled || directMode && directSending)); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
   }
   for (const button of $('questions').querySelectorAll('button')) button.disabled = !enabled || button.dataset.unavailable === 'true';
+  scheduleCursor();
 }
 async function refreshFrame() {
   clearTimeout(frameTimer);
@@ -388,11 +487,14 @@ async function refreshFrame() {
     if (selectedKey !== key || detailGeneration !== generation) return;
     if (typeof update.screen !== 'string' && (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID)) throw new Error('최신 화면을 다시 연결해주세요.');
     // Optional inputReason is omitted when a lock clears, even in an unchanged-screen response.
-    const frame = typeof update.screen === 'string' ? update : { ...previous, ...update, inputReason: update.inputReason };
+    const frame = typeof update.screen === 'string' ? update : { ...previous, ...update, inputReason: update.inputReason, cursor: update.cursor, streamID: update.streamID };
+    if (directMode && (frame.streamID || null) !== directStreamID) {
+      stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
+    }
     latestFrame = frame;
-    const changed = renderTerminal(frame.screen || '터미널 화면에 표시된 내용이 없습니다.', frame.appearance);
+    const changed = renderTerminal(frame.screen, frame.appearance);
     quietFrames = changed ? 0 : quietFrames + 1;
-    terminalState(changed && previous ? 'changed' : 'live', changed && previous ? '새 출력' : '연결됨');
+    terminalState(changed && previous ? 'changed' : 'live', !frame.screen.trim() ? '연결됨 · 빈 화면' : changed && previous ? '새 출력' : '연결됨');
     text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
   } catch (error) {
     if (controller.signal.aborted || selectedKey !== key || detailGeneration !== generation) return;
@@ -401,7 +503,7 @@ async function refreshFrame() {
     loadingFrame = false; frameController = null; updateControls();
     clearTimeout(frameTimer);
     const active = Date.now() < fastFrameUntil || selectedItem?.session.phase === 'working' || quietFrames < 2;
-    const interval = latestFrame ? active ? 500 : Math.min(2000, 700 + quietFrames * 150) : 5000;
+    const interval = latestFrame ? directMode ? 150 : active ? 500 : Math.min(2000, 700 + quietFrames * 150) : 5000;
     if (selectedItem && !document.hidden) frameTimer = setTimeout(refreshFrame, controller.signal.aborted ? 0 : Math.max(100, interval - (performance.now() - started)));
   }
 }
@@ -415,35 +517,42 @@ async function freshInputFrame(key) {
   return false;
 }
 async function sendInput(kind, value = '', quiet = false) {
-  if (mutation || !latestFrame || !selectedItem || !inputKeys().includes(kind)) return false;
+  if (mutation || inputInFlight || !latestFrame || !selectedItem || !inputKeys().includes(kind)) return false;
   const item = selectedItem, frame = latestFrame;
+  const relay = !!frame.streamID && !composeMode && !['text', 'submit'].includes(kind);
   const consumedDraft = ['text', 'submit'].includes(kind) && $('terminal-input').value === value;
   if (consumedDraft) { $('terminal-input').value = ''; drafts.delete(item.key); sizeInput(); }
-  mutation = true; inputInFlight = true; detailGeneration++; frameController?.abort(); terminalState('pending', '전달 중…'); updateControls();
+  mutation = !relay; inputInFlight = true;
+  if (!relay) { detailGeneration++; frameController?.abort(); }
+  terminalState('pending', '전달 중…'); updateControls();
   let sent = false;
   try {
-    const result = await api(endpoint('/api/input', item.node.id), { sessionID: item.session.id, revision: frame.revision, kind, text: value, requestID: uuid() });
+    const result = await api(endpoint('/api/input', item.node.id), { sessionID: item.session.id, revision: frame.revision, kind, text: value, requestID: uuid(), ...(relay ? {relay: true, streamID: frame.streamID} : {}) });
     sent = true; if (selectedKey === item.key) inputFailure = ''; if (!quiet) feedback(result.message);
   } catch (error) {
-    if (selectedKey === item.key) {
-      inputFailure = error.message;
-      if (consumedDraft) { $('terminal-input').value = value + $('terminal-input').value; drafts.set(item.key, $('terminal-input').value); sizeInput(); }
+    if (selectedKey === item.key) inputFailure = error.message;
+    if (consumedDraft) {
+      if (selectedKey === item.key && directMode) stopDirect(true, value);
+      else restoreDirectDraft(value, item.key);
     }
     feedback(error.message, true);
   }
   finally {
-    if (selectedKey === item.key) latestFrame = null;
-    mutation = false; quietFrames = 0; fastFrameUntil = Date.now() + 8000;
-    await freshInputFrame(item.key); inputInFlight = false; updateControls();
+    if (!relay && selectedKey === item.key) latestFrame = null;
+    if (!relay) mutation = false;
+    quietFrames = 0; fastFrameUntil = Date.now() + 8000;
+    if (!relay) await freshInputFrame(item.key);
+    else if (selectedKey === item.key) { clearTimeout(frameTimer); void refreshFrame(); }
+    inputInFlight = false; updateControls();
   }
   return sent;
 }
 function queueDirect(kind, value = '') {
-  if (!directMode || $('terminal-input').disabled || !inputKeys().includes(kind)) return false;
+  if (!directMode || $('terminal-keyboard').disabled || !inputKeys().includes(kind)) return false;
   if (directQueue.length >= 64 || byteLength(value) > 8000) { stopDirect(); inputFailure = '입력이 많아 바로 입력을 멈췄습니다. 현재 화면과 작성한 내용을 확인해주세요.'; updateControls(); return false; }
   const previous = directQueue[directQueue.length - 1];
   if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value) <= 8000) previous.value += value;
-  else directQueue.push({ key: selectedKey, kind, value });
+  else directQueue.push({ key: selectedKey, kind, value, streamID: latestFrame?.streamID || null });
   clearTimeout(directTimer); directTimer = setTimeout(pumpDirect, kind === 'characters' ? 80 : 0);
   return true;
 }
@@ -454,25 +563,33 @@ async function pumpDirect() {
   try {
     while (directMode && directQueue.length && inputGeneration === generation) {
       const item = directQueue[0];
-      if (selectedKey !== item.key || !await freshInputFrame(item.key) || inputGeneration !== generation) { stopDirect(); break; }
+      const fresh = await freshInputFrame(item.key);
+      if (inputGeneration !== generation) break;
+      if (selectedKey !== item.key || !fresh || (latestFrame?.streamID || null) !== item.streamID) { stopDirect(); break; }
       directQueue.shift();
-      if (!await sendInput(item.kind, item.value, true)) {
-        if (selectedKey === item.key && item.kind === 'characters') $('terminal-input').value = item.value + $('terminal-input').value;
-        stopDirect(); sizeInput(); break;
+      const sent = await sendInput(item.kind, item.value, true);
+      if (inputGeneration !== generation) {
+        if (!sent && selectedKey === item.key) stopDirect(true, item.kind === 'characters' ? item.value : '');
+        else if (!sent && item.kind === 'characters') restoreDirectDraft(item.value, item.key);
+        break;
       }
+      if (!sent) { stopDirect(true, item.kind === 'characters' ? item.value : ''); break; }
     }
   } finally { directSending = false; updateControls(); if (directMode && directQueue.length) void pumpDirect(); }
 }
 function captureDirectText() {
-  if (composing || !directMode || !$('terminal-input').value) return;
-  const value = $('terminal-input').value;
+  if (composing || !directMode || !keyboardText()) return;
+  const value = keyboardText();
   // Let multiline paste stay editable; a user can send it as one composed Enter action.
-  if (value.includes('\n') || value.includes('\t') || byteLength(value) > 8000) { stopDirect(); drafts.set(selectedKey, value); updateControls(); return; }
-  if (queueDirect('characters', value)) { $('terminal-input').value = ''; drafts.delete(selectedKey); sizeInput(); }
+  if (/[\x00-\x1f\x7f]/.test(value) || byteLength(value) > 8000) {
+    stopDirect(); inputFailure = '여러 줄 또는 특수 문자가 포함된 입력은 내용을 확인한 뒤 Enter로 전송하세요.'; updateControls();
+    $('terminal-input').focus({ preventScroll: true }); return;
+  }
+  if (queueDirect('characters', value)) resetKeyboard();
 }
 async function submitInput() {
   if (composing || $('send-input').disabled) return;
-  if (directMode) { captureDirectText(); if (directMode) { queueDirect('enter'); return; } }
+  if (!composeMode && inputKeys().includes('characters')) { armDirect(); captureDirectText(); if (directMode) { queueDirect('enter'); return; } }
   const value = $('terminal-input').value, key = selectedKey;
   if (!value) { await sendInput('enter'); return; }
   if (inputKeys().includes('submit')) { await sendInput('submit', value); return; }
@@ -574,37 +691,79 @@ for (const button of document.querySelectorAll('[data-filter]')) button.addEvent
 });
 $('automatic').addEventListener('change', () => { const enabled = $('automatic').checked; void action(selectedItem.node.id, { action: 'automatic', sessionID: selectedItem.session.id, enabled }, enabled ? '자동 승인을 켰습니다.' : '자동 승인을 껐습니다.'); });
 $('reveal').addEventListener('click', () => void action(selectedItem.node.id, { action: 'reveal', sessionID: selectedItem.session.id }, 'Mac에서 대상 터미널을 열었습니다.'));
-$('terminal-input').addEventListener('input', event => { drafts.set(selectedKey, $('terminal-input').value); sizeInput(); if (!event.isComposing) captureDirectText(); updateControls(); });
+$('terminal-input').addEventListener('input', () => { drafts.set(selectedKey, $('terminal-input').value); sizeInput(); updateControls(); });
 $('terminal-input').addEventListener('compositionstart', () => { composing = true; updateControls(); });
-$('terminal-input').addEventListener('compositionend', () => { composing = false; const generation = inputGeneration; setTimeout(() => { if (!composing && generation === inputGeneration) { captureDirectText(); updateControls(); } }, 0); updateControls(); });
-$('terminal-input').addEventListener('beforeinput', event => {
-  if (!directMode || composing || event.isComposing) return;
-  if (event.inputType === 'deleteContentBackward' && !$('terminal-input').value) { event.preventDefault(); queueDirect('backspace'); }
-  if (event.inputType === 'insertLineBreak' && !event.defaultPrevented) { event.preventDefault(); void submitInput(); }
-});
+$('terminal-input').addEventListener('compositionend', () => { composing = false; updateControls(); });
 $('terminal-input').addEventListener('keydown', event => {
   if (composing || event.isComposing || event.keyCode === 229) return;
-  if (event.key === 'Enter' && event.shiftKey) { if (directMode) { stopDirect(); updateControls(); } return; }
-  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitInput(); return; }
-  const keys = { Escape: 'escape', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Home: 'home', End: 'end', Delete: 'delete', Backspace: 'backspace', Tab: 'tab' };
-  const kind = event.ctrlKey && event.key.toLowerCase() === 'c' && !$('terminal-input').value ? 'interrupt' : keys[event.key];
-  if (kind && !event.shiftKey && inputKeys().includes(kind) && (directMode || !$('terminal-input').value && !['left', 'right', 'home', 'end', 'delete', 'backspace', 'tab'].includes(kind))) {
-    event.preventDefault(); if (directMode) queueDirect(kind); else void sendInput(kind);
+  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitInput(); }
+});
+$('terminal-keyboard').addEventListener('focus', () => { if (!$('terminal-keyboard').disabled) armDirect(); updateControls(); });
+$('terminal-keyboard').addEventListener('blur', () => { if (composing) stopDirect(); updateControls(); });
+$('terminal-keyboard').addEventListener('input', event => {
+  if (composing || event.isComposing) { text($('terminal-composition'), keyboardText()); show($('terminal-composition'), !!keyboardText()); scheduleCursor(); }
+  else captureDirectText();
+  updateControls();
+});
+$('terminal-keyboard').addEventListener('compositionstart', () => { composing = true; updateControls(); });
+$('terminal-keyboard').addEventListener('compositionend', () => {
+  composing = false; const generation = inputGeneration;
+  setTimeout(() => { if (!composing && generation === inputGeneration) { captureDirectText(); show($('terminal-composition'), false); updateControls(); } }, 0);
+  updateControls();
+});
+$('terminal-keyboard').addEventListener('beforeinput', event => {
+  if (!directMode || composing || event.isComposing) return;
+  if (['deleteContentBackward', 'deleteContentForward'].includes(event.inputType)) {
+    event.preventDefault(); captureDirectText(); queueDirect(event.inputType === 'deleteContentBackward' ? 'backspace' : 'delete'); resetKeyboard();
   }
+  if (['insertLineBreak', 'insertParagraph'].includes(event.inputType) && !event.defaultPrevented) { event.preventDefault(); void submitInput(); }
+});
+$('terminal-keyboard').addEventListener('keydown', event => {
+  if (composing || event.isComposing || event.keyCode === 229) return;
+  if (event.key === 'Enter') { event.preventDefault(); void submitInput(); return; }
+  const keys = { Escape: 'escape', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Home: 'home', End: 'end', Delete: 'delete', Backspace: 'backspace', Tab: 'tab' };
+  const kind = event.ctrlKey && event.key.toLowerCase() === 'c' ? 'interrupt' : keys[event.key];
+  if (kind && !event.shiftKey && inputKeys().includes(kind)) {
+    event.preventDefault(); captureDirectText(); queueDirect(kind);
+  }
+});
+$('terminal-keyboard').addEventListener('paste', event => {
+  if (!directMode || composing || !event.clipboardData) return;
+  event.preventDefault(); $('terminal-keyboard').value = keyboardMarker + event.clipboardData.getData('text/plain'); captureDirectText(); updateControls();
 });
 $('input-form').addEventListener('submit', event => { event.preventDefault(); void submitInput(); });
 for (const button of $('input-form').querySelectorAll('button[data-key]')) button.addEventListener('click', () => {
-  if (directMode) queueDirect(button.dataset.key); else void sendInput(button.dataset.key);
+  if (!composeMode) { armDirect(); captureDirectText(); queueDirect(button.dataset.key); } else void sendInput(button.dataset.key);
 });
-for (const button of $('input-form').querySelectorAll('button')) button.addEventListener('pointerdown', event => { if (document.activeElement === $('terminal-input') && !$('terminal-input').disabled) event.preventDefault(); });
-$('direct-input').addEventListener('change', () => {
-  const enabled = $('direct-input').checked; stopDirect(); inputFailure = '';
-  directMode = enabled; $('direct-input').checked = enabled;
-  updateControls(); if (enabled) { $('terminal-input').focus({ preventScroll: true }); captureDirectText(); }
+for (const button of $('input-form').querySelectorAll('button')) button.addEventListener('pointerdown', event => {
+  if (['terminal-input', 'terminal-keyboard'].includes(document.activeElement?.id) && !document.activeElement.disabled) event.preventDefault();
 });
+$('compose-input').addEventListener('change', () => {
+  const enabled = $('compose-input').checked; stopDirect(); composePreferred = enabled || !!$('terminal-input').value;
+  if (!enabled && $('terminal-input').value) inputFailure = '먼저 작성한 내용을 전송하거나 지운 뒤 직접 입력으로 돌아가세요.';
+  else inputFailure = '';
+  updateControls(); $('terminal-settings').open = false;
+  if (composeMode) $('terminal-input').focus({ preventScroll: true }); else focusKeyboard();
+});
+$('terminal-keyboard-toggle').addEventListener('click', () => {
+  if (document.activeElement === $('terminal-keyboard')) { $('terminal-keyboard').blur(); updateControls(); } else focusKeyboard();
+});
+let screenPointer;
+$('terminal-screen').addEventListener('pointerdown', event => {
+  screenPointer = { x: event.clientX, y: event.clientY, at: event.timeStamp };
+  if (composing && document.activeElement === $('terminal-keyboard')) event.preventDefault();
+});
+$('terminal-screen').addEventListener('click', event => {
+  const selection = window.getSelection();
+  const selecting = selection && !selection.isCollapsed && $('terminal-screen').contains(selection.anchorNode);
+  const dragged = screenPointer && (Math.hypot(event.clientX - screenPointer.x, event.clientY - screenPointer.y) > 8 || event.timeStamp - screenPointer.at > 500);
+  if (!selecting && !dragged && event.detail <= 1) focusKeyboard();
+  screenPointer = null;
+});
+$('terminal-screen').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); focusKeyboard(); } });
 $('terminal-focus').addEventListener('click', () => { terminalFocus(!document.body.classList.contains('terminal-focus')); if (!document.body.classList.contains('terminal-focus')) $('session-title').focus({ preventScroll: true }); });
 $('terminal-back').addEventListener('click', () => $('back').click());
-$('terminal-wrap').addEventListener('change', () => { $('terminal-screen').dataset.wrap = String($('terminal-wrap').checked); });
+$('terminal-wrap').addEventListener('change', () => { $('terminal-screen').dataset.wrap = String($('terminal-wrap').checked); scheduleCursor(); });
 $('terminal-screen').dataset.wrap = 'true';
 $('font-smaller').addEventListener('click', () => setFontSize(terminalFontSize - 1));
 $('font-larger').addEventListener('click', () => setFontSize(terminalFontSize + 1));
@@ -613,6 +772,8 @@ setFontSize(terminalFontSize);
 window.visualViewport?.addEventListener('resize', updateViewport);
 window.visualViewport?.addEventListener('scroll', updateViewport);
 window.addEventListener('resize', updateViewport); updateViewport();
+new ResizeObserver(scheduleCursor).observe($('terminal-screen'));
+$('terminal-screen').addEventListener('scroll', scheduleCursor, { passive: true });
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && $('terminal-settings').open) { $('terminal-settings').open = false; $('terminal-settings').querySelector('summary').focus(); event.preventDefault(); } });
 document.addEventListener('click', event => { if ($('terminal-settings').open && !$('terminal-settings').contains(event.target)) $('terminal-settings').open = false; });
 $('terminal-retry').addEventListener('click', () => void refreshFrame());
@@ -647,4 +808,5 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('hashchange', restoreSelection);
+resetKeyboard();
 void refreshNetwork();

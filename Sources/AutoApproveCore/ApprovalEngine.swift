@@ -6,7 +6,7 @@ import Combine
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     public private(set) var webService: RemoteNetworkService?
-    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil }
+    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil }
     private struct RemoteScreenRead {
         var token: UUID
         var target: ScreenTarget
@@ -18,6 +18,10 @@ import Combine
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
     private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String)] = [:]
     private var remoteInputSessions = Set<String>()
+    private var automaticInputSessions = Set<String>()
+    private var remoteInputUntil: [String: Date] = [:]
+    private var remoteStreams: [String: (generation: String, token: String)] = [:]
+    private var remoteInputStopped = false
     private var remoteInputReplies: [String: (peerID: String, continuation: CheckedContinuation<Bool, Error>)] = [:]
     public let paths: AppPaths
     private let store: AuditStore
@@ -192,6 +196,7 @@ import Combine
     }
 
     public func start(poll: Bool = true, webByDefault: Bool = false) throws {
+        remoteInputStopped = false
         let socket = SocketServer(path: paths.socket, handler: { [weak self] message, peer in
             Task { @MainActor in self?.receive(message, from: peer) }
         }, disconnected: { [weak self] id in
@@ -226,6 +231,7 @@ import Combine
         }
     }
     public func stop() {
+        remoteInputStopped = true
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
         keepAwakeTask?.cancel(); keepAwakeTask = nil
@@ -234,7 +240,7 @@ import Combine
         server?.stop(); server = nil
         webService?.stop(); webService = nil
         for pending in remoteInputReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 입력 전달 결과를 확인하지 못했습니다.")) }
-        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll()
+        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll()
         // Quitting gives macOS its normal sleep back, without putting a closed Mac to sleep.
         keepAwakeStopped = true
         keepAwakeSwitch.releaseNow()
@@ -293,9 +299,6 @@ import Combine
     }
     private func remoteInputReason(_ session: AgentSession) -> String? {
         if !remoteCanRead(session) { return "이 세션의 화면 연결이 없습니다. Mac의 연결 설정에서 터미널을 연결해주세요. 훅으로 받은 질문은 아래에서 답할 수 있습니다." }
-        if effectiveAutomatic(session.id, fallback: session) && !snapshot.paused { return "직접 입력하려면 이 세션의 자동 승인을 끄거나 이 Mac을 일시정지하세요." }
-        if capacityStates[session.id]?.phase == .sending { return "Mac에서 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요." }
-        if liveClaudeHooks.values.contains(where: { $0.request.sessionID == session.id }) { return "앱에서 응답을 기다리는 Claude 요청입니다. 아래의 요청 버튼으로 답해주세요." }
         if session.terminal == .vscode {
             let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
             if (registration?["remoteInputVersion"] as? Int ?? 0) < 1 { return "Mac에서 AutoApprove Bridge 확장을 업데이트하면 웹에서 입력할 수 있습니다." }
@@ -305,10 +308,11 @@ import Combine
 
     private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter) async throws -> RemoteObservedScreen {
         let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle)
-        let generation = "\(host.rawValue):\(session.id):\(session.pid):\(session.started):\(session.tty):\(session.orcaHandle ?? "")"
+        let generation = remoteGeneration(session, host: host)
         let pending: RemoteScreenRead
+        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : 0.6
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
-           existing.observedAt.map({ Date().timeIntervalSince($0) < 0.6 }) ?? true {
+           existing.observedAt.map({ Date().timeIntervalSince($0) < cacheAge }) ?? true {
             pending = existing
         } else {
             let reader = adapter.screens
@@ -317,7 +321,7 @@ import Combine
                 guard let screen = snapshot.screens.first(where: { $0.tty == target.tty }) else {
                     throw RemoteHTTPError(409, snapshot.failures.first?.message ?? "터미널 화면을 찾지 못했습니다.")
                 }
-                return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents))
+                return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents))
             }
             pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
             remoteScreenReads[session.id] = pending
@@ -335,60 +339,92 @@ import Combine
         }
     }
 
+    private func remoteGeneration(_ session: AgentSession, host: ScreenHost) -> String {
+        "\(host.rawValue):\(session.id):\(session.pid):\(session.started):\(session.tty):\(session.orcaHandle ?? "")"
+    }
+    private func invalidateRemoteRead(_ id: String) {
+        // A concurrent reader still owns its token; do not turn a valid live read into a disconnect.
+        if remoteScreenReads[id]?.observedAt != nil { remoteScreenReads[id]?.observedAt = .distantPast }
+    }
+
     public func remoteTerminal(sessionID: String) async throws -> RemoteTerminalFrame {
-        if remoteInputSessions.contains(sessionID) {
-            if let observed = remoteFrames[sessionID] { return observed.frame }
-            throw RemoteHTTPError(409, "입력을 전달하고 있습니다. 잠시 뒤 화면을 다시 확인해주세요.")
-        }
         guard let session = sessions[sessionID], remoteCanRead(session) else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
-        let raw: String, generation: String, observedAt: Date, appearance: TerminalAppearance?
+        let raw: String, generation: String, observedAt: Date, appearance: TerminalAppearance?, cursor: TerminalCursor?
         if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
             let observed = try await readRemoteScreen(session, host: host, adapter: adapter)
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
-            appearance = observed.appearance
+            appearance = observed.appearance; cursor = observed.cursor
         } else {
             guard let observed = remoteObservedScreens[sessionID], Date().timeIntervalSince(observed.observedAt) < 10 else { throw RemoteHTTPError(409, "최신 터미널 화면을 받지 못했습니다. VS Code 연결을 확인해주세요.") }
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
-            appearance = observed.appearance
+            appearance = observed.appearance; cursor = observed.cursor
         }
         guard let current = sessions[sessionID], current.phase != .ended, current.tty == session.tty,
               current.pid == session.pid, current.started == session.started, current.terminal == session.terminal,
               current.orcaHandle == session.orcaHandle, current.bridgeID == session.bridgeID, remoteCanRead(current) else { throw RemoteHTTPError(409, "세션 연결이 바뀌었습니다. 목록을 새로고침해주세요.") }
-        if remoteInputSessions.contains(sessionID) {
-            if let observed = remoteFrames[sessionID] { return observed.frame }
-            throw RemoteHTTPError(409, "입력을 전달하고 있습니다. 잠시 뒤 화면을 다시 확인해주세요.")
-        }
         // Reading the same screen in another browser must not invalidate an input draft.
         // An actual screen/generation change or a consumed frame gets a new token.
         let previous = remoteFrames[sessionID]
         let screen = String(raw.suffix(160_000)), visibleAppearance = screen == raw ? appearance : nil
-        let token = previous?.raw == raw && previous?.generation == generation && previous?.frame.appearance == visibleAppearance ? previous!.frame.revision : UUID().uuidString
+        let visibleCursor = screen == raw ? cursor : nil
+        let token = previous?.raw == raw && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor ? previous!.frame.revision : UUID().uuidString
+        if remoteStreams[sessionID]?.generation != generation { remoteStreams[sessionID] = (generation, UUID().uuidString) }
+        let registration = current.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == current.terminalID }
+        let relaySupported = current.terminal != .vscode || (registration?["remoteInputVersion"] as? Int ?? 0) >= 3
         let frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
-            observedAt: observedAt, keys: remoteKeys(current), inputReason: remoteInputReason(current), appearance: visibleAppearance)
+            observedAt: observedAt, keys: remoteKeys(current), inputReason: remoteInputReason(current), appearance: visibleAppearance,
+            cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil)
         remoteFrames[sessionID] = (frame, raw, generation)
         return frame
     }
 
     public func remoteInput(_ object: JSONObject) async throws -> JSONObject {
-        guard let id = object["sessionID"] as? String, let token = object["revision"] as? String,
+        let relay = object["relay"] as? Bool == true
+        guard !remoteInputStopped, let id = object["sessionID"] as? String, let token = object["revision"] as? String,
               let kind = (object["kind"] as? String).flatMap(RemoteTerminalInput.Kind.init(rawValue:)),
               let session = sessions[id], session.phase != .ended,
-              let observed = remoteFrames[id], observed.frame.revision == token,
+              let observed = remoteFrames[id], relay || observed.frame.revision == token,
               Date().timeIntervalSince(observed.frame.observedAt) < 10 else { throw RemoteHTTPError(409, "화면이 오래되었거나 연결이 바뀌었습니다. 최신 화면을 확인하고 다시 입력해주세요.") }
+        if relay {
+            guard ![.text, .submit].contains(kind), let stream = object["streamID"] as? String,
+                  observed.frame.streamID == stream, remoteStreams[id]?.token == stream,
+                  remoteStreams[id]?.generation == observed.generation else { throw RemoteHTTPError(409, "터미널 연결이 바뀌었습니다. 최신 화면을 확인해주세요.") }
+            if let host = ScreenHost(kind: session.terminal), observed.generation != remoteGeneration(session, host: host) {
+                throw RemoteHTTPError(409, "대상 터미널이 바뀌었습니다. 최신 화면을 확인해주세요.")
+            }
+        }
         if let reason = remoteInputReason(session) { throw RemoteHTTPError(409, reason) }
-        guard !remoteInputSessions.contains(id), screens[id]?.dispatchID == nil,
-              !pendingActions.values.contains(where: { $0.sessionID == id }), observed.frame.keys.contains(kind.rawValue) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
-        let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? ""); try input.validate()
+        guard !remoteInputSessions.contains(id), observed.frame.keys.contains(kind.rawValue) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
+        if !relay && automaticInputBusy(id) { throw RemoteHTTPError(409, "Mac에서 승인 또는 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요.") }
+        let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? "", relay: relay); try input.validate()
         remoteInputSessions.insert(id)
-        defer { remoteInputSessions.remove(id); remoteScreenReads.removeValue(forKey: id) }
+        defer {
+            remoteInputSessions.remove(id); remoteInputUntil[id] = Date().addingTimeInterval(0.8)
+            invalidateRemoteRead(id)
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 810_000_000)
+                guard let self, !self.remoteInputStopped, !self.userInputHasPriority(id) else { return }
+                self.scheduleScreenApproval(id); self.scheduleCapacityResume(id)
+            }
+        }
+        // Reserve user priority before awaiting an approval already being written.
+        let deadline = Date().addingTimeInterval(10)
+        while automaticInputBusy(id) {
+            guard Date() < deadline else { throw RemoteHTTPError(409, "승인 입력이 끝나지 않았습니다. 화면을 확인한 뒤 다시 입력해주세요.") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
         let reader = processReader
         let currentRecords = try await Task.detached { try reader() }.value
         let tty = session.tty.replacingOccurrences(of: "/dev/", with: "")
         guard let process = currentRecords.first(where: { $0.pid == session.pid && $0.started == session.started && $0.tty == tty && $0.agent == session.agent }),
-              process.isForeground, let current = sessions[id], current.phase != .ended, remoteInputReason(current) == nil,
-              remoteFrames[id]?.frame.revision == token else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
+              !remoteInputStopped, process.isForeground, let current = sessions[id], current.phase != .ended, remoteInputReason(current) == nil,
+              current.pid == session.pid, current.started == session.started, current.tty == session.tty,
+              current.terminal == session.terminal, current.orcaHandle == session.orcaHandle,
+              current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
+              (relay ? remoteStreams[id]?.token == (object["streamID"] as? String) : remoteFrames[id]?.frame.revision == token) else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
         // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
-        remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)
+        if !relay { remoteFrames.removeValue(forKey: id) }
+        invalidateRemoteRead(id)
         let textual = [.text, .submit, .characters].contains(kind)
         var event = AuditEvent(sessionID: id, summary: textual ? String(input.text.prefix(200)) : kind.rawValue,
             outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: textual ? input.text : kind.rawValue)
@@ -406,7 +442,7 @@ import Combine
                     remoteInputReplies[actionID] = (peerID, continuation)
                     let message: JSONObject = ["method": "remoteInput", "id": actionID, "terminalID": terminalID,
                         "screen": observed.raw, "generation": String(observed.generation.dropFirst(peerID.count + 1)),
-                        "kind": kind.rawValue, "text": input.text, "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000]
+                        "kind": kind.rawValue, "text": input.text, "relay": relay, "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000]
                     guard peer.send(message) else {
                         remoteInputReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: AppError.message("VS Code 연결이 끊겨 전달 결과를 확인하지 못했습니다.")); return
                     }
@@ -423,6 +459,13 @@ import Combine
             if event.outcome == "웹 입력 전달 확인 중" { event.outcome = "웹 입력 결과 미확인"; _ = log(event) }
             throw error
         }
+    }
+
+    private func automaticInputBusy(_ id: String) -> Bool {
+        automaticInputSessions.contains(id) || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
+    }
+    private func userInputHasPriority(_ id: String) -> Bool {
+        remoteInputSessions.contains(id) || remoteInputUntil[id].map { Date() < $0 } == true
     }
 
     public func remoteAction(_ object: JSONObject) async throws -> JSONObject {
@@ -1068,7 +1111,6 @@ import Combine
 
     public func setAutomatic(_ id: String, enabled: Bool) throws {
         let target = ownerID(id) ?? id
-        if enabled && groupIDs(target).contains(where: { remoteInputSessions.contains($0) }) { throw AppError.message("웹에서 입력을 전달하고 있습니다. 전달이 끝난 뒤 자동 승인을 켜주세요.") }
         guard var session = sessions[target], presentedSessions().first(where: { $0.id == target })?.canApprove == true || !enabled else { throw AppError.message("이 세션의 승인 연결을 먼저 설정해주세요.") }
         var nextParents = claudeParents
         // Explicit control of an orphan starts a new, independent opt-in.
@@ -1083,7 +1125,6 @@ import Combine
         Task { await evaluateKeepAwake() }
     }
     public func setPaused(_ paused: Bool) throws {
-        if !paused && !remoteInputSessions.isEmpty { throw AppError.message("웹에서 입력을 전달하고 있습니다. 전달이 끝난 뒤 재개해주세요.") }
         snapshot.paused = paused; revision &+= 1
         for id in screens.keys { screens[id]?.scheduledID = nil }
         for id in Array(capacityStates.keys) { capacityStates[id]?.scheduledID = nil }
@@ -1619,10 +1660,11 @@ import Combine
                       let generation = params["generation"] as? String else { throw AppError.message("등록되지 않은 터미널 화면입니다.") }
                 var channelChanged = false
                 let appearance = TerminalAppearance.decode(params["appearance"], screen: screen)
+                let cursor = TerminalCursor.decode(params["cursor"], screen: screen)
                 for id in Array(sessions.keys) where sessions[id]?.agent != .shell && sessions[id]?.phase != .ended && sessions[id]?.bridgeID == peer.id && sessions[id]?.terminalID == terminalID {
                     channelChanged = channelChanged || (sessions[id]?.channel != .hook && sessions[id]?.channel != .vscodeScreen)
                     if sessions[id]?.channel != .hook { sessions[id]?.channel = .vscodeScreen }
-                    receiveScreen(sessionID: id, raw: screen, generation: peer.id + ":" + generation, source: .vscodeScreen, appearance: appearance)
+                    receiveScreen(sessionID: id, raw: screen, generation: peer.id + ":" + generation, source: .vscodeScreen, appearance: appearance, cursor: cursor)
                 }
                 // receiveScreen publishes accepted observations itself. Ordinary
                 // terminal output must not recalculate unrelated CLI questions.
@@ -1716,9 +1758,9 @@ import Combine
         sessions[id]?.pendingRequestID = nil
     }
 
-    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil) {
+    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
-        remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw))
+        remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw))
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
         // A parked main terminal renders the child PTY. Its pixels cannot identify
@@ -1885,7 +1927,7 @@ import Combine
     }
 
     private func scheduleCapacityResume(_ id: String) {
-        guard let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused else { return }
+        guard let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id) else { return }
         let scheduledID = UUID(), scheduledRevision = revision
         capacityStates[id]?.scheduledID = scheduledID
         let delay = max(0, state.deadline.timeIntervalSinceNow)
@@ -1898,7 +1940,7 @@ import Combine
     private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64) async {
         func current() -> (CapacityState, AgentSession, ScreenHostAdapter, ScreenHost)? {
             guard let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
-                  revision == scheduledRevision, !snapshot.paused, let session = sessions[id], session.automatic,
+                  revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
                   session.phase != .ended, session.channel == state.channel, let host = ScreenHost(channel: state.channel),
                   let adapter = screenAdapters[host], Date() >= state.deadline,
                   Date().timeIntervalSince(state.observedAt) < 6 else { return nil }
@@ -1927,6 +1969,8 @@ import Combine
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
         let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job)
         let resume = adapter.resume, region = state.stop.region, text = CodexCapacityStop.resumeText
+        automaticInputSessions.insert(id)
+        defer { automaticInputSessions.remove(id) }
         do {
             let delivery = try await Task.detached { try resume(target, region, text) }.value
             switch delivery {
@@ -2186,7 +2230,7 @@ import Combine
     }
 
     private func scheduleScreenApproval(_ id: String) {
-        guard !hasBackgroundChildren(id), claudeParents[id] == nil,
+        guard !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
@@ -2194,10 +2238,11 @@ import Combine
         let scheduledRevision = revision
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
+        let reader = processReader
         Task { [weak self] in
-            let live = try? await Task.detached { try ProcessDiscovery.read() }.value
+            let live = try? await Task.detached { try reader() }.value
             guard let self else { return }
-            guard self.revision == scheduledRevision, !self.snapshot.paused, self.sessions[id]?.automatic == true,
+            guard self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,
@@ -2224,6 +2269,8 @@ import Combine
                 self.publish(); return
             }
             if let host, let adapter = self.screenAdapters[host] {
+                self.automaticInputSessions.insert(id)
+                defer { self.automaticInputSessions.remove(id) }
                 // The agent's foreground job, for hosts that can name the process they would type into.
                 let job = live?.first { $0.pid == session.pid && $0.started == session.started }.map { agent in
                     (live ?? []).filter { $0.tty == agent.tty && $0.processGroup == agent.processGroup }.map(\.pid)

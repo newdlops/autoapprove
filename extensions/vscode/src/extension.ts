@@ -73,7 +73,7 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const state of terminals.values()) {
       if (state.mirror?.valid) {
         const theme = terminalColors();
-        send('screen', { terminalID: state.id, screen: state.mirror.snapshot(), appearance: state.mirror.appearance(theme.palette, theme.defaults, theme.boldIsBright), generation: state.mirror.generation });
+        send('screen', { terminalID: state.id, screen: state.mirror.snapshot(), cursor: state.mirror.cursor(), appearance: state.mirror.appearance(theme.palette, theme.defaults, theme.boldIsBright), generation: state.mirror.generation });
       }
     }
   }, 250);
@@ -113,7 +113,7 @@ async function registerTerminal(terminal: vscode.Terminal): Promise<void> {
 }
 function sendRegistration(): void {
   send('register', { terminals: Array.from(terminals.values()).map(state => ({
-    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 2
+    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 3
   })) });
 }
 function send(method: string, params: Record<string, unknown>): void {

@@ -55,6 +55,10 @@ try {
   await page.locator('.session-row').first().click();
   const input = page.locator('#terminal-input');
   await page.waitForFunction(() => !document.getElementById('terminal-input').disabled);
+  if (!await input.isVisible()) {
+    if (!await page.locator('#terminal-settings').evaluate(details => details.open)) await page.locator('#terminal-settings summary').click();
+    await page.locator('#compose-input').check();
+  }
   const draft = '전송하지 않은 한글 초안 · keep this draft'; await input.fill(draft);
   const sessionHash = new URL(page.url()).hash;
   await writeFile(path.join(root, 'direct-peers.json'), JSON.stringify([older.url, newer.url, latest.url, legacy.url]));

@@ -1,5 +1,30 @@
 import Foundation
 
+/// An insertion point reported by the terminal, never inferred from prompt text.
+public struct TerminalCursor: Codable, Equatable, Sendable {
+    public enum Style: String, Codable, Sendable { case block, bar, underline }
+    public var offset: Int
+    public var padding: Int
+    public var visible: Bool
+    public var style: Style
+    public var blink: Bool
+    public init(offset: Int, padding: Int = 0, visible: Bool = true, style: Style = .block, blink: Bool = true) {
+        self.offset = offset; self.padding = padding; self.visible = visible; self.style = style; self.blink = blink
+    }
+    public func validated(for screen: String) -> TerminalCursor? {
+        let units = Array(screen.utf16)
+        guard offset >= 0, offset <= units.count, padding >= 0, padding <= 500,
+              offset == 0 || offset == units.count || !(0xdc00...0xdfff).contains(units[offset]) else { return nil }
+        return self
+    }
+    static func decode(_ object: Any?, screen: String) -> TerminalCursor? {
+        guard let object, JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object), data.count <= 1_024,
+              let cursor = try? JSONDecoder().decode(Self.self, from: data) else { return nil }
+        return cursor.validated(for: screen)
+    }
+}
+
 /// Original terminal cell attributes; never inferred from words or command output.
 /// UTF-16 ranges match the browser and VS Code. Text used to authorize input stays separate.
 public struct TerminalAppearance: Codable, Equatable, Sendable {

@@ -14,7 +14,7 @@ private final class RemoteTestScreen: @unchecked Sendable {
     func change() { lock.lock(); defer { lock.unlock() }; raw += "changed" }
     func input(_ expected: String, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
-        guard raw == expected else { return .screenChanged }
+        guard input.isRelay || raw == expected else { return .screenChanged }
         writes += 1; raw += "\n" + input.bytes; return .sent
     }
 }
@@ -44,9 +44,74 @@ private final class RemoteReadProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testRemoteInputSerializesNativeApproval() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-input-order-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("81001 1 ttys081 81001 81001 Mon Sep 21 09:00:01 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .iterm
+        let screen = RemoteTestScreen(), gate = RemoteResumeGate()
+        defer { gate.release() }
+        screen.replace("Would you like to run the following command?\n\n  $ echo test\n\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel")
+        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.read()) }) },
+            approve: { _, _, _ in _ = gate.wait(); return .missingTarget }, reveal: { _ in nil }, input: { _, expected, _, input in screen.input(expected, input) })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter])
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records); await engine.connectScreenHost(.iterm)
+        try engine.setAutomatic(session.id, enabled: true)
+        for _ in 0..<100 where !gate.started { try await Task.sleep(nanoseconds: 10_000_000) }
+        try expect(gate.started, "Native approval is already writing")
+        let frame = try await engine.remoteTerminal(sessionID: session.id)
+        let queued = Task { try await engine.remoteInput(["sessionID": session.id, "revision": frame.revision, "streamID": frame.streamID!, "relay": true, "kind": "characters", "text": "manual"] as JSONObject) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try expectEqual(screen.count(), 0, "The live keyboard queues behind the native approval")
+        try engine.setPaused(true); try engine.setPaused(false)
+        gate.release(); _ = try await queued.value
+        try expectEqual(screen.count(), 1); try expect(engine.snapshot.sessions.first?.automatic == true)
+    }
+
+    func testRemoteRelayWithAutomaticApprovalAndChangedOutput() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-live-relay-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("81001 1 ttys081 81001 81001 Mon Sep 21 09:00:01 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .iterm
+        let screen = RemoteTestScreen()
+        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.read()) }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, expected, _, input in
+                guard target.tty == "/dev/ttys081", target.jobPIDs.contains(81001) else { return .missingTarget }
+                return screen.input(expected, input)
+            })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter])
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records); await engine.connectScreenHost(.iterm)
+        try engine.setAutomatic(session.id, enabled: true)
+        let frame = try await engine.remoteTerminal(sessionID: session.id)
+        try expectNil(frame.inputReason); try expectNotNil(frame.streamID)
+        screen.change()
+        let input: JSONObject = ["sessionID": session.id, "revision": frame.revision, "streamID": frame.streamID!, "relay": true, "kind": "characters", "text": "한글 🧪"]
+        _ = try await engine.remoteInput(input)
+        try expectEqual(screen.count(), 1, "Live keys survive unrelated output while automation stays on")
+        let refreshed = try await engine.remoteTerminal(sessionID: session.id)
+        try expect(refreshed.revision != frame.revision); try expectEqual(refreshed.streamID, frame.streamID)
+        _ = try await engine.remoteInput(input)
+        try expectEqual(screen.count(), 2, "A newer screen does not replace the identity of the live stream")
+        var wrong = input; wrong["streamID"] = UUID().uuidString
+        do { _ = try await engine.remoteInput(wrong); throw AppError.message("Expected wrong-stream refusal") }
+        catch { try expect(error is RemoteHTTPError) }
+        session.tty = "/dev/ttys082"; engine.updateDiscovery([session], records: records)
+        do { _ = try await engine.remoteInput(input); throw AppError.message("Expected moved-target refusal") }
+        catch { try expect(error is RemoteHTTPError) }
+        try expectEqual(screen.count(), 2)
+        try expect(engine.snapshot.sessions.first?.automatic == true)
+    }
+
     func testRemoteOriginalTerminalAttributesAndColorOnlyFrames() async throws {
         let raw = "한글 🧪 Codex\nClaude"
         let original = TerminalAppearance(runs: [.init(offset: 3, length: 2, fg: "#d97757", bg: "#303030", bold: true)])
+        try expectNil(TerminalCursor(offset: 4).validated(for: raw))
+        try expectNil(TerminalCursor(offset: -1).validated(for: raw))
+        try expectNil(TerminalCursor(offset: 0, padding: 501).validated(for: raw))
+        try expectEqual(TerminalCursor.fromAccessibility(value: "history\n" + raw, insertion: 13, screen: raw)?.offset, 5)
+        try expectNil(TerminalCursor.fromAccessibility(value: raw, insertion: 999, screen: raw))
         try expectNotNil(original.validated(for: raw))
         for invalid in [TerminalAppearance(runs: [.init(offset: 4, length: 1, fg: "#ffffff")]),
                         TerminalAppearance(runs: [.init(offset: 0, length: 999)]),
@@ -69,6 +134,10 @@ extension ApprovalTests {
         try expectEqual(first.screen, raw); try expectEqual(first.appearance, original)
         let repeated = try await engine.remoteTerminal(sessionID: session.id)
         try expectEqual(first.revision, repeated.revision)
+        let cursor = TerminalCursor(offset: 3)
+        engine.receiveScreen(sessionID: session.id, raw: raw, generation: "color-generation", appearance: original, cursor: cursor)
+        let cursorFrame = try await engine.remoteTerminal(sessionID: session.id)
+        try expectEqual(cursorFrame.cursor, cursor); try expect(cursorFrame.revision != first.revision, "Cursor movement alone publishes a frame")
         let recolored = TerminalAppearance(runs: [.init(offset: 3, length: 2, fg: "#87d7ff", underline: true)])
         engine.receiveScreen(sessionID: session.id, raw: raw, generation: "color-generation", appearance: recolored)
         let next = try await engine.remoteTerminal(sessionID: session.id)
@@ -106,7 +175,7 @@ extension ApprovalTests {
         try expectEqual(a.revision, b.revision); try expectEqual(a.revision, c.revision)
         try engine.setAutomatic(session.id, enabled: true)
         let controls = try await engine.remoteTerminal(sessionID: session.id)
-        try expect(controls.inputReason?.contains("자동 승인") == true)
+        try expectNil(controls.inputReason)
         try expectEqual(controls.observedAt, a.observedAt, "Cached reads retain the real observation time")
         try expectEqual(probe.count() - baseline, 1)
         let service = RemoteNetworkService(engine: engine, nodeID: UUID().uuidString, onStatus: { _ in })
@@ -121,7 +190,7 @@ extension ApprovalTests {
         try expectEqual(full.status, 200); try expectEqual(compact.status, 200)
         try expectEqual(fullObject["screen"] as? String, a.screen); try expectNil(compactObject["screen"])
         try expectEqual(compactObject["revision"] as? String, a.revision)
-        try expectNotNil(compactObject["inputReason"])
+        try expectNil(compactObject["inputReason"])
         try expect(compact.body.count < full.body.count / 10, "An unchanged frame omits the screen payload")
         probe.change(); try await Task.sleep(nanoseconds: 700_000_000)
         let changed = try await engine.remoteTerminal(sessionID: session.id)
@@ -283,12 +352,6 @@ extension ApprovalTests {
         try expectEqual(frame.keys.contains("characters"), TerminalKeyboard.isAvailable)
         let secondViewer = try await engine.remoteTerminal(sessionID: session.id)
         try expectEqual(secondViewer.revision, frame.revision)
-        try engine.setAutomatic(session.id, enabled: true)
-        do {
-            _ = try await engine.remoteInput(["sessionID": session.id, "revision": frame.revision, "kind": "text", "text": "must not send"])
-            throw AppError.message("Expected automatic/manual input exclusion")
-        } catch { try expectEqual(screen.count(), 0) }
-        try engine.setAutomatic(session.id, enabled: false)
         let latest = try await engine.remoteTerminal(sessionID: session.id)
         let service = RemoteNetworkService(engine: engine, nodeID: UUID().uuidString, onStatus: { _ in })
         let pauseBody = try JSONSerialization.data(withJSONObject: ["action": "pause", "paused": true, "requestID": UUID().uuidString] as JSONObject)
@@ -329,7 +392,7 @@ extension ApprovalTests {
         screen.replace(stopped); engine.capacityResumeDelays = [0]
         try engine.setAutomatic(session.id, enabled: true)
         engine.receiveScreen(sessionID: session.id, raw: stopped, generation: "web-capacity", source: .terminalScreen)
-        for _ in 0..<100 where !resume.started { try await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<200 where !resume.started { try await Task.sleep(nanoseconds: 10_000_000) }
         try expect(resume.started, "The existing host write must be in progress")
         try engine.setPaused(true)
         let busyFrame = try await engine.remoteTerminal(sessionID: session.id)
@@ -340,7 +403,15 @@ extension ApprovalTests {
             try expect((error as? RemoteHTTPError)?.message.contains("이어서 진행") == true)
             try expectEqual(screen.count(), 1)
         }
+        try expectNil(busyFrame.inputReason)
+        let queued = Task { try await engine.remoteInput(["sessionID": session.id, "revision": busyFrame.revision,
+            "streamID": busyFrame.streamID!, "relay": true, "kind": "enter", "text": ""] as JSONObject) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try expectEqual(screen.count(), 1, "User input waits for the already dispatched automatic write")
         resume.release()
+        _ = try await queued.value
+        try expectEqual(screen.count(), 2)
+        try expect(engine.snapshot.sessions.first?.automatic == true)
         for _ in 0..<100 where engine.snapshot.sessions.first?.capacityResume?.phase == .sending { try await Task.sleep(nanoseconds: 10_000_000) }
         engine.stop()
     }
@@ -400,6 +471,10 @@ extension ApprovalTests {
         keyboard.evaluateScript("front=true; changeOnActivate=true;")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "screenChanged")
         try expectEqual(keyboard.evaluateScript("keys.length")?.toInt32(), 5)
+        let liveKey = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .left, relay: true))
+        try expectEqual(keyboard.evaluateScript(liveKey)?.toString(), "sent", "Live keys keep the exact tab while output changes")
+        keyboard.evaluateScript("wrongTab=true;")
+        try expectEqual(keyboard.evaluateScript(liveKey)?.toString(), "missingTarget")
 
         let iterm = JSContext()!
         iterm.evaluateScript("""
@@ -424,5 +499,9 @@ extension ApprovalTests {
         iterm.evaluateScript("contents = 'changed';")
         try expectEqual(iterm.evaluateScript(interrupt)?.toString(), "screenChanged")
         try expectEqual(iterm.evaluateScript("writes.length")?.toInt32(), 0)
+        let liveInterrupt = try RemoteTerminalAdapter.script(host: .iterm, target: target, expected: "screen", agent: .codex, input: .init(kind: .interrupt, relay: true))
+        try expectEqual(iterm.evaluateScript(liveInterrupt)?.toString(), "agentMissing")
+        iterm.evaluateScript("job = 81001;")
+        try expectEqual(iterm.evaluateScript(liveInterrupt)?.toString(), "sent")
     }
 }
