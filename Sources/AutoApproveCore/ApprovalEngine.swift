@@ -486,11 +486,11 @@ import Combine
         return nil
     }
 
-    private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter) async throws -> RemoteObservedScreen {
+    private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter, realtime: Bool = false) async throws -> RemoteObservedScreen {
         let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle)
         let generation = remoteGeneration(session, host: host)
         let pending: RemoteScreenRead
-        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : 0.6
+        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
            existing.observedAt.map({ Date().timeIntervalSince($0) < cacheAge }) ?? true {
             pending = existing
@@ -527,11 +527,11 @@ import Combine
         if remoteScreenReads[id]?.observedAt != nil { remoteScreenReads[id]?.observedAt = .distantPast }
     }
 
-    public func remoteTerminal(sessionID: String) async throws -> RemoteTerminalFrame {
+    public func remoteTerminal(sessionID: String, realtime: Bool = false) async throws -> RemoteTerminalFrame {
         guard let session = sessions[sessionID], remoteCanRead(session) else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
         let raw: String, generation: String, observedAt: Date, appearance: TerminalAppearance?, cursor: TerminalCursor?
         if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
-            let observed = try await readRemoteScreen(session, host: host, adapter: adapter)
+            let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime)
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
             appearance = observed.appearance; cursor = observed.cursor
         } else {
@@ -632,6 +632,7 @@ import Combine
                     }
                 }
             } else { sent = false }
+            invalidateRemoteRead(id)
             event.outcome = sent ? "웹 입력 전달" : "웹 입력 미전달 · 화면 변경"; _ = log(event)
             guard sent else { throw RemoteHTTPError(409, "현재 화면이나 CLI가 바뀌어 입력하지 않았습니다. 최신 화면을 확인해주세요.") }
             return ["sent": true, "message": "터미널에 입력을 전달했습니다. 화면에서 반영 결과를 확인하세요."]

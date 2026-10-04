@@ -10,6 +10,7 @@ let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter 
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
+let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalStreamFailed = '';
 let terminalValue = null, terminalRows = [], terminalAppearanceKey = null;
 let lastNetworkUpdate = null;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
@@ -21,9 +22,10 @@ let cursorLayoutPending = false;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const keyFor = (node, session, view) => `${node.id}/${view?.ptyID ? 'pty:' + view.ptyID : session.id}`;
-let ptyClient = null, continueItem = null, selectedOrigin = null;
+let ptyClient = null;
 const ptyDrafts = new Map();
-const ptyTemporary = new Map(), ptyRetained = new Map(), ptyAttachments = new Map();
+const ptyTemporary = new Map(), ptyRetained = new Map();
+const retainedPTYStorage = 'autoapprove-ended-ptys';
 const sessionEnded = item => item?.session.phase === 'ended' || item?.view.pty?.exitCode != null || item?.view.pty?.closed === true;
 function retainEndedPTY(item) {
   item.session.phase = 'ended'; item.session.automatic = false;
@@ -31,16 +33,20 @@ function retainEndedPTY(item) {
   item.view.phaseTitle = '종료'; item.view.canApprove = false;
   ptyRetained.set(item.key, item); ptyTemporary.delete(item.key);
   allSessions = allSessions.filter(row => row.key !== item.key);
+  try {
+    const retained = JSON.parse(sessionStorage.getItem(retainedPTYStorage) || '[]').filter(entry => entry.nodeID !== item.node.id || entry.descriptor?.ptyID !== item.view.ptyID);
+    retained.push({nodeID:item.node.id, sessionID:item.session.id, descriptor:{...item.view.pty, closed:true}, title:item.view.title});
+    sessionStorage.setItem(retainedPTYStorage, JSON.stringify(retained.slice(-24)));
+  } catch (_) {}
 }
-const supportsPTYAttach = node => {
+const supportsRelease = (node, minimum) => {
   const version = versionNumbers(node.state?.release);
   if (!version) return false;
-  const minimum = [0, 2, 41, 48];
   for (let i = 0; i < minimum.length; i++) if (version[i] !== minimum[i]) return version[i] > minimum[i];
   return true;
 };
-const canAttachPTY = item => !item.view.pty && supportsPTYAttach(item.node) && ['codex', 'claude'].includes(item.session.agent) && item.session.phase !== 'ended' && item.session.terminal !== 'claudeBackground';
-const selectedAttachment = () => !selectedItem?.view.pty && ptyAttachments.get(selectedItem?.key);
+const supportsPTYStream = node => supportsRelease(node, [0, 2, 41, 48]);
+const supportsTerminalStream = node => supportsRelease(node, [0, 2, 42, 49]);
 function reconcilePTYInventory(inventory) {
   inventory = inventory.filter(item => !sessionEnded(item) && !sessionEnded(ptyRetained.get(item.key)));
   for (const [key, temporary] of ptyTemporary) {
@@ -51,12 +57,13 @@ function reconcilePTYInventory(inventory) {
   }
   return inventory;
 }
-function descriptorItem(nodeID, descriptor, source, automatic = false) {
-  if (!descriptor || !descriptor.ptyID || !descriptor.streamID || typeof descriptor.cwd !== 'string' || !['shell','codex','claude'].includes(descriptor.program) || !Number.isInteger(descriptor.pid) || descriptor.pid < 1 || !Number.isInteger(descriptor.columns) || descriptor.columns < 20 || descriptor.columns > 240 || !Number.isInteger(descriptor.rows) || descriptor.rows < 5 || descriptor.rows > 100) throw new Error('PTY 연결 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
-  const node = nodes.find(node => node.id === nodeID) || source?.node;
+function descriptorItem(nodeID, descriptor, automatic = false) {
+  if (!descriptor || typeof descriptor.ptyID !== 'string' || !descriptor.ptyID || descriptor.ptyID.length > 128 || typeof descriptor.streamID !== 'string' || !descriptor.streamID || descriptor.streamID.length > 128 || typeof descriptor.cwd !== 'string' || descriptor.cwd.length > 8192 || !['shell','codex','claude'].includes(descriptor.program) || !Number.isInteger(descriptor.pid) || descriptor.pid < 1 || !Number.isInteger(descriptor.columns) || descriptor.columns < 20 || descriptor.columns > 240 || !Number.isInteger(descriptor.rows) || descriptor.rows < 5 || descriptor.rows > 100) throw new Error('PTY 연결 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
+  const node = nodes.find(node => node.id === nodeID);
   if (!node) throw new Error('Mac 연결을 확인한 뒤 터미널을 다시 선택해주세요.');
-  const session = {id:'pty:' + descriptor.ptyID, agent:descriptor.program, pid:descriptor.pid, started:descriptor.streamID, tty:descriptor.tty, cwd:descriptor.cwd, terminal:'pty', hostName:'PTY', phase:descriptor.exitCode != null ? 'ended' : 'idle', automatic, detail:'화면을 눌러 직접 입력하세요.'};
-  const view = {session, title:source?.view.title || 'PTY · ' + descriptor.cwd.split('/').filter(Boolean).pop(), phaseTitle:descriptor.exitCode != null ? '종료' : '입력 대기', canApprove:false, canReveal:false, canRead:true, keys:[], ptyID:descriptor.ptyID, pty:descriptor};
+  const ended = descriptor.exitCode != null || descriptor.closed === true;
+  const session = {id:'pty:' + descriptor.ptyID, agent:descriptor.program, pid:descriptor.pid, started:descriptor.streamID, tty:descriptor.tty, cwd:descriptor.cwd, terminal:'pty', hostName:'PTY', phase:ended ? 'ended' : 'idle', automatic, detail:'화면을 눌러 직접 입력하세요.'};
+  const view = {session, title:'PTY · ' + descriptor.cwd.split('/').filter(Boolean).pop(), phaseTitle:ended ? '종료' : '입력 대기', canApprove:false, canReveal:false, canRead:true, keys:[], ptyID:descriptor.ptyID, pty:descriptor};
   const key = keyFor(node, session, view);
   const existing = allSessions.find(item => item.key === key) || ptyRetained.get(key);
   if (existing) {
@@ -68,38 +75,11 @@ function descriptorItem(nodeID, descriptor, source, automatic = false) {
   else { ptyTemporary.set(key, item); allSessions.push(item); }
   return item;
 }
-function selectPTYDescriptor(nodeID, descriptor, source = null, automatic = false, focus = false) {
-  const item = descriptorItem(nodeID, descriptor, source, automatic);
-  const origin = source && {key:source.key, nodeID:source.node.id, sessionID:source.session.id};
-  selectSession(item.key, focus, false, origin);
+function selectPTYDescriptor(nodeID, descriptor, automatic = false, focus = false) {
+  const item = descriptorItem(nodeID, descriptor, automatic);
+  selectSession(item.key, focus);
   // A slow peer inventory cannot hold up this already-created terminal.
   void refreshNetwork();
-}
-function renderAttachmentState() {
-  const attachment = selectedAttachment();
-  if (!attachment) return;
-  if (attachment.state === 'pending') {
-    terminalState('pending', '터미널 연결 중…'); terminalPlaceholder('직접 입력 터미널에 연결하는 중…');
-    show($('terminal-error'), false); show($('terminal-retry'), false);
-  } else if (attachment.state === 'error') {
-    terminalState('error', '터미널 연결 확인 필요'); text($('terminal-error'), attachment.error);
-    text($('terminal-retry'), '터미널 연결 다시 시도'); show($('terminal-error'), true); show($('terminal-retry'), true);
-  }
-}
-async function attachPTY(item, focus = false, retry = false) {
-  if (!canAttachPTY(item) || ptyAttachments.get(item.key)?.state === 'pending' || !retry && ptyAttachments.get(item.key)?.state === 'error') return;
-  ptyAttachments.set(item.key, {state:'pending'}); stopDirect(); clearTimeout(frameTimer); frameController?.abort();
-  if (selectedItem?.key === item.key) { renderAttachmentState(); updateControls(); }
-  try {
-    const descriptor = await api(endpoint('/api/pty', item.node.id), {sessionID:item.session.id, reuse:true, automatic:!!item.session.automatic, columns:80, rows:24, requestID:uuid()});
-    const created = descriptorItem(item.node.id, descriptor, item, !!item.session.automatic);
-    ptyAttachments.delete(item.key);
-    if (selectedOrigin?.key === item.key && selectedItem?.key === item.key) selectSession(created.key, focus, false, selectedOrigin);
-    void refreshNetwork();
-  } catch (error) {
-    ptyAttachments.set(item.key, {state:'error', error:error.status === 404 ? '이 Mac에서 PTY를 지원하지 않습니다. AutoApprove 0.2.41 이상으로 업데이트해주세요.' : error.message});
-    if (selectedItem?.key === item.key) { renderAttachmentState(); updateControls(); void refreshFrame(); }
-  }
 }
 function stopPTY() {
   if (!ptyClient) return;
@@ -122,7 +102,7 @@ function ptyReport(state, message, client) {
 }
 function ensurePTY() {
   const item = selectedItem; if (!item?.view.pty || document.hidden) return;
-  const streaming = supportsPTYAttach(item.node);
+  const streaming = supportsPTYStream(item.node);
   if (ptyClient?.sessionKey === item.key && ptyClient.streaming === streaming) return;
   stopPTY();
   ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming);
@@ -416,7 +396,7 @@ async function refreshNetwork() {
     renderMachines(); renderNodeFilter(); renderList();
     if (selectedKey) {
       const current = allSessions.find(item => item.key === selectedKey);
-      if (current) { selectedItem = current; renderDetail(); }
+      if (current) { selectedItem = current; renderDetail(); if (!current.view.pty && (terminalStream || supportsTerminalStream(current.node))) void refreshFrame(); }
       else if (selectedItem?.view.pty) {
         // The active inventory drops closed processes before their final stream
         // bytes necessarily arrive. Keep this xterm and its retained last screen.
@@ -424,7 +404,7 @@ async function refreshNetwork() {
         if (node) selectedItem.node = node;
         ptyRetained.set(selectedKey, selectedItem); renderDetail();
       }
-      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; stopDirect(); stopPTY(); terminalState('error', '세션 종료'); updateControls(); }
+      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; frameController?.abort(); stopTerminalStream(); stopDirect(); stopPTY(); terminalState('error', currentNode()?.online ? '세션 종료' : '연결 끊김'); updateControls(); }
       else restoreSelection();
     } else restoreSelection();
   } catch (error) {
@@ -432,7 +412,7 @@ async function refreshNetwork() {
     show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
     if (!nodes.length) text($('list-empty'), 'Mac에 연결하면 감지된 세션이 여기에 표시됩니다.');
-    latestFrame = null; stopDirect();
+    latestFrame = null; frameController?.abort(); stopTerminalStream(); stopDirect();
     if (!selectedItem?.view.pty) terminalState('error', '연결 끊김');
     updateControls(); renderMachines();
   } finally {
@@ -481,7 +461,6 @@ function renderList() {
     && (filter !== 'review' || needsReview(session)) && (filter !== 'automatic' || session.automatic)
     && [view.title, session.cwd, session.terminalTitle, session.customization?.note, session.gitBranch?.name, node.name, agents[session.agent]].filter(Boolean).join(' ').toLocaleLowerCase().includes(query));
   const visibleKeys = new Set(visible.map(item => item.key));
-  const highlighted = selectedOrigin && allSessions.some(row => row.key === selectedOrigin.key) ? selectedOrigin.key : selectedKey;
   for (const [key, row] of rows) if (!visibleKeys.has(key)) { row.remove(); rows.delete(key); }
   for (const [index, item] of visible.entries()) {
     let row = rows.get(item.key);
@@ -491,7 +470,7 @@ function renderList() {
       const state = make('span', 'row-state'); state.append(make('span', 'phase'), make('span', 'row-auto')); button.append(state); row.append(button);
       button.addEventListener('click', () => selectSession(item.key, true)); rows.set(item.key, row);
     }
-    const button = row.firstChild; button.setAttribute('aria-pressed', String(item.key === highlighted));
+    const button = row.firstChild; button.setAttribute('aria-pressed', String(item.key === selectedKey));
     const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
     text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
     text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
@@ -504,16 +483,10 @@ function renderList() {
   show($('list-empty'), !visible.length);
   text($('list-empty'), allSessions.length ? '검색이나 필터에 맞는 세션이 없습니다.' : nodes.some(node => node.online) ? '감지된 세션이 없습니다. Mac에서 Claude Code 또는 Codex를 실행하세요.' : '연결된 Mac이 없습니다. 네트워크와 웹 접속 설정을 확인해주세요.');
 }
-function selectSession(key, focus = false, deliberate = focus, origin = null) {
-  const source = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!source) return;
-  // Revalidate every deliberate original-session selection: a CLI can change
-  // conversations without changing PID/TTY. Only the Mac can verify that ID.
-  const item = source;
-  if (!source.view.pty) origin = {key:source.key, nodeID:source.node.id, sessionID:source.session.id};
-  else if (!origin && selectedKey === item.key) origin = selectedOrigin;
-  selectedOrigin = origin;
+function selectSession(key, focus = false) {
+  const item = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!item) return;
   if (selectedKey !== item.key) {
-    stopPTY();
+    stopPTY(); stopTerminalStream(true);
     stopDirect(); inputFailure = ''; composing = false;
     if (selectedKey) drafts.set(selectedKey, $('terminal-input').value);
     selectedKey = item.key; selectedItem = item; latestFrame = null; detailGeneration++;
@@ -522,29 +495,39 @@ function selectSession(key, focus = false, deliberate = focus, origin = null) {
     $('terminal-input').value = drafts.get(item.key) || ''; composePreferred = !!$('terminal-input').value; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
     $('questions').replaceChildren(); $('history').replaceChildren();
     terminalPlaceholder('화면을 불러오는 중…'); terminalState('pending', '연결 중…'); text($('terminal-time'), '—'); show($('terminal-error'), false); show($('terminal-retry'), false);
-  }
+  } else if (terminalStreamFailed === item.key) stopTerminalStream(true);
+  selectedItem = item;
   document.body.classList.add('detail-open');
   if (window.innerWidth < 760) terminalFocus(true);
-  const hash = new URLSearchParams({ node: item.node.id, session: selectedOrigin?.sessionID || item.session.id, ...(item.view.ptyID ? {pty: item.view.ptyID} : {}) });
+  const hash = new URLSearchParams({ node: item.node.id, session: item.session.id, ...(item.view.ptyID ? {pty: item.view.ptyID} : {}) });
   history.replaceState(null, '', `#${hash}`);
   renderList(); renderDetail();
-  if (deliberate && canAttachPTY(item) && selectedAttachment()?.state !== 'error') void attachPTY(item, focus);
-  else void refreshFrame();
+  void refreshFrame();
   if (focus) { $(document.body.classList.contains('terminal-focus') ? 'terminal-heading' : 'session-title').focus({ preventScroll: true }); if (window.innerWidth < 760) window.scrollTo(0, 0); }
 }
 function restoreSelection() {
   const hash = new URLSearchParams(location.hash.slice(1));
-  const item = allSessions.find(item => item.node.id === hash.get('node') && item.session.id === hash.get('session'))
-    || allSessions.find(item => item.node.id === hash.get('node') && hash.get('pty') && item.view.ptyID === hash.get('pty'))
-    || ptyRetained.get(hash.get('node') + '/pty:' + hash.get('pty'));
-  if (item) selectSession(item.key, false, true);
+  const nodeID = hash.get('node'), sessionID = hash.get('session'), ptyID = hash.get('pty');
+  let item = allSessions.find(item => item.node.id === nodeID && item.session.id === sessionID);
+  // Old continuation bookmarks include an original session plus a PTY alias.
+  // Prefer that original; never silently substitute its separate copied CLI.
+  if (!item && ptyID && sessionID === 'pty:' + ptyID) item = allSessions.find(item => item.node.id === nodeID && item.view.ptyID === ptyID) || ptyRetained.get(nodeID + '/pty:' + ptyID);
+  if (!item && ptyID) {
+    try {
+      const stored = sessionStorage.getItem(retainedPTYStorage) || '[]';
+      if (stored.length > 128000) throw new Error('invalid cache');
+      const entry = JSON.parse(stored).slice(-24).find(entry => entry.nodeID === nodeID && entry.descriptor?.ptyID === ptyID && entry.descriptor.closed === true && (sessionID === 'pty:' + ptyID || sessionID === entry.sessionID));
+      if (entry) { item = descriptorItem(nodeID, entry.descriptor); if (typeof entry.title === 'string' && entry.title.length <= 1024) item.view.title = entry.title; }
+    } catch (_) {}
+  }
+  if (item) selectSession(item.key);
 }
 function renderDetail() {
   if (!selectedItem) return;
   const { node, session, view } = selectedItem;
   const isPTY = !!view.pty;
   show($('terminal-screen'), !isPTY); show($('pty-screen'), isPTY);
-  show($('pty-upgrade'), !isPTY && !supportsPTYAttach(node) && ['codex', 'claude'].includes(session.agent) && session.terminal !== 'claudeBackground'); show($('close-pty'), isPTY);
+  show($('close-pty'), isPTY);
   show($('pty-unsent'), isPTY && !!((ptyDrafts.get(selectedKey) || '') + (ptyClient?.unsent || '')));
   document.querySelector('.terminal').dataset.mode = isPTY ? 'pty' : 'mirror';
   show($('detail-empty'), false); show($('detail-content'), true); show($('session-ended'), false);
@@ -558,22 +541,20 @@ function renderDetail() {
   if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
   text($('input-help'), 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.');
   if (isPTY) { ensurePTY(); } else if (!view.canRead) {
-    latestFrame = null; terminalPlaceholder(view.inputReason || '화면 연결이 없습니다.'); terminalState('error', '화면 연결 필요'); text($('terminal-time'), '—');
+    latestFrame = null; stopTerminalStream(); stopDirect(); frameController?.abort(); terminalPlaceholder(view.inputReason || '화면 연결이 없습니다.'); terminalState('error', '화면 연결 필요'); text($('terminal-time'), '—');
   }
-  renderAttachmentState(); renderQuestions(); renderHistory(); updateControls();
+  renderQuestions(); renderHistory(); updateControls();
 }
 function updateControls() {
   if (!selectedItem) return;
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
-  const attaching = selectedAttachment()?.state === 'pending';
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
-  const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation && !attaching;
+  const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation;
   const temporaryPTY = ptyTemporary.has(selectedKey);
   $('automatic').disabled = !enabled || temporaryPTY || (!selectedItem.view.canApprove && !selectedItem.session.automatic);
   $('automatic').title = temporaryPTY ? 'PTY에서 실행 중인 CLI를 확인하는 중입니다.' : !selectedItem.view.canApprove ? 'Mac에서 이 세션의 승인 연결을 먼저 설정해주세요.' : '이 세션의 다음 지원 요청부터 적용합니다.';
   $('reveal').disabled = !enabled || !selectedItem.view.canReveal;
   $('new-pty').disabled = !connected || !nodes.some(node => node.online);
-  $('continue-pty').disabled = !enabled;
   if (selectedItem.view.pty) {
     const ready = enabled && ptyClient?.ready;
     $('terminal-keyboard').disabled = true; show($('input-editor'), false); show($('compose-input-label'), false);
@@ -586,14 +567,14 @@ function updateControls() {
     $('send-input').disabled = !ready; text($('send-input'), 'Enter');
     for (const button of $('input-form').querySelectorAll('button[data-key]')) { button.disabled = !ready; show(button, true); }
     $('close-pty').disabled = !enabled || !!ptyClient?.ending || sessionEnded(selectedItem);
-    text($('direct-input-help'), selectedOrigin ? '원래 터미널 유지 · 이어받은 대화에 직접 입력합니다. Shift Tab으로 포커스를 나갑니다.' : '화면을 눌러 직접 입력합니다. Shift Tab으로 키보드 포커스를 나갑니다.');
+    text($('direct-input-help'), '화면을 눌러 직접 입력합니다. Shift Tab으로 키보드 포커스를 나갑니다.');
     $('direct-input-help').dataset.required = 'false'; text($('input-reason'), ''); $('input-reason').dataset.blocked = 'false'; text($('input-help'), '');
     return;
   }
   $('terminal-wrap').disabled = false; show($('input-form').querySelector('[data-key="eof"]'), false);
-  const reason = !connected || !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : latestFrame?.inputReason || selectedItem.view.inputReason;
+  const reason = !connected || !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : document.hidden || terminalStreamFailed === selectedKey ? '화면을 다시 연결한 뒤 입력할 수 있습니다.' : latestFrame?.inputReason || selectedItem.view.inputReason;
   const fresh = latestFrame && Date.now() - new Date(latestFrame.observedAt).getTime() < 10000;
-  const base = connected && current?.online && sessionPresent && !reason && !attaching;
+  const base = connected && current?.online && sessionPresent && !reason;
   const inputEnabled = enabled && fresh && !reason;
   // Keep the active editor alive while its own request/refresh runs: disabling it closes mobile keyboards.
   $('terminal-input').disabled = !(base && (fresh || inputInFlight || directSending));
@@ -629,12 +610,78 @@ function updateControls() {
   for (const button of $('questions').querySelectorAll('button')) button.disabled = !enabled || button.dataset.unavailable === 'true';
   scheduleCursor();
 }
+function mergeTerminalUpdate(update, previous, sessionID) {
+  if (!update || update.sessionID !== sessionID || typeof update.revision !== 'string' || update.revision.length > 512 || typeof update.observedAt !== 'string' || !Number.isFinite(Date.parse(update.observedAt)) || !Array.isArray(update.keys) || update.keys.length > 64 || update.keys.some(key => typeof key !== 'string' || key.length > 64) || update.inputReason != null && typeof update.inputReason !== 'string' || update.streamID != null && typeof update.streamID !== 'string') throw new Error('터미널 화면 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
+  if (typeof update.screen === 'string') return update;
+  if (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID) throw new Error('최신 화면을 다시 연결해주세요.');
+  // A compact update carries current controls. Missing optional input fields
+  // clear old locks/cursors/tokens while the unchanged screen and colors remain.
+  return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, cursor:update.cursor, streamID:update.streamID};
+}
+function applyTerminalFrame(frame) {
+  const previous = latestFrame;
+  if (directMode && (frame.streamID || null) !== directStreamID) {
+    stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
+  }
+  latestFrame = frame;
+  const changed = renderTerminal(frame.screen, frame.appearance);
+  quietFrames = changed ? 0 : quietFrames + 1;
+  terminalState(changed && previous ? 'changed' : 'live', !frame.screen.trim() ? '연결됨 · 빈 화면' : changed && previous ? '새 출력' : '연결됨');
+  text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
+  updateControls();
+}
+function stopTerminalStream(resetFailure = false) {
+  terminalStream?.source.close(); terminalStream = null;
+  if (terminalPaint) cancelAnimationFrame(terminalPaint);
+  terminalPaint = 0; terminalPending = null;
+  if (resetFailure) terminalStreamFailed = '';
+}
+function failTerminalStream(stream, message) {
+  if (terminalStream !== stream) return;
+  stopTerminalStream(); terminalStreamFailed = stream.key; latestFrame = null; stopDirect();
+  text($('terminal-error'), message); show($('terminal-error'), true); text($('terminal-retry'), '화면 다시 연결'); show($('terminal-retry'), true);
+  terminalState('error', '연결 끊김'); updateControls();
+}
+function ensureTerminalStream() {
+  if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration) return;
+  stopTerminalStream();
+  const item = selectedItem, stream = {key:selectedKey, generation:detailGeneration, source:new EventSource(endpoint('/api/terminal/stream', item.node.id, item.session.id))};
+  terminalStream = stream;
+  if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
+  stream.source.addEventListener('screen', event => {
+    if (terminalStream !== stream || selectedKey !== stream.key || detailGeneration !== stream.generation || document.hidden) return;
+    try {
+      if (event.data.length > 2000000 || byteLength(event.data) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
+      const frame = mergeTerminalUpdate(JSON.parse(event.data), terminalPending || latestFrame, item.session.id);
+      // Observe token changes immediately, even if a later frame replaces this
+      // one before painting. Pending input must never cross terminal identities.
+      if (directMode && (frame.streamID || null) !== directStreamID) {
+        stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
+      }
+      terminalPending = frame;
+      if (terminalPaint) return;
+      terminalPaint = requestAnimationFrame(() => {
+        terminalPaint = 0;
+        if (terminalStream !== stream || selectedKey !== stream.key || detailGeneration !== stream.generation || document.hidden) { terminalPending = null; return; }
+        const frame = terminalPending; terminalPending = null;
+        try { if (frame) applyTerminalFrame(frame); } catch (error) { failTerminalStream(stream, error.message); }
+      });
+    } catch (error) { failTerminalStream(stream, error.message); }
+  });
+  stream.source.addEventListener('failure', event => {
+    let message = 'Mac의 터미널 연결이 끊겼습니다. 원래 터미널을 확인한 뒤 화면을 다시 연결해주세요.';
+    try { if (event.data.length <= 8192) { const failure = JSON.parse(event.data); if (typeof failure.error === 'string') message = failure.error; } } catch (_) {}
+    failTerminalStream(stream, message);
+  });
+  stream.source.onerror = () => failTerminalStream(stream, 'Mac의 터미널 연결이 끊겼습니다. 원래 터미널을 확인한 뒤 화면을 다시 연결해주세요.');
+}
 async function refreshFrame() {
   clearTimeout(frameTimer);
   if (selectedItem?.view.pty) { ensurePTY(); return; }
-  if (selectedAttachment()?.state === 'pending') return;
   if (mutation) { frameTimer = setTimeout(refreshFrame, 100); return; }
-  if (!selectedItem || !selectedItem.view.canRead || !connected || !currentNode()?.online || document.hidden) return;
+  if (!selectedItem || !selectedItem.view.canRead || sessionEnded(selectedItem) || !allSessions.some(item => item.key === selectedKey) || !connected || !currentNode()?.online || document.hidden) { stopTerminalStream(); return; }
+  if (supportsTerminalStream(currentNode())) { frameController?.abort(); ensureTerminalStream(); return; }
+  stopTerminalStream();
   if (loadingFrame) { frameTimer = setTimeout(refreshFrame, 100); return; }
   loadingFrame = true;
   const key = selectedKey, generation = detailGeneration, item = selectedItem, previous = latestFrame;
@@ -644,26 +691,16 @@ async function refreshFrame() {
     if (previous) query.set('revision', previous.revision);
     const update = await api('/api/terminal?' + query, undefined, controller.signal);
     if (selectedKey !== key || detailGeneration !== generation) return;
-    if (typeof update.screen !== 'string' && (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID)) throw new Error('최신 화면을 다시 연결해주세요.');
-    // Optional inputReason is omitted when a lock clears, even in an unchanged-screen response.
-    const frame = typeof update.screen === 'string' ? update : { ...previous, ...update, inputReason: update.inputReason, cursor: update.cursor, streamID: update.streamID };
-    if (directMode && (frame.streamID || null) !== directStreamID) {
-      stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
-    }
-    latestFrame = frame;
-    const changed = renderTerminal(frame.screen, frame.appearance);
-    quietFrames = changed ? 0 : quietFrames + 1;
-    terminalState(changed && previous ? 'changed' : 'live', !frame.screen.trim() ? '연결됨 · 빈 화면' : changed && previous ? '새 출력' : '연결됨');
-    text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
+    applyTerminalFrame(mergeTerminalUpdate(update, previous, item.session.id));
   } catch (error) {
     if (controller.signal.aborted || selectedKey !== key || detailGeneration !== generation) return;
     latestFrame = null; stopDirect(); text($('terminal-error'), error.message); show($('terminal-error'), true); show($('terminal-retry'), true); terminalState('error', '연결 끊김');
   } finally {
-    loadingFrame = false; frameController = null; renderAttachmentState(); updateControls();
+    loadingFrame = false; if (frameController === controller) frameController = null; updateControls();
     clearTimeout(frameTimer);
     const active = Date.now() < fastFrameUntil || selectedItem?.session.phase === 'working' || quietFrames < 2;
     const interval = latestFrame ? directMode ? 150 : active ? 500 : Math.min(2000, 700 + quietFrames * 150) : 5000;
-    if (selectedItem && !document.hidden) frameTimer = setTimeout(refreshFrame, controller.signal.aborted ? 0 : Math.max(100, interval - (performance.now() - started)));
+    if (selectedItem && !selectedItem.view.pty && !document.hidden && !supportsTerminalStream(currentNode() || selectedItem.node)) frameTimer = setTimeout(refreshFrame, controller.signal.aborted ? 0 : Math.max(100, interval - (performance.now() - started)));
   }
 }
 async function freshInputFrame(key) {
@@ -682,7 +719,7 @@ async function sendInput(kind, value = '', quiet = false) {
   const consumedDraft = ['text', 'submit'].includes(kind) && $('terminal-input').value === value;
   if (consumedDraft) { $('terminal-input').value = ''; drafts.delete(item.key); sizeInput(); }
   mutation = !relay; inputInFlight = true;
-  if (!relay) { detailGeneration++; frameController?.abort(); }
+  if (!relay) { detailGeneration++; frameController?.abort(); stopTerminalStream(); }
   terminalState('pending', '전달 중…'); updateControls();
   let sent = false;
   try {
@@ -940,8 +977,7 @@ document.addEventListener('click', event => { if ($('terminal-settings').open &&
 $('terminal-retry').addEventListener('click', () => {
   text($('terminal-retry'), '화면 다시 연결');
   if (selectedItem?.view.pty) { stopPTY(); ensurePTY(); }
-  else if (selectedAttachment()?.state === 'error' && canAttachPTY(selectedItem)) void attachPTY(selectedItem, false, true);
-  else void refreshFrame();
+  else { stopTerminalStream(true); frameController?.abort(); void refreshFrame(); }
 });
 try { $('terminal-colors').checked = localStorage.getItem('terminal-colors') !== 'false'; } catch (_) {}
 document.querySelector('.terminal').dataset.colored = String($('terminal-colors').checked);
@@ -953,10 +989,10 @@ $('follow').addEventListener('change', () => { if ($('follow').checked) $('termi
 $('terminal-screen').addEventListener('scroll', () => { const pre = $('terminal-screen'); if (pre.scrollHeight - pre.scrollTop - pre.clientHeight > 40) $('follow').checked = false; show($('jump-latest'), !$('follow').checked); }, { passive: true });
 $('jump-latest').addEventListener('click', () => { $('follow').checked = true; $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; show($('jump-latest'), false); });
 $('back').addEventListener('click', () => {
-  stopPTY();
+  stopPTY(); stopTerminalStream(true);
   stopDirect(); composing = false; terminalFocus(false);
-  drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedOrigin?.key || selectedKey)?.firstChild;
-  selectedKey = ''; selectedItem = null; selectedOrigin = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
+  drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.firstChild;
+  selectedKey = ''; selectedItem = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
   document.body.classList.remove('detail-open'); history.replaceState(null, '', location.pathname); show($('detail-content'), false); show($('detail-empty'), true); renderList(); previous?.focus();
 });
 $('refresh').addEventListener('click', () => { void refreshNetwork(); void refreshFrame(); });
@@ -971,39 +1007,30 @@ $('add-form').addEventListener('submit', async event => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) { frameController?.abort(); stopDirect(); stopPTY(); }
+  if (document.hidden) { frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('hashchange', restoreSelection);
-function openPTYDialog(item = null) {
-  continueItem = item;
+function openPTYDialog() {
   $('pty-node').replaceChildren(...nodes.filter(node => node.online).map(node => { const option = make('option', '', node.name); option.value = node.id; return option; }));
-  if (item) $('pty-node').value = item.node.id;
-  else if (selectedItem) $('pty-node').value = selectedItem.node.id;
-  $('pty-node').disabled = !!item; $('pty-directory').required = !item;
+  if (selectedItem) $('pty-node').value = selectedItem.node.id;
   $('pty-directory').value = selectedItem?.session.cwd || '';
-  $('pty-automatic').checked = !!item?.session.automatic;
-  text($('pty-title'), item ? 'PTY에서 대화 이어가기' : '새 PTY 터미널');
-  text($('pty-description'), item ? '선택한 대화 내용을 이어받은 새 세션을 엽니다. 원래 터미널은 유지됩니다. 대화 ID를 확인하지 못하면 CLI의 대화 선택 화면이 열립니다.' : 'Mac에서 실행되는 터미널입니다. 화면을 눌러 바로 입력할 수 있습니다.');
-  text($('pty-context'), item ? `${agents[item.session.agent]} · ${item.session.cwd}` : '');
-  show($('pty-context'), !!item); show($('pty-new-options'), !item); show($('pty-error'), false);
-  text($('start-pty'), item ? '대화 이어가기' : '터미널 열기');
+  $('pty-automatic').checked = false; show($('pty-error'), false);
   $('pty-dialog').showModal(); $('start-pty').focus();
 }
 $('new-pty').addEventListener('click', () => openPTYDialog());
-$('continue-pty').addEventListener('click', () => { if (canAttachPTY(selectedItem)) void attachPTY(selectedItem, false, true); else openPTYDialog(selectedItem); });
 $('close-pty-dialog').addEventListener('click', () => $('pty-dialog').close());
 $('pty-form').addEventListener('submit', async event => {
   event.preventDefault(); const button = $('start-pty'); if (button.disabled) return;
-  const item = continueItem, nodeID = $('pty-node').value;
-  const payload = item ? {sessionID:item.session.id,reuse:true} : {cwd:$('pty-directory').value,program:$('pty-program').value};
-  button.disabled = true; text(button, item ? '대화 확인 중…' : '터미널 여는 중…'); show($('pty-error'), false);
+  const nodeID = $('pty-node').value;
+  const payload = {cwd:$('pty-directory').value,program:$('pty-program').value};
+  button.disabled = true; text(button, '터미널 여는 중…'); show($('pty-error'), false);
   try {
     const result = await api(endpoint('/api/pty', nodeID), {...payload, automatic:$('pty-automatic').checked, columns:80, rows:24, requestID:uuid()});
     $('pty-dialog').close();
-    selectPTYDescriptor(nodeID, result, item, $('pty-automatic').checked, true);
+    selectPTYDescriptor(nodeID, result, $('pty-automatic').checked, true);
   } catch (error) { text($('pty-error'), error.status === 404 ? '이 Mac에서 PTY를 지원하지 않습니다. AutoApprove 0.2.41 이상으로 업데이트해주세요.' : error.message); show($('pty-error'), true); }
-  finally { button.disabled = false; text(button, item ? '대화 이어가기' : '터미널 열기'); }
+  finally { button.disabled = false; text(button, '터미널 열기'); }
 });
 $('close-pty').addEventListener('click', async () => {
   if (!ptyClient || $('close-pty').disabled) return;

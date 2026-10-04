@@ -61,7 +61,7 @@ public struct RemoteDashboard: Codable {
     public var preferredGateway: RemoteWebGateway? = nil
 }
 
-public struct RemoteTerminalFrame: Codable {
+public struct RemoteTerminalFrame: Codable, Sendable {
     public var sessionID: String
     public var screen: String
     public var revision: String
@@ -74,7 +74,7 @@ public struct RemoteTerminalFrame: Codable {
 }
 
 /// A browser that already has this revision only needs fresh controls and observation time.
-private struct RemoteTerminalUpdate: Encodable {
+struct RemoteTerminalUpdate: Encodable {
     var sessionID: String
     var screen: String?
     var revision: String
@@ -185,8 +185,8 @@ private struct RemoteTerminalUpdate: Encodable {
                       RemoteNetworkAddress.isLocalHost(String(describing: host)) else { connection.cancel(); return }
                 let id = UUID()
                 let client = RemoteHTTPConnection(connection, queue: self.queue, handler: { [weak self] request in
-                    guard let self, self.running, self.generation == epoch else { return .error(RemoteHTTPError(503, "웹 접속이 꺼졌습니다.")) }
-                    if request.method == "GET", request.path == "/api/pty/stream" {
+                    guard let self, !Task.isCancelled, self.running, self.generation == epoch, self.connections[id] != nil else { return .error(RemoteHTTPError(503, "웹 접속이 꺼졌거나 연결이 종료되었습니다.")) }
+                    if request.method == "GET", ["/api/pty/stream", "/api/terminal/stream"].contains(request.path) {
                         do { try request.validateOrigin() } catch { return .error(error) }
                         guard self.streamConnections.count < 12 else { return .error(RemoteHTTPError(429, "터미널 실시간 연결은 Mac 한 대에서 12개까지 열 수 있습니다. 다른 화면을 닫고 다시 연결해주세요.")) }
                         self.streamConnections.insert(id)
@@ -553,6 +553,15 @@ private struct RemoteTerminalUpdate: Encodable {
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
                     let frame = try await engine.remoteTerminal(sessionID: id)
                     return try .json(RemoteTerminalUpdate(frame, knownRevision: request.parameter("revision")))
+                case "/api/terminal/stream":
+                    if let forwarded = try await forwardStream(request) { return forwarded }
+                    guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
+                    let frame = try await engine.remoteTerminal(sessionID: id, realtime: true)
+                    let output = try RemoteTerminalBodyStream(initial: frame) { [weak engine] in
+                        guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
+                        return try await engine.remoteTerminal(sessionID: id, realtime: true)
+                    }
+                    return .eventStream(output, nodeID: nodeID)
                 case "/api/pty/stream", "/api/pty/output":
                     if request.path == "/api/pty/stream" {
                         if let forwarded = try await forwardStream(request) { return forwarded }
