@@ -8,13 +8,14 @@ public enum AgentKind: String, Codable, CaseIterable {
 }
 
 public enum TerminalKind: String, Codable {
-    case terminal, vscode, iterm, orca, claudeBackground, unknown
+    case terminal, vscode, iterm, orca, pty, claudeBackground, unknown
     public var title: String {
         switch self {
         case .terminal: return "Terminal"
         case .vscode: return "VS Code"
         case .iterm: return "iTerm2"
         case .orca: return "Orca"
+        case .pty: return "PTY"
         case .claudeBackground: return "Claude 백그라운드"
         case .unknown: return "터미널 미확인"
         }
@@ -23,22 +24,22 @@ public enum TerminalKind: String, Codable {
 
 /// Terminal apps whose screens AutoApprove reads and answers without the agent's hooks.
 public enum ScreenHost: String, CaseIterable, Codable, Sendable {
-    case terminal, iterm, orca
+    case terminal, iterm, orca, pty
     public init?(kind: TerminalKind) {
-        switch kind { case .terminal: self = .terminal; case .iterm: self = .iterm; case .orca: self = .orca; default: return nil }
+        switch kind { case .terminal: self = .terminal; case .iterm: self = .iterm; case .orca: self = .orca; case .pty: self = .pty; default: return nil }
     }
     public init?(channel: ApprovalChannel) {
-        switch channel { case .terminalScreen: self = .terminal; case .itermScreen: self = .iterm; case .orcaScreen: self = .orca; default: return nil }
+        switch channel { case .terminalScreen: self = .terminal; case .itermScreen: self = .iterm; case .orcaScreen: self = .orca; case .ptyScreen: self = .pty; default: return nil }
     }
     public var kind: TerminalKind {
-        switch self { case .terminal: return .terminal; case .iterm: return .iterm; case .orca: return .orca }
+        switch self { case .terminal: return .terminal; case .iterm: return .iterm; case .orca: return .orca; case .pty: return .pty }
     }
     public var channel: ApprovalChannel {
-        switch self { case .terminal: return .terminalScreen; case .iterm: return .itermScreen; case .orca: return .orcaScreen }
+        switch self { case .terminal: return .terminalScreen; case .iterm: return .itermScreen; case .orca: return .orcaScreen; case .pty: return .ptyScreen }
     }
     public var title: String { kind.title }
     public var bundleID: String {
-        switch self { case .terminal: return "com.apple.Terminal"; case .iterm: return "com.googlecode.iterm2"; case .orca: return "com.stablyai.orca" }
+        switch self { case .terminal: return "com.apple.Terminal"; case .iterm: return "com.googlecode.iterm2"; case .orca: return "com.stablyai.orca"; case .pty: return "local.autoapprove.mac" }
     }
 }
 
@@ -57,7 +58,7 @@ public enum SessionPhase: String, Codable {
 }
 
 public enum ApprovalChannel: String, Codable {
-    case none, hook, terminalScreen, vscodeScreen, itermScreen, orcaScreen
+    case none, hook, terminalScreen, vscodeScreen, itermScreen, orcaScreen, ptyScreen
     public var title: String {
         switch self {
         case .none: return "연결 필요"
@@ -66,6 +67,7 @@ public enum ApprovalChannel: String, Codable {
         case .vscodeScreen: return "VS Code 화면 연결됨"
         case .itermScreen: return "iTerm2 화면 연결됨"
         case .orcaScreen: return "Orca 화면 연결됨"
+        case .ptyScreen: return "PTY 연결됨"
         }
     }
     public var isScreen: Bool { self == .vscodeScreen || ScreenHost(channel: self) != nil }

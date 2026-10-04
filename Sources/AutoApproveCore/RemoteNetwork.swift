@@ -29,6 +29,8 @@ public struct RemoteSessionView: Codable {
     public var canRead: Bool
     public var inputReason: String?
     public var keys: [String]
+    public var ptyID: String? = nil
+    public var pty: ManagedPTYDescriptor? = nil
 }
 
 public struct RemoteNodeState: Codable {
@@ -112,6 +114,7 @@ private struct RemoteTerminalUpdate: Encodable {
     public var port: UInt16? { listener?.port?.rawValue }
     private let queue = DispatchQueue(label: "autoapprove.web.listener")
     private var connections: [UUID: RemoteHTTPConnection] = [:]
+    private var streamConnections: Set<UUID> = []
     private var running = false
     private var generation = UUID()
     private var status = RemoteNetworkStatus()
@@ -173,7 +176,8 @@ private struct RemoteTerminalUpdate: Encodable {
             listener.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: serviceTXT(portal: false))
         }
         // Keep NWListener's lifetime accept budget unlimited. Concurrent requests are
-        // bounded by connections.count below, and each request has a deadline.
+        // bounded by connections.count below. Streams use only 12 of the 32
+        // slots, leaving room for input, state, assets and normal API requests.
         listener.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
                 guard let self, self.running, self.generation == epoch, self.connections.count < 32,
@@ -182,8 +186,15 @@ private struct RemoteTerminalUpdate: Encodable {
                 let id = UUID()
                 let client = RemoteHTTPConnection(connection, queue: self.queue, handler: { [weak self] request in
                     guard let self, self.running, self.generation == epoch else { return .error(RemoteHTTPError(503, "웹 접속이 꺼졌습니다.")) }
+                    if request.method == "GET", request.path == "/api/pty/stream" {
+                        do { try request.validateOrigin() } catch { return .error(error) }
+                        guard self.streamConnections.count < 12 else { return .error(RemoteHTTPError(429, "터미널 실시간 연결은 Mac 한 대에서 12개까지 열 수 있습니다. 다른 화면을 닫고 다시 연결해주세요.")) }
+                        self.streamConnections.insert(id)
+                    }
                     return await self.handle(request)
-                }, onClose: { [weak self] in Task { @MainActor in self?.connections.removeValue(forKey: id) } })
+                }, onClose: { [weak self] in Task { @MainActor in
+                    self?.connections.removeValue(forKey: id); self?.streamConnections.remove(id)
+                } })
                 self.connections[id] = client; client.start()
             }
         }
@@ -272,7 +283,7 @@ private struct RemoteTerminalUpdate: Encodable {
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
         pathMonitor?.cancel(); pathMonitor = nil
-        let clients = Array(connections.values); connections.removeAll(); clients.forEach { $0.close() }
+        let clients = Array(connections.values); connections.removeAll(); streamConnections.removeAll(); clients.forEach { $0.close() }
         peers = peers.filter { $0.value.manual }
         for id in Array(peers.keys) { peers[id]?.portal = false; peers[id]?.webVerifiedAt = nil }
         status = RemoteNetworkStatus(); emitStatus()
@@ -527,6 +538,9 @@ private struct RemoteTerminalUpdate: Encodable {
                     return try asset("index.html", type: "text/html; charset=utf-8")
                 case "/app.css": return try asset("app.css", type: "text/css; charset=utf-8")
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")
+                case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
+                case "/vendor/xterm.js", "/vendor/xterm-fit.js": return try asset(String(request.path.dropFirst()), type: "text/javascript; charset=utf-8")
+                case "/vendor/xterm.css": return try asset("vendor/xterm.css", type: "text/css; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
                 case "/api/state": return try .json(localState())
                 case "/api/discovery":
@@ -539,6 +553,23 @@ private struct RemoteTerminalUpdate: Encodable {
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
                     let frame = try await engine.remoteTerminal(sessionID: id)
                     return try .json(RemoteTerminalUpdate(frame, knownRevision: request.parameter("revision")))
+                case "/api/pty/stream", "/api/pty/output":
+                    if request.path == "/api/pty/stream" {
+                        if let forwarded = try await forwardStream(request) { return forwarded }
+                    } else if let forwarded = try await forward(request) { return forwarded }
+                    guard let engine, let id = request.parameter("pty") else { throw RemoteHTTPError(400, "PTY를 지정해주세요.") }
+                    let terminal = try engine.managedPTY.terminal(id)
+                    guard request.parameter("stream") == terminal.descriptor.streamID else { throw RemoteHTTPError(409, "PTY 연결이 바뀌었습니다. 다시 연결해주세요.") }
+                    let supplied = request.parameter("offset")
+                    guard supplied == nil || Int(supplied!) != nil else { throw RemoteHTTPError(400, "올바른 출력 위치가 필요합니다.") }
+                    let offset = supplied.flatMap(Int.init)
+                    let client = request.parameter("client")
+                    if request.path == "/api/pty/stream" {
+                        return .eventStream(try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client), nodeID: nodeID)
+                    }
+                    let output = try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client, emitInitial: false)
+                    defer { output.cancel() }
+                    return try await .json(output.readUpdate(timeout: 0.75))
                 default: throw RemoteHTTPError(404, "페이지를 찾지 못했습니다.")
                 }
             }
@@ -557,7 +588,7 @@ private struct RemoteTerminalUpdate: Encodable {
                     release: state.release?.isCompatible == true ? state.release : nil, webURLs: state.webURLs ?? [], webPort: state.webPort)
                 updateNamedAddresses(); emitStatus(); refreshWebPeers()
                 return try .object(["id": state.id, "name": state.name])
-            case "/api/action", "/api/input":
+            case "/api/action", "/api/input", "/api/pty", "/api/pty/input", "/api/pty/resize", "/api/pty/close":
                 if let forwarded = try await forward(request) { return forwarded }
                 guard let engine, let requestID = object["requestID"] as? String, UUID(uuidString: requestID) != nil else { throw RemoteHTTPError(400, "고유한 요청 ID가 필요합니다.") }
                 let fingerprint = PromptDetector.fingerprint(request.path + String(decoding: request.body, as: UTF8.self))
@@ -571,6 +602,10 @@ private struct RemoteTerminalUpdate: Encodable {
                 let response: RemoteHTTPResponse
                 do {
                     if request.path == "/api/input" { response = try await .object(engine.remoteInput(object)) }
+                    else if request.path == "/api/pty" { response = try await .json(engine.createPTY(object)) }
+                    else if request.path == "/api/pty/input" { response = try await .object(engine.ptyInput(object)) }
+                    else if request.path == "/api/pty/resize" { response = try .object(engine.ptyResize(object)) }
+                    else if request.path == "/api/pty/close" { response = try .object(engine.ptyClose(object)) }
                     else { response = try await .object(engine.remoteAction(object)) }
                 } catch { response = .error(error) }
                 if let index = receipts.firstIndex(where: { $0.id == requestID }) {
@@ -586,6 +621,21 @@ private struct RemoteTerminalUpdate: Encodable {
     private func forward(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
+        return try await exchange(peer, path: forwardedPath(request), method: request.method, body: request.body)
+    }
+    private func forwardStream(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
+        guard let target = request.parameter("node"), target != nodeID else { return nil }
+        guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
+        guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
+        let epoch = generation
+        let output = try RemotePTYPeerBodyStream(endpoint: peer.endpoint, path: forwardedPath(request), expectedNodeID: peer.id)
+        do {
+            try await output.open()
+            guard running, generation == epoch, !Task.isCancelled else { throw RemoteHTTPError(503, "웹 접속이 꺼졌습니다.") }
+            return .eventStream(output, nodeID: nodeID)
+        } catch { output.cancel(); throw error }
+    }
+    private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
         let components = request.components
         // Preserve form encoding while removing the gateway selector. Re-encoding
         // Foundation queryItems turns a literal '%2B' into '+', which means space.
@@ -594,7 +644,7 @@ private struct RemoteTerminalUpdate: Encodable {
             return String(key).replacingOccurrences(of: "+", with: " ").removingPercentEncoding != "node"
         } ?? []
         let query = items.isEmpty ? "" : "?" + items.joined(separator: "&")
-        return try await exchange(peer, path: components.percentEncodedPath + query, method: request.method, body: request.body)
+        return components.percentEncodedPath + query
     }
     private func asset(_ filename: String, type: String) throws -> RemoteHTTPResponse {
         // SPM's executable accessor looks beside the main bundle. Packaged apps and their
@@ -609,9 +659,11 @@ private struct RemoteTerminalUpdate: Encodable {
         return webAsset(try Data(contentsOf: file), filename: filename, type: type)
     }
     private func webAsset(_ data: Data, filename: String, type: String) -> RemoteHTTPResponse {
-        guard filename == "index.html", let webVersion, let html = String(data: data, encoding: .utf8) else { return RemoteHTTPResponse(body: data, contentType: type) }
-        let marked = html.replacingOccurrences(of: "__AUTOAPPROVE_WEB_VERSION__", with: "\(webVersion.version):\(webVersion.build):\(webVersion.api)")
-        return RemoteHTTPResponse(body: Data(marked.utf8), contentType: type)
+        guard filename == "index.html", var html = String(data: data, encoding: .utf8) else { return RemoteHTTPResponse(body: data, contentType: type) }
+        if let webVersion { html = html.replacingOccurrences(of: "__AUTOAPPROVE_WEB_VERSION__", with: "\(webVersion.version):\(webVersion.build):\(webVersion.api)") }
+        let nonce = UUID().uuidString
+        html = html.replacingOccurrences(of: "__AUTOAPPROVE_STYLE_NONCE__", with: nonce)
+        var response = RemoteHTTPResponse(body: Data(html.utf8), contentType: type); response.styleNonce = nonce; return response
     }
     private func save<T: Encodable>(_ value: T, to file: URL) throws {
         try JSONEncoder().encode(value).write(to: file, options: .atomic)

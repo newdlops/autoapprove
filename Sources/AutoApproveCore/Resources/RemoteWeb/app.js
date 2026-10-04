@@ -4,8 +4,8 @@ const text = (element, value) => { const next = String(value ?? ''); if (element
 const show = (element, visible) => { element.hidden = !visible; };
 const make = (tag, className, value) => { const element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) text(element, value); return element; };
 const uuid = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (Number(c) ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> Number(c) / 4).toString(16));
-const agents = { codex: 'Codex', claude: 'Claude Code' };
-const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
+const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
+const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
 let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter = 'all', latestFrame = null;
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
@@ -20,7 +20,114 @@ let directStreamID = null;
 let cursorLayoutPending = false;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
-const keyFor = (node, session) => `${node.id}/${session.id}`;
+const keyFor = (node, session, view) => `${node.id}/${view?.ptyID ? 'pty:' + view.ptyID : session.id}`;
+let ptyClient = null, continueItem = null, selectedOrigin = null;
+const ptyDrafts = new Map();
+const ptyTemporary = new Map(), ptyRetained = new Map(), ptyAttachments = new Map();
+const sessionEnded = item => item?.session.phase === 'ended' || item?.view.pty?.exitCode != null || item?.view.pty?.closed === true;
+function retainEndedPTY(item) {
+  item.session.phase = 'ended'; item.session.automatic = false;
+  item.session.detail = 'PTY가 종료되었습니다. 마지막 출력은 계속 볼 수 있습니다.';
+  item.view.phaseTitle = '종료'; item.view.canApprove = false;
+  ptyRetained.set(item.key, item); ptyTemporary.delete(item.key);
+  allSessions = allSessions.filter(row => row.key !== item.key);
+}
+const supportsPTYAttach = node => {
+  const version = versionNumbers(node.state?.release);
+  if (!version) return false;
+  const minimum = [0, 2, 41, 48];
+  for (let i = 0; i < minimum.length; i++) if (version[i] !== minimum[i]) return version[i] > minimum[i];
+  return true;
+};
+const canAttachPTY = item => !item.view.pty && supportsPTYAttach(item.node) && ['codex', 'claude'].includes(item.session.agent) && item.session.phase !== 'ended' && item.session.terminal !== 'claudeBackground';
+const selectedAttachment = () => !selectedItem?.view.pty && ptyAttachments.get(selectedItem?.key);
+function reconcilePTYInventory(inventory) {
+  inventory = inventory.filter(item => !sessionEnded(item) && !sessionEnded(ptyRetained.get(item.key)));
+  for (const [key, temporary] of ptyTemporary) {
+    if (sessionEnded(temporary)) { retainEndedPTY(temporary); continue; }
+    if (inventory.some(item => item.key === key)) { ptyTemporary.delete(key); continue; }
+    const node = nodes.find(node => node.id === temporary.node.id && node.online);
+    if (node) inventory.push({...temporary, node});
+  }
+  return inventory;
+}
+function descriptorItem(nodeID, descriptor, source, automatic = false) {
+  if (!descriptor || !descriptor.ptyID || !descriptor.streamID || typeof descriptor.cwd !== 'string' || !['shell','codex','claude'].includes(descriptor.program) || !Number.isInteger(descriptor.pid) || descriptor.pid < 1 || !Number.isInteger(descriptor.columns) || descriptor.columns < 20 || descriptor.columns > 240 || !Number.isInteger(descriptor.rows) || descriptor.rows < 5 || descriptor.rows > 100) throw new Error('PTY 연결 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
+  const node = nodes.find(node => node.id === nodeID) || source?.node;
+  if (!node) throw new Error('Mac 연결을 확인한 뒤 터미널을 다시 선택해주세요.');
+  const session = {id:'pty:' + descriptor.ptyID, agent:descriptor.program, pid:descriptor.pid, started:descriptor.streamID, tty:descriptor.tty, cwd:descriptor.cwd, terminal:'pty', hostName:'PTY', phase:descriptor.exitCode != null ? 'ended' : 'idle', automatic, detail:'화면을 눌러 직접 입력하세요.'};
+  const view = {session, title:source?.view.title || 'PTY · ' + descriptor.cwd.split('/').filter(Boolean).pop(), phaseTitle:descriptor.exitCode != null ? '종료' : '입력 대기', canApprove:false, canReveal:false, canRead:true, keys:[], ptyID:descriptor.ptyID, pty:descriptor};
+  const key = keyFor(node, session, view);
+  const existing = allSessions.find(item => item.key === key) || ptyRetained.get(key);
+  if (existing) {
+    if (descriptor.exitCode != null) { existing.view.pty = {...existing.view.pty, ...descriptor}; retainEndedPTY(existing); }
+    return existing;
+  }
+  const item = {node, session, view, key};
+  if (sessionEnded(item)) retainEndedPTY(item);
+  else { ptyTemporary.set(key, item); allSessions.push(item); }
+  return item;
+}
+function selectPTYDescriptor(nodeID, descriptor, source = null, automatic = false, focus = false) {
+  const item = descriptorItem(nodeID, descriptor, source, automatic);
+  const origin = source && {key:source.key, nodeID:source.node.id, sessionID:source.session.id};
+  selectSession(item.key, focus, false, origin);
+  // A slow peer inventory cannot hold up this already-created terminal.
+  void refreshNetwork();
+}
+function renderAttachmentState() {
+  const attachment = selectedAttachment();
+  if (!attachment) return;
+  if (attachment.state === 'pending') {
+    terminalState('pending', '터미널 연결 중…'); terminalPlaceholder('직접 입력 터미널에 연결하는 중…');
+    show($('terminal-error'), false); show($('terminal-retry'), false);
+  } else if (attachment.state === 'error') {
+    terminalState('error', '터미널 연결 확인 필요'); text($('terminal-error'), attachment.error);
+    text($('terminal-retry'), '터미널 연결 다시 시도'); show($('terminal-error'), true); show($('terminal-retry'), true);
+  }
+}
+async function attachPTY(item, focus = false, retry = false) {
+  if (!canAttachPTY(item) || ptyAttachments.get(item.key)?.state === 'pending' || !retry && ptyAttachments.get(item.key)?.state === 'error') return;
+  ptyAttachments.set(item.key, {state:'pending'}); stopDirect(); clearTimeout(frameTimer); frameController?.abort();
+  if (selectedItem?.key === item.key) { renderAttachmentState(); updateControls(); }
+  try {
+    const descriptor = await api(endpoint('/api/pty', item.node.id), {sessionID:item.session.id, reuse:true, automatic:!!item.session.automatic, columns:80, rows:24, requestID:uuid()});
+    const created = descriptorItem(item.node.id, descriptor, item, !!item.session.automatic);
+    ptyAttachments.delete(item.key);
+    if (selectedOrigin?.key === item.key && selectedItem?.key === item.key) selectSession(created.key, focus, false, selectedOrigin);
+    void refreshNetwork();
+  } catch (error) {
+    ptyAttachments.set(item.key, {state:'error', error:error.status === 404 ? '이 Mac에서 PTY를 지원하지 않습니다. AutoApprove 0.2.41 이상으로 업데이트해주세요.' : error.message});
+    if (selectedItem?.key === item.key) { renderAttachmentState(); updateControls(); void refreshFrame(); }
+  }
+}
+function stopPTY() {
+  if (!ptyClient) return;
+  const key = ptyClient.sessionKey, draft = ptyClient.dispose();
+  if (draft) ptyDrafts.set(key, (ptyDrafts.get(key) || '') + draft);
+  ptyClient = null;
+}
+function ptyReport(state, message, client) {
+  if (client !== ptyClient) return;
+  if (selectedItem?.view.pty) selectedItem.view.pty.exitCode = client.descriptor.exitCode;
+  if (state === 'ended') { retainEndedPTY(selectedItem); renderDetail(); renderList(); renderMachines(); }
+  terminalState(['error', 'blocked'].includes(state) ? 'error' : ['ended','waiting','readonly'].includes(state) ? 'pending' : 'live', message);
+  const error = ['error', 'blocked'].includes(state), readonly = state === 'readonly';
+  text($('terminal-error'), readonly ? '직접 입력과 실시간 출력은 이 Mac을 AutoApprove 0.2.41 (빌드 48) 이상으로 업데이트하면 사용할 수 있습니다.' : message);
+  show($('terminal-error'), error || readonly); text($('terminal-retry'), readonly ? '화면 새로고침' : '화면 다시 연결'); show($('terminal-retry'), error || readonly);
+  text($('terminal-time'), nowLabel(new Date()));
+  const draft = (ptyDrafts.get(selectedKey) || '') + (client.unsent || '');
+  show($('pty-unsent'), !!draft); $('pty-unsent-text').value = draft;
+  updateControls();
+}
+function ensurePTY() {
+  const item = selectedItem; if (!item?.view.pty || document.hidden) return;
+  const streaming = supportsPTYAttach(item.node);
+  if (ptyClient?.sessionKey === item.key && ptyClient.streaming === streaming) return;
+  stopPTY();
+  ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming);
+  ptyClient.sessionKey = item.key;
+}
 const currentNode = () => nodes.find(node => node.id === selectedItem?.node.id);
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const needsReview = session => ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
@@ -84,6 +191,7 @@ function setFontSize(value) {
   $('font-smaller').disabled = terminalFontSize === 12; $('font-larger').disabled = terminalFontSize === 20;
   try { localStorage.setItem('terminal-font-size', String(terminalFontSize)); } catch (_) {}
   scheduleCursor();
+  ptyClient?.font(terminalFontSize);
 }
 function scheduleCursor() {
   if (cursorLayoutPending) return;
@@ -184,7 +292,7 @@ async function api(path, body, signal) {
   try {
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.');
+    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status});
     return result;
   } catch (error) {
     if (error.name === 'AbortError') throw new Error('연결 응답이 늦습니다. 입력을 다시 보내기 전에 터미널 화면을 확인해주세요.');
@@ -299,7 +407,7 @@ async function refreshNetwork() {
   try {
     const result = await api('/api/network');
     connected = true; nodes = result.nodes;
-    allSessions = nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session) })) : []);
+    allSessions = reconcilePTYInventory(nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []));
     lastNetworkUpdate = result.updatedAt;
     text($('connection'), `${nodes.filter(node => node.online).length}대 연결 · ${nowLabel(lastNetworkUpdate)} 갱신`);
     show($('network-error'), false);
@@ -309,7 +417,14 @@ async function refreshNetwork() {
     if (selectedKey) {
       const current = allSessions.find(item => item.key === selectedKey);
       if (current) { selectedItem = current; renderDetail(); }
-      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; stopDirect(); terminalState('error', '세션 종료'); updateControls(); }
+      else if (selectedItem?.view.pty) {
+        // The active inventory drops closed processes before their final stream
+        // bytes necessarily arrive. Keep this xterm and its retained last screen.
+        const node = nodes.find(node => node.id === selectedItem.node.id);
+        if (node) selectedItem.node = node;
+        ptyRetained.set(selectedKey, selectedItem); renderDetail();
+      }
+      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; stopDirect(); stopPTY(); terminalState('error', '세션 종료'); updateControls(); }
       else restoreSelection();
     } else restoreSelection();
   } catch (error) {
@@ -317,7 +432,9 @@ async function refreshNetwork() {
     show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
     if (!nodes.length) text($('list-empty'), 'Mac에 연결하면 감지된 세션이 여기에 표시됩니다.');
-    latestFrame = null; stopDirect(); terminalState('error', '연결 끊김'); updateControls(); renderMachines();
+    latestFrame = null; stopDirect();
+    if (!selectedItem?.view.pty) terminalState('error', '연결 끊김');
+    updateControls(); renderMachines();
   } finally {
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
     if (!document.hidden) networkTimer = setTimeout(refreshNetwork, connected ? 2500 : 5000);
@@ -340,7 +457,8 @@ function renderMachines() {
     text(row.querySelector('.machine-name'), node.name + (node.local ? ' · 접속한 Mac' : ''));
     const status = row.querySelector('.machine-status');
     status.className = 'machine-status ' + (!node.online || !connected ? '' : node.state.snapshot.paused ? 'paused' : 'online');
-    text(status, !connected ? '연결 확인 필요' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${node.state.sessions.length}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
+    const activeCount = node.state?.sessions?.filter(view => !sessionEnded({session:view.session, view}) && !sessionEnded(ptyRetained.get(keyFor(node, view.session, view)))).length || 0;
+    text(status, !connected ? '연결 확인 필요' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
     status.title = node.error || '';
     const button = row.lastChild; text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
@@ -363,6 +481,7 @@ function renderList() {
     && (filter !== 'review' || needsReview(session)) && (filter !== 'automatic' || session.automatic)
     && [view.title, session.cwd, session.terminalTitle, session.customization?.note, session.gitBranch?.name, node.name, agents[session.agent]].filter(Boolean).join(' ').toLocaleLowerCase().includes(query));
   const visibleKeys = new Set(visible.map(item => item.key));
+  const highlighted = selectedOrigin && allSessions.some(row => row.key === selectedOrigin.key) ? selectedOrigin.key : selectedKey;
   for (const [key, row] of rows) if (!visibleKeys.has(key)) { row.remove(); rows.delete(key); }
   for (const [index, item] of visible.entries()) {
     let row = rows.get(item.key);
@@ -372,7 +491,7 @@ function renderList() {
       const state = make('span', 'row-state'); state.append(make('span', 'phase'), make('span', 'row-auto')); button.append(state); row.append(button);
       button.addEventListener('click', () => selectSession(item.key, true)); rows.set(item.key, row);
     }
-    const button = row.firstChild; button.setAttribute('aria-pressed', String(item.key === selectedKey));
+    const button = row.firstChild; button.setAttribute('aria-pressed', String(item.key === highlighted));
     const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
     text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
     text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
@@ -385,33 +504,49 @@ function renderList() {
   show($('list-empty'), !visible.length);
   text($('list-empty'), allSessions.length ? '검색이나 필터에 맞는 세션이 없습니다.' : nodes.some(node => node.online) ? '감지된 세션이 없습니다. Mac에서 Claude Code 또는 Codex를 실행하세요.' : '연결된 Mac이 없습니다. 네트워크와 웹 접속 설정을 확인해주세요.');
 }
-function selectSession(key, focus = false) {
-  const item = allSessions.find(item => item.key === key); if (!item) return;
-  if (selectedKey !== key) {
+function selectSession(key, focus = false, deliberate = focus, origin = null) {
+  const source = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!source) return;
+  // Revalidate every deliberate original-session selection: a CLI can change
+  // conversations without changing PID/TTY. Only the Mac can verify that ID.
+  const item = source;
+  if (!source.view.pty) origin = {key:source.key, nodeID:source.node.id, sessionID:source.session.id};
+  else if (!origin && selectedKey === item.key) origin = selectedOrigin;
+  selectedOrigin = origin;
+  if (selectedKey !== item.key) {
+    stopPTY();
     stopDirect(); inputFailure = ''; composing = false;
     if (selectedKey) drafts.set(selectedKey, $('terminal-input').value);
-    selectedKey = key; selectedItem = item; latestFrame = null; detailGeneration++;
+    selectedKey = item.key; selectedItem = item; latestFrame = null; detailGeneration++;
     frameController?.abort(); quietFrames = 0; fastFrameUntil = Date.now() + 5000;
     $('detail').scrollTop = 0;
-    $('terminal-input').value = drafts.get(key) || ''; composePreferred = !!$('terminal-input').value; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
+    $('terminal-input').value = drafts.get(item.key) || ''; composePreferred = !!$('terminal-input').value; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
     $('questions').replaceChildren(); $('history').replaceChildren();
     terminalPlaceholder('화면을 불러오는 중…'); terminalState('pending', '연결 중…'); text($('terminal-time'), '—'); show($('terminal-error'), false); show($('terminal-retry'), false);
   }
   document.body.classList.add('detail-open');
   if (window.innerWidth < 760) terminalFocus(true);
-  const hash = new URLSearchParams({ node: item.node.id, session: item.session.id });
+  const hash = new URLSearchParams({ node: item.node.id, session: selectedOrigin?.sessionID || item.session.id, ...(item.view.ptyID ? {pty: item.view.ptyID} : {}) });
   history.replaceState(null, '', `#${hash}`);
-  renderList(); renderDetail(); void refreshFrame();
+  renderList(); renderDetail();
+  if (deliberate && canAttachPTY(item) && selectedAttachment()?.state !== 'error') void attachPTY(item, focus);
+  else void refreshFrame();
   if (focus) { $(document.body.classList.contains('terminal-focus') ? 'terminal-heading' : 'session-title').focus({ preventScroll: true }); if (window.innerWidth < 760) window.scrollTo(0, 0); }
 }
 function restoreSelection() {
   const hash = new URLSearchParams(location.hash.slice(1));
-  const item = allSessions.find(item => item.node.id === hash.get('node') && item.session.id === hash.get('session'));
-  if (item) selectSession(item.key);
+  const item = allSessions.find(item => item.node.id === hash.get('node') && item.session.id === hash.get('session'))
+    || allSessions.find(item => item.node.id === hash.get('node') && hash.get('pty') && item.view.ptyID === hash.get('pty'))
+    || ptyRetained.get(hash.get('node') + '/pty:' + hash.get('pty'));
+  if (item) selectSession(item.key, false, true);
 }
 function renderDetail() {
   if (!selectedItem) return;
   const { node, session, view } = selectedItem;
+  const isPTY = !!view.pty;
+  show($('terminal-screen'), !isPTY); show($('pty-screen'), isPTY);
+  show($('pty-upgrade'), !isPTY && !supportsPTYAttach(node) && ['codex', 'claude'].includes(session.agent) && session.terminal !== 'claudeBackground'); show($('close-pty'), isPTY);
+  show($('pty-unsent'), isPTY && !!((ptyDrafts.get(selectedKey) || '') + (ptyClient?.unsent || '')));
+  document.querySelector('.terminal').dataset.mode = isPTY ? 'pty' : 'mirror';
   show($('detail-empty'), false); show($('detail-content'), true); show($('session-ended'), false);
   text($('session-meta'), `${node.name} · ${agents[session.agent]} · ${session.tty || 'TTY 없음'}`);
   text($('session-title'), view.title); text($('session-path'), session.cwd || '폴더 확인 중');
@@ -422,21 +557,43 @@ function renderDetail() {
   text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
   if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
   text($('input-help'), 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.');
-  if (!view.canRead) {
+  if (isPTY) { ensurePTY(); } else if (!view.canRead) {
     latestFrame = null; terminalPlaceholder(view.inputReason || '화면 연결이 없습니다.'); terminalState('error', '화면 연결 필요'); text($('terminal-time'), '—');
   }
-  renderQuestions(); renderHistory(); updateControls();
+  renderAttachmentState(); renderQuestions(); renderHistory(); updateControls();
 }
 function updateControls() {
   if (!selectedItem) return;
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
-  const enabled = connected && current?.online && sessionPresent && !mutation;
-  $('automatic').disabled = !enabled || (!selectedItem.view.canApprove && !selectedItem.session.automatic);
-  $('automatic').title = !selectedItem.view.canApprove ? 'Mac에서 이 세션의 승인 연결을 먼저 설정해주세요.' : '이 세션의 다음 지원 요청부터 적용합니다.';
+  const attaching = selectedAttachment()?.state === 'pending';
+  const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
+  const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation && !attaching;
+  const temporaryPTY = ptyTemporary.has(selectedKey);
+  $('automatic').disabled = !enabled || temporaryPTY || (!selectedItem.view.canApprove && !selectedItem.session.automatic);
+  $('automatic').title = temporaryPTY ? 'PTY에서 실행 중인 CLI를 확인하는 중입니다.' : !selectedItem.view.canApprove ? 'Mac에서 이 세션의 승인 연결을 먼저 설정해주세요.' : '이 세션의 다음 지원 요청부터 적용합니다.';
   $('reveal').disabled = !enabled || !selectedItem.view.canReveal;
+  $('new-pty').disabled = !connected || !nodes.some(node => node.online);
+  $('continue-pty').disabled = !enabled;
+  if (selectedItem.view.pty) {
+    const ready = enabled && ptyClient?.ready;
+    $('terminal-keyboard').disabled = true; show($('input-editor'), false); show($('compose-input-label'), false);
+    $('compose-input').disabled = true; $('compose-input').checked = false;
+    $('terminal-wrap').disabled = true;
+    $('terminal-colors').disabled = true; $('terminal-colors').checked = true;
+    text($('terminal-color-status'), 'PTY가 보낸 원본 ANSI 색상과 커서');
+    $('terminal-keyboard-toggle').disabled = !ready; $('terminal-keyboard-toggle').setAttribute('aria-pressed', String(ready && document.activeElement === ptyClient?.term.textarea));
+    $('terminal-keyboard-toggle').setAttribute('aria-label', 'PTY 터미널 키보드 열기');
+    $('send-input').disabled = !ready; text($('send-input'), 'Enter');
+    for (const button of $('input-form').querySelectorAll('button[data-key]')) { button.disabled = !ready; show(button, true); }
+    $('close-pty').disabled = !enabled || !!ptyClient?.ending || sessionEnded(selectedItem);
+    text($('direct-input-help'), selectedOrigin ? '원래 터미널 유지 · 이어받은 대화에 직접 입력합니다. Shift Tab으로 포커스를 나갑니다.' : '화면을 눌러 직접 입력합니다. Shift Tab으로 키보드 포커스를 나갑니다.');
+    $('direct-input-help').dataset.required = 'false'; text($('input-reason'), ''); $('input-reason').dataset.blocked = 'false'; text($('input-help'), '');
+    return;
+  }
+  $('terminal-wrap').disabled = false; show($('input-form').querySelector('[data-key="eof"]'), false);
   const reason = !connected || !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : latestFrame?.inputReason || selectedItem.view.inputReason;
   const fresh = latestFrame && Date.now() - new Date(latestFrame.observedAt).getTime() < 10000;
-  const base = connected && current?.online && sessionPresent && !reason;
+  const base = connected && current?.online && sessionPresent && !reason && !attaching;
   const inputEnabled = enabled && fresh && !reason;
   // Keep the active editor alive while its own request/refresh runs: disabling it closes mobile keyboards.
   $('terminal-input').disabled = !(base && (fresh || inputInFlight || directSending));
@@ -474,6 +631,8 @@ function updateControls() {
 }
 async function refreshFrame() {
   clearTimeout(frameTimer);
+  if (selectedItem?.view.pty) { ensurePTY(); return; }
+  if (selectedAttachment()?.state === 'pending') return;
   if (mutation) { frameTimer = setTimeout(refreshFrame, 100); return; }
   if (!selectedItem || !selectedItem.view.canRead || !connected || !currentNode()?.online || document.hidden) return;
   if (loadingFrame) { frameTimer = setTimeout(refreshFrame, 100); return; }
@@ -500,7 +659,7 @@ async function refreshFrame() {
     if (controller.signal.aborted || selectedKey !== key || detailGeneration !== generation) return;
     latestFrame = null; stopDirect(); text($('terminal-error'), error.message); show($('terminal-error'), true); show($('terminal-retry'), true); terminalState('error', '연결 끊김');
   } finally {
-    loadingFrame = false; frameController = null; updateControls();
+    loadingFrame = false; frameController = null; renderAttachmentState(); updateControls();
     clearTimeout(frameTimer);
     const active = Date.now() < fastFrameUntil || selectedItem?.session.phase === 'working' || quietFrames < 2;
     const interval = latestFrame ? directMode ? 150 : active ? 500 : Math.min(2000, 700 + quietFrames * 150) : 5000;
@@ -731,12 +890,13 @@ $('terminal-keyboard').addEventListener('paste', event => {
   if (!directMode || composing || !event.clipboardData) return;
   event.preventDefault(); $('terminal-keyboard').value = keyboardMarker + event.clipboardData.getData('text/plain'); captureDirectText(); updateControls();
 });
-$('input-form').addEventListener('submit', event => { event.preventDefault(); void submitInput(); });
+$('input-form').addEventListener('submit', event => { event.preventDefault(); if (ptyClient) ptyClient.key('enter'); else void submitInput(); });
 for (const button of $('input-form').querySelectorAll('button[data-key]')) button.addEventListener('click', () => {
+  if (ptyClient) { ptyClient.key(button.dataset.key); return; }
   if (!composeMode) { armDirect(); captureDirectText(); queueDirect(button.dataset.key); } else void sendInput(button.dataset.key);
 });
 for (const button of $('input-form').querySelectorAll('button')) button.addEventListener('pointerdown', event => {
-  if (['terminal-input', 'terminal-keyboard'].includes(document.activeElement?.id) && !document.activeElement.disabled) event.preventDefault();
+  if ((['terminal-input', 'terminal-keyboard'].includes(document.activeElement?.id) || document.activeElement === ptyClient?.term.textarea) && !document.activeElement.disabled) event.preventDefault();
 });
 $('compose-input').addEventListener('change', () => {
   const enabled = $('compose-input').checked; stopDirect(); composePreferred = enabled || !!$('terminal-input').value;
@@ -746,6 +906,7 @@ $('compose-input').addEventListener('change', () => {
   if (composeMode) $('terminal-input').focus({ preventScroll: true }); else focusKeyboard();
 });
 $('terminal-keyboard-toggle').addEventListener('click', () => {
+  if (ptyClient) { ptyClient.focus(); return; }
   if (document.activeElement === $('terminal-keyboard')) { $('terminal-keyboard').blur(); updateControls(); } else focusKeyboard();
 });
 let screenPointer;
@@ -776,7 +937,12 @@ new ResizeObserver(scheduleCursor).observe($('terminal-screen'));
 $('terminal-screen').addEventListener('scroll', scheduleCursor, { passive: true });
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && $('terminal-settings').open) { $('terminal-settings').open = false; $('terminal-settings').querySelector('summary').focus(); event.preventDefault(); } });
 document.addEventListener('click', event => { if ($('terminal-settings').open && !$('terminal-settings').contains(event.target)) $('terminal-settings').open = false; });
-$('terminal-retry').addEventListener('click', () => void refreshFrame());
+$('terminal-retry').addEventListener('click', () => {
+  text($('terminal-retry'), '화면 다시 연결');
+  if (selectedItem?.view.pty) { stopPTY(); ensurePTY(); }
+  else if (selectedAttachment()?.state === 'error' && canAttachPTY(selectedItem)) void attachPTY(selectedItem, false, true);
+  else void refreshFrame();
+});
 try { $('terminal-colors').checked = localStorage.getItem('terminal-colors') !== 'false'; } catch (_) {}
 document.querySelector('.terminal').dataset.colored = String($('terminal-colors').checked);
 $('terminal-colors').addEventListener('change', () => {
@@ -787,9 +953,10 @@ $('follow').addEventListener('change', () => { if ($('follow').checked) $('termi
 $('terminal-screen').addEventListener('scroll', () => { const pre = $('terminal-screen'); if (pre.scrollHeight - pre.scrollTop - pre.clientHeight > 40) $('follow').checked = false; show($('jump-latest'), !$('follow').checked); }, { passive: true });
 $('jump-latest').addEventListener('click', () => { $('follow').checked = true; $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; show($('jump-latest'), false); });
 $('back').addEventListener('click', () => {
+  stopPTY();
   stopDirect(); composing = false; terminalFocus(false);
-  drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.firstChild;
-  selectedKey = ''; selectedItem = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
+  drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedOrigin?.key || selectedKey)?.firstChild;
+  selectedKey = ''; selectedItem = null; selectedOrigin = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
   document.body.classList.remove('detail-open'); history.replaceState(null, '', location.pathname); show($('detail-content'), false); show($('detail-empty'), true); renderList(); previous?.focus();
 });
 $('refresh').addEventListener('click', () => { void refreshNetwork(); void refreshFrame(); });
@@ -804,9 +971,51 @@ $('add-form').addEventListener('submit', async event => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) { frameController?.abort(); stopDirect(); }
+  if (document.hidden) { frameController?.abort(); stopDirect(); stopPTY(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('hashchange', restoreSelection);
+function openPTYDialog(item = null) {
+  continueItem = item;
+  $('pty-node').replaceChildren(...nodes.filter(node => node.online).map(node => { const option = make('option', '', node.name); option.value = node.id; return option; }));
+  if (item) $('pty-node').value = item.node.id;
+  else if (selectedItem) $('pty-node').value = selectedItem.node.id;
+  $('pty-node').disabled = !!item; $('pty-directory').required = !item;
+  $('pty-directory').value = selectedItem?.session.cwd || '';
+  $('pty-automatic').checked = !!item?.session.automatic;
+  text($('pty-title'), item ? 'PTY에서 대화 이어가기' : '새 PTY 터미널');
+  text($('pty-description'), item ? '선택한 대화 내용을 이어받은 새 세션을 엽니다. 원래 터미널은 유지됩니다. 대화 ID를 확인하지 못하면 CLI의 대화 선택 화면이 열립니다.' : 'Mac에서 실행되는 터미널입니다. 화면을 눌러 바로 입력할 수 있습니다.');
+  text($('pty-context'), item ? `${agents[item.session.agent]} · ${item.session.cwd}` : '');
+  show($('pty-context'), !!item); show($('pty-new-options'), !item); show($('pty-error'), false);
+  text($('start-pty'), item ? '대화 이어가기' : '터미널 열기');
+  $('pty-dialog').showModal(); $('start-pty').focus();
+}
+$('new-pty').addEventListener('click', () => openPTYDialog());
+$('continue-pty').addEventListener('click', () => { if (canAttachPTY(selectedItem)) void attachPTY(selectedItem, false, true); else openPTYDialog(selectedItem); });
+$('close-pty-dialog').addEventListener('click', () => $('pty-dialog').close());
+$('pty-form').addEventListener('submit', async event => {
+  event.preventDefault(); const button = $('start-pty'); if (button.disabled) return;
+  const item = continueItem, nodeID = $('pty-node').value;
+  const payload = item ? {sessionID:item.session.id,reuse:true} : {cwd:$('pty-directory').value,program:$('pty-program').value};
+  button.disabled = true; text(button, item ? '대화 확인 중…' : '터미널 여는 중…'); show($('pty-error'), false);
+  try {
+    const result = await api(endpoint('/api/pty', nodeID), {...payload, automatic:$('pty-automatic').checked, columns:80, rows:24, requestID:uuid()});
+    $('pty-dialog').close();
+    selectPTYDescriptor(nodeID, result, item, $('pty-automatic').checked, true);
+  } catch (error) { text($('pty-error'), error.status === 404 ? '이 Mac에서 PTY를 지원하지 않습니다. AutoApprove 0.2.41 이상으로 업데이트해주세요.' : error.message); show($('pty-error'), true); }
+  finally { button.disabled = false; text(button, item ? '대화 이어가기' : '터미널 열기'); }
+});
+$('close-pty').addEventListener('click', async () => {
+  if (!ptyClient || $('close-pty').disabled) return;
+  if (!confirm('이 PTY에서 실행 중인 프로세스를 종료할까요? 브라우저만 닫으면 터미널은 계속 실행됩니다.')) return;
+  const client = ptyClient; client.ending = true; client.ready = false; client.term.options.disableStdin = true; updateControls();
+  try {
+    await client.post('/api/pty/close', {});
+    if (client === ptyClient) {
+      selectedItem.view.pty.closed = true; retainEndedPTY(selectedItem); renderDetail(); renderList(); renderMachines();
+      if (client.descriptor.exitCode == null) terminalState('pending', 'PTY 종료 중…');
+    }
+  } catch (error) { client.fail(error); }
+});
 resetKeyboard();
 void refreshNetwork();

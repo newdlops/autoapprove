@@ -1,3 +1,4 @@
+import { coreLinkArguments } from './swift-core-link.mjs';
 import { copyFile, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -7,7 +8,7 @@ await mkdir(path.join(app, 'Contents/MacOS'), { recursive: true });
 await mkdir(path.join(app, 'Contents/Resources'), { recursive: true });
 await copyFile('dist/AppIcon.icns', path.join(app, 'Contents/Resources/AppIcon.icns'));
 execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/AutomaticQuestionPreview'),
-  '-I', path.resolve('.build/debug/Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3',
+  '-I', path.resolve('.build/debug/Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(path.resolve('.build/debug')),
   ...(await readdir('.build/debug/AutoApproveCore.build')).filter(name => name.endsWith('.swift.o')).map(name => path.resolve('.build/debug/AutoApproveCore.build', name)),
   'Sources/AutoApproveApp/TerminalHighlighter.swift', 'Sources/AutoApproveApp/TerminalNavigator.swift',
   'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',

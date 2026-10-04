@@ -1,3 +1,4 @@
+import { coreLinkArguments } from './swift-core-link.mjs';
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -10,13 +11,16 @@ const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-network-'));
 const build = path.resolve('.build', process.argv.includes('--release') ? 'release' : 'debug');
 const binary = path.resolve('.build/qa/RemotePreview');
 await mkdir(path.dirname(binary), { recursive: true });
-execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/RemotePreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
+execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/RemotePreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build), ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
 const children = [];
 const probeServers = [];
 const extraProbeURLs = [];
 const directOnly = process.argv.includes('--direct-only');
+// These sessions have synthetic PIDs and screen adapters. Advertise a legacy
+// release when testing the mirror UI, so selection never starts a real CLI.
+const mirrorOnly = process.argv.includes('--mirror-only');
 async function start(label) {
-  const child = spawn(binary, [path.join(root, label), label, ...(directOnly ? ['--direct-only'] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }); children.push(child);
+  const child = spawn(binary, [path.join(root, label), label, ...(directOnly ? ['--direct-only'] : []), ...(mirrorOnly ? ['--web-version=0.2.40:46'] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }); children.push(child);
   let buffer = '', errors = '';
   child.stderr.on('data', data => { errors += data; });
   return await new Promise((resolve, reject) => {

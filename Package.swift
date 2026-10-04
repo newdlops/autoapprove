@@ -12,7 +12,8 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CSQLite"),
-        .target(name: "AutoApproveCore", dependencies: ["CSQLite"], resources: [.copy("Resources/RemoteWeb")]),
+        .target(name: "CPTY", exclude: ["vendor/libvterm/LICENSE", "vendor/libvterm/UPSTREAM.md"], cSettings: [.headerSearchPath("vendor/libvterm/include"), .headerSearchPath("vendor/libvterm/src")]),
+        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY"], resources: [.copy("Resources/RemoteWeb")]),
         .executableTarget(name: "AutoApproveApp", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveCLI", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveChecks", dependencies: ["AutoApproveCore"], path: "Tests/AutoApproveCoreTests", swiftSettings: [.unsafeFlags(["-parse-as-library"])])

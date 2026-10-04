@@ -82,6 +82,9 @@ public struct ScreenHostAdapter: Sendable {
                 reveal: { try OrcaAdapter.reveal(target: $0); return nil },
                 resume: { try OrcaAdapter.resume(target: $0, region: $1, text: $2) },
                 input: { try RemoteTerminalAdapter.input(host: .orca, target: $0, expected: $1, agent: $2, input: $3) })
+        case .pty:
+            // An engine installs its own manager here. No global PTYs or slave writes.
+            return ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
         }
     }
 }

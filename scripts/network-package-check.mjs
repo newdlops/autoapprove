@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:net';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 
 // macOS Unix-domain sockets have a short path limit.
 const root = await mkdtemp('/private/tmp/aa-web-');
@@ -24,7 +25,7 @@ async function reserveDefaultPort() {
 }
 async function start() {
   stderr = '';
-  child = spawn(path.join(app, 'Contents/MacOS/autoapprove'), ['serve', '--home', home], { stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(path.join(app, 'Contents/MacOS/autoapprove'), ['serve', '--home', home], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: home, ZDOTDIR: home } });
   child.stdout.resume(); child.stderr.on('data', data => { stderr += data; });
 }
 async function stop() {
@@ -70,6 +71,24 @@ try {
   assert.deepEqual(first.release, versionMarker, 'Relocated helper must read its bundled version, not the build machine resources');
   assert.deepEqual((await (await fetch(url + '/api/discovery')).json()).release, versionMarker);
   assert.ok(first.sessions.every(view => !view.session.automatic), 'Isolated profile must never enable existing sessions');
+  for (const resource of ['/pty.js', '/vendor/xterm.js', '/vendor/xterm-fit.js', '/vendor/xterm.css']) {
+    const response = await fetch(url + resource);
+    assert.equal(response.status, 200, 'Packaged PTY resource: ' + resource);
+    assert.ok((await response.text()).length > 100);
+  }
+  async function ptyPost(route, body) {
+    const response = await fetch(url + route, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({requestID:randomUUID(), ...body}), signal: AbortSignal.timeout(5000) });
+    const value = await response.json(); assert.equal(response.status, 200, value.error); return value;
+  }
+  const pty = await ptyPost('/api/pty', {cwd:home,program:'shell',columns:80,rows:24}), clientID = randomUUID();
+  await ptyPost('/api/pty/input', {ptyID:pty.ptyID,streamID:pty.streamID,clientID,sequence:1,data:Buffer.from("printf 'PACKAGED-PTY-OK\\n'\r").toString('base64')});
+  let ptyText = '', offset;
+  for (let attempt = 0; attempt < 20 && !/PACKAGED-PTY-OK\r?\n/.test(ptyText); attempt++) {
+    const response = await fetch(url + '/api/pty/output?' + new URLSearchParams({pty:pty.ptyID,stream:pty.streamID,...(offset == null ? {} : {offset:String(offset)})}), {signal:AbortSignal.timeout(5000)});
+    assert.equal(response.status,200); const value = await response.json(); offset = value.offset; ptyText += Buffer.from(value.data,'base64').toString();
+  }
+  assert.match(ptyText,/PACKAGED-PTY-OK\r?\n/, 'The relocated signed helper must create a controlling PTY');
+  await ptyPost('/api/pty/close',{ptyID:pty.ptyID,streamID:pty.streamID});
   await stop();
   assert.equal(execFileSync('/usr/bin/sqlite3', [path.join(home, 'state.sqlite'), "SELECT value FROM settings WHERE key = 'webPort'"], { encoding: 'utf8' }).trim(), String(port), 'Actual port must be saved as the restart preference');
   await writeFile(cssPath, originalCSS);
@@ -87,7 +106,7 @@ try {
   await assert.rejects(fetch(url + '/api/state', { signal: AbortSignal.timeout(1500) }));
   await stop(); await start();
   assert.equal((await status(value => !value.enabled)).ready, false);
-  console.log('PASS: relocated packaged resources/signature, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
+  console.log('PASS: relocated packaged resources/signature, real packaged PTY and local xterm assets, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
 } finally {
   await stop();
   if (preferredPortBlocker.listening) await new Promise(resolve => preferredPortBlocker.close(resolve));

@@ -1,3 +1,4 @@
+import { coreLinkArguments } from './swift-core-link.mjs';
 // Real Swift HTTP servers and Chromium, isolated profiles and synthetic terminals only.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
@@ -11,7 +12,7 @@ const { chromium } = await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE || '
 const build = path.resolve('.build', process.argv.includes('--release') ? 'release' : 'debug');
 const binary = path.resolve('.build/qa/WebVersionPreview');
 await mkdir(path.dirname(binary), { recursive: true });
-execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/WebVersionPreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
+execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/WebVersionPreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build), ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
 const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-web-version-'));
 const output = path.resolve('dist/qa/web-version'); await mkdir(output, { recursive: true });
 const children = [], probes = [], checks = [], errors = [], views = [];

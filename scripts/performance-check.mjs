@@ -1,3 +1,4 @@
+import { coreLinkArguments } from './swift-core-link.mjs';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -9,7 +10,7 @@ const build = path.resolve('.build/release');
 const output = path.resolve('.runtime/performance-check');
 await mkdir(output, { recursive: true });
 execFileSync('/usr/bin/xcrun', ['swiftc', '-O', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/PerformanceCheck'),
-  '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3',
+  '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build),
   ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)),
   'Tests/fixtures/performance-check.swift', '-o', path.join(output, 'check')], { stdio: 'inherit' });
 const home = await mkdtemp('/private/tmp/aa-perf-');

@@ -40,7 +40,7 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === '/api/action') return json(200, { message: '검증용 변경' });
     const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-    if (!['index.html','app.js','app.css','favicon.svg'].includes(name)) { res.writeHead(404); return res.end(); }
+    if (!['index.html','app.js','app.css','pty.js','vendor/xterm.js','vendor/xterm-fit.js','vendor/xterm.css','favicon.svg'].includes(name)) { res.writeHead(404); return res.end(); }
     const data = await readFile(path.resolve('Sources/AutoApproveCore/Resources/RemoteWeb', name));
     res.writeHead(200, { 'Content-Type': name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : name.endsWith('.svg') ? 'image/svg+xml' : 'text/html', 'Cache-Control': 'no-store' }); res.end(data);
   } catch (error) { json(500, { error: error.message }); }

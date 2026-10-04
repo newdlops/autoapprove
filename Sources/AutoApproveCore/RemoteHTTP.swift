@@ -117,11 +117,14 @@ public enum RemoteNetworkAddress {
     }
 }
 
-public struct RemoteHTTPResponse {
+public struct RemoteHTTPResponse: Sendable {
     public var status: Int
     public var body: Data
     public var contentType: String
     public var location: String?
+    public var styleNonce: String?
+    var stream: RemoteHTTPBodyStream?
+    var nodeID: String?
     public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8", location: String? = nil) {
         self.status = status; self.body = body; self.contentType = contentType; self.location = location
     }
@@ -136,50 +139,143 @@ public struct RemoteHTTPResponse {
         let status = (error as? RemoteHTTPError)?.status ?? 409
         return (try? object(["error": error.localizedDescription], status: status)) ?? Self(status: 500, body: Data())
     }
+    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String) -> Self {
+        var response = Self(body: Data(), contentType: "text/event-stream; charset=utf-8")
+        response.stream = stream; response.nodeID = nodeID; return response
+    }
     var wire: Data {
         let reason = status == 200 ? "OK" : status == 302 ? "Found" : "Error"
         let redirect = location.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "Location: \($0)\r\n" } ?? ""
-        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
-        return Data(headers.utf8) + body
+        let style = styleNonce.flatMap { value in value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) ? " 'nonce-\(value)'" : nil } ?? ""
+        let length = stream == nil ? "Content-Length: \(body.count)\r\n" : ""
+        let identity = nodeID.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "X-AutoApprove-Node: \($0)\r\n" } ?? ""
+        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
+        return Data(headers.utf8) + (stream == nil ? body : Data())
     }
 }
 
-// Buffer and completion state are confined to the listener's serial queue.
+// Connection state is confined to the listener's serial queue. Streams have
+// one pending source read and one network send, with no unbounded byte queue.
 final class RemoteHTTPConnection: @unchecked Sendable {
     let connection: NWConnection
     var buffer = Data()
     var complete = false
+    private var closed = false
     let handler: @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse
     let onClose: () -> Void
     private let queue: DispatchQueue
+    private var handlerTask: Task<Void, Never>?
+    private var deadline: DispatchWorkItem?
+    private var heartbeat: DispatchSourceTimer?
+    private var stream: RemoteHTTPBodyStream?
+    private var nextPending = false
+    private var pendingResult: Result<Data?, Error>?
+    private var sending = false
     init(_ connection: NWConnection, queue: DispatchQueue, handler: @escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse, onClose: @escaping () -> Void) {
         self.connection = connection; self.queue = queue; self.handler = handler; self.onClose = onClose
     }
     func start() {
-        connection.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + 30) { [weak self] in self?.close() }
-        receive()
+        queue.async {
+            guard !self.closed else { return }
+            self.connection.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .failed, .cancelled: self?.closeNow()
+                default: break
+                }
+            }
+            let deadline = DispatchWorkItem { [weak self] in self?.closeNow() }
+            self.deadline = deadline
+            self.queue.asyncAfter(deadline: .now() + 30, execute: deadline)
+            self.connection.start(queue: self.queue); self.receive()
+        }
     }
     private func receive() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] data, _, ended, error in
-            guard let self, !self.complete else { return }
+            guard let self, !self.complete, !self.closed else { return }
             if let data { self.buffer.append(data) }
             do {
                 if let request = try RemoteHTTPRequest.parse(self.buffer) {
                     self.complete = true
-                    Task { @MainActor in
+                    self.buffer = Data(); self.monitorDisconnect()
+                    self.handlerTask = Task { @MainActor in
                         let response = await self.handler(request)
-                        self.connection.send(content: response.wire, completion: .contentProcessed { _ in self.close() })
+                        self.queue.async {
+                            self.handlerTask = nil
+                            guard !self.closed else { response.stream?.cancel(); return }
+                            if let stream = response.stream {
+                                self.stream = stream
+                                // The generic request deadline ends after a successful
+                                // SSE handshake; an idle terminal remains connected.
+                                self.deadline?.cancel(); self.deadline = nil
+                                if stream.needsHeartbeat {
+                                    let heartbeat = DispatchSource.makeTimerSource(queue: self.queue)
+                                    self.heartbeat = heartbeat
+                                    heartbeat.setEventHandler { [weak self] in
+                                        guard let self, !self.closed, self.stream != nil, !self.sending,
+                                              self.pendingResult == nil else { return }
+                                        self.send(Data(": keepalive\n\n".utf8))
+                                    }
+                                    heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
+                                }
+                                self.send(response.wire)
+                            } else { self.send(response.wire, final: true) }
+                        }
                     }
-                } else if ended || error != nil { self.close() }
+                } else if ended || error != nil { self.closeNow() }
                 else { self.receive() }
             } catch {
                 self.complete = true
-                self.connection.send(content: RemoteHTTPResponse.error(error).wire, completion: .contentProcessed { _ in self.close() })
+                self.send(RemoteHTTPResponse.error(error).wire, final: true)
             }
         }
     }
-    func close() { connection.cancel(); onClose() }
+    private func monitorDisconnect() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self] data, _, ended, error in
+            guard let self, !self.closed else { return }
+            if ended || error != nil || data?.isEmpty == false { self.closeNow() }
+            else { self.monitorDisconnect() }
+        }
+    }
+    private func send(_ data: Data, final: Bool = false) {
+        guard !closed else { return }; sending = true
+        connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.closed else { return }; self.sending = false
+                if error != nil || final { self.closeNow() } else { self.pumpStream() }
+            }
+        })
+    }
+    private func pumpStream() {
+        guard !closed, !sending, let stream else { return }
+        if let result = pendingResult {
+            pendingResult = nil
+            switch result {
+            case .success(let data):
+                if let data { send(data) } else { closeNow() }
+            case .failure(let error):
+                stream.cancel(); self.stream = nil
+                send(RemoteServerEvent.failure(error), final: true)
+            }
+            return
+        }
+        guard !nextPending else { return }; nextPending = true
+        stream.next { [weak self] result in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.closed else { return }
+                self.nextPending = false; self.pendingResult = result; self.pumpStream()
+            }
+        }
+    }
+    func close() { queue.async { self.closeNow() } }
+    private func closeNow() {
+        guard !closed else { return }; closed = true
+        deadline?.cancel(); deadline = nil; heartbeat?.cancel(); heartbeat = nil
+        handlerTask?.cancel(); handlerTask = nil
+        stream?.cancel(); stream = nil; pendingResult = nil
+        connection.stateUpdateHandler = nil; connection.cancel(); onClose()
+    }
 }
 
 /// Peer requests use resolved Bonjour endpoints directly, so the phone needs only its chosen Mac.

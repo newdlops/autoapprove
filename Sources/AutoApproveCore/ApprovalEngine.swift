@@ -6,6 +6,9 @@ import Combine
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     public private(set) var webService: RemoteNetworkService?
+    public let managedPTY: ManagedPTYManager
+    private var ptyAutomatic: [String: Bool] = [:]
+    private var ptyLifecycleObservers: [String: (terminal: ManagedPTY, token: UUID)] = [:]
     private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil }
     private struct RemoteScreenRead {
         var token: UUID
@@ -18,6 +21,10 @@ import Combine
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
     private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String)] = [:]
     private var remoteInputSessions = Set<String>()
+    private var remotePTYInput = Set<String>()
+    private var ptySessionBindings: [String: String] = [:]
+    private var ptyContinuations: [String: (source: String, conversation: String?, ptyID: String)] = [:]
+    private var ptyContinuationTasks: [String: Task<ManagedPTYDescriptor, Error>] = [:]
     private var automaticInputSessions = Set<String>()
     private var remoteInputUntil: [String: Date] = [:]
     private var remoteStreams: [String: (generation: String, token: String)] = [:]
@@ -143,12 +150,14 @@ import Combine
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live) throws {
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager()) throws {
         self.paths = paths
+        self.managedPTY = managedPTY
         self.powerControl = powerControl
         keepAwakeSwitch = KeepAwakeSwitch(control: powerControl, marker: paths.directory.appendingPathComponent("keep-awake.hold").path)
         var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0)) })
         adapters[.terminal]?.screens = { targets in try terminalReader(targets.map(\.tty)) }
+        adapters[.pty] = managedPTY.adapter
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
         self.questionTransport = questionTransport
         self.claudeRegistryReader = claudeRegistryReader
@@ -171,7 +180,7 @@ import Combine
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
         // Restore only a connection the user explicitly enabled from the app.
         for host in ScreenHost.allCases {
-            let enabled = store.value(Self.enabledKey(host)) == "true"
+            let enabled = host == .pty || store.value(Self.enabledKey(host)) == "true"
             screenConnections[host] = ScreenConnection(enabled: enabled)
             var health = snapshot.health.screen(host)
             health.requested = enabled
@@ -232,6 +241,11 @@ import Combine
     }
     public func stop() {
         remoteInputStopped = true
+        for pending in ptyContinuationTasks.values { pending.cancel() }
+        ptyContinuationTasks.removeAll()
+        for observer in ptyLifecycleObservers.values { observer.terminal.removeOutputObserver(observer.token) }
+        ptyLifecycleObservers.removeAll()
+        managedPTY.stop()
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
         keepAwakeTask?.cancel(); keepAwakeTask = nil
@@ -272,13 +286,179 @@ import Combine
     }
 
     public func remoteSessionViews() -> [RemoteSessionView] {
-        snapshot.sessions.filter { $0.phase != .ended }.map { session in
+        snapshot.sessions.filter { $0.phase != .ended }.compactMap { session -> RemoteSessionView? in
             let canRead = remoteCanRead(session)
+            let ptyID = session.id.hasPrefix("pty:") ? String(session.id.dropFirst(4)) : ptySessionBindings[session.id]
+            let terminal = ptyID.flatMap { try? managedPTY.terminal($0) }
+            if let terminal, !terminal.isRunning { return nil }
+            let pty = terminal?.descriptor
             return RemoteSessionView(session: session,
                 title: session.customization?.title.isEmpty == false ? session.customization!.title : session.terminalTitle ?? session.project,
                 phaseTitle: session.phaseTitle, canApprove: session.canApprove, canReveal: session.canReveal,
-                canRead: canRead, inputReason: remoteInputReason(session), keys: canRead ? remoteKeys(session) : [])
+                canRead: canRead, inputReason: remoteInputReason(session), keys: canRead ? remoteKeys(session) : [],
+                ptyID: pty?.ptyID, pty: pty)
         }
+    }
+    private func synchronizePTYContainers() {
+        let inventory = managedPTY.inventory
+        let activePTYs = Set(sessions.values.filter { $0.agent != .shell && $0.phase != .ended }.compactMap { ptySessionBindings[$0.id] })
+        for terminal in inventory {
+            let id = "pty:" + terminal.ptyID
+            let running = (try? managedPTY.terminal(terminal.ptyID).isRunning) == true
+            if running, activePTYs.contains(terminal.ptyID) { sessions.removeValue(forKey: id); continue }
+            var session = AgentSession(id: id, agent: .shell, pid: terminal.pid, started: terminal.streamID, tty: terminal.tty, cwd: terminal.cwd, terminal: .pty)
+            session.terminalTitle = "PTY · " + URL(fileURLWithPath: terminal.cwd).lastPathComponent
+            session.channel = running ? .ptyScreen : .none
+            session.phase = running ? .idle : .ended
+            session.detail = terminal.exitCode.map { "PTY 종료 · 종료 코드 \($0). 마지막 출력은 계속 볼 수 있습니다." } ?? "PTY 화면을 눌러 직접 입력하세요. Codex·Claude를 실행하면 자동 승인도 사용할 수 있습니다."
+            sessions[id] = session
+        }
+        let keep = Set(inventory.map { "pty:" + $0.ptyID })
+        for id in Array(sessions.keys) where id.hasPrefix("pty:") && !keep.contains(id) { sessions.removeValue(forKey: id) }
+    }
+    public func createPTY(_ object: JSONObject) async throws -> ManagedPTYDescriptor {
+        guard !remoteInputStopped else { throw RemoteHTTPError(503, "앱이 종료 중입니다.") }
+        guard let id = object["sessionID"] as? String, object["reuse"] as? Bool == true else {
+            return try await spawnPTY(object)
+        }
+        let supplied = object["conversationID"] as? String
+        if let supplied, UUID(uuidString: supplied) == nil { throw RemoteHTTPError(400, "올바른 대화 ID를 입력해주세요.") }
+        guard let session = sessions[id], session.phase != .ended else {
+            if let saved = ptyContinuations[id], supplied == nil || UUID(uuidString: supplied!)?.uuidString == saved.conversation {
+                guard let terminal = try? managedPTY.terminal(saved.ptyID) else { throw RemoteHTTPError(410, "이 PTY는 종료됐습니다. 새 터미널을 열어 대화를 다시 선택해주세요.") }
+                return terminal.descriptor
+            }
+            throw RemoteHTTPError(409, "이어갈 CLI 세션을 다시 선택해주세요.")
+        }
+        if supplied == nil, let owned = ptySessionBindings[id], let terminal = try? managedPTY.terminal(owned) { return terminal.descriptor }
+        let reader = processReader
+        let live = try await Task.detached { try reader() }.value
+        guard live.contains(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/" + $0.tty == session.tty }) else { throw RemoteHTTPError(409, "원래 CLI 세션이 바뀌었습니다. 목록을 새로고침해주세요.") }
+        // /new and /resume can change the conversation without changing the PID.
+        // Resolve the live provider identity before reusing a previous fork.
+        let observed: String?
+        if let supplied { observed = supplied } else { observed = await currentPTYConversation(session, records: live) }
+        if let observed, UUID(uuidString: observed) == nil { throw RemoteHTTPError(400, "올바른 대화 ID를 입력해주세요.") }
+        let conversation = observed.flatMap { UUID(uuidString: $0)?.uuidString }
+        let source = "\(session.id)|\(session.pid)|\(session.started)|\(session.tty)|\(session.agent.rawValue)|\(session.cwd)|\(conversation ?? "picker")"
+        if let saved = ptyContinuations[id], source == saved.source {
+            guard let terminal = try? managedPTY.terminal(saved.ptyID) else { throw RemoteHTTPError(410, "이 PTY는 종료됐습니다. 새 터미널을 열어 대화를 다시 선택해주세요.") }
+            return terminal.descriptor
+        }
+        if let pending = ptyContinuationTasks[source] { return try await pending.value }
+        var verified = object
+        if let observed { verified["conversationID"] = observed }
+        let request = verified
+        let pending = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { throw CancellationError() }
+            return try await self.spawnPTY(request)
+        }
+        ptyContinuationTasks[source] = pending
+        defer { ptyContinuationTasks.removeValue(forKey: source) }
+        let terminal = try await pending.value
+        // Remember that a continuation ended even after its bounded screen is
+        // evicted. Selecting the same source must not silently fork again.
+        ptyContinuations = ptyContinuations.filter { sessions[$0.key] != nil }
+        ptyContinuations[id] = (source, conversation, terminal.ptyID)
+        return terminal
+    }
+    private func currentPTYConversation(_ session: AgentSession, records: [ProcessRecord]) async -> String? {
+        if session.agent == .codex {
+            let pid = session.pid
+            return try? await Task.detached {
+                let files = try CommandRunner.run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-Fpn"], timeout: 5)
+                return try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[pid] ?? []).threadID
+            }.value
+        }
+        let registryReader = claudeRegistryReader, key = session.id
+        let registrations = await Task.detached { registryReader(records).filter { $0.processID == key } }.value
+        return registrations.count == 1 ? registrations.first?.activity?.providerID : nil
+    }
+    private func spawnPTY(_ object: JSONObject) async throws -> ManagedPTYDescriptor {
+        guard !remoteInputStopped else { throw RemoteHTTPError(503, "앱이 종료 중입니다.") }
+        var cwd = object["cwd"] as? String ?? NSHomeDirectory()
+        var program = object["program"] as? String ?? "shell"
+        var command: [String]?
+        if let id = object["sessionID"] as? String {
+            guard let session = sessions[id], session.phase != .ended, session.agent != .shell else { throw RemoteHTTPError(409, "이어갈 CLI 세션을 다시 선택해주세요.") }
+            let reader = processReader
+            let live = try await Task.detached { try reader() }.value
+            guard let record = live.first(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/" + $0.tty == session.tty }) else { throw RemoteHTTPError(409, "원래 CLI 세션이 바뀌었습니다. 목록을 새로고침해주세요.") }
+            cwd = session.cwd; program = session.agent.rawValue
+            let supplied = object["conversationID"] as? String
+            var conversation = supplied ?? (session.agent == .codex ? questionThreadBySession[id] : session.providerID)
+            if supplied == nil { conversation = await currentPTYConversation(session, records: live) }
+            if let conversation, UUID(uuidString: conversation) == nil { throw RemoteHTTPError(400, "올바른 대화 ID를 입력해주세요.") }
+            let fresh = try await Task.detached { try reader() }.value
+            guard !remoteInputStopped, fresh.contains(where: { $0.key == record.key && $0.agent == session.agent && "/dev/" + $0.tty == session.tty }), sessions[id]?.pid == session.pid else { throw RemoteHTTPError(409, "원래 CLI가 종료되었거나 바뀌었습니다.") }
+            // Fork the recorded conversation, preserving the original running TUI.
+            // Without an exact ID, open the provider's picker; never choose --last.
+            command = session.agent == .codex ? [record.executable, "fork"] + (conversation.map { [$0] } ?? [])
+                : [record.executable, "--resume"] + (conversation.map { [$0] } ?? []) + ["--fork-session"]
+        }
+        try Task.checkCancellation()
+        let terminal = try managedPTY.create(cwd: cwd, program: program, command: command, columns: object["columns"] as? Int ?? 80, rows: object["rows"] as? Int ?? 24)
+        ptyAutomatic[terminal.ptyID] = object["automatic"] as? Bool == true
+        let owned = try managedPTY.terminal(terminal.ptyID), id = terminal.ptyID
+        let observer = owned.observeOutput { [weak self, weak owned] in
+            guard owned?.isRunning == false else { return }
+            Task { @MainActor [weak self] in
+                guard let self, !self.remoteInputStopped, self.ptyLifecycleObservers[id] != nil else { return }
+                self.finishPTY(id)
+            }
+        }
+        ptyLifecycleObservers[id] = (owned, observer)
+        if !owned.isRunning { finishPTY(id) }
+        synchronizePTYContainers(); publish()
+        Task { [weak self] in await self?.refresh() }
+        return terminal
+    }
+    public func ptyInput(_ object: JSONObject) async throws -> JSONObject {
+        guard !remoteInputStopped, let id = object["ptyID"] as? String, let stream = object["streamID"] as? String,
+              let client = object["clientID"] as? String, let sequence = object["sequence"] as? Int,
+              let encoded = object["data"] as? String, let data = Data(base64Encoded: encoded) else { throw RemoteHTTPError(400, "PTY 연결과 입력 바이트를 지정해주세요.") }
+        let terminal = try managedPTY.terminal(id)
+        let members = sessions.values.filter { $0.tty == terminal.descriptor.tty && $0.phase != .ended }.map(\.id)
+        guard !remotePTYInput.contains(id), !members.contains(where: { remoteInputSessions.contains($0) }) else { throw RemoteHTTPError(409, "다른 PTY 입력이 진행 중입니다. 화면을 확인해주세요.") }
+        remotePTYInput.insert(id)
+        for member in members { remoteInputSessions.insert(member); screens[member]?.scheduledID = nil }
+        defer {
+            remotePTYInput.remove(id)
+            for member in members { remoteInputSessions.remove(member); remoteInputUntil[member] = Date().addingTimeInterval(0.8) }
+            Task { [weak self] in try? await Task.sleep(nanoseconds: 810_000_000); await self?.refreshScreenHost(.pty) }
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while members.contains(where: automaticInputBusy), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard !remoteInputStopped, !members.contains(where: automaticInputBusy) else { throw RemoteHTTPError(409, "진행 중인 승인 입력이 끝나지 않았습니다. 화면을 확인해주세요.") }
+        try await Task.detached { try terminal.input(data, streamID: stream, client: client, sequence: sequence) }.value
+        return ["accepted": true, "sequence": sequence]
+    }
+    public func ptyResize(_ object: JSONObject) throws -> JSONObject {
+        guard !remoteInputStopped, let id = object["ptyID"] as? String, let stream = object["streamID"] as? String,
+              let client = object["clientID"] as? String, let columns = object["columns"] as? Int, let rows = object["rows"] as? Int else { throw RemoteHTTPError(400, "PTY 연결과 화면 크기를 지정해주세요.") }
+        let terminal = try managedPTY.terminal(id)
+        try terminal.resize(columns: columns, rows: rows, streamID: stream, client: client)
+        for member in sessions.values where member.tty == terminal.descriptor.tty { screens[member.id]?.scheduledID = nil; remoteInputUntil[member.id] = Date().addingTimeInterval(0.8) }
+        return ["accepted": true]
+    }
+    public func ptyClose(_ object: JSONObject) throws -> JSONObject {
+        guard let id = object["ptyID"] as? String, let stream = object["streamID"] as? String else { throw RemoteHTTPError(400, "종료할 PTY 연결을 지정해주세요.") }
+        let terminal = try managedPTY.terminal(id)
+        guard terminal.descriptor.streamID == stream else { throw RemoteHTTPError(409, "PTY 연결이 바뀌었습니다.") }
+        terminal.close()
+        finishPTY(id)
+        return ["accepted": true]
+    }
+    private func finishPTY(_ id: String) {
+        if let observer = ptyLifecycleObservers.removeValue(forKey: id) { observer.terminal.removeOutputObserver(observer.token) }
+        for key in ptySessionBindings.keys where ptySessionBindings[key] == id {
+            sessions[key]?.setPhase(.ended, detail: "PTY가 종료되었습니다.")
+            sessions[key]?.channel = .none; sessions[key]?.automatic = false
+            sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
+            clearScreen(key); capacityStates.removeValue(forKey: key)
+        }
+        ptyAutomatic[id] = false
+        synchronizePTYContainers(); publish()
     }
     private func remoteCanRead(_ session: AgentSession) -> Bool {
         guard session.phase != .ended else { return false }
@@ -1070,8 +1250,23 @@ import Combine
     public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil) {
         self.records = records
         // Ordinary terminals do not belong in the inventory or its status counts.
-        let managed = found.filter { $0.agent == .claude || $0.agent == .codex }
+        let managed = found.filter { value in
+            guard value.agent == .claude || value.agent == .codex else { return false }
+            // A discovery read started before close may finish after it. Keep
+            // the exact binding while the final screen is retained so that
+            // stale records cannot revive that terminated CLI.
+            if let id = ptySessionBindings[value.id], let terminal = try? managedPTY.terminal(id), !terminal.isRunning { return false }
+            return true
+        }.map { value -> AgentSession in
+            var session = value
+            if let owned = managedPTY.owned(tty: session.tty) {
+                session.terminal = .pty; session.hostName = "PTY"; session.hostBundleID = "local.autoapprove.mac"
+                ptySessionBindings[session.id] = owned.descriptor.ptyID
+            } else { ptySessionBindings.removeValue(forKey: session.id) }
+            return session
+        }
         let live = Set(managed.map(\.id))
+        ptySessionBindings = ptySessionBindings.filter { live.contains($0.key) || (try? managedPTY.terminal($0.value).isRunning) == false }
         codexCompletions.retain(sessionIDs: live)
         for var session in managed {
             if var existing = sessions[session.id] {
@@ -1086,6 +1281,10 @@ import Combine
             if session.phase == .ended { session.setPhase(.unknown, detail: "새 상태를 확인하고 있습니다."); session.channel = .none; session.automatic = false }
             if sessions[session.id] == nil {
                 restorePreferences(&session)
+                if let owned = managedPTY.owned(tty: session.tty), ptyAutomatic[owned.descriptor.ptyID] == true {
+                    session.automatic = true
+                    try? store.set("automatic:\(session.id)", "true")
+                }
                 session.detail = Self.connectionGuide(session)
             }
             sessions[session.id] = session
@@ -1106,6 +1305,7 @@ import Combine
                 screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id)
             }
         }
+        synchronizePTYContainers()
         publish()
     }
 
@@ -1118,6 +1318,7 @@ import Combine
         try store.setValues(["automatic:\(target)": enabled ? "true" : "false", "claudeParents": String(decoding: try JSONEncoder().encode(nextParents), as: UTF8.self)])
         claudeParents = nextParents
         session.automatic = enabled; sessions[target] = session
+        if let owned = managedPTY.owned(tty: session.tty) { ptyAutomatic[owned.descriptor.ptyID] = enabled }
         for member in groupIDs(target) { screens[member]?.scheduledID = nil }
         if !enabled { for member in groupIDs(target) { capacityStates.removeValue(forKey: member) } }
         publish()
@@ -1148,7 +1349,8 @@ import Combine
         async let terminal: Void = refreshScreenHost(.terminal)
         async let iterm: Void = refreshScreenHost(.iterm)
         async let orca: Void = refreshScreenHost(.orca)
-        _ = await (terminal, iterm, orca)
+        async let pty: Void = refreshScreenHost(.pty)
+        _ = await (terminal, iterm, orca, pty)
     }
     public func connectScreenHost(_ host: ScreenHost) async {
         do { try store.set(Self.enabledKey(host), "true") }
@@ -1184,6 +1386,15 @@ import Combine
             let reader = adapter.screens
             let result = try await Task.detached(priority: .utility) { try reader(requests) }.value
             guard screenConnections[host]?.enabled == true else { return }
+            let targets = targets.filter { target in
+                guard let current = sessions[target.id], current.phase != .ended,
+                      current.pid == target.pid, current.started == target.started,
+                      current.tty == target.tty, current.terminal == host.kind else { return false }
+                if host == .pty {
+                    guard let id = ptySessionBindings[target.id], (try? managedPTY.terminal(id).isRunning) == true else { return false }
+                }
+                return true
+            }
             let connected = targets.filter { target in result.screens.contains { $0.tty == target.tty } }.count
             let missing = targets.count - connected
             updateHealth(host) { health in
@@ -1220,7 +1431,7 @@ import Combine
             screenConnections[host]?.permissionBlocked = blocked
             screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
             updateHealth(host) { $0.connected = false; $0.status = error.localizedDescription + (blocked ? "" : " · 자동 재연결 대기") }
-            for id in Array(sessions.keys) where sessions[id]?.channel == host.channel {
+            for id in Array(sessions.keys) where sessions[id]?.channel == host.channel && sessions[id]?.phase != .ended {
                 sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id)
             }
         }

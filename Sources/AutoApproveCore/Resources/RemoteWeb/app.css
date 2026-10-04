@@ -1,4 +1,19 @@
 :root { color-scheme: light dark; --bg: #f5f5f7; --surface: #fff; --subtle: #f0f1f4; --fg: #202124; --muted: #60636b; --line: #dcdde2; --blue: #1264d8; --on-blue: #fff; --selected: #eaf2ff; --green: #187440; --orange: #96510c; --red: #b32628; --error-bg: #fff0ef; --terminal: #171a20; --terminal-fg: #e5e8ee; --terminal-muted: #b1b7c4; --radius: 8px; }
+.new-pty { margin-top: 12px; width: 100%; flex-shrink: 0; }
+.pty-upgrade { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; font-size: 13px; flex-shrink: 0; }
+.pty-upgrade button { flex-shrink: 0; font-size: 13px; }
+.pty-screen { height: 360px; min-width: 0; min-height: 0; padding: 8px; overflow: hidden; background: #171a20; }
+.pty-screen .xterm { height: 100%; padding: 0; }
+.pty-screen .xterm-helper-textarea { padding: 0; border: 0; min-height: 0; min-width: 0; width: 0; height: 0; resize: none; font-size: 16px; border-radius: 0; }
+.pty-screen:focus-within { outline: 2px solid var(--blue); outline-offset: -2px; }
+#pty-form select { width: 100%; }
+#pty-form > label, #pty-new-options > label { display: block; margin-top: 12px; margin-bottom: 6px; }
+#pty-form .pty-auto { display: flex; margin-top: 16px; gap: 8px; }
+#pty-context { margin-top: 12px; }
+#pty-unsent textarea { margin-top: 8px; }
+body.terminal-focus .pty-screen { flex: 1; height: auto; }
+body.terminal-focus .pty-upgrade { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+@media (max-width: 480px) { .pty-upgrade span { max-width: 180px; } .pty-screen { padding: 6px; } }
 @media (prefers-color-scheme: dark) { :root { --bg: #17181b; --surface: #222429; --subtle: #2c2f35; --fg: #f1f2f5; --muted: #adb2be; --line: #41454e; --blue: #91bbff; --on-blue: #112342; --selected: #233752; --green: #80d8a5; --orange: #f8bd72; --red: #ffb2ac; --error-bg: #45282a; --terminal: #121418; } }
 * { box-sizing: border-box; }
 html { scroll-padding-top: 90px; }
@@ -225,6 +240,7 @@ body.terminal-focus .input-form { flex-shrink: 0; margin: 0; padding: 0 max(12px
 body.terminal-focus .input-form > label, body.terminal-focus #input-help { display: none; }
 body.terminal-focus #direct-input-help { font-size: 12px; }
 body.terminal-focus.terminal-compact #direct-input-help[data-required=false] { display: none; }
+body.terminal-focus.terminal-compact .pty-upgrade { display: none; }
 body.terminal-focus #direct-input-help[data-required=true] { display: block; font-size: 12px; }
 body.terminal-focus #input-reason { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
 body.terminal-focus #input-reason[data-blocked=false] { display: none; }

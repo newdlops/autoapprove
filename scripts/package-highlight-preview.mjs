@@ -1,3 +1,4 @@
+import { coreLinkArguments } from './swift-core-link.mjs';
 import { mkdir, writeFile, readdir } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -5,7 +6,7 @@ import path from 'node:path';
 const app = path.resolve('dist/qa/HighlightPreview.app');
 await mkdir(path.join(app, 'Contents/MacOS'), { recursive: true });
 execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/HighlightPreview'),
-  '-I', path.resolve('.build/release/Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3',
+  '-I', path.resolve('.build/release/Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(path.resolve('.build/release')),
   ...(await readdir('.build/release/AutoApproveCore.build')).filter(name => name.endsWith('.swift.o')).map(name => path.resolve('.build/release/AutoApproveCore.build', name)),
   'Sources/AutoApproveApp/TerminalHighlighter.swift', 'Sources/AutoApproveApp/TerminalNavigator.swift', 'Sources/AutoApproveApp/QuestionNotifications.swift',
   'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',
