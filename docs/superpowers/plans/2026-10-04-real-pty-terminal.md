@@ -33,7 +33,7 @@
 - [x] Add `/api/pty`, `/api/pty/output`, `/api/pty/input`, `/api/pty/resize`, `/api/pty/close` with existing origin checks, peer forwarding and durable receipts. Identify exactly owned TTYs in discovery; add the PTY screen adapter for automatic approvals.
 - [x] Bundle xterm.js and fit addon with licenses. Add the terminal creation dialog, direct screen input, special keys, resize, reconnection and ended states. Keep the existing mirror path available for old clients.
 - [x] Run real PTY browser interactions and screenshots at 390×844, 768×1024 and 1440×900; inspect overflow, focus, loading/error/ended states and original colors separately.
-- [ ] Run core and relevant browser regressions, review the final implementation, package and install the new version with preserved app data, and publish the authorized GitHub release.
+- [x] Run core and relevant browser regressions, review the final implementation, package and install the new version with preserved app data, and publish the authorized GitHub release. Published `v0.2.41` (build 48) from `43955b2`; installation, latest-release metadata and artifact digest verified. See [VALIDATION.md](../../../VALIDATION.md).
 
 ## Real-time streaming and automatic attach
 
