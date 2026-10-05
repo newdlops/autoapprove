@@ -119,6 +119,10 @@ function ensurePTY() {
   ptyClient.sessionKey = item.key;
 }
 const currentNode = () => nodes.find(node => node.id === selectedItem?.node.id);
+const originalStreamSelected = () => !!selectedItem && !selectedItem.view.pty && !sessionEnded(selectedItem)
+  && latestFrame?.sessionID === selectedItem.session.id && terminalStreamFailed !== selectedKey
+  && (terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration || inputInFlight);
+const originalTerminalConnected = () => !!currentNode()?.online || originalStreamSelected();
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const needsReview = session => ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
 const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
@@ -343,7 +347,7 @@ function renderNativeDisplay() {
   const native = nativeTerminal(), available = nativeConnection(), display = native ? latestFrame?.nativeDisplay : undefined;
   const image = native && display?.state === 'live' ? display.image : null;
   const host = selectedItem.session.hostName || hosts[selectedItem.session.terminal] || '터미널';
-  const online = connected && currentNode()?.online && allSessions.some(item => item.key === selectedKey);
+  const online = (connected && currentNode()?.online || originalStreamSelected()) && allSessions.some(item => item.key === selectedKey);
   const states = {live:'Mac 원본 화면',permissionRequired:'Mac 권한 필요',inactive:'원본 탭 연결 필요',unavailable:'원본 화면 연결 불가'};
   const defaults = {live:'같은 원본 탭에 입력합니다.',permissionRequired:'Mac에서 선택한 창 보기의 화면 기록 권한을 확인한 뒤 연결해주세요.',inactive:'원본 터미널 연결을 눌러 같은 탭을 열어주세요.',unavailable:'Mac의 원본 터미널과 권한을 확인해주세요.'};
   show($('native-connection'), available && (native || !!latestFrame?.outputReason || !latestFrame?.keys.includes('characters'))); show($('native-view-label'), available);
@@ -509,6 +513,12 @@ async function refreshNetwork() {
     const result = await api('/api/network');
     connected = true; nodes = result.nodes;
     allSessions = reconcilePTYInventory(nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []));
+    const unavailable = nodes.find(node => node.id === selectedItem?.node.id && !node.online);
+    // A peer's inventory can time out while its independently verified SSE
+    // remains live. Retain only that selection; online session removal is final.
+    if (unavailable && originalStreamSelected() && !allSessions.some(item => item.key === selectedKey)) {
+      allSessions.push({...selectedItem, node:{...selectedItem.node, ...unavailable, state:selectedItem.node.state}});
+    }
     lastNetworkUpdate = result.updatedAt;
     text($('connection'), `${nodes.filter(node => node.online).length}대 연결 · ${nowLabel(lastNetworkUpdate)} 갱신`);
     show($('network-error'), false);
@@ -699,9 +709,9 @@ function updateControls() {
     return;
   }
   $('terminal-wrap').disabled = false; show($('input-form').querySelector('[data-key="eof"]'), false);
-  const reason = !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : document.hidden || terminalStreamFailed === selectedKey ? '화면을 다시 연결한 뒤 입력할 수 있습니다.' : latestFrame?.inputReason || selectedItem.view.inputReason;
+  const reason = !originalTerminalConnected() || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : document.hidden || terminalStreamFailed === selectedKey ? '화면을 다시 연결한 뒤 입력할 수 있습니다.' : latestFrame?.inputReason || selectedItem.view.inputReason;
   const fresh = terminalFrameFresh();
-  const base = current?.online && sessionPresent && selectedItem.view.canRead && !reason;
+  const base = originalTerminalConnected() && sessionPresent && selectedItem.view.canRead && !reason;
   const inputEnabled = base && fresh && !mutation;
   const recovering = !!terminalStream?.reconnecting;
   const retainKeyboard = !!latestFrame && !!terminalStream && terminalStream.key === selectedKey;
@@ -869,8 +879,8 @@ async function refreshFrame() {
   clearTimeout(frameTimer);
   if (selectedItem?.view.pty) { ensurePTY(); return; }
   if (mutation) { frameTimer = setTimeout(refreshFrame, 100); return; }
-  if (!selectedItem || !selectedItem.view.canRead || sessionEnded(selectedItem) || !allSessions.some(item => item.key === selectedKey) || !currentNode()?.online || document.hidden) { stopTerminalStream(); return; }
-  if (supportsTerminalStream(currentNode())) { frameController?.abort(); ensureTerminalStream(); return; }
+  if (!selectedItem || !selectedItem.view.canRead || sessionEnded(selectedItem) || !allSessions.some(item => item.key === selectedKey) || document.hidden) { stopTerminalStream(); return; }
+  if (supportsTerminalStream(selectedItem.node)) { frameController?.abort(); ensureTerminalStream(); return; }
   stopTerminalStream();
   if (loadingFrame) { frameTimer = setTimeout(refreshFrame, 100); return; }
   loadingFrame = true;
@@ -896,7 +906,7 @@ async function refreshFrame() {
 }
 async function freshInputFrame(key) {
   const until = performance.now() + 6000;
-  while (performance.now() < until && selectedKey === key && currentNode()?.online && selectedItem?.view.canRead && !document.hidden && terminalStreamFailed !== key) {
+  while (performance.now() < until && selectedKey === key && allSessions.some(item => item.key === key) && selectedItem?.view.canRead && !document.hidden && terminalStreamFailed !== key) {
     if (!mutation && terminalFrameFresh()) return !latestFrame.inputReason;
     if (!mutation && !loadingFrame) await refreshFrame();
     await new Promise(resolve => setTimeout(resolve, 40));
@@ -925,7 +935,9 @@ async function sendInput(kind, value = '', quiet = false) {
     feedback(error.message, true);
   }
   finally {
-    if (!relay && selectedKey === item.key) latestFrame = null;
+    // Keep the consumed frame only as the binding for its pending successor.
+    // Its invalid timestamp cannot authorize a second composed input.
+    if (!relay && selectedKey === item.key) terminalFrameReceivedAt = -Infinity;
     if (!relay) mutation = false;
     quietFrames = 0; fastFrameUntil = Date.now() + 8000;
     if (!relay) await freshInputFrame(item.key);

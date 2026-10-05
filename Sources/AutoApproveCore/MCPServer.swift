@@ -34,7 +34,7 @@ public enum AutoApproveMCPServer {
             let requested = (message["params"] as? JSONObject)?["protocolVersion"] as? String ?? "2025-11-25"
             let supported = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
             return result(["protocolVersion": supported.contains(requested) ? requested : "2025-11-25",
-                "capabilities": ["tools": [:]], "serverInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.48"],
+                "capabilities": ["tools": [:]], "serverInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.49"],
                 "instructions": "휴대폰의 AutoApprove 웹에서 질문에 답하고 테스트 화면을 봅니다. ask_user 뒤 get_user_answers로 명시적 답변을 확인하세요. waiting·만료는 답변이 아닙니다. 화면은 사용자가 보고 싶어 할 때만 start_screen_share로 시작하고 시험 종료 시 stop_screen_share로 종료하세요. 기존 터미널을 재시작하거나 새 PTY를 만들 필요가 없습니다."])
         case "ping": return result([:])
         case "tools/list": return result(["tools": tools])

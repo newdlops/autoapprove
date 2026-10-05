@@ -28,6 +28,36 @@ try {
   let expected='';async function type(value){expected+=value;await page.keyboard.insertText(value);}
   async function drained(){await page.waitForFunction(()=>!directSending&&!directQueue.length&&!inputInFlight);assert.equal((await readFile(path.join(directory,'input.bin'))).toString(),expected);await page.waitForFunction(value=>latestFrame?.screen.endsWith(value)&&!terminalStream?.reconnecting,expected);}
   await type('BEFORE-');await drained();
+  let inventoryMode='normal';
+  const bindingNode=await page.evaluate(()=>selectedItem.node.id);
+  await page.route('**/api/network',async route=>{
+    const response=await route.fetch();const dashboard=await response.json();
+    if(inventoryMode==='offline')dashboard.nodes=dashboard.nodes.map(node=>node.id===bindingNode?{id:node.id,name:node.name,local:node.local,online:false,error:'QA peer state request timed out'}:node);
+    if(inventoryMode==='missing')dashboard.nodes=dashboard.nodes.map(node=>node.id===bindingNode?{...node,state:{...node.state,sessions:node.state.sessions.filter(view=>view.session.id!==binding.sessionID)}}:node);
+    await route.fulfill({response,json:dashboard});
+  });
+  stage='successful dashboard reports selected Mac offline while its stream is live';inventoryMode='offline';
+  await page.waitForFunction(()=>!loadingNetwork&&currentNode()?.online===false);
+  assert.equal(await page.evaluate(()=>directMode&&!$('terminal-keyboard').disabled),true,'A timed-out inventory request must not close a verified original terminal');
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+  for(let i=0;i<12;i++){await type('PEER'+i+'한');await page.waitForTimeout(100);}
+  await drained();
+  assert.deepEqual(await page.evaluate(()=>({sessionID:latestFrame.sessionID,streamID:latestFrame.streamID,pid:selectedItem.session.pid,tty:selectedItem.session.tty})),binding);
+  assert.equal(await page.evaluate(()=>!!terminalStreamFailed||!$('session-ended').hidden),false);
+  assert.equal(await page.evaluate(id=>machineRows.get(id).querySelector('.machine-status').textContent,bindingNode),'연결 끊김 · 웹 접속과 네트워크 확인');
+  await page.screenshot({path:path.join(output,'mobile-inventory-timeout.png')});screenshots.push('mobile-inventory-timeout.png');
+  checks.push('partial dashboard success with selected peer offline preserves focused live original input and exact single delivery');
+  stage='composed input refreshes the same source during a peer inventory timeout';
+  await page.locator('#terminal-settings summary').click();await page.locator('#compose-input').check();
+  const composed='COMPOSED-한글';expected+=composed+'\r';
+  await page.locator('#terminal-input').fill(composed);await page.locator('#send-input').click();await drained();
+  assert.deepEqual(await page.evaluate(()=>({sessionID:latestFrame.sessionID,streamID:latestFrame.streamID,pid:selectedItem.session.pid,tty:selectedItem.session.tty})),binding);
+  if(!await page.locator('#terminal-settings').evaluate(element=>element.open))await page.locator('#terminal-settings summary').click();
+  await page.locator('#compose-input').uncheck();
+  if(await page.locator('#terminal-settings').evaluate(element=>element.open))await page.locator('#terminal-settings summary').click();
+  await page.locator('#terminal-screen').click();
+  checks.push('composed input during a partial timeout reopens only the same verified source stream');
+  inventoryMode='normal';await page.waitForFunction(()=>!loadingNetwork&&currentNode()?.online===true);
   stage='background monitor fails while selected read is pending';await writeFile(path.join(directory,'monitor-fault'),'');
   for(let i=0;i<20;i++){await type('m'+i+'한');await page.waitForTimeout(80);}
   await page.waitForFunction(()=>!directSending&&!directQueue.length);await drained();
@@ -35,7 +65,9 @@ try {
   assert.equal(await page.evaluate(()=>!!inputFailure||!!terminalStreamFailed),false);
   assert.equal((await readFile(path.join(directory,'monitor-triggered'))).length,0);
   checks.push('background monitor failure during a pending source read preserves focused sustained original input with two viewers');
-  stage='temporary selected-screen read failure';await writeFile(path.join(directory,'read-fault'),'');
+  stage='temporary selected-screen read failure during a peer inventory timeout';inventoryMode='offline';
+  await page.waitForFunction(()=>!loadingNetwork&&currentNode()?.online===false);
+  await writeFile(path.join(directory,'read-fault'),'');
   await page.waitForFunction(()=>$('terminal-live').textContent.includes('재연결'));
   const before=(await readFile(path.join(directory,'input.bin'))).length;
   await type('READER-한글');await page.waitForTimeout(1200);
@@ -44,6 +76,7 @@ try {
   await page.screenshot({path:path.join(output,'mobile-read-reconnecting.png')});screenshots.push('mobile-read-reconnecting.png');
   await rm(path.join(directory,'read-fault'));await drained();
   checks.push('temporary selected-screen read failure pauses dispatch and resumes only unsent bytes without blurring');
+  inventoryMode='normal';await page.waitForFunction(()=>!loadingNetwork&&currentNode()?.online===true);
   stage='sustained typing';
   for(const [name,width,height]of[['mobile',390,544],['tablet',768,1024],['desktop',1440,900]]){
     await page.setViewportSize({width,height});await page.evaluate(enabled=>terminalFocus(enabled),width<760);await page.locator('#terminal-screen').click();
@@ -53,14 +86,25 @@ try {
     await page.screenshot({path:path.join(output,name+'-sustained.png')});screenshots.push(name+'-sustained.png');
   }
   checks.push('continuous Unicode input across mobile/tablet/desktop keeps the same stream/PID/TTY and exact single delivery');
+  stage='online inventory confirms original session ended';inventoryMode='missing';
+  await page.waitForFunction(()=>!loadingNetwork&&!$('session-ended').hidden);
+  assert.equal(await page.evaluate(()=>!directMode&&$('terminal-keyboard').disabled&&!terminalStream),true);
+  const endedBytes=(await readFile(path.join(directory,'input.bin'))).length;
+  await page.keyboard.insertText('MUST-NOT-SEND-AFTER-END');await page.waitForTimeout(250);
+  assert.equal((await readFile(path.join(directory,'input.bin'))).length,endedBytes);
+  checks.push('positive online inventory removal still stops input instead of retaining an ended session');
+  inventoryMode='normal';await page.waitForFunction(()=>!loadingNetwork&&allSessions.length===2);
+  await page.locator('.session-row').first().click();await page.waitForFunction(()=>latestFrame?.streamID&&!$('terminal-keyboard').disabled);await page.locator('#terminal-screen').click();
+  stage='permission denial during an inventory timeout';inventoryMode='offline';
+  await page.waitForFunction(()=>!loadingNetwork&&currentNode()?.online===false);
   stage='explicit permission denial';await rm(path.join(directory,'monitor-fault'));await writeFile(path.join(directory,'permission-fault'),'');
   await page.waitForFunction(()=>!directMode&&$('terminal-keyboard').disabled);
   const beforeDenied=(await readFile(path.join(directory,'input.bin'))).length;
   await page.keyboard.insertText('MUST-NOT-SEND');await page.waitForTimeout(250);
   assert.equal((await readFile(path.join(directory,'input.bin'))).length,beforeDenied);
-  checks.push('explicit permission denial still stops original input even after a temporary monitor failure');
-  assert.deepEqual(errors,[]);const report={result:'PASS',checks,screenshots,errors,bytes:Buffer.byteLength(expected),scope:'Chromium and production Swift with inert adapters; no user CLI input or physical phone'};
+  checks.push('explicit permission denial still stops original input during a partial inventory timeout');
+  assert.deepEqual(errors,[]);const report={result:'PASS',checks,screenshots,errors,bytes:Buffer.byteLength(expected),scope:'Chromium -> production Swift gateway -> production Swift source with inert adapters and synthetic inventory faults; no user CLI input or physical phone'};
   await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
   await Promise.all(['failure.png','failure.json'].map(name=>rm(path.join(output,name),{force:true})));
-}catch(error){const detail=await page?.evaluate(()=>({directMode,inputFailure,streamFailed:!!terminalStreamFailed,reason:$('input-reason').textContent,state:$('terminal-live').textContent,queue:directQueue.length,active:document.activeElement?.id})).catch(()=>null);await page?.screenshot({path:path.join(output,'failure.png')}).catch(()=>{});await writeFile(path.join(output,'failure.json'),JSON.stringify({stage,error:error.message,detail},null,2));throw error;
+}catch(error){const detail=await page?.evaluate(()=>({directMode,inputFailure,streamFailed:!!terminalStreamFailed,reason:$('input-reason').textContent,state:$('terminal-live').textContent,queue:directQueue.length,active:document.activeElement?.id,framePresent:!!latestFrame,frameFresh:terminalFrameFresh(),streamPresent:!!terminalStream,sessionPresent:allSessions.some(item=>item.key===selectedKey)})).catch(()=>null);await page?.screenshot({path:path.join(output,'failure.png')}).catch(()=>{});await writeFile(path.join(output,'failure.json'),JSON.stringify({stage,error:error.message,detail},null,2));throw error;
 }finally{await browser?.close();if(fixture&&fixture.exitCode===null){fixture.kill();await new Promise(resolve=>fixture.once('exit',resolve));}await rm(directory,{recursive:true,force:true});}

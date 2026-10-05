@@ -2,7 +2,7 @@
 
 macOS Terminal·iTerm2·Orca·tmux와 VS Code 통합 터미널의 Claude Code·Codex 세션을 관리하는 로컬 앱입니다. 메뉴 막대와 관리 창에서 세션별 자동 승인, 전체 일시정지, 승인 내역, 원래 터미널로 이동을 제공합니다. 휴대폰 브라우저에서도 Mac의 같은 터미널 화면을 보고 입력할 수 있습니다.
 
-**입력 중 연결 중단 수정 · 0.2.48 빌드 59:** 백그라운드 창 감시가 일시적으로 실패할 때 정상 웹 터미널의 입력 대상까지 지워지던 문제를 수정했습니다. 선택한 원본 세션의 화면·입력 연결을 독립적으로 유지하고, 일시적 화면 읽기 실패는 같은 세션으로 재연결합니다. 실제 권한 거부·프로세스/TTY 변경은 계속 입력을 차단합니다. 0.2.47의 네트워크 자동 복구와 미전송 입력 보존을 포함합니다.
+**여러 Mac의 입력 연결 유지 · 0.2.49 빌드 60:** Mac 목록 조회 중 한 Mac의 응답이 늦으면 살아 있는 원본 터미널의 연결과 모바일 키보드까지 닫히던 문제를 수정했습니다. 선택한 원본의 실시간 화면 연결을 유지하며, 최신 화면이 확인된 뒤 입력합니다. 온라인 목록에서 확인된 세션 종료·권한 거부·입력 대상 변경은 계속 입력을 멈춥니다. 0.2.47–0.2.48의 자동 복구와 감시 오류 분리도 포함합니다.
 
 **웹 터미널 입력 연결 안정화 · 0.2.47 빌드 58:** 일시적인 핫스팟 연결 끊김과 무응답 화면 스트림을 같은 원본 세션으로 자동 재연결합니다. 기기 목록 조회 오류가 정상 터미널을 끊지 않으며, 복구 중에도 키보드 포커스·한글 조합·미전송 입력을 유지합니다. 같은 원본 연결을 확인한 후 미전송 키를 순서대로 전달하고, 접수 결과가 불확실한 입력은 자동 재전송하지 않습니다. Mac과 휴대폰의 시계 차이도 입력을 막지 않습니다.
 
@@ -336,6 +336,7 @@ node scripts/screen-integration-check.mjs
 node scripts/codex-queue-integration-check.mjs
 node scripts/network-integration-check.mjs
 node scripts/network-package-check.mjs dist/AutoApprove.app
+node scripts/live-input-stability-check.mjs --release
 node scripts/terminal-signing-check.mjs dist/AutoApprove.app
 node scripts/install-check.mjs
 ```
@@ -345,6 +346,8 @@ node scripts/install-check.mjs
 `claude-hook-integration-check`는 비활성 PTY와 격리 소켓에서 실제 helper의 앱 승인·다음 5초 자동 응답·서버 재시작·응답 유실 재전달·중복 방지·터미널 넘기기를 확인합니다. `claude-parent-integration-check`는 메인·백그라운드 연결과 정책 상속을 검사합니다.
 
 `network-integration-check`는 합성 터미널을 가진 두 격리 엔진의 Bonjour 발견·Mac별 제어·화면 조회·입력·중복 방지·끊김과 복구를 검사합니다. `--serve`로 유지한 검증 서버의 `preview.json` 경로를 `network-browser-check.mjs`에 전달하면 Playwright·Chromium이 있는 환경에서 휴대폰·태블릿·데스크톱 화면과 조작을 확인합니다. `--http-lan`을 붙이면 테스트용 `.local` 주소를 루프백에 매핑해 일반 HTTP 환경과 UUID 대체 경로도 확인합니다. `network-package-check`는 먼저 패키징한 앱을 사용하며, 임시 복사본·프로필에서 포트 충돌·웹 설정 복원·웹 끄기와 번들 리소스를 확인합니다.
+
+`live-input-stability-check`는 Chromium과 두 격리 Swift 서버의 실제 HTTP/SSE 중계를 사용합니다. Mac 목록 일부의 시간 초과·원본 화면 조회 실패·백그라운드 감시 오류 중에도 연속 한글 입력과 키보드 포커스를 유지하고, 세션 종료·권한 거부 때에는 입력을 차단하는지 검사합니다. 입력은 테스트 어댑터에만 전달하며 실제 사용자 CLI나 물리 휴대폰을 조작하지 않습니다.
 
 `terminal-signing-check`는 같은 발행자 인증서를 보유한 배포 환경에서만 실행합니다. 업데이트의 지정 요구사항 호환성과 같은 bundle ID를 쓰는 다른 서명의 거부를 검사하며, 인증서·키체인을 새로 생성하지 않습니다. `signing-tool-check`는 도구 호출을 대역으로 바꿔 암호가 프로세스 인자와 오류 메시지에 포함되지 않는지 검사합니다.
 
