@@ -2283,6 +2283,7 @@ import TerminalInputSupport
                     var event = action.event
                     event.outcome = succeeded ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인"
                     log(event)
+                    scheduleScreenApproval(action.sessionID)
                     publish()
                 }
             case "remoteInputResult":
@@ -2430,11 +2431,12 @@ import TerminalInputSupport
             scheduleScreenApproval(sessionID)
             return
         }
-        // Codex can replace one permission dialog with the next between screen polls.
+        // A CLI can replace one permission dialog with the next between screen polls.
         // A new command must not inherit the preceding command's single-use reservation.
         // Formatting or choice-hint changes alone still cannot replay a sent input.
         let previous = screens[sessionID].flatMap {
-            $0.generation == generation && (session.agent != .codex || $0.prompt.requestIdentity == prompt.requestIdentity) ? $0 : nil
+            $0.generation == generation && ($0.prompt.requestIdentity == prompt.requestIdentity
+                || !($0.prompt.hasRequestBoundary && prompt.hasRequestBoundary)) ? $0 : nil
         }
         var current = previous ?? ScreenState(raw: raw, prompt: prompt, generation: generation)
         // Coalesce render changes while process validation is in flight. The adapter
@@ -2589,7 +2591,7 @@ import TerminalInputSupport
             sourcePID: session.pid, sourceStarted: session.started)
         let resume = adapter.resume, region = state.stop.region, text = CodexCapacityStop.resumeText
         automaticInputSessions.insert(id)
-        defer { automaticInputSessions.remove(id) }
+        defer { automaticInputSessions.remove(id); scheduleScreenApproval(id) }
         do {
             let delivery = try await Task.detached { try resume(target, region, text) }.value
             switch delivery {
@@ -2802,7 +2804,8 @@ import TerminalInputSupport
         screens[id]?.dispatchID = nil
         screens[id]?.validationFailures += 1
         // Only a definitive non-write enters this path. A fast repaint must not
-        // permanently exhaust a retry budget; back off and require a fresh frame.
+        // permanently exhaust a retry budget; back off, then validate the complete
+        // dialog at the target again even if no more output/resize event arrives.
         let delay = min(4, 0.25 * pow(2, Double(min(state.validationFailures, 4))))
         screens[id]?.retryAfter = Date().addingTimeInterval(delay)
         screens[id]?.attempted = false
@@ -2844,6 +2847,7 @@ import TerminalInputSupport
             var event = action.event
             event.outcome = "전달 확인 시간 초과 · 터미널 확인 필요"
             self.log(event)
+            self.scheduleScreenApproval(action.sessionID)
             self.publish()
         }
     }
@@ -2852,20 +2856,23 @@ import TerminalInputSupport
         guard !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
-              let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
-              state.retryAfter.map({ Date() >= $0 }) ?? true else { return }
+              let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil else { return }
         let scheduledRevision = revision
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
         let reader = processReader
         Task { [weak self] in
+            if let retryAfter = state.retryAfter {
+                let delay = retryAfter.timeIntervalSinceNow
+                if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            }
             let live = try? await Task.detached { try reader() }.value
             guard let self else { return }
             guard self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,
-                  self.sessions[id]?.orcaHandle == session.orcaHandle,
+                  self.sessions[id]?.screenHandle == session.screenHandle,
                   let current = self.screens[id], current.isCurrent, !current.attempted,
                   current.scheduledID == scheduledID,
                   current.generation == state.generation,
@@ -2889,7 +2896,7 @@ import TerminalInputSupport
             }
             if let host, let adapter = self.screenAdapters[host] {
                 self.automaticInputSessions.insert(id)
-                defer { self.automaticInputSessions.remove(id) }
+                defer { self.automaticInputSessions.remove(id); self.scheduleScreenApproval(id) }
                 // The agent's foreground job, for hosts that can name the process they would type into.
                 let job = live?.first { $0.pid == session.pid && $0.started == session.started }.map { agent in
                     (live ?? []).filter { $0.tty == agent.tty && $0.processGroup == agent.processGroup }.map(\.pid)

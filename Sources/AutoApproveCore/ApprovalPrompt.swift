@@ -10,6 +10,8 @@ public struct ApprovalPrompt: Equatable {
     /// Request content before the choices, independent of terminal wrapping and shortcut labels.
     /// Used only to suppress duplicates; delivery still validates the complete original dialog.
     public var requestIdentity: String
+    /// A known request boundary lets a consecutive dialog retire the preceding reservation.
+    public var hasRequestBoundary: Bool = true
 }
 
 public enum PromptDetector {
@@ -21,7 +23,8 @@ public enum PromptDetector {
         guard agent != .shell else { return nil }
         let rawLines = normalizedLines(screen)
         let lines = rawLines.map { $0.trimmingCharacters(in: .whitespaces) }
-        guard let promptIndex = lines.lastIndex(where: { line in permissionMarkers(agent).contains { line.hasPrefix($0) } }) else { return nil }
+        guard let heading = permissionHeading(lines, agent: agent) else { return nil }
+        let promptIndex = heading.index
         // A long command can push its title beyond the old 32-line window.
         guard lines.count - promptIndex <= 300 else { return nil }
         let dialog = Array(lines[promptIndex...]), indents = rawLines[promptIndex...].map { $0.prefix { $0 == " " }.count }
@@ -45,7 +48,7 @@ public enum PromptDetector {
                 labels[labels.count - 1] += " " + line
             }
         }
-        if agent == .codex, dialog[0].hasPrefix("Allow ") || dialog[0].hasPrefix("Approve app tool call?") {
+        if agent == .codex, heading.marker == "Allow " || heading.marker == "Approve app tool call?" {
             guard YesNoConfirmation.isToolPermissionMenu(labels) else { return nil }
         }
         guard YesNoConfirmation.singleApprovalIndex(labels) == 0 else { return nil }
@@ -55,8 +58,14 @@ public enum PromptDetector {
         // Claude prints the command/edit before its confirmation heading. Keep that context in validation.
         let start = agent == .claude ? 0 : promptIndex
         let context = rawLines[start..<(promptIndex + selectedYes)].joined(separator: "\n")
+        // A Claude panel puts its command/file before the confirmation heading. Bound its
+        // identity at a known panel title so scrollback changes cannot replay that request.
+        // Unknown panel layouts keep the conservative reservation until work is observed.
+        let requestStart = agent == .claude ? claudePanelStart(lines, before: promptIndex, marker: heading.marker) : promptIndex
+        let identityContext = rawLines[(requestStart ?? start)..<(promptIndex + selectedYes)].joined(separator: "\n")
         return ApprovalPrompt(summary: String(context.suffix(4000)), answer: "1", fingerprint: fingerprint(screen),
-            dialog: rawLines[start...].joined(separator: "\n"), requestIdentity: fingerprint(context.filter { !$0.isWhitespace }))
+            dialog: rawLines[start...].joined(separator: "\n"), requestIdentity: fingerprint(identityContext.filter { !$0.isWhitespace }),
+            hasRequestBoundary: requestStart != nil)
     }
 
     public static func normalizedLines(_ screen: String) -> [String] {
@@ -68,6 +77,37 @@ public enum PromptDetector {
         agent == .codex
             ? ["Would you like to run the following command?", "Would you like to make the following edits?", "Approve app tool call?", "Allow "]
             : ["Do you want to proceed?", "Do you want to make this edit", "Do you want to create", "Do you want to allow"]
+    }
+    /// Join only a complete, contiguous heading prefix. This accepts word/character wrapping
+    /// without completing an ellipsis, crossing blank rows or consuming menu choices.
+    static func permissionHeading(_ lines: [String], agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
+        for index in lines.indices.reversed() {
+            for marker in permissionMarkers(agent) {
+                let expected = marker.filter { !$0.isWhitespace }
+                var candidate = ""
+                for row in index..<min(lines.count, index + 8) {
+                    let line = lines[row].trimmingCharacters(in: .whitespaces)
+                    guard !line.isEmpty, !isOption(line), !line.contains("```") else { break }
+                    candidate += line.filter { !$0.isWhitespace }
+                    if candidate.hasPrefix(expected) {
+                        // `Allow ` is a word prefix, not `Allowing` or another question.
+                        if marker == "Allow ", !lines[index].hasPrefix("Allow "), lines[index] != "Allow" { break }
+                        return (index, row, marker)
+                    }
+                    if !expected.hasPrefix(candidate) { break }
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func claudePanelStart(_ lines: [String], before heading: Int, marker: String) -> Int? {
+        let titles = ["Do you want to proceed?": "Bash command", "Do you want to create": "Create file", "Do you want to make this edit": "Edit file"]
+        guard let title = titles[marker], let start = lines[..<heading].lastIndex(of: title), heading - start <= 300 else { return nil }
+        // A panel title from an earlier dialog is not a boundary for this request.
+        if let previous = permissionHeading(Array(lines[..<heading]), agent: .claude), previous.index >= start { return nil }
+        guard lines[..<start].filter({ $0.hasPrefix("```") }).count % 2 == 0 else { return nil }
+        return start
     }
     static let optionPrefix = #"^[›❯»>]?\s*[1-9][0-9]?\.\s+"#
     static func isOption(_ line: String) -> Bool {

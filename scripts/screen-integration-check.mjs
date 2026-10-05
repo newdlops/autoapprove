@@ -160,7 +160,10 @@ try {
     await show(0, dialog('cat first-pending.txt'));
     await until(() => actions.length === 6, 'first unacknowledged permission');
     await show(0, dialog('cat second-pending.txt'));
-    await until(() => actions.length === 7, 'new permission can progress before the previous acknowledgement');
+    await sleep(100);
+    assert.equal(actions.length, 6, 'Writes to one terminal remain serialized until the receipt');
+    await bridge.request('actionResult', { actionID: actions[5].id, success: false });
+    await until(() => actions.length === 7, 'receipt resumes the next permission without another screen event');
     await bridge.request('actionResult', { actionID: actions[5].id, success: false });
     await bridge.request('actionResult', { actionID: actions[6].id, success: true });
     await show(0, dialog('cat second-pending.txt'));

@@ -405,6 +405,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Approval recovery: wrapped headings retain identity and active selection", tests.testWrappedPermissionHeadingsKeepRequestIdentity),
+            ("Approval recovery: next permission resumes after input completion without another frame", tests.testNextPermissionResumesWhenPreviousInputCompletes),
+            ("Approval recovery: consecutive Claude panels tolerate history and reflow", tests.testClaudeConsecutivePanelsAndHistoryReflow),
+            ("Approval recovery: confirmed non-write retries without another output event", tests.testConfirmedNonWriteRecoversWithoutAnotherOutputEvent),
+            ("Approval recovery: exact Terminal tab works without frontmost app or focus", tests.testApprovalTargetsTabWithoutFrontmostAppOrKeyboardFocus),
+            ("Approval recovery: uncertain input is not retried after reflow or resume", tests.testUncertainApprovalDoesNotRetryAfterReflow),
+            ("Approval recovery: real terminal cells across widths and clipped heights", tests.testPermissionDetectionAcrossTerminalGridSizes),
             ("LAN HTTP bounds, origin checks and private addresses", tests.testRemoteHTTPBoundsOriginAndPrivateAddresses),
             ("Remote terminal coalesces reads, expires cache and omits unchanged output", tests.testRemoteTerminalCoalescingExpiryAndConditionalPayload),
             ("Live relay accepts changing output with automation on and binds the exact target", tests.testRemoteRelayWithAutomaticApprovalAndChangedOutput),
@@ -539,12 +546,16 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("SQLite persistence", tests.testAuditPersistsSettingsAndEvents),
             ("disconnected controls and reveal capability", tests.testDisconnectedEnrollmentCanBeDisabled)
         ]
+        let filterIndex = CommandLine.arguments.firstIndex(of: "--filter")
+        let filter = filterIndex.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
+        let selected = cases.filter { filter == nil || $0.0.localizedCaseInsensitiveContains(filter!) }
+        if selected.isEmpty { print("No matching checks"); exit(1) }
         var failures = 0
-        for (name, run) in cases {
+        for (name, run) in selected {
             do { try await run(); print("PASS \(name)") }
             catch { failures += 1; print("FAIL \(name): \(error.localizedDescription)") }
         }
-        print("\(cases.count - failures)/\(cases.count) checks passed")
+        print("\(selected.count - failures)/\(selected.count) checks passed")
         if failures > 0 { exit(1) }
     }
 }

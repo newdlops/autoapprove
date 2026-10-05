@@ -16,15 +16,17 @@ public enum QuestionDetector {
             $0.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) != nil
         }
         guard let selected else { return nil }
-        let start = lines[..<selected].lastIndex { line in
-            line.contains("?") || PromptDetector.permissionMarkers(agent).contains { line.hasPrefix($0) }
-        }
+        let permissionHeading = PromptDetector.permissionHeading(Array(lines[..<selected]), agent: agent)
+        let questionStart = lines[..<selected].lastIndex { $0.contains("?") }
+        let start = permissionHeading.map { heading in
+            questionStart.map { $0 > heading.end ? $0 : heading.index } ?? heading.index
+        } ?? questionStart
         guard let start else { return nil }
         let dialog = Array(lines[start...])
         guard dialog.filter(PromptDetector.isOption).count >= 2,
               !dialog.contains(where: { $0.contains("```") }),
               lines[..<start].filter({ $0.hasPrefix("```") }).count % 2 == 0 else { return nil }
-        let permission = PromptDetector.permissionMarkers(agent).contains { lines[start].hasPrefix($0) }
+        let permission = permissionHeading?.index == start
         return PendingScreenRequest(phase: permission ? .approval : .input, summary: String(dialog.joined(separator: "\n").prefix(4000)))
     }
 
