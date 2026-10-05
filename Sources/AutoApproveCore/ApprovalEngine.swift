@@ -525,7 +525,7 @@ import TerminalInputSupport
     }
     private func remoteCanRead(_ session: AgentSession) -> Bool {
         guard session.phase != .ended else { return false }
-        if let host = ScreenHost(kind: session.terminal) { return screenConnections[host]?.enabled == true && !session.tty.isEmpty }
+        if let host = ScreenHost(kind: session.terminal) { return screenConnections[host]?.enabled == true && screenConnections[host]?.permissionBlocked != true && !session.tty.isEmpty }
         return session.terminal == .vscode && session.bridgeID != nil && (remoteObservedScreens[session.id] != nil || nativeBridgeBinding(session) != nil)
     }
     public func remoteTmuxObservation(sessionID: String) throws -> TmuxRelayObservation? {
@@ -569,9 +569,15 @@ import TerminalInputSupport
         } else {
             let reader = adapter.screens
             let task = Task.detached(priority: .userInitiated) {
-                let snapshot = try reader([target])
+                let snapshot: TerminalSnapshot
+                do { snapshot = try reader([target]) }
+                catch let error as TerminalAdapterError { throw error }
+                catch let error as RemoteHTTPError { throw error }
+                catch {
+                    throw RemoteHTTPError(503, "원본 터미널 화면을 일시적으로 읽지 못했습니다. 같은 세션에 다시 연결합니다.")
+                }
                 guard let screen = snapshot.screens.first(where: { $0.tty == target.tty }) else {
-                    throw RemoteHTTPError(409, snapshot.failures.first?.message ?? "터미널 화면을 찾지 못했습니다.")
+                    throw RemoteHTTPError(503, snapshot.failures.first?.message ?? "원본 터미널 화면을 일시적으로 읽지 못했습니다. 같은 세션에 다시 연결합니다.")
                 }
                 return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents))
             }
@@ -1885,7 +1891,7 @@ import TerminalInputSupport
                         sessions[target.id]?.setPhase(.unknown, detail: "현재 \(title) 화면을 읽지 못했습니다.")
                         sessions[target.id]?.pendingSummary = nil
                         sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
-                        clearScreen(target.id)
+                        clearScreen(target.id, keepRemote: true)
                     }
                     continue
                 }
@@ -1903,7 +1909,7 @@ import TerminalInputSupport
             screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
             updateHealth(host) { $0.connected = false; $0.status = error.localizedDescription + (blocked ? "" : " · 자동 재연결 대기") }
             for id in Array(sessions.keys) where sessions[id]?.channel == host.channel && sessions[id]?.phase != .ended {
-                sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id)
+                sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id, keepRemote: !blocked)
             }
         }
     }
@@ -2485,8 +2491,13 @@ import TerminalInputSupport
         publish()
     }
 
-    private func clearScreen(_ id: String) {
-        remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)?.task.cancel()
+    private func clearScreen(_ id: String, keepRemote: Bool = false) {
+        // A failed background monitor clears approval observations, not the
+        // independent exact-target web stream. Its frames still expire and
+        // every input validates the original process, TTY and foreground job.
+        if !keepRemote {
+            remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)?.task.cancel()
+        }
         if sessions[id] == nil || sessions[id]?.phase == .ended { remoteOrcaBindings.removeValue(forKey: id) }
         screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id); screenObservedAt.removeValue(forKey: id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
