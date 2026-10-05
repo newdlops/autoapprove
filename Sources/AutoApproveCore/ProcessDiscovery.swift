@@ -103,6 +103,7 @@ public enum ProcessDiscovery {
                 environment.map { $0(record) ?? [:] } ?? environmentCache.environment(record, reader: ProcessEnvironment.read)
             })
             session.terminal = host.kind; session.hostName = host.name; session.hostBundleID = host.bundleID; session.orcaHandle = host.orcaHandle
+            session.tmuxHandle = host.tmuxHandle
             return session
         }
         if environment == nil { environmentCache.retain(Set(found.map(\.id))) }

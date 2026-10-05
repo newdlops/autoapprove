@@ -98,6 +98,21 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .terminal-options { display: flex; gap: 16px; flex-wrap: wrap; }
 .scroll-follow { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; }
 .terminal { --term-success: #91d9a6; --term-warning: #f4ca83; --term-error: #ffabab; background: var(--terminal); color: var(--terminal-fg); border-radius: var(--radius); overflow: hidden; position: relative; }
+.native-connection { display: flex; align-items: center; gap: 12px; margin: 0 0 12px; font-size: 13px; }
+.native-connection p { flex: 1; min-width: 0; max-height: 108px; overflow: auto; overflow-wrap: anywhere; }
+.native-connection button { flex-shrink: 0; font-size: 13px; white-space: nowrap; }
+.native-connection[data-state=permissionRequired], .native-connection[data-state=inactive] { color: var(--orange); }
+.native-connection[data-state=unavailable] { color: var(--red); }
+.native-screen { height: 360px; min-width: 0; min-height: 0; overflow: auto; position: relative; background: #111318; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y; }
+.native-image-stage { min-width: 100%; min-height: 100%; display: grid; place-items: center; }
+#native-image { display: block; max-width: none; max-height: none; user-select: none; -webkit-user-select: none; }
+.native-empty { display: grid; place-content: center; height: 100%; padding: 24px; color: var(--terminal-muted); text-align: center; font-size: 14px; }
+.native-tools { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 12px; border-top: 1px solid #393d46; color: var(--terminal-muted); font-size: 12px; flex-shrink: 0; }
+.native-tools button { min-width: 44px; padding: 8px 10px; font-size: 12px; flex-shrink: 0; }
+.native-tools output { min-width: 40px; text-align: center; font-variant-numeric: tabular-nums; }
+.native-tools span { margin-left: auto; }
+.terminal #terminal-screen.native-accessible { position: absolute; width: 1px; height: 1px; min-height: 0; max-height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); clip-path: inset(50%); white-space: nowrap; }
+.terminal:has(.terminal-keyboard:focus) .native-screen { outline: 2px solid var(--blue); outline-offset: -2px; }
 .terminal-bar { display: flex; gap: 8px; justify-content: space-between; align-items: center; flex-wrap: wrap; padding: 10px 14px; font-size: 12px; color: var(--terminal-muted); border-bottom: 1px solid #393d46; }
 #terminal-host { min-width: 0; overflow-wrap: anywhere; }
 .terminal-connection { display: flex; align-items: center; gap: 12px; margin-left: auto; white-space: nowrap; }
@@ -229,6 +244,11 @@ body.terminal-focus .focus-only { display: grid; }
 body.terminal-focus .terminal-heading h3 { white-space: nowrap; text-overflow: ellipsis; overflow: hidden; font-size: 14px; }
 body.terminal-focus .terminal-heading > button.secondary { font-size: 13px; padding: 8px 10px; }
 body.terminal-focus .terminal { display: flex; flex-direction: column; flex: 1; min-height: 0; border-radius: 0; }
+body.terminal-focus .native-connection { flex-shrink: 0; margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+body.terminal-focus .native-screen { flex: 1; height: auto; }
+body.terminal-focus .terminal-section:has(.terminal[data-display=native]) :is(#direct-input-help, #input-reason) { max-height: 66px; overflow: auto; overflow-wrap: anywhere; }
+@media (max-width: 480px) { .native-tools span { display: none; } .native-connection { gap: 8px; } }
+@media (max-height: 600px) { body.terminal-focus .native-connection p { max-height: 66px; } }
 body.terminal-focus #terminal-screen { flex: 1; min-height: 0; max-height: none; padding: 12px max(12px, env(safe-area-inset-right)) 12px max(12px, env(safe-area-inset-left)); }
 body.terminal-focus .terminal-bar { padding: 6px 12px; min-height: 30px; }
 body.terminal-focus #terminal-host { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

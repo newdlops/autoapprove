@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import TerminalInputSupport
 
 @MainActor public final class ApprovalEngine: ObservableObject {
     @Published public private(set) var snapshot: EngineSnapshot
@@ -7,19 +8,34 @@ import Combine
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     public private(set) var webService: RemoteNetworkService?
     public let managedPTY: ManagedPTYManager
+    private let tmuxRelay = TmuxRelay()
     private var ptyAutomatic: [String: Bool] = [:]
     private var ptyLifecycleObservers: [String: (terminal: ManagedPTY, token: UUID)] = [:]
-    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil }
+    private struct RemoteOrcaBinding: Equatable, Sendable {
+        let runtimeID: String
+        let ptyID: String
+        let incarnationID: String
+        let ownerPID: Int32
+        init(_ snapshot: OrcaTerminalSnapshot) {
+            runtimeID = snapshot.runtimeID; ptyID = snapshot.ptyID; incarnationID = snapshot.incarnationID
+            ownerPID = snapshot.ownerPID
+        }
+        var token: String { PromptDetector.fingerprint(runtimeID + "\u{0}" + ptyID + "\u{0}" + incarnationID + "\u{0}" + String(ownerPID)) }
+    }
+    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil; var orcaBinding: RemoteOrcaBinding? = nil }
     private struct RemoteScreenRead {
         var token: UUID
         var target: ScreenTarget
         var generation: String
         var task: Task<RemoteObservedScreen, Error>
         var observedAt: Date?
+        var sourceRevision: UInt64?
     }
     private var remoteScreenReads: [String: RemoteScreenRead] = [:]
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
-    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String)] = [:]
+    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?)] = [:]
+    private let orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)?
+    private var remoteOrcaBindings: [String: (targetGeneration: String, binding: RemoteOrcaBinding)] = [:]
     private var remoteInputSessions = Set<String>()
     private var remotePTYInput = Set<String>()
     private var ptySessionBindings: [String: String] = [:]
@@ -27,9 +43,27 @@ import Combine
     private var ptyContinuationTasks: [String: Task<ManagedPTYDescriptor, Error>] = [:]
     private var automaticInputSessions = Set<String>()
     private var remoteInputUntil: [String: Date] = [:]
-    private var remoteStreams: [String: (generation: String, token: String)] = [:]
+    private var remoteStreams: [String: (generation: String, token: String, identity: TTYInputIdentity?)] = [:]
+    private var nativeWindowCaptures: [ScreenHost: TerminalWindowCapture] = [:]
+    private var verifiedWindowCaptures: [String: TerminalWindowCapture] = [:]
+    private var bridgeWindowCaptures: [String: (binding: NativeBridgeBinding, capture: TerminalWindowCapture)] = [:]
+    private let requestTerminalKeyboardPermission: @MainActor @Sendable () -> Void
+    private let terminalInputAvailable: @Sendable () -> Bool
+    private let terminalInputIdentity: @Sendable (Int32) -> TTYInputIdentity?
+    private let bridgeOwnerBundle: @MainActor @Sendable (Int32) -> String?
+    private struct NativeBridgeBinding: Equatable, Sendable {
+        var peerID: String
+        var terminalID: String
+        var generation: String
+        var ownerPID: Int32
+        var ownerBundleID: String
+        var terminalName: String
+        var windowToken: String
+        var selected: Bool
+    }
     private var remoteInputStopped = false
     private var remoteInputReplies: [String: (peerID: String, continuation: CheckedContinuation<Bool, Error>)] = [:]
+    private var remoteRevealReplies: [String: (peerID: String, terminalID: String, continuation: CheckedContinuation<String?, Error>)] = [:]
     public let paths: AppPaths
     private let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
@@ -150,7 +184,8 @@ import Combine
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager()) throws {
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
+                terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil) throws {
         self.paths = paths
         self.managedPTY = managedPTY
         self.powerControl = powerControl
@@ -158,10 +193,25 @@ import Combine
         var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0)) })
         adapters[.terminal]?.screens = { targets in try terminalReader(targets.map(\.tty)) }
         adapters[.pty] = managedPTY.adapter
+        adapters[.tmux] = tmuxRelay.adapter
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
         self.questionTransport = questionTransport
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader
+        self.requestTerminalKeyboardPermission = requestTerminalKeyboardPermission ?? { _ = TerminalKeyboard.requestPermission() }
+        self.terminalInputAvailable = terminalInputAvailable ?? { TerminalInputClient.shared.isAvailable }
+        self.terminalInputIdentity = terminalInputIdentity ?? { try? TTYInputIdentity.capture(pid: $0) }
+        self.bridgeOwnerBundle = bridgeOwnerBundle ?? { VSCodeWindowAdapter.ownerBundleID(ownerPID: $0) }
+        // Explicit emulator adapters in fixtures do not inspect real native windows.
+        if let terminalWindowCapture { nativeWindowCaptures[.terminal] = terminalWindowCapture }
+        else if screenAdapters[.terminal] == nil { nativeWindowCaptures[.terminal] = TerminalWindowCapture() }
+        if let itermWindowCapture { nativeWindowCaptures[.iterm] = itermWindowCapture }
+        else if screenAdapters[.iterm] == nil { nativeWindowCaptures[.iterm] = TerminalWindowCapture(host: .iterm) }
+        if let orcaSnapshotReader { self.orcaSnapshotReader = orcaSnapshotReader }
+        else if screenAdapters[.orca] == nil {
+            let source = OrcaTerminalStream()
+            self.orcaSnapshotReader = { try await source.snapshot(handle: $0) }
+        } else { self.orcaSnapshotReader = nil }
         try paths.prepare()
         store = try AuditStore(path: paths.database)
         if let saved = store.value("claudeParents"), let parents = try? JSONDecoder().decode([String: String].self, from: Data(saved.utf8)) {
@@ -180,7 +230,7 @@ import Combine
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
         // Restore only a connection the user explicitly enabled from the app.
         for host in ScreenHost.allCases {
-            let enabled = host == .pty || store.value(Self.enabledKey(host)) == "true"
+            let enabled = host == .pty || (host == .tmux ? store.value(Self.enabledKey(host)) != "false" : store.value(Self.enabledKey(host)) == "true")
             screenConnections[host] = ScreenConnection(enabled: enabled)
             var health = snapshot.health.screen(host)
             health.requested = enabled
@@ -246,6 +296,7 @@ import Combine
         for observer in ptyLifecycleObservers.values { observer.terminal.removeOutputObserver(observer.token) }
         ptyLifecycleObservers.removeAll()
         managedPTY.stop()
+        tmuxRelay.stop()
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
         keepAwakeTask?.cancel(); keepAwakeTask = nil
@@ -254,7 +305,12 @@ import Combine
         server?.stop(); server = nil
         webService?.stop(); webService = nil
         for pending in remoteInputReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 입력 전달 결과를 확인하지 못했습니다.")) }
-        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll()
+        for pending in remoteRevealReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 원본 창 연결을 확인하지 못했습니다.")) }; remoteRevealReplies.removeAll()
+        for pending in remoteScreenReads.values { pending.task.cancel() }
+        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll()
+        for capture in nativeWindowCaptures.values { capture.invalidate() }
+        for capture in verifiedWindowCaptures.values { capture.invalidate() }
+        for value in bridgeWindowCaptures.values { value.capture.invalidate() }; bridgeWindowCaptures.removeAll()
         // Quitting gives macOS its normal sleep back, without putting a closed Mac to sleep.
         keepAwakeStopped = true
         keepAwakeSwitch.releaseNow()
@@ -287,7 +343,7 @@ import Combine
 
     public func remoteSessionViews() -> [RemoteSessionView] {
         snapshot.sessions.filter { $0.phase != .ended }.compactMap { session -> RemoteSessionView? in
-            let canRead = remoteCanRead(session)
+            let canRead = remoteCanRead(session) || nativeWindowCapture(for: session) != nil || usesOrcaSnapshot(session)
             let ptyID = session.id.hasPrefix("pty:") ? String(session.id.dropFirst(4)) : ptySessionBindings[session.id]
             let terminal = ptyID.flatMap { try? managedPTY.terminal($0) }
             if let terminal, !terminal.isRunning { return nil }
@@ -295,7 +351,7 @@ import Combine
             return RemoteSessionView(session: session,
                 title: session.customization?.title.isEmpty == false ? session.customization!.title : session.terminalTitle ?? session.project,
                 phaseTitle: session.phaseTitle, canApprove: session.canApprove, canReveal: session.canReveal,
-                canRead: canRead, inputReason: remoteInputReason(session), keys: canRead ? remoteKeys(session) : [],
+                canRead: canRead, inputReason: remoteInputReason(session), keys: canRead && (!usesOrcaSnapshot(session) || remoteCanRead(session)) ? remoteKeys(session) : [],
                 ptyID: pty?.ptyID, pty: pty)
         }
     }
@@ -463,13 +519,21 @@ import Combine
     private func remoteCanRead(_ session: AgentSession) -> Bool {
         guard session.phase != .ended else { return false }
         if let host = ScreenHost(kind: session.terminal) { return screenConnections[host]?.enabled == true && !session.tty.isEmpty }
-        return session.terminal == .vscode && session.bridgeID != nil && remoteObservedScreens[session.id] != nil
+        return session.terminal == .vscode && session.bridgeID != nil && (remoteObservedScreens[session.id] != nil || nativeBridgeBinding(session) != nil)
     }
+    public func remoteTmuxObservation(sessionID: String) throws -> TmuxRelayObservation? {
+        guard let session = sessions[sessionID], session.terminal == .tmux, remoteCanRead(session) else { return nil }
+        return try tmuxRelay.observe(ScreenTarget(tty: session.tty, handle: session.tmuxHandle))
+    }
+    private func usesOrcaSnapshot(_ session: AgentSession) -> Bool { session.terminal == .orca && orcaSnapshotReader != nil }
     private func remoteKeys(_ session: AgentSession) -> [String] {
         let basic = ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
         let interactive = ["submit", "characters", "left", "right", "backspace", "delete", "home", "end"]
         if session.terminal == .terminal {
-            return TerminalKeyboard.isAvailable ? basic + interactive : ["text", "submit", "enter"]
+            return terminalInputAvailable() ? basic + interactive : ["text", "submit", "enter"]
+        }
+        if usesOrcaSnapshot(session) {
+            return ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab"]
         }
         if session.terminal == .vscode {
             let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
@@ -487,12 +551,13 @@ import Combine
     }
 
     private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter, realtime: Bool = false) async throws -> RemoteObservedScreen {
-        let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle)
+        let target = ScreenTarget(tty: session.tty, handle: session.screenHandle)
         let generation = remoteGeneration(session, host: host)
         let pending: RemoteScreenRead
         let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
+        let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : nil
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
-           existing.observedAt.map({ Date().timeIntervalSince($0) < cacheAge }) ?? true {
+           existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
             pending = existing
         } else {
             let reader = adapter.screens
@@ -504,7 +569,8 @@ import Combine
                 return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents))
             }
             pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
-            remoteScreenReads[session.id] = pending
+            var tracked = pending; tracked.sourceRevision = sourceRevision
+            remoteScreenReads[session.id] = tracked
         }
         do {
             let observed = try await pending.task.value
@@ -519,18 +585,267 @@ import Combine
         }
     }
 
+    nonisolated private static func validateOrcaSnapshot(_ snapshot: OrcaTerminalSnapshot) throws {
+        guard [snapshot.runtimeID, snapshot.ptyID, snapshot.incarnationID].allSatisfy({ !$0.isEmpty && $0.utf8.count <= 1024 }),
+              snapshot.ownerPID > 0, snapshot.sequence >= 0, Date().timeIntervalSince(snapshot.observedAt) < 10,
+              snapshot.observedAt.timeIntervalSinceNow <= 1 else {
+            throw OrcaTerminalStreamError.unavailable("현재 원본 세션의 식별자나 관찰 시간을 확인하지 못했습니다.")
+        }
+    }
+    nonisolated private static func orcaOwner(_ pid: Int32, tty: String, records: [ProcessRecord]) throws -> ProcessRecord {
+        let name = tty.replacingOccurrences(of: "/dev/", with: "")
+        guard let owner = records.first(where: { $0.pid == pid && $0.tty == name }) else {
+            throw OrcaTerminalStreamError.unavailable("데몬의 원래 PTY 소유 프로세스가 선택한 CLI의 TTY와 다릅니다. 다른 터미널은 공유하지 않습니다.")
+        }
+        return owner
+    }
+    private func readOrcaScreen(_ session: AgentSession, realtime: Bool) async throws -> RemoteObservedScreen {
+        guard let reader = orcaSnapshotReader, let handle = session.orcaHandle else {
+            throw OrcaTerminalStreamError.unavailable("원래 터미널 핸들을 확인하지 못했습니다.")
+        }
+        let target = ScreenTarget(tty: session.tty, handle: handle)
+        let targetGeneration = remoteGeneration(session, host: .orca), generation = targetGeneration + ":ansi"
+        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
+        let pending: RemoteScreenRead
+        if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
+           existing.observedAt.map({ Date().timeIntervalSince($0) < cacheAge }) ?? true {
+            pending = existing
+        } else {
+            let identity = nativeIdentity(session), tty = session.tty, recordReader = processReader
+            let pid = session.pid, started = session.started, agent = session.agent.rawValue
+            let task = Task.detached(priority: .userInitiated) {
+                guard try identity() else { throw RemoteHTTPError(409, "원래 Orca CLI의 PID 또는 TTY가 바뀌었습니다. 목록을 새로고침해주세요.") }
+                let snapshot = try await reader(handle)
+                try Task.checkCancellation(); try Self.validateOrcaSnapshot(snapshot)
+                let owner = try Self.orcaOwner(snapshot.ownerPID, tty: tty, records: recordReader())
+                let rendered = try OriginalTerminalScreen.render(ansi: snapshot.ansi, columns: snapshot.columns, rows: snapshot.rows, tty: tty)
+                let after = try recordReader()
+                let currentOwner = try Self.orcaOwner(snapshot.ownerPID, tty: tty, records: after)
+                guard currentOwner.key == owner.key else { throw OrcaTerminalStreamError.unavailable("화면을 읽는 동안 원래 PTY 소유 프로세스가 바뀌었습니다.") }
+                guard after.contains(where: { $0.pid == pid && $0.started == started && "/dev/" + $0.tty == tty && $0.agent?.rawValue == agent && $0.isForeground }) else { throw RemoteHTTPError(409, "화면을 읽는 동안 원래 Orca CLI가 종료되거나 바뀌었습니다.") }
+                let binding = RemoteOrcaBinding(snapshot)
+                return RemoteObservedScreen(raw: rendered.contents, generation: generation + ":" + binding.token,
+                    observedAt: snapshot.observedAt, appearance: rendered.appearance, cursor: rendered.cursor, orcaBinding: binding)
+            }
+            pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
+            remoteScreenReads[session.id] = pending
+        }
+        do {
+            let observed = try await pending.task.value; try Task.checkCancellation()
+            guard remoteScreenReads[session.id]?.token == pending.token else {
+                throw RemoteHTTPError(409, "원래 Orca 화면 연결이 바뀌었습니다. 다시 연결해주세요.")
+            }
+            guard let binding = observed.orcaBinding else { throw OrcaTerminalStreamError.unavailable("원래 PTY의 세대를 확인하지 못했습니다.") }
+            if let original = remoteOrcaBindings[session.id], original.targetGeneration == targetGeneration, original.binding != binding {
+                throw OrcaTerminalStreamError.unavailable("같은 핸들의 PTY 세대가 바뀌어 다른 터미널 화면을 공유하지 않습니다. Mac에서 원래 CLI를 확인해주세요.")
+            }
+            remoteOrcaBindings[session.id] = (targetGeneration, binding)
+            remoteScreenReads[session.id]?.observedAt = observed.observedAt
+            return observed
+        } catch {
+            if remoteScreenReads[session.id]?.token == pending.token { remoteScreenReads.removeValue(forKey: session.id) }
+            throw error
+        }
+    }
+
     private func remoteGeneration(_ session: AgentSession, host: ScreenHost) -> String {
-        "\(host.rawValue):\(session.id):\(session.pid):\(session.started):\(session.tty):\(session.orcaHandle ?? "")"
+        "\(host.rawValue):\(session.id):\(session.pid):\(session.started):\(session.tty):\(session.screenHandle ?? "")"
     }
     private func invalidateRemoteRead(_ id: String) {
         // A concurrent reader still owns its token; do not turn a valid live read into a disconnect.
         if remoteScreenReads[id]?.observedAt != nil { remoteScreenReads[id]?.observedAt = .distantPast }
     }
 
-    public func remoteTerminal(sessionID: String, realtime: Bool = false) async throws -> RemoteTerminalFrame {
-        guard let session = sessions[sessionID], remoteCanRead(session) else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
+    /// A source-specific adapter may register only a verified exact native window.
+    /// The capture service still checks selected metadata, immutable owner and CLI identity.
+    public func setNativeWindowCapture(sessionID: String, capture: TerminalWindowCapture?) {
+        verifiedWindowCaptures.removeValue(forKey: sessionID)?.invalidate()
+        if let capture { verifiedWindowCaptures[sessionID] = capture }
+        remoteFrames.removeValue(forKey: sessionID)
+    }
+    private func nativeBridgeBinding(_ session: AgentSession, requireWindowIdentity: Bool = false) -> NativeBridgeBinding? {
+        guard session.terminal == .vscode, let peerID = session.bridgeID, peers[peerID] != nil,
+              let terminalID = session.terminalID,
+              let registration = bridges[peerID]?.first(where: { $0["id"] as? String == terminalID }),
+              let windowVersion = registration["nativeWindowVersion"] as? Int, windowVersion >= 0,
+              !requireWindowIdentity || windowVersion >= 2,
+              (registration["remoteInputVersion"] as? Int ?? 0) >= 3,
+              let number = registration["ownerPID"] as? Int, let ownerPID = Int32(exactly: number), ownerPID > 0,
+              let generation = registration["nativeGeneration"] as? String, !generation.isEmpty, generation.utf8.count <= 256,
+              let name = registration["name"] as? String, name.utf8.count <= 4096,
+              let windowToken = registration["windowToken"] as? String, windowToken.utf8.count == 36, UUID(uuidString: windowToken) != nil,
+              !requireWindowIdentity || bridges[peerID]?.filter({ $0["name"] as? String == name }).count == 1,
+              let owner = bridgeOwnerBundle(ownerPID) else { return nil }
+        return NativeBridgeBinding(peerID: peerID, terminalID: terminalID, generation: generation, ownerPID: ownerPID,
+            ownerBundleID: owner, terminalName: name, windowToken: windowToken, selected: registration["selected"] as? Bool == true)
+    }
+    private func nativeBridgeGeneration(_ binding: NativeBridgeBinding) -> String {
+        "\(binding.peerID):native:\(binding.terminalID):\(binding.generation):\(binding.ownerPID):\(binding.windowToken)"
+    }
+    private func nativeIdentity(_ session: AgentSession) -> @Sendable () throws -> Bool {
+        let reader = processReader, pid = session.pid, started = session.started, tty = session.tty.replacingOccurrences(of: "/dev/", with: ""), agent = session.agent.rawValue
+        return {
+            try reader().contains { $0.pid == pid && $0.started == started && $0.tty == tty && $0.agent?.rawValue == agent && $0.isForeground }
+        }
+    }
+    private func nativeWindowCapture(for session: AgentSession) -> TerminalWindowCapture? {
+        if let verified = verifiedWindowCaptures[session.id] { return verified }
+        if let host = ScreenHost(kind: session.terminal), let capture = nativeWindowCaptures[host] { return capture }
+        guard let binding = nativeBridgeBinding(session, requireWindowIdentity: true) else { return nil }
+        if let existing = bridgeWindowCaptures[session.id], existing.binding == binding { return existing.capture }
+        bridgeWindowCaptures.removeValue(forKey: session.id)?.capture.invalidate()
+        let id = session.id
+        let capture = TerminalWindowCapture(host: .orca, ownerBundleID: binding.ownerBundleID, requiresAccessibilityForMetadata: true,
+            permissions: { TerminalWindowPermissions(screen: TerminalWindowCapture.screenPermissionGranted, keyboard: TerminalKeyboard.isAvailable, automation: true) },
+            metadata: { [weak self] tty in
+                guard let self else { return nil }
+                return try await self.nativeBridgeWindowMetadata(sessionID: id, tty: tty, binding: binding)
+            })
+        bridgeWindowCaptures[id] = (binding, capture)
+        return capture
+    }
+    private func nativeBridgeWindowMetadata(sessionID: String, tty: String, binding: NativeBridgeBinding) async throws -> TerminalWindowMetadata? {
+        guard let session = sessions[sessionID], session.tty == tty, nativeBridgeBinding(session, requireWindowIdentity: true) == binding, binding.selected else { return nil }
+        let token = nativeBridgeGeneration(binding)
+        let metadata = try await Task.detached {
+            try VSCodeWindowAdapter.metadata(ownerPID: binding.ownerPID, tty: tty, selected: binding.selected, bindingToken: token, terminalName: binding.terminalName, windowToken: binding.windowToken)
+        }.value
+        guard let current = sessions[sessionID], current.tty == tty, nativeBridgeBinding(current, requireWindowIdentity: true) == binding else { return nil }
+        return metadata
+    }
+
+    public func connectRemoteTerminal(_ object: JSONObject) async throws -> RemoteTerminalFrame {
+        guard !remoteInputStopped, let id = object["sessionID"] as? String, let session = sessions[id], session.phase != .ended,
+              session.terminal != .pty else { throw RemoteHTTPError(409, "연결할 원래 CLI 세션을 찾지 못했습니다.") }
+        if session.terminal == .vscode, nativeBridgeBinding(session) == nil,
+           remoteObservedScreens[id].map({ Date().timeIntervalSince($0.observedAt) < 10 }) != true {
+            throw RemoteHTTPError(409, "원래 편집기 세션의 식별자를 확인하지 못했습니다. Bridge를 업데이트하고 Mac에서 원래 터미널을 선택해주세요.")
+        }
+        let identity = nativeIdentity(session)
+        guard try await Task.detached(operation: identity).value else { throw RemoteHTTPError(409, "원래 CLI의 PID 또는 TTY가 바뀌었습니다. 목록을 새로고침해주세요.") }
+        let renderWindow = object["view"] as? String == "screen"
+        if renderWindow, let capture = nativeWindowCapture(for: session) { capture.requestPermissions() }
+        if let host = ScreenHost(kind: session.terminal), host != .pty { await connectScreenHost(host) }
+        guard let current = sessions[id], current.pid == session.pid, current.started == session.started,
+              current.tty == session.tty, current.terminal == session.terminal,
+              current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
+              try await Task.detached(operation: identity).value else { throw RemoteHTTPError(409, "권한을 확인하는 동안 원래 CLI가 바뀌었습니다. 다시 선택해주세요.") }
+        if let binding = nativeBridgeBinding(current) { try await revealNativeBridge(binding, renderWindow: renderWindow) }
+        else if let host = ScreenHost(kind: current.terminal), let adapter = screenAdapters[host] {
+            let target = ScreenTarget(tty: current.tty, handle: current.screenHandle), show = adapter.reveal
+            _ = try await Task.detached { try show(target) }.value
+        } else { _ = try await reveal(current) }
+        guard let revealed = sessions[id], revealed.phase != .ended,
+              revealed.pid == session.pid, revealed.started == session.started, revealed.tty == session.tty,
+              revealed.terminal == session.terminal, revealed.orcaHandle == session.orcaHandle,
+              revealed.tmuxHandle == session.tmuxHandle,
+              revealed.bridgeID == session.bridgeID, revealed.terminalID == session.terminalID,
+              try await Task.detached(operation: identity).value else { throw RemoteHTTPError(409, "원래 CLI가 종료되거나 바뀌었습니다. 목록을 새로고침해주세요.") }
+        if renderWindow { nativeWindowCapture(for: revealed)?.invalidate() }
+        invalidateRemoteRead(id)
+        return try await remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)
+    }
+    private func revealNativeBridge(_ binding: NativeBridgeBinding, renderWindow: Bool = false) async throws {
+        guard let peer = peers[binding.peerID] else { throw RemoteHTTPError(409, "원래 편집기 창 연결이 끊겼습니다.") }
+        let actionID = UUID().uuidString
+        let generation: String? = try await withCheckedThrowingContinuation { continuation in
+            remoteRevealReplies[actionID] = (binding.peerID, binding.terminalID, continuation)
+            var message: JSONObject = ["method": "reveal", "native": true, "terminalID": binding.terminalID, "id": actionID,
+                "generation": binding.generation, "expiresAt": Date().addingTimeInterval(5).timeIntervalSince1970 * 1000]
+            if renderWindow { message["view"] = "screen" }
+            guard peer.send(message) else {
+                remoteRevealReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: RemoteHTTPError(409, "원래 편집기 창 연결이 끊겼습니다.")); return
+            }
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                self?.remoteRevealReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: RemoteHTTPError(409, "원래 편집기 터미널을 표시했는지 확인하지 못했습니다. Mac에서 같은 창과 터미널을 선택해주세요."))
+            }
+        }
+        guard let generation, let current = bridges[binding.peerID]?.first(where: { $0["id"] as? String == binding.terminalID }),
+              current["nativeGeneration"] as? String == generation, current["selected"] as? Bool == true,
+              !renderWindow || (current["nativeWindowVersion"] as? Int ?? 0) >= 2,
+              !renderWindow || bridges[binding.peerID]?.filter({ $0["name"] as? String == binding.terminalName }).count == 1,
+              current["ownerPID"] as? Int == Int(binding.ownerPID), current["windowToken"] as? String == binding.windowToken,
+              current["name"] as? String == binding.terminalName,
+              bridgeOwnerBundle(binding.ownerPID) == binding.ownerBundleID else {
+            throw RemoteHTTPError(409, "원래 편집기 창과 터미널의 선택을 확인하지 못했습니다. Mac에서 같은 터미널을 선택해주세요.")
+        }
+    }
+
+    public func remoteTerminal(sessionID: String, realtime: Bool = false, renderWindow: Bool = false) async throws -> RemoteTerminalFrame {
+        guard let session = sessions[sessionID], session.phase != .ended else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
+        let sourceCapture = [.terminal, .iterm].contains(session.terminal) ? nativeWindowCapture(for: session) : nil
+        let capture = renderWindow ? sourceCapture ?? nativeWindowCapture(for: session) : nil
+        let orcaMode = usesOrcaSnapshot(session)
+        guard remoteCanRead(session) || sourceCapture != nil || capture != nil || orcaMode else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
+        let hasFreshVT = remoteObservedScreens[sessionID].map { Date().timeIntervalSince($0.observedAt) < 10 } == true
+        let nativeBinding = nativeBridgeBinding(session)
+        let nativeOnly = session.terminal == .vscode && !hasFreshVT && nativeBinding != nil
+        var nativeDisplay: TerminalNativeDisplay?
+        if let capture {
+            if let binding = session.terminal == .vscode ? nativeBinding : nil, !binding.selected {
+                nativeDisplay = TerminalNativeDisplay(state: .inactive, message: "Mac에서 원래 편집기 창과 터미널을 선택하거나 연결 버튼으로 같은 터미널을 표시해주세요.")
+            } else if remoteCanRead(session) || verifiedWindowCaptures[sessionID] != nil {
+                do {
+                    nativeDisplay = try await capture.read(TerminalCaptureTarget(pid: session.pid, started: session.started, tty: session.tty, agent: session.agent), validateIdentity: nativeIdentity(session))
+                } catch {
+                    try Task.checkCancellation()
+                    let identity = nativeIdentity(session)
+                    guard try await Task.detached(operation: identity).value else {
+                        throw RemoteHTTPError(409, "원래 CLI의 PID 또는 TTY가 바뀌었습니다. 목록을 새로고침해주세요.")
+                    }
+                    nativeDisplay = TerminalNativeDisplay(state: .unavailable,
+                        message: "원래 창 미리보기를 읽지 못했습니다. " + String(error.localizedDescription.prefix(1000)))
+                }
+            } else {
+                nativeDisplay = capture.permissionState() ?? TerminalNativeDisplay(state: .unavailable, message: "연결 버튼을 눌러 Mac의 원래 터미널 화면을 연결해주세요.")
+            }
+        } else if renderWindow {
+            nativeDisplay = TerminalNativeDisplay(state: .unavailable, message: "선택한 원본 터미널의 정확한 앱 창을 확인하지 못했습니다. 일반 터미널의 출력과 입력은 계속 사용할 수 있습니다.")
+        } else { nativeDisplay = nil }
+        // Permissions can change while a native capture is pending. Preflight
+        // again before the legacy Apple-event path, without requesting consent.
+        let automationBlocked = [.terminal, .iterm].contains(session.terminal) && sourceCapture?.nonpromptAutomationGranted == false
+        if automationBlocked {
+            if renderWindow { nativeDisplay = capture?.permissionState() ?? TerminalNativeDisplay(state: .permissionRequired, message: "Mac에서 원래 터미널의 자동화 권한을 허용한 뒤 연결해주세요.") }
+        }
         let raw: String, generation: String, observedAt: Date, appearance: TerminalAppearance?, cursor: TerminalCursor?
-        if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
+        var orcaBinding: RemoteOrcaBinding?, sourceReason: String?, outputReason: String?
+        if orcaMode {
+            let observed: RemoteObservedScreen?
+            if !remoteCanRead(session) {
+                sourceReason = "연결 버튼을 눌러 Mac의 원래 Orca 터미널 화면을 연결해주세요. 새 터미널은 만들지 않습니다."
+                observed = nil
+            } else {
+                do { observed = try await readOrcaScreen(session, realtime: realtime) }
+                catch let error as RemoteHTTPError where error.status == 409 { throw error }
+                catch {
+                    try Task.checkCancellation()
+                    sourceReason = "Orca 원본 ANSI 화면이 연결되지 않았습니다. " + String(error.localizedDescription.prefix(1000))
+                    observed = nil
+                }
+            }
+            if let observed {
+                raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
+                appearance = observed.appearance; cursor = observed.cursor; orcaBinding = observed.orcaBinding
+            } else {
+                raw = ""; generation = remoteGeneration(session, host: .orca) + ":ansi:unavailable"; observedAt = Date()
+                appearance = nil; cursor = nil
+                outputReason = sourceReason
+                if renderWindow { nativeDisplay = TerminalNativeDisplay(state: .unavailable, message: sourceReason) }
+            }
+        } else if automationBlocked, let host = ScreenHost(kind: session.terminal) {
+            raw = ""; generation = remoteGeneration(session, host: host) + ":automation-required"; observedAt = Date(); appearance = nil; cursor = nil
+            sourceReason = "Mac에서 원래 터미널의 자동화 권한을 허용한 뒤 연결해주세요. 읽기 요청은 권한을 요청하지 않습니다."
+            outputReason = sourceReason
+        } else if nativeOnly, let binding = nativeBinding {
+            raw = ""; generation = nativeBridgeGeneration(binding); observedAt = Date(); appearance = nil; cursor = nil
+            outputReason = "Bridge가 연결되기 전의 기존 터미널 출력은 읽을 수 없습니다. 선택한 Mac 원본 터미널에 실시간 키 입력은 그대로 전달할 수 있습니다."
+            if !binding.selected { sourceReason = "Mac에서 원래 편집기 창과 터미널을 선택하거나 연결 버튼으로 같은 터미널을 표시해주세요." }
+        } else if !remoteCanRead(session), let host = ScreenHost(kind: session.terminal), sourceCapture != nil || nativeDisplay != nil {
+            raw = ""; generation = remoteGeneration(session, host: host); observedAt = Date(); appearance = nil; cursor = nil
+            outputReason = "연결 버튼을 눌러 원래 터미널의 출력과 입력을 연결해주세요. 새 터미널은 만들지 않습니다."
+        } else if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
             let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime)
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
             appearance = observed.appearance; cursor = observed.cursor
@@ -541,20 +856,42 @@ import Combine
         }
         guard let current = sessions[sessionID], current.phase != .ended, current.tty == session.tty,
               current.pid == session.pid, current.started == session.started, current.terminal == session.terminal,
-              current.orcaHandle == session.orcaHandle, current.bridgeID == session.bridgeID, remoteCanRead(current) else { throw RemoteHTTPError(409, "세션 연결이 바뀌었습니다. 목록을 새로고침해주세요.") }
+              current.orcaHandle == session.orcaHandle, current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
+              current.tmuxHandle == session.tmuxHandle,
+              !nativeOnly || nativeBridgeBinding(current) == nativeBinding,
+              remoteCanRead(current) || sourceCapture != nil || capture != nil || usesOrcaSnapshot(current) else { throw RemoteHTTPError(409, "세션 연결이 바뀌었습니다. 목록을 새로고침해주세요.") }
         // Reading the same screen in another browser must not invalidate an input draft.
         // An actual screen/generation change or a consumed frame gets a new token.
         let previous = remoteFrames[sessionID]
         let screen = String(raw.suffix(160_000)), visibleAppearance = screen == raw ? appearance : nil
         let visibleCursor = screen == raw ? cursor : nil
-        let token = previous?.raw == raw && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor ? previous!.frame.revision : UUID().uuidString
-        if remoteStreams[sessionID]?.generation != generation { remoteStreams[sessionID] = (generation, UUID().uuidString) }
+        let token = previous?.raw == raw && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor && previous?.frame.nativeDisplay == nativeDisplay && previous?.frame.outputReason == outputReason ? previous!.frame.revision : UUID().uuidString
+        let inputIdentity = [.terminal, .tmux].contains(current.terminal) ? terminalInputIdentity(current.pid) : nil
+        if let inputIdentity, inputIdentity.pid != current.pid || inputIdentity.processStart != current.started {
+            throw RemoteHTTPError(409, "원래 CLI의 실행 식별자가 바뀌었습니다. 목록을 새로고침해주세요.")
+        }
+        // Presentation generations (for example Automation availability) may
+        // rotate stream tokens, but must never replace the original lifetime.
+        if let stream = remoteStreams[sessionID] {
+            guard stream.identity == nil && inputIdentity == nil || stream.identity.map({ inputIdentity?.sameProcess(as: $0) == true }) == true else {
+                throw RemoteHTTPError(409, "원래 CLI의 실행 시각이나 TTY가 바뀌었습니다. 입력하지 않았습니다.")
+            }
+        }
+        if remoteStreams[sessionID]?.generation != generation {
+            remoteStreams[sessionID] = (generation, UUID().uuidString, remoteStreams[sessionID]?.identity ?? inputIdentity)
+        }
         let registration = current.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == current.terminalID }
-        let relaySupported = current.terminal != .vscode || (registration?["remoteInputVersion"] as? Int ?? 0) >= 3
+        let relaySupported = !automationBlocked && (!orcaMode || orcaBinding != nil) && (nativeOnly ? nativeBinding?.selected == true : current.terminal != .vscode || (registration?["remoteInputVersion"] as? Int ?? 0) >= 3)
+        var keys = remoteCanRead(current) ? remoteKeys(current) : []
+        if automationBlocked { keys = [] }
+        else if orcaMode { keys = orcaBinding != nil ? remoteKeys(current) : [] }
+        else if nativeOnly { keys = nativeBinding?.selected == true ? ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab"] : [] }
         let frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
-            observedAt: observedAt, keys: remoteKeys(current), inputReason: remoteInputReason(current), appearance: visibleAppearance,
-            cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil)
-        remoteFrames[sessionID] = (frame, raw, generation)
+            observedAt: observedAt, keys: keys, inputReason: sourceReason ?? remoteInputReason(current), appearance: visibleAppearance,
+            cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil, nativeDisplay: nativeDisplay, outputReason: outputReason)
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        guard try encoder.encode(frame).count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. Mac에서 창 크기를 줄여주세요.") }
+        remoteFrames[sessionID] = (frame, raw, generation, orcaBinding, nativeOnly ? nativeBinding : nil)
         return frame
     }
 
@@ -570,7 +907,25 @@ import Combine
                   observed.frame.streamID == stream, remoteStreams[id]?.token == stream,
                   remoteStreams[id]?.generation == observed.generation else { throw RemoteHTTPError(409, "터미널 연결이 바뀌었습니다. 최신 화면을 확인해주세요.") }
             if let host = ScreenHost(kind: session.terminal), observed.generation != remoteGeneration(session, host: host) {
-                throw RemoteHTTPError(409, "대상 터미널이 바뀌었습니다. 최신 화면을 확인해주세요.")
+                let orcaGeneration = observed.orcaBinding.map { remoteGeneration(session, host: .orca) + ":ansi:" + $0.token }
+                guard host == .orca, observed.generation == orcaGeneration else {
+                    throw RemoteHTTPError(409, "대상 터미널이 바뀌었습니다. 최신 화면을 확인해주세요.")
+                }
+            }
+        }
+        let orcaInput = usesOrcaSnapshot(session)
+        var orcaOwnerPID: Int32?
+        if orcaInput {
+            guard relay, ![.text, .submit].contains(kind), observed.orcaBinding != nil else {
+                throw RemoteHTTPError(409, "Orca 원본 ANSI 화면의 실시간 연결을 확인하고 다시 입력해주세요.")
+            }
+        }
+        let nativeBinding = session.terminal == .vscode ? nativeBridgeBinding(session) : nil
+        let nativeInput = observed.nativeBinding != nil
+        if nativeInput {
+            guard relay, ![.text, .submit].contains(kind), nativeBinding == observed.nativeBinding,
+                  nativeBinding?.selected == true, observed.generation == nativeBinding.map(nativeBridgeGeneration) else {
+                throw RemoteHTTPError(409, "원래 편집기 터미널의 실시간 연결을 확인하고 다시 입력해주세요.")
             }
         }
         if let reason = remoteInputReason(session) { throw RemoteHTTPError(409, reason) }
@@ -593,15 +948,46 @@ import Combine
             guard Date() < deadline else { throw RemoteHTTPError(409, "승인 입력이 끝나지 않았습니다. 화면을 확인한 뒤 다시 입력해주세요.") }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
+        if orcaInput {
+            guard let snapshotReader = orcaSnapshotReader, let handle = session.orcaHandle, let binding = observed.orcaBinding else {
+                throw RemoteHTTPError(409, "원래 Orca 터미널의 세대를 확인하지 못해 입력하지 않았습니다.")
+            }
+            do {
+                let latest = try await snapshotReader(handle)
+                try Self.validateOrcaSnapshot(latest)
+                guard RemoteOrcaBinding(latest) == binding else { throw OrcaTerminalStreamError.unavailable("원래 PTY의 실행 세대가 바뀌었습니다.") }
+                orcaOwnerPID = latest.ownerPID
+            } catch {
+                throw RemoteHTTPError(409, "원래 Orca 터미널을 다시 확인하지 못해 입력하지 않았습니다. " + String(error.localizedDescription.prefix(1000)))
+            }
+        }
         let reader = processReader
-        let currentRecords = try await Task.detached { try reader() }.value
+        let currentRecords: [ProcessRecord]
+        if session.terminal == .tmux {
+            guard let current = TmuxRelay.currentProcess(pid: session.pid, started: session.started, tty: session.tty, agent: session.agent) else {
+                throw RemoteHTTPError(409, "원래 tmux CLI가 종료되거나 입력 대상이 바뀌었습니다. 목록을 새로고침해주세요.")
+            }
+            currentRecords = [current]
+        } else { currentRecords = try await Task.detached { try reader() }.value }
         let tty = session.tty.replacingOccurrences(of: "/dev/", with: "")
+        if let orcaOwnerPID, !currentRecords.contains(where: { $0.pid == orcaOwnerPID && $0.tty == tty }) {
+            throw RemoteHTTPError(409, "데몬의 원래 PTY 소유 프로세스가 선택한 CLI의 TTY와 달라 입력하지 않았습니다.")
+        }
         guard let process = currentRecords.first(where: { $0.pid == session.pid && $0.started == session.started && $0.tty == tty && $0.agent == session.agent }),
               !remoteInputStopped, process.isForeground, let current = sessions[id], current.phase != .ended, remoteInputReason(current) == nil,
               current.pid == session.pid, current.started == session.started, current.tty == session.tty,
               current.terminal == session.terminal, current.orcaHandle == session.orcaHandle,
+              current.tmuxHandle == session.tmuxHandle,
               current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
+              !nativeInput || nativeBridgeBinding(current) == nativeBinding,
+              !orcaInput || remoteOrcaBindings[id]?.binding == observed.orcaBinding && remoteFrames[id]?.orcaBinding == observed.orcaBinding,
               (relay ? remoteStreams[id]?.token == (object["streamID"] as? String) : remoteFrames[id]?.frame.revision == token) else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
+        if session.terminal == .terminal, relay || ![.text, .submit, .enter].contains(kind) {
+            guard let original = remoteStreams[id]?.identity, let source = terminalInputIdentity(session.pid),
+                  source.sameProcess(as: original), source.foregroundGroup == source.processGroup else {
+                throw RemoteHTTPError(409, "원래 CLI의 실행 시각, TTY 또는 입력 대상이 바뀌어 입력하지 않았습니다.")
+            }
+        }
         // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
         if !relay { remoteFrames.removeValue(forKey: id) }
         invalidateRemoteRead(id)
@@ -613,16 +999,18 @@ import Combine
             let sent: Bool
             if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
                 let job = currentRecords.filter { $0.tty == tty && $0.processGroup == process.processGroup }.map(\.pid)
-                let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job), write = adapter.input
+                let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
+                    sourcePID: session.pid, sourceStarted: session.started, sourceIdentity: remoteStreams[id]?.identity), write = adapter.input
                 let result = try await Task.detached { try write(target, observed.raw, session.agent, input) }.value
                 sent = result == .sent
             } else if let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID {
                 let actionID = UUID().uuidString
                 sent = try await withCheckedThrowingContinuation { continuation in
                     remoteInputReplies[actionID] = (peerID, continuation)
-                    let message: JSONObject = ["method": "remoteInput", "id": actionID, "terminalID": terminalID,
-                        "screen": observed.raw, "generation": String(observed.generation.dropFirst(peerID.count + 1)),
+                    var message: JSONObject = ["method": "remoteInput", "id": actionID, "terminalID": terminalID,
+                        "screen": observed.raw, "generation": nativeInput ? nativeBinding!.generation : String(observed.generation.dropFirst(peerID.count + 1)),
                         "kind": kind.rawValue, "text": input.text, "relay": relay, "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000]
+                    if nativeInput { message["native"] = true }
                     guard peer.send(message) else {
                         remoteInputReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: AppError.message("VS Code 연결이 끊겨 전달 결과를 확인하지 못했습니다.")); return
                     }
@@ -1267,6 +1655,7 @@ import Combine
             return session
         }
         let live = Set(managed.map(\.id))
+        tmuxRelay.retain(handles: Set(managed.compactMap(\.tmuxHandle)))
         ptySessionBindings = ptySessionBindings.filter { live.contains($0.key) || (try? managedPTY.terminal($0.value).isRunning) == false }
         codexCompletions.retain(sessionIDs: live)
         for var session in managed {
@@ -1274,6 +1663,7 @@ import Combine
                 existing.tty = session.tty
                 if existing.bridgeID == nil { existing.terminal = session.terminal }
                 existing.hostName = session.hostName; existing.hostBundleID = session.hostBundleID; existing.orcaHandle = session.orcaHandle
+                existing.tmuxHandle = session.tmuxHandle
                 session = existing
             }
             if let cwd = directories[session.id], !cwd.isEmpty, session.cwd != cwd {
@@ -1350,8 +1740,9 @@ import Combine
         async let terminal: Void = refreshScreenHost(.terminal)
         async let iterm: Void = refreshScreenHost(.iterm)
         async let orca: Void = refreshScreenHost(.orca)
+        async let tmux: Void = refreshScreenHost(.tmux)
         async let pty: Void = refreshScreenHost(.pty)
-        _ = await (terminal, iterm, orca, pty)
+        _ = await (terminal, iterm, orca, tmux, pty)
     }
     public func connectScreenHost(_ host: ScreenHost) async {
         do { try store.set(Self.enabledKey(host), "true") }
@@ -1363,8 +1754,9 @@ import Combine
     }
     public func disconnectScreenHost(_ host: ScreenHost) {
         screenConnections[host]?.enabled = false; revision &+= 1
+        if host == .tmux { tmuxRelay.stop() }
         for id in sessions.keys where sessions[id]?.terminal == host.kind {
-            remoteScreenReads.removeValue(forKey: id); remoteFrames.removeValue(forKey: id)
+            remoteScreenReads.removeValue(forKey: id)?.task.cancel(); remoteFrames.removeValue(forKey: id)
         }
         updateHealth(host) { $0.status = "연결 해제됨"; $0.requested = false; $0.connected = false }
         do { try store.set(Self.enabledKey(host), "false") }
@@ -1383,7 +1775,7 @@ import Combine
         let targets = sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
         do {
-            let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.orcaHandle) }
+            let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
             let reader = adapter.screens
             let result = try await Task.detached(priority: .utility) { try reader(requests) }.value
             guard screenConnections[host]?.enabled == true else { return }
@@ -1447,7 +1839,7 @@ import Combine
             throw AppError.message("이 세션이 종료되었거나 터미널이 바뀌었습니다. 목록을 새로고침해주세요.")
         }
         if let host = ScreenHost(kind: current.terminal), let adapter = screenAdapters[host] {
-            let target = ScreenTarget(tty: current.tty, handle: current.orcaHandle), reveal = adapter.reveal
+            let target = ScreenTarget(tty: current.tty, handle: current.screenHandle), reveal = adapter.reveal
             return try await Task.detached { try reveal(target) }.value
         } else if let peerID = current.bridgeID, let terminalID = current.terminalID, let peer = peers[peerID] {
             guard peer.send(["method": "reveal", "terminalID": terminalID, "id": UUID().uuidString, "label": session.project, "detail": "\(session.agent.title) · \(session.tty)"]) else { throw AppError.message("VS Code 연결이 끊겼습니다.") }
@@ -1898,6 +2290,13 @@ import Combine
                     remoteInputReplies.removeValue(forKey: id)
                     pending.continuation.resume(returning: params["success"] as? Bool == true)
                 }
+            case "revealResult":
+                if let id = params["actionID"] as? String, let pending = remoteRevealReplies[id], pending.peerID == peer.id,
+                   params["terminalID"] as? String == pending.terminalID {
+                    remoteRevealReplies.removeValue(forKey: id)
+                    let generation = params["nativeGeneration"] as? String
+                    pending.continuation.resume(returning: params["success"] as? Bool == true && (generation?.utf8.count ?? 0) <= 256 ? generation : nil)
+                }
             default: throw AppError.message("지원하지 않는 요청입니다.")
             }
             var response: JSONObject = ["result": result]
@@ -1949,6 +2348,12 @@ import Combine
         for id in Array(remoteInputReplies.keys) where remoteInputReplies[id]?.peerID == peerID {
             remoteInputReplies.removeValue(forKey: id)?.continuation.resume(throwing: AppError.message("VS Code 연결이 끊겼습니다. 입력을 다시 보내지 말고 화면을 확인해주세요."))
         }
+        for id in Array(remoteRevealReplies.keys) where remoteRevealReplies[id]?.peerID == peerID {
+            remoteRevealReplies.removeValue(forKey: id)?.continuation.resume(throwing: AppError.message("원래 편집기 창 연결이 끊겼습니다."))
+        }
+        for id in Array(bridgeWindowCaptures.keys) where bridgeWindowCaptures[id]?.binding.peerID == peerID {
+            bridgeWindowCaptures.removeValue(forKey: id)?.capture.invalidate()
+        }
         for id in Array(pendingActions.keys) where pendingActions[id]?.peerID == peerID {
             if var event = pendingActions.removeValue(forKey: id)?.event {
                 event.outcome = "연결 끊김 · 입력 확인 필요"; log(event)
@@ -1964,7 +2369,8 @@ import Combine
     }
 
     private func clearScreen(_ id: String) {
-        remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)
+        remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)?.task.cancel()
+        if sessions[id] == nil || sessions[id]?.phase == .ended { remoteOrcaBindings.removeValue(forKey: id) }
         screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id); screenObservedAt.removeValue(forKey: id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
         sessions[id]?.pendingRequestID = nil
@@ -2179,7 +2585,8 @@ import Combine
         guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
         publish()
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
-        let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job)
+        let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
+            sourcePID: session.pid, sourceStarted: session.started)
         let resume = adapter.resume, region = state.stop.region, text = CodexCapacityStop.resumeText
         automaticInputSessions.insert(id)
         defer { automaticInputSessions.remove(id) }
@@ -2487,7 +2894,8 @@ import Combine
                 let job = live?.first { $0.pid == session.pid && $0.started == session.started }.map { agent in
                     (live ?? []).filter { $0.tty == agent.tty && $0.processGroup == agent.processGroup }.map(\.pid)
                 } ?? []
-                let target = ScreenTarget(tty: session.tty, handle: session.orcaHandle, jobPIDs: job)
+                let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
+                    sourcePID: session.pid, sourceStarted: session.started)
                 let approve = adapter.approve, raw = current.raw, kind = session.agent
                 do {
                     let delivery = try await Task.detached { try approve(target, raw, kind) }.value

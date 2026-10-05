@@ -15,6 +15,14 @@ const operations = [], receipts = new Map(), revisions = new Map([['one',0],['tw
 const cursors = new Map();
 const streamIDs = new Map([['one','stream-one'],['two','stream-two']]);
 let inputDelay = 180, failNext = false, blockInput = false, frameError = false, activeKeys = keys;
+let nextInputGate = null;
+const inputGates = new Set();
+function holdNextInput() {
+  assert.equal(nextInputGate, null);
+  let resolve; const promise = new Promise(done => { resolve = done; });
+  const gate = {promise, release: () => { inputGates.delete(gate); resolve(); }};
+  inputGates.add(gate); nextInputGate = gate; return gate;
+}
 const network = () => ({ updatedAt: new Date().toISOString(), nodes: [{ id: 'fixture-mac', name: '검증용 Mac', local: true, online: true, state: { sessions: sessions.map(view => ({...view, keys: activeKeys, inputReason: blockInput ? '화면 연결을 확인해주세요.' : undefined})), snapshot: { paused: false, events: [] } } }] });
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
@@ -33,8 +41,8 @@ const server = createServer(async (req, res) => {
       if ((input.relay ? input.streamID !== streamIDs.get(input.sessionID) : input.revision !== String(revisions.get(input.sessionID))) || blockInput) return json(409, { error: '화면이 달라졌습니다. 확인 후 다시 입력해주세요.' });
       operations.push(input); revisions.set(input.sessionID, revisions.get(input.sessionID) + 1);
       screens.set(input.sessionID, screens.get(input.sessionID) + '\n[검증용 전달] ' + (input.text || input.kind));
-      const fail = failNext; failNext = false;
-      await new Promise(resolve => setTimeout(resolve, inputDelay));
+      const fail = failNext, gate = nextInputGate; failNext = false; nextInputGate = null;
+      await (gate ? gate.promise : new Promise(resolve => setTimeout(resolve, inputDelay)));
       if (fail) return json(503, { error: '전달 결과를 확인하지 못했습니다. 현재 터미널을 확인해주세요.' });
       const receipt = { message: '검증용 터미널에 입력했습니다.' }; receipts.set(input.requestID, receipt); return json(200, receipt);
     }
@@ -123,8 +131,9 @@ try {
   checks.push('Closed-keyboard Up, Down and Enter bind one stream and preserve FIFO during a slow POST');
   await screen.click();
   assert.equal(await focused(), 'terminal-keyboard', 'Tapping terminal output opens its keyboard capture');
-  await page.keyboard.type('direct'); await waitCount(start + 1);
-  assert.deepEqual(operations.slice(start).map(({kind,text}) => [kind,text]), [['characters','direct']], 'Terminal typing sends characters before Return');
+  await page.keyboard.type('direct'); await waitCount(start + 1); await page.waitForFunction(() => !inputInFlight && !directSending && !directQueue.length);
+  assert.ok(operations.slice(start).every(input => input.kind === 'characters' && input.sessionID === 'one' && input.relay === true));
+  assert.equal(operations.slice(start).map(input => input.text).join(''), 'direct', 'Ordered character batches preserve exact text before Return');
   assert.equal(await input.isVisible(), false);
   assert.equal(await page.locator('#terminal-keyboard-toggle').getAttribute('aria-pressed'), 'true');
   checks.push('Screen tap focuses 16px keyboard capture and sends characters immediately without a separate editor');
@@ -183,24 +192,24 @@ try {
   assert.equal(await input.inputValue(),'다음 초안');
   await input.fill(''); start=operations.length; await enter.click(); await waitCount(start+1); assert.equal(operations.at(-1).kind,'enter');
   checks.push('Keyboard toggle, output selection/scroll, single-line paste, reviewed multiline paste and optional atomic compose/Return');
-  await directAgain(); start=operations.length; inputDelay=900;
-  await page.keyboard.type('stream-A'); while(operations.length===start) await page.waitForTimeout(10);
-  await page.keyboard.type('before-rotation'); streamIDs.set('one','stream-one-B'); revisions.set('one',revisions.get('one')+1);
-  await input.waitFor({state:'visible'}); await page.waitForTimeout(1100);
+  await directAgain(); start=operations.length; const rotationGate=holdNextInput();
+  await page.keyboard.insertText('stream-A'); while(operations.length===start) await page.waitForTimeout(10);
+  await page.keyboard.insertText('before-rotation'); streamIDs.set('one','stream-one-B'); revisions.set('one',revisions.get('one')+1);
+  await input.waitFor({state:'visible'}); rotationGate.release(); await page.waitForTimeout(1100);
   assert.equal(operations.length,start+1,'Text queued for stream A must never enter stream B');
   assert.equal(await input.inputValue(),'before-rotation'); inputDelay=180;
   checks.push('Connection generation rotation stops and preserves queued text instead of delivering it to a new stream');
-  await directAgain(); start=operations.length; inputDelay=400; failNext=true;
-  await page.keyboard.type('uncertain'); while(operations.length===start) await page.waitForTimeout(10);
-  await page.keyboard.type('pending'); await waitCount(start+1); await input.waitFor({state:'visible'});
+  await directAgain(); start=operations.length; failNext=true; const uncertainGate=holdNextInput();
+  await page.keyboard.insertText('uncertain'); while(operations.length===start) await page.waitForTimeout(10);
+  await page.keyboard.insertText('pending'); uncertainGate.release(); await waitCount(start+1); await input.waitFor({state:'visible'});
   await page.waitForFunction(() => document.getElementById('terminal-input').value==='uncertainpending');
   await page.waitForTimeout(700); assert.equal(operations.length,start+1);
   assert.match(await page.locator('#input-reason').textContent(),/확인/);
   assert.equal(await page.locator('#terminal-keyboard-toggle').isDisabled(),true);
   checks.push('Uncertain response stops direct input, preserves failed and queued characters in original order, never replays');
-  await directAgain(); start=operations.length;
+  await directAgain(); start=operations.length; const switchGate=holdNextInput();
   await page.keyboard.type('x'); while(operations.length===start) await page.waitForTimeout(10);
-  await page.keyboard.type('y'); await page.locator('#terminal-back').click(); await page.locator('.session-row').nth(1).click(); await ready();
+  await page.keyboard.type('y'); await page.locator('#terminal-back').click(); await page.locator('.session-row').nth(1).click(); await ready(); switchGate.release();
   await page.waitForTimeout(600); assert.equal(operations.length,start+1); assert.equal(operations.at(-1).sessionID,'one');
   await page.locator('#terminal-back').click(); await page.locator('.session-row').first().click(); await input.waitFor({state:'visible'});
   assert.equal(await input.inputValue(),'y'); inputDelay=180;
@@ -210,28 +219,28 @@ try {
   await directAgain(); blockInput=true; await page.waitForFunction(() => document.getElementById('terminal-keyboard').disabled);
   assert.equal(await enter.isDisabled(),true); blockInput=false; await ready();
   checks.push('Session switch cancels unsent keys and preserves drafts in their original session; disconnected input is disabled');
-  await screen.click(); start=operations.length; inputDelay=750; failNext=true;
-  await page.keyboard.type('old-uncertain'); while(operations.length===start) await page.waitForTimeout(10);
+  await screen.click(); start=operations.length; failNext=true; const oldDirectGate=holdNextInput();
+  await page.keyboard.insertText('old-uncertain'); while(operations.length===start) await page.waitForTimeout(10);
   await page.locator('#terminal-back').click(); await page.locator('.session-row').nth(1).click(); await ready();
   await page.locator('#terminal-back').click(); await page.locator('.session-row').first().click(); await ready();
-  await screen.click(); await page.keyboard.type('new-queued'); await waitCount(start+1); await page.waitForTimeout(1000);
+  await screen.click(); await page.keyboard.insertText('new-queued'); oldDirectGate.release(); await waitCount(start+1); await page.waitForTimeout(1000);
   assert.equal(operations.length,start+1,'Failed old generation must stop newer same-session queued text');
   assert.equal(await input.inputValue(),'old-uncertainnew-queued');
   checks.push('Switch away/back during an uncertain direct POST stops the newer same-session queue and preserves its text');
   await directAgain(); await page.locator('#terminal-settings summary').click(); await compose.check();
-  start=operations.length; inputDelay=400; failNext=true;
+  start=operations.length; failNext=true; const composedAwayGate=holdNextInput();
   await input.fill('composed-uncertain'); await enter.click(); while(operations.length===start) await page.waitForTimeout(10);
-  await page.locator('#terminal-back').click(); await page.locator('.session-row').nth(1).click(); await ready();
+  await page.locator('#terminal-back').click(); await page.locator('.session-row').nth(1).click(); await ready(); composedAwayGate.release();
   await page.waitForTimeout(650); await page.locator('#terminal-back').click(); await page.locator('.session-row').first().click();
   assert.equal(await input.inputValue(),'composed-uncertain','Failed composed POST restores text to its original session even while another session is selected');
   assert.equal(operations.length,start+1); inputDelay=180; await directAgain();
   checks.push('Failed composed POST after a session switch preserves the original-session draft without replay');
   await page.locator('#terminal-settings summary').click(); await compose.check();
-  start=operations.length; inputDelay=750; failNext=true;
+  start=operations.length; failNext=true; const oldComposedGate=holdNextInput();
   await input.fill('composed-old'); await enter.click(); while(operations.length===start) await page.waitForTimeout(10);
   await page.locator('#terminal-back').click(); await page.locator('.session-row').nth(1).click(); await ready();
   await page.locator('#terminal-back').click(); await page.locator('.session-row').first().click(); await ready();
-  await screen.click(); await page.keyboard.type('new-direct'); await waitCount(start+1); await page.waitForTimeout(1000);
+  await screen.click(); await page.keyboard.insertText('new-direct'); oldComposedGate.release(); await waitCount(start+1); await page.waitForTimeout(1000);
   assert.equal(operations.length,start+1,'Failed composed POST must stop newly armed same-session direct input');
   assert.equal(await input.inputValue(),'composed-oldnew-direct'); inputDelay=180; await directAgain();
   checks.push('Failed composed POST also stops and preserves a newer direct queue for the same session');
@@ -279,4 +288,4 @@ try {
   assert.deepEqual(errors,[]);
   const report={checks,screenshots,javascriptErrors:errors,inputOperations:operations.length,scope:'Chromium + synthetic HTTP fixture; IME, clipboard and keyboard geometry simulated; no physical phone or native Mac key delivery'};
   await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2)); console.log(JSON.stringify(report,null,2));
-} finally { if(browser) await browser.close(); await new Promise(resolve=>server.close(resolve)); }
+} finally { for(const gate of inputGates) gate.release(); if(browser) await browser.close(); await new Promise(resolve=>server.close(resolve)); }

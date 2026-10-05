@@ -8,6 +8,7 @@ public struct TerminalHost: Equatable {
     public var name: String?
     public var bundleID: String?
     public var orcaHandle: String?
+    public var tmuxHandle: String?
     public init(kind: TerminalKind, name: String? = nil, bundleID: String? = nil, orcaHandle: String? = nil) {
         self.kind = kind; self.name = name; self.bundleID = bundleID; self.orcaHandle = orcaHandle
     }
@@ -29,6 +30,14 @@ public struct TerminalHost: Equatable {
     /// read launch variables. Variables only add iTerm2, Orca and display names for other hosts.
     /// `TERM_PROGRAM` names the innermost emulator; `__CFBundleIdentifier` can be inherited from a launcher.
     static func classify(record: ProcessRecord, parents: [ProcessRecord], environment: () -> [String: String]) -> TerminalHost {
+        if let server = parents.first(where: { $0.pid != record.pid && TmuxPaneHandle.isServer($0.executable) }) {
+            if let handle = TmuxPaneHandle.launch(environment(), server: server) {
+                var host = TerminalHost(kind: .tmux, name: "tmux", bundleID: "local.autoapprove.tmux")
+                host.tmuxHandle = handle.encoded
+                return host
+            }
+            return TerminalHost(kind: .unknown, name: "tmux")
+        }
         let terminalParents = parents.prefix { $0.tty == "??" || $0.tty == record.tty }
         if terminalParents.contains(where: { $0.executable.contains("Visual Studio Code.app/") }) { return TerminalHost(kind: .vscode, bundleID: "com.microsoft.VSCode") }
         if terminalParents.contains(where: { $0.executable.hasSuffix("Terminal.app/Contents/MacOS/Terminal") }) { return TerminalHost(kind: .terminal, bundleID: "com.apple.Terminal") }
@@ -68,7 +77,7 @@ public struct TerminalHost: Equatable {
 /// Reads only allowlisted launch variables of an agent process. Terminals export secrets such as
 /// `ORCA_AGENT_HOOK_TOKEN` beside these names; no other value is retained or logged.
 public enum ProcessEnvironment {
-    public static let names: Set<String> = ["TERM_PROGRAM", "__CFBundleIdentifier", "ITERM_SESSION_ID", "ORCA_TERMINAL_HANDLE", "TMUX", "STY", "ZELLIJ"]
+    public static let names: Set<String> = ["TERM_PROGRAM", "__CFBundleIdentifier", "ITERM_SESSION_ID", "ORCA_TERMINAL_HANDLE", "TMUX", "TMUX_PANE", "STY", "ZELLIJ"]
 
     /// KERN_PROCARGS2 layout: argc, executable path, NUL padding, argv, then environment until an empty string.
     public static func parse(_ bytes: [UInt8]) -> [String: String] {

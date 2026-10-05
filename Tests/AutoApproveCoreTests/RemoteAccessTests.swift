@@ -3,6 +3,7 @@ import JavaScriptCore
 import AutoApproveCore
 import Network
 import Darwin
+import TerminalInputSupport
 
 private final class RemoteTestScreen: @unchecked Sendable {
     private let lock = NSLock()
@@ -339,17 +340,22 @@ extension ApprovalTests {
         """)
         let screen = RemoteTestScreen(), resume = RemoteResumeGate()
         defer { resume.release() }
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current; formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        let originalIdentity = TTYInputIdentity(pid: 81001, processGroup: 81001, uid: getuid(), effectiveUID: geteuid(), device: 42,
+            startSeconds: UInt64(formatter.date(from: records[1].started)!.timeIntervalSince1970), startMicroseconds: 71)
         let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.read(), title: "검증용 터미널") }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, resume: { _, _, _ in resume.wait() }, input: { target, expected, agent, input in
                 guard target.tty == "/dev/ttys081", target.jobPIDs.contains(81001), agent == .codex else { return .missingTarget }
                 return screen.input(expected, input)
             })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.terminal: adapter])
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.terminal: adapter],
+            terminalInputAvailable: { true }, terminalInputIdentity: { pid in pid == originalIdentity.pid ? originalIdentity : nil })
         let session = ProcessDiscovery.sessions(records)[0]
         engine.updateDiscovery([session], records: records); await engine.connectTerminal()
         let frame = try await engine.remoteTerminal(sessionID: session.id)
         try expect(frame.keys.contains("submit") && frame.keys.contains("enter"))
-        try expectEqual(frame.keys.contains("characters"), TerminalKeyboard.isAvailable)
+        try expect(frame.keys.contains("characters"), "The injected original input service is available independently of Mac permissions")
         let secondViewer = try await engine.remoteTerminal(sessionID: session.id)
         try expectEqual(secondViewer.revision, frame.revision)
         let latest = try await engine.remoteTerminal(sessionID: session.id)
@@ -444,14 +450,14 @@ extension ApprovalTests {
         try expectThrows(try RemoteTerminalInput(kind: .characters, text: "hidden\nReturn").validate())
         try expectThrows(try RemoteTerminalInput(kind: .backspace, text: "hidden text").validate())
 
-        // Synthetic JXA applications verify exact-tab selection and foreground revalidation.
-        // They do not grant or simulate the Mac's real accessibility permission.
+        // JXA prepares only the exact tab/window. Native CGEvent delivery is
+        // checked by the isolated keyboard fixture, with no real event posts.
         let keyboard = JSContext()!
         keyboard.evaluateScript("""
-        var keys = [], contents = 'screen', front = true, trusted = true, wrongTab = false, changeOnActivate = false;
-        var ObjC = {import:()=>{}}; var $ = {AXIsProcessTrusted:()=>trusted};
+        var keys = [], contents = 'screen', front = true, wrongTab = false, changeOnActivate = false, childAXChecks = 0;
+        var ObjC = {import:()=>{}}; var $ = {AXIsProcessTrusted:()=>{childAXChecks++; return false;}};
         var tab = {tty:()=>'/dev/ttys081', contents:()=>contents, processes:()=>['codex']};
-        var win = {tabs:()=>[tab]};
+        var win = {id:()=>96, tabs:()=>[tab]};
         Object.defineProperty(win, 'selectedTab', {set:()=>{}, get:()=>()=>wrongTab ? {tty:()=>'/dev/other'} : tab});
         function Application(id) {
           if (id === 'com.apple.systemevents') return {keystroke:text=>keys.push(text), keyCode:(code,options)=>keys.push([code,options])};
@@ -460,9 +466,9 @@ extension ApprovalTests {
         """)
         for input in [RemoteTerminalInput(kind: .characters, text: "한글 🧪"), .init(kind: .backspace), .init(kind: .left), .init(kind: .right), .init(kind: .interrupt)] {
             let keyScript = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: input)
-            try expectEqual(keyboard.evaluateScript(keyScript)?.toString(), "sent")
+            try expectEqual(keyboard.evaluateScript(keyScript)?.toString(), "ready:96")
         }
-        try expectEqual(keyboard.evaluateScript("JSON.stringify(keys)")?.toString(), "[\"한글 🧪\",[51,null],[123,null],[124,null],[8,{\"using\":[\"control down\"]}]]")
+        try expectEqual(keyboard.evaluateScript("keys.length + childAXChecks")?.toInt32(), 0)
         let raw = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .characters, text: "never send"))
         keyboard.evaluateScript("wrongTab=true;")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
@@ -470,9 +476,9 @@ extension ApprovalTests {
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
         keyboard.evaluateScript("front=true; changeOnActivate=true;")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "screenChanged")
-        try expectEqual(keyboard.evaluateScript("keys.length")?.toInt32(), 5)
+        try expectEqual(keyboard.evaluateScript("keys.length")?.toInt32(), 0)
         let liveKey = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .left, relay: true))
-        try expectEqual(keyboard.evaluateScript(liveKey)?.toString(), "sent", "Live keys keep the exact tab while output changes")
+        try expectEqual(keyboard.evaluateScript(liveKey)?.toString(), "ready:96", "Live keys prepare the exact tab while output changes")
         keyboard.evaluateScript("wrongTab=true;")
         try expectEqual(keyboard.evaluateScript(liveKey)?.toString(), "missingTarget")
 

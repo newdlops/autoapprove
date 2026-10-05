@@ -12,6 +12,10 @@ struct ConnectionSettings: View {
     @State private var questionDelayError: String?
     @State private var keepAwakeBusy = false
     @State private var keepAwakeError: String?
+    @State private var terminalWindowSharingAllowed = false
+    @State private var terminalInputStatus = TerminalInputStatus.notInstalled
+    @State private var terminalInputBusy = false
+    @State private var terminalInputError: String?
     private var questionDelayValue: Int? { Int(questionDelayText.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private var validQuestionDelay: Bool { questionDelayValue.map(EngineSnapshot.questionNotificationDelayRange.contains) ?? false }
     private var helper: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path }
@@ -22,6 +26,19 @@ struct ConnectionSettings: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     RemoteAccessSettings(engine: engine)
+                    Divider()
+                    section("tmux로 같은 터미널 공유", icon: "terminal", status: engine.snapshot.health.screen(.tmux).status) {
+                        TmuxSharingSettings(installed: TmuxRelay.executable != nil, health: engine.snapshot.health.screen(.tmux),
+                            command: TmuxRelay.startCommand,
+                            connect: { Task { await engine.connectScreenHost(.tmux) } },
+                            disconnect: { engine.disconnectScreenHost(.tmux) })
+                    }
+                    Divider()
+                    section("원본 터미널 화면·입력", icon: "display", status: "기본은 터미널 중계 · Mac 창 보기는 선택 사항입니다.") {
+                        TerminalSharingSettings(screenAllowed: terminalWindowSharingAllowed, inputStatus: terminalInputStatus,
+                            inputBusy: terminalInputBusy, inputError: terminalInputError,
+                            screenAction: requestTerminalScreenSharing, inputAction: requestTerminalInput)
+                    }
                     Divider()
                     section("질문 · 작업 완료 알림", icon: "bell", status: notifications.status) {
                         Text("질문이 설정한 시간 동안 미응답 상태로 남거나 작업이 끝나면 알립니다. 그 전에 처리된 질문은 알리지 않습니다. 같은 질문·완료는 한 번만 알리며, 알림을 누르면 해당 터미널을 엽니다.")
@@ -72,7 +89,7 @@ struct ConnectionSettings: View {
                         text: "iTerm2 세션을 연결해 요청을 읽고 해당 세션에만 승인 입력을 전달합니다. 분할 창도 세션별로 구분합니다. 한 번 연결하면 앱을 다시 실행해도 연결을 복원합니다. 처음 연결할 때 iTerm2 자동화 권한을 허용해주세요.")
                     Divider()
                     screenSection(.orca, icon: "square.grid.2x2",
-                        text: "Orca에 포함된 명령줄 도구로 각 터미널의 현재 화면을 읽고 해당 터미널에만 승인 입력을 전달합니다. 별도 권한은 필요하지 않으며 Orca가 실행 중이어야 합니다. tmux 안에서 실행한 세션은 연결하지 않습니다.")
+                        text: "Orca에 포함된 명령줄 도구로 각 터미널의 현재 화면을 읽고 해당 터미널에만 승인 입력을 전달합니다. 별도 권한은 필요하지 않으며 Orca가 실행 중이어야 합니다. tmux 안의 세션은 위의 tmux 연결을 사용합니다.")
                     Divider()
                     section("Claude Code", icon: "bolt.horizontal", status: engine.snapshot.health.claude) {
                         Text("Terminal·iTerm2·Orca·VS Code 등 모든 터미널에서 권한 요청을 직접 받습니다. 기존 설정을 백업하고 AutoApprove 훅만 추가합니다.")
@@ -88,14 +105,14 @@ struct ConnectionSettings: View {
                         Text("앱이 꺼져 있으면 원래 Claude 승인 흐름을 따릅니다.").font(.caption)
                     }
                     Divider()
-                    section("VS Code", icon: "chevron.left.forwardslash.chevron.right", status: engine.snapshot.health.vscode) {
-                        Text("AutoApprove Bridge 확장을 설치하면 터미널을 찾아 이동할 수 있습니다. 출력 감지는 확장이 연결된 뒤 시작한 명령부터 가능합니다.")
-                        Button("VS Code 확장 설치") { installExtension() }.disabled(busy)
-                            .help(busy ? "현재 연결 작업이 끝날 때까지 기다려주세요." : "앱에 포함된 AutoApprove Bridge를 VS Code에 설치합니다. 출력 감지는 연결 후 시작한 명령부터 가능합니다.")
+                    section("VS Code·Cursor", icon: "chevron.left.forwardslash.chevron.right", status: engine.snapshot.health.vscode) {
+                        Text("AutoApprove Bridge가 같은 원본 터미널에 화면과 입력을 연결합니다. 이미 실행 중인 명령은 휴대폰의 원본 연결 버튼으로 해당 창을 공유합니다. 새로 시작한 명령의 출력 연결은 앱이 재실행되어도 유지됩니다.")
+                        Button("편집기 확장 설치") { installExtension() }.disabled(busy)
+                            .help(busy ? "현재 연결 작업이 끝날 때까지 기다려주세요." : "설치된 VS Code·Cursor 계열 편집기에 앱의 AutoApprove Bridge를 설치합니다.")
                     }
                     Divider()
                     section("Codex", icon: "command", status: engine.snapshot.health.codex) {
-                        Text("현재 버전은 연결된 터미널의 승인 화면을 감지합니다. 기존 VS Code 세션의 출력에 연결할 수 없으면 확장 설치 후 CLI를 다시 실행하고 대화를 이어가세요.")
+                        Text("연결된 원본 터미널의 승인 화면을 감지합니다. 휴대폰에서 같은 실행 세션에 직접 입력할 수 있으며 새 CLI를 만들지 않습니다.")
                     }
                     if let notice {
                         Label(notice, systemImage: "info.circle").font(.callout).foregroundStyle(.primary).textSelection(.enabled)
@@ -104,7 +121,9 @@ struct ConnectionSettings: View {
                 }.padding(24)
             }
         }.frame(width: 600, height: 660)
-            .onAppear { questionDelayText = String(engine.snapshot.questionNotificationDelay) }
+            .onAppear { questionDelayText = String(engine.snapshot.questionNotificationDelay); refreshTerminalPermissions() }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in refreshTerminalPermissions() }
+            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in refreshTerminalPermissions() }
             .onChange(of: questionDelayText) { _, _ in questionDelayError = nil }
     }
     private func saveQuestionDelay() {
@@ -167,6 +186,42 @@ struct ConnectionSettings: View {
             }
         }
     }
+    private func refreshTerminalPermissions() {
+        terminalWindowSharingAllowed = TerminalWindowCapture.screenPermissionGranted
+        terminalInputStatus = TerminalInputClient.shared.state
+    }
+    private func openPrivacySettings(_ pane: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") { NSWorkspace.shared.open(url) }
+    }
+    private func requestTerminalScreenSharing() {
+        if terminalWindowSharingAllowed { openPrivacySettings("Privacy_ScreenCapture") }
+        else {
+            _ = TerminalWindowCapture.requestScreenPermission(); refreshTerminalPermissions()
+            notice = "macOS 설정에서 AutoApprove의 화면 공유를 허용해주세요. macOS가 재시작을 요청하면 앱을 다시 연 뒤 휴대폰에서 원본 터미널을 연결하세요."
+        }
+    }
+    private func requestTerminalInput() {
+        terminalInputError = nil
+        if terminalInputStatus == .requiresApproval {
+            TerminalInputInstaller.openApprovalSettings()
+            return
+        }
+        if terminalInputStatus.available {
+            TerminalInputClient.shared.refreshIfNeeded(force: true); refreshTerminalPermissions(); return
+        }
+        terminalInputBusy = true
+        Task {
+            do {
+                let result = try await Task.detached { try TerminalInputInstaller.install() }.value
+                notice = result.message
+                if result == .requiresApproval {
+                    terminalInputStatus = .requiresApproval
+                    TerminalInputInstaller.openApprovalSettings()
+                }
+            } catch { terminalInputError = error.localizedDescription }
+            terminalInputBusy = false; refreshTerminalPermissions()
+        }
+    }
     @ViewBuilder private func section<Content: View>(_ title: String, icon: String, status: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: icon).font(.headline)
@@ -177,14 +232,23 @@ struct ConnectionSettings: View {
     }
     private func installExtension() {
         guard let vsix = Bundle.main.url(forResource: "autoapprove-bridge", withExtension: "vsix") else { notice = "확장 파일이 없습니다. README의 확장 빌드 명령을 먼저 실행해주세요."; return }
-        let cli = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
-        guard FileManager.default.isExecutableFile(atPath: cli) else { notice = "Applications 폴더의 Visual Studio Code를 찾지 못했습니다."; return }
+        let editors = [
+            ("VS Code", "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+            ("VS Code Insiders", "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders"),
+            ("Cursor", "/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
+            ("Windsurf", "/Applications/Windsurf.app/Contents/Resources/app/bin/windsurf"),
+            ("VSCodium", "/Applications/VSCodium.app/Contents/Resources/app/bin/codium")
+        ].filter { FileManager.default.isExecutableFile(atPath: $0.1) }
+        guard !editors.isEmpty else { notice = "Applications 폴더에서 지원하는 편집기를 찾지 못했습니다."; return }
         busy = true
         Task {
-            do {
-                let result = try await Task.detached { try CommandRunner.run(cli, ["--install-extension", vsix.path, "--force"], timeout: 45) }.value
-                notice = result.status == 0 ? "확장을 설치했습니다. 연결되지 않으면 VS Code에서 Developer: Reload Window를 실행해주세요." : "확장 설치에 실패했습니다. \(result.error)"
-            } catch { notice = error.localizedDescription }
+            let results = await Task.detached { editors.map { name, cli -> String in
+                do {
+                    let result = try CommandRunner.run(cli, ["--install-extension", vsix.path, "--force"], timeout: 45)
+                    return result.status == 0 ? "\(name): 설치됨" : "\(name): \(result.error)"
+                } catch { return "\(name): \(error.localizedDescription)" }
+            } }.value
+            notice = results.joined(separator: "\n") + "\n이미 열려 있는 편집기는 새 확장을 사용하려면 창 새로고침이 필요할 수 있습니다. 실행 중인 터미널의 작업을 확인한 뒤 진행하세요."
             busy = false
         }
     }

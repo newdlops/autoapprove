@@ -67,6 +67,35 @@ static int codepoint(char *out, uint32_t value) {
     if (value < 0x10000) { out[0] = 0xe0 | (value >> 12); out[1] = 0x80 | ((value >> 6) & 63); out[2] = 0x80 | (value & 63); return 3; }
     out[0] = 0xf0 | (value >> 18); out[1] = 0x80 | ((value >> 12) & 63); out[2] = 0x80 | ((value >> 6) & 63); out[3] = 0x80 | (value & 63); return 4;
 }
+// Inspect an owner-provided ANSI snapshot without opening or writing a PTY.
+int ap_vt_cell(APVT *vt, int row, int column, APVTCellInfo *info, char *text, size_t capacity) {
+    if (!vt || !info || !text || capacity < 2 || row < 0 || row >= vt->rows || column < 0 || column >= vt->columns) return -1;
+    VTermScreenCell cell; memset(&cell, 0, sizeof(cell)); memset(info, 0, sizeof(*info)); text[0] = 0;
+    if (!vterm_screen_get_cell(vt->screen, (VTermPos){row, column}, &cell)) return -1;
+    if (cell.chars[0] == (uint32_t)-1) return 0;
+    info->width = cell.width ? cell.width : 1;
+    info->flags = (cell.attrs.bold ? 1 : 0) | (cell.attrs.italic ? 2 : 0) | (cell.attrs.underline ? 4 : 0)
+        | (cell.attrs.reverse ? 8 : 0) | (cell.attrs.conceal ? 16 : 0) | (cell.attrs.strike ? 32 : 0);
+    info->foreground_default = VTERM_COLOR_IS_DEFAULT_FG(&cell.fg); info->background_default = VTERM_COLOR_IS_DEFAULT_BG(&cell.bg);
+    VTermColor fg = cell.fg, bg = cell.bg;
+    vterm_screen_convert_color_to_rgb(vt->screen, &fg); vterm_screen_convert_color_to_rgb(vt->screen, &bg);
+    info->foreground = ((uint32_t)fg.rgb.red << 16) | ((uint32_t)fg.rgb.green << 8) | fg.rgb.blue;
+    info->background = ((uint32_t)bg.rgb.red << 16) | ((uint32_t)bg.rgb.green << 8) | bg.rgb.blue;
+    size_t length = 0;
+    if (!cell.chars[0]) { text[length++] = ' '; }
+    else for (int index = 0; index < VTERM_MAX_CHARS_PER_CELL && cell.chars[index]; index++) {
+        char encoded[4]; int size = codepoint(encoded, cell.chars[index]);
+        if (length + size >= capacity) return -1;
+        memcpy(text + length, encoded, size); length += size;
+    }
+    text[length] = 0; return (int)length;
+}
+void ap_vt_cursor(APVT *vt, APVTCursorInfo *info) {
+    if (!vt || !info) return;
+    VTermState *state = vterm_obtain_state(vt->term); VTermPos cursor;
+    vterm_state_get_cursorpos(state, &cursor);
+    *info = (APVTCursorInfo){cursor.row, cursor.col, state->mode.cursor_visible, state->mode.cursor_shape, state->mode.cursor_blink};
+}
 // Reconnection restores current cells and modes, never historical terminal queries.
 // libvterm alone answers queries to the PTY; browser renderers must not answer twice.
 static size_t cell_style(char *out,size_t capacity,const VTermScreenCell *cell) {

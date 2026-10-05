@@ -1,5 +1,7 @@
 import Foundation
 import CoreGraphics
+import AppKit
+import TerminalInputSupport
 
 public struct TerminalScreen: Codable {
     public var tty: String
@@ -43,7 +45,16 @@ public struct ScreenTarget: Equatable, Sendable {
     /// Processes of the agent's foreground job. A host that reports its own foreground job
     /// must name one of these before any input is written.
     public var jobPIDs: [Int32]
-    public init(tty: String, handle: String? = nil, jobPIDs: [Int32] = []) { self.tty = tty; self.handle = handle; self.jobPIDs = jobPIDs }
+    public var sourcePID: Int32?
+    public var sourceStarted: String?
+    /// Frozen when the original input stream is first bound, not per keystroke.
+    public var sourceIdentity: TTYInputIdentity?
+    public init(tty: String, handle: String? = nil, jobPIDs: [Int32] = [], sourcePID: Int32? = nil, sourceStarted: String? = nil,
+                sourceIdentity: TTYInputIdentity? = nil) {
+        self.tty = tty; self.handle = handle; self.jobPIDs = jobPIDs
+        self.sourcePID = sourcePID; self.sourceStarted = sourceStarted
+        self.sourceIdentity = sourceIdentity
+    }
 }
 
 /// The per-host channel behind every screen connection. Tests replace these closures.
@@ -82,6 +93,8 @@ public struct ScreenHostAdapter: Sendable {
                 reveal: { try OrcaAdapter.reveal(target: $0); return nil },
                 resume: { try OrcaAdapter.resume(target: $0, region: $1, text: $2) },
                 input: { try RemoteTerminalAdapter.input(host: .orca, target: $0, expected: $1, agent: $2, input: $3) })
+        case .tmux:
+            return TmuxRelay.shared.adapter
         case .pty:
             // An engine installs its own manager here. No global PTYs or slave writes.
             return ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
@@ -111,7 +124,7 @@ enum AutomationScript {
 
 public enum TerminalDelivery: String, Codable { case sent, screenChanged, missingTarget, agentMissing }
 
-public struct TerminalWindowBounds: Codable, Equatable {
+public struct TerminalWindowBounds: Codable, Equatable, Sendable {
     public let x: Double
     public let y: Double
     public let width: Double
@@ -126,7 +139,75 @@ public struct TerminalWindowBounds: Codable, Equatable {
     }
 }
 
+public struct TerminalWindowMetadata: Equatable, Sendable {
+    public var tty: String
+    public var windowID: UInt32
+    public var ownerPID: Int32
+    public var ownerBundleID: String
+    public var selected: Bool
+    public var minimized: Bool
+    public var bounds: TerminalWindowBounds?
+    public var bindingToken: String?
+    public init(tty: String, windowID: UInt32, ownerPID: Int32, ownerBundleID: String, selected: Bool, minimized: Bool, bounds: TerminalWindowBounds? = nil, bindingToken: String? = nil) {
+        self.tty = tty; self.windowID = windowID; self.ownerPID = ownerPID; self.ownerBundleID = ownerBundleID
+        self.selected = selected; self.minimized = minimized; self.bounds = bounds; self.bindingToken = bindingToken
+    }
+}
+
 public enum TerminalAdapter {
+    /// Reads the exact native window's selected TTY. It never activates/selects a tab.
+    /// The caller preflights Automation without prompting before running this helper.
+    public static func windowMetadata(tty: String, host: ScreenHost = .terminal) throws -> TerminalWindowMetadata? {
+        guard [.terminal, .iterm].contains(host) else { return nil }
+        let output = try AutomationScript.run(windowMetadataScript(tty: tty, host: host), app: host.title,
+            denied: host == .terminal ? .permissionDenied : .automationDenied(host.title), timeout: 3)
+        if output == "null" { return nil }
+        struct Selection: Decodable { var tty: String; var windowID: UInt32; var selected: Bool; var minimized: Bool; var bounds: TerminalWindowBounds? }
+        let selection = try JSONDecoder().decode(Selection.self, from: Data(output.utf8))
+        guard selection.tty == tty, selection.windowID > 0,
+              let windows = CGWindowListCopyWindowInfo(.optionIncludingWindow, selection.windowID) as? [[String: Any]],
+              let window = windows.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == selection.windowID }),
+              let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+              let owner = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier, owner == host.bundleID else { return nil }
+        return TerminalWindowMetadata(tty: tty, windowID: selection.windowID, ownerPID: ownerPID, ownerBundleID: owner,
+            selected: selection.selected, minimized: selection.minimized, bounds: selection.bounds)
+    }
+    public static func windowMetadataScript(tty: String, host: ScreenHost = .terminal) throws -> String {
+        guard [.terminal, .iterm].contains(host) else { throw RemoteHTTPError(400, "이 앱은 정확한 원본 창 주소를 제공하지 않습니다.") }
+        let value = try AutomationScript.literal(tty)
+        let lookup = host == .terminal ? """
+          for (const tab of skip(() => window.tabs()) || []) {
+            const tty = skip(() => tab.tty()); if (tty !== wanted) continue;
+            const selected = skip(() => window.selectedTab().tty()) === wanted && skip(() => tab.selected()) === true;
+            return result(window, tty, selected);
+          }
+        """ : """
+          for (const tab of skip(() => window.tabs()) || []) for (const session of skip(() => tab.sessions()) || []) {
+            const tty = skip(() => session.tty()); if (tty !== wanted) continue;
+            const tabID = skip(() => tab.id()), currentTabID = skip(() => window.currentTab().id());
+            const selected = tabID !== null && currentTabID === tabID && skip(() => tab.currentSession().tty()) === wanted;
+            return result(window, tty, selected);
+          }
+        """
+        return """
+        (() => {
+        const app = Application('\(host.bundleID)'), wanted = \(value);
+        function skip(read) { try { return read(); } catch(error) {
+          if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
+          return null;
+        } }
+        function result(window, tty, selected) {
+          const id = Number(skip(() => window.id()));
+          if (!Number.isSafeInteger(id) || id <= 0 || id > 4294967295) return 'null';
+          return JSON.stringify({tty,windowID:id,selected,minimized:skip(() => window.miniaturized()) === true,bounds:skip(() => window.bounds())});
+        }
+        if (app.running()) for (const window of app.windows()) {
+          \(lookup)
+        }
+        return 'null';
+        })();
+        """
+    }
     private static func javascript(_ body: String) throws -> String {
         try AutomationScript.run(body, app: "Terminal", denied: .permissionDenied)
     }

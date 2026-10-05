@@ -1,6 +1,6 @@
 # AutoApprove
 
-macOS Terminal·iTerm2·Orca와 VS Code 통합 터미널의 Claude Code·Codex 세션을 관리하는 로컬 앱입니다. 메뉴 막대와 관리 창에서 세션별 자동 승인, 전체 일시정지, 승인 내역, 원래 터미널로 이동을 제공합니다. 휴대폰 브라우저에서도 Mac의 같은 터미널 화면을 보고 입력할 수 있습니다.
+macOS Terminal·iTerm2·Orca·tmux와 VS Code 통합 터미널의 Claude Code·Codex 세션을 관리하는 로컬 앱입니다. 메뉴 막대와 관리 창에서 세션별 자동 승인, 전체 일시정지, 승인 내역, 원래 터미널로 이동을 제공합니다. 휴대폰 브라우저에서도 Mac의 같은 터미널 화면을 보고 입력할 수 있습니다.
 
 ## 개인 핫스팟에서 휴대폰으로 관리
 
@@ -13,13 +13,27 @@ macOS Terminal·iTerm2·Orca와 VS Code 통합 터미널의 Claude Code·Codex �
 3. Mac들이 서로 자동 발견됩니다. 하나의 주소에서 모든 세션을 검색하고, Mac별 일시정지·재개와 세션별 자동 승인을 조절합니다.
 4. 휴대폰에서 Codex·Claude 세션을 선택하면 터미널이 화면을 채웁니다. **0.2.42부터 Mac에서 실행 중인 원본 세션을 그대로 연결합니다.** Mac과 웹에서 같은 PID·TTY·실행 상태를 공유하고, 선택·새로고침·재시도로 대화를 복제하거나 새 PTY를 만들지 않습니다. 지원되는 문자·Enter·방향키·Backspace·Tab·Ctrl C를 같은 터미널로 전달합니다. **상세 보기**에서 자동 승인·질문·처리 내역을 봅니다. 자동 승인 ON에서도 입력하며 승인과 사용자 입력을 순서대로 전달합니다.
 
-**원본 동기화:** Mac의 현재 화면·커서·지원 키를 지속되는 SSE 연결로 전달하고, 웹 입력은 해당 원본 터미널의 입력 경로로 보냅니다. 화면을 보는 동안 native 화면 읽기 캐시를 짧게 유지하고 변경 없는 출력은 생략합니다. 다른 Mac의 원본도 같은 방식으로 중계합니다. Mac의 해당 터미널 화면 연결이 필요하며, 연결되지 않은 화면은 이유를 표시합니다. 구형 Mac은 기존 조건부 화면 조회를 유지합니다.
+**원본 동기화 · 0.2.43:** 기본은 SSH처럼 같은 원본 터미널의 출력과 키 입력을 SSE로 중계합니다. 화면 이미지를 캡처하거나 보내지 않으며 화면 녹음 권한도 필요 없습니다. Terminal·iTerm2는 기존 텍스트, Orca는 기존 PTY의 ANSI 셀·커서, VS Code 계열은 Bridge 0.2.8이 연결한 원본 ANSI 출력·커서를 제공합니다. 앱 재접속 중에도 VS Code 출력 읽기를 유지합니다. 출력 연결 전부터 실행된 명령은 지난 ANSI를 읽을 수 없다는 이유를 표시하고 같은 기존 터미널에 입력합니다.
+
+실제 Mac 창을 보고 싶을 때만 **화면 설정 → Mac 창 보기**를 켭니다. Terminal·iTerm2와 확인된 VS Code 계열 창의 색상·커서를 표시하며 같은 창의 분할 영역과 주변 UI도 포함합니다. 끄기·새로고침·다른 세션 선택·브라우저 숨김은 이미지 전송을 중단하고 기본 터미널로 돌아갑니다. 보기 전환은 PID·TTY·입력 연결을 바꾸거나 새 PTY를 만들지 않습니다. **원본 터미널 연결**은 같은 기존 탭을 확인하며 Mac 창 보기가 켜졌을 때만 화면 녹음 권한을 요청합니다. VS Code 계열은 **편집기 확장 설치**로 업데이트하세요. 휴대폰에는 설치가 필요 없습니다. 구형 Mac은 기존 조건부 조회를 유지하며 선택형 이미지 모드는 0.2.43 빌드 51 이상에서 지원합니다.
+
+**빌드 54의 Terminal 직접 입력 설정:** Mac의 **연결 설정 → 원본 터미널 화면·입력 → 직접 입력 연결**을 사용합니다. 정상 연결된 기존 서비스는 재설치하거나 종료하지 않습니다. 새 연결은 앱 내부의 서비스 정보를 Apple `SMAppService`로 등록하고 **시스템 설정 → 일반 → 로그인 항목 및 확장 프로그램**에서 AutoApprove의 백그라운드 실행을 허용합니다. 관리자 셸로 서비스 파일을 복사하는 이전 설치 경로는 제거했습니다. 새 등록에는 Developer ID로 서명하고 Apple 공증을 받은 앱이 필요하며, 현재 자체 서명 후보에서는 기존 연결을 확인하고 유지할 수 있습니다. 보안 경고 이력 삭제나 EDR 무탐지를 보장하지 않습니다. [Apple 서비스 등록 안내](https://developer.apple.com/documentation/servicemanagement/smappservice).
+
+**무료 tmux 공유 · 0.2.44 빌드 55:** 유료 Apple 개발자 계정이나 관리자 입력 서비스 없이 Mac과 휴대폰이 **같은 tmux 창의 원본 색상·커서·입력**을 공유합니다. tmux의 control mode에서 출력 변경을 받아 SSE로 전달하고, 키 입력도 계속 연결된 같은 창으로 보냅니다. 웹 접속·재시도·연결 해제는 새 PTY나 대화를 만들지 않으며 Mac 창 크기를 바꾸지 않습니다. 자동 승인 ON에서도 직접 입력할 수 있습니다.
+
+공유할 **각 Mac에 tmux를 설치**하고, 공유 대상 CLI를 tmux 안에서 실행합니다. **휴대폰에는 설치하지 않습니다.** Homebrew를 사용하는 Mac은 `brew install tmux`로 설치하고 `tmux -V`로 확인합니다. Mac의 **연결 설정 → tmux로 같은 터미널 공유 → 시작 명령 복사**를 사용하거나 아래 명령을 실행한 뒤 그 안에서 Codex 또는 Claude를 시작하세요. 이미 tmux 안에서 실행 중이면 **연결 확인**만 하면 됩니다.
+
+```sh
+tmux new-session -A -s autoapprove
+```
+
+이미 tmux 밖에서 실행 중인 CLI는 그대로 유지합니다. tmux 설치만으로 기존 작업을 이전할 수는 없습니다. 기존 대화를 tmux 안에서 이어가려면 사용자가 해당 CLI의 이어하기 기능을 선택해야 합니다. 다른 창에도 입력하는 `synchronize-panes`가 켜져 있거나 tmux가 복사 모드이면 입력을 거부하고 원본 상태를 확인하도록 안내합니다. tmux 3.7c와 격리한 실제 창에서 검증했으며 원본 앱의 사용자 지정 16색 팔레트는 제공되지 않아 기본 팔레트를 사용합니다. [tmux 공식 설치 안내](https://github.com/tmux/tmux/wiki/Installing), [control mode](https://github.com/tmux/tmux/wiki/Control-Mode).
 
 **새 터미널**은 별도의 독립 터미널이 필요할 때만 사용합니다. Mac·폴더·셸/Codex/Claude Code를 선택해 만들고, 화면이나 **키보드**를 눌러 입력합니다. 원본 ANSI·실제 커서·대체 화면을 표시하고 화면 키보드의 크기를 PTY의 열·행에 반영합니다. 브라우저를 닫아도 프로세스를 유지하고, 새로고침하면 같은 PTY의 현재 화면을 복원합니다. 다른 브라우저가 최근 입력 중이면 입력 차례를 기다리며, 결과 미확인 입력은 재전송하지 않습니다. **화면 설정 → PTY 종료** 또는 Mac 앱 종료는 앱이 만든 PTY의 작업을 종료합니다. 독립 PTY에는 손쉬운 사용 권한이 필요 없으며 자동 승인은 CLI 감지 후 적용하고 기본으로 꺼져 있습니다.
 
 종료한 PTY는 실행 중 목록과 세션 수에서 즉시 빠지고, 열어둔 화면에는 마지막 출력과 종료 코드를 유지합니다. 새로고침해도 닫힌 PTY를 자동 재실행하지 않습니다. Mac의 원본 세션을 선택하면 그 원본에 연결합니다.
 
-기존 터미널의 화면 중계 경로에서도 문자·완성된 한글과 Esc·Ctrl C·방향키·Backspace·Tab을 지원되는 터미널로 전달합니다. 실제 위치 정보가 있는 연결에서는 깜박이는 커서와 한글 조합을 그 위치에 표시하고, 완성된 한글만 전송합니다. VS Code는 VT 커서의 위치·모양·숨김을 전달하고 Terminal은 정확한 탭의 접근성 삽입 위치를 읽을 수 있을 때 표시합니다. iTerm2·Orca 등 위치 정보가 없는 연결은 커서를 임의로 그리지 않습니다. iTerm2·Orca와 **AutoApprove Bridge 0.2.7 이상**의 VS Code에서 지원합니다. 기본 Terminal은 Mac의 **시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용 → AutoApprove** 허용이 필요하고 대상 탭을 활성화해 키를 전달합니다. 요청되면 시스템 이벤트 제어도 허용합니다. 권한이 없으면 작성 입력과 해당 이유를 표시합니다. 구형 VS Code 확장도 작성 입력을 지원하며 연결 설정의 **VS Code 확장 설치**로 업데이트합니다.
+화면이나 **키보드**를 눌러 문자·완성된 한글과 Enter·Esc·Ctrl C·방향키·Backspace·Tab을 지원되는 원본에 전달합니다. 이미지 연결은 Mac이 실제로 그린 커서를 표시하고, Orca·VS Code의 ANSI 연결은 소유 터미널이 제공한 위치·모양·숨김을 사용합니다. **빌드 53의 Terminal 직접 입력은 기존 TTY에 바이트를 전달합니다.** 손쉬운 사용이나 선택 창에 의존하지 않으며 새 CLI를 만들지 않습니다. Mac에 설치한 보조 서비스는 같은 발행자로 서명된 앱·CLI만 받아 원본 PID·정밀한 시작 시각·TTY·전경 작업을 확인합니다. 원본 CLI가 직접 입력을 받는 모드여야 하며 전달한 입력을 자동 재전송하지 않습니다. Terminal 출력 읽기는 기존 자동화 권한을 사용합니다. 연결이 없으면 Mac 설정 안내를 표시하며 작성창을 자동으로 열지 않습니다. 작성 모드를 선택한 경우, 작성 전송이 없는 원본 연결의 내용은 초안으로 보관하고 전송을 비활성화합니다. 자동 승인 ON에서도 같은 원본에 직접 입력할 수 있습니다. 실제 관리자 서비스·원본 입력 검증 여부는 [VALIDATION.md](VALIDATION.md)에서 확인하세요.
 
 **화면 설정**에서 글자 크기·줄바꿈·원본 색상·아래로 따라가기를 조절합니다. **작성 후 Enter 전송**을 선택하면 작성 입력창을 열고, Enter로 텍스트와 Return을 함께 보냅니다. 이 작성 모드에서 Shift Enter는 줄바꿈입니다. 직접 입력 모드의 Shift Enter는 Return이며, Tab은 터미널로 보내고 Shift Tab으로 포커스를 벗어납니다. 키보드 크기에 맞춰 터미널 높이를 바꾸며 전송 중에도 키보드·초안·스크롤·선택을 유지합니다. 단일 줄 붙여넣기는 바로 전달하고 여러 줄은 작성 입력에 보존해 확인 후 Enter로 보냅니다. 연결 끊김·세션 변경·전달 결과 미확인 때 직접 입력을 멈추고 미전송 문자를 원래 세션의 작성 영역에 순서대로 보존하며 자동 재전송하지 않습니다.
 
@@ -37,7 +51,7 @@ macOS Terminal·iTerm2·Orca와 VS Code 통합 터미널의 Claude Code·Codex �
 
 실제 PTY는 프로그램이 보내는 원본 ANSI 색상과 서식을 표시합니다. 기존 탭의 웹 중계도 **AutoApprove Bridge 0.2.5 이상으로 연결한 VS Code**에서 원본 색상을 표시합니다. RGB·256색·테마의 16색, 배경색, 굵기·밑줄 등을 전달하고 문구를 보고 색을 추측하지 않습니다. **원본 색상**을 끄면 단색으로 읽을 수 있으며 설정은 브라우저에 저장됩니다. 확장은 Mac의 **연결 설정 → VS Code 확장 설치**에서 업데이트합니다. 이미 실행 중인 CLI의 지난 ANSI 출력은 읽을 수 없어 확장을 적용한 뒤 새로 실행한 CLI부터 표시합니다.
 
-**기본 Terminal·iTerm2·Orca의 현재 화면 연결은 텍스트만 제공합니다.** 이 연결에서는 원본 색상을 복구할 수 없다는 안내와 단색 화면을 표시합니다. 기존 세션을 종료하거나 바꾸지 않습니다. 출력과 입력 직후의 빠른 갱신, 동일 화면 전송·그리기 생략, **아래로 따라가기** 및 텍스트 선택 보존은 유지합니다.
+**기본 Terminal·iTerm2의 일반 출력 연결은 텍스트를 제공합니다.** 원본 ANSI 색상을 복구할 수 없다는 안내와 단색 화면을 표시합니다. 실제 색상은 선택형 **Mac 창 보기**로 확인할 수 있습니다. Orca는 영구 daemon 프로토콜 32–36의 검증된 원본 ANSI 스냅샷을 읽으며 RGB·서식·커서를 유지합니다. 소유자의 사용자 지정 indexed 팔레트가 제공되지 않으면 기본 팔레트를 사용합니다. 기존 세션을 종료하거나 바꾸지 않습니다. 출력과 입력 직후의 빠른 갱신, 동일 화면 전송·그리기 생략, **아래로 따라가기** 및 텍스트 선택 보존은 유지합니다.
 
 설치 파일은 [**최신 AutoApprove 릴리스**](https://github.com/newdlops/autoapprove/releases/latest)에서 받습니다. 검증 범위와 남은 확인 항목은 [VALIDATION.md](VALIDATION.md)에 기록합니다.
 
@@ -102,7 +116,9 @@ Codex의 `Allow / Allow for this session / Always allow / Cancel` 도구 승인�
 
 **처음 열 때 개발자 확인 경고가 표시되는 경우:** 공식 배포 파일임을 확인한 뒤 경고를 닫고 **시스템 설정 → 개인정보 보호 및 보안 → AutoApprove의 ‘그래도 열기’ → 열기**를 선택하세요. 현재 앱은 **Developer ID 서명·Apple 공증을 받지 않았으므로**, macOS의 최초 허용을 자동으로 생략할 수 없습니다. 관리형 Mac은 관리자 정책에 따라 허용이 제한될 수 있습니다. [Apple의 실행 허용 안내](https://support.apple.com/ko-kr/102445).
 
-**‘손상됨’ 경고가 표시되면** 공식 릴리스에서 DMG를 다시 받아 설치해주세요. 동일한 경고가 반복되면 경고에 나온 파일 이름과 문구를 확인해야 원인을 좁힐 수 있습니다. DMG 전환이나 드래그 복사가 다운로드 차단 속성을 자동으로 제거하지는 않습니다. 앱 번들은 ad-hoc 서명입니다.
+**‘손상됨’ 경고가 표시되면** 공식 릴리스에서 DMG를 다시 받아 설치해주세요. 동일한 경고가 반복되면 경고에 나온 파일 이름과 문구를 확인해야 원인을 좁힐 수 있습니다. DMG 전환이나 드래그 복사가 다운로드 차단 속성을 자동으로 제거하지는 않습니다. 0.2.43부터 앱은 재사용하는 자체 코드 서명 인증서로 서명하며 Developer ID 공증은 포함하지 않습니다.
+
+**Terminal 직접 입력이 안 되면:** 빌드 53부터 입력 보조 서비스를 사용하므로 손쉬운 사용 권한이 필요하지 않습니다. Mac의 **연결 설정 → 원본 터미널 화면·입력**에서 연결 상태를 확인하세요. 빌드 54에서 승인 대기 상태라면 **허용 설정 열기**로 macOS의 백그라운드 실행을 허용합니다. 서명·실행 오류가 있는 기존 서비스는 자동 교체하지 않고 이유를 표시합니다. 화면 기록은 Mac 창 보기를 선택할 때만 필요합니다. 이전 빌드 52의 키 이벤트 입력 경로에는 별도의 손쉬운 사용 허용이 필요합니다.
 
 ## 실행
 
@@ -151,7 +167,7 @@ Terminal 연결을 한 번 켜면 앱 재실행 후에도 복원합니다. 명�
 
 **iTerm2와 Orca**도 훅 없이 Terminal과 같은 방식으로 연결합니다. `연결 설정`에서 각각 연결하면 앱 재실행 후에도 복원하며, 다른 터미널의 연결에는 영향을 주지 않습니다. iTerm2는 자동화 권한으로 세션별 현재 화면을 읽고 해당 세션(분할 창 포함)에만 입력합니다. 입력 직전에 iTerm2가 알려주는 포그라운드 작업이 해당 CLI인지도 확인합니다. Orca는 앱에 포함된 `orca` 명령줄 도구로 렌더링된 화면을 읽고, 입력 직전에 화면을 다시 확인한 뒤 해당 터미널에만 `1`과 Enter를 보냅니다. 별도 권한은 필요 없고 Orca가 실행 중이어야 합니다.
 
-어느 앱의 터미널인지는 프로세스 계보와 CLI 프로세스의 실행 환경 변수(`TERM_PROGRAM`, `__CFBundleIdentifier`, `ITERM_SESSION_ID`, `ORCA_TERMINAL_HANDLE` 등 허용한 이름만)로 판별합니다. 그 밖의 환경 변수와 토큰은 읽어 두지 않습니다. Warp·Ghostty·Cursor처럼 화면 연결이 없는 앱도 이름을 표시하지만 제어 가능한 것처럼 표시하지 않습니다. tmux·screen·Zellij 안에서 실행한 세션과 다른 터미널 세션 안에서 연 중첩 PTY는 입력이 다른 창으로 갈 수 있어 연결하지 않습니다.
+어느 앱의 터미널인지는 프로세스 계보와 CLI 프로세스의 실행 환경 변수(`TERM_PROGRAM`, `__CFBundleIdentifier`, `ITERM_SESSION_ID`, `ORCA_TERMINAL_HANDLE`, `TMUX`, `TMUX_PANE` 등 허용한 이름만)로 판별합니다. Warp·Ghostty처럼 화면 연결이 없는 앱도 이름을 표시하지만 제어 가능한 것처럼 표시하지 않습니다. Cursor 등 VS Code 계열은 브리지로 연결합니다. tmux는 서버 PID·시작 시각·소켓 소유자·pane ID와 같은 CLI의 PID·TTY를 검증한 전용 중계를 사용합니다. screen·Zellij와 확인되지 않은 중첩 PTY는 연결하지 않습니다.
 
 ## 연결별 동작
 
@@ -159,14 +175,14 @@ Terminal 연결을 한 번 켜면 앱 재실행 후에도 복원합니다. 명�
 |---|---|---|
 | 프로세스 탐색 | 기존 Claude·Codex, PID·TTY·프로젝트·터미널 앱 | 도구가 실행된 터미널만 표시. 도구 종료 시 활성 목록에서 제외. 터미널 앱은 계보와 허용한 실행 환경 변수로 판별 |
 | Claude 훅 | `PermissionRequest` 직접 승인, 단일 예·아니오 확인, 질문·선택지 표시, 작업 이벤트 | 훅 설정을 읽은 세션부터 가능. 터미널로 반환된 권한 요청은 지원하는 화면 연결이 있을 때 감지·승인 |
-| Terminal | 선택한 탭의 승인 화면 감지·단일 입력, 탭으로 이동 | macOS 자동화 권한 필요. 도구·버전별 지원하는 화면 형태만 감지 |
-| iTerm2 | 세션(분할 창 포함)의 승인 화면 감지·단일 입력, 탭으로 이동 | iTerm2 자동화 권한 필요. 입력 직전 포그라운드 작업 확인. iTerm2 3.7.3에서 무동작 대역 프로세스, 실제 Codex 승인 화면, 훅을 끈 실제 Claude 권한 창으로 검증 |
-| Orca | 터미널의 렌더링된 승인 화면 감지·단일 입력, 탭 전환 | Orca 실행 필요. 앱의 `orca` 명령줄 도구 사용. 화면 확인과 입력은 별도 호출이라 원자적이지 않음. Orca 재시작 직후 복원된 일부 탭은 렌더링된 화면을 주지 않아 연결되지 않음. Orca 1.4.216에서 무동작 대역 프로세스, 실제 Codex 승인 화면, 훅을 끈 실제 Claude 권한 창으로 검증 |
-| VS Code 확장 | 터미널 등록·이동, 명령 출력 복원·단일 입력 | shell integration 필요. 확장과 앱 연결 후 시작한 실행부터 출력 감지. Cursor 등 VS Code 계열은 이름만 표시하며 확장 연결은 미검증 |
+| Terminal | 선택한 탭의 승인 감지·원본 창·직접 키 입력 | 출력 읽기는 자동화 권한 필요. 창 보기는 화면 기록, 직접 키는 원본 입력 서비스 연결 필요. 읽기 요청은 권한을 요청하거나 다른 탭을 활성화하지 않음 |
+| iTerm2 | 세션의 승인 감지·원본 창·직접 키 입력·탭 이동 | iTerm2 자동화 권한과 창 표시의 화면 기록 권한 필요. 같은 창의 분할 화면도 캡처. 입력 직전 포그라운드 작업 확인. 이전 승인 경로는 iTerm2 3.7.3에서 실제 Codex·Claude로 검증 |
+| Orca | 기존 터미널의 ANSI 셀·커서, 직접 키, 승인 감지·탭 전환 | 영구 daemon 프로토콜 32–36의 정확한 runtime/PTY/incarnation을 읽기 전용으로 확인. 비영구·비호환 소스는 연결 불가 이유 표시. RGB는 원본 유지, 소유자의 indexed 팔레트가 없으면 기본 팔레트 사용. 입력·자동 승인은 기존 Orca 명령줄 경로 사용 |
+| VS Code 계열 확장 | 원본 ANSI 출력·커서·직접 입력·재접속, 선택형 원본 창 표시 | Bridge 0.2.8. ANSI 감지는 shell integration과 확장 설치 후 시작한 실행 필요. 기본 입력은 같은 기존 Terminal 객체를 사용하며 화면 기록·손쉬운 사용이 필요 없음. 창 보기만 화면 기록·손쉬운 사용, 보이는 상태 표시줄·영어/한국어 입력 영역·창 내 유일한 터미널 이름 필요. Cursor 등 각 실제 편집기의 동작 확인은 별도 |
 | Codex 질문 기록 | 화면 밖 비동기 질문 대기열·질문별 알림 | 실행 중인 CLI의 유일한 루트 기록과 로컬 이력 DB를 읽기 전용으로 연결. Codex 0.155.1 기록 형식에서 검증 |
 | Codex app-server | 이번 버전의 실행 경로에 포함하지 않음 | 확인한 기존 CLI에 공유 서버 소켓이 없어 터미널 연결을 사용 |
 
-VS Code 확장을 뒤늦게 연결하면 이전 출력은 복구할 수 없습니다. 기존 Claude는 훅 연결을 시도할 수 있고, 기존 Codex는 연결 후 CLI에서 대화를 이어하기 해야 출력 감지가 가능합니다. 연결이 끊긴 VS Code 스트림은 다음 명령부터 다시 제어합니다. SSH, Dev Containers, WSL은 지원하지 않습니다.
+확장 설치 전에 시작한 VS Code 명령의 이전 ANSI 바이트는 공식 API로 복구할 수 없습니다. 이 경우 출력 제한을 표시하고 같은 기존 터미널 객체에 키를 보냅니다. 사용자가 원할 때 Mac 창 보기를 켤 수 있습니다. 확장 설치 후 시작한 명령은 앱 연결이 끊겨도 출력 읽기를 유지해 재접속합니다. 실제 명령 종료·읽기 실패는 감지를 중지합니다. 기존 Claude의 승인은 훅으로도 연결할 수 있습니다. SSH 원격 호스트, Dev Containers, WSL은 지원하지 않습니다.
 
 화면 감지는 승인 창 제목·선택된 일회 승인 옵션·거부 옵션·화면 끝을 함께 확인합니다. 입력 전 화면 내용과 실행 중인 프로세스를 다시 확인하지만, 터미널의 화면 확인과 입력은 원자적 작업이 아닙니다. 훅 연결은 해당 요청에 직접 응답합니다.
 
@@ -243,7 +259,9 @@ open dist/AutoApprove.app
 AUTOAPPROVE_BUILD=debug bash scripts/build.sh
 ```
 
-확장 패키지는 `dist/autoapprove-bridge.vsix`에 생성되어 앱에도 포함됩니다. 네이티브 앱은 로컬 개발용 ad-hoc 서명을 사용합니다. 외부 배포용 Developer ID 서명·공증은 포함하지 않습니다.
+확장 패키지는 `dist/autoapprove-bridge.vsix`에 생성되어 앱에도 포함됩니다. 네이티브 앱은 동일한 발행자 인증서를 재사용해 업데이트가 기존 개인정보 접근 허용 대상과 일치하도록 서명합니다. 외부 배포용 Developer ID 서명·공증은 포함하지 않습니다.
+
+개발용 기본 서명은 `.runtime/code-signing/`의 전용 비공개 키체인을 사용합니다. 최초 생성 후 macOS 코드 서명용 인증서 신뢰 확인이 필요합니다. 이 폴더를 비공개로 보관·백업하고 Git이나 배포 자산에 포함하지 마세요. 발행자 인증서를 바꾸면 기존 사용자의 접근 허용을 다시 받아야 합니다. 별도 발행 인증서는 `AUTOAPPROVE_SIGNING_IDENTITY`와 선택적 `AUTOAPPROVE_SIGNING_KEYCHAIN`으로 지정할 수 있습니다.
 
 release 빌드 후 설치용 DMG와 SHA-256 파일을 만듭니다.
 
@@ -269,6 +287,15 @@ NODE_OPTIONS=--use-system-ca bash scripts/build.sh
 swift build --disable-sandbox --cache-path .build/cache
 .build/debug/autoapprove-checks
 npm --prefix extensions/vscode test
+node scripts/terminal-window-check.mjs --release --visual
+node scripts/terminal-view-check.mjs --release
+node scripts/terminal-view-check.mjs --release --bridge
+node scripts/terminal-keyboard-check.mjs --release
+node scripts/signing-tool-check.mjs
+node scripts/terminal-signing-check.mjs dist/AutoApprove.app
+node scripts/original-terminal-screen-check.mjs --release
+node scripts/orca-terminal-stream-check.mjs
+node scripts/orca-engine-check.mjs --release
 node scripts/integration-check.mjs
 node scripts/claude-parent-integration-check.mjs
 node scripts/claude-hook-integration-check.mjs .build/debug/autoapprove
@@ -276,6 +303,7 @@ node scripts/screen-integration-check.mjs
 node scripts/codex-queue-integration-check.mjs
 node scripts/network-integration-check.mjs
 node scripts/network-package-check.mjs dist/AutoApprove.app
+node scripts/terminal-signing-check.mjs dist/AutoApprove.app
 node scripts/install-check.mjs
 ```
 
@@ -284,6 +312,8 @@ node scripts/install-check.mjs
 `claude-hook-integration-check`는 비활성 PTY와 격리 소켓에서 실제 helper의 앱 승인·다음 5초 자동 응답·서버 재시작·응답 유실 재전달·중복 방지·터미널 넘기기를 확인합니다. `claude-parent-integration-check`는 메인·백그라운드 연결과 정책 상속을 검사합니다.
 
 `network-integration-check`는 합성 터미널을 가진 두 격리 엔진의 Bonjour 발견·Mac별 제어·화면 조회·입력·중복 방지·끊김과 복구를 검사합니다. `--serve`로 유지한 검증 서버의 `preview.json` 경로를 `network-browser-check.mjs`에 전달하면 Playwright·Chromium이 있는 환경에서 휴대폰·태블릿·데스크톱 화면과 조작을 확인합니다. `--http-lan`을 붙이면 테스트용 `.local` 주소를 루프백에 매핑해 일반 HTTP 환경과 UUID 대체 경로도 확인합니다. `network-package-check`는 먼저 패키징한 앱을 사용하며, 임시 복사본·프로필에서 포트 충돌·웹 설정 복원·웹 끄기와 번들 리소스를 확인합니다.
+
+`terminal-signing-check`는 같은 발행자 인증서를 보유한 배포 환경에서만 실행합니다. 업데이트의 지정 요구사항 호환성과 같은 bundle ID를 쓰는 다른 서명의 거부를 검사하며, 인증서·키체인을 새로 생성하지 않습니다. `signing-tool-check`는 도구 호출을 대역으로 바꿔 암호가 프로세스 인자와 오류 메시지에 포함되지 않는지 검사합니다.
 
 `install-check`는 별도 서명한 테스트 앱을 임시 폴더에 설치해 다운로드 차단 속성 제거·재설치·실행 중 교체 방지·실패 시 복원을 검사합니다. 관리자 인증과 앱 열기는 대역으로 확인하며 실제 비밀번호를 요청하거나 사용자 앱을 실행하지 않습니다.
 

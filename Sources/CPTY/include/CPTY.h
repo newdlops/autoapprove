@@ -12,4 +12,11 @@ void ap_vt_resize(APVT *vt, int rows, int columns);
 size_t ap_vt_response(APVT *vt, char *buffer, size_t length);
 char *ap_vt_text(APVT *vt);
 char *ap_vt_snapshot(APVT *vt, size_t *length);
+typedef struct {
+    int width, flags, foreground_default, background_default;
+    uint32_t foreground, background;
+} APVTCellInfo;
+typedef struct { int row, column, visible, shape, blink; } APVTCursorInfo;
+int ap_vt_cell(APVT *vt, int row, int column, APVTCellInfo *info, char *text, size_t capacity);
+void ap_vt_cursor(APVT *vt, APVTCursorInfo *info);
 #endif

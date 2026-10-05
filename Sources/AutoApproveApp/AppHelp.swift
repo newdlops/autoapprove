@@ -81,6 +81,7 @@ enum AppHelp {
         case .vscodeScreen: return "AutoApprove Bridge가 전달한 VS Code 터미널 출력에서 승인 요청을 감지합니다."
         case .itermScreen: return "iTerm2 화면에서 지원하는 승인 요청을 감지하고 해당 세션에 응답합니다."
         case .orcaScreen: return "Orca 명령줄 도구로 해당 터미널의 현재 화면을 읽고, 지원하는 승인 요청에 응답합니다."
+        case .tmuxScreen: return "Mac과 휴대폰이 같은 tmux 창의 화면·커서·입력을 공유합니다. tmux는 각 Mac에만 설치하며 휴대폰은 브라우저를 사용합니다."
         case .ptyScreen: return "AutoApprove가 만든 PTY의 현재 화면을 확인하고 같은 PTY에 승인 입력을 전달합니다. 웹에서 직접 입력할 수 있습니다."
         }
     }

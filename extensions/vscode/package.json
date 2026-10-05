@@ -2,7 +2,7 @@
   "name": "autoapprove-bridge",
   "displayName": "AutoApprove Bridge",
   "description": "Connect local VS Code terminals to the AutoApprove macOS app.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "publisher": "autoapprove-local",
   "license": "UNLICENSED",
   "engines": {
@@ -48,7 +48,7 @@
   },
   "scripts": {
     "compile": "tsc -p .",
-    "test": "npm run compile && node --test out/screen.test.js",
+    "test": "npm run compile && node --test out/screen.test.js out/native-input.test.js out/extension.test.js",
     "package": "npm run compile && vsce package --allow-missing-repository --out ../../dist/autoapprove-bridge.vsix"
   },
   "dependencies": {

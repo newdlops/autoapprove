@@ -4,9 +4,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ScreenMirror } from './screen';
+import { NativeTerminalBinding } from './native-input';
 import { readThemeColors, resolveTerminalTheme } from './theme';
 
-type TerminalState = { id: string; terminal: vscode.Terminal; shellPID?: number; mirror?: ScreenMirror; execution?: vscode.TerminalShellExecution; executionActive?: boolean };
+type TerminalState = { id: string; terminal: vscode.Terminal; native: NativeTerminalBinding; shellPID?: number; mirror?: ScreenMirror; execution?: vscode.TerminalShellExecution; executionActive?: boolean };
 let connection: net.Socket | undefined;
 let reconnectTimer: NodeJS.Timeout | undefined;
 let heartbeat: NodeJS.Timeout | undefined;
@@ -18,11 +19,13 @@ let output: vscode.OutputChannel;
 let revealStatus: vscode.Disposable | undefined;
 let themeColors: Record<string, unknown> = {};
 let themeGeneration = 0;
+const windowToken = randomUUID();
 
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel('AutoApprove');
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 20);
   status.command = 'autoapprove.showStatus';
+  status.accessibilityInformation = { label: `AutoApprove window ${windowToken}` };
   context.subscriptions.push(output, status);
   context.subscriptions.push(vscode.commands.registerCommand('autoapprove.showStatus', () => output.show()));
   if (process.platform !== 'darwin' || vscode.env.remoteName) {
@@ -34,13 +37,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(vscode.window.onDidCloseTerminal(terminal => {
     terminals.get(terminal)?.mirror?.dispose(); terminals.delete(terminal); sendRegistration();
   }));
+  context.subscriptions.push(vscode.window.onDidChangeActiveTerminal(() => { updateNativeSelection(); sendRegistration(); }));
+  context.subscriptions.push(vscode.window.onDidChangeWindowState(() => { updateNativeSelection(); sendRegistration(); }));
   context.subscriptions.push(vscode.window.onDidStartTerminalShellExecution(event => {
     // read() must be called synchronously with the start event, before waiting for processId.
     const stream = event.execution.read();
     const state = ensureTerminal(event.terminal);
     state.mirror?.dispose();
     const mirror = new ScreenMirror();
-    if (!connected) { mirror.invalidate(); }
     state.mirror = mirror; state.execution = event.execution; state.executionActive = true;
     void registerTerminal(event.terminal);
     void (async () => {
@@ -69,6 +73,7 @@ export function activate(context: vscode.ExtensionContext): void {
   let tick = 0;
   heartbeat = setInterval(() => {
     if (!connected) { return; }
+    updateNativeSelection();
     if (tick++ % 8 === 0) { sendRegistration(); }
     for (const state of terminals.values()) {
       if (state.mirror?.valid) {
@@ -103,7 +108,7 @@ function terminalColors() {
 
 function ensureTerminal(terminal: vscode.Terminal): TerminalState {
   let state = terminals.get(terminal);
-  if (!state) { state = { id: randomUUID(), terminal }; terminals.set(terminal, state); }
+  if (!state) { state = { id: randomUUID(), terminal, native: new NativeTerminalBinding() }; terminals.set(terminal, state); }
   return state;
 }
 async function registerTerminal(terminal: vscode.Terminal): Promise<void> {
@@ -113,8 +118,14 @@ async function registerTerminal(terminal: vscode.Terminal): Promise<void> {
 }
 function sendRegistration(): void {
   send('register', { terminals: Array.from(terminals.values()).map(state => ({
-    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 3
+    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 3,
+    nativeWindowVersion: vscode.window.terminals.filter(terminal => terminal.name === state.terminal.name).length === 1 ? 2 : 0,
+    ownerPID: Number(process.env.VSCODE_PID) || 0, windowToken,
+    selected: state.native.selected, nativeGeneration: state.native.generation
   })) });
+}
+function updateNativeSelection(): void {
+  for (const state of terminals.values()) { state.native.updateSelection(vscode.window.state.focused && vscode.window.activeTerminal === state.terminal); }
 }
 function send(method: string, params: Record<string, unknown>): void {
   if (connected && connection && !connection.destroyed) {
@@ -137,6 +148,7 @@ function connect(): void {
     output.appendLine('AutoApprove 앱에 연결했습니다.'); sendRegistration();
   });
   socket.on('data', (data: string) => {
+    if (socket !== connection || !connected || socket.destroyed) { return; }
     buffer += data;
     if (Buffer.byteLength(buffer) > 2_000_000) { socket.destroy(); return; }
     let index: number;
@@ -150,8 +162,10 @@ function connect(): void {
   socket.on('close', () => {
     if (socket !== connection) { return; }
     connected = false;
-    for (const state of terminals.values()) { state.mirror?.invalidate(); }
-    status.text = '$(debug-disconnect) AutoApprove'; status.tooltip = '앱 연결 대기. 연결이 끊긴 출력은 다음 명령부터 다시 연결됩니다.';
+    // execution.read() continues locally while the app reconnects. Losing the
+    // socket does not lose the original terminal's ANSI screen or execution.
+    for (const state of terminals.values()) { state.native.disconnect(); }
+    status.text = '$(debug-disconnect) AutoApprove'; status.tooltip = '앱 연결 대기. 현재 터미널의 출력 연결을 유지하고 다시 연결합니다.';
     if (!stopped) { reconnectTimer = setTimeout(connect, 2000); }
   });
 }
@@ -159,7 +173,9 @@ function connect(): void {
 function handleMessage(message: Record<string, any>): void {
   if (message.method === 'remoteInput') {
     const state = Array.from(terminals.values()).find(state => state.id === message.terminalID);
-    const success = connected && !!state?.execution && !!state.mirror?.consumeInput(message);
+    updateNativeSelection();
+    const success = connected && !!state && (message.native === true
+      ? state.native.consume(message) : !!state.execution && !!state.mirror?.consumeInput(message));
     if (success) {
       const keys: Record<string, string> = { enter: '\r', escape: '\x1b', interrupt: '\x03', up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', backspace: '\x7f', delete: '\x1b[3~', home: '\x1b[H', end: '\x1b[F', tab: '\t' };
       state!.terminal.sendText(message.kind === 'submit' ? message.text + '\r' : ['text', 'characters'].includes(message.kind) ? message.text : keys[message.kind], false);
@@ -174,6 +190,39 @@ function handleMessage(message: Record<string, any>): void {
   if (message.method === 'reveal') {
     const state = Array.from(terminals.values()).find(state => state.id === message.terminalID);
     if (state) {
+      if (message.native === true) {
+        if (message.view === 'screen' && vscode.window.terminals.filter(terminal => terminal.name === state.terminal.name).length !== 1) {
+          send('revealResult', { actionID: message.id, success: false, terminalID: state.id }); return;
+        }
+        const requestedConnection = connection;
+        const validReveal = state.native.beginReveal(message);
+        const current = () => !!validReveal?.() && terminals.get(state.terminal) === state && connected
+          && connection === requestedConnection && !requestedConnection?.destroyed
+          && (message.view !== 'screen' || vscode.window.terminals.filter(terminal => terminal.name === state.terminal.name).length === 1);
+        if (!current()) { send('revealResult', { actionID: message.id, success: false, terminalID: state.id }); return; }
+        void (async () => {
+          let success = false;
+          try {
+            if (!current()) { return; }
+            await vscode.commands.executeCommand('workbench.action.focusWindow');
+            if (!current()) { return; }
+            state.terminal.show(false);
+            // show(false) only reveals this existing instance. The generic
+            // terminal.focus command may create a terminal when none remains.
+            for (let count = 0; count < 20 && current()
+              && !(vscode.window.state.focused && vscode.window.activeTerminal === state.terminal); count++) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            if (!current()) { return; }
+            success = vscode.window.state.focused && vscode.window.activeTerminal === state.terminal;
+            state.native.confirm(success); sendRegistration();
+          } catch { if (current()) { state.native.disconnect(); sendRegistration(); } }
+          if (connection === requestedConnection && connected) {
+            send('revealResult', { actionID: message.id, success, terminalID: state.id, nativeGeneration: state.native.generation });
+          }
+        })();
+        return;
+      }
       state.terminal.show(false);
       const label = typeof message.label === 'string' ? message.label.slice(0, 120) : state.terminal.name;
       const detail = typeof message.detail === 'string' ? message.detail.slice(0, 160) : state.terminal.name;

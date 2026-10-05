@@ -71,6 +71,8 @@ public struct RemoteTerminalFrame: Codable, Sendable {
     public var appearance: TerminalAppearance? = nil
     public var cursor: TerminalCursor? = nil
     public var streamID: String? = nil
+    public var nativeDisplay: TerminalNativeDisplay? = nil
+    public var outputReason: String? = nil
 }
 
 /// A browser that already has this revision only needs fresh controls and observation time.
@@ -84,12 +86,16 @@ struct RemoteTerminalUpdate: Encodable {
     var appearance: TerminalAppearance?
     var cursor: TerminalCursor?
     var streamID: String?
+    var nativeDisplay: TerminalNativeDisplay?
+    var outputReason: String?
     init(_ frame: RemoteTerminalFrame, knownRevision: String?) {
         sessionID = frame.sessionID; revision = frame.revision; observedAt = frame.observedAt
         keys = frame.keys; inputReason = frame.inputReason
         screen = knownRevision == frame.revision ? nil : frame.screen
         appearance = knownRevision == frame.revision ? nil : frame.appearance
         cursor = frame.cursor; streamID = frame.streamID
+        nativeDisplay = knownRevision == frame.revision ? frame.nativeDisplay?.compact : frame.nativeDisplay
+        outputReason = frame.outputReason
     }
 }
 
@@ -551,15 +557,20 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
-                    let frame = try await engine.remoteTerminal(sessionID: id)
+                    let frame = try await engine.remoteTerminal(sessionID: id, renderWindow: request.parameter("view") == "screen")
                     return try .json(RemoteTerminalUpdate(frame, knownRevision: request.parameter("revision")))
                 case "/api/terminal/stream":
                     if let forwarded = try await forwardStream(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
-                    let frame = try await engine.remoteTerminal(sessionID: id, realtime: true)
-                    let output = try RemoteTerminalBodyStream(initial: frame) { [weak engine] in
+                    let renderWindow = request.parameter("view") == "screen"
+                    let frame = try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)
+                    let tmuxObservation = try engine.remoteTmuxObservation(sessionID: id)
+                    let wakeup: (@Sendable () async -> Void)?
+                    if let tmuxObservation { wakeup = { await tmuxObservation.waitForChange() } }
+                    else { wakeup = nil }
+                    let output = try RemoteTerminalBodyStream(initial: frame, waitForChange: wakeup) { [weak engine] in
                         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
-                        return try await engine.remoteTerminal(sessionID: id, realtime: true)
+                        return try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)
                     }
                     return .eventStream(output, nodeID: nodeID)
                 case "/api/pty/stream", "/api/pty/output":
@@ -597,7 +608,7 @@ struct RemoteTerminalUpdate: Encodable {
                     release: state.release?.isCompatible == true ? state.release : nil, webURLs: state.webURLs ?? [], webPort: state.webPort)
                 updateNamedAddresses(); emitStatus(); refreshWebPeers()
                 return try .object(["id": state.id, "name": state.name])
-            case "/api/action", "/api/input", "/api/pty", "/api/pty/input", "/api/pty/resize", "/api/pty/close":
+            case "/api/action", "/api/input", "/api/terminal/connect", "/api/pty", "/api/pty/input", "/api/pty/resize", "/api/pty/close":
                 if let forwarded = try await forward(request) { return forwarded }
                 guard let engine, let requestID = object["requestID"] as? String, UUID(uuidString: requestID) != nil else { throw RemoteHTTPError(400, "고유한 요청 ID가 필요합니다.") }
                 let fingerprint = PromptDetector.fingerprint(request.path + String(decoding: request.body, as: UTF8.self))
@@ -611,6 +622,12 @@ struct RemoteTerminalUpdate: Encodable {
                 let response: RemoteHTTPResponse
                 do {
                     if request.path == "/api/input" { response = try await .object(engine.remoteInput(object)) }
+                    else if request.path == "/api/terminal/connect" {
+                        let frame = try await engine.connectRemoteTerminal(object)
+                        // Receipts must not retain megabytes of JPEGs for an explicit action.
+                        // The authoritative stream supplies the full image after this control ack.
+                        response = try .json(RemoteTerminalUpdate(frame, knownRevision: frame.revision))
+                    }
                     else if request.path == "/api/pty" { response = try await .json(engine.createPTY(object)) }
                     else if request.path == "/api/pty/input" { response = try await .object(engine.ptyInput(object)) }
                     else if request.path == "/api/pty/resize" { response = try .object(engine.ptyResize(object)) }

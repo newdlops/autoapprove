@@ -1,7 +1,7 @@
 // Real Chromium + synthetic original-terminal API; no user's CLI is touched.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 const {chromium}=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');
 const output=path.resolve('dist/qa/original-terminal');await mkdir(output,{recursive:true});
@@ -9,6 +9,9 @@ const keys=['text','submit','characters','enter','escape','interrupt','up','down
 const sources=['original','other'].map((id,index)=>({session:{id,agent:index?'claude':'codex',pid:4200+index,started:'fixed-start-'+id,tty:'/dev/fixture-'+id,cwd:'/fixture/shared-terminal',terminal:'iterm',hostName:'원래 Mac 터미널',phase:'idle',automatic:true,detail:'동일한 원래 터미널',queuedQuestions:[]},title:index?'두 번째 원래 터미널':'Mac과 같은 터미널',phaseTitle:'입력 대기',canRead:true,canApprove:true,canReveal:false,keys}));
 const state=new Map(sources.map(view=>[view.session.id,{screen:'원래 Mac 터미널\nREADY> ',revision:0,stream:'original-stream-'+view.session.id,cursor:null}]));
 let release={version:'0.2.42',build:49,api:1},online=true,failNext=false,inputDelay=30;
+let nextInputGate=null;
+const inputGates=new Set();
+function holdNextInput(){assert.equal(nextInputGate,null);let resolve;const promise=new Promise(done=>{resolve=done;});const gate={promise,release:()=>{inputGates.delete(gate);resolve();}};inputGates.add(gate);nextInputGate=gate;return gate;}
 const clients=new Set(),operations=[],receipts=new Map(),requests={pty:0,stream:0,poll:0};
 const oldCopies=[];
 const checks=[],screenshots=[],errors=[],latencies=[];
@@ -37,8 +40,8 @@ const server=createServer(async(req,res)=>{
       assert.equal(url.searchParams.get('node'),'original-mac');assert.ok(state.has(input.sessionID));
       if(receipts.has(input.requestID))return json(200,receipts.get(input.requestID));
       const source=state.get(input.sessionID);assert.equal(input.streamID,source.stream);
-      operations.push(input);macOutput(input.sessionID,source.screen+'\nPHONE:'+input.kind+':'+input.text);
-      const fail=failNext;failNext=false;await new Promise(resolve=>setTimeout(resolve,inputDelay));
+      operations.push(input);macOutput(input.sessionID,source.screen+(input.kind==='characters'?input.text:'\nPHONE:'+input.kind+':'+input.text));
+      const fail=failNext,gate=nextInputGate;failNext=false;nextInputGate=null;await(gate?gate.promise:new Promise(resolve=>setTimeout(resolve,inputDelay)));
       if(fail)return json(503,{error:'입력 결과를 확인하지 못했습니다. 원래 터미널을 확인해주세요.'});
       const receipt={message:'원래 터미널에 전달했습니다.'};receipts.set(input.requestID,receipt);return json(200,receipt);
     }
@@ -57,6 +60,7 @@ try{
   page.on('pageerror',error=>errors.push(error.message));page.on('console',message=>{if(message.type()==='error'&&!message.text().includes('status of 503'))errors.push(message.text());});
   async function ready(){await page.waitForFunction(()=>latestFrame?.sessionID==='original'&&!$('terminal-keyboard-toggle').disabled);}
   async function count(value){await page.waitForFunction(value=>window.qaOperationCount>=value,value);}
+  async function drained(){await page.waitForFunction(()=>!inputInFlight&&!directSending&&!directQueue.length);}
   async function capture(name){await page.screenshot({path:path.join(output,name+'.png')});screenshots.push(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);}
   await page.exposeFunction('qaOperations',()=>operations.length);
   await page.addInitScript(()=>{setInterval(async()=>{window.qaOperationCount=await window.qaOperations();},30);});
@@ -76,12 +80,14 @@ try{
   for(let i=0;i<100;i++)macOutput('original','BURST-'+i+'\nREADY> ');
   await page.waitForFunction(()=>$('terminal-screen').textContent.includes('BURST-99'));assert.equal(await page.evaluate(()=>!!terminalPending),false);
   checks.push('compact controls retain screen and burst rendering retains only latest pending frame');
-  await page.locator('#terminal-screen').click();await page.keyboard.type('PHONE-SAME');await count(1);await page.keyboard.press('ArrowLeft');await count(2);await page.keyboard.press('ArrowRight');await count(3);
-  assert.deepEqual(operations.slice(0,3).map(input=>[input.sessionID,input.kind]),[['original','characters'],['original','left'],['original','right']]);
+  await page.locator('#terminal-screen').click();await page.keyboard.type('PHONE-SAME');await drained();
+  assert.equal(operations.map(input=>input.text).join(''),'PHONE-SAME');assert.ok(operations.every(input=>input.sessionID==='original'&&input.kind==='characters'&&input.relay===true&&input.streamID==='original-stream-original'));
+  const beforeArrows=operations.length;await page.keyboard.press('ArrowLeft');await drained();await page.keyboard.press('ArrowRight');await drained();
+  assert.deepEqual(operations.slice(beforeArrows).map(input=>[input.sessionID,input.kind]),[['original','left'],['original','right']]);
   assert.equal(await page.locator('#automatic').isChecked(),true);assert.equal(await page.locator('#terminal-input').isVisible(),false);
   checks.push('phone characters and arrows target original session while automation stays ON');
-  const beforeFailure=operations.length;inputDelay=350;failNext=true;await page.keyboard.type('UNCERTAIN');await count(beforeFailure+1);await page.keyboard.type('QUEUED');await page.waitForFunction(()=>!directMode&&!!inputFailure);await page.waitForTimeout(450);
-  assert.equal(operations.length,beforeFailure+1);assert.match(await page.locator('#terminal-input').inputValue(),/UNCERTAIN.*QUEUED/);await capture('mobile-uncertain-input');
+  const beforeFailure=operations.length;failNext=true;const failureGate=holdNextInput();await page.keyboard.type('UNCERTAIN');await count(beforeFailure+1);await page.keyboard.type('QUEUED');failureGate.release();await page.waitForFunction(()=>!directMode&&!!inputFailure);await page.waitForTimeout(450);
+  assert.equal(operations.length,beforeFailure+1);assert.equal(await page.locator('#terminal-input').inputValue(),'UNCERTAINQUEUED');await capture('mobile-uncertain-input');
   checks.push('uncertain input preserves failed/queued text and never replays');
   const beforeStream=requests.stream;await page.evaluate(()=>terminalStream.source.dispatchEvent(new Event('error')));
   await page.waitForFunction(()=>!latestFrame&&$('terminal-retry').hidden===false);await page.waitForTimeout(600);assert.equal(requests.stream,beforeStream);assert.equal(operations.length,beforeFailure+1);
@@ -98,7 +104,8 @@ try{
     await page.waitForFunction(()=>!inputInFlight&&!directSending&&!directQueue.length);
     await page.setViewportSize({width,height});await page.evaluate(enabled=>terminalFocus(enabled),width<760);
     await page.waitForTimeout(150);
-    await page.locator('#terminal-screen').click();const before=operations.length,marker='VIEW-'+name;await page.keyboard.type(marker);await count(before+1);await page.waitForFunction(marker=>$('terminal-screen').textContent.includes(marker),marker);
+    await page.locator('#terminal-screen').click();const before=operations.length,marker='VIEW-'+name;await page.keyboard.type(marker);await drained();
+    const characters=operations.slice(before);assert.ok(characters.length>0&&characters.every(input=>input.sessionID==='original'&&input.kind==='characters'&&input.relay===true&&input.streamID==='original-stream-original'));assert.equal(characters.map(input=>input.text).join(''),marker);await page.waitForFunction(marker=>$('terminal-screen').textContent.includes(marker),marker);
     assert.equal(operations.at(-1).sessionID,'original');assert.equal(await page.locator('#automatic').isChecked(),true);await page.waitForTimeout(150);await capture(name+'-same-terminal');
   }
   checks.push('mobile/tablet/desktop screen taps send directly to the same original with automation ON');
@@ -109,8 +116,9 @@ try{
   await page.evaluate(()=>{history.replaceState(null,'','#node=original-mac&session=original&pty=legacy-copy');});await page.reload();await page.locator('.session-row').first().waitFor();await page.waitForTimeout(150);assert.equal(requests.pty,0);assert.equal(await page.locator('#session-count').innerText(),'2개');assert.equal(await page.evaluate(()=>selectedItem),null);
   checks.push('ended source and stale original+copy bookmark never revive, fork, or substitute the copied CLI');
   assert.deepEqual(errors,[]);await writeFile(path.join(output,'report.json'),JSON.stringify({checks,screenshots,errors,requests,macPushLatencyMs:latencies,scope:'Chromium + synthetic original HTTP/SSE fixture; no physical phone or native Mac key delivery'},null,2)+'\n');
+  await Promise.all(['failure.png','failure.json'].map(name=>rm(path.join(output,name),{force:true})));
   console.log(JSON.stringify({result:'PASS',checks,screenshots,errors,requests,macPushLatencyMs:latencies}));
 }catch(error){
   const detail=await page?.evaluate(()=>({key:selectedKey,frame:latestFrame,directMode,directQueue,inputFailure,composeMode,keyboard:document.activeElement?.id,keyboardDisabled:$('terminal-keyboard').disabled,screen:$('terminal-screen').textContent})).catch(()=>null);
   await page?.screenshot({path:path.join(output,'failure.png')}).catch(()=>{});await writeFile(path.join(output,'failure.json'),JSON.stringify({stage,error:error.message,operations,detail},null,2));throw error;
-}finally{await browser?.close();for(const client of clients)client.res.end();await new Promise(resolve=>server.close(resolve));}
+}finally{for(const gate of inputGates)gate.release();await browser?.close();for(const client of clients)client.res.end();await new Promise(resolve=>server.close(resolve));}

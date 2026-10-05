@@ -18,9 +18,15 @@ extension RemoteServerEvent {
         let keys: [String]
         let reason: String?
         let streamID: String?
-        init(_ frame: RemoteTerminalFrame) { keys = frame.keys; reason = frame.inputReason; streamID = frame.streamID }
+        let nativeState: TerminalNativeDisplay.State?
+        let nativeMessage: String?
+        init(_ frame: RemoteTerminalFrame) {
+            keys = frame.keys; reason = frame.inputReason; streamID = frame.streamID
+            nativeState = frame.nativeDisplay?.state; nativeMessage = frame.nativeDisplay?.message
+        }
     }
     private let read: @MainActor @Sendable () async throws -> RemoteTerminalFrame
+    private let waitForChange: (@Sendable () async -> Void)?
     private var initial: RemoteTerminalFrame?
     private var revision: String?
     private var controls: Controls?
@@ -29,9 +35,10 @@ extension RemoteServerEvent {
     private var waiter: RemoteHTTPStreamCompletion?
     private var cancelled = false
 
-    init(initial: RemoteTerminalFrame, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
+    init(initial: RemoteTerminalFrame, waitForChange: (@Sendable () async -> Void)? = nil, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
         _ = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
         self.initial = initial; self.read = read
+        self.waitForChange = waitForChange
     }
     deinit { task?.cancel() }
     nonisolated func next(_ completion: @escaping RemoteHTTPStreamCompletion) {
@@ -61,7 +68,8 @@ extension RemoteServerEvent {
                     // Native emulators expose screen snapshots. The engine shares
                     // their in-flight read/cache across viewers; VS Code's latest
                     // snapshot already arrives on its existing bridge connection.
-                    try await Task.sleep(nanoseconds: 150_000_000)
+                    if let waitForChange = self.waitForChange { await waitForChange() }
+                    else { try await Task.sleep(nanoseconds: 150_000_000) }
                 }
                 self.finish(.success(nil))
             } catch {

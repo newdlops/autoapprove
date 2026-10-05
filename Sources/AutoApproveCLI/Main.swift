@@ -31,6 +31,17 @@ import AutoApproveCore
                     "codexSharedSocketExists": FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/app-server-control/app-server-control.sock").path)
                 ]
                 try printJSON(versions)
+            case "terminal-input":
+                guard arguments.count == 2, ["prepare", "install"].contains(arguments[1]) else {
+                    throw AppError.message("autoapprove terminal-input prepare 또는 install을 사용해주세요.")
+                }
+                let executable = URL(fileURLWithPath: CommandLine.arguments[0], relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)).standardizedFileURL.resolvingSymlinksInPath()
+                let app = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                if arguments[1] == "prepare" { print(try TerminalInputInstaller.prepare(app: app, ownIdentifier: "local.autoapprove.helper")) }
+                else {
+                    let result = try await Task.detached { try TerminalInputInstaller.install(app: app, ownIdentifier: "local.autoapprove.helper") }.value
+                    print(result.message)
+                }
             case "status": try printJSON(SocketClient.request(path: paths.socket, message: ["method": "status"]))
             case "pause", "resume": try printJSON(SocketClient.request(path: paths.socket, message: ["method": "pause", "params": ["paused": command == "pause"]]))
             case "enable", "disable":
@@ -79,6 +90,8 @@ import AutoApproveCore
 
                   autoapprove scan          Claude Code·Codex 세션 탐색 (읽기 전용)
                   autoapprove doctor        연결 상태 확인
+                  autoapprove terminal-input prepare  원본 입력 서비스 등록 정보 확인 (읽기 전용 JSON)
+                  autoapprove terminal-input install  기존 직접 입력 연결 확인 (새 등록은 Mac 앱에서)
                   autoapprove status        앱의 세션 및 승인 내역
                   autoapprove serve         UI 없이 엔진·웹 관리·Mac 자동 발견 실행
                   autoapprove serve --web   저장된 OFF 설정에도 웹 관리 켜기 (기본 포트 8765)

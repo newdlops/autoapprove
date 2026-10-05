@@ -5,13 +5,17 @@ const show = (element, visible) => { element.hidden = !visible; };
 const make = (tag, className, value) => { const element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) text(element, value); return element; };
 const uuid = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (Number(c) ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> Number(c) / 4).toString(16));
 const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
-const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
+const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', tmux: 'tmux', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
 let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter = 'all', latestFrame = null;
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
 let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalStreamFailed = '';
+let nativeSessionKey = '', nativeZoom = 1, nativeZoomLimit = 4, nativeImageValue = null, nativeConnectingKey = '';
+const nativeTerminal = () => !!selectedItem && !selectedItem.view.pty && nativeSessionKey === selectedKey;
+const nativeConnection = () => !!selectedItem && !selectedItem.view.pty && selectedItem.session.terminal !== 'tmux' && (supportsNativeTerminal(selectedItem.node) || !!latestFrame?.nativeDisplay);
 let terminalValue = null, terminalRows = [], terminalAppearanceKey = null;
+let terminalFollowScroll = null;
 let lastNetworkUpdate = null;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
 let composePreferred = false, composeMode = false;
@@ -47,6 +51,7 @@ const supportsRelease = (node, minimum) => {
 };
 const supportsPTYStream = node => supportsRelease(node, [0, 2, 41, 48]);
 const supportsTerminalStream = node => supportsRelease(node, [0, 2, 42, 49]);
+const supportsNativeTerminal = node => supportsRelease(node, [0, 2, 43, 51]);
 function reconcilePTYInventory(inventory) {
   inventory = inventory.filter(item => !sessionEnded(item) && !sessionEnded(ptyRetained.get(item.key)));
   for (const [key, temporary] of ptyTemporary) {
@@ -181,6 +186,13 @@ function scheduleCursor() {
 function positionCursor() {
   const pre = $('terminal-screen'), caret = $('terminal-cursor'), cursor = latestFrame?.cursor;
   show(caret, false);
+  if (nativeTerminal()) {
+    const bounds = $('native-screen').getBoundingClientRect(), terminal = pre.parentElement.getBoundingClientRect();
+    $('terminal-keyboard').style.left = `${Math.max(12, bounds.left - terminal.left + 12)}px`;
+    $('terminal-keyboard').style.top = `${Math.max(48, bounds.bottom - terminal.top - 28)}px`;
+    $('terminal-composition').style.left = '12px'; $('terminal-composition').style.top = $('terminal-keyboard').style.top;
+    return;
+  }
   const value = terminalValue;
   if (!cursor || value === null || !Number.isInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > value.length
     || !Number.isInteger(cursor.padding) || cursor.padding < 0 || cursor.padding > 500 || !['block', 'bar', 'underline'].includes(cursor.style)
@@ -210,6 +222,20 @@ function positionCursor() {
     if (last?.height) y = last.top + lineHeight;
   }
   x += cursor.padding * cell;
+  const selection = window.getSelection();
+  const selecting = selection && !selection.isCollapsed && pre.contains(selection.anchorNode);
+  if (selectedItem?.session.terminal === 'tmux' && $('follow').checked && cursor.visible && !selecting) {
+    const top = pre.scrollTop, left = pre.scrollLeft;
+    const minY = bounds.top + parseFloat(style.paddingTop), maxY = bounds.bottom - parseFloat(style.paddingBottom) - lineHeight;
+    const minX = bounds.left + parseFloat(style.paddingLeft), maxX = bounds.right - parseFloat(style.paddingRight) - cell;
+    if (y < minY) pre.scrollTop += y - minY;
+    else if (y > maxY) pre.scrollTop += y - maxY;
+    if (x < minX) pre.scrollLeft += x - minX;
+    else if (x > maxX) pre.scrollLeft += x - maxX;
+    x -= pre.scrollLeft - left; y -= pre.scrollTop - top;
+    terminalFollowScroll = {key:selectedKey, top:pre.scrollTop, left:pre.scrollLeft,
+      width:pre.clientWidth, height:pre.clientHeight, contentWidth:pre.scrollWidth, contentHeight:pre.scrollHeight};
+  }
   const inView = x >= bounds.left && x < bounds.right - 1 && y + lineHeight > bounds.top && y < bounds.bottom;
   caret.style.left = `${x - container.left}px`; caret.style.top = `${y - container.top}px`;
   caret.style.width = `${Math.max(2, cell)}px`; caret.style.height = `${lineHeight}px`;
@@ -290,6 +316,96 @@ function terminalPlaceholder(value) {
   $('terminal-colors').disabled = true; text($('terminal-color-status'), '');
   show($('terminal-cursor'), false);
 }
+function clearNativeImage() {
+  nativeImageValue = null; $('native-image').removeAttribute('src');
+  $('native-image-stage').style.removeProperty('width'); $('native-image-stage').style.removeProperty('height');
+}
+function fitNativeImage() {
+  const image = latestFrame?.nativeDisplay?.image, viewport = $('native-screen');
+  if (!nativeTerminal() || !image || viewport.hidden || !viewport.clientWidth || !viewport.clientHeight) return;
+  const fit = Math.min(1, viewport.clientWidth / image.width, viewport.clientHeight / image.height);
+  nativeZoomLimit = Math.max(4, Math.ceil(1 / fit)); nativeZoom = Math.min(nativeZoom, nativeZoomLimit);
+  const scale = fit * nativeZoom;
+  const width = Math.max(1, Math.round(image.width * scale)), height = Math.max(1, Math.round(image.height * scale));
+  $('native-image').style.width = `${width}px`; $('native-image').style.height = `${height}px`;
+  $('native-image-stage').style.width = `${width}px`; $('native-image-stage').style.height = `${height}px`;
+  text($('native-scale'), `${Math.round(scale * 100)}%`);
+  $('native-zoom-out').disabled = nativeZoom <= 1; $('native-zoom-in').disabled = nativeZoom >= nativeZoomLimit;
+  if (nativeZoom === 1) { viewport.scrollLeft = 0; viewport.scrollTop = 0; }
+  scheduleCursor();
+}
+function renderNativeDisplay() {
+  const native = nativeTerminal(), available = nativeConnection(), display = native ? latestFrame?.nativeDisplay : undefined;
+  const image = native && display?.state === 'live' ? display.image : null;
+  const host = selectedItem.session.hostName || hosts[selectedItem.session.terminal] || '터미널';
+  const online = connected && currentNode()?.online && allSessions.some(item => item.key === selectedKey);
+  const states = {live:'Mac 원본 화면',permissionRequired:'Mac 권한 필요',inactive:'원본 탭 연결 필요',unavailable:'원본 화면 연결 불가'};
+  const defaults = {live:'같은 원본 탭에 입력합니다.',permissionRequired:'Mac에서 선택한 창 보기의 화면 기록 권한을 확인한 뒤 연결해주세요.',inactive:'원본 터미널 연결을 눌러 같은 탭을 열어주세요.',unavailable:'Mac의 원본 터미널과 권한을 확인해주세요.'};
+  show($('native-connection'), available && (native || !!latestFrame?.outputReason || !latestFrame?.keys.includes('characters'))); show($('native-view-label'), available);
+  $('native-view').checked = native;
+  $('native-view').disabled = !online || nativeConnectingKey === selectedKey || document.hidden;
+  show($('native-screen'), native); show($('native-tools'), !!image);
+  show($('native-image-stage'), !!image); show($('native-empty'), native && !image);
+  $('terminal-screen').classList.toggle('native-accessible', native);
+  $('terminal-screen').tabIndex = native ? -1 : 0;
+  document.querySelector('.terminal').dataset.display = native ? 'native' : 'text';
+  if (!image) clearNativeImage();
+  else if (nativeImageValue !== image.data) {
+    nativeImageValue = image.data; $('native-image').width = image.width; $('native-image').height = image.height;
+    $('native-image').src = 'data:image/jpeg;base64,' + image.data;
+  }
+  $('native-image').alt = `현재 Mac ${host}의 원본 창 화면`;
+  if (available) {
+    const waiting = nativeConnectingKey === selectedKey || !latestFrame && terminalStream && terminalStreamFailed !== selectedKey;
+    const status = !online ? 'Mac 연결 끊김' : waiting ? native ? 'Mac 창 연결 중' : '터미널 연결 중' : display ? states[display.state] : latestFrame ? `${host} 원본 터미널` : '터미널 연결 끊김';
+    const message = !online ? '연결을 확인한 뒤 원본 터미널을 다시 연결해주세요.' : waiting ? '같은 원본 터미널에 연결하고 있습니다.' : display?.message || defaults[display?.state] || latestFrame?.outputReason || latestFrame?.inputReason || '원본 출력과 키 입력을 중계합니다. Mac 창 보기는 화면 설정에서 선택할 수 있습니다.';
+    text($('native-status'), `${status} · ${message}`);
+    $('native-connection').dataset.state = online ? display?.state || (latestFrame ? 'live' : 'unavailable') : 'unavailable';
+    text($('native-empty'), !online ? 'Mac에 다시 연결하면 원본 화면을 볼 수 있습니다.' : '원본 터미널을 연결하면 실제 창 화면이 여기에 표시됩니다.');
+    $('native-connect').disabled = !online || mutation || inputInFlight || nativeConnectingKey === selectedKey || document.hidden;
+    text($('native-connect'), nativeConnectingKey === selectedKey ? '연결 중…' : native ? 'Mac 창 연결' : '원본 터미널 연결');
+  }
+  for (const id of ['terminal-wrap','terminal-colors','follow']) $(id).closest('label').hidden = native;
+  show($('terminal-font-controls'), !native);
+  if (image) { $('terminal-colors').disabled = true; text($('terminal-color-status'), `${host} 실제 창의 원본 색상과 커서`); }
+  fitNativeImage();
+}
+function mergeNativeDisplay(display, previous, compact) {
+  if (display === undefined) return undefined;
+  if (!display || !['live','permissionRequired','inactive','unavailable'].includes(display.state) || display.message != null && (typeof display.message !== 'string' || display.message.length > 4096)) throw new Error('원본 터미널 화면 상태를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
+  const result = {state:display.state, message:display.message};
+  if (display.state !== 'live') return result;
+  let image = display.image;
+  if (image === undefined && compact && previous?.state === 'live') image = previous.image;
+  if (!image) return {state:'unavailable', message:'Mac 창 이미지를 받지 못했습니다. Mac 창 보기를 다시 켜주세요. 원본 입력은 유지됩니다.'};
+  if (image !== previous?.image) {
+    try { validateNativeImage(image); }
+    catch (_) { return {state:'unavailable', message:'Mac 창 이미지 정보를 확인하지 못했습니다. Mac 창 보기를 다시 켜주세요. 원본 입력은 유지됩니다.'}; }
+  }
+  return {...result, image};
+}
+function validateNativeImage(image) {
+  const invalid = () => { throw new Error('원본 화면 이미지 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.'); };
+  if (!Number.isInteger(image.width) || image.width < 1 || image.width > 2048 || !Number.isInteger(image.height) || image.height < 1 || image.height > 2048 || image.width * image.height > 4194304 || typeof image.data !== 'string' || !image.data || image.data.length > 1000000 || image.data.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(image.data)) invalid();
+  let bytes; try { bytes = atob(image.data); } catch (_) { invalid(); }
+  if (bytes.length > 750000 || btoa(bytes) !== image.data || bytes.charCodeAt(0) !== 0xff || bytes.charCodeAt(1) !== 0xd8 || bytes.charCodeAt(bytes.length - 2) !== 0xff || bytes.charCodeAt(bytes.length - 1) !== 0xd9) invalid();
+  let offset = 2;
+  while (offset + 3 < bytes.length) {
+    if (bytes.charCodeAt(offset++) !== 0xff) invalid();
+    while (bytes.charCodeAt(offset) === 0xff) offset++;
+    const marker = bytes.charCodeAt(offset++);
+    if (marker === 0xda || marker === 0xd9) break;
+    if (marker === 0x01 || marker >= 0xd0 && marker <= 0xd7) continue;
+    const length = bytes.charCodeAt(offset) * 256 + bytes.charCodeAt(offset + 1);
+    if (length < 2 || offset + length > bytes.length) invalid();
+    if ([0xc0,0xc1,0xc2,0xc3,0xc5,0xc6,0xc7,0xc9,0xca,0xcb,0xcd,0xce,0xcf].includes(marker)) {
+      if (length < 8 || bytes.charCodeAt(offset + 3) * 256 + bytes.charCodeAt(offset + 4) !== image.height || bytes.charCodeAt(offset + 5) * 256 + bytes.charCodeAt(offset + 6) !== image.width) invalid();
+      return;
+    }
+    offset += length;
+  }
+  invalid();
+}
 function terminalAppearance(value, appearance) {
   const color = value => value === undefined || /^#[\da-f]{6}$/i.test(value);
   if (!appearance || !Array.isArray(appearance.runs) || appearance.runs.length > 8000 || !color(appearance.foreground) || !color(appearance.background)) return null;
@@ -357,7 +473,7 @@ function renderTerminal(value, inputAppearance) {
   terminalRows.splice(start, oldEnd - start, ...added); terminalValue = value; terminalAppearanceKey = appearanceKey;
   const selection = window.getSelection();
   const selecting = selection && !selection.isCollapsed && pre.contains(selection.anchorNode);
-  pre.scrollTop = $('follow').checked && !selecting ? pre.scrollHeight : scrollTop; pre.scrollLeft = scrollLeft;
+  pre.scrollTop = $('follow').checked && !selecting && selectedItem?.session.terminal !== 'tmux' ? pre.scrollHeight : scrollTop; pre.scrollLeft = scrollLeft;
   return true;
 }
 function feedback(message, error = false) {
@@ -487,7 +603,9 @@ function selectSession(key, focus = false) {
   const item = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!item) return;
   if (selectedKey !== item.key) {
     stopPTY(); stopTerminalStream(true);
+    nativeSessionKey = ''; nativeZoom = 1; clearNativeImage();
     stopDirect(); inputFailure = ''; composing = false;
+    terminalFollowScroll = null;
     if (selectedKey) drafts.set(selectedKey, $('terminal-input').value);
     selectedKey = item.key; selectedItem = item; latestFrame = null; detailGeneration++;
     frameController?.abort(); quietFrames = 0; fastFrameUntil = Date.now() + 5000;
@@ -547,6 +665,7 @@ function renderDetail() {
 }
 function updateControls() {
   if (!selectedItem) return;
+  renderNativeDisplay();
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
   const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation;
@@ -578,45 +697,55 @@ function updateControls() {
   const inputEnabled = enabled && fresh && !reason;
   // Keep the active editor alive while its own request/refresh runs: disabling it closes mobile keyboards.
   $('terminal-input').disabled = !(base && (fresh || inputInFlight || directSending));
-  const supported = inputKeys(), canDirect = supported.includes('characters') && supported.includes('backspace');
+  const supported = inputKeys(), native = nativeTerminal();
+  const composedSupported = supported.includes('text') || supported.includes('submit');
+  const canDirect = supported.includes('characters') && supported.includes('backspace');
   if ((!base || !canDirect) && directMode) stopDirect();
   const wasCompose = composeMode;
-  composeMode = composePreferred || !canDirect || !!$('terminal-input').value;
+  composeMode = composePreferred || !nativeConnection() && !canDirect || !!$('terminal-input').value;
+  const originalDraftOnly = composeMode && !composedSupported;
+  if ((native || originalDraftOnly) && composeMode) $('terminal-input').disabled = false;
   $('terminal-keyboard').disabled = !(base && canDirect && !composeMode && (fresh || inputInFlight || directSending));
   document.querySelector('.terminal').dataset.input = composeMode ? 'compose' : 'direct';
   show($('input-editor'), composeMode); show($('compose-input-label'), composeMode);
   if (composeMode && !wasCompose) sizeInput();
-  $('compose-input').checked = composeMode; $('compose-input').disabled = !canDirect || composing;
+  $('compose-input').checked = composeMode; $('compose-input').disabled = !nativeConnection() && !canDirect || composing;
   const keyboardActive = document.activeElement === $('terminal-keyboard') && !$('terminal-keyboard').disabled;
   $('terminal-keyboard-toggle').disabled = !(base && (fresh || inputInFlight || directSending)) || !canDirect || composeMode;
   $('terminal-keyboard-toggle').setAttribute('aria-pressed', String(keyboardActive));
   $('terminal-keyboard-toggle').setAttribute('aria-label', keyboardActive ? '터미널 키보드 닫기' : '터미널 키보드 열기');
-  text($('direct-input-help'), !canDirect ? selectedItem.session.terminal === 'terminal'
-    ? '화면 직접 입력은 Mac의 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 AutoApprove를 허용해야 합니다. 작성 후 Enter 전송은 사용할 수 있습니다.'
-    : '화면 직접 입력은 Mac의 VS Code 확장을 업데이트하면 사용할 수 있습니다. 지금은 작성 후 Enter로 전송하세요.'
+  const terminalSetupHelp = selectedItem.session.terminal === 'terminal' && !canDirect
+    ? 'Mac의 연결 설정 → 원본 터미널 화면·입력에서 ‘직접 입력 연결’을 설정해주세요. 처음에 Mac 관리자 승인을 받습니다. 작성 후 Enter 전송은 사용할 수 있습니다.' : '';
+  const draftReason = canDirect ? '이 원본 연결은 직접 키 입력만 지원합니다. 초안을 복사한 뒤 지우고 화면 설정에서 직접 입력으로 돌아가세요.' : latestFrame?.nativeDisplay?.message || reason || '원본 터미널 연결을 눌러 입력 권한을 확인해주세요. 작성 내용은 초안으로 보관합니다.';
+  text($('direct-input-help'), originalDraftOnly ? draftReason : terminalSetupHelp ? reason || terminalSetupHelp
+    : nativeConnection() && !canDirect ? reason || '원본 터미널 연결을 눌러 입력 권한을 확인해주세요. 작성 입력은 화면 설정에서 선택할 수 있습니다.'
+    : !canDirect ? '화면 직접 입력은 Mac의 VS Code 확장을 업데이트하면 사용할 수 있습니다. 지금은 작성 후 Enter로 전송하세요.'
     : composeMode ? '작성 후 Enter로 전송합니다. 화면 설정에서 직접 입력으로 돌아갈 수 있습니다.'
     : keyboardActive ? '직접 입력 중 · 키와 완성된 한글을 기존 터미널로 전달합니다.' : '화면을 누르거나 키보드 버튼을 눌러 직접 입력하세요.');
-  $('direct-input-help').dataset.required = String(!canDirect);
+  $('direct-input-help').dataset.required = String(!canDirect || originalDraftOnly);
   $('terminal-keyboard-toggle').title = $('direct-input-help').textContent;
-  text($('input-help'), composeMode ? 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.' : '키보드의 문자·Enter·방향키를 직접 보냅니다. Shift Tab으로 포커스를 빠져나갑니다.');
-  $('send-input').disabled = !(inputEnabled || directMode && base && directSending) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value) > 8000;
+  text($('input-help'), originalDraftOnly ? '이 연결은 작성 전송을 지원하지 않습니다. 작성 내용은 초안으로 보관합니다.' : composeMode ? 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.' : !canDirect ? 'Mac의 원본 입력 권한을 연결한 뒤 직접 입력할 수 있습니다.' : '키보드의 문자·Enter·방향키를 직접 보냅니다. Shift Tab으로 포커스를 빠져나갑니다.');
+  const nativeInput = !native || (composeMode ? composedSupported && (!!$('terminal-input').value || supported.includes('enter')) : canDirect);
+  $('send-input').disabled = originalDraftOnly || !nativeInput || !(inputEnabled || directMode && base && directSending) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value) > 8000;
   text($('send-input'), inputInFlight && !directMode ? '전달 중' : 'Enter');
   text($('input-reason'), inputFailure || reason || (fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
   $('input-reason').dataset.blocked = String(!!inputFailure || !!reason || !fresh);
   for (const button of $('input-form').querySelectorAll('button[data-key]')) {
     const available = supported.includes(button.dataset.key);
-    show(button, available); button.disabled = composing || !(base && (inputEnabled || directMode && directSending)); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
+    show(button, available || native && button.dataset.key !== 'eof'); button.disabled = !available || originalDraftOnly || native && !composeMode && !canDirect || composing || !(base && (inputEnabled || directMode && directSending)); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
   }
   for (const button of $('questions').querySelectorAll('button')) button.disabled = !enabled || button.dataset.unavailable === 'true';
   scheduleCursor();
 }
 function mergeTerminalUpdate(update, previous, sessionID) {
   if (!update || update.sessionID !== sessionID || typeof update.revision !== 'string' || update.revision.length > 512 || typeof update.observedAt !== 'string' || !Number.isFinite(Date.parse(update.observedAt)) || !Array.isArray(update.keys) || update.keys.length > 64 || update.keys.some(key => typeof key !== 'string' || key.length > 64) || update.inputReason != null && typeof update.inputReason !== 'string' || update.streamID != null && typeof update.streamID !== 'string') throw new Error('터미널 화면 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
-  if (typeof update.screen === 'string') return update;
+  if (update.outputReason != null && (typeof update.outputReason !== 'string' || update.outputReason.length > 4096)) throw new Error('원본 출력 상태를 확인하지 못했습니다.');
+  const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string') : undefined;
+  if (typeof update.screen === 'string') return {...update, nativeDisplay};
   if (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID) throw new Error('최신 화면을 다시 연결해주세요.');
   // A compact update carries current controls. Missing optional input fields
   // clear old locks/cursors/tokens while the unchanged screen and colors remain.
-  return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, cursor:update.cursor, streamID:update.streamID};
+  return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, nativeDisplay};
 }
 function applyTerminalFrame(frame) {
   const previous = latestFrame;
@@ -627,6 +756,7 @@ function applyTerminalFrame(frame) {
   const changed = renderTerminal(frame.screen, frame.appearance);
   quietFrames = changed ? 0 : quietFrames + 1;
   terminalState(changed && previous ? 'changed' : 'live', !frame.screen.trim() ? '연결됨 · 빈 화면' : changed && previous ? '새 출력' : '연결됨');
+  if (nativeTerminal()) terminalState(frame.nativeDisplay?.state === 'live' ? 'live' : 'pending', frame.nativeDisplay?.state === 'live' ? '원본 창 화면' : '원본 연결 필요');
   text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
   updateControls();
 }
@@ -643,9 +773,11 @@ function failTerminalStream(stream, message) {
   terminalState('error', '연결 끊김'); updateControls();
 }
 function ensureTerminalStream() {
-  if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration) return;
+  const renderWindow = nativeTerminal();
+  if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
-  const item = selectedItem, stream = {key:selectedKey, generation:detailGeneration, source:new EventSource(endpoint('/api/terminal/stream', item.node.id, item.session.id))};
+  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + (renderWindow ? '&view=screen' : '');
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, source:new EventSource(streamURL)};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
   stream.source.addEventListener('screen', event => {
@@ -657,6 +789,9 @@ function ensureTerminalStream() {
       // one before painting. Pending input must never cross terminal identities.
       if (directMode && (frame.streamID || null) !== directStreamID) {
         stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
+      }
+      if (directMode && (!frame.keys.includes('characters') || !frame.keys.includes('backspace') || frame.inputReason)) {
+        stopDirect(); inputFailure = frame.inputReason || '원본 입력 권한을 다시 연결해주세요.';
       }
       terminalPending = frame;
       if (terminalPaint) return;
@@ -684,13 +819,14 @@ async function refreshFrame() {
   stopTerminalStream();
   if (loadingFrame) { frameTimer = setTimeout(refreshFrame, 100); return; }
   loadingFrame = true;
-  const key = selectedKey, generation = detailGeneration, item = selectedItem, previous = latestFrame;
+  const key = selectedKey, generation = detailGeneration, renderWindow = nativeTerminal(), item = selectedItem, previous = latestFrame;
   const started = performance.now(), controller = new AbortController(); frameController = controller;
   try {
     const query = new URLSearchParams({ node: item.node.id, session: item.session.id });
+    if (renderWindow) query.set('view', 'screen');
     if (previous) query.set('revision', previous.revision);
     const update = await api('/api/terminal?' + query, undefined, controller.signal);
-    if (selectedKey !== key || detailGeneration !== generation) return;
+    if (selectedKey !== key || detailGeneration !== generation || renderWindow !== nativeTerminal()) return;
     applyTerminalFrame(mergeTerminalUpdate(update, previous, item.session.id));
   } catch (error) {
     if (controller.signal.aborted || selectedKey !== key || detailGeneration !== generation) return;
@@ -959,6 +1095,60 @@ $('terminal-screen').addEventListener('click', event => {
   screenPointer = null;
 });
 $('terminal-screen').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); focusKeyboard(); } });
+let nativePointer = null;
+$('native-screen').addEventListener('pointerdown', event => {
+  nativePointer = {x:event.clientX,y:event.clientY,at:event.timeStamp,left:$('native-screen').scrollLeft,top:$('native-screen').scrollTop,dragged:false};
+  if (composing && document.activeElement === $('terminal-keyboard')) event.preventDefault();
+  if (event.pointerType === 'mouse' && event.button === 0) $('native-screen').setPointerCapture(event.pointerId);
+});
+$('native-screen').addEventListener('pointermove', event => {
+  if (!nativePointer || event.pointerType !== 'mouse' || event.buttons !== 1) return;
+  const dx = event.clientX - nativePointer.x, dy = event.clientY - nativePointer.y;
+  if (Math.hypot(dx, dy) > 8) nativePointer.dragged = true;
+  if (nativePointer.dragged) { $('native-screen').scrollLeft = nativePointer.left - dx; $('native-screen').scrollTop = nativePointer.top - dy; event.preventDefault(); }
+});
+$('native-screen').addEventListener('click', event => {
+  const viewport = $('native-screen');
+  const dragged = nativePointer && (nativePointer.dragged || Math.hypot(event.clientX - nativePointer.x, event.clientY - nativePointer.y) > 8 || event.timeStamp - nativePointer.at > 500 || Math.abs(viewport.scrollLeft - nativePointer.left) + Math.abs(viewport.scrollTop - nativePointer.top) > 8);
+  if (!dragged && event.detail <= 1) focusKeyboard(); nativePointer = null;
+});
+$('native-screen').addEventListener('pointercancel', () => { nativePointer = null; });
+$('native-screen').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); focusKeyboard(); } });
+$('native-zoom-in').addEventListener('click', () => { nativeZoom = Math.min(nativeZoomLimit, nativeZoom * 1.5); fitNativeImage(); });
+$('native-zoom-out').addEventListener('click', () => { nativeZoom = Math.max(1, nativeZoom / 1.5); fitNativeImage(); });
+$('native-fit').addEventListener('click', () => { nativeZoom = 1; fitNativeImage(); });
+$('native-view').addEventListener('change', () => {
+  nativeSessionKey = $('native-view').checked ? selectedKey : ''; nativeZoom = 1; clearNativeImage();
+  if (latestFrame) latestFrame = {...latestFrame, nativeDisplay:undefined};
+  frameController?.abort(); stopTerminalStream(true); $('terminal-settings').open = false;
+  renderTerminal(latestFrame?.screen || '', latestFrame?.appearance); updateControls(); scheduleCursor(); void refreshFrame();
+});
+function failNativeImage() {
+  if (!nativeTerminal() || !nativeImageValue || !$('native-image').hasAttribute('src')) return;
+  latestFrame = {...latestFrame, nativeDisplay:{state:'unavailable', message:'Mac 창 이미지를 표시하지 못했습니다. Mac 창 보기를 다시 켜주세요. 원본 입력은 유지됩니다.'}};
+  clearNativeImage(); updateControls();
+}
+$('native-image').addEventListener('error', failNativeImage);
+$('native-image').addEventListener('load', () => {
+  const image = latestFrame?.nativeDisplay?.image;
+  if (!image || !nativeTerminal()) return;
+  if ($('native-image').naturalWidth !== image.width || $('native-image').naturalHeight !== image.height) { failNativeImage(); return; }
+  fitNativeImage();
+});
+$('native-connect').addEventListener('click', async () => {
+  if ($('native-connect').disabled || !nativeConnection()) return;
+  const item = selectedItem, key = selectedKey, generation = detailGeneration;
+  nativeConnectingKey = key; stopDirect(); frameController?.abort(); stopTerminalStream(true); latestFrame = null; updateControls();
+  try {
+    const result = await api(endpoint('/api/terminal/connect', item.node.id), {sessionID:item.session.id, requestID:uuid(), ...(nativeTerminal() ? {view:'screen'} : {})});
+    if (selectedKey !== key || detailGeneration !== generation || document.hidden) return;
+    if (typeof result.screen === 'string' && typeof result.revision === 'string') applyTerminalFrame(mergeTerminalUpdate(result, null, item.session.id));
+    void refreshFrame(); void refreshNetwork();
+  } catch (error) {
+    if (selectedKey !== key || detailGeneration !== generation) return;
+    terminalStreamFailed = key; text($('terminal-error'), error.message); show($('terminal-error'), true); show($('terminal-retry'), true); terminalState('error', '원본 연결 확인 필요');
+  } finally { if (nativeConnectingKey === key) nativeConnectingKey = ''; if (selectedKey === key) updateControls(); }
+});
 $('terminal-focus').addEventListener('click', () => { terminalFocus(!document.body.classList.contains('terminal-focus')); if (!document.body.classList.contains('terminal-focus')) $('session-title').focus({ preventScroll: true }); });
 $('terminal-back').addEventListener('click', () => $('back').click());
 $('terminal-wrap').addEventListener('change', () => { $('terminal-screen').dataset.wrap = String($('terminal-wrap').checked); scheduleCursor(); });
@@ -971,6 +1161,7 @@ window.visualViewport?.addEventListener('resize', updateViewport);
 window.visualViewport?.addEventListener('scroll', updateViewport);
 window.addEventListener('resize', updateViewport); updateViewport();
 new ResizeObserver(scheduleCursor).observe($('terminal-screen'));
+new ResizeObserver(fitNativeImage).observe($('native-screen'));
 $('terminal-screen').addEventListener('scroll', scheduleCursor, { passive: true });
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && $('terminal-settings').open) { $('terminal-settings').open = false; $('terminal-settings').querySelector('summary').focus(); event.preventDefault(); } });
 document.addEventListener('click', event => { if ($('terminal-settings').open && !$('terminal-settings').contains(event.target)) $('terminal-settings').open = false; });
@@ -985,11 +1176,24 @@ $('terminal-colors').addEventListener('change', () => {
   document.querySelector('.terminal').dataset.colored = String($('terminal-colors').checked);
   try { localStorage.setItem('terminal-colors', String($('terminal-colors').checked)); } catch (_) {}
 });
-$('follow').addEventListener('change', () => { if ($('follow').checked) $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; show($('jump-latest'), !$('follow').checked); });
-$('terminal-screen').addEventListener('scroll', () => { const pre = $('terminal-screen'); if (pre.scrollHeight - pre.scrollTop - pre.clientHeight > 40) $('follow').checked = false; show($('jump-latest'), !$('follow').checked); }, { passive: true });
-$('jump-latest').addEventListener('click', () => { $('follow').checked = true; $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight; show($('jump-latest'), false); });
+function followTerminal() {
+  if (selectedItem?.session.terminal === 'tmux') scheduleCursor();
+  else $('terminal-screen').scrollTop = $('terminal-screen').scrollHeight;
+}
+$('follow').addEventListener('change', () => { if ($('follow').checked) followTerminal(); show($('jump-latest'), !$('follow').checked); });
+$('terminal-screen').addEventListener('scroll', () => {
+  const pre = $('terminal-screen'), expected = terminalFollowScroll;
+  const followingCursor = selectedItem?.session.terminal === 'tmux';
+  const sameLayout = expected && expected.width === pre.clientWidth && expected.height === pre.clientHeight
+    && expected.contentWidth === pre.scrollWidth && expected.contentHeight === pre.scrollHeight;
+  // Browser reflow can adjust scroll offsets when the phone keyboard or viewport changes.
+  if (followingCursor ? expected?.key === selectedKey && sameLayout && (expected.top !== pre.scrollTop || expected.left !== pre.scrollLeft) : pre.scrollHeight - pre.scrollTop - pre.clientHeight > 40) $('follow').checked = false;
+  show($('jump-latest'), !$('follow').checked);
+}, { passive: true });
+$('jump-latest').addEventListener('click', () => { $('follow').checked = true; followTerminal(); show($('jump-latest'), false); });
 $('back').addEventListener('click', () => {
   stopPTY(); stopTerminalStream(true);
+  nativeSessionKey = ''; clearNativeImage();
   stopDirect(); composing = false; terminalFocus(false);
   drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.firstChild;
   selectedKey = ''; selectedItem = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
@@ -1007,7 +1211,7 @@ $('add-form').addEventListener('submit', async event => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) { frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
+  if (document.hidden) { nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('hashchange', restoreSelection);
