@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import readline from 'node:readline';
 
 // macOS Unix-domain sockets have a short path limit.
 const root = await mkdtemp('/private/tmp/aa-web-');
@@ -15,7 +16,7 @@ await chmod(root, 0o755);
 const app = path.join(root, 'RelocatedAutoApprove.app');
 const home = path.join(root, 'isolated-profile');
 const run = promisify(execFile), wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-let child, stderr = '';
+let child, mcp, stderr = '';
 const preferredPortBlocker = createServer();
 async function reserveDefaultPort() {
   await new Promise((resolve, reject) => {
@@ -102,12 +103,37 @@ try {
   const restored = await (await fetch(url + '/api/state')).json();
   assert.equal(restored.id, first.id, 'Mac identity must survive restart');
   assert.deepEqual(restored.release, JSON.parse(originalVersion), 'Restart must publish the restored bundled web version');
+  // A relocated, signed package must expose the stdio tools and return only explicit web answers.
+  mcp = spawn(path.join(app, 'Contents/MacOS/autoapprove'), ['mcp', '--home', home], {stdio:['pipe','pipe','pipe']});
+  mcp.stderr.resume(); const replies = new Map(); let rpcID = 0;
+  readline.createInterface({input:mcp.stdout}).on('line', line => { const value=JSON.parse(line); replies.get(value.id)?.(value); replies.delete(value.id); });
+  async function rpc(method, params={}) {
+    const id=++rpcID; let timer;
+    const response=new Promise((resolve,reject)=>{ replies.set(id,resolve); timer=setTimeout(()=>reject(Error('Packaged MCP timeout: '+method)),5000); });
+    mcp.stdin.write(JSON.stringify({jsonrpc:'2.0',id,method,params})+'\n');
+    try { const value=await response; assert.equal(value.error,undefined); return value.result; } finally { clearTimeout(timer); replies.delete(id); }
+  }
+  async function tool(name, args={}) { const result=await rpc('tools/call',{name,arguments:args}); assert.equal(result.isError,false,JSON.stringify(result)); return result.structuredContent; }
+  assert.equal((await rpc('initialize',{protocolVersion:'2025-11-25'})).serverInfo.version, JSON.parse(originalVersion).version);
+  mcp.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
+  assert.equal((await rpc('tools/list')).tools.length,5);
+  const publication=await tool('ask_user',{questions:[{id:'fixture',question:'격리한 패키지의 질문 응답을 확인할까요?',options:[{label:'확인'}]}]});
+  const questionID=publication.request.id;
+  assert.equal((await tool('get_user_answers',{requestID:questionID})).request.phase,'waiting');
+  const stateWithQuestion=await (await fetch(url+'/api/state')).json(); assert.ok(stateWithQuestion.questionForms.some(question=>question.id===questionID));
+  await ptyPost('/api/action',{action:'replyWebQuestion',questionID,answers:{fixture:{choices:['확인'],text:'한글🧪'}}});
+  const answered=(await tool('get_user_answers',{requestID:questionID})).request;
+  assert.equal(answered.phase,'answered'); assert.equal(answered.answers['격리한 패키지의 질문 응답을 확인할까요?'],'확인\n한글🧪');
+  const cancelled=(await tool('ask_user',{questions:[{question:'연결 종료 시 취소되는 격리 질문'}]})).request.id;
+  const mcpClosed=once(mcp,'close'); mcp.stdin.end(); await mcpClosed; assert.equal(mcp.exitCode,0); mcp=null;
+  assert.ok(!(await (await fetch(url+'/api/state')).json()).questionForms.some(question=>question.id===cancelled));
   await web('off'); await status(value => !value.enabled && !value.ready);
   await assert.rejects(fetch(url + '/api/state', { signal: AbortSignal.timeout(1500) }));
   await stop(); await start();
   assert.equal((await status(value => !value.enabled)).ready, false);
-  console.log('PASS: relocated packaged resources/signature, real packaged PTY and local xterm assets, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
+  console.log('PASS: relocated packaged resources/signature, stdio MCP question/explicit answer/disconnect, real packaged PTY and local xterm assets, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
 } finally {
+  if (mcp && mcp.exitCode===null) { mcp.stdin.end(); mcp.kill(); }
   await stop();
   if (preferredPortBlocker.listening) await new Promise(resolve => preferredPortBlocker.close(resolve));
   await rm(root, { recursive: true, force: true });

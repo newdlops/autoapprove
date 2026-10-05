@@ -8,6 +8,8 @@ import TerminalInputSupport
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     public private(set) var webService: RemoteNetworkService?
     public let managedPTY: ManagedPTYManager
+    public let webQuestions = WebQuestionInbox()
+    public let testScreens: TestScreenSharing
     private let tmuxRelay = TmuxRelay()
     private var ptyAutomatic: [String: Bool] = [:]
     private var ptyLifecycleObservers: [String: (terminal: ManagedPTY, token: UUID)] = [:]
@@ -83,6 +85,7 @@ import TerminalInputSupport
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private var replyingQuestions = Set<String>()
+    private var sendingMessages = Set<String>()
     private var readableQuestionSessions = Set<String>()
     private var questionThreadBySession: [String: String] = [:]
     private var restoredQuestionIDs = Set<String>()
@@ -185,8 +188,9 @@ import TerminalInputSupport
     }
 
     public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
-                terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil) throws {
+                terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil) throws {
         self.paths = paths
+        self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
         self.powerControl = powerControl
         keepAwakeSwitch = KeepAwakeSwitch(control: powerControl, marker: paths.directory.appendingPathComponent("keep-awake.hold").path)
@@ -296,6 +300,8 @@ import TerminalInputSupport
         for observer in ptyLifecycleObservers.values { observer.terminal.removeOutputObserver(observer.token) }
         ptyLifecycleObservers.removeAll()
         managedPTY.stop()
+        testScreens.stopAll()
+        webQuestions.clear()
         tmuxRelay.stop()
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
@@ -317,7 +323,7 @@ import TerminalInputSupport
         setKeepAwakeActivity(false)
     }
 
-    public func setWebEnabled(_ enabled: Bool, port: UInt16? = nil) throws {
+    public func setWebEnabled(_ enabled: Bool, port: UInt16? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil) throws {
         if enabled {
             if webService != nil {
                 guard port != nil else { return }
@@ -325,7 +331,7 @@ import TerminalInputSupport
             }
             let nodeID = store.value("webNodeID") ?? UUID().uuidString
             try store.set("webNodeID", nodeID)
-            let service = RemoteNetworkService(engine: self, nodeID: nodeID) { [weak self] status in
+            let service = RemoteNetworkService(engine: self, nodeID: nodeID, bonjourEnabled: bonjourEnabled, discoveryAddresses: discoveryAddresses) { [weak self] status in
                 guard let self else { return }
                 self.webStatus = status
                 if status.ready, let actualPort = status.port { try? self.store.set("webPort", String(actualPort)) }
@@ -337,6 +343,7 @@ import TerminalInputSupport
             webService = service
         } else {
             try store.set("webEnabled", "false")
+            testScreens.stopAll()
             webService?.stop(); webService = nil
         }
     }
@@ -1037,8 +1044,48 @@ import TerminalInputSupport
         remoteInputSessions.contains(id) || remoteInputUntil[id].map { Date() < $0 } == true
     }
 
+    public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
+        guard let owner = object["owner"] as? String, UUID(uuidString: owner) != nil,
+              let tool = object["tool"] as? String else { throw RemoteHTTPError(400, "MCP 연결 정보가 필요합니다.") }
+        func encoded<T: Encodable>(_ value: T) throws -> Any {
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            return try JSONSerialization.jsonObject(with: encoder.encode(value))
+        }
+        func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
+        switch tool {
+        case "ask_user":
+            guard webStatus.ready else { throw RemoteHTTPError(409, "Mac에서 AutoApprove 웹 접속을 켠 뒤 질문을 게시해주세요.") }
+            var params = object
+            if let id = params["sessionID"] as? String, sessions[id]?.phase == .ended || sessions[id] == nil { params.removeValue(forKey: "sessionID") }
+            let request = try webQuestions.create(params, owner: owner)
+            return ["request": try encoded(request), "urls": urls("request=" + request.id)]
+        case "get_user_answers":
+            guard let id = object["requestID"] as? String else { throw RemoteHTTPError(400, "질문 ID를 지정해주세요.") }
+            return ["request": try encoded(webQuestions.get(id, owner: owner))]
+        case "list_screens": return ["sources": try await encoded(testScreens.availableSources())]
+        case "start_screen_share":
+            guard webStatus.ready else { throw RemoteHTTPError(409, "Mac에서 AutoApprove 웹 접속을 켠 뒤 공유해주세요.") }
+            let share = try await testScreens.start(object, owner: owner)
+            return ["share": try encoded(share), "urls": urls("share=" + share.id), "message": "휴대폰의 테스트 화면에서 볼 수 있습니다. 시험을 마치면 공유를 종료해주세요."]
+        case "stop_screen_share":
+            guard let id = object["shareID"] as? String else { throw RemoteHTTPError(400, "공유 ID를 지정해주세요.") }
+            try testScreens.stop(id, owner: owner); return ["stopped": true]
+        case "disconnect":
+            testScreens.stopAll(owner: owner); webQuestions.cancel(owner: owner); return ["ok": true]
+        default: throw RemoteHTTPError(400, "지원하지 않는 MCP 도구입니다.")
+        }
+    }
+
     public func remoteAction(_ object: JSONObject) async throws -> JSONObject {
         guard let action = object["action"] as? String else { throw RemoteHTTPError(400, "동작을 지정해주세요.") }
+        if action == "replyWebQuestion" {
+            guard let id = object["questionID"] as? String else { throw RemoteHTTPError(400, "질문을 지정해주세요.") }
+            try webQuestions.answer(id, answers: object["answers"]); return ["ok": true]
+        }
+        if action == "stopScreenShare" {
+            guard let id = object["shareID"] as? String else { throw RemoteHTTPError(400, "공유를 지정해주세요.") }
+            try testScreens.stop(id); return ["ok": true]
+        }
         if action == "pause" {
             guard let paused = object["paused"] as? Bool else { throw RemoteHTTPError(400, "일시정지 값을 지정해주세요.") }
             try setPaused(paused); return ["paused": snapshot.paused]
@@ -1061,6 +1108,37 @@ import TerminalInputSupport
         case "replyQuestion":
             guard let question = object["questionID"] as? String, let answer = object["answer"] as? String else { throw RemoteHTTPError(400, "질문과 답변을 지정해주세요.") }
             try await replyToQuestion(sessionID: id, questionID: question, answer: answer)
+        case "replyClaudeQuestions":
+            guard let request = object["requestIDForApproval"] as? String else { throw RemoteHTTPError(400, "질문 요청을 지정해주세요.") }
+            try replyClaudeQuestions(sessionID: id, requestID: request, answers: object["answers"])
+        case "beginClaudeQuestion":
+            guard let request = object["requestIDForApproval"] as? String,
+                  let pending = liveClaudeHooks[request], pending.request.sessionID == id, pending.receipt.response == nil else {
+                throw RemoteHTTPError(409, "질문이 이미 처리되었습니다.")
+            }
+            try store.set("claudeQuestionEditing:" + request, "true"); publish()
+        case "sendMessage":
+            guard session.agent == .codex, let message = object["text"] as? String,
+                  !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, message.utf8.count <= 32_000, !message.contains("\0") else {
+                throw RemoteHTTPError(400, "Codex 메시지를 32,000바이트 이내로 입력해주세요.")
+            }
+            guard !sendingMessages.contains(id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 결과를 확인해주세요.") }
+            sendingMessages.insert(id); defer { sendingMessages.remove(id) }
+            let target = try await questionTransport.prepareMessage(session)
+            guard !remoteInputStopped, let current = sessions[id], current.phase != .ended,
+                  current.pid == session.pid, current.started == session.started, current.tty == session.tty,
+                  questionThreadBySession[id] == nil || questionThreadBySession[id] == target.threadID else {
+                throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 대화를 확인해주세요.")
+            }
+            var event = AuditEvent(sessionID: id, summary: String(message.prefix(200)), outcome: "메시지 전달 확인 중", source: "웹 메시지", context: AuditContext(session: session), answer: message)
+            guard log(event) else { throw RemoteHTTPError(409, "메시지 전달 내역을 저장하지 못했습니다.") }
+            do {
+                let receipt = try await questionTransport.send(target, message)
+                event.outcome = "메시지 대기열 등록"; _ = log(event)
+                return ["ok": true, "queueID": receipt, "message": "Codex 메시지 대기열에 등록했습니다."]
+            } catch {
+                event.outcome = "메시지 접수 결과 미확인"; _ = log(event); throw error
+            }
         case "cancelQuestion":
             guard let question = object["questionID"] as? String else { throw RemoteHTTPError(400, "질문을 지정해주세요.") }
             try cancelQuestionAutomaticReply(sessionID: id, questionID: question)
@@ -2080,7 +2158,7 @@ import TerminalInputSupport
                 return bridgeResponse([:])
             }
         }
-        if request.response == nil {
+        if request.response == nil && request.questions == nil {
             invalidateClaudeHooks(for: payload, sessionID: request.sessionID)
             let response = handleHook(payload)
             receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
@@ -2098,7 +2176,7 @@ import TerminalInputSupport
             try saveClaudeReceipt(receipt)
         }
         liveClaudeHooks[request.id] = LiveClaudeHook(request: request, receipt: receipt, lastContact: now)
-        if now.timeIntervalSince(receipt.createdAt) >= 5, effectiveAutomatic(request.sessionID), !snapshot.paused {
+        if request.response != nil, store.value("claudeQuestionEditing:" + request.id) != "true", now.timeIntervalSince(receipt.createdAt) >= 5, effectiveAutomatic(request.sessionID), !snapshot.paused {
             try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
             if let response = liveClaudeHooks[request.id]?.receipt.response {
                 removeLiveClaudeHook(request.id)
@@ -2148,6 +2226,32 @@ import TerminalInputSupport
         try saveClaudeReceipt(receipt)
         removeLiveClaudeHook(requestID, terminal: true)
         publish()
+    }
+
+    public func replyClaudeQuestions(sessionID: String, requestID: String, answers: Any?, at now: Date = Date()) throws {
+        guard let pending = liveClaudeHooks[requestID], pending.request.sessionID == sessionID,
+              pending.receipt.response == nil, pending.receipt.expiresAt > now,
+              now.timeIntervalSince(pending.lastContact) < 25, let fields = pending.request.questions else {
+            throw RemoteHTTPError(409, "질문이 이미 처리되었거나 Claude 연결이 끝났습니다.")
+        }
+        let values = try WebQuestionField.answers(answers, for: fields)
+        let current = try processReader()
+        guard current.contains(where: { $0.key == sessionID && $0.agent == .claude }) else { throw RemoteHTTPError(409, "질문을 보낸 Claude 실행이 종료되었습니다.") }
+        updateDiscovery(ProcessDiscovery.sessions(current), records: current)
+        guard sessions[sessionID]?.phase != .ended, liveClaudeHooks[requestID]?.receipt.response == nil else { throw RemoteHTTPError(409, "질문 상태가 변경되었습니다.") }
+        var input = pending.request.payload["tool_input"] as? JSONObject ?? [:]
+        input["answers"] = values
+        let event = pending.request.payload["hook_event_name"] as? String ?? "PreToolUse"
+        let response: JSONObject = ["hookSpecificOutput": event == "PreToolUse"
+            ? ["hookEventName": event, "permissionDecision": "allow", "updatedInput": input]
+            : ["hookEventName": event, "decision": ["behavior": "allow", "updatedInput": input]]]
+        var receipt = pending.receipt
+        receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+        receipt.audit = contextualEvent(AuditEvent(sessionID: sessionID, summary: pending.request.summary,
+            outcome: "답변 대기열 등록", source: "Claude 질문 웹 폼", tool: "AskUserQuestion", request: pending.request.inputJSON,
+            answer: fields.map { "\($0.question): \(values[$0.question]!)" }.joined(separator: "\n\n")))
+        try saveClaudeReceipt(receipt)
+        liveClaudeHooks[requestID]?.receipt = receipt; claudeHookObservedAt[sessionID] = now; publish()
     }
 
     public func acknowledgeClaudeHook(_ payload: JSONObject, at now: Date = Date()) throws {
@@ -2201,7 +2305,8 @@ import TerminalInputSupport
             sessions[id]?.claudeApprovals = pending.isEmpty ? nil : pending.map { item in
                 ClaudeApproval(id: item.request.id, summary: item.request.summary, answer: item.request.answer,
                     isQuestion: item.request.isQuestion, sending: item.receipt.response != nil, expiresAt: item.receipt.expiresAt,
-                    automaticAt: automatic ? item.receipt.createdAt.addingTimeInterval(5) : nil)
+                    automaticAt: automatic && item.request.response != nil && store.value("claudeQuestionEditing:" + item.request.id) != "true" ? item.receipt.createdAt.addingTimeInterval(5) : nil,
+                    questions: item.request.questions)
             }
             if let first = pending.first, sessions[id]?.phase != .ended {
                 sessions[id]?.pendingSummary = first.request.summary
@@ -2216,6 +2321,17 @@ import TerminalInputSupport
     private func receive(_ message: JSONObject, from peer: SocketConnection) {
         let method = message["method"] as? String ?? ""
         let params = message["params"] as? JSONObject ?? [:]
+        if method == "mcp" {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                var response: JSONObject
+                do { response = ["result": try await self.mcpAction(params)] }
+                catch { response = ["error": error.localizedDescription] }
+                if let id = message["id"] { response["id"] = id }
+                _ = peer.send(response)
+            }
+            return
+        }
         var result: JSONObject = [:]
         do {
             switch method {

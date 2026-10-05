@@ -405,6 +405,11 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),
+            ("Web interaction: MCP ownership, expiry and no default answer", tests.testWebQuestionOwnershipExpiryAndNoDefaultAnswer),
+            ("Web interaction: explicit screen capture, cache, permission and stop", tests.testTestScreenCaptureIsExplicitAndStops),
+            ("Web interaction: MCP stdio initialization, tool list and errors", tests.testMCPStdioProtocolAndToolErrors),
+            ("Web interaction: Claude multiple questions and editing hold", tests.testClaudeWebAnswersMultipleQuestionsAndEditingHold),
             ("Approval recovery: wrapped headings retain identity and active selection", tests.testWrappedPermissionHeadingsKeepRequestIdentity),
             ("Approval recovery: next permission resumes after input completion without another frame", tests.testNextPermissionResumesWhenPreviousInputCompletes),
             ("Approval recovery: consecutive Claude panels tolerate history and reflow", tests.testClaudeConsecutivePanelsAndHistoryReflow),

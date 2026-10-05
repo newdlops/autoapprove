@@ -26,10 +26,29 @@ public struct CodexReplyTarget: Sendable {
 
 public struct CodexReplyTransport: Sendable {
     public var prepare: @Sendable (AgentSession, QueuedQuestion) async throws -> CodexReplyTarget
+    public var prepareMessage: @Sendable (AgentSession) async throws -> CodexReplyTarget
     public var send: @Sendable (CodexReplyTarget, String) async throws -> String
     public init(prepare: @escaping @Sendable (AgentSession, QueuedQuestion) async throws -> CodexReplyTarget,
-                send: @escaping @Sendable (CodexReplyTarget, String) async throws -> String) {
-        self.prepare = prepare; self.send = send
+                send: @escaping @Sendable (CodexReplyTarget, String) async throws -> String,
+                prepareMessage: @escaping @Sendable (AgentSession) async throws -> CodexReplyTarget = { try await messageTarget($0) }) {
+        self.prepare = prepare; self.send = send; self.prepareMessage = prepareMessage
+    }
+    public static func messageTarget(_ session: AgentSession) async throws -> CodexReplyTarget {
+        try await Task.detached(priority: .utility) {
+            let records = try ProcessDiscovery.read()
+            guard records.contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
+                throw AppError.message("이 Codex 실행이 종료되었거나 바뀌었습니다.")
+            }
+            let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
+            let location = try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[session.pid] ?? [])
+            var buffer = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(session.pid, &buffer, UInt32(buffer.count)) > 0 else { throw AppError.message("Codex 실행 파일을 찾지 못했습니다.") }
+            let executable = String(cString: buffer)
+            guard URL(fileURLWithPath: executable).lastPathComponent == "codex", FileManager.default.isExecutableFile(atPath: executable) else {
+                throw AppError.message("Codex 메시지 대기열을 확인하지 못했습니다.")
+            }
+            return CodexReplyTarget(executable: executable, home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: location.threadID)
+        }.value
     }
     public static let live = CodexReplyTransport(prepare: { session, question in
         try await Task.detached(priority: .utility) {

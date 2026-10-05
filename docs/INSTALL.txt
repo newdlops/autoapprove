@@ -71,6 +71,23 @@ AutoApprove 설치 안내
   공식 설치 안내: https://github.com/tmux/tmux/wiki/Installing
 
 지원 환경: macOS 14 이상. arm64 배포 파일은 Apple Silicon용입니다.
+휴대폰 질문·메시지와 테스트 화면 (0.2.46 빌드 57):
+  휴대폰에서 터미널 하단의 '질문·메시지'를 엽니다.
+  여러 질문의 선택지와 직접 답변을 입력한 뒤 '답변 보내기'를 누릅니다.
+  같은 창의 '새 메시지'에서 선택한 원본 대화에 질문이나 다음 작업을 보냅니다.
+  Codex는 작업 중에도 같은 대화의 메시지 대기열로 전달합니다.
+  Claude 질문 폼은 Mac에서 AutoApprove의 Claude 동기 훅이 연결되어야 합니다.
+  Mac의 터미널에서 로컬 MCP를 한 번 등록할 수 있습니다:
+  codex mcp add autoapprove -- /Applications/AutoApprove.app/Contents/MacOS/autoapprove mcp
+  claude mcp add --transport stdio --scope user autoapprove -- /Applications/AutoApprove.app/Contents/MacOS/autoapprove mcp
+  이미 실행 중인 CLI는 종료하지 않습니다. 새 실행이나 MCP 재연결부터 적용됩니다.
+  Codex·Claude에 '테스트 화면을 AutoApprove MCP로 공유해줘'라고 요청하면
+  휴대폰의 '테스트 화면 → 화면 보기'에서 기본 Mac 전체 화면을 확인합니다.
+  이 선택 기능은 Mac의 화면 녹음 권한이 필요하고 전체 화면에는 다른 앱도 포함됩니다.
+  화면을 열어 볼 때만 이미지를 전달하고 닫거나 브라우저를 숨기면 전송을 멈춥니다.
+  '공유 종료'·만료·MCP 정상 종료·웹 접속 끄기·앱 종료는 공유를 해제합니다.
+  휴대폰에는 별도 앱을 설치하지 않으며 외부 중계 서비스를 사용하지 않습니다.
+
 Claude Code와 Codex는 별도로 설치하고 실행해야 합니다.
 SSH, Dev Containers, WSL은 지원하지 않습니다.
 

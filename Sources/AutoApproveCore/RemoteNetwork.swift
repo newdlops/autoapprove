@@ -41,6 +41,8 @@ public struct RemoteNodeState: Codable {
     public var release: RemoteWebVersion? = nil
     public var webURLs: [String]? = nil
     public var webPort: UInt16? = nil
+    public var questionForms: [WebQuestionRequest]? = nil
+    public var screenShares: [TestScreenShare]? = nil
 }
 
 public struct RemoteNodeView: Codable {
@@ -484,7 +486,8 @@ struct RemoteTerminalUpdate: Encodable {
     private func localState() throws -> RemoteNodeState {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
         return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
-            release: webVersion, webURLs: port.map(Self.addresses), webPort: port)
+            release: webVersion, webURLs: port.map(Self.addresses), webPort: port,
+            questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active)
     }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data()) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
@@ -554,6 +557,10 @@ struct RemoteTerminalUpdate: Encodable {
                     if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }
                     return try .object(object)
                 case "/api/network": return try await .json(dashboard())
+                case "/api/test-screen":
+                    if let forwarded = try await forward(request) { return forwarded }
+                    guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }
+                    return try await .json(engine.testScreens.frame(id))
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }

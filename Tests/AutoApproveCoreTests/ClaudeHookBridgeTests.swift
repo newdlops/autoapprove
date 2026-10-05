@@ -195,8 +195,10 @@ extension ApprovalTests {
         try expectEqual((output?["decision"] as? JSONObject)?["behavior"] as? String, "allow")
         var question = hookPayload(now)
         question["tool_input"] = ["questions": [["question": "어떤 환경?", "options": [["label": "개발"], ["label": "운영"]]]]]
-        try expect(bridgeAnswer(try engine.handleClaudeHook(question, at: now))!.isEmpty)
-        try expect(engine.snapshot.sessions.first { $0.id == hookSession(12) }!.backgroundChildren.first { $0.id == hookSession(21) }!.claudeApprovals == nil)
+        try expect(bridgeWaiting(try engine.handleClaudeHook(question, at: now)))
+        try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(12) }!.backgroundChildren.first { $0.id == hookSession(21) }!.claudeApprovals?.first?.questions?.count, 1)
+        var invalid = hookPayload(now); invalid["tool_input"] = ["questions": []]
+        try expect(bridgeAnswer(try engine.handleClaudeHook(invalid, at: now))!.isEmpty, "Malformed question preserves the original terminal flow")
     }
 
     func testClaudeLiveHookOwnsScreenAndRechecksParent() throws {
@@ -222,5 +224,31 @@ extension ApprovalTests {
         try expect(bridgeWaiting(try engine.handleClaudeHook(child, at: now.addingTimeInterval(6))))
         try expect(engine.snapshot.events.allSatisfy { $0.result == .manual })
         try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(21) }?.automatic, false)
+    }
+
+    func testClaudeWebAnswersMultipleQuestionsAndEditingHold() async throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try hookEngine(paths), now = Date()
+        var payload = hookPayload(now)
+        let input: JSONObject = ["questions": [
+            ["question": "환경?", "options": [["label": "개발"], ["label": "운영"]]],
+            ["question": "확인 항목?", "multiSelect": true, "options": [["label": "화면"], ["label": "입력"]]]]]
+        payload["tool_input"] = input
+        try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now)))
+        try engine.setAutomatic(hookSession(12), enabled: true)
+        try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(6))), "General questions never auto-select a default")
+        try expectThrows(try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String, answers: [:], at: now.addingTimeInterval(6)))
+        try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String,
+            answers: ["0": ["choices": ["개발"], "text": ""], "1": ["choices": ["화면", "입력"], "text": "한글🧪"]], at: now.addingTimeInterval(6))
+        let output = bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(7)))!["hookSpecificOutput"] as! JSONObject
+        let updated = output["updatedInput"] as! JSONObject
+        try expectEqual(updated["answers"] as? [String: String], ["환경?": "개발", "확인 항목?": "화면, 입력\n한글🧪"])
+        try expectEqual(try JSONSerialization.data(withJSONObject: updated["questions"]!, options: .sortedKeys), try JSONSerialization.data(withJSONObject: input["questions"]!, options: .sortedKeys))
+        try expectThrows(try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String, answers: [:]))
+        let yes = hookPayload(now)
+        _ = try engine.handleClaudeHook(yes, at: now)
+        _ = try await engine.remoteAction(["action": "beginClaudeQuestion", "sessionID": hookSession(21), "requestIDForApproval": yes["requestID"]!])
+        try expect(bridgeWaiting(try engine.handleClaudeHook(yes, at: now.addingTimeInterval(6))), "Editing stops the five-second automatic answer")
+        try expect(engine.snapshot.sessions.first { $0.id == hookSession(12) }!.automatic)
     }
 }

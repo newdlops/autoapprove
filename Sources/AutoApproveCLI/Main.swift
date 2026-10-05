@@ -16,6 +16,8 @@ import AutoApproveCore
         let command = arguments.first ?? "help"
         do {
             switch command {
+            case "mcp":
+                await Task.detached { AutoApproveMCPServer.run(paths: paths) }.value
             case "scan":
                 let records = try ProcessDiscovery.read()
                 var sessions = ProcessDiscovery.sessions(records)
@@ -90,6 +92,7 @@ import AutoApproveCore
 
                   autoapprove scan          Claude Code·Codex 세션 탐색 (읽기 전용)
                   autoapprove doctor        연결 상태 확인
+                  autoapprove mcp           휴대폰 질문·테스트 화면 공유 MCP (stdio)
                   autoapprove terminal-input prepare  원본 입력 서비스 등록 정보 확인 (읽기 전용 JSON)
                   autoapprove terminal-input install  기존 직접 입력 연결 확인 (새 등록은 Mac 앱에서)
                   autoapprove status        앱의 세션 및 승인 내역

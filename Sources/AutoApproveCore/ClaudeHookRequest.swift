@@ -10,6 +10,7 @@ public struct ClaudeApproval: Codable, Equatable, Identifiable {
     public var sending: Bool
     public var expiresAt: Date
     public var automaticAt: Date?
+    public var questions: [WebQuestionField]? = nil
     public var buttonTitle: String { isQuestion ? (answer.count > 32 ? String(answer.prefix(31)) + "…" : answer) : "허용" }
 }
 
@@ -38,6 +39,7 @@ struct ClaudeHookRequest {
     let summary: String
     let tool: String
     let inputJSON: String?
+    let questions: [WebQuestionField]?
     var isQuestion: Bool { tool == "AskUserQuestion" }
 
     init?(_ payload: JSONObject, at now: Date) {
@@ -56,6 +58,8 @@ struct ClaudeHookRequest {
         expiresAt = Date(timeIntervalSince1970: expiry)
         tool = payload["tool_name"] as? String ?? ""
         let input = payload["tool_input"] as? JSONObject ?? [:]
+        questions = tool == "AskUserQuestion" && ["PreToolUse", "PermissionRequest"].contains(event) && (input["answers"] as? JSONObject)?.isEmpty != false
+            ? try? WebQuestionField.parse(input["questions"]) : nil
         summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
         inputJSON = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
         if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event), let yes = YesNoConfirmation.detect(input) {
@@ -69,7 +73,7 @@ struct ClaudeHookRequest {
             answer = "허용"
             response = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow"]]]
         } else { answer = ""; response = nil }
-        if response != nil {
+        if response != nil || questions != nil {
             let toolID = (payload["tool_use_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id
             logicalID = sessionID + ":" + provider + ":" + toolID
         } else { logicalID = nil }

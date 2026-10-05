@@ -653,12 +653,17 @@ private struct ClaudeApprovalControls: View {
         }
     }
     @ViewBuilder private var approvalButtons: some View {
-        Button(approval.buttonTitle) { perform { try approve(false) } }
-            .buttonStyle(.borderedProminent)
-            .help("이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
-        if !automatic && !paused {
-            Button("허용하고 자동 승인 켜기") { perform { try approve(true) } }
-                .help("현재 요청에 응답하고 이 메인 세션과 연결된 백그라운드의 자동 승인을 켭니다.")
+        if approval.questions != nil && approval.answer.isEmpty {
+            Text("휴대폰 웹의 ‘질문·메시지’에서 선택지를 고르거나 답변을 입력할 수 있습니다.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        } else {
+            Button(approval.buttonTitle) { perform { try approve(false) } }
+                .buttonStyle(.borderedProminent)
+                .help("이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
+            if !automatic && !paused {
+                Button("허용하고 자동 승인 켜기") { perform { try approve(true) } }
+                    .help("현재 요청에 응답하고 이 메인 세션과 연결된 백그라운드의 자동 승인을 켭니다.")
+            }
         }
     }
     private func perform(_ action: () throws -> Void) {
