@@ -12,6 +12,7 @@
 - 최종 Swift 중계의 잘린 SSE 이벤트는 완결된 `retryable:true` 오류로 전달되고, 크기 초과는 `retryable:false`·다른 Mac 식별자는 HTTP 502로 차단되는 통합 검사를 통과했다. 상대 Mac 연결을 브라우저가 닫으면 원래 소켓도 해제한다. 기존 질문·메시지·선택형 화면 MCP 브라우저 회귀 **7개 그룹**도 통과했다. 실제 사용자 Mac 화면은 캡처하지 않았다.
 - 같은 발행자로 서명한 앱을 임시 프로필로 재배치해 내장 버전/리소스·MCP 질문/명시적 답변/소유 연결 해제·포트 충돌 대체·ON/OFF/ID 보존을 확인했다. DMG 이미지 체크섬·읽기 전용 마운트·서명·실행 파일/설치 안내의 원본 일치를 통과했다. SHA-256: `1148407cbd34069ea7f29ee6df8c480661382a495b29f3d68b6d5984c046de01`.
 - **2026-10-05 22:50 KST**, `/Applications/AutoApprove.app`에 **0.2.47/58**을 적용했다. 원본 CLI **15개 PID·시작 시각·TTY**, 설정·승인 기록 **6,092건**과 정상 root 입력 서비스의 PID·실행 횟수·파일 해시를 보존했다. 터미널 재연결·웹 8765·다른 Mac 한 대·앱 소유 PTY 0개를 확인했다. 설치 직후 첫 GET 응답이 제한 시간을 넘었지만 이후 상태 응답은 10ms였고 루프백과 숫자 Wi-Fi 주소에서 웹 리소스 **6개씩**의 소스 일치 검사를 통과했다. 설치 검사는 PID 없는 Claude 훅 논리 세션을 실제 CLI 프로세스와 구분한다. 이전 앱/DB 백업과 설치 검증은 비공개 `.runtime/releases/0.2.47/input-stability-58/`에 있다.
+- [GitHub v0.2.47 정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.47)를 최신 릴리스로 게시했다. 태그의 소스 커밋은 `5a3ab39`이며 draft/prerelease가 아님, DMG·체크섬의 uploaded 상태·크기·digest와 태그 대상 일치를 확인했다. 두 게시 파일을 다시 내려받아 SHA-256과 준비한 파일의 바이트 일치를 통과했다.
 - 원본 검사 보고서는 `dist/qa/original-terminal/`, 기존 모바일 검사는 `dist/qa/mobile-terminal/`, 실제 tmux 검사는 `dist/qa/tmux-browser/`에 있다. Chromium에서 검증했으며 실제 Safari·물리 휴대폰 소프트웨어 키보드·핫스팟 라디오 끊김은 직접 시험하지 않았다. 사용자 CLI에는 테스트 입력하지 않았다.
 
 ## 0.2.46 휴대폰 질문·메시지와 테스트 화면 MCP · 빌드 57
