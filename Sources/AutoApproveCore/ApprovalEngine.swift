@@ -84,6 +84,8 @@ import TerminalInputSupport
     private var codexCompletions = CodexCompletionTracker()
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
+    private let codexQueue: CodexQueueTransport
+    private var clearingCodexQueues = Set<String>()
     private var replyingQuestions = Set<String>()
     private var sendingMessages = Set<String>()
     private var readableQuestionSessions = Set<String>()
@@ -188,7 +190,8 @@ import TerminalInputSupport
     }
 
     public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
-                terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil) throws {
+                terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
+                codexQueue: CodexQueueTransport = .live) throws {
         self.paths = paths
         self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
@@ -200,6 +203,7 @@ import TerminalInputSupport
         adapters[.tmux] = tmuxRelay.adapter
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
         self.questionTransport = questionTransport
+        self.codexQueue = codexQueue
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader
         self.requestTerminalKeyboardPermission = requestTerminalKeyboardPermission ?? { _ = TerminalKeyboard.requestPermission() }
@@ -1092,6 +1096,12 @@ import TerminalInputSupport
             guard let id = object["shareID"] as? String else { throw RemoteHTTPError(400, "공유를 지정해주세요.") }
             try testScreens.stop(id); return ["ok": true]
         }
+        if action == "startScreenShare" {
+            guard webStatus.ready else { throw RemoteHTTPError(409, "Mac에서 웹 접속을 켠 뒤 공유해주세요.") }
+            let share = try await testScreens.start(["scope": "display", "durationSeconds": 600], owner: "web")
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            return ["share": try JSONSerialization.jsonObject(with: encoder.encode(share))]
+        }
         if action == "pause" {
             guard let paused = object["paused"] as? Bool else { throw RemoteHTTPError(400, "일시정지 값을 지정해주세요.") }
             try setPaused(paused); return ["paused": snapshot.paused]
@@ -1102,6 +1112,40 @@ import TerminalInputSupport
         }
         guard let id = object["sessionID"] as? String, let session = sessions[id], session.phase != .ended else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
         switch action {
+        case "clearQueuedInputs":
+            guard session.agent == .codex, let thread = object["threadID"] as? String,
+                  let supplied = object["queueIDs"] as? [String], !supplied.isEmpty, supplied.count <= 100,
+                  Set(supplied).count == supplied.count, supplied.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 128 }),
+                  clearingCodexQueues.insert(id).inserted else { throw RemoteHTTPError(409, "삭제할 대기 입력 목록을 다시 확인해주세요.") }
+            defer { clearingCodexQueues.remove(id) }
+            let target = try await questionTransport.prepareQueue(session, thread)
+            guard thread == target.threadID else { throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 대기 입력을 다시 확인해주세요.") }
+            try validateCodexQueueSession(session, threadID: target.threadID)
+            try await codexQueue.validate(target, session.cwd)
+            let current = try await codexQueue.list(target), pending = Set(current.map(\.id))
+            try validateCodexQueueSession(session, threadID: target.threadID)
+            let ids = supplied.filter { pending.contains($0) }
+            var event = AuditEvent(sessionID: id, summary: "Codex 대기 입력 \(ids.count)개 삭제", outcome: "대기 입력 삭제 확인 중", source: "웹 대기 입력", context: AuditContext(session: session))
+            guard log(event) else { throw RemoteHTTPError(409, "삭제 내역을 저장하지 못했습니다.") }
+            var removed = 0
+            do {
+                try validateCodexQueueSession(session, threadID: target.threadID)
+                try await codexQueue.validate(target, session.cwd)
+                let result = try await codexQueue.delete(target, ids)
+                removed = result.removed.count
+                let removedIDs = Set(result.removed)
+                for question in sessions[id]?.questions ?? [] where question.reply?.queueID.map({ removedIDs.contains($0) }) == true {
+                    questionAutomationOverrides[question.id] = .cancelled; cancelAutomaticQuestionReply(question.id)
+                    try store.set("questionAutomation:" + question.id, QuestionAutomation.Phase.cancelled.rawValue)
+                    try setReply(QuestionReply(phase: .cancelled, answer: question.reply?.answer ?? "", message: "대기 입력을 삭제해 답변 전달을 취소했습니다. 필요하면 다시 답변해주세요."), sessionID: id, question: question, persist: true)
+                }
+                if let error = result.error { throw AppError.message(error) }
+                event.outcome = "대기 입력 \(removed)개 삭제"; _ = log(event)
+                return ["ok": true, "removed": removed, "skipped": supplied.count - removed]
+            } catch {
+                event.outcome = "대기 입력 \(removed)개 삭제 · 나머지 확인 필요"; _ = log(event)
+                throw RemoteHTTPError(503, "\(removed)개를 삭제한 뒤 중단되었습니다. 대기 입력 목록을 새로고침해주세요. \(error.localizedDescription)")
+            }
         case "automatic":
             guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "자동 승인 값을 지정해주세요.") }
             try setAutomatic(id, enabled: enabled)
@@ -1155,6 +1199,38 @@ import TerminalInputSupport
         default: throw RemoteHTTPError(400, "지원하지 않는 동작입니다.")
         }
         return ["ok": true]
+    }
+
+    public func remoteCodexConversations(sessionID: String) async throws -> RemoteCodexConversations {
+        guard let session = sessions[sessionID], session.agent == .codex, session.phase != .ended, session.cwd.hasPrefix("/") else { throw RemoteHTTPError(409, "Codex 실행과 작업 폴더를 확인해주세요.") }
+        let target = try await questionTransport.queueHome(session)
+        try validateCodexQueueSession(session, threadID: nil)
+        let items = try await codexQueue.conversations(target, session.cwd)
+        try validateCodexQueueSession(session, threadID: nil)
+        return RemoteCodexConversations(sessionID: sessionID, items: items)
+    }
+
+    public func remoteCodexQueue(sessionID: String, threadID: String? = nil) async throws -> RemoteCodexQueue {
+        guard let session = sessions[sessionID], session.agent == .codex, session.phase != .ended else {
+            throw RemoteHTTPError(404, "Codex 세션이 종료되었거나 찾을 수 없습니다.")
+        }
+        let target: CodexReplyTarget
+        if let threadID { target = try await questionTransport.prepareQueue(session, threadID) }
+        else { target = try await questionTransport.prepareMessage(session) }
+        try validateCodexQueueSession(session, threadID: target.threadID)
+        if threadID != nil { try await codexQueue.validate(target, session.cwd) }
+        let items = try await codexQueue.list(target)
+        try validateCodexQueueSession(session, threadID: target.threadID)
+        return RemoteCodexQueue(sessionID: sessionID, threadID: target.threadID, items: items)
+    }
+
+    private func validateCodexQueueSession(_ session: AgentSession, threadID: String?) throws {
+        guard !remoteInputStopped, let current = sessions[session.id], current.phase != .ended,
+              current.pid == session.pid, current.started == session.started, current.tty == session.tty, current.cwd == session.cwd,
+              threadID == nil || questionThreadBySession[session.id] == nil || questionThreadBySession[session.id] == threadID,
+              try processReader().contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
+            throw RemoteHTTPError(409, "Codex 실행이나 대화가 바뀌었습니다. 현재 목록을 다시 확인해주세요.")
+        }
     }
 
     private func ownerID(_ id: String) -> String? {

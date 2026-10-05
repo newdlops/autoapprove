@@ -43,7 +43,7 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>연결한 Terminal·iTerm2 세션의 승인 화면을 확인하고 해당 탭에 승인 입력을 전달합니다.</string>
-  <key>NSScreenCaptureUsageDescription</key><string>사용자가 Mac 창 보기를 켜거나 MCP로 테스트 화면 공유를 시작할 때만 지정한 Mac 화면을 같은 네트워크로 전달합니다.</string>
+  <key>NSScreenCaptureUsageDescription</key><string>사용자가 Mac 창 보기·테스트 화면 버튼 또는 MCP로 화면 공유를 시작할 때만 Mac 화면을 같은 네트워크로 전달합니다.</string>
   <key>NSLocalNetworkUsageDescription</key><string>개인 핫스팟의 다른 AutoApprove Mac을 발견하고 휴대폰에서 세션 상태와 터미널을 관리합니다.</string>
   <key>NSBonjourServices</key><array><string>_autoapprove._tcp</string></array>
 </dict></plist>

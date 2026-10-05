@@ -19,6 +19,7 @@ const nativeConnection = () => !!selectedItem && !selectedItem.view.pty && selec
 let terminalValue = null, terminalRows = [], terminalAppearanceKey = null;
 let terminalFollowScroll = null;
 let lastNetworkUpdate = null;
+let lastNetworkStartedAt = -Infinity;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
 let composePreferred = false, composeMode = false;
 const keyboardMarker = '\u200b';
@@ -28,6 +29,10 @@ let cursorLayoutPending = false;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const structuredDrafts = new Map(), messageDrafts = new Map();
+const questionDeliveries = new Map(), questionEditing = new Map();
+let queueSnapshot = null, queueLoading = false, queueGeneration = 0, queueSessionKey = '';
+const queueConversations = new Map();
+let screenStarting = false, screenStartNode = null;
 let webFormSignature = '', screenListSignature = '', sharedScreen = null, sharedScreenTimer, sharedScreenController;
 let messageSending = false, messageUncertain = new Set(), interactionLinkOpened = false;
 const keyFor = (node, session, view) => `${node.id}/${view?.ptyID ? 'pty:' + view.ptyID : session.id}`;
@@ -504,14 +509,41 @@ async function action(nodeID, payload, message) {
   } catch (error) { feedback(error.message, true); }
   finally { mutation = false; if (selectedItem) $('automatic').checked = selectedItem.session.automatic; updateControls(); renderMachines(); }
 }
+function beginQuestionEditing(key, nodeID, payload) {
+  if (questionEditing.has(key)) return;
+  // Holding an automatic reply is not a form submission. Do not disable every
+  // Send button or swallow a tap while this independently acknowledged POST runs.
+  const pending = api(endpoint('/api/action', nodeID), {...payload, requestID:uuid()}).catch(error => {
+    const state = questionDeliveries.get(key) || {};
+    if (!state.busy) { state.error = error.message; questionDeliveries.set(key, state); updateInteractionControls(); }
+  });
+  questionEditing.set(key, pending);
+}
+async function sendQuestionAnswer(key, nodeID, payload, message) {
+  const previous = questionDeliveries.get(key);
+  if (previous?.busy || previous?.sent || previous?.uncertain) return false;
+  const state = {busy:true, error:'', uncertain:false}; questionDeliveries.set(key, state); updateInteractionControls();
+  try {
+    await questionEditing.get(key);
+    await api(endpoint('/api/action', nodeID), {...payload, requestID:uuid()});
+    state.sent = true; state.finishedAt = performance.now(); state.message = message; state.error = ''; void refreshNetwork();
+    if (selectedItem?.session.agent === 'codex' && $('interaction-dialog').open) void refreshCodexQueue();
+    return true;
+  } catch (error) {
+    state.error = error.message; state.uncertain = !error.status || error.status >= 500; state.failedAt = performance.now();
+    if (state.uncertain) state.error += ' 전달 여부를 확인한 뒤 진행해주세요. 작성한 답변은 보관합니다.';
+    void refreshNetwork(); return false;
+  } finally { state.busy = false; updateInteractionControls(); }
+}
 
 async function refreshNetwork() {
   clearTimeout(networkTimer);
   if (loadingNetwork) return;
   loadingNetwork = true; $('refresh').disabled = true; $('refresh').setAttribute('aria-busy', 'true');
+  const startedAt = performance.now();
   try {
     const result = await api('/api/network');
-    connected = true; nodes = result.nodes;
+    connected = true; nodes = result.nodes; lastNetworkStartedAt = startedAt;
     allSessions = reconcilePTYInventory(nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []));
     const unavailable = nodes.find(node => node.id === selectedItem?.node.id && !node.online);
     // A peer's inventory can time out while its independently verified SSE
@@ -756,7 +788,6 @@ function updateControls() {
     const available = supported.includes(button.dataset.key);
     show(button, available || native && button.dataset.key !== 'eof'); button.disabled = !available || originalDraftOnly || native && !composeMode && !canDirect || composing || !(inputEnabled || queueEnabled); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
   }
-  for (const button of $('questions').querySelectorAll('button')) button.disabled = !enabled || button.dataset.unavailable === 'true';
   scheduleCursor();
 }
 function mergeTerminalUpdate(update, previous, sessionID) {
@@ -1020,8 +1051,8 @@ function renderQuestions() {
         count++; $('questions').append(structuredQuestionForm(`${node.id}/${source.id}/${approval.id}`, approval.questions, {
           nodeID: node.id, title: source.id === session.id ? 'Claude의 질문' : 'Claude 백그라운드 질문', unavailable: approval.sending,
           status: approval.sending ? 'Claude에 답변을 전달하고 있습니다.' : approval.automaticAt ? '자동 응답 예약 · 답변을 작성하면 예약을 멈춥니다.' : '',
-          begin: () => action(node.id, {action:'beginClaudeQuestion', sessionID:source.id, requestIDForApproval:approval.id}),
-          send: answers => action(node.id, {action:'replyClaudeQuestions', sessionID:source.id, requestIDForApproval:approval.id, answers}, 'Claude에 답변을 전달했습니다.')
+          begin: () => beginQuestionEditing(`${node.id}/${source.id}/${approval.id}`, node.id, {action:'beginClaudeQuestion', sessionID:source.id, requestIDForApproval:approval.id}),
+          send: answers => sendQuestionAnswer(`${node.id}/${source.id}/${approval.id}`, node.id, {action:'replyClaudeQuestions', sessionID:source.id, requestIDForApproval:approval.id, answers}, 'Claude에 답변을 전달했습니다.')
         })); continue;
       }
       count++; const section = make('div', 'question'); section.append(make('h4', '', approval.summary));
@@ -1037,9 +1068,14 @@ function renderQuestions() {
     }
     for (const question of source.queuedQuestions || []) {
       count++; const questionKey = `${node.id}/${source.id}/${question.id}`, draft = questionDrafts.get(questionKey) || { answer: '', choices: [] };
+      if (['failed','cancelled'].includes(question.reply?.phase) && !questionDeliveries.get(questionKey)?.busy && lastNetworkStartedAt > (questionDeliveries.get(questionKey)?.failedAt ?? questionDeliveries.get(questionKey)?.finishedAt ?? -Infinity)) {
+        const state = questionDeliveries.get(questionKey) || {}; state.uncertain = false; state.sent = false;
+        state.error = question.reply.phase === 'failed' ? question.reply.message : ''; state.message = question.reply.phase === 'cancelled' ? question.reply.message : ''; questionDeliveries.set(questionKey,state);
+      }
       const form = make('form', 'question'); form.dataset.questionKey = questionKey; form.append(make('h4', '', question.title));
       const unavailable = ['sending', 'queued', 'uncertain'].includes(question.reply?.phase);
-      if (question.reply?.phase) form.append(make('p', 'muted small', { sending: '답변을 전달하고 있습니다.', queued: '답변이 대기열에 등록되었습니다.', uncertain: '전달 결과를 확인하지 못했습니다. 터미널에서 확인해주세요.', failed: '답변 전달에 실패했습니다.' }[question.reply.phase] || question.reply.phase));
+      form.dataset.readOnly = String(unavailable);
+      if (question.reply?.phase) form.append(make('p', 'muted small', { sending: '답변을 전달하고 있습니다.', queued: '답변이 대기열에 등록되었습니다.', uncertain: '전달 결과를 확인하지 못했습니다. 터미널에서 확인해주세요.', failed: '답변 전달에 실패했습니다.', cancelled: '대기 입력을 삭제해 답변 전달을 취소했습니다.' }[question.reply.phase] || question.reply.phase));
       const options = make('div', 'question-options');
       for (const option of question.options || []) {
         const label = make('label', 'question-option'), checkbox = make('input'); checkbox.type = 'checkbox'; checkbox.value = option; checkbox.checked = draft.choices.includes(option); checkbox.disabled = unavailable;
@@ -1055,20 +1091,20 @@ function renderQuestions() {
         questionDrafts.set(questionKey, { answer: answer.value, choices });
         send.dataset.unavailable = String(unavailable || (!answer.value.trim() && !choices.length)); updateControls();
       }
-      form.addEventListener('input', saveDraft);
+      form.addEventListener('input', saveDraft); form.addEventListener('change', saveDraft);
       let editing = false;
-      form.addEventListener('focusin', () => { if (!editing && !unavailable && ['scheduled', 'paused'].includes(question.automation?.phase)) { editing = true; void action(node.id, { action: 'beginQuestion', sessionID: source.id, questionID: question.id }); } });
+      form.addEventListener('focusin', () => { if (!editing && !unavailable && ['scheduled', 'paused'].includes(question.automation?.phase)) { editing = true; beginQuestionEditing(questionKey, node.id, { action: 'beginQuestion', sessionID: source.id, questionID: question.id }); } });
       form.addEventListener('submit', event => {
         event.preventDefault(); saveDraft();
         const current = questionDrafts.get(questionKey); const value = [...current.choices, current.answer.trim()].filter(Boolean).join('\n');
-        if (value && !unavailable) void action(node.id, { action: 'replyQuestion', sessionID: source.id, questionID: question.id, answer: value }, '답변을 전달했습니다.');
+        if (value && !unavailable && !send.disabled) void sendQuestionAnswer(questionKey, node.id, { action: 'replyQuestion', sessionID: source.id, questionID: question.id, answer: value }, '답변을 Codex 대기열에 등록했습니다.');
       });
       actions.append(send);
       if (['scheduled', 'paused', 'unavailable'].includes(question.automation?.phase)) {
         const cancel = make('button', 'secondary', '자동 응답 취소'); cancel.type = 'button';
         cancel.addEventListener('click', () => void action(node.id, { action: 'cancelQuestion', sessionID: source.id, questionID: question.id }, '이 질문의 자동 응답을 취소했습니다.')); actions.append(cancel);
       }
-      form.append(actions); $('questions').append(form);
+      appendQuestionDelivery(form); form.append(actions); $('questions').append(form);
     }
     if (source.pendingSummary && !(source.claudeApprovals || []).length && !(source.queuedQuestions || []).length) {
       count++; const section = make('div', 'question'); section.append(make('h4', '', source.pendingSummary), make('p', 'muted small', '이 요청은 터미널 화면에서 직접 답해주세요.')); $('questions').append(section);
@@ -1088,11 +1124,11 @@ function renderQuestions() {
 }
 function structuredQuestionForm(key, fields, config) {
   const form = make('form', 'question'); form.dataset.questionKey = key; form.dataset.structured = 'true'; form.dataset.nodeID = config.nodeID;
+  form.dataset.readOnly = String(!!config.unavailable);
   form.append(make('h3', '', config.title));
   if (config.status) form.append(make('p', 'muted small', config.status));
   const draft = structuredDrafts.get(key) || {}, controls = [];
   const send = make('button', '', '답변 보내기'); send.type = 'submit';
-  const error = make('p', 'error-text'); error.setAttribute('role', 'alert'); error.hidden = true;
   for (const field of fields) {
     const group = make('fieldset', 'question-field'); group.disabled = !!config.unavailable;
     group.append(make('legend', '', field.question));
@@ -1113,18 +1149,20 @@ function structuredQuestionForm(key, fields, config) {
     send.dataset.unavailable = String(!!config.unavailable || !Object.values(answers).every(answer => answer.choices.length || answer.text.trim()));
     updateInteractionControls(); return answers;
   }
-  form.addEventListener('input', save); let editing = false;
+  form.addEventListener('input', save); form.addEventListener('change', save); let editing = false;
   form.addEventListener('focusin', () => { if (!editing && !config.unavailable && config.begin) { editing = true; void config.begin(); } });
   form.addEventListener('submit', async event => {
     event.preventDefault(); const answers = save();
     if (send.disabled || mutation) return;
-    form.setAttribute('aria-busy', 'true'); text(send, '전달 중…'); show(error, false);
     const success = await config.send(answers);
     if (success) structuredDrafts.delete(key);
-    else { text(error, '답변 전달 결과를 확인하지 못했습니다. 질문 상태를 확인해주세요. 작성한 답변은 보관합니다.'); show(error, true); }
-    form.removeAttribute('aria-busy'); text(send, '답변 보내기'); save();
   });
-  const actions = make('div', 'question-actions'); actions.append(send); form.append(error, actions); save(); return form;
+  const actions = make('div', 'question-actions'); actions.append(send); appendQuestionDelivery(form); form.append(actions); save(); return form;
+}
+function appendQuestionDelivery(form) {
+  const status = make('p', 'muted small'); status.dataset.deliveryStatus = 'true'; status.setAttribute('role','status'); status.hidden = true;
+  const error = make('p','error-text'); error.dataset.deliveryError = 'true'; error.setAttribute('role','alert'); error.hidden = true;
+  form.append(status, error);
 }
 function interactionSources() { return selectedItem ? [selectedItem.session, ...(selectedItem.session.backgroundSessions || [])] : []; }
 function renderInteractions() {
@@ -1142,7 +1180,7 @@ function renderInteractions() {
     $('web-question-forms').replaceChildren();
     for (const {node,request} of forms) $('web-question-forms').append(structuredQuestionForm(`${node.id}/mcp/${request.id}`, request.questions, {
       nodeID:node.id, title:`${request.title} · ${node.name}`, unavailable:!node.online,
-      send:answers=>action(node.id, {action:'replyWebQuestion', questionID:request.id, answers}, '질문에 답변했습니다.')
+      send:answers=>sendQuestionAnswer(`${node.id}/mcp/${request.id}`, node.id, {action:'replyWebQuestion', questionID:request.id, answers}, '질문에 답변했습니다.')
     }));
     if (key && selection) { const form = Array.from($('web-question-forms').querySelectorAll('form')).find(item=>item.dataset.questionKey===key); const field=form?.querySelectorAll('textarea')[fieldIndex]; if (field && !field.disabled) { field.focus({preventScroll:true}); field.setSelectionRange(...selection); } }
   }
@@ -1155,13 +1193,24 @@ function renderInteractions() {
   if (!interactionLinkOpened && link.has('request') && forms.some(({request})=>request.id===link.get('request'))) { interactionLinkOpened=true; openInteraction(); }
   if (!interactionLinkOpened && link.has('share')) {
     const found = nodes.flatMap(node=>(node.state?.screenShares || []).map(share=>({node,share}))).find(item=>item.share.id===link.get('share'));
-    if (found) { interactionLinkOpened=true; openTestScreens(); selectTestScreen(found.node,found.share); }
+    if (found) { interactionLinkOpened=true; void openTestScreens(false,found); }
   }
 }
 function updateInteractionControls() {
+  const replies = new Map(interactionSources().flatMap(source => (source.queuedQuestions || []).map(question => [`${selectedItem.node.id}/${source.id}/${question.id}`, question.reply])));
   for (const form of document.querySelectorAll('#interaction-dialog form.question')) {
     const node = nodes.find(item=>item.id===(form.dataset.nodeID || selectedItem?.node.id));
-    for (const button of form.querySelectorAll('button')) button.disabled = mutation || !connected || !node?.online || button.dataset.unavailable === 'true';
+    const state = questionDeliveries.get(form.dataset.questionKey) || {};
+    const reply = replies.get(form.dataset.questionKey);
+    if (!state.busy && state.uncertain && lastNetworkStartedAt > state.failedAt && ['failed','cancelled'].includes(reply?.phase)) { state.uncertain = false; state.error = reply.phase === 'failed' ? reply.message : ''; }
+    const available = connected && node?.online || node?.id === selectedItem?.node.id && originalStreamSelected();
+    for (const button of form.querySelectorAll('button')) button.disabled = mutation || state.busy || state.sent || state.uncertain || !available || button.dataset.unavailable === 'true';
+    for (const control of form.querySelectorAll('fieldset,input,textarea')) control.disabled = form.dataset.readOnly === 'true' || !!state.busy || !!state.sent || !!state.uncertain;
+    if (state.busy) form.setAttribute('aria-busy','true'); else form.removeAttribute('aria-busy');
+    const submit = form.querySelector('button[type=submit]'); if (submit) text(submit, state.busy ? '전달 중…' : state.sent ? '전달 완료' : '답변 보내기');
+    const status = form.querySelector('[data-delivery-status]'), error = form.querySelector('[data-delivery-error]');
+    if (status) { text(status,state.message || ''); show(status,!!state.message); }
+    if (error) { text(error,state.error || ''); show(error,!!state.error); }
   }
   const present = selectedItem && allSessions.some(item=>item.key===selectedKey), codex = selectedItem?.session.agent === 'codex';
   const terminal = present && !['approval','input'].includes(selectedItem.session.phase) && !selectedItem.session.pendingInTerminal;
@@ -1173,12 +1222,14 @@ function updateInteractionControls() {
   $('send-message').disabled = !available || mutation || messageSending || uncertain || !$('message-input').value.trim();
   text($('send-message'), messageSending ? '전달 중…' : '메시지 보내기');
   text($('message-help'), !present ? '목록에서 메시지를 보낼 터미널을 선택해주세요.' : uncertain ? '전달 결과가 불확실합니다. 같은 내용을 다시 보내기 전에 원본 터미널의 접수를 확인해주세요.' : codex && !queueSupported ? '메시지 전송은 이 Mac을 AutoApprove 0.2.46 이상으로 업데이트하면 사용할 수 있습니다.' : codex ? '작업 중에도 같은 Codex 대화의 메시지 대기열로 전달합니다.' : !terminal ? '현재 터미널의 질문에 먼저 답변한 뒤 새 메시지를 보내주세요.' : !available ? '원본 터미널 입력 연결을 확인해주세요. 초안은 보관합니다.' : inputKeys().includes('submit') ? '같은 원본 터미널의 입력창에 메시지를 보냅니다.' : '이 원본 연결에서는 한 줄 메시지를 지원합니다.');
+  updateQueueControls();
 }
 function openInteraction() {
   text($('message-status'),''); show($('message-error'),false);
   if (selectedItem) { renderQuestions(); $('message-input').value=messageDrafts.get(selectedKey) || ''; }
   else { show($('questions-section'),false); $('message-input').value=''; }
   renderInteractions(); if (!$('interaction-dialog').open) $('interaction-dialog').showModal();
+  void refreshCodexQueue();
   if (!$('questions-section').hidden || $('web-question-forms').childElementCount) $('close-interaction').focus();
 }
 async function submitMessage(event) {
@@ -1199,7 +1250,7 @@ async function submitMessage(event) {
       }
       if(selectedKey===key)text($('message-status'),'원본 터미널에 메시지를 전달했습니다.');
     }
-    messageDrafts.delete(key); if (selectedKey===key) $('message-input').value=''; await refreshNetwork();
+    messageDrafts.delete(key); if (selectedKey===key) { $('message-input').value=''; void refreshCodexQueue(); } await refreshNetwork();
   } catch (error) {
     if (!error.unsent && ![400,404].includes(error.status)) messageUncertain.add(key);
     if(selectedKey===key){text($('message-error'),error.message); show($('message-error'),true);}
@@ -1210,11 +1261,103 @@ function renderTestScreenList() {
   text($('screen-count'),shares.length || ''); text($('global-screens'),`공유 ${shares.length}`); show($('global-screens'),shares.length>0);
   const signature=JSON.stringify(shares.map(({node,share})=>[node.id,node.online,share])); if(signature===screenListSignature)return;
   screenListSignature=signature; $('test-screen-list').replaceChildren();
-  if(!shares.length)$('test-screen-list').append(make('p','muted','공유 중인 테스트 화면이 없습니다. Codex·Claude에 MCP의 start_screen_share를 사용해 화면을 공유하도록 요청하세요.'));
+  if(!shares.length)$('test-screen-list').append(make('p','muted','공유 중인 테스트 화면이 없습니다. 화면 공유를 시작하면 여기에 표시됩니다.'));
   for(const {node,share} of shares){const row=make('div','test-screen-row'),info=make('div');info.append(make('strong','',share.title),make('p','muted small',`${node.name} · ${share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · ${nowLabel(share.expiresAt)}까지`));const open=make('button','secondary','화면 보기');open.disabled=!node.online;open.addEventListener('click',()=>selectTestScreen(node,share));row.append(info,open);$('test-screen-list').append(row);}
-  if(sharedScreen && !shares.some(item=>item.node.id===sharedScreen.node.id&&item.share.id===sharedScreen.share.id)){stopTestScreenRead();text($('test-screen-status'),'화면 공유가 종료되었습니다.');$('test-screen-image').removeAttribute('src');$('stop-test-screen').disabled=true;}
+  // The selected capture endpoint authoritatively reports expiry/revocation.
+  // An inventory timeout must not close a still-authorized image viewer.
 }
-function openTestScreens(){renderTestScreenList();if(!$('test-screen-dialog').open)$('test-screen-dialog').showModal();}
+async function openTestScreens(start = false, requested = null) {
+  renderTestScreenList(); if (!$('test-screen-dialog').open) $('test-screen-dialog').showModal();
+  screenStartNode = requested?.node || currentNode() || nodes.find(node => node.local && node.online) || nodes.find(node => node.online);
+  text($('test-screen-source'), screenStartNode ? `${screenStartNode.name} · Mac 전체 화면 · 10분 동안 공유` : '화면을 공유할 Mac에 연결해주세요.');
+  const shares = nodes.flatMap(node => (node.state?.screenShares || []).map(share => ({node,share}))).filter(item => item.node.online);
+  const existing = requested || shares.find(item => item.node.id === screenStartNode?.id) || (!start ? shares[0] : null);
+  show($('screen-start-error'),false); text($('screen-start-status'),'');
+  show($('start-test-screen'),!existing); $('start-test-screen').disabled = screenStarting || !screenStartNode?.online || !supportsRelease(screenStartNode,[0,2,50,61]);
+  if (existing) { selectTestScreen(existing.node, existing.share); return; }
+  show($('test-screen-viewer'),false);
+  if (screenStartNode && !supportsRelease(screenStartNode,[0,2,50,61])) text($('screen-start-status'),'이 Mac을 AutoApprove 0.2.50 이상으로 업데이트하면 버튼으로 화면 공유를 시작할 수 있습니다.');
+  else if (start) await startTestScreen();
+}
+async function startTestScreen() {
+  const node = screenStartNode; if (screenStarting || !node?.online || !supportsRelease(node,[0,2,50,61])) return;
+  screenStarting = true; $('start-test-screen').disabled = true; show($('screen-start-error'),false); text($('screen-start-status'),'Mac 화면 공유를 시작하고 있습니다…');
+  try {
+    const result = await api(endpoint('/api/action', node.id), {action:'startScreenShare',requestID:uuid()});
+    if (!result.share?.id || result.share.source?.scope !== 'display') throw new Error('Mac의 화면 공유 정보를 확인하지 못했습니다.');
+    text($('screen-start-status'),''); void refreshNetwork();
+    if ($('test-screen-dialog').open && screenStartNode?.id === node.id) { show($('start-test-screen'),false); selectTestScreen(node,result.share); }
+  } catch (error) { text($('screen-start-error'),error.message); show($('screen-start-error'),true); text($('screen-start-status'),'화면 공유를 시작하지 못했습니다. Mac의 권한과 연결을 확인한 뒤 다시 시도해주세요.'); }
+  finally { screenStarting = false; $('start-test-screen').disabled = !screenStartNode?.online; }
+}
+function updateQueueControls() {
+  const codex = selectedItem?.session.agent === 'codex'; show($('codex-queue'),codex);
+  if (!codex) return;
+  if (queueSessionKey !== selectedKey) {
+    queueSessionKey = selectedKey; queueGeneration++; queueSnapshot = null; queueLoading = false;
+    $('queued-inputs').replaceChildren(); text($('queue-count'),''); text($('queue-status'),'목록을 갱신하면 현재 Codex 대기 입력을 확인합니다.'); show($('queue-error'),false); show($('queue-confirm'),false);
+    show($('queue-conversation-picker'),false); show($('connect-queue-conversation'),false);
+  }
+  const supported = supportsRelease(selectedItem.node,[0,2,50,61]), online = connected && currentNode()?.online;
+  $('refresh-queue').disabled = !online || !supported || queueLoading;
+  text($('refresh-queue'), queueLoading ? '확인 중…' : '목록 갱신');
+  $('clear-queue').disabled = !online || queueLoading || !queueSnapshot?.items.length;
+  $('confirm-clear-queue').disabled = $('clear-queue').disabled;
+  $('cancel-clear-queue').disabled = queueLoading;
+  $('connect-queue-conversation').disabled = !online || !supported || queueLoading;
+  $('queue-conversation').disabled = queueLoading;
+  $('use-queue-conversation').disabled = !online || queueLoading || !$('queue-conversation').value;
+  if (!supported) text($('queue-status'),'이 Mac을 AutoApprove 0.2.50 이상으로 업데이트하면 대기 입력을 확인하고 비울 수 있습니다.');
+}
+async function refreshCodexQueue() {
+  updateQueueControls(); if (!selectedItem || $('refresh-queue').disabled) return;
+  const item = selectedItem, key = selectedKey, generation = ++queueGeneration;
+  queueLoading = true; queueSnapshot = null; show($('queue-confirm'),false); show($('queue-error'),false); text($('queue-status'),'Codex 대기 입력을 확인하고 있습니다…'); updateQueueControls();
+  try {
+    const chosen = queueConversations.get(key);
+    const result = await api(endpoint('/api/codex/queue',item.node.id,item.session.id)+(chosen ? '&thread='+encodeURIComponent(chosen.id) : ''));
+    if (generation !== queueGeneration || selectedKey !== key) return;
+    if (result.sessionID !== item.session.id || typeof result.threadID !== 'string' || !Array.isArray(result.items) || result.items.some(entry => typeof entry.id !== 'string' || typeof entry.text !== 'string')) throw new Error('이 세션의 대기 입력 목록을 확인하지 못했습니다.');
+    queueSnapshot = result; $('queued-inputs').replaceChildren();
+    for (const entry of result.items) { const row = make('li','',entry.text || '첨부 입력'); if (entry.attachments) row.append(make('span','muted small',` · 첨부 ${entry.attachments}개`)); $('queued-inputs').append(row); }
+    text($('queue-count'),result.items.length || ''); text($('queue-status'),(chosen ? `${chosen.title} · ` : '')+(result.items.length ? '아직 처리하지 않은 후속 입력입니다. 실행 중인 작업은 계속됩니다.' + (result.items.length > 100 ? ' 한 번에 100개씩 비웁니다.' : '') : '대기 입력이 없습니다.'));
+    show($('queue-conversation-picker'),false); show($('connect-queue-conversation'),!!chosen);
+  } catch (error) { if (generation === queueGeneration && selectedKey === key) { text($('queue-error'),error.message); show($('queue-error'),true); text($('queue-status'),'대기 입력을 확인하지 못했습니다. 대화 기록을 직접 열지 않는 Codex는 실행 중인 대화를 선택해 연결할 수 있습니다.'); show($('connect-queue-conversation'),true); } }
+  finally { if (generation === queueGeneration) { queueLoading = false; updateQueueControls(); } }
+}
+async function chooseQueueConversation() {
+  if ($('connect-queue-conversation').disabled || !selectedItem) return;
+  const item = selectedItem, key = selectedKey, generation = ++queueGeneration;
+  queueLoading = true; queueSnapshot = null; show($('queue-confirm'),false); show($('queue-error'),false); show($('queue-conversation-picker'),false); text($('queue-status'),'같은 작업 폴더의 실행 중인 Codex 대화를 확인하고 있습니다…'); updateQueueControls();
+  try {
+    const result = await api(endpoint('/api/codex/conversations',item.node.id,item.session.id));
+    if (generation !== queueGeneration || selectedKey !== key) return;
+    if (result.sessionID !== item.session.id || !Array.isArray(result.items) || result.items.some(entry=>typeof entry.id!=='string'||typeof entry.title!=='string')) throw new Error('Codex 대화 목록을 확인하지 못했습니다.');
+    $('queue-conversation').replaceChildren(new Option('연결할 대화를 선택해주세요.',''));
+    for (const entry of result.items) { const option = new Option(`${entry.title || 'Codex 대화'} · ${entry.id}`,entry.id); option.dataset.title = entry.title || 'Codex 대화'; $('queue-conversation').append(option); }
+    show($('queue-conversation-picker'),result.items.length>0); text($('queue-status'),result.items.length ? '원본 Codex의 대화와 일치하는 항목을 선택해주세요. 선택한 대화의 대기 입력만 관리합니다.' : '이 작업 폴더에서 실행 중인 Codex 대화를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요.');
+  } catch (error) { if (generation === queueGeneration && selectedKey === key) { text($('queue-error'),error.message); show($('queue-error'),true); } }
+  finally { if (generation === queueGeneration) { queueLoading = false; updateQueueControls(); } }
+}
+async function clearCodexQueue() {
+  if ($('confirm-clear-queue').disabled || !queueSnapshot) return;
+  const item = selectedItem, key = selectedKey, snapshot = queueSnapshot, generation = ++queueGeneration;
+  queueLoading = true; updateQueueControls(); show($('queue-error'),false); text($('queue-status'),'선택한 대기 입력을 삭제하고 있습니다…');
+  let status = '', errorMessage = '';
+  try {
+    const result = await api(endpoint('/api/action',item.node.id),{action:'clearQueuedInputs',sessionID:item.session.id,threadID:snapshot.threadID,queueIDs:snapshot.items.slice(0,100).map(entry=>entry.id),requestID:uuid()});
+    status = `대기 입력 ${result.removed}개를 삭제했습니다.`;
+  } catch (error) { errorMessage = error.message; }
+  finally {
+    if (generation === queueGeneration) {
+      queueLoading = false; queueSnapshot = null; show($('queue-confirm'),false); updateQueueControls(); await refreshCodexQueue();
+      if (selectedKey === key) {
+        if (errorMessage) { text($('queue-error'),errorMessage); show($('queue-error'),true); }
+        else if (status) text($('queue-status'),status + ' ' + $('queue-status').textContent);
+      }
+    }
+  }
+}
 function stopTestScreenRead(){clearTimeout(sharedScreenTimer);sharedScreenController?.abort();sharedScreenController=null;}
 function selectTestScreen(node,share){stopTestScreenRead();sharedScreen={node,share};$('test-screen-image').removeAttribute('src');$('test-screen-image').dataset.zoom='false';$('test-screen-zoom').setAttribute('aria-pressed','false');$('test-screen-zoom').setAttribute('aria-label','공유 화면 확대');$('test-screen-zoom').disabled=true;$('stop-test-screen').disabled=false;show($('test-screen-viewer'),true);show($('test-screen-error'),false);void readTestScreen();}
 async function readTestScreen(){
@@ -1231,9 +1374,20 @@ async function readTestScreen(){
 
 $('global-questions').addEventListener('click',openInteraction);$('terminal-questions').addEventListener('click',openInteraction);
 $('close-interaction').addEventListener('click',()=>$('interaction-dialog').close());
+$('connect-queue-conversation').addEventListener('click',()=>void chooseQueueConversation());
+$('queue-conversation').addEventListener('change',updateQueueControls);
+$('use-queue-conversation').addEventListener('click',()=>{
+  if ($('use-queue-conversation').disabled || !selectedItem) return;
+  const option = $('queue-conversation').selectedOptions[0]; queueConversations.set(selectedKey,{id:option.value,title:option.dataset.title}); void refreshCodexQueue();
+});
 $('message-form').addEventListener('submit',submitMessage);$('message-input').addEventListener('input',()=>{if(selectedKey)messageDrafts.set(selectedKey,$('message-input').value);updateInteractionControls();});
 $('new-message').addEventListener('click',()=>{if(!selectedKey||messageSending)return;messageUncertain.delete(selectedKey);messageDrafts.delete(selectedKey);$('message-input').value='';show($('message-error'),false);text($('message-status'),'이전 전달 결과는 원본 터미널에서 확인해주세요.');updateInteractionControls();$('message-input').focus();});
-$('global-screens').addEventListener('click',openTestScreens);$('terminal-screens').addEventListener('click',openTestScreens);
+$('global-screens').addEventListener('click',()=>void openTestScreens());$('terminal-screens').addEventListener('click',()=>void openTestScreens(true));
+$('start-test-screen').addEventListener('click',()=>void startTestScreen());
+$('refresh-queue').addEventListener('click',()=>void refreshCodexQueue());
+$('clear-queue').addEventListener('click',()=>{if($('clear-queue').disabled)return;show($('queue-confirm'),true);text($('confirm-clear-queue'),`${Math.min(100,queueSnapshot.items.length)}개 삭제`);text($('queue-status'),'현재 목록의 대기 입력을 삭제합니다. 삭제 후 복원할 수 없습니다. 새로 들어오는 입력은 유지합니다.');$('confirm-clear-queue').focus();});
+$('cancel-clear-queue').addEventListener('click',()=>{show($('queue-confirm'),false);text($('queue-status'),'삭제를 취소했습니다.');$('clear-queue').focus();});
+$('confirm-clear-queue').addEventListener('click',()=>void clearCodexQueue());
 $('close-test-screen').addEventListener('click',()=>$('test-screen-dialog').close());$('test-screen-dialog').addEventListener('close',()=>{stopTestScreenRead();$('test-screen-image').removeAttribute('src');});
 $('retry-test-screen').addEventListener('click',()=>void readTestScreen());
 $('test-screen-image').addEventListener('load',()=>{$('test-screen-zoom').disabled=false;});

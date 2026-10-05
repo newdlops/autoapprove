@@ -10,8 +10,9 @@ import {coreLinkArguments} from './swift-core-link.mjs';
 const {chromium}=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');
 const build=path.resolve('.build',process.argv.includes('--release')?'release':'debug');
 const directory=await mkdtemp(path.join(tmpdir(),'aa-web-interaction-'));
-const output=path.resolve('dist/qa/web-interaction');await mkdir(output,{recursive:true});
-let fixture, browser, mcp;const errors=[],screenshots=[],checks=[];
+const baseline=process.argv.includes('--baseline-question');
+const output=path.resolve('dist/qa',baseline?'web-interaction-baseline':'web-interaction');await mkdir(output,{recursive:true});
+let fixture, browser, mcp, page;const errors=[],screenshots=[],checks=[];
 const optionalFile=async name=>{try{return await readFile(path.join(directory,name),'utf8');}catch{return '';}};
 try {
   const cache=path.resolve('.build/cache/WebInteractionFixture');await mkdir(cache,{recursive:true});
@@ -37,7 +38,8 @@ try {
   const share=(await tool('start_screen_share',{title:'합성 Mac 전체 테스트 화면',sourceID:1,durationSeconds:600})).share;
   assert.equal(await optionalFile('captures.txt'),'');checks.push('stdio initialize/list, question publication and explicit desktop share start without capture');
   browser=await chromium.launch({headless:true,executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH||undefined});
-  const page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});page.setDefaultTimeout(15000);page.on('pageerror',error=>errors.push(error.message));
+  page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});page.setDefaultTimeout(15000);page.on('pageerror',error=>errors.push(error.message));
+  if(baseline){const previous=execFileSync('git',['show','v0.2.49:Sources/AutoApproveCore/Resources/RemoteWeb/app.js'],{encoding:'utf8'});await page.route('**/app.js',route=>route.fulfill({status:200,contentType:'text/javascript',body:previous}));}
   async function capture(name){await page.screenshot({path:path.join(output,name+'.png')});screenshots.push(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,name+' horizontal overflow');}
   for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
     await page.setViewportSize({width,height});
@@ -62,8 +64,36 @@ try {
   const mcpForm=page.locator('#web-question-forms form').filter({hasText:'합성 MCP 질문'});await mcpForm.getByRole('button',{name:'답변 보내기'}).click();
   await page.waitForFunction(()=>!$('web-question-forms').textContent.includes('합성 MCP 질문'));
   const answered=(await tool('get_user_answers',{requestID})).request;assert.equal(answered.phase,'answered');assert.equal(answered.answers[questions[0].question],'휴대폰 세로 화면');assert.match(answered.answers[questions[1].question],/한글과 이모지 🧪\n입력 도중/);
-  const codexForm=page.locator('#questions form').filter({hasText:'어떤 모바일 화면을 확인할까요?'});await codexForm.getByRole('checkbox',{name:'질문과 답변'}).check();await codexForm.getByRole('button',{name:'답변 보내기'}).click();
+  let beginStarted=false,beginFinished=false,replyAfterBegin=false;
+  await page.route('**/api/action**',async route=>{
+    const request=route.request().postDataJSON();
+    if(request.action==='beginQuestion'){beginStarted=true;await new Promise(resolve=>setTimeout(resolve,1500));beginFinished=true;}
+    if(request.action==='replyQuestion')replyAfterBegin=beginFinished;
+    return route.continue();
+  });
+  const binding=await page.evaluate(()=>({id:selectedItem.session.id,pid:selectedItem.session.pid,tty:selectedItem.session.tty}));
+  const codexForm=page.locator('#questions form').filter({hasText:'합성 모바일 테스트를 진행할까요?'});await codexForm.getByRole('checkbox',{name:'아니요',exact:true}).check();
+  for(let i=0;i<10&&!beginStarted;i++)await new Promise(resolve=>setTimeout(resolve,25));
+  assert.equal(beginStarted,true,'Question editing should be acknowledged independently');assert.equal(beginFinished,false);
+  assert.equal(await codexForm.getByRole('button',{name:'답변 보내기'}).isEnabled(),true,'Holding automation must not swallow a Send tap');
+  await codexForm.getByRole('button',{name:'답변 보내기'}).click({timeout:800});
   await page.waitForFunction(()=>$('questions').textContent.includes('대기열에 등록'));
+  assert.equal(replyAfterBegin,true);assert.equal((await optionalFile('messages.txt')).split('> 합성 모바일 테스트를 진행할까요?').length-1,1);
+  await page.unroute('**/api/action**');checks.push('Immediate Send during a delayed editing acknowledgement delivers the selected Codex answer exactly once');
+  const nodeID=await page.evaluate(()=>selectedItem.node.id);
+  await page.route('**/api/network',async route=>{const response=await route.fetch(),dashboard=await response.json();dashboard.nodes=dashboard.nodes.map(node=>node.id===nodeID?{id:node.id,name:node.name,local:node.local,online:false,error:'synthetic inventory timeout'}:node);await route.fulfill({response,json:dashboard});});
+  await page.waitForFunction(()=>currentNode()?.online===false&&!loadingNetwork);
+  const failedQuestion=page.locator('#questions form').filter({hasText:'한글·이모지·긴 선택지의 줄바꿈'});
+  await failedQuestion.getByRole('checkbox',{name:'질문을 먼저 확인',exact:true}).check();await failedQuestion.locator('textarea').fill('선택한 답변과 추가 설명을 보관합니다.');
+  await writeFile(path.join(directory,'reply-failure'),'');
+  assert.equal(await failedQuestion.getByRole('button',{name:'답변 보내기'}).isEnabled(),true,'Terminal control refresh must retain the independently verified question Send state');
+  await failedQuestion.getByRole('button',{name:'답변 보내기'}).click();
+  const inlineError=failedQuestion.locator('[data-delivery-error]');await inlineError.waitFor({state:'visible'});assert.match(await inlineError.textContent(),/합성 응답 경로 오류/);
+  await inlineError.scrollIntoViewIfNeeded();await capture('mobile-question-error');
+  assert.equal(await failedQuestion.locator('textarea').inputValue(),'선택한 답변과 추가 설명을 보관합니다.');assert.equal(await failedQuestion.getByRole('checkbox',{name:'질문을 먼저 확인',exact:true}).isChecked(),true);
+  await page.unroute('**/api/network');await page.waitForFunction(()=>currentNode()?.online===true&&selectedItem.session.queuedQuestions.some(item=>item.reply?.phase==='failed'));
+  await rm(path.join(directory,'reply-failure'));await failedQuestion.getByRole('button',{name:'답변 보내기'}).click();await page.waitForFunction(()=>selectedItem.session.queuedQuestions.every(item=>item.reply?.phase==='queued'));
+  checks.push('Verified original-stream question remains sendable during inventory timeout; production preflight error is inline, preserves selections/text and permits an explicit retry only after a fresh authoritative failed status');
   await page.locator('#message-input').fill('작업 도중 새 질문입니다. 한글🧪');await page.locator('#send-message').click();await page.waitForFunction(()=>$('message-status').textContent.includes('등록'));
   assert.match(await optionalFile('messages.txt'),/작업 도중 새 질문입니다\. 한글🧪/);checks.push('MCP explicit answers reach originating process and Codex replies/messages use the same validated queue transport');
   await page.locator('#message-input').fill('전달 결과를 모를 때 중복 전송하지 않는지 확인');await page.locator('#message-input').focus();await page.setViewportSize({width:390,height:544});await capture('mobile-message-keyboard');await page.setViewportSize({width:390,height:844});
@@ -71,6 +101,29 @@ try {
   await page.route('**/api/action**',route=>{if(route.request().postDataJSON()?.action==='sendMessage')return route.abort('failed');return route.continue();});
   await page.locator('#send-message').click();await page.locator('#message-error').waitFor({state:'visible'});assert.equal(await page.locator('#send-message').isDisabled(),true);await capture('mobile-message-error');
   await page.locator('#new-message').click();assert.equal(await page.locator('#message-input').inputValue(),'');assert.equal(await optionalFile('messages.txt'),queuedBeforeFailure);await page.unroute('**/api/action**');checks.push('mobile keyboard height, inline delivery error and explicit new draft without automatic retry');
+  await writeFile(path.join(directory,'queue-unbound'),'');await page.locator('#refresh-queue').click();await page.locator('#queue-error').waitFor({state:'visible'});
+  await page.locator('#connect-queue-conversation').click();await page.locator('#queue-conversation').selectOption('00000000-0000-4000-8000-000000000001');
+  for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await page.locator('#queue-conversation-picker').scrollIntoViewIfNeeded();await capture(name+'-queue-conversation');}
+  await page.setViewportSize({width:390,height:844});await page.locator('#use-queue-conversation').click();await page.waitForFunction(()=>queueSnapshot?.items.length===5);await rm(path.join(directory,'queue-unbound'));
+  checks.push('A Codex CLI without an open rollout offers an explicit active conversation choice; its validated selected queue loads without restarting the CLI');
+  const queueBefore=(await(await fetch(base+'/api/codex/queue?session='+encodeURIComponent(binding.id))).json()).items;
+  await page.locator('#clear-queue').click();await page.locator('#cancel-clear-queue').click();assert.deepEqual((await(await fetch(base+'/api/codex/queue?session='+encodeURIComponent(binding.id))).json()).items,queueBefore);
+  await page.route('**/api/action**',route=>route.request().postDataJSON().action==='clearQueuedInputs'?route.abort('failed'):route.continue());
+  await page.locator('#clear-queue').click();await page.locator('#confirm-clear-queue').click();await page.locator('#queue-error').waitFor({state:'visible'});await capture('mobile-queue-error');
+  assert.deepEqual((await(await fetch(base+'/api/codex/queue?session='+encodeURIComponent(binding.id))).json()).items,queueBefore);await page.unroute('**/api/action**');
+  const addedDuringDelete='삭제 도중 들어온 새 입력 · 한글🧪와 긴 내용을 보관합니다. '.repeat(5);
+  await page.route('**/api/action**',async route=>{
+    if(route.request().postDataJSON().action==='clearQueuedInputs'){
+      const response=await fetch(base+'/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'sendMessage',sessionID:binding.id,text:addedDuringDelete,requestID:crypto.randomUUID()})});assert.equal(response.status,200);
+    }
+    return route.continue();
+  });
+  await page.locator('#clear-queue').click();await page.locator('#confirm-clear-queue').click();await page.waitForFunction(()=>queueSnapshot?.items.length===1&&!queueLoading);await page.unroute('**/api/action**');
+  assert.equal(await page.locator('#queued-inputs li').textContent(),addedDuringDelete);assert.match(await page.locator('#queue-status').textContent(),/5개를 삭제/);
+  await page.waitForFunction(()=>selectedItem.session.queuedQuestions.every(item=>item.reply?.phase==='cancelled'));
+  assert.deepEqual(await page.evaluate(()=>({id:selectedItem.session.id,pid:selectedItem.session.pid,tty:selectedItem.session.tty})),binding);assert.equal(await page.locator('#automatic').isChecked(),true);
+  for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await page.locator('#codex-queue').scrollIntoViewIfNeeded();await capture(name+'-queue-after-clear');}
+  await page.setViewportSize({width:390,height:844});checks.push('Actual queue list, cancel, failed deletion without replay, clear preserves concurrently added input, cancelled answer becomes editable and original identity/automation stay intact');
   await page.locator('#close-interaction').click();await page.locator('#back').click();await page.locator('#session-list button').filter({hasText:'Claude Code'}).click();await page.locator('#terminal-questions').click();
   assert.equal(await page.locator('#message-status').textContent(),'','Messages must not show another session\'s delivery status');
   const claudeForm=page.locator('#questions form[data-structured=true]');await claudeForm.getByRole('radio',{name:/개발/}).check();await claudeForm.getByRole('checkbox',{name:'휴대폰 질문 폼'}).check();await claudeForm.getByRole('checkbox',{name:'Mac 전체 화면 공유'}).check();await claudeForm.locator('textarea').nth(1).fill('휴대폰으로 확인');await capture('mobile-claude-multiple');await claudeForm.getByRole('button',{name:'답변 보내기'}).click();
@@ -80,13 +133,27 @@ try {
   await page.locator('#refresh').evaluate(button=>button.click());await page.waitForFunction(()=>!$('questions').textContent.includes('어떤 기능을 테스트할까요?'));
   await page.locator('#message-input').fill('같은 Claude 터미널로 새 메시지');await page.waitForFunction(()=>!$('send-message').disabled);await page.locator('#send-message').click();await page.waitForFunction(()=>$('message-status').textContent.includes('전달했습니다'));
   assert.match(await optionalFile('inputs.txt'),/^submit:같은 Claude 터미널로 새 메시지\n$/);checks.push('Claude new message uses the existing original terminal input after its question is answered');
-  await page.locator('#close-interaction').click();await page.locator('#terminal-screens').click();await page.getByRole('button',{name:'화면 보기'}).click();
+  await page.locator('#close-interaction').click();await page.locator('#terminal-screens').click();
   await page.waitForFunction(()=>$('test-screen-image').complete&&$('test-screen-image').naturalWidth===640);await capture('mobile-test-screen');assert.ok((await optionalFile('captures.txt')).length>0);
   await page.locator('#test-screen-zoom').focus();await page.keyboard.press('Enter');assert.equal(await page.locator('#test-screen-image').getAttribute('data-zoom'),'true');
   await page.locator('#close-test-screen').click();await page.waitForTimeout(1000);const stoppedCount=(await optionalFile('captures.txt')).length;await page.waitForTimeout(1200);assert.equal((await optionalFile('captures.txt')).length,stoppedCount,'Closed viewer must not request captures');
-  await page.locator('#terminal-screens').click();await page.getByRole('button',{name:'화면 보기'}).click();await page.waitForFunction(()=>$('test-screen-image').naturalWidth===640);await page.locator('#stop-test-screen').click();await page.waitForFunction(()=>$('test-screen-status').textContent.includes('종료'));
+  await page.locator('#terminal-screens').click();await page.waitForFunction(()=>$('test-screen-image').naturalWidth===640);await page.locator('#stop-test-screen').click();await page.waitForFunction(()=>$('test-screen-status').textContent.includes('종료'));
   const ended=await fetch(base+'/api/test-screen?share='+share.id);assert.equal(ended.status,410);checks.push('explicit desktop viewer, zoom, close stops capture requests and phone stop revokes image access');
+  await page.locator('#close-test-screen').click();await writeFile(path.join(directory,'screen-denied'),'');const capturesBeforeDenied=await optionalFile('captures.txt');
+  await page.locator('#terminal-screens').click();await page.locator('#screen-start-error').waitFor({state:'visible'});assert.match(await page.locator('#screen-start-error').textContent(),/화면 녹음 권한/);assert.equal(await optionalFile('captures.txt'),capturesBeforeDenied);await capture('mobile-screen-permission');
+  await rm(path.join(directory,'screen-denied'));await page.locator('#start-test-screen').click();await page.waitForFunction(()=>$('test-screen-image').naturalWidth===640);
+  const webShare=await page.evaluate(()=>sharedScreen.share.id);assert.notEqual(webShare,share.id);
+  for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
+    await page.setViewportSize({width,height});await capture(name+'-screen-button');
+    assert.ok(await page.locator('.test-screen-image').evaluate(element=>element.scrollHeight<=element.clientHeight+1),'Default sharing view must show the whole screen without vertical cropping');
+  }
+  await page.locator('#stop-test-screen').click();assert.equal((await fetch(base+'/api/test-screen?share='+webShare)).status,410);
+  checks.push('One terminal Test Screen click opens an existing MCP share or directly starts full-display sharing; permission denial captures nothing and explicit retry/stop work');
   assert.equal(errors.length,0,errors.join('\n'));const state=await(await fetch(base+'/api/state')).json();assert.equal(state.sessions.some(item=>item.pty),false);
+  await rm(path.join(output,'failure.json'),{force:true});
   await writeFile(path.join(output,'report.json'),JSON.stringify({result:'PASS',scope:'Real browser, production Swift HTTP/MCP/hooks with synthetic sessions/providers/images; no physical phone or user desktop',checks,screenshots,errors},null,2));console.log(JSON.stringify({result:'PASS',checks,screenshots,errors},null,2));
-}catch(error){await writeFile(path.join(output,'failure.json'),JSON.stringify({error:error.message,errors,checks},null,2));throw error;}
+}catch(error){
+  const client=page ? await page.evaluate(()=>({deliveries:[...questionDeliveries.entries()],questions:interactionSources().flatMap(source=>source.queuedQuestions||[]),buttons:[...document.querySelectorAll('#questions button')].map(button=>({text:button.textContent,disabled:button.disabled})),network:{connected,mutation,original:originalStreamSelected()}})).catch(()=>null) : null;
+  await writeFile(path.join(output,'failure.json'),JSON.stringify({error:error.message,errors,checks,client},null,2));throw error;
+}
 finally{if(browser)await browser.close();if(mcp){mcp.stdin.end();await new Promise(resolve=>setTimeout(resolve,200));if(mcp.exitCode===null)mcp.kill('SIGTERM');}if(fixture&&fixture.exitCode===null)fixture.kill('SIGTERM');await rm(directory,{recursive:true,force:true});}

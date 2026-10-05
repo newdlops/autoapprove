@@ -30,7 +30,7 @@ public struct TestScreenFrame: Codable, Sendable {
     public var image: TerminalNativeImage
 }
 
-/// Only explicit MCP start calls authorize a source. No captures occur in discovery or ordinary terminal mode.
+/// Only explicit MCP/web start calls authorize a source. No captures occur in discovery or ordinary terminal mode.
 @MainActor public final class TestScreenSharing {
     private struct Entry {
         var owner: String

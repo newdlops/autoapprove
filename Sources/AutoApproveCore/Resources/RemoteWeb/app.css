@@ -205,14 +205,22 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .message-form p { margin-top: 6px; font-size: 13px; }
 .message-actions { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 12px; }
 .message-actions span { flex: 1; overflow-wrap: anywhere; }
+.codex-queue { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 20px; }
+.codex-queue .section-heading { flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+#queued-inputs { margin: 8px 0; padding-left: 24px; max-height: 180px; overflow: auto; overscroll-behavior: contain; }
+#queued-inputs li { padding: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+#queue-confirm:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
+#queue-status, #screen-start-status, #test-screen-source { overflow-wrap: anywhere; }
+#queue-conversation-picker label { display: block; margin-top: 12px; }
+#queue-conversation { width: 100%; margin: 8px 0; }
 .test-screen-dialog { width: min(1000px, calc(100% - 32px)); max-height: 90dvh; }
 .test-screen-row { display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding: 12px 0; }
 .test-screen-row > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .test-screen-row button { flex-shrink: 0; }
 .test-screen-image { margin-top: 12px; overflow: auto; max-height: 60dvh; overscroll-behavior: contain; }
-.test-screen-image img { display: block; width: 100%; height: auto; }
+.test-screen-image img { display: block; width: 100%; height: auto; max-height: 60dvh; object-fit: contain; }
 .screen-zoom-button { display: block; width: 100%; padding: 0; border: 0; background: transparent; color: inherit; }
-.test-screen-image img[data-zoom=true] { width: auto; max-width: none; cursor: zoom-out; }
+.test-screen-image img[data-zoom=true] { width: auto; max-width: none; max-height: none; cursor: zoom-out; }
 #test-screen-image { cursor: zoom-in; }
 #test-screen-status { overflow-wrap: anywhere; }
 .question-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }

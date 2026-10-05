@@ -27,11 +27,48 @@ public struct CodexReplyTarget: Sendable {
 public struct CodexReplyTransport: Sendable {
     public var prepare: @Sendable (AgentSession, QueuedQuestion) async throws -> CodexReplyTarget
     public var prepareMessage: @Sendable (AgentSession) async throws -> CodexReplyTarget
+    public var queueHome: @Sendable (AgentSession) async throws -> CodexReplyTarget
+    public var prepareQueue: @Sendable (AgentSession, String) async throws -> CodexReplyTarget
     public var send: @Sendable (CodexReplyTarget, String) async throws -> String
     public init(prepare: @escaping @Sendable (AgentSession, QueuedQuestion) async throws -> CodexReplyTarget,
                 send: @escaping @Sendable (CodexReplyTarget, String) async throws -> String,
-                prepareMessage: @escaping @Sendable (AgentSession) async throws -> CodexReplyTarget = { try await messageTarget($0) }) {
+                prepareMessage: @escaping @Sendable (AgentSession) async throws -> CodexReplyTarget = { try await messageTarget($0) },
+                queueHome: (@Sendable (AgentSession) async throws -> CodexReplyTarget)? = nil,
+                prepareQueue: (@Sendable (AgentSession, String) async throws -> CodexReplyTarget)? = nil) {
         self.prepare = prepare; self.send = send; self.prepareMessage = prepareMessage
+        self.queueHome = queueHome ?? prepareMessage
+        self.prepareQueue = prepareQueue ?? { session, thread in
+            let target = try await prepareMessage(session)
+            guard target.threadID == thread else { throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 목록을 다시 확인해주세요.") }
+            return target
+        }
+    }
+    /// An explicitly selected queue conversation is validated through the server.
+    /// Its home comes only from this live CLI's own open, user-owned data files.
+    public static func selectedQueueTarget(_ session: AgentSession, threadID: String = "") async throws -> CodexReplyTarget {
+        try await Task.detached(priority: .utility) {
+            guard threadID.isEmpty || UUID(uuidString: threadID) != nil,
+                  try ProcessDiscovery.read().contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
+                throw RemoteHTTPError(409, "Codex 실행이나 대화 선택을 다시 확인해주세요.")
+            }
+            let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
+            var homes = Set<String>()
+            for path in CodexThreadLocation.openFiles(files.output)[session.pid] ?? [] {
+                let url = URL(fileURLWithPath: path)
+                // Daemon-backed CLIs keep only the log database open locally.
+                guard ["state_5.sqlite", "thread_history_1.sqlite", "queue_1.sqlite", "logs_2.sqlite"].contains(url.lastPathComponent),
+                      let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                      attributes[.type] as? FileAttributeType == .typeRegular,
+                      (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else { continue }
+                homes.insert(url.deletingLastPathComponent().resolvingSymlinksInPath().path)
+            }
+            guard homes.count == 1, let home = homes.first else { throw RemoteHTTPError(409, "이 Codex 실행의 로컬 서버 위치를 확인하지 못했습니다.") }
+            var buffer = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(session.pid, &buffer, UInt32(buffer.count)) > 0 else { throw AppError.message("Codex 실행 파일을 찾지 못했습니다.") }
+            let executable = String(cString: buffer)
+            guard URL(fileURLWithPath: executable).lastPathComponent == "codex", FileManager.default.isExecutableFile(atPath: executable) else { throw AppError.message("Codex 실행을 확인하지 못했습니다.") }
+            return CodexReplyTarget(executable: executable, home: home, threadID: threadID)
+        }.value
     }
     public static func messageTarget(_ session: AgentSession) async throws -> CodexReplyTarget {
         try await Task.detached(priority: .utility) {
@@ -91,7 +128,7 @@ public struct CodexReplyTransport: Sendable {
                 environment: ["CODEX_HOME": target.home])
             return try receipt(output: result.output, status: result.status, threadID: target.threadID)
         }.value
-    })
+    }, queueHome: { try await selectedQueueTarget($0) }, prepareQueue: { try await selectedQueueTarget($0, threadID: $1) })
 
     public static func message(question: QueuedQuestion, answer: String) throws -> String {
         let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
