@@ -1,5 +1,6 @@
 // Real Chromium -> real Swift HTTP/SSE/input -> isolated real tmux QA pane.
 import assert from 'node:assert/strict';
+import {createServer,request} from 'node:http';
 import {execFileSync,spawn} from 'node:child_process';
 import {mkdtemp,mkdir,readdir,readFile,rm,writeFile,access} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -11,7 +12,9 @@ const tmux=process.env.AUTOAPPROVE_TMUX||path.join(process.env.HOME,'.local/bin/
 const directory=await mkdtemp(path.join(tmpdir(),'aa-tmux-web-'));
 const output=path.resolve('dist/qa/tmux-browser');await mkdir(output,{recursive:true});
 const socket=path.join(directory,'socket'),record=path.join(directory,'input.bin');
-let created=false,fixture,browser;
+let created=false,fixture,browser,proxy;
+let streamAvailable=true;
+const subscriptions=new Set();
 const errors=[],screenshots=[],latencies=[];
 try {
   const cache=path.resolve('.build/cache/TmuxWebFixture');await mkdir(cache,{recursive:true});
@@ -28,7 +31,22 @@ try {
   const deadline=Date.now()+15000;
   while(!port&&Date.now()<deadline){try{port=Number(await readFile(path.join(directory,'port'),'utf8'));}catch{}if(fixture.exitCode!==null)throw Error(fixtureError);if(!port)await new Promise(resolve=>setTimeout(resolve,40));}
   assert.ok(port,'Private web fixture did not become ready: '+fixtureError);
-  const base='http://127.0.0.1:'+port;
+  const origin='http://127.0.0.1:'+port;
+  // Drop only QA browser subscriptions; the original tmux pane and Swift
+  // relay keep running. This exercises real SSE recovery and real input bytes.
+  proxy=createServer((req,res)=>{
+    const streaming=req.url.startsWith('/api/terminal/stream');
+    if(streaming&&!streamAvailable){res.writeHead(503);res.end('temporary QA transport outage');return;}
+    const headers={...req.headers,host:'127.0.0.1:'+port};
+    // Match the legitimate same-origin browser request to this private upstream.
+    if(headers.origin&&new URL(headers.origin).host===req.headers.host)headers.origin=origin;
+    const upstream=request(origin+req.url,{method:req.method,headers},response=>{res.writeHead(response.statusCode,response.headers);response.pipe(res);});
+    const subscription={upstream,res};if(streaming)subscriptions.add(subscription);
+    upstream.on('error',()=>{if(!res.headersSent)res.writeHead(502);res.end();});
+    res.on('close',()=>{subscriptions.delete(subscription);upstream.destroy();});req.pipe(upstream);
+  });
+  await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
+  const base='http://127.0.0.1:'+proxy.address().port;
   browser=await chromium.launch({headless:true,executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH||undefined});
   const page=await browser.newPage({viewport:{width:390,height:844}});
   page.on('pageerror',error=>errors.push(error.message));
@@ -101,11 +119,33 @@ try {
   assert.equal(await page.locator('#follow').isChecked(),true,'Restoring mobile height must retain cursor following');
   await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});
   await page.screenshot({path:path.join(output,'mobile-dark.png')});screenshots.push('mobile-dark.png');
+  let expectedBytes=bytes.toString('utf8');
+  for(const [name,width,height]of[['mobile',390,544],['tablet',768,1024],['desktop',1440,900]]){
+    await page.setViewportSize({width,height});await page.evaluate(enabled=>terminalFocus(enabled),width<760);
+    await page.locator('#terminal-screen').click();
+    const before=(await readFile(record)).length;
+    streamAvailable=false;for(const subscription of [...subscriptions])subscription.res.destroy();
+    await page.waitForFunction(()=>$('terminal-live').textContent.includes('재연결'));
+    const marker='RECOVER-'+name+'한글';await page.keyboard.insertText(marker);await page.keyboard.press('ArrowLeft');await page.keyboard.press('Enter');
+    await page.waitForTimeout(700);assert.equal((await readFile(record)).length,before,'Disconnected keys must remain unsent');
+    assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+    await page.screenshot({path:path.join(output,name+'-reconnecting.png')});screenshots.push(name+'-reconnecting.png');
+    streamAvailable=true;
+    await page.waitForFunction(()=>terminalStream&&!terminalStream.reconnecting&&!directSending&&!directQueue.length);
+    expectedBytes+=marker+'\x1b[D\r';assert.equal((await readFile(record)).toString('utf8'),expectedBytes,'Recovery must deliver exact ordered bytes once');
+    assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+    assert.equal(await page.evaluate(()=>latestFrame.sessionID),sessionID);assert.equal(await page.evaluate(()=>latestFrame.streamID),streamID);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    assert.equal(subscriptions.size,1);
+    await page.screenshot({path:path.join(output,name+'-reconnected.png')});screenshots.push(name+'-reconnected.png');
+  }
+  assert.equal(execFileSync(tmux,['-S',socket,'list-panes','-a','-F','#{pane_pid}|#{pane_tty}|#{pane_width}|#{pane_height}'],{encoding:'utf8'}).trim(),original);
   assert.deepEqual(errors,[]);
-  const report={checks:['real tmux RGB/cursor over Swift SSE','mobile/tablet/desktop direct input while automation ON','visible active output/cursor at every viewport','manual scroll pauses follow; return follows original cursor','viewport and mobile height changes retain cursor following','exact Korean/emoji/arrow bytes and wide-cell cursor','same original PID/TTY/geometry, no extra PTY'],latencies,screenshots,errors};
+  const report={checks:['real tmux RGB/cursor over Swift SSE','mobile/tablet/desktop direct input while automation ON','visible active output/cursor at every viewport','manual scroll pauses follow; return follows original cursor','viewport and mobile height changes retain cursor following','exact Korean/emoji/arrow bytes and wide-cell cursor','same original PID/TTY/geometry, no extra PTY','real Swift SSE socket recovery preserves focused input and delivers Unicode/arrows/Enter exactly once at all three viewports'],latencies,screenshots,errors};
   await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
 }finally{
   if(browser)await browser.close();
+  if(proxy){for(const subscription of subscriptions){subscription.res.destroy();subscription.upstream.destroy();}await new Promise(resolve=>proxy.close(resolve));}
   if(fixture&&fixture.exitCode===null){fixture.kill('SIGTERM');await Promise.race([new Promise(resolve=>fixture.once('exit',resolve)),new Promise(resolve=>setTimeout(resolve,5000))]);}
   if(created){try{execFileSync(tmux,['-S',socket,'kill-server'],{stdio:'ignore',timeout:5000});}catch{}}
   await rm(directory,{recursive:true,force:true});

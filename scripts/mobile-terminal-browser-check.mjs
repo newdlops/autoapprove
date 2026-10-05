@@ -253,7 +253,7 @@ try {
     await page.screenshot({path:path.join(output,name+'.png')}); screenshots.push(name);
   }
   sessions[0].session.terminal='terminal'; activeKeys=['text','submit','enter'];
-  await page.waitForFunction(() => document.getElementById('direct-input-help').textContent.includes('손쉬운 사용'));
+  await page.waitForFunction(() => document.getElementById('direct-input-help').textContent.includes('직접 입력 연결'));
   assert.equal(await keyboard.isDisabled(),true); assert.equal(await input.isVisible(),true); assert.equal(await enter.isEnabled(),true);
   await capture('mobile-permission-fallback');
   sessions[0].session.terminal='vscode'; activeKeys=['text','enter','escape','interrupt','up','down','tab'];

@@ -9,29 +9,32 @@ const keys=['text','submit','characters','enter','escape','interrupt','up','down
 const sources=['original','other'].map((id,index)=>({session:{id,agent:index?'claude':'codex',pid:4200+index,started:'fixed-start-'+id,tty:'/dev/fixture-'+id,cwd:'/fixture/shared-terminal',terminal:'iterm',hostName:'원래 Mac 터미널',phase:'idle',automatic:true,detail:'동일한 원래 터미널',queuedQuestions:[]},title:index?'두 번째 원래 터미널':'Mac과 같은 터미널',phaseTitle:'입력 대기',canRead:true,canApprove:true,canReveal:false,keys}));
 const state=new Map(sources.map(view=>[view.session.id,{screen:'원래 Mac 터미널\nREADY> ',revision:0,stream:'original-stream-'+view.session.id,cursor:null}]));
 let release={version:'0.2.42',build:49,api:1},online=true,failNext=false,inputDelay=30;
+let networkFail=false,streamAvailable=true,clockOffset=0,pauseHeartbeats=false;
 let nextInputGate=null;
 const inputGates=new Set();
 function holdNextInput(){assert.equal(nextInputGate,null);let resolve;const promise=new Promise(done=>{resolve=done;});const gate={promise,release:()=>{inputGates.delete(gate);resolve();}};inputGates.add(gate);nextInputGate=gate;return gate;}
 const clients=new Set(),operations=[],receipts=new Map(),requests={pty:0,stream:0,poll:0};
 const oldCopies=[];
 const checks=[],screenshots=[],errors=[],latencies=[];
+const expectedTransportErrors=[];let transportFault=false;
 const network=()=>({updatedAt:new Date().toISOString(),nodes:[{id:'original-mac',name:'원래 Mac',local:true,online,state:{release,snapshot:{paused:false,events:[]},sessions:[...sources.filter(view=>view.session.phase!=='ended'),...oldCopies]}}]});
-function update(id,full=true){const value=state.get(id);return {sessionID:id,revision:String(value.revision),streamID:value.stream,observedAt:new Date().toISOString(),keys,cursor:value.cursor||{offset:value.screen.length,padding:0,visible:true,style:'block',blink:false},...(full?{screen:value.screen}:{} )};}
+function update(id,full=true){const value=state.get(id);return {sessionID:id,revision:String(value.revision),streamID:value.stream,observedAt:new Date(Date.now()+clockOffset).toISOString(),keys,cursor:value.cursor||{offset:value.screen.length,padding:0,visible:true,style:'block',blink:false},...(full?{screen:value.screen}:{} )};}
 function push(id,full=true){for(const client of clients)if(client.id===id)client.res.write('event: screen\ndata: '+JSON.stringify(update(id,full))+'\n\n');}
 function macOutput(id,value){const item=state.get(id);item.screen=value;item.revision++;push(id);}
 const server=createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost');
   const json=(status,data)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(data));};
   try{
-    if(url.pathname==='/api/network')return json(200,network());
+    if(url.pathname==='/api/network')return networkFail?json(503,{error:'기기 목록 조회 일시 중단'}):json(200,network());
     if(url.pathname==='/api/pty'){requests.pty++;return json(409,{error:'기존 터미널에서 새 프로세스를 만들면 안 됩니다.'});}
     if(url.pathname==='/api/terminal/stream'){
       requests.stream++;const id=url.searchParams.get('session');
+      if(!streamAvailable)return json(503,{error:'일시적인 화면 연결 중단'});
       assert.equal(url.searchParams.get('node'),'original-mac');assert.ok(state.has(id));
       if(sources.find(view=>view.session.id===id).session.phase==='ended')return json(410,{error:'원래 터미널이 종료되었습니다.'});
       res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});res.flushHeaders();
       const client={id,res};clients.add(client);push(id);
-      const heartbeat=setInterval(()=>push(id,false),2000);
+      const heartbeat=setInterval(()=>{if(!pauseHeartbeats)push(id,false);},2000);
       res.on('close',()=>{clearInterval(heartbeat);clients.delete(client);});return;
     }
     if(url.pathname==='/api/terminal'){requests.poll++;return json(200,update(url.searchParams.get('session')));}
@@ -57,13 +60,18 @@ let browser,page,stage='selection';
 try{
   browser=await chromium.launch({headless:true,executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH||undefined});
   page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});page.setDefaultTimeout(12000);
-  page.on('pageerror',error=>errors.push(error.message));page.on('console',message=>{if(message.type()==='error'&&!message.text().includes('status of 503'))errors.push(message.text());});
+  page.on('pageerror',error=>errors.push(error.message));page.on('console',message=>{
+    if(message.type()!=='error'||message.text().includes('status of 503'))return;
+    if(transportFault&&message.text().includes('net::ERR_INCOMPLETE_CHUNKED_ENCODING'))expectedTransportErrors.push(message.text());
+    else errors.push(message.text());
+  });
   async function ready(){await page.waitForFunction(()=>latestFrame?.sessionID==='original'&&!$('terminal-keyboard-toggle').disabled);}
   async function count(value){await page.waitForFunction(value=>window.qaOperationCount>=value,value);}
   async function drained(){await page.waitForFunction(()=>!inputInFlight&&!directSending&&!directQueue.length);}
   async function capture(name){await page.screenshot({path:path.join(output,name+'.png')});screenshots.push(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);}
   await page.exposeFunction('qaOperations',()=>operations.length);
-  await page.addInitScript(()=>{setInterval(async()=>{window.qaOperationCount=await window.qaOperations();},30);});
+  await page.exposeFunction('qaStreams',()=>requests.stream);
+  await page.addInitScript(()=>{setInterval(async()=>{window.qaOperationCount=await window.qaOperations();window.qaStreamCount=await window.qaStreams();},30);});
   await page.goto(url);await page.locator('.session-row').first().click();await ready();
   assert.equal(requests.pty,0,'Selecting an existing original must create zero PTYs');
   assert.equal(requests.stream,1);assert.equal(requests.poll,0);
@@ -86,13 +94,64 @@ try{
   assert.deepEqual(operations.slice(beforeArrows).map(input=>[input.sessionID,input.kind]),[['original','left'],['original','right']]);
   assert.equal(await page.locator('#automatic').isChecked(),true);assert.equal(await page.locator('#terminal-input').isVisible(),false);
   checks.push('phone characters and arrows target original session while automation stays ON');
+  stage='inventory outage';
+  const beforeInventory=operations.length,streamBeforeInventory=requests.stream;
+  networkFail=true;await page.evaluate(()=>refreshNetwork());
+  assert.equal(await page.locator('#terminal-keyboard').isDisabled(),false,'An inventory error must retain the healthy original keyboard');
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+  await page.keyboard.type('LIST-OUTAGE');await drained();
+  assert.equal(operations.slice(beforeInventory).map(input=>input.text).join(''),'LIST-OUTAGE');
+  assert.equal(requests.stream,streamBeforeInventory,'A healthy SSE must survive a failed independent inventory request');
+  networkFail=false;await page.evaluate(()=>refreshNetwork());
+  checks.push('inventory outage keeps the healthy SSE, keyboard focus and ordered input');
+  stage='clock skew';clockOffset=-120000;push('original',false);
+  await page.waitForFunction(()=>Date.now()-Date.parse(latestFrame.observedAt)>110000);
+  assert.equal(await page.locator('#terminal-keyboard').isDisabled(),false,'Frame freshness must use local receipt time despite Mac/phone clock skew');
+  const beforeClock=operations.length;await page.keyboard.type('CLOCK');await drained();
+  assert.equal(operations.slice(beforeClock).map(input=>input.text).join(''),'CLOCK');clockOffset=0;
+  checks.push('two-minute Mac/phone clock skew does not disable verified fresh input');
+  stage='transport outage';
+  const beforeReconnect=operations.length,streamBeforeReconnect=requests.stream;
+  transportFault=true;streamAvailable=false;for(const client of [...clients])client.res.destroy();
+  await page.waitForFunction(()=>$('terminal-live').textContent.includes('재연결'));
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+  await page.keyboard.type('RECOVER');await page.keyboard.press('ArrowLeft');
+  await page.evaluate(()=>{
+    const keyboard=$('terminal-keyboard');keyboard.dispatchEvent(new CompositionEvent('compositionstart'));
+    keyboard.value=keyboardMarker+'한글🧪';keyboard.dispatchEvent(new InputEvent('input',{inputType:'insertCompositionText',data:'한글🧪',isComposing:true}));
+  });
+  await capture('mobile-reconnecting-composition');
+  await page.waitForTimeout(6500);
+  assert.equal(operations.length,beforeReconnect,'Unsent keys must wait through an outage longer than the input frame deadline');
+  assert.equal(await page.evaluate(()=>directMode&&composing&&document.activeElement?.id==='terminal-keyboard'),true);
+  await page.evaluate(()=>{$('terminal-keyboard').dispatchEvent(new CompositionEvent('compositionend',{data:'한글🧪'}));});
+  await page.waitForFunction(()=>!composing&&directQueue.length>=3);
+  await page.keyboard.press('Enter');streamAvailable=true;
+  await page.waitForFunction(()=>terminalStream&&!terminalStream.reconnecting&&!!latestFrame);await drained();
+  assert.deepEqual(operations.slice(beforeReconnect).map(input=>[input.kind,input.text]),[['characters','RECOVER'],['left',''],['characters','한글🧪'],['enter','']]);
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+  assert.ok(requests.stream-streamBeforeReconnect<=6,'Reconnect attempts must back off');
+  transportFault=false;
+  assert.equal(requests.pty,0);await capture('mobile-reconnected-input');
+  checks.push('real socket loss backs off, retains focus/IME and resumes unsent Unicode/arrows/Enter once in order');
+  stage='stalled SSE';const beforeStall=requests.stream;pauseHeartbeats=true;
+  await page.waitForFunction(before=>qaStreamCount>before,beforeStall);pauseHeartbeats=false;
+  await page.waitForFunction(()=>terminalStream&&!terminalStream.reconnecting&&!!latestFrame);
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+  assert.equal(clients.size,1);checks.push('silent open SSE is refreshed automatically without a second terminal or keyboard blur');
+  stage='transient peer failure';const beforePeer=requests.stream;
+  for(const client of [...clients]){client.res.write('event: failure\ndata: '+JSON.stringify({error:'상대 Mac의 연결이 일시 중단되었습니다.',retryable:true})+'\n\n');client.res.end();}
+  await page.waitForFunction(before=>qaStreamCount>before&&!terminalStream?.reconnecting,beforePeer);
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
+  assert.equal(await page.locator('#terminal-retry').isVisible(),false);
+  checks.push('retryable upstream peer failure reconnects the same original without closing its keyboard');
   const beforeFailure=operations.length;failNext=true;const failureGate=holdNextInput();await page.keyboard.type('UNCERTAIN');await count(beforeFailure+1);await page.keyboard.type('QUEUED');failureGate.release();await page.waitForFunction(()=>!directMode&&!!inputFailure);await page.waitForTimeout(450);
   assert.equal(operations.length,beforeFailure+1);assert.equal(await page.locator('#terminal-input').inputValue(),'UNCERTAINQUEUED');await capture('mobile-uncertain-input');
   checks.push('uncertain input preserves failed/queued text and never replays');
-  const beforeStream=requests.stream;await page.evaluate(()=>terminalStream.source.dispatchEvent(new Event('error')));
+  const beforeStream=requests.stream;await page.evaluate(()=>terminalStream.source.dispatchEvent(new MessageEvent('failure',{data:JSON.stringify({error:'원본 세션의 입력 권한이 해제되었습니다.'})})));
   await page.waitForFunction(()=>!latestFrame&&$('terminal-retry').hidden===false);await page.waitForTimeout(600);assert.equal(requests.stream,beforeStream);assert.equal(operations.length,beforeFailure+1);
   await capture('mobile-stream-error');await page.locator('#terminal-retry').click();await page.waitForFunction(()=>latestFrame?.sessionID==='original');assert.equal(requests.pty,0);assert.equal(operations.length,beforeFailure+1);
-  checks.push('stream failure stops input and explicit retry never forks or replays');
+  checks.push('explicit server failure stops input and manual retry never forks or replays uncertain input');
   await page.locator('#terminal-back').click();await page.locator('.session-row').nth(1).click();await page.waitForFunction(()=>latestFrame?.sessionID==='other');await page.waitForTimeout(100);assert.equal([...clients].some(client=>client.id==='original'),false);
   await page.locator('#terminal-back').click();await page.locator('.session-row').first().click();await page.waitForFunction(()=>latestFrame?.sessionID==='original');
   await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'));});await page.waitForTimeout(100);assert.equal(clients.size,0);
@@ -115,7 +174,7 @@ try{
   sources[0].session.phase='ended';oldCopies.push({...sources[0],session:{...sources[0].session,id:'pty:legacy-copy',pid:4300,tty:'/dev/fixture-copy',phase:'idle'},ptyID:'legacy-copy',pty:{ptyID:'legacy-copy',streamID:'legacy-copy-stream',pid:4300,tty:'/dev/fixture-copy',cwd:'/fixture/copied-terminal',program:'codex',columns:80,rows:24}});
   await page.evaluate(()=>{history.replaceState(null,'','#node=original-mac&session=original&pty=legacy-copy');});await page.reload();await page.locator('.session-row').first().waitFor();await page.waitForTimeout(150);assert.equal(requests.pty,0);assert.equal(await page.locator('#session-count').innerText(),'2개');assert.equal(await page.evaluate(()=>selectedItem),null);
   checks.push('ended source and stale original+copy bookmark never revive, fork, or substitute the copied CLI');
-  assert.deepEqual(errors,[]);await writeFile(path.join(output,'report.json'),JSON.stringify({checks,screenshots,errors,requests,macPushLatencyMs:latencies,scope:'Chromium + synthetic original HTTP/SSE fixture; no physical phone or native Mac key delivery'},null,2)+'\n');
+  assert.deepEqual(errors,[]);await writeFile(path.join(output,'report.json'),JSON.stringify({checks,screenshots,errors,expectedTransportErrors,requests,macPushLatencyMs:latencies,scope:'Chromium + synthetic original HTTP/SSE fixture; no physical phone or native Mac key delivery'},null,2)+'\n');
   await Promise.all(['failure.png','failure.json'].map(name=>rm(path.join(output,name),{force:true})));
   console.log(JSON.stringify({result:'PASS',checks,screenshots,errors,requests,macPushLatencyMs:latencies}));
 }catch(error){

@@ -297,6 +297,9 @@ body.terminal-focus .conversation-actions { margin: 0; padding: 6px 12px; border
 body.terminal-focus .input-form > label, body.terminal-focus #input-help { display: none; }
 body.terminal-focus #direct-input-help { font-size: 12px; }
 body.terminal-focus.terminal-compact #direct-input-help[data-required=false] { display: none; }
+body.terminal-focus.terminal-compact .terminal-heading { padding-top: max(4px, env(safe-area-inset-top)); padding-bottom: 4px; }
+body.terminal-focus.terminal-compact .conversation-actions { padding-top: 2px; padding-bottom: 2px; }
+body.terminal-focus.terminal-compact .input-actions { margin-top: 4px; margin-bottom: 4px; }
 body.terminal-focus #direct-input-help[data-required=true] { display: block; font-size: 12px; }
 body.terminal-focus #input-reason { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
 body.terminal-focus #input-reason[data-blocked=false] { display: none; }

@@ -201,7 +201,10 @@ try {
         const response=await fetch(url+route,{signal:AbortSignal.timeout(5000)});
         assert.equal(response.status,200);
         const text=await response.text();
-        assert.match(text,/^event: failure\ndata: \{"error":/,'A failed peer must produce a complete failure event between output frames');
+        assert.match(text,/^event: failure\ndata: \{[^\n]+\}\n\n$/,'A failed peer must produce a complete failure event between output frames');
+        const failure=JSON.parse(text.split('\n').find(line=>line.startsWith('data:')).slice(6));
+        assert.equal(typeof failure.error,'string');
+        assert.equal(failure.retryable,mode==='incomplete','Only transient transport truncation is retryable; oversized output must remain blocked');
         assert.ok(!text.includes('event: output'),'Partial or oversized upstream output must stay inside the bounded peer source');
       }
       peer.setMode('mismatch');assert.equal((await api(route)).status,502,'Changed peer identity must fail before SSE headers');
@@ -214,6 +217,8 @@ try {
   if (process.argv.includes('--serve')) {
     console.log(JSON.stringify({ url, root, pty: created.data, conversationID }));
     await new Promise(resolve => process.on('SIGTERM', resolve));
+  } else if (process.argv.includes('--peer-transport-only')) {
+    await checkPeerTransport();
   } else if (process.argv.includes('--dead-leader-only')) {
     await checkDeadLeader();
   } else if (process.argv.includes('--closed-inventory-only')) {

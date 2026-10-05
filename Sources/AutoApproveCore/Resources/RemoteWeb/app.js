@@ -11,6 +11,8 @@ let connected = false, loadingNetwork = false, loadingFrame = false, mutation = 
 let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
 let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalStreamFailed = '';
+let terminalFrameReceivedAt = -Infinity, terminalPendingAt = -Infinity;
+const terminalFrameFresh = () => !!latestFrame && !terminalStream?.reconnecting && performance.now() - terminalFrameReceivedAt < 10000;
 let nativeSessionKey = '', nativeZoom = 1, nativeZoomLimit = 4, nativeImageValue = null, nativeConnectingKey = '';
 const nativeTerminal = () => !!selectedItem && !selectedItem.view.pty && nativeSessionKey === selectedKey;
 const nativeConnection = () => !!selectedItem && !selectedItem.view.pty && selectedItem.session.terminal !== 'tmux' && (supportsNativeTerminal(selectedItem.node) || !!latestFrame?.nativeDisplay);
@@ -532,8 +534,9 @@ async function refreshNetwork() {
     show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
     if (!nodes.length) text($('list-empty'), 'Mac에 연결하면 감지된 세션이 여기에 표시됩니다.');
-    latestFrame = null; frameController?.abort(); stopTerminalStream(); stopDirect();
-    if (!selectedItem?.view.pty) terminalState('error', '연결 끊김');
+    // Inventory and terminal connections are independent. A failed list request
+    // cannot invalidate a verified original stream or close its mobile keyboard.
+    if (!selectedItem?.view.pty && !terminalStream && !latestFrame) terminalState('pending', '다시 연결 중…');
     updateControls(); renderMachines();
   } finally {
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
@@ -696,12 +699,14 @@ function updateControls() {
     return;
   }
   $('terminal-wrap').disabled = false; show($('input-form').querySelector('[data-key="eof"]'), false);
-  const reason = !connected || !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : document.hidden || terminalStreamFailed === selectedKey ? '화면을 다시 연결한 뒤 입력할 수 있습니다.' : latestFrame?.inputReason || selectedItem.view.inputReason;
-  const fresh = latestFrame && Date.now() - new Date(latestFrame.observedAt).getTime() < 10000;
-  const base = connected && current?.online && sessionPresent && !reason;
-  const inputEnabled = enabled && fresh && !reason;
+  const reason = !current?.online || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : document.hidden || terminalStreamFailed === selectedKey ? '화면을 다시 연결한 뒤 입력할 수 있습니다.' : latestFrame?.inputReason || selectedItem.view.inputReason;
+  const fresh = terminalFrameFresh();
+  const base = current?.online && sessionPresent && selectedItem.view.canRead && !reason;
+  const inputEnabled = base && fresh && !mutation;
+  const recovering = !!terminalStream?.reconnecting;
+  const retainKeyboard = !!latestFrame && !!terminalStream && terminalStream.key === selectedKey;
   // Keep the active editor alive while its own request/refresh runs: disabling it closes mobile keyboards.
-  $('terminal-input').disabled = !(base && (fresh || inputInFlight || directSending));
+  $('terminal-input').disabled = !(base && (fresh || retainKeyboard || inputInFlight || directSending));
   const supported = inputKeys(), native = nativeTerminal();
   const composedSupported = supported.includes('text') || supported.includes('submit');
   const canDirect = supported.includes('characters') && supported.includes('backspace');
@@ -710,13 +715,13 @@ function updateControls() {
   composeMode = composePreferred || !nativeConnection() && !canDirect || !!$('terminal-input').value;
   const originalDraftOnly = composeMode && !composedSupported;
   if ((native || originalDraftOnly) && composeMode) $('terminal-input').disabled = false;
-  $('terminal-keyboard').disabled = !(base && canDirect && !composeMode && (fresh || inputInFlight || directSending));
+  $('terminal-keyboard').disabled = !(base && canDirect && !composeMode && (fresh || retainKeyboard || inputInFlight || directSending));
   document.querySelector('.terminal').dataset.input = composeMode ? 'compose' : 'direct';
   show($('input-editor'), composeMode); show($('compose-input-label'), composeMode);
   if (composeMode && !wasCompose) sizeInput();
   $('compose-input').checked = composeMode; $('compose-input').disabled = !nativeConnection() && !canDirect || composing;
   const keyboardActive = document.activeElement === $('terminal-keyboard') && !$('terminal-keyboard').disabled;
-  $('terminal-keyboard-toggle').disabled = !(base && (fresh || inputInFlight || directSending)) || !canDirect || composeMode;
+  $('terminal-keyboard-toggle').disabled = $('terminal-keyboard').disabled;
   $('terminal-keyboard-toggle').setAttribute('aria-pressed', String(keyboardActive));
   $('terminal-keyboard-toggle').setAttribute('aria-label', keyboardActive ? '터미널 키보드 닫기' : '터미널 키보드 열기');
   const terminalSetupHelp = selectedItem.session.terminal === 'terminal' && !canDirect
@@ -731,13 +736,15 @@ function updateControls() {
   $('terminal-keyboard-toggle').title = $('direct-input-help').textContent;
   text($('input-help'), originalDraftOnly ? '이 연결은 작성 전송을 지원하지 않습니다. 작성 내용은 초안으로 보관합니다.' : composeMode ? 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.' : !canDirect ? 'Mac의 원본 입력 권한을 연결한 뒤 직접 입력할 수 있습니다.' : '키보드의 문자·Enter·방향키를 직접 보냅니다. Shift Tab으로 포커스를 빠져나갑니다.');
   const nativeInput = !native || (composeMode ? composedSupported && (!!$('terminal-input').value || supported.includes('enter')) : canDirect);
-  $('send-input').disabled = originalDraftOnly || !nativeInput || !(inputEnabled || directMode && base && directSending) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value) > 8000;
+  const queueEnabled = directMode && base && canDirect && !composeMode && (retainKeyboard || directSending);
+  $('send-input').disabled = originalDraftOnly || !nativeInput || !(inputEnabled || queueEnabled) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value) > 8000;
   text($('send-input'), inputInFlight && !directMode ? '전달 중' : 'Enter');
-  text($('input-reason'), inputFailure || reason || (fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
+  const recoveryHelp = composeMode ? '원래 터미널에 재연결 중입니다. 작성 내용은 유지됩니다. 연결 확인 후 전송하세요.' : '원래 터미널에 재연결 중입니다. 작성한 입력은 보관하고 연결 확인 후 순서대로 전달합니다.';
+  text($('input-reason'), inputFailure || reason || (recovering ? recoveryHelp : fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
   $('input-reason').dataset.blocked = String(!!inputFailure || !!reason || !fresh);
   for (const button of $('input-form').querySelectorAll('button[data-key]')) {
     const available = supported.includes(button.dataset.key);
-    show(button, available || native && button.dataset.key !== 'eof'); button.disabled = !available || originalDraftOnly || native && !composeMode && !canDirect || composing || !(base && (inputEnabled || directMode && directSending)); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
+    show(button, available || native && button.dataset.key !== 'eof'); button.disabled = !available || originalDraftOnly || native && !composeMode && !canDirect || composing || !(inputEnabled || queueEnabled); button.title = reason || `현재 터미널에 ${button.textContent} 키 입력`;
   }
   for (const button of $('questions').querySelectorAll('button')) button.disabled = !enabled || button.dataset.unavailable === 'true';
   scheduleCursor();
@@ -752,23 +759,28 @@ function mergeTerminalUpdate(update, previous, sessionID) {
   // clear old locks/cursors/tokens while the unchanged screen and colors remain.
   return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, nativeDisplay};
 }
-function applyTerminalFrame(frame) {
+function applyTerminalFrame(frame, receivedAt = performance.now()) {
   const previous = latestFrame;
   if (directMode && (frame.streamID || null) !== directStreamID) {
     stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
   }
   latestFrame = frame;
+  terminalFrameReceivedAt = receivedAt;
   const changed = renderTerminal(frame.screen, frame.appearance);
   quietFrames = changed ? 0 : quietFrames + 1;
   terminalState(changed && previous ? 'changed' : 'live', !frame.screen.trim() ? '연결됨 · 빈 화면' : changed && previous ? '새 출력' : '연결됨');
   if (nativeTerminal()) terminalState(frame.nativeDisplay?.state === 'live' ? 'live' : 'pending', frame.nativeDisplay?.state === 'live' ? '원본 창 화면' : '원본 연결 필요');
   text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
   updateControls();
+  if (directMode && directQueue.length && !directSending) void pumpDirect();
 }
 function stopTerminalStream(resetFailure = false) {
-  terminalStream?.source.close(); terminalStream = null;
+  if (terminalStream) {
+    terminalStream.source?.close(); clearTimeout(terminalStream.retryTimer); clearTimeout(terminalStream.watchdog);
+  }
+  terminalStream = null;
   if (terminalPaint) cancelAnimationFrame(terminalPaint);
-  terminalPaint = 0; terminalPending = null;
+  terminalPaint = 0; terminalPending = null; terminalPendingAt = -Infinity;
   if (resetFailure) terminalStreamFailed = '';
 }
 function failTerminalStream(stream, message) {
@@ -777,19 +789,48 @@ function failTerminalStream(stream, message) {
   text($('terminal-error'), message); show($('terminal-error'), true); text($('terminal-retry'), '화면 다시 연결'); show($('terminal-retry'), true);
   terminalState('error', '연결 끊김'); updateControls();
 }
+function reconnectTerminalStream(stream) {
+  if (terminalStream !== stream || document.hidden || stream.retryTimer) return;
+  stream.source?.close(); clearTimeout(stream.watchdog);
+  if (terminalPaint) cancelAnimationFrame(terminalPaint);
+  terminalPaint = 0; terminalPending = null;
+  stream.reconnecting = true;
+  terminalState('pending', '재연결 중…');
+  text($('terminal-error'), '네트워크 연결이 끊겨 원래 터미널에 다시 연결하고 있습니다.');
+  show($('terminal-error'), false); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
+  updateControls();
+  // Retry only the read subscription. Input POSTs are never replayed here.
+  const delay = Math.min(5000, 500 * 2 ** Math.min(stream.retries++, 4));
+  stream.retryTimer = setTimeout(() => {
+    stream.retryTimer = null;
+    if (terminalStream === stream && !document.hidden) openTerminalStream(stream);
+  }, delay);
+}
+function watchTerminalStream(stream) {
+  clearTimeout(stream.watchdog);
+  // The server emits current controls at least every two seconds. Recover a
+  // half-open Wi-Fi/VPN connection even when EventSource emits no error.
+  stream.watchdog = setTimeout(() => reconnectTerminalStream(stream), 8000);
+}
 function ensureTerminalStream() {
   const renderWindow = nativeTerminal();
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
   const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + (renderWindow ? '&view=screen' : '');
-  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, source:new EventSource(streamURL)};
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, sessionID:item.session.id, source:null, retries:0, reconnecting:false, retryTimer:null, watchdog:null};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
-  stream.source.addEventListener('screen', event => {
-    if (terminalStream !== stream || selectedKey !== stream.key || detailGeneration !== stream.generation || document.hidden) return;
+  openTerminalStream(stream);
+}
+function openTerminalStream(stream) {
+  const source = new EventSource(stream.url); stream.source = source;
+  const current = () => terminalStream === stream && stream.source === source && selectedKey === stream.key && detailGeneration === stream.generation && !document.hidden;
+  watchTerminalStream(stream);
+  source.addEventListener('screen', event => {
+    if (!current()) return;
     try {
       if (event.data.length > 2000000 || byteLength(event.data) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
-      const frame = mergeTerminalUpdate(JSON.parse(event.data), terminalPending || latestFrame, item.session.id);
+      const frame = mergeTerminalUpdate(JSON.parse(event.data), terminalPending || latestFrame, stream.sessionID);
       // Observe token changes immediately, even if a later frame replaces this
       // one before painting. Pending input must never cross terminal identities.
       if (directMode && (frame.streamID || null) !== directStreamID) {
@@ -798,28 +839,37 @@ function ensureTerminalStream() {
       if (directMode && (!frame.keys.includes('characters') || !frame.keys.includes('backspace') || frame.inputReason)) {
         stopDirect(); inputFailure = frame.inputReason || '원본 입력 권한을 다시 연결해주세요.';
       }
+      stream.reconnecting = false; stream.retries = 0; watchTerminalStream(stream);
       terminalPending = frame;
+      terminalPendingAt = performance.now();
       if (terminalPaint) return;
       terminalPaint = requestAnimationFrame(() => {
         terminalPaint = 0;
-        if (terminalStream !== stream || selectedKey !== stream.key || detailGeneration !== stream.generation || document.hidden) { terminalPending = null; return; }
-        const frame = terminalPending; terminalPending = null;
-        try { if (frame) applyTerminalFrame(frame); } catch (error) { failTerminalStream(stream, error.message); }
+        if (!current()) { terminalPending = null; return; }
+        const frame = terminalPending, receivedAt = terminalPendingAt; terminalPending = null;
+        try { if (frame) applyTerminalFrame(frame, receivedAt); } catch (error) { failTerminalStream(stream, error.message); }
       });
     } catch (error) { failTerminalStream(stream, error.message); }
   });
-  stream.source.addEventListener('failure', event => {
+  source.addEventListener('failure', event => {
+    if (!current()) return;
     let message = 'Mac의 터미널 연결이 끊겼습니다. 원래 터미널을 확인한 뒤 화면을 다시 연결해주세요.';
-    try { if (event.data.length <= 8192) { const failure = JSON.parse(event.data); if (typeof failure.error === 'string') message = failure.error; } } catch (_) {}
+    try {
+      if (event.data.length <= 8192) {
+        const failure = JSON.parse(event.data);
+        if (failure.retryable === true) { reconnectTerminalStream(stream); return; }
+        if (typeof failure.error === 'string') message = failure.error;
+      }
+    } catch (_) {}
     failTerminalStream(stream, message);
   });
-  stream.source.onerror = () => failTerminalStream(stream, 'Mac의 터미널 연결이 끊겼습니다. 원래 터미널을 확인한 뒤 화면을 다시 연결해주세요.');
+  source.onerror = () => { if (current()) reconnectTerminalStream(stream); };
 }
 async function refreshFrame() {
   clearTimeout(frameTimer);
   if (selectedItem?.view.pty) { ensurePTY(); return; }
   if (mutation) { frameTimer = setTimeout(refreshFrame, 100); return; }
-  if (!selectedItem || !selectedItem.view.canRead || sessionEnded(selectedItem) || !allSessions.some(item => item.key === selectedKey) || !connected || !currentNode()?.online || document.hidden) { stopTerminalStream(); return; }
+  if (!selectedItem || !selectedItem.view.canRead || sessionEnded(selectedItem) || !allSessions.some(item => item.key === selectedKey) || !currentNode()?.online || document.hidden) { stopTerminalStream(); return; }
   if (supportsTerminalStream(currentNode())) { frameController?.abort(); ensureTerminalStream(); return; }
   stopTerminalStream();
   if (loadingFrame) { frameTimer = setTimeout(refreshFrame, 100); return; }
@@ -845,9 +895,9 @@ async function refreshFrame() {
   }
 }
 async function freshInputFrame(key) {
-  const until = Date.now() + 6000;
-  while (Date.now() < until && selectedKey === key && connected && currentNode()?.online && selectedItem?.view.canRead && !document.hidden) {
-    if (!mutation && latestFrame && Date.now() - new Date(latestFrame.observedAt).getTime() < 10000) return !latestFrame.inputReason;
+  const until = performance.now() + 6000;
+  while (performance.now() < until && selectedKey === key && currentNode()?.online && selectedItem?.view.canRead && !document.hidden && terminalStreamFailed !== key) {
+    if (!mutation && terminalFrameFresh()) return !latestFrame.inputReason;
     if (!mutation && !loadingFrame) await refreshFrame();
     await new Promise(resolve => setTimeout(resolve, 40));
   }
@@ -902,7 +952,8 @@ async function pumpDirect() {
       const item = directQueue[0];
       const fresh = await freshInputFrame(item.key);
       if (inputGeneration !== generation) break;
-      if (selectedKey !== item.key || !fresh || (latestFrame?.streamID || null) !== item.streamID) { stopDirect(); break; }
+      if (selectedKey !== item.key || (latestFrame?.streamID || null) !== item.streamID) { stopDirect(); break; }
+      if (!fresh) break; // Keep bounded unsent input until the same stream is verified again.
       directQueue.shift();
       const sent = await sendInput(item.kind, item.value, true);
       if (inputGeneration !== generation) {
@@ -912,7 +963,10 @@ async function pumpDirect() {
       }
       if (!sent) { stopDirect(true, item.kind === 'characters' ? item.value : ''); break; }
     }
-  } finally { directSending = false; updateControls(); if (directMode && directQueue.length) void pumpDirect(); }
+  } finally {
+    directSending = false; updateControls();
+    if (directMode && directQueue.length) { clearTimeout(directTimer); directTimer = setTimeout(pumpDirect, 250); }
+  }
 }
 function captureDirectText() {
   if (composing || !directMode || !keyboardText()) return;

@@ -18,7 +18,9 @@ enum RemoteServerEvent {
         return Data("event: output\nid: \(value.offset)\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
     static func failure(_ error: Error) -> Data {
-        let json = (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription])) ?? Data("{\"error\":\"Stream failed\"}".utf8)
+        let status = (error as? RemoteHTTPError)?.status
+        let retryable = error is NWError || status == 503 || status == 504
+        let json = (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription, "retryable": retryable])) ?? Data("{\"error\":\"Stream failed\"}".utf8)
         return Data("event: failure\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
 }
@@ -259,7 +261,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
             let incomplete = !buffer.isEmpty; buffer = Data()
             waiter = nil
             if let failure { completion(.failure(failure)) }
-            else if incomplete { completion(.failure(RemoteHTTPError(502, "Mac의 터미널 출력이 전송 중 끊겼습니다. 다시 연결해주세요."))) }
+            else if incomplete { completion(.failure(RemoteHTTPError(503, "Mac의 터미널 출력이 전송 중 끊겼습니다. 다시 연결해주세요."))) }
             else { completion(.success(nil)) }
             return
         }
