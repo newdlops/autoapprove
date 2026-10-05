@@ -15,6 +15,7 @@
 - 서명한 패키지를 별도 프로필로 재배치해 내장 버전/리소스·포트 충돌·웹 ON/OFF 보존을 확인했다. DMG 체크섬·읽기 전용 마운트·서명·설치 안내·앱 파일 일치를 통과했다. SHA-256: `8ebb57f625ea9ef4587265e863666b643604edd53019ae5556455c70a5d62f0d`.
 - **2026-10-05 18:36 KST**, `/Applications/AutoApprove.app`을 **0.2.45/56**으로 적용했다. 원본 CLI **15개 PID·시작 시각·TTY**, 설정과 기존 승인 기록 **5,906건**, 기존 root 입력 서비스의 PID·실행 횟수·파일 해시를 보존했다. Terminal 재연결·웹 8765·다른 Mac 한 대 발견을 확인했다. 앱 소유 PTY 0개를 확인했고 원본 CLI에는 시험 입력하지 않았다. 이전 앱과 DB·검사 보고서는 비공개 `.runtime/releases/0.2.45/approval-56/`에 보관한다.
 - 설치본의 루프백·현재 Wi-Fi 숫자 주소에서 읽기 전용 GET으로 **0.2.45/56/API 1**, 웹 리소스 **6개씩**의 소스 일치와 앱 소유 PTY 0개를 확인했다. HTML 버전·nonce 치환을 반영했다. 실제 휴대폰 접속이나 다른 앱 알림 표시 결과로 해석하지 않는다.
+- [GitHub v0.2.45 정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.45)를 최신 릴리스로 게시했다. 태그의 배포 소스는 `6d8f0e5`이며 GitHub의 태그 대상 커밋 일치, draft/prerelease가 아님, DMG·체크섬의 uploaded 상태와 DMG digest 일치를 확인했다. 두 파일을 GitHub에서 다시 내려받아 SHA-256 검사와 준비한 파일의 바이트 일치를 확인했다.
 
 ## 0.2.44 무료 tmux 원본 중계 · 빌드 55 — 이전 Mac 적용
 
