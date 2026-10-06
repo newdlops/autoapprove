@@ -16,6 +16,7 @@ import AutoApproveCore
     private var active: [String: AttentionRequest] = [:]
     private var submitted = Set<String>()
     private var failed = Set<String>()
+    private var clearedRead = Set<String>()
     private var deliveries: [String: Task<Void, Never>] = [:]
     private static let category = "MANUAL_ANSWER"
     private static let completionCategory = "WORK_COMPLETED"
@@ -92,16 +93,22 @@ import AutoApproveCore
         let next = Dictionary(uniqueKeysWithValues: requests.map { ($0.id, $0) })
         let removed = Set(active.keys).subtracting(next.keys)
         for id in removed { deliveries.removeValue(forKey: id)?.cancel(); submitted.remove(id); failed.remove(id) }
-        center.removePendingNotificationRequests(withIdentifiers: Array(removed))
-        center.removeDeliveredNotifications(withIdentifiers: Array(removed))
+        if !removed.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: Array(removed))
+            center.removeDeliveredNotifications(withIdentifiers: Array(removed))
+        }
         active = next
         let read = requests.filter { engine.isNotificationRead(sessionID: $0.originSessionID ?? $0.sessionID, sourceKey: $0.notificationKey) }
         for request in read {
             deliveries.removeValue(forKey: request.id)?.cancel()
             submitted.insert(request.id)
         }
-        center.removePendingNotificationRequests(withIdentifiers: read.map(\.id))
-        center.removeDeliveredNotifications(withIdentifiers: read.map(\.id))
+        let readIDs = Set(read.map(\.id)), newlyRead = readIDs.subtracting(clearedRead)
+        clearedRead = readIDs
+        if !newlyRead.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: Array(newlyRead))
+            center.removeDeliveredNotifications(withIdentifiers: Array(newlyRead))
+        }
         guard allowed else { return }
         for request in requests where !submitted.contains(request.id) && deliveries[request.id] == nil {
             let observedAt = Date()

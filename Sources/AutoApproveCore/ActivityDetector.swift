@@ -10,6 +10,11 @@ public struct ActivityObservation: Equatable {
 /// Silence, a motionless spinner, and low CPU usage are not completion signals.
 public enum ActivityDetector {
     public static func detect(_ screen: String, agent: AgentKind) -> ActivityObservation {
+        detect(screen, agent: agent, permissionPrompt: { PromptDetector.detect(screen, agent: agent) != nil })
+    }
+
+    /// An already-analyzed frame can share its permission result without changing detection order.
+    static func detect(_ screen: String, agent: AgentKind, permissionPrompt: () -> Bool) -> ActivityObservation {
         let unknown = ActivityObservation(phase: .unknown, detail: "현재 화면에서 작업 중인지 입력 대기 중인지 확인하지 못했습니다.")
         guard agent != .shell else { return unknown }
         let lines = screen.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
@@ -19,7 +24,7 @@ public enum ActivityDetector {
         if matches(bottom, #"(?i)(?:esc|ctrl\+c) to (?:interrupt|stop)|tab to queue"#) {
             return ActivityObservation(phase: .working, detail: "CLI 화면에 실행 중인 작업 또는 중단 안내가 표시되어 있습니다.")
         }
-        if PromptDetector.detect(screen, agent: agent) != nil {
+        if permissionPrompt() {
             return ActivityObservation(phase: .approval, detail: "실행 권한에 대한 응답을 기다리고 있습니다.")
         }
         let background = matches(bottom, #"(?i)\b[1-9][0-9]* (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b|running in (?:the )?background"#)
@@ -63,10 +68,15 @@ public struct ActivityTracker {
 
     public mutating func observe(_ screen: String, agent: AgentKind, generation: String, at now: Date = Date()) -> ActivityObservation {
         let observation = ActivityDetector.detect(screen, agent: agent)
+        return observe(observation, fingerprint: PromptDetector.fingerprint(screen), agent: agent, generation: generation, at: now)
+    }
+
+    /// Time and generation are checked on every observation, even when parsing is reused.
+    mutating func observe(_ observation: ActivityObservation, fingerprint: @autoclosure () -> String, agent: AgentKind, generation: String, at now: Date) -> ActivityObservation {
         guard observation.phase == .idle else { candidate = nil; return observation }
         // Background output may keep changing while the ready composer stays usable.
         // Consecutive idle observations still require the same CLI generation.
-        let fingerprint = observation.monitoring ? "monitoring:\(agent.rawValue)" : PromptDetector.fingerprint(screen)
+        let fingerprint = observation.monitoring ? "monitoring:\(agent.rawValue)" : fingerprint()
         if let candidate, candidate.fingerprint == fingerprint, candidate.generation == generation {
             if now.timeIntervalSince(candidate.since) >= 2 { return observation }
         } else {

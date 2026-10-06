@@ -113,6 +113,20 @@ import TerminalInputSupport
     private var bridges: [String: [JSONObject]] = [:]
     private var screens: [String: ScreenState] = [:]
     private var activityTrackers: [String: ActivityTracker] = [:]
+    /// Only pure parsing is reused. Observation times, policies, reservations and delivery validation stay live.
+    private final class ScreenAnalysis {
+        let raw: String
+        let agent: AgentKind
+        lazy var prompt = PromptDetector.detect(raw, agent: agent)
+        lazy var request = QuestionDetector.detect(raw, agent: agent)
+        lazy var activity = ActivityDetector.detect(raw, agent: agent, permissionPrompt: { self.prompt != nil })
+        lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent)
+        lazy var fingerprint = PromptDetector.fingerprint(raw)
+        init(raw: String, agent: AgentKind) { self.raw = raw; self.agent = agent }
+    }
+    private var screenAnalyses: [String: ScreenAnalysis] = [:]
+    private var screenPublicationDepth = 0
+    private var screenPublicationPending = false
     private var screenObservedAt: [String: Date] = [:]
     private var handledHookIDs: Set<String> = []
     private var hookIDOrder: [String] = []
@@ -317,7 +331,7 @@ import TerminalInputSupport
         for pending in remoteInputReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 입력 전달 결과를 확인하지 못했습니다.")) }
         for pending in remoteRevealReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 원본 창 연결을 확인하지 못했습니다.")) }; remoteRevealReplies.removeAll()
         for pending in remoteScreenReads.values { pending.task.cancel() }
-        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll()
+        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll(); screenAnalyses.removeAll()
         for capture in nativeWindowCaptures.values { capture.invalidate() }
         for capture in verifiedWindowCaptures.values { capture.invalidate() }
         for value in bridgeWindowCaptures.values { value.capture.invalidate() }; bridgeWindowCaptures.removeAll()
@@ -1375,6 +1389,7 @@ import TerminalInputSupport
     }
 
     private func publish() {
+        if screenPublicationDepth > 0 { screenPublicationPending = true; return }
         projectClaudeApprovals()
         projectCapacityResumes()
         reconcileAutomaticQuestionReplies()
@@ -1391,6 +1406,20 @@ import TerminalInputSupport
         // Heartbeats still reconcile timers and notices, but identical state must
         // not invalidate every SwiftUI window and notification subscription.
         if snapshot.sessions != presented { snapshot.sessions = presented }
+    }
+
+    /// A single host result is synchronous: publish all of its sessions together, without
+    /// holding a batch across an await or delaying independent hooks and user actions.
+    private func withScreenPublicationBatch(_ body: () -> Void) {
+        screenPublicationDepth += 1
+        defer {
+            screenPublicationDepth -= 1
+            if screenPublicationDepth == 0, screenPublicationPending {
+                screenPublicationPending = false
+                publish()
+            }
+        }
+        body()
     }
 
     /// Reorder only the visible slots; filtered-out sessions keep their positions.
@@ -1517,8 +1546,10 @@ import TerminalInputSupport
                 return Dictionary(found.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
             }.value
             updateDiscovery(found, records: discovered, directories: directories)
-            snapshot.health.discoveryError = nil
-        } catch { snapshot.health.discoveryError = error.localizedDescription }
+            if snapshot.health.discoveryError != nil { snapshot.health.discoveryError = nil }
+        } catch {
+            if snapshot.health.discoveryError != error.localizedDescription { snapshot.health.discoveryError = error.localizedDescription }
+        }
         refreshGitBranches()
         let codexTargets = Array(sessions.values).filter { $0.agent == .codex && $0.phase != .ended }
         async let questions = codexQuestions.collect(codexTargets)
@@ -1919,7 +1950,7 @@ import TerminalInputSupport
         screenConnections[host, default: ScreenConnection()].enabled = true
         screenConnections[host]?.permissionBlocked = false; screenConnections[host]?.retryAfter = .distantPast
         updateHealth(host) { $0.requested = true; $0.status = "연결 확인 중…" }
-        await refreshScreenHost(host); publish()
+        await refreshScreenHost(host, reportConnecting: true); publish()
     }
     public func disconnectScreenHost(_ host: ScreenHost) {
         screenConnections[host]?.enabled = false; revision &+= 1
@@ -1936,11 +1967,16 @@ import TerminalInputSupport
         }
         publish()
     }
-    public func refreshScreenHost(_ host: ScreenHost) async {
+    public func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool = false) async {
         guard let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
               Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return }
-        screenConnections[host]?.polling = true; updateHealth(host) { $0.connecting = true }
-        defer { screenConnections[host]?.polling = false; updateHealth(host) { $0.connecting = false } }
+        screenConnections[host]?.polling = true
+        let announceConnection = reportConnecting || !snapshot.health.screen(host).connected
+        if announceConnection { updateHealth(host) { $0.connecting = true } }
+        defer {
+            screenConnections[host]?.polling = false
+            if announceConnection { updateHealth(host) { $0.connecting = false } }
+        }
         let targets = sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
         do {
@@ -1969,23 +2005,26 @@ import TerminalInputSupport
                     health.status = "해당 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first?.message ?? "닫힌 탭인지 확인한 후 다시 연결해주세요.")
                 }
             }
-            for target in targets {
-                guard let screen = result.screens.first(where: { $0.tty == target.tty }) else {
-                    if sessions[target.id]?.channel != .hook {
-                        sessions[target.id]?.channel = .none
-                        sessions[target.id]?.setPhase(.unknown, detail: "현재 \(title) 화면을 읽지 못했습니다.")
-                        sessions[target.id]?.pendingSummary = nil
-                        sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
-                        clearScreen(target.id, keepRemote: true)
+            withScreenPublicationBatch {
+                for target in targets {
+                    guard let screen = result.screens.first(where: { $0.tty == target.tty }) else {
+                        if sessions[target.id]?.channel != .hook {
+                            sessions[target.id]?.channel = .none
+                            sessions[target.id]?.setPhase(.unknown, detail: "현재 \(title) 화면을 읽지 못했습니다.")
+                            sessions[target.id]?.pendingSummary = nil
+                            sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
+                            clearScreen(target.id, keepRemote: true)
+                        }
+                        continue
                     }
-                    continue
+                    sessions[target.id]?.terminalTitle = screen.title
+                    if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
+                        if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
+                        sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
+                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance)
+                    }
                 }
-                sessions[target.id]?.terminalTitle = screen.title
-                if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
-                    if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
-                    sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                    receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance)
-                }
+                publish()
             }
         } catch {
             // Denied Automation stays blocked until the user reconnects; other failures retry.
@@ -1996,6 +2035,7 @@ import TerminalInputSupport
             for id in Array(sessions.keys) where sessions[id]?.channel == host.channel && sessions[id]?.phase != .ended {
                 sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id, keepRemote: !blocked)
             }
+            publish()
         }
     }
 
@@ -2585,6 +2625,7 @@ import TerminalInputSupport
         }
         if sessions[id] == nil || sessions[id]?.phase == .ended { remoteOrcaBindings.removeValue(forKey: id) }
         screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id); screenObservedAt.removeValue(forKey: id)
+        screenAnalyses.removeValue(forKey: id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
         sessions[id]?.pendingRequestID = nil
     }
@@ -2597,7 +2638,16 @@ import TerminalInputSupport
         // A parked main terminal renders the child PTY. Its pixels cannot identify
         // which child owns the prompt; the child's hook is the response channel.
         guard !hasBackgroundChildren(sessionID), claudeParents[sessionID] == nil else { return }
-        let prompt = PromptDetector.detect(raw, agent: session.agent)
+        let analysis: ScreenAnalysis
+        if let cached = screenAnalyses[sessionID], cached.agent == session.agent, cached.raw.utf8.elementsEqual(raw.utf8) { analysis = cached }
+        else {
+            analysis = ScreenAnalysis(raw: raw, agent: session.agent)
+            screenAnalyses.removeValue(forKey: sessionID)
+            // At most one 128-KiB input per session and 32 cached sessions; larger screens
+            // still work normally. End/disconnect/stop removes their parsing cache.
+            if raw.utf8.count <= 131_072, screenAnalyses.count < 32 { screenAnalyses[sessionID] = analysis }
+        }
+        let prompt = analysis.prompt
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
             guard session.phase == .approval, session.pendingInTerminal, prompt != nil,
@@ -2606,10 +2656,10 @@ import TerminalInputSupport
         } else if !session.channel.isScreen { return }
         defer { publish() }
         screenObservedAt[sessionID] = now
-        if session.agent == .codex { observeCapacity(sessionID, raw: raw, at: now) }
+        if session.agent == .codex { observeCapacity(sessionID, analysis: analysis, at: now) }
         guard let prompt else {
-            let request = QuestionDetector.detect(raw, agent: session.agent)
-            let observation = ActivityDetector.detect(raw, agent: session.agent)
+            let request = analysis.request
+            let observation = analysis.activity
             // An incomplete repaint is not evidence that a dispatched request finished.
             // Keep its reservation, but never dispatch from this unverified frame.
             if screens[sessionID]?.generation == generation, request?.phase != .input,
@@ -2633,7 +2683,7 @@ import TerminalInputSupport
                 sessions[sessionID]?.setPhase(.unknown, detail: "CLI가 터미널의 입력 대상이 아닙니다. 백그라운드 실행 또는 일시정지 상태를 확인해주세요.", at: now)
                 return
             }
-            let activity = activityTrackers[sessionID, default: ActivityTracker()].observe(raw, agent: session.agent, generation: generation, at: now)
+            let activity = activityTrackers[sessionID, default: ActivityTracker()].observe(observation, fingerprint: analysis.fingerprint, agent: session.agent, generation: generation, at: now)
             presentPhase(sessionID, activity, at: now)
             return
         }
@@ -2668,10 +2718,11 @@ import TerminalInputSupport
 
     /// Answers a capacity stop only for a screen-connected Codex session with auto-approval on.
     /// After a confirmed send, the next stop drawn is the next failure of the same run.
-    private func observeCapacity(_ id: String, raw: String, at now: Date) {
+    private func observeCapacity(_ id: String, analysis: ScreenAnalysis, at now: Date) {
+        let raw = analysis.raw
         guard let session = sessions[id], session.agent == .codex, session.phase != .ended else { return }
         guard session.automatic, session.channel.isScreen else { capacityStates.removeValue(forKey: id); return }
-        let stop = CodexCapacityStop.detect(raw, agent: .codex)
+        let stop = analysis.capacityStop
         if var state = capacityStates[id] {
             if let stop {
                 state.observedAt = now
@@ -2698,7 +2749,7 @@ import TerminalInputSupport
                     }
                 }
             } else {
-                let phase = ActivityDetector.detect(raw, agent: .codex).phase
+                let phase = analysis.activity.phase
                 switch state.phase {
                 case .sending: break
                 case .sent:

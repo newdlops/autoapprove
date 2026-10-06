@@ -78,17 +78,28 @@ public enum PromptDetector {
             ? ["Would you like to run the following command?", "Would you like to make the following edits?", "Approve app tool call?", "Allow "]
             : ["Do you want to proceed?", "Do you want to make this edit", "Do you want to create", "Do you want to allow"]
     }
+    private static let codexHeadings = permissionMarkers(.codex).map { (marker: $0, compact: $0.filter { !$0.isWhitespace }) }
+    private static let claudeHeadings = permissionMarkers(.claude).map { (marker: $0, compact: $0.filter { !$0.isWhitespace }) }
     /// Join only a complete, contiguous heading prefix. This accepts word/character wrapping
     /// without completing an ellipsis, crossing blank rows or consuming menu choices.
     static func permissionHeading(_ lines: [String], agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
+        let headings = agent == .codex ? codexHeadings : claudeHeadings
         for index in lines.indices.reversed() {
-            for marker in permissionMarkers(agent) {
-                let expected = marker.filter { !$0.isWhitespace }
-                var candidate = ""
+            let first = lines[index].trimmingCharacters(in: .whitespaces)
+            // Ordinary output and menu rows cannot start one of the ASCII headings.
+            // Reject them before regex checks or rebuilding every marker for every row.
+            guard let initial = first.first, headings.contains(where: { $0.compact.first == initial }) else { continue }
+            let compact = first.filter { !$0.isWhitespace }
+            let candidates = headings.filter { $0.compact.hasPrefix(compact) || compact.hasPrefix($0.compact) }
+            guard !candidates.isEmpty, !isOption(first), !first.contains("```") else { continue }
+            for (marker, expected) in candidates {
+                var candidate = compact
                 for row in index..<min(lines.count, index + 8) {
                     let line = lines[row].trimmingCharacters(in: .whitespaces)
-                    guard !line.isEmpty, !isOption(line), !line.contains("```") else { break }
-                    candidate += line.filter { !$0.isWhitespace }
+                    if row != index {
+                        guard !line.isEmpty, !isOption(line), !line.contains("```") else { break }
+                        candidate += line.filter { !$0.isWhitespace }
+                    }
                     if candidate.hasPrefix(expected) {
                         // `Allow ` is a word prefix, not `Allowing` or another question.
                         if marker == "Allow ", !lines[index].hasPrefix("Allow "), lines[index] != "Allow" { break }

@@ -113,8 +113,22 @@ public enum ProcessDiscovery {
         workingDirectories(pids: [pid])[pid] ?? ""
     }
     public static func workingDirectories(pids: [Int32]) -> [Int32: String] {
-        guard !pids.isEmpty, let result = try? CommandRunner.run("/usr/sbin/lsof", ["-a", "-p", pids.map(String.init).joined(separator: ","), "-d", "cwd", "-Fpn"], timeout: 3) else { return [:] }
-        var directories: [Int32: String] = [:], current: Int32?
+        var directories: [Int32: String] = [:], missing: [Int32] = []
+        for pid in Set(pids) where pid > 0 {
+            var info = proc_vnodepathinfo()
+            let size = Int32(MemoryLayout.size(ofValue: info))
+            let path: String? = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size
+                ? withUnsafeBytes(of: info.pvi_cdir.vip_path) { bytes in
+                    guard let end = bytes.firstIndex(of: 0), end > 0 else { return nil }
+                    let value = String(decoding: bytes[..<end], as: UTF8.self)
+                    return value.hasPrefix("/") ? value : nil
+                } : nil
+            if let path { directories[pid] = path } else { missing.append(pid) }
+        }
+        // Read the current kernel cwd every poll; never cache a path across chdir or PID reuse.
+        // Keep the existing reader for processes whose path libproc cannot provide.
+        guard !missing.isEmpty, let result = try? CommandRunner.run("/usr/sbin/lsof", ["-a", "-p", missing.map(String.init).joined(separator: ","), "-d", "cwd", "-Fpn"], timeout: 3) else { return directories }
+        var current: Int32?
         for line in result.output.split(separator: "\n") {
             if line.hasPrefix("p") { current = Int32(line.dropFirst()) }
             else if line.hasPrefix("n/"), let pid = current { directories[pid] = String(line.dropFirst()) }

@@ -403,6 +403,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
 
 @main struct CheckRunner {
     @MainActor static func main() async {
+        if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
             ("Codex selected conversation: explicit message, stale target rejection and original preservation", tests.testExplicitCodexConversationMessagePreservesOriginalAndRejectsStaleTarget),
@@ -429,6 +430,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Remote exact terminal, manual input, stale frames and restart receipts", tests.testRemoteTerminalExactTargetStaleFrameAndDurableReceipt),
             ("Remote Terminal scripts validate screen, agent and supported keys", tests.testRemoteTerminalScriptValidationAndKeys),
             ("Unchanged observations stay quiet while changes publish immediately", tests.testUnchangedObservationsDoNotPublishSnapshots),
+            ("Repeated screens retain time, generation, changed requests and ended-process checks", tests.testRepeatedScreensPreserveTimeGenerationAndChangedRequests),
+            ("Screen polling publishes coherent batches and preserves immediate stream updates", tests.testScreenPollsPublishTogetherAndKeepImmediateUpdates),
+            ("Native cwd reads preserve valid paths with duplicate and missing processes", tests.testWorkingDirectoryReadsKeepValidPathsWithDuplicateAndMissingPIDs),
+            ("Native cwd reads follow a Unicode child's directory changes", tests.testWorkingDirectoryFollowsUnicodeChildDirectoryChanges),
             ("Duplicate indexing preserves Unicode, thread identity and manual overrides", tests.testQuestionDuplicateIndexPreservesCanonicalAndThreadIdentity),
             ("Claude app approval continues through thirty separately timed requests", tests.testClaudeAppApprovalThenThirtySequentialQuestions),
             ("Automatic Claude questions stay quiet while manual fallback still alerts", tests.testClaudeAutomaticAttentionAndManualFallback),
