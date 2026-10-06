@@ -405,6 +405,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Codex selected conversation: explicit message, stale target rejection and original preservation", tests.testExplicitCodexConversationMessagePreservesOriginalAndRejectsStaleTarget),
             ("Codex queue: snapshot deletion preserves new inputs, consumed inputs and original session", tests.testCodexQueueSnapshotDeletionPreservesNewAndConsumedInputs),
             ("Codex queue: partial deletion, audit and exited-process rejection", tests.testCodexQueuePartialFailureKeepsUndeletedInputsAndAudit),
             ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),

@@ -210,10 +210,11 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 #queued-inputs { margin: 8px 0; padding-left: 24px; max-height: 180px; overflow: auto; overscroll-behavior: contain; }
 #queued-inputs li { padding: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 #queue-confirm:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
-#queue-status, #screen-start-status, #test-screen-source { overflow-wrap: anywhere; }
+#queue-status, #screen-start-status, #test-screen-source, #screen-session-label { overflow-wrap: anywhere; }
 #queue-conversation-picker label { display: block; margin-top: 12px; }
 #queue-conversation { width: 100%; margin: 8px 0; }
 .test-screen-dialog { width: min(1000px, calc(100% - 32px)); max-height: 90dvh; }
+#screen-share-picker > summary { min-height: 44px; padding: 10px 0; cursor: pointer; }
 .test-screen-row { display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding: 12px 0; }
 .test-screen-row > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .test-screen-row button { flex-shrink: 0; }

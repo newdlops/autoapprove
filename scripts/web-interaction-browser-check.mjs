@@ -12,7 +12,7 @@ const build=path.resolve('.build',process.argv.includes('--release')?'release':'
 const directory=await mkdtemp(path.join(tmpdir(),'aa-web-interaction-'));
 const baseline=process.argv.includes('--baseline-question');
 const output=path.resolve('dist/qa',baseline?'web-interaction-baseline':'web-interaction');await mkdir(output,{recursive:true});
-let fixture, browser, mcp, page;const errors=[],screenshots=[],checks=[];
+let fixture, browser, mcp, page;const errors=[],screenshots=[],checks=[],actions=[];
 const optionalFile=async name=>{try{return await readFile(path.join(directory,name),'utf8');}catch{return '';}};
 try {
   const cache=path.resolve('.build/cache/WebInteractionFixture');await mkdir(cache,{recursive:true});
@@ -39,6 +39,7 @@ try {
   assert.equal(await optionalFile('captures.txt'),'');checks.push('stdio initialize/list, question publication and explicit desktop share start without capture');
   browser=await chromium.launch({headless:true,executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH||undefined});
   page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});page.setDefaultTimeout(15000);page.on('pageerror',error=>errors.push(error.message));
+  page.on('request',request=>{if(request.method()==='POST'&&new URL(request.url()).pathname==='/api/action')actions.push(request.postDataJSON());});
   if(baseline){const previous=execFileSync('git',['show','v0.2.49:Sources/AutoApproveCore/Resources/RemoteWeb/app.js'],{encoding:'utf8'});await page.route('**/app.js',route=>route.fulfill({status:200,contentType:'text/javascript',body:previous}));}
   async function capture(name){await page.screenshot({path:path.join(output,name+'.png')});screenshots.push(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,name+' horizontal overflow');}
   for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
@@ -124,6 +125,11 @@ try {
   assert.deepEqual(await page.evaluate(()=>({id:selectedItem.session.id,pid:selectedItem.session.pid,tty:selectedItem.session.tty})),binding);assert.equal(await page.locator('#automatic').isChecked(),true);
   for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await page.locator('#codex-queue').scrollIntoViewIfNeeded();await capture(name+'-queue-after-clear');}
   await page.setViewportSize({width:390,height:844});checks.push('Actual queue list, cancel, failed deletion without replay, clear preserves concurrently added input, cancelled answer becomes editable and original identity/automation stay intact');
+  const selectedCodex=await page.evaluate(()=>({sessionID:selectedItem.session.id,threadID:queueConversations.get(selectedKey).id}));
+  const codexInstruction='브라우저 로그인 흐름을 자동 테스트하고 결과를 알려주세요.';
+  await page.locator('#message-input').fill(codexInstruction);await page.locator('#send-message').click();await page.waitForFunction(()=>$('message-status').textContent.includes('대기열'));
+  const codexDelivery=actions.filter(action=>action.action==='sendMessage'&&action.text===codexInstruction);assert.equal(codexDelivery.length,1);assert.equal(codexDelivery[0].sessionID,selectedCodex.sessionID);assert.equal(codexDelivery[0].threadID,selectedCodex.threadID);
+  assert.equal(await optionalFile('inputs.txt'),'');checks.push('Explicitly chosen Codex conversation receives one test instruction through its validated queue without terminal key injection');
   await page.locator('#close-interaction').click();await page.locator('#back').click();await page.locator('#session-list button').filter({hasText:'Claude Code'}).click();await page.locator('#terminal-questions').click();
   assert.equal(await page.locator('#message-status').textContent(),'','Messages must not show another session\'s delivery status');
   const claudeForm=page.locator('#questions form[data-structured=true]');await claudeForm.getByRole('radio',{name:/개발/}).check();await claudeForm.getByRole('checkbox',{name:'휴대폰 질문 폼'}).check();await claudeForm.getByRole('checkbox',{name:'Mac 전체 화면 공유'}).check();await claudeForm.locator('textarea').nth(1).fill('휴대폰으로 확인');await capture('mobile-claude-multiple');await claudeForm.getByRole('button',{name:'답변 보내기'}).click();
@@ -136,6 +142,21 @@ try {
   await page.locator('#close-interaction').click();await page.locator('#terminal-screens').click();
   await page.waitForFunction(()=>$('test-screen-image').complete&&$('test-screen-image').naturalWidth===640);await capture('mobile-test-screen');assert.ok((await optionalFile('captures.txt')).length>0);
   await page.locator('#test-screen-zoom').focus();await page.keyboard.press('Enter');assert.equal(await page.locator('#test-screen-image').getAttribute('data-zoom'),'true');
+  const beforeViewInput=await optionalFile('inputs.txt');await page.keyboard.press('ArrowUp');await page.keyboard.type('view only');assert.equal(await optionalFile('inputs.txt'),beforeViewInput);
+  assert.match(await page.locator('#test-screen-source').textContent(),/보기 전용/);assert.equal(await page.locator('#screen-share-picker').isVisible(),false);
+  const additionalShare=(await tool('start_screen_share',{title:'합성 다른 공유 화면 · '+ '긴 테스트 결과 이름 '.repeat(7),sourceID:1})).share;
+  await page.waitForFunction(()=>!$('screen-share-picker').hidden);await page.locator('#screen-share-picker summary').click();
+  assert.ok((await page.locator('#screen-share-picker summary').boundingBox()).height>=44);await capture('mobile-multiple-shares');
+  await page.locator('.test-screen-row').filter({hasText:additionalShare.title}).getByRole('button',{name:'화면 보기'}).click();assert.equal(await page.evaluate(()=>sharedScreen.share.id),additionalShare.id);
+  await page.locator('.test-screen-row').filter({hasText:share.title}).getByRole('button',{name:'화면 보기'}).click();await tool('stop_screen_share',{shareID:additionalShare.id});
+  await page.waitForFunction(()=>$('screen-share-picker').hidden);checks.push('Multiple shared screens use a 44px disclosure control; long titles wrap and normal selection stays bound to the same session');
+  const viewerBinding=await page.evaluate(()=>({shareID:sharedScreen.share.id,sessionID:selectedItem.session.id,key:selectedKey}));
+  await page.locator('#screen-message').click();await page.waitForFunction(()=>$('interaction-dialog').open);
+  await capture('mobile-screen-instruction');assert.equal(await page.evaluate(()=>selectedKey),viewerBinding.key);
+  const claudeInstruction='현재 Mac 화면의 앱을 자동 테스트해주세요.';await page.locator('#message-input').fill(claudeInstruction);await page.locator('#send-message').click();await page.waitForFunction(()=>$('message-status').textContent.includes('전달했습니다'));
+  const claudeDelivery=await optionalFile('inputs.txt');assert.equal(claudeDelivery,beforeViewInput+'submit:'+claudeInstruction+'\n');
+  await page.locator('#close-interaction').click();assert.equal(await page.evaluate(()=>$('test-screen-dialog').open&&sharedScreen.share.id),viewerBinding.shareID);
+  checks.push('View-only screen pointer/keyboard actions inject zero keys; test instruction uses the original Claude session and closing its form returns to the same share');
   await page.locator('#close-test-screen').click();await page.waitForTimeout(1000);const stoppedCount=(await optionalFile('captures.txt')).length;await page.waitForTimeout(1200);assert.equal((await optionalFile('captures.txt')).length,stoppedCount,'Closed viewer must not request captures');
   await page.locator('#terminal-screens').click();await page.waitForFunction(()=>$('test-screen-image').naturalWidth===640);await page.locator('#stop-test-screen').click();await page.waitForFunction(()=>$('test-screen-status').textContent.includes('종료'));
   const ended=await fetch(base+'/api/test-screen?share='+share.id);assert.equal(ended.status,410);checks.push('explicit desktop viewer, zoom, close stops capture requests and phone stop revokes image access');
@@ -149,6 +170,10 @@ try {
   }
   await page.locator('#stop-test-screen').click();assert.equal((await fetch(base+'/api/test-screen?share='+webShare)).status,410);
   checks.push('One terminal Test Screen click opens an existing MCP share or directly starts full-display sharing; permission denial captures nothing and explicit retry/stop work');
+  await page.locator('#close-test-screen').click();const standalone=(await tool('start_screen_share',{title:'합성 보기 전용 화면',sourceID:1})).share;
+  const beforeStandaloneInput=await optionalFile('inputs.txt');await page.goto(base+'#share='+standalone.id);await page.reload();await page.waitForFunction(()=>$('test-screen-image').naturalWidth===640&&$('test-screen-dialog').open);
+  assert.equal(await page.locator('#screen-message').isVisible(),false);assert.equal(await page.evaluate(()=>selectedItem),null);await capture('desktop-screen-without-session');assert.equal(await optionalFile('inputs.txt'),beforeStandaloneInput);
+  await page.locator('#stop-test-screen').click();checks.push('MCP share link without a selected agent displays only the Mac image and never chooses or controls a terminal');
   assert.equal(errors.length,0,errors.join('\n'));const state=await(await fetch(base+'/api/state')).json();assert.equal(state.sessions.some(item=>item.pty),false);
   await rm(path.join(output,'failure.json'),{force:true});
   await writeFile(path.join(output,'report.json'),JSON.stringify({result:'PASS',scope:'Real browser, production Swift HTTP/MCP/hooks with synthetic sessions/providers/images; no physical phone or user desktop',checks,screenshots,errors},null,2));console.log(JSON.stringify({result:'PASS',checks,screenshots,errors},null,2));

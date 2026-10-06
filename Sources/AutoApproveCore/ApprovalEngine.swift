@@ -1174,7 +1174,15 @@ import TerminalInputSupport
             }
             guard !sendingMessages.contains(id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 결과를 확인해주세요.") }
             sendingMessages.insert(id); defer { sendingMessages.remove(id) }
-            let target = try await questionTransport.prepareMessage(session)
+            let target: CodexReplyTarget
+            if let value = object["threadID"] {
+                guard let thread = value as? String, UUID(uuidString: thread) != nil else { throw RemoteHTTPError(400, "연결한 Codex 대화를 다시 선택해주세요.") }
+                target = try await questionTransport.prepareQueue(session, thread)
+                guard target.threadID == thread else { throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 다시 연결해주세요.") }
+                try validateCodexQueueSession(session, threadID: thread)
+                try await codexQueue.validate(target, session.cwd)
+                try validateCodexQueueSession(session, threadID: thread)
+            } else { target = try await questionTransport.prepareMessage(session) }
             guard !remoteInputStopped, let current = sessions[id], current.phase != .ended,
                   current.pid == session.pid, current.started == session.started, current.tty == session.tty,
                   questionThreadBySession[id] == nil || questionThreadBySession[id] == target.threadID else {
@@ -1183,6 +1191,7 @@ import TerminalInputSupport
             var event = AuditEvent(sessionID: id, summary: String(message.prefix(200)), outcome: "메시지 전달 확인 중", source: "웹 메시지", context: AuditContext(session: session), answer: message)
             guard log(event) else { throw RemoteHTTPError(409, "메시지 전달 내역을 저장하지 못했습니다.") }
             do {
+                if object["threadID"] != nil { try validateCodexQueueSession(session, threadID: target.threadID) }
                 let receipt = try await questionTransport.send(target, message)
                 event.outcome = "메시지 대기열 등록"; _ = log(event)
                 return ["ok": true, "queueID": receipt, "message": "Codex 메시지 대기열에 등록했습니다."]

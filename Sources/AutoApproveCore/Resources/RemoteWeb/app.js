@@ -1215,14 +1215,15 @@ function updateInteractionControls() {
   const present = selectedItem && allSessions.some(item=>item.key===selectedKey), codex = selectedItem?.session.agent === 'codex';
   const terminal = present && !['approval','input'].includes(selectedItem.session.phase) && !selectedItem.session.pendingInTerminal;
   const queueSupported = codex && supportsRelease(selectedItem.node,[0,2,46,57]);
-  const available = present && connected && selectedItem.node.online && (queueSupported || !codex && terminal && (inputKeys().includes('submit') || latestFrame?.streamID && inputKeys().includes('characters')));
+  const chosenConversation = queueConversations.get(selectedKey), chosenSupported = !chosenConversation || selectedItem && supportsRelease(selectedItem.node,[0,2,51,62]);
+  const available = present && connected && selectedItem.node.online && chosenSupported && (queueSupported || !codex && terminal && (inputKeys().includes('submit') || latestFrame?.streamID && inputKeys().includes('characters')));
   const uncertain = messageUncertain.has(selectedKey);
   show($('new-message'), uncertain); $('new-message').disabled = messageSending;
   $('message-input').disabled = !present || messageSending || uncertain;
   $('send-message').disabled = !available || mutation || messageSending || uncertain || !$('message-input').value.trim();
   text($('send-message'), messageSending ? '전달 중…' : '메시지 보내기');
-  text($('message-help'), !present ? '목록에서 메시지를 보낼 터미널을 선택해주세요.' : uncertain ? '전달 결과가 불확실합니다. 같은 내용을 다시 보내기 전에 원본 터미널의 접수를 확인해주세요.' : codex && !queueSupported ? '메시지 전송은 이 Mac을 AutoApprove 0.2.46 이상으로 업데이트하면 사용할 수 있습니다.' : codex ? '작업 중에도 같은 Codex 대화의 메시지 대기열로 전달합니다.' : !terminal ? '현재 터미널의 질문에 먼저 답변한 뒤 새 메시지를 보내주세요.' : !available ? '원본 터미널 입력 연결을 확인해주세요. 초안은 보관합니다.' : inputKeys().includes('submit') ? '같은 원본 터미널의 입력창에 메시지를 보냅니다.' : '이 원본 연결에서는 한 줄 메시지를 지원합니다.');
-  updateQueueControls();
+  text($('message-help'), !present ? '목록에서 메시지를 보낼 터미널을 선택해주세요.' : uncertain ? '전달 결과가 불확실합니다. 같은 내용을 다시 보내기 전에 원본 터미널의 접수를 확인해주세요.' : codex && !queueSupported ? '메시지 전송은 이 Mac을 AutoApprove 0.2.46 이상으로 업데이트하면 사용할 수 있습니다.' : codex && !chosenSupported ? '선택한 Codex 대화에 메시지를 보내려면 이 Mac을 AutoApprove 0.2.51 이상으로 업데이트해주세요.' : codex && chosenConversation ? `선택한 대화 ‘${chosenConversation.title}’의 메시지 대기열로 전달합니다.` : codex ? '작업 중에도 같은 Codex 대화의 메시지 대기열로 전달합니다.' : !terminal ? '현재 터미널의 질문에 먼저 답변한 뒤 새 메시지를 보내주세요.' : !available ? '원본 터미널 입력 연결을 확인해주세요. 초안은 보관합니다.' : inputKeys().includes('submit') ? '같은 원본 터미널의 입력창에 메시지를 보냅니다.' : '이 원본 연결에서는 한 줄 메시지를 지원합니다.');
+  updateQueueControls(); updateScreenSessionControls();
 }
 function openInteraction() {
   text($('message-status'),''); show($('message-error'),false);
@@ -1238,7 +1239,8 @@ async function submitMessage(event) {
   messageSending=true; updateInteractionControls(); show($('message-error'),false); text($('message-status'),'');
   try {
     if (item.session.agent==='codex') {
-      const result=await api(endpoint('/api/action',item.node.id), {action:'sendMessage', sessionID:item.session.id, text:value, requestID:uuid()});
+      const chosen = queueConversations.get(key);
+      const result=await api(endpoint('/api/action',item.node.id), {action:'sendMessage', sessionID:item.session.id, ...(chosen ? {threadID:chosen.id} : {}), text:value, requestID:uuid()});
       if(selectedKey===key)text($('message-status'),result.message || '메시지 대기열에 등록했습니다.');
     } else {
       if (inputKeys().includes('submit')) {
@@ -1258,10 +1260,10 @@ async function submitMessage(event) {
 }
 function renderTestScreenList() {
   const shares=nodes.flatMap(node=>(node.state?.screenShares || []).map(share=>({node,share})));
-  text($('screen-count'),shares.length || ''); text($('global-screens'),`공유 ${shares.length}`); show($('global-screens'),shares.length>0);
+  text($('screen-count'),shares.length || ''); text($('global-screens'),`화면 공유 ${shares.length}`); show($('global-screens'),shares.length>0); show($('screen-share-picker'),shares.length>1);
   const signature=JSON.stringify(shares.map(({node,share})=>[node.id,node.online,share])); if(signature===screenListSignature)return;
   screenListSignature=signature; $('test-screen-list').replaceChildren();
-  if(!shares.length)$('test-screen-list').append(make('p','muted','공유 중인 테스트 화면이 없습니다. 화면 공유를 시작하면 여기에 표시됩니다.'));
+  if(!shares.length)$('test-screen-list').append(make('p','muted','공유 중인 화면이 없습니다.'));
   for(const {node,share} of shares){const row=make('div','test-screen-row'),info=make('div');info.append(make('strong','',share.title),make('p','muted small',`${node.name} · ${share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · ${nowLabel(share.expiresAt)}까지`));const open=make('button','secondary','화면 보기');open.disabled=!node.online;open.addEventListener('click',()=>selectTestScreen(node,share));row.append(info,open);$('test-screen-list').append(row);}
   // The selected capture endpoint authoritatively reports expiry/revocation.
   // An inventory timeout must not close a still-authorized image viewer.
@@ -1269,7 +1271,7 @@ function renderTestScreenList() {
 async function openTestScreens(start = false, requested = null) {
   renderTestScreenList(); if (!$('test-screen-dialog').open) $('test-screen-dialog').showModal();
   screenStartNode = requested?.node || currentNode() || nodes.find(node => node.local && node.online) || nodes.find(node => node.online);
-  text($('test-screen-source'), screenStartNode ? `${screenStartNode.name} · Mac 전체 화면 · 10분 동안 공유` : '화면을 공유할 Mac에 연결해주세요.');
+  text($('test-screen-source'), screenStartNode ? `${screenStartNode.name} · Mac 전체 화면 · 보기 전용` : '화면을 공유할 Mac에 연결해주세요.');
   const shares = nodes.flatMap(node => (node.state?.screenShares || []).map(share => ({node,share}))).filter(item => item.node.online);
   const existing = requested || shares.find(item => item.node.id === screenStartNode?.id) || (!start ? shares[0] : null);
   show($('screen-start-error'),false); text($('screen-start-status'),'');
@@ -1335,7 +1337,7 @@ async function chooseQueueConversation() {
     if (result.sessionID !== item.session.id || !Array.isArray(result.items) || result.items.some(entry=>typeof entry.id!=='string'||typeof entry.title!=='string')) throw new Error('Codex 대화 목록을 확인하지 못했습니다.');
     $('queue-conversation').replaceChildren(new Option('연결할 대화를 선택해주세요.',''));
     for (const entry of result.items) { const option = new Option(`${entry.title || 'Codex 대화'} · ${entry.id}`,entry.id); option.dataset.title = entry.title || 'Codex 대화'; $('queue-conversation').append(option); }
-    show($('queue-conversation-picker'),result.items.length>0); text($('queue-status'),result.items.length ? '원본 Codex의 대화와 일치하는 항목을 선택해주세요. 선택한 대화의 대기 입력만 관리합니다.' : '이 작업 폴더에서 실행 중인 Codex 대화를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요.');
+    show($('queue-conversation-picker'),result.items.length>0); text($('queue-status'),result.items.length ? '원본 Codex의 대화와 일치하는 항목을 선택해주세요. 선택한 대화의 대기 입력을 관리하고 새 메시지를 보냅니다.' : '이 작업 폴더에서 실행 중인 Codex 대화를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요.');
   } catch (error) { if (generation === queueGeneration && selectedKey === key) { text($('queue-error'),error.message); show($('queue-error'),true); } }
   finally { if (generation === queueGeneration) { queueLoading = false; updateQueueControls(); } }
 }
@@ -1359,7 +1361,13 @@ async function clearCodexQueue() {
   }
 }
 function stopTestScreenRead(){clearTimeout(sharedScreenTimer);sharedScreenController?.abort();sharedScreenController=null;}
-function selectTestScreen(node,share){stopTestScreenRead();sharedScreen={node,share};$('test-screen-image').removeAttribute('src');$('test-screen-image').dataset.zoom='false';$('test-screen-zoom').setAttribute('aria-pressed','false');$('test-screen-zoom').setAttribute('aria-label','공유 화면 확대');$('test-screen-zoom').disabled=true;$('stop-test-screen').disabled=false;show($('test-screen-viewer'),true);show($('test-screen-error'),false);void readTestScreen();}
+function selectTestScreen(node,share){stopTestScreenRead();sharedScreen={node,share,sessionKey:selectedItem?.node.id===node.id&&['codex','claude'].includes(selectedItem.session.agent)?selectedKey:''};text($('test-screen-source'),`${node.name} · ${share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · 보기 전용`);$('test-screen-image').removeAttribute('src');$('test-screen-image').dataset.zoom='false';$('test-screen-zoom').setAttribute('aria-pressed','false');$('test-screen-zoom').setAttribute('aria-label','공유 화면 확대');$('test-screen-zoom').disabled=true;$('stop-test-screen').disabled=false;show($('test-screen-viewer'),true);show($('test-screen-error'),false);updateScreenSessionControls();void readTestScreen();}
+function updateScreenSessionControls(){
+  const key=sharedScreen?.sessionKey,item=key&&allSessions.find(item=>item.key===key);
+  const same=item&&selectedKey===key&&item.node.id===sharedScreen.node.id&&item.session.phase!=='ended';
+  show($('screen-message'),!!key);$('screen-message').disabled=!same||mutation||!(connected&&item.node.online||same&&originalStreamSelected());
+  text($('screen-session-label'),!key?'':!same?'공유를 연 세션이 종료되거나 선택이 바뀌었습니다.':'테스트 지시 · '+agents[item.session.agent]+' · '+item.view.title);
+}
 async function readTestScreen(){
   if(!sharedScreen||document.hidden||!$('test-screen-dialog').open)return;
   const current=sharedScreen,controller=new AbortController();sharedScreenController=controller;
@@ -1384,6 +1392,7 @@ $('message-form').addEventListener('submit',submitMessage);$('message-input').ad
 $('new-message').addEventListener('click',()=>{if(!selectedKey||messageSending)return;messageUncertain.delete(selectedKey);messageDrafts.delete(selectedKey);$('message-input').value='';show($('message-error'),false);text($('message-status'),'이전 전달 결과는 원본 터미널에서 확인해주세요.');updateInteractionControls();$('message-input').focus();});
 $('global-screens').addEventListener('click',()=>void openTestScreens());$('terminal-screens').addEventListener('click',()=>void openTestScreens(true));
 $('start-test-screen').addEventListener('click',()=>void startTestScreen());
+$('screen-message').addEventListener('click',()=>{updateScreenSessionControls();if($('screen-message').disabled)return;openInteraction();});
 $('refresh-queue').addEventListener('click',()=>void refreshCodexQueue());
 $('clear-queue').addEventListener('click',()=>{if($('clear-queue').disabled)return;show($('queue-confirm'),true);text($('confirm-clear-queue'),`${Math.min(100,queueSnapshot.items.length)}개 삭제`);text($('queue-status'),'현재 목록의 대기 입력을 삭제합니다. 삭제 후 복원할 수 없습니다. 새로 들어오는 입력은 유지합니다.');$('confirm-clear-queue').focus();});
 $('cancel-clear-queue').addEventListener('click',()=>{show($('queue-confirm'),false);text($('queue-status'),'삭제를 취소했습니다.');$('clear-queue').focus();});
