@@ -45,6 +45,28 @@ private final class RemoteReadProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testRemotePreferredPeerAddressKeepsSharedWiFiRoute() throws {
+        let wifi = RemoteLANInterface(name: "en0", address: "192.168.43.2", netmask: "255.255.255.0", kind: .wifi)
+        let ethernet = RemoteLANInterface(name: "en7", address: "10.2.3.4", netmask: "255.255.255.0", kind: .ethernet)
+        let bonjour = NWEndpoint.service(name: UUID().uuidString, type: RemoteNetworkService.serviceType, domain: "local.", interface: nil)
+        let wifiPeer = try RemoteNetworkAddress.endpoint("http://192.168.43.8:8765")
+        let ethernetPeer = try RemoteNetworkAddress.endpoint("http://10.2.3.8:8765")
+        let advertised = ["http://10.2.3.8:8765", "http://192.168.43.8:8765"]
+        let chosen = RemoteLAN.preferredEndpoint(bonjour, addresses: advertised, port: 8765, interfaces: [ethernet, wifi])
+        try expectEqual(chosen, wifiPeer, "An Ethernet-first advertisement must still use the shared Wi-Fi subnet")
+        let parameters = try RemoteLAN.tcpParameters(to: chosen, interfaces: [ethernet, wifi])
+        try expectEqual(parameters.requiredInterfaceType, .wifi)
+        try expectEqual(parameters.requiredLocalEndpoint, .hostPort(host: "192.168.43.2", port: .any))
+        try expectEqual(RemoteLAN.preferredEndpoint(bonjour, addresses: advertised, port: 8765, interfaces: [ethernet]), ethernetPeer)
+        try expectEqual(RemoteLAN.preferredEndpoint(bonjour, addresses: ["http://192.168.43.8:8765"], port: 8765, interfaces: [ethernet]), bonjour,
+                        "A cached address on a disconnected subnet cannot select that route")
+        let rejected = ["http://8.8.8.8:8765", "http://192.168.43.8:9999", "https://192.168.43.8:8765",
+                        "http://user@192.168.43.8:8765", "http://127.0.0.1:8765", "http://192.168.43.2:8765",
+                        "http://192.168.43.8:8765/path", "http://10.1.2.3:8765", "http://[fe80::123]:8765"]
+        try expectEqual(RemoteLAN.preferredEndpoint(bonjour, addresses: rejected, port: 8765, interfaces: [ethernet, wifi]), bonjour,
+                        "Only a peer's matching port on a connected physical IPv4 subnet is preferred")
+    }
+
     func testRemoteInputSerializesNativeApproval() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-input-order-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

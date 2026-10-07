@@ -33,7 +33,7 @@ const questionDeliveries = new Map(), questionEditing = new Map();
 let queueSnapshot = null, queueLoading = false, queueGeneration = 0, queueSessionKey = '';
 const queueConversations = new Map();
 let screenStarting = false, screenStartNode = null;
-let webFormSignature = '', screenListSignature = '', sharedScreen = null, sharedScreenTimer, sharedScreenController;
+let webFormSignature = '', screenListSignature = '', sharedScreen = null, sharedScreenTimer, sharedScreenController, sharedScreenFailures = 0;
 let messageSending = false, messageUncertain = new Set(), interactionLinkOpened = false;
 const keyFor = (node, session, view) => `${node.id}/${view?.ptyID ? 'pty:' + view.ptyID : session.id}`;
 let ptyClient = null;
@@ -315,8 +315,11 @@ async function api(path, body, signal) {
     if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status});
     return result;
   } catch (error) {
-    if (error.name === 'AbortError') throw new Error('연결 응답이 늦습니다. 입력을 다시 보내기 전에 터미널 화면을 확인해주세요.');
-    if (error instanceof TypeError) throw new Error('Mac과의 연결이 끊겼습니다. 같은 핫스팟과 Mac의 웹 접속 설정을 확인해주세요.');
+    if (error.name === 'AbortError') {
+      if (signal?.aborted) throw error;
+      throw Object.assign(new Error('연결 응답이 늦습니다. 입력을 다시 보내기 전에 터미널 화면을 확인해주세요.'), {retryable: !body});
+    }
+    if (error instanceof TypeError) throw Object.assign(new Error('Mac과의 연결이 끊겼습니다. 같은 핫스팟과 Mac의 웹 접속 설정을 확인해주세요.'), {retryable: !body});
     throw error;
   } finally { clearTimeout(timeout); signal?.removeEventListener('abort', abort); }
 }
@@ -1360,7 +1363,7 @@ async function clearCodexQueue() {
     }
   }
 }
-function stopTestScreenRead(){clearTimeout(sharedScreenTimer);sharedScreenController?.abort();sharedScreenController=null;}
+function stopTestScreenRead(){clearTimeout(sharedScreenTimer);sharedScreenController?.abort();sharedScreenController=null;sharedScreenFailures=0;}
 function selectTestScreen(node,share){stopTestScreenRead();sharedScreen={node,share,sessionKey:selectedItem?.node.id===node.id&&['codex','claude'].includes(selectedItem.session.agent)?selectedKey:''};text($('test-screen-source'),`${node.name} · ${share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · 보기 전용`);$('test-screen-image').removeAttribute('src');$('test-screen-image').dataset.zoom='false';$('test-screen-zoom').setAttribute('aria-pressed','false');$('test-screen-zoom').setAttribute('aria-label','공유 화면 확대');$('test-screen-zoom').disabled=true;$('stop-test-screen').disabled=false;show($('test-screen-viewer'),true);show($('test-screen-error'),false);updateScreenSessionControls();void readTestScreen();}
 function updateScreenSessionControls(){
   const key=sharedScreen?.sessionKey,item=key&&allSessions.find(item=>item.key===key);
@@ -1370,13 +1373,24 @@ function updateScreenSessionControls(){
 }
 async function readTestScreen(){
   if(!sharedScreen||document.hidden||!$('test-screen-dialog').open)return;
+  clearTimeout(sharedScreenTimer);if(sharedScreenController)return;
   const current=sharedScreen,controller=new AbortController();sharedScreenController=controller;
   try{const result=await api(endpoint('/api/test-screen',current.node.id)+`&share=${encodeURIComponent(current.share.id)}`,undefined,controller.signal);
     if(sharedScreen!==current||controller.signal.aborted)return;
     const image=result.image;if(result.shareID!==current.share.id||typeof image?.data!=='string'||image.data.length>1000000||!Number.isInteger(image.width)||!Number.isInteger(image.height)||image.width<1||image.height<1||image.width>2048||image.height>2048)throw new Error('공유 화면의 형식이나 크기를 확인하지 못했습니다.');
+    sharedScreenFailures=0;current.observedAt=result.observedAt;
     $('test-screen-image').width=image.width;$('test-screen-image').height=image.height;$('test-screen-image').src='data:image/jpeg;base64,'+image.data;text($('test-screen-status'),`${current.share.title} · ${nowLabel(result.observedAt)} 갱신 · 누르면 확대`);show($('test-screen-error'),false);show($('retry-test-screen'),false);
     sharedScreenTimer=setTimeout(readTestScreen,750);
-  }catch(error){if(error.name==='AbortError')return;text($('test-screen-error'),error.message);show($('test-screen-error'),true);show($('retry-test-screen'),error.status!==410);if(error.status===410){$('test-screen-image').removeAttribute('src');$('stop-test-screen').disabled=true;}}
+  }catch(error){
+    if(controller.signal.aborted||sharedScreen!==current||document.hidden||!$('test-screen-dialog').open||error.name==='AbortError')return;
+    const retry=error.retryable||[408,429,500,502,503,504].includes(error.status);
+    text($('test-screen-error'),retry?'Mac 화면 연결이 잠시 끊겼습니다. 자동으로 다시 연결하고 있습니다.':error.message);show($('test-screen-error'),true);show($('retry-test-screen'),error.status!==410);
+    if(retry){
+      text($('test-screen-status'),current.observedAt?`${current.share.title} · ${nowLabel(current.observedAt)} 마지막 화면 · 다시 연결 중…`:'Mac 화면에 다시 연결하고 있습니다…');
+      sharedScreenTimer=setTimeout(readTestScreen,Math.min(3000,500*2**Math.min(sharedScreenFailures++,3)));
+    }
+    if([403,410].includes(error.status)){$('test-screen-image').removeAttribute('src');$('test-screen-zoom').disabled=true;if(error.status===410)$('stop-test-screen').disabled=true;}
+  }
   finally{if(sharedScreenController===controller)sharedScreenController=null;}
 }
 

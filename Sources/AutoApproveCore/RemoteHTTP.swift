@@ -4,7 +4,8 @@ import Network
 public struct RemoteHTTPError: LocalizedError {
     public let status: Int
     public let message: String
-    public init(_ status: Int, _ message: String) { self.status = status; self.message = message }
+    public let diagnostics: [String: String]?
+    public init(_ status: Int, _ message: String, diagnostics: [String: String]? = nil) { self.status = status; self.message = message; self.diagnostics = diagnostics }
     public var errorDescription: String? { message }
 }
 
@@ -137,7 +138,9 @@ public struct RemoteHTTPResponse: Sendable {
     }
     public static func error(_ error: Error) -> Self {
         let status = (error as? RemoteHTTPError)?.status ?? 409
-        return (try? object(["error": error.localizedDescription], status: status)) ?? Self(status: 500, body: Data())
+        var value: JSONObject = ["error": error.localizedDescription]
+        if let diagnostics = (error as? RemoteHTTPError)?.diagnostics { value["diagnostics"] = diagnostics }
+        return (try? object(value, status: status)) ?? Self(status: 500, body: Data())
     }
     static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String) -> Self {
         var response = Self(body: Data(), contentType: "text/event-stream; charset=utf-8")
@@ -238,11 +241,23 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     }
     private func send(_ data: Data, final: Bool = false) {
         guard !closed else { return }; sending = true
-        connection.send(content: data, completion: .contentProcessed { [weak self] error in
+        if final, deadline == nil {
+            // SSE cancels the request deadline after its handshake. A final
+            // error must still release its slot if the peer never disconnects.
+            let deadline = DispatchWorkItem { [weak self] in self?.closeNow() }
+            self.deadline = deadline
+            queue.asyncAfter(deadline: .now() + 5, execute: deadline)
+        }
+        // Finish the HTTP write side with FIN, then let the reader disconnect.
+        // Cancelling immediately after contentProcessed can tear down the
+        // connection while a peer is still receiving a large response.
+        connection.send(content: data, contentContext: final ? .finalMessage : .defaultMessage,
+                        isComplete: true, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.queue.async {
                 guard !self.closed else { return }; self.sending = false
-                if error != nil || final { self.closeNow() } else { self.pumpStream() }
+                if error != nil { self.closeNow() }
+                else if !final { self.pumpStream() }
             }
         })
     }
@@ -286,6 +301,10 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private let timeout: TimeInterval
     private var buffer = Data()
     private var continuation: CheckedContinuation<RemoteHTTPResponse, Error>?
+    private var deadline: DispatchWorkItem?
+    private var cancelled = false
+    private var phase = "connecting"
+    private var responseLength: Int?
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
     init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) throws {
         connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
@@ -294,32 +313,50 @@ final class RemoteHTTPExchange: @unchecked Sendable {
         request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
     }
     func run() async throws -> RemoteHTTPResponse {
-        try await withCheckedThrowingContinuation { continuation in
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler(operation: {
+          try await withCheckedThrowingContinuation { continuation in
             queue.async {
+                guard !self.cancelled else { continuation.resume(throwing: CancellationError()); return }
                 self.continuation = continuation
                 self.connection.stateUpdateHandler = { state in
+                    self.phase = String(describing: state)
                     switch state {
                     case .ready:
                         self.connection.send(content: self.request, completion: .contentProcessed { error in
-                            if let error { self.finish(.failure(error)) } else { self.receive() }
+                            if let error { self.finish(.failure(error)) } else { self.phase = "waiting_headers"; self.receive() }
                         })
                     case .failed(let error): self.finish(.failure(error))
                     default: break
                     }
                 }
                 self.connection.start(queue: self.queue)
-                self.queue.asyncAfter(deadline: .now() + self.timeout) { self.finish(.failure(RemoteHTTPError(504, "Mac의 응답을 기다리다 시간이 지났습니다. 전송한 입력은 다시 보내지 말고 화면을 확인해주세요."))) }
+                let deadline = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.finish(.failure(RemoteHTTPError(504, "Mac의 응답을 기다리다 시간이 지났습니다. 전송한 입력은 다시 보내지 말고 화면을 확인해주세요.", diagnostics: [
+                        "phase": self.phase, "receivedBytes": String(self.buffer.count), "expectedBytes": self.responseLength.map(String.init) ?? "unknown",
+                        "endpoint": String(describing: self.connection.endpoint), "interfaces": self.connection.currentPath?.availableInterfaces.map(\.name).joined(separator: ",") ?? "unknown"
+                    ])))
+                }
+                self.deadline = deadline
+                self.queue.asyncAfter(deadline: .now() + self.timeout, execute: deadline)
             }
-        }
+          }
+        }, onCancel: {
+            self.queue.async { self.cancelled = true; self.finish(.failure(CancellationError())) }
+        })
     }
     private func receive() {
+        guard continuation != nil else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64_000) { data, _, ended, error in
             if let data { self.buffer.append(data) }
+            if !self.buffer.isEmpty { self.phase = "receiving" }
             if self.buffer.count > 4_000_000 { self.finish(.failure(RemoteHTTPError(502, "Mac의 응답이 너무 큽니다."))); return }
             if let boundary = self.buffer.range(of: Data("\r\n\r\n".utf8)),
                let head = String(data: self.buffer[..<boundary.lowerBound], encoding: .utf8) {
                 let lines = head.components(separatedBy: "\r\n")
                 let length = lines.first { $0.lowercased().hasPrefix("content-length:") }.flatMap { Int($0.dropFirst(15).trimmingCharacters(in: .whitespaces)) }
+                self.responseLength = length
                 let status = lines.first?.split(separator: " ").dropFirst().first.flatMap { Int($0) }
                 if let length, let status, length >= 0, length <= 4_000_000, self.buffer.count >= boundary.upperBound + length {
                     self.finish(.success(RemoteHTTPResponse(status: status, body: self.buffer.subdata(in: boundary.upperBound..<boundary.upperBound + length))))
@@ -333,6 +370,7 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     }
     private func finish(_ result: Result<RemoteHTTPResponse, Error>) {
         guard let continuation else { return }; self.continuation = nil
+        deadline?.cancel(); deadline = nil; buffer = Data()
         connection.stateUpdateHandler = nil; connection.cancel()
         continuation.resume(with: result)
     }

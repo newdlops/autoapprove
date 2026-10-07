@@ -141,6 +141,31 @@ try {
   assert.match(await optionalFile('inputs.txt'),/^submit:같은 Claude 터미널로 새 메시지\n$/);checks.push('Claude new message uses the existing original terminal input after its question is answered');
   await page.locator('#close-interaction').click();await page.locator('#terminal-screens').click();
   await page.waitForFunction(()=>$('test-screen-image').complete&&$('test-screen-image').naturalWidth===640);await capture('mobile-test-screen');assert.ok((await optionalFile('captures.txt')).length>0);
+  const previousScreen=await page.locator('#test-screen-image').getAttribute('src');
+  let failScreenReads=true,failedScreenReads=0;
+  await page.route('**/api/test-screen**',async route=>{
+    if(failScreenReads){failedScreenReads++;await route.fulfill({status:504,contentType:'application/json',body:JSON.stringify({error:'합성 중계 응답 시간 초과'})});}
+    else await route.continue();
+  });
+  await page.locator('#test-screen-error').waitFor({state:'visible'});
+  assert.match(await page.locator('#test-screen-status').textContent(),/마지막 화면.*다시 연결 중/);
+  assert.equal(await page.locator('#test-screen-image').getAttribute('src'),previousScreen,'A transient read failure keeps the last actual image');
+  for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
+    await page.setViewportSize({width,height});await capture(name+'-screen-reconnecting');
+  }
+  failScreenReads=false;
+  await page.waitForFunction(()=>$('test-screen-error').hidden&&$('test-screen-status').textContent.includes('갱신'));
+  assert.ok(failedScreenReads>0);assert.equal(await page.evaluate(()=>sharedScreen.share.id),share.id);
+  await page.unroute('**/api/test-screen**');await page.setViewportSize({width:390,height:844});
+  let releaseScreenRead,screenReadStarted;
+  const screenReadGate=new Promise(resolve=>releaseScreenRead=resolve),screenReadReady=new Promise(resolve=>screenReadStarted=resolve);
+  await page.route('**/api/test-screen**',async route=>{screenReadStarted();await screenReadGate;try{await route.continue();}catch{}});
+  await screenReadReady;await page.locator('#close-test-screen').click();releaseScreenRead();await page.waitForTimeout(300);
+  assert.equal(await page.locator('#test-screen-error').isVisible(),false);
+  assert.equal(await page.evaluate(()=>$('test-screen-error').textContent.includes('응답이 늦습니다')),false,'Closing a viewer is cancellation, not a timeout');
+  await page.unroute('**/api/test-screen**');await page.locator('#terminal-screens').click();
+  await page.waitForFunction(()=>$('test-screen-image').complete&&$('test-screen-image').naturalWidth===640);
+  checks.push('Transient screen relay failure retains the last image, labels it stale and automatically recovers; closing a pending read never reports a false timeout');
   await page.locator('#test-screen-zoom').focus();await page.keyboard.press('Enter');assert.equal(await page.locator('#test-screen-image').getAttribute('data-zoom'),'true');
   const beforeViewInput=await optionalFile('inputs.txt');await page.keyboard.press('ArrowUp');await page.keyboard.type('view only');assert.equal(await optionalFile('inputs.txt'),beforeViewInput);
   assert.match(await page.locator('#test-screen-source').textContent(),/보기 전용/);assert.equal(await page.locator('#screen-share-picker').isVisible(),false);

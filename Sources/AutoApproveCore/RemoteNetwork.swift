@@ -306,7 +306,7 @@ struct RemoteTerminalUpdate: Encodable {
     public func cancelLANUpdate() { updateReceiver.stop() }
     private func checkLANUpdate() {
         guard running, let peer = newerWebPeers().first(where: { verified($0) }), let release = peer.release else { return }
-        updateReceiver.check(endpoint: peer.endpoint, nodeID: peer.id, release: release)
+        updateReceiver.check(endpoint: connectionEndpoint(peer), nodeID: peer.id, release: release)
     }
     private func emitStatus() { status.peerCount = peers.values.filter(\.available).count; onStatus(status) }
     private func serviceTXT(portal: Bool) -> NWTXTRecord {
@@ -316,6 +316,18 @@ struct RemoteTerminalUpdate: Encodable {
     }
     private func verified(_ peer: Peer) -> Bool {
         peer.available && peer.release?.isCompatible == true && peer.webVerifiedAt.map { Date().timeIntervalSince($0) < 150 } == true
+    }
+    private func connectionEndpoint(_ peer: Peer) -> NWEndpoint {
+        let manual = manualPeers.first(where: { $0.id == peer.id }).flatMap { try? RemoteNetworkAddress.endpoint($0.address) }
+        let fallback: NWEndpoint
+        // A rediscovered numeric endpoint may have a new port after restart.
+        // Use a saved address only when Bonjour would otherwise resolve again.
+        if case .service = peer.endpoint { fallback = manual ?? peer.endpoint }
+        else { fallback = peer.endpoint }
+        // Gateway/version freshness is independent of a confirmed LAN route.
+        // Each request still checks the exact node ID at its destination.
+        guard let port = peer.webPort else { return fallback }
+        return RemoteLAN.preferredEndpoint(fallback, addresses: peer.webURLs, port: port, interfaces: RemoteLAN.interfaces())
     }
     private func acceptWebMetadata(_ found: RemotePeerDiscovery.Found) {
         guard peers[found.id] != nil else { return }
@@ -336,7 +348,8 @@ struct RemoteTerminalUpdate: Encodable {
                 guard self.running, self.generation == epoch, !Task.isCancelled else { return }
                 let found = await withTaskGroup(of: RemotePeerDiscovery.Found?.self, returning: [RemotePeerDiscovery.Found].self) { group in
                     for peer in candidates[offset..<min(offset + 8, candidates.count)] {
-                        group.addTask { await RemotePeerDiscovery.probe(peer.endpoint, expectedID: peer.id) }
+                        let endpoint = self.connectionEndpoint(peer)
+                        group.addTask { await RemotePeerDiscovery.probe(endpoint, expectedID: peer.id) }
                     }
                     var result: [RemotePeerDiscovery.Found] = []
                     for await value in group { if let value { result.append(value) } }
@@ -380,7 +393,7 @@ struct RemoteTerminalUpdate: Encodable {
         // Never redirect API requests. Recheck only a bounded number of newer web
         // providers; an offline or reassigned IP must still leave this page usable.
         for peer in newerWebPeers().prefix(4) {
-            let found = await RemotePeerDiscovery.probe(peer.endpoint, expectedID: peer.id)
+            let found = await RemotePeerDiscovery.probe(connectionEndpoint(peer), expectedID: peer.id)
             guard running, generation == epoch else { return nil }
             guard peers[peer.id]?.endpoint == peer.endpoint else { continue }
             if let found {
@@ -503,7 +516,7 @@ struct RemoteTerminalUpdate: Encodable {
     }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data()) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
-        return try await RemoteHTTPExchange(endpoint: peer.endpoint, path: path, method: method, body: body, expectedNodeID: peer.id).run()
+        return try await RemoteHTTPExchange(endpoint: connectionEndpoint(peer), path: path, method: method, body: body, expectedNodeID: peer.id).run()
     }
     public func dashboard() async throws -> RemoteDashboard {
         let own = try localState()
@@ -532,10 +545,16 @@ struct RemoteTerminalUpdate: Encodable {
         }
         for node in other {
             guard peers[node.id] != nil else { continue }
+            guard node.online, let state = node.state else {
+                // A single failed read must not erase the last confirmed LAN
+                // addresses and send the next request back through Bonjour.
+                peers[node.id]?.webVerifiedAt = nil
+                continue
+            }
             let confirmed = peers[node.id]?.release == node.state?.release && peers[node.id]?.webVerifiedAt != nil
-            peers[node.id]?.release = node.state?.release?.isCompatible == true ? node.state?.release : nil
-            peers[node.id]?.webURLs = node.state?.webURLs ?? []
-            peers[node.id]?.webPort = node.state?.webPort
+            peers[node.id]?.release = state.release?.isCompatible == true ? state.release : nil
+            peers[node.id]?.webURLs = state.webURLs ?? []
+            peers[node.id]?.webPort = state.webPort
             peers[node.id]?.webVerifiedAt = node.online && confirmed ? Date() : nil
         }
         updateNamedAddresses(); emitStatus()
@@ -687,7 +706,7 @@ struct RemoteTerminalUpdate: Encodable {
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let epoch = generation
-        let output = try RemotePTYPeerBodyStream(endpoint: peer.endpoint, path: forwardedPath(request), expectedNodeID: peer.id)
+        let output = try RemotePTYPeerBodyStream(endpoint: connectionEndpoint(peer), path: forwardedPath(request), expectedNodeID: peer.id)
         do {
             try await output.open()
             guard running, generation == epoch, !Task.isCancelled else { throw RemoteHTTPError(503, "웹 접속이 꺼졌습니다.") }

@@ -109,6 +109,30 @@ try {
   const sent = await request(first, `/api/input?node=${second.id}`, input); assert.equal(sent.status, 200);
   const replay = await request(first, `/api/input?node=${second.id}`, input); assert.deepEqual(replay, sent);
   const after = await request(first, route); assert.equal(after.data.screen.split(input.text).length - 1, 1);
+  const delayedID = randomUUID();
+  let delayedURL, readStarted, peerClosed;
+  const startedRead = new Promise(resolve => { readStarted = resolve; });
+  const closedRead = new Promise(resolve => { peerClosed = resolve; });
+  const delayed = createServer((req, res) => {
+    if (new URL(req.url, 'http://localhost').pathname === '/api/test-screen') {
+      req.socket.once('close', peerClosed); readStarted(); return;
+    }
+    const body = JSON.stringify(req.url === '/api/discovery'
+      ? {service:'autoapprove',version:1,id:delayedID,name:'Cancellation fixture',release:firstState.release,urls:[delayedURL],port:new URL(delayedURL).port*1}
+      : {...firstState,id:delayedID,name:'Cancellation fixture',webURLs:[delayedURL],webPort:new URL(delayedURL).port*1});
+    res.writeHead(200, {'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),Connection:'close'}); res.end(body);
+  });
+  await new Promise(resolve => delayed.listen(0, '127.0.0.1', resolve)); probeServers.push(delayed);
+  delayedURL = 'http://127.0.0.1:' + delayed.address().port;
+  assert.equal((await request(first, '/api/peers', {address:delayedURL})).status,200);
+  const controller = new AbortController();
+  const pendingRead = fetch(first.url+'/api/test-screen?'+new URLSearchParams({node:delayedID,share:randomUUID()}),{signal:controller.signal}).catch(()=>null);
+  await Promise.race([startedRead,wait(5000).then(()=>{throw Error('Delayed peer did not receive its request');})]);
+  const cancelAt = performance.now(); controller.abort(); await pendingRead;
+  await Promise.race([closedRead,wait(2000).then(()=>{throw Error('Cancelled browser retained its peer connection');})]);
+  assert.ok(performance.now()-cancelAt<2000,'Cancelled reads must release the peer socket before its 15-second timeout');
+  assert.equal((await request(first,'/api/state')).status,200);
+  console.log('PASS: closing a pending browser read immediately cancels its peer connection');
   for (let index = 0; index < 70; index++) assert.equal((await request(first, '/api/state')).status, 200, 'Repeated polling must not exhaust the listener');
   const denied = await request(first, '/api/action', { action: 'pause', paused: true, requestID: randomUUID() }, { Origin: 'https://unrelated.example' }); assert.equal(denied.status, 403);
   const publicAddress = await request(first, '/api/peers', { address: 'http://8.8.8.8:8765' }); assert.equal(publicAddress.status, 400);

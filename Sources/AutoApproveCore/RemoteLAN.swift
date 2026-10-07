@@ -81,6 +81,21 @@ public enum RemoteLAN {
         parameters.prohibitedInterfaceTypes = [.other, .cellular]
         return parameters
     }
+    /// Use a verified peer's published physical address before resolving Bonjour
+    /// again. A service can advertise both Ethernet and Wi-Fi (and IPv6), while
+    /// only one of those networks is shared with the requesting Mac.
+    public static func preferredEndpoint(_ fallback: NWEndpoint, addresses: [String], port: UInt16,
+                                         interfaces: [RemoteLANInterface]) -> NWEndpoint {
+        let candidates = addresses.enumerated().compactMap { index, address -> (NWEndpoint, Int, Int)? in
+            guard let endpoint = try? RemoteNetworkAddress.endpoint(address),
+                  case .hostPort(let host, let publishedPort) = endpoint, publishedPort.rawValue == port,
+                  let ip = ipv4(String(describing: host)), ip >> 24 != 127,
+                  !interfaces.contains(where: { $0.address == String(describing: host) }),
+                  let source = route(to: String(describing: host), interfaces: interfaces) else { return nil }
+            return (endpoint, source.kind == .wifi ? 0 : 1, index)
+        }
+        return candidates.min { ($0.1, $0.2) < ($1.1, $1.2) }?.0 ?? fallback
+    }
     public static func tcpParameters(to endpoint: NWEndpoint, interfaces: [RemoteLANInterface]) throws -> NWParameters {
         let parameters = tcpParameters()
         guard case .hostPort(let host, _) = endpoint else { return parameters }
