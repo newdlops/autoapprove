@@ -75,9 +75,10 @@ public enum PromptDetector {
     }
     static func permissionMarkers(_ agent: AgentKind) -> [String] {
         agent == .codex
-            ? ["Would you like to run the following command?", "Would you like to make the following edits?", "Approve app tool call?", "Allow "]
+            ? ["Would you like to run the following command?", "Would you like to make the following edits?", codexTerminalInputMarker, "Approve app tool call?", "Allow "]
             : ["Do you want to proceed?", "Do you want to make this edit", "Do you want to create", "Do you want to allow"]
     }
+    private static let codexTerminalInputMarker = "Would you like to send input to terminal "
     private static let codexHeadings = permissionMarkers(.codex).map { (marker: $0, compact: $0.filter { !$0.isWhitespace }) }
     private static let claudeHeadings = permissionMarkers(.claude).map { (marker: $0, compact: $0.filter { !$0.isWhitespace }) }
     /// Join only a complete, contiguous heading prefix. This accepts word/character wrapping
@@ -101,6 +102,16 @@ public enum PromptDetector {
                         candidate += line.filter { !$0.isWhitespace }
                     }
                     if candidate.hasPrefix(expected) {
+                        if marker == codexTerminalInputMarker {
+                            // The terminal ID and closing question mark must be present. Either
+                            // can wrap, but an incomplete title or unrelated question cannot match.
+                            let terminal = String(candidate.dropFirst(expected.count))
+                            if terminal.range(of: #"^[0-9]+\?$"#, options: .regularExpression) != nil {
+                                return (index, row, marker)
+                            }
+                            guard terminal.allSatisfy({ $0 >= "0" && $0 <= "9" }) else { break }
+                            continue
+                        }
                         // `Allow ` is a word prefix, not `Allowing` or another question.
                         if marker == "Allow ", !lines[index].hasPrefix("Allow "), lines[index] != "Allow" { break }
                         return (index, row, marker)

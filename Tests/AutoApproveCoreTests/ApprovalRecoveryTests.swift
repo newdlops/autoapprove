@@ -102,6 +102,31 @@ extension ApprovalTests {
         try expectEqual(probe.inputs.count, 3, "Reflow of an answered request cannot send again")
     }
 
+    func testCodexTerminalInputApprovalIsolatedAndSingleUse() async throws {
+        let probe = ApprovalRecoveryProbe()
+        let (engine, sessions, directory) = try recoveryEngine(probe, agents: [.codex, .codex])
+        defer { probe.release(); engine.stop(); try? FileManager.default.removeItem(at: directory) }
+        probe.blockedTTY = sessions[0].tty
+        let first = codexTerminalInputPermissionFixture
+        let second = first.replacingOccurrences(of: "75522?", with: "85523?")
+        let wrapped = first.replacingOccurrences(of: "terminal 75522?", with: "terminal\n75522?")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: first, generation: "first-process")
+        try await waitForRecovery({ probe.inputs.count == 1 }, "The terminal input permission must enter the approval adapter")
+        engine.receiveScreen(sessionID: sessions[1].id, raw: second, generation: "second-process")
+        try await waitForRecovery({ probe.inputs.count == 2 }, "Another session's terminal input request cannot be blocked")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: wrapped, generation: "first-process")
+        probe.release()
+        try await waitForRecovery({ engine.snapshot.events.filter { $0.outcome == "승인 입력 전달" }.count == 2 }, "Both exact requests must complete")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: "Earlier output\n" + wrapped, generation: "first-process")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expectEqual(probe.inputs.count, 2, "Reflow and polling cannot repeat approval")
+        let next = first.replacingOccurrences(of: #"\u{4}"#, with: "fixture text")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: next, generation: "first-process")
+        try await waitForRecovery({ probe.inputs.count == 3 }, "Different input to the same terminal is a new request")
+        try expectEqual(probe.inputs.filter { $0.0.tty == sessions[0].tty }.map { $0.1 }, [first, next])
+        try expectEqual(probe.inputs.filter { $0.0.tty == sessions[1].tty }.map { $0.1 }, [second])
+    }
+
     func testPermissionDetectionAcrossTerminalGridSizes() throws {
         func wrapWords(_ text: String, width: Int) -> String {
             var rows = [String](), row = ""

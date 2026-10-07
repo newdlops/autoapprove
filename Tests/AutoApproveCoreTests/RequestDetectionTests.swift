@@ -5,6 +5,21 @@ import AutoApproveCore
 private let permissionFixture = "Would you like to run the following command?\n\n  $ echo 한글\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nEnter to confirm or esc to cancel"
 private let claudePermissionFixture = "Bash command\n  echo 한글\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel"
 private let questionFixture = "어떤 환경을 사용할까요?\n❯ 1. 개발 환경\n  2. 테스트 환경\nEnter to select · Esc to cancel"
+let codexTerminalInputPermissionFixture = #"""
+Would you like to send input to terminal 75522?
+
+Environment: local
+
+Reason: Send input to an existing terminal. This terminal was launched outside the sandbox, bypassing any managed network proxy. The cwd is its launch directory; the terminal’s
+current directory and state may have changed.
+
+Input: “\u{4}”
+
+› 1. Yes, proceed (y)
+2. No, and tell Codex what to do differently (esc)
+
+Press enter to confirm or esc to cancel
+"""#
 private let reportedCodexPermissionFixture = """
 Would you like to run the following command?
 
@@ -72,6 +87,87 @@ private let claudeCreatePermissionFixture = """
 """
 
 extension ApprovalTests {
+    func testCodexTerminalInputEscapesSurviveScreenAndDelivery() throws {
+        for payload in [#"\u{4}"#, #"\u0004"#, #"\x04"#, #"\u{1b}[31m"#, #"\n\t"#] {
+            let original = codexTerminalInputPermissionFixture.replacingOccurrences(of: #"\u{4}"#, with: payload)
+            let context = JSContext()!
+            context.setObject(original, forKeyedSubscript: "current" as NSString)
+            context.evaluateScript("""
+            var writes = [];
+            const tab = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex']};
+            function Application() { return {running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
+            """)
+            let encoded = context.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture"]))!.toString()!
+            try expectNil(context.exception)
+            let screen = try JSONDecoder().decode(TerminalSnapshot.self, from: Data(encoded.utf8)).screens[0].contents
+            try expect(screen.utf8.elementsEqual(original.utf8), "Screen JSON must preserve each literal escape byte")
+            let prompt = PromptDetector.detect(screen, agent: .codex)!
+            try expect(prompt.summary.contains("Input: “" + payload + "”"))
+            try expectEqual(prompt.dialog, original)
+            let script = try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: screen, agent: .codex)
+            try expectEqual(context.evaluateScript(script)?.toString(), "sent", "Swift JSON and JXA must not decode literal escapes")
+            try expectNil(context.exception)
+            try expectEqual(context.evaluateScript("writes.join(',')")?.toString(), "1", "Only the approval choice is written")
+            context.setObject(original.replacingOccurrences(of: payload, with: "\u{4}"), forKeyedSubscript: "current" as NSString)
+            try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged", "A control character is different from its printed escape")
+            try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
+            for columns in [80, 240] {
+                let grid = try OriginalTerminalScreen.render(ansi: "\u{1B}[33m" + original.replacingOccurrences(of: "\n", with: "\r\n") + "\u{1B}[0m", columns: columns, rows: 60, tty: "/dev/fixture")
+                try expect(grid.contents.contains("Input: “" + payload + "”"), "ANSI cell rendering must keep printed escapes")
+                try expectEqual(PromptDetector.detect(grid.contents, agent: .codex)?.answer, "1")
+            }
+        }
+    }
+
+    func testCodexTerminalInputPermissionAndWrapping() throws {
+        let original = codexTerminalInputPermissionFixture
+        let identity = PromptDetector.detect(original, agent: .codex)?.requestIdentity
+        try expectNotNil(identity, "The reported terminal input permission must be recognized")
+        let heading = "Would you like to send input to terminal 75522?"
+        let variants = [original, "Earlier output\n" + original,
+            original.replacingOccurrences(of: heading, with: "Would you like to send input\nto terminal 75522?"),
+            original.replacingOccurrences(of: heading, with: "Would you like to send input to term\ninal 75522?"),
+            original.replacingOccurrences(of: heading, with: "Would you like to send input to terminal\n755\n22?"),
+            original.replacingOccurrences(of: heading, with: "Would you like to send input to terminal 75522\n?"),
+            original.replacingOccurrences(of: "Yes, proceed (y)", with: "Yes, proceed\n     (y)")
+                .replacingOccurrences(of: "what to do differently (esc)", with: "what to do\n   differently (esc)")
+                .replacingOccurrences(of: "Press enter to confirm or esc to cancel", with: "Press enter to\nconfirm or esc to cancel")]
+        for frame in variants {
+            let prompt = PromptDetector.detect(frame, agent: .codex)
+            try expectEqual(prompt?.answer, "1", frame)
+            try expectEqual(prompt?.requestIdentity, identity, "Wrapping and earlier output must not replay the request")
+            try expectEqual(prompt?.dialog, frame.hasPrefix("Earlier output") ? original : frame, "Delivery retains the exact dialog")
+            try expectEqual(PromptDetector.detect(frame.replacingOccurrences(of: "\n", with: "\r\n"), agent: .codex)?.dialog, prompt?.dialog)
+        }
+        try expectNil(PromptDetector.detect(original, agent: .shell))
+        try expectNil(PromptDetector.detect(original, agent: .claude))
+    }
+
+    func testCodexTerminalInputPermissionBoundsAndIdentity() throws {
+        let original = codexTerminalInputPermissionFixture
+        let heading = "Would you like to send input to terminal 75522?"
+        for invalid in ["Would you like to send input to terminal ?", "Would you like to send input to terminal 75522",
+                        "Would you like to send input to terminal …?", "Would you like to send input to terminal abc?",
+                        "Would you like to send input to terminal 75522? then deploy?",
+                        "Would you like to send input to terminal\n\n75522?"] {
+            try expectNil(PromptDetector.detect(original.replacingOccurrences(of: heading, with: invalid), agent: .codex))
+        }
+        let selectedNo = original.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "\n2. No", with: "\n› 2. No")
+        try expectNil(PromptDetector.detect(selectedNo, agent: .codex))
+        try expectEqual(QuestionDetector.detect(selectedNo, agent: .codex)?.phase, .approval)
+        try expectNil(PromptDetector.detect(original.replacingOccurrences(of: "Press enter to confirm or esc to cancel", with: ""), agent: .codex))
+        for history in [original + "\nWorking…", original + "\n› Another input", "```\n" + original + "\n```", original.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n")] {
+            try expectNil(PromptDetector.detect(history, agent: .codex))
+        }
+        let identity = PromptDetector.detect(original, agent: .codex)!.requestIdentity
+        for changed in [original.replacingOccurrences(of: "75522?", with: "75523?"),
+                        original.replacingOccurrences(of: #"\u{4}"#, with: #"\u{3}"#),
+                        original.replacingOccurrences(of: "Environment: local", with: "Environment: remote"),
+                        original.replacingOccurrences(of: "may have changed", with: "has changed")] {
+            try expect(PromptDetector.detect(changed, agent: .codex)?.requestIdentity != identity, "Terminal, payload, environment and reason identify the request")
+        }
+    }
+
     func testWrappedLabelTextMayLookLikeACursorOrAnOption() throws {
         let wrappedCommand = "start with `/usr/bin/time -p /bin/ps -axo pid=,tty=\n     > /private/tmp/process-timing.txt` (p)"
         let arrow = wrappedRedirectFixture.replacingOccurrences(of: wrappedCommand, with: "start with `node -e 'live.filter(x=\n     >x.automatic)'` (p)")
@@ -210,6 +306,18 @@ extension ApprovalTests {
         try check("Changed history\n" + permissionFixture.decomposedStringWithCanonicalMapping + "\n\n", expected: "Old history\n" + permissionFixture, delivery: "sent", writes: 1)
         try check(reportedCodexPermissionFixture, expected: reportedCodexPermissionFixture, delivery: "sent", writes: 1)
         try check(wrappedRedirectFixture, expected: wrappedRedirectFixture, delivery: "sent", writes: 1)
+        let terminalInput = codexTerminalInputPermissionFixture
+        let wrappedTerminalInput = terminalInput.replacingOccurrences(of: "terminal 75522?", with: "terminal\n75522?")
+        for screen in [terminalInput, wrappedTerminalInput] {
+            try check("Earlier output\n" + screen, expected: screen, delivery: "sent", writes: 1)
+            for changed in [screen.replacingOccurrences(of: "75522?", with: "75523?"),
+                            screen.replacingOccurrences(of: #"\u{4}"#, with: #"\u{3}"#),
+                            screen.replacingOccurrences(of: "Environment: local", with: "Environment: remote"),
+                            screen.replacingOccurrences(of: "may have changed", with: "has changed"),
+                            screen.replacingOccurrences(of: "› 1.", with: "  1."), screen + "\nWorking…"] {
+                try check(changed, expected: screen, delivery: "screenChanged", writes: 0)
+            }
+        }
         try check(claudeBashPermissionFixture, expected: claudeBashPermissionFixture, agent: .claude, processes: ["claude"], delivery: "sent", writes: 1)
         let toolPermission = "Allow preview?\nTool: preview\n› 1. Allow                   Run the tool and continue.\n  2. Allow for this session  Run the tool and remember this choice for this session.\n  3. Always allow            Run the tool and remember this choice for future tool calls.\n  4. Cancel                  Cancel this tool call\nEnter to submit or esc to cancel"
         try check(toolPermission, expected: toolPermission, delivery: "sent", writes: 1)

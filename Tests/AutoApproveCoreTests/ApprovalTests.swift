@@ -406,6 +406,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Codex terminal input permission: literal escapes survive screen JSON, cells and delivery", tests.testCodexTerminalInputEscapesSurviveScreenAndDelivery),
+            ("Codex terminal input permission: complete title, wrapping and literal payload", tests.testCodexTerminalInputPermissionAndWrapping),
+            ("Codex terminal input permission: inactive, incomplete and changed requests", tests.testCodexTerminalInputPermissionBoundsAndIdentity),
+            ("Codex terminal input permission: concurrent isolation and single use", tests.testCodexTerminalInputApprovalIsolatedAndSingleUse),
             ("Codex selected conversation: explicit message, stale target rejection and original preservation", tests.testExplicitCodexConversationMessagePreservesOriginalAndRejectsStaleTarget),
             ("LAN updates: reject wrong peer, downgrade, architecture and oversize", tests.testLANUpdateRejectsWrongPeerDowngradeArchitectureAndOversize),
             ("LAN updates: reject unsafe ZIP paths, links, duplicates and bombs", tests.testLANUpdateArchiveRejectsTraversalLinksDuplicatesAndBombs),
