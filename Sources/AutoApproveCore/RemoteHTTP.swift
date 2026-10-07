@@ -299,6 +299,7 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private let connection: NWConnection
     private let request: Data
     private let timeout: TimeInterval
+    private let retryRead: Bool
     private var buffer = Data()
     private var continuation: CheckedContinuation<RemoteHTTPResponse, Error>?
     private var deadline: DispatchWorkItem?
@@ -306,13 +307,28 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private var phase = "connecting"
     private var responseLength: Int?
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
-    init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) throws {
-        connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
-        self.timeout = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
+    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) throws {
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
-        request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
+        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
+        let duration = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
+        let retryRead = method == "GET" && body.isEmpty
+        try self.init(endpoint: endpoint, request: request, timeout: retryRead ? duration / 2 : duration, retryRead: retryRead)
+    }
+    private init(endpoint: NWEndpoint, request: Data, timeout: TimeInterval, retryRead: Bool) throws {
+        connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
+        self.request = request; self.timeout = timeout; self.retryRead = retryRead
     }
     func run() async throws -> RemoteHTTPResponse {
+        do { return try await runOnce() }
+        catch let error as RemoteHTTPError where retryRead && error.status == 504 {
+            try Task.checkCancellation()
+            // Retry only an empty-body GET, once, within the original time
+            // budget. Keep the exact path and node header. POST is never replayed.
+            return try await RemoteHTTPExchange(endpoint: connection.endpoint, request: request,
+                                                timeout: timeout, retryRead: false).runOnce()
+        }
+    }
+    private func runOnce() async throws -> RemoteHTTPResponse {
         try Task.checkCancellation()
         return try await withTaskCancellationHandler(operation: {
           try await withCheckedThrowingContinuation { continuation in

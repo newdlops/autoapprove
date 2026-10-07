@@ -133,6 +133,31 @@ try {
   assert.ok(performance.now()-cancelAt<2000,'Cancelled reads must release the peer socket before its 15-second timeout');
   assert.equal((await request(first,'/api/state')).status,200);
   console.log('PASS: closing a pending browser read immediately cancels its peer connection');
+  const retryID = randomUUID(); let retryURL, readAttempts=0, writeAttempts=0, firstReadClosed=false;
+  const retryPeer = createServer((req,res) => {
+    const pathname=new URL(req.url,'http://localhost').pathname;
+    if(pathname==='/api/test-screen') {
+      readAttempts++;
+      if(readAttempts===1){req.socket.once('close',()=>{firstReadClosed=true;});return;}
+      const body=JSON.stringify({recovered:true});
+      res.writeHead(200,{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),Connection:'close'});res.end(body);return;
+    }
+    if(pathname==='/api/input'){writeAttempts++;req.socket.destroy();return;}
+    const body=JSON.stringify(pathname==='/api/discovery'
+      ?{service:'autoapprove',version:1,id:retryID,name:'Read retry fixture',release:firstState.release,urls:[retryURL],port:new URL(retryURL).port*1}
+      :{...firstState,id:retryID,name:'Read retry fixture',webURLs:[retryURL],webPort:new URL(retryURL).port*1});
+    res.writeHead(200,{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),Connection:'close'});res.end(body);
+  });
+  await new Promise(resolve=>retryPeer.listen(0,'127.0.0.1',resolve));probeServers.push(retryPeer);
+  retryURL='http://127.0.0.1:'+retryPeer.address().port;
+  assert.equal((await request(first,'/api/peers',{address:retryURL})).status,200);
+  const readAt=performance.now(), recovered=await request(first,'/api/test-screen?'+new URLSearchParams({node:retryID,share:randomUUID()}));
+  assert.equal(recovered.status,200);assert.equal(recovered.data.recovered,true);assert.equal(readAttempts,2);
+  assert.ok(firstReadClosed,'The stalled socket must close before the replacement read completes');
+  assert.ok(performance.now()-readAt<14000,'The retry must stay within the original 15-second budget');
+  const uncertain=await request(first,'/api/input?node='+retryID,{...input,requestID:randomUUID()});
+  assert.ok([409,502,504].includes(uncertain.status));assert.equal(writeAttempts,1,'An uncertain input must never be replayed');
+  console.log('PASS: a stalled GET recovers on one fresh connection within its original budget; uncertain POST input is sent once');
   for (let index = 0; index < 70; index++) assert.equal((await request(first, '/api/state')).status, 200, 'Repeated polling must not exhaust the listener');
   const denied = await request(first, '/api/action', { action: 'pause', paused: true, requestID: randomUUID() }, { Origin: 'https://unrelated.example' }); assert.equal(denied.status, 403);
   const publicAddress = await request(first, '/api/peers', { address: 'http://8.8.8.8:8765' }); assert.equal(publicAddress.status, 400);
