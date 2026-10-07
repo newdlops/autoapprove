@@ -9,6 +9,7 @@ import AutoApproveCore
     init() {
         do {
             let engine = try ApprovalEngine()
+            engine.finishLANUpdate = { NSApp.terminate(nil) }
             engine.upgradeClaudeHooks(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path)
             try engine.start(webByDefault: true)
             self.engine = engine; self.error = nil

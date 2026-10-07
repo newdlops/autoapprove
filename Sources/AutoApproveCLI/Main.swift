@@ -16,6 +16,9 @@ import AutoApproveCore
         let command = arguments.first ?? "help"
         do {
             switch command {
+            case "lan-update-install":
+                guard arguments.count == 2 else { throw AppError.message("업데이트 작업 파일을 지정해주세요.") }
+                try await LANUpdateInstallation.install(jobFile: URL(fileURLWithPath: arguments[1]))
             case "mcp":
                 await Task.detached { AutoApproveMCPServer.run(paths: paths) }.value
             case "scan":

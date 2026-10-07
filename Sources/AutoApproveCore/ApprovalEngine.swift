@@ -6,6 +6,8 @@ import TerminalInputSupport
     @Published public private(set) var snapshot: EngineSnapshot
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
+    @Published public private(set) var lanUpdate = LANUpdateStatus()
+    public var finishLANUpdate: @MainActor () -> Void = {}
     public private(set) var webService: RemoteNetworkService?
     public let managedPTY: ManagedPTYManager
     public let webQuestions = WebQuestionInbox()
@@ -245,6 +247,8 @@ import TerminalInputSupport
             sessionOrder = ids.filter { seen.insert($0).inserted }
         }
         snapshot = EngineSnapshot(sessions: [], events: store.recent(), paused: store.value("paused") == "true", health: ConnectionHealth())
+        lanUpdate.enabled = store.value("lanUpdateEnabled") != "false"
+        if !lanUpdate.enabled { lanUpdate.phase = "off"; lanUpdate.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다." }
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
         keepAwakeEnabled = store.value("keepAwake") == "true"
         snapshot.keepAwake = keepAwakeEnabled ? KeepAwakeStatus(phase: .checking, detail: Self.keepAwakeChecking, enabled: true, ruleFile: powerControl.ruleFile())
@@ -364,6 +368,26 @@ import TerminalInputSupport
             testScreens.stopAll()
             webService?.stop(); webService = nil
         }
+    }
+
+    public func setLANUpdateEnabled(_ enabled: Bool) throws {
+        try store.set("lanUpdateEnabled", enabled ? "true" : "false")
+        var value = LANUpdateStatus(); value.enabled = enabled
+        if !enabled { value.phase = "off"; value.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다."; webService?.cancelLANUpdate() }
+        lanUpdate = value
+    }
+    func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
+    var lanUpdateWaitReason: String? {
+        if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
+        if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||
+            !sendingMessages.isEmpty || !replyingQuestions.isEmpty || !clearingCodexQueues.isEmpty ||
+            !remoteInputReplies.isEmpty || automaticQuestionReplies.values.contains(where: { $0.sending }) ||
+            remoteInputUntil.values.contains(where: { $0 > Date() }) {
+            return "입력 전송이 끝난 뒤 업데이트합니다."
+        }
+        if !webQuestions.pending().isEmpty || !testScreens.active.isEmpty { return "웹 질문과 화면 공유가 끝난 뒤 업데이트합니다." }
+        if powerControl.read().lidClosed { return "덮개를 열면 업데이트합니다. 닫힌 동안에는 연결을 유지합니다." }
+        return nil
     }
 
     public func remoteSessionViews() -> [RemoteSessionView] {

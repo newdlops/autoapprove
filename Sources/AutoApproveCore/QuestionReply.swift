@@ -48,7 +48,7 @@ public struct CodexReplyTransport: Sendable {
     public static func selectedQueueTarget(_ session: AgentSession, threadID: String = "") async throws -> CodexReplyTarget {
         try await Task.detached(priority: .utility) {
             guard threadID.isEmpty || UUID(uuidString: threadID) != nil,
-                  try ProcessDiscovery.read().contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
+                  let record = try ProcessDiscovery.read().first(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw RemoteHTTPError(409, "Codex 실행이나 대화 선택을 다시 확인해주세요.")
             }
             let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
@@ -62,12 +62,15 @@ public struct CodexReplyTransport: Sendable {
                       (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else { continue }
                 homes.insert(url.deletingLastPathComponent().resolvingSymlinksInPath().path)
             }
+            if homes.isEmpty {
+                let launchHome = ProcessEnvironment.read(record)?["CODEX_HOME"]
+                let hints = [launchHome, FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path].compactMap { $0 }
+                if let connected = CodexServerLocation.connectedHome(pid: session.pid, hints: hints) { homes.insert(connected) }
+            }
             guard homes.count == 1, let home = homes.first else { throw RemoteHTTPError(409, "이 Codex 실행의 로컬 서버 위치를 확인하지 못했습니다.") }
-            var buffer = [CChar](repeating: 0, count: 4096)
-            guard proc_pidpath(session.pid, &buffer, UInt32(buffer.count)) > 0 else { throw AppError.message("Codex 실행 파일을 찾지 못했습니다.") }
-            let executable = String(cString: buffer)
-            guard URL(fileURLWithPath: executable).lastPathComponent == "codex", FileManager.default.isExecutableFile(atPath: executable) else { throw AppError.message("Codex 실행을 확인하지 못했습니다.") }
-            return CodexReplyTarget(executable: executable, home: home, threadID: threadID)
+            // A CLI upgrade may unlink the executable of a still-running session.
+            // The original process and its own user-owned server files remain authoritative.
+            return CodexReplyTarget(executable: "", home: home, threadID: threadID)
         }.value
     }
     public static func messageTarget(_ session: AgentSession) async throws -> CodexReplyTarget {
@@ -78,13 +81,7 @@ public struct CodexReplyTransport: Sendable {
             }
             let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
             let location = try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[session.pid] ?? [])
-            var buffer = [CChar](repeating: 0, count: 4096)
-            guard proc_pidpath(session.pid, &buffer, UInt32(buffer.count)) > 0 else { throw AppError.message("Codex 실행 파일을 찾지 못했습니다.") }
-            let executable = String(cString: buffer)
-            guard URL(fileURLWithPath: executable).lastPathComponent == "codex", FileManager.default.isExecutableFile(atPath: executable) else {
-                throw AppError.message("Codex 메시지 대기열을 확인하지 못했습니다.")
-            }
-            return CodexReplyTarget(executable: executable, home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: location.threadID)
+            return CodexReplyTarget(executable: "", home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: location.threadID)
         }.value
     }
     public static let live = CodexReplyTransport(prepare: { session, question in
@@ -106,28 +103,14 @@ public struct CodexReplyTransport: Sendable {
             } else if current.hasLaterUserMessage == true {
                 automaticReplyUnavailableReason = "질문 이후 사용자 메시지가 있어 자동 응답을 멈췄습니다. 이미 답했는지 확인해주세요."
             } else { automaticReplyUnavailableReason = nil }
-            var buffer = [CChar](repeating: 0, count: 4096)
-            guard proc_pidpath(session.pid, &buffer, UInt32(buffer.count)) > 0 else {
-                throw AppError.message("이 세션의 Codex 실행 파일을 찾지 못했습니다. 터미널에서 답해주세요.")
-            }
-            let executable = String(cString: buffer)
-            guard URL(fileURLWithPath: executable).lastPathComponent == "codex",
-                  FileManager.default.isExecutableFile(atPath: executable) else {
-                throw AppError.message("Codex 응답 경로를 확인하지 못했습니다. 터미널에서 답해주세요.")
-            }
-            return CodexReplyTarget(executable: executable,
+            return CodexReplyTarget(executable: "",
                 home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: question.threadID,
                 automaticReplyUnavailableReason: automaticReplyUnavailableReason)
         }.value
     }, send: { target, message in
-        try await Task.detached(priority: .utility) {
-            // Arguments are passed directly, never through a shell. Queue only the
-            // answer; leave the running turn and terminal composer alone.
-            let result = try CommandRunner.run(target.executable,
-                ["queue", "--thread", target.threadID, "--message", message], timeout: 12,
-                environment: ["CODEX_HOME": target.home])
-            return try receipt(output: result.output, status: result.status, threadID: target.threadID)
-        }.value
+        // Use the existing daemon directly. Never start a CLI/daemon or touch the
+        // terminal composer, and never resend after an ambiguous acknowledgement.
+        try await CodexQueueTransport.enqueue(target, message: message)
     }, queueHome: { try await selectedQueueTarget($0) }, prepareQueue: { try await selectedQueueTarget($0, threadID: $1) })
 
     public static func message(question: QueuedQuestion, answer: String) throws -> String {

@@ -77,6 +77,19 @@ struct RemoteAccessSettings: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("VPN을 사용해도 Wi-Fi·유선 LAN 주소로 연결합니다. Zscaler에서 로컬 통신을 차단하면 관리자에게 핫스팟 내 접속 허용을 요청해야 합니다.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Divider().padding(.vertical, 4)
+            Toggle("같은 네트워크에서 자동 업데이트", isOn: Binding(get: { engine.lanUpdate.enabled }, set: {
+                do { try engine.setLANUpdateEnabled($0); error = nil } catch { self.error = error.localizedDescription }
+            })).toggleStyle(.switch)
+                .help("최신 Mac이 제공하는 같은 게시자의 서명된 설치 파일을 받아 이 앱을 업데이트합니다. 휴대폰 설치는 필요 없습니다.")
+            Text(engine.lanUpdate.detail).font(.callout).textSelection(.enabled)
+                .foregroundStyle(engine.lanUpdate.phase == "failed" ? .red : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let progress = engine.lanUpdate.progress {
+                ProgressView(value: Double(progress), total: 100).accessibilityLabel("업데이트 다운로드 \(progress)%")
+            }
+            Text("웹 접속을 켠 동안 최신 Mac에서 받습니다. 원본 Codex·Claude 세션은 유지합니다. 별도 PTY·입력 전송·화면 공유가 진행 중이거나 덮개가 닫혀 있으면 적용을 기다립니다. 구버전에는 이 기능을 한 번 설치해야 이후부터 자동으로 업데이트됩니다.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let error { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.red) }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }

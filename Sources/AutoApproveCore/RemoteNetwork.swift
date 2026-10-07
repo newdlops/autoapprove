@@ -43,6 +43,7 @@ public struct RemoteNodeState: Codable {
     public var webPort: UInt16? = nil
     public var questionForms: [WebQuestionRequest]? = nil
     public var screenShares: [TestScreenShare]? = nil
+    public var update: LANUpdateStatus? = nil
 }
 
 public struct RemoteNodeView: Codable {
@@ -108,6 +109,8 @@ struct RemoteTerminalUpdate: Encodable {
     public let webVersion: RemoteWebVersion?
     public var directDiscoveryInterval: TimeInterval = 45
     private weak var engine: ApprovalEngine?
+    private let updateArchive: LANUpdateArchive
+    private let updateReceiver: LANUpdateReceiver
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
@@ -157,6 +160,8 @@ struct RemoteTerminalUpdate: Encodable {
     private var manualPeers: [ManualPeer] = []
     public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
+        updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
+        updateReceiver = LANUpdateReceiver(engine: engine)
         self.bonjourEnabled = bonjourEnabled
         self.discoveryAddresses = discoveryAddresses ?? RemotePeerDiscovery.addresses
         self.name = name ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
@@ -280,11 +285,13 @@ struct RemoteTerminalUpdate: Encodable {
             while !Task.isCancelled {
                 guard let self, self.running, self.generation == epoch else { return }
                 await self.discoverDirectPeers(epoch: epoch)
+                self.checkLANUpdate()
                 do { try await Task.sleep(for: .seconds(max(1, self.directDiscoveryInterval))) } catch { return }
             }
         }
     }
     public func stop() {
+        updateReceiver.stop()
         running = false; generation = UUID()
         discoveryTask?.cancel(); discoveryTask = nil
         webPeerTask?.cancel(); webPeerTask = nil
@@ -295,6 +302,11 @@ struct RemoteTerminalUpdate: Encodable {
         peers = peers.filter { $0.value.manual }
         for id in Array(peers.keys) { peers[id]?.portal = false; peers[id]?.webVerifiedAt = nil }
         status = RemoteNetworkStatus(); emitStatus()
+    }
+    public func cancelLANUpdate() { updateReceiver.stop() }
+    private func checkLANUpdate() {
+        guard running, let peer = newerWebPeers().first(where: { verified($0) }), let release = peer.release else { return }
+        updateReceiver.check(endpoint: peer.endpoint, nodeID: peer.id, release: release)
     }
     private func emitStatus() { status.peerCount = peers.values.filter(\.available).count; onStatus(status) }
     private func serviceTXT(portal: Bool) -> NWTXTRecord {
@@ -487,7 +499,7 @@ struct RemoteTerminalUpdate: Encodable {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
         return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
             release: webVersion, webURLs: port.map(Self.addresses), webPort: port,
-            questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active)
+            questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate)
     }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data()) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
@@ -552,6 +564,12 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/vendor/xterm.css": return try asset("vendor/xterm.css", type: "text/css; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
                 case "/api/state": return try .json(localState())
+                case "/api/update/manifest":
+                    let (manifest, _) = try await updateArchive.offer()
+                    return try .json(manifest)
+                case "/api/update/chunk":
+                    guard let hash = request.parameter("sha256"), let value = request.parameter("offset"), let offset = Int(value) else { throw RemoteHTTPError(400, "업데이트 파일과 위치를 지정해주세요.") }
+                    return RemoteHTTPResponse(body: try await updateArchive.chunk(hash: hash, offset: offset), contentType: "application/zip")
                 case "/api/discovery":
                     var object: JSONObject = ["service": "autoapprove", "version": 1, "id": nodeID, "name": name, "urls": port.map(Self.addresses) ?? [], "port": Int(port ?? 0), "portal": namedAccess?.ownsPortal == true]
                     if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }

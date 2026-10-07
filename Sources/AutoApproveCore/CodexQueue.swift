@@ -32,8 +32,28 @@ public struct CodexQueueDeletion: Sendable {
 }
 
 /// The existing daemon owns this queue. Never edit its database, resume a thread,
-/// start a daemon or interrupt a turn to inspect/delete pending follow-up inputs.
+/// start a daemon or interrupt a turn to manage pending follow-up inputs.
 public struct CodexQueueTransport: Sendable {
+    public static func enqueue(_ target: CodexReplyTarget, message: String) async throws -> String {
+        try await Task.detached(priority: .utility) {
+            guard UUID(uuidString: target.threadID) != nil, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  message.utf8.count <= 65_536, !message.contains("\0") else {
+                throw AppError.message("Codex 대화와 메시지를 다시 확인해주세요.")
+            }
+            let connection = try CodexQueueConnection(home: target.home)
+            let clientID = UUID().uuidString
+            let result = try connection.request("thread/queue/add", ["threadId": target.threadID,
+                "clientUserMessageId": clientID, "input": [["type": "text", "text": message]]])
+            guard let submission = result["queuedSubmission"] as? JSONObject,
+                  let id = submission["id"] as? String, UUID(uuidString: id) != nil,
+                  let receiptID = submission["clientUserMessageId"] as? String, UUID(uuidString: receiptID) == UUID(uuidString: clientID),
+                  let input = submission["input"] as? [JSONObject], input.count == 1,
+                  input[0]["type"] as? String == "text", input[0]["text"] as? String == message else {
+                throw AppError.message("Codex의 접수 결과를 확인하지 못했습니다. 중복 전송을 피하려면 메시지 대기열을 확인해주세요.")
+            }
+            return id
+        }.value
+    }
     public var list: @Sendable (CodexReplyTarget) async throws -> [CodexQueuedInput]
     public var delete: @Sendable (CodexReplyTarget, [String]) async throws -> CodexQueueDeletion
     public var conversations: @Sendable (CodexReplyTarget, String) async throws -> [CodexQueueConversation]
@@ -170,7 +190,7 @@ private final class CodexQueueConnection {
             let accept = Data(Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))).base64EncodedString()
             guard lines.first?.split(separator: " ").dropFirst().first == "101", headers["upgrade"]?.lowercased() == "websocket",
                   headers["sec-websocket-accept"] == accept else { throw AppError.message("Codex 대기열 서버의 연결 형식을 지원하지 않습니다.") }
-            _ = try request("initialize", ["clientInfo": ["name": "autoapprove", "version": "0.2.52"], "capabilities": ["experimentalApi": true]])
+            _ = try request("initialize", ["clientInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.53"], "capabilities": ["experimentalApi": true]])
             try send(["method": "initialized"])
         } catch { Darwin.close(fd); fd = -1; throw error }
     }
@@ -181,12 +201,12 @@ private final class CodexQueueConnection {
         while true {
             guard let object = try JSONSerialization.jsonObject(with: message()) as? JSONObject else { throw AppError.message("Codex 응답을 읽지 못했습니다.") }
             if let incoming = object["id"], object["method"] != nil {
-                // This read/delete client cannot answer permission or user questions.
+                // Unrelated permission requests must stay with the original client.
                 try send(["id": incoming, "error": ["code": -32601, "message": "Unsupported request"]]); continue
             }
             guard object["id"] as? Int == id else { continue }
             if let error = object["error"] as? JSONObject {
-                if error["code"] as? Int == -32601 { throw AppError.message("이 Codex 버전은 대기열 조회·삭제를 지원하지 않습니다. Codex를 업데이트해주세요.") }
+                if error["code"] as? Int == -32601 { throw AppError.message("이 Codex 버전은 대기열 제어를 지원하지 않습니다. Codex를 업데이트해주세요.") }
                 throw AppError.message("Codex 대기열 요청에 실패했습니다. 목록을 다시 확인해주세요. (\(error["code"] as? Int ?? 0))")
             }
             guard let result = object["result"] as? JSONObject else { throw AppError.message("Codex 대기열 응답을 확인하지 못했습니다.") }
@@ -199,7 +219,10 @@ private final class CodexQueueConnection {
         var data = Data([0x80 | opcode])
         if payload.count < 126 { data.append(0x80 | UInt8(payload.count)) }
         else if payload.count <= 65_535 { data.append(0x80 | 126); data.append(UInt8(payload.count >> 8)); data.append(UInt8(payload.count & 255)) }
-        else { throw AppError.message("Codex 대기열 요청이 너무 큽니다.") }
+        else if payload.count <= 256_000 {
+            data.append(0x80 | 127)
+            for shift in stride(from: 56, through: 0, by: -8) { data.append(UInt8((UInt64(payload.count) >> shift) & 255)) }
+        } else { throw AppError.message("Codex 대기열 요청이 너무 큽니다.") }
         data.append(contentsOf: mask); data.append(contentsOf: payload.enumerated().map { $0.element ^ mask[$0.offset % 4] })
         try write(data)
     }

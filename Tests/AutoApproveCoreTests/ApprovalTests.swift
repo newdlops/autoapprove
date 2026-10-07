@@ -407,6 +407,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
             ("Codex selected conversation: explicit message, stale target rejection and original preservation", tests.testExplicitCodexConversationMessagePreservesOriginalAndRejectsStaleTarget),
+            ("LAN updates: reject wrong peer, downgrade, architecture and oversize", tests.testLANUpdateRejectsWrongPeerDowngradeArchitectureAndOversize),
+            ("LAN updates: reject unsafe ZIP paths, links, duplicates and bombs", tests.testLANUpdateArchiveRejectsTraversalLinksDuplicatesAndBombs),
+            ("LAN updates: preference persists across engine restart", tests.testLANUpdatePreferenceSurvivesEngineRestart),
             ("Codex queue: snapshot deletion preserves new inputs, consumed inputs and original session", tests.testCodexQueueSnapshotDeletionPreservesNewAndConsumedInputs),
             ("Codex queue: partial deletion, audit and exited-process rejection", tests.testCodexQueuePartialFailureKeepsUndeletedInputsAndAudit),
             ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),
