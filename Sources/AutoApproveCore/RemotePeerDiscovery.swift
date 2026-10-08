@@ -25,11 +25,11 @@ enum RemotePeerDiscovery {
     static func find(_ address: String) async -> Found? {
         guard !Task.isCancelled, let endpoint = try? RemoteNetworkAddress.endpoint(address) else { return nil }
         do {
-            let response = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/discovery", method: "GET", body: Data(), timeout: 0.8).run()
+            let response = try await RemoteDiscoveryTraffic.shared.get(endpoint, path: "/api/discovery", timeout: 0.8)
             if response.status == 200, let peer = decode(response.body, address: address) { return peer }
             // Older AutoApprove clients expose their identity through /api/state.
             if response.status == 404 && !Task.isCancelled {
-                let legacy = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/state", method: "GET", body: Data(), timeout: 1).run()
+                let legacy = try await RemoteDiscoveryTraffic.shared.get(endpoint, path: "/api/state", timeout: 1)
                 let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
                 guard legacy.status == 200, let state = try? decoder.decode(RemoteNodeState.self, from: legacy.body), UUID(uuidString: state.id) != nil else { return nil }
                 return Found(id: state.id, name: String(state.name.prefix(100)), address: address,
@@ -41,7 +41,15 @@ enum RemotePeerDiscovery {
 
     static func probe(_ endpoint: NWEndpoint, expectedID: String, address: String = "") async -> Found? {
         do {
-            let response = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/discovery", method: "GET", body: Data(), expectedNodeID: expectedID, timeout: 1).run()
+            let response = try await RemoteDiscoveryTraffic.shared.get(endpoint, path: "/api/discovery", expectedID: expectedID)
+            if response.status == 404 {
+                let legacy = try await RemoteDiscoveryTraffic.shared.get(endpoint, path: "/api/state", expectedID: expectedID)
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+                if legacy.status == 200, let state = try? decoder.decode(RemoteNodeState.self, from: legacy.body), state.id == expectedID {
+                    return Found(id: state.id, name: String(state.name.prefix(100)), address: address, release: state.release, urls: state.webURLs ?? [], port: state.webPort)
+                }
+                return nil
+            }
             guard response.status == 200, let peer = decode(response.body, address: address), peer.id == expectedID else { return nil }
             return peer
         } catch { return nil }
@@ -73,7 +81,10 @@ extension RemoteNetworkAddress {
         let boundedMask = originalMask | 0xffffff00
         let network = host & boundedMask, broadcast = network | ~boundedMask
         guard broadcast > network + 1 else { return [] }
-        return (network + 1..<broadcast).filter { $0 != host }.map { value in
+        return (network + 1..<broadcast).filter { $0 != host }.sorted {
+            let first = abs(Int64($0) - Int64(host)), second = abs(Int64($1) - Int64(host))
+            return (first, $0) < (second, $1)
+        }.map { value in
             "http://\((value >> 24) & 255).\((value >> 16) & 255).\((value >> 8) & 255).\(value & 255):8765"
         }
     }

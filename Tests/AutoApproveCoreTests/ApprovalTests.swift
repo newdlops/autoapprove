@@ -430,6 +430,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Approval recovery: real terminal cells across widths and clipped heights", tests.testPermissionDetectionAcrossTerminalGridSizes),
             ("LAN HTTP bounds, origin checks and private addresses", tests.testRemoteHTTPBoundsOriginAndPrivateAddresses),
             ("Verified peer addresses keep the shared Wi-Fi route", tests.testRemotePreferredPeerAddressKeepsSharedWiFiRoute),
+            ("Discovery: passive neighbor cache filtering and nearby address order", tests.testDiscoveryNeighborHintsAndNearbyOrder),
             ("Remote terminal coalesces reads, expires cache and omits unchanged output", tests.testRemoteTerminalCoalescingExpiryAndConditionalPayload),
             ("Live relay accepts changing output with automation on and binds the exact target", tests.testRemoteRelayWithAutomaticApprovalAndChangedOutput),
             ("Native approval writes serialize with live user input", tests.testRemoteInputSerializesNativeApproval),

@@ -307,11 +307,11 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private var phase = "connecting"
     private var responseLength: Int?
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
-    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil) throws {
+    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, retryReads: Bool = true) throws {
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
         let duration = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
-        let retryRead = method == "GET" && body.isEmpty
+        let retryRead = retryReads && method == "GET" && body.isEmpty
         try self.init(endpoint: endpoint, request: request, timeout: retryRead ? duration / 2 : duration, retryRead: retryRead)
     }
     private init(endpoint: NWEndpoint, request: Data, timeout: TimeInterval, retryRead: Bool) throws {

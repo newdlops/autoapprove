@@ -71,6 +71,26 @@ public enum RemoteLAN {
     public static func ordered(_ interfaces: [RemoteLANInterface]) -> [RemoteLANInterface] {
         interfaces.sorted { ($0.kind == .wifi ? 0 : 1, $0.name, $0.address) < ($1.kind == .wifi ? 0 : 1, $1.name, $1.address) }
     }
+    /// Read the existing OS neighbor cache only. -n prevents DNS lookups; no ping or ARP mutation.
+    public static func neighborURLs() -> [String] {
+        guard let result = try? CommandRunner.run("/usr/sbin/arp", ["-an"], timeout: 1), result.status == 0 else { return [] }
+        return neighborURLs(from: result.output, interfaces: interfaces())
+    }
+    public static func neighborURLs(from text: String, interfaces: [RemoteLANInterface]) -> [String] {
+        let regex = try! NSRegularExpression(pattern: #"\(([0-9.]+)\) at ([0-9a-fA-F:]+) on (en[0-9]+)\b"#)
+        var result: [(Int, String)] = [], seen = Set<String>()
+        for line in text.components(separatedBy: .newlines).prefix(2048) {
+            let value = line as NSString
+            guard let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: value.length)) else { continue }
+            let address = value.substring(with: match.range(at: 1)), hardware = value.substring(with: match.range(at: 2)), name = value.substring(with: match.range(at: 3))
+            guard hardware != "ff:ff:ff:ff:ff:ff", !interfaces.contains(where: { $0.address == address }),
+                  let source = route(to: address, interfaces: interfaces), source.name == name,
+                  let host = ipv4(address), let local = ipv4(source.address), let mask = source.mask,
+                  host > (local & mask), host < ((local & mask) | ~mask), seen.insert(address).inserted else { continue }
+            result.append((source.kind == .wifi ? 0 : 1, "http://\(address):8765"))
+        }
+        return result.sorted { $0.0 < $1.0 }.prefix(64).map(\.1)
+    }
     public static func route(to address: String, interfaces: [RemoteLANInterface]) -> RemoteLANInterface? {
         guard let host = ipv4(address) else { return nil }
         return ordered(interfaces).filter { $0.contains(host) }.max { ($0.mask ?? 0) < ($1.mask ?? 0) }

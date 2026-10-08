@@ -94,7 +94,12 @@ private final class PreviewScreens: @unchecked Sendable {
         let info: JSONObject = ["id": nodeID, "name": "QA Mac \(label) · 검증용", "url": "http://127.0.0.1:\(port)",
                                 "namedURL": status.urls.first(where: { URL(string: $0)?.host?.hasPrefix("autoapprove-") == true }) ?? ""]
         print(String(decoding: try JSONSerialization.data(withJSONObject: info), as: UTF8.self)); fflush(stdout)
-        while !Task.isCancelled { try await Task.sleep(nanoseconds: 1_000_000_000) }
+        while !Task.isCancelled {
+            if CommandLine.arguments.contains("--trace-routes"), let value = Mirror(reflecting: web).children.first(where: { $0.label == "peers" })?.value {
+                try? String(describing: value).write(to: directory.appendingPathComponent("route-trace.txt"), atomically: true, encoding: .utf8)
+            }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
         web.stop(); engine.stop()
     }
 }

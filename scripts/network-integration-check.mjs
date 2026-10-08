@@ -1,5 +1,5 @@
 import { coreLinkArguments } from './swift-core-link.mjs';
-import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -20,7 +20,7 @@ const directOnly = process.argv.includes('--direct-only');
 // release when testing the mirror UI, so selection never starts a real CLI.
 const mirrorOnly = process.argv.includes('--mirror-only');
 async function start(label) {
-  const child = spawn(binary, [path.join(root, label), label, ...(directOnly ? ['--direct-only'] : []), ...(mirrorOnly ? ['--web-version=0.2.40:46'] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }); children.push(child);
+  const child = spawn(binary, [path.join(root, label), label, '--trace-routes', ...(directOnly ? ['--direct-only'] : []), ...(mirrorOnly ? ['--web-version=0.2.40:46'] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }); children.push(child);
   let buffer = '', errors = '';
   child.stderr.on('data', data => { errors += data; });
   return await new Promise((resolve, reject) => {
@@ -63,23 +63,33 @@ try {
     assert.equal(named.id, node.id, 'A Mac-specific Bonjour name must resolve to the exact instance/port');
   }
   assert.equal(firstState.sessions.length, 6); assert.equal(secondState.sessions.length, 6);
-  const html = await fetch(first.url); assert.equal(html.status, 200); assert.ok((await html.text()).includes('터미널 화면'));
+  const html = await fetch(first.url,{redirect:'manual'}); assert.ok([200,302].includes(html.status)); if(html.status===200)assert.ok((await html.text()).includes('터미널 화면'));else assert.ok(html.headers.get('location'));
   assert.match(html.headers.get('content-security-policy'), /frame-ancestors 'none'/);
   for (const [gateway, peer] of [[first, second], [second, first]]) {
-    const page = await fetch(gateway.url);
-    assert.equal(page.status, 200, 'Every client must publish its own web page');
+    const page = await fetch(gateway.url,{redirect:'manual'});
+    assert.ok([200,302].includes(page.status), 'Every client must publish its own page or the verified newer gateway');
     let discovered = false;
     for (let attempt = 0; attempt < (directOnly ? 180 : 15); attempt++) {
       const result = await request(gateway, '/api/network');
       if ([gateway.id, peer.id].every(id => result.data.nodes.some(node => node.id === id && node.online))) { discovered = true; break; }
       await wait(300);
     }
+    if(!discovered) {
+      const label=gateway.id===first.id?'A':'B',trace=await readFile(path.join(root,label,'route-trace.txt'),'utf8').catch(()=> '');
+      await mkdir('.runtime/discovery-debug',{recursive:true,mode:0o700});
+      await writeFile('.runtime/discovery-debug/failure.json',JSON.stringify({stage:'initial',gateway:{id:gateway.id,url:gateway.url},peer:{id:peer.id,url:peer.url},trace},null,2));
+    }
     assert.equal(discovered, true, 'Every client must automatically discover its peer and serve the complete list');
   }
   console.log(`PASS: ${directOnly ? 'Bonjour disabled, direct HTTP discovery' : 'Bonjour'} — both clients publish pages and discover the same Mac list without manual registration`);
   if (directOnly) {
     for (const gateway of [first, second]) {
-      const result = await request(gateway, '/api/network');
+      let result;
+      for(let attempt=0;attempt<30;attempt++) {
+        result=await request(gateway,'/api/network');
+        if(result.data.nodes.some(node=>node.id===legacyID&&node.online))break;
+        await wait(100);
+      }
       assert.ok(result.data.nodes.some(node => node.id === legacyID && node.online), 'An old client without /api/discovery must still be found');
       assert.ok(!result.data.nodes.some(node => node.id === foreignID), 'An unrelated HTTP service must not enter the client list');
     }
@@ -196,6 +206,11 @@ try {
         }
       }
       await wait(300); // Bonjour advertisement and endpoint resolution settle asynchronously.
+    }
+    if(!restoredPeer?.online) {
+      const trace=await readFile(path.join(root,'A/route-trace.txt'),'utf8').catch(()=> '');
+      await mkdir('.runtime/discovery-debug',{recursive:true,mode:0o700});
+      await writeFile('.runtime/discovery-debug/failure.json',JSON.stringify({second:{id:second.id,url:second.url},restored:{id:restored.id,url:restored.url},trace},null,2));
     }
     assert.ok(restoredPeer?.online, 'Restarted Mac must be rediscovered: ' + (restoredPeer?.error || 'missing peer'));
     assert.equal(durable?.status, 200, 'Stored receipt must return after rediscovery: ' + JSON.stringify(durable?.data));
