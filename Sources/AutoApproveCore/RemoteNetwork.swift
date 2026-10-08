@@ -118,10 +118,15 @@ struct RemoteTerminalUpdate: Encodable {
     private var webPeerTask: Task<Void, Never>?
     private var lanInterfaces: [RemoteLANInterface] = []
     private let bonjourEnabled: Bool
+    private let advertisement: RemoteServiceAdvertising
     private let discoveryAddresses: () -> [String]
     private var namedAccess: RemoteNamedAccess?
     private var updatingNamedAccess = false
     private var publishedPortal = false
+    private var listenerRetry: Task<Void, Never>?
+    private var listenerRetryDelay: Double = 1
+    private var listenerPort: UInt16 = 8765
+    private var allowListenerPortFallback = false
     public var port: UInt16? { listener?.port?.rawValue }
     private let queue = DispatchQueue(label: "autoapprove.web.listener")
     private var connections: [UUID: RemoteHTTPConnection] = [:]
@@ -158,11 +163,12 @@ struct RemoteTerminalUpdate: Encodable {
     private let manualURL: URL
     private struct ManualPeer: Codable { var id: String; var name: String; var address: String }
     private var manualPeers: [ManualPeer] = []
-    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
+    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
         updateReceiver = LANUpdateReceiver(engine: engine)
         self.bonjourEnabled = bonjourEnabled
+        self.advertisement = advertisement ?? RemoteServiceAdvertisement()
         self.discoveryAddresses = discoveryAddresses ?? RemotePeerDiscovery.addresses
         self.name = name ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         self.webVersion = webVersion?.isCompatible == true ? webVersion : nil
@@ -184,16 +190,21 @@ struct RemoteTerminalUpdate: Encodable {
         lanInterfaces = RemoteLAN.interfaces(refresh: true)
         let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
         let epoch = UUID(); generation = epoch; running = true; self.listener = listener
+        listenerPort = port; allowListenerPortFallback = allowPortFallback; listenerRetryDelay = 1
         publishedPortal = false
-        if bonjourEnabled {
-            listener.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: serviceTXT(portal: false))
-        }
+        configureListener(listener, port: port, epoch: epoch)
+        status.enabled = true; status.detail = "웹 접속과 같은 네트워크의 Mac을 연결하고 있습니다."
+        listener.start(queue: queue)
+        startDiscovery(parameters: parameters, epoch: epoch)
+    }
+
+    private func configureListener(_ listener: NWListener, port: UInt16, epoch: UUID) {
         // Keep NWListener's lifetime accept budget unlimited. Concurrent requests are
         // bounded by connections.count below. Streams use only 12 of the 32
         // slots, leaving room for input, state, assets and normal API requests.
-        listener.newConnectionHandler = { [weak self] connection in
+        listener.newConnectionHandler = { [weak self, weak listener] connection in
             Task { @MainActor in
-                guard let self, self.running, self.generation == epoch, self.connections.count < 32,
+                guard let self, let listener, self.listener === listener, self.running, self.generation == epoch, self.connections.count < 32,
                       case .hostPort(let host, _) = connection.endpoint,
                       RemoteNetworkAddress.isLocalHost(String(describing: host)) else { connection.cancel(); return }
                 let id = UUID()
@@ -213,34 +224,63 @@ struct RemoteTerminalUpdate: Encodable {
         }
         listener.stateUpdateHandler = { [weak self, weak listener] state in
             Task { @MainActor in
-                guard let self, self.running, self.generation == epoch else { return }
+                guard let self, let listener, self.running, self.generation == epoch, self.listener === listener else { return }
                 switch state {
                 case .ready:
                     self.status.ready = true; self.status.detail = "같은 네트워크의 휴대폰과 Mac에서 접속할 수 있습니다."
-                    self.status.port = listener?.port?.rawValue ?? port
+                    self.status.port = listener.port?.rawValue ?? port
+                    self.listenerPort = self.status.port ?? port
+                    self.listenerRetry?.cancel(); self.listenerRetry = nil; self.listenerRetryDelay = 1
+                    self.publishService(port: self.listenerPort)
                     self.updateNamedAddresses()
                 case .waiting(let error), .failed(let error):
-                    if allowPortFallback, port != 0, case .posix(let code) = error,
+                    if self.allowListenerPortFallback, port != 0, case .posix(let code) = error,
                        code == .EADDRINUSE || code == .EINVAL {
-                        // Let Network.framework allocate the fallback port atomically.
-                        self.stop()
-                        do { try self.start(port: 0) }
-                        catch {
-                            self.status.enabled = true
-                            self.status.detail = "웹 연결을 열지 못했습니다. \(error.localizedDescription)"
-                            self.emitStatus()
-                        }
-                        return
+                        self.listenerPort = 0
                     }
                     self.status.ready = false; self.status.urls = []; self.status.port = nil
-                    self.status.detail = "웹 연결을 열지 못했습니다. 로컬 네트워크 권한과 포트 \(port)를 확인해주세요. \(error.localizedDescription)"
+                    self.status.detail = "웹 연결을 다시 열고 있습니다. \(error.localizedDescription)"
+                    self.scheduleListenerRetry(epoch: epoch)
                 default: break
                 }
                 self.emitStatus()
             }
         }
-        status.enabled = true; status.detail = "웹 접속과 같은 네트워크의 Mac을 연결하고 있습니다."
-        listener.start(queue: queue)
+    }
+
+    private func scheduleListenerRetry(epoch: UUID) {
+        guard listenerRetry == nil, running else { return }
+        let delay = listenerRetryDelay
+        listenerRetryDelay = min(30, delay * 2)
+        listenerRetry = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, self.running, self.generation == epoch else { return }
+            self.listenerRetry = nil
+            // Accepted requests and durable receipts remain alive while the acceptor recovers.
+            self.listener?.cancel(); self.listener = nil
+            do {
+                let listener = try NWListener(using: RemoteLAN.tcpParameters(), on: NWEndpoint.Port(rawValue: self.listenerPort)!)
+                self.listener = listener
+                self.configureListener(listener, port: self.listenerPort, epoch: epoch)
+                listener.start(queue: self.queue)
+            } catch {
+                self.status.detail = "웹 연결을 다시 열고 있습니다. \(error.localizedDescription)"
+                self.emitStatus(); self.scheduleListenerRetry(epoch: epoch)
+            }
+        }
+    }
+
+    private func publishService(port: UInt16) {
+        guard bonjourEnabled else { return }
+        advertisement.publish(name: nodeID, type: Self.serviceType, port: port, txt: serviceTXT(portal: publishedPortal, port: port)) { [weak self] ready in
+            guard let self, self.running else { return }
+            if !ready { self.discoveryError = "이름 검색을 다시 연결하고 있습니다. 숫자 주소의 웹 접속과 메시지 전송은 계속 사용할 수 있습니다." }
+            else { self.discoveryError = nil }
+            self.emitStatus()
+        }
+    }
+
+    private func startDiscovery(parameters: NWParameters, epoch: UUID) {
         if bonjourEnabled {
             let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Self.serviceType, domain: "local."), using: parameters)
             self.browser = browser
@@ -294,6 +334,7 @@ struct RemoteTerminalUpdate: Encodable {
         updateReceiver.stop()
         running = false; generation = UUID()
         discoveryTask?.cancel(); discoveryTask = nil
+        listenerRetry?.cancel(); listenerRetry = nil; advertisement.stop()
         webPeerTask?.cancel(); webPeerTask = nil
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
@@ -309,10 +350,10 @@ struct RemoteTerminalUpdate: Encodable {
         updateReceiver.check(endpoint: connectionEndpoint(peer), nodeID: peer.id, release: release)
     }
     private func emitStatus() { status.peerCount = peers.values.filter(\.available).count; onStatus(status) }
-    private func serviceTXT(portal: Bool) -> NWTXTRecord {
-        var values = ["name": String(name.prefix(100)), "version": "1", "portal": portal ? "1" : "0"]
+    private func serviceTXT(portal: Bool, port: UInt16) -> Data {
+        var values = ["name": String(name.prefix(60)), "version": "1", "portal": portal ? "1" : "0", "http-port": String(port)]
         if let webVersion { values["app-version"] = webVersion.version; values["app-build"] = String(webVersion.build) }
-        return NWTXTRecord(values)
+        return NetService.data(fromTXTRecord: values.mapValues { Data($0.utf8) })
     }
     private func verified(_ peer: Peer) -> Bool {
         peer.available && peer.release?.isCompatible == true && peer.webVerifiedAt.map { Date().timeIntervalSince($0) < 150 } == true
@@ -322,7 +363,10 @@ struct RemoteTerminalUpdate: Encodable {
         let fallback: NWEndpoint
         // A rediscovered numeric endpoint may have a new port after restart.
         // Use a saved address only when Bonjour would otherwise resolve again.
-        if case .service = peer.endpoint { fallback = manual ?? peer.endpoint }
+        if case .service = peer.endpoint {
+            if let manual, case .hostPort(_, let savedPort) = manual, peer.webPort == nil || savedPort.rawValue == peer.webPort { fallback = manual }
+            else { fallback = peer.endpoint }
+        }
         else { fallback = peer.endpoint }
         // Gateway/version freshness is independent of a confirmed LAN route.
         // Each request still checks the exact node ID at its destination.
@@ -431,7 +475,7 @@ struct RemoteTerminalUpdate: Encodable {
         let ownsPortal = namedAccess?.ownsPortal == true
         if ownsPortal != publishedPortal {
             publishedPortal = ownsPortal
-            listener?.service = NWListener.Service(name: nodeID, type: Self.serviceType, domain: "local.", txtRecord: serviceTXT(portal: ownsPortal))
+            publishService(port: port)
         }
     }
     private func discovered(_ results: Set<NWBrowser.Result>) {
@@ -459,11 +503,16 @@ struct RemoteTerminalUpdate: Encodable {
                 let value = RemoteWebVersion(version: version, build: number)
                 if value.isCompatible { advertised = value }
             }
-            let unchanged = previous?.release == advertised
-            let direct = previous?.directlySeen.map { Date().timeIntervalSince($0) < 150 } == true
+            let advertisedPort: UInt16?
+            if case .bonjour(let txt) = result.metadata, case .string(let value) = txt.getEntry(for: "http-port"), let port = UInt16(value), port > 0 { advertisedPort = port }
+            else { advertisedPort = nil }
+            // A restarted listener can keep its version and service ID while changing ports.
+            // Fresh DNS-SD metadata must supersede an old numeric/manual address.
+            let unchanged = previous?.release == advertised && (advertisedPort == nil || previous?.webPort == advertisedPort)
+            let direct = unchanged && previous?.directlySeen.map { Date().timeIntervalSince($0) < 150 } == true
                 ? previous?.directAddress.flatMap { try? RemoteNetworkAddress.endpoint($0) } : nil
             peers[id] = Peer(id: id, name: peerName, endpoint: direct ?? result.endpoint, available: true, manual: previous?.manual ?? false, portal: portal, bonjour: true, directlySeen: previous?.directlySeen, directAddress: previous?.directAddress,
-                release: advertised, webURLs: unchanged ? previous?.webURLs ?? [] : [], webPort: unchanged ? previous?.webPort : nil, webVerifiedAt: unchanged ? previous?.webVerifiedAt : nil)
+                release: advertised, webURLs: unchanged ? previous?.webURLs ?? [] : [], webPort: advertisedPort ?? (unchanged ? previous?.webPort : nil), webVerifiedAt: unchanged ? previous?.webVerifiedAt : nil)
         }
         // Keep disconnected machines visible, but bound the history on long-running networks.
         if peers.count > 100 {
@@ -602,6 +651,13 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "Codex 세션을 지정해주세요.") }
                     return try await .json(engine.remoteCodexQueue(sessionID: id, threadID: request.parameter("thread")))
+                case "/api/receipt":
+                    if let forwarded = try await forward(request) { return forwarded }
+                    guard let id = request.parameter("request"), UUID(uuidString: id) != nil else { throw RemoteHTTPError(400, "전송 요청을 지정해주세요.") }
+                    guard let receipt = receipts.first(where: { $0.id == id }) else { return try .object(["requestID": id, "phase": "missing"]) }
+                    guard let body = receipt.response, let status = receipt.status else { return try .object(["requestID": id, "phase": "pending"]) }
+                    return try .object(["requestID": id, "phase": "completed", "status": status,
+                        "result": (try? JSONSerialization.jsonObject(with: body)) ?? [:]])
                 case "/api/codex/conversations":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "Codex 세션을 지정해주세요.") }

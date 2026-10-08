@@ -103,13 +103,15 @@ public final class TmuxRelay: @unchecked Sendable {
             guard fields.count == 15, Int32(fields[0]) == handle.serverPID, TmuxPaneHandle.identifier(fields[1], prefix: "$"),
                   fields[2] == handle.pane, let pid = Int32(fields[3]), pid > 0, fields[4] == tty,
                   let columns = Int(fields[5]), (1...500).contains(columns), let rows = Int(fields[6]), (1...300).contains(rows),
-                  let x = Int(fields[7]), (0..<columns).contains(x), let y = Int(fields[8]), (0..<rows).contains(y),
+                  let x = Int(fields[7]), (0...columns).contains(x), let y = Int(fields[8]), (0..<rows).contains(y),
                   [fields[9], fields[11], fields[13], fields[14]].allSatisfy({ $0 == "0" || $0 == "1" }),
                   let modes = Int(fields[12]), modes >= 0 else {
                 throw AppError.message("선택한 CLI와 tmux 창의 TTY 또는 식별자가 다릅니다. 다른 창은 연결하지 않습니다.")
             }
             self.session = fields[1]; self.pid = pid; self.columns = columns; self.rows = rows
-            self.x = x; self.y = y; self.visible = fields[9] == "1"; self.shape = fields[10]; self.blink = fields[11] == "1"
+            // tmux reports x == width while a full last cell is waiting for autowrap.
+            // That is a valid pane; an emulator's cursor remains on its last cell.
+            self.x = min(x, columns - 1); self.y = y; self.visible = fields[9] == "1"; self.shape = fields[10]; self.blink = fields[11] == "1"
             self.inMode = modes > 0; self.synchronized = fields[13] == "1"; self.inputOff = fields[14] == "1"
         }
     }

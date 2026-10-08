@@ -34,7 +34,21 @@ let queueSnapshot = null, queueLoading = false, queueGeneration = 0, queueSessio
 const queueConversations = new Map();
 let screenStarting = false, screenStartNode = null;
 let webFormSignature = '', screenListSignature = '', sharedScreen = null, sharedScreenTimer, sharedScreenController, sharedScreenFailures = 0;
-let messageSending = false, messageUncertain = new Set(), interactionLinkOpened = false;
+const messageDeliveries = new Map(), messageReceiptReads = new Set();
+let messageUncertain = new Set(), interactionLinkOpened = false, messageReceiptTimer;
+const messageStorage = 'autoapprove-message-drafts-v1';
+try {
+  const saved = JSON.parse(sessionStorage.getItem(messageStorage) || '{}');
+  for (const [key,value] of Object.entries(saved.drafts || {})) if(typeof value === 'string' && new TextEncoder().encode(value).length <= 32000) messageDrafts.set(key,value);
+  for (const [key,value] of Object.entries(saved.deliveries || {})) if(value && typeof value.requestID === 'string' && typeof value.text === 'string' && new TextEncoder().encode(value.text).length <= 32000 && ['busy','uncertain','failed','accepted'].includes(value.phase)) {
+    if(value.phase === 'busy') value.phase = 'uncertain';
+    messageDeliveries.set(key,value); if(value.phase === 'uncertain') messageUncertain.add(key);
+  }
+} catch (_) {}
+function saveMessageDrafts() {
+  try { sessionStorage.setItem(messageStorage,JSON.stringify({drafts:Object.fromEntries(messageDrafts),deliveries:Object.fromEntries(messageDeliveries)})); } catch (_) {}
+}
+const messageBusy = key => messageDeliveries.get(key)?.phase === 'busy';
 const keyFor = (node, session, view) => `${node.id}/${view?.ptyID ? 'pty:' + view.ptyID : session.id}`;
 let ptyClient = null;
 const ptyDrafts = new Map();
@@ -54,7 +68,7 @@ function retainEndedPTY(item) {
   } catch (_) {}
 }
 const supportsRelease = (node, minimum) => {
-  const version = versionNumbers(node.state?.release);
+  const version = versionNumbers(node?.state?.release);
   if (!version) return false;
   for (let i = 0; i < minimum.length; i++) if (version[i] !== minimum[i]) return version[i] > minimum[i];
   return true;
@@ -312,7 +326,7 @@ async function api(path, body, signal) {
   try {
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
     const result = await response.json();
-    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status});
+    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, unsent:result.diagnostics?.delivery === 'not_started'});
     return result;
   } catch (error) {
     if (error.name === 'AbortError') {
@@ -659,7 +673,9 @@ function selectSession(key, focus = false) {
     stopDirect(); inputFailure = ''; composing = false;
     terminalFollowScroll = null;
     if (selectedKey) drafts.set(selectedKey, $('terminal-input').value);
+    if (selectedKey && $('interaction-dialog').open) { messageDrafts.set(selectedKey,$('message-input').value); saveMessageDrafts(); }
     selectedKey = item.key; selectedItem = item; latestFrame = null; detailGeneration++;
+    $('message-input').value = messageDrafts.get(selectedKey) || '';
     frameController?.abort(); quietFrames = 0; fastFrameUntil = Date.now() + 5000;
     $('detail').scrollTop = 0;
     $('terminal-input').value = drafts.get(item.key) || ''; composePreferred = !!$('terminal-input').value; sizeInput(); $('follow').checked = true; show($('jump-latest'), false); questionSignature = ''; historySignature = '';
@@ -747,7 +763,7 @@ function updateControls() {
   const reason = !originalTerminalConnected() || !sessionPresent ? 'Mac과 세션의 연결을 확인해주세요.' : document.hidden || terminalStreamFailed === selectedKey ? '화면을 다시 연결한 뒤 입력할 수 있습니다.' : latestFrame?.inputReason || selectedItem.view.inputReason;
   const fresh = terminalFrameFresh();
   const base = originalTerminalConnected() && sessionPresent && selectedItem.view.canRead && !reason;
-  const inputEnabled = base && fresh && !mutation;
+  const inputEnabled = base && fresh && !mutation && !messageBusy(selectedKey);
   const recovering = !!terminalStream?.reconnecting;
   const retainKeyboard = !!latestFrame && !!terminalStream && terminalStream.key === selectedKey;
   // Keep the active editor alive while its own request/refresh runs: disabling it closes mobile keyboards.
@@ -760,7 +776,7 @@ function updateControls() {
   composeMode = composePreferred || !nativeConnection() && !canDirect || !!$('terminal-input').value;
   const originalDraftOnly = composeMode && !composedSupported;
   if ((native || originalDraftOnly) && composeMode) $('terminal-input').disabled = false;
-  $('terminal-keyboard').disabled = !(base && canDirect && !composeMode && (fresh || retainKeyboard || inputInFlight || directSending));
+  $('terminal-keyboard').disabled = !(base && canDirect && !composeMode && !messageBusy(selectedKey) && (fresh || retainKeyboard || inputInFlight || directSending));
   document.querySelector('.terminal').dataset.input = composeMode ? 'compose' : 'direct';
   show($('input-editor'), composeMode); show($('compose-input-label'), composeMode);
   if (composeMode && !wasCompose) sizeInput();
@@ -981,7 +997,7 @@ async function sendInput(kind, value = '', quiet = false) {
   return sent;
 }
 function queueDirect(kind, value = '') {
-  if (!directMode || $('terminal-keyboard').disabled || !inputKeys().includes(kind)) return false;
+  if (!directMode || messageBusy(selectedKey) || $('terminal-keyboard').disabled || !inputKeys().includes(kind)) return false;
   if (directQueue.length >= 64 || byteLength(value) > 8000) { stopDirect(); inputFailure = '입력이 많아 바로 입력을 멈췄습니다. 현재 화면과 작성한 내용을 확인해주세요.'; updateControls(); return false; }
   const previous = directQueue[directQueue.length - 1];
   if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value) <= 8000) previous.value += value;
@@ -1216,16 +1232,33 @@ function updateInteractionControls() {
     if (error) { text(error,state.error || ''); show(error,!!state.error); }
   }
   const present = selectedItem && allSessions.some(item=>item.key===selectedKey), codex = selectedItem?.session.agent === 'codex';
-  const terminal = present && !['approval','input'].includes(selectedItem.session.phase) && !selectedItem.session.pendingInTerminal;
+  const terminal = present && selectedItem.session.phase !== 'approval' && !selectedItem.session.pendingInTerminal;
   const queueSupported = codex && supportsRelease(selectedItem.node,[0,2,46,57]);
   const chosenConversation = queueConversations.get(selectedKey), chosenSupported = !chosenConversation || selectedItem && supportsRelease(selectedItem.node,[0,2,51,62]);
-  const available = present && connected && selectedItem.node.online && chosenSupported && (queueSupported || !codex && terminal && (inputKeys().includes('submit') || latestFrame?.streamID && inputKeys().includes('characters')));
+  const directMessage = present && !selectedItem.view.pty && !chosenConversation && supportsRelease(selectedItem.node,[0,2,58,73]);
+  const routeConnected = connected && selectedItem?.node.online || originalStreamSelected();
+  const available = present && routeConnected && chosenSupported && (directMessage ? terminal && terminalFrameFresh() && !latestFrame?.inputReason && (inputKeys().includes('message') || inputKeys().includes('submit') || latestFrame?.streamID && inputKeys().includes('characters') && inputKeys().includes('enter')) : queueSupported || !codex && terminal && (inputKeys().includes('submit') || latestFrame?.streamID && inputKeys().includes('characters')));
+  const messageSending = messageBusy(selectedKey), delivery = messageDeliveries.get(selectedKey);
   const uncertain = messageUncertain.has(selectedKey);
   show($('new-message'), uncertain); $('new-message').disabled = messageSending;
   $('message-input').disabled = !present || messageSending || uncertain;
-  $('send-message').disabled = !available || mutation || messageSending || uncertain || !$('message-input').value.trim();
+  $('send-message').disabled = !available || mutation || inputInFlight || directSending || directQueue.length>0 || messageSending || uncertain || !$('message-input').value.trim();
   text($('send-message'), messageSending ? '전달 중…' : '메시지 보내기');
-  text($('message-help'), !present ? '목록에서 메시지를 보낼 터미널을 선택해주세요.' : uncertain ? '전달 결과가 불확실합니다. 같은 내용을 다시 보내기 전에 원본 터미널의 접수를 확인해주세요.' : codex && !queueSupported ? '메시지 전송은 이 Mac을 AutoApprove 0.2.46 이상으로 업데이트하면 사용할 수 있습니다.' : codex && !chosenSupported ? '선택한 Codex 대화에 메시지를 보내려면 이 Mac을 AutoApprove 0.2.51 이상으로 업데이트해주세요.' : codex && chosenConversation ? `선택한 대화 ‘${chosenConversation.title}’의 메시지 대기열로 전달합니다.` : codex ? '작업 중에도 같은 Codex 대화의 메시지 대기열로 전달합니다.' : !terminal ? '현재 터미널의 질문에 먼저 답변한 뒤 새 메시지를 보내주세요.' : !available ? '원본 터미널 입력 연결을 확인해주세요. 초안은 보관합니다.' : inputKeys().includes('submit') ? '같은 원본 터미널의 입력창에 메시지를 보냅니다.' : '이 원본 연결에서는 한 줄 메시지를 지원합니다.');
+  show($('check-message'), uncertain && supportsRelease(selectedItem?.node,[0,2,58,73])); $('check-message').disabled = messageReceiptReads.has(delivery?.requestID);
+  show($('use-original-message'), !!chosenConversation && supportsRelease(selectedItem?.node,[0,2,58,73]));
+  $('use-original-message').disabled = messageSending;
+  text($('message-status'),delivery?.message || ''); text($('message-error'),delivery?.error || ''); show($('message-error'),!!delivery?.error);
+  const archives=[...messageDeliveries].filter(([key])=>key.startsWith(selectedKey+'#')).slice(-10);
+  show($('message-history'),archives.length>0);
+  const archiveSignature=JSON.stringify(archives.map(([key,record])=>[key,record.phase,record.text]));
+  if($('message-history-list').dataset.signature!==archiveSignature) {
+    $('message-history-list').dataset.signature=archiveSignature; $('message-history-list').replaceChildren();
+    for(const [,record] of archives) {
+      const row=make('li'), label=make('p','muted small',record.phase==='accepted' ? '전달 확인' : record.phase==='failed' ? '전송 전 중단' : '전달 결과 미확인');
+      row.append(label,make('p','',record.text)); $('message-history-list').append(row);
+    }
+  }
+  text($('message-help'), !present ? '목록에서 메시지를 보낼 터미널을 선택해주세요.' : uncertain ? '접수 결과를 확인하고 있습니다. 작성한 메시지는 보관하며 자동으로 다시 보내지 않습니다.' : directMessage ? !terminal ? '원본 터미널의 질문에 먼저 답변해주세요. 초안은 보관합니다.' : !available ? '원본 터미널 연결을 확인해주세요. 초안은 보관합니다.' : '작업 중이거나 대기 중인 같은 원본 터미널에 메시지를 보냅니다.' : codex && !queueSupported ? '메시지 전송은 이 Mac을 AutoApprove 0.2.46 이상으로 업데이트하면 사용할 수 있습니다.' : codex && !chosenSupported ? '선택한 Codex 대화에 메시지를 보내려면 이 Mac을 AutoApprove 0.2.51 이상으로 업데이트해주세요.' : codex && chosenConversation ? `선택한 대화 ‘${chosenConversation.title}’의 메시지 대기열로 전달합니다.` : codex ? '작업 중에도 같은 Codex 대화의 메시지 대기열로 전달합니다.' : !terminal ? '현재 터미널의 질문에 먼저 답변한 뒤 새 메시지를 보내주세요.' : !available ? '원본 터미널 입력 연결을 확인해주세요. 초안은 보관합니다.' : inputKeys().includes('submit') ? '같은 원본 터미널의 입력창에 메시지를 보냅니다.' : '이 원본 연결에서는 한 줄 메시지를 지원합니다.');
   updateQueueControls(); updateScreenSessionControls();
 }
 function openInteraction() {
@@ -1233,18 +1266,22 @@ function openInteraction() {
   if (selectedItem) { renderQuestions(); $('message-input').value=messageDrafts.get(selectedKey) || ''; }
   else { show($('questions-section'),false); $('message-input').value=''; }
   renderInteractions(); if (!$('interaction-dialog').open) $('interaction-dialog').showModal();
-  void refreshCodexQueue();
+  void refreshCodexQueue(); void checkPendingMessages();
   if (!$('questions-section').hidden || $('web-question-forms').childElementCount) $('close-interaction').focus();
 }
 async function submitMessage(event) {
   event.preventDefault(); if ($('send-message').disabled || !selectedItem) return;
   const item = selectedItem, key = selectedKey, value=$('message-input').value; messageDrafts.set(key,value);
-  messageSending=true; updateInteractionControls(); show($('message-error'),false); text($('message-status'),'');
+  const delivery = {requestID:uuid(),nodeID:item.node.id,sessionID:item.session.id,text:value,phase:'busy',error:'',message:'메시지를 전달하고 있습니다…'};
+  messageDeliveries.set(key,delivery); saveMessageDrafts(); updateInteractionControls();
   try {
-    if (item.session.agent==='codex') {
-      const chosen = queueConversations.get(key);
-      const result=await api(endpoint('/api/action',item.node.id), {action:'sendMessage', sessionID:item.session.id, ...(chosen ? {threadID:chosen.id} : {}), text:value, requestID:uuid()});
-      if(selectedKey===key)text($('message-status'),result.message || '메시지 대기열에 등록했습니다.');
+    const chosen = queueConversations.get(key);
+    if (!item.view.pty && !chosen && supportsRelease(item.node,[0,2,58,73])) {
+      const result = await api(endpoint('/api/action',item.node.id),{action:'sendMessage',transport:'terminal',sessionID:item.session.id,revision:latestFrame?.revision,streamID:latestFrame?.streamID,text:value,requestID:delivery.requestID});
+      delivery.message=result.message || '같은 원본 터미널에 메시지를 전달했습니다.';
+    } else if (item.session.agent==='codex') {
+      const result=await api(endpoint('/api/action',item.node.id), {action:'sendMessage', sessionID:item.session.id, ...(chosen ? {threadID:chosen.id} : {}), text:value, requestID:delivery.requestID});
+      delivery.message=result.message || '메시지 대기열에 등록했습니다.';
     } else {
       if (inputKeys().includes('submit')) {
         if (!await sendInput('submit',value,true)) throw new Error('메시지 전달 결과를 확인하지 못했습니다. 원본 터미널을 확인해주세요.');
@@ -1253,13 +1290,45 @@ async function submitMessage(event) {
         if (!await sendInput('characters',value,true)) throw new Error('메시지 전달 결과를 확인하지 못했습니다. 원본 터미널을 확인해주세요.');
         if (selectedKey!==key || !await freshInputFrame(key) || !await sendInput('enter','',true)) throw new Error('문자는 전달했지만 Enter 전달 결과를 확인하지 못했습니다. 원본 터미널을 확인해주세요.');
       }
-      if(selectedKey===key)text($('message-status'),'원본 터미널에 메시지를 전달했습니다.');
+      delivery.message='원본 터미널에 메시지를 전달했습니다.';
     }
-    messageDrafts.delete(key); if (selectedKey===key) { $('message-input').value=''; void refreshCodexQueue(); } await refreshNetwork();
+    acceptMessage(key,delivery); void refreshNetwork();
   } catch (error) {
-    if (!error.unsent && ![400,404].includes(error.status)) messageUncertain.add(key);
-    if(selectedKey===key){text($('message-error'),error.message); show($('message-error'),true);}
-  } finally { messageSending=false; updateControls(); }
+    delivery.phase = error.unsent || [400,403,404,413].includes(error.status) ? 'failed' : 'uncertain';
+    delivery.error=error.message; delivery.message=delivery.phase==='failed' ? '메시지를 보내기 전에 중단됐습니다. 수정하거나 다시 연결한 뒤 보낼 수 있습니다.' : '접수 결과를 확인하고 있습니다…';
+    if(delivery.phase==='uncertain') { messageUncertain.add(key); void checkMessageReceipt(key,delivery); }
+  } finally { saveMessageDrafts(); updateControls(); }
+}
+function acceptMessage(key,delivery) {
+  delivery.phase='accepted'; delivery.error=''; messageUncertain.delete(key);
+  if(messageDrafts.get(key)===delivery.text)messageDrafts.delete(key);
+  if(selectedKey===key && $('message-input').value===delivery.text) $('message-input').value='';
+  saveMessageDrafts(); updateInteractionControls();
+}
+async function checkMessageReceipt(key,delivery) {
+  const node=nodes.find(item=>item.id===delivery.nodeID);
+  if(!node || !supportsRelease(node,[0,2,58,73]) || document.hidden || messageReceiptReads.has(delivery.requestID) || delivery.phase!=='uncertain')return;
+  messageReceiptReads.add(delivery.requestID); updateInteractionControls();
+  delivery.receiptChecks=(delivery.receiptChecks || 0)+1;
+  try {
+    const result=await api(endpoint('/api/receipt',delivery.nodeID)+'&request='+encodeURIComponent(delivery.requestID));
+    if(result.requestID!==delivery.requestID)throw new Error('전송 요청의 접수 결과가 일치하지 않습니다.');
+    if(result.phase==='completed') {
+      if(result.status>=200 && result.status<300) { delivery.message=result.result?.message || '메시지 접수를 확인했습니다.'; acceptMessage(key,delivery); }
+      else if(result.result?.diagnostics?.delivery==='not_started' || [400,403,404,413].includes(result.status)) {
+        delivery.phase='failed'; delivery.error=result.result?.error || '메시지가 전송 전에 거부됐습니다.'; delivery.message='전송되지 않은 메시지입니다. 수정하거나 다시 연결한 뒤 보낼 수 있습니다.'; messageUncertain.delete(key);
+      } else { delivery.receiptSettled=true; delivery.message='전달 여부를 확인하지 못했습니다. 원본 터미널을 확인해주세요.'; }
+    }
+  } catch (_) { delivery.message='연결이 복구되면 접수 결과를 다시 확인합니다. 작성한 메시지는 보관합니다.'; }
+  finally { messageReceiptReads.delete(delivery.requestID); saveMessageDrafts(); updateInteractionControls(); scheduleMessageReceipts(); }
+}
+function scheduleMessageReceipts() {
+  clearTimeout(messageReceiptTimer);
+  if(!document.hidden && [...messageDeliveries.values()].some(value=>value.phase==='uncertain' && !value.receiptSettled && (value.receiptChecks || 0)<15 && supportsRelease(nodes.find(node=>node.id===value.nodeID),[0,2,58,73]))) messageReceiptTimer=setTimeout(checkPendingMessages,2000);
+}
+async function checkPendingMessages() {
+  await Promise.all([...messageDeliveries].filter(([,value])=>value.phase==='uncertain' && !value.receiptSettled && (value.receiptChecks || 0)<15).map(([key,value])=>checkMessageReceipt(key,value)));
+  scheduleMessageReceipts();
 }
 function renderTestScreenList() {
   const shares=nodes.flatMap(node=>(node.state?.screenShares || []).map(share=>({node,share})));
@@ -1402,8 +1471,11 @@ $('use-queue-conversation').addEventListener('click',()=>{
   if ($('use-queue-conversation').disabled || !selectedItem) return;
   const option = $('queue-conversation').selectedOptions[0]; queueConversations.set(selectedKey,{id:option.value,title:option.dataset.title}); void refreshCodexQueue();
 });
-$('message-form').addEventListener('submit',submitMessage);$('message-input').addEventListener('input',()=>{if(selectedKey)messageDrafts.set(selectedKey,$('message-input').value);updateInteractionControls();});
-$('new-message').addEventListener('click',()=>{if(!selectedKey||messageSending)return;messageUncertain.delete(selectedKey);messageDrafts.delete(selectedKey);$('message-input').value='';show($('message-error'),false);text($('message-status'),'이전 전달 결과는 원본 터미널에서 확인해주세요.');updateInteractionControls();$('message-input').focus();});
+$('message-form').addEventListener('submit',submitMessage);$('message-input').addEventListener('input',()=>{if(selectedKey)messageDrafts.set(selectedKey,$('message-input').value);saveMessageDrafts();updateInteractionControls();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(messageReceiptTimer);else void checkPendingMessages();});
+$('check-message').addEventListener('click',()=>{const value=messageDeliveries.get(selectedKey);if(value)void checkMessageReceipt(selectedKey,value);});
+$('use-original-message').addEventListener('click',()=>{if(messageBusy(selectedKey))return;queueConversations.delete(selectedKey);updateInteractionControls();});
+$('new-message').addEventListener('click',()=>{if(!selectedKey||messageBusy(selectedKey))return;messageUncertain.delete(selectedKey);messageDrafts.delete(selectedKey);const previous=messageDeliveries.get(selectedKey);if(previous)messageDeliveries.set(selectedKey+'#'+previous.requestID,previous);messageDeliveries.delete(selectedKey);$('message-input').value='';saveMessageDrafts();updateInteractionControls();$('message-input').focus();});
 $('global-screens').addEventListener('click',()=>void openTestScreens());$('terminal-screens').addEventListener('click',()=>void openTestScreens(true));
 $('start-test-screen').addEventListener('click',()=>void startTestScreen());
 $('screen-message').addEventListener('click',()=>{updateScreenSessionControls();if($('screen-message').disabled)return;openInteraction();});

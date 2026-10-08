@@ -95,6 +95,8 @@ try {
   await page.unroute('**/api/network');await page.waitForFunction(()=>currentNode()?.online===true&&selectedItem.session.queuedQuestions.some(item=>item.reply?.phase==='failed'));
   await rm(path.join(directory,'reply-failure'));await failedQuestion.getByRole('button',{name:'답변 보내기'}).click();await page.waitForFunction(()=>selectedItem.session.queuedQuestions.every(item=>item.reply?.phase==='queued'));
   checks.push('Verified original-stream question remains sendable during inventory timeout; production preflight error is inline, preserves selections/text and permits an explicit retry only after a fresh authoritative failed status');
+  await writeFile(path.join(directory,'queue-unbound'),'');await page.locator('#refresh-queue').click();await page.locator('#queue-error').waitFor({state:'visible'});
+  await page.locator('#connect-queue-conversation').click();await page.locator('#queue-conversation').selectOption('00000000-0000-4000-8000-000000000001');await page.locator('#use-queue-conversation').click();await rm(path.join(directory,'queue-unbound'));
   await page.locator('#message-input').fill('작업 도중 새 질문입니다. 한글🧪');await page.locator('#send-message').click();await page.waitForFunction(()=>$('message-status').textContent.includes('등록'));
   assert.match(await optionalFile('messages.txt'),/작업 도중 새 질문입니다\. 한글🧪/);checks.push('MCP explicit answers reach originating process and Codex replies/messages use the same validated queue transport');
   await page.locator('#message-input').fill('전달 결과를 모를 때 중복 전송하지 않는지 확인');await page.locator('#message-input').focus();await page.setViewportSize({width:390,height:544});await capture('mobile-message-keyboard');await page.setViewportSize({width:390,height:844});
@@ -102,7 +104,7 @@ try {
   await page.route('**/api/action**',route=>{if(route.request().postDataJSON()?.action==='sendMessage')return route.abort('failed');return route.continue();});
   await page.locator('#send-message').click();await page.locator('#message-error').waitFor({state:'visible'});assert.equal(await page.locator('#send-message').isDisabled(),true);await capture('mobile-message-error');
   await page.locator('#new-message').click();assert.equal(await page.locator('#message-input').inputValue(),'');assert.equal(await optionalFile('messages.txt'),queuedBeforeFailure);await page.unroute('**/api/action**');checks.push('mobile keyboard height, inline delivery error and explicit new draft without automatic retry');
-  await writeFile(path.join(directory,'queue-unbound'),'');await page.locator('#refresh-queue').click();await page.locator('#queue-error').waitFor({state:'visible'});
+  await page.locator('#use-original-message').click();await writeFile(path.join(directory,'queue-unbound'),'');await page.locator('#refresh-queue').click();await page.locator('#queue-error').waitFor({state:'visible'});
   await page.locator('#connect-queue-conversation').click();await page.locator('#queue-conversation').selectOption('00000000-0000-4000-8000-000000000001');
   for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await page.locator('#queue-conversation-picker').scrollIntoViewIfNeeded();await capture(name+'-queue-conversation');}
   await page.setViewportSize({width:390,height:844});await page.locator('#use-queue-conversation').click();await page.waitForFunction(()=>queueSnapshot?.items.length===5);await rm(path.join(directory,'queue-unbound'));

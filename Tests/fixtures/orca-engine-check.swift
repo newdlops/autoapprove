@@ -20,6 +20,7 @@ private final class OrcaProbe: @unchecked Sendable {
     var snapshots = 0, legacyReads = 0, approvals = 0
     var writes = [(ScreenTarget, RemoteTerminalInput)]()
     var failRead = false, replaceProcessDuringRead = false
+    var rejectEnter = false
     func mutate(_ body: (OrcaProbe) -> Void) { lock.lock(); defer { lock.unlock() }; body(self) }
     func read<T>(_ body: (OrcaProbe) throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body(self) }
     func snapshot(handle: String) async throws -> OrcaTerminalSnapshot {
@@ -39,7 +40,10 @@ private final class OrcaProbe: @unchecked Sendable {
             mutate { $0.legacyReads += 1 }
             return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "private legacy approval text") })
         }, approve: { [self] _, _, _ in mutate { $0.approvals += 1 }; return .missingTarget }, reveal: { _ in nil },
-        input: { [self] target, _, _, input in mutate { $0.writes.append((target, input)) }; return .sent })
+        input: { [self] target, _, _, input in
+            if input.kind == .enter, read({ $0.rejectEnter }) { return .screenChanged }
+            mutate { $0.writes.append((target, input)) }; return .sent
+        })
     }
 }
 
@@ -164,6 +168,31 @@ private final class OrcaProbe: @unchecked Sendable {
         try require(submit.status == 409 && probe.read({ $0.writes.count }) == 1, "Renderer text must never authorize a composed submit against a different legacy CLI screen")
         try require(probe.read { $0.approvals == 0 && $0.legacyReads == legacyBaseline }, "Web ANSI reads/input must preserve the independent automatic approval text source")
         checks.append("receipt-protected Unicode relay reaches the exact original and ANSI renderer cannot authorize compose or approvals")
+
+        let messageProbe = OrcaProbe()
+        let messageEngine = try ApprovalEngine(paths: AppPaths(directory: directory.appendingPathComponent("messages")),
+            processReader: { messageProbe.read { $0.records } }, screenAdapters: [.orca: messageProbe.adapter],
+            orcaSnapshotReader: { try await messageProbe.snapshot(handle: $0) })
+        defer { messageEngine.stop() }
+        messageEngine.updateDiscovery([session], records: messageProbe.read { $0.records }); await messageEngine.connectScreenHost(.orca)
+        let messageGateway = RemoteNetworkService(engine: messageEngine, nodeID: UUID().uuidString, bonjourEnabled: false, onStatus: { _ in })
+        let messageFrame = try await messageEngine.remoteTerminal(sessionID: session.id, realtime: true)
+        let messageRequest: JSONObject = ["requestID": UUID().uuidString, "action": "sendMessage", "transport": "terminal", "sessionID": session.id,
+            "revision": messageFrame.revision, "streamID": messageFrame.streamID!, "text": "대화 기록 없이 한글 메시지"]
+        let messageSent = await messageGateway.handle(try request("POST", "/api/action", messageRequest))
+        let messageReplay = await messageGateway.handle(try request("POST", "/api/action", messageRequest))
+        try require(messageSent.status == 200 && messageReplay.status == 200 && messageProbe.read({ $0.writes.map { $0.1.kind } }) == [.characters, .enter],
+            "A characters-only source must receive one message and one Enter without a queue binding or duplicate writes")
+        var multiline = messageRequest; multiline["requestID"] = UUID().uuidString; multiline["text"] = "한 줄\n두 줄"
+        let multilineResult = await messageGateway.handle(try request("POST", "/api/action", multiline))
+        try require(multilineResult.status == 400 && messageProbe.read({ $0.writes.count }) == 2, "Unsupported multiline input must be rejected before writing")
+        messageProbe.mutate { $0.rejectEnter = true }
+        var partial = messageRequest; partial["requestID"] = UUID().uuidString; partial["text"] = "문자는 쓰고 Enter는 거부"
+        let partialResult = await messageGateway.handle(try request("POST", "/api/action", partial))
+        let partialJSON = try JSONSerialization.jsonObject(with: partialResult.body) as! JSONObject
+        try require(partialResult.status == 409 && (partialJSON["diagnostics"] as? [String:String])?["delivery"] == "unknown" && messageProbe.read({ $0.writes.count }) == 3,
+            "After characters were sent, an Enter refusal is uncertain and must not retype the message")
+        checks.append("characters-only original messages, duplicate receipts, multiline rejection and uncertain Enter never replay text")
 
         probe.mutate { $0.incarnation = "replacement-incarnation" }
         let refused = await gateway.handle(try request("POST", "/api/input", ["requestID": UUID().uuidString, "sessionID": session.id, "revision": moved.revision,

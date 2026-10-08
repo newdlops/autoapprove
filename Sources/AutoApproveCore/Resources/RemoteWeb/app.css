@@ -203,7 +203,12 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .message-form > label { margin: 0 0 8px; }
 .message-form textarea { max-height: 120px; min-height: 72px; }
 .message-form p { margin-top: 6px; font-size: 13px; }
-.message-actions { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 12px; }
+.message-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px 12px; margin-top: 12px; }
+.message-history { margin-top: 8px; font-size: 13px; }
+.message-history summary { min-height: 44px; padding: 10px 0; cursor: pointer; }
+.message-history ul { max-height: 120px; overflow: auto; overscroll-behavior: contain; margin: 0; padding: 0 0 0 20px; }
+.message-history li { padding: 8px 0; overflow-wrap: anywhere; }
+.message-history li p { white-space: pre-wrap; }
 .message-actions span { flex: 1; overflow-wrap: anywhere; }
 .codex-queue { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 20px; }
 .codex-queue .section-heading { flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }

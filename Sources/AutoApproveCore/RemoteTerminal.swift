@@ -171,7 +171,7 @@ public enum TerminalKeyboard {
 }
 
 public struct RemoteTerminalInput: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable { case text, submit, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab }
+    public enum Kind: String, Codable, Sendable { case text, submit, message, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab }
     public var kind: Kind
     public var text: String
     public var relay: Bool? = nil
@@ -181,6 +181,7 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
         switch kind {
         case .text, .characters: return text
         case .submit: return text + "\r"
+        case .message: return "\u{1b}[200~" + text + "\u{1b}[201~\r"
         case .enter: return "\r"
         case .escape: return "\u{1b}"
         case .interrupt: return "\u{03}"
@@ -196,9 +197,29 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
         }
     }
     public func validate() throws {
-        let textual = [.text, .submit, .characters].contains(kind)
-        guard !textual || (!text.isEmpty && text.utf8.count <= 8_000 && text.unicodeScalars.allSatisfy({ ($0.value >= 32 && $0.value != 127) || kind != .characters && ($0 == "\n" || $0 == "\t") })),
-              textual || text.isEmpty else { throw RemoteHTTPError(400, "텍스트는 제어 문자 없이 8,000바이트 이내로 입력해주세요.") }
+        let textual = [.text, .submit, .message, .characters].contains(kind)
+        let limit = kind == .message ? 7_987 : 8_000
+        guard !textual || (!text.isEmpty && text.utf8.count <= limit && text.unicodeScalars.allSatisfy({ ($0.value >= 32 && $0.value != 127) || kind != .characters && ($0 == "\n" || $0 == "\t") })),
+              textual || text.isEmpty else { throw RemoteHTTPError(400, "텍스트는 제어 문자 없이 \(limit)바이트 이내로 입력해주세요.") }
+    }
+}
+
+enum RemoteMessageReadiness {
+    /// A message must not act as Enter on a CLI's current setup or choice menu.
+    /// Historical menus above a newer composer do not block new messages.
+    static func hasMenu(_ screen: String, agent: AgentKind) -> Bool {
+        if PromptDetector.detect(screen, agent: agent) != nil || QuestionDetector.detect(screen, agent: agent) != nil { return true }
+        let rows = Array(PromptDetector.normalizedLines(screen).suffix(30)).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let option = #"^(?:[›❯»>]\s*)?[1-9][0-9]?\.\s+"#
+        guard let last = rows.lastIndex(where: { $0.range(of: option, options: .regularExpression) != nil }),
+              rows[...last].filter({ $0.range(of: option, options: .regularExpression) != nil }).count >= 2,
+              rows[...last].contains(where: { $0.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) != nil }) else {
+            // Claude's initial workspace trust menu has unnumbered choices.
+            return agent == .claude && rows.contains("Accessing workspace:") && rows.contains(where: { $0.hasPrefix("❯ No, exit") || $0.hasPrefix("❯ Yes, I trust this folder") }) && rows.contains(where: { $0.contains("Enter to confirm") })
+        }
+        return rows.dropFirst(last + 1).allSatisfy { row in
+            row.allSatisfy { "─━╌- ".contains($0) } || row.range(of: #"(?i)^(?:press |enter\b|esc\b|use (?:the )?arrow|↑|↓)"#, options: .regularExpression) != nil
+        }
     }
 }
 

@@ -16,6 +16,7 @@ private actor FixtureQueue {
 @main struct WebInteractionFixture {
     @MainActor static func main() async throws {
         let directory = URL(fileURLWithPath: CommandLine.arguments[1]), paths = AppPaths(directory: directory.appendingPathComponent("profile"))
+        let messagesOnly = CommandLine.arguments.contains("--messages-only")
         let records = ProcessDiscovery.parse("1 0 ?? 1 0 Mon Oct 5 09:00:00 2026 /sbin/launchd\n20 1 ?? 20 0 Mon Oct 5 09:00:00 2026 /fixture/iTerm2/iTermServer\n40 20 ttys080 40 41 Mon Oct 5 09:00:00 2026 /bin/zsh\n41 40 ttys080 41 41 Mon Oct 5 09:00:00 2026 codex\n50 20 ttys081 50 51 Mon Oct 5 09:00:00 2026 /bin/zsh\n51 50 ttys081 51 51 Mon Oct 5 09:00:00 2026 claude")
         let codex = records.first { $0.pid == 41 }!, claude = records.first { $0.pid == 51 }!
         let thread = "00000000-0000-4000-8000-000000000001"
@@ -26,7 +27,7 @@ private actor FixtureQueue {
         }, send: { _, message in
             try (message + "\n").append(to: directory.appendingPathComponent("messages.txt")); return await queue.add(message)
         }, prepareMessage: { _ in
-            if FileManager.default.fileExists(atPath: directory.appendingPathComponent("queue-unbound").path) { throw AppError.message("이 Codex 세션의 질문 기록을 찾지 못했습니다.") }
+            if messagesOnly || FileManager.default.fileExists(atPath: directory.appendingPathComponent("queue-unbound").path) { throw AppError.message("이 Codex 세션의 질문 기록을 찾지 못했습니다.") }
             return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread)
         }, queueHome: { _ in CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: "") }, prepareQueue: { _, selected in
             guard selected == thread else { throw RemoteHTTPError(409, "다른 대화입니다.") }
@@ -41,7 +42,10 @@ private actor FixtureQueue {
             CGImageDestinationAddImage(destination, context.makeImage()!, nil); guard CGImageDestinationFinalize(destination) else { throw AppError.message("Fixture JPEG failed") }
             return TerminalNativeImage(data: (data as Data).base64EncodedString(), width: 640, height: 480)
         })
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "합성 시험 세션 · 실제 사용자 터미널이 아닙니다.\nREADY> ") }) }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in
+        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "합성 시험 세션 · 실제 사용자 터미널이 아닙니다.\nREADY> ") }) }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in
+            if FileManager.default.fileExists(atPath: directory.appendingPathComponent("message-preflight-failure").path) { return .screenChanged }
+            let route: JSONObject = ["tty": target.tty, "pid": target.sourcePID ?? 0, "text": input.text]
+            try (String(decoding: JSONSerialization.data(withJSONObject: route), as: UTF8.self) + "\n").append(to: directory.appendingPathComponent("message-routes.jsonl"))
             try (input.kind.rawValue + ":" + input.text + "\n").append(to: directory.appendingPathComponent("inputs.txt")); return .sent
         })
         let engine = try ApprovalEngine(paths: paths, questionTransport: transport, claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.iterm: adapter], testScreenSharing: screen,
@@ -59,6 +63,12 @@ private actor FixtureQueue {
         // Keep the synthetic yes/no prompt pending while the browser inspects
         // three viewports. Manual replies must still work during an auto pause.
         try engine.setPaused(true)
+        if messagesOnly {
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(["port":String(engine.webStatus.port!), "codex":codex.key, "claude":claude.key]).write(to: directory.appendingPathComponent("ready.json"))
+            while !Task.isCancelled { try await Task.sleep(nanoseconds: 400_000_000) }
+            engine.stop(); return
+        }
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: codex.key, questions: [], threadID: thread)])
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: codex.key, questions: [QueuedQuestion(id: "fixture-q1", threadID: thread, title: "합성 모바일 테스트를 진행할까요?", options: ["예", "아니요"]), QueuedQuestion(id: "fixture-q2", threadID: thread, title: "한글·이모지·긴 선택지의 줄바꿈과 전송 결과를 함께 확인할까요?", options: ["질문을 먼저 확인", "긴 선택지와 추가 설명을 함께 보내기"])] )])
         let now = Date()

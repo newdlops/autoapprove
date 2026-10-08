@@ -107,6 +107,12 @@ try {
   const legacy = await request(first, route); assert.equal(legacy.data.screen, frame.data.screen, 'Clients without a revision keep the full frame protocol');
   const input = { requestID: randomUUID(), sessionID: id, revision: frame.data.revision, kind: 'text', text: '웹에서 보낸 한글 · 검증용' };
   const sent = await request(first, `/api/input?node=${second.id}`, input); assert.equal(sent.status, 200);
+  const receiptRoute = '/api/receipt?' + new URLSearchParams({node:second.id,request:input.requestID});
+  const receipt = await request(first,receiptRoute);
+  assert.equal(receipt.status,200);assert.equal(receipt.data.phase,'completed');assert.equal(receipt.data.status,200);assert.deepEqual(receipt.data.result,sent.data);
+  const missingReceipt = await request(first,'/api/receipt?'+new URLSearchParams({node:second.id,request:randomUUID()}));
+  assert.equal(missingReceipt.data.phase,'missing');
+  assert.equal((await request(first,'/api/receipt?request=invalid')).status,400);
   const replay = await request(first, `/api/input?node=${second.id}`, input); assert.deepEqual(replay, sent);
   const after = await request(first, route); assert.equal(after.data.screen.split(input.text).length - 1, 1);
   const delayedID = randomUUID();
@@ -181,6 +187,9 @@ try {
       if (restoredPeer?.online) {
         restoredFrame = await request(first, route);
         if (restoredFrame.status === 200) {
+          const recoveredReceipt = await request(first,receiptRoute);
+          assert.equal(recoveredReceipt.data.phase,'completed');assert.deepEqual(recoveredReceipt.data.result,sent.data);
+          assert.equal(restoredFrame.data.screen.includes(input.text),false,'A read-only receipt lookup must not write to the restarted terminal');
           // Replay this already-completed request ID only, never a new input.
           durable = await request(first, `/api/input?node=${second.id}`, input);
           if (durable.status === 200) break;
@@ -192,7 +201,7 @@ try {
     assert.equal(durable?.status, 200, 'Stored receipt must return after rediscovery: ' + JSON.stringify(durable?.data));
     assert.equal(restoredFrame?.status, 200, 'Restored terminal must be readable: ' + JSON.stringify(restoredFrame?.data));
     assert.equal(restoredFrame.data.screen.includes(input.text), false, 'Restarted receipt must not replay input');
-    console.log('PASS: disconnect, rediscovery, stored peer address and durable input receipt after restart');
+    console.log('PASS: disconnect, rediscovery, stored peer address and read-only durable input receipt after restart');
   }
 } finally {
   for (const child of children) child.kill();

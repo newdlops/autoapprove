@@ -595,8 +595,9 @@ import TerminalInputSupport
         let basic = ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
         let interactive = ["submit", "characters", "left", "right", "backspace", "delete", "home", "end"]
         if session.terminal == .terminal {
-            return terminalInputAvailable() ? basic + interactive : ["text", "submit", "enter"]
+            return terminalInputAvailable() ? basic + interactive + ["message"] : ["text", "submit", "enter"]
         }
+        if session.terminal == .tmux { return basic + interactive + ["message"] }
         if usesOrcaSnapshot(session) {
             return ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab"]
         }
@@ -967,6 +968,16 @@ import TerminalInputSupport
     }
 
     public func remoteInput(_ object: JSONObject) async throws -> JSONObject {
+        var deliveryStarted = false
+        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted) }
+        catch {
+            var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
+            if diagnostics["delivery"] == nil { diagnostics["delivery"] = deliveryStarted ? "unknown" : "not_started" }
+            throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 409, error.localizedDescription, diagnostics: diagnostics)
+        }
+    }
+
+    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool) async throws -> JSONObject {
         let relay = object["relay"] as? Bool == true
         guard !remoteInputStopped, let id = object["sessionID"] as? String, let token = object["revision"] as? String,
               let kind = (object["kind"] as? String).flatMap(RemoteTerminalInput.Kind.init(rawValue:)),
@@ -1003,6 +1014,12 @@ import TerminalInputSupport
         guard !remoteInputSessions.contains(id), observed.frame.keys.contains(kind.rawValue) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
         if !relay && automaticInputBusy(id) { throw RemoteHTTPError(409, "Mac에서 승인 또는 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요.") }
         let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? "", relay: relay); try input.validate()
+        if kind == .message {
+            guard relay, !session.pendingInTerminal, session.phase != .approval, !RemoteMessageReadiness.hasMenu(observed.raw, agent: session.agent),
+                  [.terminal, .tmux].contains(session.terminal) else {
+                throw RemoteHTTPError(409, "현재 원본 터미널의 질문에 먼저 답변해주세요.")
+            }
+        }
         remoteInputSessions.insert(id)
         defer {
             remoteInputSessions.remove(id); remoteInputUntil[id] = Date().addingTimeInterval(0.8)
@@ -1051,6 +1068,7 @@ import TerminalInputSupport
               current.tmuxHandle == session.tmuxHandle,
               current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
               !nativeInput || nativeBridgeBinding(current) == nativeBinding,
+              kind != .message || !current.pendingInTerminal && current.phase != .approval,
               !orcaInput || remoteOrcaBindings[id]?.binding == observed.orcaBinding && remoteFrames[id]?.orcaBinding == observed.orcaBinding,
               (relay ? remoteStreams[id]?.token == (object["streamID"] as? String) : remoteFrames[id]?.frame.revision == token) else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
         if session.terminal == .terminal, relay || ![.text, .submit, .enter].contains(kind) {
@@ -1062,11 +1080,12 @@ import TerminalInputSupport
         // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
         if !relay { remoteFrames.removeValue(forKey: id) }
         invalidateRemoteRead(id)
-        let textual = [.text, .submit, .characters].contains(kind)
+        let textual = [.text, .submit, .message, .characters].contains(kind)
         var event = AuditEvent(sessionID: id, summary: textual ? String(input.text.prefix(200)) : kind.rawValue,
             outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: textual ? input.text : kind.rawValue)
         guard log(event) else { throw RemoteHTTPError(409, "입력 내역을 저장하지 못해 전송하지 않았습니다.") }
         do {
+            deliveryStarted = true
             let sent: Bool
             if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
                 let job = currentRecords.filter { $0.tty == tty && $0.processGroup == process.processGroup }.map(\.pid)
@@ -1093,7 +1112,7 @@ import TerminalInputSupport
             } else { sent = false }
             invalidateRemoteRead(id)
             event.outcome = sent ? "웹 입력 전달" : "웹 입력 미전달 · 화면 변경"; _ = log(event)
-            guard sent else { throw RemoteHTTPError(409, "현재 화면이나 CLI가 바뀌어 입력하지 않았습니다. 최신 화면을 확인해주세요.") }
+            guard sent else { throw RemoteHTTPError(409, "현재 화면이나 CLI가 바뀌어 입력하지 않았습니다. 최신 화면을 확인해주세요.", diagnostics: ["delivery": "not_started", "retryable": "true"]) }
             return ["sent": true, "message": "터미널에 입력을 전달했습니다. 화면에서 반영 결과를 확인하세요."]
         } catch {
             if event.outcome == "웹 입력 전달 확인 중" { event.outcome = "웹 입력 결과 미확인"; _ = log(event) }
@@ -1103,6 +1122,70 @@ import TerminalInputSupport
 
     private func automaticInputBusy(_ id: String) -> Bool {
         automaticInputSessions.contains(id) || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
+    }
+
+    private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject) async throws -> JSONObject {
+        var outcome = "not_started"
+        do {
+            guard original.agent != .shell, let text = object["text"] as? String,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !text.contains("\0"),
+                  let suppliedRevision = object["revision"] as? String, !suppliedRevision.isEmpty else {
+                throw RemoteHTTPError(400, "메시지와 원본 터미널 연결을 확인해주세요.")
+            }
+            guard !sendingMessages.contains(original.id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 잠시 후 다시 확인해주세요.") }
+            sendingMessages.insert(original.id); defer { sendingMessages.remove(original.id) }
+            for attempt in 0..<3 {
+                let frame = try await remoteTerminal(sessionID: original.id, realtime: true)
+                guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
+                      current.tty == original.tty, current.terminal == original.terminal,
+                      current.bridgeID == original.bridgeID, current.terminalID == original.terminalID,
+                      !current.pendingInTerminal, current.phase != .approval, frame.inputReason == nil,
+                      !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
+                    throw RemoteHTTPError(409, "원본 터미널의 연결이나 질문 상태가 바뀌었습니다. 현재 화면을 확인해주세요.")
+                }
+                if let supplied = object["streamID"] as? String, supplied != frame.streamID {
+                    throw RemoteHTTPError(409, "원본 터미널 연결이 바뀌었습니다. 같은 세션을 다시 연결해주세요.")
+                }
+                var input: JSONObject = ["sessionID": original.id, "revision": frame.revision, "text": text]
+                var submitSeparately = false
+                if frame.keys.contains("message"), let stream = frame.streamID {
+                    input["kind"] = "message"; input["relay"] = true; input["streamID"] = stream
+                } else if frame.keys.contains("submit") { input["kind"] = "submit" }
+                else if frame.keys.contains("characters"), frame.keys.contains("enter"), let stream = frame.streamID {
+                    guard !text.contains("\n"), !text.contains("\r") else { throw RemoteHTTPError(400, "이 원본 연결에는 한 줄 메시지를 입력해주세요. 작성한 내용은 보관합니다.") }
+                    input["kind"] = "characters"; input["relay"] = true; input["streamID"] = stream; submitSeparately = true
+                }
+                else { throw RemoteHTTPError(409, "이 원본의 메시지 전송 연결을 확인해주세요. 작성한 내용은 보관합니다.") }
+                var textWasSent = false
+                do {
+                    _ = try await remoteInput(input)
+                    if submitSeparately {
+                        textWasSent = true; outcome = "unknown"
+                        let next = try await remoteTerminal(sessionID: original.id, realtime: true)
+                        guard next.streamID == frame.streamID, next.inputReason == nil,
+                              !RemoteMessageReadiness.hasMenu(next.screen, agent: original.agent),
+                              sessions[original.id]?.pendingInTerminal == false, sessions[original.id]?.phase != .approval else {
+                            throw RemoteHTTPError(409, "문자는 전달했지만 원본의 입력 상태가 바뀌어 Enter를 보내지 않았습니다. 원본 화면을 확인해주세요.")
+                        }
+                        _ = try await remoteInput(["sessionID": original.id, "revision": next.revision, "streamID": next.streamID!, "relay": true, "kind": "enter"])
+                    }
+                    return ["ok": true, "transport": "terminal", "message": "같은 원본 터미널에 메시지를 전달했습니다."]
+                } catch let error as RemoteHTTPError {
+                    if textWasSent {
+                        var diagnostics = error.diagnostics ?? [:]; diagnostics["delivery"] = "unknown"
+                        throw RemoteHTTPError(error.status, error.localizedDescription, diagnostics: diagnostics)
+                    }
+                    outcome = error.diagnostics?["delivery"] ?? "unknown"
+                    if outcome == "not_started", error.diagnostics?["retryable"] == "true", attempt < 2 { continue }
+                    throw error
+                }
+            }
+            throw RemoteHTTPError(409, "최신 원본 화면을 확인하고 다시 보내주세요.")
+        } catch {
+            var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
+            if diagnostics["delivery"] == nil { diagnostics["delivery"] = outcome }
+            throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 409, error.localizedDescription, diagnostics: diagnostics)
+        }
     }
     private func userInputHasPriority(_ id: String) -> Bool {
         remoteInputSessions.contains(id) || remoteInputUntil[id].map { Date() < $0 } == true
@@ -1228,28 +1311,30 @@ import TerminalInputSupport
             }
             try store.set("claudeQuestionEditing:" + request, "true"); publish()
         case "sendMessage":
+            if object["transport"] as? String == "terminal" { return try await sendOriginalTerminalMessage(session, object: object) }
             guard session.agent == .codex, let message = object["text"] as? String,
                   !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, message.utf8.count <= 32_000, !message.contains("\0") else {
                 throw RemoteHTTPError(400, "Codex 메시지를 32,000바이트 이내로 입력해주세요.")
             }
-            guard !sendingMessages.contains(id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 결과를 확인해주세요.") }
+            guard !sendingMessages.contains(id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 결과를 확인해주세요.", diagnostics: ["delivery": "not_started"]) }
             sendingMessages.insert(id); defer { sendingMessages.remove(id) }
             let target: CodexReplyTarget
-            if let value = object["threadID"] {
+            do { if let value = object["threadID"] {
                 guard let thread = value as? String, UUID(uuidString: thread) != nil else { throw RemoteHTTPError(400, "연결한 Codex 대화를 다시 선택해주세요.") }
                 target = try await questionTransport.prepareQueue(session, thread)
                 guard target.threadID == thread else { throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 다시 연결해주세요.") }
                 try validateCodexQueueSession(session, threadID: thread)
                 try await codexQueue.validate(target, session.cwd)
                 try validateCodexQueueSession(session, threadID: thread)
-            } else { target = try await questionTransport.prepareMessage(session) }
+            } else { target = try await questionTransport.prepareMessage(session) } }
+            catch { throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 409, error.localizedDescription, diagnostics: ["delivery": "not_started"]) }
             guard !remoteInputStopped, let current = sessions[id], current.phase != .ended,
                   current.pid == session.pid, current.started == session.started, current.tty == session.tty,
                   questionThreadBySession[id] == nil || questionThreadBySession[id] == target.threadID else {
-                throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 대화를 확인해주세요.")
+                throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 대화를 확인해주세요.", diagnostics: ["delivery": "not_started"])
             }
             var event = AuditEvent(sessionID: id, summary: String(message.prefix(200)), outcome: "메시지 전달 확인 중", source: "웹 메시지", context: AuditContext(session: session), answer: message)
-            guard log(event) else { throw RemoteHTTPError(409, "메시지 전달 내역을 저장하지 못했습니다.") }
+            guard log(event) else { throw RemoteHTTPError(409, "메시지 전달 내역을 저장하지 못했습니다.", diagnostics: ["delivery": "not_started"]) }
             do {
                 if object["threadID"] != nil { try validateCodexQueueSession(session, threadID: target.threadID) }
                 let receipt = try await questionTransport.send(target, message)

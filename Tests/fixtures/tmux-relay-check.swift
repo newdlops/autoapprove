@@ -74,6 +74,17 @@ import AutoApproveCore
         }
         precondition(reflected.screen.contains("WEB") && reflected.streamID == frame.streamID && engine.managedPTY.inventory.isEmpty)
         print("PASS real engine/frame/relay input while automatic ON and privileged input unavailable; \(Int(Date().timeIntervalSince(startedHTTP) * 1000)) ms round trip; no PTY created")
+        let edge = "\u{1b}[10;1H" + String(repeating: "W", count: 80)
+        _ = try call(["send-keys", "-H", "-t", handle.pane] + edge.utf8.map { String(format: "%02x", $0) })
+        for _ in 0..<100 {
+            if try call(["display-message", "-p", "-t", handle.pane, "#{cursor_x}"]).trimmingCharacters(in: .newlines) == "80" { break }
+            usleep(10_000)
+        }
+        let edgeColumn = try call(["display-message", "-p", "-t", handle.pane, "#{cursor_x}"]).trimmingCharacters(in: .newlines)
+        precondition(edgeColumn == "80", "Fixture must reproduce tmux's pending autowrap cursor")
+        let edgeFrame = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+        precondition(edgeFrame.screen.contains(String(repeating: "W", count: 80)) && edgeFrame.streamID == frame.streamID)
+        print("PASS pending autowrap at x == pane width keeps the original stream readable")
         engine.disconnectScreenHost(.tmux)
         do { _ = try await engine.remoteTerminal(sessionID: session.id); fatalError("Disconnected tmux readable") } catch {}
         await engine.connectScreenHost(.tmux)
