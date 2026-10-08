@@ -8,7 +8,8 @@ public struct SessionNotice: Codable, Equatable, Identifiable {
     public var summary: String
     public var date: Date
     public var isRead: Bool
-    public var title: String { kind == .completion ? "작업 완료" : "응답 필요" }
+    public var isInterruption: Bool? = nil
+    public var title: String { isInterruption == true ? "작업 중단" : kind == .completion ? "작업 완료" : "응답 필요" }
 
     public static func key(_ kind: Kind, _ identifier: String) -> String {
         kind.rawValue + ":" + PromptDetector.fingerprint(identifier)
@@ -21,8 +22,9 @@ public struct SessionInbox: Codable, Equatable {
         public var key: String
         public var kind: SessionNotice.Kind
         public var summary: String
-        public init(key: String, kind: SessionNotice.Kind, summary: String) {
-            self.key = key; self.kind = kind; self.summary = summary
+        public var isInterruption: Bool = false
+        public init(key: String, kind: SessionNotice.Kind, summary: String, isInterruption: Bool = false) {
+            self.key = key; self.kind = kind; self.summary = summary; self.isInterruption = isInterruption
         }
     }
     private struct Active: Codable, Equatable {
@@ -46,7 +48,8 @@ public struct SessionInbox: Codable, Equatable {
             let delay: TimeInterval = candidate.kind == .completion ? 3 : 0.8
             if !event.posted && date.timeIntervalSince(event.observedAt) >= delay {
                 entries.insert(SessionNotice(id: event.id, sourceKey: candidate.key, kind: candidate.kind,
-                    summary: String(candidate.summary.prefix(600)), date: date, isRead: event.acknowledged), at: 0)
+                    summary: String(candidate.summary.prefix(600)), date: date, isRead: event.acknowledged,
+                    isInterruption: candidate.isInterruption ? true : nil), at: 0)
                 event.posted = true
             }
             active[candidate.key] = event

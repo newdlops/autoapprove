@@ -2,7 +2,7 @@ import Foundation
 
 public enum HookInstaller {
     public static let marker = "AutoApprove local bridge"
-    public static let events = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop", "SessionEnd", "Notification"]
+    public static let events = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop", "StopFailure", "SessionEnd", "Notification"]
     public static var settingsURL: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json") }
     public static func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     private static func owned(_ hook: JSONObject) -> Bool {
@@ -37,7 +37,7 @@ public enum HookInstaller {
               let hooks = settings["hooks"] as? [String: [JSONObject]] else { return false }
         return (hooks["PermissionRequest"] ?? []).contains { (($0["hooks"] as? [JSONObject]) ?? []).contains(where: owned) }
     }
-    /// Upgrade only this installed helper's time budget. Never reconnect removed hooks or steal another app's hooks.
+    /// Upgrade this enabled installation. Preserve other helpers and explicitly removed failure hooks.
     @discardableResult public static func upgradeTimeouts(executable: String, url: URL = settingsURL) throws -> URL? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
@@ -45,6 +45,7 @@ public enum HookInstaller {
               settings["disableAllHooks"] as? Bool != true,
               var hooks = settings["hooks"] as? [String: [JSONObject]] else { return nil }
         var changed = false
+        var installedCommand: String?
         for event in events {
             guard var groups = hooks[event] else { continue }
             for index in groups.indices {
@@ -52,6 +53,7 @@ public enum HookInstaller {
                 for position in handlers.indices {
                     guard owned(handlers[position]), let command = handlers[position]["command"] as? String,
                           command.hasSuffix(quote(executable) + " hook --autoapprove-managed") else { continue }
+                    if event == "PermissionRequest" { installedCommand = command }
                     let timeout = ["PreToolUse", "PermissionRequest"].contains(event) ? 660 : 10
                     if (handlers[position]["timeout"] as? Int ?? 0) < timeout {
                         handlers[position]["timeout"] = timeout; changed = true
@@ -60,6 +62,17 @@ public enum HookInstaller {
                 groups[index]["hooks"] = handlers
             }
             hooks[event] = groups
+        }
+        // Only migrate an older complete installation. An existing StopFailure
+        // entry (even an empty one) is an explicit user choice and stays intact.
+        if hooks["StopFailure"] == nil, let command = installedCommand,
+           ["SessionStart", "Stop", "SessionEnd"].allSatisfy({ event in
+               (hooks[event] ?? []).contains { group in
+                   ((group["hooks"] as? [JSONObject]) ?? []).contains { $0["command"] as? String == command }
+               }
+           }) {
+            hooks["StopFailure"] = [["matcher":"", "hooks":[["type":"command", "command":command, "timeout":10]]]]
+            changed = true
         }
         guard changed else { return nil }
         settings["hooks"] = hooks

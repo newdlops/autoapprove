@@ -65,13 +65,16 @@ public struct ScreenHostAdapter: Sendable {
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
     /// Sends a message into a Codex composer stopped at the given region (see `CodexCapacityStop`).
     public var resume: @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery
+    /// The source is an already verified, idle original shell after an observed CLI error.
+    public var restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
     public var input: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
     public init(screens: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot,
                 approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
                 reveal: @escaping @Sendable (ScreenTarget) throws -> TerminalWindowBounds?,
                 resume: @escaping @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery = { _, _, _ in .missingTarget },
+                restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)? = nil,
                 input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget }) {
-        self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.input = input
+        self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.restart = restart; self.input = input
     }
     public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
         switch host {
@@ -80,12 +83,14 @@ public struct ScreenHostAdapter: Sendable {
                 approve: { try TerminalAdapter.approve(tty: $0.tty, expectedScreen: $1, agent: $2) },
                 reveal: { try TerminalAdapter.reveal(tty: $0.tty) },
                 resume: { try TerminalAdapter.resume(tty: $0.tty, region: $1, text: $2) },
+                restart: { try TerminalAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) })
         case .iterm:
             return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
                 reveal: { try ITermAdapter.reveal(tty: $0.tty) },
                 resume: { try ITermAdapter.resume(target: $0, region: $1, text: $2) },
+                restart: { try ITermAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) })
         case .orca:
             return ScreenHostAdapter(screens: { try OrcaAdapter.screens(targets: $0) },
@@ -155,6 +160,30 @@ public struct TerminalWindowMetadata: Equatable, Sendable {
 }
 
 public enum TerminalAdapter {
+    public static func restart(target: ScreenTarget, expected: String, command: String) throws -> TerminalDelivery {
+        let output = try AutomationScript.run(restartScript(target:target,expected:expected,command:command),app:"Terminal",denied:.permissionDenied)
+        guard let result = TerminalDelivery(rawValue:output) else { throw AppError.message("같은 대화 복구 명령의 전달 결과를 확인하지 못했습니다.") }
+        return result
+    }
+    public static func restartScript(target: ScreenTarget, expected: String, command: String) throws -> String {
+        let literal = try AutomationScript.literal(["tty":target.tty,"screen":expected,"command":command] as JSONObject)
+        return """
+        (() => {
+          const app = Application('com.apple.Terminal'), target = \(literal);
+          const normalize = text => String(text).normalize('NFC').replace(/\\r\\n?/g,'\\n');
+          if (!app.running()) return 'missingTarget';
+          for (const window of app.windows()) for (const tab of window.tabs()) {
+            if (tab.tty() !== target.tty) continue;
+            if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
+            const jobs = tab.processes().map(p => String(p).toLowerCase());
+            if (jobs.length !== 1 || !/^(?:-)?(?:zsh|bash|sh|fish|dash|ksh)$/.test(jobs[0])) return 'agentMissing';
+            app.doScript(String(target.command).normalize('NFC'), {in:tab});
+            return 'sent';
+          }
+          return 'missingTarget';
+        })();
+        """
+    }
     /// Reads the exact native window's selected TTY. It never activates/selects a tab.
     /// The caller preflights Automation without prompting before running this helper.
     public static func windowMetadata(tty: String, host: ScreenHost = .terminal) throws -> TerminalWindowMetadata? {
@@ -358,7 +387,7 @@ public enum TerminalAdapter {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;
           const before = resumeRows(tab.contents());
           if (!resumeReady(before, target.region)) return 'screenChanged';
-          if (!tab.processes().some(p => p.toLowerCase().includes('codex'))) return 'agentMissing';
+          if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return 'agentMissing';
           // do script types the text and Return in one write, which Codex keeps as a paste.
           // A separate Return submits it, only while the draft sits in the same stopped composer.
           app.doScript(text, {in:tab});

@@ -2,6 +2,27 @@ import Foundation
 
 /// iTerm2's scripting dictionary mirrors Terminal's tab model one level deeper: windows → tabs → sessions.
 public enum ITermAdapter {
+    public static func restart(target: ScreenTarget, expected: String, command: String) throws -> TerminalDelivery {
+        let literal = try AutomationScript.literal(["tty":target.tty,"screen":expected,"command":command,"pid":Int(target.sourcePID ?? 0)] as JSONObject)
+        let script = """
+        (() => {
+          const app = \(app), target = \(literal);
+          \(visibleFunction)
+          const normalize = text => String(text).normalize('NFC').replace(/\\r\\n?/g,'\\n');
+          if (!app.running()) return 'missingTarget';
+          for (const window of app.windows()) for (const tab of window.tabs()) for (const session of tab.sessions()) {
+            if (session.tty() !== target.tty) continue;
+            if (normalize(visible(session)) !== normalize(target.screen)) return 'screenChanged';
+            if (Number(session.variable({named:'jobPid'})) !== target.pid) return 'agentMissing';
+            session.write({text:String(target.command).normalize('NFC')}); return 'sent';
+          }
+          return 'missingTarget';
+        })();
+        """
+        let output = try AutomationScript.run(script,app:"iTerm2",denied:.automationDenied("iTerm2"))
+        guard let result = TerminalDelivery(rawValue:output) else { throw AppError.message("같은 대화 복구 명령의 전달 결과를 확인하지 못했습니다.") }
+        return result
+    }
     static let app = "Application('com.googlecode.iterm2')"
     private static func javascript(_ body: String) throws -> String {
         try AutomationScript.run(body, app: "iTerm2", denied: .automationDenied("iTerm2"))

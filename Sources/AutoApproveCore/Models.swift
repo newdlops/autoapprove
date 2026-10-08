@@ -123,11 +123,24 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var completionError: String?
     /// A Codex turn stopped at model capacity, while this session's auto-approval is on.
     public var capacityResume: CapacityResume?
+    /// An observed CLI failure, independent of Mac/web connectivity.
+    public var interruption: SessionInterruption?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
-    public var phaseTitle: String { isMonitoring ? "대기 중 · 모니터링" : phase.title }
-    public var needsReview: Bool { phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending }) }
+    public var phaseTitle: String {
+        if interruption?.needsAttention == true {
+            if phase == .ended { return "오류로 종료됨" }
+            switch capacityResume?.phase {
+            case .scheduled: return "중단 · 자동 이어가기 대기"
+            case .sending, .awaiting: return "중단 · 이어가는 중"
+            case .paused: return "중단 · 자동 이어가기 일시정지"
+            default: return "오류로 중단됨"
+            }
+        }
+        return isMonitoring ? "대기 중 · 모니터링" : phase.title
+    }
+    public var needsReview: Bool { interruption?.needsAttention == true || (phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending })) }
     public var canApprove: Bool { agent != .shell && phase != .ended && (channel != .none || backgroundChildren.contains(where: \.canApprove)) }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
     public var canReveal: Bool {
@@ -165,6 +178,7 @@ public struct CapacityResume: Codable, Equatable {
     public var limit: Int
     public var deadline: Date?
     public var message: String
+    public var reason: String?
     public init(phase: Phase, attempt: Int, limit: Int, deadline: Date? = nil, message: String = CodexCapacityStop.resumeText) {
         self.phase = phase; self.attempt = attempt; self.limit = limit; self.deadline = deadline; self.message = message
     }

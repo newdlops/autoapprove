@@ -144,6 +144,8 @@ import TerminalInputSupport
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
     /// Seconds before each automatic continue within one run of capacity failures; its count is the limit.
     public var capacityResumeDelays: [TimeInterval] = [30, 60, 120, 240, 480]
+    /// Transient connection failures continue with a bounded delay until progress or cancellation.
+    public var interruptionResumeDelays: [TimeInterval] = [5, 15, 30, 60, 120, 300]
     /// Wait after a final check that typed nothing, before trying the next fresh frame.
     public var capacityUnsentRetryDelay: TimeInterval = 3
     /// After a verified send, a frame read before it can still arrive. A stop that looks the same
@@ -164,6 +166,9 @@ import TerminalInputSupport
         var unsent = 0
     }
     private var capacityStates: [String: CapacityState] = [:]
+    private var exitRecoveries: [String: SessionExitRecovery] = [:]
+    private var exitRecoveryTasks = Set<String>()
+    private var conversationReads = Set<String>()
     /// Work must be gone this long before the hold ends. It bridges a turn's end and the next approval or continue.
     public var keepAwakeGrace: TimeInterval = 120
     /// On battery at or below this percent the hold ends; macOS's own low-battery sleep is off while it holds.
@@ -268,6 +273,22 @@ import TerminalInputSupport
             health.requested = enabled
             if enabled { health.status = "저장된 \(host.title) 연결 복원 중…" }
             snapshot.health.setScreen(host, health)
+        }
+        if let saved = store.value("interruptedSessions"),
+           let values = try? JSONDecoder().decode([SessionExitRecovery].self,from:Data(saved.utf8)) {
+            for var value in values.suffix(100) where value.session.interruption?.needsAttention == true &&
+                Date().timeIntervalSince(value.session.interruption?.date ?? .distantPast) < 7 * 86400 {
+                if value.state == "launching" { value.state = "review"; value.session.interruption?.recoveryStatus = "review" }
+                value.session.phase = .ended; value.session.channel = .none; value.session.automatic = false
+                sessions[value.session.id] = value.session; exitRecoveries[value.session.id] = value
+            }
+        }
+        if let saved = store.value("interruptedSessionNotices"),
+           let values = try? JSONDecoder().decode([AgentSession].self,from:Data(saved.utf8)) {
+            for value in values.suffix(100) where sessions[value.id] == nil && value.interruption?.needsAttention == true &&
+                Date().timeIntervalSince(value.interruption?.date ?? .distantPast) < 7 * 86400 {
+                sessions[value.id] = value
+            }
         }
     }
     static func connectionGuide(_ session: AgentSession) -> String {
@@ -409,7 +430,8 @@ import TerminalInputSupport
     }
 
     public func remoteSessionViews() -> [RemoteSessionView] {
-        snapshot.sessions.filter { $0.phase != .ended }.compactMap { session -> RemoteSessionView? in
+        snapshot.sessions.filter { $0.phase != .ended || $0.interruption?.needsAttention == true ||
+            ($0.interruption?.resumedSessionID != nil && Date().timeIntervalSince($0.interruption?.recoveredAt ?? .distantPast) < 300) }.compactMap { session -> RemoteSessionView? in
             let canRead = remoteCanRead(session) || nativeWindowCapture(for: session) != nil || usesOrcaSnapshot(session)
             let ptyID = session.id.hasPrefix("pty:") ? String(session.id.dropFirst(4)) : ptySessionBindings[session.id]
             let terminal = ptyID.flatMap { try? managedPTY.terminal($0) }
@@ -421,6 +443,11 @@ import TerminalInputSupport
                 canRead: canRead, inputReason: remoteInputReason(session), keys: canRead && (!usesOrcaSnapshot(session) || remoteCanRead(session)) ? remoteKeys(session) : [],
                 ptyID: pty?.ptyID, pty: pty)
         }
+    }
+    public func remoteHistory(sessionID: String) throws -> [AuditEvent] {
+        guard let session = snapshot.sessions.first(where:{$0.id == sessionID}) else { throw RemoteHTTPError(404,"세션을 찾을 수 없습니다.") }
+        let members = Set([session.id]+session.backgroundChildren.map(\.id))
+        return Array(snapshot.events.filter {members.contains($0.sessionID) || $0.originSessionID.map(members.contains) == true}.prefix(12))
     }
     private func synchronizePTYContainers() {
         let inventory = managedPTY.inventory
@@ -1264,7 +1291,8 @@ import TerminalInputSupport
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             return ["mouseActivity": try JSONSerialization.jsonObject(with: encoder.encode(mouseActivity.status))]
         }
-        guard let id = object["sessionID"] as? String, let session = sessions[id], session.phase != .ended else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
+        guard let id = object["sessionID"] as? String, let session = sessions[id],
+              session.phase != .ended || ["cancelCapacity","read"].contains(action) else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
         switch action {
         case "clearQueuedInputs":
             guard session.agent == .codex, let thread = object["threadID"] as? String,
@@ -1645,6 +1673,9 @@ import TerminalInputSupport
             inboxes[session.id] = inbox
             session.notices = inbox.entries.isEmpty ? nil : inbox.entries
         } else { session.notices = nil }
+        if let saved = store.value("interruption:\(session.id)") {
+            session.interruption = try? JSONDecoder().decode(SessionInterruption.self, from:Data(saved.utf8))
+        }
     }
 
     private func updateInboxes() {
@@ -1654,7 +1685,8 @@ import TerminalInputSupport
             guard var session = sessions[id] else { continue }
             session.automatic = effectiveAutomatic(id)
             var candidates = AttentionRequest.candidates(session, paused: snapshot.paused).map {
-                SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary)
+                SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary,
+                    isInterruption: $0.kind == .interruption)
             }
             if session.phase != .ended, let completion = session.completion, now.timeIntervalSince(completion.date) <= 300 {
                 candidates.append(.init(key: SessionNotice.key(.completion, completion.id), kind: .completion, summary: completion.summary))
@@ -2021,12 +2053,16 @@ import TerminalInputSupport
                 session.detail = Self.connectionGuide(session)
             }
             sessions[session.id] = session
+            rememberExitContext(session,records:records)
         }
         for key in Array(sessions.keys) where key.hasPrefix("process:") && !live.contains(key) {
+            let newlyEnded = sessions[key]?.phase != .ended
+            if newlyEnded { prepareExitRecovery(key) }
             sessions[key]?.setPhase(.ended, detail: "프로세스가 종료되었습니다."); sessions[key]?.channel = .none; sessions[key]?.automatic = false
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
             claudeWorkIDs.removeValue(forKey: key)
             clearScreen(key); capacityStates.removeValue(forKey: key)
+            if newlyEnded, sessions[key]?.interruption != nil { persistInterruption(key); saveExitRecoveries() }
         }
         let registrations = claudeRegistrations ?? claudeRegistryReader(records)
         reconcileClaudeParents(registrations: registrations)
@@ -2039,6 +2075,7 @@ import TerminalInputSupport
             }
         }
         synchronizePTYContainers()
+        for id in Array(exitRecoveries.keys) where sessions[id]?.phase == .ended { advanceExitRecovery(id,records:records) }
         publish()
     }
 
@@ -2349,7 +2386,18 @@ import TerminalInputSupport
             } else if first && !deferApproval {
                 log(AuditEvent(sessionID: key, summary: summary, outcome: "터미널에서 확인", source: "Claude 훅", tool: tool, request: request), session: session)
             }
-        case "SessionEnd": session.setPhase(.ended, detail: "Claude 세션 종료 이벤트를 받았습니다."); session.automatic = false; session.pendingSummary = nil; session.pendingInTerminal = false
+        case "SessionEnd":
+            sessions[key] = session; prepareExitRecovery(key); session = sessions[key] ?? session
+            session.setPhase(.ended, detail: "Claude 세션 종료 이벤트를 받았습니다."); session.automatic = false; session.pendingSummary = nil; session.pendingInTerminal = false
+        case "StopFailure":
+            let failure = payload["error"] as? String ?? "unknown"
+            let detail = payload["last_assistant_message"] as? String ?? payload["error_details"] as? String ?? failure
+            session.completion = nil
+            session.setPhase(.idle,detail:"Claude가 오류로 요청을 중단했습니다.",monitoring:false)
+            session.pendingSummary = nil; session.pendingInTerminal = false; session.pendingRequestID = nil
+            if session.interruption?.needsAttention != true {
+                session.interruption = SessionInterruption(id:UUID().uuidString,kind:.claudeFailure(failure),detail:detail)
+            }
         case "Stop":
             guard !session.pendingInTerminal else { break }
             let background = payload["background_tasks"] as? [Any] ?? []
@@ -2373,7 +2421,9 @@ import TerminalInputSupport
         case "PreToolUse":
             session.setPhase(needsAnswer ? .input : .working, detail: needsAnswer ? "Claude가 질문에 대한 응답을 기다리고 있습니다." : "Claude의 도구 실행 이벤트를 받았습니다.")
             session.pendingSummary = needsAnswer ? summary : nil; session.pendingInTerminal = needsAnswer
-        case "UserPromptSubmit", "PostToolUse": session.setPhase(.working, detail: "Claude가 요청을 처리하고 있습니다."); session.pendingSummary = nil; session.pendingInTerminal = false
+        case "UserPromptSubmit", "PostToolUse":
+            if session.interruption?.needsAttention == true { session.interruption?.recoveredAt = Date(); session.interruption?.resumeUncertain = false }
+            session.setPhase(.working, detail: "Claude가 요청을 처리하고 있습니다."); session.pendingSummary = nil; session.pendingInTerminal = false
         default: break
         }
         if session.pendingSummary == nil {
@@ -2385,7 +2435,9 @@ import TerminalInputSupport
                 session.pendingRequestID = "hook:\(providerID):\(requestID)"
             }
         }
-        sessions[key] = session; snapshot.health.claude = "연결됨 · 세션 이벤트 수신 중"; publish()
+        sessions[key] = session
+        if session.interruption != nil { persistInterruption(key) }
+        snapshot.health.claude = "연결됨 · 세션 이벤트 수신 중"; publish()
         return response
     }
 
@@ -2792,6 +2844,8 @@ import TerminalInputSupport
             // still work normally. End/disconnect/stop removes their parsing cache.
             if raw.utf8.count <= 131_072, screenAnalyses.count < 32 { screenAnalyses[sessionID] = analysis }
         }
+        observeCapacity(sessionID,analysis:analysis,at:now)
+        defer { publish() }
         let prompt = analysis.prompt
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
@@ -2799,9 +2853,7 @@ import TerminalInputSupport
                   let source, source.isScreen else { return }
             sessions[sessionID]?.channel = source
         } else if !session.channel.isScreen { return }
-        defer { publish() }
         screenObservedAt[sessionID] = now
-        if session.agent == .codex { observeCapacity(sessionID, analysis: analysis, at: now) }
         guard let prompt else {
             let request = analysis.request
             let observation = analysis.activity
@@ -2865,9 +2917,22 @@ import TerminalInputSupport
     /// After a confirmed send, the next stop drawn is the next failure of the same run.
     private func observeCapacity(_ id: String, analysis: ScreenAnalysis, at now: Date) {
         let raw = analysis.raw
-        guard let session = sessions[id], session.agent == .codex, session.phase != .ended else { return }
-        guard session.automatic, session.channel.isScreen else { capacityStates.removeValue(forKey: id); return }
+        guard let session = sessions[id], session.agent != .shell, session.phase != .ended else { return }
         let stop = analysis.capacityStop
+        if let stop {
+            rememberExitContext(session,records:records)
+            if session.interruption?.needsAttention != true || session.interruption?.kind != stop.kind {
+                sessions[id]?.interruption = SessionInterruption(id:UUID().uuidString,kind:stop.kind,detail:stop.error,date:now)
+                persistInterruption(id)
+            }
+            readRecoveryConversation(id)
+        } else if analysis.activity.phase == .working, session.interruption?.needsAttention == true {
+            sessions[id]?.interruption?.recoveredAt = now
+            sessions[id]?.interruption?.resumeUncertain = false
+            persistInterruption(id)
+        }
+        let channel = ScreenHost(kind:session.terminal).flatMap { screenConnections[$0]?.enabled == true ? $0.channel : nil } ?? session.channel
+        guard session.automatic, channel.isScreen else { capacityStates.removeValue(forKey: id); return }
         if var state = capacityStates[id] {
             if let stop {
                 state.observedAt = now
@@ -2880,14 +2945,14 @@ import TerminalInputSupport
                     let elapsed = now.timeIntervalSince(state.sentAt ?? now)
                     if stop.identity != state.stop.identity || elapsed >= capacityStaleFrameWindow {
                         let attempt = elapsed >= capacityProgressWindow ? 1 : state.attempt + 1
-                        startCapacityRun(id, stop: stop, channel: session.channel, attempt: attempt, at: now)
+                        startCapacityRun(id, stop: stop, channel: channel, attempt: attempt, at: now)
                     } else {
                         capacityStates[id] = state
                     }
                 case .waiting, .unavailable, .review, .exhausted, .cancelled:
                     if stop.identity != state.stop.identity {
                         // Not ours: someone continued by hand, or the transcript was redrawn.
-                        startCapacityRun(id, stop: stop, channel: session.channel, attempt: 1, at: now)
+                        startCapacityRun(id, stop: stop, channel: channel, attempt: 1, at: now)
                     } else {
                         state.stop = stop; capacityStates[id] = state
                         if state.phase == .waiting, state.scheduledID == nil { scheduleCapacityResume(id) }
@@ -2903,6 +2968,9 @@ import TerminalInputSupport
                         capacityStates[id]?.phase = .review
                     } else if phase == .idle || (phase != .unknown && elapsed >= capacityProgressWindow) {
                         // Ended normally, or kept working: the run of failures is over.
+                        sessions[id]?.interruption?.recoveredAt = now
+                        sessions[id]?.interruption?.resumeUncertain = false
+                        persistInterruption(id)
                         capacityStates.removeValue(forKey: id)
                     }
                 case .review where CodexResumeCheck.draftVisible(raw, text: CodexCapacityStop.resumeText):
@@ -2915,7 +2983,7 @@ import TerminalInputSupport
                 }
             }
         } else if let stop {
-            startCapacityRun(id, stop: stop, channel: session.channel, attempt: 1, at: now)
+            startCapacityRun(id, stop: stop, channel: channel, attempt: 1, at: now)
         }
     }
 
@@ -2925,30 +2993,32 @@ import TerminalInputSupport
             sessions[id]?.setPhase(activity.phase, detail: activity.detail, at: now, monitoring: activity.monitoring)
             return
         }
-        let detail = "모델 용량 부족으로 Codex 작업이 멈췄습니다."
+        let detail = "\(state.stop.kind.title)로 \(sessions[id]?.agent.title ?? "CLI") 작업이 멈췄습니다."
         guard state.phase == .review || state.phase == .exhausted else {
             sessions[id]?.setPhase(activity.phase, detail: detail, at: now, monitoring: activity.monitoring)
             return
         }
         sessions[id]?.setPhase(.input, detail: detail, at: now)
         sessions[id]?.pendingSummary = state.phase == .review
-            ? "이어서 진행 요청을 입력했지만 전송을 확인하지 못했습니다. 터미널에서 Codex 입력창을 확인해주세요."
+            ? state.stop.kind.retryable ? "이어서 진행 요청의 전달 결과를 확인하지 못했습니다. 같은 입력은 다시 보내지 않습니다. 원본 입력창을 확인해주세요." : "인증 또는 설정 오류를 해결한 뒤 같은 세션에서 이어서 진행해주세요."
             : "모델 용량 부족이 계속되어 자동으로 \(capacityResumeDelays.count)회 이어서 진행한 뒤 멈췄습니다. 터미널에서 이어서 진행해주세요."
         sessions[id]?.pendingInTerminal = true
         sessions[id]?.pendingRequestID = "capacity:\(state.phase == .review ? "review" : "exhausted"):\(state.stop.identity)"
     }
 
     private func startCapacityRun(_ id: String, stop: CodexCapacityStop, channel: ApprovalChannel, attempt: Int, at now: Date) {
-        let delays = capacityResumeDelays
-        var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: min(attempt, delays.count),
+        let delays = stop.kind == .capacity ? capacityResumeDelays : interruptionResumeDelays
+        var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: stop.kind == .capacity ? min(attempt,delays.count) : attempt,
             deadline: now, observedAt: now)
-        // VS Code sessions have no typing path for this yet.
-        if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil {
+        if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true && sessions[id]?.interruption?.resumeIdentity == stop.identity) {
+            state.phase = .review
+        } else if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil &&
+                    !(channel == .vscodeScreen && sessions[id]?.bridgeID.flatMap({peers[$0]}) != nil) {
             state.phase = .unavailable
-        } else if attempt > delays.count {
+        } else if stop.kind == .capacity, attempt > delays.count {
             state.phase = .exhausted
         } else {
-            state.deadline = now.addingTimeInterval(delays[attempt - 1])
+            state.deadline = now.addingTimeInterval(delays[min(attempt - 1,delays.count - 1)])
         }
         capacityStates[id] = state
         if state.phase == .waiting { scheduleCapacityResume(id) }
@@ -2966,13 +3036,14 @@ import TerminalInputSupport
     }
 
     private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64) async {
-        func current() -> (CapacityState, AgentSession, ScreenHostAdapter, ScreenHost)? {
+        func current() -> (CapacityState, AgentSession, ScreenHostAdapter?)? {
             guard let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
-                  session.phase != .ended, session.channel == state.channel, let host = ScreenHost(channel: state.channel),
-                  let adapter = screenAdapters[host], Date() >= state.deadline,
+                  session.phase != .ended, (session.channel == state.channel || ScreenHost(kind:session.terminal)?.channel == state.channel), Date() >= state.deadline,
                   Date().timeIntervalSince(state.observedAt) < 6 else { return nil }
-            return (state, session, adapter, host)
+            let adapter = ScreenHost(channel:state.channel).flatMap {screenAdapters[$0]}
+            guard adapter != nil || (state.channel == .vscodeScreen && session.bridgeID.flatMap({peers[$0]}) != nil) else { return nil }
+            return (state, session, adapter)
         }
         guard current() != nil else {
             // A later frame reschedules a stop that is still visible.
@@ -2981,30 +3052,36 @@ import TerminalInputSupport
         }
         let reader = processReader
         let live = try? await Task.detached(priority: .utility) { try reader() }.value
-        guard let (state, session, adapter, host) = current(),
-              let process = live?.first(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == .codex
+        guard let (state, session, adapter) = current(),
+              let process = live?.first(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent
                   && "/dev/" + $0.tty == session.tty }), process.isForeground else {
             if capacityStates[id]?.scheduledID == scheduledID { capacityStates[id]?.scheduledID = nil }
             return
         }
         capacityStates[id]?.phase = .sending; capacityStates[id]?.scheduledID = nil
-        var event = AuditEvent(sessionID: id, summary: "모델 용량 부족 · 이어서 진행 요청 (\(state.attempt)/\(capacityResumeDelays.count))",
-            outcome: "이어서 진행 요청 · 결과 미확인", source: "\(host.title) 화면", context: AuditContext(session: session),
+        var event = AuditEvent(sessionID: id, summary: "\(state.stop.kind.title) · 이어서 진행 요청 (\(state.attempt))",
+            outcome: "이어서 진행 요청 · 결과 미확인", source: state.channel.title, context: AuditContext(session: session),
             request: state.stop.region, answer: CodexCapacityStop.resumeText)
         // Persist the attempt before typing; a crash or lost result remains traceable.
         guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
+        sessions[id]?.interruption?.resumeUncertain = true
+        sessions[id]?.interruption?.resumeIdentity = state.stop.identity
+        guard persistInterruption(id) else { capacityStates[id]?.phase = .review; publish(); return }
         publish()
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
         let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
             sourcePID: session.pid, sourceStarted: session.started)
-        let resume = adapter.resume, region = state.stop.region, text = CodexCapacityStop.resumeText
+        let region = state.stop.region, text = CodexCapacityStop.resumeText
         automaticInputSessions.insert(id)
         defer { automaticInputSessions.remove(id); scheduleScreenApproval(id) }
         do {
-            let delivery = try await Task.detached { try resume(target, region, text) }.value
+            let delivery: ResumeDelivery
+            if let adapter { delivery = try await Task.detached { try adapter.resume(target,region,text) }.value }
+            else { delivery = try await resumeBridgeSession(session,region:region,text:text) }
             switch delivery {
             case .sent:
                 event.outcome = "이어서 진행 요청 전달"
+                sessions[id]?.interruption?.resumeUncertain = false
                 capacityStates[id]?.phase = .sent; capacityStates[id]?.sentAt = Date(); capacityStates[id]?.unsent = 0
             case .typed:
                 // Typed, but neither a draft nor a new message was visible: never type again.
@@ -3012,6 +3089,7 @@ import TerminalInputSupport
                 capacityStates[id]?.phase = .review
             case .screenChanged, .missingTarget, .agentMissing:
                 // Nothing was typed. Try again on a fresh frame, a few times.
+                sessions[id]?.interruption?.resumeUncertain = false
                 event.outcome = "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                 let unsent = (capacityStates[id]?.unsent ?? 0) + 1
                 capacityStates[id]?.unsent = unsent
@@ -3024,10 +3102,235 @@ import TerminalInputSupport
             capacityStates[id]?.phase = .review
         }
         log(event)
+        persistInterruption(id)
         publish()
     }
 
+    @discardableResult private func persistInterruption(_ id: String) -> Bool {
+        guard let value = sessions[id]?.interruption else { return true }
+        do {
+            try store.set("interruption:\(id)",String(decoding:try JSONEncoder().encode(value),as:UTF8.self))
+            return true
+        } catch { snapshot.health.auditError = "작업 중단 상태를 저장하지 못했습니다. \(error.localizedDescription)"; return false }
+    }
+
+    private func resumeBridgeSession(_ session: AgentSession, region: String, text: String) async throws -> ResumeDelivery {
+        let id = session.id
+        guard let before = remoteObservedScreens[id], Date().timeIntervalSince(before.observedAt) < 6,
+              CodexResumeCheck.ready(before.raw,region:region) else { return .screenChanged }
+        func write(_ observed: RemoteObservedScreen, kind: String, value: String) async throws -> Bool {
+            let reader = processReader, live = try await Task.detached { try reader() }.value
+            guard !remoteInputStopped, !snapshot.paused, !userInputHasPriority(id),
+                  live.contains(where:{$0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/"+$0.tty == session.tty && $0.isForeground}),
+                  let current = sessions[id], current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
+                  let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID,
+                  remoteObservedScreens[id]?.raw == observed.raw, remoteObservedScreens[id]?.generation == observed.generation else { return false }
+            let actionID = UUID().uuidString
+            return try await withCheckedThrowingContinuation { continuation in
+                remoteInputReplies[actionID] = (peerID,continuation)
+                if !peer.send(["method":"remoteInput","id":actionID,"terminalID":terminalID,"screen":observed.raw,
+                    "generation":String(observed.generation.dropFirst(peerID.count+1)),"kind":kind,"text":value,
+                    "expiresAt":Date().addingTimeInterval(2).timeIntervalSince1970*1000]) {
+                    remoteInputReplies.removeValue(forKey:actionID)?.continuation.resume(throwing:AppError.message("원본 편집기 연결이 끊겼습니다.")); return
+                }
+                Task { [weak self] in
+                    try? await Task.sleep(for:.seconds(3))
+                    self?.remoteInputReplies.removeValue(forKey:actionID)?.continuation.resume(throwing:AppError.message("원본 편집기의 입력 결과를 확인하지 못했습니다."))
+                }
+            }
+        }
+        guard try await write(before,kind:"characters",value:text) else { return .screenChanged }
+        let deadline = Date().addingTimeInterval(8)
+        repeat {
+            try await Task.sleep(for:.milliseconds(250))
+            guard let after = remoteObservedScreens[id], after.generation == before.generation else { return .typed }
+            let state = CodexResumeCheck.state(before:before.raw,after:after.raw,region:region,text:text)
+            if state == .submitted { return .sent }
+            if state == .draft {
+                guard try await write(after,kind:"enter",value:"") else { return .typed }
+                let until = Date().addingTimeInterval(4)
+                repeat {
+                    try await Task.sleep(for:.milliseconds(250))
+                    if let next = remoteObservedScreens[id], next.generation == before.generation,
+                       !CodexResumeCheck.draftVisible(next.raw,text:text) { return .sent }
+                } while Date() < until
+                return .typed
+            }
+        } while Date() < deadline
+        return .typed
+    }
+
+    private func rememberExitContext(_ session: AgentSession, records: [ProcessRecord]) {
+        guard session.automatic, session.phase != .ended,
+              let process = records.first(where:{$0.pid == session.pid && $0.started == session.started}),
+              let shell = ProcessDiscovery.ancestors(of:process.parent,records:records).first(where: {
+                  $0.tty == process.tty && SessionExitRecovery.isShell($0)
+              }) else { return }
+        let conversation = session.agent == .codex ? questionThreadBySession[session.id] : session.providerID
+        var context = SessionExitRecovery(session:session,process:process,shell:shell,conversationID:conversation)
+        context.conversationID = context.conversationID ?? exitRecoveries[session.id]?.conversationID
+        exitRecoveries[session.id] = context
+    }
+
+    private func readRecoveryConversation(_ id: String) {
+        guard let session = sessions[id], session.phase != .ended, session.interruption?.needsAttention == true,
+              exitRecoveries[id]?.conversationID == nil,
+              conversationReads.insert(id).inserted else { return }
+        let current = records
+        Task { [weak self] in
+            guard let self else { return }
+            defer { conversationReads.remove(id) }
+            let value = await currentPTYConversation(session,records:current)
+            guard let value, UUID(uuidString:value) != nil else { return }
+            exitRecoveries[id]?.conversationID = value.lowercased()
+            if sessions[id]?.phase == .ended { saveExitRecoveries() }
+        }
+    }
+
+    private func prepareExitRecovery(_ id: String) {
+        guard let session = sessions[id], let error = session.interruption, error.needsAttention else { return }
+        sessions[id]?.interruption?.processEnded = true
+        let eligible = session.automatic && error.kind.retryable && error.resumeUncertain != true && capacityStates[id]?.phase != .cancelled
+        if var context = exitRecoveries[id] {
+            context.session = sessions[id] ?? session
+            context.conversationID = context.conversationID ?? SessionExitRecovery.conversation(in:screenAnalyses[id]?.raw ?? "")
+            context.state = eligible ? "scheduled" : "review"
+            context.deadline = Date().addingTimeInterval(interruptionResumeDelays.first ?? 5)
+            exitRecoveries[id] = context
+            sessions[id]?.interruption?.recoveryStatus = context.state
+            sessions[id]?.interruption?.recoveryDetail = eligible ? "원본 셸과 같은 대화를 확인한 뒤 자동 복구합니다." : "자동 복구가 꺼졌거나 입력 결과 확인이 필요합니다."
+        } else {
+            sessions[id]?.interruption?.recoveryStatus = "unavailable"
+            sessions[id]?.interruption?.recoveryDetail = "원본 셸을 확인할 수 없습니다. Mac에서 같은 대화를 다시 열어주세요."
+        }
+        persistInterruption(id); saveExitRecoveries()
+    }
+
+    @discardableResult private func saveExitRecoveries() -> Bool {
+        let values = exitRecoveries.values.compactMap { value -> SessionExitRecovery? in
+            guard let session = sessions[value.session.id], session.interruption?.processEnded == true,
+                  session.interruption?.needsAttention == true,
+                  Date().timeIntervalSince(session.interruption?.date ?? .distantPast) < 7 * 86400 else { return nil }
+            var result = value; result.session = session; return result
+        }.sorted { ($0.session.interruption?.date ?? .distantPast) < ($1.session.interruption?.date ?? .distantPast) }.suffix(100)
+        let notices = sessions.values.filter { $0.phase == .ended && $0.interruption?.needsAttention == true &&
+            Date().timeIntervalSince($0.interruption?.date ?? .distantPast) < 7 * 86400 }.sorted { $0.lastActivity < $1.lastActivity }.suffix(100)
+        do {
+            try store.setValues(["interruptedSessions":String(decoding:try JSONEncoder().encode(Array(values)),as:UTF8.self),
+                "interruptedSessionNotices":String(decoding:try JSONEncoder().encode(Array(notices)),as:UTF8.self)])
+            return true
+        }
+        catch { snapshot.health.auditError = "종료된 세션의 복구 상태를 저장하지 못했습니다. \(error.localizedDescription)"; return false }
+    }
+
+    private func advanceExitRecovery(_ id: String, records: [ProcessRecord]) {
+        guard let context = exitRecoveries[id], sessions[id]?.interruption?.needsAttention == true else { return }
+        if context.state == "awaiting" {
+            if Date().timeIntervalSince(context.deadline ?? .distantPast) > 120 {
+                sessions[id]?.interruption?.recoveryStatus = "review"
+                sessions[id]?.interruption?.recoveryDetail = "복구 명령은 전달했지만 같은 대화의 실행을 확인하지 못했습니다. Mac의 원본 터미널을 확인해주세요."
+            }
+            let candidates = records.filter { process in
+                process.agent == context.session.agent && process.tty == context.shell.tty && process.key != id &&
+                ProcessDiscovery.ancestors(of:process.parent,records:records).contains {$0.pid == context.shell.pid && $0.started == context.shell.started}
+            }
+            guard candidates.count == 1, let process = candidates.first, let next = sessions[process.key],
+                  conversationReads.insert(id).inserted else { return }
+            Task { [weak self] in
+                guard let self else { return }; defer { conversationReads.remove(id) }
+                let conversation = next.agent == .codex ? questionThreadBySession[next.id] : next.providerID
+                let actual: String?
+                if let conversation { actual = conversation } else { actual = await currentPTYConversation(next,records:records) }
+                guard let actual, actual.lowercased() == context.conversationID?.lowercased(),
+                      sessions[next.id]?.phase != .ended else { return }
+                sessions[id]?.interruption?.resumedSessionID = next.id
+                sessions[id]?.interruption?.recoveredAt = Date()
+                sessions[id]?.interruption?.resumeUncertain = false
+                sessions[id]?.interruption?.recoveryStatus = "recovered"
+                sessions[next.id]?.automatic = true
+                try? store.set("automatic:\(next.id)","true")
+                persistInterruption(id); exitRecoveries.removeValue(forKey:id); saveExitRecoveries(); publish()
+            }
+            return
+        }
+        guard context.state == "scheduled", !snapshot.paused, !remoteInputStopped,
+              !userInputHasPriority(id), Date() >= (context.deadline ?? .distantPast),
+              exitRecoveryTasks.insert(id).inserted else { return }
+        Task { [weak self] in
+            guard let self else { return }; defer { exitRecoveryTasks.remove(id) }
+            await restartExitedSession(id)
+        }
+    }
+
+    private func restartExitedSession(_ id: String) async {
+        guard var context = exitRecoveries[id], let host = ScreenHost(kind:context.session.terminal),
+              screenConnections[host]?.enabled == true, let adapter = screenAdapters[host], let restart = adapter.restart else {
+            sessions[id]?.interruption?.recoveryStatus = "unavailable"
+            sessions[id]?.interruption?.recoveryDetail = "이 원본 터미널은 종료 후 자동 복구 입력을 지원하지 않습니다. Mac에서 같은 대화를 다시 열어주세요."
+            exitRecoveries[id]?.state = "unavailable"; persistInterruption(id); saveExitRecoveries(); publish(); return
+        }
+        let reader = processReader
+        do {
+            let live = try await Task.detached { try reader() }.value
+            guard let shell = context.verifiedShell(in:live) else {
+                sessions[id]?.interruption?.recoveryDetail = "원본 셸이 닫혔거나 다른 작업 중입니다. 원본 셸이 돌아오면 다시 확인합니다."
+                exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); publish(); return
+            }
+            let target = ScreenTarget(tty:context.session.tty,handle:context.session.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
+            let first = try await Task.detached { try adapter.screens([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            guard let first, SessionExitRecovery.emptyShellPrompt(first) else {
+                exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
+                sessions[id]?.interruption?.recoveryDetail = "원본 셸의 빈 입력창을 기다리고 있습니다."; publish(); return
+            }
+            context.conversationID = context.conversationID ?? SessionExitRecovery.conversation(in:first)
+            guard let command = context.command else {
+                exitRecoveries[id]?.state = "unavailable"
+                sessions[id]?.interruption?.recoveryStatus = "unavailable"
+                sessions[id]?.interruption?.recoveryDetail = "정확한 대화 ID를 확인하지 못했습니다. Mac에서 원래 대화를 선택해주세요."
+                persistInterruption(id); saveExitRecoveries(); publish(); return
+            }
+            try await Task.sleep(for:.seconds(1))
+            let fresh = try await Task.detached { try reader() }.value
+            guard !snapshot.paused, !remoteInputStopped, context.verifiedShell(in:fresh) != nil else { return }
+            let screen = try await Task.detached { try adapter.screens([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            guard screen == first else { exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); return }
+            context.state = "launching"; context.deadline = Date(); context.attempts += 1; exitRecoveries[id] = context
+            sessions[id]?.interruption?.resumeUncertain = true
+            sessions[id]?.interruption?.recoveryStatus = "sending"
+            sessions[id]?.interruption?.recoveryDetail = "원본 터미널에서 같은 대화를 여는 중입니다."
+            guard persistInterruption(id), saveExitRecoveries() else { exitRecoveries[id]?.state = "review"; return }
+            let event = AuditEvent(sessionID:id,summary:"오류 종료 · 같은 대화 복구",outcome:"복구 명령 전달 · 결과 미확인",source:host.title,context:AuditContext(session:context.session))
+            guard log(event) else { exitRecoveries[id]?.state = "review"; return }
+            publish()
+            let delivery = try await Task.detached { try restart(target,first,command) }.value
+            if delivery == .sent {
+                exitRecoveries[id]?.state = "awaiting"; exitRecoveries[id]?.conversationID = context.conversationID
+                sessions[id]?.interruption?.recoveryStatus = "awaiting"
+                sessions[id]?.interruption?.recoveryDetail = "같은 대화의 실행을 확인하고 있습니다. 복구 명령은 다시 보내지 않습니다."
+            } else {
+                exitRecoveries[id]?.state = context.attempts < 3 ? "scheduled" : "review"
+                exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
+                sessions[id]?.interruption?.resumeUncertain = false
+                sessions[id]?.interruption?.recoveryStatus = exitRecoveries[id]?.state
+                sessions[id]?.interruption?.recoveryDetail = "복구 명령이 전달되지 않았습니다. 원본 셸을 다시 확인합니다."
+            }
+        } catch {
+            let uncertain = sessions[id]?.interruption?.resumeUncertain == true
+            exitRecoveries[id]?.state = uncertain ? "review" : "scheduled"
+            exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
+            sessions[id]?.interruption?.recoveryStatus = uncertain ? "review" : "scheduled"
+            sessions[id]?.interruption?.recoveryDetail = uncertain ? "복구 입력의 결과를 확인하지 못했습니다. 같은 명령을 다시 보내지 않습니다." : "원본 터미널 연결을 다시 확인합니다. \(error.localizedDescription)"
+        }
+        persistInterruption(id); saveExitRecoveries(); publish()
+    }
+
     public func cancelCapacityResume(_ id: String) {
+        if exitRecoveries[id]?.state == "scheduled" {
+            exitRecoveries[id]?.state = "cancelled"
+            sessions[id]?.interruption?.recoveryStatus = "cancelled"
+            sessions[id]?.interruption?.recoveryDetail = "같은 대화의 자동 복구를 취소했습니다."
+            persistInterruption(id); saveExitRecoveries(); publish(); return
+        }
         guard let phase = capacityStates[id]?.phase, phase == .waiting || phase == .unavailable else { return }
         capacityStates[id]?.phase = .cancelled; capacityStates[id]?.scheduledID = nil
         publish()
@@ -3205,7 +3508,6 @@ import TerminalInputSupport
     }
 
     private func projectCapacityResumes() {
-        let limit = capacityResumeDelays.count
         for id in Array(sessions.keys) {
             var presented: CapacityResume?
             if let state = capacityStates[id], sessions[id]?.phase != .ended {
@@ -3219,7 +3521,14 @@ import TerminalInputSupport
                 case .exhausted: phase = .exhausted
                 case .cancelled: phase = .cancelled
                 }
-                presented = CapacityResume(phase: phase, attempt: state.attempt, limit: limit, deadline: phase == .scheduled ? state.deadline : nil)
+                presented = CapacityResume(phase: phase, attempt: state.attempt, limit:state.stop.kind == .capacity ? capacityResumeDelays.count : 0, deadline: phase == .scheduled ? state.deadline : nil)
+                presented?.reason = state.stop.kind.title
+            } else if let recovery = exitRecoveries[id], sessions[id]?.phase == .ended,
+                      sessions[id]?.interruption?.needsAttention == true, recovery.state != "ready" {
+                let phase = snapshot.paused && recovery.state == "scheduled" ? CapacityResume.Phase.paused :
+                    CapacityResume.Phase(rawValue:sessions[id]?.interruption?.recoveryStatus ?? recovery.state) ?? .review
+                presented = CapacityResume(phase:phase,attempt:max(1,recovery.attempts),limit:0,deadline:phase == .scheduled ? recovery.deadline : nil)
+                presented?.reason = sessions[id]?.interruption?.kind.title
             }
             if sessions[id]?.capacityResume != presented { sessions[id]?.capacityResume = presented }
         }

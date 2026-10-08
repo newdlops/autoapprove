@@ -87,7 +87,13 @@ public final class TmuxRelay: @unchecked Sendable {
             let current = try screen(target, fresh: true).contents
             guard OrcaAdapter.activeDialog(current, dialog: dialog, agent: agent) == OrcaAdapter.normalize(dialog) else { return .screenChanged }
             return try send(target, agent: agent, bytes: Data("1\r".utf8))
-        }, reveal: { _ in nil }, input: { [self] target, expected, agent, input in
+        }, reveal: { _ in nil }, resume: { [self] target, region, text in
+            try VerifiedResumeInput.deliver(region:region,text:text,read:{ try screen(target,fresh:true).contents },write:{ expected,input in
+                try adapter.input(target,expected,CodexResumeCheck.agent(in:region),input)
+            })
+        }, restart: { [self] target, expected, command in
+            try restart(target,expected:expected,command:command)
+        }, input: { [self] target, expected, agent, input in
             try input.validate()
             if !input.isRelay, OrcaAdapter.normalize(try screen(target, fresh: true).contents) != OrcaAdapter.normalize(expected) { return .screenChanged }
             return try send(target, agent: agent, bytes: Data(input.bytes.utf8))
@@ -205,6 +211,24 @@ public final class TmuxRelay: @unchecked Sendable {
             throw AppError.message("tmux 창의 입력 상태가 바뀌었습니다. 다시 보내지 말고 원본 창을 확인해주세요.")
         }
         return .sent
+    }
+    private func restart(_ target: ScreenTarget, expected: String, command: String) throws -> TerminalDelivery {
+        let handle = try handle(target), connection = try link(handle,tty:target.tty)
+        let pane = try Pane(connection.command("display-message -p -t \(handle.pane) '\(Self.metadataFormat)'"),handle:handle,tty:target.tty)
+        guard !pane.inMode, !pane.synchronized, !pane.inputOff,
+              OrcaAdapter.normalize(try screen(target,fresh:true).contents) == OrcaAdapter.normalize(expected),
+              SessionExitRecovery.emptyShellPrompt(expected) else { return .screenChanged }
+        let records = try ProcessDiscovery.read()
+        guard let shell = records.first(where:{$0.pid == target.sourcePID && $0.started == target.sourceStarted && "/dev/"+$0.tty == target.tty}),
+              SessionExitRecovery.isShell(shell), shell.isForeground,
+              records.filter({$0.tty == shell.tty && $0.processGroup == shell.foregroundGroup}).count == 1,
+              Self.hasAncestor(pid:shell.pid,ancestor:pane.pid), Self.hasAncestor(pid:pane.pid,ancestor:handle.serverPID) else { return .agentMissing }
+        let guardFormat = "#{&&:#{==:#{pane_pid},\(pane.pid)},#{&&:#{==:#{pane_in_mode},0},#{&&:#{==:#{synchronize-panes},0},#{==:#{pane_input_off},0}}}}"
+        let keys = Data((command+"\r").utf8).map {String(format:"%02x",$0)}.joined(separator:" ")
+        let receipt = UUID().uuidString, rejected = UUID().uuidString
+        try handle.validate()
+        let result = try connection.command("if-shell -F -t \(handle.pane) '\(guardFormat)' 'send-keys -H -t \(handle.pane) \(keys) ; display-message -p \(receipt)' 'display-message -p \(rejected)'",receipt:(receipt,rejected))
+        return result.components(separatedBy:"\n").contains(receipt) ? .sent : .screenChanged
     }
     /// Reads live foreground identity with libproc, without launching ps or
     /// performing any TTY input operation.

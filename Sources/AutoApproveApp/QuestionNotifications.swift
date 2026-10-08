@@ -26,7 +26,7 @@ import AutoApproveCore
     var status: String {
         if busy { return "macOS 권한 창에서 알림을 허용해주세요" }
         switch authorization {
-        case .authorized, .provisional: return "허용됨 · 작업 완료와 오래 기다리는 질문을 알립니다"
+        case .authorized, .provisional: return "허용됨 · 작업 중단·완료와 오래 기다리는 질문을 알립니다"
         case .denied: return "알림 꺼짐 · 시스템 설정에서 허용해주세요"
         default: return "알림 허용 필요"
         }
@@ -119,7 +119,7 @@ import AutoApproveCore
                 // an existing alert. Completion retains its three-second grace period.
                 while true {
                     guard let self, self.active[request.id] != nil, self.allowed else { return }
-                    let delay = request.kind == .completion ? 3 : self.engine.snapshot.questionNotificationDelay
+                    let delay = request.kind == .interruption ? 0 : request.kind == .completion ? 3 : self.engine.snapshot.questionNotificationDelay
                     let remaining = observedAt.addingTimeInterval(TimeInterval(delay)).timeIntervalSinceNow
                     if remaining <= 0 { break }
                     do { try await Task.sleep(nanoseconds: UInt64(min(remaining, 1) * 1_000_000_000)) } catch { return }

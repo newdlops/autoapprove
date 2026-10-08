@@ -14,12 +14,8 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
   <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#17181b" media="(prefers-color-scheme: dark)">
   <title>AutoApprove · 네트워크 세션</title>
-  <link rel="stylesheet" href="/vendor/xterm.css">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
-  <script src="/vendor/xterm.js" defer></script>
-  <script src="/vendor/xterm-fit.js" defer></script>
-  <script src="/pty.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -31,6 +27,10 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
   <main>
     <div id="network-error" class="notice error" role="alert" hidden></div>
     <div id="discovery" class="notice" hidden></div>
+    <section id="session-interruptions" class="notice error" aria-labelledby="interruption-title" hidden>
+      <h2 id="interruption-title" aria-live="polite"></h2>
+      <div id="interruption-list"></div>
+    </section>
     <div id="web-update" class="notice web-update" role="status" hidden><span id="web-update-message"></span><a id="open-latest-web" target="_blank" rel="noopener" aria-label="최신 웹 화면을 새 탭에서 열기" aria-describedby="web-update-message">최신 화면 열기 ↗</a></div>
     <section class="network" aria-label="네트워크의 Mac"><div class="section-heading"><h2>연결된 Mac <span id="mac-count" class="muted">—</span></h2><span class="muted small">코드 없이 같은 네트워크로 연결</span></div><div id="machines" class="machines"><p class="empty-inline">Mac을 찾고 있습니다…</p></div></section>
     <div class="workspace" id="workspace">

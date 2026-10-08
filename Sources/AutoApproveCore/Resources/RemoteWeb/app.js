@@ -28,6 +28,9 @@ let directStreamID = null;
 let cursorLayoutPending = false;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
+const interruptionRows = new Map();
+const sessionHistories = new Map();
+let terminalLibraries = null;
 const structuredDrafts = new Map(), messageDrafts = new Map();
 const questionDeliveries = new Map(), questionEditing = new Map();
 let queueSnapshot = null, queueLoading = false, queueGeneration = 0, queueSessionKey = '';
@@ -77,7 +80,7 @@ const supportsPTYStream = node => supportsRelease(node, [0, 2, 41, 48]);
 const supportsTerminalStream = node => supportsRelease(node, [0, 2, 42, 49]);
 const supportsNativeTerminal = node => supportsRelease(node, [0, 2, 43, 51]);
 function reconcilePTYInventory(inventory) {
-  inventory = inventory.filter(item => !sessionEnded(item) && !sessionEnded(ptyRetained.get(item.key)));
+  inventory = inventory.filter(item => (!sessionEnded(item) || item.session.interruption?.recoveredAt == null && !!item.session.interruption) && !sessionEnded(ptyRetained.get(item.key)));
   for (const [key, temporary] of ptyTemporary) {
     if (sessionEnded(temporary)) { retainEndedPTY(temporary); continue; }
     if (inventory.some(item => item.key === key)) { ptyTemporary.delete(key); continue; }
@@ -129,10 +132,27 @@ function ptyReport(state, message, client) {
   show($('pty-unsent'), !!draft); $('pty-unsent-text').value = draft;
   updateControls();
 }
-function ensurePTY() {
+async function loadTerminalLibraries() {
+  if (!terminalLibraries) terminalLibraries = (async () => {
+    const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/vendor/xterm.css'; document.head.append(style);
+    for (const src of ['/vendor/xterm.js','/vendor/xterm-fit.js','/pty.js']) await new Promise((resolve,reject) => {
+      const script = document.createElement('script'); script.src = src;
+      script.onload = resolve; script.onerror = () => { script.remove(); reject(new Error('터미널 구성 요소를 받지 못했습니다. 화면 다시 연결을 눌러주세요.')); };
+      document.head.append(script);
+    });
+  })().catch(error => { terminalLibraries = null; throw error; });
+  return terminalLibraries;
+}
+async function ensurePTY() {
   const item = selectedItem; if (!item?.view.pty || document.hidden) return;
   const streaming = supportsPTYStream(item.node);
   if (ptyClient?.sessionKey === item.key && ptyClient.streaming === streaming) return;
+  try { await loadTerminalLibraries(); }
+  catch (error) {
+    if (selectedKey === item.key) { terminalState('error','터미널 로드 실패'); text($('terminal-error'),error.message); show($('terminal-error'),true); show($('terminal-retry'),true); }
+    return;
+  }
+  if (selectedKey !== item.key || document.hidden || ptyClient?.sessionKey === item.key) return;
   stopPTY();
   ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming);
   ptyClient.sessionKey = item.key;
@@ -143,7 +163,7 @@ const originalStreamSelected = () => !!selectedItem && !selectedItem.view.pty &&
   && (terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration || inputInFlight);
 const originalTerminalConnected = () => !!currentNode()?.online || originalStreamSelected();
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-const needsReview = session => ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
+const needsReview = session => !!session.interruption && session.interruption.recoveredAt == null || ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
 const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
 const byteLength = value => new TextEncoder().encode(value).length;
 let webInteracted = false, firstWebRefresh = true;
@@ -157,7 +177,7 @@ const newerVersion = (left, right) => {
   return false;
 };
 function updateWebVersion(result) {
-  const initial = firstWebRefresh; firstWebRefresh = false;
+  const initial = firstWebRefresh; if (!result.partial) firstWebRefresh = false;
   const loaded = versionNumbers(loadedWebVersion) ? loadedWebVersion : result.gatewayRelease;
   let gateway = result.preferredGateway;
   if (!gateway && newerVersion(result.gatewayRelease, loaded)) gateway = { id: result.gatewayID, name: '이 Mac', url: location.origin + '/', release: result.gatewayRelease };
@@ -553,15 +573,23 @@ async function sendQuestionAnswer(key, nodeID, payload, message) {
   } finally { state.busy = false; updateInteractionControls(); }
 }
 
-async function refreshNetwork() {
+async function refreshNetwork(initial = false) {
   clearTimeout(networkTimer);
   if (loadingNetwork) return;
   loadingNetwork = true; $('refresh').disabled = true; $('refresh').setAttribute('aria-busy', 'true');
   const startedAt = performance.now();
   try {
-    const result = await api('/api/network');
+    const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
+    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network');
     connected = true; nodes = result.nodes; lastNetworkStartedAt = startedAt;
-    allSessions = reconcilePTYInventory(nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []));
+    const inventory = nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []);
+    const continuation = inventory.find(item => item.key === selectedKey)?.session.interruption?.resumedSessionID;
+    const recovered = continuation && inventory.find(item => item.node.id === selectedItem?.node.id && item.session.id === continuation && !sessionEnded(item));
+    for (const item of allSessions) {
+      const node = nodes.find(node => node.id === item.node.id && !node.online);
+      if (node && item.session.interruption?.recoveredAt == null && item.session.interruption) inventory.push({...item,node:{...item.node,...node,state:item.node.state}});
+    }
+    allSessions = reconcilePTYInventory(inventory);
     const unavailable = nodes.find(node => node.id === selectedItem?.node.id && !node.online);
     // A peer's inventory can time out while its independently verified SSE
     // remains live. Retain only that selection; online session removal is final.
@@ -574,6 +602,7 @@ async function refreshNetwork() {
     text($('discovery'), result.discovery || ''); show($('discovery'), !!result.discovery);
     updateWebVersion(result);
     renderMachines(); renderNodeFilter(); renderList();
+    if (recovered) selectSession(recovered.key, true);
     if (selectedKey) {
       const current = allSessions.find(item => item.key === selectedKey);
       if (current) { selectedItem = current; renderDetail(); if (!current.view.pty && (terminalStream || supportsTerminalStream(current.node))) void refreshFrame(); }
@@ -599,7 +628,7 @@ async function refreshNetwork() {
     updateControls(); renderMachines();
   } finally {
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
-    if (!document.hidden) networkTimer = setTimeout(refreshNetwork, connected ? 2500 : 5000);
+    if (!document.hidden) networkTimer = setTimeout(refreshNetwork, initial && connected ? 0 : connected ? 2500 : 5000);
   }
 }
 function renderMachines() {
@@ -609,7 +638,7 @@ function renderMachines() {
     let row = machineRows.get(node.id);
     if (!row) {
       row = make('article', 'machine'); const info = make('div', 'machine-info');
-      info.append(make('p', 'machine-name'), make('p', 'machine-status')); row.append(info, make('button', 'secondary'));
+      info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status')); row.append(info, make('button', 'secondary'));
       row.lastChild.addEventListener('click', () => {
         const current = nodes.find(item => item.id === node.id);
         if (current?.online) void action(node.id, { action: 'pause', paused: !current.state.snapshot.paused }, current.state.snapshot.paused ? '이 Mac의 자동 승인을 재개했습니다.' : '이 Mac의 자동 승인을 일시정지했습니다.');
@@ -617,23 +646,60 @@ function renderMachines() {
       machineRows.set(node.id, row); $('machines').append(row);
     }
     text(row.querySelector('.machine-name'), node.name + (node.local ? ' · 접속한 Mac' : ''));
+    text(row.querySelector('.machine-version'), machineVersionLabel(node));
     const status = row.querySelector('.machine-status');
     status.className = 'machine-status ' + (!node.online || !connected ? '' : node.state.snapshot.paused ? 'paused' : 'online');
     const activeCount = node.state?.sessions?.filter(view => !sessionEnded({session:view.session, view}) && !sessionEnded(ptyRetained.get(keyFor(node, view.session, view)))).length || 0;
-    text(status, !connected ? '연결 확인 필요' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
+    text(status, !connected ? '연결 확인 필요' : node.loading ? '세션 확인 중…' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
     status.title = node.error || '';
     const button = row.lastChild; text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
     button.setAttribute('aria-label', `${node.name} 자동 승인 ${node.online && node.state.snapshot.paused ? '재개' : '일시정지'}`);
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
   }
+  renderInterruptions();
+}
+function interruptionStatus(session) {
+  if (session.phase === 'ended') return (session.capacityResume?.phase === 'paused' ? '자동 복구 일시정지 · ' : '') + (session.interruption?.recoveryDetail || 'CLI 종료 · Mac에서 원본 대화 확인 필요');
+  const recovery = session.capacityResume;
+  if (!recovery) return session.automatic ? '원본 연결 확인 필요' : '자동 승인 꺼짐 · 직접 이어가기';
+  const states = {scheduled:'자동 이어가기 대기',sending:'이어서 진행 요청 중…',awaiting:'작업 재개 확인 중…',paused:'자동 이어가기 일시정지',unavailable:'원본 입력 연결 필요',review:'입력 확인 필요',exhausted:'자동 이어가기 확인 필요',cancelled:'자동 이어가기 취소됨'};
+  return `${states[recovery.phase] || '복구 상태 확인 중'}${recovery.deadline ? ` · ${nowLabel(recovery.deadline)} 다시 시도` : ''}`;
+}
+function renderInterruptions() {
+  const active = allSessions.filter(item => item.session.interruption && item.session.interruption.recoveredAt == null);
+  const keys = new Set(active.map(item => item.key));
+  for (const [key,row] of interruptionRows) if (!keys.has(key)) { row.remove(); interruptionRows.delete(key); }
+  show($('session-interruptions'), active.length > 0);
+  text($('interruption-title'), `중단된 세션 ${active.length}개`);
+  for (const item of active) {
+    let row = interruptionRows.get(item.key);
+    if (!row) {
+      row = make('article','interruption-row'); const info = make('div');
+      info.append(make('p','interruption-name'),make('p','small interruption-state'));
+      const details = make('details'); details.append(make('summary','','오류 내용'),make('p','small interruption-detail')); info.append(details);
+      const button = make('button','secondary','세션 보기'); button.addEventListener('click',()=>selectSession(item.key,true));
+      row.append(info,button); interruptionRows.set(item.key,row); $('interruption-list').append(row);
+    }
+    text(row.querySelector('.interruption-name'), `${item.node.name} · ${item.view.title} · ${agents[item.session.agent]}`);
+    text(row.querySelector('.interruption-state'), interruptionStatus(item.session) + (!item.node.online ? ' · Mac 연결 끊김' : ''));
+    text(row.querySelector('.interruption-detail'), item.session.interruption.detail);
+    row.lastChild.setAttribute('aria-label',`${item.node.name}의 중단된 ${item.view.title} 세션 보기`);
+  }
+}
+function machineVersionLabel(node) {
+  const release = [node.state?.release, node.release].find(value => versionNumbers(value));
+  if (!release) return '버전 미확인';
+  return `${connected && node.online ? '' : '마지막 확인 · '}v${release.version} · 빌드 ${release.build}`;
 }
 function renderNodeFilter() {
   const select = $('node-filter'), value = select.value;
   for (const node of nodes) {
     let option = Array.from(select.options).find(item => item.value === node.id);
     if (!option) { option = make('option'); option.value = node.id; select.append(option); }
-    text(option, node.name + (node.online ? '' : ' · 끊김'));
+    const release = [node.state?.release, node.release].find(value => versionNumbers(value));
+    text(option, node.name + (release ? ` · v${release.version}` : '') + (node.online ? '' : ' · 끊김'));
+    option.title = `${node.name} · ${machineVersionLabel(node)}`;
   }
   select.value = value;
 }
@@ -656,7 +722,7 @@ function renderList() {
     const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
     text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
     text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
-    const phase = row.querySelector('.phase'); text(phase, item.view.phaseTitle); phase.dataset.phase = item.session.phase;
+    const phase = row.querySelector('.phase'); text(phase, item.view.phaseTitle); phase.dataset.phase = item.session.interruption && item.session.interruption.recoveredAt == null ? 'error' : item.session.phase;
     text(row.querySelector('.row-auto'), item.session.automatic ? item.node.state.snapshot.paused ? '자동 승인 · 정지' : '자동 승인 켜짐' : '자동 승인 꺼짐');
     const atPosition = $('session-list').children[index];
     if (atPosition !== row) $('session-list').insertBefore(row, atPosition || null);
@@ -720,7 +786,12 @@ function renderDetail() {
   text($('session-meta'), `${node.name} · ${agents[session.agent]} · ${session.tty || 'TTY 없음'}`);
   text($('session-title'), view.title); text($('session-path'), session.cwd || '폴더 확인 중');
   text($('session-branch'), session.gitBranch?.name ? `브랜치 · ${session.gitBranch.name}` : session.customization?.note || '');
-  const phase = $('session-phase'); text(phase, view.phaseTitle); phase.dataset.phase = session.phase;
+  const phase = $('session-phase'); text(phase, view.phaseTitle); phase.dataset.phase = session.interruption && session.interruption.recoveredAt == null ? 'error' : session.phase;
+  if (session.phase === 'ended' && session.interruption) {
+    show($('session-ended'),true);
+    text($('session-ended'),`${interruptionStatus(session)}. 오류 내용과 복구 상태를 아래에서 확인해주세요.`);
+    terminalPlaceholder(session.interruption.detail); terminalState('error','CLI 종료');
+  }
   $('automatic').checked = session.automatic; text($('session-status'), node.state.snapshot.paused ? '이 Mac의 자동 승인이 일시정지되어 있습니다.' : session.activityDetail || session.detail);
   const terminalHost = `${node.name} · ${session.hostName || hosts[session.terminal]}`;
   text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
@@ -739,7 +810,7 @@ function updateControls() {
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
   const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation;
   const temporaryPTY = ptyTemporary.has(selectedKey);
-  $('automatic').disabled = !enabled || temporaryPTY || (!selectedItem.view.canApprove && !selectedItem.session.automatic);
+  $('automatic').disabled = !enabled || sessionEnded(selectedItem) || temporaryPTY || (!selectedItem.view.canApprove && !selectedItem.session.automatic);
   $('automatic').title = temporaryPTY ? 'PTY에서 실행 중인 CLI를 확인하는 중입니다.' : !selectedItem.view.canApprove ? 'Mac에서 이 세션의 승인 연결을 먼저 설정해주세요.' : '이 세션의 다음 지원 요청부터 적용합니다.';
   $('reveal').disabled = !enabled || !selectedItem.view.canReveal;
   $('new-pty').disabled = !connected || !nodes.some(node => node.online);
@@ -1129,7 +1200,8 @@ function renderQuestions() {
       count++; const section = make('div', 'question'); section.append(make('h4', '', source.pendingSummary), make('p', 'muted small', '이 요청은 터미널 화면에서 직접 답해주세요.')); $('questions').append(section);
     }
     if (source.capacityResume) {
-      count++; const section = make('div', 'question'); section.append(make('h4', '', 'Codex 이어서 진행'), make('p', 'muted small', `${source.capacityResume.attempt}/${source.capacityResume.limit} · ${source.capacityResume.message}`));
+      count++; const section = make('div', 'question'); const recovery = source.capacityResume;
+      section.append(make('h4', '', `${agents[source.agent]} 이어서 진행`), make('p', 'muted small', `${recovery.reason || '모델 용량 부족'} · ${recovery.limit > 0 ? `${recovery.attempt}/${recovery.limit}` : `${recovery.attempt}번째 시도`} · ${recovery.message}`),make('p','muted small',interruptionStatus(source)));
       if (['scheduled', 'paused'].includes(source.capacityResume.phase)) { const button = make('button', 'secondary', '이어서 진행 취소'); button.addEventListener('click', () => void action(node.id, { action: 'cancelCapacity', sessionID: source.id }, '이어서 진행을 취소했습니다.')); section.append(button); }
       $('questions').append(section);
     }
@@ -1492,15 +1564,30 @@ $('stop-test-screen').addEventListener('click',async()=>{if(!sharedScreen||mutat
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopTestScreenRead();$('test-screen-image').removeAttribute('src');}else if(sharedScreen&&$('test-screen-dialog').open)void readTestScreen();});
 function renderHistory() {
   const members = new Set([selectedItem.session.id, ...(selectedItem.session.backgroundSessions || []).map(item => item.id)]);
-  const events = (selectedItem.node.state.snapshot.events || []).filter(event => members.has(event.sessionID) || members.has(event.originSessionID)).slice(0, 12);
+  const cached = sessionHistories.get(selectedKey);
+  if (selectedItem.node.state.historyDeferred && !cached?.loading && (!cached || Date.now()-cached.at > 5000 && !cached.error)) void loadSessionHistory(selectedItem);
+  const events = (selectedItem.node.state.historyDeferred ? cached?.events || [] : selectedItem.node.state.snapshot.events || []).filter(event => members.has(event.sessionID) || members.has(event.originSessionID)).slice(0, 12);
   const signature = JSON.stringify(events); if (signature === historySignature) return; historySignature = signature;
   const expanded = new Set(Array.from($('history').querySelectorAll('details[open]')).map(item => item.dataset.id));
   $('history').replaceChildren();
-  if (!events.length) { $('history').append(make('p', 'muted small', '아직 처리 내역이 없습니다.')); return; }
+  if (!events.length) {
+    $('history').append(make('p', 'muted small', cached?.loading ? '처리 내역을 불러오는 중…' : cached?.error || '아직 처리 내역이 없습니다.'));
+    if (cached?.error) { const retry = make('button','secondary','내역 다시 불러오기'); retry.addEventListener('click',()=>void loadSessionHistory(selectedItem)); $('history').append(retry); }
+    return;
+  }
   for (const event of events) {
     const detail = make('details', 'history-item'); detail.dataset.id = event.id; detail.open = expanded.has(event.id);
     detail.append(make('summary', '', `${nowLabel(event.date)} · ${event.outcome}`), make('pre', '', [event.request || event.summary, event.answer ? `답변: ${event.answer}` : '', event.source].filter(Boolean).join('\n\n'))); $('history').append(detail);
   }
+}
+async function loadSessionHistory(item) {
+  const cached = sessionHistories.get(item.key) || {}; if (cached.loading || !item.node.online) return;
+  sessionHistories.set(item.key,{...cached,loading:true,at:Date.now(),error:''});
+  try {
+    const result = await api(endpoint(supportsRelease(item.node,[0,2,61,76]) ? '/api/history?session='+encodeURIComponent(item.session.id) : '/api/state',item.node.id));
+    sessionHistories.set(item.key,{events:Array.isArray(result) ? result : result.snapshot?.events || [],loading:false,at:Date.now(),error:''});
+  } catch (error) { sessionHistories.set(item.key,{...cached,loading:false,at:Date.now(),error:'처리 내역을 받지 못했습니다. '+error.message}); }
+  if (selectedKey === item.key) { historySignature = ''; renderHistory(); }
 }
 
 $('search').addEventListener('input', renderList); $('node-filter').addEventListener('change', renderList);
@@ -1735,4 +1822,4 @@ $('close-pty').addEventListener('click', async () => {
   } catch (error) { client.fail(error); }
 });
 resetKeyboard();
-void refreshNetwork();
+void refreshNetwork(true);

@@ -265,6 +265,15 @@ public final class ManagedPTY: @unchecked Sendable {
         guard let prompt = PromptDetector.detect(expected, agent: agent) else { return .screenChanged }
         try writeBytes(Data((prompt.answer + "\r").utf8)); return .sent
     }
+    public func recoveryInput(expected: String, input: RemoteTerminalInput, jobPIDs: [Int32]) throws -> TerminalDelivery {
+        try input.validate()
+        lock.lock(); defer { lock.unlock() }
+        guard master >= 0, !closing, info.exitCode == nil else { return .missingTarget }
+        guard Date().timeIntervalSince(lastUserInput) >= 0.8, Date() >= writerUntil, screen() == expected else { return .screenChanged }
+        let group = tcgetpgrp(master)
+        guard group > 0, jobPIDs.contains(group) else { return .agentMissing }
+        try writeBytes(Data(input.bytes.utf8)); return .sent
+    }
 }
 
 public final class ManagedPTYManager: @unchecked Sendable {
@@ -291,6 +300,14 @@ public final class ManagedPTYManager: @unchecked Sendable {
         }) }, approve: { [self] target, expected, agent in
             guard let terminal = owned(tty: target.tty) else { return .missingTarget }
             return try terminal.approve(expected: expected, agent: agent, jobPIDs: target.jobPIDs)
-        }, reveal: { _ in nil })
+        }, reveal: { _ in nil }, resume: { [self] target,region,text in
+            guard let terminal = owned(tty:target.tty) else { return .missingTarget }
+            return try VerifiedResumeInput.deliver(region:region,text:text,read:{ terminal.screen() },write:{ expected,input in
+                try terminal.recoveryInput(expected:expected,input:input,jobPIDs:target.jobPIDs)
+            })
+        }, restart: { [self] target,expected,command in
+            guard let terminal = owned(tty:target.tty), SessionExitRecovery.emptyShellPrompt(expected) else { return .missingTarget }
+            return try terminal.recoveryInput(expected:expected,input:RemoteTerminalInput(kind:.submit,text:command),jobPIDs:target.jobPIDs)
+        })
     }
 }

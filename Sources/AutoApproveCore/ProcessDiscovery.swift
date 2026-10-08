@@ -38,7 +38,7 @@ public enum CommandRunner {
     }
 }
 
-public struct ProcessRecord: Equatable {
+public struct ProcessRecord: Codable, Equatable, Sendable {
     public var pid: Int32
     public var parent: Int32
     public var tty: String

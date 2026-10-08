@@ -1,7 +1,7 @@
 import Foundation
 
 public struct AttentionRequest: Equatable, Identifiable {
-    public enum Kind: Equatable { case question, completion }
+    public enum Kind: Equatable { case question, completion, interruption }
     public let id: String
     public let sessionID: String
     public let project: String
@@ -10,7 +10,7 @@ public struct AttentionRequest: Equatable, Identifiable {
     public var kind: Kind = .question
     public var notificationKey: String = ""
     public var originSessionID: String?
-    public var title: String { project + (kind == .completion ? " · 작업 완료" : " · 응답 필요") }
+    public var title: String { project + (kind == .completion ? " · 작업 완료" : kind == .interruption ? " · 작업 중단" : " · 응답 필요") }
 
     public static func completions(_ snapshot: EngineSnapshot, at now: Date = Date()) -> [AttentionRequest] {
         snapshot.sessions.flatMap { session in
@@ -33,13 +33,20 @@ public struct AttentionRequest: Equatable, Identifiable {
         public var summary: String
         public var sourceSessionID: String
         public var sourceKey: String
+        public var kind: Kind = .question
     }
 
     public static func candidates(_ session: AgentSession, paused: Bool) -> [Candidate] {
-        guard session.agent != .shell, session.phase != .ended else { return [] }
+        guard session.agent != .shell else { return [] }
+        var failures: [Candidate] = []
+        if let error = session.interruption, error.needsAttention {
+            failures.append(Candidate(key: "interruption:" + error.id, summary: error.kind.title + " · " + error.detail,
+                sourceSessionID: session.id, sourceKey: "interruption:" + error.id, kind: .interruption))
+        }
+        guard session.phase != .ended else { return failures }
         let phase = session.ownPhase ?? session.phase
         let automatic = session.automatic && !paused
-        var result = session.unansweredQuestions.filter {
+        var result = failures + session.unansweredQuestions.filter {
             !automatic || $0.automation?.phase != .scheduled
         }.map { Candidate(key: $0.id, summary: $0.summary, sourceSessionID: session.id, sourceKey: $0.id) }
         if let approvals = session.claudeApprovals, !approvals.isEmpty {
@@ -69,6 +76,9 @@ public struct AttentionRequest: Equatable, Identifiable {
 
     /// Old child notifications may open their verified live main, never a similar project or TTY.
     public static func target(sessionID: String, sessions: [AgentSession]) throws -> AgentSession {
+        if let old = sessions.first(where:{$0.id == sessionID && $0.phase == .ended}),
+           let resumed = old.interruption?.resumedSessionID,
+           let live = sessions.first(where:{$0.id == resumed && $0.phase != .ended && $0.canReveal}) { return live }
         guard let session = sessions.first(where: {
             $0.phase != .ended && ($0.id == sessionID || $0.backgroundChildren.contains { $0.id == sessionID && $0.phase != .ended })
         }) else {
@@ -95,6 +105,7 @@ public struct AttentionTracker {
                 guard next[key] == nil else { continue }
                 let request = AttentionRequest(id: active[key]?.id ?? "attention-" + UUID().uuidString,
                     sessionID: session.id, project: session.project, agent: session.agent.title, summary: candidate.summary,
+                    kind: candidate.kind,
                     notificationKey: SessionNotice.key(.question, candidate.sourceKey), originSessionID: candidate.sourceSessionID)
                 next[key] = request; requests.append(request)
             }

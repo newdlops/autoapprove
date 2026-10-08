@@ -44,6 +44,12 @@ public struct RemoteNodeState: Codable {
     public var questionForms: [WebQuestionRequest]? = nil
     public var screenShares: [TestScreenShare]? = nil
     public var update: LANUpdateStatus? = nil
+    public var historyDeferred: Bool? = nil
+    public var inventory: RemoteNodeState {
+        var value = self
+        value.snapshot.sessions = []; value.snapshot.events = []; value.historyDeferred = true
+        return value
+    }
 }
 
 public struct RemoteNodeView: Codable {
@@ -53,6 +59,9 @@ public struct RemoteNodeView: Codable {
     public var online: Bool
     public var state: RemoteNodeState?
     public var error: String?
+    /// Last verified discovery version remains visible when a state read is unavailable.
+    public var release: RemoteWebVersion? = nil
+    public var loading: Bool? = nil
 }
 
 public struct RemoteDashboard: Codable {
@@ -62,6 +71,7 @@ public struct RemoteDashboard: Codable {
     public var discovery: String?
     public var gatewayRelease: RemoteWebVersion? = nil
     public var preferredGateway: RemoteWebGateway? = nil
+    public var partial: Bool? = nil
 }
 
 public struct RemoteTerminalFrame: Codable, Sendable {
@@ -715,7 +725,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
         let endpoints = Array(peerEndpoints(peer).prefix(2))
         guard endpoints.count > 1 else { return try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id, timeout: timeout).run() }
-        let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (path == "/api/state" ? 4 : 15))
+        let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (["/api/state","/api/inventory"].contains(path) ? 4 : 15))
         let epoch = generation
         for (index, endpoint) in endpoints.enumerated() {
             do {
@@ -743,15 +753,16 @@ struct RemoteTerminalUpdate: Encodable {
         if let task = stateReads.task(for: peer.id, endpoint: endpoint) { return await task.value }
         let epoch = generation, token = UUID()
         let task = Task { @MainActor [weak self] () -> RemoteNodeView in
-            guard let self else { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: "웹 연결이 종료되었습니다.") }
+            guard let self else { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: "웹 연결이 종료되었습니다.", release: peer.release) }
             let result: RemoteNodeView
             do {
-                let response = try await RemoteDashboardTraffic.shared.read { @MainActor in try await self.exchange(peer, path: "/api/state") }
+                let compact = peer.release.map { $0 >= RemoteWebVersion(version:"0.2.61",build:76,api:1) } == true
+                let response = try await RemoteDashboardTraffic.shared.read { @MainActor in try await self.exchange(peer, path: compact ? "/api/inventory" : "/api/state",timeout:4) }
                 let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
                 let state = try decoder.decode(RemoteNodeState.self, from: response.body)
                 guard response.status == 200, state.id == peer.id else { throw RemoteHTTPError(502, "Mac의 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
-                result = RemoteNodeView(id: peer.id, name: state.name, local: false, online: true, state: state)
-            } catch { result = RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription) }
+                result = RemoteNodeView(id: peer.id, name: state.name, local: false, online: true, state: state.inventory, release: state.release ?? peer.release)
+            } catch { result = RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription, release: peer.release) }
             if self.running, self.generation == epoch {
                 self.stateReads.finish(id: peer.id, token: token, endpoint: self.peers[peer.id].map(self.connectionEndpoint) ?? endpoint,
                     expires: Date().addingTimeInterval(result.online ? 0.75 : 2))
@@ -761,9 +772,18 @@ struct RemoteTerminalUpdate: Encodable {
         stateReads.insert(task, id: peer.id, token: token, endpoint: endpoint)
         return await task.value
     }
-    public func dashboard() async throws -> RemoteDashboard {
-        let own = try localState()
+    public func dashboard(initial: Bool = false, selectedNode: String? = nil) async throws -> RemoteDashboard {
+        let own = try localState().inventory
         let candidates = Array(peers.values).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        if initial {
+            var nodes = candidates.prefix(100).map { RemoteNodeView(id:$0.id,name:$0.name,local:false,online:false,release:$0.release,loading:true) }
+            if let selectedNode, let peer = candidates.first(where:{$0.id == selectedNode}) {
+                let value = await readPeerState(peer)
+                if let index = nodes.firstIndex(where:{$0.id == selectedNode}) { nodes[index] = value }
+            }
+            return RemoteDashboard(gatewayID:nodeID,nodes:[RemoteNodeView(id:nodeID,name:name,local:true,online:true,state:own,release:own.release)]+nodes,
+                updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(),partial:true)
+        }
         let other = await withTaskGroup(of: RemoteNodeView.self) { group in
             for peer in candidates.prefix(100) {
                 group.addTask { @MainActor in await self.readPeerState(peer) }
@@ -787,7 +807,7 @@ struct RemoteTerminalUpdate: Encodable {
             peers[node.id]?.webVerifiedAt = node.online && confirmed ? Date() : nil
         }
         updateNamedAddresses(); emitStatus()
-        return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own)] + other, updatedAt: Date(), discovery: discoveryError,
+        return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own, release: own.release)] + other, updatedAt: Date(), discovery: discoveryError,
             gatewayRelease: webVersion, preferredGateway: preferredGateway())
     }
     public func handle(_ request: RemoteHTTPRequest) async -> RemoteHTTPResponse {
@@ -811,7 +831,14 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/vendor/xterm.js", "/vendor/xterm-fit.js": return try asset(String(request.path.dropFirst()), type: "text/javascript; charset=utf-8")
                 case "/vendor/xterm.css": return try asset("vendor/xterm.css", type: "text/css; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
-                case "/api/state": return try .json(localState())
+                case "/api/state":
+                    if let forwarded = try await forward(request) { return forwarded }
+                    return try .json(localState())
+                case "/api/inventory": return try .json(localState().inventory)
+                case "/api/history":
+                    if let forwarded = try await forward(request) { return forwarded }
+                    guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400,"세션을 지정해주세요.") }
+                    return try .json(engine.remoteHistory(sessionID:id))
                 case "/api/update/manifest":
                     let (manifest, _) = try await updateArchive.offer()
                     return try .json(manifest)
@@ -822,7 +849,7 @@ struct RemoteTerminalUpdate: Encodable {
                     var object: JSONObject = ["service": "autoapprove", "version": 1, "id": nodeID, "name": name, "urls": port.map(Self.addresses) ?? [], "port": Int(port ?? 0), "portal": namedAccess?.ownsPortal == true]
                     if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }
                     return try .object(object)
-                case "/api/network": return try await .json(dashboard())
+                case "/api/network": return try await .json(dashboard(initial:request.parameter("initial") == "1",selectedNode:request.parameter("node")))
                 case "/api/test-screen":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }

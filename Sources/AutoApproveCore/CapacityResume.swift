@@ -2,7 +2,7 @@ import Foundation
 
 /// Codex ends a turn with this error cell when the selected model is at capacity
 /// (`CodexErr::ServerOverloaded`). It does not retry; the user continues by sending a message.
-public struct CodexCapacityStop: Equatable {
+public struct CodexCapacityStop: Codable, Equatable {
     public static let message = "Selected model is at capacity. Please try a different model."
     /// The message the user sent by hand after each of these stops.
     public static let resumeText = "이어서 진행하자."
@@ -10,11 +10,14 @@ public struct CodexCapacityStop: Equatable {
     public var region: String
     /// Everything visible above the composer. A repeated failure draws a longer transcript.
     public var identity: String
+    public var kind: SessionInterruption.Kind = .capacity
+    public var agent: AgentKind = .codex
+    public var error: String = CodexCapacityStop.message
 
     /// Only the newest cell above a ready, empty composer counts. Codex wraps the cell without
     /// indentation in a narrow window.
     public static func detect(_ screen: String, agent: AgentKind) -> CodexCapacityStop? {
-        guard agent == .codex, ActivityDetector.detect(screen, agent: agent).phase == .idle else { return nil }
+        guard agent != .shell, ActivityDetector.detect(screen, agent: agent).phase == .idle else { return nil }
         let raw = PromptDetector.normalizedLines(screen)
         let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
         guard !CodexResumeCheck.blocked(lines), let composer = lines.lastIndex(where: CodexResumeCheck.isComposer),
@@ -22,9 +25,25 @@ public struct CodexCapacityStop: Equatable {
         var start = end
         while start > 0, !lines[start - 1].isEmpty { start -= 1 }
         let cell = lines[start...end].joined(separator: " ").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        guard cell == "■ " + message else { return nil }
-        return CodexCapacityStop(region: raw[start...composer].joined(separator: "\n"),
+        let kind: SessionInterruption.Kind
+        let lower = cell.lowercased()
+        if agent == .codex, cell == "■ " + message { kind = .capacity }
+        else {
+            let isError = agent == .codex ? cell.hasPrefix("■ ") : cell.hasPrefix("API Error:") || cell.hasPrefix("⎿ API Error:")
+            guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
+            if lower.contains("stream disconnected before completion") || lower.contains("connection error") ||
+                lower.contains("transport error") || lower.contains("request timed out") || lower.contains("network error") {
+                kind = .transport
+            } else if lower.range(of:#"\b(?:401|403)\b|authentication|unauthorized|invalid api key"#,options:.regularExpression) != nil {
+                kind = .authentication
+            } else if lower.range(of:#"\b(?:408|429|500|502|503|504|529)\b|overloaded|rate.?limit|server error|max.?output.?tokens"#,options:.regularExpression) != nil {
+                kind = .api
+            } else { return nil }
+        }
+        var result = CodexCapacityStop(region: raw[start...composer].joined(separator: "\n"),
             identity: PromptDetector.fingerprint(raw[..<composer].joined(separator: "\n")))
+        result.kind = kind; result.agent = agent; result.error = cell
+        return result
     }
 }
 
@@ -32,7 +51,10 @@ public enum ResumeDelivery: String, Codable { case sent, typed, screenChanged, m
 
 /// The same rules as `CodexResumeScript.functions`, for hosts that are read and written from Swift.
 public enum CodexResumeCheck {
-    static func isComposer(_ line: String) -> Bool { line.trimmingCharacters(in: .whitespaces).first.map { "›»".contains($0) } == true }
+    public static func agent(in region: String) -> AgentKind {
+        rows(region).first?.trimmingCharacters(in:.whitespaces).hasPrefix("■ ") == true ? .codex : .claude
+    }
+    static func isComposer(_ line: String) -> Bool { line.trimmingCharacters(in: .whitespaces).first.map { "›»❯".contains($0) } == true }
     /// Vim normal or replace mode would run typed text as commands; a running turn owns the composer.
     static func blocked(_ lines: [String]) -> Bool {
         lines.suffix(8).joined(separator: "\n").range(of: #"Vim: (?:Normal|Replace)|(?i:esc to interrupt)"#, options: .regularExpression) != nil
@@ -90,6 +112,34 @@ public enum CodexResumeCheck {
     }
 }
 
+/// Existing tmux/PTY streams share the original foreground job and exact stopped composer.
+public enum VerifiedResumeInput {
+    public static func deliver(region: String, text: String, read: () throws -> String,
+                              write: (String, RemoteTerminalInput) throws -> TerminalDelivery) throws -> ResumeDelivery {
+        let before = try read()
+        guard CodexResumeCheck.ready(before,region:region) else { return .screenChanged }
+        let typed = try write(before,RemoteTerminalInput(kind:.characters,text:text))
+        guard typed == .sent else {
+            switch typed { case .screenChanged: return .screenChanged; case .agentMissing: return .agentMissing; default: return .missingTarget }
+        }
+        var state = CodexResumeCheck.TypedState.typed, after = before, reads = 0
+        let until = Date().addingTimeInterval(8)
+        repeat {
+            Thread.sleep(forTimeInterval:0.25); after = try read(); reads += 1
+            state = CodexResumeCheck.state(before:before,after:after,region:region,text:text)
+        } while state == .typed && (Date() < until || reads < 3)
+        if state == .submitted { return .sent }
+        guard state == .draft else { return .typed }
+        guard try write(after,RemoteTerminalInput(kind:.enter)) == .sent else { return .typed }
+        let sentUntil = Date().addingTimeInterval(4)
+        repeat {
+            Thread.sleep(forTimeInterval:0.25)
+            if !CodexResumeCheck.draftVisible(try read(),text:text) { return .sent }
+        } while Date() < sentUntil
+        return .typed
+    }
+}
+
 /// Shared by the Terminal and iTerm2 scripts; `CodexResumeCheck` applies the same rules from Swift.
 enum CodexResumeScript {
     static let functions = """
@@ -98,7 +148,8 @@ enum CodexResumeScript {
       while (rows.length && !rows[rows.length - 1].trim()) rows.pop();
       return rows;
     }
-    function isComposer(row) { return /^[›»]/.test(row.trim()); }
+    function isComposer(row) { return /^[›»❯]/.test(row.trim()); }
+    function resumeAgent(region) { return resumeRows(region)[0].trim().startsWith('■ ') ? 'codex' : 'claude'; }
     function composerText(row) { return row.trim().slice(1).trim(); }
     function resumeBlocked(rows) { return /Vim: (?:Normal|Replace)|esc to interrupt/i.test(rows.slice(-8).map(row => row.trim()).join('\\n')); }
     function activeRegion(rows, heading) {

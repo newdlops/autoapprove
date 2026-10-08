@@ -55,6 +55,17 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .machine { min-width: 240px; max-width: 100%; display: flex; gap: 16px; align-items: center; padding: 8px 0; flex: 1 0 240px; border-bottom: 1px solid var(--line); }
 .machine-info { min-width: 0; flex: 1; }
 .machine-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.machine-version { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.interruption-row { display: flex; align-items: flex-start; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.interruption-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.interruption-row > div { min-width: 0; flex: 1; }
+.interruption-name { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+.interruption-state, .interruption-detail { overflow-wrap: anywhere; }
+.interruption-detail { white-space: pre-wrap; }
+.interruption-row button { flex-shrink: 0; }
+.interruption-row details { margin-top: 4px; }
+.interruption-row summary { cursor: pointer; min-height: 44px; display: list-item; padding: 9px 0; }
+#interruption-list { max-height: 320px; overflow: auto; overscroll-behavior: contain; }
 .machine-status { color: var(--muted); font-size: 12px; }
 .machine button { font-size: 13px; flex-shrink: 0; }
 .online { color: var(--green); }
@@ -80,6 +91,7 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .phase[data-phase=working] { color: var(--blue); }
 .phase[data-phase=approval], .phase[data-phase=input] { color: var(--orange); }
 .phase[data-phase=idle] { color: var(--green); }
+.phase[data-phase=error] { color: var(--red); }
 .list-foot { margin-top: 24px; }
 .empty-inline { color: var(--muted); padding: 24px 8px; font-size: 14px; }
 .detail { min-width: 0; padding: 24px; overflow: auto; scroll-padding: 16px; }
