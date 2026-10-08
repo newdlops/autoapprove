@@ -37,6 +37,7 @@ import TerminalInputSupport
     }
     private var remoteScreenReads: [String: RemoteScreenRead] = [:]
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
+    private var remoteTerminalChanges: [String: RemoteTerminalChangeSignal] = [:]
     private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?)] = [:]
     private let orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)?
     private var remoteOrcaBindings: [String: (targetGeneration: String, binding: RemoteOrcaBinding)] = [:]
@@ -352,6 +353,7 @@ import TerminalInputSupport
         for pending in remoteRevealReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 원본 창 연결을 확인하지 못했습니다.")) }; remoteRevealReplies.removeAll()
         for pending in remoteScreenReads.values { pending.task.cancel() }
         remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll(); screenAnalyses.removeAll()
+        remoteTerminalChanges.values.forEach { $0.notify() }; remoteTerminalChanges.removeAll()
         for capture in nativeWindowCaptures.values { capture.invalidate() }
         for capture in verifiedWindowCaptures.values { capture.invalidate() }
         for value in bridgeWindowCaptures.values { value.capture.invalidate() }; bridgeWindowCaptures.removeAll()
@@ -726,6 +728,7 @@ import TerminalInputSupport
     private func invalidateRemoteRead(_ id: String) {
         // A concurrent reader still owns its token; do not turn a valid live read into a disconnect.
         if remoteScreenReads[id]?.observedAt != nil { remoteScreenReads[id]?.observedAt = .distantPast }
+        remoteTerminalChanges[id]?.notify()
     }
 
     /// A source-specific adapter may register only a verified exact native window.
@@ -1021,6 +1024,7 @@ import TerminalInputSupport
             }
         }
         remoteInputSessions.insert(id)
+        remoteTerminalChanges[id]?.notify()
         defer {
             remoteInputSessions.remove(id); remoteInputUntil[id] = Date().addingTimeInterval(0.8)
             invalidateRemoteRead(id)
@@ -1189,6 +1193,13 @@ import TerminalInputSupport
     }
     private func userInputHasPriority(_ id: String) -> Bool {
         remoteInputSessions.contains(id) || remoteInputUntil[id].map { Date() < $0 } == true
+    }
+    func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
+        if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
+        return remoteTerminalChanges[sessionID]!.observe()
+    }
+    func remoteTerminalNeedsResponsiveRead(_ id: String) -> Bool {
+        userInputHasPriority(id) || automaticInputBusy(id) || sessions[id]?.phase == .working
     }
 
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
@@ -2754,7 +2765,8 @@ import TerminalInputSupport
         if !keepRemote {
             remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)?.task.cancel()
         }
-        if sessions[id] == nil || sessions[id]?.phase == .ended { remoteOrcaBindings.removeValue(forKey: id) }
+        remoteTerminalChanges[id]?.notify()
+        if sessions[id] == nil || sessions[id]?.phase == .ended { remoteOrcaBindings.removeValue(forKey: id); remoteTerminalChanges.removeValue(forKey:id) }
         screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id); screenObservedAt.removeValue(forKey: id)
         screenAnalyses.removeValue(forKey: id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
@@ -2763,6 +2775,8 @@ import TerminalInputSupport
 
     public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
+        let previousFrame = remoteObservedScreens[sessionID]
+        if previousFrame?.raw != raw || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance { remoteTerminalChanges[sessionID]?.notify() }
         remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw))
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }

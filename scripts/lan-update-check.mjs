@@ -10,7 +10,7 @@ import {createHash} from 'node:crypto';
 import {coreLinkArguments} from './swift-core-link.mjs';
 import {signApp} from './sign-app.mjs';
 
-const artifact=path.resolve(process.argv[2]||'.runtime/releases/0.2.53/lan-64/AutoApprove.app');
+const artifact=path.resolve(process.argv[2]||'dist/AutoApprove.app');
 const root=path.resolve('.runtime/qa/lan-update'),build=path.resolve('.build/release');
 await mkdir(root,{recursive:true});
 const objects=(await readdir(path.join(build,'AutoApproveCore.build'))).filter(n=>n.endsWith('.swift.o')).map(n=>path.join(build,'AutoApproveCore.build',n));
@@ -54,17 +54,27 @@ async function start(app){
   catch(error) { console.error('Isolated app status:',await readFile(path.join(app.directory,'fixture-web.json'),'utf8').catch(()=>'(unavailable)'));throw error; }
   return child;
 }
-async function proxy(port,manifest,archive){
+async function proxy(port,manifest,archive,options={}){
+  const stats={offsets:[],manifests:0,dropped:false};
   const server=http.createServer((request,response)=>{
     let body,type='application/json',status=200;
     const url=new URL(request.url,'http://localhost');
-    if(url.pathname==='/api/discovery')body=Buffer.from(JSON.stringify({service:'autoapprove',version:1,id:manifest.nodeID,name:'isolated source',release:manifest.release,port,urls:['http://127.0.0.1:'+port]}));
-    else if(url.pathname==='/api/update/manifest')body=Buffer.from(JSON.stringify(manifest));
-    else if(url.pathname==='/api/update/chunk'){const offset=Number(url.searchParams.get('offset'));body=archive.subarray(offset,Math.min(offset+256*1024,archive.length));type='application/zip';}
+    if(url.pathname==='/api/discovery')body=Buffer.from(JSON.stringify({service:'autoapprove',version:1,id:manifest.nodeID,name:'isolated source',release:manifest.release,port,urls:options.urls||['http://127.0.0.1:'+port]}));
+    else if(url.pathname==='/api/update/manifest'){
+      stats.manifests++;
+      if(options.failManifest){request.socket.destroy();return;}
+      body=Buffer.from(JSON.stringify(manifest));
+    }
+    else if(url.pathname==='/api/update/chunk'){
+      const offset=Number(url.searchParams.get('offset'));stats.offsets.push(offset);
+      if(offset===options.dropOffset&&!stats.dropped){stats.dropped=true;request.socket.destroy();return;}
+      body=archive.subarray(offset,Math.min(offset+256*1024,archive.length));type='application/zip';
+    }
     else {status=404;body=Buffer.from('{}');}
     response.writeHead(status,{'Content-Type':type,'Content-Length':body.length});response.end(body);
   });
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});servers.push(server);
+  return stats;
 }
 const checks=[];
 try{
@@ -98,6 +108,18 @@ try{
   const disabled=await application('disabled',{port:0,peer:'http://127.0.0.1:'+high.port,low:true,enabled:false});const disabledProcess=await start(disabled);
   await delay(3500);const off=await appState(disabled);assert.equal(off.update.phase,'off');assert.equal(off.release.version,'0.2.52');assert.equal(disabledProcess.exitCode,null);
   checks.push('the saved disabled preference prevents automatic installation');
+  const interrupted=await proxy(ports[6],manifest,archive,{dropOffset:256*1024});
+  const resumed=await application('resumed',{port:0,peer:'http://127.0.0.1:'+ports[6],low:true,lidClosed:true});await start(resumed);
+  await waitFor(async()=>{const s=await appState(resumed);return s.update?.phase==='waiting'?s:null;});
+  assert.equal(interrupted.dropped,true);assert.equal(interrupted.offsets.filter(offset=>offset===0).length,1);
+  assert.equal(interrupted.offsets.filter(offset=>offset===256*1024).length,2);
+  checks.push('a disconnected chunk retries within seconds and resumes without downloading the completed prefix again');
+  const backup=await proxy(ports[7],manifest,archive);
+  const failedRoute=await proxy(ports[1],manifest,archive,{failManifest:true,urls:['http://127.0.0.1:'+ports[1],'http://127.0.0.1:'+ports[7]]});
+  const alternate=await application('alternate',{port:0,peer:'http://127.0.0.1:'+ports[1],low:true,lidClosed:true});await start(alternate);
+  await waitFor(async()=>{const s=await appState(alternate);return s.update?.phase==='waiting'?s:null;});
+  assert.ok(failedRoute.manifests>0);assert.ok(backup.manifests>0);assert.ok(backup.offsets.length>0);
+  checks.push('healthy discovery with a failed update route recovers the manifest and chunks over the same verified node on another address');
   const report={result:'PASS',version:release,checks};await writeFile(path.join(root,'verification.json'),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report,null,2));
 }finally{
   for(const pid of pids){

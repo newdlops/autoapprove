@@ -14,8 +14,12 @@ struct MouseActivitySettings: View {
             Text("커서 위치를 바꾸거나 클릭·키 입력을 하지 않습니다. 켜 둔 동안 1분마다 신호를 보내며, 앱을 다시 열어도 설정을 유지합니다.")
             Text(status.detail).font(.callout.weight(.medium)).foregroundStyle(.primary).textSelection(.enabled)
                 .accessibilityLabel("마우스 신호 상태: \(status.detail)")
+            if let permissions = status.permissions {
+                Text("손쉬운 사용: \(permissions.accessibilityGranted ? "허용" : "미허용") · 마우스 신호: \(permissions.eventPostingGranted ? "허용" : "미허용")")
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
             if status.phase == .permission {
-                Button("손쉬운 사용 허용") { requestPermission() }
+                Button(status.permissions?.accessibilityGranted == true ? "권한 다시 확인" : "손쉬운 사용 허용") { requestPermission() }
                     .help("macOS에서 AutoApprove의 마우스 신호 권한을 허용합니다.")
             }
             if let sent = status.lastSentAt {

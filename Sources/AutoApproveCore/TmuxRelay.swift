@@ -369,7 +369,7 @@ public final class TmuxRelayObservation: @unchecked Sendable {
         if current != nil { waiter = nil; timeout?.cancel(); timeout = nil }
         lock.unlock(); current?.1.resume()
     }
-    public func waitForChange() async {
+    public func waitForChange(timeout interval: TimeInterval = 1.5) async {
         let id = UUID()
         await withTaskCancellationHandler(operation: {
             await withCheckedContinuation { continuation in
@@ -379,7 +379,7 @@ public final class TmuxRelayObservation: @unchecked Sendable {
                 }
                 waiter = (id, continuation)
                 timeout = Task { [weak self] in
-                    do { try await Task.sleep(nanoseconds: 1_500_000_000) } catch { return }
+                    do { try await Task.sleep(for:.seconds(max(0.01,interval))) } catch { return }
                     self?.release(id)
                 }
                 lock.unlock()

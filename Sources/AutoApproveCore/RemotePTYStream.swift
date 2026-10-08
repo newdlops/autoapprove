@@ -146,6 +146,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private let connection: NWConnection
     private let request: Data
     private let expectedNodeID: String
+    private let openingTimeout: TimeInterval
     private let queue = DispatchQueue(label: "autoapprove.web.pty-peer-stream")
     private var opening: CheckedContinuation<Void, Error>?
     private var deadline: DispatchWorkItem?
@@ -159,10 +160,11 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private var failure: Error?
     private static let eventLimit = 2_000_128
 
-    init(endpoint: NWEndpoint, path: String, expectedNodeID: String) throws {
+    init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15) throws {
         guard !expectedNodeID.contains("\r"), !expectedNodeID.contains("\n") else { throw RemoteHTTPError(502, "Mac의 연결 ID가 올바르지 않습니다.") }
         connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
         self.expectedNodeID = expectedNodeID
+        openingTimeout = max(0.05, timeout)
         request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\nAccept: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
     }
     deinit { connection.cancel() }
@@ -191,7 +193,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                         self.fail(RemoteHTTPError(504, "Mac의 터미널 연결을 기다리다 시간이 지났습니다. 다시 연결해주세요."))
                     }
                     self.deadline = deadline
-                    self.queue.asyncAfter(deadline: .now() + 15, execute: deadline)
+                    self.queue.asyncAfter(deadline: .now() + self.openingTimeout, execute: deadline)
                     self.connection.start(queue: self.queue)
                 }
             }
@@ -217,7 +219,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                     if status == 200 {
                         guard headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "text/event-stream",
                               headers["transfer-encoding"] == nil,
-                              headers["x-autoapprove-node"] == self.expectedNodeID else { throw RemoteHTTPError(502, "Mac의 터미널 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
+                              headers["x-autoapprove-node"] == self.expectedNodeID else { throw RemoteHTTPError(502, "Mac의 터미널 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.", diagnostics: ["failureKind":"identity"]) }
                         self.buffer = self.buffer.subdata(in: boundary.upperBound..<self.buffer.count)
                         self.opened = true; self.ended = ended; self.failure = error
                         self.deadline?.cancel(); self.deadline = nil

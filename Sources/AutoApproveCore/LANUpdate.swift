@@ -11,6 +11,8 @@ public struct LANUpdateStatus: Codable, Equatable, Sendable {
     public var detail = "같은 네트워크의 최신 버전을 자동으로 받습니다."
     public var version: String?
     public var progress: Int?
+    public var retryAt: Date?
+    public var diagnostics: [String: String]?
     public init() {}
 }
 
@@ -280,50 +282,57 @@ public enum LANUpdateInstallation {
     private let app: URL?
     private var task: Task<Void, Never>?
     private var retryAfter = Date.distantPast
+    private var failures = 0
+    private var context: (node: String, release: RemoteWebVersion, route: String)?
+    private var rejected: (node: String, release: RemoteWebVersion)?
     private var staged: (LANUpdateManifest, URL, URL)?
     private var applying = false
     init(engine: ApprovalEngine) { self.engine = engine; app = try? LANUpdateInstallation.currentApp() }
     deinit { if !applying, let staged { try? FileManager.default.removeItem(at: staged.1) } }
-    func stop() { task?.cancel() }
-    func check(endpoint: NWEndpoint, nodeID: String, release: RemoteWebVersion) {
+    func stop() { task?.cancel(); retryAfter = .distantPast; failures = 0; rejected = nil }
+    func check(nodeID: String, release: RemoteWebVersion, routeKey: String,
+               read: @escaping @MainActor @Sendable (String) async throws -> RemoteHTTPResponse) {
+        if context?.node != nodeID || context?.release != release { retryAfter = .distantPast; failures = 0; rejected = nil }
+        else if context?.route != routeKey { retryAfter = .distantPast }
+        context = (nodeID,release,routeKey)
         guard let engine, engine.lanUpdate.enabled, let app, let current = RemoteWebVersion.current,
-              release > current, task == nil, Date() >= retryAfter else { return }
+              release > current, task == nil, Date() >= retryAfter,
+              rejected?.node != nodeID || rejected?.release != release else { return }
         task = Task { [weak self] in
             guard let self else { return }
             defer { self.task = nil }
             var incoming: URL?
+            var stage = "manifest"
+            let partial = engine.paths.directory.appendingPathComponent("updates/partial-download")
             do {
                 if self.staged?.0.release != release || self.staged?.0.nodeID != nodeID {
                     if let previous = self.staged { try? FileManager.default.removeItem(at: previous.1) }; self.staged = nil
                     self.status("checking", "최신 Mac의 업데이트를 확인하고 있습니다.", version: release.version)
-                    let offered = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/update/manifest", method: "GET", body: Data(), expectedNodeID: nodeID).run()
-                    guard offered.status == 200 else { throw AppError.message("이 Mac은 자동 업데이트 제공을 지원하지 않습니다. 첫 업데이트는 설치 파일로 적용해주세요.") }
+                    let offered = try await read("/api/update/manifest")
+                    guard offered.status == 200 else {
+                        if [502,503,504].contains(offered.status) { throw RemoteHTTPError(offered.status,"업데이트 파일 응답이 늦습니다.") }
+                        throw AppError.message("이 Mac은 자동 업데이트 제공을 지원하지 않습니다. 첫 업데이트는 설치 파일로 적용해주세요.")
+                    }
                     let manifest = try JSONDecoder().decode(LANUpdateManifest.self, from: offered.body)
                     try manifest.validate(nodeID: nodeID, newerThan: current)
                     guard manifest.release == release else { throw AppError.message("Mac의 업데이트 버전이 바뀌었습니다.") }
+                    stage = "download"
+                    let archive = try await LANUpdateDownload.download(manifest:manifest,directory:partial,read:read) { offset in
+                        self.status("downloading", "최신 버전을 받고 있습니다.", version:release.version,progress:offset * 100 / manifest.size)
+                    }
+                    try Task.checkCancellation()
+                    stage = "verify"
                     let directory = engine.paths.directory.appendingPathComponent("updates/incoming-\(UUID().uuidString)")
                     incoming = directory
                     try? FileManager.default.removeItem(at: directory)
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                    let archive = directory.appendingPathComponent("update.zip")
-                    FileManager.default.createFile(atPath: archive.path, contents: nil, attributes: [.posixPermissions: 0o600])
-                    let handle = try FileHandle(forWritingTo: archive)
-                    defer { try? handle.close() }
-                    for offset in stride(from: 0, to: manifest.size, by: LANUpdateManifest.chunkSize) {
-                        try Task.checkCancellation()
-                        guard engine.lanUpdate.enabled else { throw CancellationError() }
-                        self.status("downloading", "최신 버전을 받고 있습니다.", version: release.version, progress: offset * 100 / manifest.size)
-                        let chunk = try await RemoteHTTPExchange(endpoint: endpoint,
-                            path: "/api/update/chunk?sha256=\(manifest.sha256)&offset=\(offset)", method: "GET", body: Data(), expectedNodeID: nodeID).run()
-                        guard chunk.status == 200, chunk.body.count == min(LANUpdateManifest.chunkSize, manifest.size - offset) else { throw AppError.message("업데이트 전송이 끊겼습니다. 잠시 후 다시 확인합니다.") }
-                        try handle.write(contentsOf: chunk.body)
-                    }
-                    try handle.synchronize(); try handle.close()
                     self.status("checking", "업데이트 서명과 체크섬을 확인하고 있습니다.", version: release.version)
                     let candidate = try await Task.detached(priority: .utility) { try LANUpdateInstallation.stage(archive: archive, manifest: manifest, directory: directory) }.value
                     try Task.checkCancellation()
                     self.staged = (manifest, directory, candidate); incoming = nil
+                    try LANUpdateDownload.clear(directory:partial)
                 }
+                stage = "install"
                 guard let staged = self.staged, engine.lanUpdate.enabled else { return }
                 if let reason = engine.lanUpdateWaitReason {
                     self.status("waiting", reason, version: release.version); return
@@ -361,8 +370,19 @@ public enum LANUpdateInstallation {
             } catch {
                 if let incoming { try? FileManager.default.removeItem(at: incoming) }
                 if !Task.isCancelled, engine.lanUpdate.enabled {
-                    self.retryAfter = Date().addingTimeInterval(600)
-                    self.status("failed", error.localizedDescription, version: release.version)
+                    var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
+                    if diagnostics["stage"] == nil { diagnostics["stage"] = stage }
+                    if RemoteReadRecovery.isTransient(error) {
+                        self.failures += 1
+                        let delay = LANUpdateRetryPolicy.delay(failures:self.failures)
+                        self.retryAfter = Date().addingTimeInterval(delay)
+                        self.status("failed", "업데이트 연결이 끊겼습니다. \(Int(delay))초 뒤 다시 확인합니다.", version:release.version)
+                        var value = engine.lanUpdate; value.retryAt = self.retryAfter; value.diagnostics = diagnostics; engine.updateLANUpdateStatus(value)
+                    } else {
+                        self.rejected = (nodeID,release); try? LANUpdateDownload.clear(directory:partial)
+                        self.status("failed", error.localizedDescription, version:release.version)
+                        var value = engine.lanUpdate; value.diagnostics = diagnostics; engine.updateLANUpdateStatus(value)
+                    }
                 }
             }
         }
@@ -370,6 +390,7 @@ public enum LANUpdateInstallation {
     private func status(_ phase: String, _ detail: String, version: String?, progress: Int? = nil) {
         guard let engine, engine.lanUpdate.enabled else { return }
         var value = engine.lanUpdate; value.phase = phase; value.detail = detail; value.version = version; value.progress = progress
+        value.retryAt = nil; value.diagnostics = nil
         engine.updateLANUpdateStatus(value)
     }
 }

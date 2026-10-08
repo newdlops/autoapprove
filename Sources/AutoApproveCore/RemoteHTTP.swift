@@ -9,6 +9,16 @@ public struct RemoteHTTPError: LocalizedError {
     public var errorDescription: String? { message }
 }
 
+enum RemoteReadRecovery {
+    static func isTransient(_ error: Error) -> Bool {
+        guard !(error is CancellationError), !Task.isCancelled else { return false }
+        if error is NWError { return true }
+        guard let value = error as? RemoteHTTPError, value.diagnostics?["failureKind"] != "identity",
+              value.diagnostics?["failureKind"] != "protocol" else { return false }
+        return [502,503,504].contains(value.status)
+    }
+}
+
 /// A bounded, single-request HTTP connection. No cookies, CORS or socket-bridge passthrough.
 public struct RemoteHTTPRequest {
     public let method: String

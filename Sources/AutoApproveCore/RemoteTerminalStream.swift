@@ -26,7 +26,8 @@ extension RemoteServerEvent {
         }
     }
     private let read: @MainActor @Sendable () async throws -> RemoteTerminalFrame
-    private let waitForChange: (@Sendable () async -> Void)?
+    private let waitForChange: (@Sendable (TimeInterval) async -> Void)?
+    private let responsive: @MainActor @Sendable () -> Bool
     private var initial: RemoteTerminalFrame?
     private var revision: String?
     private var controls: Controls?
@@ -34,11 +35,14 @@ extension RemoteServerEvent {
     private var task: Task<Void, Never>?
     private var waiter: RemoteHTTPStreamCompletion?
     private var cancelled = false
+    private var unchanged = 0
 
-    init(initial: RemoteTerminalFrame, waitForChange: (@Sendable () async -> Void)? = nil, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
+    init(initial: RemoteTerminalFrame, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
+         responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
         _ = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
         self.initial = initial; self.read = read
         self.waitForChange = waitForChange
+        self.responsive = responsive
     }
     deinit { task?.cancel() }
     nonisolated func next(_ completion: @escaping RemoteHTTPStreamCompletion) {
@@ -60,6 +64,7 @@ extension RemoteServerEvent {
                     else { frame = try await self.read() }
                     guard !self.cancelled, !Task.isCancelled else { self.finish(.success(nil)); return }
                     let controls = Controls(frame)
+                    self.unchanged = frame.revision == self.revision && controls == self.controls ? self.unchanged + 1 : 0
                     if frame.revision != self.revision || controls != self.controls || Date().timeIntervalSince(self.emittedAt) >= 2 {
                         let data = try RemoteServerEvent.screen(frame, knownRevision: self.revision)
                         self.revision = frame.revision; self.controls = controls; self.emittedAt = Date()
@@ -68,8 +73,10 @@ extension RemoteServerEvent {
                     // Native emulators expose screen snapshots. The engine shares
                     // their in-flight read/cache across viewers; VS Code's latest
                     // snapshot already arrives on its existing bridge connection.
-                    if let waitForChange = self.waitForChange { await waitForChange() }
-                    else { try await Task.sleep(nanoseconds: 150_000_000) }
+                    let interval = min(RemoteTerminalPolling.interval(unchanged:self.unchanged,responsive:self.responsive()),
+                        max(0.01,2-Date().timeIntervalSince(self.emittedAt)))
+                    if let waitForChange = self.waitForChange { await waitForChange(interval) }
+                    else { try await Task.sleep(for:.seconds(interval)) }
                 }
                 self.finish(.success(nil))
             } catch {

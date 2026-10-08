@@ -1,5 +1,19 @@
 import Foundation
 import CoreGraphics
+import ApplicationServices
+
+public struct MouseActivityPermissions: Codable, Equatable, Sendable {
+    public var accessibilityGranted: Bool
+    public var eventPostingGranted: Bool
+    public var processID: Int32
+    public var bundleIdentifier: String?
+    public var executable: String
+    public init(accessibilityGranted: Bool, eventPostingGranted: Bool, processID: Int32 = ProcessInfo.processInfo.processIdentifier,
+                bundleIdentifier: String? = Bundle.main.bundleIdentifier, executable: String = CommandLine.arguments[0]) {
+        self.accessibilityGranted = accessibilityGranted; self.eventPostingGranted = eventPostingGranted
+        self.processID = processID; self.bundleIdentifier = bundleIdentifier; self.executable = executable
+    }
+}
 
 public struct MouseActivityStatus: Codable, Equatable {
     public enum Phase: String, Codable { case off, ready, active, locked, permission, unavailable, failed }
@@ -7,8 +21,10 @@ public struct MouseActivityStatus: Codable, Equatable {
     public var phase: Phase
     public var detail: String
     public var lastSentAt: Date?
-    public init(enabled: Bool, phase: Phase, detail: String, lastSentAt: Date? = nil) {
+    public var permissions: MouseActivityPermissions?
+    public init(enabled: Bool, phase: Phase, detail: String, lastSentAt: Date? = nil, permissions: MouseActivityPermissions? = nil) {
         self.enabled = enabled; self.phase = phase; self.detail = detail; self.lastSentAt = lastSentAt
+        self.permissions = permissions
     }
 }
 
@@ -21,11 +37,14 @@ public struct MouseActivityControl: Sendable {
     public var session: @Sendable () -> MouseActivitySession
     public var pulse: @Sendable () throws -> Void
     public var requestPermission: @MainActor @Sendable () -> Bool
+    public var diagnostics: @Sendable () -> MouseActivityPermissions?
     public init(uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                 permission: @escaping @Sendable () -> Bool, session: @escaping @Sendable () -> MouseActivitySession,
-                pulse: @escaping @Sendable () throws -> Void, requestPermission: @escaping @MainActor @Sendable () -> Bool) {
+                pulse: @escaping @Sendable () throws -> Void, requestPermission: @escaping @MainActor @Sendable () -> Bool,
+                diagnostics: @escaping @Sendable () -> MouseActivityPermissions? = { nil }) {
         self.uptime = uptime; self.permission = permission; self.session = session
         self.pulse = pulse; self.requestPermission = requestPermission
+        self.diagnostics = diagnostics
     }
     public static let live = Self(permission: { CGPreflightPostEventAccess() }, session: { currentSession() }, pulse: {
         // Check again at delivery: a lock or permission change must not race the timer's earlier read.
@@ -46,7 +65,11 @@ public struct MouseActivityControl: Sendable {
         event.setIntegerValueField(.mouseEventDeltaX, value: 0)
         event.setIntegerValueField(.mouseEventDeltaY, value: 0)
         event.post(tap: .cghidEventTap)
-    }, requestPermission: { CGPreflightPostEventAccess() || CGRequestPostEventAccess() })
+    }, requestPermission: {
+        if CGPreflightPostEventAccess() { return true }
+        if !AXIsProcessTrusted() { _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary) }
+        return CGRequestPostEventAccess()
+    }, diagnostics: { MouseActivityPermissions(accessibilityGranted:AXIsProcessTrusted(),eventPostingGranted:CGPreflightPostEventAccess()) })
 
     private static func currentSession() -> MouseActivitySession {
         guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return .unavailable }
@@ -111,6 +134,7 @@ private enum MouseActivityFailure: Error { case locked, permission, unavailable 
     }
 
     @discardableResult private func refreshAvailability() -> Bool {
+        status.permissions = control.diagnostics()
         switch control.session() {
         case .locked:
             setPhase(.locked, "화면이 잠겨 있어 신호를 보내지 않습니다. 직접 잠금을 해제하면 다시 보냅니다."); return false
@@ -119,7 +143,10 @@ private enum MouseActivityFailure: Error { case locked, permission, unavailable 
         case .active: break
         }
         guard control.permission() else {
-            setPhase(.permission, "마우스 신호를 보내려면 손쉬운 사용 권한을 허용해주세요."); return false
+            let detail = status.permissions?.accessibilityGranted == true
+                ? "손쉬운 사용은 허용됐지만 마우스 신호 권한은 아직 확인되지 않습니다. 권한 다시 확인을 눌러 현재 설치본을 확인해주세요."
+                : "현재 AutoApprove 설치본의 손쉬운 사용 권한을 확인하지 못했습니다. 시스템 설정에서 이 앱을 허용해주세요."
+            setPhase(.permission, detail); return false
         }
         setPhase(.ready, "켜져 있습니다. 1분마다 현재 커서 위치에 마우스 신호를 보냅니다.")
         return true
