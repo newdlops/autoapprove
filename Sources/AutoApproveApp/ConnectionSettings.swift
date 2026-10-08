@@ -12,6 +12,7 @@ struct ConnectionSettings: View {
     @State private var questionDelayError: String?
     @State private var keepAwakeBusy = false
     @State private var keepAwakeError: String?
+    @State private var mouseActivityError: String?
     @State private var terminalWindowSharingAllowed = false
     @State private var terminalInputStatus = TerminalInputStatus.notInstalled
     @State private var terminalInputBusy = false
@@ -81,6 +82,17 @@ struct ConnectionSettings: View {
                     }
                     Divider()
                     keepAwakeSection
+                    Divider()
+                    section("마우스 활동 유지", icon: "computermouse", status: "켜 두면 1분마다 신호를 보냅니다.") {
+                        MouseActivitySettings(status: engine.snapshot.mouseActivity ?? MouseActivityStatus(enabled: false, phase: .off, detail: "마우스 신호가 꺼져 있습니다."),
+                            error: mouseActivityError, setEnabled: { enabled in
+                                do { try engine.setMouseActivity(enabled); mouseActivityError = nil }
+                                catch { mouseActivityError = error.localizedDescription }
+                            }, requestPermission: {
+                                engine.requestMouseActivityPermission()
+                                if engine.snapshot.mouseActivity?.phase == .permission { openPrivacySettings("Privacy_Accessibility") }
+                            })
+                    }
                     Divider()
                     screenSection(.terminal, icon: "terminal",
                         text: "실행 중인 탭을 연결해 요청을 읽고 해당 탭에만 승인 입력을 전달합니다. 한 번 연결하면 앱을 다시 실행해도 연결을 복원합니다. 처음 연결할 때 macOS의 자동화 권한을 허용해주세요.")

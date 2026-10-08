@@ -69,6 +69,32 @@ private func waitUntil(_ seconds: Double = 20, _ condition: () -> Bool) -> Bool 
 }
 
 extension ApprovalTests {
+    @MainActor func testMouseActivityIndependentAndRestored() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-mouse-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let power = FakePower(), mouse = FakeMouseActivity(), paths = AppPaths(directory: directory)
+        power.reading = PowerReading(onBattery: true, batteryPercent: 1, thermal: .critical)
+        let engine = try ApprovalEngine(paths: paths, powerControl: power.control, mouseActivityControl: mouse.control)
+        try engine.setPaused(true)
+        try expectEqual(engine.snapshot.sessions.count, 0)
+        // The setting is independent of work, the global approval pause, battery and temperature.
+        let reply = try await engine.remoteAction(["action": "mouseActivity", "enabled": true])
+        try expect((reply["mouseActivity"] as? JSONObject)?["enabled"] as? Bool == true)
+        mouse.now += 60; engine.evaluateMouseActivity(); try expectEqual(mouse.pulses.count, 1)
+        try expectEqual(power.reads, 0); try expectEqual(power.changes, [])
+        engine.stop(); mouse.now += 60; engine.evaluateMouseActivity(); try expectEqual(mouse.pulses.count, 1)
+        let restored = try ApprovalEngine(paths: paths, powerControl: power.control, mouseActivityControl: mouse.control)
+        try expectEqual(restored.snapshot.mouseActivity?.enabled, true)
+        mouse.now += 60; restored.evaluateMouseActivity(); try expectEqual(mouse.pulses.count, 2)
+        try expectEqual(restored.snapshot.paused, true)
+        try restored.setMouseActivity(false); mouse.now += 60; restored.evaluateMouseActivity()
+        try expectEqual(mouse.pulses.count, 2)
+        restored.stop()
+        let off = try ApprovalEngine(paths: paths, powerControl: power.control, mouseActivityControl: mouse.control)
+        try expectEqual(off.snapshot.mouseActivity?.enabled, false)
+        off.stop(); try expectEqual(mouse.requests, 0)
+    }
+
     func testKeepAwakeWorkingSessions() throws {
         func session(_ phase: SessionPhase, automatic: Bool = true, agent: AgentKind = .codex, _ change: (inout AgentSession) -> Void = { _ in }) -> AgentSession {
             var value = AgentSession(id: UUID().uuidString, agent: agent, pid: 1, started: "", tty: "/dev/ttys1", cwd: "/tmp/demo", terminal: .terminal)

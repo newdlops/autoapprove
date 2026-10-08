@@ -190,6 +190,8 @@ import TerminalInputSupport
     private var keepAwakeStopped = false
     private var keepAwakeTask: Task<Void, Never>?
     private var keepAwakeActivity: NSObjectProtocol?
+    private let mouseActivity: MouseActivity
+    private var mouseActivityTask: Task<Void, Never>?
     private var discovering = false
     private var revision: UInt64 = 0
     private struct ScreenState {
@@ -207,11 +209,12 @@ import TerminalInputSupport
 
     public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
-                codexQueue: CodexQueueTransport = .live) throws {
+                codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live) throws {
         self.paths = paths
         self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
         self.powerControl = powerControl
+        mouseActivity = MouseActivity(control: mouseActivityControl)
         keepAwakeSwitch = KeepAwakeSwitch(control: powerControl, marker: paths.directory.appendingPathComponent("keep-awake.hold").path)
         var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0)) })
         adapters[.terminal]?.screens = { targets in try terminalReader(targets.map(\.tty)) }
@@ -251,6 +254,8 @@ import TerminalInputSupport
         if !lanUpdate.enabled { lanUpdate.phase = "off"; lanUpdate.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다." }
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
         keepAwakeEnabled = store.value("keepAwake") == "true"
+        mouseActivity.setEnabled(store.value("mouseActivity") == "true")
+        snapshot.mouseActivity = mouseActivity.status
         snapshot.keepAwake = keepAwakeEnabled ? KeepAwakeStatus(phase: .checking, detail: Self.keepAwakeChecking, enabled: true, ruleFile: powerControl.ruleFile())
             : KeepAwakeStatus(phase: .off, detail: Self.keepAwakeOff, enabled: false, ruleFile: powerControl.ruleFile())
         snapshot.health.claude = HookInstaller.isInstalled() ? "설치됨 · 세션 이벤트 대기" : "훅 설치 필요"
@@ -290,6 +295,8 @@ import TerminalInputSupport
         try socket.start(); server = socket
         questionAutomationStopped = false
         keepAwakeStopped = false
+        mouseActivity.setEnabled(store.value("mouseActivity") == "true")
+        snapshot.mouseActivity = mouseActivity.status
         reconcileAutomaticQuestionReplies()
         let savedWeb = store.value("webEnabled")
         if savedWeb == "true" || (savedWeb == nil && webByDefault) {
@@ -300,6 +307,13 @@ import TerminalInputSupport
             }
         }
         if poll {
+            // Independent of keep-awake's work, battery, heat and asynchronous privilege checks.
+            mouseActivityTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    self?.evaluateMouseActivity()
+                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { break }
+                }
+            }
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refresh()
@@ -328,6 +342,8 @@ import TerminalInputSupport
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         gitBranchTask?.cancel(); gitBranchTask = nil
         keepAwakeTask?.cancel(); keepAwakeTask = nil
+        mouseActivityTask?.cancel(); mouseActivityTask = nil
+        mouseActivity.stop()
         questionAutomationStopped = true
         for id in Array(automaticQuestionReplies.keys) { cancelAutomaticQuestionReply(id) }
         server?.stop(); server = nil
@@ -1147,6 +1163,12 @@ import TerminalInputSupport
         if action == "questionDelay" {
             guard let seconds = object["seconds"] as? Int else { throw RemoteHTTPError(400, "대기 시간을 지정해주세요.") }
             try setQuestionNotificationDelay(seconds); return ["seconds": snapshot.questionNotificationDelay]
+        }
+        if action == "mouseActivity" {
+            guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "마우스 신호 설정을 지정해주세요.") }
+            try setMouseActivity(enabled)
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            return ["mouseActivity": try JSONSerialization.jsonObject(with: encoder.encode(mouseActivity.status))]
         }
         guard let id = object["sessionID"] as? String, let session = sessions[id], session.phase != .ended else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
         switch action {
@@ -2910,6 +2932,24 @@ import TerminalInputSupport
         guard let phase = capacityStates[id]?.phase, phase == .waiting || phase == .unavailable else { return }
         capacityStates[id]?.phase = .cancelled; capacityStates[id]?.scheduledID = nil
         publish()
+    }
+
+    // MARK: Independent mouse activity
+
+    public func setMouseActivity(_ enabled: Bool) throws {
+        try store.set("mouseActivity", enabled ? "true" : "false")
+        mouseActivity.setEnabled(enabled)
+        snapshot.mouseActivity = mouseActivity.status
+    }
+
+    public func requestMouseActivityPermission() {
+        _ = mouseActivity.requestPermission()
+        snapshot.mouseActivity = mouseActivity.status
+    }
+
+    public func evaluateMouseActivity() {
+        mouseActivity.evaluate()
+        if snapshot.mouseActivity != mouseActivity.status { snapshot.mouseActivity = mouseActivity.status }
     }
 
     // MARK: Keeping the Mac awake with the lid closed
