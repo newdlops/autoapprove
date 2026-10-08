@@ -45,6 +45,8 @@ public struct RemoteNodeState: Codable {
     public var screenShares: [TestScreenShare]? = nil
     public var update: LANUpdateStatus? = nil
     public var historyDeferred: Bool? = nil
+    /// This name resolves on this Mac only, and is not a LAN address for peers or phones.
+    public var localAddressReady: Bool? = nil
     public var inventory: RemoteNodeState {
         var value = self
         value.snapshot.sessions = []; value.snapshot.events = []; value.historyDeferred = true
@@ -574,26 +576,6 @@ struct RemoteTerminalUpdate: Encodable {
     private func preferredGateway(client: String? = nil) -> RemoteWebGateway? {
         newerWebPeers().compactMap {gateway($0,client:client)}.first
     }
-    private func verifiedGateway(client: String?) async -> RemoteWebGateway? {
-        let epoch = generation
-        // Never redirect API requests. Recheck only a bounded number of newer web
-        // providers; an offline or reassigned IP must still leave this page usable.
-        for peer in newerWebPeers().filter({gateway($0,client:client,requireVerified:false) != nil}).prefix(4) {
-            guard let offered = gateway(peer,client:client,requireVerified:false), var address = URLComponents(string:offered.url) else { continue }
-            address.query = nil
-            guard let value = address.string, let endpoint = try? RemoteNetworkAddress.endpoint(value) else { continue }
-            let found = await RemotePeerDiscovery.probe(endpoint, expectedID: peer.id,address:Self.numericURL(endpoint))
-            guard running, generation == epoch else { return nil }
-            guard peers[peer.id]?.endpoint == peer.endpoint else { continue }
-            if let found {
-                acceptWebMetadata(found)
-                if let current = peers[peer.id], let local = webVersion, current.release.map({ $0 > local }) == true, let result = gateway(current,client:client) {
-                    updateNamedAddresses(); emitStatus(); return result
-                }
-            } else { peers[peer.id]?.webVerifiedAt = nil }
-        }
-        updateNamedAddresses(); emitStatus(); return nil
-    }
     private func updateNamedAddresses() {
         guard running, status.ready, let port = status.port, !updatingNamedAccess else { return }
         guard bonjourEnabled else { status.urls = Self.addresses(port: port); return }
@@ -733,7 +715,8 @@ struct RemoteTerminalUpdate: Encodable {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
         return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
             release: webVersion, webURLs: port.map(Self.addresses), webPort: port,
-            questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate)
+            questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
+            localAddressReady:LocalDashboardAddress.status() == .ready)
     }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
@@ -858,9 +841,8 @@ struct RemoteTerminalUpdate: Encodable {
                 switch request.path {
                 case "/", "/index.html":
                     if let expected = request.parameter("webNode"), expected != nodeID { throw RemoteHTTPError(409, "이 주소의 Mac이 바뀌었습니다. 원래 즐겨찾기나 Mac의 접속 링크로 다시 열어주세요.") }
-                    if let gateway = await verifiedGateway(client:request.clientAddress) {
-                        return RemoteHTTPResponse(status: 302, body: Data(), contentType: "text/plain; charset=utf-8", location: gateway.url)
-                    }
+                    // Every client owns its entry document. A newer/offline Mac
+                    // cannot delay or redirect a phone's first byte or local alias.
                     return try asset("index.html", type: "text/html; charset=utf-8")
                 case "/app.css": return try asset("app.css", type: "text/css; charset=utf-8")
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")

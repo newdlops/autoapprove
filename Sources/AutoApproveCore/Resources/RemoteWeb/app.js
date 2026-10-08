@@ -166,7 +166,6 @@ const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-d
 const needsReview = session => !!session.interruption && session.interruption.recoveredAt == null || ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
 const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
 const byteLength = value => new TextEncoder().encode(value).length;
-let webInteracted = false, firstWebRefresh = true;
 const bundledWebVersion = document.querySelector('meta[name="autoapprove-web-version"]')?.content.split(':');
 const loadedWebVersion = bundledWebVersion?.length === 3 ? { version: bundledWebVersion[0], build: Number(bundledWebVersion[1]), api: Number(bundledWebVersion[2]) } : null;
 const versionNumbers = release => release?.api === 1 && Number.isInteger(release.build) && release.build > 0 && release.build <= 1000000 && /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/.test(release.version) ? [...release.version.split('.').map(Number), release.build] : null;
@@ -177,7 +176,6 @@ const newerVersion = (left, right) => {
   return false;
 };
 function updateWebVersion(result) {
-  const initial = firstWebRefresh; if (!result.partial) firstWebRefresh = false;
   const loaded = versionNumbers(loadedWebVersion) ? loadedWebVersion : result.gatewayRelease;
   let gateway = result.preferredGateway;
   if (!gateway && newerVersion(result.gatewayRelease, loaded)) gateway = { id: result.gatewayID, name: '이 Mac', url: location.origin + '/', release: result.gatewayRelease };
@@ -187,16 +185,13 @@ function updateWebVersion(result) {
   try {
     url = new URL(gateway.url);
     const host = url.hostname, parts = host.split('.').map(Number);
-    const privateHost = host === 'localhost' || parts.length === 4 && parts.every(n => Number.isInteger(n) && n >= 0 && n <= 255) && (parts[0] === 127 || parts[0] === 10 || parts[0] === 192 && parts[1] === 168 || parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31 || parts[0] === 169 && parts[1] === 254);
+    const privateHost = host === 'localhost' || host === 'autoapprove' || parts.length === 4 && parts.every(n => Number.isInteger(n) && n >= 0 && n <= 255) && (parts[0] === 127 || parts[0] === 10 || parts[0] === 192 && parts[1] === 168 || parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31 || parts[0] === 169 && parts[1] === 254);
     if (url.protocol !== 'http:' || !privateHost || url.username || url.password || !['', '/'].includes(url.pathname)) throw new Error('invalid gateway');
     url.search = new URLSearchParams({ webNode: gateway.id }).toString(); url.hash = location.hash;
   } catch (_) { show($('web-update'), false); return; }
-  const draftPresent = composing || mutation || inputInFlight || directSending || directQueue.length || $('terminal-input').value || [...drafts.values()].some(Boolean) || [...questionDrafts.values()].some(draft => draft.answer || draft.choices.length);
-  if (initial && !webInteracted && !draftPresent) { location.replace(url.href); return; }
   text($('web-update-message'), `${gateway.name} · 웹 ${gateway.release.version} (빌드 ${gateway.release.build}). 새 탭에서 열며 초안은 여기에 남습니다.`);
   $('open-latest-web').href = url.href; show($('web-update'), true);
 }
-for (const event of ['pointerdown', 'keydown', 'input', 'compositionstart']) document.addEventListener(event, () => { webInteracted = true; }, { capture: true, passive: true });
 $('open-latest-web').addEventListener('click', () => { const url = new URL($('open-latest-web').href); url.hash = location.hash; $('open-latest-web').href = url.href; });
 
 function updateViewport() {

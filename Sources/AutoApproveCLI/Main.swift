@@ -16,6 +16,10 @@ import AutoApproveCore
         let command = arguments.first ?? "help"
         do {
             switch command {
+            case "local-name":
+                guard arguments.count == 2, ["status","apply"].contains(arguments[1]) else {throw AppError.message("autoapprove local-name status 또는 apply를 사용해주세요.")}
+                if arguments[1] == "apply" {try LocalDashboardAddress.applySystem()}
+                try printJSON(["ready":LocalDashboardAddress.status() == .ready,"url":LocalDashboardAddress.url().absoluteString,"detail":LocalDashboardAddress.status().detail])
             case "lan-update-install":
                 guard arguments.count == 2 else { throw AppError.message("업데이트 작업 파일을 지정해주세요.") }
                 try await LANUpdateInstallation.install(jobFile: URL(fileURLWithPath: arguments[1]))
@@ -95,6 +99,8 @@ import AutoApproveCore
 
                   autoapprove scan          Claude Code·Codex 세션 탐색 (읽기 전용)
                   autoapprove doctor        연결 상태 확인
+                  autoapprove local-name status  이 Mac의 autoapprove 주소 설정 확인
+                  autoapprove local-name apply   관리자 권한으로 이 Mac의 로컬 주소 설정
                   autoapprove mcp           휴대폰 질문·테스트 화면 공유 MCP (stdio)
                   autoapprove terminal-input prepare  원본 입력 서비스 등록 정보 확인 (읽기 전용 JSON)
                   autoapprove terminal-input install  기존 직접 입력 연결 확인 (새 등록은 Mac 앱에서)

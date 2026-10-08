@@ -101,27 +101,41 @@ try {
   assert.equal(await input.inputValue(), draft); assert.equal(new URL(page.url()).origin, older.url);
   checks.push('Explicit latest link opens a new tab, preserves exact session hash and leaves original draft intact');
 
-  const redirect = await rootResponse(older);
-  assert.equal(redirect.status,302); assert.equal(redirect.headers.get('cache-control'),'no-store');
-  assert.equal(new URL(redirect.headers.get('location')).origin, latest.url);
-  assert.equal(new URL(redirect.headers.get('location')).searchParams.get('webNode'),latest.id);
-  for (const route of ['/app.js','/app.css','/api/state','/api/network']) assert.equal((await fetch(older.url + route,{redirect:'manual'})).status,200,'Only entry documents redirect');
+  const ownEntry = await rootResponse(older);
+  assert.equal(ownEntry.status,200); assert.equal(ownEntry.headers.get('cache-control'),'no-store');
+  assert.match(await ownEntry.text(),/0\.2\.9:20:1/);
+  // The newest discovered peer is alive but stops responding. Initial HTML
+  // must still come straight from the contacted Mac, without a peer probe.
+  const localEntryTimes = [];
+  latest.child.kill('SIGSTOP');
+  try {
+    for (const route of ['/', '/index.html', '/']) {
+      const started = performance.now();
+      const response = await fetch(older.url + route, { redirect:'manual', signal:AbortSignal.timeout(1000) });
+      assert.equal(response.status,200);
+      assert.match(await response.text(),/0\.2\.9:20:1/);
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed < 350, `Initial HTML waited ${elapsed.toFixed(1)}ms with a stalled peer`);
+      localEntryTimes.push(Math.round(elapsed));
+    }
+  } finally { latest.child.kill('SIGCONT'); }
+  checks.push(`Initial HTML stays below 350ms with an unresponsive newer peer (${localEntryTimes.join(', ')}ms)`);
+  for (const route of ['/app.js','/app.css','/api/state','/api/network']) assert.equal((await fetch(older.url + route,{redirect:'manual'})).status,200);
   assert.equal((await rootResponse(latest)).status,200);
   const entry = await browser.newPage({viewport:{width:390,height:844}}); entry.on('pageerror', error => errors.push(error.message));
   await entry.goto(older.url + '/' + sessionHash);
   await entry.waitForFunction(() => document.body.classList.contains('terminal-focus'));
-  assert.equal(new URL(entry.url()).origin, latest.url); assert.equal(new URL(entry.url()).hash,sessionHash);
-  assert.equal(await entry.locator('meta[name="autoapprove-web-version"]').getAttribute('content'),'0.2.10:12:1');
-  const stableURL = entry.url(); await entry.waitForTimeout(2800); assert.equal(entry.url(),stableURL);
-  checks.push('Fresh numeric entry redirects to newest verified Mac; fragment survives HTTP redirect and equal versions do not loop');
-  const bootstrap = await browser.newPage({viewport:{width:390,height:844}}); bootstrap.on('pageerror',error => errors.push(error.message));
-  const bootstrapURL = older.url+'/?bootstrap';
-  await bootstrap.route(bootstrapURL, async route => route.fulfill({status:200,contentType:'text/html',body:(await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/index.html','utf8')).replace('__AUTOAPPROVE_WEB_VERSION__','0.2.9:20:1')}));
-  await bootstrap.goto(bootstrapURL+sessionHash,{waitUntil:'commit'});
-  await bootstrap.waitForURL(url => url.origin === latest.url);
-  await bootstrap.waitForFunction(() => document.body.classList.contains('terminal-focus'));
-  assert.equal(new URL(bootstrap.url()).hash,sessionHash);
-  checks.push('An untouched page loaded before discovery redirects on its first network response');
+  assert.equal(new URL(entry.url()).origin,older.url);assert.equal(new URL(entry.url()).hash,sessionHash);
+  assert.equal(await entry.locator('meta[name="autoapprove-web-version"]').getAttribute('content'),'0.2.9:20:1');
+  await entry.locator('#web-update').waitFor({state:'visible',timeout:15000});
+  const stableURL=entry.url();await entry.waitForTimeout(2800);assert.equal(entry.url(),stableURL);
+  checks.push('Every numeric entry serves its own document immediately and keeps its session fragment despite a newer peer');
+  const bootstrap = await browser.newPage({viewport:{width:390,height:844}});bootstrap.on('pageerror',error=>errors.push(error.message));
+  await bootstrap.goto(older.url+'/?bootstrap'+sessionHash);
+  await bootstrap.waitForFunction(()=>document.body.classList.contains('terminal-focus'));
+  await bootstrap.locator('#web-update').waitFor({state:'visible',timeout:15000});
+  assert.equal(new URL(bootstrap.url()).origin,older.url);assert.equal(new URL(bootstrap.url()).hash,sessionHash);
+  checks.push('An untouched page remains on the contacted client; latest web opens only through its explicit link');
 
   // A registered endpoint whose discovery identity disagrees with its state must not win.
   const fakeID = randomUUID(), wrongID = randomUUID();
@@ -134,17 +148,17 @@ try {
   await new Promise(resolve => fake.listen(0,'127.0.0.1',resolve)); probes.push(fake); fakeURL='http://127.0.0.1:'+fake.address().port;
   assert.equal((await fetch(older.url+'/api/peers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:fakeURL})})).status,200);
   assert.equal((await get(older,'/api/network')).preferredGateway?.id,latest.id);
-  assert.equal(new URL((await rootResponse(older)).headers.get('location')).origin,latest.url);
+  assert.equal((await rootResponse(older)).status,200);
   checks.push('Mismatched discovery identity cannot displace a verified latest client');
   const wrongEntry = await fetch(latest.url+'/?webNode='+older.id,{redirect:'manual'}); assert.equal(wrongEntry.status,409);
 
   latest.child.kill(); await wait(250);
   await until(async () => (await get(older,'/api/network')).preferredGateway?.id === newer.id,'fallback to next online version');
-  assert.equal(new URL((await rootResponse(older)).headers.get('location')).origin,newer.url);
+  assert.equal((await rootResponse(older)).status,200);
   newer.child.kill(); await wait(250);
   const fallback = await rootResponse(older); assert.equal(fallback.status,200); assert.match(await fallback.text(),/0\.2\.9:20:1/);
   assert.equal((await get(older)).id,older.id);
-  checks.push('Latest Mac offline falls back to next release; all newer clients offline serves own page and API');
+  checks.push('Latest link falls back to the next release; entry document and API always remain available locally');
   assert.deepEqual(errors,[]);
   await writeFile(path.join(output,'report.json'),JSON.stringify({checks,views,javascriptErrors:errors},null,2)+'\n');
   console.log(JSON.stringify({checks,views,javascriptErrors:errors},null,2));

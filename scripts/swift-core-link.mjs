@@ -8,6 +8,8 @@ export async function coreLinkArguments(build) {
     return (await Promise.all(entries.map(entry => entry.isDirectory() ? objects(path.join(directory, entry.name)) : entry.name.endsWith('.o') ? [path.join(directory, entry.name)] : []))).flat();
   }
   return ['-I', path.resolve('Sources/CPTY/include'), '-I', path.join(build, 'CTTYInput.build'),
+    '-I', path.join(build, 'CLocalDashboard.build'),
     ...await objects(path.join(build, 'CPTY.build')), ...await objects(path.join(build, 'CTTYInput.build')),
+    ...await objects(path.join(build, 'CLocalDashboard.build')),
     ...await objects(path.join(build, 'TerminalInputSupport.build'))];
 }

@@ -7,6 +7,9 @@ struct RemoteAccessSettings: View {
     @ObservedObject var engine: ApprovalEngine
     @State private var error: String?
     @State private var selectedURL = ""
+    @State private var localAddressStatus = LocalDashboardAddress.status()
+    @State private var localAddressBusy = false
+    @State private var localAddressError: String?
     var body: some View {
         let status = engine.webStatus
         let phoneURLs = status.directURLs
@@ -25,6 +28,42 @@ struct RemoteAccessSettings: View {
                     do { try engine.setWebEnabled(false); try engine.setWebEnabled(true); error = nil } catch { self.error = error.localizedDescription }
                 }.help("웹 연결을 다시 열고 같은 네트워크의 Mac을 찾습니다.")
             }
+            VStack(alignment:.leading,spacing:8) {
+                Text("이 Mac에서 여는 주소").font(.callout.weight(.medium))
+                Text(LocalDashboardAddress.url(port:status.port ?? 8765).absoluteString)
+                    .font(.system(.callout,design:.monospaced)).textSelection(.enabled)
+                    .fixedSize(horizontal:false,vertical:true)
+                Text(status.enabled ? localAddressStatus.detail : "웹 접속을 켜면 이 Mac의 관리 페이지를 열 수 있습니다.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                HStack(spacing:8) {
+                    Button(localAddressBusy ? "설정 중…" : localAddressStatus == .ready ? "주소 확인" : "주소 설정") {
+                        if localAddressStatus == .ready {localAddressStatus = LocalDashboardAddress.status(); return}
+                        localAddressBusy = true; localAddressError = nil
+                        let app = Bundle.main.bundleURL
+                        let backup = engine.paths.directory.appendingPathComponent("local-address-backups")
+                        Task {
+                            do {
+                                try await Task.detached {try LocalDashboardAddress.configure(app:app,backupDirectory:backup)}.value
+                                localAddressStatus = LocalDashboardAddress.status()
+                            } catch {localAddressError = error.localizedDescription}
+                            localAddressBusy = false
+                        }
+                    }.disabled(localAddressBusy || localAddressStatus == .conflict)
+                        .help("Mac 관리자 승인으로 autoapprove라는 이름만 자기 자신에 연결합니다. 다른 주소와 파일 권한은 유지합니다.")
+                    if localAddressBusy {ProgressView().controlSize(.small).accessibilityLabel("로컬 주소 설정 중")}
+                    Link("이 Mac에서 열기",destination:LocalDashboardAddress.url(port:status.port ?? 8765))
+                        .disabled(localAddressStatus != .ready || !status.ready || localAddressBusy)
+                        .help("이 Mac의 기본 브라우저에서 자기 관리 페이지를 엽니다.")
+                }
+                if let localAddressError {
+                    Label(localAddressError,systemImage:"exclamationmark.circle").font(.callout).foregroundStyle(.red)
+                        .fixedSize(horizontal:false,vertical:true)
+                }
+                if localAddressStatus == .conflict {
+                    Label(localAddressStatus.detail,systemImage:"exclamationmark.circle").font(.caption).foregroundStyle(.red)
+                        .fixedSize(horizontal:false,vertical:true)
+                }
+            }.padding(.vertical,4)
             if let url, let address = URL(string: url) {
                 HStack(alignment: .top, spacing: 16) {
                     if let qr = qrCode(url) {
@@ -92,6 +131,7 @@ struct RemoteAccessSettings: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let error { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.red) }
         }.frame(maxWidth: .infinity, alignment: .leading)
+            .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) {_ in localAddressStatus = LocalDashboardAddress.status()}
     }
     private func qrCode(_ text: String) -> NSImage? {
         let filter = CIFilter.qrCodeGenerator(); filter.message = Data(text.utf8)

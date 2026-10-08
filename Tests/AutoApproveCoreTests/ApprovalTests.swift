@@ -548,6 +548,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Codex continue scripts type, re-read, then submit only a visible draft", tests.testCodexResumeScriptsTypeThenSubmit),
             ("Codex capacity continue: opt-in, backoff, limit, cancel, pause, drafts and unverified writes", tests.testCodexCapacityResumeRuns),
             ("CLI interruption detection rejects drafts, busy frames and historical errors", tests.testSessionInterruptionDetection),
+            ("Local dashboard address maps self and preserves other names, backup, permissions and inode", tests.testLocalDashboardNamePreservesHostFileAndOnlyMapsSelf),
+            ("Local dashboard alias accepts its exact origin and rejects unrelated sites", tests.testLocalDashboardOriginKeepsExactSameOriginRules),
             ("Cold dashboard publishes healthy Macs and bookmarked local pages before six stalled reads", tests.testColdDashboardPublishesHealthyPeerBeforeStalledReads),
             ("Goal failure recovery uses lifecycle commands and respects drafts, pause, limits and completion", tests.testGoalFailureRecoveryUsesLifecycleCommand),
             ("Goal recovery retires numeric approvals and audits the exact continuation command", tests.testGoalRecoveryRetiresNumericApprovalAndAuditsActualCommand),

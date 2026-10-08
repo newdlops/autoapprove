@@ -81,7 +81,7 @@ public struct RemoteHTTPRequest {
     public func validateOrigin() throws {
         guard let host = headers["host"], let authority = URLComponents(string: "http://" + host),
               authority.user == nil, authority.password == nil, let hostname = authority.host,
-              (RemoteNetworkAddress.isLocalHost(hostname) || ["approve", "approve."].contains(hostname.lowercased())),
+              (RemoteNetworkAddress.isLocalHost(hostname) || ["approve", "approve.", "autoapprove", "autoapprove."].contains(hostname.lowercased())),
               authority.path.isEmpty, authority.query == nil, authority.fragment == nil else {
             throw RemoteHTTPError(403, "같은 네트워크의 Mac 주소로 접속해주세요.")
         }
