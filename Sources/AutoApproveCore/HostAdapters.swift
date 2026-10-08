@@ -176,14 +176,14 @@ public enum ITermAdapter {
         for (const session of skipClosed(() => tab.sessions()) || []) {
           if (skipClosed(() => session.tty()) !== target.tty) continue;
           const before = resumeRows(visible(session));
-          if (!resumeReady(before, target.region)) return 'screenChanged';
+          if (!resumeReady(before, target.region, text)) return 'screenChanged';
           let job = 0;
           try { job = Number(session.variable({named: 'jobPid'})) || 0; } catch (_) {}
           if (job > 0 && !target.jobPIDs.includes(job)) return 'agentMissing';
           // Text and Return arriving together stay a paste in Codex; Return follows separately.
           session.write({text, newline: false});
           const state = awaitTypedState(() => visible(session), before, target.region, text);
-          if (state === 'draft') { session.write({text: ''}); return awaitDraftGone(() => visible(session), text) ? 'sent' : 'typed'; }
+          if (state === 'draft') { session.write({text: ''}); return awaitSubmitted(() => visible(session), before, target.region, text) ? 'sent' : 'typed'; }
           return state === 'submitted' ? 'sent' : 'typed';
         }
         return 'missingTarget';
@@ -326,7 +326,7 @@ public enum OrcaAdapter {
         let before: String
         do { before = try readScreen(handle: handle) }
         catch let error as OrcaAdapterError where error.isStaleHandle { return .missingTarget }
-        guard CodexResumeCheck.ready(before, region: region) else { return .screenChanged }
+        guard CodexResumeCheck.ready(before, region: region, text: text) else { return .screenChanged }
         let typed: JSONObject
         do { typed = try sendComposed(handle: handle, text: text) }
         catch let error as OrcaAdapterError where error.isStaleHandle { return .missingTarget }
@@ -346,7 +346,7 @@ public enum OrcaAdapter {
             var checks = 0
             repeat {
                 Thread.sleep(forTimeInterval: 0.25)
-                if !CodexResumeCheck.draftVisible(try readScreen(handle: handle), text: text) { return .sent }
+                if CodexResumeCheck.state(before: before, after: try readScreen(handle: handle), region: region, text: text) == .submitted { return .sent }
                 checks += 1
             } while Date() < gone || checks < 2
             return .typed

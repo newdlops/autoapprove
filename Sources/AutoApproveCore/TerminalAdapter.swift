@@ -386,13 +386,13 @@ public enum TerminalAdapter {
         if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;
           const before = resumeRows(tab.contents());
-          if (!resumeReady(before, target.region)) return 'screenChanged';
+          if (!resumeReady(before, target.region, text)) return 'screenChanged';
           if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return 'agentMissing';
           // do script types the text and Return in one write, which Codex keeps as a paste.
           // A separate Return submits it, only while the draft sits in the same stopped composer.
           app.doScript(text, {in:tab});
           const state = awaitTypedState(() => tab.contents(), before, target.region, text);
-          if (state === 'draft') { app.doScript('', {in:tab}); return awaitDraftGone(() => tab.contents(), text) ? 'sent' : 'typed'; }
+          if (state === 'draft') { app.doScript('', {in:tab}); return awaitSubmitted(() => tab.contents(), before, target.region, text) ? 'sent' : 'typed'; }
           return state === 'submitted' ? 'sent' : 'typed';
         }
         return 'missingTarget';

@@ -92,7 +92,7 @@ extension ApprovalTests {
 
     func testCodexResumeScriptsTypeThenSubmit() throws {
         let stop = try unwrap(CodexCapacityStop.detect(stoppedFrame, agent: .codex))
-        func terminal(_ frames: [String], processes: [String] = ["login", "-zsh", "codex"], windows: String = "[{tabs: () => [tab]}]", tty: String = "/dev/ttys901") throws -> (String?, [String]) {
+        func terminal(_ frames: [String], processes: [String] = ["login", "-zsh", "codex"], windows: String = "[{tabs: () => [tab]}]", tty: String = "/dev/ttys901", region: String? = nil, input: String? = nil) throws -> (String?, [String]) {
             let context = JSContext()!
             context.setObject(frames, forKeyedSubscript: "frames" as NSString)
             context.setObject(processes, forKeyedSubscript: "processes" as NSString)
@@ -105,7 +105,7 @@ extension ApprovalTests {
               doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
             """)
             // Process hands osascript its arguments decomposed (NFD), Korean text included.
-            let result = context.evaluateScript(try TerminalAdapter.resumeScript(tty: "/dev/ttys901", region: stop.region, text: CodexCapacityStop.resumeText)
+            let result = context.evaluateScript(try TerminalAdapter.resumeScript(tty: "/dev/ttys901", region: region ?? stop.region, text: input ?? CodexCapacityStop.resumeText)
                 .decomposedStringWithCanonicalMapping)
             if let exception = context.exception { throw AppError.message(exception.toString()) }
             return (result?.toString(), context.evaluateScript("writes")?.toArray() as? [String] ?? [])
@@ -125,6 +125,25 @@ extension ApprovalTests {
         try expectEqual(delivery, "sent"); try expectEqual(writes, [text])
         (delivery, writes) = try terminal([stoppedFrame, stoppedFrame])
         try expectEqual(delivery, "typed"); try expectEqual(writes, [text], "An unverified write is reported, never followed by Return")
+        (delivery, writes) = try terminal([stoppedFrame, draftFrame, ""])
+        try expectEqual(delivery, "typed"); try expectEqual(writes, [text, ""], "A blank repaint after Return does not prove submission")
+        let workingWithoutComposer = "› 이어서 진행하자.\n\n• Working (1s • esc to interrupt)"
+        (delivery, writes) = try terminal([stoppedFrame, draftFrame, "", workingWithoutComposer])
+        try expectEqual(delivery, "sent"); try expectEqual(writes, [text, ""], "A submitted message can be the last glyph while the composer is clipped")
+        (delivery, writes) = try terminal([stoppedFrame, workingWithoutComposer])
+        try expectEqual(delivery, "sent"); try expectEqual(writes, [text], "A working transcript is not an unsent draft")
+        let stalled = stoppedFrame.replacingOccurrences(of:"? for shortcuts",with:"? for shortcuts · Goal stalled (/goal resume)")
+        let goal = try unwrap(CodexCapacityStop.detect(stalled,agent:.codex))
+        let goalDraft = stalled.replacingOccurrences(of:"› Ask Codex to do anything",with:"› /goal resume")
+        let pursuing = stoppedFrame.replacingOccurrences(of:"? for shortcuts",with:"? for shortcuts · Pursuing goal")
+        (delivery,writes) = try terminal([stalled,goalDraft,"",pursuing],region:goal.region,input:goal.continuationText)
+        try expectEqual(delivery,"sent"); try expectEqual(writes,["/goal resume",""],"A slash command is acknowledged by its Goal state, without a user-message cell")
+        (delivery,writes) = try terminal([stalled,goalDraft,stalled],region:goal.region,input:goal.continuationText)
+        try expectEqual(delivery,"typed"); try expectEqual(writes,["/goal resume",""],"A Goal still stalled after Return has not resumed")
+        (delivery,writes) = try terminal([stalled],region:goal.region,input:text)
+        try expectEqual(delivery,"screenChanged"); try expectEqual(writes,[],"Do not substitute a plain prompt for a lifecycle command")
+        (delivery,writes) = try terminal([stalled.replacingOccurrences(of:"Goal stalled",with:"Goal paused")],region:goal.region,input:goal.continuationText)
+        try expectEqual(delivery,"screenChanged"); try expectEqual(writes,[],"A user pause between detection and delivery wins")
         (delivery, writes) = try terminal([draftFrame])
         try expectEqual(delivery, "screenChanged"); try expectEqual(writes, [])
         (delivery, writes) = try terminal([stoppedFrame.replacingOccurrences(of: "? for shortcuts", with: "? for shortcuts · Vim: Normal")])
@@ -153,6 +172,11 @@ extension ApprovalTests {
         try expectNil(context.exception)
         try expectEqual(iterm?.toString(), "sent")
         try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(), #"[{"text":"이어서 진행하자.","newline":false},{"text":""}]"#)
+        context.setObject([stalled,goalDraft,pursuing],forKeyedSubscript:"frames" as NSString)
+        context.evaluateScript("writes = []; reads = 0; clock = 0;")
+        let goalITerm = context.evaluateScript(try ITermAdapter.resumeScript(target:ScreenTarget(tty:"/dev/ttys902",jobPIDs:[77]),region:goal.region,text:goal.continuationText))
+        try expectNil(context.exception); try expectEqual(goalITerm?.toString(),"sent")
+        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(),#"[{"text":"/goal resume","newline":false},{"text":""}]"#)
     }
 
     func testCodexCapacityResumeRuns() async throws {

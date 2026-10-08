@@ -12,7 +12,10 @@ extension ApprovalTests {
         let completeView = try view("complete",online:true), pendingView = try view("pending",online:false), removedView = try view("removed",online:false)
         let finished = Task { completeView }
         cache.insert(finished,id:"complete",token:token,endpoint:endpoint)
-        cache.finish(id:"complete",token:token,endpoint:endpoint,expires:now.addingTimeInterval(1))
+        cache.finish(id:"complete",token:token,endpoint:endpoint,expires:now.addingTimeInterval(1),value:completeView)
+        try expect(cache.value(for:"complete",endpoint:endpoint,at:now)?.online == true)
+        try expectNil(cache.value(for:"complete",endpoint:.hostPort(host:"127.0.0.2",port:8765),at:now))
+        try expectNil(cache.value(for:"complete",endpoint:endpoint,at:now.addingTimeInterval(2)))
         let pending = Task { () -> RemoteNodeView in
             try? await Task.sleep(for:.seconds(30)); return pendingView
         }

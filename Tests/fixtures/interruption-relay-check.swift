@@ -23,6 +23,20 @@ import AutoApproveCore
         let ptyBytes=try Data(contentsOf:ptyRecord)
         precondition(ptyBytes==Data((CodexCapacityStop.resumeText+"\r").utf8))
         print("PASS actual owned PTY types exact UTF-8 then submits the verified draft once")
+        let goalRecord=root.appendingPathComponent("goal-pty-input.bin")
+        let goalPTY=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,goalRecord.path,"goal"],columns:100,rows:25)
+        var goalTarget=ScreenTarget(tty:goalPTY.tty)
+        for _ in 0..<100 {
+            let records=try ProcessDiscovery.read()
+            if let process=records.first(where:{$0.agent == .codex && "/dev/"+$0.tty == goalPTY.tty && $0.isForeground}) {goalTarget.jobPIDs=[process.pid];goalTarget.sourcePID=process.pid;goalTarget.sourceStarted=process.started;break}
+            try await Task.sleep(for:.milliseconds(20))
+        }
+        try await Task.sleep(for:.milliseconds(100))
+        let goalBefore=try manager.terminal(goalPTY.ptyID).screen(),goalStop=CodexCapacityStop.detect(goalBefore,agent:.codex)!
+        precondition(goalStop.continuationText == "/goal resume")
+        let goalResult=try manager.adapter.resume(goalTarget,goalStop.region,goalStop.continuationText),goalBytes=try Data(contentsOf:goalRecord)
+        precondition(goalResult == .sent);precondition(goalBytes == Data("/goal resume\r".utf8))
+        print("PASS actual owned PTY acknowledges Goal reactivation without a user-message cell")
         let meta=try call(["list-panes","-F","#{pane_tty}|#{pane_pid}"]).trimmingCharacters(in:.newlines).components(separatedBy:"|")
         let tmuxRecord=root.appendingPathComponent("tmux-input.bin")
         _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(tmuxRecord.path)])
@@ -41,7 +55,29 @@ import AutoApproveCore
         let tmuxBytes=try Data(contentsOf:tmuxRecord)
         precondition(tmuxBytes==Data((CodexCapacityStop.resumeText+"\r").utf8))
         print("PASS actual original tmux pane sends the same continuation once without creating a PTY")
-        try await Task.sleep(for:.milliseconds(200))
+        for _ in 0..<100 {
+            if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}) {break}
+            try await Task.sleep(for:.milliseconds(20))
+        }
+        let goalTmuxRecord=root.appendingPathComponent("goal-tmux-input.bin")
+        _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(goalTmuxRecord.path)+" goal"])
+        _=try call(["send-keys","Enter"])
+        var goalSession:AgentSession?
+        for _ in 0..<100 {
+            goalSession=ProcessDiscovery.sessions(try ProcessDiscovery.read()).first(where:{$0.terminal == .tmux && $0.tty == meta[0]})
+            if goalSession != nil {break};try await Task.sleep(for:.milliseconds(20))
+        }
+        let goalOriginal=goalSession!,goalTmuxTarget=ScreenTarget(tty:goalOriginal.tty,handle:goalOriginal.tmuxHandle,jobPIDs:[goalOriginal.pid],sourcePID:goalOriginal.pid,sourceStarted:goalOriginal.started)
+        try await Task.sleep(for:.milliseconds(100))
+        let goalScreen=try relay.screen(goalTmuxTarget,fresh:true),goalTmuxStop=CodexCapacityStop.detect(goalScreen.contents,agent:.codex)!
+        precondition(goalTmuxStop.continuationText == "/goal resume")
+        let goalTmuxResult=try relay.adapter.resume(goalTmuxTarget,goalTmuxStop.region,goalTmuxStop.continuationText),goalTmuxBytes=try Data(contentsOf:goalTmuxRecord)
+        precondition(goalTmuxResult == .sent);precondition(goalTmuxBytes == Data("/goal resume\r".utf8))
+        print("PASS actual original tmux pane reactivates a stalled Goal with exact command and Return")
+        for _ in 0..<100 {
+            if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}) {break}
+            try await Task.sleep(for:.milliseconds(20))
+        }
         let records=try ProcessDiscovery.read(),shell=records.first(where:{$0.pid == Int32(meta[1])})!
         precondition(SessionExitRecovery.isShell(shell) && shell.isForeground)
         let shellTarget=ScreenTarget(tty:original.tty,handle:original.tmuxHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)

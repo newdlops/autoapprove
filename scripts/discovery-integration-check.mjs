@@ -51,7 +51,9 @@ try {
   const warm=await fixture('warm',{known,candidates:Array.from({length:512},(_,i)=>'http://127.2.'+Math.floor(i/250)+'.'+(i%250+1)+':65530')});
   const foundMs=await online(warm,peer.id);console.log('Cached peer discovery: '+Math.round(foundMs)+' ms');assert.ok(foundMs<2000,'A cached peer must bypass the subnet cursor and old 2-second startup delay: '+Math.round(foundMs)+' ms');
   checks.push({check:'Verified cached peer reconnects before scanning 512 unrelated candidates',foundMs:Math.round(foundMs)});
-  await wait(1000);const before=peer.stats.stateReads;
+  // Let the three-second successful inventory cache expire before checking
+  // that concurrent browsers coalesce into one fresh upstream request.
+  await wait(3200);const before=peer.stats.stateReads;
   const dashboards=await Promise.all(Array.from({length:16},()=>get(warm,'/api/network')));
   assert.ok(dashboards.every(result=>result.data.nodes.some(node=>node.id===peer.id&&node.online)));assert.equal(peer.stats.stateReads-before,1);
   checks.push({check:'16 simultaneous browsers share one exact peer state request',upstreamReads:peer.stats.stateReads-before});

@@ -8,10 +8,12 @@ private func interruptionFrame(_ error: String, agent: AgentKind) -> String {
 private final class InterruptionProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var calls = 0
+    private var inputs: [String] = []
     let reply: ResumeDelivery
     init(_ reply: ResumeDelivery = .sent) { self.reply = reply }
-    func send() -> ResumeDelivery { lock.lock(); defer { lock.unlock() }; calls += 1; return reply }
+    func send(_ text: String = CodexCapacityStop.resumeText) -> ResumeDelivery { lock.lock(); defer { lock.unlock() }; calls += 1; inputs.append(text); return reply }
     var count: Int { lock.lock(); defer { lock.unlock() }; return calls }
+    var texts: [String] { lock.lock(); defer { lock.unlock() }; return inputs }
 }
 
 private final class ExitProbe: @unchecked Sendable {
@@ -29,6 +31,63 @@ private final class ExitProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testGoalFailureRecoveryUsesLifecycleCommand() throws {
+        let frame = interruptionFrame("■ stream disconnected before completion: network error",agent:.codex)
+        let stalled = frame.replacingOccurrences(of:"? for shortcuts",with:"? for shortcuts · Goal stalled (/goal resume)")
+        guard let stop = CodexCapacityStop.detect(stalled,agent:.codex) else { throw AppError.message("Expected an interrupted Goal") }
+        try expectEqual(stop.continuationText,"/goal resume")
+        try expectEqual(CodexCapacityStop.detect(frame,agent:.codex)?.continuationText,"이어서 진행하자.")
+        try expect(CodexResumeCheck.ready(stalled,region:stop.region,text:stop.continuationText))
+        try expectFalse(CodexResumeCheck.ready(stalled,region:stop.region,text:CodexCapacityStop.resumeText))
+        for status in ["Goal paused (/goal resume)","Goal hit usage limits (/goal resume)","Goal budget reached","Goal achieved (1h)"] {
+            let held = stalled.replacingOccurrences(of:"Goal stalled (/goal resume)",with:status)
+            try expect(CodexCapacityStop.detect(held,agent:.codex) == nil,"A held or completed Goal is never resumed")
+            try expectFalse(CodexResumeCheck.ready(held,region:stop.region,text:stop.continuationText))
+        }
+        try expect(CodexCapacityStop.detect(stalled.replacingOccurrences(of:"› Ask Codex to do anything",with:"› 1"),agent:.codex) == nil,"Preserve a user draft, even a single digit")
+        try expect(CodexCapacityStop.detect(stalled.replacingOccurrences(of:"■ stream disconnected before completion: network error",with:"• Work complete"),agent:.codex) == nil,"Stalled alone cannot trigger a retry")
+        let quoted = "Goal stalled (/goal resume)\n\n"+frame
+        try expectEqual(CodexCapacityStop.detect(quoted,agent:.codex)?.continuationText,CodexCapacityStop.resumeText,"Only the current status footer counts")
+        let working = "› 이어서 진행하자.\n\nWorking · esc to interrupt"
+        try expectFalse(CodexResumeCheck.draftVisible(working,text:CodexCapacityStop.resumeText))
+        let plain = CodexCapacityStop.detect(frame,agent:.codex)!
+        try expectEqual(CodexResumeCheck.state(before:frame,after:working,region:plain.region,text:plain.continuationText),.submitted)
+        try expectEqual(CodexResumeCheck.state(before:frame,after:"",region:plain.region,text:plain.continuationText),.typed)
+        let resumed = stalled.replacingOccurrences(of:"Goal stalled (/goal resume)",with:"Pursuing goal")
+        try expectEqual(CodexResumeCheck.state(before:stalled,after:resumed,region:stop.region,text:stop.continuationText),.submitted)
+        try expectEqual(CodexResumeCheck.state(before:stalled,after:stalled,region:stop.region,text:stop.continuationText),.typed)
+        var legacy = try JSONSerialization.jsonObject(with:JSONEncoder().encode(stop)) as! JSONObject
+        legacy.removeValue(forKey:"inputText")
+        try expectEqual(try JSONDecoder().decode(CodexCapacityStop.self,from:JSONSerialization.data(withJSONObject:legacy)).continuationText,CodexCapacityStop.resumeText)
+    }
+
+    @MainActor func testGoalRecoveryRetiresNumericApprovalAndAuditsActualCommand() async throws {
+        let directory = URL(fileURLWithPath:"/private/tmp/aa-goal-error-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        let approval = InterruptionProbe(), recovery = InterruptionProbe()
+        let adapter = ScreenHostAdapter(screens:{_ in TerminalSnapshot()},approve:{_,_,_ in _ = approval.send("1"); return .sent},reveal:{_ in nil},resume:{_,_,text in recovery.send(text)})
+        let engine = try ApprovalEngine(paths:AppPaths(directory:directory),processReader:{[record]},screenAdapters:[.terminal:adapter])
+        defer {engine.stop()}
+        engine.interruptionResumeDelays = [0.02]
+        var session = AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/ttys901",cwd:"/tmp/qa",terminal:.terminal)
+        session.channel = .terminalScreen; engine.updateDiscovery([session],records:[record]); try engine.setAutomatic(session.id,enabled:true)
+        let permission = "Would you like to run the following command?\n\n$ echo QA\n\n› 1. Yes\n  2. No\n\nEnter to confirm or esc to cancel"
+        engine.receiveScreen(sessionID:session.id,raw:permission,generation:"QA")
+        let frame = interruptionFrame("■ stream disconnected before completion: network error",agent:.codex)+" · Goal stalled (/goal resume)"
+        engine.receiveScreen(sessionID:session.id,raw:permission+"\n\n"+frame,generation:"QA")
+        try expectEqual(engine.snapshot.sessions.first?.capacityResume?.message,"/goal resume")
+        try await Task.sleep(for:.milliseconds(250))
+        try expectEqual(approval.count,0,"A permission replaced by an error cannot type 1 into its composer")
+        try expectEqual(recovery.texts,["/goal resume"])
+        try expectEqual(engine.snapshot.events.first?.answer,"/goal resume")
+        try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase,.awaiting)
+        engine.receiveScreen(sessionID:session.id,raw:permission+"\n\n"+frame,generation:"QA")
+        try await Task.sleep(for:.milliseconds(80)); try expectEqual(recovery.count,1)
+        engine.receiveScreen(sessionID:session.id,raw:"Working · esc to interrupt\n\n› Ask Codex to do anything\n\n? for shortcuts · Pursuing goal",generation:"QA")
+        try expectNotNil(engine.snapshot.sessions.first?.interruption?.recoveredAt)
+    }
+
     func testSessionInterruptionDetection() throws {
         let examples: [(AgentKind,String,SessionInterruption.Kind)] = [
             (.codex,"■ stream disconnected before completion: Transport error: network error: error decoding response body",.transport),

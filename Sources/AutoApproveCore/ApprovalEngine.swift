@@ -2846,6 +2846,16 @@ import TerminalInputSupport
         }
         observeCapacity(sessionID,analysis:analysis,at:now)
         defer { publish() }
+        if analysis.capacityStop != nil {
+            // An error's empty composer accepts text, not the numeric permission answer.
+            // Retire a previously queued approval before its asynchronous process check returns.
+            screens.removeValue(forKey:sessionID)
+            sessions[sessionID]?.pendingSummary = nil; sessions[sessionID]?.pendingInTerminal = false
+            sessions[sessionID]?.pendingRequestID = nil
+            activityTrackers.removeValue(forKey:sessionID)
+            presentPhase(sessionID,analysis.activity,at:now)
+            return
+        }
         let prompt = analysis.prompt
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
@@ -2964,7 +2974,7 @@ import TerminalInputSupport
                 case .sending: break
                 case .sent:
                     let elapsed = now.timeIntervalSince(state.sentAt ?? now)
-                    if elapsed > 10, CodexResumeCheck.draftVisible(raw, text: CodexCapacityStop.resumeText) {
+                    if elapsed > 10, CodexResumeCheck.draftVisible(raw, text: state.stop.continuationText) {
                         capacityStates[id]?.phase = .review
                     } else if phase == .idle || (phase != .unknown && elapsed >= capacityProgressWindow) {
                         // Ended normally, or kept working: the run of failures is over.
@@ -2973,7 +2983,7 @@ import TerminalInputSupport
                         persistInterruption(id)
                         capacityStates.removeValue(forKey: id)
                     }
-                case .review where CodexResumeCheck.draftVisible(raw, text: CodexCapacityStop.resumeText):
+                case .review where CodexResumeCheck.draftVisible(raw, text: state.stop.continuationText):
                     break // Our unsent text still waits in the composer for the user.
                 case .waiting, .unavailable, .review, .exhausted, .cancelled:
                     // The user typed or a turn is running. A partial repaint keeps the stop.
@@ -3061,7 +3071,7 @@ import TerminalInputSupport
         capacityStates[id]?.phase = .sending; capacityStates[id]?.scheduledID = nil
         var event = AuditEvent(sessionID: id, summary: "\(state.stop.kind.title) · 이어서 진행 요청 (\(state.attempt))",
             outcome: "이어서 진행 요청 · 결과 미확인", source: state.channel.title, context: AuditContext(session: session),
-            request: state.stop.region, answer: CodexCapacityStop.resumeText)
+            request: state.stop.region, answer: state.stop.continuationText)
         // Persist the attempt before typing; a crash or lost result remains traceable.
         guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
         sessions[id]?.interruption?.resumeUncertain = true
@@ -3071,7 +3081,7 @@ import TerminalInputSupport
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
         let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
             sourcePID: session.pid, sourceStarted: session.started)
-        let region = state.stop.region, text = CodexCapacityStop.resumeText
+        let region = state.stop.region, text = state.stop.continuationText
         automaticInputSessions.insert(id)
         defer { automaticInputSessions.remove(id); scheduleScreenApproval(id) }
         do {
@@ -3117,7 +3127,7 @@ import TerminalInputSupport
     private func resumeBridgeSession(_ session: AgentSession, region: String, text: String) async throws -> ResumeDelivery {
         let id = session.id
         guard let before = remoteObservedScreens[id], Date().timeIntervalSince(before.observedAt) < 6,
-              CodexResumeCheck.ready(before.raw,region:region) else { return .screenChanged }
+              CodexResumeCheck.ready(before.raw,region:region,text:text) else { return .screenChanged }
         func write(_ observed: RemoteObservedScreen, kind: String, value: String) async throws -> Bool {
             let reader = processReader, live = try await Task.detached { try reader() }.value
             guard !remoteInputStopped, !snapshot.paused, !userInputHasPriority(id),
@@ -3152,7 +3162,7 @@ import TerminalInputSupport
                 repeat {
                     try await Task.sleep(for:.milliseconds(250))
                     if let next = remoteObservedScreens[id], next.generation == before.generation,
-                       !CodexResumeCheck.draftVisible(next.raw,text:text) { return .sent }
+                       CodexResumeCheck.state(before:before.raw,after:next.raw,region:region,text:text) == .submitted { return .sent }
                 } while Date() < until
                 return .typed
             }
@@ -3521,7 +3531,7 @@ import TerminalInputSupport
                 case .exhausted: phase = .exhausted
                 case .cancelled: phase = .cancelled
                 }
-                presented = CapacityResume(phase: phase, attempt: state.attempt, limit:state.stop.kind == .capacity ? capacityResumeDelays.count : 0, deadline: phase == .scheduled ? state.deadline : nil)
+                presented = CapacityResume(phase: phase, attempt: state.attempt, limit:state.stop.kind == .capacity ? capacityResumeDelays.count : 0, deadline: phase == .scheduled ? state.deadline : nil, message:state.stop.continuationText)
                 presented?.reason = state.stop.kind.title
             } else if let recovery = exitRecoveries[id], sessions[id]?.phase == .ended,
                       sessions[id]?.interruption?.needsAttention == true, recovery.state != "ready" {

@@ -8,6 +8,7 @@ import Network
         var endpoint: NWEndpoint
         let task: Task<RemoteNodeView, Never>
         var expires: Date
+        var value: RemoteNodeView?
     }
     private var entries: [String: Entry] = [:]
     public var count: Int { entries.count }
@@ -19,9 +20,13 @@ import Network
     public func insert(_ task: Task<RemoteNodeView, Never>, id: String, token: UUID, endpoint: NWEndpoint) {
         entries[id] = Entry(token: token, endpoint: endpoint, task: task, expires: .distantFuture)
     }
-    public func finish(id: String, token: UUID, endpoint: NWEndpoint, expires: Date) {
+    public func finish(id: String, token: UUID, endpoint: NWEndpoint, expires: Date, value: RemoteNodeView? = nil) {
         guard entries[id]?.token == token else { return }
-        entries[id]?.endpoint = endpoint; entries[id]?.expires = expires
+        entries[id]?.endpoint = endpoint; entries[id]?.expires = expires; entries[id]?.value = value
+    }
+    public func value(for id: String, endpoint: NWEndpoint, at now: Date = Date()) -> RemoteNodeView? {
+        guard let entry = entries[id], entry.endpoint == endpoint, entry.expires > now else { return nil }
+        return entry.value
     }
     public func remove(_ id: String) { entries.removeValue(forKey: id)?.task.cancel() }
     public func removeAll() { entries.values.forEach { $0.task.cancel() }; entries.removeAll() }

@@ -744,7 +744,8 @@ struct RemoteTerminalUpdate: Encodable {
             return response
         }
         let endpoints = Array(peerEndpoints(peer).prefix(2))
-        guard endpoints.count > 1 else { return try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id, timeout: timeout).run() }
+        guard endpoints.count > 1 else { return try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id, timeout: timeout,
+            retryReads: !["/api/state","/api/inventory"].contains(path)).run() }
         let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (["/api/state","/api/inventory"].contains(path) ? 4 : 15))
         let epoch = generation
         for (index, endpoint) in endpoints.enumerated() {
@@ -768,9 +769,9 @@ struct RemoteTerminalUpdate: Encodable {
         }
         throw RemoteHTTPError(503, "Mac의 연결을 확인해주세요.")
     }
-    private func readPeerState(_ peer: Peer) async -> RemoteNodeView {
+    private func peerStateTask(_ peer: Peer) -> Task<RemoteNodeView, Never> {
         let endpoint = connectionEndpoint(peer)
-        if let task = stateReads.task(for: peer.id, endpoint: endpoint) { return await task.value }
+        if let task = stateReads.task(for: peer.id, endpoint: endpoint) { return task }
         let epoch = generation, token = UUID()
         let task = Task { @MainActor [weak self] () -> RemoteNodeView in
             guard let self else { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: "웹 연결이 종료되었습니다.", release: peer.release) }
@@ -785,35 +786,51 @@ struct RemoteTerminalUpdate: Encodable {
             } catch { result = RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription, release: peer.release) }
             if self.running, self.generation == epoch {
                 self.stateReads.finish(id: peer.id, token: token, endpoint: self.peers[peer.id].map(self.connectionEndpoint) ?? endpoint,
-                    expires: Date().addingTimeInterval(result.online ? 0.75 : 2))
+                    expires: Date().addingTimeInterval(result.online ? 3 : 2), value:result)
             }
             return result
         }
         stateReads.insert(task, id: peer.id, token: token, endpoint: endpoint)
-        return await task.value
+        return task
     }
     public func dashboard(initial: Bool = false, selectedNode: String? = nil, client: String? = nil) async throws -> RemoteDashboard {
         let own = try localState().inventory
-        let candidates = Array(peers.values).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let candidates = Array(peers.values).sorted {
+            if verified($0) != verified($1) { return verified($0) }
+            if $0.available != $1.available { return $0.available }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        var completed: [String:(NWEndpoint,RemoteNodeView)] = [:]
+        func value(_ peer: Peer) -> RemoteNodeView? {
+            let endpoint = peers[peer.id].map(connectionEndpoint) ?? connectionEndpoint(peer)
+            if let result = stateReads.value(for:peer.id,endpoint:endpoint) { completed[peer.id] = (endpoint,result) }
+            return completed[peer.id].flatMap { $0.0 == endpoint ? $0.1 : nil }
+        }
+        func waitForReads(_ peers: [Peer]) async throws {
+            for peer in peers { _ = peerStateTask(peer) }
+            // A dead or old Mac must not hold every healthy Mac behind a full timeout.
+            // Reads keep their single in-flight reservation and finish in the background.
+            let until = ProcessInfo.processInfo.systemUptime + 0.35
+            while peers.contains(where:{value($0) == nil}), ProcessInfo.processInfo.systemUptime < until {
+                try await Task.sleep(for:.milliseconds(20))
+            }
+        }
         if initial {
             var nodes = candidates.prefix(100).map { RemoteNodeView(id:$0.id,name:$0.name,local:false,online:false,release:$0.release,loading:true) }
             if let selectedNode, let peer = candidates.first(where:{$0.id == selectedNode}) {
-                let value = await readPeerState(peer)
-                if let index = nodes.firstIndex(where:{$0.id == selectedNode}) { nodes[index] = value }
+                try await waitForReads([peer])
+                if let index = nodes.firstIndex(where:{$0.id == selectedNode}), let completed = value(peer) { nodes[index] = completed }
             }
             return RemoteDashboard(gatewayID:nodeID,nodes:[RemoteNodeView(id:nodeID,name:name,local:true,online:true,state:own,release:own.release)]+nodes,
                 updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(client:client),partial:true)
         }
-        let other = await withTaskGroup(of: RemoteNodeView.self) { group in
-            for peer in candidates.prefix(100) {
-                group.addTask { @MainActor in await self.readPeerState(peer) }
-            }
-            var result: [RemoteNodeView] = []
-            for await node in group { result.append(node) }
-            return result.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        }
+        let requested = Array(candidates.prefix(100))
+        try await waitForReads(requested)
+        let other = requested.map { peer in value(peer) ?? RemoteNodeView(id:peer.id,name:peer.name,local:false,online:false,release:peer.release,loading:true) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         for node in other {
             guard peers[node.id] != nil else { continue }
+            if node.loading == true { continue } // An unfinished read is not a failed identity or route check.
             guard node.online, let state = node.state else {
                 // A single failed read must not erase the last confirmed LAN
                 // addresses and send the next request back through Bonjour.
@@ -828,7 +845,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
         updateNamedAddresses(); emitStatus()
         return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own, release: own.release)] + other, updatedAt: Date(), discovery: discoveryError,
-            gatewayRelease: webVersion, preferredGateway: preferredGateway(client:client))
+            gatewayRelease: webVersion, preferredGateway: preferredGateway(client:client),partial:other.contains(where:{$0.loading == true}) ? true : nil)
     }
     public func handle(_ request: RemoteHTTPRequest) async -> RemoteHTTPResponse {
         do {
