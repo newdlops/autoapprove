@@ -10,7 +10,44 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <limits.h>
+#include <time.h>
 extern char **environ;
+
+static int64_t dashboard_monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+// Child-process notifications must not restart the administrator's whole wait.
+static int dashboard_poll_until(int fd, int64_t deadline) {
+    for (;;) {
+        int64_t remaining = deadline - dashboard_monotonic_ms();
+        if (remaining <= 0) return 0;
+        struct pollfd waiter = {fd, POLLIN, 0};
+        int ready = poll(&waiter, 1, remaining > INT_MAX ? INT_MAX : (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        return ready;
+    }
+}
+
+static void dashboard_reap(pid_t pid, int terminate) {
+    if (terminate) kill(pid, SIGTERM);
+    int status;
+    int64_t deadline = dashboard_monotonic_ms() + 1000;
+    for (;;) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid || (result < 0 && errno == ECHILD)) return;
+        if (dashboard_monotonic_ms() >= deadline) break;
+        struct timespec pause = {0, 20000000};
+        nanosleep(&pause, NULL);
+    }
+    // Only the fixed authopen child created by this request is terminated.
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
 
 int aa_open_dashboard_hosts(int writable) {
     if (writable != 0 && writable != 1) { errno = EINVAL; return -1; }
@@ -39,9 +76,7 @@ int aa_open_dashboard_hosts(int writable) {
     close(sockets[1]);
     if (error) { close(sockets[0]); errno = error; return -1; }
     int descriptor = -1, saved = EACCES;
-    struct pollfd waiter = {sockets[0], POLLIN, 0};
-    int ready;
-    do { ready = poll(&waiter, 1, 600000); } while (ready < 0 && errno == EINTR);
+    int ready = dashboard_poll_until(sockets[0], dashboard_monotonic_ms() + 600000);
     if (ready > 0) {
         char byte;
         struct iovec data = {&byte, 1};
@@ -57,10 +92,9 @@ int aa_open_dashboard_hosts(int writable) {
             if (header && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS && header->cmsg_len >= CMSG_LEN(sizeof(int)))
                 memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
         }
-    } else { saved = ready == 0 ? ETIMEDOUT : errno; kill(pid, SIGTERM); }
+    } else { saved = ready == 0 ? ETIMEDOUT : errno; }
     close(sockets[0]);
-    int status;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    dashboard_reap(pid, descriptor < 0);
     if (descriptor >= 0) {
         struct stat actual, current;
         int flags = fcntl(descriptor, F_GETFL);
