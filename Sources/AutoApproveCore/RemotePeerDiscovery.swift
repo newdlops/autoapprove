@@ -16,10 +16,7 @@ enum RemotePeerDiscovery {
     }
 
     static func addresses() -> [String] {
-        let interfaces = RemoteLAN.interfaces()
-        var seen = Set(interfaces.map { "http://\($0.address):8765" })
-        return Array(interfaces.flatMap { RemoteNetworkAddress.discoveryURLs(address: $0.address, netmask: $0.netmask) }
-            .filter { seen.insert($0).inserted }.prefix(512))
+        RemoteLAN.discoveryURLs(interfaces:RemoteLAN.interfaces())
     }
 
     static func find(_ address: String) async -> Found? {

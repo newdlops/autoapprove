@@ -71,6 +71,32 @@ public enum RemoteLAN {
     public static func ordered(_ interfaces: [RemoteLANInterface]) -> [RemoteLANInterface] {
         interfaces.sorted { ($0.kind == .wifi ? 0 : 1, $0.name, $0.address) < ($1.kind == .wifi ? 0 : 1, $1.name, $1.address) }
     }
+    /// Give every physical LAN an early slot, even with a large first subnet.
+    public static func interleaved(_ groups: [[String]], excluding: Set<String> = [], limit: Int) -> [String] {
+        var result: [String] = [], seen = excluding
+        for index in 0..<(groups.map(\.count).max() ?? 0) {
+            for group in groups where index < group.count {
+                if seen.insert(group[index]).inserted { result.append(group[index]) }
+                if result.count >= limit { return result }
+            }
+        }
+        return result
+    }
+    public static func discoveryURLs(interfaces: [RemoteLANInterface]) -> [String] {
+        interleaved(ordered(interfaces).map { RemoteNetworkAddress.discoveryURLs(address:$0.address,netmask:$0.netmask) },
+            excluding:Set(interfaces.map {"http://\($0.address):8765"}),limit:512)
+    }
+    public static func discoveryLane(_ address: String, interfaces: [RemoteLANInterface]) -> String {
+        guard let host = URLComponents(string:address)?.host else { return address }
+        if let source = route(to:host,interfaces:interfaces) { return source.name }
+        return host.split(separator:".").prefix(3).joined(separator:".")
+    }
+    public static func sharesClientLAN(_ address: String, client: String?, interfaces: [RemoteLANInterface]) -> Bool {
+        guard let client, client != "::1", !client.hasPrefix("127.") else { return true }
+        guard let source = route(to:client,interfaces:interfaces),
+              let destination = route(to:address,interfaces:interfaces) else { return false }
+        return source.name == destination.name
+    }
     /// Read the existing OS neighbor cache only. -n prevents DNS lookups; no ping or ARP mutation.
     public static func neighborURLs() -> [String] {
         guard let result = try? CommandRunner.run("/usr/sbin/arp", ["-an"], timeout: 1), result.status == 0 else { return [] }
@@ -78,7 +104,7 @@ public enum RemoteLAN {
     }
     public static func neighborURLs(from text: String, interfaces: [RemoteLANInterface]) -> [String] {
         let regex = try! NSRegularExpression(pattern: #"\(([0-9.]+)\) at ([0-9a-fA-F:]+) on (en[0-9]+)\b"#)
-        var result: [(Int, String)] = [], seen = Set<String>()
+        var result: [String: [String]] = [:], seen = Set<String>()
         for line in text.components(separatedBy: .newlines).prefix(2048) {
             let value = line as NSString
             guard let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: value.length)) else { continue }
@@ -87,13 +113,13 @@ public enum RemoteLAN {
                   let source = route(to: address, interfaces: interfaces), source.name == name,
                   let host = ipv4(address), let local = ipv4(source.address), let mask = source.mask,
                   host > (local & mask), host < ((local & mask) | ~mask), seen.insert(address).inserted else { continue }
-            result.append((source.kind == .wifi ? 0 : 1, "http://\(address):8765"))
+            result[source.name,default:[]].append("http://\(address):8765")
         }
-        return result.sorted { $0.0 < $1.0 }.prefix(64).map(\.1)
+        return interleaved(ordered(interfaces).map { result[$0.name] ?? [] },limit:64)
     }
     public static func route(to address: String, interfaces: [RemoteLANInterface]) -> RemoteLANInterface? {
         guard let host = ipv4(address) else { return nil }
-        return ordered(interfaces).filter { $0.contains(host) }.max { ($0.mask ?? 0) < ($1.mask ?? 0) }
+        return ordered(interfaces).filter { $0.contains(host) }.sorted { ($0.mask ?? 0) > ($1.mask ?? 0) }.first
     }
     public static func tcpParameters() -> NWParameters {
         let parameters = NWParameters.tcp

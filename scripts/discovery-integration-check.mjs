@@ -82,6 +82,20 @@ try {
   const uncertain=await fake(template);uncertain.dropPost();const once=await fixture('once',{known:[{...known[0],id:uncertain.id,address:uncertain.url,urls:[uncertain.url],port:new URL(uncertain.url).port*1}]});await online(once,uncertain.id);
   const response=await fetch(once.url+'/api/action?node='+uncertain.id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pause',paused:true,requestID:randomUUID()})});assert.ok(response.status>=400);assert.equal(uncertain.stats.posts,1);
   checks.push({check:'An ambiguous POST is transmitted once and is never replayed during route recovery',posts:uncertain.stats.posts});
+  // Distinct address namespaces exercise the same lane scheduler on loopback.
+  // Physical Wi-Fi/Ethernet enumeration and interface binding are covered by the policy checks.
+  const stalledLane=await fake(template,{unrelated:true,delay:5000}),wifiFound=await fake(template),ethernetFound=await fake(template);
+  const wifiAddress=address=>address.replace('127.0.0.1','localhost');
+  const both=await fixture('two-lanes',{candidates:[wifiAddress(stalledLane.url),wifiAddress(wifiFound.url),...Array.from({length:250},(_,i)=>'http://localhost:'+(64000+i)),ethernetFound.url]});
+  const ethernetMs=await online(both,ethernetFound.id,2500);
+  assert.ok(ethernetMs<2000,'A stalled first lane and 252 queued candidates cannot block the other LAN: '+ethernetMs);
+  const wifiMs=await online(both,wifiFound.id,3500);
+  assert.ok(wifiMs<3500,'Finding Ethernet cannot slow the still-unresolved Wi-Fi lane to five-second blind probes: '+wifiMs);
+  checks.push({check:'Two search lanes discover both peers despite a stalled first address and a long first-lane queue',ethernetMs:Math.round(ethernetMs),wifiMs:Math.round(wifiMs)});
+  const selected=(await get(both,'/api/network?initial=1&node='+wifiFound.id)).data;
+  assert.ok(selected.nodes.some(node=>node.id===wifiFound.id&&node.online));
+  const page=await fetch(both.url+'/?webNode='+both.id);assert.equal(page.status,200);assert.match(await page.text(),/AutoApprove/);
+  checks.push({check:'Both discovered nodes remain in one gateway and the selected peer page keeps the original origin',pageStatus:page.status});
   await writeFile(path.join(output,'report.json'),JSON.stringify({result:'PASS',checks},null,2));console.log(JSON.stringify({result:'PASS',checks},null,2));
 } finally {
   for(const child of children)if(child.exitCode===null)child.kill();

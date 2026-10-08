@@ -57,6 +57,9 @@ extension ApprovalTests {
         let parameters = try RemoteLAN.tcpParameters(to: chosen, interfaces: [ethernet, wifi])
         try expectEqual(parameters.requiredInterfaceType, .wifi)
         try expectEqual(parameters.requiredLocalEndpoint, .hostPort(host: "192.168.43.2", port: .any))
+        let wiredParameters = try RemoteLAN.tcpParameters(to:ethernetPeer,interfaces:[wifi,ethernet])
+        try expectEqual(wiredParameters.requiredInterfaceType,.wiredEthernet)
+        try expectEqual(wiredParameters.requiredLocalEndpoint,.hostPort(host:"10.2.3.4",port:.any))
         try expectEqual(RemoteLAN.preferredEndpoint(bonjour, addresses: advertised, port: 8765, interfaces: [ethernet]), ethernetPeer)
         try expectEqual(RemoteLAN.preferredEndpoint(bonjour, addresses: ["http://192.168.43.8:8765"], port: 8765, interfaces: [ethernet]), bonjour,
                         "A cached address on a disconnected subnet cannot select that route")

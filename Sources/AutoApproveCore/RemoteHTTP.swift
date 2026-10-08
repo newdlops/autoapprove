@@ -25,6 +25,8 @@ public struct RemoteHTTPRequest {
     public let target: String
     public let headers: [String: String]
     public let body: Data
+    /// Supplied by the accepted socket, never by a browser header.
+    public var clientAddress: String? = nil
     public var components: URLComponents { URLComponents(string: "http://localhost" + target)! }
     public var path: String { components.path }
     public func parameter(_ name: String) -> String? {
@@ -207,7 +209,8 @@ final class RemoteHTTPConnection: @unchecked Sendable {
             guard let self, !self.complete, !self.closed else { return }
             if let data { self.buffer.append(data) }
             do {
-                if let request = try RemoteHTTPRequest.parse(self.buffer) {
+                if var request = try RemoteHTTPRequest.parse(self.buffer) {
+                    if case .hostPort(let host, _) = self.connection.endpoint { request.clientAddress = String(describing:host) }
                     self.complete = true
                     self.buffer = Data(); self.monitorDisconnect()
                     self.handlerTask = Task { @MainActor in
