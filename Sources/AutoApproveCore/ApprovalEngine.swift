@@ -50,6 +50,7 @@ import TerminalInputSupport
     private var automaticInputSessions = Set<String>()
     private var remoteInputUntil: [String: Date] = [:]
     private var remoteStreams: [String: (generation: String, token: String, identity: TTYInputIdentity?)] = [:]
+    private var remoteFrameSequence = 0
     private var nativeWindowCaptures: [ScreenHost: TerminalWindowCapture] = [:]
     private var verifiedWindowCaptures: [String: TerminalWindowCapture] = [:]
     private var bridgeWindowCaptures: [String: (binding: NativeBridgeBinding, capture: TerminalWindowCapture)] = [:]
@@ -220,7 +221,7 @@ import TerminalInputSupport
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0, includeCursor: false) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live) throws {
         self.paths = paths
@@ -685,7 +686,7 @@ import TerminalInputSupport
            existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
             pending = existing
         } else {
-            let reader = adapter.screens
+            let reader = adapter.presentationScreens ?? adapter.screens
             let task = Task.detached(priority: .userInitiated) {
                 let snapshot: TerminalSnapshot
                 do { snapshot = try reader([target]) }
@@ -1022,9 +1023,10 @@ import TerminalInputSupport
         if automationBlocked { keys = [] }
         else if orcaMode { keys = orcaBinding != nil ? remoteKeys(current) : [] }
         else if nativeOnly { keys = nativeBinding?.selected == true ? ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab"] : [] }
+        remoteFrameSequence += 1
         let frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
             observedAt: observedAt, keys: keys, inputReason: sourceReason ?? remoteInputReason(current), appearance: visibleAppearance,
-            cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil, nativeDisplay: nativeDisplay, outputReason: outputReason)
+            cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil, nativeDisplay: nativeDisplay, outputReason: outputReason, sequence: remoteFrameSequence)
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         guard try encoder.encode(frame).count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. Mac에서 창 크기를 줄여주세요.") }
         remoteFrames[sessionID] = (frame, raw, generation, orcaBinding, nativeOnly ? nativeBinding : nil)

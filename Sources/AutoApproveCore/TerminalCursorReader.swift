@@ -4,12 +4,19 @@ import ApplicationServices
 
 /// Reads an authoritative insertion range only from the exact selected Terminal window.
 enum TerminalCursorReader {
-    static func snapshot(screen: String, title: String, bounds: TerminalWindowBounds) -> TerminalTextSnapshot? {
+    static func snapshot(screen: String, windowID: UInt32, title: String, bounds: TerminalWindowBounds) -> TerminalTextSnapshot? {
         guard AXIsProcessTrusted(), !screen.isEmpty,
               let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else { return nil }
+        // Native tab groups also expose hidden virtual windows as selected.
+        // Their titles/bounds can coincide. CG metadata identifies the actual
+        // on-screen window without capturing pixels or requesting recording.
+        let visible = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        guard visible.contains(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID
+            && ($0[kCGWindowOwnerPID as String] as? Int32) == app.processIdentifier }) else { return nil }
         let deadline = Date().addingTimeInterval(0.35)
         func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
             guard Date() < deadline else { return nil }
+            AXUIElementSetMessagingTimeout(element, 0.05)
             var value: CFTypeRef?
             return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
         }
@@ -100,13 +107,15 @@ final class TerminalCursorObservation: @unchecked Sendable {
               let value else { return nil }
         let application = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(application, 0.1)
+        let deadline = Date().addingTimeInterval(0.3)
         func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+            guard Date() < deadline else { return nil }
+            AXUIElementSetMessagingTimeout(element, 0.05)
             var result: CFTypeRef?
             return AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success ? result : nil
         }
         var pending = attribute(application, kAXWindowsAttribute) as? [AXUIElement] ?? []
         var targets: [AXUIElement] = [], count = 0
-        let deadline = Date().addingTimeInterval(0.3)
         while let element = pending.popLast(), count < 256, Date() < deadline {
             count += 1
             if attribute(element, kAXRoleAttribute) as? String == kAXTextAreaRole { targets.append(element) }

@@ -10,7 +10,7 @@ let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter 
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
-let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalStreamFailed = '';
+let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalPaintTimer = null, terminalStreamFailed = '';
 let terminalFrameReceivedAt = -Infinity, terminalPendingAt = -Infinity;
 const terminalFrameFresh = () => !!latestFrame && !terminalStream?.reconnecting && performance.now() - terminalFrameReceivedAt < 10000;
 let nativeSessionKey = '', nativeZoom = 1, nativeZoomLimit = 4, nativeImageValue = null, nativeConnectingKey = '';
@@ -25,7 +25,7 @@ let composePreferred = false, composeMode = false;
 const keyboardMarker = '\u200b';
 let inputGeneration = 0, terminalFontSize = 14;
 let directStreamID = null;
-let cursorLayoutPending = false;
+let cursorLayoutPending = false, cursorLayoutTimer = null;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const interruptionRows = new Map();
@@ -224,7 +224,8 @@ function setFontSize(value) {
 function scheduleCursor() {
   if (cursorLayoutPending) return;
   cursorLayoutPending = true;
-  requestAnimationFrame(() => { cursorLayoutPending = false; positionCursor(); });
+  const layout = () => { if (!cursorLayoutPending) return; cursorLayoutPending = false; clearTimeout(cursorLayoutTimer); positionCursor(); };
+  requestAnimationFrame(layout); cursorLayoutTimer = setTimeout(layout, 100);
 }
 function positionCursor() {
   const pre = $('terminal-screen'), caret = $('terminal-cursor'), cursor = latestFrame?.cursor;
@@ -332,12 +333,12 @@ function focusKeyboard() {
   $('terminal-keyboard').focus({ preventScroll: true }); updateControls();
 }
 
-async function api(path, body, signal) {
+async function api(path, body, signal, timeoutMS = 20000) {
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
   if (signal?.aborted) controller.abort();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMS);
   try {
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
     const result = await response.json();
@@ -878,6 +879,7 @@ function updateControls() {
 function mergeTerminalUpdate(update, previous, sessionID) {
   if (!update || update.sessionID !== sessionID || typeof update.revision !== 'string' || update.revision.length > 512 || typeof update.observedAt !== 'string' || !Number.isFinite(Date.parse(update.observedAt)) || !Array.isArray(update.keys) || update.keys.length > 64 || update.keys.some(key => typeof key !== 'string' || key.length > 64) || update.inputReason != null && typeof update.inputReason !== 'string' || update.streamID != null && typeof update.streamID !== 'string') throw new Error('터미널 화면 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
   if (update.outputReason != null && (typeof update.outputReason !== 'string' || update.outputReason.length > 4096)) throw new Error('원본 출력 상태를 확인하지 못했습니다.');
+  if (update.sequence != null && (!Number.isSafeInteger(update.sequence) || update.sequence < 0)) throw new Error('원본 화면 순서를 확인하지 못했습니다.');
   const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string') : undefined;
   if (typeof update.screen === 'string') return {...update, nativeDisplay};
   if (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID) throw new Error('최신 화면을 다시 연결해주세요.');
@@ -885,10 +887,18 @@ function mergeTerminalUpdate(update, previous, sessionID) {
   // clear old locks/cursors/tokens while the unchanged screen and colors remain.
   return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, nativeDisplay};
 }
+function terminalUpdateIsOlder(update, previous) {
+  if (!previous || update.sessionID !== previous.sessionID || !previous.streamID || update.streamID !== previous.streamID) return false;
+  if (Number.isSafeInteger(update.sequence) && Number.isSafeInteger(previous.sequence)) return update.sequence < previous.sequence;
+  return false; // Legacy Mac clocks can change; observation time is not an ordering token.
+}
 function applyTerminalFrame(frame, receivedAt = performance.now()) {
   const previous = latestFrame;
   if (directMode && (frame.streamID || null) !== directStreamID) {
     stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
+  }
+  if (directMode && (!frame.keys.includes('characters') || !frame.keys.includes('backspace') || frame.inputReason)) {
+    stopDirect(); inputFailure = frame.inputReason || '원본 입력 권한을 다시 연결해주세요.';
   }
   latestFrame = frame;
   terminalFrameReceivedAt = receivedAt;
@@ -902,10 +912,12 @@ function applyTerminalFrame(frame, receivedAt = performance.now()) {
 }
 function stopTerminalStream(resetFailure = false) {
   if (terminalStream) {
-    terminalStream.source?.close(); clearTimeout(terminalStream.retryTimer); clearTimeout(terminalStream.watchdog);
+    terminalStream.source?.close(); clearTimeout(terminalStream.retryTimer); clearTimeout(terminalStream.watchdog); clearTimeout(terminalStream.fallbackWatchdog);
+    stopTerminalFallback(terminalStream);
   }
   terminalStream = null;
   if (terminalPaint) cancelAnimationFrame(terminalPaint);
+  clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
   terminalPaint = 0; terminalPending = null; terminalPendingAt = -Infinity;
   if (resetFailure) terminalStreamFailed = '';
 }
@@ -915,16 +927,74 @@ function failTerminalStream(stream, message) {
   text($('terminal-error'), message); show($('terminal-error'), true); text($('terminal-retry'), '화면 다시 연결'); show($('terminal-retry'), true);
   terminalState('error', '연결 끊김'); updateControls();
 }
+function terminalStreamCurrent(stream) {
+  return terminalStream === stream && selectedKey === stream.key && detailGeneration === stream.generation
+    && nativeTerminal() === stream.renderWindow && !document.hidden;
+}
+function stopTerminalFallback(stream) {
+  clearTimeout(stream.pollTimer); stream.pollTimer = null;
+  stream.pollController?.abort(); stream.pollController = null;
+}
+async function readTerminalFallback(stream) {
+  if (!terminalStreamCurrent(stream) || stream.pollController || stream.sseReady) return;
+  clearTimeout(stream.pollTimer); stream.pollTimer = null;
+  const controller = new AbortController(); stream.pollController = controller;
+  try {
+    const query = new URLSearchParams({node:stream.nodeID, session:stream.sessionID});
+    if (stream.renderWindow) query.set('view', 'screen');
+    if (latestFrame) query.set('revision', latestFrame.revision); else query.set('initial', '1');
+    // A short read can work when a hotspot/VPN buffers a long-lived SSE.
+    // It stays on the selected original; it never creates or resumes a CLI.
+    const update = await api('/api/terminal?' + query, undefined, controller.signal, 7000);
+    if (!terminalStreamCurrent(stream) || stream.pollController !== controller || stream.sseReady) return;
+    if (terminalUpdateIsOlder(update, latestFrame)) return;
+    const frame = mergeTerminalUpdate(update, latestFrame, stream.sessionID);
+    const changedStream = latestFrame?.streamID && frame.streamID !== latestFrame.streamID;
+    if (changedStream) {
+      stream.source?.close(); stream.source = null; clearTimeout(stream.retryTimer); stream.retryTimer = null;
+      if (terminalPaint) cancelAnimationFrame(terminalPaint);
+      clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
+      terminalPaint = 0; terminalPending = null; terminalPendingAt = -Infinity;
+    }
+    stream.reconnecting = false; stream.pollFailures = 0;
+    applyTerminalFrame(frame);
+    if (changedStream) openTerminalStream(stream);
+  } catch (error) {
+    if (!terminalStreamCurrent(stream) || stream.pollController !== controller || controller.signal.aborted || stream.sseReady) return;
+    if ([400,401,403,404,409,410].includes(error.status) || !error.status && !error.retryable) {
+      failTerminalStream(stream, error.message); return;
+    }
+    stream.pollFailures++; stream.reconnecting = true;
+    terminalState('pending', '다시 연결 중…');
+    text($('terminal-error'), '터미널 연결을 다시 확인하고 있습니다. 마지막 화면은 유지됩니다.');
+    show($('terminal-error'), !latestFrame); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
+    updateControls();
+  } finally {
+    if (stream.pollController === controller) {
+      stream.pollController = null;
+      if (terminalStreamCurrent(stream) && !stream.sseReady) {
+        const interval = stream.pollFailures ? Math.min(3000, 500 * 2 ** Math.min(stream.pollFailures,3)) : directMode || selectedItem?.session.phase === 'working' ? 250 : 750;
+        stream.pollTimer = setTimeout(() => void readTerminalFallback(stream), interval);
+      }
+    }
+  }
+}
 function reconnectTerminalStream(stream) {
   if (terminalStream !== stream || document.hidden || stream.retryTimer) return;
   stream.source?.close(); clearTimeout(stream.watchdog);
   if (terminalPaint) cancelAnimationFrame(terminalPaint);
+  clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
   terminalPaint = 0; terminalPending = null;
-  stream.reconnecting = true;
-  terminalState('pending', '재연결 중…');
-  text($('terminal-error'), '네트워크 연결이 끊겨 원래 터미널에 다시 연결하고 있습니다.');
-  show($('terminal-error'), false); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
+  stream.sseReady = false;
+  // A failed stream must not invalidate a fresh, successful fallback read.
+  stream.reconnecting ||= !latestFrame || performance.now() - terminalFrameReceivedAt >= 3000;
+  if (stream.reconnecting) {
+    terminalState('pending', '재연결 중…');
+    text($('terminal-error'), '네트워크 연결이 끊겨 원래 터미널에 다시 연결하고 있습니다.');
+    show($('terminal-error'), false); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
+  }
   updateControls();
+  void readTerminalFallback(stream);
   // Retry only the read subscription. Input POSTs are never replayed here.
   const delay = Math.min(5000, 500 * 2 ** Math.min(stream.retries++, 4));
   stream.retryTimer = setTimeout(() => {
@@ -933,7 +1003,12 @@ function reconnectTerminalStream(stream) {
   }, delay);
 }
 function watchTerminalStream(stream) {
-  clearTimeout(stream.watchdog);
+  clearTimeout(stream.watchdog); clearTimeout(stream.fallbackWatchdog);
+  stream.fallbackWatchdog = setTimeout(() => {
+    if (!terminalStreamCurrent(stream)) return;
+    stream.sseReady = false;
+    void readTerminalFallback(stream);
+  }, 3000);
   // The server emits current controls at least every two seconds. Recover a
   // half-open Wi-Fi/VPN connection even when EventSource emits no error.
   stream.watchdog = setTimeout(() => reconnectTerminalStream(stream), 8000);
@@ -943,10 +1018,11 @@ function ensureTerminalStream() {
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
   const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + (renderWindow ? '&view=screen' : '');
-  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, sessionID:item.session.id, source:null, retries:0, reconnecting:false, retryTimer:null, watchdog:null};
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
   openTerminalStream(stream);
+  void readTerminalFallback(stream);
 }
 function openTerminalStream(stream) {
   const source = new EventSource(stream.url); stream.source = source;
@@ -956,7 +1032,9 @@ function openTerminalStream(stream) {
     if (!current()) return;
     try {
       if (event.data.length > 2000000 || byteLength(event.data) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
-      const frame = mergeTerminalUpdate(JSON.parse(event.data), terminalPending || latestFrame, stream.sessionID);
+      const update = JSON.parse(event.data), previous = terminalPending || latestFrame;
+      if (terminalUpdateIsOlder(update, previous)) { stream.sseReady = false; void readTerminalFallback(stream); return; }
+      const frame = mergeTerminalUpdate(update, previous, stream.sessionID);
       // Observe token changes immediately, even if a later frame replaces this
       // one before painting. Pending input must never cross terminal identities.
       if (directMode && (frame.streamID || null) !== directStreamID) {
@@ -965,16 +1043,21 @@ function openTerminalStream(stream) {
       if (directMode && (!frame.keys.includes('characters') || !frame.keys.includes('backspace') || frame.inputReason)) {
         stopDirect(); inputFailure = frame.inputReason || '원본 입력 권한을 다시 연결해주세요.';
       }
-      stream.reconnecting = false; stream.retries = 0; watchTerminalStream(stream);
+      stream.sseReady = true; stream.reconnecting = false; stream.retries = 0; stopTerminalFallback(stream); watchTerminalStream(stream);
       terminalPending = frame;
       terminalPendingAt = performance.now();
       if (terminalPaint) return;
-      terminalPaint = requestAnimationFrame(() => {
+      const paint = () => {
+        if (!terminalPaint) return;
+        cancelAnimationFrame(terminalPaint); clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
         terminalPaint = 0;
         if (!current()) { terminalPending = null; return; }
         const frame = terminalPending, receivedAt = terminalPendingAt; terminalPending = null;
         try { if (frame) applyTerminalFrame(frame, receivedAt); } catch (error) { failTerminalStream(stream, error.message); }
-      });
+      };
+      terminalPaint = requestAnimationFrame(paint);
+      // A suspended animation callback must not freeze an otherwise live read.
+      terminalPaintTimer = setTimeout(paint, 100);
     } catch (error) { failTerminalStream(stream, error.message); }
   });
   source.addEventListener('failure', event => {

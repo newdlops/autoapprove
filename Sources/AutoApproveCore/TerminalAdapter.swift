@@ -63,6 +63,7 @@ public struct ScreenTarget: Equatable, Sendable {
 /// The per-host channel behind every screen connection. Tests replace these closures.
 public struct ScreenHostAdapter: Sendable {
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
+    public var presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var approve: @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery
     /// nil means the host revealed the tab but reports no window frame to highlight.
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
@@ -76,18 +77,21 @@ public struct ScreenHostAdapter: Sendable {
                 reveal: @escaping @Sendable (ScreenTarget) throws -> TerminalWindowBounds?,
                 resume: @escaping @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery = { _, _, _ in .missingTarget },
                 restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)? = nil,
-                input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget }) {
+                input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget },
+                presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.restart = restart; self.input = input
+        self.presentationScreens = presentationScreens
     }
     public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
         switch host {
         case .terminal:
-            return ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty)) },
+            return ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false) },
                 approve: { try TerminalAdapter.approve(tty: $0.tty, expectedScreen: $1, agent: $2) },
                 reveal: { try TerminalAdapter.reveal(tty: $0.tty) },
                 resume: { try TerminalAdapter.resume(tty: $0.tty, region: $1, text: $2) },
                 restart: { try TerminalAdapter.restart(target:$0,expected:$1,command:$2) },
-                input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) })
+                input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) },
+                presentationScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty)) })
         case .iterm:
             return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
@@ -244,24 +248,26 @@ public enum TerminalAdapter {
         try AutomationScript.run(body, app: "Terminal", denied: .permissionDenied)
     }
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
-    public static func screens(ttys: [String]) throws -> TerminalSnapshot {
-        let output = try javascript(screenScript(ttys: ttys))
+    public static func screens(ttys: [String], includeCursor: Bool = true) throws -> TerminalSnapshot {
+        let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor))
         let data = Data(output.utf8)
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
+        guard includeCursor else { return snapshot }
         let records = (try? JSONSerialization.jsonObject(with: data) as? JSONObject)?["screens"] as? [JSONObject] ?? []
         for index in snapshot.screens.indices {
             guard let metadata = records.first(where: { $0["tty"] as? String == snapshot.screens[index].tty })?["cursorWindow"] as? JSONObject,
+                  let windowID = metadata["windowID"] as? UInt32,
                   let title = metadata["title"] as? String, let boundsObject = metadata["bounds"],
                   let boundsData = try? JSONSerialization.data(withJSONObject: boundsObject),
                   let bounds = try? JSONDecoder().decode(TerminalWindowBounds.self, from: boundsData) else { continue }
-            let visible = TerminalCursorReader.snapshot(screen: snapshot.screens[index].contents, title: title, bounds: bounds)
+            let visible = TerminalCursorReader.snapshot(screen: snapshot.screens[index].contents, windowID: windowID, title: title, bounds: bounds)
             snapshot.screens[index].display = visible
             if visible?.screen == snapshot.screens[index].contents { snapshot.screens[index].cursor = visible?.cursor }
         }
         return snapshot
     }
     /// Exposed for contract tests against Terminal's scripting dictionary, without sending Apple events.
-    public static func screenScript(ttys: [String]) throws -> String {
+    public static func screenScript(ttys: [String], includeCursor: Bool = true) throws -> String {
         let allowed = try literal(ttys)
         return """
         const app = Application('com.apple.Terminal');
@@ -286,7 +292,7 @@ public enum TerminalAdapter {
                 if (tabs.length === 1 || tab.selected()) title = String(window.name() || '').trim() || null;
               } catch (_) {}
               let cursorWindow = null;
-              try { if (tab.selected()) cursorWindow = {title:String(window.name()), bounds:window.bounds()}; } catch (_) {}
+              try { if (\(includeCursor ? "true" : "false") && tab.selected()) cursorWindow = {windowID:Number(window.id()), title:String(window.name()), bounds:window.bounds()}; } catch (_) {}
               screens.push({tty:tty, contents:tab.contents(), title:title, cursorWindow:cursorWindow});
               allowed.delete(tty);
               if (!allowed.size) break screenWindows;

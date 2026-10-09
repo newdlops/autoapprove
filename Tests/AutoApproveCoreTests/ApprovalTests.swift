@@ -105,9 +105,9 @@ import AutoApproveCore
             running: () => true,
             windows: () => [
               {tabs: () => { throw Error('closed window (-1728)'); }},
-              {tabs: () => [
+              {id:()=>7, name:()=>'Original', bounds:()=>({x:1,y:2,width:800,height:600}), tabs: () => [
                 {tty: () => { throw Error('closed tab (-1728)'); }},
-                {tty: () => '/dev/ttys001', contents: () => 'approval dialog'},
+                {tty: () => '/dev/ttys001', selected:()=>true, contents: () => 'approval dialog'},
                 {tty: () => '/dev/ttys002', contents: () => { throw Error('must not read unrelated tab'); }}
               ]}
             ]
@@ -121,6 +121,12 @@ import AutoApproveCore
         try expectEqual(result.screens.first?.tty, "/dev/ttys001")
         try expectEqual(result.screens.first?.contents, "approval dialog")
         try expectEqual(result.failures.count, 2)
+        let metadata = try JSONSerialization.jsonObject(with: Data(value!.toString().utf8)) as! JSONObject
+        try expectEqual(((metadata["screens"] as! [JSONObject])[0]["cursorWindow"] as? JSONObject)?["windowID"] as? Int, 7)
+        let rawValue = context.evaluateScript("{\n" + (try TerminalAdapter.screenScript(ttys: ["/dev/ttys001"], includeCursor: false)) + "\n}")!
+        try expectNil(context.exception)
+        let rawMetadata = try JSONSerialization.jsonObject(with: Data(rawValue.toString().utf8)) as! JSONObject
+        try expect((rawMetadata["screens"] as! [JSONObject])[0]["cursorWindow"] is NSNull, "Background approval reads must skip native window/cursor metadata")
         // No mock tab exposes name(), matching Terminal.sdef. Calling it loses the healthy tab.
     }
     func testOrdinaryTerminalsAreExcluded() throws {

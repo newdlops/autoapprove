@@ -9,7 +9,7 @@ const keys=['text','submit','characters','enter','escape','interrupt','up','down
 const sources=['original','other'].map((id,index)=>({session:{id,agent:index?'claude':'codex',pid:4200+index,started:'fixed-start-'+id,tty:'/dev/fixture-'+id,cwd:'/fixture/shared-terminal',terminal:'iterm',hostName:'원래 Mac 터미널',phase:'idle',automatic:true,detail:'동일한 원래 터미널',queuedQuestions:[]},title:index?'두 번째 원래 터미널':'Mac과 같은 터미널',phaseTitle:'입력 대기',canRead:true,canApprove:true,canReveal:false,keys}));
 const state=new Map(sources.map(view=>[view.session.id,{screen:'원래 Mac 터미널\nREADY> ',revision:0,stream:'original-stream-'+view.session.id,cursor:null}]));
 let release={version:'0.2.42',build:49,api:1},online=true,failNext=false,inputDelay=30;
-let networkFail=false,streamAvailable=true,clockOffset=0,pauseHeartbeats=false;
+let networkFail=false,streamAvailable=true,readAvailable=true,clockOffset=0,pauseHeartbeats=false;
 let nextInputGate=null;
 const inputGates=new Set();
 function holdNextInput(){assert.equal(nextInputGate,null);let resolve;const promise=new Promise(done=>{resolve=done;});const gate={promise,release:()=>{inputGates.delete(gate);resolve();}};inputGates.add(gate);nextInputGate=gate;return gate;}
@@ -37,7 +37,7 @@ const server=createServer(async(req,res)=>{
       const heartbeat=setInterval(()=>{if(!pauseHeartbeats)push(id,false);},2000);
       res.on('close',()=>{clearInterval(heartbeat);clients.delete(client);});return;
     }
-    if(url.pathname==='/api/terminal'){requests.poll++;return json(200,update(url.searchParams.get('session')));}
+    if(url.pathname==='/api/terminal'){requests.poll++;return readAvailable?json(200,update(url.searchParams.get('session'))):json(503,{error:'터미널 읽기 연결도 중단되었습니다.'});}
     if(url.pathname==='/api/input'){
       let data='';for await(const part of req)data+=part;const input=JSON.parse(data);
       assert.equal(url.searchParams.get('node'),'original-mac');assert.ok(state.has(input.sessionID));
@@ -74,15 +74,16 @@ try{
   await page.addInitScript(()=>{setInterval(async()=>{window.qaOperationCount=await window.qaOperations();window.qaStreamCount=await window.qaStreams();},30);});
   await page.goto(url);await page.locator('.session-row').first().click();await ready();
   assert.equal(requests.pty,0,'Selecting an existing original must create zero PTYs');
-  assert.equal(requests.stream,1);assert.equal(requests.poll,0);
+  assert.equal(requests.stream,1);assert.ok(requests.poll<=1,'Only the first-screen GET may race a healthy stream');
   const identity=await page.evaluate(()=>({id:selectedItem.session.id,pid:selectedItem.session.pid,tty:selectedItem.session.tty,count:allSessions.length}));
   assert.deepEqual(identity,{id:'original',pid:4200,tty:'/dev/fixture-original',count:2});
   assert.equal(await page.locator('#pty-dialog').isVisible(),false);assert.equal(await page.locator('#continue-pty').count(),0);
   await page.reload();await ready();assert.equal(requests.pty,0);assert.deepEqual(await page.evaluate(()=>({id:selectedItem.session.id,pid:selectedItem.session.pid,tty:selectedItem.session.tty,count:allSessions.length})),identity);
   await page.evaluate(()=>{history.replaceState(null,'','#node=original-mac&session=original&pty=legacy-copy');restoreSelection();});await ready();assert.equal(await page.evaluate(()=>selectedItem.session.id),'original');assert.equal(requests.pty,0);
   checks.push('original selection and reload retain session/PID/TTY/count with zero PTY creation');
+  const pollsBeforePush=requests.poll;
   for(let i=0;i<5;i++){const marker='MAC-PUSH-'+i,started=Date.now();macOutput('original','Mac의 같은 화면\n'+marker+'\nREADY> ');await page.waitForFunction(marker=>$('terminal-screen').textContent.includes(marker),marker);latencies.push(Date.now()-started);}
-  assert.ok(Math.max(...latencies)<600);assert.equal(requests.poll,0);checks.push('Mac-side pushed output arrives without terminal polling');
+  assert.ok(Math.max(...latencies)<600);assert.equal(requests.poll,pollsBeforePush);checks.push('Mac-side pushed output arrives without ongoing terminal polling');
   const frameBefore=await page.evaluate(()=>latestFrame.screen);state.get('original').cursor={offset:0,padding:0,visible:true,style:'bar',blink:false};push('original',false);
   await page.waitForFunction(()=>latestFrame?.cursor?.offset===0);assert.equal(await page.evaluate(()=>latestFrame.screen),frameBefore);
   stage='Codex source cursor and composer above a long footer';
@@ -133,7 +134,7 @@ try{
   checks.push('two-minute Mac/phone clock skew does not disable verified fresh input');
   stage='transport outage';
   const beforeReconnect=operations.length,streamBeforeReconnect=requests.stream;
-  transportFault=true;streamAvailable=false;for(const client of [...clients])client.res.destroy();
+  transportFault=true;streamAvailable=false;readAvailable=false;for(const client of [...clients])client.res.destroy();
   await page.waitForFunction(()=>$('terminal-live').textContent.includes('재연결'));
   assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');
   await page.keyboard.type('RECOVER');await page.keyboard.press('ArrowLeft');
@@ -147,7 +148,7 @@ try{
   assert.equal(await page.evaluate(()=>directMode&&composing&&document.activeElement?.id==='terminal-keyboard'),true);
   await page.evaluate(()=>{$('terminal-keyboard').dispatchEvent(new CompositionEvent('compositionend',{data:'한글🧪'}));});
   await page.waitForFunction(()=>!composing&&directQueue.length>=3);
-  await page.keyboard.press('Enter');streamAvailable=true;
+  await page.keyboard.press('Enter');streamAvailable=true;readAvailable=true;
   await page.waitForFunction(()=>terminalStream&&!terminalStream.reconnecting&&!!latestFrame);await drained();
   assert.deepEqual(operations.slice(beforeReconnect).map(input=>[input.kind,input.text]),[['characters','RECOVER'],['left',''],['characters','한글🧪'],['enter','']]);
   assert.equal(await page.evaluate(()=>document.activeElement?.id),'terminal-keyboard');

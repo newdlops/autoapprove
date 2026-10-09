@@ -86,20 +86,25 @@ extension ApprovalTests {
             let records = ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /fixture/" + agent)
             var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .iterm
             let probe = RemoteCursorProbe()
-            let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { probe.screen($0.tty) }) },
-                approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,expected,_,_ in probe.input(expected) })
+            let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { TerminalScreen(tty: $0.tty, contents: probe.raw) }) },
+                approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,expected,_,_ in probe.input(expected) },
+                presentationScreens: { TerminalSnapshot(screens: $0.map { probe.screen($0.tty) }) })
             let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter])
             defer { engine.stop() }
             engine.updateDiscovery([session], records: records); await engine.connectScreenHost(.iterm)
             try engine.setAutomatic(session.id, enabled: true)
-            let first = try await engine.remoteTerminal(sessionID: session.id, initial: true)
+            let first = try await engine.remoteTerminal(sessionID: session.id)
             try expectEqual(first.screen, "Working 10%\n› abc\nCodex footer"); try expectEqual(first.cursor?.offset, 17)
+            try expect((first.sequence ?? 0) > 0, "First snapshot carries its source ordering token")
             let current = "Working 20%\n› 한글🧪abc\nCodex footer"
             let at = "Working 20%\n› 한글🧪a".utf16.count
             probe.change(current, cursor: at)
+            // The first presentation read uses the same bounded live-read cache.
+            try await Task.sleep(for: .milliseconds(220))
             let typed = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
             try expectEqual(typed.screen, current); try expectEqual(typed.cursor?.offset, at)
             try expectEqual(typed.streamID, first.streamID); try expect(typed.revision != first.revision)
+            try expect(typed.sequence! > first.sequence!, "HTTP and SSE readers can order simultaneous source observations")
             _ = try await engine.remoteInput(["requestID": UUID().uuidString, "sessionID": session.id, "revision": typed.revision,
                 "streamID": typed.streamID!, "relay": true, "kind": "characters", "text": "웹 입력 한글🧪"])
             try expectEqual(probe.count(), 1, "Displayed text must never replace the raw source used at input")
@@ -108,6 +113,7 @@ extension ApprovalTests {
             try expectEqual(moved.screen, current); try expectEqual(moved.cursor?.offset, at - 1)
             try expect(moved.revision != typed.revision, "Cursor movement without text change must publish a frame")
             try expectEqual(moved.streamID, first.streamID)
+            try expect(moved.sequence! > typed.sequence!, "Consuming an input frame must not reset display ordering")
             engine.updateDiscovery([], records: [])
             do { _ = try await engine.remoteTerminal(sessionID: session.id); throw AppError.message("Ended source was displayed") }
             catch { try expect(error is RemoteHTTPError) }
