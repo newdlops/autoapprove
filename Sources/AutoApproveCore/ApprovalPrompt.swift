@@ -15,14 +15,22 @@ public struct ApprovalPrompt: Equatable {
 }
 
 public enum PromptDetector {
+    private static let hexDigits = Array("0123456789abcdef".utf8)
     public static func fingerprint(_ screen: String) -> String {
-        SHA256.hash(data: Data(screen.utf8)).map { String(format: "%02x", $0) }.joined()
+        var hex: [UInt8] = []; hex.reserveCapacity(64)
+        for byte in SHA256.hash(data: Data(screen.utf8)) {
+            hex.append(hexDigits[Int(byte >> 4)]); hex.append(hexDigits[Int(byte & 15)])
+        }
+        return String(decoding: hex, as: UTF8.self)
     }
     /// Matches complete, active CLI permission dialogs. Arbitrary yes/no text is never sufficient.
     public static func detect(_ screen: String, agent: AgentKind) -> ApprovalPrompt? {
+        detect(screen, agent: agent, prepared: DetectionLines(screen))
+    }
+
+    static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines) -> ApprovalPrompt? {
         guard agent != .shell else { return nil }
-        let rawLines = normalizedLines(screen)
-        let lines = rawLines.map { $0.trimmingCharacters(in: .whitespaces) }
+        let rawLines = prepared.raw, lines = prepared.trimmed
         guard let heading = permissionHeading(lines, agent: agent) else { return nil }
         let promptIndex = heading.index
         // A long command can push its title beyond the old 32-line window.
@@ -133,7 +141,10 @@ public enum PromptDetector {
     }
     static let optionPrefix = #"^[›❯»>]?\s*[1-9][0-9]?\.\s+"#
     static func isOption(_ line: String) -> Bool {
-        line.range(of: optionPrefix, options: .regularExpression) != nil
+        // An ASCII option number or selection cursor must be the first nonspace
+        // character. Ordinary output cannot match, so avoid its regex work entirely.
+        guard let first = line.first, first.isWhitespace || "›❯»>123456789".contains(first) else { return false }
+        return line.range(of: optionPrefix, options: .regularExpression) != nil
     }
     /// A new option starts left of the previous label. A long label wraps at that label's
     /// column, where its text can look like a selection cursor (`=>`, `> file`) or `2. …`.

@@ -8,8 +8,12 @@ public struct PendingScreenRequest {
 public enum QuestionDetector {
     /// Recognize a current interactive menu without treating its first option as an answer.
     public static func detect(_ screen: String, agent: AgentKind) -> PendingScreenRequest? {
+        detect(agent: agent, prepared: DetectionLines(screen))
+    }
+
+    static func detect(agent: AgentKind, prepared: DetectionLines) -> PendingScreenRequest? {
         guard agent != .shell else { return nil }
-        let lines = Array(PromptDetector.normalizedLines(screen).suffix(300)).map { $0.trimmingCharacters(in: .whitespaces) }
+        let lines = prepared.trimmedSuffix(300)
         guard let last = lines.lastIndex(where: PromptDetector.isOption) else { return nil }
         guard PromptDetector.dialogFooterStart(in: lines, after: last) != nil else { return nil }
         let selected = lines[...last].lastIndex {

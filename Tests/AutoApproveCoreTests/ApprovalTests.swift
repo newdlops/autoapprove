@@ -451,6 +451,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Remote exact terminal, manual input, stale frames and restart receipts", tests.testRemoteTerminalExactTargetStaleFrameAndDurableReceipt),
             ("Remote Terminal scripts validate screen, agent and supported keys", tests.testRemoteTerminalScriptValidationAndKeys),
             ("Unchanged observations stay quiet while changes publish immediately", tests.testUnchangedObservationsDoNotPublishSnapshots),
+            ("Detection optimization preserves exact persisted fingerprints and raw Unicode bytes", tests.testFingerprintEncodingKeepsExistingReceipts),
+            ("Detection optimization preserves Unicode option spacing and ordinary-output rejection", tests.testOptionPrecheckKeepsUnicodeMenusAndRejectsOrdinaryOutput),
             ("Repeated screens retain time, generation, changed requests and ended-process checks", tests.testRepeatedScreensPreserveTimeGenerationAndChangedRequests),
             ("Screen polling publishes coherent batches and preserves immediate stream updates", tests.testScreenPollsPublishTogetherAndKeepImmediateUpdates),
             ("Native cwd reads preserve valid paths with duplicate and missing processes", tests.testWorkingDirectoryReadsKeepValidPathsWithDuplicateAndMissingPIDs),

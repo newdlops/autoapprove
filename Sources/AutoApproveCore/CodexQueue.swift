@@ -190,7 +190,7 @@ private final class CodexQueueConnection {
             let accept = Data(Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))).base64EncodedString()
             guard lines.first?.split(separator: " ").dropFirst().first == "101", headers["upgrade"]?.lowercased() == "websocket",
                   headers["sec-websocket-accept"] == accept else { throw AppError.message("Codex 대기열 서버의 연결 형식을 지원하지 않습니다.") }
-            _ = try request("initialize", ["clientInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.67"], "capabilities": ["experimentalApi": true]])
+            _ = try request("initialize", ["clientInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.68"], "capabilities": ["experimentalApi": true]])
             try send(["method": "initialized"])
         } catch { Darwin.close(fd); fd = -1; throw error }
     }

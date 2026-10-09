@@ -120,11 +120,17 @@ import TerminalInputSupport
     private final class ScreenAnalysis {
         let raw: String
         let agent: AgentKind
-        lazy var prompt = PromptDetector.detect(raw, agent: agent)
-        lazy var request = QuestionDetector.detect(raw, agent: agent)
+        private var prepared: DetectionLines?
+        private var lines: DetectionLines {
+            if let prepared { return prepared }
+            let value = DetectionLines(raw); prepared = value; return value
+        }
+        lazy var prompt = PromptDetector.detect(raw, agent: agent, prepared: lines)
+        lazy var request = QuestionDetector.detect(agent: agent, prepared: lines)
         lazy var activity = ActivityDetector.detect(raw, agent: agent, permissionPrompt: { self.prompt != nil })
-        lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent, activity: activity)
+        lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent, activity: activity, prepared: lines)
         lazy var fingerprint = PromptDetector.fingerprint(raw)
+        func discardPreparedLines() { prepared = nil }
         init(raw: String, agent: AgentKind) { self.raw = raw; self.agent = agent }
     }
     private var screenAnalyses: [String: ScreenAnalysis] = [:]
@@ -2856,6 +2862,7 @@ import TerminalInputSupport
             // still work normally. End/disconnect/stop removes their parsing cache.
             if raw.utf8.count <= 131_072, screenAnalyses.count < 32 { screenAnalyses[sessionID] = analysis }
         }
+        defer { analysis.discardPreparedLines() }
         observeCapacity(sessionID,analysis:analysis,at:now)
         defer { publish() }
         if analysis.capacityStop != nil {

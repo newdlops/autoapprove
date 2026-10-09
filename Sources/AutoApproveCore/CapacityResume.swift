@@ -26,14 +26,14 @@ public struct CodexCapacityStop: Codable, Equatable {
     /// indentation in a narrow window.
     public static func detect(_ screen: String, agent: AgentKind) -> CodexCapacityStop? {
         guard agent != .shell else { return nil }
-        return detect(screen, agent: agent, activity: ActivityDetector.detect(screen, agent: agent))
+        return detect(screen, agent: agent, activity: ActivityDetector.detect(screen, agent: agent), prepared: DetectionLines(screen))
     }
 
     /// A frame's activity and permission analysis are shared by the engine's detectors.
-    static func detect(_ screen: String, agent: AgentKind, activity: ActivityObservation) -> CodexCapacityStop? {
+    static func detect(_ screen: String, agent: AgentKind, activity: ActivityObservation,
+                       prepared: @autoclosure () -> DetectionLines) -> CodexCapacityStop? {
         guard agent != .shell, activity.phase == .idle else { return nil }
-        let raw = PromptDetector.normalizedLines(screen)
-        let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
+        let frame = prepared(), raw = frame.raw, lines = frame.trimmed
         guard !CodexResumeCheck.blocked(lines), let composer = lines.lastIndex(where: CodexResumeCheck.isComposer),
               let end = lines[..<composer].lastIndex(where: { !$0.isEmpty }) else { return nil }
         guard agent != .codex || !CodexResumeCheck.goalHeld(lines) else { return nil }
