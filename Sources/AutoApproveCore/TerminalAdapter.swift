@@ -9,8 +9,11 @@ public struct TerminalScreen: Codable {
     public var title: String?
     public var appearance: TerminalAppearance?
     public var cursor: TerminalCursor?
-    public init(tty: String, contents: String, title: String? = nil, appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil) {
+    public var display: TerminalTextSnapshot?
+    public init(tty: String, contents: String, title: String? = nil, appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil,
+                display: TerminalTextSnapshot? = nil) {
         self.tty = tty; self.contents = contents; self.title = title; self.appearance = appearance; self.cursor = cursor
+        self.display = display
     }
 }
 
@@ -251,7 +254,9 @@ public enum TerminalAdapter {
                   let title = metadata["title"] as? String, let boundsObject = metadata["bounds"],
                   let boundsData = try? JSONSerialization.data(withJSONObject: boundsObject),
                   let bounds = try? JSONDecoder().decode(TerminalWindowBounds.self, from: boundsData) else { continue }
-            snapshot.screens[index].cursor = TerminalCursorReader.read(screen: snapshot.screens[index].contents, title: title, bounds: bounds)
+            let visible = TerminalCursorReader.snapshot(screen: snapshot.screens[index].contents, title: title, bounds: bounds)
+            snapshot.screens[index].display = visible
+            if visible?.screen == snapshot.screens[index].contents { snapshot.screens[index].cursor = visible?.cursor }
         }
         return snapshot
     }

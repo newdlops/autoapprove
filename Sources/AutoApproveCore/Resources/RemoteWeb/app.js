@@ -267,7 +267,7 @@ function positionCursor() {
   x += cursor.padding * cell;
   const selection = window.getSelection();
   const selecting = selection && !selection.isCollapsed && pre.contains(selection.anchorNode);
-  if (selectedItem?.session.terminal === 'tmux' && $('follow').checked && cursor.visible && !selecting) {
+  if ($('follow').checked && cursor.visible && !selecting) {
     const top = pre.scrollTop, left = pre.scrollLeft;
     const minY = bounds.top + parseFloat(style.paddingTop), maxY = bounds.bottom - parseFloat(style.paddingBottom) - lineHeight;
     const minX = bounds.left + parseFloat(style.paddingLeft), maxX = bounds.right - parseFloat(style.paddingRight) - cell;
@@ -283,7 +283,7 @@ function positionCursor() {
   caret.style.left = `${x - container.left}px`; caret.style.top = `${y - container.top}px`;
   caret.style.width = `${Math.max(2, cell)}px`; caret.style.height = `${lineHeight}px`;
   caret.dataset.style = cursor.style; caret.dataset.blink = String(cursor.blink); caret.dataset.offset = String(cursor.offset);
-  show(caret, cursor.visible === true && inView && !composing && !!latestFrame && connected);
+  show(caret, cursor.visible === true && inView && !composing && !!latestFrame && originalTerminalConnected());
   // Native phone IME candidate UI uses this same insertion point.
   if (inView && !composing) {
     $('terminal-keyboard').style.left = `${x - container.left}px`;
@@ -519,7 +519,7 @@ function renderTerminal(value, inputAppearance) {
   terminalRows.splice(start, oldEnd - start, ...added); terminalValue = value; terminalAppearanceKey = appearanceKey;
   const selection = window.getSelection();
   const selecting = selection && !selection.isCollapsed && pre.contains(selection.anchorNode);
-  pre.scrollTop = $('follow').checked && !selecting && selectedItem?.session.terminal !== 'tmux' ? pre.scrollHeight : scrollTop; pre.scrollLeft = scrollLeft;
+  pre.scrollTop = $('follow').checked && !selecting && latestFrame?.cursor?.visible !== true ? pre.scrollHeight : scrollTop; pre.scrollLeft = scrollLeft;
   return true;
 }
 function feedback(message, error = false) {

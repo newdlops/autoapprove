@@ -1,7 +1,11 @@
 import Foundation
 import Darwin
 import TerminalInputSupport
+#if DEBUG
 @testable import AutoApproveCore
+#else
+import AutoApproveCore
+#endif
 
 private final class Sender: @unchecked Sendable {
     private let lock = NSLock()
@@ -17,6 +21,7 @@ private final class Sender: @unchecked Sendable {
     var requests: [TTYInputRequest] { lock.lock(); defer { lock.unlock() }; return packets }
 }
 
+#if DEBUG
 private final class SetupProbe: @unchecked Sendable {
     var connected = false
     var legacy = false
@@ -40,6 +45,7 @@ private final class SetupProbe: @unchecked Sendable {
             ownIdentifier: TTYInputConfiguration.appIdentifier, environment: environment)
     }
 }
+#endif
 
 @main struct Check {
     static func main() throws {
@@ -51,8 +57,8 @@ private final class SetupProbe: @unchecked Sendable {
             .init(available: { available }, capture: { pid in precondition(pid == 99); return identity }, send: { try sender.send($0) })
         }
         func deliver(_ sender: Sender, input: RemoteTerminalInput, identity: TTYInputIdentity = original,
-                     selected: ScreenTarget = target, available: Bool = true, agent: AgentKind = .codex) throws -> TerminalDelivery {
-            try TerminalDeviceInput.deliver(target: selected, agent: agent, input: input,
+                     selected: ScreenTarget = target, available: Bool = true, agent: AgentKind = .codex, screen: String = "") throws -> TerminalDelivery {
+            try TerminalDeviceInput.deliver(target: selected, agent: agent, input: input, screen: screen,
                 environment: environment(sender, identity: identity, available: available))
         }
         func expectHTTP(_ status: Int, _ action: () throws -> Void) {
@@ -65,9 +71,23 @@ private final class SetupProbe: @unchecked Sendable {
         for input in [characters, .init(kind: .left, relay: true), .init(kind: .enter, relay: true), .init(kind: .interrupt, relay: true)] {
             try check(deliver(sender, input: input) == .sent)
         }
-        precondition(sender.requests.map(\.bytes) == [Data("한글é🙂".utf8), Data([27, 91, 68]), Data([13]), Data([3])])
+        precondition(sender.requests.map(\.bytes) == [Data("한글é🙂".utf8), Data([2]), Data([13]), Data([3])])
         precondition(sender.requests.allSatisfy { $0.identity == original && $0.tty == target.tty && $0.deadline > before && $0.deadline <= TTYInputConfiguration.uptime + 2.1 })
         precondition(Set(sender.requests.map(\.id)).count == 4)
+        let editor = Sender(), claude = Sender(), menu = Sender()
+        let keys: [RemoteTerminalInput.Kind] = [.left, .right, .up, .down, .home, .end, .delete, .backspace]
+        let dialog = "Would you like to run the following command?\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel"
+        for kind in keys {
+            let input = RemoteTerminalInput(kind: kind, relay: true)
+            try check(deliver(editor, input: input, screen: "› draft\n  model · context left") == .sent)
+            try check(deliver(claude, input: input, agent: .claude) == .sent)
+            try check(deliver(menu, input: input, screen: dialog) == .sent)
+        }
+        precondition(editor.requests.map(\.bytes) == [[2], [6], [16], [14], [1], [5], [27, 91, 51, 126], [127]].map { Data($0) })
+        precondition(claude.requests.map(\.bytes) == keys.map { Data(RemoteTerminalInput(kind: $0).bytes.utf8) })
+        precondition(menu.requests.map(\.bytes) == keys.map { kind in
+            kind == .up ? Data([16]) : kind == .down ? Data([14]) : Data(RemoteTerminalInput(kind: kind).bytes.utf8)
+        })
         for change in [
             { (value: inout TTYInputIdentity) in value.pid = 100 },
             { value in value.startSeconds += 1 },
@@ -110,6 +130,7 @@ private final class SetupProbe: @unchecked Sendable {
         expectHTTP(409) { _ = try deliver(disconnected, input: characters) }
         precondition(disconnected.requests.count == 1)
 
+#if DEBUG
         let plistData = try Data(contentsOf: URL(fileURLWithPath: "scripts/resources/local.autoapprove.tty-input.plist"))
         try TerminalInputInstaller.validatePlist(plistData)
         let plist = try PropertyListSerialization.propertyList(from: plistData, format: nil) as! [String: Any]
@@ -155,5 +176,8 @@ private final class SetupProbe: @unchecked Sendable {
         precondition(immediate.registrations == 1)
         precondition(TerminalInputStatus.requiresApproval.message == TerminalInputInstaller.Result.requiresApproval.message)
         print("PASS: original source input guards and exact bytes preserved; bundled daemon contract rejects substituted executables; native registration requires platform trust, preserves existing services and handles approval without administrator shell execution")
+#else
+        print("PASS: original source input guards, Codex editor/list keys, unchanged Claude bytes and no uncertain-input retries")
+#endif
     }
 }

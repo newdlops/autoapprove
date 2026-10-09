@@ -1,5 +1,27 @@
 import Foundation
 
+/// Display text and insertion point captured together from the verified native
+/// text area. Command authorization continues to use TerminalScreen.contents.
+public struct TerminalTextSnapshot: Codable, Equatable, Sendable {
+    public var screen: String
+    public var cursor: TerminalCursor
+    public init(screen: String, cursor: TerminalCursor) { self.screen = screen; self.cursor = cursor }
+    public func validated() -> Self? {
+        guard screen.utf8.count <= 200_000, cursor.validated(for: screen) != nil else { return nil }
+        return self
+    }
+    public static func fromAccessibility(value: String, insertion: Int, visible: NSRange) -> Self? {
+        let text = value as NSString
+        guard visible.location != NSNotFound, visible.location >= 0, visible.length > 0,
+              visible.location <= text.length, visible.length <= text.length - visible.location,
+              insertion >= visible.location, insertion - visible.location <= visible.length else { return nil }
+        let units = Array(value.utf16), end = visible.location + visible.length
+        guard !(0xdc00...0xdfff).contains(units[visible.location]),
+              end == units.count || !(0xdc00...0xdfff).contains(units[end]) else { return nil }
+        return Self(screen: text.substring(with: visible), cursor: TerminalCursor(offset: insertion - visible.location)).validated()
+    }
+}
+
 /// An insertion point reported by the terminal, never inferred from prompt text.
 public struct TerminalCursor: Codable, Equatable, Sendable {
     public enum Style: String, Codable, Sendable { case block, bar, underline }

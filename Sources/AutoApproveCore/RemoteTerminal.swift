@@ -227,7 +227,7 @@ public enum RemoteTerminalAdapter {
     public static func input(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput) throws -> TerminalDelivery {
         try input.validate()
         if host == .terminal, input.isRelay || ![.text, .submit, .enter].contains(input.kind) {
-            return try TerminalDeviceInput.deliver(target: target, agent: agent, input: input)
+            return try TerminalDeviceInput.deliver(target: target, agent: agent, input: input, screen: expected)
         }
         if host == .orca {
             guard let handle = target.handle else { return .missingTarget }

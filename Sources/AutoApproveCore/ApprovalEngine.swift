@@ -26,7 +26,7 @@ import TerminalInputSupport
         }
         var token: String { PromptDetector.fingerprint(runtimeID + "\u{0}" + ptyID + "\u{0}" + incarnationID + "\u{0}" + String(ownerPID)) }
     }
-    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil; var orcaBinding: RemoteOrcaBinding? = nil }
+    private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil; var orcaBinding: RemoteOrcaBinding? = nil; var display: TerminalTextSnapshot? = nil }
     private struct RemoteScreenRead {
         var token: UUID
         var target: ScreenTarget
@@ -697,7 +697,7 @@ import TerminalInputSupport
                 guard let screen = snapshot.screens.first(where: { $0.tty == target.tty }) else {
                     throw RemoteHTTPError(503, snapshot.failures.first?.message ?? "원본 터미널 화면을 일시적으로 읽지 못했습니다. 같은 세션에 다시 연결합니다.")
                 }
-                return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents))
+                return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents), display: screen.display?.validated())
             }
             pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
             var tracked = pending; tracked.sourceRevision = sourceRevision
@@ -943,7 +943,7 @@ import TerminalInputSupport
             if renderWindow { nativeDisplay = capture?.permissionState() ?? TerminalNativeDisplay(state: .permissionRequired, message: "Mac에서 원래 터미널의 자동화 권한을 허용한 뒤 연결해주세요.") }
         }
         let raw: String, generation: String, observedAt: Date, appearance: TerminalAppearance?, cursor: TerminalCursor?
-        var orcaBinding: RemoteOrcaBinding?, sourceReason: String?, outputReason: String?
+        var orcaBinding: RemoteOrcaBinding?, sourceReason: String?, outputReason: String?, display: TerminalTextSnapshot?
         if orcaMode {
             let observed: RemoteObservedScreen?
             if !remoteCanRead(session) {
@@ -982,10 +982,12 @@ import TerminalInputSupport
             let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime, initial: initial && !renderWindow)
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
             appearance = observed.appearance; cursor = observed.cursor
+            display = observed.display
         } else {
             guard let observed = remoteObservedScreens[sessionID], Date().timeIntervalSince(observed.observedAt) < 10 else { throw RemoteHTTPError(409, "최신 터미널 화면을 받지 못했습니다. VS Code 연결을 확인해주세요.") }
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
             appearance = observed.appearance; cursor = observed.cursor
+            display = observed.display
         }
         guard let current = sessions[sessionID], current.phase != .ended, current.tty == session.tty,
               current.pid == session.pid, current.started == session.started, current.terminal == session.terminal,
@@ -996,9 +998,10 @@ import TerminalInputSupport
         // Reading the same screen in another browser must not invalidate an input draft.
         // An actual screen/generation change or a consumed frame gets a new token.
         let previous = remoteFrames[sessionID]
-        let screen = String(raw.suffix(160_000)), visibleAppearance = screen == raw ? appearance : nil
-        let visibleCursor = screen == raw ? cursor : nil
-        let token = previous?.raw == raw && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor && previous?.frame.nativeDisplay == nativeDisplay && previous?.frame.outputReason == outputReason ? previous!.frame.revision : UUID().uuidString
+        let presented = display?.screen ?? raw
+        let screen = String(presented.suffix(160_000)), visibleAppearance = screen == raw ? appearance : nil
+        let visibleCursor = screen == presented ? (display?.cursor ?? cursor)?.validated(for: screen) : nil
+        let token = previous?.raw == raw && previous?.frame.screen == screen && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor && previous?.frame.nativeDisplay == nativeDisplay && previous?.frame.outputReason == outputReason ? previous!.frame.revision : UUID().uuidString
         let inputIdentity = [.terminal, .tmux].contains(current.terminal) ? terminalInputIdentity(current.pid) : nil
         if let inputIdentity, inputIdentity.pid != current.pid || inputIdentity.processStart != current.started {
             throw RemoteHTTPError(409, "원래 CLI의 실행 식별자가 바뀌었습니다. 목록을 새로고침해주세요.")
@@ -1254,7 +1257,13 @@ import TerminalInputSupport
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
-        return remoteTerminalChanges[sessionID]!.observe()
+        let observation = remoteTerminalChanges[sessionID]!.observe()
+        if sessions[sessionID]?.terminal == .terminal {
+            observation.observeNativeCursor { [weak self] in
+                Task { @MainActor [weak self] in self?.invalidateRemoteRead(sessionID) }
+            }
+        }
+        return observation
     }
     func remoteTerminalNeedsResponsiveRead(_ id: String) -> Bool {
         userInputHasPriority(id) || automaticInputBusy(id) || sessions[id]?.phase == .working
@@ -2240,12 +2249,12 @@ import TerminalInputSupport
                     if [.terminal, .iterm].contains(host) {
                         remoteMonitorFrames[target.id] = RemoteObservedScreen(raw: screen.contents,
                             generation: remoteGeneration(target, host: host), observedAt: readStartedAt,
-                            appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents))
+                            appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents), display: screen.display?.validated())
                     }
                     if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
                         if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
                         sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor)
+                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor, display: screen.display)
                     }
                 }
                 publish()
@@ -2877,11 +2886,11 @@ import TerminalInputSupport
         sessions[id]?.pendingRequestID = nil
     }
 
-    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil) {
+    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
         let previousFrame = remoteObservedScreens[sessionID]
-        if previousFrame?.raw != raw || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance { remoteTerminalChanges[sessionID]?.notify() }
-        remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw))
+        if previousFrame?.raw != raw || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance || previousFrame?.display != display { remoteTerminalChanges[sessionID]?.notify() }
+        remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw), display: display?.validated())
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
         // A parked main terminal renders the child PTY. Its pixels cannot identify

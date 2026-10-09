@@ -16,8 +16,16 @@ final class RemoteTerminalObservation: @unchecked Sendable {
     private var token: UUID?, pending = true
     private var waiter: (UUID, CheckedContinuation<Void,Never>)?
     private var timeout: Task<Void,Never>?
+    private var cursorObservation: TerminalCursorObservation?
     fileprivate init(signal: RemoteTerminalChangeSignal) {
         self.signal = signal; token = signal.add { [weak self] in self?.changed() }
+    }
+    @MainActor func observeNativeCursor(_ changed: @escaping @Sendable () -> Void) {
+        // Send the prepared first frame before discovering native AX elements.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(50))
+            self?.cursorObservation = TerminalCursorObservation(changed: changed)
+        }
     }
     private func changed() {
         lock.lock(); pending = true; let current = waiter; waiter = nil

@@ -49,7 +49,71 @@ private final class RemoteReadProbe: @unchecked Sendable {
     var automationAllowed = true
 }
 
+private final class RemoteCursorProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    let raw = "원본 입력 검증 화면\nREADY> "
+    private var display = TerminalTextSnapshot(screen: "Working 10%\n› abc\nCodex footer", cursor: TerminalCursor(offset: 17))
+    private var writes = 0
+    func screen(_ tty: String) -> TerminalScreen {
+        lock.lock(); defer { lock.unlock() }
+        return TerminalScreen(tty: tty, contents: raw, display: display)
+    }
+    func change(_ screen: String, cursor: Int) { lock.lock(); display = TerminalTextSnapshot(screen: screen, cursor: TerminalCursor(offset: cursor)); lock.unlock() }
+    func input(_ expected: String) -> TerminalDelivery { lock.lock(); defer { lock.unlock() }; guard expected == raw else { return .screenChanged }; writes += 1; return .sent }
+    func count() -> Int { lock.lock(); defer { lock.unlock() }; return writes }
+}
+
 extension ApprovalTests {
+    func testNativeTextSnapshotKeepsCodexCursorOnSameViewport() throws {
+        let history = "이전 출력\n", visible = "Working 20%\n› 한글🧪ab\nCodex footer"
+        let insertion = history.utf16.count + "Working 20%\n› 한글🧪".utf16.count
+        let snapshot = TerminalTextSnapshot.fromAccessibility(value: history + visible, insertion: insertion,
+            visible: NSRange(location: history.utf16.count, length: visible.utf16.count))
+        try expectEqual(snapshot?.screen, visible)
+        try expectEqual(snapshot?.cursor.offset, "Working 20%\n› 한글🧪".utf16.count)
+        try expectNil(TerminalTextSnapshot.fromAccessibility(value: visible, insertion: -1, visible: NSRange(location: 0, length: visible.utf16.count)))
+        try expectNil(TerminalTextSnapshot.fromAccessibility(value: visible, insertion: visible.utf16.count + 1, visible: NSRange(location: 0, length: visible.utf16.count)))
+        try expectNil(TerminalTextSnapshot.fromAccessibility(value: visible, insertion: 0, visible: NSRange(location: NSNotFound, length: 3)))
+        try expectNil(TerminalTextSnapshot.fromAccessibility(value: "🧪", insertion: 1, visible: NSRange(location: 1, length: 1)))
+        try expectNil(TerminalTextSnapshot.fromAccessibility(value: "🧪", insertion: 0, visible: NSRange(location: 0, length: 1)))
+        try expectNil(TerminalTextSnapshot(screen: "🧪", cursor: TerminalCursor(offset: 1)).validated())
+    }
+
+    func testNativePresentationAndCursorPreserveOriginalInput() async throws {
+        for agent in ["codex", "claude"] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-cursor-source-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let records = ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /fixture/" + agent)
+            var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .iterm
+            let probe = RemoteCursorProbe()
+            let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { probe.screen($0.tty) }) },
+                approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,expected,_,_ in probe.input(expected) })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter])
+            defer { engine.stop() }
+            engine.updateDiscovery([session], records: records); await engine.connectScreenHost(.iterm)
+            try engine.setAutomatic(session.id, enabled: true)
+            let first = try await engine.remoteTerminal(sessionID: session.id, initial: true)
+            try expectEqual(first.screen, "Working 10%\n› abc\nCodex footer"); try expectEqual(first.cursor?.offset, 17)
+            let current = "Working 20%\n› 한글🧪abc\nCodex footer"
+            let at = "Working 20%\n› 한글🧪a".utf16.count
+            probe.change(current, cursor: at)
+            let typed = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+            try expectEqual(typed.screen, current); try expectEqual(typed.cursor?.offset, at)
+            try expectEqual(typed.streamID, first.streamID); try expect(typed.revision != first.revision)
+            _ = try await engine.remoteInput(["requestID": UUID().uuidString, "sessionID": session.id, "revision": typed.revision,
+                "streamID": typed.streamID!, "relay": true, "kind": "characters", "text": "웹 입력 한글🧪"])
+            try expectEqual(probe.count(), 1, "Displayed text must never replace the raw source used at input")
+            probe.change(current, cursor: at - 1)
+            let moved = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+            try expectEqual(moved.screen, current); try expectEqual(moved.cursor?.offset, at - 1)
+            try expect(moved.revision != typed.revision, "Cursor movement without text change must publish a frame")
+            try expectEqual(moved.streamID, first.streamID)
+            engine.updateDiscovery([], records: [])
+            do { _ = try await engine.remoteTerminal(sessionID: session.id); throw AppError.message("Ended source was displayed") }
+            catch { try expect(error is RemoteHTTPError) }
+        }
+    }
+
     func testTargetedOriginalProcessReadMatchesDiscovery() throws {
         let pid = ProcessInfo.processInfo.processIdentifier
         let all = try ProcessDiscovery.read()
