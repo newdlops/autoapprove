@@ -448,6 +448,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Native approval writes serialize with live user input", tests.testRemoteInputSerializesNativeApproval),
             ("Remote original ANSI attributes, bounds and color-only frames", tests.testRemoteOriginalTerminalAttributesAndColorOnlyFrames),
             ("Remote terminal read stops once the exact target is found", tests.testRemoteTerminalReadStopsAtExactTarget),
+            ("First terminal frame reuses only verified recent monitoring and live output remains fresh", tests.testInitialTerminalReusesOnlyVerifiedRecentMonitor),
+            ("First terminal frame rejects changed original processes and ended sessions", tests.testInitialTerminalRejectsChangedOriginalProcess),
             ("Remote exact terminal, manual input, stale frames and restart receipts", tests.testRemoteTerminalExactTargetStaleFrameAndDurableReceipt),
             ("Remote Terminal scripts validate screen, agent and supported keys", tests.testRemoteTerminalScriptValidationAndKeys),
             ("Unchanged observations stay quiet while changes publish immediately", tests.testUnchangedObservationsDoNotPublishSnapshots),

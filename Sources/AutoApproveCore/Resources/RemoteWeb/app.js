@@ -748,8 +748,8 @@ function selectSession(key, focus = false) {
   if (window.innerWidth < 760) terminalFocus(true);
   const hash = new URLSearchParams({ node: item.node.id, session: item.session.id, ...(item.view.ptyID ? {pty: item.view.ptyID} : {}) });
   history.replaceState(null, '', `#${hash}`);
-  renderList(); renderDetail();
   void refreshFrame();
+  renderList(); renderDetail();
   if (focus) { $(document.body.classList.contains('terminal-focus') ? 'terminal-heading' : 'session-title').focus({ preventScroll: true }); if (window.innerWidth < 760) window.scrollTo(0, 0); }
 }
 function restoreSelection() {
@@ -1004,6 +1004,7 @@ async function refreshFrame() {
   const started = performance.now(), controller = new AbortController(); frameController = controller;
   try {
     const query = new URLSearchParams({ node: item.node.id, session: item.session.id });
+    if (!previous) query.set('initial', '1');
     if (renderWindow) query.set('view', 'screen');
     if (previous) query.set('revision', previous.revision);
     const update = await api('/api/terminal?' + query, undefined, controller.signal);

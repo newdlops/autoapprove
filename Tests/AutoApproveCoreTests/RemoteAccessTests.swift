@@ -234,6 +234,56 @@ extension ApprovalTests {
         catch { try expect(error is RemoteHTTPError, "An old in-flight read cannot restore a disconnected frame") }
     }
 
+    func testInitialTerminalReusesOnlyVerifiedRecentMonitor() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-terminal-entry-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .terminal
+        let probe = RemoteReadProbe()
+        let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { probe.read($0.tty) }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records)
+        let before = Date(); await engine.connectTerminal()
+        let baseline = probe.count()
+        let first = try await engine.remoteTerminal(sessionID: session.id, realtime: true, initial: true)
+        try expectEqual(probe.count(), baseline, "First subscription must reuse the monitor's actual screen without another host read")
+        try expect(first.observedAt >= before && first.observedAt.timeIntervalSinceNow < -0.06, "Retain the real conservative observation time")
+        probe.change()
+        let live = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+        try expectEqual(probe.count(), baseline + 1, "The live stream must immediately read current output")
+        try expect(live.screen.contains("새 출력")); try expect(live.revision != first.revision)
+        try await Task.sleep(for: .milliseconds(2100))
+        _ = try await engine.remoteTerminal(sessionID: session.id, initial: true)
+        try expectEqual(probe.count(), baseline + 2, "Expired monitoring cannot stand in for a fresh first frame")
+        session.tty = "/dev/ttys081"; engine.updateDiscovery([session], records: records)
+        _ = try await engine.remoteTerminal(sessionID: session.id, initial: true)
+        try expectEqual(probe.count(), baseline + 3, "A different TTY must not inherit monitoring")
+        engine.disconnectTerminal()
+        do { _ = try await engine.remoteTerminal(sessionID: session.id, initial: true); throw AppError.message("Disconnected monitor accepted") }
+        catch { try expect(error is RemoteHTTPError) }
+    }
+
+    func testInitialTerminalRejectsChangedOriginalProcess() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-terminal-entry-life-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .terminal
+        let probe = RemoteReadProbe()
+        let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { probe.read($0.tty) }) }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [] }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records); await engine.connectTerminal()
+        let baseline = probe.count()
+        do { _ = try await engine.remoteTerminal(sessionID: session.id, initial: true); throw AppError.message("Ended process's monitored screen accepted") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        try expectEqual(probe.count(), baseline, "An old binding cannot read or expose a replacement terminal")
+        engine.updateDiscovery([], records: [])
+        do { _ = try await engine.remoteTerminal(sessionID: session.id, initial: true); throw AppError.message("Ended session accepted") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+    }
+
     func testRemoteTerminalReadStopsAtExactTarget() throws {
         let context = JSContext()!
         context.evaluateScript("""

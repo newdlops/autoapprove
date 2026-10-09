@@ -168,7 +168,8 @@ try{
     assert.equal(operations.at(-1).sessionID,'original');assert.equal(await page.locator('#automatic').isChecked(),true);await page.waitForTimeout(150);await capture(name+'-same-terminal');
   }
   checks.push('mobile/tablet/desktop screen taps send directly to the same original with automation ON');
-  online=false;await page.evaluate(()=>refreshNetwork());await page.waitForTimeout(100);assert.equal(clients.size,0);assert.equal(await page.locator('#terminal-keyboard-toggle').isDisabled(),true);
+  online=false;await page.evaluate(()=>refreshNetwork());await page.waitForTimeout(100);assert.equal(clients.size,1);assert.equal(await page.locator('#terminal-keyboard-toggle').isDisabled(),false);
+  checks.push('an inventory timeout retains the independently verified original stream and keyboard');
   online=true;release={version:'0.2.41',build:48,api:1};await page.evaluate(()=>refreshNetwork());await page.evaluate(()=>refreshFrame());await page.waitForFunction(()=>!!latestFrame);assert.ok(requests.poll>0);assert.equal(clients.size,0);assert.equal(requests.pty,0);
   checks.push('disconnect disables original input and older peers retain polling without fork offers');
   sources[0].session.phase='ended';oldCopies.push({...sources[0],session:{...sources[0].session,id:'pty:legacy-copy',pid:4300,tty:'/dev/fixture-copy',phase:'idle'},ptyID:'legacy-copy',pty:{ptyID:'legacy-copy',streamID:'legacy-copy-stream',pid:4300,tty:'/dev/fixture-copy',cwd:'/fixture/copied-terminal',program:'codex',columns:80,rows:24}});

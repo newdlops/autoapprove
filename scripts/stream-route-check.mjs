@@ -31,18 +31,20 @@ async function start(label, known = []) {
 async function json(url) { const response = await fetch(url,{signal:AbortSignal.timeout(8000)}); assert.equal(response.status,200); return response.json(); }
 const id = randomUUID(), sessionID = 'isolated-audit-session';
 const stats = {primaryStream:0,backupStream:0,backupState:0,posts:0};
+const activeStreams = new Set();
 let mode='closed', template, primaryURL, backupURL;
 function server(backup) {
   const instance = createServer((req,res) => {
     if(req.method !== 'GET') { stats.posts++; res.writeHead(405); res.end(); return; }
     if(req.headers['x-autoapprove-node'] && req.headers['x-autoapprove-node'] !== id) { res.writeHead(409); res.end(); return; }
     if(req.url.startsWith('/api/terminal/stream')) {
+      activeStreams.add(req.socket);req.socket.once('close',()=>activeStreams.delete(req.socket));
       if(!backup) {
         stats.primaryStream++;
         if(mode==='closed'){req.socket.destroy();return;}
-        if(mode==='stall'||mode==='cancel'){return;}
+        if(mode==='stall'||mode==='cancel'||mode==='cancel-both'){return;}
         if(mode==='denied'){const body=JSON.stringify({error:'QA explicit permission denial'});res.writeHead(403,{'Content-Length':Buffer.byteLength(body),Connection:'close'});res.end(body);return;}
-      } else stats.backupStream++;
+      } else {stats.backupStream++;if(mode==='cancel-both')return;}
       res.useChunkedEncodingByDefault = false;
       res.writeHead(200,{'Content-Type':'text/event-stream','X-AutoApprove-Node':(!backup&&mode==='identity')?randomUUID():id,Connection:'close'});
       const frame = {sessionID,screen:'Isolated read-only terminal',revision:'audit-1',observedAt:new Date().toISOString(),keys:[],streamID:'audit-stream'};
@@ -67,27 +69,30 @@ try {
   await new Promise(resolve=>backup.listen(0,'127.0.0.1',resolve));
   primaryURL = 'http://127.0.0.1:'+primary.address().port; backupURL = 'http://127.0.0.1:'+backup.address().port;
   const checks=[];
-  for(const fault of ['closed','stall','denied','identity','cancel']) {
+  for(const fault of ['fast','closed','stall','denied','identity','cancel','cancel-both']) {
     mode=fault; const before={...stats};
     const gateway=await start('gateway-'+fault,[{id,name:'Isolated peer',address:primaryURL,urls:[primaryURL,backupURL],port:primary.address().port,release:template.release,lastSeen:new Date().toISOString()}]);
     let online=false;
     for(let i=0;i<40&&!online;i++){online=(await json(gateway.url+'/api/network')).nodes.some(node=>node.id===id&&node.online);if(!online)await wait(100);}
     assert.ok(online,'Metadata/state must remain healthy');
     const controller=new AbortController(), started=performance.now();
-    let timer;if(fault==='cancel')timer=setTimeout(()=>controller.abort(),350);
+    let timer;if(fault.startsWith('cancel'))timer=setTimeout(()=>controller.abort(),fault==='cancel'?100:350);
+    let firstFrameMs=null;
     try {
       const response=await fetch(gateway.url+'/api/terminal/stream?node='+id+'&session='+sessionID,{signal:controller.signal});
-      if(['closed','stall'].includes(fault)) {
+      if(['fast','closed','stall'].includes(fault)) {
         assert.equal(response.status,200);assert.equal(response.headers.get('transfer-encoding'),null);
         const initial=await response.body.getReader().read();assert.match(new TextDecoder().decode(initial.value),/event: screen/);
-        assert.equal(stats.backupStream-before.backupStream,1);assert.ok(performance.now()-started<7000);controller.abort();
+        firstFrameMs=Math.round(performance.now()-started);
+        assert.equal(stats.backupStream-before.backupStream,fault==='fast'?0:1);assert.ok(firstFrameMs<900,'A stalled primary must not add its former two-second timeout');controller.abort();
       } else {
         assert.equal(response.status,fault==='denied'?403:502);await response.text();assert.equal(stats.backupStream-before.backupStream,0);
       }
-    } catch(error){if(fault!=='cancel'||!controller.signal.aborted)throw error;}
+    } catch(error){if(!fault.startsWith('cancel')||!controller.signal.aborted)throw error;}
     finally{clearTimeout(timer);controller.abort();}
-    await wait(400);assert.equal(stats.posts,0);if(fault==='cancel')assert.equal(stats.backupStream-before.backupStream,0);
-    checks.push({fault,elapsedMs:Math.round(performance.now()-started),backupRequests:stats.backupStream-before.backupStream});
+    await wait(400);assert.equal(stats.posts,0);assert.equal(activeStreams.size,0,'Cancelled or losing subscriptions must release all upstream sockets');
+    assert.equal(stats.primaryStream-before.primaryStream,1);if(fault==='cancel')assert.equal(stats.backupStream-before.backupStream,0);if(fault==='cancel-both')assert.equal(stats.backupStream-before.backupStream,1);
+    checks.push({fault,firstFrameMs,elapsedMs:Math.round(performance.now()-started),primaryRequests:stats.primaryStream-before.primaryStream,backupRequests:stats.backupStream-before.backupStream});
   }
   const report={result:'PASS',checks,posts:stats.posts,scope:'Release Swift Core; isolated loopback-only peers; no Bonjour, physical subnet scan or user CLI'};
   await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));

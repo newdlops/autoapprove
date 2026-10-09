@@ -36,6 +36,7 @@ import TerminalInputSupport
         var sourceRevision: UInt64?
     }
     private var remoteScreenReads: [String: RemoteScreenRead] = [:]
+    private var remoteMonitorFrames: [String: RemoteObservedScreen] = [:]
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
     private var remoteTerminalChanges: [String: RemoteTerminalChangeSignal] = [:]
     private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?)] = [:]
@@ -378,6 +379,7 @@ import TerminalInputSupport
         for pending in remoteInputReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 입력 전달 결과를 확인하지 못했습니다.")) }
         for pending in remoteRevealReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 원본 창 연결을 확인하지 못했습니다.")) }; remoteRevealReplies.removeAll()
         for pending in remoteScreenReads.values { pending.task.cancel() }
+        remoteMonitorFrames.removeAll()
         remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll(); screenAnalyses.removeAll()
         remoteTerminalChanges.values.forEach { $0.notify() }; remoteTerminalChanges.removeAll()
         for capture in nativeWindowCaptures.values { capture.invalidate() }
@@ -650,9 +652,27 @@ import TerminalInputSupport
         return nil
     }
 
-    private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter, realtime: Bool = false) async throws -> RemoteObservedScreen {
+    private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter,
+                                  realtime: Bool = false, initial: Bool = false) async throws -> RemoteObservedScreen {
         let target = ScreenTarget(tty: session.tty, handle: session.screenHandle)
         let generation = remoteGeneration(session, host: host)
+        // The monitor already read this exact original process. Only the first
+        // subscription can use it, with its real timestamp; later frames and
+        // input-triggered reads retain the tighter live-read cache.
+        if initial, !userInputHasPriority(session.id), [.terminal, .iterm].contains(host),
+           let observed = remoteMonitorFrames[session.id], observed.generation == generation,
+           (0..<2).contains(Date().timeIntervalSince(observed.observedAt)) {
+            let reader = processReader
+            let verified = try await Task.detached { try reader().contains {
+                $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/" + $0.tty == session.tty
+            } }.value
+            guard verified, let current = sessions[session.id], current.phase != .ended,
+                  remoteGeneration(current, host: host) == generation, remoteCanRead(current),
+                  remoteMonitorFrames[session.id]?.generation == generation else {
+                throw RemoteHTTPError(409, "원본 터미널 연결이 바뀌었습니다. 다시 연결해주세요.")
+            }
+            return observed
+        }
         let pending: RemoteScreenRead
         let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
         let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : nil
@@ -879,7 +899,8 @@ import TerminalInputSupport
         }
     }
 
-    public func remoteTerminal(sessionID: String, realtime: Bool = false, renderWindow: Bool = false) async throws -> RemoteTerminalFrame {
+    public func remoteTerminal(sessionID: String, realtime: Bool = false, renderWindow: Bool = false,
+                               initial: Bool = false) async throws -> RemoteTerminalFrame {
         guard let session = sessions[sessionID], session.phase != .ended else { throw RemoteHTTPError(409, "화면 연결이 없습니다. Mac의 연결 설정을 확인해주세요.") }
         let sourceCapture = [.terminal, .iterm].contains(session.terminal) ? nativeWindowCapture(for: session) : nil
         let capture = renderWindow ? sourceCapture ?? nativeWindowCapture(for: session) : nil
@@ -953,7 +974,7 @@ import TerminalInputSupport
             raw = ""; generation = remoteGeneration(session, host: host); observedAt = Date(); appearance = nil; cursor = nil
             outputReason = "연결 버튼을 눌러 원래 터미널의 출력과 입력을 연결해주세요. 새 터미널은 만들지 않습니다."
         } else if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
-            let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime)
+            let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime, initial: initial && !renderWindow)
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
             appearance = observed.appearance; cursor = observed.cursor
         } else {
@@ -2148,6 +2169,7 @@ import TerminalInputSupport
         if host == .tmux { tmuxRelay.stop() }
         for id in sessions.keys where sessions[id]?.terminal == host.kind {
             remoteScreenReads.removeValue(forKey: id)?.task.cancel(); remoteFrames.removeValue(forKey: id)
+            remoteMonitorFrames.removeValue(forKey: id)
         }
         updateHealth(host) { $0.status = "연결 해제됨"; $0.requested = false; $0.connected = false }
         do { try store.set(Self.enabledKey(host), "false") }
@@ -2173,6 +2195,7 @@ import TerminalInputSupport
         do {
             let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
             let reader = adapter.screens
+            let readStartedAt = Date()
             let result = try await Task.detached(priority: .utility) { try reader(requests) }.value
             guard screenConnections[host]?.enabled == true else { return }
             let targets = targets.filter { target in
@@ -2209,10 +2232,15 @@ import TerminalInputSupport
                         continue
                     }
                     sessions[target.id]?.terminalTitle = screen.title
+                    if [.terminal, .iterm].contains(host) {
+                        remoteMonitorFrames[target.id] = RemoteObservedScreen(raw: screen.contents,
+                            generation: remoteGeneration(target, host: host), observedAt: readStartedAt,
+                            appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents))
+                    }
                     if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
                         if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
                         sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance)
+                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor)
                     }
                 }
                 publish()
@@ -2829,6 +2857,7 @@ import TerminalInputSupport
     }
 
     private func clearScreen(_ id: String, keepRemote: Bool = false) {
+        remoteMonitorFrames.removeValue(forKey: id)
         // A failed background monitor clears approval observations, not the
         // independent exact-target web stream. Its frames still expire and
         // every input validates the original process, TTY and foreground job.

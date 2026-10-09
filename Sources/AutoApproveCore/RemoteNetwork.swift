@@ -891,13 +891,13 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
-                    let frame = try await engine.remoteTerminal(sessionID: id, renderWindow: request.parameter("view") == "screen")
+                    let frame = try await engine.remoteTerminal(sessionID: id, renderWindow: request.parameter("view") == "screen", initial: request.parameter("initial") == "1")
                     return try .json(RemoteTerminalUpdate(frame, knownRevision: request.parameter("revision")))
                 case "/api/terminal/stream":
                     if let forwarded = try await forwardStream(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
                     let renderWindow = request.parameter("view") == "screen"
-                    let frame = try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)
+                    let frame = try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow, initial: true)
                     let tmuxObservation = try engine.remoteTmuxObservation(sessionID: id)
                     let observation = engine.remoteTerminalObservation(sessionID:id)
                     let wakeup: @Sendable (TimeInterval) async -> Void
@@ -991,22 +991,36 @@ struct RemoteTerminalUpdate: Encodable {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let epoch = generation
         let endpoints = Array(peerEndpoints(peer).prefix(2)), deadline = ProcessInfo.processInfo.systemUptime + 7
-        for (index, endpoint) in endpoints.enumerated() {
-            try Task.checkCancellation()
-            let remaining = max(0.05, deadline - ProcessInfo.processInfo.systemUptime)
-            let output = try RemotePTYPeerBodyStream(endpoint: endpoint, path: forwardedPath(request), expectedNodeID: peer.id,
-                timeout: index == 0 && endpoints.count > 1 ? min(2, remaining / 2) : remaining)
-            do {
-                try await output.open()
-                guard running, generation == epoch, !Task.isCancelled else { throw CancellationError() }
-                if peers[peer.id]?.endpoint == peer.endpoint { peers[peer.id]?.preferredEndpoint = endpoint }
-                return .eventStream(output, nodeID: nodeID)
-            } catch {
-                output.cancel()
-                if index == endpoints.count - 1 || !RemoteReadRecovery.isTransient(error) { throw error }
+        // Only read subscriptions race. A working primary stays alone; a stalled
+        // Wi-Fi/VPN route must not consume two seconds before trying the other LAN.
+        let opened = try await withThrowingTaskGroup(of: (NWEndpoint, RemotePTYPeerBodyStream).self) { group in
+            for (index, endpoint) in endpoints.enumerated() {
+                let path = forwardedPath(request), expectedID = peer.id
+                group.addTask {
+                    if index > 0 { try await Task.sleep(for: .milliseconds(200)) }
+                    try Task.checkCancellation()
+                    let output = try RemotePTYPeerBodyStream(endpoint: endpoint, path: path, expectedNodeID: expectedID,
+                        timeout: max(0.05, deadline - ProcessInfo.processInfo.systemUptime))
+                    do {
+                        try await output.open(); try Task.checkCancellation()
+                        return (endpoint, output)
+                    } catch { output.cancel(); throw error }
+                }
             }
+            var lastError: Error = RemoteHTTPError(503, "Mac의 스트림 연결을 확인해주세요.")
+            while !group.isEmpty {
+                do {
+                    if let result = try await group.next() { group.cancelAll(); return result }
+                } catch {
+                    if !RemoteReadRecovery.isTransient(error) { group.cancelAll(); throw error }
+                    lastError = error
+                }
+            }
+            throw lastError
         }
-        throw RemoteHTTPError(503, "Mac의 스트림 연결을 확인해주세요.")
+        guard running, generation == epoch, !Task.isCancelled else { opened.1.cancel(); throw CancellationError() }
+        if peers[peer.id]?.endpoint == peer.endpoint { peers[peer.id]?.preferredEndpoint = opened.0 }
+        return .eventStream(opened.1, nodeID: nodeID)
     }
     private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
         let components = request.components
