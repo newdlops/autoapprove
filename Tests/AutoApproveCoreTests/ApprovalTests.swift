@@ -406,6 +406,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Codex MCP tool permission: two-choice Allow/Cancel, colors and wrapping", tests.testCodexMCPToolPermissionWithTwoChoices),
+            ("Codex MCP tool permission: escaped payloads, JSON and exact Terminal/iTerm delivery", tests.testCodexMCPToolPermissionEscapesAndExactDelivery),
+            ("Codex MCP tool permission: concurrent isolation and single use", tests.testCodexMCPToolPermissionConcurrentAndSingleUse),
             ("Codex terminal input permission: literal escapes survive screen JSON, cells and delivery", tests.testCodexTerminalInputEscapesSurviveScreenAndDelivery),
             ("Codex terminal input permission: complete title, wrapping and literal payload", tests.testCodexTerminalInputPermissionAndWrapping),
             ("Codex terminal input permission: inactive, incomplete and changed requests", tests.testCodexTerminalInputPermissionBoundsAndIdentity),

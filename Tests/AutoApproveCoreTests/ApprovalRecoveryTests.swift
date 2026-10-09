@@ -127,6 +127,31 @@ extension ApprovalTests {
         try expectEqual(probe.inputs.filter { $0.0.tty == sessions[1].tty }.map { $0.1 }, [second])
     }
 
+    func testCodexMCPToolPermissionConcurrentAndSingleUse() async throws {
+        let probe = ApprovalRecoveryProbe()
+        let (engine, sessions, directory) = try recoveryEngine(probe, agents: [.codex, .codex])
+        defer { probe.release(); engine.stop(); try? FileManager.default.removeItem(at: directory) }
+        probe.blockedTTY = sessions[0].tty
+        let first = codexMCPToolPermissionFixture
+        let second = first.replacingOccurrences(of: "fixture_tool", with: "another_tool")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: first, generation: "first-process")
+        try await waitForRecovery({ probe.inputs.count == 1 }, "The two-choice Allow permission must dispatch")
+        engine.receiveScreen(sessionID: sessions[1].id, raw: second, generation: "second-process")
+        try await waitForRecovery({ probe.inputs.count == 2 }, "A concurrent Allow in another session must dispatch independently")
+        let reflow = first.replacingOccurrences(of: "fixture MCP server", with: "fixture MCP\n  server")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: "Earlier output\n" + reflow, generation: "first-process")
+        probe.release()
+        try await waitForRecovery({ engine.snapshot.events.filter { $0.outcome == "승인 입력 전달" }.count == 2 }, "Both independent approvals must complete")
+        engine.receiveScreen(sessionID: sessions[0].id, raw: reflow, generation: "first-process")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expectEqual(probe.inputs.count, 2, "Reflow and polling cannot repeat the same approval")
+        let next = first.replacingOccurrences(of: #"\u{4}"#, with: #"\u{3}"#)
+        engine.receiveScreen(sessionID: sessions[0].id, raw: next, generation: "first-process")
+        try await waitForRecovery({ probe.inputs.count == 3 }, "A changed literal argument identifies the next request")
+        try expectEqual(probe.inputs.filter { $0.0.tty == sessions[0].tty }.map { $0.1 }, [first, next])
+        try expectEqual(probe.inputs.filter { $0.0.tty == sessions[1].tty }.map { $0.1 }, [second])
+    }
+
     func testPermissionDetectionAcrossTerminalGridSizes() throws {
         func wrapWords(_ text: String, width: Int) -> String {
             var rows = [String](), row = ""

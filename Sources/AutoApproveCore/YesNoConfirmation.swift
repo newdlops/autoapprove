@@ -69,9 +69,11 @@ public struct YesNoConfirmation {
     }
 
     /// Codex renders tool permission labels and descriptions in two columns. Match
-    /// only these complete descriptions, including when a narrow terminal wraps them.
+    /// only complete known phrases. Terminal cells can wrap inside a word, so the
+    /// added line-boundary space must not change those phrases' meaning.
     private static func permissionLabel(_ value: String) -> String {
         let text = cleaned(value)
+        let compact = text.filter { !$0.isWhitespace }
         let descriptions = [
             ("Allow", "Run the tool and continue."),
             ("Allow for this session", "Run the tool and remember this choice for this session."),
@@ -79,14 +81,18 @@ public struct YesNoConfirmation {
             ("Allow and don't ask me again", "Run the tool and remember this choice for future tool calls."),
             ("Cancel", "Cancel this tool call.")
         ]
-        for (label, description) in descriptions where text.caseInsensitiveCompare(cleaned(label + " " + description)) == .orderedSame {
-            return label
+        for (label, description) in descriptions {
+            for phrase in [label, cleaned(label + " " + description)] where compact.caseInsensitiveCompare(phrase.filter { !$0.isWhitespace }) == .orderedSame {
+                return label
+            }
         }
         return text
     }
 
     static func isToolPermissionMenu(_ labels: [String]) -> Bool {
         let labels = labels.map { permissionLabel($0).lowercased() }
+        // MCP servers without remembered permission scopes show only Allow/Cancel.
+        if labels == ["allow", "cancel"] { return true }
         return labels.count == 4 && labels[0] == "allow" && labels[1] == "allow for this session"
             && ["always allow", "allow and don't ask me again"].contains(labels[2]) && labels[3] == "cancel"
     }

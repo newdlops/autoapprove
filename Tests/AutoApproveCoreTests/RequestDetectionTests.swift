@@ -5,6 +5,17 @@ import AutoApproveCore
 private let permissionFixture = "Would you like to run the following command?\n\n  $ echo 한글\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nEnter to confirm or esc to cancel"
 private let claudePermissionFixture = "Bash command\n  echo 한글\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel"
 private let questionFixture = "어떤 환경을 사용할까요?\n❯ 1. 개발 환경\n  2. 테스트 환경\nEnter to select · Esc to cancel"
+// Sanitized shape of the observed two-choice MCP permission (no remembered scopes).
+let codexMCPToolPermissionFixture = #"""
+  Allow the fixture MCP server to run tool "fixture_tool"?
+
+  Arguments: {"text":"\u{4}"}
+
+  › 1. Allow   Run the tool and continue
+    2. Cancel  Cancel this tool call
+
+  enter to submit | esc to cancel
+"""#
 let codexTerminalInputPermissionFixture = #"""
 Would you like to send input to terminal 75522?
 
@@ -87,6 +98,78 @@ private let claudeCreatePermissionFixture = """
 """
 
 extension ApprovalTests {
+    func testCodexMCPToolPermissionWithTwoChoices() throws {
+        let original = codexMCPToolPermissionFixture
+        let variants = [original,
+            original.replacingOccurrences(of: "Allow the fixture MCP server to run tool", with: "Allow the fixture MCP server\n  to run tool"),
+            original.replacingOccurrences(of: "Run the tool and continue", with: "Run the tool and\n               continue."),
+            original.replacingOccurrences(of: "   Run the tool and continue", with: "")
+                .replacingOccurrences(of: "  Cancel this tool call", with: ""),
+            original.replacingOccurrences(of: "enter to submit | esc to cancel", with: "Enter to submit\n  | Esc to cancel"),
+            original.replacingOccurrences(of: "Allow the fixture MCP server to run tool \"fixture_tool\"?", with: "Approve app tool call?"),
+            original.replacingOccurrences(of: "\n", with: "\r\n")]
+        for frame in variants {
+            let prompt = PromptDetector.detect(frame, agent: .codex)
+            try expectEqual(prompt?.answer, "1", "A complete Allow/Cancel tool permission must be recognized")
+            try expectEqual(prompt?.dialog, frame.replacingOccurrences(of: "\r\n", with: "\n"), "Keep exact request bytes for final validation")
+        }
+        try expectEqual(QuestionDetector.detect(original, agent: .codex)?.phase, .approval)
+        for columns in [24, 40, 80, 160] {
+            let grid = try OriginalTerminalScreen.render(ansi: "\u{1B}[36m" + original.replacingOccurrences(of: "\n", with: "\r\n") + "\u{1B}[0m", columns: columns, rows: 40, tty: "/dev/fixture")
+            try expectEqual(PromptDetector.detect(grid.contents, agent: .codex)?.answer, "1", "Colored \(columns)-column terminal cells")
+        }
+        let cancelled = original.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "  2.", with: "› 2.")
+        for invalid in [cancelled,
+            original.replacingOccurrences(of: "enter to submit | esc to cancel", with: ""),
+            original.replacingOccurrences(of: "Run the tool and continue", with: "Run another tool instead"),
+            original.replacingOccurrences(of: "Allow   Run", with: "Always allow   Run"),
+            original.replacingOccurrences(of: "Allow   Run", with: #"\u0041llow   Run"#),
+            original.replacingOccurrences(of: "Allow the fixture", with: "Allowing the fixture"),
+            original.replacingOccurrences(of: "    2.", with: "  › 2."),
+            original.replacingOccurrences(of: "\n  enter", with: "\n    3. Choose another tool\n  enter"),
+            original + "\n› Another message", "```\n" + original + "\n```"] {
+            try expectNil(PromptDetector.detect(invalid, agent: .codex))
+        }
+        try expectEqual(QuestionDetector.detect(cancelled, agent: .codex)?.phase, .approval)
+    }
+
+    func testCodexMCPToolPermissionEscapesAndExactDelivery() throws {
+        for payload in [#"\u{4}"#, #"\u0004"#, #"\x04"#, #"\u0041llow"#, #"\u001b[31mYes\u001b[0m"#, #"\n\t\\\""#] {
+            let original = codexMCPToolPermissionFixture.replacingOccurrences(of: #"\u{4}"#, with: payload)
+                .replacingOccurrences(of: "fixture_tool", with: #"fixture\"tool\\name"#)
+            // A JSON escape for the selection arrow is decoded once at the transport boundary.
+            let encoded = String(decoding: try JSONSerialization.data(withJSONObject: ["screen": original]), as: UTF8.self)
+                .replacingOccurrences(of: "›", with: #"\u203a"#)
+            let decoded = try JSONSerialization.jsonObject(with: Data(encoded.utf8)) as! JSONObject
+            let screen = decoded["screen"] as! String
+            try expect(screen.utf8.elementsEqual(original.utf8), "JSON decoding must not recursively interpret printed escapes")
+            let prompt = PromptDetector.detect(screen, agent: .codex)
+            try expectEqual(prompt?.answer, "1")
+            try expectEqual(prompt?.dialog, original)
+            for iterm in [false, true] {
+                let context = JSContext()!
+                context.setObject(screen, forKeyedSubscript: "current" as NSString)
+                context.evaluateScript("""
+                var writes = [];
+                const session = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex'],
+                  variable: () => 42, rows: () => 100, write: value => writes.push(value.text)};
+                const tab = {...session, sessions: () => [session]};
+                function Application() { return {running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
+                """)
+                let script = iterm
+                    ? try ITermAdapter.approvalScript(target: ScreenTarget(tty: "/dev/fixture", jobPIDs: [42]), expectedScreen: screen, agent: .codex)
+                    : try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: screen, agent: .codex)
+                try expectEqual(context.evaluateScript(script)?.toString(), "sent", "Escaped tool names and arguments survive final validation")
+                try expectNil(context.exception)
+                try expectEqual(context.evaluateScript("writes.join(',')")?.toString(), "1", "Only the approval choice is delivered")
+                context.setObject(screen.replacingOccurrences(of: payload, with: "\u{4}"), forKeyedSubscript: "current" as NSString)
+                try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged", "Literal escape text must differ from a real control byte")
+                try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
+            }
+            try expect(PromptDetector.detect(screen.replacingOccurrences(of: payload, with: "other argument"), agent: .codex)?.requestIdentity != prompt?.requestIdentity)
+        }
+    }
+
     func testCodexTerminalInputEscapesSurviveScreenAndDelivery() throws {
         for payload in [#"\u{4}"#, #"\u0004"#, #"\x04"#, #"\u{1b}[31m"#, #"\n\t"#] {
             let original = codexTerminalInputPermissionFixture.replacingOccurrences(of: #"\u{4}"#, with: payload)
