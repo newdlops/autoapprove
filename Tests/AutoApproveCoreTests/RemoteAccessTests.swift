@@ -44,7 +44,40 @@ private final class RemoteReadProbe: @unchecked Sendable {
     func change() { lock.lock(); raw += "\n새 출력"; lock.unlock() }
 }
 
+@MainActor private final class RemotePermissionProbe {
+    var full = 0, automation = 0, keyboard = 0
+    var automationAllowed = true
+}
+
 extension ApprovalTests {
+    func testTargetedOriginalProcessReadMatchesDiscovery() throws {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let all = try ProcessDiscovery.read()
+        let selected = try ProcessDiscovery.read(pid: pid)
+        try expectEqual(selected.count, 1)
+        try expectEqual(selected.first, all.first { $0.pid == pid }, "Targeted verification retains the original PID/start/TTY/executable fields")
+        let ended = Process(); ended.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try ended.run(); ended.waitUntilExit()
+        try expect(try ProcessDiscovery.read(pid: ended.processIdentifier).isEmpty, "A process that ended cannot supply a replacement identity")
+        try expectThrows(ProcessDiscovery.read(pid: 0))
+    }
+
+    func testCommandRunnerExitTimeoutAndConcurrentPipes() throws {
+        for _ in 0..<20 {
+            let result = try CommandRunner.run("/usr/bin/true", [])
+            try expectEqual(result.status, 0); try expectEqual(result.output, ""); try expectEqual(result.error, "")
+        }
+        let text = "한글 🧪\n" + String(repeating: "pipe-data", count: 20_000)
+        let echoed = try CommandRunner.run("/bin/cat", [], input: Data(text.utf8))
+        try expectEqual(echoed.output, text); try expectEqual(echoed.status, 0)
+        let both = try CommandRunner.run("/bin/sh", ["-c", "i=0; while [ $i -lt 10000 ]; do printf stdout; printf stderr >&2; i=$((i+1)); done; exit 7"])
+        try expectEqual(both.status, 7); try expectEqual(both.output.count, 60_000); try expectEqual(both.error.count, 60_000)
+        let started = ProcessInfo.processInfo.systemUptime
+        do { _ = try CommandRunner.run("/bin/sleep", ["2"], timeout: 0.05); throw AppError.message("Child timeout was ignored") }
+        catch let error as AppError { try expect(error.localizedDescription.contains("초과")) }
+        try expect(ProcessInfo.processInfo.systemUptime - started < 1.5, "Waiting for completion must still enforce the command's timeout")
+    }
+
     func testRemotePreferredPeerAddressKeepsSharedWiFiRoute() throws {
         let wifi = RemoteLANInterface(name: "en0", address: "192.168.43.2", netmask: "255.255.255.0", kind: .wifi)
         let ethernet = RemoteLANInterface(name: "en7", address: "10.2.3.4", netmask: "255.255.255.0", kind: .ethernet)
@@ -55,6 +88,8 @@ extension ApprovalTests {
         let chosen = RemoteLAN.preferredEndpoint(bonjour, addresses: advertised, port: 8765, interfaces: [ethernet, wifi])
         try expectEqual(chosen, wifiPeer, "An Ethernet-first advertisement must still use the shared Wi-Fi subnet")
         let parameters = try RemoteLAN.tcpParameters(to: chosen, interfaces: [ethernet, wifi])
+        try expect((parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.noDelay == true,
+            "LAN terminal traffic must not wait to batch small TCP writes")
         try expectEqual(parameters.requiredInterfaceType, .wifi)
         try expectEqual(parameters.requiredLocalEndpoint, .hostPort(host: "192.168.43.2", port: .any))
         let wiredParameters = try RemoteLAN.tcpParameters(to:ethernetPeer,interfaces:[wifi,ethernet])
@@ -177,6 +212,18 @@ extension ApprovalTests {
         try expectEqual(compact.status, 200)
         let object = try JSONSerialization.jsonObject(with: compact.body) as! JSONObject
         try expectNil(object["screen"]); try expectNil(object["appearance"])
+        query.path = "/api/terminal/stream"; query.queryItems = [URLQueryItem(name: "session", value: session.id)]
+        let streamRequest = try RemoteHTTPRequest.parse(Data("GET \(query.string!) HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8))!
+        let streamed = await service.handle(streamRequest)
+        try expectEqual(streamed.status, 200)
+        let event = String(decoding: streamed.body, as: UTF8.self)
+        try expect(event.hasPrefix("event: screen\n"), "The prepared first screen must be part of the HTTP response's initial write")
+        guard let dataLine = event.components(separatedBy: "\n").first(where: { $0.hasPrefix("data: ") }) else {
+            throw AppError.message("First screen event has no JSON data")
+        }
+        let initial = try JSONSerialization.jsonObject(with: Data(dataLine.dropFirst(6).utf8)) as! JSONObject
+        try expectEqual(initial["sessionID"] as? String, session.id); try expectEqual(initial["screen"] as? String, raw)
+        try expectEqual(initial["revision"] as? String, next.revision)
         engine.receiveScreen(sessionID: session.id, raw: raw, generation: "color-generation")
         let plain = try await engine.remoteTerminal(sessionID: session.id)
         try expectNil(plain.appearance); try expect(plain.revision != next.revision)
@@ -282,6 +329,40 @@ extension ApprovalTests {
         engine.updateDiscovery([], records: [])
         do { _ = try await engine.remoteTerminal(sessionID: session.id, initial: true); throw AppError.message("Ended session accepted") }
         catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+    }
+
+    func testTextTerminalChecksOnlyRequiredPermissions() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-text-permissions-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .terminal
+        let probe = RemotePermissionProbe(), screens = RemoteReadProbe()
+        let capture = TerminalWindowCapture(permissions: {
+            probe.full += 1
+            return TerminalWindowPermissions(screen: false, keyboard: false, automation: probe.automationAllowed)
+        }, automationPermission: { probe.automation += 1; return probe.automationAllowed },
+           keyboardPermission: { probe.keyboard += 1; return false })
+        let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { screens.read($0.tty) }) }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records },
+            screenAdapters: [.terminal: adapter], terminalWindowCapture: capture, terminalInputAvailable: { false })
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records); await engine.connectTerminal()
+        probe.full = 0; probe.automation = 0; probe.keyboard = 0
+        let first = try await engine.remoteTerminal(sessionID: session.id, initial: true)
+        try expect(!first.screen.isEmpty); try expectNil(first.nativeDisplay)
+        try expectEqual(probe.full, 0, "Text streaming must not query screen recording or accessibility")
+        try expectEqual(probe.automation, 1); try expectEqual(probe.keyboard, 0)
+        probe.automationAllowed = false
+        let denied = try await engine.remoteTerminal(sessionID: session.id, initial: true)
+        try expect(denied.keys.isEmpty); try expectEqual(denied.screen, "")
+        try expectEqual(probe.full, 0); try expectEqual(probe.automation, 2, "Recheck live Automation permission even on a cached screen")
+        probe.automationAllowed = true
+        let native = try await engine.remoteTerminal(sessionID: session.id, renderWindow: true)
+        try expectEqual(native.nativeDisplay?.state, .permissionRequired)
+        try expect(probe.full > 0, "Explicit native preview must retain all capture permission checks")
+        try expect(!capture.keyboardPermissionGranted); try expectEqual(probe.keyboard, 1)
+        let legacy = TerminalWindowCapture(permissions: { TerminalWindowPermissions(screen: false, keyboard: false, automation: false) })
+        try expect(!legacy.nonpromptAutomationGranted); try expect(!legacy.keyboardPermissionGranted)
     }
 
     func testRemoteTerminalReadStopsAtExactTarget() throws {

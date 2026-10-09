@@ -74,6 +74,7 @@ import TerminalInputSupport
     private let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
+    private let remoteProcessVerifier: @Sendable (AgentSession) throws -> Bool
     private var claudeParents: [String: String] = [:]
     private var recoveredClaudeStates = Set<String>()
     private var claudeHookObservedAt: [String: Date] = [:]
@@ -219,7 +220,7 @@ import TerminalInputSupport
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: @escaping @Sendable () throws -> [ProcessRecord] = { try ProcessDiscovery.read() }, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
+    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live) throws {
         self.paths = paths
@@ -236,7 +237,13 @@ import TerminalInputSupport
         self.questionTransport = questionTransport
         self.codexQueue = codexQueue
         self.claudeRegistryReader = claudeRegistryReader
-        self.processReader = processReader
+        self.processReader = processReader ?? { try ProcessDiscovery.read() }
+        self.remoteProcessVerifier = { session in
+            let records = try processReader.map { try $0() } ?? ProcessDiscovery.read(pid: session.pid)
+            return records.contains {
+                $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/" + $0.tty == session.tty
+            }
+        }
         self.requestTerminalKeyboardPermission = requestTerminalKeyboardPermission ?? { _ = TerminalKeyboard.requestPermission() }
         self.terminalInputAvailable = terminalInputAvailable ?? { TerminalInputClient.shared.isAvailable }
         self.terminalInputIdentity = terminalInputIdentity ?? { try? TTYInputIdentity.capture(pid: $0) }
@@ -662,10 +669,8 @@ import TerminalInputSupport
         if initial, !userInputHasPriority(session.id), [.terminal, .iterm].contains(host),
            let observed = remoteMonitorFrames[session.id], observed.generation == generation,
            (0..<2).contains(Date().timeIntervalSince(observed.observedAt)) {
-            let reader = processReader
-            let verified = try await Task.detached { try reader().contains {
-                $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/" + $0.tty == session.tty
-            } }.value
+            let verifier = remoteProcessVerifier
+            let verified = try await Task.detached { try verifier(session) }.value
             guard verified, let current = sessions[session.id], current.phase != .ended,
                   remoteGeneration(current, host: host) == generation, remoteCanRead(current),
                   remoteMonitorFrames[session.id]?.generation == generation else {

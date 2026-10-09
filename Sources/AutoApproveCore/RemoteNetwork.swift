@@ -903,12 +903,14 @@ struct RemoteTerminalUpdate: Encodable {
                     let wakeup: @Sendable (TimeInterval) async -> Void
                     if let tmuxObservation { wakeup = { interval in await tmuxObservation.waitForChange(timeout:interval) } }
                     else { wakeup = { interval in await observation.waitForChange(timeout:interval) } }
-                    let output = try RemoteTerminalBodyStream(initial: frame, waitForChange: wakeup,
+                    let output = try RemoteTerminalBodyStream(initial: frame, emitInitial: false, waitForChange: wakeup,
                         responsive: { [weak engine] in engine?.remoteTerminalNeedsResponsiveRead(id) ?? false }) { [weak engine] in
                         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
                         return try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)
                     }
-                    return .eventStream(output, nodeID: nodeID)
+                    // The verified first event is ready. Send it with the headers,
+                    // without another main-actor hop or a second small TCP write.
+                    return .eventStream(output, nodeID: nodeID, initialData: output.initialEvent)
                 case "/api/pty/stream", "/api/pty/output":
                     if request.path == "/api/pty/stream" {
                         if let forwarded = try await forwardStream(request) { return forwarded }

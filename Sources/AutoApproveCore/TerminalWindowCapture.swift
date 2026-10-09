@@ -63,6 +63,8 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
     private let ownerBundleID: String
     private let requiresAccessibilityForMetadata: Bool
     private let permissions: @MainActor @Sendable () -> TerminalWindowPermissions
+    private let automationPermission: @MainActor @Sendable () -> Bool
+    private let keyboardPermission: @MainActor @Sendable () -> Bool
     private let request: @MainActor @Sendable () -> Void
     private let metadata: @Sendable (String) async throws -> TerminalWindowMetadata?
     private let captureImage: @Sendable (TerminalWindowMetadata) async throws -> TerminalNativeImage
@@ -80,6 +82,8 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
                 ownerBundleID: String? = nil,
                 requiresAccessibilityForMetadata: Bool = false,
                 permissions: (@MainActor @Sendable () -> TerminalWindowPermissions)? = nil,
+                automationPermission: (@MainActor @Sendable () -> Bool)? = nil,
+                keyboardPermission: (@MainActor @Sendable () -> Bool)? = nil,
                 requestPermissions: (@MainActor @Sendable () -> Void)? = nil,
                 metadata: (@Sendable (String) async throws -> TerminalWindowMetadata?)? = nil,
                 capture: (@Sendable (TerminalWindowMetadata) async throws -> TerminalNativeImage)? = nil) {
@@ -87,6 +91,12 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         let expectedOwner = ownerBundleID ?? host.bundleID
         self.ownerBundleID = expectedOwner; self.requiresAccessibilityForMetadata = requiresAccessibilityForMetadata
         self.permissions = permissions ?? { Self.livePermissions(host) }
+        if let automationPermission { self.automationPermission = automationPermission }
+        else if let permissions { self.automationPermission = { permissions().automation } }
+        else { self.automationPermission = { Self.liveAutomationPermission(host) } }
+        if let keyboardPermission { self.keyboardPermission = keyboardPermission }
+        else if let permissions { self.keyboardPermission = { permissions().keyboard } }
+        else { self.keyboardPermission = { TerminalKeyboard.isAvailable } }
         self.request = requestPermissions ?? {
             if requiresAccessibilityForMetadata { _ = TerminalKeyboard.requestPermission() }
             _ = Self.requestScreenPermission()
@@ -95,8 +105,8 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         self.captureImage = capture ?? { try await Self.captureVerifiedWindow($0, ownerBundleID: expectedOwner) }
     }
     deinit { for value in pending.values { value.task.cancel(); value.validation?.task.cancel() } }
-    public var keyboardPermissionGranted: Bool { permissions().keyboard }
-    public var nonpromptAutomationGranted: Bool { permissions().automation }
+    public var keyboardPermissionGranted: Bool { keyboardPermission() }
+    public var nonpromptAutomationGranted: Bool { automationPermission() }
     public func requestPermissions() { request(); invalidate() }
     public func invalidate() {
         for value in pending.values { value.task.cancel(); value.validation?.task.cancel() }; pending.removeAll()
@@ -111,11 +121,14 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         return TerminalNativeDisplay(state: .permissionRequired,
             message: "Mac의 시스템 설정 → 개인정보 보호 및 보안에서 AutoApprove의 \(missing.joined(separator: " · ")) 권한을 허용해주세요. 연결 버튼을 누르면 원래 터미널에 다시 연결합니다.")
     }
-    private static func livePermissions(_ host: ScreenHost) -> TerminalWindowPermissions {
+    private static func liveAutomationPermission(_ host: ScreenHost) -> Bool {
         let descriptor = NSAppleEventDescriptor(bundleIdentifier: host.bundleID)
         // This preflight cannot open the app or ask for Automation consent.
-        let automation = AEDeterminePermissionToAutomateTarget(descriptor.aeDesc, typeWildCard, typeWildCard, false) == noErr
-        return TerminalWindowPermissions(screen: screenPermissionGranted, keyboard: TerminalKeyboard.isAvailable, automation: automation)
+        return AEDeterminePermissionToAutomateTarget(descriptor.aeDesc, typeWildCard, typeWildCard, false) == noErr
+    }
+    private static func livePermissions(_ host: ScreenHost) -> TerminalWindowPermissions {
+        TerminalWindowPermissions(screen: screenPermissionGranted, keyboard: TerminalKeyboard.isAvailable,
+            automation: liveAutomationPermission(host))
     }
 
     public func read(_ target: TerminalCaptureTarget, validateIdentity: @escaping @Sendable () throws -> Bool) async throws -> TerminalNativeDisplay {

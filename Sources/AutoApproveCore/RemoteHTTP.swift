@@ -154,8 +154,8 @@ public struct RemoteHTTPResponse: Sendable {
         if let diagnostics = (error as? RemoteHTTPError)?.diagnostics { value["diagnostics"] = diagnostics }
         return (try? object(value, status: status)) ?? Self(status: 500, body: Data())
     }
-    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String) -> Self {
-        var response = Self(body: Data(), contentType: "text/event-stream; charset=utf-8")
+    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String, initialData: Data = Data()) -> Self {
+        var response = Self(body: initialData, contentType: "text/event-stream; charset=utf-8")
         response.stream = stream; response.nodeID = nodeID; return response
     }
     var wire: Data {
@@ -165,7 +165,7 @@ public struct RemoteHTTPResponse: Sendable {
         let length = stream == nil ? "Content-Length: \(body.count)\r\n" : ""
         let identity = nodeID.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
-        return Data(headers.utf8) + (stream == nil ? body : Data())
+        return Data(headers.utf8) + body
     }
 }
 

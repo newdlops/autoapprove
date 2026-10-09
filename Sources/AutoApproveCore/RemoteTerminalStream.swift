@@ -14,6 +14,7 @@ extension RemoteServerEvent {
 /// slow consumers skip intermediate snapshots rather than accumulate output.
 @MainActor final class RemoteTerminalBodyStream: RemoteHTTPBodyStream {
     nonisolated let needsHeartbeat = true
+    let initialEvent: Data
     private struct Controls: Equatable {
         let keys: [String]
         let reason: String?
@@ -37,10 +38,13 @@ extension RemoteServerEvent {
     private var cancelled = false
     private var unchanged = 0
 
-    init(initial: RemoteTerminalFrame, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
+    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
          responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
-        _ = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
-        self.initial = initial; self.read = read
+        initialEvent = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
+        self.initial = emitInitial ? initial : nil; self.read = read
+        if !emitInitial {
+            revision = initial.revision; controls = Controls(initial); emittedAt = Date()
+        }
         self.waitForChange = waitForChange
         self.responsive = responsive
     }

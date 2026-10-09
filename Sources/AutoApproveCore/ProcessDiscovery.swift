@@ -31,7 +31,7 @@ public enum CommandRunner {
         group.enter()
         DispatchQueue.global().async { err = stderr.fileHandleForReading.readDataToEndOfFile(); group.leave() }
         let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.002) }
         if process.isRunning { process.terminate(); throw AppError.message("명령 응답 시간이 초과되었습니다: \(URL(fileURLWithPath: executable).lastPathComponent)") }
         group.wait()
         return CommandResult(output: String(decoding: out, as: UTF8.self), error: String(decoding: err, as: UTF8.self), status: process.terminationStatus)
@@ -72,6 +72,15 @@ public enum ProcessDiscovery {
         let result = try CommandRunner.run("/bin/ps", ["-axo", "pid=,ppid=,tty=,pgid=,tpgid=,lstart=,comm="], environment: ["LC_ALL": "C", "LANG": "C"])
         guard result.status == 0 else { throw AppError.message("프로세스 목록을 읽지 못했습니다. \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))") }
         return parse(result.output)
+    }
+    /// Fresh, read-only verification of one original process uses the same
+    /// fields and locale as discovery without scanning unrelated processes.
+    public static func read(pid: Int32) throws -> [ProcessRecord] {
+        guard pid > 0 else { throw AppError.message("올바른 프로세스 ID가 필요합니다.") }
+        let result = try CommandRunner.run("/bin/ps", ["-p", String(pid), "-o", "pid=,ppid=,tty=,pgid=,tpgid=,lstart=,comm="], environment: ["LC_ALL": "C", "LANG": "C"])
+        if result.status == 1 && result.output.isEmpty && result.error.isEmpty { return [] }
+        guard result.status == 0 else { throw AppError.message("원본 프로세스를 확인하지 못했습니다. \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        return parse(result.output).filter { $0.pid == pid }
     }
     public static func ancestors(of pid: Int32, records: [ProcessRecord]) -> [ProcessRecord] {
         let byID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })

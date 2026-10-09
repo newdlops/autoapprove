@@ -122,7 +122,9 @@ public enum RemoteLAN {
         return ordered(interfaces).filter { $0.contains(host) }.sorted { ($0.mask ?? 0) > ($1.mask ?? 0) }.first
     }
     public static func tcpParameters() -> NWParameters {
-        let parameters = NWParameters.tcp
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcp)
         parameters.includePeerToPeer = false
         parameters.prohibitedInterfaceTypes = [.other, .cellular]
         return parameters
