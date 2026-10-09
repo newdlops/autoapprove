@@ -123,7 +123,7 @@ import TerminalInputSupport
         lazy var prompt = PromptDetector.detect(raw, agent: agent)
         lazy var request = QuestionDetector.detect(raw, agent: agent)
         lazy var activity = ActivityDetector.detect(raw, agent: agent, permissionPrompt: { self.prompt != nil })
-        lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent)
+        lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent, activity: activity)
         lazy var fingerprint = PromptDetector.fingerprint(raw)
         init(raw: String, agent: AgentKind) { self.raw = raw; self.agent = agent }
     }
@@ -148,9 +148,6 @@ import TerminalInputSupport
     public var interruptionResumeDelays: [TimeInterval] = [5, 15, 30, 60, 120, 300]
     /// Wait after a final check that typed nothing, before trying the next fresh frame.
     public var capacityUnsentRetryDelay: TimeInterval = 3
-    /// After a verified send, a frame read before it can still arrive. A stop that looks the same
-    /// as the one answered counts as the next failure only after this long.
-    public var capacityStaleFrameWindow: TimeInterval = 3
     /// A continued turn that keeps working this long made progress: its next stop starts a new run.
     public var capacityProgressWindow: TimeInterval = 120
     private struct CapacityState {
@@ -162,12 +159,14 @@ import TerminalInputSupport
         var deadline: Date
         var observedAt: Date
         var scheduledID: UUID?
+        var dispatchID: UUID?
         var sentAt: Date?
         var unsent = 0
+        var workingObserved = false
     }
     private var capacityStates: [String: CapacityState] = [:]
     private var exitRecoveries: [String: SessionExitRecovery] = [:]
-    private var exitRecoveryTasks = Set<String>()
+    private var exitRecoveryTasks: [String: UUID] = [:]
     private var conversationReads = Set<String>()
     /// Work must be gone this long before the hold ends. It bridges a turn's end and the next approval or continue.
     public var keepAwakeGrace: TimeInterval = 120
@@ -2090,7 +2089,14 @@ import TerminalInputSupport
         session.automatic = enabled; sessions[target] = session
         if let owned = managedPTY.owned(tty: session.tty) { ptyAutomatic[owned.descriptor.ptyID] = enabled }
         for member in groupIDs(target) { screens[member]?.scheduledID = nil }
-        if !enabled { for member in groupIDs(target) { capacityStates.removeValue(forKey: member) } }
+        if !enabled {
+            for member in groupIDs(target) {
+                cancelCapacityResume(member)
+                capacityStates.removeValue(forKey: member)
+                exitRecoveries[member]?.automaticCancelled = true
+            }
+            saveExitRecoveries()
+        }
         publish()
         if enabled { scheduleScreenApproval(target) }
         Task { await evaluateKeepAwake() }
@@ -2400,6 +2406,12 @@ import TerminalInputSupport
             }
         case "Stop":
             guard !session.pendingInTerminal else { break }
+            // A normal completion supersedes the preceding failed turn. Keeping its
+            // error active would restart the CLI later when the user exits normally.
+            if session.interruption?.needsAttention == true {
+                session.interruption?.recoveredAt = Date(); session.interruption?.resumeUncertain = false
+            }
+            capacityStates.removeValue(forKey: key)
             let background = payload["background_tasks"] as? [Any] ?? []
             let scheduled = payload["session_crons"] as? [Any] ?? []
             if !background.isEmpty || !scheduled.isEmpty {
@@ -2950,18 +2962,19 @@ import TerminalInputSupport
                 case .sending:
                     capacityStates[id] = state
                 case .sent:
-                    // The send was verified, so a stop drawn afterwards is the next failure of this run.
-                    // Repeated failures can fill the screen until it looks unchanged.
+                    // Time alone cannot prove another failure. An unchanged error may
+                    // remain after completion; only a changed transcript or observed work
+                    // followed by this stop can authorize another continuation.
                     let elapsed = now.timeIntervalSince(state.sentAt ?? now)
-                    if stop.identity != state.stop.identity || elapsed >= capacityStaleFrameWindow {
+                    if stop.continuationKey != state.stop.continuationKey || state.workingObserved {
                         let attempt = elapsed >= capacityProgressWindow ? 1 : state.attempt + 1
                         startCapacityRun(id, stop: stop, channel: channel, attempt: attempt, at: now)
                     } else {
                         capacityStates[id] = state
                     }
                 case .waiting, .unavailable, .review, .exhausted, .cancelled:
-                    if stop.identity != state.stop.identity {
-                        // Not ours: someone continued by hand, or the transcript was redrawn.
+                    if stop.continuationKey != state.stop.continuationKey {
+                        // Someone continued by hand. A spacing-only redraw is still ours.
                         startCapacityRun(id, stop: stop, channel: channel, attempt: 1, at: now)
                     } else {
                         state.stop = stop; capacityStates[id] = state
@@ -2973,6 +2986,7 @@ import TerminalInputSupport
                 switch state.phase {
                 case .sending: break
                 case .sent:
+                    if phase == .working { capacityStates[id]?.workingObserved = true }
                     let elapsed = now.timeIntervalSince(state.sentAt ?? now)
                     if elapsed > 10, CodexResumeCheck.draftVisible(raw, text: state.stop.continuationText) {
                         capacityStates[id]?.phase = .review
@@ -3020,7 +3034,9 @@ import TerminalInputSupport
         let delays = stop.kind == .capacity ? capacityResumeDelays : interruptionResumeDelays
         var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: stop.kind == .capacity ? min(attempt,delays.count) : attempt,
             deadline: now, observedAt: now)
-        if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true && sessions[id]?.interruption?.resumeIdentity == stop.identity) {
+        let previousIdentity = sessions[id]?.interruption?.resumeIdentity
+        if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true &&
+            (previousIdentity == stop.continuationKey || previousIdentity == stop.identity)) {
             state.phase = .review
         } else if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil &&
                     !(channel == .vscodeScreen && sessions[id]?.bridgeID.flatMap({peers[$0]}) != nil) {
@@ -3069,13 +3085,14 @@ import TerminalInputSupport
             return
         }
         capacityStates[id]?.phase = .sending; capacityStates[id]?.scheduledID = nil
+        capacityStates[id]?.dispatchID = scheduledID
         var event = AuditEvent(sessionID: id, summary: "\(state.stop.kind.title) · 이어서 진행 요청 (\(state.attempt))",
             outcome: "이어서 진행 요청 · 결과 미확인", source: state.channel.title, context: AuditContext(session: session),
             request: state.stop.region, answer: state.stop.continuationText)
         // Persist the attempt before typing; a crash or lost result remains traceable.
         guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
         sessions[id]?.interruption?.resumeUncertain = true
-        sessions[id]?.interruption?.resumeIdentity = state.stop.identity
+        sessions[id]?.interruption?.resumeIdentity = state.stop.continuationKey
         guard persistInterruption(id) else { capacityStates[id]?.phase = .review; publish(); return }
         publish()
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
@@ -3083,24 +3100,38 @@ import TerminalInputSupport
             sourcePID: session.pid, sourceStarted: session.started)
         let region = state.stop.region, text = state.stop.continuationText
         automaticInputSessions.insert(id)
-        defer { automaticInputSessions.remove(id); scheduleScreenApproval(id) }
+        var superseded = false
+        defer {
+            automaticInputSessions.remove(id); scheduleScreenApproval(id)
+            if superseded { scheduleCapacityResume(id) }
+        }
+        func ownsDelivery() -> Bool {
+            capacityStates[id]?.phase == .sending && capacityStates[id]?.dispatchID == scheduledID
+                && sessions[id]?.phase != .ended
+        }
         do {
             let delivery: ResumeDelivery
             if let adapter { delivery = try await Task.detached { try adapter.resume(target,region,text) }.value }
             else { delivery = try await resumeBridgeSession(session,region:region,text:text) }
+            // Always retain the actual result, but an old callback cannot change a
+            // replacement failure, a cancelled run, or a session that has ended.
+            switch delivery {
+            case .sent: event.outcome = "이어서 진행 요청 전달"
+            case .typed: event.outcome = "입력 확인 필요 · 이어서 진행 전송 미확인"
+            case .screenChanged, .missingTarget, .agentMissing:
+                event.outcome = "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
+            }
+            guard ownsDelivery() else { superseded = true; log(event); publish(); return }
             switch delivery {
             case .sent:
-                event.outcome = "이어서 진행 요청 전달"
                 sessions[id]?.interruption?.resumeUncertain = false
                 capacityStates[id]?.phase = .sent; capacityStates[id]?.sentAt = Date(); capacityStates[id]?.unsent = 0
             case .typed:
                 // Typed, but neither a draft nor a new message was visible: never type again.
-                event.outcome = "입력 확인 필요 · 이어서 진행 전송 미확인"
                 capacityStates[id]?.phase = .review
             case .screenChanged, .missingTarget, .agentMissing:
                 // Nothing was typed. Try again on a fresh frame, a few times.
                 sessions[id]?.interruption?.resumeUncertain = false
-                event.outcome = "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                 let unsent = (capacityStates[id]?.unsent ?? 0) + 1
                 capacityStates[id]?.unsent = unsent
                 capacityStates[id]?.phase = unsent >= 3 ? .review : .waiting
@@ -3109,8 +3140,10 @@ import TerminalInputSupport
         } catch {
             // The write may have happened; an uncertain input is never repeated.
             event.outcome = "입력 확인 필요: \(error.localizedDescription)"
+            guard ownsDelivery() else { superseded = true; log(event); publish(); return }
             capacityStates[id]?.phase = .review
         }
+        capacityStates[id]?.dispatchID = nil
         log(event)
         persistInterruption(id)
         publish()
@@ -3252,42 +3285,61 @@ import TerminalInputSupport
                 let actual: String?
                 if let conversation { actual = conversation } else { actual = await currentPTYConversation(next,records:records) }
                 guard let actual, actual.lowercased() == context.conversationID?.lowercased(),
-                      sessions[next.id]?.phase != .ended else { return }
+                      sessions[next.id]?.phase != .ended, !snapshot.paused, !remoteInputStopped,
+                      exitRecoveries[id]?.state == "awaiting",
+                      exitRecoveries[id]?.conversationID == context.conversationID else { return }
                 sessions[id]?.interruption?.resumedSessionID = next.id
                 sessions[id]?.interruption?.recoveredAt = Date()
                 sessions[id]?.interruption?.resumeUncertain = false
                 sessions[id]?.interruption?.recoveryStatus = "recovered"
-                sessions[next.id]?.automatic = true
-                try? store.set("automatic:\(next.id)","true")
+                if exitRecoveries[id]?.automaticCancelled != true {
+                    sessions[next.id]?.automatic = true
+                    try? store.set("automatic:\(next.id)","true")
+                }
                 persistInterruption(id); exitRecoveries.removeValue(forKey:id); saveExitRecoveries(); publish()
             }
             return
         }
         guard context.state == "scheduled", !snapshot.paused, !remoteInputStopped,
               !userInputHasPriority(id), Date() >= (context.deadline ?? .distantPast),
-              exitRecoveryTasks.insert(id).inserted else { return }
+              exitRecoveryTasks[id] == nil else { return }
+        let token = UUID(), scheduledRevision = revision
+        exitRecoveryTasks[id] = token
         Task { [weak self] in
-            guard let self else { return }; defer { exitRecoveryTasks.remove(id) }
-            await restartExitedSession(id)
+            guard let self else { return }
+            defer { if exitRecoveryTasks[id] == token { exitRecoveryTasks.removeValue(forKey: id) } }
+            await restartExitedSession(id, token: token, scheduledRevision: scheduledRevision)
         }
     }
 
-    private func restartExitedSession(_ id: String) async {
-        guard var context = exitRecoveries[id], let host = ScreenHost(kind:context.session.terminal),
+    private func restartExitedSession(_ id: String, token: UUID, scheduledRevision: UInt64) async {
+        func owns(_ phase: String) -> Bool {
+            exitRecoveryTasks[id] == token && exitRecoveries[id]?.state == phase
+        }
+        func mayLaunch() -> Bool {
+            owns("scheduled") && revision == scheduledRevision && !snapshot.paused && !remoteInputStopped
+                && !userInputHasPriority(id) && sessions[id]?.phase == .ended
+                && sessions[id]?.interruption?.needsAttention == true
+        }
+        guard mayLaunch(), var context = exitRecoveries[id] else { return }
+        guard let host = ScreenHost(kind:context.session.terminal),
               screenConnections[host]?.enabled == true, let adapter = screenAdapters[host], let restart = adapter.restart else {
             sessions[id]?.interruption?.recoveryStatus = "unavailable"
             sessions[id]?.interruption?.recoveryDetail = "이 원본 터미널은 종료 후 자동 복구 입력을 지원하지 않습니다. Mac에서 같은 대화를 다시 열어주세요."
             exitRecoveries[id]?.state = "unavailable"; persistInterruption(id); saveExitRecoveries(); publish(); return
         }
         let reader = processReader
+        var launched = false
         do {
             let live = try await Task.detached { try reader() }.value
+            guard mayLaunch() else { return }
             guard let shell = context.verifiedShell(in:live) else {
                 sessions[id]?.interruption?.recoveryDetail = "원본 셸이 닫혔거나 다른 작업 중입니다. 원본 셸이 돌아오면 다시 확인합니다."
                 exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); publish(); return
             }
             let target = ScreenTarget(tty:context.session.tty,handle:context.session.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
             let first = try await Task.detached { try adapter.screens([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            guard mayLaunch() else { return }
             guard let first, SessionExitRecovery.emptyShellPrompt(first) else {
                 exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
                 sessions[id]?.interruption?.recoveryDetail = "원본 셸의 빈 입력창을 기다리고 있습니다."; publish(); return
@@ -3300,9 +3352,11 @@ import TerminalInputSupport
                 persistInterruption(id); saveExitRecoveries(); publish(); return
             }
             try await Task.sleep(for:.seconds(1))
+            guard mayLaunch() else { return }
             let fresh = try await Task.detached { try reader() }.value
-            guard !snapshot.paused, !remoteInputStopped, context.verifiedShell(in:fresh) != nil else { return }
+            guard mayLaunch(), context.verifiedShell(in:fresh) != nil else { return }
             let screen = try await Task.detached { try adapter.screens([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            guard mayLaunch() else { return }
             guard screen == first else { exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); return }
             context.state = "launching"; context.deadline = Date(); context.attempts += 1; exitRecoveries[id] = context
             sessions[id]?.interruption?.resumeUncertain = true
@@ -3312,7 +3366,9 @@ import TerminalInputSupport
             let event = AuditEvent(sessionID:id,summary:"오류 종료 · 같은 대화 복구",outcome:"복구 명령 전달 · 결과 미확인",source:host.title,context:AuditContext(session:context.session))
             guard log(event) else { exitRecoveries[id]?.state = "review"; return }
             publish()
+            launched = true
             let delivery = try await Task.detached { try restart(target,first,command) }.value
+            guard owns("launching") else { return }
             if delivery == .sent {
                 exitRecoveries[id]?.state = "awaiting"; exitRecoveries[id]?.conversationID = context.conversationID
                 sessions[id]?.interruption?.recoveryStatus = "awaiting"
@@ -3325,6 +3381,9 @@ import TerminalInputSupport
                 sessions[id]?.interruption?.recoveryDetail = "복구 명령이 전달되지 않았습니다. 원본 셸을 다시 확인합니다."
             }
         } catch {
+            // Cancellation while reading must not revive its captured recovery plan.
+            // Once writing started, retain uncertainty even if controls changed during the write.
+            guard launched ? owns("launching") : mayLaunch() else { return }
             let uncertain = sessions[id]?.interruption?.resumeUncertain == true
             exitRecoveries[id]?.state = uncertain ? "review" : "scheduled"
             exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)

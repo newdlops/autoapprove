@@ -274,10 +274,10 @@ extension ApprovalTests {
         session = try unwrap(subject.snapshot.sessions.first { $0.id == id })
         try expect(AttentionRequest.needsAttention(session, paused: false))
 
-        // A screen filled with repeated failures looks unchanged; after the stale-frame window it is the next failure.
+        // A full screen can look unchanged. Only observed work proves the next failure;
+        // waiting longer must never replay the old answered error.
         probe = ResumeProbe([])
         (subject, id) = try engine(probe, delays: [0.05, 0.05])
-        subject.capacityStaleFrameWindow = 0.5
         try subject.setAutomatic(id, enabled: true)
         subject.receiveScreen(sessionID: id, raw: refailedFrame, generation: "terminal:\(id)")
         await settle()
@@ -286,6 +286,9 @@ extension ApprovalTests {
         await settle()
         try expectEqual(probe.count, 1, "Too soon after the send to trust an identical frame")
         await settle()
+        subject.receiveScreen(sessionID: id, raw: refailedFrame, generation: "terminal:\(id)")
+        try expectEqual(resume(subject, id)?.attempt, 1, "Time passing is not a new failure")
+        subject.receiveScreen(sessionID: id, raw: "• Working (esc to interrupt)", generation: "terminal:\(id)")
         subject.receiveScreen(sessionID: id, raw: refailedFrame, generation: "terminal:\(id)")
         try expectEqual(resume(subject, id)?.attempt, 2)
         await settle()

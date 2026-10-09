@@ -11,6 +11,10 @@ public struct CodexCapacityStop: Codable, Equatable {
     public var region: String
     /// Everything visible above the composer. A repeated failure draws a longer transcript.
     public var identity: String
+    /// A redraw that only changes spacing or wrapping is the same failure. The raw
+    /// identity and region remain available for exact input validation and legacy receipts.
+    public var continuationIdentity: String?
+    var continuationKey: String { continuationIdentity ?? identity }
     public var kind: SessionInterruption.Kind = .capacity
     public var agent: AgentKind = .codex
     public var error: String = CodexCapacityStop.message
@@ -21,7 +25,13 @@ public struct CodexCapacityStop: Codable, Equatable {
     /// Only the newest cell above a ready, empty composer counts. Codex wraps the cell without
     /// indentation in a narrow window.
     public static func detect(_ screen: String, agent: AgentKind) -> CodexCapacityStop? {
-        guard agent != .shell, ActivityDetector.detect(screen, agent: agent).phase == .idle else { return nil }
+        guard agent != .shell else { return nil }
+        return detect(screen, agent: agent, activity: ActivityDetector.detect(screen, agent: agent))
+    }
+
+    /// A frame's activity and permission analysis are shared by the engine's detectors.
+    static func detect(_ screen: String, agent: AgentKind, activity: ActivityObservation) -> CodexCapacityStop? {
+        guard agent != .shell, activity.phase == .idle else { return nil }
         let raw = PromptDetector.normalizedLines(screen)
         let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
         guard !CodexResumeCheck.blocked(lines), let composer = lines.lastIndex(where: CodexResumeCheck.isComposer),
@@ -45,8 +55,10 @@ public struct CodexCapacityStop: Codable, Equatable {
                 kind = .api
             } else { return nil }
         }
+        let transcript = raw[..<composer].joined(separator: "\n")
         var result = CodexCapacityStop(region: raw[start...composer].joined(separator: "\n"),
-            identity: PromptDetector.fingerprint(raw[..<composer].joined(separator: "\n")))
+            identity: PromptDetector.fingerprint(transcript))
+        result.continuationIdentity = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
         result.kind = kind; result.agent = agent; result.error = cell
         if agent == .codex, kind.retryable, CodexResumeCheck.goalStalled(lines) { result.inputText = goalResumeText }
         return result

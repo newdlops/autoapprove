@@ -10,6 +10,9 @@ public struct SessionExitRecovery: Codable {
     public var state: String = "ready"
     public var deadline: Date?
     public var attempts: Int = 0
+    /// An explicit opt-out after launch must not enable automation on the replacement CLI.
+    /// Missing in older saved plans: preserve their original recovery behavior.
+    public var automaticCancelled: Bool?
     public init(session: AgentSession, process: ProcessRecord, shell: ProcessRecord, conversationID: String?) {
         self.session = session; self.shell = shell; executable = process.executable
         self.conversationID = conversationID.flatMap { UUID(uuidString:$0)?.uuidString.lowercased() }

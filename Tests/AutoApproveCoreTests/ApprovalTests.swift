@@ -191,6 +191,11 @@ import AutoApproveCore
         }
         try expectEqual(ActivityDetector.detect(codex, agent: .codex).phase, .approval)
         try expectEqual(ActivityDetector.detect("› Please fix this\n? for shortcuts", agent: .codex).phase, .input)
+        let history = String(repeating: "Old output\n", count: 2000)
+        for newline in ["\n", "\r\n", "\r", "\u{000B}", "\u{000C}", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            try expectEqual(ActivityDetector.detect(history + idle.replacingOccurrences(of: "\n", with: newline), agent: .codex).phase, .idle)
+        }
+        try expectEqual(ActivityDetector.detect("esc to interrupt\n" + history + idle, agent: .codex).phase, .idle, "Old working hints outside the visible tail cannot change the phase")
     }
     func testIdleConfirmationAndGenerationChange() throws {
         let idle = "Done.\n›\n? for shortcuts"
@@ -551,6 +556,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Codex continue scripts type, re-read, then submit only a visible draft", tests.testCodexResumeScriptsTypeThenSubmit),
             ("Codex capacity continue: opt-in, backoff, limit, cancel, pause, drafts and unverified writes", tests.testCodexCapacityResumeRuns),
             ("CLI interruption detection rejects drafts, busy frames and historical errors", tests.testSessionInterruptionDetection),
+            ("Automation optimization: identical or wrapped failures cannot repeat plain or Goal continuation", tests.testUnchangedFailureNeverQueuesRepeatedContinuation),
+            ("Automation optimization: exit preflight rechecks cancellation, pause, disconnect and opt-out", tests.testExitRecoveryRechecksCancellationAtEveryRead),
+            ("Automation optimization: a stale resume result cannot overwrite a new failure", tests.testStaleResumeResultCannotReplaceNewFailure),
+            ("Automation optimization: normal completion retires errors before process exit", tests.testNormalCompletionRetiresFailureBeforeExit),
             ("Local dashboard address maps self and preserves other names, backup, permissions and inode", tests.testLocalDashboardNamePreservesHostFileAndOnlyMapsSelf),
             ("Local dashboard alias accepts its exact origin and rejects unrelated sites", tests.testLocalDashboardOriginKeepsExactSameOriginRules),
             ("Cold dashboard publishes healthy Macs and bookmarked local pages before six stalled reads", tests.testColdDashboardPublishesHealthyPeerBeforeStalledReads),

@@ -17,8 +17,10 @@ public enum ActivityDetector {
     static func detect(_ screen: String, agent: AgentKind, permissionPrompt: () -> Bool) -> ActivityObservation {
         let unknown = ActivityObservation(phase: .unknown, detail: "현재 화면에서 작업 중인지 입력 대기 중인지 확인하지 못했습니다.")
         guard agent != .shell else { return unknown }
-        let lines = screen.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
-        let tail = Array(lines.filter { !$0.isEmpty }.suffix(18))
+        // Only the final 18 nonempty rows participate. Avoid trimming and copying the
+        // entire scrollback on every changing frame, while retaining Foundation's newline rules.
+        let tail = Array(screen.components(separatedBy: .newlines).reversed().lazy
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.prefix(18).reversed())
         guard !tail.isEmpty else { return unknown }
         let bottom = tail.suffix(8).joined(separator: "\n")
         if matches(bottom, #"(?i)(?:esc|ctrl\+c) to (?:interrupt|stop)|tab to queue"#) {
