@@ -158,6 +158,15 @@ private final class SetupProbe: @unchecked Sendable {
         do { _ = try enabled.run(); preconditionFailure("Disconnected registered service was reported connected") }
         catch { }
         precondition(enabled.registrations == 0 && enabled.policyChecks == 0)
+        // The real signed-package probe returns .notFound for a fresh bundled
+        // daemon. It must reach native approval rather than claim the app is missing.
+        let absentRecord = SetupProbe()
+        absentRecord.state = TerminalInputInstaller.serviceRegistrationState(.notFound)
+        precondition(absentRecord.state == .notRegistered)
+        try check(absentRecord.run() == .requiresApproval)
+        precondition(absentRecord.policyChecks == 1 && absentRecord.registrations == 1 && absentRecord.refreshes == 1)
+        precondition(TerminalInputInstaller.serviceRegistrationState(.enabled) == .enabled)
+        precondition(TerminalInputInstaller.serviceRegistrationState(.requiresApproval) == .requiresApproval)
         for scenario in 0..<5 {
             let rejected = SetupProbe()
             switch scenario {

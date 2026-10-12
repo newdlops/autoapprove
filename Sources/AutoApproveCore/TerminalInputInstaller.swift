@@ -49,11 +49,18 @@ public enum TerminalInputInstaller {
            SMAppService.statusForLegacyPlist(at: URL(fileURLWithPath: TTYInputConfiguration.plistPath)) == .requiresApproval {
             return .requiresApproval
         }
-        switch SMAppService.daemon(plistName: plistName).status {
+        return serviceRegistrationState(SMAppService.daemon(plistName: plistName).status)
+    }
+
+    static func serviceRegistrationState(_ status: SMAppService.Status) -> RegistrationState {
+        switch status {
         case .notRegistered: return .notRegistered
         case .enabled: return .enabled
         case .requiresApproval: return .requiresApproval
-        case .notFound: return .missingBundle
+        // A valid signed app may have no ServiceManagement record before its
+        // first native installation. Bundle presence is checked separately above;
+        // the package and native helper signatures are validated before approval.
+        case .notFound: return .notRegistered
         @unknown default: return .missingBundle
         }
     }
