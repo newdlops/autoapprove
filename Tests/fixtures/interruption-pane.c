@@ -13,8 +13,10 @@ int main(int argc, char **argv) {
     mode=original; cfmakeraw(&mode); if(tcsetattr(0,TCSANOW,&mode))return 3;
     int goal=argc>2 && !strcmp(argv[2],"goal");
     int blocked=argc>2 && !strcmp(argv[2],"blocked");
+    int capacity=argc>2 && (!strcmp(argv[2],"capacity") || !strcmp(argv[2],"capacity-goal"));
+    goal=goal||(argc>2 && !strcmp(argv[2],"capacity-goal"));
     goal=goal||blocked;
-    const char *heading=blocked?"• External dependency still unavailable":"■ stream disconnected before completion: network error";
+    const char *heading=capacity?"■ Selected model is at capacity. Please try a different model.":blocked?"• External dependency still unavailable":"■ stream disconnected before completion: network error";
     const char *text=goal?"/goal resume":"이어서 진행하자.";
     const char *status=goal?" · Goal stalled (/goal resume)":"";
     char frame[4096];

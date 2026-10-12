@@ -18,12 +18,13 @@ try {
  const dashboard=await(await fetch(base+'/api/network')).json(),own=dashboard.nodes[0],codex=own.state.sessions.find(v=>v.session.agent==='codex');
  const initial=await(await fetch(base+'/api/network?initial=1')).json();assert.equal(initial.partial,true);assert.deepEqual(initial.nodes[0].state.snapshot.events,[]);assert.deepEqual(initial.nodes[0].state.snapshot.sessions,[]);assert.equal(initial.nodes[0].state.sessions.length,2);
  checks.push('Production initial inventory contains session views without duplicated sessions or full audit bodies');
- let ended=false,recovered=false,offline=false,delayFull=true,goalBlocked=false;
+ let ended=false,recovered=false,offline=false,delayFull=true,goalBlocked=false,capacity=false;
  const errorNode='00000000-0000-4000-8000-000000000062';
  function content(source){const value=structuredClone(source);const local=value.nodes[0],view=local.state.sessions.find(v=>v.session.agent==='codex');
   view.session.interruption={id:'synthetic-failure',kind:'transport',detail:'stream disconnected before completion: Transport error: network error: '+('긴 오류 설명 및 주소/검사경로/'.repeat(30)),date:new Date().toISOString(),processEnded:ended,recoveryStatus:ended?'awaiting':undefined,recoveryDetail:ended?'같은 대화의 실행을 확인하고 있습니다. 복구 명령은 다시 보내지 않습니다.':undefined,...(recovered?{recoveredAt:new Date().toISOString(),resumedSessionID:'process:61:synthetic'}:{})};
   view.session.capacityResume={phase:'scheduled',attempt:1,limit:0,deadline:new Date(Date.now()+30000).toISOString(),reason:'연결 오류',message:'이어서 진행하자.'};view.session.phase=ended?'ended':'idle';view.phaseTitle=ended?'오류로 종료됨':'중단 · 자동 이어가기 대기';
   if(goalBlocked){view.session.interruption.kind='goalBlocked';view.session.interruption.detail='Goal blocked · /goal resume로 현재 목표의 상태를 다시 확인합니다.';view.session.capacityResume.reason='Goal blocked';view.session.capacityResume.message='/goal resume';}
+  if(capacity){view.session.interruption.kind='capacity';view.session.interruption.detail='Selected model is at capacity. Please try a different model.';view.session.capacityResume.reason='모델 용량 부족';view.session.capacityResume.attempt=8;view.session.capacityResume.deadline=new Date(Date.now()+480000).toISOString();}
   if(recovered){const next=structuredClone(view);next.session.id='process:61:synthetic';next.session.pid=61;next.session.phase='working';delete next.session.interruption;delete next.session.capacityResume;next.phaseTitle='작업 중';local.state.sessions.push(next);}
   value.nodes.push({id:errorNode,name:'합성 다른 Mac · 긴 이름과 이더넷/Wi-Fi 연결 상태',local:false,online:!offline,release:{version:'0.2.59',build:74,api:1},...(offline?{error:'합성 연결 끊김'}:{state:{...structuredClone(local.state),id:errorNode,name:'합성 다른 Mac',release:{version:'0.2.59',build:74,api:1},sessions:[]}})});
   value.nodes.push({id:'00000000-0000-4000-8000-000000000063',name:'버전 정보가 없는 이전 Mac',local:false,online:false});return value;}
@@ -46,6 +47,12 @@ try {
  for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await capture(name+'-goal-blocked');}
  await page.locator('#close-interaction').click();goalBlocked=false;
  checks.push('Blocked Goal exposes the exact lifecycle command, delayed recovery and cancellation in the existing session UI');
+ capacity=true;await page.locator('#refresh').click();await page.waitForFunction(()=>selectedItem?.session.interruption?.kind==='capacity');await page.locator('#terminal-questions').click();
+ assert.match(await page.locator('#questions').textContent(),/모델 용량 부족.*8번째 시도.*이어서 진행하자/s);
+ assert.equal(await page.getByRole('button',{name:'이어서 진행 취소',exact:true}).count(),1);
+ for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await capture(name+'-capacity-retry');}
+ await page.locator('#close-interaction').click();capacity=false;
+ checks.push('Capacity retry beyond five attempts exposes the next retry time, uncapped attempt count and cancellation at all supported widths');
  await page.setViewportSize({width:390,height:844});if(await page.locator('#terminal-focus').getAttribute('aria-pressed')==='true')await page.locator('#terminal-focus').click();ended=true;await page.locator('#refresh').click();await page.waitForFunction(()=>selectedItem.session.phase==='ended');await capture('mobile-ended-awaiting');assert.equal(await page.locator('#automatic').isDisabled(),true);
  checks.push('Failure details wrap, View session selects the exact session, and ended CLI controls are disabled');
  recovered=true;await page.locator('#refresh').click();await page.waitForFunction(()=>selectedItem?.session.id==='process:61:synthetic');assert.equal(await page.locator('#terminal-input').inputValue(),'');checks.push('Same-conversation recovery follows the verified new session without copying or replaying an old input draft');

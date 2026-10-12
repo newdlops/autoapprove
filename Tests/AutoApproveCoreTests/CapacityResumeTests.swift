@@ -48,8 +48,49 @@ private final class ResumeProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    @MainActor func testCapacityRetryContinuesBeyondBackoffSchedule() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-capacity-repeat-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        for goal in [false, true] {
+            let probe = ResumeProbe([])
+            let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil },
+                resume: { probe.resume($0, $1, $2) })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory.appendingPathComponent(goal ? "goal" : "plain")),
+                processReader: { [record] }, screenAdapters: [.terminal: adapter])
+            defer { engine.stop() }
+            engine.capacityResumeDelays = [0.01, 0.03]
+            var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+            session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
+            let footer = "? for shortcuts" + (goal ? " · Goal stalled (/goal resume)" : "")
+            var frame = ""
+            for attempt in 1...8 {
+                frame = "› Retry \(attempt)\n\n" + capacityCell + "\n\n› Ask Codex to do anything\n\n" + footer
+                let observed = Date()
+                engine.receiveScreen(sessionID: session.id, raw: frame, generation: "QA")
+                try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .scheduled)
+                try expectEqual(engine.snapshot.sessions.first?.capacityResume?.attempt, attempt)
+                let wait = engine.snapshot.sessions.first?.capacityResume?.deadline?.timeIntervalSince(observed) ?? -1
+                try expect(wait >= 0 && wait <= 0.04, "The final backoff is reused instead of growing or stopping")
+                try await Task.sleep(for: .milliseconds(100))
+                try expectEqual(probe.count, attempt, "Retry \(attempt) must continue beyond the schedule length")
+                try expectEqual(probe.last?.2, goal ? "/goal resume" : "이어서 진행하자.")
+                try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .awaiting)
+                try expectEqual(engine.snapshot.sessions.first?.capacityResume?.limit, 0)
+                engine.receiveScreen(sessionID: session.id, raw: frame, generation: "QA", at: Date().addingTimeInterval(3600))
+                try await Task.sleep(for: .milliseconds(45)); try expectEqual(probe.count, attempt, "An old frame cannot replay a confirmed input")
+            }
+            engine.receiveScreen(sessionID: session.id, raw: "› Retry 9\n\n" + capacityCell + "\n\n› Ask Codex to do anything\n\n" + footer, generation: "QA")
+            engine.cancelCapacityResume(session.id)
+            try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, 8)
+        }
+    }
+
     func testCodexCapacityStopDetection() throws {
         let stop = try unwrap(CodexCapacityStop.detect(stoppedFrame, agent: .codex))
+        for cell in ["■ Selected model is at capacity", "■ Selected model is at capacity.", "■ Selected model is at ca\npacity."] {
+            try expectEqual(CodexCapacityStop.detect(stoppedFrame.replacingOccurrences(of: capacityCell, with: cell), agent: .codex)?.kind, .capacity)
+        }
         try expect(stop.region.hasPrefix(capacityCell) && stop.region.hasSuffix("› Ask Codex to do anything"), "The region runs from the error cell to the empty composer")
         let narrow = try unwrap(CodexCapacityStop.detect(narrowFrame, agent: .codex), "A wrapped cell is the same stop")
         try expect(narrow.region.hasPrefix("■ Selected model is at capacity. Please try\na different model."))
@@ -204,7 +245,7 @@ extension ApprovalTests {
         await settle()
         try expectNil(resume(subject, id)); try expectEqual(probe.count, 0)
 
-        // On: one continue per stop, the next failure waits longer, and the limit asks for attention.
+        // On: one continue per stop; subsequent failures reuse the final delay.
         try subject.setAutomatic(id, enabled: true)
         subject.receiveScreen(sessionID: id, raw: stoppedFrame, generation: "terminal:\(id)")
         try expectEqual(resume(subject, id)?.phase, .scheduled); try expectEqual(resume(subject, id)?.attempt, 1)
@@ -226,10 +267,10 @@ extension ApprovalTests {
         let third = refailedFrame.replacingOccurrences(of: "› Ask Codex to do anything", with: "› 이어서 진행하자.\n\n\n" + capacityCell + "\n\n\n› Ask Codex to do anything")
         subject.receiveScreen(sessionID: id, raw: third, generation: "terminal:\(id)")
         await settle()
-        try expectEqual(probe.count, 2, "Two delays allow two automatic attempts")
-        try expectEqual(resume(subject, id)?.phase, .exhausted)
+        try expectEqual(probe.count, 3, "Two delays continue at the final interval rather than impose a limit")
+        try expectEqual(resume(subject, id)?.phase, .awaiting)
         var session = try unwrap(subject.snapshot.sessions.first { $0.id == id })
-        try expectEqual(session.phase, .input); try expect(AttentionRequest.needsAttention(session, paused: false))
+        try expectEqual(resume(subject, id)?.limit, 0)
         // A normal answer ends the run; a later stop starts over at the first attempt.
         subject.receiveScreen(sessionID: id, raw: continuedFrame, generation: "terminal:\(id)")
         try expectNil(resume(subject, id))

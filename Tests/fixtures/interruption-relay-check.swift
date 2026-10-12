@@ -15,7 +15,7 @@ import AutoApproveCore
         }
         let manager=ManagedPTYManager();defer{manager.stop()}
         let ptyRecord=root.appendingPathComponent("pty-input.bin")
-        let pty=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,ptyRecord.path],columns:100,rows:25)
+        let pty=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,ptyRecord.path,"capacity"],columns:100,rows:25)
         var ptyTarget=ScreenTarget(tty:pty.tty)
         for _ in 0..<100 {
             let records=try ProcessDiscovery.read()
@@ -24,6 +24,7 @@ import AutoApproveCore
         }
         try await Task.sleep(for:.milliseconds(150))
         let (before,stop)=try await stopped {try manager.terminal(pty.ptyID).screen()}
+        precondition(stop.kind == .capacity)
         let result=try manager.adapter.resume(ptyTarget,stop.region,CodexCapacityStop.resumeText)
         if result != .sent {
             let received=(try? String(contentsOf:ptyRecord,encoding:.utf8)) ?? "none",after=try manager.terminal(pty.ptyID).screen()
@@ -31,9 +32,10 @@ import AutoApproveCore
         }
         let ptyBytes=try Data(contentsOf:ptyRecord)
         precondition(ptyBytes==Data((CodexCapacityStop.resumeText+"\r").utf8))
-        print("PASS actual owned PTY types exact UTF-8 then submits the verified draft once")
-        let goalRecord=root.appendingPathComponent("goal-pty-input.bin")
-        let goalPTY=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,goalRecord.path,"blocked"],columns:100,rows:25)
+        print("PASS actual owned PTY resumes capacity failure with exact UTF-8 and one verified Return")
+        for mode in ["blocked", "capacity-goal"] {
+        let goalRecord=root.appendingPathComponent("\(mode)-pty-input.bin")
+        let goalPTY=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,goalRecord.path,mode],columns:100,rows:25)
         var goalTarget=ScreenTarget(tty:goalPTY.tty)
         for _ in 0..<100 {
             let records=try ProcessDiscovery.read()
@@ -43,13 +45,14 @@ import AutoApproveCore
         try await Task.sleep(for:.milliseconds(100))
         let (_,goalStop)=try await stopped {try manager.terminal(goalPTY.ptyID).screen()}
         precondition(goalStop.continuationText == "/goal resume")
-        precondition(goalStop.kind == .goalBlocked)
+        precondition(goalStop.kind == (mode == "blocked" ? .goalBlocked : .capacity))
         let goalResult=try manager.adapter.resume(goalTarget,goalStop.region,goalStop.continuationText),goalBytes=try Data(contentsOf:goalRecord)
         precondition(goalResult == .sent);precondition(goalBytes == Data("/goal resume\r".utf8))
-        print("PASS actual owned PTY recovers a blocked Goal without an API error or user-message cell")
+        print("PASS actual owned PTY reactivates \(mode) with exact /goal resume and one verified Return")
+        }
         let meta=try call(["list-panes","-F","#{pane_tty}|#{pane_pid}"]).trimmingCharacters(in:.newlines).components(separatedBy:"|")
         let tmuxRecord=root.appendingPathComponent("tmux-input.bin")
-        _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(tmuxRecord.path)])
+        _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(tmuxRecord.path)+" capacity"])
         _=try call(["send-keys","Enter"])
         var session:AgentSession?
         for _ in 0..<100 {
@@ -60,11 +63,12 @@ import AutoApproveCore
         let target=ScreenTarget(tty:original.tty,handle:original.tmuxHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
         try await Task.sleep(for:.milliseconds(100))
         let (_,tmuxStop)=try await stopped {try relay.screen(target,fresh:true).contents}
+        precondition(tmuxStop.kind == .capacity)
         let sent=try relay.adapter.resume(target,tmuxStop.region,CodexCapacityStop.resumeText)
         precondition(sent == .sent)
         let tmuxBytes=try Data(contentsOf:tmuxRecord)
         precondition(tmuxBytes==Data((CodexCapacityStop.resumeText+"\r").utf8))
-        print("PASS actual original tmux pane sends the same continuation once without creating a PTY")
+        print("PASS actual original tmux pane resumes capacity failure once without creating a PTY")
         for _ in 0..<100 {
             if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}) {break}
             try await Task.sleep(for:.milliseconds(20))

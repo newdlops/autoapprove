@@ -876,7 +876,7 @@ struct CapacityResumeStatus: View {
         Label(message(at: date), systemImage: icon)
             .font(.caption).monospacedDigit().foregroundStyle(attention ? .orange : .secondary)
             .fixedSize(horizontal: false, vertical: true)
-            .help("Codex가 ‘Selected model is at capacity’로 작업을 멈추면, 자동 승인이 켜진 세션에서 ‘\(resume.message)’를 보냅니다. 실패가 이어지면 30초부터 두 배씩 기다리며 최대 \(resume.limit)회 시도합니다.")
+            .help("자동 승인이 켜진 세션에서 ‘\(resume.message)’로 이어갑니다. 실패가 반복되면 대기 간격을 늘려 계속 재시도합니다. 같은 오류 화면의 입력을 반복하지 않으며 취소·일시정지·사용자 초안은 유지합니다.")
     }
     @ViewBuilder private var cancelButton: some View {
         if resume.canCancel {
@@ -894,7 +894,7 @@ struct CapacityResumeStatus: View {
         }
     }
     private func message(at date: Date) -> String {
-        let count = "\(resume.attempt)/\(resume.limit)회"
+        let count = resume.limit > 0 ? "\(resume.attempt)/\(resume.limit)회" : "\(resume.attempt)번째 시도"
         switch resume.phase {
         case .scheduled:
             let seconds = max(0, Int(ceil((resume.deadline ?? date).timeIntervalSince(date))))

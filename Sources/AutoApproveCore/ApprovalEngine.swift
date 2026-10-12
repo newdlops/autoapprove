@@ -151,7 +151,7 @@ import TerminalInputSupport
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
-    /// Seconds before each automatic continue within one run of capacity failures; its count is the limit.
+    /// Seconds before each automatic continue; repeated capacity failures reuse the final delay.
     public var capacityResumeDelays: [TimeInterval] = [30, 60, 120, 240, 480]
     /// Transient connection failures continue with a bounded delay until progress or cancellation.
     public var interruptionResumeDelays: [TimeInterval] = [5, 15, 30, 60, 120, 300]
@@ -162,7 +162,7 @@ import TerminalInputSupport
     /// A continued turn that keeps working this long made progress: its next stop starts a new run.
     public var capacityProgressWindow: TimeInterval = 120
     private struct CapacityState {
-        enum Phase { case waiting, sending, sent, unavailable, review, exhausted, cancelled }
+        enum Phase { case waiting, sending, sent, unavailable, review, cancelled }
         var phase: Phase
         var stop: CodexCapacityStop
         var channel: ApprovalChannel
@@ -3026,7 +3026,7 @@ import TerminalInputSupport
                     } else {
                         capacityStates[id] = state
                     }
-                case .waiting, .unavailable, .review, .exhausted, .cancelled:
+                case .waiting, .unavailable, .review, .cancelled:
                     if stop.continuationKey != state.stop.continuationKey {
                         // Someone continued by hand. A spacing-only redraw is still ours.
                         startCapacityRun(id, stop: stop, channel: channel, attempt: 1, at: now)
@@ -3053,7 +3053,7 @@ import TerminalInputSupport
                     }
                 case .review where CodexResumeCheck.draftVisible(raw, text: state.stop.continuationText):
                     break // Our unsent text still waits in the composer for the user.
-                case .waiting, .unavailable, .review, .exhausted, .cancelled:
+                case .waiting, .unavailable, .review, .cancelled:
                     // The user typed or a turn is running. A partial repaint keeps the stop.
                     if phase != .unknown || CodexResumeCheck.composerChanged(raw, region: state.stop.region) {
                         capacityStates.removeValue(forKey: id)
@@ -3072,21 +3072,21 @@ import TerminalInputSupport
             return
         }
         let detail = "\(state.stop.kind.title)로 \(sessions[id]?.agent.title ?? "CLI") 작업이 멈췄습니다."
-        guard state.phase == .review || state.phase == .exhausted else {
+        guard state.phase == .review else {
             sessions[id]?.setPhase(activity.phase, detail: detail, at: now, monitoring: activity.monitoring)
             return
         }
         sessions[id]?.setPhase(.input, detail: detail, at: now)
-        sessions[id]?.pendingSummary = state.phase == .review
-            ? state.stop.kind.retryable ? "이어서 진행 요청의 전달 결과를 확인하지 못했습니다. 같은 입력은 다시 보내지 않습니다. 원본 입력창을 확인해주세요." : "인증 또는 설정 오류를 해결한 뒤 같은 세션에서 이어서 진행해주세요."
-            : "모델 용량 부족이 계속되어 자동으로 \(capacityResumeDelays.count)회 이어서 진행한 뒤 멈췄습니다. 터미널에서 이어서 진행해주세요."
+        sessions[id]?.pendingSummary = state.stop.kind.retryable
+            ? "이어서 진행 요청의 전달 결과를 확인하지 못했습니다. 같은 입력은 다시 보내지 않습니다. 원본 입력창을 확인해주세요."
+            : "인증 또는 설정 오류를 해결한 뒤 같은 세션에서 이어서 진행해주세요."
         sessions[id]?.pendingInTerminal = true
-        sessions[id]?.pendingRequestID = "capacity:\(state.phase == .review ? "review" : "exhausted"):\(state.stop.identity)"
+        sessions[id]?.pendingRequestID = "capacity:review:\(state.stop.identity)"
     }
 
     private func startCapacityRun(_ id: String, stop: CodexCapacityStop, channel: ApprovalChannel, attempt: Int, at now: Date) {
         let delays = stop.kind == .capacity ? capacityResumeDelays : stop.kind == .goalBlocked ? goalBlockedResumeDelays : interruptionResumeDelays
-        var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: stop.kind == .capacity ? min(attempt,delays.count) : attempt,
+        var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: attempt,
             deadline: now, observedAt: now)
         let previousIdentity = sessions[id]?.interruption?.resumeIdentity
         if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true &&
@@ -3099,8 +3099,6 @@ import TerminalInputSupport
         } else if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil &&
                     !(channel == .vscodeScreen && sessions[id]?.bridgeID.flatMap({peers[$0]}) != nil) {
             state.phase = .unavailable
-        } else if stop.kind == .capacity, attempt > delays.count {
-            state.phase = .exhausted
         } else {
             state.deadline = now.addingTimeInterval(delays[min(attempt - 1,delays.count - 1)])
         }
@@ -3649,10 +3647,9 @@ import TerminalInputSupport
                 case .sent: phase = .awaiting
                 case .unavailable: phase = .unavailable
                 case .review: phase = .review
-                case .exhausted: phase = .exhausted
                 case .cancelled: phase = .cancelled
                 }
-                presented = CapacityResume(phase: phase, attempt: state.attempt, limit:state.stop.kind == .capacity ? capacityResumeDelays.count : 0, deadline: phase == .scheduled ? state.deadline : nil, message:state.stop.continuationText)
+                presented = CapacityResume(phase: phase, attempt: state.attempt, limit:0, deadline: phase == .scheduled ? state.deadline : nil, message:state.stop.continuationText)
                 presented?.reason = state.stop.kind.title
             } else if let recovery = exitRecoveries[id], sessions[id]?.phase == .ended,
                       sessions[id]?.interruption?.needsAttention == true, recovery.state != "ready" {

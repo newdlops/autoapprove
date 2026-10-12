@@ -59,7 +59,8 @@ public struct CodexCapacityStop: Codable, Equatable {
 
     private static func errorKind(_ cell: String, agent: AgentKind) -> SessionInterruption.Kind? {
         let compact = cell.lowercased().filter { !$0.isWhitespace }
-        if agent == .codex, compact == ("■ " + message).lowercased().filter({ !$0.isWhitespace }) { return .capacity }
+        if agent == .codex, ["■selectedmodelisatcapacity", "■selectedmodelisatcapacity.",
+                            ("■ " + message).lowercased().filter({ !$0.isWhitespace })].contains(compact) { return .capacity }
         let isError = agent == .codex ? cell.hasPrefix("■ ") : cell.hasPrefix("API Error:") || cell.hasPrefix("⎿ API Error:")
         guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
         // Explicit account failures win even when wrapped in a transport error.
