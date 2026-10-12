@@ -39,9 +39,10 @@ public enum ActivityDetector {
             matches(line, #"\?\s*for shortcuts|shift\+tab to cycle"#)
                 || (agent == .codex && matches(line, #"[0-9]{1,3}% (?:context )?left|^[^·]+ · [~/]"#))
         }
-        guard !footer.isEmpty, footer.count <= 4, !bottom.contains("```"),
+        guard !footer.isEmpty, footer.count <= 6, !bottom.contains("```"),
               footer.contains(where: isHint),
-              footer.allSatisfy({ isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } }) else { return unresolved }
+              (footer.allSatisfy({ isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } })
+                || (agent == .codex && CodexResumeCheck.goalStalled(tail))) else { return unresolved }
         // Option menus and questions also use prompt glyphs; they are never idle composers.
         if matches(prompt, #"^[0-9]+\."#) { return unknown }
         let placeholder = agent == .codex

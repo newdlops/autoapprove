@@ -14,7 +14,8 @@ public struct CodexCapacityStop: Codable, Equatable {
     /// A redraw that only changes spacing or wrapping is the same failure. The raw
     /// identity and region remain available for exact input validation and legacy receipts.
     public var continuationIdentity: String?
-    var continuationKey: String { continuationIdentity ?? identity }
+    var legacyContinuationKey: String { continuationIdentity ?? identity }
+    var continuationKey: String { continuationText == Self.goalResumeText ? "goal:" + legacyContinuationKey : legacyContinuationKey }
     public var kind: SessionInterruption.Kind = .capacity
     public var agent: AgentKind = .codex
     public var error: String = CodexCapacityStop.message
@@ -34,34 +35,46 @@ public struct CodexCapacityStop: Codable, Equatable {
                        prepared: @autoclosure () -> DetectionLines) -> CodexCapacityStop? {
         guard agent != .shell, activity.phase == .idle else { return nil }
         let frame = prepared(), raw = frame.raw, lines = frame.trimmed
-        guard !CodexResumeCheck.blocked(lines), let composer = lines.lastIndex(where: CodexResumeCheck.isComposer),
-              let end = lines[..<composer].lastIndex(where: { !$0.isEmpty }) else { return nil }
+        guard !CodexResumeCheck.blocked(lines), let composer = lines.lastIndex(where: CodexResumeCheck.isComposer) else { return nil }
         guard agent != .codex || !CodexResumeCheck.goalHeld(lines) else { return nil }
-        var start = end
-        while start > 0, !lines[start - 1].isEmpty { start -= 1 }
-        let cell = lines[start...end].joined(separator: " ").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let end = lines[..<composer].lastIndex(where: { !$0.isEmpty })
+        var start = end ?? composer
+        while start > 0, end != nil, !lines[start - 1].isEmpty { start -= 1 }
+        let cell = end.map { lines[start...$0].joined(separator: " ").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ") } ?? ""
         let kind: SessionInterruption.Kind
-        let lower = cell.lowercased()
-        if agent == .codex, cell == "■ " + message { kind = .capacity }
-        else {
-            let isError = agent == .codex ? cell.hasPrefix("■ ") : cell.hasPrefix("API Error:") || cell.hasPrefix("⎿ API Error:")
-            guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
-            if lower.contains("stream disconnected before completion") || lower.contains("connection error") ||
-                lower.contains("transport error") || lower.contains("request timed out") || lower.contains("network error") {
-                kind = .transport
-            } else if lower.range(of:#"\b(?:401|403)\b|authentication|unauthorized|invalid api key"#,options:.regularExpression) != nil {
-                kind = .authentication
-            } else if lower.range(of:#"\b(?:408|429|500|502|503|504|529)\b|overloaded|rate.?limit|server error|max.?output.?tokens"#,options:.regularExpression) != nil {
-                kind = .api
-            } else { return nil }
-        }
+        if let errorKind = errorKind(cell, agent: agent) { kind = errorKind }
+        else if agent == .codex, CodexResumeCheck.goalStalled(lines) { kind = .goalBlocked }
+        else { return nil }
         let transcript = raw[..<composer].joined(separator: "\n")
-        var result = CodexCapacityStop(region: raw[start...composer].joined(separator: "\n"),
+        // Blocked is a lifecycle footer, not an API error cell. Keep its exact
+        // composer and footer together for the final validation before typing.
+        let region = kind == .goalBlocked ? raw[composer...].joined(separator: "\n") : raw[start...composer].joined(separator: "\n")
+        var result = CodexCapacityStop(region: region,
             identity: PromptDetector.fingerprint(transcript))
         result.continuationIdentity = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
-        result.kind = kind; result.agent = agent; result.error = cell
+        result.kind = kind; result.agent = agent; result.error = kind == .goalBlocked ? "Goal blocked · /goal resume로 현재 목표의 상태를 다시 확인합니다." : cell
         if agent == .codex, kind.retryable, CodexResumeCheck.goalStalled(lines) { result.inputText = goalResumeText }
         return result
+    }
+
+    private static func errorKind(_ cell: String, agent: AgentKind) -> SessionInterruption.Kind? {
+        let compact = cell.lowercased().filter { !$0.isWhitespace }
+        if agent == .codex, compact == ("■ " + message).lowercased().filter({ !$0.isWhitespace }) { return .capacity }
+        let isError = agent == .codex ? cell.hasPrefix("■ ") : cell.hasPrefix("API Error:") || cell.hasPrefix("⎿ API Error:")
+        guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
+        // Explicit account failures win even when wrapped in a transport error.
+        if cell.range(of: #"(?i)\b(?:401|403)\b"#, options: .regularExpression) != nil ||
+            ["authentication", "unauthorized", "invalidapikey", "invalid_api_key", "oauth_org_not_allowed"].contains(where: compact.contains) { return .authentication }
+        if cell.range(of: #"\b(?:400|402|404|422)\b"#, options: .regularExpression) != nil ||
+            ["billing_error", "billingerror", "insufficient_quota", "insufficientquota", "account_on_hold", "model_not_found", "modelnotfound", "invalid_request", "context_length_exceeded", "contextlengthexceeded"].contains(where: compact.contains) { return .configuration }
+        if ["streamdisconnectedbeforecompletion", "connectionerror", "transporterror", "requesttimedout", "networkerror",
+            "connectionreset", "connectionrefused", "connectionclosed", "error-decodingresponsebody", "errordecodingresponsebody",
+            "failedtosendrequest", "error-sendingrequest", "errorsendingrequest", "reconnectfailed", "streamclosed", "socketclosed",
+            "requesttimeout", "deadlineexceeded", "connectionaborted", "brokenpipe"].contains(where: compact.contains) { return .transport }
+        if cell.range(of: #"\b(?:408|429|500|502|503|504|529)\b"#, options: .regularExpression) != nil ||
+            ["overloaded", "ratelimit", "rate_limit", "servererror", "server_error", "max_output_tokens", "maxoutputtokens",
+             "internalservererror", "temporarilyunavailable", "anerroroccurredwhileprocessingyourrequest"].contains(where: compact.contains) { return .api }
+        return nil
     }
 }
 
@@ -70,7 +83,8 @@ public enum ResumeDelivery: String, Codable { case sent, typed, screenChanged, m
 /// The same rules as `CodexResumeScript.functions`, for hosts that are read and written from Swift.
 public enum CodexResumeCheck {
     public static func agent(in region: String) -> AgentKind {
-        rows(region).first?.trimmingCharacters(in:.whitespaces).hasPrefix("■ ") == true ? .codex : .claude
+        let current = rows(region)
+        return current.first?.trimmingCharacters(in:.whitespaces).hasPrefix("■ ") == true || goalStalled(current) ? .codex : .claude
     }
     static func isComposer(_ line: String) -> Bool { line.trimmingCharacters(in: .whitespaces).first.map { "›»❯".contains($0) } == true }
     /// Vim normal or replace mode would run typed text as commands; a running turn owns the composer.
@@ -82,9 +96,12 @@ public enum CodexResumeCheck {
         guard let last = rows.lastIndex(where: isComposer) else { return "" }
         return rows.dropFirst(last + 1).joined(separator: "\n")
     }
-    static func goalStalled(_ rows: [String]) -> Bool { footer(rows).contains("Goal stalled (/goal resume)") }
+    static func goalStalled(_ rows: [String]) -> Bool {
+        let compact = footer(rows).filter { !$0.isWhitespace }
+        return compact.contains("Goalstalled(/goalresume)") || compact.contains("Goalblocked(/goalresume)")
+    }
     static func goalHeld(_ rows: [String]) -> Bool {
-        footer(rows).range(of: #"Goal (?:paused|hit usage limits|hit budget|budget|achieved|abandoned)"#, options: .regularExpression) != nil
+        footer(rows).filter { !$0.isWhitespace }.range(of: #"Goal(?:paused|hitusagelimits|hitbudget|budget|achieved|abandoned)"#, options: .regularExpression) != nil
     }
     private static func running(_ rows: [String]) -> Bool {
         rows.suffix(8).joined(separator: "\n").range(of: #"(?i)(?:esc|ctrl\+c) to (?:interrupt|stop)|tab to queue"#, options: .regularExpression) != nil
@@ -100,9 +117,15 @@ public enum CodexResumeCheck {
         return rows[start...end].joined(separator: "\n")
     }
     public static func ready(_ screen: String, region: String, text: String? = nil) -> Bool {
-        let heading = rows(region).first?.trimmingCharacters(in: .whitespaces) ?? ""
+        let expected = rows(region), current = rows(screen)
+        let heading = expected.first?.trimmingCharacters(in: .whitespaces) ?? ""
         if let text, CodexCapacityStop.detect(screen, agent: agent(in: region))?.continuationText != text { return false }
-        return !heading.isEmpty && !blocked(rows(screen).map { $0.trimmingCharacters(in: .whitespaces) })
+        if goalStalled(expected) {
+            guard !goalHeld(current), !blocked(current), let composer = current.lastIndex(where: isComposer),
+                  ActivityDetector.detect(screen, agent: .codex).phase == .idle else { return false }
+            return Array(current[composer...]) == expected
+        }
+        return !heading.isEmpty && !blocked(current.map { $0.trimmingCharacters(in: .whitespaces) })
             && activeRegion(screen, heading: heading) == rows(region).joined(separator: "\n")
     }
     private static func messages(_ rows: [String], text: String) -> Int {
@@ -112,7 +135,8 @@ public enum CodexResumeCheck {
     /// The composer now holds something other than the stop's placeholder: the user is typing.
     public static func composerChanged(_ screen: String, region: String) -> Bool {
         let current = rows(screen)
-        guard let last = current.lastIndex(where: isComposer), let stopped = rows(region).last else { return false }
+        let expected = rows(region)
+        guard let last = current.lastIndex(where: isComposer), let stopped = expected.last(where: isComposer) else { return false }
         let text = composerText(current[last])
         return !text.isEmpty && text != composerText(stopped)
     }
@@ -130,6 +154,9 @@ public enum CodexResumeCheck {
         let expected = rows(region), current = rows(after)
         let heading = expected.first?.trimmingCharacters(in: .whitespaces) ?? ""
         if draftVisible(after, text: text) {
+            if goalStalled(expected) {
+                return goalStalled(current) && !goalHeld(current) && footer(current) == footer(expected) ? .draft : .typed
+            }
             // A draft makes the composer taller, so only the filled rows above it must match.
             let filled: ([String]) -> [String] = { $0.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
             guard let active = activeRegion(after, heading: heading).map(rows),
@@ -138,7 +165,7 @@ public enum CodexResumeCheck {
         }
         if text == CodexCapacityStop.goalResumeText {
             // Slash commands do not create a user-message cell. The lifecycle footer acknowledges them.
-            return goalStalled(rows(before)) && footer(current).contains("Pursuing goal") ? .submitted : .typed
+            return goalStalled(rows(before)) && footer(current).filter({ !$0.isWhitespace }).contains("Pursuinggoal") ? .submitted : .typed
         }
         return messages(current, text: text) > 0 && transcript(current) != transcript(rows(before)) ? .submitted : .typed
     }
@@ -185,7 +212,7 @@ enum CodexResumeScript {
       return rows;
     }
     function isComposer(row) { return /^[›»❯]/.test(row.trim()); }
-    function resumeAgent(region) { return resumeRows(region)[0].trim().startsWith('■ ') ? 'codex' : 'claude'; }
+    function resumeAgent(region) { const rows = resumeRows(region); return rows[0].trim().startsWith('■ ') || goalStalled(rows) ? 'codex' : 'claude'; }
     function composerText(row) { return row.trim().slice(1).trim(); }
     function resumeBlocked(rows) { return /Vim: (?:Normal|Replace)|esc to interrupt/i.test(rows.slice(-8).map(row => row.trim()).join('\\n')); }
     function activeRegion(rows, heading) {
@@ -197,12 +224,17 @@ enum CodexResumeScript {
     }
     function lastComposer(rows) { for (let index = rows.length - 1; index >= 0; index--) if (isComposer(rows[index])) return index; return -1; }
     function resumeFooter(rows) { const last = lastComposer(rows); return last < 0 ? '' : rows.slice(last + 1).join('\\n'); }
-    function goalStalled(rows) { return resumeFooter(rows).includes('Goal stalled (/goal resume)'); }
-    function goalHeld(rows) { return /Goal (?:paused|hit usage limits|hit budget|budget|achieved|abandoned)/.test(resumeFooter(rows)); }
+    function goalStalled(rows) { return /Goal(?:stalled|blocked)\\(\\/goalresume\\)/.test(resumeFooter(rows).replace(/\\s/g, '')); }
+    function goalHeld(rows) { return /Goal(?:paused|hitusagelimits|hitbudget|budget|achieved|abandoned)/.test(resumeFooter(rows).replace(/\\s/g, '')); }
     function resumeRunning(rows) { return /(?:esc|ctrl\\+c) to (?:interrupt|stop)|tab to queue/i.test(rows.slice(-8).join('\\n')); }
     function resumeReady(rows, region, text) {
       const expected = resumeRows(region), active = activeRegion(rows, expected[0].trim());
       const codex = resumeAgent(region) === 'codex';
+      if (goalStalled(expected)) {
+        const composer = lastComposer(rows);
+        return !resumeBlocked(rows) && !resumeRunning(rows) && !goalHeld(rows) && goalStalled(rows)
+          && text === '/goal resume' && composer >= 0 && rows.slice(composer).join('\\n') === expected.join('\\n');
+      }
       return !resumeBlocked(rows) && !(codex && goalHeld(rows))
         && (!codex || (text === '/goal resume') === goalStalled(rows))
         && active !== null && active.join('\\n') === expected.join('\\n');
@@ -217,11 +249,12 @@ enum CodexResumeScript {
     function typedState(before, after, region, text) {
       const expected = resumeRows(region);
       if (draftShown(after, text)) {
+        if (goalStalled(expected)) return goalStalled(after) && !goalHeld(after) && resumeFooter(after) === resumeFooter(expected) ? 'draft' : 'typed';
         // A draft makes the composer taller, so only the filled rows above it must match.
         const active = activeRegion(after, expected[0].trim());
         return active !== null && filledRows(active.slice(0, -1)) === filledRows(expected.slice(0, -1)) ? 'draft' : 'typed';
       }
-      if (text === '/goal resume') return goalStalled(before) && resumeFooter(after).includes('Pursuing goal') ? 'submitted' : 'typed';
+      if (text === '/goal resume') return goalStalled(before) && resumeFooter(after).replace(/\\s/g, '').includes('Pursuinggoal') ? 'submitted' : 'typed';
       // Submitted at once: the screen above the composer changed and shows the text as a message.
       return messageCount(after, text) > 0 && transcript(after) !== transcript(before) ? 'submitted' : 'typed';
     }

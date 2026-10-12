@@ -45,7 +45,7 @@ extension ApprovalTests {
             try expectFalse(CodexResumeCheck.ready(held,region:stop.region,text:stop.continuationText))
         }
         try expect(CodexCapacityStop.detect(stalled.replacingOccurrences(of:"› Ask Codex to do anything",with:"› 1"),agent:.codex) == nil,"Preserve a user draft, even a single digit")
-        try expect(CodexCapacityStop.detect(stalled.replacingOccurrences(of:"■ stream disconnected before completion: network error",with:"• Work complete"),agent:.codex) == nil,"Stalled alone cannot trigger a retry")
+        try expectEqual(CodexCapacityStop.detect(stalled.replacingOccurrences(of:"■ stream disconnected before completion: network error",with:"• External dependency unavailable"),agent:.codex)?.kind,.goalBlocked,"A blocked Goal does not need an API error")
         let quoted = "Goal stalled (/goal resume)\n\n"+frame
         try expectEqual(CodexCapacityStop.detect(quoted,agent:.codex)?.continuationText,CodexCapacityStop.resumeText,"Only the current status footer counts")
         let working = "› 이어서 진행하자.\n\nWorking · esc to interrupt"

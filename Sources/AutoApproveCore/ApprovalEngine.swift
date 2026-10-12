@@ -155,6 +155,8 @@ import TerminalInputSupport
     public var capacityResumeDelays: [TimeInterval] = [30, 60, 120, 240, 480]
     /// Transient connection failures continue with a bounded delay until progress or cancellation.
     public var interruptionResumeDelays: [TimeInterval] = [5, 15, 30, 60, 120, 300]
+    /// A blocked Goal rechecks external conditions at a slower cadence than a network error.
+    public var goalBlockedResumeDelays: [TimeInterval] = [30, 60, 120, 300]
     /// Wait after a final check that typed nothing, before trying the next fresh frame.
     public var capacityUnsentRetryDelay: TimeInterval = 3
     /// A continued turn that keeps working this long made progress: its next stop starts a new run.
@@ -3083,13 +3085,17 @@ import TerminalInputSupport
     }
 
     private func startCapacityRun(_ id: String, stop: CodexCapacityStop, channel: ApprovalChannel, attempt: Int, at now: Date) {
-        let delays = stop.kind == .capacity ? capacityResumeDelays : interruptionResumeDelays
+        let delays = stop.kind == .capacity ? capacityResumeDelays : stop.kind == .goalBlocked ? goalBlockedResumeDelays : interruptionResumeDelays
         var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: stop.kind == .capacity ? min(attempt,delays.count) : attempt,
             deadline: now, observedAt: now)
         let previousIdentity = sessions[id]?.interruption?.resumeIdentity
         if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true &&
-            (previousIdentity == stop.continuationKey || previousIdentity == stop.identity)) {
+            (previousIdentity == stop.continuationKey || previousIdentity == stop.identity ||
+                (sessions[id]?.interruption?.resumeCommand == nil && previousIdentity == stop.legacyContinuationKey))) {
             state.phase = .review
+        } else if let confirmed = sessions[id]?.interruption?.resumeConfirmedAt,
+                  previousIdentity == stop.continuationKey || previousIdentity == stop.identity {
+            state.phase = .sent; state.sentAt = confirmed
         } else if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil &&
                     !(channel == .vscodeScreen && sessions[id]?.bridgeID.flatMap({peers[$0]}) != nil) {
             state.phase = .unavailable
@@ -3117,6 +3123,7 @@ import TerminalInputSupport
         func current() -> (CapacityState, AgentSession, ScreenHostAdapter?)? {
             guard let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
+                  session.unansweredQuestions.isEmpty,
                   session.phase != .ended, (session.channel == state.channel || ScreenHost(kind:session.terminal)?.channel == state.channel), Date() >= state.deadline,
                   Date().timeIntervalSince(state.observedAt) < 6 else { return nil }
             let adapter = ScreenHost(channel:state.channel).flatMap {screenAdapters[$0]}
@@ -3144,7 +3151,9 @@ import TerminalInputSupport
         // Persist the attempt before typing; a crash or lost result remains traceable.
         guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
         sessions[id]?.interruption?.resumeUncertain = true
+        sessions[id]?.interruption?.resumeConfirmedAt = nil
         sessions[id]?.interruption?.resumeIdentity = state.stop.continuationKey
+        sessions[id]?.interruption?.resumeCommand = state.stop.continuationText
         guard persistInterruption(id) else { capacityStates[id]?.phase = .review; publish(); return }
         publish()
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
@@ -3177,6 +3186,7 @@ import TerminalInputSupport
             switch delivery {
             case .sent:
                 sessions[id]?.interruption?.resumeUncertain = false
+                sessions[id]?.interruption?.resumeConfirmedAt = Date()
                 capacityStates[id]?.phase = .sent; capacityStates[id]?.sentAt = Date(); capacityStates[id]?.unsent = 0
             case .typed:
                 // Typed, but neither a draft nor a new message was visible: never type again.

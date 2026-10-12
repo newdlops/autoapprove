@@ -2,7 +2,7 @@ import Foundation
 
 public struct SessionInterruption: Codable, Equatable {
     public enum Kind: String, Codable {
-        case capacity, transport, api, authentication, configuration
+        case capacity, transport, api, authentication, configuration, goalBlocked
         public var title: String {
             switch self {
             case .capacity: return "모델 용량 부족"
@@ -10,6 +10,7 @@ public struct SessionInterruption: Codable, Equatable {
             case .api: return "API 오류"
             case .authentication: return "인증 오류"
             case .configuration: return "설정 확인 필요"
+            case .goalBlocked: return "Goal blocked"
             }
         }
         public var retryable: Bool { self != .authentication && self != .configuration }
@@ -31,6 +32,10 @@ public struct SessionInterruption: Codable, Equatable {
     public var recoveredAt: Date?
     public var resumeUncertain: Bool?
     public var resumeIdentity: String?
+    public var resumeCommand: String?
+    /// A confirmed continuation is retained across app restarts until work or a
+    /// different failure is observed. An unchanged footer cannot replay the command.
+    public var resumeConfirmedAt: Date?
     public var recoveryStatus: String?
     public var recoveryDetail: String?
     public var needsAttention: Bool { recoveredAt == nil }

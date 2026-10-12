@@ -12,10 +12,13 @@ int main(int argc, char **argv) {
     if (argc < 2 || tcgetattr(0,&original)) return 2;
     mode=original; cfmakeraw(&mode); if(tcsetattr(0,TCSANOW,&mode))return 3;
     int goal=argc>2 && !strcmp(argv[2],"goal");
+    int blocked=argc>2 && !strcmp(argv[2],"blocked");
+    goal=goal||blocked;
+    const char *heading=blocked?"• External dependency still unavailable":"■ stream disconnected before completion: network error";
     const char *text=goal?"/goal resume":"이어서 진행하자.";
     const char *status=goal?" · Goal stalled (/goal resume)":"";
     char frame[4096];
-    snprintf(frame,sizeof(frame),"\033[2J\033[H■ stream disconnected before completion: network error\r\n\r\n› Ask Codex to do anything\r\n\r\n? for shortcuts%s",status);
+    snprintf(frame,sizeof(frame),"\033[2J\033[H%s\r\n\r\n› Ask Codex to do anything\r\n\r\n? for shortcuts%s",heading,status);
     write(1,frame,strlen(frame));
     FILE *f=fopen(argv[1],"ab");if(!f)return 4;
     unsigned char bytes[4096];ssize_t count;
@@ -27,7 +30,7 @@ int main(int argc, char **argv) {
                 : "\033[2J\033[H› 이어서 진행하자.\r\n\r\nWorking · esc to interrupt";
             write(1,working,strlen(working));usleep(750000);break;
         }
-        snprintf(frame,sizeof(frame),"\033[2J\033[H■ stream disconnected before completion: network error\r\n\r\n› %s\r\n\r\n? for shortcuts%s",text,status);
+        snprintf(frame,sizeof(frame),"\033[2J\033[H%s\r\n\r\n› %s\r\n\r\n? for shortcuts%s",heading,text,status);
         write(1,frame,strlen(frame));
     }
     fclose(f);tcsetattr(0,TCSANOW,&original);return 0;
