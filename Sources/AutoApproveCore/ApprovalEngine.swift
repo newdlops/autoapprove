@@ -88,6 +88,7 @@ import TerminalInputSupport
     private var parentSaveFailed = false
     private let codexQuestions = CodexQuestionCollector()
     private var codexCompletions = CodexCompletionTracker()
+    private var codexTurns: [String: (state: CodexTurnState, observedAt: Date)] = [:]
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private let codexQueue: CodexQueueTransport
@@ -161,6 +162,8 @@ import TerminalInputSupport
     public var capacityResumeDelays: [TimeInterval] = [30, 60, 120, 240, 480]
     /// Transient connection failures continue with a bounded delay until progress or cancellation.
     public var interruptionResumeDelays: [TimeInterval] = [5, 15, 30, 60, 120, 300]
+    /// Authentication/configuration fixes may happen outside the CLI. Keep checking slowly.
+    public var accountErrorResumeDelays: [TimeInterval] = [60, 120, 300, 600]
     /// A blocked Goal rechecks external conditions at a slower cadence than a network error.
     public var goalBlockedResumeDelays: [TimeInterval] = [30, 60, 120, 300]
     /// Wait after a final check that typed nothing, before trying the next fresh frame.
@@ -180,6 +183,7 @@ import TerminalInputSupport
         var sentAt: Date?
         var unsent = 0
         var workingObserved = false
+        var turnIdentity: String?
     }
     private var capacityStates: [String: CapacityState] = [:]
     private var exitRecoveries: [String: SessionExitRecovery] = [:]
@@ -1834,12 +1838,14 @@ import TerminalInputSupport
             session.codexQuestionsError = update.error
             session.completionError = update.completionError ?? (update.turn == nil && !update.completionReadPending ? update.error : nil)
             if let turn = update.turn {
+                codexTurns[session.id] = (turn, date)
                 let completed = codexCompletions.observe(turn, sessionID: session.id, at: date)
                 if turn.status != "completed" || session.completion?.id != "codex:\(turn.threadID):\(turn.turnID ?? "")" {
                     session.completion = nil
                 }
                 if let completed { session.completion = completed }
             } else if update.completionReadPending || update.error != nil || update.completionError != nil {
+                codexTurns.removeValue(forKey: session.id)
                 session.completion = nil
             }
             if update.error == nil, let questions = update.questions {
@@ -2177,6 +2183,7 @@ import TerminalInputSupport
         tmuxRelay.retain(handles: Set(managed.compactMap(\.tmuxHandle)))
         ptySessionBindings = ptySessionBindings.filter { live.contains($0.key) || (try? managedPTY.terminal($0.value).isRunning) == false }
         codexCompletions.retain(sessionIDs: live)
+        codexTurns = codexTurns.filter { live.contains($0.key) }
         for var session in managed {
             if var existing = sessions[session.id] {
                 existing.tty = session.tty
@@ -3121,19 +3128,28 @@ import TerminalInputSupport
                     // remain after completion; only a changed transcript or observed work
                     // followed by this stop can authorize another continuation.
                     let elapsed = now.timeIntervalSince(state.sentAt ?? now)
-                    if stop.continuationKey != state.stop.continuationKey || state.workingObserved {
+                    let newFailedTurn = failedTurnAdvanced(id, after: state.turnIdentity, at: now)
+                    if stop.continuationKey != state.stop.continuationKey || state.workingObserved || newFailedTurn {
                         let attempt = elapsed >= capacityProgressWindow ? 1 : state.attempt + 1
                         startCapacityRun(id, stop: stop, channel: channel, attempt: attempt, at: now)
                     } else {
                         capacityStates[id] = state
                     }
                 case .waiting, .unavailable, .review, .cancelled:
-                    if stop.continuationKey != state.stop.continuationKey {
+                    let advanced = state.phase == .review && failedTurnAdvanced(id, after: state.turnIdentity, at: now)
+                    if stop.continuationKey != state.stop.continuationKey || advanced {
                         // Someone continued by hand. A spacing-only redraw is still ours.
-                        startCapacityRun(id, stop: stop, channel: channel, attempt: 1, at: now)
+                        // A later failed root turn also resolves an uncertain earlier send.
+                        if advanced { sessions[id]?.interruption?.resumeUncertain = false; persistInterruption(id) }
+                        startCapacityRun(id, stop: stop, channel: channel, attempt: advanced ? state.attempt + 1 : 1, at: now)
                     } else {
                         state.stop = stop; capacityStates[id] = state
                         if state.phase == .waiting, state.scheduledID == nil { scheduleCapacityResume(id) }
+                        else if state.phase == .unavailable,
+                                ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) != nil ||
+                                    (channel == .vscodeScreen && session.bridgeID.flatMap({ peers[$0] }) != nil) {
+                            startCapacityRun(id, stop: stop, channel: channel, attempt: state.attempt, at: now)
+                        }
                     }
                 }
             } else {
@@ -3185,18 +3201,49 @@ import TerminalInputSupport
         sessions[id]?.pendingRequestID = "capacity:review:\(state.stop.identity)"
     }
 
+    private func failedTurnIdentity(_ id: String, at now: Date) -> String? {
+        guard let turn = codexTurns[id], now.timeIntervalSince(turn.observedAt) >= -5,
+              now.timeIntervalSince(turn.observedAt) < 6, turn.state.status == "failed",
+              let turnID = turn.state.turnID else { return nil }
+        return turn.state.threadID + ":" + turnID
+    }
+
+    private func failedTurnAdvanced(_ id: String, after previous: String?, at now: Date) -> Bool {
+        guard let previous, let next = failedTurnIdentity(id, at: now), next != previous,
+              let thread = codexTurns[id]?.state.threadID else { return false }
+        return previous.hasPrefix(thread + ":")
+    }
+
+    private func recoveryDelays(for kind: SessionInterruption.Kind) -> [TimeInterval] {
+        switch kind {
+        case .capacity: return capacityResumeDelays
+        case .goalBlocked: return goalBlockedResumeDelays
+        case .authentication, .configuration: return accountErrorResumeDelays
+        case .transport, .api: return interruptionResumeDelays
+        }
+    }
+
     private func startCapacityRun(_ id: String, stop: CodexCapacityStop, channel: ApprovalChannel, attempt: Int, at now: Date) {
-        let delays = stop.kind == .capacity ? capacityResumeDelays : stop.kind == .goalBlocked ? goalBlockedResumeDelays : interruptionResumeDelays
+        let delays = recoveryDelays(for: stop.kind)
         var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: attempt,
             deadline: now, observedAt: now)
+        state.turnIdentity = failedTurnIdentity(id, at: now)
         let previousIdentity = sessions[id]?.interruption?.resumeIdentity
+        let advanced = failedTurnAdvanced(id, after: sessions[id]?.interruption?.resumeTurnIdentity, at: now)
+        if advanced, sessions[id]?.interruption?.resumeUncertain == true {
+            sessions[id]?.interruption?.resumeUncertain = false
+            persistInterruption(id)
+        }
         if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true &&
             (previousIdentity == stop.continuationKey || previousIdentity == stop.identity ||
                 (sessions[id]?.interruption?.resumeCommand == nil && previousIdentity == stop.legacyContinuationKey))) {
             state.phase = .review
+            state.turnIdentity = sessions[id]?.interruption?.resumeTurnIdentity ?? state.turnIdentity
         } else if let confirmed = sessions[id]?.interruption?.resumeConfirmedAt,
-                  previousIdentity == stop.continuationKey || previousIdentity == stop.identity {
+                  previousIdentity == stop.continuationKey || previousIdentity == stop.identity,
+                  !advanced {
             state.phase = .sent; state.sentAt = confirmed
+            state.turnIdentity = sessions[id]?.interruption?.resumeTurnIdentity
         } else if ScreenHost(channel: channel).flatMap({ screenAdapters[$0] }) == nil &&
                     !(channel == .vscodeScreen && sessions[id]?.bridgeID.flatMap({peers[$0]}) != nil) {
             state.phase = .unavailable
@@ -3222,7 +3269,9 @@ import TerminalInputSupport
         func current() -> (CapacityState, AgentSession, ScreenHostAdapter?)? {
             guard let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
-                  session.unansweredQuestions.isEmpty,
+                  // Preserve async questions in history, but do not let questions
+                  // followed by later user input block a fresh error/Goal retry.
+                  session.unansweredQuestions.allSatisfy({ $0.hasLaterUserMessage == true }),
                   session.phase != .ended, (session.channel == state.channel || ScreenHost(kind:session.terminal)?.channel == state.channel), Date() >= state.deadline,
                   Date().timeIntervalSince(state.observedAt) < 6 else { return nil }
             let adapter = ScreenHost(channel:state.channel).flatMap {screenAdapters[$0]}
@@ -3253,6 +3302,9 @@ import TerminalInputSupport
         sessions[id]?.interruption?.resumeConfirmedAt = nil
         sessions[id]?.interruption?.resumeIdentity = state.stop.continuationKey
         sessions[id]?.interruption?.resumeCommand = state.stop.continuationText
+        let turnIdentity = failedTurnIdentity(id, at: Date())
+        capacityStates[id]?.turnIdentity = turnIdentity
+        sessions[id]?.interruption?.resumeTurnIdentity = turnIdentity
         guard persistInterruption(id) else { capacityStates[id]?.phase = .review; publish(); return }
         publish()
         let job = (live ?? []).filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
@@ -3291,23 +3343,34 @@ import TerminalInputSupport
                 // Typed, but neither a draft nor a new message was visible: never type again.
                 capacityStates[id]?.phase = .review
             case .screenChanged, .missingTarget, .agentMissing:
-                // Nothing was typed. Try again on a fresh frame, a few times.
-                sessions[id]?.interruption?.resumeUncertain = false
-                let unsent = (capacityStates[id]?.unsent ?? 0) + 1
-                capacityStates[id]?.unsent = unsent
-                capacityStates[id]?.phase = unsent >= 3 ? .review : .waiting
-                capacityStates[id]?.deadline = Date().addingTimeInterval(capacityUnsentRetryDelay)
+                // Nothing was typed. A temporary target or screen failure must not
+                // permanently stop recovery. Back off and require another fresh frame.
+                retryUnsentCapacity(id)
             }
         } catch {
-            // The write may have happened; an uncertain input is never repeated.
-            event.outcome = "입력 확인 필요: \(error.localizedDescription)"
+            let notStarted = (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started"
+            event.outcome = (notStarted ? "입력 미전달: " : "입력 확인 필요: ") + error.localizedDescription
             guard ownsDelivery() else { superseded = true; log(event); publish(); return }
-            capacityStates[id]?.phase = .review
+            if notStarted { retryUnsentCapacity(id) }
+            // The write may have happened; an uncertain input is never repeated.
+            else { capacityStates[id]?.phase = .review }
         }
         capacityStates[id]?.dispatchID = nil
         log(event)
         persistInterruption(id)
         publish()
+    }
+
+    private func retryUnsentCapacity(_ id: String) {
+        guard let state = capacityStates[id] else { return }
+        sessions[id]?.interruption?.resumeUncertain = false
+        let unsent = state.unsent + 1
+        capacityStates[id]?.unsent = unsent
+        capacityStates[id]?.phase = .waiting
+        let delays = recoveryDelays(for: state.stop.kind)
+        let delay = unsent <= 1 || delays.isEmpty ? capacityUnsentRetryDelay :
+            max(capacityUnsentRetryDelay, delays[min(unsent - 2, delays.count - 1)])
+        capacityStates[id]?.deadline = Date().addingTimeInterval(delay)
     }
 
     @discardableResult private func persistInterruption(_ id: String) -> Bool {
@@ -3399,7 +3462,7 @@ import TerminalInputSupport
             context.session = sessions[id] ?? session
             context.conversationID = context.conversationID ?? SessionExitRecovery.conversation(in:screenAnalyses[id]?.raw ?? "")
             context.state = eligible ? "scheduled" : "review"
-            context.deadline = Date().addingTimeInterval(interruptionResumeDelays.first ?? 5)
+            context.deadline = Date().addingTimeInterval(recoveryDelays(for: error.kind).first ?? 5)
             exitRecoveries[id] = context
             sessions[id]?.interruption?.recoveryStatus = context.state
             sessions[id]?.interruption?.recoveryDetail = eligible ? "원본 셸과 같은 대화를 확인한 뒤 자동 복구합니다." : "자동 복구가 꺼졌거나 입력 결과 확인이 필요합니다."
@@ -3429,6 +3492,18 @@ import TerminalInputSupport
 
     private func advanceExitRecovery(_ id: String, records: [ProcessRecord]) {
         guard let context = exitRecoveries[id], sessions[id]?.interruption?.needsAttention == true else { return }
+        // A connection that was unavailable at exit can return later. Recheck the
+        // original shell/conversation then; never require another app restart.
+        if context.state == "unavailable", context.automaticCancelled != true,
+           sessions[id]?.automatic == true, !snapshot.paused, !remoteInputStopped,
+           let host = ScreenHost(kind: context.session.terminal), screenConnections[host]?.enabled == true,
+           screenAdapters[host]?.restart != nil {
+            exitRecoveries[id]?.state = "scheduled"
+            exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
+            sessions[id]?.interruption?.recoveryStatus = "scheduled"
+            persistInterruption(id); saveExitRecoveries(); publish()
+            return
+        }
         if context.state == "awaiting" {
             if Date().timeIntervalSince(context.deadline ?? .distantPast) > 120 {
                 sessions[id]?.interruption?.recoveryStatus = "review"
@@ -3535,8 +3610,10 @@ import TerminalInputSupport
                 sessions[id]?.interruption?.recoveryStatus = "awaiting"
                 sessions[id]?.interruption?.recoveryDetail = "같은 대화의 실행을 확인하고 있습니다. 복구 명령은 다시 보내지 않습니다."
             } else {
-                exitRecoveries[id]?.state = context.attempts < 3 ? "scheduled" : "review"
-                exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
+                exitRecoveries[id]?.state = "scheduled"
+                let delays = recoveryDelays(for: sessions[id]?.interruption?.kind ?? .transport)
+                let delay = delays.isEmpty ? 30 : delays[min(context.attempts - 1, delays.count - 1)]
+                exitRecoveries[id]?.deadline = Date().addingTimeInterval(delay)
                 sessions[id]?.interruption?.resumeUncertain = false
                 sessions[id]?.interruption?.recoveryStatus = exitRecoveries[id]?.state
                 sessions[id]?.interruption?.recoveryDetail = "복구 명령이 전달되지 않았습니다. 원본 셸을 다시 확인합니다."

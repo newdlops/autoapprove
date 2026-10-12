@@ -47,7 +47,250 @@ private final class ResumeProbe: @unchecked Sendable {
     var last: (ScreenTarget, String, String)? { lock.lock(); defer { lock.unlock() }; return calls.last }
 }
 
+private final class RejectedResumeProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    let definite: Bool
+    init(definite: Bool) { self.definite = definite }
+    func resume() throws -> ResumeDelivery {
+        lock.lock(); defer { lock.unlock() }; calls += 1
+        if calls <= 4 {
+            throw RemoteHTTPError(503, "QA temporarily disconnected", diagnostics: ["delivery": definite ? "not_started" : "unknown"])
+        }
+        return .sent
+    }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return calls }
+}
+
 extension ApprovalTests {
+    @MainActor func testUncertainRecoveryContinuesAfterAuthoritativeNewFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-uncertain-new-failure-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        let probe = ResumeProbe([.typed, .sent])
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil }, resume: { probe.resume($0, $1, $2) })
+        func create() throws -> ApprovalEngine {
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter])
+            engine.capacityResumeDelays = [0.02]
+            var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+            session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); return engine
+        }
+        var engine = try create(); defer { engine.stop() }; try engine.setAutomatic(record.key, enabled: true)
+        func observe(_ number: Int, _ status: String) {
+            engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: record.key, turn: CodexTurnState(threadID: "QA", turnID: "turn-\(number)", status: status))])
+            engine.receiveScreen(sessionID: record.key, raw: stoppedFrame, generation: "QA")
+        }
+        observe(1, "failed"); try await Task.sleep(for: .milliseconds(140))
+        try expectEqual(probe.count, 1); try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .review)
+        observe(1, "failed"); try await Task.sleep(for: .milliseconds(80)); try expectEqual(probe.count, 1)
+        observe(2, "inProgress"); try await Task.sleep(for: .milliseconds(80)); try expectEqual(probe.count, 1)
+        engine.stop(); engine = try create()
+        observe(2, "failed"); try await Task.sleep(for: .milliseconds(140))
+        try expectEqual(probe.count, 2, "A confirmed later failed turn allows a fresh continuation without replaying the uncertain one")
+        try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .awaiting)
+        try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, false)
+        observe(2, "failed"); try await Task.sleep(for: .milliseconds(80)); try expectEqual(probe.count, 2)
+    }
+
+    @MainActor func testRecoveryRetriesRejectedWritesButPreservesUnknownResults() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-recovery-rejection-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        for definite in [true, false] {
+            let probe = RejectedResumeProbe(definite: definite)
+            let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil }, resume: { _,_,_ in try probe.resume() })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory.appendingPathComponent(String(definite))), processReader: { [record] }, screenAdapters: [.terminal: adapter])
+            defer { engine.stop() }; engine.capacityResumeDelays = [0.01]; engine.capacityUnsentRetryDelay = 0.01
+            var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+            session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
+            for _ in 0..<6 {
+                engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
+                try await Task.sleep(for: .milliseconds(110))
+            }
+            try expectEqual(probe.count, definite ? 5 : 1)
+            try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, definite ? .awaiting : .review)
+            try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, !definite)
+        }
+    }
+
+    @MainActor func testAllCLIErrorCellsKeepRetrying() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-all-errors-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let processing = "■ stream disconnected before completion: An error occurred while processing your request. " +
+            "You can retry your request, or contact us through our help center at help.openai.com if the error persists. " +
+            "Please include the request ID 00000000-\n0000-4000-8000-000000000061 in your message."
+        let cases: [(AgentKind, String, SessionInterruption.Kind, Bool)] = [
+            (.codex, capacityCell, .capacity, false), (.codex, processing, .transport, false),
+            (.codex, processing, .transport, true), (.codex, "■ unexpected status 503 Service Unavailable", .api, false),
+            (.codex, "■ Authentication token expired", .authentication, false),
+            (.codex, "■ unexpected status 404 model_not_found", .configuration, true),
+            (.codex, "■ A new upstream failure that is not on the wording list", .api, false),
+            (.claude, "API Error: Connection error.", .transport, false),
+            (.claude, "API Error: billing_error", .configuration, false),
+            (.claude, "Error: A new upstream failure", .api, false)
+        ]
+        for (index, item) in cases.enumerated() {
+            let (agent, error, kind, goal) = item
+            let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/" + agent.rawValue)[0]
+            let probe = ResumeProbe([])
+            let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil },
+                resume: { probe.resume($0, $1, $2) })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory.appendingPathComponent(String(index))),
+                processReader: { [record] }, screenAdapters: [.terminal: adapter])
+            defer { engine.stop() }
+            engine.capacityResumeDelays = [0.01, 0.02]; engine.interruptionResumeDelays = [0.01, 0.02]
+            engine.accountErrorResumeDelays = [0.01, 0.02]
+            var session = AgentSession(id: record.key, agent: agent, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+            session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
+            if agent == .codex {
+                let history = (0..<29).map { number -> QueuedQuestion in
+                    var question = QueuedQuestion(id: "old-\(number)", threadID: "QA", title: "이전 질문 \(number)")
+                    question.hasLaterUserMessage = true; return question
+                }
+                engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: history)])
+            }
+            let composer = agent == .codex ? "› Ask Codex to do anything" : "❯ "
+            let footer = "? for shortcuts" + (goal ? " · Goal stalled (/goal resume)" : "")
+            for attempt in 1...8 {
+                let frame = "› Retry \(attempt)\n\n" + error + "\n\n" + composer + "\n\n" + footer
+                engine.receiveScreen(sessionID: session.id, raw: frame, generation: "QA")
+                let until = Date().addingTimeInterval(3)
+                while (probe.count < attempt || engine.snapshot.sessions.first?.capacityResume?.phase != .awaiting), Date() < until {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                try expectEqual(probe.count, attempt, "Case \(index): \(agent) \(kind) must retry beyond the backoff schedule")
+                try expectEqual(probe.last?.2, goal ? "/goal resume" : "이어서 진행하자.")
+                try expectEqual(engine.snapshot.sessions.first?.interruption?.kind, kind)
+                try expectEqual(engine.snapshot.sessions.first?.capacityResume?.limit, 0)
+                engine.receiveScreen(sessionID: session.id, raw: frame, generation: "QA")
+                try await Task.sleep(for: .milliseconds(30)); try expectEqual(probe.count, attempt)
+            }
+            if agent == .codex { try expectEqual(engine.snapshot.sessions.first?.questions.count, 29) }
+            engine.receiveScreen(sessionID: session.id, raw: "› Retry 9\n\n" + error + "\n\n" + composer + "\n\n" + footer, generation: "QA")
+            engine.cancelCapacityResume(session.id)
+            try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.count, 8)
+        }
+    }
+
+    @MainActor func testTransportRetryPreservesCurrentQuestion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-transport-question-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        let probe = ResumeProbe([])
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil }, resume: { probe.resume($0, $1, $2) })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }; engine.interruptionResumeDelays = [0.02]
+        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+        session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
+        var question = QueuedQuestion(id: "current", threadID: "QA", title: "어떤 작업으로 진행할까요?")
+        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: [question])])
+        let frame = "■ stream disconnected before completion: An error occurred while processing your request.\n\n› Ask Codex to do anything\n\n? for shortcuts"
+        engine.receiveScreen(sessionID: session.id, raw: frame, generation: "QA")
+        try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, 0)
+        question.hasLaterUserMessage = true
+        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: [question])])
+        engine.receiveScreen(sessionID: session.id, raw: frame, generation: "QA")
+        try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, 1)
+        try expectEqual(engine.snapshot.sessions.first?.questions.first?.reply, nil)
+    }
+
+    @MainActor func testRecoveryKeepsRetryingDefiniteNonWrites() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-recovery-nonwrite-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        let replies = (0..<12).map { [ResumeDelivery.screenChanged, .missingTarget, .agentMissing][$0 % 3] }
+        let probe = ResumeProbe(replies)
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil }, resume: { probe.resume($0, $1, $2) })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }; engine.capacityResumeDelays = [0.01, 0.02]; engine.capacityUnsentRetryDelay = 0.01
+        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+        session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
+        for attempt in 1...13 {
+            engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
+            try await Task.sleep(for: .milliseconds(110))
+            try expectEqual(probe.count, attempt)
+            try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, false)
+            try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, attempt == 13 ? .awaiting : .scheduled)
+        }
+        engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
+        try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.count, 13)
+    }
+
+    @MainActor func testIdenticalErrorUsesNewFailedRootTurnAcrossRestart() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-identical-failure-turn-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        let probe = ResumeProbe([])
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil }, resume: { probe.resume($0, $1, $2) })
+        func create() throws -> ApprovalEngine {
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter])
+            engine.capacityResumeDelays = [0.01, 0.02]
+            var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+            session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); return engine
+        }
+        func turn(_ engine: ApprovalEngine, _ number: Int, _ status: String, thread: String = "QA") {
+            engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: record.key, turn: CodexTurnState(threadID: thread, turnID: "turn-\(number)", status: status))])
+            engine.receiveScreen(sessionID: record.key, raw: stoppedFrame, generation: "QA")
+        }
+        let first = try create(); try first.setAutomatic(record.key, enabled: true)
+        turn(first, 1, "failed"); try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, 1)
+        first.stop()
+        let restored = try create(); defer { restored.stop() }
+        turn(restored, 1, "failed"); try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.count, 1)
+        for number in 2...9 {
+            turn(restored, number, "inProgress"); try await Task.sleep(for: .milliseconds(40)); try expectEqual(probe.count, number - 1)
+            turn(restored, number, "failed"); try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, number)
+            turn(restored, number, "failed"); try await Task.sleep(for: .milliseconds(40)); try expectEqual(probe.count, number)
+        }
+        for status in ["completed", "interrupted"] { turn(restored, 10, status); try await Task.sleep(for: .milliseconds(60)); try expectEqual(probe.count, 9) }
+        turn(restored, 10, "failed", thread: "another-root")
+        try await Task.sleep(for: .milliseconds(60)); try expectEqual(probe.count, 9, "Another conversation cannot authorize an unchanged original frame")
+        turn(restored, 10, "failed"); restored.cancelCapacityResume(record.key)
+        try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, 9)
+    }
+
+    @MainActor func testCapacityRetryWithHistoricalQuestions() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-capacity-history-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("42 1 ttys901 42 42 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")[0]
+        let probe = ResumeProbe([])
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .sent }, reveal: { _ in nil },
+            resume: { probe.resume($0, $1, $2) })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }
+        engine.capacityResumeDelays = [0.02]
+        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+        session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
+        var history = (0..<29).map { index -> QueuedQuestion in
+            var question = QueuedQuestion(id: "old-\(index)", threadID: "QA", title: "이전 질문 \(index)")
+            question.hasLaterUserMessage = true
+            return question
+        }
+        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: history)])
+        engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
+        try await Task.sleep(for: .milliseconds(180))
+        try expectEqual(probe.count, 1, "Historical questions followed by later user input cannot block the currently stopped capacity turn")
+        try expectEqual(probe.last?.2, "이어서 진행하자.")
+        try expectEqual(engine.snapshot.sessions.first?.questions.count, 29, "Do not discard historical questions or pretend they were answered")
+        try expect(engine.snapshot.sessions.first?.questions.allSatisfy { $0.reply == nil } == true)
+        engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA", at: Date().addingTimeInterval(3600))
+        try await Task.sleep(for: .milliseconds(80)); try expectEqual(probe.count, 1, "An unchanged stop cannot repeat a confirmed continuation")
+
+        // An unresolved current question still blocks continuation until a later
+        // user message shows the CLI has progressed beyond that question.
+        var current = QueuedQuestion(id: "current", threadID: "QA", title: "어떤 환경으로 진행할까요?")
+        history.append(current)
+        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: history)])
+        engine.receiveScreen(sessionID: session.id, raw: refailedFrame, generation: "QA")
+        try await Task.sleep(for: .milliseconds(180)); try expectEqual(probe.count, 1)
+        current.hasLaterUserMessage = true; history[history.count - 1] = current
+        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: history)])
+        engine.receiveScreen(sessionID: session.id, raw: refailedFrame, generation: "QA")
+        try await Task.sleep(for: .milliseconds(180)); try expectEqual(probe.count, 2)
+        try expectEqual(engine.snapshot.sessions.first?.questions.count, 30)
+        try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .awaiting)
+    }
+
     @MainActor func testCapacityRetryContinuesBeyondBackoffSchedule() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-capacity-repeat-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -103,10 +346,11 @@ extension ApprovalTests {
             stoppedFrame.replacingOccurrences(of: "? for shortcuts", with: "? for shortcuts · Vim: Normal"),
             stoppedFrame.replacingOccurrences(of: "  Take your time.", with: "• Working (3s • esc to interrupt)\n  Take your time.")
                 .replacingOccurrences(of: "  mock-model default", with: "  • Working (3s • esc to interrupt)\n  mock-model default"),
-            stoppedFrame.replacingOccurrences(of: "at capacity.", with: "unavailable."),
             stoppedFrame.replacingOccurrences(of: "› Ask Codex to do anything", with: "• Ran npm test\n\n› Ask Codex to do anything"),
             stoppedFrame.replacingOccurrences(of: capacityCell, with: "Note: " + capacityCell),
         ] { try expectNil(CodexCapacityStop.detect(changed, agent: .codex)) }
+        try expectEqual(CodexCapacityStop.detect(stoppedFrame.replacingOccurrences(of: "at capacity.", with: "unavailable."), agent: .codex)?.kind, .api,
+            "New explicit CLI error wording still reaches recovery")
 
         // Orca applies the same checks from Swift.
         try expect(CodexResumeCheck.ready(stoppedFrame, region: stop.region))
@@ -352,7 +596,7 @@ extension ApprovalTests {
         subject.receiveScreen(sessionID: id, raw: refailedFrame, generation: "terminal:\(id)")
         try expectEqual(resume(subject, id)?.attempt, 1, "Hours of work between stops are not one run of failures")
 
-        // Nothing typed: retried on fresh frames a few times, then left for review.
+        // Nothing typed: transient failures continue beyond three attempts, then succeed.
         probe = ResumeProbe([.screenChanged, .screenChanged, .screenChanged])
         (subject, id) = try engine(probe, delays: [0.05])
         subject.capacityUnsentRetryDelay = 0.05
@@ -361,6 +605,6 @@ extension ApprovalTests {
             subject.receiveScreen(sessionID: id, raw: stoppedFrame, generation: "terminal:\(id)")
             await settle(0.3)
         }
-        try expectEqual(probe.count, 3); try expectEqual(resume(subject, id)?.phase, .review)
+        try expectEqual(probe.count, 4); try expectEqual(resume(subject, id)?.phase, .awaiting)
     }
 }

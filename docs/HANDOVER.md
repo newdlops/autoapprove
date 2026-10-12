@@ -1,17 +1,24 @@
 # AutoApprove 작업 인계
 
-최종 갱신: 2026-10-12 (KST), 0.2.77 · 빌드 99. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
+최종 갱신: 2026-10-13 (KST), 0.2.78 · 빌드 100. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
 
 ## 현재 상태
 
-- 사용자 요청: 질문 목록의 ‘실행 중인 Codex의 로컬 서버를 찾지 못했습니다’ 오류를 해결하고 허가·불허 외의 선택형 질문도 웹에서 답한다.
-- 앱 **0.2.77/99**, Bridge **0.2.9**. 이 Mac에 적용했으며 원본 식별·직접 입력 키는 **이 Mac 20개**다. 사용자 원본 CLI는 재시작하지 않았다. 다른 Mac은 현재 연결 해제여서 0.2.77 적용·원본 연결을 확인하지 못했다. 같은 네트워크에 재연결하면 LAN 자동 업데이트를 확인한다.
-- 소스 태그·정식 릴리스·DMG/체크섬 게시와 인증 없는 다운로드 바이트 일치를 확인했다. 소스 커밋: `f8b422875ec1eb745f29ba00cd27cfe0ea7437e8`.
-- 최신 공개 배포: [v0.2.77](https://github.com/newdlops/autoapprove/releases/tag/v0.2.77). 설치 파일 `AutoApprove-0.2.77-macOS-arm64.dmg`, SHA-256 `a01638fe4c553975164305565d6c83903761720fb81e5ddc6d5795a693a28731`.
-- project `/Users/lky/project/autoapprove`, macOS arm64·Swift 패키지. [AGENTS.md](../AGENTS.md), [README.md](../README.md), [DESIGN.md](../DESIGN.md), [VALIDATION.md](../VALIDATION.md)를 따른다.
-- 이전 capacity 자동 이어가기(0.2.76)의 5회 제한 제거와 최대 480초 반복 간격, 0.2.75의 blocked Goal 복구는 유지한다. 완료된 기존 목표를 임의로 재개하거나 새 목표를 만들지 않는다.
+- 앱 **0.2.78/100**, Bridge **0.2.9**. 두 Mac 적용, 원본 식별·직접 입력 **이 Mac 19개 / 다른 Mac 4개**. 원본 CLI 재시작 없음.
+- 검증·설치 완료. 소스 커밋·태그 push·GitHub 게시·공개 다운로드 검증이 남아 있다.
+- 배포: [v0.2.78](https://github.com/newdlops/autoapprove/releases/tag/v0.2.78). DMG SHA-256 `191acd5729907d9a4d41679d7ef083fc1f46ceb8e4ac56fba4309951198e9104`.
 
-## 이번 변경의 연결 경로
+## 0.2.78 오류 복구 경로
+
+- 사용자 목표: **어떤 에러가 나도 다시 재시도를 반복하며 작업을 이어나가야 한다.** `Selected model is at capacity`와 긴 `stream disconnected before completion: An error occurred while processing your request`, 줄바꿈된 모의 request ID를 포함한다. 현재 실제 Codex/Claude 오류 셀의 새 문구도 감지한다. 일반 로그·인용·실행 중인 작업·사용자 초안은 오류 셀로 취급하지 않는다.
+- 연결/API 5·15·30·60·120·최대 300초, capacity 30·60·120·240·최대 480초, 인증/설정 60·120·300·최대 600초, blocked Goal 30·60·120·최대 300초. 마지막 간격을 횟수 제한 없이 반복한다. 일반 요청은 `이어서 진행하자.`, 멈춘 Goal은 `/goal resume`다. 모델·인증·결제·설정을 자동 변경하지 않으며 외부 문제가 해결되면 다음 같은 요청으로 계속한다.
+- `hasLaterUserMessage == true`인 과거 질문은 재개를 막지 않으며 질문 기록/응답을 삭제하지 않는다. 현재 질문, OFF·초안·일시정지·취소·원본 PID/시작/TTY/전경·입력창 검증은 유지한다.
+- 같은 원본 Codex thread에서 새 `failed` turn이 확인되면 동일 화면도 새 실패로 처리한다. 실패 turn을 전송 기록과 함께 저장해 앱 재시작 후 이전 입력을 반복하지 않는다. 실제 새 실패가 이전 미확인 전달을 해소하면 새 요청으로 계속한다. 다른 root·inProgress/completed/interrupted·동일 turn·단순 시간/줄바꿈 변경은 반복 입력의 근거가 아니다.
+- `screenChanged/missingTarget/agentMissing` 및 `delivery=not_started`는 새 화면을 요구하고 간격을 늘려 계속 시도한다. CLI 종료 후 확정 미전달도 세 번으로 포기하지 않는다. 입력/복구 연결이 돌아오면 재확인한다. 증거 없는 미확인 쓰기는 반복하지 않고 상태 확인을 계속한다. 정상 종료는 재시작하지 않는다.
+
+- 구현: `CapacityResume.swift`의 현재 오류 셀 감지, `SessionInterruption.resumeTurnIdentity`의 전송 실패-turn 기록, `ApprovalEngine.recoveryDelays/failedTurnAdvanced/retryUnsentCapacity/restartExitedSession`의 반복 복구. Codex turn은 기존 exact-thread 읽기 전용 수집을 재사용한다. 새 7개 Core 검사와 PTY/tmux 14개 조건이 경로를 검증한다.
+
+## 0.2.77 질문 선택·원본 응답 경로 (유지)
 
 | 경로 | 동작 |
 |---|---|
@@ -28,19 +35,21 @@ Codex 0.162.1의 설치된 문자열과 공식 구현을 확인했다. 기본 `Q
 
 ## 검증 및 실제 사용 확인
 
-- release Core **216/216**, Bridge **17/17**, 새 브라우저 **8개**, 기존 웹 **17개**, Unix 소켓 **8개**, 실제 격리 PTY/tmux **9개 조건** 통과.
-- 모바일·태블릿·데스크톱 렌더링과 다음 질문·미확인/완료 상태를 별도 확인. QA 데이터와 이미지는 무시된 `dist/qa/`에만 둔다.
-- 서명·입력 서비스 메타데이터·앱 리소스·격리된 웹/MCP/PTY·DMG 검증 완료. 로컬 원본 CLI 20개, 저장 설정·승인 기록 14,591건, 기존 root 서비스 보존. 다른 Mac은 현재 연결 해제여서 0.2.77 적용·원본 연결을 확인하지 못했다. 같은 네트워크에 재연결하면 LAN 자동 업데이트를 확인한다.
-- 실제 휴대폰에서는 페이지를 새로고침해 **0.2.77 · 빌드 99**를 확인하고 일반 선택형 질문·다음 질문을 시험한다. 제공자의 질문을 강제로 만들거나 사용자 세션에 테스트 문자를 보내지 않았다.
-- VS Code의 선택 메뉴 입력은 Bridge **0.2.9** 등록 후 사용한다. 기존 창·CLI를 강제로 재시작하지 않는다. 숫자 메뉴가 아닌 자유 답변과 알 수 없는 키 바인딩 화면은 원본 입력을 유지한다.
-- 다른 Mac의 주소·세션 수는 바뀐다. 고정 IP·세션 수를 가정하지 말고 온라인 상태·버전·입력 키를 다시 확인한다.
+- 최종 release Core **224/224**, 새 오류 복구 **7/7**, 기존 capacity **4/4** 통과. 10개 오류/에이전트/Goal 조합 각각 8번, 역사 질문 29개 보존, 현재 질문 보호, 확정 미전달 12회 뒤 복구, 거절/미확인 구분, 원본 셸 4회 실패 뒤 5번째 성공, 동일 화면의 새 실패 및 앱 재시작을 검증했다.
+- 실제 격리 PTY/tmux **14개 조건**에서 긴 요청 처리 오류·Goal·새 오류·인증 오류의 정확한 원본 UTF-8 입력과 Return 및 기존 질문/종료 복구를 확인했다. 사용자 CLI에 시험 문자를 보내지 않았다. 실제 사용자 request ID·터미널 내용·서명 비밀을 게시하지 않았다.
+- release 빌드, 서명·입력 서비스 메타데이터/상호 서명, 격리 웹/MCP/PTY·리소스·포트·설정 복원, DMG 마운트·파일 일치·무결성 검사 통과. UI/Bridge 코드 변경 없음. 새 브라우저/시각 검사를 수행했다고 주장하지 않는다. 이전 0.2.77의 Bridge 17·브라우저 8·웹 17·소켓 8·시각 검증은 이전 기록이다. Bridge 0.2.9 포함.
+- 두 Mac **0.2.78/100** 확인. 원본 식별·직접 입력 키: **이 Mac 19개 / 다른 Mac 4개**. 로컬 원본 CLI **19개**의 PID·시작·TTY, 설정·기존 승인 기록 **14,863건**, root 입력 서비스 프로세스/파일 보존.
+- 검증·설치 완료. 소스 커밋·태그 push·GitHub 게시·공개 다운로드 검증이 남아 있다. DMG SHA-256 `191acd5729907d9a4d41679d7ef083fc1f46ceb8e4ac56fba4309951198e9104`.
+- 휴대폰 웹에서 **0.2.78 · 빌드 100**을 확인한다. 실제 제공자 혼잡/장애를 강제로 만들지는 않았다. 재시도·전달·재개는 격리 실패 시나리오에서 검증했다. 제공자 정상화 시점은 보장하지 않으며 인증/설정 원인은 외부에서 수정해야 성공한다.
+
+- 회사 Wi-Fi와 핫스팟 교대 연결 논의는 별도 미구현 사항이다. 실제 SSID/라우팅 전환은 하지 않았다.
 
 ## 유지할 사용자 요구
 
 - 휴대폰 설치·연결 코드·외부 중계 서비스 없이 같은 핫스팟의 Mac 웹(TCP 8765)과 Mac 목록을 사용한다. 휴대폰의 localhost는 Mac이 아니다.
 - 항상 같은 원본 CLI를 제어한다. 별도 PTY 이동이나 CLI 재시작으로 동기화를 대체하지 않는다.
 - 평소에는 텍스트 터미널을 유지하며 화면 공유는 요청 시 보기 목적으로만 시작한다.
-- 원본 식별·전경 작업·최신 화면·입력 내역을 확인한다. 미확인 입력과 같은 실패 화면은 자동 재전송하지 않는다.
+- 원본 식별·전경 작업·최신 화면·입력 내역을 확인한다. 미확인 입력이나 새 실패 근거가 없는 동일 화면은 자동 재전송하지 않는다.
 - 자동 승인 OFF, 전체 일시정지, 취소, 초안·질문 대기를 존중한다. 명시적으로 일시정지/완료한 Goal과 예산·사용량 제한은 자동 재개하지 않는다.
 - 이미 잠긴 화면을 해제하지 않는다. 관리자 암호·macOS 권한은 사용자가 직접 승인한다.
 - Zscaler·SentinelOne·TCC·Gatekeeper·회사 정책을 끄거나 우회하지 않는다. 이전 suspicious:bash 이후 새 경고가 없었다는 사용자 보고는 경고 없음의 보장이 아니다.
@@ -57,15 +66,15 @@ node scripts/terminal-question-browser-check.mjs --release
 node scripts/codex-queue-transport-check.mjs
 npm --prefix extensions/vscode test
 npm --prefix extensions/vscode run package
-node scripts/package-app.mjs release .runtime/releases/0.2.77/questions-99/AutoApprove.app
-node scripts/terminal-input-package-check.mjs .runtime/releases/0.2.77/questions-99/AutoApprove.app
-node scripts/network-package-check.mjs .runtime/releases/0.2.77/questions-99/AutoApprove.app
-node scripts/package-dmg.mjs .runtime/releases/0.2.77/questions-99/AutoApprove.app
+node scripts/package-app.mjs release .runtime/releases/0.2.78/capacity-history-100/AutoApprove.app
+node scripts/terminal-input-package-check.mjs .runtime/releases/0.2.78/capacity-history-100/AutoApprove.app
+node scripts/network-package-check.mjs .runtime/releases/0.2.78/capacity-history-100/AutoApprove.app
+node scripts/package-dmg.mjs .runtime/releases/0.2.78/capacity-history-100/AutoApprove.app
 ```
 
 이번 패키지 경로는 완료 기록이다. 다음 배포는 **새 버전·빌드·새 디렉터리**를 사용한다. Swift 빌드 중 Swift 소스를 바꾸지 않는다. 브라우저 검사는 설치된 Playwright/Chromium 경로를 `AUTOAPPROVE_PLAYWRIGHT_MODULE`·`AUTOAPPROVE_CHROMIUM_PATH`로 지정한다. 샌드박스로 차단된 네트워크·서명·시스템 접근은 정식 실행 승인을 사용한다.
 
-이번 비공개 자료는 `.runtime/releases/0.2.77/questions-99/`의 `deploy.py`, `verification.json`, `network-{before,after}.json`, `verify-github.mjs`, `github-verification.json`이다. 설치 스크립트를 다시 실행해 백업을 덮어쓰지 않는다. 앱 관리자만 재시작하고 원본 CLI·정상 root 서비스·설정·기록은 전후 비교한다. 살아 있는 앱 소유 PTY가 있으면 종료 승인 전 업데이트하지 않는다.
+이번 비공개 자료는 `.runtime/releases/0.2.78/capacity-history-100/`의 `deploy.py`, `verification.json`, `network-{before,after}.json`, `verify-github.mjs`, `github-verification.json`이다. 설치 스크립트를 다시 실행해 백업을 덮어쓰지 않는다. 앱 관리자만 재시작하고 원본 CLI·정상 root 서비스·설정·기록은 전후 비교한다. 살아 있는 앱 소유 PTY가 있으면 종료 승인 전 업데이트하지 않는다.
 
 태그는 검증한 소스 커밋에 만들고 main·태그를 push한 뒤 `gh release create`로 DMG·체크섬을 게시한다. 공개 태그·두 파일·다운로드 바이트를 확인한다. 이 Mac의 Node TLS는 Zscaler CA로 실패한 적이 있으므로 정상 시스템 TLS의 `/usr/bin/curl`을 사용하며 인증서 검사를 끄지 않는다.
 

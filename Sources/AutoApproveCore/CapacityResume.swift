@@ -61,7 +61,8 @@ public struct CodexCapacityStop: Codable, Equatable {
         let compact = cell.lowercased().filter { !$0.isWhitespace }
         if agent == .codex, ["■selectedmodelisatcapacity", "■selectedmodelisatcapacity.",
                             ("■ " + message).lowercased().filter({ !$0.isWhitespace })].contains(compact) { return .capacity }
-        let isError = agent == .codex ? cell.hasPrefix("■ ") : cell.hasPrefix("API Error:") || cell.hasPrefix("⎿ API Error:")
+        let isError = agent == .codex ? cell.hasPrefix("■ ") :
+            ["API Error:", "⎿ API Error:", "Error:", "⎿ Error:"].contains(where: cell.hasPrefix)
         guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
         // Explicit account failures win even when wrapped in a transport error.
         if cell.range(of: #"(?i)\b(?:401|403)\b"#, options: .regularExpression) != nil ||
@@ -75,7 +76,9 @@ public struct CodexCapacityStop: Codable, Equatable {
         if cell.range(of: #"\b(?:408|429|500|502|503|504|529)\b"#, options: .regularExpression) != nil ||
             ["overloaded", "ratelimit", "rate_limit", "servererror", "server_error", "max_output_tokens", "maxoutputtokens",
              "internalservererror", "temporarilyunavailable", "anerroroccurredwhileprocessingyourrequest"].contains(where: compact.contains) { return .api }
-        return nil
+        // An actual CLI error cell can introduce a new provider wording. Keep its
+        // classification generic instead of silently leaving that turn stopped.
+        return .api
     }
 }
 

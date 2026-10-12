@@ -72,6 +72,18 @@ import AutoApproveCore
         precondition(goalResult == .sent);precondition(goalBytes == Data("/goal resume\r".utf8))
         print("PASS actual owned PTY reactivates \(mode) with exact /goal resume and one verified Return")
         }
+        for (mode, kind) in [("processing", SessionInterruption.Kind.transport), ("processing-goal", .transport), ("unknown", .api), ("authentication", .authentication)] {
+            let record=root.appendingPathComponent("\(mode)-pty-input.bin")
+            let terminal=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,record.path,mode],columns:100,rows:25)
+            let target=try await foreground(terminal.tty)
+            let (_,failure)=try await stopped {try manager.terminal(terminal.ptyID).screen()}
+            precondition(failure.kind == kind)
+            let text=mode == "processing-goal" ? "/goal resume" : CodexCapacityStop.resumeText
+            precondition(failure.continuationText == text)
+            let delivered=try manager.adapter.resume(target,failure.region,text)
+            precondition(delivered == .sent); try await received(record,text+"\r")
+            print("PASS actual owned PTY recovers \(mode) in its original composer with exact text and one verified Return")
+        }
         for mode in ["choice", "request-choice"] {
             let record=root.appendingPathComponent("\(mode)-pty-input.bin")
             let terminal=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,record.path,mode],columns:100,rows:25)
@@ -134,6 +146,16 @@ import AutoApproveCore
             if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}) {break}
             try await Task.sleep(for:.milliseconds(20))
         }
+        let processingRecord=root.appendingPathComponent("processing-tmux-input.bin")
+        _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(processingRecord.path)+" processing"])
+        _=try call(["send-keys","Enter"])
+        var processingTarget=try await foreground(meta[0]);processingTarget.handle=original.tmuxHandle
+        let (_,processingStop)=try await stopped {try relay.screen(processingTarget,fresh:true).contents}
+        precondition(processingStop.kind == .transport)
+        let processingDelivery=try relay.adapter.resume(processingTarget,processingStop.region,processingStop.continuationText)
+        precondition(processingDelivery == .sent);try await received(processingRecord,CodexCapacityStop.resumeText+"\r")
+        print("PASS actual original tmux pane recovers the wrapped request-processing error with exact text and one Return")
+        for _ in 0..<100 {if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}){break};try await Task.sleep(for:.milliseconds(20))}
         let choiceRecord=root.appendingPathComponent("choice-tmux-input.bin")
         _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(choiceRecord.path)+" choice"]);_=try call(["send-keys","Enter"])
         var choiceTarget=try await foreground(meta[0]);choiceTarget.handle=original.tmuxHandle

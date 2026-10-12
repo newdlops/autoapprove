@@ -38,9 +38,14 @@ int main(int argc, char **argv) {
     int goal=argc>2 && !strcmp(argv[2],"goal");
     int blocked=argc>2 && !strcmp(argv[2],"blocked");
     int capacity=argc>2 && (!strcmp(argv[2],"capacity") || !strcmp(argv[2],"capacity-goal"));
+    int processing=argc>2 && (!strcmp(argv[2],"processing") || !strcmp(argv[2],"processing-goal"));
     goal=goal||(argc>2 && !strcmp(argv[2],"capacity-goal"));
+    goal=goal||(argc>2 && !strcmp(argv[2],"processing-goal"));
     goal=goal||blocked;
-    const char *heading=capacity?"■ Selected model is at capacity. Please try a different model.":blocked?"• External dependency still unavailable":"■ stream disconnected before completion: network error";
+    const char *heading=capacity?"■ Selected model is at capacity. Please try a different model.":blocked?"• External dependency still unavailable":
+        processing?"■ stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 00000000-\r\n0000-4000-8000-000000000061 in your message.":
+        argc>2&&!strcmp(argv[2],"unknown")?"■ A new upstream failure that is not on the wording list":
+        argc>2&&!strcmp(argv[2],"authentication")?"■ Authentication token expired":"■ stream disconnected before completion: network error";
     const char *text=goal?"/goal resume":"이어서 진행하자.";
     const char *status=goal?" · Goal stalled (/goal resume)":"";
     char frame[4096];

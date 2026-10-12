@@ -103,7 +103,7 @@ extension ApprovalTests {
             let screen = error + "\n\n" + composer + "\n\n? for shortcuts"
             guard let stop = CodexCapacityStop.detect(screen, agent: agent) else { throw AppError.message("Expected current error: \(error)") }
             try expectEqual(stop.kind, kind)
-            try expectEqual(stop.kind.retryable, kind != .authentication && kind != .configuration)
+            try expect(stop.kind.retryable, "Account failures can recover after an external fix without changing credentials")
             try expectNil(CodexCapacityStop.detect(screen.replacingOccurrences(of: error, with: "Note: " + error), agent: agent))
             try expectNil(CodexCapacityStop.detect(screen.replacingOccurrences(of: error, with: error + "\n\n• Later successful response"), agent: agent))
         }

@@ -13,7 +13,9 @@ public struct SessionInterruption: Codable, Equatable {
             case .goalBlocked: return "Goal blocked"
             }
         }
-        public var retryable: Bool { self != .authentication && self != .configuration }
+        /// Retrying the same request never changes credentials or configuration.
+        /// Account failures use a slower cadence so recovery can follow an external fix.
+        public var retryable: Bool { true }
         public static func claudeFailure(_ error: String) -> Kind {
             switch error {
             case "authentication_failed", "oauth_org_not_allowed", "cloud_credential_error": return .authentication
@@ -33,6 +35,9 @@ public struct SessionInterruption: Codable, Equatable {
     public var resumeUncertain: Bool?
     public var resumeIdentity: String?
     public var resumeCommand: String?
+    /// Exact root failed turn at dispatch, when the read-only Codex history is available.
+    /// A later failed turn can be new even when a full viewport looks identical.
+    public var resumeTurnIdentity: String?
     /// A confirmed continuation is retained across app restarts until work or a
     /// different failure is observed. An unchanged footer cannot replay the command.
     public var resumeConfirmedAt: Date?

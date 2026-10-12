@@ -21,16 +21,49 @@ private final class ExitProbe: @unchecked Sendable {
     var records: [ProcessRecord] = []
     var commands: [String] = []
     var uncertain = false
+    var replies: [TerminalDelivery] = []
     var screen = "To continue this session, run codex resume 00000000-0000-4000-8000-000000000061\nqa% "
     func read() -> [ProcessRecord] { lock.lock(); defer {lock.unlock()}; return records }
     func launch(_ command: String) throws -> TerminalDelivery {
         lock.lock(); defer {lock.unlock()}; commands.append(command)
         if uncertain { throw AppError.message("QA lost result after write") }
-        return .sent
+        return replies.isEmpty ? .sent : replies.removeFirst()
     }
 }
 
 extension ApprovalTests {
+    @MainActor func testExitedRecoveryRetriesPastThreeNonWrites() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-exit-nonwrite-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        41 1 ttys901 41 42 Mon Sep 21 09:00:00 2026 /bin/zsh
+        42 41 ttys901 42 42 Mon Sep 21 09:00:01 2026 /usr/local/bin/claude
+        """)
+        let probe = ExitProbe(); probe.records = records
+        probe.replies = [.missingTarget, .screenChanged, .agentMissing, .missingTarget, .sent]
+        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: probe.screen) }) },
+            approve: { _,_,_ in .sent }, reveal: { _ in nil }, restart: { _,_,command in try probe.launch(command) })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: { _ in [] }, processReader: { probe.read() }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }; await engine.connectScreenHost(.terminal)
+        engine.interruptionResumeDelays = [0.01]
+        var session = AgentSession(id: records[1].key, agent: .claude, pid: 42, started: records[1].started, tty: "/dev/ttys901", cwd: "/tmp/qa", terminal: .terminal)
+        session.providerID = "00000000-0000-4000-8000-000000000061"; session.channel = .terminalScreen
+        engine.updateDiscovery([session], records: records); try engine.setAutomatic(session.id, enabled: true)
+        engine.receiveScreen(sessionID: session.id, raw: interruptionFrame("API Error: Connection error.", agent: .claude), generation: "QA")
+        var shell = records[0]; shell.foregroundGroup = shell.processGroup; probe.records = [shell]
+        let until = Date().addingTimeInterval(12)
+        repeat {
+            engine.updateDiscovery([], records: [shell])
+            try await Task.sleep(for: .milliseconds(110))
+        } while probe.commands.count < 5 && Date() < until
+        try await Task.sleep(for: .milliseconds(100))
+        try expectEqual(probe.commands.count, 5, "A definite failed launch must remain scheduled past the third attempt")
+        try expectEqual(engine.snapshot.sessions.first?.interruption?.recoveryStatus, "awaiting")
+        try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, true)
+        for _ in 0..<3 { engine.updateDiscovery([], records: [shell]); try await Task.sleep(for: .milliseconds(100)) }
+        try expectEqual(probe.commands.count, 5, "A confirmed launch is never repeated")
+    }
+
     func testGoalFailureRecoveryUsesLifecycleCommand() throws {
         let frame = interruptionFrame("■ stream disconnected before completion: network error",agent:.codex)
         let stalled = frame.replacingOccurrences(of:"? for shortcuts",with:"? for shortcuts · Goal stalled (/goal resume)")
@@ -261,7 +294,7 @@ extension ApprovalTests {
         try JSONSerialization.data(withJSONObject:settings).write(to:url)
         try expectNil(try HookInstaller.upgradeTimeouts(executable:executable,url:url))
         try expectEqual(SessionInterruption.Kind.claudeFailure("billing_error"),.configuration)
-        try expect(!SessionInterruption.Kind.claudeFailure("authentication_failed").retryable)
+        try expect(SessionInterruption.Kind.claudeFailure("authentication_failed").retryable)
     }
 
     @MainActor func testCompactInventoryDefersAuditWithoutLosingExactHistory() async throws {
