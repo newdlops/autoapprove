@@ -6,8 +6,8 @@
 
 - 사용자 요청: 질문 목록의 ‘실행 중인 Codex의 로컬 서버를 찾지 못했습니다’ 오류를 해결하고 허가·불허 외의 선택형 질문도 웹에서 답한다.
 - 앱 **0.2.77/99**, Bridge **0.2.9**. 이 Mac에 적용했으며 원본 식별·직접 입력 키는 **이 Mac 20개**다. 사용자 원본 CLI는 재시작하지 않았다. 다른 Mac은 현재 연결 해제여서 0.2.77 적용·원본 연결을 확인하지 못했다. 같은 네트워크에 재연결하면 LAN 자동 업데이트를 확인한다.
-- 로컬 검증·이 Mac 설치를 완료했다. 소스 커밋·태그 push·GitHub 게시 및 공개 다운로드 확인을 마무리해야 한다.
-- 게시할 배포: [v0.2.77](https://github.com/newdlops/autoapprove/releases/tag/v0.2.77). 설치 파일 `AutoApprove-0.2.77-macOS-arm64.dmg`, SHA-256 `a01638fe4c553975164305565d6c83903761720fb81e5ddc6d5795a693a28731`.
+- 소스 태그·정식 릴리스·DMG/체크섬 게시와 인증 없는 다운로드 바이트 일치를 확인했다. 소스 커밋: `f8b422875ec1eb745f29ba00cd27cfe0ea7437e8`.
+- 최신 공개 배포: [v0.2.77](https://github.com/newdlops/autoapprove/releases/tag/v0.2.77). 설치 파일 `AutoApprove-0.2.77-macOS-arm64.dmg`, SHA-256 `a01638fe4c553975164305565d6c83903761720fb81e5ddc6d5795a693a28731`.
 - project `/Users/lky/project/autoapprove`, macOS arm64·Swift 패키지. [AGENTS.md](../AGENTS.md), [README.md](../README.md), [DESIGN.md](../DESIGN.md), [VALIDATION.md](../VALIDATION.md)를 따른다.
 - 이전 capacity 자동 이어가기(0.2.76)의 5회 제한 제거와 최대 480초 반복 간격, 0.2.75의 blocked Goal 복구는 유지한다. 완료된 기존 목표를 임의로 재개하거나 새 목표를 만들지 않는다.
 
