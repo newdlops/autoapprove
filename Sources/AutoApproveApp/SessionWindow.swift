@@ -756,7 +756,7 @@ struct CodexQuestionList: View {
         if session.questions.contains(where: { $0.reply?.phase == .queued }) {
             Text("전달 대기 \(session.questions.filter { $0.reply?.phase == .queued }.count)건")
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                .help("답변을 Codex 메시지 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달됩니다.")
+                .help("답변을 접수했습니다. 각 질문에서 실제 전달 경로와 상태를 확인할 수 있습니다.")
         }
     }
 }

@@ -17,6 +17,7 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
     public var threadID: String
     public var title: String
     public var options: [String]
+    public var multiSelect: Bool? = nil
     public var reply: QuestionReply?
     public var automation: QuestionAutomation?
     /// A later unquoted message may already answer this question; keep it visible,
@@ -31,6 +32,7 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
     }
     func isSameRequest(as other: QueuedQuestion) -> Bool {
         id == other.id && threadID == other.threadID && title == other.title && options == other.options
+            && (multiSelect ?? false) == (other.multiSelect ?? false)
     }
     var titleIdentity: String {
         title.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
@@ -72,8 +74,10 @@ public enum CodexQuestionHistory {
                let questions = item["questions"] as? [JSONObject] {
                 for (index, question) in questions.enumerated() {
                     guard let title = question["title"] as? String, !normalized(title).isEmpty else { continue }
-                    pending.append(QueuedQuestion(id: "codex:\(threadID):\(id):\(index)", threadID: threadID,
-                        title: title, options: question["options"] as? [String] ?? []))
+                    var pendingQuestion = QueuedQuestion(id: "codex:\(threadID):\(id):\(index)", threadID: threadID,
+                        title: title, options: question["options"] as? [String] ?? [])
+                    pendingQuestion.multiSelect = question["multiSelect"] as? Bool
+                    pending.append(pendingQuestion)
                 }
             } else if item["type"] as? String == "userMessage", let content = item["content"] as? [JSONObject] {
                 let text = content.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")

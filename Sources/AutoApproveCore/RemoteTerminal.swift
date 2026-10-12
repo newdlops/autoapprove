@@ -171,7 +171,7 @@ public enum TerminalKeyboard {
 }
 
 public struct RemoteTerminalInput: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable { case text, submit, message, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab }
+    public enum Kind: String, Codable, Sendable { case text, submit, message, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab, choice }
     public var kind: Kind
     public var text: String
     public var relay: Bool? = nil
@@ -194,9 +194,20 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
         case .home: return "\u{1b}[H"
         case .end: return "\u{1b}[F"
         case .tab: return "\t"
+        case .choice:
+            if text.hasPrefix("digit:"), let number = Int(text.dropFirst(6)), (1...9).contains(number) { return String(number) }
+            let delta = Int(text).flatMap { (-19...19).contains($0) ? $0 : nil } ?? 0
+            return String(repeating: delta < 0 ? "\u{1b}[A" : "\u{1b}[B", count: abs(delta)) + "\r"
         }
     }
     public func validate() throws {
+        if kind == .choice {
+            if text.hasPrefix("digit:"), let number = Int(text.dropFirst(6)), (1...9).contains(number), text == "digit:\(number)" { return }
+            guard let delta = Int(text), (-19...19).contains(delta), String(delta) == text else {
+                throw RemoteHTTPError(400, "선택할 항목을 다시 확인해주세요.")
+            }
+            return
+        }
         let textual = [.text, .submit, .message, .characters].contains(kind)
         let limit = kind == .message ? 7_987 : 8_000
         guard !textual || (!text.isEmpty && text.utf8.count <= limit && text.unicodeScalars.allSatisfy({ ($0.value >= 32 && $0.value != 127) || kind != .characters && ($0 == "\n" || $0 == "\t") })),
@@ -208,6 +219,7 @@ enum RemoteMessageReadiness {
     /// A message must not act as Enter on a CLI's current setup or choice menu.
     /// Historical menus above a newer composer do not block new messages.
     static func hasMenu(_ screen: String, agent: AgentKind) -> Bool {
+        if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(screen) { return true }
         if PromptDetector.detect(screen, agent: agent) != nil || QuestionDetector.detect(screen, agent: agent) != nil { return true }
         let rows = Array(PromptDetector.normalizedLines(screen).suffix(30)).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         let option = #"^(?:[›❯»>]\s*)?[1-9][0-9]?\.\s+"#
@@ -226,12 +238,17 @@ enum RemoteMessageReadiness {
 public enum RemoteTerminalAdapter {
     public static func input(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput) throws -> TerminalDelivery {
         try input.validate()
+        if input.kind == .choice, host == .terminal {
+            let latest = try TerminalAdapter.screens(ttys: [target.tty], includeCursor: false)
+            guard latest.screens.first(where: { $0.tty == target.tty })?.contents == expected else { return .screenChanged }
+        }
         if host == .terminal, input.isRelay || ![.text, .submit, .enter].contains(input.kind) {
             return try TerminalDeviceInput.deliver(target: target, agent: agent, input: input, screen: expected)
         }
         if host == .orca {
             guard let handle = target.handle else { return .missingTarget }
-            if !input.isRelay, OrcaAdapter.normalize(try OrcaAdapter.readScreen(handle: handle)) != OrcaAdapter.normalize(expected) { return .screenChanged }
+            if !input.isRelay || input.kind == .choice,
+               OrcaAdapter.normalize(try OrcaAdapter.readScreen(handle: handle)) != OrcaAdapter.normalize(expected) { return .screenChanged }
             let result = try OrcaAdapter.sendComposed(handle: handle, text: input.bytes)
             return (result["send"] as? JSONObject)?["accepted"] as? Bool == true ? .sent : .missingTarget
         }

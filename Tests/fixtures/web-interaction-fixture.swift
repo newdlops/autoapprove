@@ -17,21 +17,22 @@ private actor FixtureQueue {
     @MainActor static func main() async throws {
         let directory = URL(fileURLWithPath: CommandLine.arguments[1]), paths = AppPaths(directory: directory.appendingPathComponent("profile"))
         let messagesOnly = CommandLine.arguments.contains("--messages-only")
+        let noCodexServer = CommandLine.arguments.contains("--no-codex-server")
         let records = ProcessDiscovery.parse("1 0 ?? 1 0 Mon Oct 5 09:00:00 2026 /sbin/launchd\n20 1 ?? 20 0 Mon Oct 5 09:00:00 2026 /fixture/iTerm2/iTermServer\n40 20 ttys080 40 41 Mon Oct 5 09:00:00 2026 /bin/zsh\n41 40 ttys080 41 41 Mon Oct 5 09:00:00 2026 codex\n50 20 ttys081 50 51 Mon Oct 5 09:00:00 2026 /bin/zsh\n51 50 ttys081 51 51 Mon Oct 5 09:00:00 2026 claude")
         let codex = records.first { $0.pid == 41 }!, claude = records.first { $0.pid == 51 }!
         let thread = "00000000-0000-4000-8000-000000000001"
         let queue = FixtureQueue()
         let transport = CodexReplyTransport(prepare: { _, _ in
             if FileManager.default.fileExists(atPath: directory.appendingPathComponent("reply-failure").path) { throw AppError.message("합성 응답 경로 오류 · 연결을 확인해주세요.") }
-            return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread)
+            return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread, queueAvailable: !noCodexServer)
         }, send: { _, message in
             try (message + "\n").append(to: directory.appendingPathComponent("messages.txt")); return await queue.add(message)
         }, prepareMessage: { _ in
             if messagesOnly || FileManager.default.fileExists(atPath: directory.appendingPathComponent("queue-unbound").path) { throw AppError.message("이 Codex 세션의 질문 기록을 찾지 못했습니다.") }
-            return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread)
-        }, queueHome: { _ in CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: "") }, prepareQueue: { _, selected in
+            return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread, queueAvailable: !noCodexServer)
+        }, queueHome: { _ in CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: "", queueAvailable: !noCodexServer) }, prepareQueue: { _, selected in
             guard selected == thread else { throw RemoteHTTPError(409, "다른 대화입니다.") }
-            return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread)
+            return CodexReplyTarget(executable: "/fixture/codex", home: "/fixture", threadID: thread, queueAvailable: !noCodexServer)
         })
         let screen = TestScreenSharing(permission: { _ in !FileManager.default.fileExists(atPath: directory.appendingPathComponent("screen-denied").path) }, sources: { [TestScreenSource(id: 1, scope: "display", title: "합성 Mac 시험 화면", width: 640, height: 480)] }, capture: { _ in
             try "capture\n".append(to: directory.appendingPathComponent("captures.txt"))
@@ -42,11 +43,31 @@ private actor FixtureQueue {
             CGImageDestinationAddImage(destination, context.makeImage()!, nil); guard CGImageDestinationFinalize(destination) else { throw AppError.message("Fixture JPEG failed") }
             return TerminalNativeImage(data: (data as Data).base64EncodedString(), width: 640, height: 480)
         })
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "합성 시험 세션 · 실제 사용자 터미널이 아닙니다.\nREADY> ") }) }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in
+        let adapter = ScreenHostAdapter(screens: { targets in
+            TerminalSnapshot(screens: targets.map { target in
+                let menu = target.tty == "/dev/ttys080" ? try? String(contentsOf: directory.appendingPathComponent("terminal-question"), encoding: .utf8) : nil
+                return TerminalScreen(tty: target.tty, contents: menu ?? "합성 시험 세션 · 실제 사용자 터미널이 아닙니다.\nREADY> ")
+            })
+        }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, expected, _, input in
             if FileManager.default.fileExists(atPath: directory.appendingPathComponent("message-preflight-failure").path) { return .screenChanged }
+            if input.kind == .choice {
+                guard let current=try? String(contentsOf:directory.appendingPathComponent("terminal-question"),encoding:.utf8),current==expected else{return .screenChanged}
+            }
             let route: JSONObject = ["tty": target.tty, "pid": target.sourcePID ?? 0, "text": input.text]
             try (String(decoding: JSONSerialization.data(withJSONObject: route), as: UTF8.self) + "\n").append(to: directory.appendingPathComponent("message-routes.jsonl"))
-            try (input.kind.rawValue + ":" + input.text + "\n").append(to: directory.appendingPathComponent("inputs.txt")); return .sent
+            try (input.kind.rawValue + ":" + input.text + "\n").append(to: directory.appendingPathComponent("inputs.txt"))
+            if input.kind == .choice {
+                if FileManager.default.fileExists(atPath: directory.appendingPathComponent("choice-uncertain").path) { throw AppError.message("합성 선택 입력 결과 미확인") }
+                let value: JSONObject = ["tty":target.tty,"pid":target.sourcePID ?? 0,"bytes":input.bytes]
+                try JSONSerialization.data(withJSONObject: value).write(to: directory.appendingPathComponent("choice-delivered.json"))
+                let file = directory.appendingPathComponent("terminal-question")
+                let current = try String(contentsOf: file, encoding: .utf8)
+                if input.text.hasPrefix("digit:"), current.contains("Question 1/2 (2 unanswered)") {
+                    try current.replacingOccurrences(of: "Question 1/2 (2 unanswered)", with: "Question 2/2 (1 unanswered)")
+                        .replacingOccurrences(of: "enter to submit answer", with: "enter to submit all").write(to: file, atomically: true, encoding: .utf8)
+                } else { try FileManager.default.removeItem(at: file) }
+            }
+            return .sent
         })
         let engine = try ApprovalEngine(paths: paths, questionTransport: transport, claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.iterm: adapter], testScreenSharing: screen,
             codexQueue: CodexQueueTransport(list: { _ in await queue.list() }, delete: { _, ids in await queue.remove(ids) },

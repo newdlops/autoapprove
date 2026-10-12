@@ -15,6 +15,8 @@ public struct RemoteCodexQueue: Codable, Sendable {
     public var sessionID: String
     public var threadID: String
     public var items: [CodexQueuedInput]
+    public var available: Bool? = nil
+    public var unavailableReason: String? = nil
 }
 public struct CodexQueueConversation: Codable, Sendable {
     public var id: String
@@ -24,6 +26,8 @@ public struct CodexQueueConversation: Codable, Sendable {
 public struct RemoteCodexConversations: Codable, Sendable {
     public var sessionID: String
     public var items: [CodexQueueConversation]
+    public var available: Bool? = nil
+    public var unavailableReason: String? = nil
 }
 public struct CodexQueueDeletion: Sendable {
     public var removed: [String]
@@ -34,6 +38,9 @@ public struct CodexQueueDeletion: Sendable {
 /// The existing daemon owns this queue. Never edit its database, resume a thread,
 /// start a daemon or interrupt a turn to manage pending follow-up inputs.
 public struct CodexQueueTransport: Sendable {
+    public static let unavailableMessage = "실행 중인 Codex의 로컬 서버를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요."
+    public static let unavailableReason = "이 Codex 실행 방식에서는 대기 입력 목록·삭제를 지원하지 않습니다. 질문 답변과 새 메시지는 같은 원본 터미널로 전달할 수 있습니다."
+    public static func isAvailable(home: String) -> Bool { CodexQueueConnection.socketPath(home: home) != nil }
     public static func enqueue(_ target: CodexReplyTarget, message: String) async throws -> String {
         try await Task.detached(priority: .utility) {
             guard UUID(uuidString: target.threadID) != nil, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -140,18 +147,24 @@ private final class CodexQueueConnection {
     private var fd: Int32 = -1
     private let deadline = Date().addingTimeInterval(8)
     private var sequence = 0
-    init(home: String) throws {
+    static func socketPath(home: String) -> String? {
         let entry = URL(fileURLWithPath: home).appendingPathComponent("app-server-control/app-server-control.sock")
         var link = stat()
         guard lstat(entry.path, &link) == 0, link.st_uid == getuid(),
               (link.st_mode & S_IFMT) == S_IFSOCK || (link.st_mode & S_IFMT) == S_IFLNK else {
-            throw AppError.message("실행 중인 Codex의 로컬 서버를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요.")
+            return nil
         }
         // Codex publishes a user-owned link to its socket in a private temporary directory.
         let path = entry.resolvingSymlinksInPath().path
         var info = stat()
         guard lstat(path, &info) == 0, info.st_uid == getuid(), (info.st_mode & S_IFMT) == S_IFSOCK else {
-            throw AppError.message("실행 중인 Codex의 로컬 서버를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요.")
+            return nil
+        }
+        return path
+    }
+    init(home: String) throws {
+        guard let path = Self.socketPath(home: home) else {
+            throw RemoteHTTPError(409, CodexQueueTransport.unavailableMessage, diagnostics: ["delivery": "not_started"])
         }
         var address = sockaddr_un(); address.sun_family = sa_family_t(AF_UNIX)
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -192,7 +205,11 @@ private final class CodexQueueConnection {
                   headers["sec-websocket-accept"] == accept else { throw AppError.message("Codex 대기열 서버의 연결 형식을 지원하지 않습니다.") }
             _ = try request("initialize", ["clientInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.72"], "capabilities": ["experimentalApi": true]])
             try send(["method": "initialized"])
-        } catch { Darwin.close(fd); fd = -1; throw error }
+        } catch {
+            Darwin.close(fd); fd = -1
+            // Initialization has not submitted any queue operation.
+            throw RemoteHTTPError(409, error.localizedDescription, diagnostics: ["delivery": "not_started"])
+        }
     }
     deinit { if fd >= 0 { Darwin.close(fd) } }
     func request(_ method: String, _ params: JSONObject) throws -> JSONObject {

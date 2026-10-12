@@ -52,6 +52,10 @@ public enum TerminalDeviceInput {
         // rest of a CSI sequence arrives. Its default editor/list bindings also
         // provide these single-byte keys, without changing terminal modes.
         switch input.kind {
+        case .choice:
+            if input.text.hasPrefix("digit:") { return input.bytes }
+            let delta = Int(input.text) ?? 0
+            return String(repeating: delta < 0 ? "\u{10}" : "\u{0e}", count: min(19, abs(delta))) + "\r"
         case .up: return "\u{10}" // Ctrl-P: editor and list up
         case .down: return "\u{0e}" // Ctrl-N: editor and list down
         default: break

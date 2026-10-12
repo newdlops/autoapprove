@@ -1,10 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ScreenMirror } from './screen';
+import { ScreenMirror, choiceInputBytes } from './screen';
 import { readThemeColors, resolveTerminalTheme } from './theme';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+
+test('explicit terminal choice has one Return and cannot bypass screen validation', async () => {
+  const mirror = new ScreenMirror(); await mirror.write('Which screen?\r\n› 1. Mobile\r\n  2. Desktop');
+  const now = Date.now(), action = {id:'choice', generation:mirror.generation, expiresAt:now+1000, screen:mirror.snapshot(), kind:'choice', text:'1'};
+  assert.equal(choiceInputBytes('1'),'\x1b[B\r'); assert.equal(choiceInputBytes('-2'),'\x1b[A\x1b[A\r'); assert.equal(choiceInputBytes('0'),'\r');
+  assert.equal(choiceInputBytes('digit:2'),'2');
+  for (const text of ['digit:0','digit:10','digit:-1','digit:02']) assert.throws(()=>choiceInputBytes(text));
+  for (const text of ['20','-20','01','-0','NaN','\x1b','']) assert.throws(()=>choiceInputBytes(text));
+  assert.equal(mirror.consumeInput({...action, screen:'old menu', relay:true},now),false);
+  assert.equal(mirror.consumeInput(action,now),true); assert.equal(mirror.consumeInput(action,now),false);
+  mirror.dispose();
+});
 
 test('live terminal cursor follows ANSI movement, wide text and hidden cursor mode', async () => {
   const mirror = new ScreenMirror(); mirror.resize(80, 12);

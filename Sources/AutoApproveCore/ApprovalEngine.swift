@@ -129,7 +129,13 @@ import TerminalInputSupport
             let value = DetectionLines(raw); prepared = value; return value
         }
         lazy var prompt = PromptDetector.detect(raw, agent: agent, prepared: lines)
-        lazy var request = QuestionDetector.detect(agent: agent, prepared: lines)
+        lazy var request: PendingScreenRequest? = {
+            if let request = QuestionDetector.detect(agent: agent, prepared: lines) { return request }
+            if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(raw) {
+                return PendingScreenRequest(phase: .input, summary: TerminalChoiceQuestion.detect(raw, agent: agent)?.question ?? "Codex가 질문의 답변을 기다리고 있습니다. 원본 입력란에서 답변해주세요.")
+            }
+            return nil
+        }()
         lazy var activity = ActivityDetector.detect(raw, agent: agent, permissionPrompt: { self.prompt != nil })
         lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent, activity: activity, prepared: lines)
         lazy var fingerprint = PromptDetector.fingerprint(raw)
@@ -639,17 +645,17 @@ import TerminalInputSupport
     private func usesOrcaSnapshot(_ session: AgentSession) -> Bool { session.terminal == .orca && orcaSnapshotReader != nil }
     private func remoteKeys(_ session: AgentSession) -> [String] {
         let basic = ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
-        let interactive = ["submit", "characters", "left", "right", "backspace", "delete", "home", "end"]
+        let interactive = ["submit", "characters", "left", "right", "backspace", "delete", "home", "end", "choice"]
         if session.terminal == .terminal {
             return terminalInputAvailable() ? basic + interactive + ["message"] : ["text", "submit", "enter"]
         }
         if session.terminal == .tmux { return basic + interactive + ["message"] }
         if usesOrcaSnapshot(session) {
-            return ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab"]
+            return ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab", "choice"]
         }
         if session.terminal == .vscode {
             let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
-            return basic + ((registration?["remoteInputVersion"] as? Int ?? 0) >= 2 ? interactive : [])
+            return basic + ((registration?["remoteInputVersion"] as? Int ?? 0) >= 2 ? interactive.filter { $0 != "choice" || registration?["choiceInput"] as? Bool == true } : [])
         }
         return basic + interactive
     }
@@ -1026,9 +1032,13 @@ import TerminalInputSupport
         else if orcaMode { keys = orcaBinding != nil ? remoteKeys(current) : [] }
         else if nativeOnly { keys = nativeBinding?.selected == true ? ["characters", "enter", "escape", "interrupt", "up", "down", "left", "right", "backspace", "delete", "home", "end", "tab"] : [] }
         remoteFrameSequence += 1
-        let frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
+        var frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
             observedAt: observedAt, keys: keys, inputReason: sourceReason ?? remoteInputReason(current), appearance: visibleAppearance,
             cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil, nativeDisplay: nativeDisplay, outputReason: outputReason, sequence: remoteFrameSequence)
+        if var question = TerminalChoiceQuestion.detect(raw, agent: current.agent) {
+            question.reply = savedReply("terminalChoice:\(sessionID):\(question.id)")
+            frame.question = question
+        }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         guard try encoder.encode(frame).count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. Mac에서 창 크기를 줄여주세요.") }
         remoteFrames[sessionID] = (frame, raw, generation, orcaBinding, nativeOnly ? nativeBinding : nil)
@@ -1086,6 +1096,15 @@ import TerminalInputSupport
             guard relay, !session.pendingInTerminal, session.phase != .approval, !RemoteMessageReadiness.hasMenu(observed.raw, agent: session.agent),
                   [.terminal, .tmux].contains(session.terminal) else {
                 throw RemoteHTTPError(409, "현재 원본 터미널의 질문에 먼저 답변해주세요.")
+            }
+        }
+        if kind == .choice {
+            guard let currentQuestion = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent),
+                  let questionID = object["questionID"] as? String, questionID == currentQuestion.id,
+                  replyingQuestions.contains("terminalChoice:\(id):\(questionID)"),
+                  let target = currentQuestion.targetIndex(command: input.text), currentQuestion.options.indices.contains(target),
+                  currentQuestion.command(for: target) == input.text else {
+                throw RemoteHTTPError(409, "질문이나 선택지가 바뀌어 답변하지 않았습니다. 현재 질문을 확인해주세요.")
             }
         }
         remoteInputSessions.insert(id)
@@ -1152,6 +1171,9 @@ import TerminalInputSupport
         let textual = [.text, .submit, .message, .characters].contains(kind)
         var event = AuditEvent(sessionID: id, summary: textual ? String(input.text.prefix(200)) : kind.rawValue,
             outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: textual ? input.text : kind.rawValue)
+        if kind == .choice, let question = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent), let selected = question.targetIndex(command: input.text) {
+            event.summary = question.question; event.request = question.question + "\n" + question.options.joined(separator: "\n"); event.answer = question.options[selected]
+        }
         guard log(event) else { throw RemoteHTTPError(409, "입력 내역을 저장하지 못해 전송하지 않았습니다.") }
         do {
             deliveryStarted = true
@@ -1193,7 +1215,8 @@ import TerminalInputSupport
         automaticInputSessions.contains(id) || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
     }
 
-    private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject) async throws -> JSONObject {
+    private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
+                                            preflight: (() async throws -> Void)? = nil) async throws -> JSONObject {
         var outcome = "not_started"
         do {
             guard original.agent != .shell, let text = object["text"] as? String,
@@ -1227,6 +1250,7 @@ import TerminalInputSupport
                 else { throw RemoteHTTPError(409, "이 원본의 메시지 전송 연결을 확인해주세요. 작성한 내용은 보관합니다.") }
                 var textWasSent = false
                 do {
+                    try await preflight?()
                     _ = try await remoteInput(input)
                     if submitSeparately {
                         textWasSent = true; outcome = "unknown"
@@ -1345,6 +1369,7 @@ import TerminalInputSupport
                   clearingCodexQueues.insert(id).inserted else { throw RemoteHTTPError(409, "삭제할 대기 입력 목록을 다시 확인해주세요.") }
             defer { clearingCodexQueues.remove(id) }
             let target = try await questionTransport.prepareQueue(session, thread)
+            guard target.queueAvailable else { throw RemoteHTTPError(409, CodexQueueTransport.unavailableReason) }
             guard thread == target.threadID else { throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 대기 입력을 다시 확인해주세요.") }
             try validateCodexQueueSession(session, threadID: target.threadID)
             try await codexQueue.validate(target, session.cwd)
@@ -1384,6 +1409,8 @@ import TerminalInputSupport
         case "replyQuestion":
             guard let question = object["questionID"] as? String, let answer = object["answer"] as? String else { throw RemoteHTTPError(400, "질문과 답변을 지정해주세요.") }
             try await replyToQuestion(sessionID: id, questionID: question, answer: answer)
+            return ["ok": true, "message": sessions[id]?.questions.first(where: { $0.id == question })?.reply?.message ?? "답변을 전달했습니다."]
+        case "replyTerminalQuestion": return try await replyTerminalQuestion(session, object: object)
         case "replyClaudeQuestions":
             guard let request = object["requestIDForApproval"] as? String else { throw RemoteHTTPError(400, "질문 요청을 지정해주세요.") }
             try replyClaudeQuestions(sessionID: id, requestID: request, answers: object["answers"])
@@ -1442,6 +1469,7 @@ import TerminalInputSupport
         guard let session = sessions[sessionID], session.agent == .codex, session.phase != .ended, session.cwd.hasPrefix("/") else { throw RemoteHTTPError(409, "Codex 실행과 작업 폴더를 확인해주세요.") }
         let target = try await questionTransport.queueHome(session)
         try validateCodexQueueSession(session, threadID: nil)
+        if !target.queueAvailable { return RemoteCodexConversations(sessionID: sessionID, items: [], available: false, unavailableReason: CodexQueueTransport.unavailableReason) }
         let items = try await codexQueue.conversations(target, session.cwd)
         try validateCodexQueueSession(session, threadID: nil)
         return RemoteCodexConversations(sessionID: sessionID, items: items)
@@ -1455,6 +1483,7 @@ import TerminalInputSupport
         if let threadID { target = try await questionTransport.prepareQueue(session, threadID) }
         else { target = try await questionTransport.prepareMessage(session) }
         try validateCodexQueueSession(session, threadID: target.threadID)
+        if !target.queueAvailable { return RemoteCodexQueue(sessionID: sessionID, threadID: target.threadID, items: [], available: false, unavailableReason: CodexQueueTransport.unavailableReason) }
         if threadID != nil { try await codexQueue.validate(target, session.cwd) }
         let items = try await codexQueue.list(target)
         try validateCodexQueueSession(session, threadID: target.threadID)
@@ -1852,9 +1881,58 @@ import TerminalInputSupport
         publish()
     }
 
+    private func replyTerminalQuestion(_ session: AgentSession, object: JSONObject) async throws -> JSONObject {
+        guard let questionID = object["questionID"] as? String, let revision = object["revision"] as? String,
+              let index = object["choice"] as? Int,
+              let observed = remoteFrames[session.id], observed.frame.revision == revision,
+              let question = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent),
+              question.id == questionID, question.options.indices.contains(index) else {
+            throw RemoteHTTPError(409, "질문이나 선택지가 바뀌었습니다. 현재 질문을 확인해주세요.", diagnostics: ["delivery": "not_started"])
+        }
+        let receiptKey = "terminalChoice:\(session.id):\(questionID)"
+        guard savedReply(receiptKey) == nil || savedReply(receiptKey)?.canRetry == true,
+              replyingQuestions.insert(receiptKey).inserted else {
+            throw RemoteHTTPError(409, "이미 답변했거나 전송 결과를 확인해야 하는 질문입니다.", diagnostics: ["delivery": "unknown"])
+        }
+        defer { replyingQuestions.remove(receiptKey); publish() }
+        var attempted = false
+        func save(_ reply: QuestionReply) throws {
+            try store.set("questionReply:\(receiptKey)", String(decoding: JSONEncoder().encode(reply), as: UTF8.self))
+            remoteTerminalChanges[session.id]?.notify()
+        }
+        do {
+            let frame = try await remoteTerminal(sessionID: session.id, realtime: true)
+            guard frame.revision == revision, let current = frame.question, current.id == questionID,
+                  frame.keys.contains("choice"), frame.inputReason == nil else {
+                throw RemoteHTTPError(409, "질문이나 입력 연결이 바뀌었습니다. 현재 질문을 확인해주세요.", diagnostics: ["delivery": "not_started"])
+            }
+            try save(QuestionReply(phase: .sending, answer: question.options[index], message: "원본 질문의 선택을 전송하고 있습니다.", transport: .terminal))
+            var input: JSONObject = ["sessionID": session.id, "revision": frame.revision, "questionID": questionID,
+                                     "kind": "choice", "text": current.command(for: index)]
+            if session.terminal == .orca, let stream = frame.streamID { input["relay"] = true; input["streamID"] = stream }
+            attempted = true
+            _ = try await remoteInput(input)
+            let message = "같은 원본 터미널에서 ‘\(question.options[index])’를 선택했습니다."
+            try save(QuestionReply(phase: .queued, answer: question.options[index], message: message, transport: .terminal))
+            return ["ok": true, "message": message]
+        } catch {
+            let uncertain = attempted && (error as? RemoteHTTPError)?.diagnostics?["delivery"] != "not_started"
+            try? save(QuestionReply(phase: uncertain ? .uncertain : .failed, answer: question.options[index], message: error.localizedDescription, transport: .terminal))
+            var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
+            diagnostics["delivery"] = uncertain ? "unknown" : "not_started"
+            throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 409, error.localizedDescription, diagnostics: diagnostics)
+        }
+    }
+
     private func savedReply(_ questionID: String) -> QuestionReply? {
         guard let json = store.value("questionReply:\(questionID)"),
               var reply = try? JSONDecoder().decode(QuestionReply.self, from: Data(json.utf8)) else { return nil }
+        // This legacy error was thrown by lstat, before a socket or submission
+        // existed. It is a proven non-write, unlike timeouts after dispatch.
+        if reply.phase == .uncertain && reply.message == CodexQueueTransport.unavailableMessage {
+            reply.phase = .failed
+            reply.message = "이전 답변은 전송되지 않았습니다. 같은 원본 터미널로 다시 보낼 수 있습니다."
+        }
         if reply.phase == .sending && !replyingQuestions.contains(questionID) {
             reply.phase = .uncertain
             reply.message = "이전 전송의 접수 결과를 확인하지 못했습니다. 터미널에서 확인해주세요."
@@ -2031,18 +2109,41 @@ import TerminalInputSupport
             audit = event
             // A crash after this reservation requires verification, never an automatic resend.
             try setReply(sending, sessionID: sessionID, question: question, persist: true)
-            launched = true
-            let queueID = try await questionTransport.send(target, message)
-            let reply = QuestionReply(phase: .queued, answer: answer,
-                message: "답변을 Codex 대기열에 넣었습니다. Codex가 받을 차례가 되면 전달됩니다.", queueID: queueID)
+            let reply: QuestionReply
+            if target.queueAvailable {
+                launched = true
+                let queueID = try await questionTransport.send(target, message)
+                reply = QuestionReply(phase: .queued, answer: answer,
+                    message: "답변을 Codex 대기열에 등록했습니다. Codex가 받을 차례가 되면 전달됩니다.", queueID: queueID)
+            } else {
+                let frame = try await remoteTerminal(sessionID: sessionID, realtime: true)
+                launched = true
+                _ = try await sendOriginalTerminalMessage(session, object: ["text": message, "revision": frame.revision], preflight: {
+                    let verified = try await self.questionTransport.prepare(session, question)
+                    guard verified.threadID == question.threadID,
+                          self.sessions[sessionID]?.questions.contains(where: { $0.isSameRequest(as: question) }) == true else {
+                        throw RemoteHTTPError(409, "질문이나 대화가 바뀌어 답변하지 않았습니다.")
+                    }
+                    if let automaticToken {
+                        guard !Task.isCancelled, !self.snapshot.paused, self.sessions[sessionID]?.automatic == true,
+                              self.automaticQuestionReplies[questionID]?.token == automaticToken,
+                              verified.automaticReplyUnavailableReason == nil else {
+                            throw RemoteHTTPError(409, "자동 응답이 취소되었습니다. 필요하면 직접 답변해주세요.")
+                        }
+                    }
+                })
+                reply = QuestionReply(phase: .queued, answer: answer,
+                    message: "같은 원본 터미널에 답변을 전달했습니다. Codex가 응답할 차례에 처리합니다.", transport: .terminal)
+            }
             do { try setReply(reply, sessionID: sessionID, question: question, persist: true) }
             catch {
                 snapshot.health.auditError = error.localizedDescription
                 try setReply(reply, sessionID: sessionID, question: question, persist: false)
             }
-            audit?.outcome = "답변 대기열 등록"
+            audit?.outcome = reply.transport == .terminal ? "답변 원본 터미널 전달" : "답변 대기열 등록"
             if let audit { log(audit, session: session) }
         } catch {
+            if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" { launched = false }
             let cancelled = automaticToken.map { !launched && (Task.isCancelled || automaticQuestionReplies[questionID]?.token != $0) } ?? false
             let reply = QuestionReply(phase: cancelled ? .cancelled : (launched ? .uncertain : .failed), answer: answer,
                 message: cancelled ? "전송 전에 자동 응답을 멈췄습니다." : error.localizedDescription)

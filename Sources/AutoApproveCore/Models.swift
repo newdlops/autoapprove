@@ -216,7 +216,7 @@ public struct AuditEvent: Identifiable, Codable, Equatable {
     public var result: AuditResult {
         if ["승인 전달", "승인 입력 전달", "질문 응답 전달", "이어서 진행 요청 전달", "웹 입력 전달"].contains(outcome) { return .delivered }
         if outcome == "터미널에서 확인" { return .manual }
-        if outcome == "답변 대기열 등록" { return .queued }
+        if outcome == "답변 대기열 등록" || outcome == "답변 원본 터미널 전달" { return .queued }
         return .review
     }
     public var requestText: String { request ?? summary }

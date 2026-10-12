@@ -3,7 +3,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { ScreenMirror } from './screen';
+import { ScreenMirror, choiceInputBytes } from './screen';
 import { NativeTerminalBinding } from './native-input';
 import { readThemeColors, resolveTerminalTheme } from './theme';
 
@@ -118,7 +118,7 @@ async function registerTerminal(terminal: vscode.Terminal): Promise<void> {
 }
 function sendRegistration(): void {
   send('register', { terminals: Array.from(terminals.values()).map(state => ({
-    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 3,
+    id: state.id, shellPID: state.shellPID, name: state.terminal.name, streamAttached: state.mirror?.valid === true, executionActive: state.executionActive, remoteInputVersion: 3, choiceInput: true,
     nativeWindowVersion: vscode.window.terminals.filter(terminal => terminal.name === state.terminal.name).length === 1 ? 2 : 0,
     ownerPID: Number(process.env.VSCODE_PID) || 0, windowToken,
     selected: state.native.selected, nativeGeneration: state.native.generation
@@ -178,7 +178,7 @@ function handleMessage(message: Record<string, any>): void {
       ? state.native.consume(message) : !!state.execution && !!state.mirror?.consumeInput(message));
     if (success) {
       const keys: Record<string, string> = { enter: '\r', escape: '\x1b', interrupt: '\x03', up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', backspace: '\x7f', delete: '\x1b[3~', home: '\x1b[H', end: '\x1b[F', tab: '\t' };
-      state!.terminal.sendText(message.kind === 'submit' ? message.text + '\r' : ['text', 'characters'].includes(message.kind) ? message.text : keys[message.kind], false);
+      state!.terminal.sendText(message.kind === 'choice' ? choiceInputBytes(message.text) : message.kind === 'submit' ? message.text + '\r' : ['text', 'characters'].includes(message.kind) ? message.text : keys[message.kind], false);
     }
     send('remoteInputResult', { actionID: message.id, success });
     return;

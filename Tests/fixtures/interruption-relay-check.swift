@@ -13,6 +13,28 @@ import AutoApproveCore
             } while Date()<deadline
             throw AppError.message("Test terminal did not draw a stopped composer: \(screen)")
         }
+        func choice(_ read: () throws -> String, expected: String? = nil) async throws -> (String, TerminalChoiceQuestion) {
+            let deadline=Date().addingTimeInterval(3)
+            repeat { let screen=try read(); if let menu=TerminalChoiceQuestion.detect(screen,agent:.codex), expected == nil || menu.question.contains(expected!) {return(screen,menu)};try await Task.sleep(for:.milliseconds(20)) } while Date()<deadline
+            throw AppError.message("Test terminal did not draw a choice menu")
+        }
+        func foreground(_ tty:String) async throws -> ScreenTarget {
+            for _ in 0..<100 {
+                if let process=try ProcessDiscovery.read().first(where:{$0.agent == .codex && "/dev/"+$0.tty == tty && $0.isForeground}) {return ScreenTarget(tty:tty,jobPIDs:[process.pid],sourcePID:process.pid,sourceStarted:process.started)}
+                try await Task.sleep(for:.milliseconds(20))
+            }
+            throw AppError.message("Test CLI did not enter its foreground TTY")
+        }
+        func received(_ file:URL, _ expected:String) async throws {
+            let bytes=Data(expected.utf8),deadline=Date().addingTimeInterval(3)
+            repeat {
+                let actual=(try? Data(contentsOf:file)) ?? Data()
+                if actual==bytes{return}
+                guard actual.count<=bytes.count else{throw AppError.message("Test received extra input bytes")}
+                try await Task.sleep(for:.milliseconds(20))
+            }while Date()<deadline
+            throw AppError.message("Test did not receive the expected input bytes")
+        }
         let manager=ManagedPTYManager();defer{manager.stop()}
         let ptyRecord=root.appendingPathComponent("pty-input.bin")
         let pty=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,ptyRecord.path,"capacity"],columns:100,rows:25)
@@ -49,6 +71,25 @@ import AutoApproveCore
         let goalResult=try manager.adapter.resume(goalTarget,goalStop.region,goalStop.continuationText),goalBytes=try Data(contentsOf:goalRecord)
         precondition(goalResult == .sent);precondition(goalBytes == Data("/goal resume\r".utf8))
         print("PASS actual owned PTY reactivates \(mode) with exact /goal resume and one verified Return")
+        }
+        for mode in ["choice", "request-choice"] {
+            let record=root.appendingPathComponent("\(mode)-pty-input.bin")
+            let terminal=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,record.path,mode],columns:100,rows:25)
+            let target=try await foreground(terminal.tty)
+            let (before,menu)=try await choice {try manager.terminal(terminal.ptyID).screen()}
+            let index=mode == "choice" ? 2:1, input=RemoteTerminalInput(kind:.choice,text:menu.command(for:index))
+            let selected=try manager.adapter.input(target,before,.codex,input)
+            guard selected == .sent else { throw AppError.message("Test \(mode) input refused: \(selected.rawValue)") }
+            if mode == "request-choice" {
+                let (next,current)=try await choice({try manager.terminal(terminal.ptyID).screen()},expected:"Question 2/2")
+                precondition(current.question.contains("Question 2/2"));try await received(record,"2")
+                let answered=try manager.adapter.input(target,next,.codex,RemoteTerminalInput(kind:.choice,text:current.command(for:0)));precondition(answered == .sent)
+                try await received(record,"21")
+                print("PASS actual owned PTY answers two Codex question tabs with two explicit digits and zero extra Return")
+            } else {
+                try await received(record,"\u{1b}[B\r")
+                print("PASS actual owned PTY selects the requested menu position with one move and one Return")
+            }
         }
         let meta=try call(["list-panes","-F","#{pane_tty}|#{pane_pid}"]).trimmingCharacters(in:.newlines).components(separatedBy:"|")
         let tmuxRecord=root.appendingPathComponent("tmux-input.bin")
@@ -93,6 +134,14 @@ import AutoApproveCore
             if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}) {break}
             try await Task.sleep(for:.milliseconds(20))
         }
+        let choiceRecord=root.appendingPathComponent("choice-tmux-input.bin")
+        _=try call(["send-keys","-l",HookInstaller.quote(root.appendingPathComponent("codex").path)+" "+HookInstaller.quote(choiceRecord.path)+" choice"]);_=try call(["send-keys","Enter"])
+        var choiceTarget=try await foreground(meta[0]);choiceTarget.handle=original.tmuxHandle
+        let (choiceScreen,choiceMenu)=try await choice {try relay.screen(choiceTarget,fresh:true).contents}
+        let choiceResult=try relay.adapter.input(choiceTarget,choiceScreen,.codex,RemoteTerminalInput(kind:.choice,text:choiceMenu.command(for:2)));precondition(choiceResult == .sent)
+        try await received(choiceRecord,"\u{1b}[B\r")
+        print("PASS actual original tmux pane selects a generic question in the same pane with one Return")
+        for _ in 0..<100 {if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}){break};try await Task.sleep(for:.milliseconds(20))}
         let records=try ProcessDiscovery.read(),shell=records.first(where:{$0.pid == Int32(meta[1])})!
         precondition(SessionExitRecovery.isShell(shell) && shell.isForeground)
         let shellTarget=ScreenTarget(tty:original.tty,handle:original.tmuxHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)

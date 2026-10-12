@@ -1,15 +1,18 @@
 import Foundation
 import Darwin
 
-public struct QuestionReply: Codable, Equatable {
-    public enum Phase: String, Codable { case sending, queued, failed, uncertain, cancelled }
+public struct QuestionReply: Codable, Equatable, Sendable {
+    public enum Phase: String, Codable, Sendable { case sending, queued, failed, uncertain, cancelled }
+    public enum Transport: String, Codable, Sendable { case queue, terminal }
     public var phase: Phase
     public var answer: String
     public var message: String
     public var queueID: String?
+    public var transport: Transport?
     public var canRetry: Bool { phase == .failed || phase == .cancelled }
-    public init(phase: Phase, answer: String, message: String, queueID: String? = nil) {
+    public init(phase: Phase, answer: String, message: String, queueID: String? = nil, transport: Transport = .queue) {
         self.phase = phase; self.answer = answer; self.message = message; self.queueID = queueID
+        self.transport = transport
     }
 }
 
@@ -18,9 +21,11 @@ public struct CodexReplyTarget: Sendable {
     public var home: String
     public var threadID: String
     public var automaticReplyUnavailableReason: String?
-    public init(executable: String, home: String, threadID: String, automaticReplyUnavailableReason: String? = nil) {
+    public var queueAvailable: Bool
+    public init(executable: String, home: String, threadID: String, automaticReplyUnavailableReason: String? = nil, queueAvailable: Bool = true) {
         self.executable = executable; self.home = home; self.threadID = threadID
         self.automaticReplyUnavailableReason = automaticReplyUnavailableReason
+        self.queueAvailable = queueAvailable
     }
 }
 
@@ -70,7 +75,7 @@ public struct CodexReplyTransport: Sendable {
             guard homes.count == 1, let home = homes.first else { throw RemoteHTTPError(409, "이 Codex 실행의 로컬 서버 위치를 확인하지 못했습니다.") }
             // A CLI upgrade may unlink the executable of a still-running session.
             // The original process and its own user-owned server files remain authoritative.
-            return CodexReplyTarget(executable: "", home: home, threadID: threadID)
+            return CodexReplyTarget(executable: "", home: home, threadID: threadID, queueAvailable: CodexQueueTransport.isAvailable(home: home))
         }.value
     }
     public static func messageTarget(_ session: AgentSession) async throws -> CodexReplyTarget {
@@ -81,7 +86,8 @@ public struct CodexReplyTransport: Sendable {
             }
             let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
             let location = try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[session.pid] ?? [])
-            return CodexReplyTarget(executable: "", home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: location.threadID)
+            let home = URL(fileURLWithPath: location.database).deletingLastPathComponent().path
+            return CodexReplyTarget(executable: "", home: home, threadID: location.threadID, queueAvailable: CodexQueueTransport.isAvailable(home: home))
         }.value
     }
     public static let live = CodexReplyTransport(prepare: { session, question in
@@ -103,9 +109,9 @@ public struct CodexReplyTransport: Sendable {
             } else if current.hasLaterUserMessage == true {
                 automaticReplyUnavailableReason = "질문 이후 사용자 메시지가 있어 자동 응답을 멈췄습니다. 이미 답했는지 확인해주세요."
             } else { automaticReplyUnavailableReason = nil }
-            return CodexReplyTarget(executable: "",
-                home: URL(fileURLWithPath: location.database).deletingLastPathComponent().path, threadID: question.threadID,
-                automaticReplyUnavailableReason: automaticReplyUnavailableReason)
+            let home = URL(fileURLWithPath: location.database).deletingLastPathComponent().path
+            return CodexReplyTarget(executable: "", home: home, threadID: question.threadID,
+                automaticReplyUnavailableReason: automaticReplyUnavailableReason, queueAvailable: CodexQueueTransport.isAvailable(home: home))
         }.value
     }, send: { target, message in
         // Use the existing daemon directly. Never start a CLI/daemon or touch the

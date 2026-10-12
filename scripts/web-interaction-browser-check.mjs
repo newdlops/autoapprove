@@ -73,7 +73,7 @@ try {
     return route.continue();
   });
   const binding=await page.evaluate(()=>({id:selectedItem.session.id,pid:selectedItem.session.pid,tty:selectedItem.session.tty}));
-  const codexForm=page.locator('#questions form').filter({hasText:'합성 모바일 테스트를 진행할까요?'});await codexForm.getByRole('checkbox',{name:'아니요',exact:true}).check();
+  const codexForm=page.locator('#questions form').filter({hasText:'합성 모바일 테스트를 진행할까요?'});await codexForm.getByRole('radio',{name:'아니요',exact:true}).check();
   for(let i=0;i<10&&!beginStarted;i++)await new Promise(resolve=>setTimeout(resolve,25));
   assert.equal(beginStarted,true,'Question editing should be acknowledged independently');assert.equal(beginFinished,false);
   assert.equal(await codexForm.getByRole('button',{name:'답변 보내기'}).isEnabled(),true,'Holding automation must not swallow a Send tap');
@@ -85,13 +85,13 @@ try {
   await page.route('**/api/network',async route=>{const response=await route.fetch(),dashboard=await response.json();dashboard.nodes=dashboard.nodes.map(node=>node.id===nodeID?{id:node.id,name:node.name,local:node.local,online:false,error:'synthetic inventory timeout'}:node);await route.fulfill({response,json:dashboard});});
   await page.waitForFunction(()=>currentNode()?.online===false&&!loadingNetwork);
   const failedQuestion=page.locator('#questions form').filter({hasText:'한글·이모지·긴 선택지의 줄바꿈'});
-  await failedQuestion.getByRole('checkbox',{name:'질문을 먼저 확인',exact:true}).check();await failedQuestion.locator('textarea').fill('선택한 답변과 추가 설명을 보관합니다.');
+  await failedQuestion.getByRole('radio',{name:'질문을 먼저 확인',exact:true}).check();await failedQuestion.locator('textarea').fill('선택한 답변과 추가 설명을 보관합니다.');
   await writeFile(path.join(directory,'reply-failure'),'');
   assert.equal(await failedQuestion.getByRole('button',{name:'답변 보내기'}).isEnabled(),true,'Terminal control refresh must retain the independently verified question Send state');
   await failedQuestion.getByRole('button',{name:'답변 보내기'}).click();
   const inlineError=failedQuestion.locator('[data-delivery-error]');await inlineError.waitFor({state:'visible'});assert.match(await inlineError.textContent(),/합성 응답 경로 오류/);
   await inlineError.scrollIntoViewIfNeeded();await capture('mobile-question-error');
-  assert.equal(await failedQuestion.locator('textarea').inputValue(),'선택한 답변과 추가 설명을 보관합니다.');assert.equal(await failedQuestion.getByRole('checkbox',{name:'질문을 먼저 확인',exact:true}).isChecked(),true);
+  assert.equal(await failedQuestion.locator('textarea').inputValue(),'선택한 답변과 추가 설명을 보관합니다.');assert.equal(await failedQuestion.getByRole('radio',{name:'질문을 먼저 확인',exact:true}).isChecked(),true);
   await page.unroute('**/api/network');await page.waitForFunction(()=>currentNode()?.online===true&&selectedItem.session.queuedQuestions.some(item=>item.reply?.phase==='failed'));
   await rm(path.join(directory,'reply-failure'));await failedQuestion.getByRole('button',{name:'답변 보내기'}).click();await page.waitForFunction(()=>selectedItem.session.queuedQuestions.every(item=>item.reply?.phase==='queued'));
   checks.push('Verified original-stream question remains sendable during inventory timeout; production preflight error is inline, preserves selections/text and permits an explicit retry only after a fresh authoritative failed status');

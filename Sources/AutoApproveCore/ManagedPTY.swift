@@ -308,6 +308,9 @@ public final class ManagedPTYManager: @unchecked Sendable {
         }, restart: { [self] target,expected,command in
             guard let terminal = owned(tty:target.tty), SessionExitRecovery.emptyShellPrompt(expected) else { return .missingTarget }
             return try terminal.recoveryInput(expected:expected,input:RemoteTerminalInput(kind:.submit,text:command),jobPIDs:target.jobPIDs)
+        }, input: { [self] target,expected,_,input in
+            guard let terminal = owned(tty: target.tty) else { return .missingTarget }
+            return try terminal.recoveryInput(expected: expected, input: input, jobPIDs: target.jobPIDs)
         })
     }
 }

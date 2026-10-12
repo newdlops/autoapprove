@@ -1,6 +1,13 @@
 import { Terminal } from '@xterm/headless';
 import { createHash, randomUUID } from 'node:crypto';
 
+export function choiceInputBytes(value: string): string {
+  if (/^digit:[1-9]$/.test(value)) return value.slice(6);
+  const delta = Number(value);
+  if (!Number.isInteger(delta) || Math.abs(delta) > 19 || String(delta) !== value) throw new Error('Invalid choice movement');
+  return (delta < 0 ? '\x1b[A' : '\x1b[B').repeat(Math.abs(delta)) + '\r';
+}
+
 // Offsets are UTF-16, as in the browser. Screen text remains the exact input guard.
 export type TerminalRun = { offset: number; length: number; fg?: string; bg?: string; bold?: boolean; dim?: boolean; italic?: boolean; underline?: boolean; strike?: boolean; inverse?: boolean; hidden?: boolean };
 export type TerminalAppearance = { runs: TerminalRun[]; foreground?: string; background?: string };
@@ -120,13 +127,15 @@ export class ScreenMirror {
   }
   fingerprint(): string { return createHash('sha256').update(this.snapshot()).digest('hex'); }
   consumeInput(action: Record<string, unknown>, now = Date.now()): boolean {
-    const relay = action.relay === true && !['text', 'submit'].includes(String(action.kind));
+    const relay = action.relay === true && !['text', 'submit', 'choice'].includes(String(action.kind));
     if (!this.valid || !relay && this.pendingWrites !== 0 || typeof action.id !== 'string' || this.attempted.has(action.id)
       || action.generation !== this.generation || typeof action.expiresAt !== 'number' || action.expiresAt < now || action.expiresAt > now + 5000
       || typeof action.screen !== 'string' || !relay && action.screen !== this.snapshot() || typeof action.kind !== 'string') { return false; }
     if (['text', 'submit', 'characters'].includes(action.kind)) {
       if (typeof action.text !== 'string' || !action.text || Buffer.byteLength(action.text) > 8000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(action.text)
         || action.kind === 'characters' && /[\n\t]/.test(action.text)) { return false; }
+    } else if (action.kind === 'choice') {
+      try { if (typeof action.text !== 'string') return false; choiceInputBytes(action.text); } catch { return false; }
     } else if (!['enter', 'escape', 'interrupt', 'up', 'down', 'left', 'right', 'backspace', 'delete', 'home', 'end', 'tab'].includes(action.kind) || action.text !== '') { return false; }
     this.attempted.add(action.id);
     if (this.attempted.size > 512) { this.attempted.delete(this.attempted.values().next().value!); }

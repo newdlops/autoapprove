@@ -342,7 +342,7 @@ async function api(path, body, signal, timeoutMS = 20000) {
   try {
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
     const result = await response.json();
-    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, unsent:result.diagnostics?.delivery === 'not_started'});
+    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, unsent:result.diagnostics?.delivery === 'not_started', delivery:result.diagnostics?.delivery});
     return result;
   } catch (error) {
     if (error.name === 'AbortError') {
@@ -558,13 +558,14 @@ async function sendQuestionAnswer(key, nodeID, payload, message) {
   const state = {busy:true, error:'', uncertain:false}; questionDeliveries.set(key, state); updateInteractionControls();
   try {
     await questionEditing.get(key);
-    await api(endpoint('/api/action', nodeID), {...payload, requestID:uuid()});
-    state.sent = true; state.finishedAt = performance.now(); state.message = message; state.error = ''; void refreshNetwork();
+    const result = await api(endpoint('/api/action', nodeID), {...payload, requestID:uuid()});
+    state.sent = true; state.finishedAt = performance.now(); state.message = result.message || message; state.error = ''; void refreshNetwork();
     if (selectedItem?.session.agent === 'codex' && $('interaction-dialog').open) void refreshCodexQueue();
     return true;
   } catch (error) {
-    state.error = error.message; state.uncertain = !error.status || error.status >= 500; state.failedAt = performance.now();
+    state.error = error.message; state.uncertain = error.delivery === 'unknown' || !error.status || error.status >= 500; state.failedAt = performance.now();
     if (state.uncertain) state.error += ' 전달 여부를 확인한 뒤 진행해주세요. 작성한 답변은 보관합니다.';
+    if (!Array.from($('questions').querySelectorAll('form')).some(form=>form.dataset.questionKey===key)) feedback(error.message,true);
     void refreshNetwork(); return false;
   } finally { state.busy = false; updateInteractionControls(); }
 }
@@ -880,12 +881,13 @@ function mergeTerminalUpdate(update, previous, sessionID) {
   if (!update || update.sessionID !== sessionID || typeof update.revision !== 'string' || update.revision.length > 512 || typeof update.observedAt !== 'string' || !Number.isFinite(Date.parse(update.observedAt)) || !Array.isArray(update.keys) || update.keys.length > 64 || update.keys.some(key => typeof key !== 'string' || key.length > 64) || update.inputReason != null && typeof update.inputReason !== 'string' || update.streamID != null && typeof update.streamID !== 'string') throw new Error('터미널 화면 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
   if (update.outputReason != null && (typeof update.outputReason !== 'string' || update.outputReason.length > 4096)) throw new Error('원본 출력 상태를 확인하지 못했습니다.');
   if (update.sequence != null && (!Number.isSafeInteger(update.sequence) || update.sequence < 0)) throw new Error('원본 화면 순서를 확인하지 못했습니다.');
+  if (update.question != null && (typeof update.question.id !== 'string' || update.question.id.length > 512 || typeof update.question.question !== 'string' || update.question.question.length > 4000 || !Array.isArray(update.question.options) || update.question.options.length < 2 || update.question.options.length > 20 || update.question.options.some(option=>typeof option!=='string'||!option||option.length>4000) || !Number.isInteger(update.question.selected) || update.question.selected<0 || update.question.selected>=update.question.options.length)) throw new Error('원본 질문의 선택지를 확인하지 못했습니다.');
   const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string') : undefined;
   if (typeof update.screen === 'string') return {...update, nativeDisplay};
   if (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID) throw new Error('최신 화면을 다시 연결해주세요.');
   // A compact update carries current controls. Missing optional input fields
   // clear old locks/cursors/tokens while the unchanged screen and colors remain.
-  return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, nativeDisplay};
+  return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, question:update.question, nativeDisplay};
 }
 function terminalUpdateIsOlder(update, previous) {
   if (!previous || update.sessionID !== previous.sessionID || !previous.streamID || update.streamID !== previous.streamID) return false;
@@ -907,6 +909,7 @@ function applyTerminalFrame(frame, receivedAt = performance.now()) {
   terminalState(changed && previous ? 'changed' : 'live', !frame.screen.trim() ? '연결됨 · 빈 화면' : changed && previous ? '새 출력' : '연결됨');
   if (nativeTerminal()) terminalState(frame.nativeDisplay?.state === 'live' ? 'live' : 'pending', frame.nativeDisplay?.state === 'live' ? '원본 창 화면' : '원본 연결 필요');
   text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
+  if (selectedItem) renderQuestions();
   updateControls();
   if (directMode && directQueue.length && !directSending) void pumpDirect();
 }
@@ -1201,8 +1204,9 @@ async function submitInput() {
 }
 function renderQuestions() {
   const { session, node } = selectedItem;
+  const terminalQuestion = latestFrame?.sessionID === session.id ? latestFrame.question : null;
   const sources = [session, ...(session.backgroundSessions || [])];
-  const signature = JSON.stringify(sources.map(source => [source.id, source.claudeApprovals, source.queuedQuestions, source.pendingSummary, source.capacityResume]));
+  const signature = JSON.stringify([terminalQuestion, terminalQuestion && [latestFrame.keys.includes('choice'),latestFrame.inputReason], sources.map(source => [source.id, source.claudeApprovals, source.queuedQuestions, source.pendingSummary, source.capacityResume])]);
   if (signature === questionSignature) return;
   // Capture every draft before status-driven rerender; never discard a typed answer on a polling tick.
   for (const form of $('questions').querySelectorAll('form')) {
@@ -1210,10 +1214,25 @@ function renderQuestions() {
     questionDrafts.set(form.dataset.questionKey, { answer: form.querySelector('textarea').value, choices: Array.from(form.querySelectorAll('input:checked')).map(input => input.value) });
   }
   const active = document.activeElement, activeQuestion = active?.closest('#questions form')?.dataset.questionKey;
+  const activeChoice = active?.tagName === 'INPUT' ? {name:active.name, value:active.value} : null;
   const wasText = active?.tagName === 'TEXTAREA', selectionStart = wasText ? active.selectionStart : null, selectionEnd = wasText ? active.selectionEnd : null;
   const fieldIndex = wasText && activeQuestion ? Array.from(active.closest('form').querySelectorAll('textarea')).indexOf(active) : 0;
   $('questions').replaceChildren(); questionSignature = signature;
   let count = 0;
+  if (terminalQuestion) {
+    count++; const key = `${node.id}/${session.id}/terminal:${terminalQuestion.id}`;
+    const unavailable = ['sending','queued','uncertain'].includes(terminalQuestion.reply?.phase) || !latestFrame.keys.includes('choice') || !!latestFrame.inputReason;
+    $('questions').append(structuredQuestionForm(key, [{id:'choice', question:terminalQuestion.question, allowText:false,
+      options:terminalQuestion.options.map((label,index)=>({label,value:String(index)}))}], {
+      nodeID:node.id, title:'원본 터미널의 질문', unavailable,
+      status:terminalQuestion.reply?.message || (unavailable ? latestFrame.inputReason || '이 연결에는 선택형 질문 입력이 필요합니다. Mac에서 직접 입력 연결 또는 VS Code 확장을 확인해주세요.' : '항목을 고른 뒤 답변 보내기를 누르면 같은 터미널에서 선택합니다.'),
+      send:async answers=>{
+        const frame = latestFrame;
+        if (frame?.sessionID !== session.id || frame.question?.id !== terminalQuestion.id) { feedback('질문이 바뀌었습니다. 현재 질문을 확인해주세요.',true);return false; }
+        return sendQuestionAnswer(key,node.id,{action:'replyTerminalQuestion',sessionID:session.id,questionID:terminalQuestion.id,choice:Number(answers.choice.choices[0]),revision:frame.revision},'원본 터미널에 선택을 전달했습니다.');
+      }
+    }));
+  }
   for (const source of sources) {
     for (const approval of source.claudeApprovals || []) {
       if (approval.questions?.length) {
@@ -1244,10 +1263,11 @@ function renderQuestions() {
       const form = make('form', 'question'); form.dataset.questionKey = questionKey; form.append(make('h4', '', question.title));
       const unavailable = ['sending', 'queued', 'uncertain'].includes(question.reply?.phase);
       form.dataset.readOnly = String(unavailable);
-      if (question.reply?.phase) form.append(make('p', 'muted small', { sending: '답변을 전달하고 있습니다.', queued: '답변이 대기열에 등록되었습니다.', uncertain: '전달 결과를 확인하지 못했습니다. 터미널에서 확인해주세요.', failed: '답변 전달에 실패했습니다.', cancelled: '대기 입력을 삭제해 답변 전달을 취소했습니다.' }[question.reply.phase] || question.reply.phase));
+      if (question.reply?.phase) form.append(make('p', 'muted small', question.reply.message || { sending: '답변을 전달하고 있습니다.', queued: '답변을 접수했습니다.', uncertain: '전달 결과를 확인하지 못했습니다. 터미널에서 확인해주세요.', failed: '답변 전달에 실패했습니다.', cancelled: '대기 입력을 삭제해 답변 전달을 취소했습니다.' }[question.reply.phase] || question.reply.phase));
       const options = make('div', 'question-options');
+      const heading = form.querySelector('h4'); heading.id = 'question-heading-' + uuid(); options.setAttribute('role',question.multiSelect ? 'group' : 'radiogroup'); options.setAttribute('aria-labelledby',heading.id);
       for (const option of question.options || []) {
-        const label = make('label', 'question-option'), checkbox = make('input'); checkbox.type = 'checkbox'; checkbox.value = option; checkbox.checked = draft.choices.includes(option); checkbox.disabled = unavailable;
+        const label = make('label', 'question-option'), checkbox = make('input'); checkbox.type = question.multiSelect ? 'checkbox' : 'radio'; checkbox.name = 'choice-' + questionKey; checkbox.value = option; checkbox.checked = draft.choices.includes(option); checkbox.disabled = unavailable;
         label.append(checkbox, make('span', '', option)); options.append(label);
       }
       form.append(options);
@@ -1266,7 +1286,7 @@ function renderQuestions() {
       form.addEventListener('submit', event => {
         event.preventDefault(); saveDraft();
         const current = questionDrafts.get(questionKey); const value = [...current.choices, current.answer.trim()].filter(Boolean).join('\n');
-        if (value && !unavailable && !send.disabled) void sendQuestionAnswer(questionKey, node.id, { action: 'replyQuestion', sessionID: source.id, questionID: question.id, answer: value }, '답변을 Codex 대기열에 등록했습니다.');
+        if (value && !unavailable && !send.disabled) void sendQuestionAnswer(questionKey, node.id, { action: 'replyQuestion', sessionID: source.id, questionID: question.id, answer: value }, '답변을 전달했습니다.');
       });
       actions.append(send);
       if (['scheduled', 'paused', 'unavailable'].includes(question.automation?.phase)) {
@@ -1275,7 +1295,7 @@ function renderQuestions() {
       }
       appendQuestionDelivery(form); form.append(actions); $('questions').append(form);
     }
-    if (source.pendingSummary && !(source.claudeApprovals || []).length && !(source.queuedQuestions || []).length) {
+    if (source.pendingSummary && !(source.claudeApprovals || []).length && !(source.queuedQuestions || []).length && !(source.id === session.id && terminalQuestion)) {
       count++; const section = make('div', 'question'); section.append(make('h4', '', source.pendingSummary), make('p', 'muted small', '이 요청은 터미널 화면에서 직접 답해주세요.')); $('questions').append(section);
     }
     if (source.capacityResume) {
@@ -1287,9 +1307,14 @@ function renderQuestions() {
   }
   show($('questions-section'), count > 0);
   text($('question-count'), count || '');
+  updateInteractionControls();
   if (activeQuestion && wasText) {
     const form = Array.from($('questions').querySelectorAll('form')).find(form => form.dataset.questionKey === activeQuestion);
     const answer = form?.querySelectorAll('textarea')[fieldIndex]; if (answer && !answer.disabled) { answer.focus({ preventScroll: true }); answer.setSelectionRange(selectionStart, selectionEnd); }
+  } else if (activeQuestion && activeChoice) {
+    const form = Array.from($('questions').querySelectorAll('form')).find(form => form.dataset.questionKey === activeQuestion);
+    const choice = Array.from(form?.querySelectorAll('input') || []).find(input=>input.name===activeChoice.name&&input.value===activeChoice.value);
+    if (choice && !choice.disabled) choice.focus({preventScroll:true});
   }
 }
 function structuredQuestionForm(key, fields, config) {
@@ -1305,16 +1330,19 @@ function structuredQuestionForm(key, fields, config) {
     const choices = make('div', 'question-options'), current = draft[field.id] || {choices:[], text:''};
     for (const option of field.options || []) {
       const label = make('label', 'question-option'), input = make('input'); input.type = field.multiSelect ? 'checkbox' : 'radio';
-      input.name = 'question-' + key + '-' + field.id; input.value = option.label; input.checked = current.choices.includes(option.label);
+      input.name = 'question-' + key + '-' + field.id; input.value = option.value ?? option.label; input.checked = current.choices.includes(input.value);
       const description = make('span', '', option.label); if (option.description) description.append(make('span', 'option-description', option.description));
       label.append(input, description); choices.append(label);
     }
-    const answerID = 'answer-' + uuid(), label = make('label', 'question-label', field.options?.length ? '직접 답변 또는 추가 설명' : '답변'); label.htmlFor = answerID;
-    const answer = make('textarea'); answer.id = answerID; answer.name = 'question-answer'; answer.rows = 2; answer.maxLength = 8000; answer.value = current.text;
-    group.append(choices, label, answer); form.append(group); controls.push({id:field.id, choices, answer});
+    group.append(choices); let answer;
+    if (field.allowText !== false) {
+      const answerID = 'answer-' + uuid(), label = make('label', 'question-label', field.options?.length ? '직접 답변 또는 추가 설명' : '답변'); label.htmlFor = answerID;
+      answer = make('textarea'); answer.id = answerID; answer.name = 'question-answer'; answer.rows = 2; answer.maxLength = 8000; answer.value = current.text; group.append(label,answer);
+    }
+    form.append(group); controls.push({id:field.id, choices, answer});
   }
   function save() {
-    const answers = Object.fromEntries(controls.map(({id,choices,answer}) => [id, {choices:Array.from(choices.querySelectorAll('input:checked')).map(input=>input.value), text:answer.value}]));
+    const answers = Object.fromEntries(controls.map(({id,choices,answer}) => [id, {choices:Array.from(choices.querySelectorAll('input:checked')).map(input=>input.value), text:answer?.value || ''}]));
     structuredDrafts.set(key, answers);
     send.dataset.unavailable = String(!!config.unavailable || !Object.values(answers).every(answer => answer.choices.length || answer.text.trim()));
     updateInteractionControls(); return answers;
@@ -1544,6 +1572,10 @@ async function refreshCodexQueue() {
     if (generation !== queueGeneration || selectedKey !== key) return;
     if (result.sessionID !== item.session.id || typeof result.threadID !== 'string' || !Array.isArray(result.items) || result.items.some(entry => typeof entry.id !== 'string' || typeof entry.text !== 'string')) throw new Error('이 세션의 대기 입력 목록을 확인하지 못했습니다.');
     queueSnapshot = result; $('queued-inputs').replaceChildren();
+    if (result.available === false) {
+      text($('queue-count'),''); text($('queue-status'),result.unavailableReason || '이 실행 방식에서는 대기 입력 관리를 지원하지 않습니다. 질문 답변은 원본 터미널로 보낼 수 있습니다.');
+      show($('connect-queue-conversation'),false); show($('queue-conversation-picker'),false); return;
+    }
     for (const entry of result.items) { const row = make('li','',entry.text || '첨부 입력'); if (entry.attachments) row.append(make('span','muted small',` · 첨부 ${entry.attachments}개`)); $('queued-inputs').append(row); }
     text($('queue-count'),result.items.length || ''); text($('queue-status'),(chosen ? `${chosen.title} · ` : '')+(result.items.length ? '아직 처리하지 않은 후속 입력입니다. 실행 중인 작업은 계속됩니다.' + (result.items.length > 100 ? ' 한 번에 100개씩 비웁니다.' : '') : '대기 입력이 없습니다.'));
     show($('queue-conversation-picker'),false); show($('connect-queue-conversation'),!!chosen);
@@ -1558,6 +1590,7 @@ async function chooseQueueConversation() {
     const result = await api(endpoint('/api/codex/conversations',item.node.id,item.session.id));
     if (generation !== queueGeneration || selectedKey !== key) return;
     if (result.sessionID !== item.session.id || !Array.isArray(result.items) || result.items.some(entry=>typeof entry.id!=='string'||typeof entry.title!=='string')) throw new Error('Codex 대화 목록을 확인하지 못했습니다.');
+    if (result.available === false) { text($('queue-status'),result.unavailableReason); show($('connect-queue-conversation'),false); return; }
     $('queue-conversation').replaceChildren(new Option('연결할 대화를 선택해주세요.',''));
     for (const entry of result.items) { const option = new Option(`${entry.title || 'Codex 대화'} · ${entry.id}`,entry.id); option.dataset.title = entry.title || 'Codex 대화'; $('queue-conversation').append(option); }
     show($('queue-conversation-picker'),result.items.length>0); text($('queue-status'),result.items.length ? '원본 Codex의 대화와 일치하는 항목을 선택해주세요. 선택한 대화의 대기 입력을 관리하고 새 메시지를 보냅니다.' : '이 작업 폴더에서 실행 중인 Codex 대화를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요.');

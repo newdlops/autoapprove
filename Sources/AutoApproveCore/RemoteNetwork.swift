@@ -89,6 +89,7 @@ public struct RemoteTerminalFrame: Codable, Sendable {
     public var nativeDisplay: TerminalNativeDisplay? = nil
     public var outputReason: String? = nil
     public var sequence: Int? = nil
+    public var question: TerminalChoiceQuestion? = nil
 }
 
 /// A browser that already has this revision only needs fresh controls and observation time.
@@ -105,6 +106,7 @@ struct RemoteTerminalUpdate: Encodable {
     var nativeDisplay: TerminalNativeDisplay?
     var outputReason: String?
     var sequence: Int?
+    var question: TerminalChoiceQuestion?
     init(_ frame: RemoteTerminalFrame, knownRevision: String?) {
         sessionID = frame.sessionID; revision = frame.revision; observedAt = frame.observedAt
         keys = frame.keys; inputReason = frame.inputReason
@@ -114,6 +116,7 @@ struct RemoteTerminalUpdate: Encodable {
         nativeDisplay = knownRevision == frame.revision ? frame.nativeDisplay?.compact : frame.nativeDisplay
         outputReason = frame.outputReason
         sequence = frame.sequence
+        question = frame.question
     }
 }
 
