@@ -84,6 +84,19 @@ try {
   assert.deepEqual(signedPaths.slice(beforeService),[path.join(withService,'Contents/MacOS/autoapprove'),path.join(withService,'Contents/MacOS/AutoApproveTTYService'),withService],
     'The signed TTY service must be sealed before its containing app');
   assert.deepEqual(searchList,originalSearch,'Nested service signing must restore the original search list');
+  await mkdir(path.join(withService,'Contents/Library/LaunchServices'),{recursive:true});
+  await writeFile(path.join(withService,'Contents/Library/LaunchServices/local.autoapprove.tty-input'),'disposable native helper');
+  const beforeNative=signedPaths.length;
+  let prepared=false;
+  await signApp(withService,{prepare:()=>{
+    prepared=true;assert.equal(signedPaths.at(-1),path.join(withService,'Contents/MacOS/autoapprove'));
+  }});
+  assert.equal(prepared,true);
+  assert.deepEqual(signedPaths.slice(beforeNative),[path.join(withService,'Contents/MacOS/autoapprove'),
+    path.join(withService,'Contents/MacOS/AutoApproveTTYService'),
+    path.join(withService,'Contents/Library/LaunchServices/local.autoapprove.tty-input'),withService]);
+  await assert.rejects(()=>signApp(withService,{prepare:()=>{throw Error('Disposable metadata failure');}}),/Disposable metadata failure/);
+  assert.deepEqual(searchList,originalSearch,'Native metadata preparation failure must restore the original search list');
   failSigning=true;
   await assert.rejects(()=>signApp(path.join(directory,'SigningFailure.app')),/Disposable signing failure/);
   assert.deepEqual(searchList,originalSearch,'Signing failure must restore the original search list');

@@ -30,6 +30,7 @@ private final class SetupProbe: @unchecked Sendable {
     var packageFailure = false
     var policyFailure = false
     var registrationFailure = false
+    var connectsAfterInstall = true
     var registrations = 0
     var policyChecks = 0
     var refreshes = 0
@@ -37,7 +38,7 @@ private final class SetupProbe: @unchecked Sendable {
         .init(validate: { _, _ in if self.packageFailure { throw AppError.message("invalid package") } },
             connected: { self.connected }, legacyInstalled: { self.legacy }, state: { self.state },
             registrationPolicy: { _, _ in self.policyChecks += 1; if self.policyFailure { throw AppError.message("platform trust denied") } },
-            register: { self.registrations += 1; if self.registrationFailure { throw AppError.message("registration failed") }; self.state = self.next },
+            register: { self.registrations += 1; if self.registrationFailure { throw AppError.message("registration failed") }; self.state = self.next; self.connected = self.connectsAfterInstall },
             refresh: { self.refreshes += 1 })
     }
     func run() throws -> TerminalInputInstaller.Result {
@@ -150,11 +151,13 @@ private final class SetupProbe: @unchecked Sendable {
         try check(existing.run() == .alreadyConnected)
         precondition(existing.registrations == 0 && existing.policyChecks == 0 && existing.refreshes == 0)
         let awaiting = SetupProbe(); awaiting.state = .requiresApproval
+        awaiting.legacy = true
         try check(awaiting.run() == .requiresApproval)
         precondition(awaiting.registrations == 0 && awaiting.policyChecks == 0)
         let enabled = SetupProbe(); enabled.state = .enabled
-        try check(enabled.run() == .registered)
-        precondition(enabled.registrations == 0 && enabled.policyChecks == 0 && enabled.refreshes == 1)
+        do { _ = try enabled.run(); preconditionFailure("Disconnected registered service was reported connected") }
+        catch { }
+        precondition(enabled.registrations == 0 && enabled.policyChecks == 0)
         for scenario in 0..<5 {
             let rejected = SetupProbe()
             switch scenario {
@@ -174,8 +177,15 @@ private final class SetupProbe: @unchecked Sendable {
         let immediate = SetupProbe(); immediate.next = .enabled
         try check(immediate.run() == .registered)
         precondition(immediate.registrations == 1)
+        let native = SetupProbe(); native.next = .notRegistered
+        try check(native.run() == .registered)
+        precondition(native.registrations == 1 && native.connected)
+        let noConnection = SetupProbe(); noConnection.next = .notRegistered; noConnection.connectsAfterInstall = false
+        do { _ = try noConnection.run(); preconditionFailure("Installation without an XPC reply was reported connected") }
+        catch { }
+        precondition(noConnection.registrations == 1 && noConnection.refreshes == 1)
         precondition(TerminalInputStatus.requiresApproval.message == TerminalInputInstaller.Result.requiresApproval.message)
-        print("PASS: original source input guards and exact bytes preserved; bundled daemon contract rejects substituted executables; native registration requires platform trust, preserves existing services and handles approval without administrator shell execution")
+        print("PASS: original source input guards and exact bytes preserved; substituted executables rejected; native setup preserves healthy, disabled and broken existing services, rejects installation failure and requires a live XPC connection before completion")
 #else
         print("PASS: original source input guards, Codex editor/list keys, unchanged Claude bytes and no uncertain-input retries")
 #endif

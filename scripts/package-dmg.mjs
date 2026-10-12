@@ -50,7 +50,7 @@ try {
   if ((await readFile(path.join(mounted, guideName), 'utf8')) !== guide) {
     throw new Error('Installation instructions differ from source');
   }
-  for (const relative of ['Contents/Info.plist', 'Contents/MacOS/AutoApproveApp', 'Contents/MacOS/autoapprove', 'Contents/MacOS/AutoApproveTTYService']) {
+  for (const relative of ['Contents/Info.plist', 'Contents/MacOS/AutoApproveApp', 'Contents/MacOS/autoapprove', 'Contents/MacOS/AutoApproveTTYService', 'Contents/Library/LaunchServices/local.autoapprove.tty-input']) {
     if (!(await readFile(path.join(mountedApp, relative))).equals(await readFile(path.join(app, relative)))) {
       throw new Error(`App differs from the verified source: ${relative}`);
     }

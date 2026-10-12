@@ -46,7 +46,7 @@ function withSigningKeychain(keychain,sign) {
   }
 }
 
-export async function signApp(app,{allowProvisioning=true}={}) {
+export async function signApp(app,{allowProvisioning=true,prepare}={}) {
   let identity=process.env.AUTOAPPROVE_SIGNING_IDENTITY;
   let keychain=process.env.AUTOAPPROVE_SIGNING_KEYCHAIN;
   if(keychain&&!path.isAbsolute(keychain))throw new Error('AUTOAPPROVE_SIGNING_KEYCHAIN must be an absolute path');
@@ -95,10 +95,13 @@ export async function signApp(app,{allowProvisioning=true}={}) {
   const options=['--force','--sign',identity,...(keychain?['--keychain',keychain]:[])];
   withSigningKeychain(keychain,()=>{
     execFileSync('/usr/bin/codesign',[...options,'--identifier','local.autoapprove.helper',path.join(app,'Contents/MacOS/autoapprove')],{stdio:'inherit'});
+    if(prepare)prepare();
     const ttyHelper=path.join(app,'Contents/MacOS/AutoApproveTTYService');
     // Older already-published bundles do not contain this optional component.
     // The current packager always includes it and fails on a missing binary.
     if(existsSync(ttyHelper))execFileSync('/usr/bin/codesign',[...options,'--identifier','local.autoapprove.tty-input',ttyHelper],{stdio:'inherit'});
+    const nativeHelper=path.join(app,'Contents/Library/LaunchServices/local.autoapprove.tty-input');
+    if(existsSync(nativeHelper))execFileSync('/usr/bin/codesign',[...options,'--identifier','local.autoapprove.tty-input',nativeHelper],{stdio:'inherit'});
     execFileSync('/usr/bin/codesign',[...options,'--entitlements','scripts/entitlements.plist',app],{stdio:'inherit'});
     execFileSync('/usr/bin/codesign',['--verify','--deep','--strict',app],{stdio:'inherit'});
     const requirement=execFileSync('/usr/bin/codesign',['-d','-r-',app],{encoding:'utf8',stdio:['ignore','pipe','pipe']});

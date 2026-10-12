@@ -6,7 +6,7 @@ public enum TerminalInputStatus: Equatable, Sendable {
     case notInstalled, available, requiresApproval, unavailable(String)
     public var message: String {
         switch self {
-        case .notInstalled: return "Terminal 직접 입력 연결이 필요합니다. Mac 앱에서 등록하고 로그인 항목 설정에서 허용합니다."
+        case .notInstalled: return "Terminal 직접 입력 연결이 필요합니다. Mac 앱의 ‘직접 입력 연결’에서 처음 한 번 관리자 승인으로 설치합니다."
         case .available: return "원본 터미널 직접 입력 연결됨 · 손쉬운 사용 권한 없이 사용합니다."
         case .requiresApproval: return TerminalInputInstaller.Result.requiresApproval.message
         case .unavailable(let message): return message
@@ -49,6 +49,7 @@ public final class TerminalInputClient: @unchecked Sendable {
     }
     private func probe() -> TerminalInputStatus {
         let legacy = FileManager.default.fileExists(atPath: TTYInputConfiguration.helperPath)
+        if legacy, TerminalInputInstaller.registrationState == .requiresApproval { return .requiresApproval }
         if !legacy {
             switch TerminalInputInstaller.registrationState {
             case .requiresApproval: return .requiresApproval

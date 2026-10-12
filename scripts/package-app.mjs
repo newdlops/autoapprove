@@ -1,6 +1,7 @@
 import { mkdir, copyFile, writeFile, readFile, chmod, access, unlink, cp } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+import {prepareTerminalInputBundle} from './terminal-input-bundle.mjs';
 
 const configuration = process.argv[2] ?? 'debug';
 if (!['debug', 'release'].includes(configuration)) throw new Error('Expected debug or release');
@@ -48,5 +49,5 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>NSBonjourServices</key><array><string>_autoapprove._tcp</string></array>
 </dict></plist>
 `);
-await (await import('./sign-app.mjs')).signApp(app);
+await (await import('./sign-app.mjs')).signApp(app,{prepare:()=>prepareTerminalInputBundle(app,configuration,webVersion)});
 console.log(app);

@@ -853,7 +853,7 @@ function updateControls() {
   $('terminal-keyboard-toggle').setAttribute('aria-pressed', String(keyboardActive));
   $('terminal-keyboard-toggle').setAttribute('aria-label', keyboardActive ? '터미널 키보드 닫기' : '터미널 키보드 열기');
   const terminalSetupHelp = selectedItem.session.terminal === 'terminal' && !canDirect
-    ? 'Mac의 연결 설정 → 원본 터미널 화면·입력에서 ‘직접 입력 연결’을 설정해주세요. 처음에 Mac 관리자 승인을 받습니다. 작성 후 Enter 전송은 사용할 수 있습니다.' : '';
+    ? '접속한 Mac의 AutoApprove 앱에서 연결 설정 → 원본 터미널 화면·입력 → 직접 입력 연결을 설정해주세요. 각 Mac에서 처음 한 번 관리자 승인으로 설치합니다. 휴대폰에는 설치하지 않습니다. 작성 후 Enter 전송은 사용할 수 있습니다.' : '';
   const draftReason = canDirect ? '이 원본 연결은 직접 키 입력만 지원합니다. 초안을 복사한 뒤 지우고 화면 설정에서 직접 입력으로 돌아가세요.' : latestFrame?.nativeDisplay?.message || reason || '원본 터미널 연결을 눌러 입력 권한을 확인해주세요. 작성 내용은 초안으로 보관합니다.';
   text($('direct-input-help'), originalDraftOnly ? draftReason : terminalSetupHelp ? reason || terminalSetupHelp
     : nativeConnection() && !canDirect ? reason || '원본 터미널 연결을 눌러 입력 권한을 확인해주세요. 작성 입력은 화면 설정에서 선택할 수 있습니다.'
