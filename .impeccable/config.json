@@ -1,0 +1,35 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "broken-image",
+        "value": "*",
+        "files": [
+          "Sources/AutoApproveCore/Resources/RemoteWeb/index.html"
+        ],
+        "createdAt": "2026-10-06T06:57:40.632Z",
+        "reason": "Agent: native and shared screen images stay hidden without src until an authorized frame arrives; current browser captures verify no visible broken-image boxes."
+      },
+      {
+        "rule": "clipped-overflow-container",
+        "value": "*",
+        "files": [
+          "Sources/AutoApproveCore/Resources/RemoteWeb/index.html"
+        ],
+        "createdAt": "2026-10-06T06:57:41.500Z",
+        "reason": "Agent: the workspace intentionally contains terminal panes and clips their positioned input cursor; modal dialogs use the browser top layer and are not clipped."
+      },
+      {
+        "rule": "cramped-padding",
+        "value": "*",
+        "files": [
+          "Sources/AutoApproveCore/Resources/RemoteWeb/index.html"
+        ],
+        "createdAt": "2026-10-06T06:57:42.113Z",
+        "reason": "Agent: the interaction dialog has no wrapper padding because its heading, scrolling body and message form each supply their own 24px horizontal inset, verified in the browser."
+      }
+    ]
+  }
+}
