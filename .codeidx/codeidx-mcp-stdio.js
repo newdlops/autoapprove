@@ -2,7 +2,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const cli = "/Users/lky/.vscode/extensions/newdlops.intellij-styled-search-0.1.7149/out/codeidxMcpCli.js";
+const cli = "/Users/lky/.vscode/extensions/newdlops.intellij-styled-search-0.1.7163/out/codeidxMcpCli.js";
 const workspaceRoot = path.resolve(__dirname, '..');
 function argIndex(names) {
   return process.argv.findIndex((arg, index) => index >= 2 && names.some((name) => arg === name || arg.startsWith(name + "=")));
