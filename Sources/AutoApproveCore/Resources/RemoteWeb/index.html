@@ -27,6 +27,10 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
   <main>
     <div id="network-error" class="notice error" role="alert" hidden></div>
     <div id="discovery" class="notice" hidden></div>
+    <section id="system-safety" class="notice error" aria-labelledby="system-safety-title" hidden>
+      <h2 id="system-safety-title" role="alert"></h2>
+      <div id="system-safety-list"></div>
+    </section>
     <section id="session-interruptions" class="notice error" aria-labelledby="interruption-title" hidden>
       <h2 id="interruption-title" aria-live="polite"></h2>
       <div id="interruption-list"></div>
@@ -51,6 +55,7 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
           <div class="session-controls"><label class="switch-label"><input id="automatic" type="checkbox" role="switch"><span>자동 승인</span></label><button id="reveal" class="secondary">Mac에서 터미널 열기</button></div>
           <p id="session-status" class="muted small"></p><p id="session-ended" class="notice error" hidden>이 세션이 종료되었거나 Mac 연결이 끊겼습니다. 목록에서 다른 세션을 선택해주세요.</p>
           </div>
+          <section id="session-safety" class="notice error safety-panel" aria-label="시스템 변경 보호 상태" hidden></section>
           <section class="terminal-section" aria-labelledby="terminal-heading">
             <div class="section-heading terminal-heading">
               <button id="terminal-back" type="button" class="icon-button focus-only" aria-label="세션 목록으로 돌아가기"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>

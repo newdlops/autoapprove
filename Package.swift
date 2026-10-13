@@ -21,7 +21,7 @@ let package = Package(
         .executableTarget(name: "AutoApproveTTYService", dependencies: ["TerminalInputSupport"]),
         .executableTarget(name: "AutoApproveApp", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveCLI", dependencies: ["AutoApproveCore"]),
-        .executableTarget(name: "AutoApproveChecks", dependencies: ["AutoApproveCore"], path: "Tests/AutoApproveCoreTests", swiftSettings: [.unsafeFlags(["-parse-as-library"])])
+        .executableTarget(name: "AutoApproveChecks", dependencies: ["AutoApproveCore"], path: "Tests/AutoApproveCoreTests", swiftSettings: [.unsafeFlags(["-parse-as-library"]), .unsafeFlags(["-Onone"], .when(configuration: .release))])
     ],
     swiftLanguageModes: [.v5]
 )

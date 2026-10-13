@@ -29,6 +29,7 @@ let cursorLayoutPending = false, cursorLayoutTimer = null;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const interruptionRows = new Map();
+const safetyRows = new Map();
 const sessionHistories = new Map();
 let terminalLibraries = null;
 const structuredDrafts = new Map(), messageDrafts = new Map();
@@ -655,6 +656,59 @@ function renderMachines() {
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
   }
   renderInterruptions();
+  renderSystemSafety();
+}
+function systemSafetyTitle(risk) {
+  return {persistence:'시스템 자동 실행 변경',security:'보안·접근 권한 변경',settings:'시스템 설정·파일 변경',privileged:'관리자 권한 실행'}[risk?.kind] || '시스템 변경';
+}
+function systemSafetyStatus(source, node) {
+  const notice = source.systemSafety;
+  if (notice.phase === 'detected') return node.state?.snapshot.paused ? '전체 일시정지 중 · 시스템 변경을 자동 승인하지 않습니다.' : !source.automatic ? '자동 승인 꺼짐 · 켜면 시스템 변경을 거절하고 안전한 대안을 안내합니다.' : notice.message;
+  return notice.message;
+}
+function renderSystemSafety() {
+  const active = allSessions.flatMap(item => [item.session,...(item.session.backgroundSessions || [])].filter(source =>
+    source.systemSafety && (source.notices || []).some(notice => notice.isSystemSafety && !notice.isRead)
+  ).map(source => ({item,source,key:item.key+'/'+source.id+'/'+source.systemSafety.id})));
+  const keys = new Set(active.map(value => value.key));
+  for (const [key,row] of safetyRows) if (!keys.has(key)) { row.remove(); safetyRows.delete(key); }
+  show($('system-safety'),active.length > 0);
+  text($('system-safety-title'),`시스템 변경 경고 · ${active.length}개 세션`);
+  for (const {item,source,key} of active) {
+    let row = safetyRows.get(key);
+    if (!row) {
+      row = make('article','interruption-row'); const info = make('div');
+      info.append(make('p','interruption-name'),make('p','small interruption-state'));
+      const button = make('button','secondary','세션 보기'); button.type = 'button';
+      button.addEventListener('click',()=>selectSession(item.key,true)); row.append(info,button);
+      safetyRows.set(key,row); $('system-safety-list').append(row);
+    }
+    text(row.querySelector('.interruption-name'),`${item.node.name} · ${item.view.title} · ${systemSafetyTitle(source.systemSafety.risk)}`);
+    text(row.querySelector('.interruption-state'),systemSafetyStatus(source,item.node) + (!item.node.online ? ' · Mac 연결 끊김' : ''));
+    row.lastChild.setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 시스템 변경 경고 보기`);
+  }
+}
+function renderSessionSafety() {
+  const {session,node} = selectedItem, container = $('session-safety');
+  const sources = [session,...(session.backgroundSessions || [])].filter(source => source.systemSafety);
+  const keys = new Set(sources.map(source=>source.id));
+  for (const article of container.children) if (!keys.has(article.dataset.source)) article.remove();
+  show(container,sources.length > 0);
+  for (const source of sources) {
+    const notice = source.systemSafety;
+    let article = Array.from(container.children).find(value=>value.dataset.source === source.id);
+    if (!article) {
+      article = make('article'); article.dataset.source = source.id;
+      article.append(make('h3'),make('p','safety-status'));
+      article.querySelector('p').setAttribute('role','status');
+      const details = make('details'); details.append(make('summary','','요청과 안전한 대안'),make('pre','safety-request'),make('p','safety-alternative'));
+      article.append(details);container.append(article);
+    }
+    text(article.querySelector('h3'),systemSafetyTitle(notice.risk) + (source.id !== session.id ? ' · 백그라운드 실행' : ''));
+    text(article.querySelector('.safety-status'),systemSafetyStatus(source,node));
+    text(article.querySelector('.safety-request'),notice.request);
+    text(article.querySelector('.safety-alternative'),'이미 실행 중인 프로그램의 타이머나 프로젝트 내부 작업으로 계속합니다. 시스템 자동 실행 등록·관리자 권한 상승·보안 설정 변경이나 우회는 하지 않습니다.');
+  }
 }
 function interruptionStatus(session) {
   if (session.phase === 'ended') return (session.capacityResume?.phase === 'paused' ? '자동 복구 일시정지 · ' : '') + (session.interruption?.recoveryDetail || 'CLI 종료 · Mac에서 원본 대화 확인 필요');
@@ -790,6 +844,7 @@ function renderDetail() {
     terminalPlaceholder(session.interruption.detail); terminalState('error','CLI 종료');
   }
   $('automatic').checked = session.automatic; text($('session-status'), node.state.snapshot.paused ? '이 Mac의 자동 승인이 일시정지되어 있습니다.' : session.activityDetail || session.detail);
+  renderSessionSafety();
   const terminalHost = `${node.name} · ${session.hostName || hosts[session.terminal]}`;
   text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
   if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
@@ -1206,7 +1261,7 @@ function renderQuestions() {
   const { session, node } = selectedItem;
   const terminalQuestion = latestFrame?.sessionID === session.id ? latestFrame.question : null;
   const sources = [session, ...(session.backgroundSessions || [])];
-  const signature = JSON.stringify([terminalQuestion, terminalQuestion && [latestFrame.keys.includes('choice'),latestFrame.inputReason], sources.map(source => [source.id, source.claudeApprovals, source.queuedQuestions, source.pendingSummary, source.capacityResume])]);
+  const signature = JSON.stringify([terminalQuestion, terminalQuestion && [latestFrame.keys.includes('choice'),latestFrame.inputReason], sources.map(source => [source.id, source.claudeApprovals, source.queuedQuestions, source.pendingSummary, source.capacityResume, source.systemCommandRisk, source.systemSafety])]);
   if (signature === questionSignature) return;
   // Capture every draft before status-driven rerender; never discard a typed answer on a polling tick.
   for (const form of $('questions').querySelectorAll('form')) {
@@ -1235,7 +1290,7 @@ function renderQuestions() {
   }
   for (const source of sources) {
     for (const approval of source.claudeApprovals || []) {
-      if (approval.questions?.length) {
+      if (!approval.systemCommandRisk && approval.questions?.length) {
         count++; $('questions').append(structuredQuestionForm(`${node.id}/${source.id}/${approval.id}`, approval.questions, {
           nodeID: node.id, title: source.id === session.id ? 'Claude의 질문' : 'Claude 백그라운드 질문', unavailable: approval.sending,
           status: approval.sending ? 'Claude에 답변을 전달하고 있습니다.' : approval.automaticAt ? '자동 응답 예약 · 답변을 작성하면 예약을 멈춥니다.' : '',
@@ -1243,11 +1298,15 @@ function renderQuestions() {
           send: answers => sendQuestionAnswer(`${node.id}/${source.id}/${approval.id}`, node.id, {action:'replyClaudeQuestions', sessionID:source.id, requestIDForApproval:approval.id, answers}, 'Claude에 답변을 전달했습니다.')
         })); continue;
       }
-      count++; const section = make('div', 'question'); section.append(make('h4', '', approval.summary));
+      count++; const section = make('div', 'question'); section.append(make('h4', '', approval.systemCommandRisk ? systemSafetyTitle(approval.systemCommandRisk) : approval.summary));
+      if (approval.systemCommandRisk) {
+        section.append(make('p','notice error','이 명령을 거절하고 같은 대화에 안전한 대안을 전달합니다.'));
+        const details = make('details'); details.append(make('summary','','요청 내용'),make('pre','safety-request',approval.summary)); section.append(details);
+      }
       if (source.id !== session.id) section.append(make('p', 'muted small', 'Claude 백그라운드 요청'));
       if (approval.automaticAt) section.append(make('p', 'muted small', '자동 응답 예약 · ' + nowLabel(approval.automaticAt)));
       const actions = make('div', 'question-actions');
-      for (const [label, actionName] of [[approval.isQuestion ? approval.answer : '이번 요청 허용', 'claudeApprove'], ['터미널에서 답하기', 'claudeRelease']]) {
+      for (const [label, actionName] of [[approval.systemCommandRisk ? '안전한 방법으로 계속' : approval.isQuestion ? approval.answer : '이번 요청 허용', 'claudeApprove'], ['터미널에서 답하기', 'claudeRelease']]) {
         const button = make('button', actionName === 'claudeRelease' ? 'secondary' : '', label); button.dataset.unavailable = String(approval.sending);
         button.addEventListener('click', () => void action(node.id, { action: actionName, sessionID: source.id, requestIDForApproval: approval.id }, '요청을 처리했습니다.'));
         actions.append(button);

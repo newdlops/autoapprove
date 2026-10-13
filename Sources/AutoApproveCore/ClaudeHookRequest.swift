@@ -11,7 +11,8 @@ public struct ClaudeApproval: Codable, Equatable, Identifiable {
     public var expiresAt: Date
     public var automaticAt: Date?
     public var questions: [WebQuestionField]? = nil
-    public var buttonTitle: String { isQuestion ? (answer.count > 32 ? String(answer.prefix(31)) + "…" : answer) : "허용" }
+    public var systemCommandRisk: SystemCommandRisk? = nil
+    public var buttonTitle: String { systemCommandRisk != nil ? "안전한 방법으로 계속" : isQuestion ? (answer.count > 32 ? String(answer.prefix(31)) + "…" : answer) : "허용" }
 }
 
 struct ClaudeHookReceipt: Codable {
@@ -40,6 +41,12 @@ struct ClaudeHookRequest {
     let tool: String
     let inputJSON: String?
     let questions: [WebQuestionField]?
+    let systemCommandRisk: SystemCommandRisk?
+    var safetyResponse: JSONObject? {
+        guard let risk = systemCommandRisk, let event = payload["hook_event_name"] as? String,
+              ["PreToolUse", "PermissionRequest"].contains(event) else { return nil }
+        return risk.denial(event: event)
+    }
     var isQuestion: Bool { tool == "AskUserQuestion" }
 
     init?(_ payload: JSONObject, at now: Date) {
@@ -61,6 +68,8 @@ struct ClaudeHookRequest {
         questions = tool == "AskUserQuestion" && ["PreToolUse", "PermissionRequest"].contains(event) && (input["answers"] as? JSONObject)?.isEmpty != false
             ? try? WebQuestionField.parse(input["questions"]) : nil
         summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
+        systemCommandRisk = ["PreToolUse", "PermissionRequest"].contains(event)
+            ? SystemCommandRisk.detect(tool: tool, input: input, summary: summary, cwd: payload["cwd"] as? String ?? "") : nil
         inputJSON = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
         if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event), let yes = YesNoConfirmation.detect(input) {
             answer = yes.answer
@@ -73,7 +82,7 @@ struct ClaudeHookRequest {
             answer = "허용"
             response = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow"]]]
         } else { answer = ""; response = nil }
-        if response != nil || questions != nil {
+        if response != nil || questions != nil || systemCommandRisk != nil {
             let toolID = (payload["tool_use_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id
             logicalID = sessionID + ":" + provider + ":" + toolID
         } else { logicalID = nil }

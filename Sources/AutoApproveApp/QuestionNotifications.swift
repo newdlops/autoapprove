@@ -119,7 +119,7 @@ import AutoApproveCore
                 // an existing alert. Completion retains its three-second grace period.
                 while true {
                     guard let self, self.active[request.id] != nil, self.allowed else { return }
-                    let delay = request.kind == .interruption ? 0 : request.kind == .completion ? 3 : self.engine.snapshot.questionNotificationDelay
+                    let delay = request.kind == .interruption || request.kind == .systemChange ? 0 : request.kind == .completion ? 3 : self.engine.snapshot.questionNotificationDelay
                     let remaining = observedAt.addingTimeInterval(TimeInterval(delay)).timeIntervalSinceNow
                     if remaining <= 0 { break }
                     do { try await Task.sleep(nanoseconds: UInt64(min(remaining, 1) * 1_000_000_000)) } catch { return }

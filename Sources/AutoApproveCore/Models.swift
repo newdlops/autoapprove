@@ -1,6 +1,6 @@
 import Foundation
 
-public enum AgentKind: String, Codable, CaseIterable {
+public enum AgentKind: String, Codable, CaseIterable, Sendable {
     case claude, codex, shell
     public var title: String {
         switch self { case .claude: return "Claude Code"; case .codex: return "Codex"; case .shell: return "일반 터미널" }
@@ -115,6 +115,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var pendingSummary: String?
     public var pendingRequestID: String?
     public var pendingInTerminal = false
+    public var systemCommandRisk: SystemCommandRisk?
+    public var systemSafety: SystemSafetyNotice?
     public var claudeApprovals: [ClaudeApproval]?
     public var queuedQuestions: [QueuedQuestion]?
     public var codexQuestionsObservedAt: Date?
@@ -214,7 +216,7 @@ public struct AuditEvent: Identifiable, Codable, Equatable {
     public var request: String?
     public var answer: String?
     public var result: AuditResult {
-        if ["승인 전달", "승인 입력 전달", "질문 응답 전달", "이어서 진행 요청 전달", "웹 입력 전달"].contains(outcome) { return .delivered }
+        if ["승인 전달", "승인 입력 전달", "질문 응답 전달", "이어서 진행 요청 전달", "웹 입력 전달", "시스템 변경 거절 · 안전한 대안 안내 전달 확인", "안전한 대안 안내 전달 확인", "시스템 변경 거절 입력 전달"].contains(outcome) { return .delivered }
         if outcome == "터미널에서 확인" { return .manual }
         if outcome == "답변 대기열 등록" || outcome == "답변 원본 터미널 전달" { return .queued }
         return .review

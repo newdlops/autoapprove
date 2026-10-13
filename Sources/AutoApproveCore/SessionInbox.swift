@@ -9,7 +9,8 @@ public struct SessionNotice: Codable, Equatable, Identifiable {
     public var date: Date
     public var isRead: Bool
     public var isInterruption: Bool? = nil
-    public var title: String { isInterruption == true ? "작업 중단" : kind == .completion ? "작업 완료" : "응답 필요" }
+    public var isSystemSafety: Bool? = nil
+    public var title: String { isSystemSafety == true ? "시스템 변경 경고" : isInterruption == true ? "작업 중단" : kind == .completion ? "작업 완료" : "응답 필요" }
 
     public static func key(_ kind: Kind, _ identifier: String) -> String {
         kind.rawValue + ":" + PromptDetector.fingerprint(identifier)
@@ -23,8 +24,9 @@ public struct SessionInbox: Codable, Equatable {
         public var kind: SessionNotice.Kind
         public var summary: String
         public var isInterruption: Bool = false
-        public init(key: String, kind: SessionNotice.Kind, summary: String, isInterruption: Bool = false) {
-            self.key = key; self.kind = kind; self.summary = summary; self.isInterruption = isInterruption
+        public var isSystemSafety: Bool = false
+        public init(key: String, kind: SessionNotice.Kind, summary: String, isInterruption: Bool = false, isSystemSafety: Bool = false) {
+            self.key = key; self.kind = kind; self.summary = summary; self.isInterruption = isInterruption; self.isSystemSafety = isSystemSafety
         }
     }
     private struct Active: Codable, Equatable {
@@ -45,11 +47,11 @@ public struct SessionInbox: Codable, Equatable {
         if reconcilesAbsence { active = active.filter { keys.contains($0.key) } }
         for candidate in candidates {
             var event = active[candidate.key] ?? Active(observedAt: date)
-            let delay: TimeInterval = candidate.kind == .completion ? 3 : 0.8
+            let delay: TimeInterval = candidate.isSystemSafety ? 0 : candidate.kind == .completion ? 3 : 0.8
             if !event.posted && date.timeIntervalSince(event.observedAt) >= delay {
                 entries.insert(SessionNotice(id: event.id, sourceKey: candidate.key, kind: candidate.kind,
                     summary: String(candidate.summary.prefix(600)), date: date, isRead: event.acknowledged,
-                    isInterruption: candidate.isInterruption ? true : nil), at: 0)
+                    isInterruption: candidate.isInterruption ? true : nil, isSystemSafety: candidate.isSystemSafety ? true : nil), at: 0)
                 event.posted = true
             }
             active[candidate.key] = event

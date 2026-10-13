@@ -1,7 +1,7 @@
 import Foundation
 
 public struct AttentionRequest: Equatable, Identifiable {
-    public enum Kind: Equatable { case question, completion, interruption }
+    public enum Kind: Equatable { case question, completion, interruption, systemChange }
     public let id: String
     public let sessionID: String
     public let project: String
@@ -10,7 +10,7 @@ public struct AttentionRequest: Equatable, Identifiable {
     public var kind: Kind = .question
     public var notificationKey: String = ""
     public var originSessionID: String?
-    public var title: String { project + (kind == .completion ? " · 작업 완료" : kind == .interruption ? " · 작업 중단" : " · 응답 필요") }
+    public var title: String { project + (kind == .systemChange ? " · 시스템 변경 경고" : kind == .completion ? " · 작업 완료" : kind == .interruption ? " · 작업 중단" : " · 응답 필요") }
 
     public static func completions(_ snapshot: EngineSnapshot, at now: Date = Date()) -> [AttentionRequest] {
         snapshot.sessions.flatMap { session in
@@ -39,6 +39,11 @@ public struct AttentionRequest: Equatable, Identifiable {
     public static func candidates(_ session: AgentSession, paused: Bool) -> [Candidate] {
         guard session.agent != .shell else { return [] }
         var failures: [Candidate] = []
+        if let safety = session.systemSafety,
+           session.notices?.first(where: { $0.sourceKey == SessionNotice.key(.question, "systemSafety:" + safety.id) })?.isRead != true {
+            failures.append(Candidate(key: "systemSafety:" + safety.id, summary: safety.risk.title + " · " + safety.message,
+                sourceSessionID: session.id, sourceKey: "systemSafety:" + safety.id, kind: .systemChange))
+        }
         if let error = session.interruption, error.needsAttention {
             failures.append(Candidate(key: "interruption:" + error.id, summary: error.kind.title + " · " + error.detail,
                 sourceSessionID: session.id, sourceKey: "interruption:" + error.id, kind: .interruption))
@@ -52,9 +57,9 @@ public struct AttentionRequest: Equatable, Identifiable {
         if let approvals = session.claudeApprovals, !approvals.isEmpty {
             // A live five-second countdown needs no manual attention. Keep the request
             // visible in the detail view, but share this rule across banners and badges.
-            result += approvals.filter { !$0.sending && (!automatic || $0.automaticAt == nil) }
+            result += approvals.filter { $0.systemCommandRisk == nil && !$0.sending && (!automatic || $0.automaticAt == nil) }
                 .map { Candidate(key: "bridge:" + $0.id, summary: $0.summary, sourceSessionID: session.id, sourceKey: "bridge:" + $0.id) }
-        } else if let summary = session.pendingSummary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        } else if session.systemCommandRisk == nil, let summary = session.pendingSummary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            phase == .input || (phase == .approval && (session.pendingInTerminal || !session.automatic || paused)) {
             let normalized = summary.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             let alreadyQueued = phase == .input && session.questions.contains {

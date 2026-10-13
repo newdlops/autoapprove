@@ -502,6 +502,28 @@ private struct SessionDetail: View {
                     }
                 }
                 Divider()
+                ForEach(([session] + session.backgroundChildren).filter { $0.systemSafety != nil }) { source in
+                    if let notice = source.systemSafety {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label(notice.risk.title, systemImage: "exclamationmark.shield")
+                                .font(.headline).foregroundStyle(.red)
+                            Text(notice.message).font(.callout).fixedSize(horizontal: false, vertical: true)
+                            if source.id != session.id { Text("백그라운드 실행 · \(source.tty)").font(.caption).foregroundStyle(.secondary) }
+                            if notice.phase == .detected && (!session.automatic || paused) {
+                                Text(paused ? "전체 일시정지 중입니다. 자동 안내는 재개한 뒤 진행합니다." : "자동 승인을 켜면 시스템 변경을 거절하고 안전한 대안을 안내합니다.")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            }
+                            DisclosureGroup("요청과 안전한 대안") {
+                                Text(notice.request).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+                                Text(notice.risk.guidance).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            }
+                        }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+                            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.red.opacity(0.35), lineWidth: 1))
+                        Divider()
+                    }
+                }
                 if ([session] + session.backgroundChildren).contains(where: { $0.pendingSummary != nil && $0.phase != .ended }) {
                     VStack(alignment: .leading, spacing: 14) {
                         Text("현재 요청").font(.headline)
@@ -621,6 +643,10 @@ private struct ClaudeApprovalControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if let risk = approval.systemCommandRisk {
+                Label(risk.title, systemImage: "exclamationmark.shield").font(.callout.weight(.semibold)).foregroundStyle(.red)
+                Text("이 명령을 거절하고 같은 대화에 안전한 대안을 전달합니다.").font(.callout).fixedSize(horizontal: false, vertical: true)
+            }
             Text(approval.summary).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
             if approval.sending {
@@ -653,14 +679,14 @@ private struct ClaudeApprovalControls: View {
         }
     }
     @ViewBuilder private var approvalButtons: some View {
-        if approval.questions != nil && approval.answer.isEmpty {
+        if approval.systemCommandRisk == nil && approval.questions != nil && approval.answer.isEmpty {
             Text("휴대폰 웹의 ‘질문·메시지’에서 선택지를 고르거나 답변을 입력할 수 있습니다.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         } else {
             Button(approval.buttonTitle) { perform { try approve(false) } }
                 .buttonStyle(.borderedProminent)
-                .help("이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
-            if !automatic && !paused {
+                .help(approval.systemCommandRisk != nil ? "시스템 변경을 거절하고 같은 대화에서 안전한 방법으로 계속합니다." : "이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
+            if approval.systemCommandRisk == nil && !automatic && !paused {
                 Button("허용하고 자동 승인 켜기") { perform { try approve(true) } }
                     .help("현재 요청에 응답하고 이 메인 세션과 연결된 백그라운드의 자동 승인을 켭니다.")
             }

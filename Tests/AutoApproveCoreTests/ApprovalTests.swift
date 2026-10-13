@@ -417,6 +417,16 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("System safety: mutations, escaped paths and readonly boundaries", tests.testSystemRiskMutationsAndReadOnlyBoundaries),
+            ("System safety: local installers are bounded and never executed", tests.testSystemRiskLocalInstallerIsBoundedAndNeverExecuted),
+            ("System safety: original composer ownership and submission", tests.testSystemSafetyComposerOwnershipAndSubmission),
+            ("System safety: Claude denies without interruption and durably replays", tests.testSystemSafetyClaudeDeniesAndContinuesWithDurableReplay),
+            ("System safety: Claude pause, safe manual action and readonly approval", tests.testSystemSafetyClaudePauseManualAndReadOnlyApproval),
+            ("System safety: screen redirection, newline and no approval bytes", tests.testSystemSafetyScreenRedirectHandlesNewlineWithoutApproval),
+            ("System safety: screen pause and original user drafts", tests.testSystemSafetyScreenPauseAndUserDraftArePreserved),
+            ("System safety: uncertain writes never replay after restart", tests.testSystemSafetyScreenUncertainWriteNeverReplaysAfterRestart),
+            ("System safety: original PID start and foreground recheck", tests.testSystemSafetyScreenRechecksProcessAndForegroundBeforeGuidance),
+            ("System safety: concurrent Claude acknowledgements are request-bound", tests.testSystemSafetyConcurrentClaudeReceiptsMatchTheirOwnRequest),
             ("Codex MCP tool permission: two-choice Allow/Cancel, colors and wrapping", tests.testCodexMCPToolPermissionWithTwoChoices),
             ("Codex MCP tool permission: escaped payloads, JSON and exact Terminal/iTerm delivery", tests.testCodexMCPToolPermissionEscapesAndExactDelivery),
             ("Codex MCP tool permission: concurrent isolation and single use", tests.testCodexMCPToolPermissionConcurrentAndSingleUse),

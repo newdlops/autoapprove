@@ -540,3 +540,8 @@ Claude의 `PermissionRequest`가 모든 종류의 확인창을 포괄한다고 �
 - [VS Code TerminalShellExecution API](https://code.visualstudio.com/api/references/vscode-api#TerminalShellExecution)는 `read()` 호출 이후의 출력만 읽는다고 명시한다. [Terminal API](https://code.visualstudio.com/api/references/vscode-api#Terminal)는 특정 터미널의 입력 전달과 표시 기능을 제공한다.
 - 로컬 `/System/Applications/Utilities/Terminal.app/Contents/Resources/Terminal.sdef`에서 탭의 `contents`, `history`, `tty`, `processes`와 `do script`를 확인했다. 실제 탭을 읽거나 입력을 보내지는 않았다.
 - UI는 `ui-design-workflow`, `ui-ux-pro-max`, `impeccable`을 참고해 SwiftUI 네이티브 목록과 분할 창으로 구현했다. 기능 테스트와 실제 앱 화면 확인 범위는 [VALIDATION.md](VALIDATION.md)에 기록한다. 성능 목표의 정량 측정은 남아 있다.
+# 시스템 변경 대신 안전하게 계속 · 0.2.80
+
+기존 시스템 서체·의미 색상·분할 화면을 유지한다. 시스템 자동 실행 등록·보안 설정 변경·관리자 실행 요청은 일반 승인에서 제외하고, 같은 원본 대화에 거절 이유와 안전한 대안을 전달한다. Mac 알림은 질문 지연 없이 소리와 함께 보내며, 휴대폰 목록과 선택한 세션에도 빨간 경고 패널을 표시한다. 패널은 감지·거절 중·대안 전달 중·전달 확인·결과 미확인·입력 연결 필요를 구분한다. 자동 승인 OFF·전체 일시정지·사용자 작성 중에는 자동 입력하지 않는다. Claude 버튼은 ‘안전한 방법으로 계속’으로 표시하고, 일반 ‘허용’ 버튼을 제공하지 않는다. 원본 터미널의 수동 선택은 유지한다.
+
+완료 기준: 위험한 요청에 승인 바이트가 전달되지 않음, 같은 CLI·시작 시각·TTY·화면을 재검사한 거절과 안내, 훅 재전송·앱 재시작 중복 방지, 줄바꿈만 된 경우 소유한 안내문에 Enter만 재전송, 사용자 초안·다른 질문·다른 CLI에 입력 없음, 읽기 전용 시스템 조회의 기존 승인 유지. 기능 검사와 별도로 실제 브라우저 390×844·768×1024·1440×900에서 경고·대기·완료·오류·긴 명령 줄바꿈·키보드 포커스·44px 버튼을 확인한다.

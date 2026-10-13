@@ -48,6 +48,8 @@ import TerminalInputSupport
     private var ptyContinuations: [String: (source: String, conversation: String?, ptyID: String)] = [:]
     private var ptyContinuationTasks: [String: Task<ManagedPTYDescriptor, Error>] = [:]
     private var automaticInputSessions = Set<String>()
+    private var systemSafetyStates: [String: SystemSafetyState] = [:]
+    private var systemSafetyTasks = Set<String>()
     private var remoteInputUntil: [String: Date] = [:]
     private var remoteStreams: [String: (generation: String, token: String, identity: TTYInputIdentity?)] = [:]
     private var remoteFrameSequence = 0
@@ -1121,7 +1123,7 @@ import TerminalInputSupport
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 810_000_000)
                 guard let self, !self.remoteInputStopped, !self.userInputHasPriority(id) else { return }
-                self.scheduleScreenApproval(id); self.scheduleCapacityResume(id)
+                self.scheduleSystemSafety(id); self.scheduleScreenApproval(id); self.scheduleCapacityResume(id)
             }
         }
         // Reserve user priority before awaiting an approval already being written.
@@ -1218,7 +1220,7 @@ import TerminalInputSupport
     }
 
     private func automaticInputBusy(_ id: String) -> Bool {
-        automaticInputSessions.contains(id) || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
+        automaticInputSessions.contains(id) || systemSafetyTasks.contains(id) || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
     }
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
@@ -1755,6 +1757,10 @@ import TerminalInputSupport
         if let saved = store.value("interruption:\(session.id)") {
             session.interruption = try? JSONDecoder().decode(SessionInterruption.self, from:Data(saved.utf8))
         }
+        if let saved = store.value("systemSafety:\(session.id)"),
+           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)) {
+            systemSafetyStates[session.id] = state; session.systemSafety = state.notice
+        }
     }
 
     private func updateInboxes() {
@@ -1765,7 +1771,7 @@ import TerminalInputSupport
             session.automatic = effectiveAutomatic(id)
             var candidates = AttentionRequest.candidates(session, paused: snapshot.paused).map {
                 SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary,
-                    isInterruption: $0.kind == .interruption)
+                    isInterruption: $0.kind == .interruption, isSystemSafety: $0.kind == .systemChange)
             }
             if session.phase != .ended, let completion = session.completion, now.timeIntervalSince(completion.date) <= 300 {
                 candidates.append(.init(key: SessionNotice.key(.completion, completion.id), kind: .completion, summary: completion.summary))
@@ -2253,7 +2259,7 @@ import TerminalInputSupport
             saveExitRecoveries()
         }
         publish()
-        if enabled { scheduleScreenApproval(target) }
+        if enabled { for member in groupIDs(target) { scheduleSystemSafety(member); scheduleScreenApproval(member) } }
         Task { await evaluateKeepAwake() }
     }
     public func setPaused(_ paused: Bool) throws {
@@ -2263,6 +2269,7 @@ import TerminalInputSupport
         try store.set("paused", paused ? "true" : "false")
         if !paused {
             for id in screens.keys { scheduleScreenApproval(id) }
+            for id in systemSafetyStates.keys { scheduleSystemSafety(id) }
             // A deadline that passed while paused still leaves a moment to cancel.
             for (id, state) in capacityStates where state.phase == .waiting {
                 capacityStates[id]?.deadline = max(state.deadline, Date().addingTimeInterval(5))
@@ -2495,6 +2502,9 @@ import TerminalInputSupport
         let summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
         let request = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
         let needsAnswer = ["AskUserQuestion", "ExitPlanMode", "EnterPlanMode"].contains(tool)
+        let risk = ["PreToolUse", "PermissionRequest"].contains(event)
+            ? SystemCommandRisk.detect(tool: tool, input: input, summary: summary, cwd: session.cwd) : nil
+        if event != "Notification" { session.systemCommandRisk = risk }
         if ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest"].contains(event) {
             if event == "UserPromptSubmit" || claudeWorkIDs[key] == nil { claudeWorkIDs[key] = UUID().uuidString }
             session.completion = nil
@@ -2502,6 +2512,27 @@ import TerminalInputSupport
             claudeWorkIDs.removeValue(forKey: key); session.completion = nil
         }
         var response: JSONObject = [:]
+        if let risk {
+            // Legacy hook decisions use the same safe denial as the durable bridge.
+            // Denying a tool with a reason leaves Claude free to choose an alternative.
+            let toolID = payload["tool_use_id"] as? String ?? requestID
+            session.systemSafety = SystemSafetyNotice(id: "hook:" + providerID + ":" + toolID, risk: risk, request: summary)
+            session.setPhase(.approval, detail: risk.detail); session.pendingSummary = summary; session.pendingInTerminal = true
+            if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused {
+                let audit = AuditEvent(sessionID: key, summary: summary, outcome: "시스템 변경 거절 · 안전한 대안 안내", source: "Claude 훅",
+                    tool: tool, request: request, answer: risk.guidance)
+                if log(audit, session: session) {
+                    response = risk.denial(event: event)
+                    session.systemSafety?.phase = .guided
+                    session.systemSafety?.message = "시스템 변경을 거절하고 같은 Claude 대화에 안전한 대안을 전달했습니다."
+                    session.setPhase(.working, detail: session.systemSafety!.message)
+                    session.pendingSummary = nil; session.pendingInTerminal = false; session.pendingRequestID = nil
+                }
+            }
+            sessions[key] = session
+            snapshot.health.claude = "연결됨 · 세션 이벤트 수신 중"; publish()
+            return response
+        }
         if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event),
            let confirmation = YesNoConfirmation.detect(input) {
             // tool_use_id joins PreToolUse and PermissionRequest for one logical question.
@@ -2511,7 +2542,8 @@ import TerminalInputSupport
                 session.setPhase(.input, detail: "Claude가 예·아니오 확인을 기다리고 있습니다.")
                 session.pendingSummary = summary; session.pendingInTerminal = true
                 session.pendingRequestID = "hook:\(providerID):\(toolID)"
-                if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused {
+                if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused,
+                   risk == nil {
                     let audit = AuditEvent(sessionID: key, summary: summary, outcome: "질문 응답 전달", source: "Claude 훅",
                         tool: tool, request: request, answer: confirmation.answer)
                     if log(audit, session: session) {
@@ -2543,7 +2575,8 @@ import TerminalInputSupport
             session.setPhase(needsAnswer ? .input : .approval, detail: needsAnswer ? "Claude가 질문에 대한 응답을 기다리고 있습니다." : "Claude가 실행 권한에 대한 응답을 기다리고 있습니다."); session.pendingSummary = summary; session.pendingInTerminal = true
             let fingerprint = key + ":" + requestID
             let first = rememberHook(fingerprint)
-            if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused, first, !needsAnswer {
+            if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused, first, !needsAnswer,
+               risk == nil {
                 response = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": ["behavior": "allow"]]]
                 session.setPhase(.working, detail: "권한을 승인해 작업을 계속합니다."); session.pendingSummary = nil; session.pendingInTerminal = false
                 if !log(AuditEvent(sessionID: key, summary: summary, outcome: "승인 전달", source: "Claude 훅", tool: tool, request: request), session: session) {
@@ -2652,12 +2685,19 @@ import TerminalInputSupport
                 logicalID: request.logicalID, createdAt: now, expiresAt: request.expiresAt)
             if let logicalID = request.logicalID, let previous = try store.claudeHook(logicalID: logicalID), previous.expiresAt > now {
                 // PreToolUse -> PermissionRequest is the same tool call, not another approval.
+                if previous.audit?.outcome.hasPrefix("시스템 변경 거절") == true,
+                   let message = previous.audit?.answer, let event = payload["hook_event_name"] as? String {
+                    let response = SystemCommandRisk.denial(event: event, message: message)
+                    receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+                    try saveClaudeReceipt(receipt)
+                    return bridgeResponse(response)
+                }
                 receipt.response = "{}"
                 try saveClaudeReceipt(receipt)
                 return bridgeResponse([:])
             }
         }
-        if request.response == nil && request.questions == nil {
+        if request.response == nil && request.questions == nil && request.safetyResponse == nil {
             invalidateClaudeHooks(for: payload, sessionID: request.sessionID)
             let response = handleHook(payload)
             receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
@@ -2675,13 +2715,15 @@ import TerminalInputSupport
             try saveClaudeReceipt(receipt)
         }
         liveClaudeHooks[request.id] = LiveClaudeHook(request: request, receipt: receipt, lastContact: now)
-        if request.response != nil, store.value("claudeQuestionEditing:" + request.id) != "true", now.timeIntervalSince(receipt.createdAt) >= 5, effectiveAutomatic(request.sessionID), !snapshot.paused {
+        if request.safetyResponse != nil, effectiveAutomatic(request.sessionID), !snapshot.paused {
             try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
-            if let response = liveClaudeHooks[request.id]?.receipt.response {
-                removeLiveClaudeHook(request.id)
-                publish()
-                return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
-            }
+        } else if request.response != nil, store.value("claudeQuestionEditing:" + request.id) != "true", now.timeIntervalSince(receipt.createdAt) >= 5, effectiveAutomatic(request.sessionID), !snapshot.paused {
+            try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
+        }
+        if let response = liveClaudeHooks[request.id]?.receipt.response {
+            removeLiveClaudeHook(request.id)
+            publish()
+            return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
         }
         publish()
         return bridgeResponse()
@@ -2690,7 +2732,7 @@ import TerminalInputSupport
     public func answerClaudeApproval(sessionID: String, requestID: String, enableAutomatic: Bool = false, automatically: Bool = false, at now: Date = Date()) throws {
         guard let pending = liveClaudeHooks[requestID], pending.request.sessionID == sessionID,
               pending.receipt.response == nil, pending.receipt.expiresAt > now,
-              now.timeIntervalSince(pending.lastContact) < 25, let response = pending.request.response else {
+              now.timeIntervalSince(pending.lastContact) < 25, let defaultResponse = pending.request.safetyResponse ?? pending.request.response else {
             throw AppError.message("이 요청은 이미 처리되었거나 연결이 끝났습니다. 현재 요청을 확인해주세요.")
         }
         // A click cannot target a reused PID/TTY or a stale parent association.
@@ -2703,14 +2745,22 @@ import TerminalInputSupport
             throw AppError.message("요청 상태가 변경되어 응답하지 않았습니다.")
         }
         if automatically, snapshot.paused || !effectiveAutomatic(sessionID) { return }
-        if enableAutomatic { try setAutomatic(sessionID, enabled: true) }
+        let risk = pending.request.systemCommandRisk ?? SystemCommandRisk.detect(tool: pending.request.tool,
+            input: pending.request.payload["tool_input"] as? JSONObject ?? [:], summary: pending.request.summary, cwd: sessions[sessionID]?.cwd ?? "")
+        let response = risk?.denial(event: pending.request.payload["hook_event_name"] as? String ?? "PermissionRequest") ?? defaultResponse
+        if enableAutomatic, risk == nil { try setAutomatic(sessionID, enabled: true) }
         var receipt = pending.receipt
         receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
         receipt.audit = contextualEvent(AuditEvent(sessionID: sessionID, summary: pending.request.summary,
-            outcome: "답변 대기열 등록", source: "Claude 훅", tool: pending.request.tool,
-            request: pending.request.inputJSON, answer: pending.request.answer))
+            outcome: risk != nil ? "시스템 변경 거절 · 안전한 대안 안내 대기열 등록" : "답변 대기열 등록", source: "Claude 훅", tool: pending.request.tool,
+            request: pending.request.inputJSON, answer: risk?.guidance ?? pending.request.answer))
         try saveClaudeReceipt(receipt)
         liveClaudeHooks[requestID]?.receipt = receipt
+        if let risk {
+            var notice = sessions[sessionID]?.systemSafety ?? SystemSafetyNotice(id: requestID, risk: risk, request: pending.request.summary, at: now)
+            notice.phase = .submitting; notice.message = "Claude에 거절 이유와 안전한 대안 안내를 전달하고 있습니다…"; notice.updatedAt = now
+            try saveSystemSafety(sessionID, SystemSafetyState(notice: notice, hookRequestID: requestID))
+        }
         claudeHookObservedAt[sessionID] = now
         publish()
     }
@@ -2729,6 +2779,7 @@ import TerminalInputSupport
 
     public func replyClaudeQuestions(sessionID: String, requestID: String, answers: Any?, at now: Date = Date()) throws {
         guard let pending = liveClaudeHooks[requestID], pending.request.sessionID == sessionID,
+              pending.request.systemCommandRisk == nil,
               pending.receipt.response == nil, pending.receipt.expiresAt > now,
               now.timeIntervalSince(pending.lastContact) < 25, let fields = pending.request.questions else {
             throw RemoteHTTPError(409, "질문이 이미 처리되었거나 Claude 연결이 끝났습니다.")
@@ -2759,8 +2810,15 @@ import TerminalInputSupport
         receipt.acknowledged = true
         if receipt.audit?.outcome == "답변 대기열 등록" {
             receipt.audit?.outcome = request.isQuestion ? "질문 응답 전달" : "승인 전달"
+        } else if receipt.audit?.outcome == "시스템 변경 거절 · 안전한 대안 안내 대기열 등록" {
+            receipt.audit?.outcome = "시스템 변경 거절 · 안전한 대안 안내 전달 확인"
         }
         try saveClaudeReceipt(receipt)
+        if receipt.audit?.outcome == "시스템 변경 거절 · 안전한 대안 안내 전달 확인",
+           var state = systemSafetyStates[request.sessionID], state.generation == nil, state.hookRequestID == request.id {
+            state.notice.phase = .guided; state.notice.message = "시스템 변경을 거절하고 같은 Claude 대화에 안전한 대안을 전달했습니다."; state.notice.updatedAt = now
+            try saveSystemSafety(request.sessionID, state)
+        }
         removeLiveClaudeHook(request.id)
         publish()
     }
@@ -2776,6 +2834,7 @@ import TerminalInputSupport
             sessions[key]?.setPhase(pending.request.isQuestion ? .input : .approval, detail: "이 요청은 터미널에서 답해주세요. 다음 지원 요청은 앱에서 처리할 수 있습니다.")
         } else if sessions[key]?.pendingRequestID == "bridge:" + id {
             sessions[key]?.pendingSummary = nil; sessions[key]?.pendingRequestID = nil; sessions[key]?.pendingInTerminal = false
+            sessions[key]?.systemCommandRisk = nil
             sessions[key]?.setPhase(.working, detail: "응답을 전달해 Claude 작업을 계속합니다.")
         }
     }
@@ -2802,16 +2861,17 @@ import TerminalInputSupport
             let pending = liveClaudeHooks.values.filter { $0.request.sessionID == id }.sorted { $0.receipt.createdAt < $1.receipt.createdAt }
             let automatic = effectiveAutomatic(id) && !snapshot.paused
             sessions[id]?.claudeApprovals = pending.isEmpty ? nil : pending.map { item in
-                ClaudeApproval(id: item.request.id, summary: item.request.summary, answer: item.request.answer,
+                let risk = item.request.systemCommandRisk
+                return ClaudeApproval(id: item.request.id, summary: item.request.summary, answer: item.request.answer,
                     isQuestion: item.request.isQuestion, sending: item.receipt.response != nil, expiresAt: item.receipt.expiresAt,
-                    automaticAt: automatic && item.request.response != nil && store.value("claudeQuestionEditing:" + item.request.id) != "true" ? item.receipt.createdAt.addingTimeInterval(5) : nil,
-                    questions: item.request.questions)
+                    automaticAt: automatic && risk == nil && item.request.response != nil && store.value("claudeQuestionEditing:" + item.request.id) != "true" ? item.receipt.createdAt.addingTimeInterval(5) : nil,
+                    questions: item.request.questions, systemCommandRisk: risk)
             }
             if let first = pending.first, sessions[id]?.phase != .ended {
                 sessions[id]?.pendingSummary = first.request.summary
                 sessions[id]?.pendingRequestID = "bridge:" + first.request.id
                 sessions[id]?.pendingInTerminal = true
-                let detail = first.receipt.response != nil ? "Claude에 응답을 전달하는 중입니다…" : "AutoApprove에서 이번 요청을 허용할 수 있습니다."
+                let detail = first.receipt.response != nil ? "Claude에 응답을 전달하는 중입니다…" : first.request.systemCommandRisk?.detail ?? "AutoApprove에서 이번 요청을 허용할 수 있습니다."
                 sessions[id]?.setPhase(first.request.isQuestion ? .input : .approval, detail: detail)
             }
         }
@@ -2849,7 +2909,8 @@ import TerminalInputSupport
             case "hookAck": try acknowledgeClaudeHook(params)
             case "claudeApprove":
                 guard let id = params["sessionID"] as? String, let request = params["requestID"] as? String else { throw AppError.message("세션과 요청 ID가 필요합니다.") }
-                try answerClaudeApproval(sessionID: id, requestID: request, enableAutomatic: params["enableAutomatic"] as? Bool ?? false)
+                try answerClaudeApproval(sessionID: id, requestID: request, enableAutomatic: params["enableAutomatic"] as? Bool ?? false,
+                    at: Date())
             case "claudeRelease":
                 guard let id = params["sessionID"] as? String, let request = params["requestID"] as? String else { throw AppError.message("세션과 요청 ID가 필요합니다.") }
                 try releaseClaudeApproval(sessionID: id, requestID: request)
@@ -2998,6 +3059,7 @@ import TerminalInputSupport
         screenAnalyses.removeValue(forKey: id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
         sessions[id]?.pendingRequestID = nil
+        sessions[id]?.systemCommandRisk = nil
     }
 
     public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil) {
@@ -3021,8 +3083,9 @@ import TerminalInputSupport
         }
         defer { analysis.discardPreparedLines() }
         observeCapacity(sessionID,analysis:analysis,at:now)
-        defer { publish() }
+        defer { scheduleSystemSafety(sessionID); publish() }
         if analysis.capacityStop != nil {
+            sessions[sessionID]?.systemCommandRisk = nil
             // An error's empty composer accepts text, not the numeric permission answer.
             // Retire a previously queued approval before its asynchronous process check returns.
             screens.removeValue(forKey:sessionID)
@@ -3041,6 +3104,7 @@ import TerminalInputSupport
         } else if !session.channel.isScreen { return }
         screenObservedAt[sessionID] = now
         guard let prompt else {
+            sessions[sessionID]?.systemCommandRisk = nil
             let request = analysis.request
             let observation = analysis.activity
             // An incomplete repaint is not evidence that a dispatched request finished.
@@ -3071,8 +3135,12 @@ import TerminalInputSupport
             return
         }
         activityTrackers.removeValue(forKey: sessionID)
+        let risk = SystemCommandRisk.detect(prompt.summary, cwd: session.cwd)
+        sessions[sessionID]?.systemCommandRisk = risk
+        if let risk { observeSystemSafety(sessionID, risk: risk, prompt: prompt, generation: generation, at: now) }
         if let existing = screens[sessionID], existing.isCurrent, existing.generation == generation, existing.prompt.identity == prompt.identity {
             screens[sessionID]?.raw = raw; screens[sessionID]?.prompt = prompt
+            if let risk { screens[sessionID]?.scheduledID = nil; sessions[sessionID]?.pendingInTerminal = true; sessions[sessionID]?.activityDetail = risk.detail }
             scheduleScreenApproval(sessionID)
             return
         }
@@ -3089,12 +3157,206 @@ import TerminalInputSupport
         if current.prompt.requestIdentity != prompt.requestIdentity { current.scheduledID = nil }
         current.raw = raw; current.prompt = prompt; current.isCurrent = true
         screens[sessionID] = current
-        sessions[sessionID]?.setPhase(.approval, detail: current.reviewDetail ?? "터미널에서 실행 권한에 대한 응답을 기다리고 있습니다.", at: now)
+        sessions[sessionID]?.setPhase(.approval, detail: risk?.detail ?? current.reviewDetail ?? "터미널에서 실행 권한에 대한 응답을 기다리고 있습니다.", at: now)
         sessions[sessionID]?.pendingSummary = prompt.summary
-        sessions[sessionID]?.pendingInTerminal = current.reviewDetail != nil
+        sessions[sessionID]?.pendingInTerminal = risk != nil || current.reviewDetail != nil
         sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.requestIdentity)"
         sessions[sessionID]?.lastActivity = Date()
         scheduleScreenApproval(sessionID)
+    }
+
+    // MARK: System changes: refuse the mutation, continue in the same conversation
+
+    private func saveSystemSafety(_ id: String, _ state: SystemSafetyState) throws {
+        try store.set("systemSafety:" + id, String(decoding: try JSONEncoder().encode(state), as: UTF8.self))
+        systemSafetyStates[id] = state; sessions[id]?.systemSafety = state.notice
+    }
+
+    private func observeSystemSafety(_ id: String, risk: SystemCommandRisk, prompt: ApprovalPrompt, generation: String, at now: Date) {
+        let previous = systemSafetyStates[id]
+        if previous?.generation == generation, previous?.promptIdentity == prompt.requestIdentity,
+           previous?.notice.phase != .guided { return }
+        // Once guidance was visibly submitted, an identical new permission is
+        // a new request. Fresh-screen checks still reject a stale monitor frame.
+        let key = PromptDetector.fingerprint(id + "\n" + generation + "\n" + prompt.requestIdentity + "\n" + UUID().uuidString)
+        let state = SystemSafetyState(notice: SystemSafetyNotice(id: key, risk: risk, request: prompt.summary, at: now),
+            generation: generation, promptIdentity: prompt.requestIdentity)
+        do {
+            try saveSystemSafety(id, state)
+            _ = log(AuditEvent(sessionID: id, summary: prompt.summary, outcome: "시스템 변경 감지 · 자동 승인 제외", source: "시스템 변경 보호",
+                request: prompt.dialog, answer: risk.guidance))
+        } catch {
+            sessions[id]?.systemSafety = state.notice
+            sessions[id]?.activityDetail = "보호 기록을 저장하지 못해 입력하지 않았습니다. " + error.localizedDescription
+        }
+    }
+
+    private func scheduleSystemSafety(_ id: String) {
+        guard let state = systemSafetyStates[id], state.generation != nil,
+              state.notice.phase != .guided, state.notice.phase != .uncertain,
+              state.retryAfter.map({ $0 > Date() }) != true,
+              !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id),
+              !userInputHasPriority(id), !automaticInputBusy(id),
+              let session = sessions[id], session.phase != .ended, session.channel.isScreen,
+              !liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) else { return }
+        systemSafetyTasks.insert(id)
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.systemSafetyTasks.remove(id); self.publish(); self.scheduleScreenApproval(id) }
+            await self.dispatchSystemSafety(session, noticeID: state.notice.id)
+        }
+    }
+
+    private func safetyInputAllowed(_ original: AgentSession, noticeID: String) -> Bool {
+        guard !remoteInputStopped, !snapshot.paused, effectiveAutomatic(original.id), !userInputHasPriority(original.id),
+              let current = sessions[original.id], current.phase != .ended, current.pid == original.pid,
+              current.started == original.started, current.tty == original.tty, current.channel == original.channel,
+              current.terminal == original.terminal, current.screenHandle == original.screenHandle,
+              current.bridgeID == original.bridgeID, current.terminalID == original.terminalID,
+              systemSafetyStates[original.id]?.notice.id == noticeID else { return false }
+        return true
+    }
+
+    private func safetyRead(_ original: AgentSession) async throws -> String {
+        if let host = ScreenHost(channel: original.channel), let adapter = screenAdapters[host] {
+            let target = ScreenTarget(tty: original.tty, handle: original.screenHandle, sourcePID: original.pid, sourceStarted: original.started)
+            let snapshot = try await Task.detached { try adapter.screens([target]) }.value
+            guard let screen = snapshot.screens.first(where: { $0.tty == original.tty }) else { throw AppError.message("원본 화면 연결이 필요합니다.") }
+            return screen.contents
+        }
+        guard let frame = remoteObservedScreens[original.id], Date().timeIntervalSince(frame.observedAt) < 6,
+              frame.generation == systemSafetyStates[original.id]?.generation else { throw AppError.message("원본 편집기 화면을 기다리고 있습니다.") }
+        return frame.raw
+    }
+
+    /// This path does not impersonate a user input or reopen a CLI. Every write
+    /// rechecks the original foreground job and the exact current screen.
+    private func safetyWrite(_ original: AgentSession, noticeID: String, expected: String, input: RemoteTerminalInput) async throws -> TerminalDelivery {
+        let reader = processReader, live = try await Task.detached { try reader() }.value
+        guard safetyInputAllowed(original, noticeID: noticeID),
+              let process = live.first(where: { $0.pid == original.pid && $0.started == original.started && $0.agent == original.agent
+                && "/dev/" + $0.tty == original.tty && $0.isForeground }) else { return .agentMissing }
+        if let host = ScreenHost(channel: original.channel), let adapter = screenAdapters[host] {
+            let job = live.filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
+            let target = ScreenTarget(tty: original.tty, handle: original.screenHandle, jobPIDs: job, sourcePID: original.pid,
+                sourceStarted: original.started, sourceIdentity: original.terminal == .terminal ? terminalInputIdentity(original.pid) : nil)
+            guard original.terminal != .terminal || target.sourceIdentity != nil else { return .missingTarget }
+            let fresh = try await safetyRead(original)
+            guard fresh == expected, safetyInputAllowed(original, noticeID: noticeID) else { return .screenChanged }
+            return try await Task.detached {
+                // Relay keys ordinarily tolerate output changes; safety actions don't.
+                guard try adapter.screens([target]).screens.first(where: { $0.tty == target.tty })?.contents == expected else { return TerminalDelivery.screenChanged }
+                guard try reader().contains(where: { $0.pid == original.pid && $0.started == original.started && $0.agent == original.agent
+                    && "/dev/" + $0.tty == original.tty && $0.isForeground }) else { return .agentMissing }
+                return try adapter.input(target, expected, original.agent, input)
+            }.value
+        }
+        guard let observed = remoteObservedScreens[original.id], observed.raw == expected,
+              observed.generation == systemSafetyStates[original.id]?.generation,
+              let peerID = original.bridgeID, let peer = peers[peerID], let terminalID = original.terminalID else { return .screenChanged }
+        let actionID = UUID().uuidString
+        let sent: Bool = try await withCheckedThrowingContinuation { continuation in
+            remoteInputReplies[actionID] = (peerID, continuation)
+            if !peer.send(["method": "remoteInput", "id": actionID, "terminalID": terminalID, "screen": expected,
+                "generation": String(observed.generation.dropFirst(peerID.count + 1)), "kind": input.kind.rawValue, "text": input.text,
+                "expiresAt": Date().addingTimeInterval(2).timeIntervalSince1970 * 1000]) {
+                remoteInputReplies.removeValue(forKey: actionID)?.continuation.resume(returning: false); return
+            }
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                self?.remoteInputReplies.removeValue(forKey: actionID)?.continuation.resume(throwing: AppError.message("원본 입력의 전달 결과를 확인하지 못했습니다."))
+            }
+        }
+        return sent ? .sent : .screenChanged
+    }
+
+    private func dispatchSystemSafety(_ original: AgentSession, noticeID: String) async {
+        let id = original.id, deadline = Date().addingTimeInterval(45)
+        var wrote = false
+        func update(_ phase: SystemSafetyNotice.Phase, _ message: String, retry: TimeInterval? = nil) throws {
+            guard var state = systemSafetyStates[id], state.notice.id == noticeID else { return }
+            state.notice.phase = phase; state.notice.message = message; state.notice.updatedAt = Date()
+            state.retryAfter = retry.map { Date().addingTimeInterval($0) }
+            try saveSystemSafety(id, state); publish()
+        }
+        do {
+            while safetyInputAllowed(original, noticeID: noticeID), var state = systemSafetyStates[id], Date() < deadline {
+                let raw = try await safetyRead(original)
+                guard safetyInputAllowed(original, noticeID: noticeID) else { return }
+                switch state.notice.phase {
+                case .guided, .uncertain: return
+                case .cancelling:
+                    // A crash while Escape was in flight cannot replay that key.
+                    try update(.uncertain, "시스템 변경은 승인하지 않았습니다. 거절 결과를 확인하지 못해 입력을 반복하지 않습니다."); return
+                case .detected,
+                     .unavailable where state.cancelledAt == nil:
+                    guard let prompt = PromptDetector.detect(raw, agent: original.agent), prompt.requestIdentity == state.promptIdentity,
+                          SystemCommandRisk.detect(prompt.summary, cwd: original.cwd) != nil else {
+                        try update(.uncertain, "원본 요청이 바뀌어 입력하지 않았습니다. 현재 대화에서 안전하게 진행해주세요."); return
+                    }
+                    try update(.cancelling, "이 시스템 변경 요청을 거절하고 있습니다…")
+                    wrote = true
+                    let result = try await safetyWrite(original, noticeID: noticeID, expected: raw, input: RemoteTerminalInput(kind: .escape))
+                    wrote = false
+                    guard result == .sent else {
+                        try update(.unavailable, "시스템 변경은 승인하지 않았습니다. 원본 직접 입력 연결을 확인하면 안전한 대안 안내를 다시 시도합니다.", retry: 5); return
+                    }
+                    state = systemSafetyStates[id]!
+                    state.cancelledAt = Date(); state.notice.phase = .cancelled
+                    state.notice.message = "요청을 거절했습니다. 같은 대화의 빈 입력창을 확인하고 있습니다…"
+                    try saveSystemSafety(id, state)
+                    _ = log(AuditEvent(sessionID: id, summary: state.notice.request, outcome: "시스템 변경 거절 입력 전달", source: "시스템 변경 보호", answer: "Escape"))
+                case .cancelled, .unavailable:
+                    if state.draft != nil {
+                        try update(.typing, "이미 입력한 안내문의 전달 상태를 확인하고 있습니다…"); continue
+                    }
+                    guard Date().timeIntervalSince(state.cancelledAt ?? state.notice.date) < 30 else {
+                        try update(.uncertain, "요청을 거절했지만 빈 입력창을 확인하지 못했습니다. 다른 입력을 덮어쓰지 않았습니다."); return
+                    }
+                    guard let composer = SystemSafetyComposer.capture(raw, agent: original.agent, text: state.notice.risk.guidance) else {
+                        try await Task.sleep(nanoseconds: 250_000_000); continue
+                    }
+                    state.draft = composer; state.notice.phase = .typing; state.notice.message = "같은 원본 대화에 안전한 대안을 입력하고 있습니다…"
+                    try saveSystemSafety(id, state); publish()
+                    wrote = true
+                    let result = try await safetyWrite(original, noticeID: noticeID, expected: raw,
+                        input: RemoteTerminalInput(kind: .characters, text: composer.text))
+                    wrote = false
+                    if result != .sent {
+                        state = systemSafetyStates[id]!; state.draft = nil; try saveSystemSafety(id, state)
+                        try update(.cancelled, "입력 전 화면이 바뀌어 대안 안내를 기다리고 있습니다.", retry: 2); return
+                    }
+                case .typing, .draft, .submitting:
+                    guard let composer = state.draft else { try update(.uncertain, "안내문의 전달 상태를 확인하지 못해 입력을 반복하지 않습니다."); return }
+                    if composer.submitted(raw) {
+                        try update(.guided, "시스템 변경을 거절하고 같은 대화에 안전한 대안을 전달했습니다.")
+                        _ = log(AuditEvent(sessionID: id, summary: state.notice.request, outcome: "안전한 대안 안내 전달 확인", source: "시스템 변경 보호", answer: composer.text)); return
+                    }
+                    guard composer.draftReady(raw) else { try await Task.sleep(nanoseconds: 250_000_000); continue }
+                    guard state.submitAttempts < 3 else {
+                        try update(.uncertain, "대안 안내문은 입력됐지만 전송을 확인하지 못했습니다. 원본 입력창의 Enter를 확인해주세요."); return
+                    }
+                    try await Task.sleep(nanoseconds: 750_000_000)
+                    let fresh = try await safetyRead(original)
+                    guard composer.draftReady(fresh), safetyInputAllowed(original, noticeID: noticeID) else { continue }
+                    state = systemSafetyStates[id]!
+                    state.submitAttempts += 1; state.notice.phase = .submitting; state.notice.message = "안내문 전송을 확인하고 있습니다…"
+                    try saveSystemSafety(id, state); publish()
+                    wrote = true
+                    let result = try await safetyWrite(original, noticeID: noticeID, expected: fresh, input: RemoteTerminalInput(kind: .enter, relay: true))
+                    wrote = false
+                    if result != .sent { try update(.draft, "같은 안내문을 확인한 뒤 Enter만 다시 시도합니다.", retry: 2); return }
+                    try await Task.sleep(nanoseconds: 750_000_000)
+                }
+            }
+            guard safetyInputAllowed(original, noticeID: noticeID), let state = systemSafetyStates[id] else { return }
+            if state.cancelledAt != nil && state.draft == nil {
+                try update(.cancelled, "시스템 변경을 거절했습니다. 같은 대화의 빈 입력창을 기다리고 있습니다.", retry: 2)
+            } else { try update(.uncertain, "대안 안내의 전달을 확인하지 못해 입력을 반복하지 않습니다. 원본 대화를 확인해주세요.") }
+        } catch {
+            let phase: SystemSafetyNotice.Phase = wrote ? .uncertain : .unavailable
+            try? update(phase, "시스템 변경은 승인하지 않았습니다. " + String(error.localizedDescription.prefix(600)), retry: wrote ? nil : 5)
+        }
     }
 
     // MARK: Codex capacity stops
@@ -3314,7 +3576,8 @@ import TerminalInputSupport
     }
 
     private func scheduleCapacityResume(_ id: String) {
-        guard let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id) else { return }
+        guard !remoteInputStopped, systemSafetyStates[id]?.notice.isPending != true,
+              let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id) else { return }
         let scheduledID = UUID(), scheduledRevision = revision
         capacityStates[id]?.scheduledID = scheduledID
         let delay = max(0, state.deadline.timeIntervalSinceNow)
@@ -3974,10 +4237,12 @@ import TerminalInputSupport
     }
 
     private func scheduleScreenApproval(_ id: String) {
-        guard !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
+        if systemSafetyStates[id]?.notice.isPending == true { scheduleSystemSafety(id); return }
+        guard !remoteInputStopped, !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
-              let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil else { return }
+              let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
+              SystemCommandRisk.detect(state.prompt.summary, cwd: session.cwd) == nil else { return }
         let scheduledRevision = revision
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
@@ -3998,6 +4263,7 @@ import TerminalInputSupport
                   current.scheduledID == scheduledID,
                   current.generation == state.generation,
                   current.prompt.requestIdentity == state.prompt.requestIdentity,
+                  SystemCommandRisk.detect(current.prompt.summary, cwd: session.cwd) == nil,
                   live?.contains(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent
                       && "/dev/" + $0.tty == session.tty && $0.isForeground }) == true else {
                 if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }

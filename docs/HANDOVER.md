@@ -1,12 +1,24 @@
 # AutoApprove 작업 인계
 
-최종 갱신: 2026-10-13 (KST), 0.2.79 · 빌드 101. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
+최종 갱신: 2026-10-13 (KST), 0.2.80 · 빌드 102. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
 
 ## 현재 상태
 
-- 앱 **0.2.79/101**, Bridge **0.2.9**. 두 Mac 적용, 원본 식별·직접 입력 **이 Mac 19개 / 다른 Mac 4개**. 원본 CLI 재시작 없음.
-- 소스 태그·GitHub 정식 릴리스·DMG/체크섬 게시 및 인증 없는 다운로드 바이트 일치 확인. 소스 커밋 `002804fd574b02c23960c589bdaf804b404b2b69`.
-- 배포: [v0.2.79](https://github.com/newdlops/autoapprove/releases/tag/v0.2.79). DMG SHA-256 `03c90071b34edbcf9735a71e9c0eefc3080a374437ab8075045eb7e9858f29cc`.
+- 앱 **0.2.80/102**, Bridge **0.2.9**. 두 Mac 적용, 원본 식별·직접 입력 **이 Mac 20개 / 다른 Mac 4개**. 원본 CLI 재시작 없음. 숫자 LAN 주소의 노드/버전 일치 이 Mac 2주소·다른 Mac 1주소 확인.
+- 소스 태그·GitHub 정식 릴리스·DMG/체크섬 게시 및 인증 없는 다운로드 검증을 같은 작업에서 완료한다.
+- DMG SHA-256 `c556c0557edab9ca21b4bd56b9208997fe1613b26f769a079bc0d30a259a77fe`.
+
+## 0.2.80 시스템 변경 대신 안전하게 계속
+
+- 사용자 목표: 위험한 시스템 변경만 거절하고 원래 작업은 같은 Codex·Claude 세션에서 안전한 대안으로 계속한다. 회사 보안 정책을 우회하거나 별도 상주 서비스를 만들지 않는다. 반복 작업은 이미 실행 중인 프로그램의 타이머 또는 프로젝트 안에서 명시적으로 실행하는 작업으로 안내한다.
+- `SystemCommandRisk.swift`: 실제 자동 실행 경로/서비스 명령·보안/권한·전역 설정·관리자 실행 감지, 읽기 전용 예외, 작업 폴더 안의 제한된 설치 소스 읽기. 앱 번들 안의 보조 프로그램을 만드는 것과 실제 시스템 등록을 구분한다. 승인 없는 실행과 임의 간접 코드의 모든 의미를 검사하는 경계는 아니다.
+- `SystemSafety.swift`: 공개 `SystemSafetyNotice`와 비공개 저장 상태·입력창 소유 근거를 분리한다. 감지 → 취소 → 안내문 입력 → Enter 제출 → 전달 확인을 저장한다. 미확인 쓰기는 자동 반복하지 않는다. 요청 원문은 공개 상태에서 최대 4,000자로 제한한다.
+- `ApprovalEngine.swift`: 일반 승인/오류 재개 경로보다 먼저 위험 요청을 분리한다. Claude는 현재 요청에 deny+대안 안내, `interrupt: false`, 정확한 요청별 helper ACK를 사용한다. 원본 터미널은 Escape 후 빈 입력창·PID/시작/TTY/전경/화면을 재검사하며 같은 안내문을 한 번만 입력한다. 750ms 안정 확인 뒤 소유한 전체 안내문에 Enter만 최대 세 번 보내고 실제 대화의 새 메시지로 제출을 확인한다. 앱 재시작, 반복된 위험 요청, PreToolUse/PermissionRequest 중복과 동시 요청을 격리한다.
+- `AttentionRequest.swift`·`SessionInbox.swift`·`QuestionNotifications.swift`: 시스템 변경 경고를 일반 질문 알림 지연 없이 전달하고 기존 알림 권한/기록을 사용한다. 네이티브 세션 화면과 웹 목록/선택 세션은 빨간 경고·전달 상태·접은 요청/대안을 표시한다. Claude 위험 요청의 앱/Web 버튼은 ‘안전한 방법으로 계속’이며 일반 허용/자동 켜기를 제공하지 않는다. 원본 터미널 수동 조작은 유지한다.
+- 자동 승인 OFF·전체 일시정지·사용자 초안·현재 질문·명시적 Goal 정지·원본 변경은 존중한다. 입력이 확인되지 않으면 안내 상태를 보여주며 다른 세션으로 보내거나 새 PTY/CLI를 만들지 않는다.
+- 새 검사는 `SystemSafetyTests.swift` 10개, 웹 fixture `system-safety-fixture.swift`, 네이티브 preview `system-safety-preview.swift`, 브라우저 검사 `system-safety-browser-check.mjs`다. 모든 fixture는 합성 대화이며 사용자 세션에 시험 문자를 보내지 않는다.
+- 검증: release Core **240/240**, Chromium 기능 **4개 조건/12개 화면/오류 0건**, 실제 SwiftUI preview **세 상태**, 서명·웹/MCP/PTY·DMG 패키지 통과. 시각 확인은 모바일/태블릿/데스크톱·다크·긴 요청·미확인 상태를 포함한다. 실제 시스템 알림 수신과 물리 휴대폰 Safari/IME는 미검증이다. 상세 기록은 [VALIDATION.md](../VALIDATION.md).
+- 로컬 설치 전후 원본 CLI **20개**의 PID·시작·TTY, 설정·기존 승인 기록 **15,239건**, root 입력 서비스 프로세스/파일 보존. 상대 Mac **4개**의 동일 세션과 직접 입력도 LAN에서 확인했다.
 
 ## 0.2.79 줄바꿈 후 제출 복구
 
@@ -43,7 +55,7 @@ Codex 0.162.1의 설치된 문자열과 공식 구현을 확인했다. 기본 `Q
 
 대기 입력 목록·삭제 미지원은 전체 질문 연결 실패가 아니다. 기존 서버 미발견 문구는 소켓 접속 전 실패였으므로 그 정확한 과거 상태만 재시도 가능하게 복원한다. 실제 전달 후 시간 초과·부분 입력·프로세스 재시작 중 sending 기록은 uncertain으로 보존하며 자동 재전송하지 않는다.
 
-## 검증 및 실제 사용 확인
+## 이전 0.2.79 검증 및 실제 사용 확인
 
 - 최종 release Core **230/230**, 새 제출 복구 **6/6**, 기존 capacity **4/4**, Goal blocked **4/4** 통과. 전체 초안/숨겨진 안내/줄바꿈·앱 재시작·취소/일시정지/OFF/메모 보호·확정 Enter 거절 4회 뒤 5번째 성공·기존 Goal 감사 기록의 정확한 복원을 검사했다.
 - 실제 격리 PTY/tmux **18개 조건** 통과. 추가 4개는 첫 Return이 빈 줄만 만드는 일반 요청/Goal을 두 경로에서 재현하며, 최종 수신 바이트가 문구 한 번+`CR CR`임을 검사했다. 시험 Terminal에서 `do script`는 실제 CR을 보냈고 LF가 아니었음을 확인했다. 사용자 CLI에는 시험 문자를 보내지 않았다.
@@ -64,32 +76,28 @@ Codex 0.162.1의 설치된 문자열과 공식 구현을 확인했다. 기본 `Q
 - 자동 승인 OFF, 전체 일시정지, 취소, 초안·질문 대기를 존중한다. 명시적으로 일시정지/완료한 Goal과 예산·사용량 제한은 자동 재개하지 않는다.
 - 이미 잠긴 화면을 해제하지 않는다. 관리자 암호·macOS 권한은 사용자가 직접 승인한다.
 - Zscaler·SentinelOne·TCC·Gatekeeper·회사 정책을 끄거나 우회하지 않는다. 이전 suspicious:bash 이후 새 경고가 없었다는 사용자 보고는 경고 없음의 보장이 아니다.
+- 위험 시스템 변경 요청은 자동 거절하고 같은 원본 대화에 안전한 대안으로 계속하라는 안내를 전달한다. 강한 경고·감사 기록·전달 확인을 유지한다. 자동 승인 OFF·일시정지·사용자 초안·미확인 쓰기를 무시해서 진행하지 않는다.
 - 유료 Apple 계정 없이 기존 발행자 서명·정상 입력 서비스를 유지한다. 0.2.73/0.2.74 설치 호환 수정의 SMJobBless·상호 서명 검증은 유지한다.
 - **버전을 올렸으면 같은 작업에서 GitHub 릴리스까지 완료한다.**
 
 ## 재현 및 배포
 
-0.2.79의 최종 release 전체 검사는 230/230 통과했다. 최적화 컴파일과 병행한 debug 전체 검사에서는 기존의 짧은 타이밍 검사 두 개가 실패해 228/230이었다. 컴파일 완료 후 release 전체 검사와 입력 거절 검사의 독립 재검사가 통과했다. 최적화 빌드는 919초 걸렸다.
-
-GitHub 업로드 후 공개 전환 때 네트워크 오류가 발생했으나, 두 파일이 남은 초안을 확인한 뒤 게시를 완료했다. 두 Mac의 버전·원본 입력 검증은 업데이트 직후의 기록이다. 게시 중 다른 Mac이 목록에서 사라졌으므로 다음 작업에서 현재 LAN 상태를 다시 확인한다.
+0.2.80은 승인된 실제 Mac 환경의 release 전체 검사 240/240 통과했다. 기본 샌드박스에서는 시스템/프로세스/네트워크 접근을 사용하는 기존 5개가 실패했으며 정식 실행 승인으로 전체를 재검사했다. 앱과 Core는 release 최적화를 유지하고 검사 실행 파일만 `-Onone`이다. 최적화 빌드 246.46초, 최종 리소스 복사 1.17초였다.
 
 ```sh
 swift build -c release
 .build/release/autoapprove-checks
-node scripts/interruption-relay-check.mjs --release
-node scripts/terminal-question-browser-check.mjs --release
-node scripts/codex-queue-transport-check.mjs
-npm --prefix extensions/vscode test
-npm --prefix extensions/vscode run package
-node scripts/package-app.mjs release .runtime/releases/0.2.79/submit-101/AutoApprove.app
-node scripts/terminal-input-package-check.mjs .runtime/releases/0.2.79/submit-101/AutoApprove.app
-node scripts/network-package-check.mjs .runtime/releases/0.2.79/submit-101/AutoApprove.app
-node scripts/package-dmg.mjs .runtime/releases/0.2.79/submit-101/AutoApprove.app
+node scripts/system-safety-browser-check.mjs --release
+node scripts/package-system-safety-preview.mjs
+node scripts/package-app.mjs release .runtime/releases/0.2.80/safety-102/AutoApprove.app
+node scripts/terminal-input-package-check.mjs .runtime/releases/0.2.80/safety-102/AutoApprove.app
+node scripts/network-package-check.mjs .runtime/releases/0.2.80/safety-102/AutoApprove.app
+node scripts/package-dmg.mjs .runtime/releases/0.2.80/safety-102/AutoApprove.app
 ```
 
 이번 패키지 경로는 완료 기록이다. 다음 배포는 **새 버전·빌드·새 디렉터리**를 사용한다. Swift 빌드 중 Swift 소스를 바꾸지 않는다. 브라우저 검사는 설치된 Playwright/Chromium 경로를 `AUTOAPPROVE_PLAYWRIGHT_MODULE`·`AUTOAPPROVE_CHROMIUM_PATH`로 지정한다. 샌드박스로 차단된 네트워크·서명·시스템 접근은 정식 실행 승인을 사용한다.
 
-이번 비공개 자료는 `.runtime/releases/0.2.79/submit-101/`의 `deploy.py`, `verification.json`, `network-{before,after}.json`, `verify-github.mjs`, `github-verification.json`이다. 설치 스크립트를 다시 실행해 백업을 덮어쓰지 않는다. 앱 관리자만 재시작하고 원본 CLI·정상 root 서비스·설정·기록은 전후 비교한다. 살아 있는 앱 소유 PTY가 있으면 종료 승인 전 업데이트하지 않는다.
+이번 비공개 자료는 `.runtime/releases/0.2.80/safety-102/`의 `deploy.py`, `verification.json`, `network-{before,after}.json`, `installed-http-verification.json`, `verify-github.mjs`, `github-verification.json`이다. 사건 조사 원문은 `.runtime/security-review-20261013/`에만 보관한다. 두 디렉터리 모두 공개 저장소에서 제외한다. 설치 스크립트를 다시 실행해 백업을 덮어쓰지 않는다. 앱 관리자만 재시작하고 원본 CLI·정상 root 서비스·설정·기록은 전후 비교한다. 살아 있는 앱 소유 PTY가 있으면 종료 승인 전 업데이트하지 않는다.
 
 태그는 검증한 소스 커밋에 만들고 main·태그를 push한 뒤 `gh release create`로 DMG·체크섬을 게시한다. 공개 태그·두 파일·다운로드 바이트를 확인한다. 이 Mac의 Node TLS는 Zscaler CA로 실패한 적이 있으므로 정상 시스템 TLS의 `/usr/bin/curl`을 사용하며 인증서 검사를 끄지 않는다.
 

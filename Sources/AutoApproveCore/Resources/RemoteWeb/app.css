@@ -248,6 +248,12 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .history-item pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .notice { background: var(--subtle); color: var(--fg); font-size: 14px; border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px; overflow-wrap: anywhere; }
 .notice.error { background: var(--error-bg); color: var(--red); }
+.safety-panel h3, #system-safety h2 { margin: 0 0 6px; font-size: 16px; text-wrap: balance; }
+.safety-panel p { margin: 6px 0; max-width: 75ch; }
+.safety-panel article + article { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.safety-panel summary { cursor: pointer; min-height: 44px; padding: 10px 0; }
+.safety-panel pre, .safety-request { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+.question:has(.safety-request) summary { min-height: 44px; padding: 10px 0; cursor: pointer; }
 .web-update { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; }
 .web-update span { flex: 1 1 180px; }
 .web-update a { display: inline-flex; align-items: center; min-height: 44px; padding: 9px 15px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-weight: 600; text-decoration: none; touch-action: manipulation; }
@@ -295,12 +301,17 @@ body.terminal-focus { position: fixed; top: var(--terminal-viewport-top, 0px); l
 body.terminal-focus .app-header, body.terminal-focus .network, body.terminal-focus .sessions, body.terminal-focus main > .notice { display: none; }
 body.terminal-focus main { width: 100%; max-width: none; height: 100%; padding: 0; margin: 0; display: flex; min-height: 0; }
 body.terminal-focus main { flex-direction: column; }
+body.terminal-focus main > #system-safety { display: block; flex-shrink: 0; max-height: min(20dvh, 160px); overflow: auto; margin: 0; border-radius: 0; padding: 8px 12px; }
+body.terminal-focus #system-safety h2 { font-size: 14px; }
+body.terminal-focus #system-safety .interruption-row { padding: 6px 0; }
 body.terminal-focus main > .web-update { display: flex; flex-shrink: 0; margin: 0; border-radius: 0; padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left)); font-size: 12px; }
 body.terminal-focus .web-update:not([hidden]) ~ .workspace .terminal-heading { padding-top: 8px; }
 body.terminal-focus .workspace { flex: 1; }
 body.terminal-focus .workspace { width: 100%; height: 100%; min-height: 0; display: flex; border: 0; border-radius: 0; }
 body.terminal-focus .detail { display: flex; width: 100%; padding: 0; min-height: 0; overflow: hidden; }
 body.terminal-focus #detail-content { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+body.terminal-focus #session-safety { flex-shrink: 0; max-height: min(30dvh, 220px); overflow: auto; margin: 0; border-radius: 0; padding: 8px 12px; }
+body.terminal-focus #session-safety h3 { font-size: 14px; }
 body.terminal-focus .session-summary, body.terminal-focus .detail-section { display: none; }
 body.terminal-focus .terminal-section { display: flex; flex-direction: column; flex: 1; min-height: 0; margin: 0; }
 body.terminal-focus .terminal-heading { padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px max(8px, env(safe-area-inset-left)); margin: 0; gap: 6px; flex-wrap: nowrap; }

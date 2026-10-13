@@ -1,0 +1,10 @@
+import {mkdir,readdir,writeFile} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
+import path from 'node:path';
+import {coreLinkArguments} from './swift-core-link.mjs';
+const configuration=process.argv.includes('--release')?'release':'debug',build=path.resolve('.build',configuration),app=path.resolve('dist/qa/SystemSafetyPreview.app');
+await mkdir(app+'/Contents/MacOS',{recursive:true});await mkdir('.build/cache/SystemSafetyPreview',{recursive:true});
+const views=(await readdir('Sources/AutoApproveApp')).filter(name=>name.endsWith('.swift')&&!['AutoApproveApp.swift','QuestionNotifications.swift'].includes(name)).map(name=>'Sources/AutoApproveApp/'+name);
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/SystemSafetyPreview'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...(await readdir(build+'/AutoApproveCore.build')).filter(name=>name.endsWith('.swift.o')).map(name=>build+'/AutoApproveCore.build/'+name),...views,'Tests/fixtures/system-safety-preview.swift','-o',app+'/Contents/MacOS/SystemSafetyPreview'],{stdio:'inherit'});
+await writeFile(app+'/Contents/Info.plist','<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.autoapprove.system-safety-preview</string><key>CFBundleExecutable</key><string>SystemSafetyPreview</string><key>CFBundleName</key><string>SystemSafetyPreview</string><key>CFBundlePackageType</key><string>APPL</string><key>LSMinimumSystemVersion</key><string>14.0</string><key>NSHighResolutionCapable</key><true/></dict></plist>');
+execFileSync('/usr/bin/codesign',['--force','--sign','-',app],{stdio:'inherit'});console.log(app);
