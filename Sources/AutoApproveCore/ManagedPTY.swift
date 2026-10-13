@@ -305,6 +305,11 @@ public final class ManagedPTYManager: @unchecked Sendable {
             return try VerifiedResumeInput.deliver(region:region,text:text,read:{ terminal.screen() },write:{ expected,input in
                 try terminal.recoveryInput(expected:expected,input:input,jobPIDs:target.jobPIDs)
             })
+        }, completeResume: { [self] target,stop in
+            guard let terminal = owned(tty: target.tty) else { return .missingTarget }
+            return try VerifiedResumeInput.complete(stop: stop, read: { terminal.screen() }, write: { expected,input in
+                try terminal.recoveryInput(expected: expected, input: input, jobPIDs: target.jobPIDs)
+            })
         }, restart: { [self] target,expected,command in
             guard let terminal = owned(tty:target.tty), SessionExitRecovery.emptyShellPrompt(expected) else { return .missingTarget }
             return try terminal.recoveryInput(expected:expected,input:RemoteTerminalInput(kind:.submit,text:command),jobPIDs:target.jobPIDs)

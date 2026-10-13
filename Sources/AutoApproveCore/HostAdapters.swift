@@ -157,6 +157,28 @@ public enum ITermAdapter {
         guard let delivery = ResumeDelivery(rawValue: result) else { throw AppError.message("이어서 진행 요청의 전달 결과를 확인하지 못했습니다.") }
         return delivery
     }
+    public static func completeResume(target: ScreenTarget, stop: CodexCapacityStop) throws -> ResumeDelivery {
+        let literal = try AutomationScript.literal(["tty": target.tty, "region": stop.region, "text": stop.continuationText,
+            "footer": stop.composerFooter as Any? ?? NSNull(), "jobPIDs": target.jobPIDs.map(Int.init)] as JSONObject)
+        let body = """
+        (() => {
+          const app = \(app), target = \(literal);
+          \(visibleFunction)
+          \(CodexResumeScript.functions)
+          if (app.running()) for (const window of app.windows()) for (const tab of window.tabs()) for (const session of tab.sessions()) {
+            if (session.tty() !== target.tty) continue;
+            const read = () => visible(session), before = resumeRows(read());
+            const enter = () => { let job = 0; try { job = Number(session.variable({named:'jobPid'})) || 0; } catch (_) {}
+              if (job > 0 && !target.jobPIDs.includes(job)) return false;
+              session.write({text:'\\r',newline:false}); return true; };
+            return submitDraft(read, enter, before, target.region, String(target.text).normalize('NFC'), target.footer);
+          }
+          return 'missingTarget';
+        })();
+        """
+        let result = try AutomationScript.run(body, app: "iTerm2", denied: .automationDenied("iTerm2"), timeout: 40)
+        return ResumeDelivery(rawValue: result) ?? .typed
+    }
     public static func resumeScript(target: ScreenTarget, region: String, text: String) throws -> String {
         let literal = try AutomationScript.literal(["tty": target.tty, "region": region, "text": text, "jobPIDs": target.jobPIDs.map(Int.init)] as JSONObject)
         return """
@@ -183,7 +205,11 @@ public enum ITermAdapter {
           // Text and Return arriving together stay a paste in Codex; Return follows separately.
           session.write({text, newline: false});
           const state = awaitTypedState(() => visible(session), before, target.region, text);
-          if (state === 'draft') { session.write({text: ''}); return awaitSubmitted(() => visible(session), before, target.region, text) ? 'sent' : 'typed'; }
+          if (state === 'draft') return submitDraft(() => visible(session), () => {
+            let currentJob = 0; try { currentJob = Number(session.variable({named:'jobPid'})) || 0; } catch (_) {}
+            if (currentJob > 0 && !target.jobPIDs.includes(currentJob)) return false;
+            session.write({text:'\\r',newline:false}); return true;
+          }, before, target.region, text, resumeFooter(before));
           return state === 'submitted' ? 'sent' : 'typed';
         }
         return 'missingTarget';
@@ -340,18 +366,18 @@ public enum OrcaAdapter {
         } while state == .typed && (Date() < until || reads < 3)
         switch state {
         case .draft:
-            let enter = try call(["terminal", "send", "--terminal", handle, "--text", "\r"])
-            guard (enter["send"] as? JSONObject)?["accepted"] as? Bool == true else { return .typed }
-            let gone = Date().addingTimeInterval(4)
-            var checks = 0
-            repeat {
-                Thread.sleep(forTimeInterval: 0.25)
-                if CodexResumeCheck.state(before: before, after: try readScreen(handle: handle), region: region, text: text) == .submitted { return .sent }
-                checks += 1
-            } while Date() < gone || checks < 2
-            return .typed
+            guard let stop = CodexCapacityStop.detect(before, agent: CodexResumeCheck.agent(in: region)) else { return .typed }
+            return try completeResume(target: target, stop: stop)
         case .submitted: return .sent
         case .typed: return .typed
         }
+    }
+    public static func completeResume(target: ScreenTarget, stop: CodexCapacityStop) throws -> ResumeDelivery {
+        guard let handle = target.handle else { return .missingTarget }
+        return try VerifiedResumeInput.complete(stop: stop, read: { try readScreen(handle: handle) }, write: { expected,input in
+            guard normalize(try readScreen(handle: handle)) == normalize(expected) else { return .screenChanged }
+            let result = try sendComposed(handle: handle, text: input.bytes)
+            return (result["send"] as? JSONObject)?["accepted"] as? Bool == true ? .sent : .missingTarget
+        })
     }
 }

@@ -69,6 +69,7 @@ public struct ScreenHostAdapter: Sendable {
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
     /// Sends a message into a Codex composer stopped at the given region (see `CodexCapacityStop`).
     public var resume: @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery
+    public var completeResume: (@Sendable (ScreenTarget, CodexCapacityStop) throws -> ResumeDelivery)?
     /// The source is an already verified, idle original shell after an observed CLI error.
     public var restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
     public var input: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
@@ -76,10 +77,11 @@ public struct ScreenHostAdapter: Sendable {
                 approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
                 reveal: @escaping @Sendable (ScreenTarget) throws -> TerminalWindowBounds?,
                 resume: @escaping @Sendable (ScreenTarget, String, String) throws -> ResumeDelivery = { _, _, _ in .missingTarget },
+                completeResume: (@Sendable (ScreenTarget, CodexCapacityStop) throws -> ResumeDelivery)? = nil,
                 restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)? = nil,
                 input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget },
                 presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
-        self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.restart = restart; self.input = input
+        self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
     }
     public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
@@ -88,7 +90,8 @@ public struct ScreenHostAdapter: Sendable {
             return ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false) },
                 approve: { try TerminalAdapter.approve(tty: $0.tty, expectedScreen: $1, agent: $2) },
                 reveal: { try TerminalAdapter.reveal(tty: $0.tty) },
-                resume: { try TerminalAdapter.resume(tty: $0.tty, region: $1, text: $2) },
+                resume: { try TerminalAdapter.resume(target: $0, region: $1, text: $2) },
+                completeResume: { try TerminalAdapter.completeResume(target: $0, stop: $1) },
                 restart: { try TerminalAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) },
                 presentationScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty)) })
@@ -97,6 +100,7 @@ public struct ScreenHostAdapter: Sendable {
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
                 reveal: { try ITermAdapter.reveal(tty: $0.tty) },
                 resume: { try ITermAdapter.resume(target: $0, region: $1, text: $2) },
+                completeResume: { try ITermAdapter.completeResume(target: $0, stop: $1) },
                 restart: { try ITermAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) })
         case .orca:
@@ -104,6 +108,7 @@ public struct ScreenHostAdapter: Sendable {
                 approve: { try OrcaAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
                 reveal: { try OrcaAdapter.reveal(target: $0); return nil },
                 resume: { try OrcaAdapter.resume(target: $0, region: $1, text: $2) },
+                completeResume: { try OrcaAdapter.completeResume(target: $0, stop: $1) },
                 input: { try RemoteTerminalAdapter.input(host: .orca, target: $0, expected: $1, agent: $2, input: $3) })
         case .tmux:
             return TmuxRelay.shared.adapter
@@ -167,6 +172,63 @@ public struct TerminalWindowMetadata: Equatable, Sendable {
 }
 
 public enum TerminalAdapter {
+    private static func boundResumeTarget(_ target: ScreenTarget) -> ScreenTarget? {
+        guard let pid = target.sourcePID, let started = target.sourceStarted, target.jobPIDs.contains(pid),
+              let identity = try? TTYInputIdentity.capture(pid: pid), identity.processStart == started else { return nil }
+        var bound = target
+        if let original = target.sourceIdentity, !identity.sameProcess(as: original) { return nil }
+        bound.sourceIdentity = target.sourceIdentity ?? identity
+        return bound
+    }
+    private static func resumeRead(_ target: ScreenTarget) throws -> String {
+        guard let screen = try screens(ttys: [target.tty], includeCursor: false).screens.first(where: { $0.tty == target.tty }) else {
+            throw AppError.message("재시도할 원본 터미널 화면을 확인하지 못했습니다.")
+        }
+        return screen.contents
+    }
+    public static func resume(target: ScreenTarget, region: String, text: String) throws -> ResumeDelivery {
+        guard TerminalInputClient.shared.isAvailable else { return try resume(tty: target.tty, region: region, text: text) }
+        guard let bound = boundResumeTarget(target) else { return .agentMissing }
+        let agent = CodexResumeCheck.agent(in: region)
+        return try VerifiedResumeInput.deliver(region: region, text: text, read: { try resumeRead(bound) }, write: { expected,input in
+            guard try resumeRead(bound) == expected else { return .screenChanged }
+            return try TerminalDeviceInput.deliver(target: bound, agent: agent, input: input, screen: expected)
+        })
+    }
+    public static func completeResume(target: ScreenTarget, stop: CodexCapacityStop) throws -> ResumeDelivery {
+        if TerminalInputClient.shared.isAvailable {
+            guard let bound = boundResumeTarget(target) else { return .agentMissing }
+            return try VerifiedResumeInput.complete(stop: stop, read: { try resumeRead(bound) }, write: { expected,input in
+                guard try resumeRead(bound) == expected else { return .screenChanged }
+                return try TerminalDeviceInput.deliver(target: bound, agent: stop.agent, input: input, screen: expected)
+            })
+        }
+        let result = try AutomationScript.run(completeResumeScript(tty: target.tty, stop: stop), app: "Terminal", denied: .permissionDenied, timeout: 40)
+        return ResumeDelivery(rawValue: result) ?? .typed
+    }
+    public static func completeResumeScript(tty: String, stop: CodexCapacityStop) throws -> String {
+        let data = try AutomationScript.literal(["tty": tty, "region": stop.region, "text": stop.continuationText, "footer": stop.composerFooter as Any? ?? NSNull()])
+        return """
+        (() => {
+          const app = Application('com.apple.Terminal'), target = \(data);
+          \(CodexResumeScript.functions)
+          function skipClosed(read) {
+            try { return read(); } catch (error) {
+              if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
+              return null;
+            }
+          }
+          if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
+            if (skipClosed(() => tab.tty()) !== target.tty) continue;
+            const read = () => tab.contents(), before = resumeRows(read());
+            const enter = () => { if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return false;
+              app.doScript('', {in:tab}); return true; };
+            return submitDraft(read, enter, before, target.region, String(target.text).normalize('NFC'), target.footer);
+          }
+          return 'missingTarget';
+        })();
+        """
+    }
     public static func restart(target: ScreenTarget, expected: String, command: String) throws -> TerminalDelivery {
         let output = try AutomationScript.run(restartScript(target:target,expected:expected,command:command),app:"Terminal",denied:.permissionDenied)
         guard let result = TerminalDelivery(rawValue:output) else { throw AppError.message("같은 대화 복구 명령의 전달 결과를 확인하지 못했습니다.") }
@@ -403,7 +465,10 @@ public enum TerminalAdapter {
           // A separate Return submits it, only while the draft sits in the same stopped composer.
           app.doScript(text, {in:tab});
           const state = awaitTypedState(() => tab.contents(), before, target.region, text);
-          if (state === 'draft') { app.doScript('', {in:tab}); return awaitSubmitted(() => tab.contents(), before, target.region, text) ? 'sent' : 'typed'; }
+          if (state === 'draft') return submitDraft(() => tab.contents(), () => {
+            if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return false;
+            app.doScript('', {in:tab}); return true;
+          }, before, target.region, text, resumeFooter(before));
           return state === 'submitted' ? 'sent' : 'typed';
         }
         return 'missingTarget';

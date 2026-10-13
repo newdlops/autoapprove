@@ -38,6 +38,9 @@ public struct SessionInterruption: Codable, Equatable {
     /// Exact root failed turn at dispatch, when the read-only Codex history is available.
     /// A later failed turn can be new even when a full viewport looks identical.
     public var resumeTurnIdentity: String?
+    /// An exact saved stop authorizes only submission of its already typed text.
+    public var resumeStop: CodexCapacityStop?
+    public var resumeSubmissionCancelled: Bool?
     /// A confirmed continuation is retained across app restarts until work or a
     /// different failure is observed. An unchanged footer cannot replay the command.
     public var resumeConfirmedAt: Date?

@@ -21,6 +21,9 @@ public struct CodexCapacityStop: Codable, Equatable {
     public var error: String = CodexCapacityStop.message
     /// Older persisted stops have no override. A stalled Goal needs its lifecycle command.
     public var inputText: String?
+    /// Footer captured before typing; everything above it in the composer must
+    /// contain only this request, including wrapping and empty trailing lines.
+    public var composerFooter: String?
     public var continuationText: String { inputText ?? Self.resumeText }
 
     /// Only the newest cell above a ready, empty composer counts. Codex wraps the cell without
@@ -53,6 +56,7 @@ public struct CodexCapacityStop: Codable, Equatable {
             identity: PromptDetector.fingerprint(transcript))
         result.continuationIdentity = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
         result.kind = kind; result.agent = agent; result.error = kind == .goalBlocked ? "Goal blocked · /goal resume로 현재 목표의 상태를 다시 확인합니다." : cell
+        result.composerFooter = raw.dropFirst(composer + 1).joined(separator: "\n")
         if agent == .codex, kind.retryable, CodexResumeCheck.goalStalled(lines) { result.inputText = goalResumeText }
         return result
     }
@@ -82,7 +86,7 @@ public struct CodexCapacityStop: Codable, Equatable {
     }
 }
 
-public enum ResumeDelivery: String, Codable { case sent, typed, screenChanged, missingTarget, agentMissing }
+public enum ResumeDelivery: String, Codable { case sent, draft, typed, screenChanged, missingTarget, agentMissing }
 
 /// The same rules as `CodexResumeScript.functions`, for hosts that are read and written from Swift.
 public enum CodexResumeCheck {
@@ -150,23 +154,54 @@ public enum CodexResumeCheck {
         guard !running(current) else { return false }
         return current.lastIndex(where: isComposer).map { composerText(current[$0]) == text } ?? false
     }
+    /// A submission retry must never resend text or submit extra user notes. The
+    /// original error/lifecycle region and the complete composer body are checked.
+    public static func draftReady(_ screen: String, stop: CodexCapacityStop) -> Bool {
+        let current = rows(screen), expected = rows(stop.region)
+        guard !blocked(current), !running(current), let composer = current.lastIndex(where: isComposer),
+              stop.agent != .codex || !goalHeld(current), let footer = stop.composerFooter else { return false }
+        if !stop.identity.isEmpty {
+            let transcript = current[..<composer].joined(separator: "\n")
+            let compact = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
+            guard PromptDetector.fingerprint(transcript) == stop.identity || compact == stop.continuationIdentity else { return false }
+        }
+        let tail = current.indices.filter { $0 > composer && !current[$0].trimmingCharacters(in: .whitespaces).isEmpty }
+        let text = stop.continuationText.precomposedStringWithCanonicalMapping
+        let ownedBody = footerVariants(footer, agent: stop.agent).contains { expectedFooter in
+            guard tail.count >= expectedFooter.count,
+                  tail.suffix(expectedFooter.count).map({ current[$0].trimmingCharacters(in: .whitespaces) }) == expectedFooter else { return false }
+            let end = expectedFooter.isEmpty ? current.endIndex : tail[tail.count - expectedFooter.count]
+            let body = ([composerText(current[composer])] + current[(composer + 1)..<end].map { $0.trimmingCharacters(in: .whitespaces) }).filter { !$0.isEmpty }
+            return body.joined() == text || body.joined(separator: " ") == text
+        }
+        guard ownedBody else { return false }
+        if goalStalled(expected) { return goalStalled(current) }
+        let heading = expected.first?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard let active = activeRegion(screen, heading: heading).map(rows), active.last == current[composer] else { return false }
+        let filled: ([String]) -> [String] = { $0.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
+        return filled(Array(active.dropLast())) == filled(Array(expected.dropLast()))
+    }
+    private static func footerVariants(_ footer: String, agent: AgentKind) -> [[String]] {
+        let original = rows(footer).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard agent == .codex else { return [original] }
+        // Codex hides empty-composer shortcuts while a draft is present. Keep
+        // model/path/warnings and lifecycle text exact; only these hints may vanish.
+        let hidden = original.map {
+            $0.replacingOccurrences(of: #"← for agents\s*·\s*\? for shortcuts|\? for shortcuts"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }.filter { !$0.isEmpty }
+        return original == hidden ? [original] : [original, hidden]
+    }
     /// `draft`: only the composer of the same stop holds the text. `submitted`: the screen above the
     /// composer changed and shows the text as a message. A screen that looks unchanged proves nothing,
     /// so it stays `typed`, which is never typed again.
     public enum TypedState: String { case draft, submitted, typed }
     public static func state(before: String, after: String, region: String, text: String) -> TypedState {
-        let expected = rows(region), current = rows(after)
-        let heading = expected.first?.trimmingCharacters(in: .whitespaces) ?? ""
-        if draftVisible(after, text: text) {
-            if goalStalled(expected) {
-                return goalStalled(current) && !goalHeld(current) && footer(current) == footer(expected) ? .draft : .typed
-            }
-            // A draft makes the composer taller, so only the filled rows above it must match.
-            let filled: ([String]) -> [String] = { $0.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
-            guard let active = activeRegion(after, heading: heading).map(rows),
-                  filled(Array(active.dropLast())) == filled(Array(expected.dropLast())) else { return .typed }
-            return .draft
-        }
+        let current = rows(after)
+        var stop = CodexCapacityStop.detect(before, agent: CodexResumeCheck.agent(in: region)) ?? CodexCapacityStop(region: region, identity: "")
+        stop.agent = agent(in: region); stop.inputText = text; stop.composerFooter = footer(rows(before))
+        if draftReady(after, stop: stop) { return .draft }
+        if draftVisible(after, text: text) { return .typed }
         if text == CodexCapacityStop.goalResumeText {
             // Slash commands do not create a user-message cell. The lifecycle footer acknowledges them.
             return goalStalled(rows(before)) && footer(current).filter({ !$0.isWhitespace }).contains("Pursuinggoal") ? .submitted : .typed
@@ -197,13 +232,35 @@ public enum VerifiedResumeInput {
         } while state == .typed && (Date() < until || reads < 3)
         if state == .submitted { return .sent }
         guard state == .draft else { return .typed }
-        guard try write(after,RemoteTerminalInput(kind:.enter)) == .sent else { return .typed }
+        var stop = CodexCapacityStop.detect(before, agent: CodexResumeCheck.agent(in: region)) ?? CodexCapacityStop(region: region, identity: "")
+        stop.agent = CodexResumeCheck.agent(in: region); stop.inputText = text
+        let rows = PromptDetector.normalizedLines(before)
+        if let composer = rows.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces).first.map { "›»❯".contains($0) } == true }) {
+            stop.composerFooter = rows.dropFirst(composer + 1).joined(separator: "\n")
+        }
+        return try complete(stop: stop, read: read, write: write)
+    }
+
+    /// Revalidate a stable owned draft, then send Return alone. If it only adds
+    /// an empty line, the engine can try Return later without ever retyping text.
+    public static func complete(stop: CodexCapacityStop, read: () throws -> String,
+                                write: (String, RemoteTerminalInput) throws -> TerminalDelivery) throws -> ResumeDelivery {
+        guard CodexResumeCheck.draftReady(try read(), stop: stop) else { return .typed }
+        Thread.sleep(forTimeInterval: 0.75)
+        let before = try read()
+        guard CodexResumeCheck.draftReady(before, stop: stop) else { return .typed }
+        let delivered = try write(before, RemoteTerminalInput(kind: .enter, relay: true))
+        guard delivered == .sent else {
+            switch delivered { case .screenChanged: return .screenChanged; case .agentMissing: return .agentMissing; default: return .missingTarget }
+        }
         let sentUntil = Date().addingTimeInterval(4)
+        var after = before
         repeat {
             Thread.sleep(forTimeInterval:0.25)
-            if CodexResumeCheck.state(before:before,after:try read(),region:region,text:text) == .submitted { return .sent }
+            after = try read()
+            if CodexResumeCheck.state(before: before, after: after, region: stop.region, text: stop.continuationText) == .submitted { return .sent }
         } while Date() < sentUntil
-        return .typed
+        return CodexResumeCheck.draftReady(after, stop: stop) ? .draft : .typed
     }
 }
 
@@ -248,16 +305,36 @@ enum CodexResumeScript {
       return rows.filter((row, index) => index !== last && isComposer(row) && composerText(row) === text).length;
     }
     function filledRows(rows) { return rows.map(row => row.trim()).filter(row => row).join('\\n'); }
+    function resumeFooters(footer, agent) {
+      const original = resumeRows(footer).map(row => row.trim()).filter(Boolean);
+      if (agent !== 'codex') return [original];
+      const hidden = original.map(row => row.replace(/← for agents\\s*·\\s*\\? for shortcuts|\\? for shortcuts/g, '').trim()).filter(Boolean);
+      return original.join('\\n') === hidden.join('\\n') ? [original] : [original, hidden];
+    }
+    function draftReady(rows, region, text, footer) {
+      const expected = resumeRows(region), last = lastComposer(rows);
+      if (last < 0 || resumeBlocked(rows) || resumeRunning(rows) || (resumeAgent(region) === 'codex' && goalHeld(rows)) || footer == null) return false;
+      const tail = []; for (let i = last + 1; i < rows.length; i++) if (rows[i].trim()) tail.push(i);
+      const owned = resumeFooters(footer, resumeAgent(region)).some(expectedFooter => {
+        if (tail.length < expectedFooter.length) return false;
+        const actual = expectedFooter.length ? tail.slice(-expectedFooter.length).map(i => rows[i].trim()) : [];
+        if (actual.join('\\n') !== expectedFooter.join('\\n')) return false;
+        const end = expectedFooter.length ? tail[tail.length - expectedFooter.length] : rows.length;
+        const body = [composerText(rows[last]), ...rows.slice(last + 1, end).map(row => row.trim())].filter(Boolean);
+        return body.join('') === text || body.join(' ') === text;
+      });
+      if (!owned) return false;
+      if (goalStalled(expected)) return goalStalled(rows);
+      const active = activeRegion(rows, expected[0].trim());
+      return active !== null && active[active.length - 1] === rows[last]
+        && filledRows(active.slice(0, -1)) === filledRows(expected.slice(0, -1));
+    }
     function transcript(rows) { const last = resumeRunning(rows) ? -1 : lastComposer(rows); return rows.slice(0, last < 0 ? rows.length : last).join('\\n'); }
     function draftShown(rows, text) { const last = lastComposer(rows); return !resumeRunning(rows) && last >= 0 && composerText(rows[last]) === text; }
     function typedState(before, after, region, text) {
       const expected = resumeRows(region);
-      if (draftShown(after, text)) {
-        if (goalStalled(expected)) return goalStalled(after) && !goalHeld(after) && resumeFooter(after) === resumeFooter(expected) ? 'draft' : 'typed';
-        // A draft makes the composer taller, so only the filled rows above it must match.
-        const active = activeRegion(after, expected[0].trim());
-        return active !== null && filledRows(active.slice(0, -1)) === filledRows(expected.slice(0, -1)) ? 'draft' : 'typed';
-      }
+      if (draftReady(after, region, text, resumeFooter(before))) return 'draft';
+      if (draftShown(after, text)) return 'typed';
       if (text === '/goal resume') return goalStalled(before) && resumeFooter(after).replace(/\\s/g, '').includes('Pursuinggoal') ? 'submitted' : 'typed';
       // Submitted at once: the screen above the composer changed and shows the text as a message.
       return messageCount(after, text) > 0 && transcript(after) !== transcript(before) ? 'submitted' : 'typed';
@@ -274,6 +351,16 @@ enum CodexResumeScript {
       const until = Date.now() + 4000; let reads = 0;
       do { delay(0.25); reads++; if (typedState(before, resumeRows(read()), region, text) === 'submitted') return true; } while (Date.now() < until || reads < 2);
       return false;
+    }
+    function submitDraft(read, enter, before, region, text, footer) {
+      if (!draftReady(resumeRows(read()), region, text, footer)) return 'typed';
+      delay(0.75);
+      const stable = resumeRows(read());
+      if (!draftReady(stable, region, text, footer)) return typedState(before, stable, region, text) === 'submitted' ? 'sent' : 'typed';
+      if (transcript(stable).replace(/\\s/g, '') !== transcript(before).replace(/\\s/g, '')) return 'typed';
+      if (!enter()) return 'agentMissing';
+      if (awaitSubmitted(read, stable, region, text)) return 'sent';
+      return draftReady(resumeRows(read()), region, text, footer) ? 'draft' : 'typed';
     }
     """
 }

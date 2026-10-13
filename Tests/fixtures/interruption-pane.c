@@ -39,8 +39,11 @@ int main(int argc, char **argv) {
     int blocked=argc>2 && !strcmp(argv[2],"blocked");
     int capacity=argc>2 && (!strcmp(argv[2],"capacity") || !strcmp(argv[2],"capacity-goal"));
     int processing=argc>2 && (!strcmp(argv[2],"processing") || !strcmp(argv[2],"processing-goal"));
+    int newline_first=argc>2 && (!strcmp(argv[2],"newline-first") || !strcmp(argv[2],"newline-goal"));
+    int returns=0;
     goal=goal||(argc>2 && !strcmp(argv[2],"capacity-goal"));
     goal=goal||(argc>2 && !strcmp(argv[2],"processing-goal"));
+    goal=goal||(argc>2 && !strcmp(argv[2],"newline-goal"));
     goal=goal||blocked;
     const char *heading=capacity?"■ Selected model is at capacity. Please try a different model.":blocked?"• External dependency still unavailable":
         processing?"■ stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 00000000-\r\n0000-4000-8000-000000000061 in your message.":
@@ -56,6 +59,10 @@ int main(int argc, char **argv) {
     while((count=read(0,bytes,sizeof(bytes)))>0){
         fwrite(bytes,1,count,f);fflush(f);
         if(memchr(bytes,'\r',count)){
+            if(newline_first && returns++ == 0){
+                snprintf(frame,sizeof(frame),"\033[2J\033[H%s\r\n\r\n› %s\r\n\r\n\r\n? for shortcuts%s",heading,text,status);
+                write(1,frame,strlen(frame));continue;
+            }
             const char *working=goal
                 ? "\033[2J\033[H› Ask Codex to do anything\r\n\r\n? for shortcuts · Pursuing goal"
                 : "\033[2J\033[H› 이어서 진행하자.\r\n\r\nWorking · esc to interrupt";

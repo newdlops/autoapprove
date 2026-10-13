@@ -184,8 +184,10 @@ import TerminalInputSupport
         var unsent = 0
         var workingObserved = false
         var turnIdentity: String?
+        var submitOnly = false
     }
     private var capacityStates: [String: CapacityState] = [:]
+    private var legacyResumeDraftReceipts: [String: [CodexCapacityStop]] = [:]
     private var exitRecoveries: [String: SessionExitRecovery] = [:]
     private var exitRecoveryTasks: [String: UUID] = [:]
     private var conversationReads = Set<String>()
@@ -3099,9 +3101,66 @@ import TerminalInputSupport
 
     /// Answers a capacity stop only for a screen-connected Codex session with auto-approval on.
     /// After a confirmed send, the next stop drawn is the next failure of the same run.
+    /// 0.2.78 recorded a Goal command's full original footer in the audit, but
+    /// not in the receipt. Migrate only a draft bound to that exact saved run.
+    private func restoreLegacyResumeDraft(_ id: String, raw: String) {
+        guard let session = sessions[id], session.automatic, let receipt = session.interruption,
+              receipt.resumeUncertain == true, receipt.resumeStop == nil,
+              receipt.resumeSubmissionCancelled != true, receipt.kind == .goalBlocked,
+              receipt.resumeCommand == CodexCapacityStop.goalResumeText,
+              let key = receipt.resumeIdentity, key.hasPrefix("goal:"),
+              CodexResumeCheck.draftVisible(raw, text: CodexCapacityStop.goalResumeText) else { return }
+        let cacheKey = id + ":" + receipt.id + ":" + key
+        if legacyResumeDraftReceipts[cacheKey] == nil {
+            guard let events = try? store.history(search: id, limit: 32).events else { return }
+            legacyResumeDraftReceipts[cacheKey] = events.compactMap { event in
+                guard event.sessionID == id, event.answer == receipt.resumeCommand, let region = event.request else { return nil }
+                let rows = PromptDetector.normalizedLines(region)
+                guard CodexResumeCheck.goalStalled(rows), let composer = rows.lastIndex(where: CodexResumeCheck.isComposer) else { return nil }
+                let identity = String(key.dropFirst("goal:".count))
+                var stop = CodexCapacityStop(region: region, identity: identity)
+                stop.continuationIdentity = identity; stop.kind = receipt.kind; stop.agent = session.agent
+                stop.inputText = receipt.resumeCommand; stop.composerFooter = rows.dropFirst(composer + 1).joined(separator: "\n")
+                return stop
+            }
+        }
+        for stop in legacyResumeDraftReceipts[cacheKey] ?? [] {
+            guard CodexResumeCheck.draftReady(raw, stop: stop) else { continue }
+            sessions[id]?.interruption?.resumeStop = stop
+            persistInterruption(id)
+            return
+        }
+    }
+
     private func observeCapacity(_ id: String, analysis: ScreenAnalysis, at now: Date) {
         let raw = analysis.raw
+        restoreLegacyResumeDraft(id, raw: raw)
         guard let session = sessions[id], session.agent != .shell, session.phase != .ended else { return }
+        // A newline is not a submitted continuation. An exact saved owned draft
+        // can be completed later or after restart, without typing its text again.
+        if session.automatic, session.interruption?.resumeUncertain == true,
+           session.interruption?.resumeSubmissionCancelled != true,
+           let saved = session.interruption?.resumeStop,
+           session.interruption?.resumeIdentity == saved.continuationKey,
+           session.interruption?.resumeCommand == saved.continuationText,
+           CodexResumeCheck.draftReady(raw, stop: saved) {
+            let channel = ScreenHost(kind:session.terminal).flatMap { screenConnections[$0]?.enabled == true ? $0.channel : nil } ?? session.channel
+            let adapter = ScreenHost(channel:channel).flatMap { screenAdapters[$0] }
+            if channel.isScreen, adapter?.completeResume != nil || (channel == .vscodeScreen && session.bridgeID.flatMap({ peers[$0] }) != nil) {
+                if var state = capacityStates[id] {
+                    state.observedAt = now
+                    if state.phase == .cancelled || state.phase == .sending { capacityStates[id] = state; return }
+                    state.stop = saved; state.submitOnly = true
+                    if state.phase != .waiting { state.phase = .waiting; state.deadline = now.addingTimeInterval(capacityUnsentRetryDelay); state.scheduledID = nil }
+                    capacityStates[id] = state
+                } else {
+                    var state = CapacityState(phase: .waiting, stop: saved, channel: channel, attempt: 1,
+                        deadline: now.addingTimeInterval(capacityUnsentRetryDelay), observedAt: now)
+                    state.submitOnly = true; capacityStates[id] = state
+                }
+                scheduleCapacityResume(id); return
+            }
+        }
         let stop = analysis.capacityStop
         if let stop {
             rememberExitContext(session,records:records)
@@ -3302,6 +3361,8 @@ import TerminalInputSupport
         sessions[id]?.interruption?.resumeConfirmedAt = nil
         sessions[id]?.interruption?.resumeIdentity = state.stop.continuationKey
         sessions[id]?.interruption?.resumeCommand = state.stop.continuationText
+        sessions[id]?.interruption?.resumeStop = state.stop
+        sessions[id]?.interruption?.resumeSubmissionCancelled = false
         let turnIdentity = failedTurnIdentity(id, at: Date())
         capacityStates[id]?.turnIdentity = turnIdentity
         sessions[id]?.interruption?.resumeTurnIdentity = turnIdentity
@@ -3323,12 +3384,18 @@ import TerminalInputSupport
         }
         do {
             let delivery: ResumeDelivery
-            if let adapter { delivery = try await Task.detached { try adapter.resume(target,region,text) }.value }
-            else { delivery = try await resumeBridgeSession(session,region:region,text:text) }
+            if let adapter {
+                if state.submitOnly, let complete = adapter.completeResume {
+                    let stop = state.stop
+                    delivery = try await Task.detached { try complete(target,stop) }.value
+                } else if state.submitOnly { delivery = .typed }
+                else { delivery = try await Task.detached { try adapter.resume(target,region,text) }.value }
+            } else { delivery = try await resumeBridgeSession(session,stop:state.stop,submitOnly:state.submitOnly) }
             // Always retain the actual result, but an old callback cannot change a
             // replacement failure, a cancelled run, or a session that has ended.
             switch delivery {
             case .sent: event.outcome = "이어서 진행 요청 전달"
+            case .draft: event.outcome = "재시도 입력 작성 확인 · Enter 제출 대기"
             case .typed: event.outcome = "입력 확인 필요 · 이어서 진행 전송 미확인"
             case .screenChanged, .missingTarget, .agentMissing:
                 event.outcome = "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
@@ -3339,6 +3406,12 @@ import TerminalInputSupport
                 sessions[id]?.interruption?.resumeUncertain = false
                 sessions[id]?.interruption?.resumeConfirmedAt = Date()
                 capacityStates[id]?.phase = .sent; capacityStates[id]?.sentAt = Date(); capacityStates[id]?.unsent = 0
+            case .draft:
+                // Only a complete, owned, unsubmitted body authorizes Return again.
+                // The text itself is never retyped by this path.
+                capacityStates[id]?.submitOnly = true
+                capacityStates[id]?.phase = .waiting
+                capacityStates[id]?.deadline = Date().addingTimeInterval(capacityUnsentRetryDelay)
             case .typed:
                 // Typed, but neither a draft nor a new message was visible: never type again.
                 capacityStates[id]?.phase = .review
@@ -3363,7 +3436,8 @@ import TerminalInputSupport
 
     private func retryUnsentCapacity(_ id: String) {
         guard let state = capacityStates[id] else { return }
-        sessions[id]?.interruption?.resumeUncertain = false
+        // A rejected Return does not undo the text already written earlier.
+        sessions[id]?.interruption?.resumeUncertain = state.submitOnly
         let unsent = state.unsent + 1
         capacityStates[id]?.unsent = unsent
         capacityStates[id]?.phase = .waiting
@@ -3381,15 +3455,16 @@ import TerminalInputSupport
         } catch { snapshot.health.auditError = "작업 중단 상태를 저장하지 못했습니다. \(error.localizedDescription)"; return false }
     }
 
-    private func resumeBridgeSession(_ session: AgentSession, region: String, text: String) async throws -> ResumeDelivery {
+    private func resumeBridgeSession(_ session: AgentSession, stop: CodexCapacityStop, submitOnly: Bool = false) async throws -> ResumeDelivery {
         let id = session.id
+        let region = stop.region, text = stop.continuationText
         guard let before = remoteObservedScreens[id], Date().timeIntervalSince(before.observedAt) < 6,
-              CodexResumeCheck.ready(before.raw,region:region,text:text) else { return .screenChanged }
+              submitOnly ? CodexResumeCheck.draftReady(before.raw, stop: stop) : CodexResumeCheck.ready(before.raw,region:region,text:text) else { return .screenChanged }
         func write(_ observed: RemoteObservedScreen, kind: String, value: String) async throws -> Bool {
             let reader = processReader, live = try await Task.detached { try reader() }.value
             guard !remoteInputStopped, !snapshot.paused, !userInputHasPriority(id),
                   live.contains(where:{$0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/"+$0.tty == session.tty && $0.isForeground}),
-                  let current = sessions[id], current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
+                  let current = sessions[id], current.automatic, current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
                   let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID,
                   remoteObservedScreens[id]?.raw == observed.raw, remoteObservedScreens[id]?.generation == observed.generation else { return false }
             let actionID = UUID().uuidString
@@ -3406,7 +3481,7 @@ import TerminalInputSupport
                 }
             }
         }
-        guard try await write(before,kind:"characters",value:text) else { return .screenChanged }
+        if !submitOnly { guard try await write(before,kind:"characters",value:text) else { return .screenChanged } }
         let deadline = Date().addingTimeInterval(8)
         repeat {
             try await Task.sleep(for:.milliseconds(250))
@@ -3414,14 +3489,17 @@ import TerminalInputSupport
             let state = CodexResumeCheck.state(before:before.raw,after:after.raw,region:region,text:text)
             if state == .submitted { return .sent }
             if state == .draft {
-                guard try await write(after,kind:"enter",value:"") else { return .typed }
+                try await Task.sleep(for: .milliseconds(750))
+                guard let stable = remoteObservedScreens[id], Date().timeIntervalSince(stable.observedAt) < 6,
+                      CodexResumeCheck.draftReady(stable.raw, stop: stop) else { return .typed }
+                guard try await write(stable,kind:"enter",value:"") else { return .typed }
                 let until = Date().addingTimeInterval(4)
                 repeat {
                     try await Task.sleep(for:.milliseconds(250))
                     if let next = remoteObservedScreens[id], next.generation == before.generation,
                        CodexResumeCheck.state(before:before.raw,after:next.raw,region:region,text:text) == .submitted { return .sent }
                 } while Date() < until
-                return .typed
+                return remoteObservedScreens[id].map { CodexResumeCheck.draftReady($0.raw, stop: stop) } == true ? .draft : .typed
             }
         } while Date() < deadline
         return .typed
@@ -3640,6 +3718,8 @@ import TerminalInputSupport
         }
         guard let phase = capacityStates[id]?.phase, phase == .waiting || phase == .unavailable else { return }
         capacityStates[id]?.phase = .cancelled; capacityStates[id]?.scheduledID = nil
+        sessions[id]?.interruption?.resumeSubmissionCancelled = true
+        persistInterruption(id)
         publish()
     }
 

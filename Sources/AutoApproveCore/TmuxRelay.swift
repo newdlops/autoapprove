@@ -91,6 +91,11 @@ public final class TmuxRelay: @unchecked Sendable {
             try VerifiedResumeInput.deliver(region:region,text:text,read:{ try screen(target,fresh:true).contents },write:{ expected,input in
                 try adapter.input(target,expected,CodexResumeCheck.agent(in:region),input)
             })
+        }, completeResume: { [self] target, stop in
+            try VerifiedResumeInput.complete(stop: stop, read: { try screen(target, fresh: true).contents }, write: { expected,input in
+                guard OrcaAdapter.normalize(try screen(target, fresh: true).contents) == OrcaAdapter.normalize(expected) else { return .screenChanged }
+                return try adapter.input(target, expected, stop.agent, input)
+            })
         }, restart: { [self] target, expected, command in
             try restart(target,expected:expected,command:command)
         }, input: { [self] target, expected, agent, input in

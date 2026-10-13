@@ -1,7 +1,9 @@
 import Foundation
+import Darwin
 import AutoApproveCore
 @main struct InterruptionRelayCheck {
     static func main() async throws {
+        setbuf(stdout, nil)
         let root=URL(fileURLWithPath:CommandLine.arguments[1]),socket=CommandLine.arguments[2],tmux=CommandLine.arguments[3]
         func call(_ args:[String]) throws -> String { let r=try CommandRunner.run(tmux,["-S",socket]+args); precondition(r.status==0,r.error);return r.output }
         func stopped(_ read: () throws -> String) async throws -> (String, CodexCapacityStop) {
@@ -84,6 +86,19 @@ import AutoApproveCore
             precondition(delivered == .sent); try await received(record,text+"\r")
             print("PASS actual owned PTY recovers \(mode) in its original composer with exact text and one verified Return")
         }
+        for mode in ["newline-first", "newline-goal"] {
+            let record = root.appendingPathComponent("\(mode)-pty-input.bin")
+            let terminal = try manager.create(cwd: root.path, program: "codex", command: [root.appendingPathComponent("codex").path, record.path, mode], columns: 100, rows: 25)
+            let target = try await foreground(terminal.tty)
+            let (_, failure) = try await stopped { try manager.terminal(terminal.ptyID).screen() }
+            let first = try manager.adapter.resume(target, failure.region, failure.continuationText)
+            precondition(first == .draft)
+            try await received(record, failure.continuationText + "\r")
+            let submitted = try manager.adapter.completeResume!(target, failure)
+            precondition(submitted == .sent)
+            try await received(record, failure.continuationText + "\r\r")
+            print("PASS actual owned PTY \(mode) retries Return alone after a newline, without retyping text")
+        }
         for mode in ["choice", "request-choice"] {
             let record=root.appendingPathComponent("\(mode)-pty-input.bin")
             let terminal=try manager.create(cwd:root.path,program:"codex",command:[root.appendingPathComponent("codex").path,record.path,mode],columns:100,rows:25)
@@ -164,6 +179,21 @@ import AutoApproveCore
         try await received(choiceRecord,"\u{1b}[B\r")
         print("PASS actual original tmux pane selects a generic question in the same pane with one Return")
         for _ in 0..<100 {if try ProcessDiscovery.read().contains(where:{$0.pid == Int32(meta[1]) && $0.isForeground}){break};try await Task.sleep(for:.milliseconds(20))}
+        for mode in ["newline-first", "newline-goal"] {
+            let record = root.appendingPathComponent("\(mode)-tmux-input.bin")
+            _ = try call(["send-keys", "-l", HookInstaller.quote(root.appendingPathComponent("codex").path) + " " + HookInstaller.quote(record.path) + " " + mode])
+            _ = try call(["send-keys", "Enter"])
+            var target = try await foreground(meta[0]); target.handle = original.tmuxHandle
+            let (_, failure) = try await stopped { try relay.screen(target, fresh: true).contents }
+            let first = try relay.adapter.resume(target, failure.region, failure.continuationText)
+            precondition(first == .draft)
+            try await received(record, failure.continuationText + "\r")
+            let submitted = try relay.adapter.completeResume!(target, failure)
+            precondition(submitted == .sent)
+            try await received(record, failure.continuationText + "\r\r")
+            print("PASS actual original tmux pane \(mode) retries Return alone without a replacement PTY or duplicate text")
+            for _ in 0..<100 { if try ProcessDiscovery.read().contains(where: { $0.pid == Int32(meta[1]) && $0.isForeground }) { break }; try await Task.sleep(for: .milliseconds(20)) }
+        }
         let records=try ProcessDiscovery.read(),shell=records.first(where:{$0.pid == Int32(meta[1])})!
         precondition(SessionExitRecovery.isShell(shell) && shell.isForeground)
         let shellTarget=ScreenTarget(tty:original.tty,handle:original.tmuxHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)

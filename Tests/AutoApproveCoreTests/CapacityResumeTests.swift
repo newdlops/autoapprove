@@ -382,10 +382,19 @@ extension ApprovalTests {
             context.setObject(frames, forKeyedSubscript: "frames" as NSString)
             context.setObject(processes, forKeyedSubscript: "processes" as NSString)
             context.setObject(tty, forKeyedSubscript: "tty" as NSString)
+            let draftAt = frames.indices.dropFirst().first(where: {
+                CodexResumeCheck.state(before: frames[0], after: frames[$0], region: region ?? stop.region, text: input ?? CodexCapacityStop.resumeText) == .draft
+            }) ?? -1
+            context.setObject(draftAt, forKeyedSubscript: "draftAt" as NSString)
             context.evaluateScript("""
-            var writes = [], reads = 0;
+            var writes = [], reads = 0, submittedReads = 0;
             var clock = 0; Date.now = () => clock; function delay(seconds) { clock += seconds * 1000; }
-            var tab = {tty: () => tty, contents: () => frames[Math.min(reads++, frames.length - 1)], processes: () => processes};
+            function screen() {
+              if (!writes.length) return frames[0];
+              if (writes.length === 1) return frames[Math.min(++reads, draftAt < 0 ? frames.length - 1 : draftAt)];
+              return frames[Math.min(draftAt + 1 + submittedReads++, frames.length - 1)];
+            }
+            var tab = {tty: () => tty, contents: screen, processes: () => processes};
             function Application(id) { return {running: () => true, windows: () => \(windows),
               doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
             """)
@@ -403,7 +412,7 @@ extension ApprovalTests {
         (delivery, writes) = try terminal([stoppedFrame, stoppedFrame, stoppedFrame, draftFrame, continuedFrame])
         try expectEqual(delivery, "sent"); try expectEqual(writes, [text, ""], "A draft drawn several reads later is still found")
         (delivery, writes) = try terminal([stoppedFrame, draftFrame])
-        try expectEqual(delivery, "typed"); try expectEqual(writes, [text, ""], "Return that leaves the draft in place is not a send")
+        try expectEqual(delivery, "draft"); try expectEqual(writes, [text, ""], "Return that leaves the exact owned draft in place can be submitted later without retyping")
         (delivery, writes) = try terminal([stoppedFrame, continuedFrame])
         try expectEqual(delivery, "sent"); try expectEqual(writes, [text], "An already submitted message gets no extra Return")
         (delivery, writes) = try terminal([stoppedFrame, refailedFrame])
@@ -448,7 +457,7 @@ extension ApprovalTests {
         context.evaluateScript("""
         var writes = [], reads = 0;
         var clock = 0; Date.now = () => clock; function delay(seconds) { clock += seconds * 1000; }
-        var session = {tty: () => '/dev/ttys902', rows: () => 30, contents: () => frames[Math.min(reads++, frames.length - 1)] + '\\n',
+        var session = {tty: () => '/dev/ttys902', rows: () => 30, contents: () => frames[Math.min(writes.length, frames.length - 1)] + '\\n',
           variable: () => 77, write: (options) => writes.push(options)};
         function Application(id) { return {running: () => true, windows: () => [{tabs: () => [{sessions: () => [session]}]}]}; }
         """)
@@ -456,12 +465,12 @@ extension ApprovalTests {
             .decomposedStringWithCanonicalMapping)
         try expectNil(context.exception)
         try expectEqual(iterm?.toString(), "sent")
-        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(), #"[{"text":"이어서 진행하자.","newline":false},{"text":""}]"#)
+        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(), #"[{"text":"이어서 진행하자.","newline":false},{"text":"\r","newline":false}]"#)
         context.setObject([stalled,goalDraft,pursuing],forKeyedSubscript:"frames" as NSString)
         context.evaluateScript("writes = []; reads = 0; clock = 0;")
         let goalITerm = context.evaluateScript(try ITermAdapter.resumeScript(target:ScreenTarget(tty:"/dev/ttys902",jobPIDs:[77]),region:goal.region,text:goal.continuationText))
         try expectNil(context.exception); try expectEqual(goalITerm?.toString(),"sent")
-        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(),#"[{"text":"/goal resume","newline":false},{"text":""}]"#)
+        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(),#"[{"text":"/goal resume","newline":false},{"text":"\r","newline":false}]"#)
     }
 
     func testCodexCapacityResumeRuns() async throws {

@@ -62,7 +62,7 @@ extension ApprovalTests {
                 context.evaluateScript("""
                 var writes = [], reads = 0, clock = 0;
                 Date.now = () => clock; function delay(seconds) { clock += seconds * 1000; }
-                var tab = {tty: () => '/dev/ttys901', contents: () => frames[Math.min(reads++, frames.length - 1)],
+                var tab = {tty: () => '/dev/ttys901', contents: () => frames[Math.min(writes.length, frames.length - 1)],
                   processes: () => ['login','zsh','codex'], rows: () => 30, variable: () => 42,
                   write: options => writes.push(options)};
                 function Application(id) { return {running: () => true, windows: () => [{tabs: () => [Object.assign(tab, {sessions: () => [tab]})]}],
