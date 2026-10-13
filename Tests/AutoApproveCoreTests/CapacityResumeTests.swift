@@ -315,7 +315,11 @@ extension ApprovalTests {
                 try expectEqual(engine.snapshot.sessions.first?.capacityResume?.attempt, attempt)
                 let wait = engine.snapshot.sessions.first?.capacityResume?.deadline?.timeIntervalSince(observed) ?? -1
                 try expect(wait >= 0 && wait <= 0.04, "The final backoff is reused instead of growing or stopping")
-                try await Task.sleep(for: .milliseconds(100))
+                let deliveredBy = ProcessInfo.processInfo.systemUptime + 3
+                while (probe.count < attempt || engine.snapshot.sessions.first?.capacityResume?.phase != .awaiting),
+                      ProcessInfo.processInfo.systemUptime < deliveredBy {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
                 try expectEqual(probe.count, attempt, "Retry \(attempt) must continue beyond the schedule length")
                 try expectEqual(probe.last?.2, goal ? "/goal resume" : "이어서 진행하자.")
                 try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .awaiting)

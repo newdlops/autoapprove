@@ -31,6 +31,7 @@ import AutoApproveCore
             try await Task.sleep(nanoseconds: 700_000_000)
             return UUID().uuidString
         }))
+        engine.automaticConfirmationDelay = 5 // Keep the extended editing/cancellation preview explicit.
         var session = AgentSession(id: sessionID, agent: .codex, pid: 1200, started: "preview",
             tty: "/dev/ttys-preview", cwd: "/tmp/응답 자동화 검증", terminal: .vscode)
         session.phase = .working; session.channel = .vscodeScreen

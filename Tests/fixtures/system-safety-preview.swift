@@ -41,5 +41,8 @@ import AutoApproveCore
         Window("시스템 변경 보호 · 합성 시험", id: "main") {
             SessionWindow(engine: model.engine, notifications: model.notifications, openTerminal: { _,_ in })
         }.defaultSize(width: 1060, height: 760)
+        Window("도움말 · 합성 시험", id: "help") {
+            HelpWindow(connectionsAvailable: false)
+        }.defaultSize(width: 540, height: 660)
     }
 }

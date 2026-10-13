@@ -98,10 +98,10 @@ public enum ClaudeHookClient {
         let decision = ["PreToolUse", "PermissionRequest"].contains(payload["hook_event_name"] as? String ?? "")
         let deadline = Date().addingTimeInterval(decision ? 600 : 8)
         payload["autoapproveExpiresAt"] = deadline.timeIntervalSince1970
-        var lastContact = Date()
+        var lastContact = Date(), waiting = false
         while Date() < deadline {
             do {
-                let result = try SocketClient.request(path: path, message: ["method": "hook", "params": payload], timeout: decision ? 5 : 2)
+                let result = try SocketClient.request(path: path, message: ["method": waiting ? "hookWait" : "hook", "params": payload], timeout: waiting ? 20 : decision ? 5 : 2)
                 // Older apps return the normal hook JSON, including an empty object.
                 guard let bridge = result["autoapproveBridge"] as? JSONObject else { return result }
                 lastContact = Date()
@@ -111,7 +111,10 @@ public enum ClaudeHookClient {
                     return response
                 }
                 guard bridge["waiting"] as? Bool == true else { return [:] }
+                waiting = decision && bridge["waitSupported"] as? Bool == true
+                if waiting { continue }
             } catch {
+                waiting = false
                 // Allow a short app restart; leave the original Claude flow available if it stays down.
                 if Date().timeIntervalSince(lastContact) >= (decision ? 20 : 4) { return [:] }
             }

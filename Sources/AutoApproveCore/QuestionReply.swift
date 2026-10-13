@@ -53,7 +53,7 @@ public struct CodexReplyTransport: Sendable {
     public static func selectedQueueTarget(_ session: AgentSession, threadID: String = "") async throws -> CodexReplyTarget {
         try await Task.detached(priority: .utility) {
             guard threadID.isEmpty || UUID(uuidString: threadID) != nil,
-                  let record = try ProcessDiscovery.read().first(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
+                  let record = try ProcessDiscovery.read(pid: session.pid).first(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw RemoteHTTPError(409, "Codex 실행이나 대화 선택을 다시 확인해주세요.")
             }
             let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
@@ -80,7 +80,7 @@ public struct CodexReplyTransport: Sendable {
     }
     public static func messageTarget(_ session: AgentSession) async throws -> CodexReplyTarget {
         try await Task.detached(priority: .utility) {
-            let records = try ProcessDiscovery.read()
+            let records = try ProcessDiscovery.read(pid: session.pid)
             guard records.contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw AppError.message("이 Codex 실행이 종료되었거나 바뀌었습니다.")
             }
@@ -92,7 +92,7 @@ public struct CodexReplyTransport: Sendable {
     }
     public static let live = CodexReplyTransport(prepare: { session, question in
         try await Task.detached(priority: .utility) {
-            let records = try ProcessDiscovery.read()
+            let records = try ProcessDiscovery.read(pid: session.pid)
             guard records.contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw AppError.message("이 Codex 세션이 종료되었거나 바뀌었습니다. 목록을 새로고침해주세요.")
             }

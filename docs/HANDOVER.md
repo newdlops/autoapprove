@@ -1,12 +1,25 @@
 # AutoApprove 작업 인계
 
-최종 갱신: 2026-10-13 (KST), 0.2.80 · 빌드 102. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
+최종 갱신: 2026-10-13 (KST), 0.2.81 · 빌드 103. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
 
 ## 현재 상태
 
-- 앱 **0.2.80/102**, Bridge **0.2.9**. 두 Mac 적용, 원본 식별·직접 입력 **이 Mac 20개 / 다른 Mac 4개**. 원본 CLI 재시작 없음. 숫자 LAN 주소의 노드/버전 일치 이 Mac 2주소·다른 Mac 1주소 확인.
-- 소스 태그·GitHub 정식 최신 릴리스·DMG/체크섬 게시 및 인증 없는 다운로드 바이트 일치 확인. 소스 커밋 `d694595971ed934287fa400771dee25f9ea1237a`.
-- 배포: [v0.2.80](https://github.com/newdlops/autoapprove/releases/tag/v0.2.80). DMG 9,015,697바이트, SHA-256 `c556c0557edab9ca21b4bd56b9208997fe1613b26f769a079bc0d30a259a77fe`.
+- 이 Mac **0.2.81/103**, Bridge **0.2.9**. 원본 식별·직접 입력 **20/20**, 숫자 LAN 주소 한 개의 노드/버전 일치 확인. 원본 CLI 재시작 없음. 다른 Mac은 현재 연결 해제이며 마지막 확인 버전은 0.2.80/102다.
+- release Core **252/252**, 새 응답 검사 **12/12**, 실제 Claude helper의 적은 대기 호출·빠른 응답·재시작/응답 유실 복구, 웹 질문/안전 보호 **12개 조건**, 서명·입력 서비스·웹/MCP/PTY·DMG 검사 완료. 시각 검증은 아래 기록과 [VALIDATION.md](../VALIDATION.md)에 범위를 구분한다.
+- DMG 9,075,393바이트, SHA-256 `fdbac0cfe237cb7074a7dc794432fa8c12ae0be31a53e0fa8055dcc953e19517`. GitHub v0.2.81 정식 게시·태그·인증 없는 다운로드 검증을 진행한다. 이전 v0.2.80 게시 기록은 아래에 유지한다.
+
+## 0.2.81 승인 지연·오류 복구
+
+- 사용자에게 가장 느린 구간은 자동 승인 질문 처리다. 기본 확인 대기 **0.5초**, 연결/API 첫 이어가기 **1초**. 명시적 사용자 초안·질문 대기·OFF·일시정지·취소·미확인 쓰기 및 위험 시스템 변경 거절은 유지한다. capacity·계정/설정·Goal backoff는 이전대로다.
+- `ApprovalEngine`: discovery/질문 기록/호스트별 관찰을 독립 실행하고 호스트 안의 중복 읽기를 막는다. 원본 식별 변화와 자동 켜기/재개가 대기를 깨운다. 일시정지/수동/빈 호스트의 조회 주기는 늘린다. 관리자 실행 세대가 다른 늦은 결과는 적용하지 않는다.
+- `CommandRunner`는 종료 callback을 기다린다. 질문 준비 단계의 일시적 읽기는 60/180ms로 두 번만 추가 확인한다. 쓰기를 시작한 뒤의 불확실한 결과는 반복하지 않는다. `QuestionReply`의 생존 검증은 대상 PID만 읽되 PID·시작·TTY·원본 대화를 유지한다.
+- 같은 질문에는 이전 자동 상태/응답을 유지하고 공개 관찰 시각/스냅샷을 매번 바꾸지 않는다. 성공 여부와 최신 턴은 비공개 상태에서 계속 갱신한다. 100회 같은 기록의 UI 갱신은 0회이며 오류/회복/변화는 즉시 반영한다.
+- Claude `hookWait`: 동일 UUID·전체 인자·저장된 응답·정확한 ACK를 유지한다. 결정 저장 즉시 대기 소켓을 깨우고 15초 heartbeat, 20초 클라이언트 timeout, 구버전 polling fallback을 사용한다. 동시 요청·pause/편집·앱 restart·유실된 응답은 기존 보호에 따른다. 5.2초 수동 대기의 실제 helper 호출은 hook/hookWait 두 번이고 이후 정확한 수신 확인만 보낸다.
+- 합성 3초 느린 호스트와 정상 호스트 비교(버전별 3회 중앙값): 승인 **5.064 → 1.531초**, 재개 감지와 공통 시험 대기 0.1초 **5.161 → 0.598초**. 실제 기본 첫 1초 재시도는 별도 검사다. 명령 40개의 자체 CPU는 0.075822 → 0.078892초여서 CPU 감소는 확인하지 못했다. helper 호출·변경 없는 UI·관찰 정책 감소를 전체 시스템 CPU/메모리 감소로 확대해 주장하지 않는다.
+- DEBUG 새 검사 12개와 release 전체 252개 통과. 이전 고정 100/120ms 후 전달을 단정하던 두 복구 검사는 예약 시각 검증을 유지하고 실제 완료를 기다린다. 네트워크 패키지 검사는 첫 ANSI 스냅샷과 offset 이후 실시간 출력 바이트를 구분한다.
+- Chromium 질문 8개 조건/9개 캡처, 안전 보호 4개 조건/12개 캡처, 세 화면 크기·오류/overflow 0건. 대표 네 이미지를 별도 시각 확인했다. SwiftUI 합성 도움말 540×660과 최종 앱 620×660에서 0.5초·무제한 오류 복구·버전/줄바꿈을 확인했다. 물리 휴대폰 Safari/IME·실제 OS 알림은 미검증이다.
+- 로컬 설치에서 CLI 20개 PID·시작·TTY, 설정·기존 기록 15,313건 보존. root 서비스는 보관된 0.2.80 PID·runs·파일과 같고 등록하지 않았다. 초기 웹 RPC 한 번이 실패해 재설치하지 않고 읽기 전용 후속 검증으로 완료했다. 비공개 설치 경로는 `.runtime/releases/0.2.81/response-103/`; `deploy.py` 재실행 금지(백업 보존). 후속은 `verify-deployment.py`·`inspect-network.mjs`·`verify-installed.mjs`로 확인했다.
+- 현재 다른 Mac에 접근할 수 없다. 같은 LAN으로 재연결한 뒤 자동 업데이트와 원본 네 세션·직접 입력을 확인한다. SSID·VPN·SentinelOne·권한을 바꾸지 않는다. 실제 upstream 장애와 물리 휴대폰의 체감 지연을 강제로 재현하지 않았다.
 
 ## 0.2.80 시스템 변경 대신 안전하게 계속
 
@@ -19,6 +32,7 @@
 - 새 검사는 `SystemSafetyTests.swift` 10개, 웹 fixture `system-safety-fixture.swift`, 네이티브 preview `system-safety-preview.swift`, 브라우저 검사 `system-safety-browser-check.mjs`다. 모든 fixture는 합성 대화이며 사용자 세션에 시험 문자를 보내지 않는다.
 - 검증: release Core **240/240**, Chromium 기능 **4개 조건/12개 화면/오류 0건**, 실제 SwiftUI preview **세 상태**, 서명·웹/MCP/PTY·DMG 패키지 통과. 시각 확인은 모바일/태블릿/데스크톱·다크·긴 요청·미확인 상태를 포함한다. 실제 시스템 알림 수신과 물리 휴대폰 Safari/IME는 미검증이다. 상세 기록은 [VALIDATION.md](../VALIDATION.md).
 - 로컬 설치 전후 원본 CLI **20개**의 PID·시작·TTY, 설정·기존 승인 기록 **15,239건**, root 입력 서비스 프로세스/파일 보존. 상대 Mac **4개**의 동일 세션과 직접 입력도 LAN에서 확인했다.
+- 이전 배포 [v0.2.80](https://github.com/newdlops/autoapprove/releases/tag/v0.2.80)의 소스 커밋은 `d694595971ed934287fa400771dee25f9ea1237a`다. DMG 9,015,697바이트, SHA-256 `c556c0557edab9ca21b4bd56b9208997fe1613b26f769a079bc0d30a259a77fe`. 당시 두 Mac과 인증 없는 다운로드를 확인한 기록이며 현재 연결 상태를 뜻하지 않는다.
 
 ## 0.2.79 줄바꿈 후 제출 복구
 
@@ -82,22 +96,24 @@ Codex 0.162.1의 설치된 문자열과 공식 구현을 확인했다. 기본 `Q
 
 ## 재현 및 배포
 
-0.2.80은 승인된 실제 Mac 환경의 release 전체 검사 240/240 통과했다. 기본 샌드박스에서는 시스템/프로세스/네트워크 접근을 사용하는 기존 5개가 실패했으며 정식 실행 승인으로 전체를 재검사했다. 앱과 Core는 release 최적화를 유지하고 검사 실행 파일만 `-Onone`이다. 최적화 빌드 246.46초, 최종 리소스 복사 1.17초였다.
+0.2.81은 승인된 실제 Mac 환경의 release 전체 검사 252/252를 통과했다. Swift의 사용자 모듈 캐시와 시스템/프로세스/로컬 네트워크 검사는 정식 실행 승인을 사용한다. 앱과 Core는 release 최적화를 유지하고 검사 실행 파일만 `-Onone`이다. 최적화 빌드 472.02초, 마지막 도움말 빌드 104.38초였다.
 
 ```sh
 swift build -c release
 .build/release/autoapprove-checks
 node scripts/system-safety-browser-check.mjs --release
-node scripts/package-system-safety-preview.mjs
-node scripts/package-app.mjs release .runtime/releases/0.2.80/safety-102/AutoApprove.app
-node scripts/terminal-input-package-check.mjs .runtime/releases/0.2.80/safety-102/AutoApprove.app
-node scripts/network-package-check.mjs .runtime/releases/0.2.80/safety-102/AutoApprove.app
-node scripts/package-dmg.mjs .runtime/releases/0.2.80/safety-102/AutoApprove.app
+node scripts/terminal-question-browser-check.mjs --release
+node scripts/claude-hook-integration-check.mjs .build/release/autoapprove
+node scripts/response-performance-check.mjs --label=current --compare=baseline-080 --assert-responsive
+node scripts/package-app.mjs release .runtime/releases/0.2.81/response-103/AutoApprove.app
+node scripts/terminal-input-package-check.mjs .runtime/releases/0.2.81/response-103/AutoApprove.app
+node scripts/network-package-check.mjs .runtime/releases/0.2.81/response-103/AutoApprove.app
+node scripts/package-dmg.mjs .runtime/releases/0.2.81/response-103/AutoApprove.app
 ```
 
 이번 패키지 경로는 완료 기록이다. 다음 배포는 **새 버전·빌드·새 디렉터리**를 사용한다. Swift 빌드 중 Swift 소스를 바꾸지 않는다. 브라우저 검사는 설치된 Playwright/Chromium 경로를 `AUTOAPPROVE_PLAYWRIGHT_MODULE`·`AUTOAPPROVE_CHROMIUM_PATH`로 지정한다. 샌드박스로 차단된 네트워크·서명·시스템 접근은 정식 실행 승인을 사용한다.
 
-이번 비공개 자료는 `.runtime/releases/0.2.80/safety-102/`의 `deploy.py`, `verification.json`, `network-{before,after}.json`, `installed-http-verification.json`, `verify-github.mjs`, `github-verification.json`이다. 사건 조사 원문은 `.runtime/security-review-20261013/`에만 보관한다. 두 디렉터리 모두 공개 저장소에서 제외한다. 설치 스크립트를 다시 실행해 백업을 덮어쓰지 않는다. 앱 관리자만 재시작하고 원본 CLI·정상 root 서비스·설정·기록은 전후 비교한다. 살아 있는 앱 소유 PTY가 있으면 종료 승인 전 업데이트하지 않는다.
+이번 비공개 자료는 `.runtime/releases/0.2.81/response-103/`의 설치/검증 파일과 `.runtime/response-latency-20261013/`, `.runtime/response-performance-check/`의 측정·비교 기록이다. 0.2.80 설치 자료와 사건 조사 `.runtime/security-review-20261013/`도 비공개로 유지한다. 모두 공개 저장소에서 제외한다. 설치 스크립트를 다시 실행해 백업을 덮어쓰지 않는다. 앱 관리자만 재시작하고 원본 CLI·정상 root 서비스·설정·기록은 비교한다. 살아 있는 앱 소유 PTY가 있으면 종료 승인 전 업데이트하지 않는다. `baseline-080`은 예전 Core에 연결한 동일 fixture의 실행 기록이 있어야 한다.
 
 태그는 검증한 소스 커밋에 만들고 main·태그를 push한 뒤 `gh release create`로 DMG·체크섬을 게시한다. 공개 태그·두 파일·다운로드 바이트를 확인한다. 이 Mac의 Node TLS는 Zscaler CA로 실패한 적이 있으므로 정상 시스템 TLS의 `/usr/bin/curl`을 사용하며 인증서 검사를 끄지 않는다.
 

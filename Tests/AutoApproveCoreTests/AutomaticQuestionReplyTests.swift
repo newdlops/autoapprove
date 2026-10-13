@@ -35,6 +35,7 @@ private actor AutomaticReplyProbe {
     init(root: URL, name: String, transport: CodexReplyTransport, enabled: Bool = true, restored: Bool = false) throws {
         paths = AppPaths(directory: root.appendingPathComponent(name))
         engine = try ApprovalEngine(paths: paths, questionTransport: transport)
+        engine.automaticConfirmationDelay = 5
         session = AgentSession(id: "process:\(name):first", agent: .codex, pid: 42, started: name,
             tty: "/dev/fixture-\(name)", cwd: "/tmp/reply", terminal: .terminal)
         session.phase = .working; session.channel = .terminalScreen

@@ -87,6 +87,8 @@ import TerminalInputSupport
         var lastContact: Date
     }
     private var liveClaudeHooks: [String: LiveClaudeHook] = [:]
+    private var claudeHookSignals: [String: RemoteTerminalChangeSignal] = [:]
+    private var claudeHookWaitTasks: [String: (token: UUID, task: Task<Void, Never>)] = [:]
     private var parentSaveFailed = false
     private let codexQuestions = CodexQuestionCollector()
     private var codexCompletions = CodexCompletionTracker()
@@ -117,6 +119,11 @@ import TerminalInputSupport
     private var records: [ProcessRecord] = []
     private var server: SocketServer?
     private var pollTask: Task<Void, Never>?
+    private var historyPollTask: Task<Void, Never>?
+    private var screenPollTasks: [ScreenHost: Task<Void, Never>] = [:]
+    private var observationEpoch: UInt64 = 0
+    private let historyPollSignal = RemoteTerminalChangeSignal()
+    private let screenPollSignals = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, RemoteTerminalChangeSignal()) })
     private var gitBranchTask: Task<Void, Never>?
     private var peers: [String: SocketConnection] = [:]
     private var bridges: [String: [JSONObject]] = [:]
@@ -160,10 +167,16 @@ import TerminalInputSupport
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
+    /// A brief cancellation window for supported yes/no confirmations. Ordinary
+    /// permission screens are handled immediately; unsafe system changes deny.
+    public var automaticConfirmationDelay: TimeInterval = 0.5
+    private var confirmationDelay: TimeInterval {
+        automaticConfirmationDelay.isFinite ? min(30, max(0, automaticConfirmationDelay)) : 0.5
+    }
     /// Seconds before each automatic continue; repeated capacity failures reuse the final delay.
     public var capacityResumeDelays: [TimeInterval] = [30, 60, 120, 240, 480]
     /// Transient connection failures continue with a bounded delay until progress or cancellation.
-    public var interruptionResumeDelays: [TimeInterval] = [5, 15, 30, 60, 120, 300]
+    public var interruptionResumeDelays: [TimeInterval] = [1, 15, 30, 60, 120, 300]
     /// Authentication/configuration fixes may happen outside the CLI. Keep checking slowly.
     public var accountErrorResumeDelays: [TimeInterval] = [60, 120, 300, 600]
     /// A blocked Goal rechecks external conditions at a slower cadence than a network error.
@@ -344,7 +357,7 @@ import TerminalInputSupport
         }, disconnected: { [weak self] id in
             Task { @MainActor in self?.disconnect(id) }
         })
-        try socket.start(); server = socket
+        try socket.start(); server = socket; observationEpoch &+= 1
         questionAutomationStopped = false
         keepAwakeStopped = false
         mouseActivity.setEnabled(store.value("mouseActivity") == "true")
@@ -368,8 +381,9 @@ import TerminalInputSupport
             }
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
-                    await self?.refresh()
-                    do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { break }
+                    await self?.refreshDiscovery()
+                    self?.startObservationPolling()
+                    do { try await Task.sleep(for: .seconds(4)) } catch { break }
                 }
             }
             // Screen reads can take many seconds; battery, heat and idle checks keep their own pace.
@@ -383,6 +397,9 @@ import TerminalInputSupport
     }
     public func stop() {
         remoteInputStopped = true
+        observationEpoch &+= 1
+        for pending in claudeHookWaitTasks.values { pending.task.cancel() }; claudeHookWaitTasks.removeAll()
+        claudeHookSignals.values.forEach { $0.notify() }; claudeHookSignals.removeAll()
         for pending in ptyContinuationTasks.values { pending.cancel() }
         ptyContinuationTasks.removeAll()
         for observer in ptyLifecycleObservers.values { observer.terminal.removeOutputObserver(observer.token) }
@@ -392,6 +409,8 @@ import TerminalInputSupport
         webQuestions.clear()
         tmuxRelay.stop()
         revision &+= 1; pollTask?.cancel(); pollTask = nil
+        historyPollTask?.cancel(); historyPollTask = nil
+        for task in screenPollTasks.values { task.cancel() }; screenPollTasks.removeAll()
         gitBranchTask?.cancel(); gitBranchTask = nil
         keepAwakeTask?.cancel(); keepAwakeTask = nil
         mouseActivityTask?.cancel(); mouseActivityTask = nil
@@ -1790,8 +1809,17 @@ import TerminalInputSupport
     }
 
     public func refresh() async {
+        await refreshDiscovery()
+        async let questions: Void = refreshCodexHistory()
+        await refreshScreens()
+        await questions
+        publish()
+    }
+
+    private func refreshDiscovery() async {
         guard !discovering else { return }
         discovering = true
+        let epoch = observationEpoch
         defer {
             discovering = false
             if !initialDiscoveryComplete { initialDiscoveryComplete = true }
@@ -1799,22 +1827,83 @@ import TerminalInputSupport
         do {
             let reader = processReader
             let discovered = try await Task.detached(priority: .utility) { try reader() }.value
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             let found = ProcessDiscovery.sessions(discovered)
             let directories = await Task.detached(priority: .utility) {
                 let paths = ProcessDiscovery.workingDirectories(pids: found.map(\.pid))
                 return Dictionary(found.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
             }.value
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             updateDiscovery(found, records: discovered, directories: directories)
             if snapshot.health.discoveryError != nil { snapshot.health.discoveryError = nil }
         } catch {
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             if snapshot.health.discoveryError != error.localizedDescription { snapshot.health.discoveryError = error.localizedDescription }
         }
         refreshGitBranches()
-        let codexTargets = Array(sessions.values).filter { $0.agent == .codex && $0.phase != .ended }
-        async let questions = codexQuestions.collect(codexTargets)
-        await refreshScreens()
-        updateCodexQuestions(await questions)
         publish()
+    }
+
+    private func refreshCodexHistory() async {
+        let epoch = observationEpoch
+        let codexTargets = Array(sessions.values).filter { $0.agent == .codex && $0.phase != .ended }
+        let updates = await codexQuestions.collect(codexTargets)
+        guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
+        updateCodexQuestions(updates)
+    }
+
+    private func pollingTargets(_ host: ScreenHost) -> [AgentSession] {
+        sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
+    }
+
+    private func pollingIdentities() -> [ScreenHost: Set<String>] {
+        Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { host in
+            (host, Set(pollingTargets(host).map { $0.id + ":" + $0.tty + ":" + ($0.screenHandle ?? "") }))
+        })
+    }
+
+    private func screenPollInterval(_ host: ScreenHost) -> TimeInterval {
+        let targets = pollingTargets(host)
+        guard !targets.isEmpty, screenConnections[host]?.enabled == true,
+              screenConnections[host]?.permissionBlocked != true else { return 8 }
+        if targets.contains(where: { userInputHasPriority($0.id) || automaticInputBusy($0.id) }) { return 0.35 }
+        if snapshot.paused || !targets.contains(where: { effectiveAutomatic($0.id) }) { return 4 }
+        if targets.contains(where: { $0.phase == .approval || $0.phase == .input }) { return 0.5 }
+        if targets.contains(where: { capacityStates[$0.id].map { $0.phase == .waiting && $0.deadline.timeIntervalSinceNow <= 2 } == true }) { return 0.5 }
+        if targets.contains(where: { $0.interruption?.needsAttention == true }) { return 2 }
+        return targets.contains(where: { $0.phase == .working || $0.phase == .unknown }) ? 1.5 : 3
+    }
+
+    private func startObservationPolling() {
+        guard pollTask != nil, !remoteInputStopped, !Task.isCancelled else { return }
+        if historyPollTask == nil {
+            let observation = historyPollSignal.observe()
+            historyPollTask = Task { [weak self] in
+                await observation.waitForChange(timeout: 0)
+                while !Task.isCancelled, let self, !self.remoteInputStopped {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    await self.refreshCodexHistory()
+                    let targets = self.sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
+                    let responsive = targets.contains { target in
+                        target.unansweredQuestions.contains(where: { $0.hasLaterUserMessage != true }) ||
+                            self.capacityStates[target.id].map { $0.phase == .waiting && $0.deadline.timeIntervalSinceNow <= 2 } == true
+                    }
+                    let interval: TimeInterval = targets.isEmpty ? 8 : responsive && !self.snapshot.paused ? 1 : 2
+                    await observation.waitForChange(timeout: max(0.1, interval - (ProcessInfo.processInfo.systemUptime - started)))
+                }
+            }
+        }
+        for host in ScreenHost.allCases where screenPollTasks[host] == nil {
+            guard let observation = screenPollSignals[host]?.observe() else { continue }
+            screenPollTasks[host] = Task { [weak self] in
+                await observation.waitForChange(timeout: 0)
+                while !Task.isCancelled, let self, !self.remoteInputStopped {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    if !self.pollingTargets(host).isEmpty { await self.refreshScreenHost(host) }
+                    await observation.waitForChange(timeout: max(0.1, self.screenPollInterval(host) - (ProcessInfo.processInfo.systemUptime - started)))
+                }
+            }
+        }
     }
 
     private func refreshGitBranches() {
@@ -1843,6 +1932,7 @@ import TerminalInputSupport
     public func updateCodexQuestions(_ updates: [CodexQuestionUpdate], at date: Date = Date()) {
         for update in updates {
             guard var session = sessions[update.sessionID], session.agent == .codex, session.phase != .ended else { continue }
+            let previousQuestions = session.queuedQuestions, previousError = session.codexQuestionsError
             session.codexQuestionsError = update.error
             session.completionError = update.completionError ?? (update.turn == nil && !update.completionReadPending ? update.error : nil)
             if let turn = update.turn {
@@ -1859,7 +1949,8 @@ import TerminalInputSupport
             if update.error == nil, let questions = update.questions {
                 let threadID = update.threadID ?? update.turn?.threadID ?? questions.first?.threadID
                     ?? questionThreadBySession[session.id] ?? session.id
-                if questionThreadBySession[session.id] != threadID {
+                let threadChanged = questionThreadBySession[session.id] != threadID
+                if threadChanged {
                     restoredQuestionIDs.formUnion(questions.map(\.id))
                     questionThreadBySession[session.id] = threadID
                 }
@@ -1872,12 +1963,17 @@ import TerminalInputSupport
                     }
                     if let previous = session.questions.first(where: { $0.id == question.id }) {
                         question.reply = previous.isSameRequest(as: question) ? previous.reply : nil
+                        if previous.isSameRequest(as: question) { question.automation = previous.automation }
                     } else {
                         question.reply = savedReply(question.id)
                     }
                     return question
                 }
-                session.codexQuestionsObservedAt = date
+                // Successful reads remain authoritative privately; an unchanged
+                // list must not repaint every window just to tick a timestamp.
+                if session.codexQuestionsObservedAt == nil || session.queuedQuestions != previousQuestions || previousError != nil || threadChanged {
+                    session.codexQuestionsObservedAt = date
+                }
                 readableQuestionSessions.insert(session.id)
             } else {
                 readableQuestionSessions.remove(session.id)
@@ -2056,9 +2152,9 @@ import TerminalInputSupport
         }
         for (id, candidate) in candidates where automaticQuestionReplies[id] == nil && !replyingQuestions.contains(id) {
             let token = UUID()
-            let deadline = Date().addingTimeInterval(5)
+            let delay = confirmationDelay, deadline = Date().addingTimeInterval(confirmationDelay)
             let task = Task { [weak self] in
-                do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
                 guard let self, self.automaticQuestionReplies[id]?.token == token else { return }
                 self.automaticQuestionReplies[id]?.sending = true
                 defer {
@@ -2084,6 +2180,30 @@ import TerminalInputSupport
         try await sendQuestionReply(sessionID: sessionID, questionID: questionID, answer: answer)
     }
 
+    /// Only transient reads before dispatch may be retried. The answer remains
+    /// single-use; an ambiguous write is never part of this recovery loop.
+    private func prepareQuestionReply(_ session: AgentSession, question: QueuedQuestion, automaticToken: UUID?) async throws -> CodexReplyTarget {
+        for attempt in 0...2 {
+            guard !Task.isCancelled, !remoteInputStopped, let current = sessions[session.id], current.phase != .ended,
+                  current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
+                throw AppError.message("세션이나 질문이 바뀌어 전송 전에 멈췄습니다.")
+            }
+            if let token = automaticToken {
+                guard !snapshot.paused, current.automatic, automaticQuestionReplies[question.id]?.token == token,
+                      questionAutomationOverrides[question.id] == nil else { throw CancellationError() }
+            }
+            do { return try await questionTransport.prepare(session, question) }
+            catch {
+                let http = error as? RemoteHTTPError
+                let temporary = (error as? CodexHistoryReadError)?.isTemporary == true ||
+                    (http?.diagnostics?["delivery"] == "not_started" && [408, 429, 500, 502, 503, 504].contains(http?.status ?? 0))
+                guard attempt < 2, temporary else { throw error }
+                try await Task.sleep(for: .milliseconds(attempt == 0 ? 60 : 180))
+            }
+        }
+        throw AppError.message("Codex 응답 경로를 확인하지 못했습니다.")
+    }
+
     /// Queuing acknowledges receipt, not delivery to the running turn.
     /// Uncertain submissions are not retried, including after an app restart.
     private func sendQuestionReply(sessionID: String, questionID: String, answer: String, automaticToken: UUID? = nil) async throws {
@@ -2104,8 +2224,8 @@ import TerminalInputSupport
         do {
             let message = try CodexReplyTransport.message(question: question, answer: answer)
             try setReply(sending, sessionID: sessionID, question: question, persist: false)
-            let target = try await questionTransport.prepare(session, question)
-            guard target.threadID == question.threadID, let current = sessions[sessionID], current.phase != .ended,
+            let target = try await prepareQuestionReply(session, question: question, automaticToken: automaticToken)
+            guard !Task.isCancelled, !remoteInputStopped, target.threadID == question.threadID, let current = sessions[sessionID], current.phase != .ended,
                   current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌었습니다. 목록을 새로고침해주세요.")
             }
@@ -2133,7 +2253,7 @@ import TerminalInputSupport
                 let frame = try await remoteTerminal(sessionID: sessionID, realtime: true)
                 launched = true
                 _ = try await sendOriginalTerminalMessage(session, object: ["text": message, "revision": frame.revision], preflight: {
-                    let verified = try await self.questionTransport.prepare(session, question)
+                    let verified = try await self.prepareQuestionReply(session, question: question, automaticToken: automaticToken)
                     guard verified.threadID == question.threadID,
                           self.sessions[sessionID]?.questions.contains(where: { $0.isSameRequest(as: question) }) == true else {
                         throw RemoteHTTPError(409, "질문이나 대화가 바뀌어 답변하지 않았습니다.")
@@ -2170,6 +2290,8 @@ import TerminalInputSupport
     }
 
     public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil) {
+        let previousPolling = pollingIdentities()
+        let previousCodex = Set(sessions.values.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id))
         self.records = records
         // Ordinary terminals do not belong in the inventory or its status counts.
         let managed = found.filter { value in
@@ -2235,6 +2357,9 @@ import TerminalInputSupport
             }
         }
         synchronizePTYContainers()
+        let nextPolling = pollingIdentities()
+        for host in ScreenHost.allCases where previousPolling[host] != nextPolling[host] { screenPollSignals[host]?.notify() }
+        if previousCodex != Set(sessions.values.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id)) { historyPollSignal.notify() }
         for id in Array(exitRecoveries.keys) where sessions[id]?.phase == .ended { advanceExitRecovery(id,records:records) }
         publish()
     }
@@ -2259,7 +2384,14 @@ import TerminalInputSupport
             saveExitRecoveries()
         }
         publish()
-        if enabled { for member in groupIDs(target) { scheduleSystemSafety(member); scheduleScreenApproval(member) } }
+        if enabled {
+            for member in groupIDs(target) {
+                scheduleSystemSafety(member); scheduleScreenApproval(member)
+                if let current = sessions[member], let host = ScreenHost(kind: current.terminal) { screenPollSignals[host]?.notify() }
+            }
+            historyPollSignal.notify()
+            claudeHookSignals.values.forEach { $0.notify() }
+        }
         Task { await evaluateKeepAwake() }
     }
     public func setPaused(_ paused: Bool) throws {
@@ -2277,6 +2409,8 @@ import TerminalInputSupport
             }
         }
         publish()
+        if !paused { screenPollSignals.values.forEach { $0.notify() }; historyPollSignal.notify() }
+        claudeHookSignals.values.forEach { $0.notify() }
         Task { await evaluateKeepAwake() }
     }
     public func connectTerminal() async { await connectScreenHost(.terminal) }
@@ -2316,14 +2450,16 @@ import TerminalInputSupport
         publish()
     }
     public func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool = false) async {
-        guard let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
+        guard !remoteInputStopped, let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
               Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return }
         screenConnections[host]?.polling = true
+        let epoch = observationEpoch
         let announceConnection = reportConnecting || !snapshot.health.screen(host).connected
         if announceConnection { updateHealth(host) { $0.connecting = true } }
         defer {
             screenConnections[host]?.polling = false
-            if announceConnection { updateHealth(host) { $0.connecting = false } }
+            if observationEpoch != epoch { screenPollSignals[host]?.notify() }
+            else if announceConnection { updateHealth(host) { $0.connecting = false } }
         }
         let targets = sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
@@ -2332,7 +2468,7 @@ import TerminalInputSupport
             let reader = adapter.screens
             let readStartedAt = Date()
             let result = try await Task.detached(priority: .utility) { try reader(requests) }.value
-            guard screenConnections[host]?.enabled == true else { return }
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return }
             let targets = targets.filter { target in
                 guard let current = sessions[target.id], current.phase != .ended,
                       current.pid == target.pid, current.started == target.started,
@@ -2381,6 +2517,7 @@ import TerminalInputSupport
                 publish()
             }
         } catch {
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             // Denied Automation stays blocked until the user reconnects; other failures retry.
             let blocked = error is TerminalAdapterError
             screenConnections[host]?.permissionBlocked = blocked
@@ -2656,13 +2793,14 @@ import TerminalInputSupport
     }
 
     private func bridgeResponse(_ response: JSONObject? = nil) -> JSONObject {
-        if let response { return ["autoapproveBridge": ["response": response]] }
-        return ["autoapproveBridge": ["waiting": true]]
+        if let response { return ["autoapproveBridge": ["response": response, "waitSupported": true]] }
+        return ["autoapproveBridge": ["waiting": true, "waitSupported": true]]
     }
 
     private func saveClaudeReceipt(_ receipt: ClaudeHookReceipt) throws {
         do {
             try store.saveClaudeHook(receipt)
+            if receipt.response != nil { claudeHookSignals[receipt.id]?.notify() }
             snapshot.health.auditError = nil
             if receipt.audit != nil { snapshot.events = store.recent() }
         } catch { snapshot.health.auditError = error.localizedDescription; throw error }
@@ -2717,7 +2855,7 @@ import TerminalInputSupport
         liveClaudeHooks[request.id] = LiveClaudeHook(request: request, receipt: receipt, lastContact: now)
         if request.safetyResponse != nil, effectiveAutomatic(request.sessionID), !snapshot.paused {
             try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
-        } else if request.response != nil, store.value("claudeQuestionEditing:" + request.id) != "true", now.timeIntervalSince(receipt.createdAt) >= 5, effectiveAutomatic(request.sessionID), !snapshot.paused {
+        } else if request.response != nil, store.value("claudeQuestionEditing:" + request.id) != "true", now.timeIntervalSince(receipt.createdAt) >= confirmationDelay, effectiveAutomatic(request.sessionID), !snapshot.paused {
             try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
         }
         if let response = liveClaudeHooks[request.id]?.receipt.response {
@@ -2726,6 +2864,37 @@ import TerminalInputSupport
             return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
         }
         publish()
+        return bridgeResponse()
+    }
+
+    /// Keep the helper's existing socket waiting for its exact saved response.
+    /// Fifteen-second heartbeats retain reconnect/expiry checks without 400ms
+    /// polling. The original confirmation deadline wakes the wait precisely.
+    private func waitForClaudeHook(_ payload: JSONObject) async throws -> JSONObject {
+        guard payload["autoapproveProtocol"] as? Int == 1 else { throw AppError.message("지원하는 Claude 응답 프로토콜이 필요합니다.") }
+        var result = try handleClaudeHook(payload)
+        guard let id = payload["requestID"] as? String,
+              (result["autoapproveBridge"] as? JSONObject)?["waiting"] as? Bool == true,
+              liveClaudeHooks[id] != nil else { return result }
+        let signal = claudeHookSignals[id] ?? RemoteTerminalChangeSignal(); claudeHookSignals[id] = signal
+        let observation = signal.observe(), epoch = observationEpoch, heartbeat = Date().addingTimeInterval(15)
+        await observation.waitForChange(timeout: 0)
+        while !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch {
+            guard let pending = liveClaudeHooks[id] else { return try handleClaudeHook(payload) }
+            if pending.receipt.response != nil { return try handleClaudeHook(payload) }
+            var interval = min(heartbeat, pending.receipt.expiresAt).timeIntervalSinceNow
+            guard interval > 0 else { return try handleClaudeHook(payload) }
+            if pending.request.response != nil, !snapshot.paused, effectiveAutomatic(pending.request.sessionID),
+               store.value("claudeQuestionEditing:" + id) != "true" {
+                let untilConfirmation = pending.receipt.createdAt.addingTimeInterval(confirmationDelay).timeIntervalSinceNow
+                if untilConfirmation > 0 { interval = min(interval, untilConfirmation) }
+            }
+            await observation.waitForChange(timeout: interval)
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return bridgeResponse() }
+            result = try handleClaudeHook(payload)
+            guard (result["autoapproveBridge"] as? JSONObject)?["waiting"] as? Bool == true else { return result }
+            if Date() >= heartbeat { return result }
+        }
         return bridgeResponse()
     }
 
@@ -2824,6 +2993,7 @@ import TerminalInputSupport
     }
 
     private func removeLiveClaudeHook(_ id: String, terminal: Bool = false) {
+        claudeHookSignals.removeValue(forKey: id)?.notify()
         guard let pending = liveClaudeHooks.removeValue(forKey: id) else { return }
         let key = pending.request.sessionID
         if sessions[key]?.phase == .ended { return }
@@ -2864,7 +3034,7 @@ import TerminalInputSupport
                 let risk = item.request.systemCommandRisk
                 return ClaudeApproval(id: item.request.id, summary: item.request.summary, answer: item.request.answer,
                     isQuestion: item.request.isQuestion, sending: item.receipt.response != nil, expiresAt: item.receipt.expiresAt,
-                    automaticAt: automatic && risk == nil && item.request.response != nil && store.value("claudeQuestionEditing:" + item.request.id) != "true" ? item.receipt.createdAt.addingTimeInterval(5) : nil,
+                    automaticAt: automatic && risk == nil && item.request.response != nil && store.value("claudeQuestionEditing:" + item.request.id) != "true" ? item.receipt.createdAt.addingTimeInterval(confirmationDelay) : nil,
                     questions: item.request.questions, systemCommandRisk: risk)
             }
             if let first = pending.first, sessions[id]?.phase != .ended {
@@ -2880,6 +3050,22 @@ import TerminalInputSupport
     private func receive(_ message: JSONObject, from peer: SocketConnection) {
         let method = message["method"] as? String ?? ""
         let params = message["params"] as? JSONObject ?? [:]
+        if method == "hookWait" {
+            guard claudeHookWaitTasks[peer.id] == nil else { _ = peer.send(["error": "이 연결에는 이미 대기 중인 응답이 있습니다."]); return }
+            let token = UUID()
+            let task = Task { @MainActor [weak self] in
+                guard let self else { return }
+                var response: JSONObject
+                do { response = ["result": try await self.waitForClaudeHook(params)] }
+                catch { response = ["error": error.localizedDescription] }
+                guard !Task.isCancelled, self.claudeHookWaitTasks[peer.id]?.token == token else { return }
+                self.claudeHookWaitTasks.removeValue(forKey: peer.id)
+                if let id = message["id"] { response["id"] = id }
+                _ = peer.send(response)
+            }
+            claudeHookWaitTasks[peer.id] = (token, task)
+            return
+        }
         if method == "mcp" {
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -3018,6 +3204,7 @@ import TerminalInputSupport
     }
 
     private func disconnect(_ peerID: String) {
+        claudeHookWaitTasks.removeValue(forKey: peerID)?.task.cancel()
         // Status clients and Claude helpers are short-lived socket connections,
         // not VS Code bridges. Their close cannot change bridge/session state.
         guard peers.removeValue(forKey: peerID) != nil else { return }

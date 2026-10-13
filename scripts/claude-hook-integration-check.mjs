@@ -10,7 +10,8 @@ import { randomUUID } from 'node:crypto';
 const exec = promisify(execFile), binary = path.resolve(process.argv[2] || '.build/release/autoapprove');
 const root = await mkdtemp('/private/tmp/aa-hooks-'), state = path.join(root, 'state'), proxyHome = path.join(root, 'proxy');
 const children = [], connections = new Set();
-let daemon, proxy, dropped = false, diagnostics = '';
+let daemon, proxy, dropped = false, dropApprovalResponse = false, diagnostics = '';
+const helperCalls = [];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function request(method, params = {}) {
   return new Promise((resolve, reject) => {
@@ -73,37 +74,53 @@ try {
   start(holder, [fixture], { cwd: root });
   await startServer();
   const session = await until(async () => (await request('status')).sessions.find(s => s.cwd === root && s.agent === 'claude'), 'inert process');
-  const manual = helper(session, 1), first = await current(session);
-  await delay(5200); assert.equal(manual.ended(), false, 'Manual requests remain available beyond the old timeout');
-  await request('claudeApprove', { sessionID: session.id, requestID: first.id, enableAutomatic: true });
-  assertAnswer(await manual.completion, manual.question);
-
-  const started = Date.now(), next = helper(session, 2);
-  assertAnswer(await next.completion, next.question);
-  assert(Date.now() - started >= 4900, 'The next question gets its own five-second countdown');
-
-  const duringRestart = helper(session, 3);
-  await current(session); await stop(daemon); await delay(1200); await startServer();
-  assertAnswer(await duringRestart.completion, duringRestart.question);
-
-  // Drop exactly the first response containing an approval. The helper must retry its same UUID.
+  // Observe only this fixture's helper traffic; status reads use the direct socket.
   proxy = net.createServer(client => {
     connections.add(client); client.on('close', () => connections.delete(client)); client.on('error', () => {});
     const upstream = net.createConnection(path.join(state, 'bridge.sock'));
     connections.add(upstream); upstream.on('close', () => connections.delete(upstream)); upstream.on('error', () => client.destroy());
+    let requests = '';
+    client.on('data', chunk => {
+      requests += chunk;
+      while (requests.includes('\n')) {
+        const end = requests.indexOf('\n'), message = JSON.parse(requests.slice(0, end)); requests = requests.slice(end + 1);
+        helperCalls.push({method: message.method, requestID: message.params?.requestID});
+      }
+    });
     client.pipe(upstream); let buffer = '';
     upstream.on('data', chunk => {
       buffer += chunk;
       while (buffer.includes('\n')) {
         const end = buffer.indexOf('\n'), line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
         const message = JSON.parse(line);
-        if (!dropped && message.result?.autoapproveBridge?.response?.hookSpecificOutput) { dropped = true; client.destroy(); upstream.destroy(); }
+        if (dropApprovalResponse && !dropped && message.result?.autoapproveBridge?.response?.hookSpecificOutput) { dropped = true; client.destroy(); upstream.destroy(); }
         else client.write(line + '\n');
       }
     });
     client.on('close', () => upstream.destroy());
   });
   await new Promise(resolve => proxy.listen(path.join(proxyHome, 'bridge.sock'), resolve));
+  const manual = helper(session, 1, proxyHome), first = await current(session);
+  await delay(5200); assert.equal(manual.ended(), false, 'Manual requests remain available beyond the old timeout');
+  assert.deepEqual(helperCalls.map(call => call.method), ['hook', 'hookWait'], 'An idle helper keeps one waiting socket rather than repeating 400ms hook reads');
+  assert.equal(new Set(helperCalls.map(call => call.requestID)).size, 1);
+  await request('claudeApprove', { sessionID: session.id, requestID: first.id, enableAutomatic: true });
+  assertAnswer(await manual.completion, manual.question);
+
+  const started = Date.now(), next = helper(session, 2);
+  assertAnswer(await next.completion, next.question);
+  const automaticMilliseconds = Date.now() - started;
+  assert(automaticMilliseconds >= 450 && automaticMilliseconds < 2500, 'A new confirmation keeps its 0.5-second cancellation window and responds promptly');
+
+  await request('pause', { paused: true });
+  const duringRestart = helper(session, 3);
+  await current(session); await stop(daemon); await delay(1200); await startServer();
+  await delay(600); assert.equal(duringRestart.ended(), false, 'A restarted paused app must not approve');
+  await request('pause', { paused: false });
+  assertAnswer(await duringRestart.completion, duringRestart.question);
+
+  // Drop exactly the first response containing an approval. The helper must retry its same UUID.
+  dropApprovalResponse = true;
   const lost = helper(session, 4, proxyHome);
   assertAnswer(await lost.completion, lost.question); assert(dropped);
   const status = await request('status');
@@ -115,7 +132,7 @@ try {
   const handoff = helper(session, 5), pending = await current(session);
   await request('claudeRelease', { sessionID: session.id, requestID: pending.id });
   assert.deepEqual(await handoff.completion, {});
-  console.log('PASS real helper: manual app approval, next automatic response after five seconds, in-flight app restart, dropped response replay exactly once, delivery receipts and terminal handoff');
+  console.log(`PASS real helper: 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts and terminal handoff`);
 } finally {
   for (const socket of connections) socket.destroy();
   if (proxy) await new Promise(resolve => proxy.close(resolve));

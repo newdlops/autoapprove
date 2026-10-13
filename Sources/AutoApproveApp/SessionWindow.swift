@@ -973,7 +973,7 @@ struct QuestionAutomationStatus: View {
         case .scheduled:
             let seconds = max(0, Int(ceil((automation.deadline ?? date).timeIntervalSince(date))))
             return seconds > 0 ? "\(seconds)초 후 자동 응답: \(automation.answer ?? "Yes")" : "자동 응답을 준비하고 있습니다…"
-        case .paused: return "일시정지 중 · 재개하면 5초 후 자동 응답"
+        case .paused: return "일시정지 중 · 재개하면 0.5초 후 자동 응답"
         case .editing: return "직접 답변 · 자동 응답 중지"
         case .cancelled: return "이번 질문의 자동 응답을 취소했습니다"
         case .restored: return "이전에 받은 질문 · 직접 확인해주세요"

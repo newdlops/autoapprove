@@ -122,10 +122,15 @@ extension ApprovalTests {
             session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); return engine
         }
         let frame = blockedGoalFrame(), first = try create()
+        defer { first.stop() }
         try first.setAutomatic(record.key, enabled: true)
         first.receiveScreen(sessionID: record.key, raw: frame, generation: "QA")
         try expectEqual(first.snapshot.sessions.first?.capacityResume?.phase, .scheduled)
-        try await Task.sleep(for: .milliseconds(120))
+        let deliveredBy = ProcessInfo.processInfo.systemUptime + 3
+        while (probe.texts.isEmpty || first.snapshot.sessions.first?.interruption?.resumeConfirmedAt == nil),
+              ProcessInfo.processInfo.systemUptime < deliveredBy {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         try expectEqual(probe.texts, ["/goal resume"])
         try expectEqual(first.snapshot.events.first?.answer, "/goal resume")
         try expectNotNil(first.snapshot.sessions.first?.interruption?.resumeConfirmedAt)
@@ -138,7 +143,12 @@ extension ApprovalTests {
         restored.receiveScreen(sessionID: record.key, raw: next, generation: "QA")
         try expectEqual(restored.snapshot.sessions.first?.capacityResume?.attempt, 2)
         try await Task.sleep(for: .milliseconds(60)); try expectEqual(probe.texts.count, 1, "The repeated blocked run uses the second delay")
-        try await Task.sleep(for: .milliseconds(180)); try expectEqual(probe.texts.count, 2)
+        let nextDeliveredBy = ProcessInfo.processInfo.systemUptime + 3
+        while (probe.texts.count < 2 || restored.snapshot.sessions.first?.capacityResume?.phase != .awaiting),
+              ProcessInfo.processInfo.systemUptime < nextDeliveredBy {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expectEqual(probe.texts.count, 2)
         restored.receiveScreen(sessionID: record.key, raw: "• Rechecked again.\n\n" + next, generation: "QA")
         restored.cancelCapacityResume(record.key)
         try await Task.sleep(for: .milliseconds(250)); try expectEqual(probe.texts.count, 2)

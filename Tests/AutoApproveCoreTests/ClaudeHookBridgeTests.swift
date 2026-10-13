@@ -24,6 +24,7 @@ private func bridgeWaiting(_ value: JSONObject) -> Bool { (value["autoapproveBri
 private func bridgeAnswer(_ value: JSONObject) -> JSONObject? { (value["autoapproveBridge"] as? JSONObject)?["response"] as? JSONObject }
 @MainActor private func hookEngine(_ paths: AppPaths, processes: HookProcesses = HookProcesses()) throws -> ApprovalEngine {
     let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { _ in [] }, processReader: { processes.records })
+    engine.automaticConfirmationDelay = 5
     engine.updateDiscovery(ProcessDiscovery.sessions(processes.records), records: processes.records)
     return engine
 }

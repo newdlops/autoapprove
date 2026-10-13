@@ -82,8 +82,12 @@ try {
     const value = await response.json(); assert.equal(response.status, 200, value.error); return value;
   }
   const pty = await ptyPost('/api/pty', {cwd:home,program:'shell',columns:80,rows:24}), clientID = randomUUID();
+  // Establish the stream offset before input. An initial ANSI screen snapshot
+  // uses cursor positioning rather than literal newlines; verify new live bytes.
+  const initialOutput = await fetch(url + '/api/pty/output?' + new URLSearchParams({pty:pty.ptyID,stream:pty.streamID}), {signal:AbortSignal.timeout(5000)});
+  assert.equal(initialOutput.status,200);
+  let ptyText = '', offset = (await initialOutput.json()).offset;
   await ptyPost('/api/pty/input', {ptyID:pty.ptyID,streamID:pty.streamID,clientID,sequence:1,data:Buffer.from("printf 'PACKAGED-PTY-OK\\n'\r").toString('base64')});
-  let ptyText = '', offset;
   for (let attempt = 0; attempt < 20 && !/PACKAGED-PTY-OK\r?\n/.test(ptyText); attempt++) {
     const response = await fetch(url + '/api/pty/output?' + new URLSearchParams({pty:pty.ptyID,stream:pty.streamID,...(offset == null ? {} : {offset:String(offset)})}), {signal:AbortSignal.timeout(5000)});
     assert.equal(response.status,200); const value = await response.json(); offset = value.offset; ptyText += Buffer.from(value.data,'base64').toString();

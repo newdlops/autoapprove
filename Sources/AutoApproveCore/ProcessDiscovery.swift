@@ -17,6 +17,8 @@ public enum CommandRunner {
         let stdout = Pipe(), stderr = Pipe(), stdin = input.map { _ in Pipe() }
         process.standardOutput = stdout; process.standardError = stderr
         if let stdin { process.standardInput = stdin }
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         try process.run()
         if let stdin, let input {
             DispatchQueue.global().async {
@@ -30,9 +32,11 @@ public enum CommandRunner {
         DispatchQueue.global().async { out = stdout.fileHandleForReading.readDataToEndOfFile(); group.leave() }
         group.enter()
         DispatchQueue.global().async { err = stderr.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.002) }
-        if process.isRunning { process.terminate(); throw AppError.message("명령 응답 시간이 초과되었습니다: \(URL(fileURLWithPath: executable).lastPathComponent)") }
+        let finished = exited.wait(timeout: .now() + max(0, timeout))
+        if finished == .timedOut && process.isRunning {
+            process.terminate()
+            throw AppError.message("명령 응답 시간이 초과되었습니다: \(URL(fileURLWithPath: executable).lastPathComponent)")
+        }
         group.wait()
         return CommandResult(output: String(decoding: out, as: UTF8.self), error: String(decoding: err, as: UTF8.self), status: process.terminationStatus)
     }
