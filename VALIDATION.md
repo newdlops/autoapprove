@@ -9,7 +9,7 @@
 - UI Design Workflow로 기존 구성·토큰·버튼/링크·초점/터치 크기를 유지했고 관련 Web Interface Guidelines의 상태·탐색·초점·오류·내용/overflow 기준을 검토했다. 전체 기존 인터페이스의 감사 완료를 주장하지 않는다. Swift 실행 코드는 0.2.85와 동일하며 **258/258** 전체 Core는 그 버전에서 수행한 기록이다. 이번 리소스 수정에서 전체 Core를 새로 실행했다고 표시하지 않는다.
 - 실제 이 Mac의 Wi-Fi 주소 `/api/inventory`는 HTTP 200·458,156바이트·약 15ms 응답이다. 이 Mac에서 사용자가 알려준 다른 Mac으로 가는 TCP 8765는 여러 차례 시간 초과이고, en0 경로 확인 및 Wi-Fi 인터페이스를 명시한 읽기에서도 같다. 휴대폰에서 해당 Mac의 페이지가 열린다는 사용자 보고와 구분한다. 회사 보안 정책이나 VPN이 원인인지는 확정하지 않았으며 설정을 변경하지 않았다. 양방향 물리 Mac/휴대폰 종단 연결은 이번 합성 시험의 결과로 대체하지 않는다.
 - 최종 release 리소스 빌드·기존 발행자 서명·입력 서비스 메타데이터/상호 서명·재배치한 웹/MCP/명시적 입력/PTY/포트/설정 복원·DMG 마운트/파일 일치/무결성 검사 통과. 로컬 **0.2.86/110** 설치 전후 원본 CLI **20개** PID·시작·TTY, 설정·기존 승인 기록 **16,245건**, root 입력 서비스 프로세스·파일을 보존했다. 직접 입력 지원 **20개**, 숫자 LAN 주소와 설치된 JS 자산의 원문 일치를 확인했다. 다른 Mac은 연결 해제여서 **0.2.86 적용 미확인**이다.
-- DMG **9,118,410바이트**, SHA-256 **41d75bbf89d462e00c184ab9252ae7d5d6a12221565dc49422124ddbf0e22146**. 비공개 배포·검증 경로는 `.runtime/releases/0.2.86/peer-connection-110/`, `dist/qa/peer-session/`, `dist/qa/terminal-connection/`다. GitHub 게시·인증 없는 다운로드 검증은 후속으로 기록한다.
+- [GitHub v0.2.86](https://github.com/newdlops/autoapprove/releases/tag/v0.2.86)의 정식 최신 릴리스와 소스 태그 `e866aa82e5ff5089f2591724dc1ecc576a3f73dd`, DMG·체크섬 두 파일을 확인했다. 인증 없는 실제 다운로드가 검증한 파일의 바이트·크기·체크섬과 일치했다. DMG **9,118,410바이트**, SHA-256 **41d75bbf89d462e00c184ab9252ae7d5d6a12221565dc49422124ddbf0e22146**. 비공개 배포·검증 경로는 `.runtime/releases/0.2.86/peer-connection-110/`, `dist/qa/peer-session/`, `dist/qa/terminal-connection/`이며 게시 확인은 `github-verification.json`에 둔다. 게시 후 다른 Mac의 읽기 전용 HTTP 재확인도 TCP 연결 시간 초과여서 적용·실제 종단 연결은 미확인으로 유지한다.
 
 ## 0.2.85 긴 터미널 출력과 UI 응답 · 빌드 109
 
