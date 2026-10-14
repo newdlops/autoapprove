@@ -159,6 +159,10 @@ async function ensurePTY() {
   ptyClient.sessionKey = item.key;
 }
 const currentNode = () => nodes.find(node => node.id === selectedItem?.node.id);
+// A subscription that has not received its first frame is still independent of
+// the inventory read. Retaining it grants no input or connected capability.
+const originalReadSelected = () => !!selectedItem && !selectedItem.view.pty && !sessionEnded(selectedItem)
+  && terminalStreamFailed !== selectedKey && terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration;
 const originalStreamSelected = () => !!selectedItem && !selectedItem.view.pty && !sessionEnded(selectedItem)
   && latestFrame?.sessionID === selectedItem.session.id && terminalStreamFailed !== selectedKey
   && (terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration || inputInFlight);
@@ -583,8 +587,14 @@ async function refreshNetwork(initial = false) {
   try {
     const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
     const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network');
-    connected = true; nodes = result.nodes; lastNetworkStartedAt = startedAt;
-    const inventory = nodes.flatMap(node => node.online ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []);
+    connected = true;
+    const previousNodes = new Map(nodes.map(node => [node.id,node]));
+    // A partial response means the read is pending, not that the peer's original
+    // sessions ended. Keep its last inventory, without claiming it is online.
+    nodes = result.nodes.map(node => node.loading && !node.state && previousNodes.get(node.id)?.state
+      ? {...node,state:previousNodes.get(node.id).state} : node);
+    lastNetworkStartedAt = startedAt;
+    const inventory = nodes.flatMap(node => node.online || node.loading && node.state ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []);
     const continuation = inventory.find(item => item.key === selectedKey)?.session.interruption?.resumedSessionID;
     const recovered = continuation && inventory.find(item => item.node.id === selectedItem?.node.id && item.session.id === continuation && !sessionEnded(item));
     for (const item of allSessions) {
@@ -593,9 +603,9 @@ async function refreshNetwork(initial = false) {
     }
     allSessions = reconcilePTYInventory(inventory);
     const unavailable = nodes.find(node => node.id === selectedItem?.node.id && !node.online);
-    // A peer's inventory can time out while its independently verified SSE
-    // remains live. Retain only that selection; online session removal is final.
-    if (unavailable && originalStreamSelected() && !allSessions.some(item => item.key === selectedKey)) {
+    // A peer's inventory can time out before its first independent terminal
+    // frame arrives. Keep that selected read; online session removal is final.
+    if (unavailable && (originalReadSelected() || originalStreamSelected()) && !allSessions.some(item => item.key === selectedKey)) {
       allSessions.push({...selectedItem, node:{...selectedItem.node, ...unavailable, state:selectedItem.node.state}});
     }
     lastNetworkUpdate = result.updatedAt;
@@ -615,7 +625,14 @@ async function refreshNetwork(initial = false) {
         if (node) selectedItem.node = node;
         ptyRetained.set(selectedKey, selectedItem); renderDetail();
       }
-      else if (selectedItem) { show($('session-ended'), true); latestFrame = null; frameController?.abort(); stopTerminalStream(); stopDirect(); stopPTY(); terminalState('error', currentNode()?.online ? '세션 종료' : '연결 끊김'); updateControls(); }
+      else if (selectedItem) {
+        const ended = !!currentNode()?.online;
+        show($('session-ended'), true);
+        text($('session-ended'), ended ? '이 Mac에서 원본 세션이 종료되었거나 목록에서 제거됐습니다. 다른 세션을 선택해주세요.' : '원본 Mac 연결을 확인하지 못했습니다. 연결되면 같은 세션을 다시 확인합니다.');
+        if (ended) { text($('session-phase'),'종료'); $('session-phase').dataset.phase='ended'; }
+        latestFrame = null; frameController?.abort(); stopTerminalStream(); stopDirect(); stopPTY();
+        terminalState('error', ended ? '세션 종료' : '연결 끊김'); updateControls();
+      }
       else restoreSelection();
     } else restoreSelection();
     renderInteractions();
@@ -652,7 +669,7 @@ function renderMachines() {
     const status = row.querySelector('.machine-status');
     status.className = 'machine-status ' + (!node.online || !connected ? '' : node.state.snapshot.paused ? 'paused' : 'online');
     const activeCount = node.state?.sessions?.filter(view => !sessionEnded({session:view.session, view}) && !sessionEnded(ptyRetained.get(keyFor(node, view.session, view)))).length || 0;
-    text(status, !connected ? '연결 확인 필요' : node.loading ? '세션 확인 중…' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
+    text(status, !connected ? '연결 확인 필요' : node.loading ? node.state ? `${activeCount}개 세션 · 갱신 중…` : '세션 확인 중…' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
     status.title = node.error || '';
     const button = row.lastChild; text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
@@ -782,7 +799,7 @@ function renderNodeFilter() {
     let option = Array.from(select.options).find(item => item.value === node.id);
     if (!option) { option = make('option'); option.value = node.id; select.append(option); }
     const release = [node.state?.release, node.release].find(value => versionNumbers(value));
-    text(option, node.name + (release ? ` · v${release.version}` : '') + (node.online ? '' : ' · 끊김'));
+    text(option, node.name + (release ? ` · v${release.version}` : '') + (node.loading ? ' · 확인 중' : node.online ? '' : ' · 끊김'));
     option.title = `${node.name} · ${machineVersionLabel(node)}`;
   }
   select.value = value;
@@ -889,8 +906,37 @@ function renderDetail() {
   }
   renderQuestions(); renderHistory(); updateControls();
 }
+function originalPageURL(item, pageURL = location.href) {
+  if (!item || item.node.local || item.view.pty || sessionEnded(item)) return null;
+  const current = (()=>{try{return new URL(pageURL);}catch(_){return null;}})();
+  const localPage = current && (current.hostname === 'localhost' || current.hostname.startsWith('127.'));
+  const candidates = [];
+  for (const address of item.node.state?.webURLs || []) {
+    try {
+      const url = new URL(address), parts = url.hostname.split('.').map(Number);
+      const numeric = /^\d+\.\d+\.\d+\.\d+$/.test(url.hostname) && parts.every(n=>Number.isInteger(n)&&n>=0&&n<=255);
+      const privateHost = numeric && (parts[0]===10 || parts[0]===192&&parts[1]===168 || parts[0]===172&&parts[1]>=16&&parts[1]<=31 || parts[0]===169&&parts[1]===254 || localPage&&parts[0]===127);
+      if (url.protocol!=='http:' || !privateHost || url.username || url.password || !['','/'].includes(url.pathname)
+        || !Number.isInteger(item.node.state?.webPort) || Number(url.port||80)!==item.node.state.webPort) continue;
+      url.search = new URLSearchParams({webNode:item.node.id}).toString();
+      url.hash = new URLSearchParams({node:item.node.id,session:item.session.id}).toString();
+      const sharedSubnet = current?.hostname.split('.').slice(0,3).join('.')===url.hostname.split('.').slice(0,3).join('.');
+      candidates.push({url,sharedSubnet});
+    } catch (_) {}
+  }
+  return candidates.sort((a,b)=>Number(b.sharedSubnet)-Number(a.sharedSubnet))[0]?.url || null;
+}
+function updateTerminalRecovery() {
+  const link = $('terminal-direct-page'), url = originalPageURL(selectedItem);
+  const available = !!url && allSessions.some(item=>item.key===selectedKey) && (!latestFrame || terminalStream?.reconnecting || !currentNode()?.online || document.activeElement===link);
+  show(link,available);show($('terminal-direct-help'),available);
+  if (available) { link.href=url.href;link.setAttribute('aria-label',`${selectedItem.node.name}의 같은 세션을 새 탭에서 열기`); }
+  else link.removeAttribute('href');
+  show($('terminal-recovery-actions'),!$('terminal-retry').hidden || available);
+}
 function updateControls() {
   updateInteractionControls();
+  updateTerminalRecovery();
   if (!selectedItem) return;
   renderNativeDisplay();
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
@@ -1058,8 +1104,8 @@ async function readTerminalFallback(stream) {
       failTerminalStream(stream, error.message); return;
     }
     stream.pollFailures++; stream.reconnecting = true;
-    terminalState('pending', '다시 연결 중…');
-    text($('terminal-error'), '터미널 연결을 다시 확인하고 있습니다. 마지막 화면은 유지됩니다.');
+    terminalState('pending', latestFrame ? '다시 연결 중…' : '첫 화면 연결 지연');
+    text($('terminal-error'), latestFrame ? '터미널 연결을 다시 확인하고 있습니다. 마지막 화면은 유지됩니다.' : '원본 Mac의 첫 화면을 아직 받지 못했습니다. 자동으로 재연결 중이며, 원본 Mac에서 직접 열 수도 있습니다.');
     show($('terminal-error'), !latestFrame); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
     updateControls();
   } finally {
@@ -1082,9 +1128,10 @@ function reconnectTerminalStream(stream) {
   // A failed stream must not invalidate a fresh, successful fallback read.
   stream.reconnecting ||= !latestFrame || performance.now() - terminalFrameReceivedAt >= 3000;
   if (stream.reconnecting) {
-    terminalState('pending', '재연결 중…');
-    text($('terminal-error'), '네트워크 연결이 끊겨 원래 터미널에 다시 연결하고 있습니다.');
-    show($('terminal-error'), false); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
+    const firstDelayed = !latestFrame && stream.pollFailures > 0;
+    terminalState('pending', firstDelayed ? '첫 화면 연결 지연' : '재연결 중…');
+    text($('terminal-error'), firstDelayed ? '원본 Mac의 첫 화면을 아직 받지 못했습니다. 자동으로 재연결 중이며, 원본 Mac에서 직접 열 수도 있습니다.' : '네트워크 연결이 끊겨 원래 터미널에 다시 연결하고 있습니다.');
+    show($('terminal-error'), firstDelayed); text($('terminal-retry'), '지금 다시 연결'); show($('terminal-retry'), true);
   }
   updateControls();
   void readTerminalFallback(stream);
