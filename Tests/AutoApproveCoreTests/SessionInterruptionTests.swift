@@ -182,6 +182,8 @@ extension ApprovalTests {
             let subject = try engine(); try subject.setAutomatic(record.key,enabled:true)
             subject.receiveScreen(sessionID:record.key,raw:frame,generation:"QA")
             try expectEqual(subject.snapshot.sessions.first?.interruption?.kind,.transport)
+            try subject.markNotificationsRead(record.key, interruptionID: subject.snapshot.sessions.first!.interruption!.id)
+            try expectNotNil(subject.snapshot.sessions.first?.interruption?.acknowledgedAt)
             try await Task.sleep(for:.milliseconds(250))
             try expectEqual(probe.count,1); try expectEqual(subject.snapshot.sessions.first?.capacityResume?.phase,.review)
             subject.stop()

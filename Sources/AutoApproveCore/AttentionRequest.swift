@@ -44,7 +44,7 @@ public struct AttentionRequest: Equatable, Identifiable {
             failures.append(Candidate(key: "systemSafety:" + safety.id, summary: safety.risk.title + " · " + safety.message,
                 sourceSessionID: session.id, sourceKey: "systemSafety:" + safety.id, kind: .systemChange))
         }
-        if let error = session.interruption, error.needsAttention {
+        if let error = session.interruption, error.needsAttention, error.acknowledgedAt == nil {
             failures.append(Candidate(key: "interruption:" + error.id, summary: error.kind.title + " · " + error.detail,
                 sourceSessionID: session.id, sourceKey: "interruption:" + error.id, kind: .interruption))
         }

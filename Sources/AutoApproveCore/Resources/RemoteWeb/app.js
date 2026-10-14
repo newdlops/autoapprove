@@ -164,7 +164,11 @@ const originalStreamSelected = () => !!selectedItem && !selectedItem.view.pty &&
   && (terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration || inputInFlight);
 const originalTerminalConnected = () => !!currentNode()?.online || originalStreamSelected();
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-const needsReview = session => !!session.interruption && session.interruption.recoveredAt == null || ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
+const unreadInterruption = session => !!session.interruption && session.interruption.recoveredAt == null && session.interruption.acknowledgedAt == null;
+const retainedError = item => item.session.phase === 'ended' && !!item.session.interruption && !unreadInterruption(item.session);
+const needsReview = session => unreadInterruption(session) || ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
+const interruptionReads = new Set();
+const interruptionReadKey = item => item.key + '/' + item.session.interruption?.id;
 const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
 const byteLength = value => new TextEncoder().encode(value).length;
 const bundledWebVersion = document.querySelector('meta[name="autoapprove-web-version"]')?.content.split(':');
@@ -718,7 +722,7 @@ function interruptionStatus(session) {
   return `${states[recovery.phase] || '복구 상태 확인 중'}${recovery.deadline ? ` · ${nowLabel(recovery.deadline)} 다시 시도` : ''}`;
 }
 function renderInterruptions() {
-  const active = allSessions.filter(item => item.session.interruption && item.session.interruption.recoveredAt == null);
+  const active = allSessions.filter(item => unreadInterruption(item.session));
   const keys = new Set(active.map(item => item.key));
   for (const [key,row] of interruptionRows) if (!keys.has(key)) { row.remove(); interruptionRows.delete(key); }
   show($('session-interruptions'), active.length > 0);
@@ -729,14 +733,43 @@ function renderInterruptions() {
       row = make('article','interruption-row'); const info = make('div');
       info.append(make('p','interruption-name'),make('p','small interruption-state'));
       const details = make('details'); details.append(make('summary','','오류 내용'),make('p','small interruption-detail')); info.append(details);
+      const actions = make('div','interruption-actions');
       const button = make('button','secondary','세션 보기'); button.addEventListener('click',()=>selectSession(item.key,true));
-      row.append(info,button); interruptionRows.set(item.key,row); $('interruption-list').append(row);
+      const read = make('button','secondary interruption-read','확인했음'); read.addEventListener('click',()=>void acknowledgeInterruption(allSessions.find(value=>value.key===item.key)));
+      actions.append(button,read); row.append(info,actions); interruptionRows.set(item.key,row); $('interruption-list').append(row);
     }
     text(row.querySelector('.interruption-name'), `${item.node.name} · ${item.view.title} · ${agents[item.session.agent]}`);
     text(row.querySelector('.interruption-state'), interruptionStatus(item.session) + (!item.node.online ? ' · Mac 연결 끊김' : ''));
     text(row.querySelector('.interruption-detail'), item.session.interruption.detail);
-    row.lastChild.setAttribute('aria-label',`${item.node.name}의 중단된 ${item.view.title} 세션 보기`);
+    const [view,read] = row.querySelectorAll('button');
+    view.setAttribute('aria-label',`${item.node.name}의 중단된 ${item.view.title} 세션 보기`);
+    read.setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 오류 확인했음`);
+    const pending = interruptionReads.has(interruptionReadKey(item));
+    const supportsReceipt = supportsRelease(item.node,[0,2,84,108]);
+    text(read,pending ? '확인 중…' : '확인했음'); read.disabled = pending || !connected || !item.node.online || !supportsReceipt;
+    read.setAttribute('aria-busy',String(pending));
+    read.title = !item.node.online ? 'Mac에 다시 연결한 뒤 확인 상태를 저장할 수 있습니다.' : !supportsReceipt ? '이 Mac을 0.2.84 이상으로 업데이트하면 오류 확인 상태를 저장할 수 있습니다.' : '오류 알림을 정리합니다. 자동 이어가기는 유지됩니다.';
   }
+}
+async function acknowledgeInterruption(item) {
+  if (!item || !item.node.online || !connected || !supportsRelease(item.node,[0,2,84,108]) || !unreadInterruption(item.session)) return;
+  const key = interruptionReadKey(item), errorID = item.session.interruption.id;
+  if (interruptionReads.has(key)) return;
+  const restoreFocus = interruptionRows.get(item.key)?.querySelector('.interruption-read') === document.activeElement;
+  interruptionReads.add(key); renderInterruptions();
+  try {
+    await api(endpoint('/api/action',item.node.id),{action:'read',sessionID:item.session.id,interruptionID:errorID,requestID:uuid()});
+    // Reflect only the successfully saved receipt for this exact episode. A
+    // newer error received while the POST ran must still attract attention.
+    for (const current of [...allSessions,selectedItem].filter(Boolean)) {
+      if (current.key === item.key && current.session.interruption?.id === errorID) current.session.interruption.acknowledgedAt = new Date().toISOString();
+    }
+    renderInterruptions(); renderList();
+    if (restoreFocus && document.activeElement === document.body && !interruptionRows.has(item.key)) ($('interruption-list').querySelector('button') || $('session-list').querySelector('button') || $('search')).focus({preventScroll:true});
+    if ($('feedback').dataset.error === 'true' && $('feedback').textContent.startsWith('오류 확인 상태를 저장하지 못했습니다.')) feedback('오류 확인 상태를 저장했습니다.');
+    void refreshNetwork();
+  } catch (error) { feedback('오류 확인 상태를 저장하지 못했습니다. '+error.message+' Mac 연결을 확인한 뒤 다시 눌러주세요.',true); }
+  finally { interruptionReads.delete(key); renderInterruptions(); }
 }
 function machineVersionLabel(node) {
   const release = [node.state?.release, node.release].find(value => versionNumbers(value));
@@ -756,7 +789,8 @@ function renderNodeFilter() {
 }
 function renderList() {
   const query = $('search').value.trim().toLocaleLowerCase();
-  const visible = allSessions.filter(({ node, view, session }) => ($('node-filter').value === 'all' || node.id === $('node-filter').value)
+  const available = allSessions.filter(item => !retainedError(item));
+  const visible = available.filter(({ node, view, session }) => ($('node-filter').value === 'all' || node.id === $('node-filter').value)
     && (filter !== 'review' || needsReview(session)) && (filter !== 'automatic' || session.automatic)
     && [view.title, session.cwd, session.terminalTitle, session.customization?.note, session.gitBranch?.name, node.name, agents[session.agent]].filter(Boolean).join(' ').toLocaleLowerCase().includes(query));
   const visibleKeys = new Set(visible.map(item => item.key));
@@ -780,7 +814,7 @@ function renderList() {
   }
   text($('session-count'), `${visible.length}개`);
   show($('list-empty'), !visible.length);
-  text($('list-empty'), allSessions.length ? '검색이나 필터에 맞는 세션이 없습니다.' : nodes.some(node => node.online) ? '감지된 세션이 없습니다. Mac에서 Claude Code 또는 Codex를 실행하세요.' : '연결된 Mac이 없습니다. 네트워크와 웹 접속 설정을 확인해주세요.');
+  text($('list-empty'), available.length ? '검색이나 필터에 맞는 세션이 없습니다.' : nodes.some(node => node.online) ? '감지된 세션이 없습니다. Mac에서 Claude Code 또는 Codex를 실행하세요.' : '연결된 Mac이 없습니다. 네트워크와 웹 접속 설정을 확인해주세요.');
 }
 function selectSession(key, focus = false) {
   const item = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!item) return;
@@ -806,6 +840,7 @@ function selectSession(key, focus = false) {
   history.replaceState(null, '', `#${hash}`);
   void refreshFrame();
   renderList(); renderDetail();
+  if (focus) void acknowledgeInterruption(item);
   if (focus) { $(document.body.classList.contains('terminal-focus') ? 'terminal-heading' : 'session-title').focus({ preventScroll: true }); if (window.innerWidth < 760) window.scrollTo(0, 0); }
 }
 function restoreSelection() {

@@ -32,6 +32,8 @@ public struct SessionInterruption: Codable, Equatable {
     public var processEnded: Bool = false
     public var resumedSessionID: String?
     public var recoveredAt: Date?
+    /// A read receipt only; acknowledging a failure never cancels its recovery.
+    public var acknowledgedAt: Date?
     public var resumeUncertain: Bool?
     public var resumeIdentity: String?
     public var resumeCommand: String?

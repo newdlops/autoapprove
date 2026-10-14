@@ -7,6 +7,92 @@ private let koreanInput: JSONObject = ["questions": [["header": "확인", "multi
     "question": "계속 진행할까요?"]]]
 
 extension ApprovalTests {
+    func testInterruptionReadSurvivesStaleExitCacheAndRejectsNewErrors() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-error-read-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(directory: root)
+        try paths.prepare()
+        let store = try AuditStore(path: paths.database)
+        var session = AgentSession(id: "process:42:fixture", agent: .codex, pid: 42, started: "fixture", tty: "/dev/test", cwd: "/tmp/qa", terminal: .terminal)
+        session.phase = .ended
+        session.interruption = SessionInterruption(id: "current-error", kind: .transport, detail: "network error")
+        var inbox = SessionInbox()
+        let key = SessionNotice.key(.question, "interruption:current-error")
+        let candidate = SessionInbox.Candidate(key: key, kind: .question, summary: "network error", isInterruption: true)
+        inbox.update([candidate], at: Date().addingTimeInterval(-2)); inbox.update([candidate])
+        session.notices = inbox.entries
+        try store.setValues(["interruptedSessionNotices": String(decoding: JSONEncoder().encode([session]), as: UTF8.self),
+            "inbox:\(session.id)": String(decoding: JSONEncoder().encode(inbox), as: UTF8.self), "unrelated-setting": "preserve"])
+        let engine = try ApprovalEngine(paths: paths)
+        engine.refreshNotices()
+        try expectEqual(engine.snapshot.sessions.first?.unreadNoticeCount, 1)
+        let history = store.recent()
+        _ = try await engine.remoteAction(["action": "read", "sessionID": session.id, "interruptionID": "current-error"])
+        let acknowledged = engine.snapshot.sessions.first!
+        try expectNotNil(acknowledged.interruption?.acknowledgedAt)
+        try expect(acknowledged.interruption?.needsAttention == true, "Read receipts cannot claim recovery or cancel it")
+        try expect(!acknowledged.needsReview)
+        try expectEqual(acknowledged.unreadNoticeCount, 0)
+        try expectEqual(store.recent(), history)
+        try expectEqual(store.value("unrelated-setting"), "preserve")
+        let restarted = try ApprovalEngine(paths: paths)
+        restarted.refreshNotices()
+        try expectEqual(restarted.snapshot.sessions.first?.interruption?.acknowledgedAt, acknowledged.interruption?.acknowledgedAt)
+        try expectEqual(restarted.snapshot.sessions.first?.unreadNoticeCount, 0)
+        try expect(AttentionRequest.candidates(restarted.snapshot.sessions.first!, paused: false).isEmpty)
+        // The exit cache still carries the old unread error; the current receipt
+        // wins on restart, while a different episode never inherits it.
+        session.interruption = SessionInterruption(id: "new-error", kind: .transport, detail: "network error")
+        session.notices = nil
+        try store.set("interruptedSessionNotices", String(decoding: JSONEncoder().encode([session]), as: UTF8.self))
+        let next = try ApprovalEngine(paths: paths)
+        next.refreshNotices()
+        try expectNil(next.snapshot.sessions.first?.interruption?.acknowledgedAt)
+        do {
+            _ = try await next.remoteAction(["action": "read", "sessionID": session.id, "interruptionID": "current-error"])
+            throw AppError.message("A stale error receipt was accepted")
+        } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        try expectNil(next.snapshot.sessions.first?.interruption?.acknowledgedAt)
+        try expect(next.snapshot.sessions.first?.needsReview == true)
+    }
+
+    func testLegacyInterruptionReceiptRestoresOnlyTheExactEpisode() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-legacy-error-read-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(directory: root)
+        try paths.prepare()
+        let store = try AuditStore(path: paths.database)
+        var sessions = [AgentSession]()
+        for (index, errorID) in ["old-error", "new-error"].enumerated() {
+            var session = AgentSession(id: "process:\(42 + index):fixture", agent: .codex, pid: Int32(42 + index), started: "fixture", tty: "/dev/test\(index)", cwd: "/tmp/qa", terminal: .terminal)
+            session.phase = .ended
+            session.interruption = SessionInterruption(id: errorID, kind: .transport, detail: "network error")
+            var inbox = SessionInbox()
+            let candidate = SessionInbox.Candidate(key: SessionNotice.key(.question, "interruption:old-error"), kind: .question, summary: "network error", isInterruption: true)
+            inbox.update([candidate], at: Date().addingTimeInterval(-2)); inbox.update([candidate]); inbox.markRead()
+            try store.set("inbox:\(session.id)", String(decoding: JSONEncoder().encode(inbox), as: UTF8.self))
+            sessions.append(session)
+        }
+        try store.set("interruptedSessionNotices", String(decoding: JSONEncoder().encode(sessions), as: UTF8.self))
+        let engine = try ApprovalEngine(paths: paths)
+        engine.refreshNotices()
+        try expectNotNil(engine.snapshot.sessions.first { $0.id == sessions[0].id }?.interruption?.acknowledgedAt)
+        try expectNil(engine.snapshot.sessions.first { $0.id == sessions[1].id }?.interruption?.acknowledgedAt)
+    }
+
+    func testInterruptionReadFailureDoesNotHideTheError() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-error-read-failure-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(directory: root), engine = try ApprovalEngine(paths: paths)
+        var session = AgentSession(id: "process:42:fixture", agent: .codex, pid: 42, started: "fixture", tty: "/dev/test", cwd: "/tmp/qa", terminal: .terminal)
+        session.interruption = SessionInterruption(id: "error", kind: .transport, detail: "network error")
+        engine.updateDiscovery([session], records: [])
+        _ = try CommandRunner.run("/usr/bin/sqlite3", [paths.database, "DROP TABLE settings"])
+        try expectThrows(try engine.markNotificationsRead(session.id, interruptionID: "error"))
+        try expectNil(engine.snapshot.sessions.first?.interruption?.acknowledgedAt)
+        try expect(engine.snapshot.sessions.first?.needsReview == true)
+    }
+
     func testClaudeDisconnectionPersistsOffAndRejectsFailedSave() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-disconnect-save-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -322,14 +322,16 @@ import TerminalInputSupport
             for var value in values.suffix(100) where value.session.interruption?.needsAttention == true &&
                 Date().timeIntervalSince(value.session.interruption?.date ?? .distantPast) < 7 * 86400 {
                 if value.state == "launching" { value.state = "review"; value.session.interruption?.recoveryStatus = "review" }
+                restoreNotificationReceipts(&value.session)
                 value.session.phase = .ended; value.session.channel = .none; value.session.automatic = false
                 sessions[value.session.id] = value.session; exitRecoveries[value.session.id] = value
             }
         }
         if let saved = store.value("interruptedSessionNotices"),
            let values = try? JSONDecoder().decode([AgentSession].self,from:Data(saved.utf8)) {
-            for value in values.suffix(100) where sessions[value.id] == nil && value.interruption?.needsAttention == true &&
+            for var value in values.suffix(100) where sessions[value.id] == nil && value.interruption?.needsAttention == true &&
                 Date().timeIntervalSince(value.interruption?.date ?? .distantPast) < 7 * 86400 {
+                restoreNotificationReceipts(&value)
                 sessions[value.id] = value
             }
         }
@@ -1428,7 +1430,7 @@ import TerminalInputSupport
             guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "자동 승인 값을 지정해주세요.") }
             try setAutomatic(id, enabled: enabled)
         case "reveal": _ = try await reveal(session)
-        case "read": try markNotificationsRead(id)
+        case "read": try markNotificationsRead(id, interruptionID: object["interruptionID"] as? String)
         case "claudeApprove", "claudeRelease":
             guard let request = object["requestIDForApproval"] as? String else { throw RemoteHTTPError(400, "승인 요청을 지정해주세요.") }
             if action == "claudeApprove" { try answerClaudeApproval(sessionID: id, requestID: request) }
@@ -1729,12 +1731,22 @@ import TerminalInputSupport
         publish()
     }
 
-    public func markNotificationsRead(_ id: String) throws {
+    public func markNotificationsRead(_ id: String, interruptionID: String? = nil) throws {
+        if let interruptionID, sessions[id]?.interruption?.id != interruptionID {
+            throw RemoteHTTPError(409, "오류가 바뀌었습니다. 현재 오류 내용을 확인해주세요.")
+        }
         var updated: [String: SessionInbox] = [:], values: [String: String] = [:]
+        var interruptions: [String: SessionInterruption] = [:]
         for member in groupIDs(id) {
-            guard var inbox = inboxes[member], inbox.markRead() else { continue }
-            values["inbox:\(member)"] = String(decoding: try JSONEncoder().encode(inbox), as: UTF8.self)
-            updated[member] = inbox
+            if var inbox = inboxes[member], inbox.markRead() {
+                values["inbox:\(member)"] = String(decoding: try JSONEncoder().encode(inbox), as: UTF8.self)
+                updated[member] = inbox
+            }
+            if var error = sessions[member]?.interruption, error.acknowledgedAt == nil {
+                error.acknowledgedAt = Date()
+                values["interruption:\(member)"] = String(decoding: try JSONEncoder().encode(error), as: UTF8.self)
+                interruptions[member] = error
+            }
         }
         guard !values.isEmpty else { return }
         try store.setValues(values)
@@ -1742,6 +1754,7 @@ import TerminalInputSupport
             inboxes[member] = inbox
             sessions[member]?.notices = inbox.entries.isEmpty ? nil : inbox.entries
         }
+        for (member, error) in interruptions { sessions[member]?.interruption = error }
         publish()
     }
 
@@ -1768,17 +1781,33 @@ import TerminalInputSupport
            let value = try? decoded.normalized(), !value.isEmpty {
             session.customization = value
         }
+        session.notices = nil
+        if let saved = store.value("interruption:\(session.id)") {
+            session.interruption = try? JSONDecoder().decode(SessionInterruption.self, from:Data(saved.utf8))
+        }
+        restoreNotificationReceipts(&session)
+        if let saved = store.value("systemSafety:\(session.id)"),
+           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)) {
+            systemSafetyStates[session.id] = state; session.systemSafety = state.notice
+        }
+    }
+
+    private func restoreNotificationReceipts(_ session: inout AgentSession) {
         if let saved = store.value("inbox:\(session.id)"),
            let inbox = try? JSONDecoder().decode(SessionInbox.self, from: Data(saved.utf8)) {
             inboxes[session.id] = inbox
             session.notices = inbox.entries.isEmpty ? nil : inbox.entries
-        } else { session.notices = nil }
-        if let saved = store.value("interruption:\(session.id)") {
-            session.interruption = try? JSONDecoder().decode(SessionInterruption.self, from:Data(saved.utf8))
         }
-        if let saved = store.value("systemSafety:\(session.id)"),
-           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)) {
-            systemSafetyStates[session.id] = state; session.systemSafety = state.notice
+        guard let error = session.interruption else { return }
+        if let saved = store.value("interruption:\(session.id)"),
+           let current = try? JSONDecoder().decode(SessionInterruption.self, from: Data(saved.utf8)), current.id == error.id {
+            session.interruption?.acknowledgedAt = current.acknowledgedAt
+        }
+        // Older versions stored only the exact inbox receipt; a later error has
+        // a different key and must remain unread. Recovery state stays intact.
+        if session.interruption?.acknowledgedAt == nil,
+           inboxes[session.id]?.isRead(SessionNotice.key(.question, "interruption:" + error.id)) == true {
+            session.interruption?.acknowledgedAt = Date()
         }
     }
 

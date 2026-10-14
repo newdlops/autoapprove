@@ -142,7 +142,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
         }
         return isMonitoring ? "대기 중 · 모니터링" : phase.title
     }
-    public var needsReview: Bool { interruption?.needsAttention == true || (phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending })) }
+    public var needsReview: Bool { (interruption?.needsAttention == true && interruption?.acknowledgedAt == nil) || (phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending })) }
     public var canApprove: Bool { agent != .shell && phase != .ended && (channel != .none || backgroundChildren.contains(where: \.canApprove)) }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
     public var canReveal: Bool {

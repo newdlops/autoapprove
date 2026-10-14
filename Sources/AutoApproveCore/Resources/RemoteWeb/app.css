@@ -63,6 +63,7 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .interruption-state, .interruption-detail { overflow-wrap: anywhere; }
 .interruption-detail { white-space: pre-wrap; }
 .interruption-row button { flex-shrink: 0; }
+.interruption-row > .interruption-actions { flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px; }
 .interruption-row details { margin-top: 4px; }
 .interruption-row summary { cursor: pointer; min-height: 44px; display: list-item; padding: 9px 0; }
 #interruption-list { max-height: 320px; overflow: auto; overscroll-behavior: contain; }
