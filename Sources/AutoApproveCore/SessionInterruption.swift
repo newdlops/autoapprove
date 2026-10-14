@@ -1,7 +1,7 @@
 import Foundation
 
 public struct SessionInterruption: Codable, Equatable {
-    public enum Kind: String, Codable {
+    public enum Kind: String, Codable, Sendable {
         case capacity, transport, api, authentication, configuration, goalBlocked
         public var title: String {
             switch self {

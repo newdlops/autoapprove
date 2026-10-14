@@ -2,7 +2,7 @@ import Foundation
 
 /// Codex ends a turn with this error cell when the selected model is at capacity
 /// (`CodexErr::ServerOverloaded`). It does not retry; the user continues by sending a message.
-public struct CodexCapacityStop: Codable, Equatable {
+public struct CodexCapacityStop: Codable, Equatable, Sendable {
     public static let message = "Selected model is at capacity. Please try a different model."
     /// The message the user sent by hand after each of these stops.
     public static let resumeText = "이어서 진행하자."

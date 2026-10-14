@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-public struct ApprovalPrompt: Equatable {
+public struct ApprovalPrompt: Equatable, Sendable {
     public var summary: String
     public var answer: String
     public var fingerprint: String

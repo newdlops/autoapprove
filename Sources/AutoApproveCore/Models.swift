@@ -44,7 +44,7 @@ public enum ScreenHost: String, CaseIterable, Codable, Sendable {
     }
 }
 
-public enum SessionPhase: String, Codable {
+public enum SessionPhase: String, Codable, Sendable {
     case unknown, working, approval, input, idle, ended
     public var title: String {
         switch self {

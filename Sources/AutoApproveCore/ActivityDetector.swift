@@ -1,6 +1,6 @@
 import Foundation
 
-public struct ActivityObservation: Equatable {
+public struct ActivityObservation: Equatable, Sendable {
     public let phase: SessionPhase
     public let detail: String
     public var monitoring = false

@@ -129,29 +129,7 @@ import TerminalInputSupport
     private var bridges: [String: [JSONObject]] = [:]
     private var screens: [String: ScreenState] = [:]
     private var activityTrackers: [String: ActivityTracker] = [:]
-    /// Only pure parsing is reused. Observation times, policies, reservations and delivery validation stay live.
-    private final class ScreenAnalysis {
-        let raw: String
-        let agent: AgentKind
-        private var prepared: DetectionLines?
-        private var lines: DetectionLines {
-            if let prepared { return prepared }
-            let value = DetectionLines(raw); prepared = value; return value
-        }
-        lazy var prompt = PromptDetector.detect(raw, agent: agent, prepared: lines)
-        lazy var request: PendingScreenRequest? = {
-            if let request = QuestionDetector.detect(agent: agent, prepared: lines) { return request }
-            if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(raw) {
-                return PendingScreenRequest(phase: .input, summary: TerminalChoiceQuestion.detect(raw, agent: agent)?.question ?? "Codex가 질문의 답변을 기다리고 있습니다. 원본 입력란에서 답변해주세요.")
-            }
-            return nil
-        }()
-        lazy var activity = ActivityDetector.detect(raw, agent: agent, permissionPrompt: { self.prompt != nil })
-        lazy var capacityStop = CodexCapacityStop.detect(raw, agent: agent, activity: activity, prepared: lines)
-        lazy var fingerprint = PromptDetector.fingerprint(raw)
-        func discardPreparedLines() { prepared = nil }
-        init(raw: String, agent: AgentKind) { self.raw = raw; self.agent = agent }
-    }
+    /// Only immutable parsing results are reused. Policies, reservations and delivery checks stay live.
     private var screenAnalyses: [String: ScreenAnalysis] = [:]
     private var screenPublicationDepth = 0
     private var screenPublicationPending = false
@@ -2496,7 +2474,25 @@ import TerminalInputSupport
             let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
             let reader = adapter.screens
             let readStartedAt = Date()
-            let result = try await Task.detached(priority: .utility) { try reader(requests) }.value
+            let cached = screenAnalyses
+            let analysisTargets = targets.map { (id: $0.id, tty: $0.tty, agent: $0.agent) }
+            // A large scrollback in many tabs must not monopolize the UI actor.
+            // One bounded worker per host reads and parses; no policy or input is run here.
+            let worker = Task.detached(priority: .utility) {
+                let result = try reader(requests)
+                var analyses: [String: ScreenAnalysis] = [:]
+                for target in analysisTargets {
+                    try Task.checkCancellation()
+                    guard let screen = result.screens.first(where: { $0.tty == target.tty }) else { continue }
+                    if let previous = cached[target.id], previous.matches(screen.contents, agent: target.agent) {
+                        analyses[target.id] = previous
+                    } else {
+                        analyses[target.id] = ScreenAnalysis(raw: screen.contents, agent: target.agent)
+                    }
+                }
+                return (result, analyses)
+            }
+            let (result, analyses) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return }
             let targets = targets.filter { target in
                 guard let current = sessions[target.id], current.phase != .ended,
@@ -2540,7 +2536,7 @@ import TerminalInputSupport
                     if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
                         if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
                         sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor, display: screen.display)
+                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor, display: screen.display, precomputed: analyses[target.id])
                     }
                 }
                 publish()
@@ -3279,6 +3275,10 @@ import TerminalInputSupport
     }
 
     public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil) {
+        receiveScreen(sessionID: sessionID, raw: raw, generation: generation, source: source, at: now, appearance: appearance, cursor: cursor, display: display, precomputed: nil)
+    }
+
+    private func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil, precomputed: ScreenAnalysis?) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
         let previousFrame = remoteObservedScreens[sessionID]
         if previousFrame?.raw != raw || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance || previousFrame?.display != display { remoteTerminalChanges[sessionID]?.notify() }
@@ -3289,15 +3289,15 @@ import TerminalInputSupport
         // which child owns the prompt; the child's hook is the response channel.
         guard !hasBackgroundChildren(sessionID), claudeParents[sessionID] == nil else { return }
         let analysis: ScreenAnalysis
-        if let cached = screenAnalyses[sessionID], cached.agent == session.agent, cached.raw.utf8.elementsEqual(raw.utf8) { analysis = cached }
+        if let precomputed { analysis = precomputed }
+        else if let cached = screenAnalyses[sessionID], cached.matches(raw, agent: session.agent) { analysis = cached }
         else {
             analysis = ScreenAnalysis(raw: raw, agent: session.agent)
-            screenAnalyses.removeValue(forKey: sessionID)
-            // At most one 128-KiB input per session and 32 cached sessions; larger screens
-            // still work normally. End/disconnect/stop removes their parsing cache.
-            if raw.utf8.count <= 131_072, screenAnalyses.count < 32 { screenAnalyses[sessionID] = analysis }
         }
-        defer { analysis.discardPreparedLines() }
+        screenAnalyses.removeValue(forKey: sessionID)
+        // At most one 128-KiB input per session and 32 cached sessions; larger screens
+        // still work normally. End/disconnect/stop removes their parsing cache.
+        if raw.utf8.count <= 131_072, screenAnalyses.count < 32 { screenAnalyses[sessionID] = analysis }
         observeCapacity(sessionID,analysis:analysis,at:now)
         defer { scheduleSystemSafety(sessionID); publish() }
         if analysis.capacityStop != nil {

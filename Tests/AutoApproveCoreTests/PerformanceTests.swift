@@ -10,7 +10,146 @@ private final class PollingScreens: @unchecked Sendable {
     func read() -> TerminalSnapshot { lock.lock(); defer { lock.unlock() }; return snapshot }
 }
 
+@MainActor private final class ScreenHeartbeat {
+    var ticks = 0
+    var previous = ProcessInfo.processInfo.systemUptime
+    var largestGap: TimeInterval = 0
+    func tick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        largestGap = max(largestGap, now - previous); previous = now; ticks += 1
+    }
+    func reset() { previous = ProcessInfo.processInfo.systemUptime; largestGap = 0; ticks = 0 }
+}
+
+private final class DelayedLargeScreens: @unchecked Sendable {
+    private let lock = NSLock(), release = DispatchSemaphore(value: 0)
+    private var delayed = false, entered = false
+    let raw = String(repeating: "synthetic unchanged scrollback /fixture/output.swift\n", count: 30_000)
+        + "Would you like to run the following command?\n$ touch ~/Library/LaunchAgents/com.fixture.late.plist\n› 1. Yes\n  2. No\nEsc to cancel"
+    func arm() { lock.lock(); delayed = true; lock.unlock() }
+    var waiting: Bool { lock.lock(); defer { lock.unlock() }; return entered }
+    func finish() { release.signal() }
+    func read(_ targets: [ScreenTarget]) -> TerminalSnapshot {
+        lock.lock(); let wait = delayed; if wait { entered = true }; lock.unlock()
+        if wait { _ = release.wait(timeout: .now() + 3) }
+        return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: wait ? raw : "Working\nesc to interrupt") })
+    }
+}
+
 extension ApprovalTests {
+    func testLargeScreenPollKeepsUIResponsiveAndPublishesTogether() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-screen-responsive-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let frames = PollingScreens()
+        let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }
+        let sessions = (0..<24).map {
+            AgentSession(id: "process:\(910_000 + $0):large-screen", agent: .codex, pid: Int32(910_000 + $0),
+                started: "large-screen", tty: "/dev/fixture-large-\($0)", cwd: root.path, terminal: .terminal)
+        }
+        engine.updateDiscovery(sessions, records: [])
+        frames.set(TerminalSnapshot(screens: sessions.map { TerminalScreen(tty: $0.tty, contents: "Working\nesc to interrupt") }))
+        await engine.connectScreenHost(.terminal)
+        let raw = String(repeating: "synthetic build output: processed file /fixture/output.swift\n", count: 45_000)
+            + "Would you like to run the following command?\n$ pwd\n› 1. Yes\n  2. No\nEsc to cancel"
+        frames.set(TerminalSnapshot(screens: sessions.map { TerminalScreen(tty: $0.tty, contents: raw) }))
+        var publications = [[SessionPhase]]()
+        let subscription = engine.$snapshot.dropFirst().sink { publications.append($0.sessions.map(\.phase)) }
+        defer { subscription.cancel() }
+        let heartbeat = ScreenHeartbeat()
+        let timer = Task { @MainActor in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(10)) } catch { return }
+                heartbeat.tick()
+            }
+        }
+        defer { timer.cancel() }
+        try await Task.sleep(for: .milliseconds(30)); heartbeat.reset()
+        await engine.refreshScreenHost(.terminal)
+        let duringAnalysis = heartbeat.ticks
+        heartbeat.tick(); timer.cancel()
+        try expect(duringAnalysis >= 4, "UI tasks must run while the host analyzes many long screens")
+        try expect(heartbeat.largestGap < 0.75, "Long scrollback must not block the UI actor for seconds")
+        try expectEqual(publications.count, 1, "Background parsing must keep one coherent host publication")
+        try expect(publications[0].allSatisfy { $0 == .approval })
+        try expect(engine.snapshot.sessions.allSatisfy { $0.pendingSummary == "Would you like to run the following command?\n$ pwd" && !$0.automatic })
+        try expectEqual(engine.snapshot.events.count, 0, "Load observation must not manufacture input")
+    }
+
+    func testBackgroundScreenAnalysisPreservesQuestionsErrorsAndSafety() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-screen-parsed-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let frames = PollingScreens()
+        let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }
+        let agents: [AgentKind] = [.codex, .claude, .codex, .claude, .codex, .claude, .codex]
+        let sessions = agents.enumerated().map { index, agent in
+            AgentSession(id: "process:\(920_000 + index):parsed-screen", agent: agent, pid: Int32(920_000 + index),
+                started: "parsed-screen", tty: "/dev/fixture-parsed-\(index)", cwd: root.path, terminal: .terminal)
+        }
+        engine.updateDiscovery(sessions, records: [])
+        let history = String(repeating: "synthetic output 한글 🙂 /fixture/source.swift\n", count: 6_000)
+        let tails = [
+            "Would you like to run the following command?\n$ pwd\n› 1. Yes\n  2. No\nEsc to cancel",
+            "Do you want to proceed?\n$ touch ~/Library/LaunchAgents/com.fixture.test.plist\n❯ 1. Yes\n  2. No\nEsc to cancel",
+            "Which synthetic test?\n› 1. First\n  2. Second\nEnter to select",
+            "Which synthetic test?\n❯ 1. First\n  2. Second\nEnter to select",
+            "Original synthetic task\n\n■ stream disconnected before completion: network error\n\n› Ask Codex to do anything\n\n? for shortcuts",
+            "Working\nesc to interrupt",
+            "› 사용자가 작성한 메모 🙂\n? for shortcuts"
+        ]
+        for wave in 0..<2 {
+            frames.set(TerminalSnapshot(screens: sessions.enumerated().map { index, session in
+                TerminalScreen(tty: session.tty, contents: history + "wave \(wave)\n" + tails[index])
+            }))
+            if wave == 0 { await engine.connectScreenHost(.terminal) } else { await engine.refreshScreenHost(.terminal) }
+            let result = Dictionary(uniqueKeysWithValues: engine.snapshot.sessions.map { ($0.id, $0) })
+            try expectEqual(result[sessions[0].id]?.phase, .approval)
+            try expectEqual(result[sessions[0].id]?.pendingSummary, "Would you like to run the following command?\n$ pwd")
+            try expectEqual(result[sessions[1].id]?.phase, .approval)
+            try expectNotNil(result[sessions[1].id]?.systemCommandRisk)
+            try expectNotNil(result[sessions[1].id]?.systemSafety, "A system mutation remains excluded from ordinary approvals")
+            for index in [2, 3] {
+                try expectEqual(result[sessions[index].id]?.phase, .input)
+                try expect(result[sessions[index].id]?.pendingSummary?.contains("Which synthetic test?") == true)
+            }
+            try expectEqual(result[sessions[4].id]?.interruption?.kind, .transport)
+            try expectEqual(result[sessions[5].id]?.phase, .working)
+            try expectEqual(result[sessions[6].id]?.phase, .input, "A user draft must remain user-owned")
+            try expect(engine.snapshot.sessions.allSatisfy { !$0.automatic })
+            try expect(engine.snapshot.events.allSatisfy { $0.outcome == "시스템 변경 감지 · 자동 승인 제외" })
+        }
+    }
+
+    func testBackgroundScreenResultsRejectChangedTargetsDisconnectAndCancellation() async throws {
+        for action in ["replace", "disconnect", "cancel"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-screen-stale-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let frames = DelayedLargeScreens(); defer { frames.finish() }
+            let adapter = ScreenHostAdapter(screens: { frames.read($0) }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+            defer { engine.stop() }
+            let session = AgentSession(id: "process:42:stale-large", agent: .codex, pid: 42, started: "old",
+                tty: "/dev/fixture-stale", cwd: root.path, terminal: .terminal)
+            engine.updateDiscovery([session], records: []); await engine.connectScreenHost(.terminal)
+            frames.arm(); let pending = Task { await engine.refreshScreenHost(.terminal) }
+            let deadline = ProcessInfo.processInfo.systemUptime + 1
+            while !frames.waiting, ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for: .milliseconds(5)) }
+            try expect(frames.waiting)
+            if action == "replace" {
+                var changed = session; changed.pid = 43; changed.started = "new"; changed.tty = "/dev/fixture-replaced"
+                engine.updateDiscovery([changed], records: [])
+            } else if action == "disconnect" { engine.disconnectScreenHost(.terminal) }
+            else { pending.cancel() }
+            frames.finish(); await pending.value
+            try expect(engine.snapshot.sessions.allSatisfy { $0.systemCommandRisk == nil && $0.systemSafety == nil && $0.pendingSummary == nil }, "A stale or cancelled host result must not create an approval")
+            try expect(engine.snapshot.events.isEmpty)
+            try expectFalse(engine.snapshot.health.screen(.terminal).connecting)
+        }
+    }
+
     func testRepeatedScreensPreserveTimeGenerationAndChangedRequests() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-screen-time-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

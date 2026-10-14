@@ -1,6 +1,6 @@
 import Foundation
 
-public struct PendingScreenRequest {
+public struct PendingScreenRequest: Sendable {
     public let phase: SessionPhase
     public let summary: String
 }

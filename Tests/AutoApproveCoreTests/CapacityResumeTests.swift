@@ -76,16 +76,31 @@ extension ApprovalTests {
             session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); return engine
         }
         var engine = try create(); defer { engine.stop() }; try engine.setAutomatic(record.key, enabled: true)
-        func observe(_ number: Int, _ status: String) {
+        @discardableResult func observe(_ number: Int, _ status: String) -> Date {
             engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: record.key, turn: CodexTurnState(threadID: "QA", turnID: "turn-\(number)", status: status))])
-            engine.receiveScreen(sessionID: record.key, raw: stoppedFrame, generation: "QA")
+            let observed = Date()
+            engine.receiveScreen(sessionID: record.key, raw: stoppedFrame, generation: "QA", at: observed)
+            return observed
         }
-        observe(1, "failed"); try await Task.sleep(for: .milliseconds(140))
+        func waitForDelivery(_ count: Int, _ phase: CapacityResume.Phase) async throws {
+            let deadline = ProcessInfo.processInfo.systemUptime + 2
+            while (probe.count < count || engine.snapshot.sessions.first?.capacityResume?.phase != phase),
+                  ProcessInfo.processInfo.systemUptime < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        let first = observe(1, "failed")
+        let firstDeadline = try unwrap(engine.snapshot.sessions.first?.capacityResume?.deadline)
+        try expect(abs(firstDeadline.timeIntervalSince(first) - 0.02) < 0.001, "Keep the configured retry delay; wait for delivery rather than assuming a 140ms scheduler wakeup")
+        try await waitForDelivery(1, .review)
         try expectEqual(probe.count, 1); try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .review)
         observe(1, "failed"); try await Task.sleep(for: .milliseconds(80)); try expectEqual(probe.count, 1)
         observe(2, "inProgress"); try await Task.sleep(for: .milliseconds(80)); try expectEqual(probe.count, 1)
         engine.stop(); engine = try create()
-        observe(2, "failed"); try await Task.sleep(for: .milliseconds(140))
+        let second = observe(2, "failed")
+        let secondDeadline = try unwrap(engine.snapshot.sessions.first?.capacityResume?.deadline)
+        try expect(abs(secondDeadline.timeIntervalSince(second) - 0.02) < 0.001)
+        try await waitForDelivery(2, .awaiting)
         try expectEqual(probe.count, 2, "A confirmed later failed turn allows a fresh continuation without replaying the uncertain one")
         try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .awaiting)
         try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, false)
