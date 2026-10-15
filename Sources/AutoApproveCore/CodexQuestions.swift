@@ -127,10 +127,9 @@ public struct CodexThreadLocation: Equatable {
                 .deletingLastPathComponent().deletingLastPathComponent()
             guard url.path.hasPrefix(home.appendingPathComponent("sessions/").path + "/") else { continue }
             guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
-            let data = try? handle.read(upToCount: 1_048_576)
+            let data = try? readMetadataLine { try handle.read(upToCount: $0) }
             try? handle.close()
-            guard let data, let newline = data.firstIndex(of: 10),
-                  let row = try? JSONSerialization.jsonObject(with: data[..<newline]) as? JSONObject,
+            guard let data, let row = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
                   row["type"] as? String == "session_meta", let meta = row["payload"] as? JSONObject,
                   meta["source"] as? String == "cli", let id = meta["id"] as? String, !id.isEmpty else { continue }
             let db = home.appendingPathComponent("thread_history_1.sqlite").path
@@ -140,6 +139,24 @@ public struct CodexThreadLocation: Equatable {
             throw AppError.message(locations.isEmpty ? "이 Codex 세션의 질문 기록을 찾지 못했습니다." : "여러 Codex 대화가 연결되어 질문 대기열을 확정할 수 없습니다.")
         }
         return locations[0]
+    }
+
+    /// Read a fresh, newline-terminated header, retaining the existing 1-MiB
+    /// bound. Chunking stops at the first line instead of fetching scrollback.
+    /// The injected read is also used by the real FileHandle path above.
+    public static func readMetadataLine(_ read: (Int) throws -> Data?) throws -> Data? {
+        let limit = 1_048_576
+        var line = Data()
+        while line.count < limit {
+            let count = min(4096, limit - line.count)
+            guard let chunk = try read(count), !chunk.isEmpty, chunk.count <= count else { return nil }
+            if let end = chunk.firstIndex(of: 10) {
+                line.append(contentsOf: chunk[..<end])
+                return line
+            }
+            line.append(chunk)
+        }
+        return nil
     }
 
     public static func openFiles(_ output: String) -> [Int32: [String]] {
@@ -158,6 +175,7 @@ public final class CodexHistoryReader {
     private var cursor: Int64 = 0
     private var items: [String: CodexQuestionHistory.Item] = [:]
     private var location: CodexThreadLocation?
+    private var pending: [QueuedQuestion] = []
     public init() {}
     public func read(_ location: CodexThreadLocation) throws -> [QueuedQuestion] {
         let db = try CodexHistoryAccess.open(location.database, subject: "질문")
@@ -181,6 +199,7 @@ public final class CodexHistoryReader {
         let reset = self.location != location || next < cursor
         let from: Int64 = reset ? 0 : cursor
         var updated = reset ? [:] : items
+        var changed = reset
         let statement = try prepare("""
             SELECT item_id, rollout_ordinal, item_json FROM thread_items
             WHERE thread_id = ? AND (rollout_ordinal >= ? OR updated_at_ordinal >= ?)
@@ -196,11 +215,15 @@ public final class CodexHistoryReader {
                 throw CodexHistoryReadError(.invalidData, subject: "질문")
             }
             updated[String(cString: rawID)] = CodexQuestionHistory.Item(ordinal: sqlite3_column_int64(statement, 1), json: json)
+            changed = true
             status = sqlite3_step(statement)
         }
         guard status == SQLITE_DONE else { throw CodexHistoryAccess.failure(db, subject: "질문", result: status) }
         items = updated; cursor = next; self.location = location
-        return CodexQuestionHistory.pending(threadID: location.threadID, items: Array(items.values))
+        // Both SQL queries still run on every read, including schema/error checks
+        // and updates to old rows. Reuse only the unchanged projection result.
+        if changed { pending = CodexQuestionHistory.pending(threadID: location.threadID, items: Array(items.values)) }
+        return pending
     }
 }
 

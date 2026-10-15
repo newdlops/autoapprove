@@ -417,6 +417,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("History processing: metadata chunks, exact bytes and read bound", tests.testRolloutHeaderStopsAtFirstLineAndKeepsByteLimit),
+            ("History processing: fresh long metadata and incomplete header rejection", tests.testRolloutBindingReadsFreshLongMetadataAndRejectsIncompleteHeaders),
+            ("History processing: unchanged queries, delta, reset, thread switch and failure", tests.testUnchangedHistoryStillChecksUpdatesResetsAndFailures),
+            ("History processing: risk variants, Unicode and fresh installer source", tests.testSystemRiskLazyVariantsRetainWhitespaceUnicodeAndFreshSource),
             ("Session processing: path equivalence and executable identity", tests.testProcessClassificationPreservesPathAndExecutableIdentity),
             ("Session processing: nested, orphan, cyclic and ended ownership", tests.testSessionProjectionKeepsNestedOrphanCyclicAndEndedPolicies),
             ("System safety: mutations, escaped paths and readonly boundaries", tests.testSystemRiskMutationsAndReadOnlyBoundaries),

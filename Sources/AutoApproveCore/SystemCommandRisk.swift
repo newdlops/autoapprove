@@ -43,12 +43,34 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         }
         let protectedStartup = #"(?i)(?:(?:~|\$(?:HOME|\{HOME\}))[/\\]+Library[/\\]+(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])(?:/Users/[^/\r\n]+)?/Library/(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])/etc/(?:cron|systemd)|(?:~|\$(?:HOME|\{HOME\}))[/\\]+\.config[/\\]+autostart)"#
         let write = #"(?i)\b(?:cp|mv|rm|install|tee|touch|mkdir|chmod|chown|ln|write_bytes|write_text|writeFile|copyFile|copyfile|copy2|copy|replace|rename|unlink|remove)\b|>>?|--install|--register|등록|설치|생성|수정|삭제"#
-        let compact = text.filter { !$0.isWhitespace }
-        let wrapped = text.replacingOccurrences(of: #"\n[ \t]*"#, with: "", options: .regularExpression)
+        var compactValue: String?
+        func compact() -> String {
+            if let compactValue { return compactValue }
+            let value = text.filter { !$0.isWhitespace }
+            compactValue = value
+            return value
+        }
+        func targetsStartup() -> Bool {
+            if matches(text, protectedStartup) { return true }
+            var wrappedValue: String?
+            if text.utf8.contains(10) {
+                let wrapped = text.replacingOccurrences(of: #"\n[ \t]*"#, with: "", options: .regularExpression)
+                if !wrapped.utf8.elementsEqual(text.utf8) {
+                    if matches(wrapped, protectedStartup) { return true }
+                    wrappedValue = wrapped
+                }
+            }
+            let value = compact()
+            // Skip only byte-identical inputs already tested with the same rule.
+            // No result, command or local installer source survives this call.
+            guard !value.utf8.elementsEqual(text.utf8),
+                  wrappedValue.map({ !value.utf8.elementsEqual($0.utf8) }) ?? true else { return false }
+            return matches(value, protectedStartup)
+        }
         let computedHome = matches(command, #"(?i)(?:python[\w/.-]*|node|ruby|osascript)\s+(?:-[ce]|--eval)\b"#)
             && matches(command, #"Path\.home\(|NSHomeDirectory\(|expanduser\(|(?:HOME|home_dir|homeDirectory)"#)
             && matches(command, #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools"#)
-        if (computedHome || matches(text, protectedStartup) || matches(wrapped, protectedStartup) || matches(compact, protectedStartup)), (matches(text, write) || matches(compact, #"--install|--register|write_bytes|write_text|writeFile|copyFile|등록|설치|생성|수정|삭제"#)) {
+        if (computedHome || targetsStartup()), (matches(text, write) || matches(compact(), #"--install|--register|write_bytes|write_text|writeFile|copyFile|등록|설치|생성|수정|삭제"#)) {
             return Self(kind: .persistence, evidence: "자동 실행 항목 또는 관리자 입력 서비스 경로 변경")
         }
         if matches(text, #"(?i)\b(?:spctl|csrutil|tccutil)\s+(?:(?:authenticated-root)\s+)?(?:--master-disable|--global-disable|disable|reset)\b|\b(?:security|dscl)\s+(?:add-|delete-|authorizationdb|create|passwd)|\bchmod\s+(?:-\S+\s+)*(?:777|666)\b|with\s+administrator\s+privileges"#) {
