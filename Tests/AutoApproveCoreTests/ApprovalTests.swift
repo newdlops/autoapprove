@@ -417,6 +417,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Session processing: path equivalence and executable identity", tests.testProcessClassificationPreservesPathAndExecutableIdentity),
+            ("Session processing: nested, orphan, cyclic and ended ownership", tests.testSessionProjectionKeepsNestedOrphanCyclicAndEndedPolicies),
             ("System safety: mutations, escaped paths and readonly boundaries", tests.testSystemRiskMutationsAndReadOnlyBoundaries),
             ("System safety: local installers are bounded and never executed", tests.testSystemRiskLocalInstallerIsBoundedAndNeverExecuted),
             ("System safety: original composer ownership and submission", tests.testSystemSafetyComposerOwnershipAndSubmission),

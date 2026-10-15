@@ -51,11 +51,17 @@ public struct ProcessRecord: Codable, Equatable, Sendable {
     public var started: String
     public var executable: String
     public var agent: AgentKind? {
-        let name = URL(fileURLWithPath: executable).lastPathComponent
-        if executable.contains("/Applications/ChatGPT.app/") { return nil }
-        if name == "codex" { return .codex }
-        if name == "claude" || (executable.contains("/claude/versions/") && name.first?.isNumber == true) { return .claude }
-        return nil
+        // ps supplies paths or bare process names. Avoid constructing a file URL
+        // for every unrelated process on every discovery/hook. Dot/empty paths
+        // retain the old relative-path resolution; never cache across exec/PID reuse.
+        let component = (executable as NSString).lastPathComponent
+        let name = component.isEmpty || component == "." || component == ".."
+            ? URL(fileURLWithPath: executable).lastPathComponent : component
+        let candidate: AgentKind?
+        if name == "codex" { candidate = .codex }
+        else if name == "claude" || (name.first?.isNumber == true && executable.contains("/claude/versions/")) { candidate = .claude }
+        else { return nil }
+        return executable.contains("/Applications/ChatGPT.app/") ? nil : candidate
     }
     public var key: String { "process:\(pid):\(started)" }
     public var isForeground: Bool { processGroup > 0 && processGroup == foregroundGroup }

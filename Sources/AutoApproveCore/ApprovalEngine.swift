@@ -1551,10 +1551,17 @@ import TerminalInputSupport
     }
 
     private func presentedSessions() -> [AgentSession] {
+        // Resolve current ownership once per publication, including missing/ended
+        // parents and cycles. This map never survives a state change or an await.
+        let owners = Dictionary(uniqueKeysWithValues: sessions.keys.compactMap { id in
+            ownerID(id).map { (id, $0) }
+        })
         let raw = sessions.values.map { value -> AgentSession in
             var session = value
-            session.automatic = effectiveAutomatic(value.id)
-            if claudeParents[value.id] != nil && ownerID(value.id) == nil && value.phase != .ended {
+            if claudeParents[value.id] != nil {
+                session.automatic = !parentSaveFailed && owners[value.id].flatMap { sessions[$0]?.automatic } == true
+            }
+            if claudeParents[value.id] != nil && owners[value.id] == nil && value.phase != .ended {
                 session.detail = "메인 세션이 종료되었거나 연결을 확인할 수 없어 자동 승인을 멈췄습니다. 독립적으로 처리하려면 이 세션의 자동 승인을 다시 켜세요."
             }
             return session
@@ -1562,10 +1569,11 @@ import TerminalInputSupport
         func priority(_ phase: SessionPhase) -> Int {
             switch phase { case .input: return 6; case .approval: return 5; case .working: return 4; case .unknown: return 3; case .idle: return 2; case .ended: return 0 }
         }
+        let childrenByOwner = Dictionary(grouping: raw.filter { owners[$0.id] != nil && owners[$0.id] != $0.id }, by: { owners[$0.id]! })
         return raw.compactMap { value in
-            if let root = ownerID(value.id), root != value.id { return nil }
+            if let root = owners[value.id], root != value.id { return nil }
             var parent = value
-            let children = raw.filter { $0.id != value.id && ownerID($0.id) == value.id }.sorted {
+            let children = (childrenByOwner[value.id] ?? []).sorted {
                 if priority($0.phase) != priority($1.phase) { return priority($0.phase) > priority($1.phase) }
                 return $0.id < $1.id
             }
@@ -1646,11 +1654,14 @@ import TerminalInputSupport
         updateQuestionAutomationStates()
         updateInboxes()
         let ranks = Dictionary(uniqueKeysWithValues: sessionOrder.enumerated().map { ($0.element, $0.offset) })
-        let presented = presentedSessions().sorted {
+        let rows = presentedSessions()
+        let projects = Dictionary(uniqueKeysWithValues: rows.filter { ranks[$0.id] == nil }.map { ($0.id, $0.project) })
+        let presented = rows.sorted {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
             let left = ranks[$0.id] ?? Int.max, right = ranks[$1.id] ?? Int.max
             if left != right { return left < right }
-            if $0.project != $1.project { return $0.project.localizedStandardCompare($1.project) == .orderedAscending }
+            let leftProject = projects[$0.id] ?? $0.project, rightProject = projects[$1.id] ?? $1.project
+            if leftProject != rightProject { return leftProject.localizedStandardCompare(rightProject) == .orderedAscending }
             return $0.id < $1.id
         }
         // Heartbeats still reconcile timers and notices, but identical state must
