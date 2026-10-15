@@ -197,6 +197,7 @@ struct RemoteTerminalUpdate: Encodable {
         var failures = 0
         var bonjourEndpoint: NWEndpoint?
         var preferredEndpoint: NWEndpoint?
+        var readTiming = RemoteReadTiming()
     }
     private var peers: [String: Peer] = [:]
     private var discoveryError: String?
@@ -217,6 +218,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var knownSaveTask: Task<Void, Never>?
     private let stateReads = RemotePeerStateCache()
     private let inventoryValidation = RemotePeerInventoryCache()
+    private var readTimingEpoch = UUID()
     public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
@@ -360,7 +362,11 @@ struct RemoteTerminalUpdate: Encodable {
                 let interfaces = RemoteLAN.interfaces(refresh: true)
                 if interfaces != self.lanInterfaces {
                     self.lanInterfaces = interfaces
-                    for id in self.peers.keys { self.peers[id]?.nextProbe = .distantPast; self.peers[id]?.preferredEndpoint = nil }
+                    self.readTimingEpoch = UUID()
+                    for id in self.peers.keys {
+                        self.peers[id]?.nextProbe = .distantPast; self.peers[id]?.preferredEndpoint = nil
+                        self.peers[id]?.readTiming = RemoteReadTiming()
+                    }
                     self.stateReads.removeAll(); self.inventoryValidation.removeAll()
                     self.nextHintRead = .distantPast; self.nextBlindProbe = .distantPast; self.directCursor = 0
                     self.directProbedAt.removeAll(); self.pendingHints.removeAll()
@@ -433,6 +439,8 @@ struct RemoteTerminalUpdate: Encodable {
         browserRetry?.cancel(); browserRetry = nil
         knownSaveTask?.cancel(); knownSaveTask = nil; saveKnownPeers()
         stateReads.removeAll(); inventoryValidation.removeAll()
+        readTimingEpoch = UUID()
+        for id in peers.keys { peers[id]?.readTiming = RemoteReadTiming() }
         directProbedAt.removeAll(); pendingHints.removeAll(); directCursor = 0
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
@@ -680,7 +688,8 @@ struct RemoteTerminalUpdate: Encodable {
                 ? previous?.directAddress.flatMap { try? RemoteNetworkAddress.endpoint($0) } : nil
             peers[id] = Peer(id: id, name: peerName, endpoint: direct ?? result.endpoint, available: true, manual: previous?.manual ?? false, portal: portal, bonjour: true, directlySeen: previous?.directlySeen, directAddress: previous?.directAddress,
                 release: advertised, webURLs: advertisedURLs.isEmpty ? (unchanged ? previous?.webURLs ?? [] : []) : advertisedURLs, webPort: advertisedPort ?? (unchanged ? previous?.webPort : nil), webVerifiedAt: unchanged ? previous?.webVerifiedAt : nil,
-                nextProbe: unchanged ? previous?.nextProbe ?? .distantPast : .distantPast, failures: previous?.failures ?? 0, bonjourEndpoint: result.endpoint, preferredEndpoint: unchanged ? previous?.preferredEndpoint : nil)
+                nextProbe: unchanged ? previous?.nextProbe ?? .distantPast : .distantPast, failures: previous?.failures ?? 0, bonjourEndpoint: result.endpoint, preferredEndpoint: unchanged ? previous?.preferredEndpoint : nil,
+                readTiming: unchanged ? previous?.readTiming ?? RemoteReadTiming() : RemoteReadTiming())
         }
         // Keep disconnected machines visible, but bound the history on long-running networks.
         if peers.count > 100 {
@@ -756,7 +765,7 @@ struct RemoteTerminalUpdate: Encodable {
             questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
             localAddressReady:LocalDashboardAddress.status() == .ready)
     }
-    private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse) }
+    private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse,TimeInterval) }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let primary = connectionEndpoint(peer)
@@ -771,25 +780,28 @@ struct RemoteTerminalUpdate: Encodable {
             retryReads: !["/api/state","/api/inventory"].contains(path)).run() }
         let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (["/api/state","/api/inventory"].contains(path) ? 4 : 15))
         let epoch = generation
+        let timingEpoch = readTimingEpoch, kind = RemoteReadTiming.Kind.finite(path: path)
+        let delay = peer.readTiming.delay(route: String(describing: endpoints[0]), kind: kind)
         let expectedID = peer.id
         let read: @Sendable (Int) async throws -> PeerReadResult = { index in
+            let started = ProcessInfo.processInfo.systemUptime
             let response = try await RemoteHTTPExchange(endpoint:endpoints[index],path:path,method:method,body:body,expectedNodeID:expectedID,
                 timeout:max(0.05,deadline-ProcessInfo.processInfo.systemUptime),entityTag:entityTag,retryReads:false).run()
             if [502,503,504].contains(response.status) { throw RemoteHTTPError(response.status,"Mac의 읽기 연결을 다른 LAN 주소에서 확인합니다.") }
-            return .response(index,response)
+            return .response(index,response,ProcessInfo.processInfo.systemUptime-started)
         }
-        // Healthy LAN reads use one request. A stalled path gets one delayed
-        // alternate, and a definite transport failure wakes it immediately.
+        // Adapt the optional alternate to this route's response time and jitter.
+        // A definite transport failure still wakes it immediately.
         // Both requests share the original deadline; POST never enters here.
-        let winner = try await withThrowingTaskGroup(of:PeerReadResult.self) { group -> (Int,RemoteHTTPResponse) in
+        let winner = try await withThrowingTaskGroup(of:PeerReadResult.self) { group -> (Int,RemoteHTTPResponse,TimeInterval) in
             group.addTask { try await read(0) }
-            group.addTask { try await Task.sleep(for:.milliseconds(200)); return .stagger }
+            group.addTask { try await Task.sleep(for:.seconds(delay)); return .stagger }
             var alternate = false, active = 1
             while !group.isEmpty {
               do {
                 guard let result = try await group.next() else { break }
                 switch result {
-                case .response(let index,let response): group.cancelAll(); return (index,response)
+                case .response(let index,let response,let elapsed): group.cancelAll(); return (index,response,elapsed)
                 case .stagger:
                     if !alternate { alternate = true; active += 1; group.addTask { try await read(1) } }
                 }
@@ -805,6 +817,9 @@ struct RemoteTerminalUpdate: Encodable {
         }
         guard running, generation == epoch, !Task.isCancelled else { throw CancellationError() }
         let endpoint = endpoints[winner.0], response = winner.1
+        if timingEpoch == readTimingEpoch, response.nodeID == peer.id, [200,304].contains(response.status), peers[peer.id]?.endpoint == peer.endpoint {
+            peers[peer.id]?.readTiming.observe(route: String(describing: endpoint), kind: kind, elapsed: winner.2)
+        }
         if (response.status == 200 || response.status == 304 && response.nodeID == peer.id), peers[peer.id]?.endpoint == peer.endpoint {
             peers[peer.id]?.preferredEndpoint = endpoint
             if !Self.numericURL(endpoint).isEmpty { peers[peer.id]?.directAddress = Self.numericURL(endpoint); rememberPeer(peer.id) }
@@ -1064,41 +1079,57 @@ struct RemoteTerminalUpdate: Encodable {
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
         return try await exchange(peer, path: forwardedPath(request), method: request.method, body: request.body)
     }
+    private enum PeerStreamResult: Sendable { case stagger; case opened(Int,RemotePTYPeerBodyStream,TimeInterval) }
     private func forwardStream(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let epoch = generation
         let endpoints = Array(peerEndpoints(peer).prefix(2)), deadline = ProcessInfo.processInfo.systemUptime + 7
-        // Only read subscriptions race. A working primary stays alone; a stalled
-        // Wi-Fi/VPN route must not consume two seconds before trying the other LAN.
-        let opened = try await withThrowingTaskGroup(of: (NWEndpoint, RemotePTYPeerBodyStream).self) { group in
-            for (index, endpoint) in endpoints.enumerated() {
-                let path = forwardedPath(request), expectedID = peer.id
-                group.addTask {
-                    if index > 0 { try await Task.sleep(for: .milliseconds(200)) }
-                    try Task.checkCancellation()
-                    let output = try RemotePTYPeerBodyStream(endpoint: endpoint, path: path, expectedNodeID: expectedID,
-                        timeout: max(0.05, deadline - ProcessInfo.processInfo.systemUptime))
-                    do {
-                        try await output.open(); try Task.checkCancellation()
-                        return (endpoint, output)
-                    } catch { output.cancel(); throw error }
-                }
-            }
-            var lastError: Error = RemoteHTTPError(503, "Mac의 스트림 연결을 확인해주세요.")
+        let timingEpoch = readTimingEpoch
+        let delay = peer.readTiming.delay(route: String(describing: endpoints[0]), kind: .stream)
+        let path = forwardedPath(request), expectedID = peer.id
+        let open: @Sendable (Int) async throws -> PeerStreamResult = { index in
+            try Task.checkCancellation()
+            let started = ProcessInfo.processInfo.systemUptime
+            let output = try RemotePTYPeerBodyStream(endpoint: endpoints[index], path: path, expectedNodeID: expectedID,
+                timeout: max(0.05, deadline - started))
+            do {
+                try await output.open(); try Task.checkCancellation()
+                return .opened(index,output,ProcessInfo.processInfo.systemUptime-started)
+            } catch { output.cancel(); throw error }
+        }
+        // Keep opening latency separate from finite bodies. Failed transports
+        // wake the alternate immediately; healthy but busy peers avoid duplicates.
+        let opened = try await withThrowingTaskGroup(of: PeerStreamResult.self) { group -> (Int,RemotePTYPeerBodyStream,TimeInterval) in
+            group.addTask { try await open(0) }
+            if endpoints.count > 1 { group.addTask { try await Task.sleep(for: .seconds(delay)); return .stagger } }
+            var alternate = endpoints.count < 2, active = 1
             while !group.isEmpty {
                 do {
-                    if let result = try await group.next() { group.cancelAll(); return result }
+                    guard let result = try await group.next() else { break }
+                    switch result {
+                    case .opened(let index,let output,let elapsed): group.cancelAll(); return (index,output,elapsed)
+                    case .stagger:
+                        if !alternate { alternate = true; active += 1; group.addTask { try await open(1) } }
+                    }
                 } catch {
                     if !RemoteReadRecovery.isTransient(error) { group.cancelAll(); throw error }
-                    lastError = error
+                    try Task.checkCancellation()
+                    active -= 1
+                    if !alternate { alternate = true; active += 1; group.addTask { try await open(1) } }
+                    else if active == 0 { group.cancelAll(); throw error }
                 }
             }
-            throw lastError
+            throw RemoteHTTPError(503, "Mac의 스트림 연결을 확인해주세요.")
         }
         guard running, generation == epoch, !Task.isCancelled else { opened.1.cancel(); throw CancellationError() }
-        if peers[peer.id]?.endpoint == peer.endpoint { peers[peer.id]?.preferredEndpoint = opened.0 }
+        if peers[peer.id]?.endpoint == peer.endpoint {
+            peers[peer.id]?.preferredEndpoint = endpoints[opened.0]
+            if timingEpoch == readTimingEpoch {
+                peers[peer.id]?.readTiming.observe(route: String(describing: endpoints[opened.0]), kind: .stream, elapsed: opened.2)
+            }
+        }
         return .eventStream(opened.1, nodeID: nodeID)
     }
     private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
