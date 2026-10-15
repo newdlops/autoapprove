@@ -281,7 +281,9 @@ struct RemoteTerminalUpdate: Encodable {
                         guard self.streamConnections.count < 12 else { return .error(RemoteHTTPError(429, "터미널 실시간 연결은 Mac 한 대에서 12개까지 열 수 있습니다. 다른 화면을 닫고 다시 연결해주세요.")) }
                         self.streamConnections.insert(id)
                     }
-                    return await self.handle(request)
+                    var response = await self.handle(request)
+                    if response.nodeID == nil { response.nodeID = self.nodeID }
+                    return response
                 }, onClose: { [weak self] in Task { @MainActor in
                     self?.connections.removeValue(forKey: id); self?.streamConnections.remove(id)
                 } })
@@ -748,6 +750,7 @@ struct RemoteTerminalUpdate: Encodable {
             questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
             localAddressReady:LocalDashboardAddress.status() == .ready)
     }
+    private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse) }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let primary = connectionEndpoint(peer)
@@ -762,26 +765,45 @@ struct RemoteTerminalUpdate: Encodable {
             retryReads: !["/api/state","/api/inventory"].contains(path)).run() }
         let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (["/api/state","/api/inventory"].contains(path) ? 4 : 15))
         let epoch = generation
-        for (index, endpoint) in endpoints.enumerated() {
-            do {
-                try Task.checkCancellation()
-                let remaining = max(0.05, deadline - ProcessInfo.processInfo.systemUptime)
-                let response = try await RemoteHTTPExchange(endpoint: endpoint, path: path, method: method, body: body, expectedNodeID: peer.id,
-                    timeout: index == 0 ? remaining / 2 : remaining, entityTag: entityTag, retryReads: false).run()
-                if [502,503,504].contains(response.status), index < endpoints.count - 1 {
-                    throw RemoteHTTPError(response.status, "Mac의 읽기 연결을 다른 LAN 주소에서 확인합니다.")
-                }
-                if running, generation == epoch, (response.status == 200 || response.status == 304 && response.nodeID == peer.id), peers[peer.id]?.endpoint == peer.endpoint {
-                    peers[peer.id]?.preferredEndpoint = endpoint
-                    if !Self.numericURL(endpoint).isEmpty { peers[peer.id]?.directAddress = Self.numericURL(endpoint); rememberPeer(peer.id) }
-                }
-                return response
-            } catch {
-                if error is CancellationError || Task.isCancelled || index == endpoints.count - 1 { throw error }
-                if !RemoteReadRecovery.isTransient(error) { throw error }
-            }
+        let expectedID = peer.id
+        let read: @Sendable (Int) async throws -> PeerReadResult = { index in
+            let response = try await RemoteHTTPExchange(endpoint:endpoints[index],path:path,method:method,body:body,expectedNodeID:expectedID,
+                timeout:max(0.05,deadline-ProcessInfo.processInfo.systemUptime),entityTag:entityTag,retryReads:false).run()
+            if [502,503,504].contains(response.status) { throw RemoteHTTPError(response.status,"Mac의 읽기 연결을 다른 LAN 주소에서 확인합니다.") }
+            return .response(index,response)
         }
-        throw RemoteHTTPError(503, "Mac의 연결을 확인해주세요.")
+        // Healthy LAN reads use one request. A stalled path gets one delayed
+        // alternate, and a definite transport failure wakes it immediately.
+        // Both requests share the original deadline; POST never enters here.
+        let winner = try await withThrowingTaskGroup(of:PeerReadResult.self) { group -> (Int,RemoteHTTPResponse) in
+            group.addTask { try await read(0) }
+            group.addTask { try await Task.sleep(for:.milliseconds(200)); return .stagger }
+            var alternate = false, active = 1
+            while !group.isEmpty {
+              do {
+                guard let result = try await group.next() else { break }
+                switch result {
+                case .response(let index,let response): group.cancelAll(); return (index,response)
+                case .stagger:
+                    if !alternate { alternate = true; active += 1; group.addTask { try await read(1) } }
+                }
+              } catch {
+                guard RemoteReadRecovery.isTransient(error) else { group.cancelAll(); throw error }
+                try Task.checkCancellation()
+                active -= 1
+                if !alternate { alternate = true; active += 1; group.addTask { try await read(1) } }
+                else if active == 0 { group.cancelAll(); throw error }
+              }
+            }
+            throw RemoteHTTPError(503,"Mac의 연결을 확인해주세요.")
+        }
+        guard running, generation == epoch, !Task.isCancelled else { throw CancellationError() }
+        let endpoint = endpoints[winner.0], response = winner.1
+        if (response.status == 200 || response.status == 304 && response.nodeID == peer.id), peers[peer.id]?.endpoint == peer.endpoint {
+            peers[peer.id]?.preferredEndpoint = endpoint
+            if !Self.numericURL(endpoint).isEmpty { peers[peer.id]?.directAddress = Self.numericURL(endpoint); rememberPeer(peer.id) }
+        }
+        return response
     }
     private func peerStateTask(_ peer: Peer) -> Task<RemoteNodeView, Never> {
         let endpoint = connectionEndpoint(peer)

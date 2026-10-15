@@ -366,34 +366,40 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private let request: Data
     private let timeout: TimeInterval
     private let retryRead: Bool
-    private var buffer = Data()
+    private let expectedNodeID: String?
+    private let acceptsGzip: Bool
+    private let decoder: RemotePeerResponseDecoder
     private var continuation: CheckedContinuation<RemoteHTTPResponse, Error>?
     private var deadline: DispatchWorkItem?
     private var cancelled = false
     private var phase = "connecting"
-    private var responseLength: Int?
+    private var requestSent = false
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
     convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, entityTag: String? = nil, retryReads: Bool = true) throws {
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         guard entityTag == nil || method == "GET" && body.isEmpty && path == "/api/inventory" && entityTag!.count <= 128 && !entityTag!.contains("\r") && !entityTag!.contains("\n") else { throw RemoteHTTPError(400,"목록 조회의 조건부 요청이 올바르지 않습니다.") }
         let validator = entityTag.map { "If-None-Match: \($0)\r\n" } ?? ""
-        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)\(validator)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
+        let acceptsGzip = method == "GET" && body.isEmpty
+        let encoding = acceptsGzip ? "Accept-Encoding: gzip\r\n" : ""
+        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)\(validator)\(encoding)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
         let duration = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
         let retryRead = retryReads && method == "GET" && body.isEmpty
-        try self.init(endpoint: endpoint, request: request, timeout: retryRead ? duration / 2 : duration, retryRead: retryRead)
+        try self.init(endpoint: endpoint, request: request, timeout: retryRead ? duration / 2 : duration, retryRead: retryRead, expectedNodeID:expectedNodeID, acceptsGzip:acceptsGzip)
     }
-    private init(endpoint: NWEndpoint, request: Data, timeout: TimeInterval, retryRead: Bool) throws {
+    private init(endpoint: NWEndpoint, request: Data, timeout: TimeInterval, retryRead: Bool, expectedNodeID: String?, acceptsGzip: Bool) throws {
         connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
         self.request = request; self.timeout = timeout; self.retryRead = retryRead
+        self.expectedNodeID = expectedNodeID; self.acceptsGzip = acceptsGzip
+        decoder = RemotePeerResponseDecoder(expectedNodeID:expectedNodeID,acceptsGzip:acceptsGzip)
     }
     func run() async throws -> RemoteHTTPResponse {
-        do { return try await runOnce() }
+        do { let response = try await runOnce(); try Task.checkCancellation(); return response }
         catch let error as RemoteHTTPError where retryRead && error.status == 504 {
             try Task.checkCancellation()
             // Retry only an empty-body GET, once, within the original time
             // budget. Keep the exact path and node header. POST is never replayed.
             return try await RemoteHTTPExchange(endpoint: connection.endpoint, request: request,
-                                                timeout: timeout, retryRead: false).runOnce()
+                                                timeout: timeout, retryRead: false, expectedNodeID:expectedNodeID, acceptsGzip:acceptsGzip).runOnce()
         }
     }
     private func runOnce() async throws -> RemoteHTTPResponse {
@@ -406,7 +412,8 @@ final class RemoteHTTPExchange: @unchecked Sendable {
                 self.connection.stateUpdateHandler = { state in
                     self.phase = String(describing: state)
                     switch state {
-                    case .ready:
+                    case .ready where !self.requestSent:
+                        self.requestSent = true
                         self.connection.send(content: self.request, completion: .contentProcessed { error in
                             if let error { self.finish(.failure(error)) } else { self.phase = "waiting_headers"; self.receive() }
                         })
@@ -418,7 +425,7 @@ final class RemoteHTTPExchange: @unchecked Sendable {
                 let deadline = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     self.finish(.failure(RemoteHTTPError(504, "Mac의 응답을 기다리다 시간이 지났습니다. 전송한 입력은 다시 보내지 말고 화면을 확인해주세요.", diagnostics: [
-                        "phase": self.phase, "receivedBytes": String(self.buffer.count), "expectedBytes": self.responseLength.map(String.init) ?? "unknown",
+                        "phase": self.phase, "receivedBytes": String(self.decoder.receivedBytes), "expectedBytes": self.decoder.expectedBytes.map(String.init) ?? "unknown",
                         "endpoint": String(describing: self.connection.endpoint), "interfaces": self.connection.currentPath?.availableInterfaces.map(\.name).joined(separator: ",") ?? "unknown"
                     ])))
                 }
@@ -433,44 +440,23 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private func receive() {
         guard continuation != nil else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64_000) { data, _, ended, error in
-            if let data { self.buffer.append(data) }
-            if !self.buffer.isEmpty { self.phase = "receiving" }
-            if self.buffer.count > 4_000_000 { self.finish(.failure(RemoteHTTPError(502, "Mac의 응답이 너무 큽니다."))); return }
-            if let boundary = self.buffer.range(of: Data("\r\n\r\n".utf8)),
-               let head = String(data: self.buffer[..<boundary.lowerBound], encoding: .utf8) {
-                let lines = head.components(separatedBy: "\r\n")
-                let length = lines.first { $0.lowercased().hasPrefix("content-length:") }.flatMap { Int($0.dropFirst(15).trimmingCharacters(in: .whitespaces)) }
-                self.responseLength = length
-                let status = lines.first?.split(separator: " ").dropFirst().first.flatMap { Int($0) }
-                var metadata: [String:String] = [:]
-                for line in lines.dropFirst() {
-                    guard let colon = line.firstIndex(of:":") else { continue }
-                    let key = line[..<colon].lowercased()
-                    guard ["etag","x-autoapprove-node"].contains(key) else { continue }
-                    if metadata[key] != nil { self.finish(.failure(RemoteHTTPError(502,"Mac의 목록 응답 헤더가 중복되었습니다.",diagnostics:["failureKind":"protocol"]))); return }
-                    metadata[key] = line[line.index(after:colon)...].trimmingCharacters(in:.whitespaces)
+            guard self.continuation != nil else { return }
+            do {
+                if let data, !data.isEmpty {
+                    self.phase = "receiving"
+                    if let response = try self.decoder.append(data) { self.finish(.success(response)); return }
                 }
-                if status == 304 {
-                    guard self.buffer.count == boundary.upperBound else { self.finish(.failure(RemoteHTTPError(502,"Mac의 조건부 응답에 잘못된 본문이 있습니다.",diagnostics:["failureKind":"protocol"]))); return }
-                    var response = RemoteHTTPResponse(status:304,body:Data())
-                    response.entityTag = metadata["etag"]; response.nodeID = metadata["x-autoapprove-node"]
-                    self.finish(.success(response)); return
-                }
-                if let length, let status, length >= 0, length <= 4_000_000, self.buffer.count >= boundary.upperBound + length {
-                    var response = RemoteHTTPResponse(status: status, body: self.buffer.subdata(in: boundary.upperBound..<boundary.upperBound + length))
-                    response.entityTag = metadata["etag"]; response.nodeID = metadata["x-autoapprove-node"]
-                    self.finish(.success(response))
-                    return
-                }
+                if let error { throw error }
+                if ended { try self.decoder.finish() }
+                else { self.receive() }
+            } catch {
+                self.finish(.failure(error))
             }
-            if let error { self.finish(.failure(error)) }
-            else if ended { self.finish(.failure(RemoteHTTPError(502, "Mac과의 연결이 끊겼습니다. 상태를 새로고침해주세요."))) }
-            else { self.receive() }
         }
     }
     private func finish(_ result: Result<RemoteHTTPResponse, Error>) {
         guard let continuation else { return }; self.continuation = nil
-        deadline?.cancel(); deadline = nil; buffer = Data()
+        deadline?.cancel(); deadline = nil
         connection.stateUpdateHandler = nil; connection.cancel()
         continuation.resume(with: result)
     }

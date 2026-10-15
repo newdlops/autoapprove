@@ -56,4 +56,22 @@ public final class RemoteGzipDecoder {
     public func finish() throws {
         guard ended else { throw RemoteHTTPError(503,"Mac의 압축 스트림이 전송 중 끊겼습니다. 다시 연결합니다.") }
     }
+    /// Finite peer GETs use the same bounded inflater and require the footer.
+    public static func complete(_ data: Data, maximum: Int = 4_000_000) throws -> Data {
+        guard (1...4_000_000).contains(maximum), data.count <= 4_000_000 else {
+            throw RemoteHTTPError(502,"Mac의 응답 크기가 올바르지 않습니다.",diagnostics:["failureKind":"protocol"])
+        }
+        let decoder = try Self(); var output = Data()
+        for offset in stride(from:0,to:data.count,by:65_536) {
+            try decoder.append(data.subdata(in:offset..<min(data.count,offset+65_536)))
+            while !decoder.needsInput, !decoder.ended {
+                let chunk = try decoder.read(maximum:min(32_768,maximum-output.count+1))
+                guard output.count+chunk.count <= maximum else {
+                    throw RemoteHTTPError(502,"Mac의 압축 해제 응답이 너무 큽니다.",diagnostics:["failureKind":"protocol"])
+                }
+                output.append(chunk)
+            }
+        }
+        try decoder.finish(); return output
+    }
 }
