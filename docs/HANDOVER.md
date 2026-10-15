@@ -7,7 +7,8 @@
 - 일반 GET 텍스트/JSON은 1KiB~2.1MB·명시적 gzip 협상·32바이트 이상 절감 시 zlib 6 완결 응답을 쓴다. SSE는 빠른 기존 zlib 1·이벤트별 flush를 유지한다. 강한 ETag는 identity, 기존 약한 network ETag/304·CSP·색상/키/원본과 q=0/구버전 호환을 유지한다. 첫 웹 파일 3개 본문 **235,555→58,409바이트(75.2%)**, 합성 전체 화면 GET **68,651→4,352바이트(93.7%)**다. 전체 통신/CPU 수치로 확대하지 않는다.
 - Core **284/284**, 실제 중계 **16개 조건**, Chromium/WebKit 변경분 **각 15개**·기존 연결 **각 11개**, 실제 Core 중계 gzip EventSource/명시적 입력·최종 패키지/DMG 검사를 통과했다. 정지·부분 gzip은 약 35초, 수신 정지는 약 30초에 정리됐고 정상 heartbeat는 37초 유지됐다. 세 화면 크기·초안이 남은 오프라인 화면을 확인했다. [VALIDATION.md](../VALIDATION.md)에 측정/시각 범위와 실제 휴대폰·물리 VPN 장애 미검증을 구분한다.
 - 두 Mac **0.2.94/118**, 원본 CLI 식별/직접 입력 **21개·3개**를 확인했다. 로컬 원본 PID·시작·TTY 21개·설정·기존 승인 기록 **18,527건**·root 입력 서비스 프로세스/파일을 보존했다. 재시작 직후 입력 준비는 후속 읽기에서 해소됐고 서비스 재등록/권한 변경은 없다. 숫자 LAN 두 주소와 실제 자산 일치도 확인했다.
-- 주요 재현 스크립트 `stream-payload-check.mjs --output=.runtime/performance/stability-094`, `stream-route-check.mjs`, `terminal-delta-browser-check.mjs --output=.runtime/performance/stability-094/browser`와 기존 연결 검사. 비공개 검증 `.runtime/performance/stability-094/`, 배포 `.runtime/releases/0.2.94/stability-118/`. 0.2.94 `deploy.py`는 이미 실행했으므로 재실행하지 않는다. GitHub 게시 결과 확인 후 이 항목과 현재 상태를 마무리한다. `.codeidx/`·`.vscode/settings.json`은 보존하고 배포하지 않는다.
+- [GitHub v0.2.94](https://github.com/newdlops/autoapprove/releases/tag/v0.2.94)의 정식 최신 릴리스·태그·두 자산과 인증 없는 실제 다운로드 바이트/해시를 확인했다. 소스 커밋 `65a8c273067cb97697bbc3f650664b3524886916`, DMG 9,150,085바이트·SHA-256 `77ce87b0608bf767e5405824b34ed82f5f8bef28d292f0d2652c0876677158e9`. 게시 후 두 Mac의 버전·원본·직접 입력과 상대 식별 보존도 다시 확인했다. 문서만 별도 커밋하며 태그는 이동하지 않는다.
+- 주요 재현 스크립트 `stream-payload-check.mjs --output=.runtime/performance/stability-094`, `stream-route-check.mjs`, `terminal-delta-browser-check.mjs --output=.runtime/performance/stability-094/browser`와 기존 연결 검사. 비공개 검증 `.runtime/performance/stability-094/`, 배포 `.runtime/releases/0.2.94/stability-118/`. 0.2.94 `deploy.py`는 이미 실행했으므로 재실행하지 않는다. `.codeidx/`·`.vscode/settings.json`은 보존하고 배포하지 않는다.
 
 ## 2026-10-15 터미널 변경분·중계 압축·읽기 복구 · 0.2.93/117
 
@@ -96,13 +97,13 @@
 - 교대 연결의 코드·UI·검사·설정·위치 권한 요청을 삭제했다. 0.2.83/107은 0.2.81의 실행 코드와 기능을 유지하는 제거 업데이트다. 0.2.82 검사본이 다른 Mac에 자동 적용된 기록이 있어 그 Mac도 업데이트 대상으로 확인한다.
 - 이 기능의 비공개 시험 자료와 빌드 제품도 삭제했다. 이 Mac의 교대 연결 설정과 추가한 위치 접근 권한을 제거했고, 원본 세션·사용자 설정·기존 승인 기록·입력 서비스를 보존했다. 복원 확인 기록은 `.runtime/wifi-removal-20261013/`에 비공개로 둔다.
 
-최종 갱신: 2026-10-15 (KST), 0.2.93 · 빌드 117. Wi-Fi 교대 연결 개발은 사용자 요청으로 취소·삭제했다. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
+최종 갱신: 2026-10-15 (KST), 0.2.94 · 빌드 118. Wi-Fi 교대 연결 개발은 사용자 요청으로 취소·삭제했다. 새 작업 전에 현재 Git 및 실행 상태를 다시 확인한다.
 
 ## 현재 상태
 
-- 두 Mac **0.2.93/117**. 원본 CLI **21개·3개**의 식별과 직접 입력 지원을 확인했다. 로컬 기존 승인 기록 **18,464건**·사용자 설정·root 입력 서비스 프로세스/파일을 보존했다. 연결 설정과 HTTP 상태에 교대 연결 영역이 없다.
-- 0.2.93 전체 Core **283/283**, 실제 직접/중계 HTTP SSE gzip/변경분·압축 손상/중단·Chromium/WebKit EventSource/명시적 입력, 최종 서명·입력 서비스·웹/MCP/PTY·DMG 검사를 통과했다. 세 크기의 시각 확인과 합성 갱신 구간 측정의 범위는 [VALIDATION.md](../VALIDATION.md)에 구분한다. 실제 휴대폰 체감·Wi-Fi/VPN 자체 장애 방지는 자동 검사에 포함하지 않는다.
-- [GitHub v0.2.93](https://github.com/newdlops/autoapprove/releases/tag/v0.2.93)의 정식 최신 릴리스·태그·두 자산과 인증 없는 다운로드 바이트 일치를 확인했다. 소스 커밋 `6295b58562ab8982d4b654b00510a3657cfd459a`. DMG **9,154,208바이트**, SHA-256 `fbea6b03334bf2b4cf100b29fcff085d1e675a2d2832608ee56369aa5231116d`. 게시 검증은 `.runtime/releases/0.2.93/stream-117/github-verification.json`에 비공개로 보관한다. 배포 후 문서만 별도 커밋하고 태그를 이동하지 않는다.
+- 두 Mac **0.2.94/118**. 원본 CLI **21개·3개**의 식별과 직접 입력 지원을 확인했다. 로컬 기존 승인 기록 **18,527건**·사용자 설정·root 입력 서비스 프로세스/파일을 보존했다. 연결 설정과 HTTP 상태에 교대 연결 영역이 없다.
+- 0.2.94 전체 Core **284/284**, 실제 중계 **16개 조건**·일반 GET/SSE gzip/변경분과 Chromium/WebKit EventSource/미확인 입력·오프라인 복귀, 최종 서명·입력 서비스·웹/MCP/PTY·DMG 검사를 통과했다. 세 크기의 시각 확인과 응답 본문 측정의 범위는 [VALIDATION.md](../VALIDATION.md)에 구분한다. 실제 휴대폰 체감·Wi-Fi/VPN 자체 장애 방지는 자동 검사에 포함하지 않는다.
+- [GitHub v0.2.94](https://github.com/newdlops/autoapprove/releases/tag/v0.2.94)의 정식 최신 릴리스·태그·두 자산과 인증 없는 다운로드 바이트 일치를 확인했다. 소스 커밋 `65a8c273067cb97697bbc3f650664b3524886916`. DMG **9,150,085바이트**, SHA-256 `77ce87b0608bf767e5405824b34ed82f5f8bef28d292f0d2652c0876677158e9`. 게시 검증은 `.runtime/releases/0.2.94/stability-118/github-verification.json`에 비공개로 보관한다. 배포 후 문서만 별도 커밋하고 태그를 이동하지 않는다.
 - 현재 주소는 비공개 HTTP 검증 파일에서 확인한다. 보안 정책·방화벽·VPN·네트워크 연결을 변경하지 않았다. 기존 세션을 새 PTY로 옮기거나 재시작하지 않았다.
 
 ## 0.2.81 승인 지연·오류 복구
