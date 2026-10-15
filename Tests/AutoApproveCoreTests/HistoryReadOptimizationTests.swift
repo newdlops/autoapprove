@@ -1,12 +1,15 @@
 import Foundation
+import Darwin
 import CSQLite
 import AutoApproveCore
 
 private final class HistoryReadFixture {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-history-read-" + UUID().uuidString)
+    let filename: String
     var db: OpaquePointer?
-    var path: String { root.appendingPathComponent("history.sqlite").path }
-    init() throws {
+    var path: String { root.appendingPathComponent(filename).path }
+    init(filename: String = "history.sqlite") throws {
+        self.filename = filename
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         guard sqlite3_open(path, &db) == SQLITE_OK else { throw AppError.message("Fixture database unavailable") }
         try sql("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_ordinal INTEGER); CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT); INSERT INTO thread_history_projection_state VALUES('root',2),('other',2);")
@@ -21,6 +24,36 @@ private final class HistoryReadFixture {
 }
 
 extension ApprovalTests {
+    func testCodexCollectorIsolatesFileFailuresAndFollowsCurrentRollout() async throws {
+        let fixture = try HistoryReadFixture(filename:"thread_history_1.sqlite")
+        try fixture.question("First live question");try fixture.question("Other live question",thread:"other")
+        let day = fixture.root.appendingPathComponent("sessions/2026/10/15")
+        try FileManager.default.createDirectory(at:day,withIntermediateDirectories:true)
+        let file = day.appendingPathComponent("rollout-fixture.jsonl")
+        func select(_ id: String) throws {
+            var data = try JSONSerialization.data(withJSONObject:["type":"session_meta","payload":["source":"cli","id":id]])
+            data.append(10);try data.write(to:file)
+        }
+        try select("root")
+        let held = try FileHandle(forReadingFrom:file)
+        defer { try? held.close() }
+        let collector = CodexQuestionCollector(fileReader:{ session, timeout in
+            if session.id == "failed" { throw POSIXError(.EPERM) }
+            return try ProcessOpenFiles.paths(pid:session.pid,expectedStart:session.started,timeout:timeout)
+        })
+        let start = try ProcessDiscovery.read(pid:getpid()).first!.started
+        let good = AgentSession(id:"good",agent:.codex,pid:getpid(),started:start,tty:"/dev/fixture",cwd:fixture.root.path,terminal:.terminal)
+        var failed = good;failed.id = "failed";failed.pid = 43
+        var updates = await collector.collect([failed,good])
+        try expectNotNil(updates.first(where:{$0.sessionID == failed.id})?.error)
+        try expectNil(updates.first(where:{$0.sessionID == good.id})?.error)
+        try expectEqual(updates.first(where:{$0.sessionID == good.id})?.questions?.first?.title,"First live question","One denied/closed process cannot hide another process's questions")
+        try select("other")
+        updates = await collector.collect([good,failed])
+        try expectEqual(updates.first(where:{$0.sessionID == good.id})?.threadID,"other")
+        try expectEqual(updates.first(where:{$0.sessionID == good.id})?.questions?.first?.title,"Other live question","The same process path must resolve its current conversation every time")
+    }
+
     func testRolloutHeaderStopsAtFirstLineAndKeepsByteLimit() throws {
         let header = Data("{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\",\"source\":\"cli\"}}".utf8)
         let bytes = header + Data([10]) + Data(repeating: 120, count: 2_097_152)

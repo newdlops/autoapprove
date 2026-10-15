@@ -229,20 +229,26 @@ public final class CodexHistoryReader {
 
 public actor CodexQuestionCollector {
     private var readers: [String: CodexSessionHistoryReader] = [:]
-    public init() {}
+    private let fileReader: @Sendable (AgentSession, TimeInterval) throws -> [String]
+    public init(fileReader: @escaping @Sendable (AgentSession, TimeInterval) throws -> [String] = {
+        try ProcessOpenFiles.paths(pid:$0.pid,expectedStart:$0.started,timeout:$1)
+    }) { self.fileReader = fileReader }
     public func collect(_ sessions: [AgentSession]) -> [CodexQuestionUpdate] {
         let targets = sessions.filter { $0.agent == .codex && $0.phase != .ended }
         readers = readers.filter { key, _ in targets.contains { $0.id == key } }
         guard !targets.isEmpty else { return [] }
-        let files: [Int32: [String]]
-        do {
-            let result = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", targets.map { String($0.pid) }.joined(separator: ","), "-Fpn"], timeout: 4)
-            guard result.status == 0 || !result.output.isEmpty else { throw AppError.message("Codex 질문 기록 연결을 확인하지 못했습니다.") }
-            files = CodexThreadLocation.openFiles(result.output)
-        } catch { return targets.map { CodexQuestionUpdate(sessionID: $0.id, error: error.localizedDescription) } }
+        // Preserve the old batch lsof budget across all metadata reads, before
+        // the existing per-session database work. Never reuse failed paths.
+        let deadline = ProcessInfo.processInfo.systemUptime + 4
+        var files = [String:[String]](), failures = [String:String]()
+        for session in targets {
+            do { files[session.id] = try fileReader(session,max(0,deadline-ProcessInfo.processInfo.systemUptime)) }
+            catch { failures[session.id] = error.localizedDescription }
+        }
         return targets.map { session in
+            if let error = failures[session.id] { return CodexQuestionUpdate(sessionID:session.id,error:error) }
             do {
-                let location = try CodexThreadLocation.locate(paths: files[session.pid] ?? [])
+                let location = try CodexThreadLocation.locate(paths:files[session.id] ?? [])
                 let reader = readers[session.id] ?? CodexSessionHistoryReader()
                 readers[session.id] = reader
                 return reader.read(sessionID: session.id, location: location)

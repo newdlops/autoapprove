@@ -697,29 +697,35 @@ struct RemoteTerminalUpdate: Encodable {
             pendingHints = Array(hints.prefix(64)).filter { directProbedAt[$0].map { Date().timeIntervalSince($0) < 60 } != true }
         }
         var addresses: [String] = []
-        var seen = Set<String>()
-        let candidates = Array(discoveryAddresses().prefix(512)).filter { seen.insert($0).inserted }
-        let known = Set(peers.values.flatMap { [ $0.directAddress ].compactMap { $0 } + $0.webURLs })
         if !pendingHints.isEmpty { addresses = Array(pendingHints.prefix(2)); pendingHints.removeFirst(addresses.count) }
-        else if Date() >= nextBlindProbe, !candidates.isEmpty {
-            let lanes = Set(candidates.map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)})
-            let reached = Set(peers.values.filter {verified($0)}.flatMap {peer in
-                ([peer.directAddress,peer.preferredEndpoint.map(Self.numericURL)].compactMap {$0}).map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)}
-            })
-            let allReached = !lanes.isEmpty && lanes.isSubset(of:reached)
-            nextBlindProbe = Date().addingTimeInterval(allReached ? min(5, max(0.5, directDiscoveryInterval)) : 0.5)
-            var selectedLanes = Set<String>()
-            for _ in 0..<candidates.count {
-                let address = candidates[directCursor % candidates.count]; directCursor = (directCursor + 1) % candidates.count
-                let lane = RemoteLAN.discoveryLane(address,interfaces:lanInterfaces)
-                if !known.contains(address), !selectedLanes.contains(lane), directProbedAt[address].map({ Date().timeIntervalSince($0) >= max(10, directDiscoveryInterval) }) ?? true {
-                    addresses.append(address); selectedLanes.insert(lane)
-                    if addresses.count == 2 || selectedLanes.count == lanes.count { break }
+        else if Date() >= nextBlindProbe {
+            // Preparing hundreds of subnet candidates also reads interface
+            // metadata. Do it only when a blind probe is actually due, after
+            // passive hints, rather than on every 250-ms maintenance tick.
+            var seen = Set<String>()
+            let candidates = Array(discoveryAddresses().prefix(512)).filter { seen.insert($0).inserted }
+            if !candidates.isEmpty {
+                let known = Set(peers.values.flatMap { [ $0.directAddress ].compactMap { $0 } + $0.webURLs })
+                let lanes = Set(candidates.map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)})
+                let reached = Set(peers.values.filter {verified($0)}.flatMap {peer in
+                    ([peer.directAddress,peer.preferredEndpoint.map(Self.numericURL)].compactMap {$0}).map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)}
+                })
+                let allReached = !lanes.isEmpty && lanes.isSubset(of:reached)
+                nextBlindProbe = Date().addingTimeInterval(allReached ? min(5, max(0.5, directDiscoveryInterval)) : 0.5)
+                var selectedLanes = Set<String>()
+                for _ in 0..<candidates.count {
+                    let address = candidates[directCursor % candidates.count]; directCursor = (directCursor + 1) % candidates.count
+                    let lane = RemoteLAN.discoveryLane(address,interfaces:lanInterfaces)
+                    if !known.contains(address), !selectedLanes.contains(lane), directProbedAt[address].map({ Date().timeIntervalSince($0) >= max(10, directDiscoveryInterval) }) ?? true {
+                        addresses.append(address); selectedLanes.insert(lane)
+                        if addresses.count == 2 || selectedLanes.count == lanes.count { break }
+                    }
                 }
             }
         }
         for address in addresses { directProbedAt[address] = Date() }
         directProbedAt = directProbedAt.filter { Date().timeIntervalSince($0.value) < 300 }
+        guard !addresses.isEmpty else { return }
         await withTaskGroup(of: RemotePeerDiscovery.Found?.self) { group in
             for address in addresses { group.addTask { await RemotePeerDiscovery.find(address) } }
             for await value in group {
