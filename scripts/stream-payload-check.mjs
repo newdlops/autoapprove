@@ -3,12 +3,12 @@ import {coreLinkArguments} from './swift-core-link.mjs';
 import {execFileSync,spawn} from 'node:child_process';
 import {mkdtemp,mkdir,readdir,readFile,writeFile,rm,stat} from 'node:fs/promises';
 import {get} from 'node:http';
-import {createGunzip} from 'node:zlib';
+import {createGunzip,gunzipSync} from 'node:zlib';
 import {StringDecoder} from 'node:string_decoder';
 import {randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-const build=path.resolve('.build/release'),out=path.resolve('.runtime/performance/stream-093'),cache=path.resolve('.build/cache/StreamPayload');
+const build=path.resolve('.build/release'),out=path.resolve(process.argv.find(arg=>arg.startsWith('--output='))?.slice(9)||'dist/qa/stream-payload'),cache=path.resolve('.build/cache/StreamPayload');
 await mkdir(out,{recursive:true});await mkdir(cache,{recursive:true});
 const binary=path.join(out,'StreamPayloadPreview');
 const objects=(await readdir(build+'/AutoApproveCore.build')).filter(name=>name.endsWith('.swift.o')).map(name=>build+'/AutoApproveCore.build/'+name);
@@ -24,6 +24,11 @@ async function start(label){
  await until(()=>!!info,'Fixture startup: '+stderr,20000);return info;
 }
 async function request(node,route,body){const r=await fetch(node.url+route,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(10000)});const value=await r.json();assert.equal(r.status,200,JSON.stringify(value));return value;}
+function rawRead(node,route,encoding,extra={}){
+ return new Promise((resolve,reject)=>{const req=get(node.url+route,{headers:{...(encoding==null?{}:{'Accept-Encoding':encoding}),...extra}},res=>{
+  const chunks=[];res.on('data',chunk=>chunks.push(chunk));res.on('error',reject);res.on('end',()=>{const wire=Buffer.concat(chunks);assert.ok(wire.length<4_000_000);resolve({status:res.statusCode,headers:res.headers,wire,body:res.headers['content-encoding']==='gzip'?gunzipSync(wire):wire});});
+ });req.on('error',reject);req.setTimeout(10000,()=>req.destroy(new Error('Finite HTTP read timed out')));});
+}
 function collect(url,encoding){
  const value={wireBytes:0,events:[],failures:[],encoding:null,error:null,closed:false};let response,decoder,buffer='',previous;const utf8=new StringDecoder('utf8');
  const consume=bytes=>{buffer+=utf8.write(bytes);let end;while((end=buffer.indexOf('\n\n'))>=0){const event=buffer.slice(0,end);buffer=buffer.slice(end+2);const json=event.split('\n').find(line=>line.startsWith('data: '));if(event.startsWith('event: failure')&&json)value.failures.push(JSON.parse(json.slice(6)));if(event.startsWith('event: screen')&&json){
@@ -43,6 +48,26 @@ function collect(url,encoding){
 try{
  const [a,b]=await Promise.all([start('A'),start('B')]);await request(a,'/api/peers',{address:b.url});
  const state=await request(b,'/api/state'),id=state.sessions[0].session.id;
+ const finite=[];
+ for(const route of ['/app.js','/app.css','/','/api/terminal?'+new URLSearchParams({session:id}),'/api/terminal?'+new URLSearchParams({node:b.id,session:id})]){
+  const owner=route.includes('node=')?a:b,plain=await rawRead(owner,route,'identity'),compressed=await rawRead(owner,route,'gzip');
+  assert.equal(plain.status,200);assert.equal(compressed.status,200);assert.equal(plain.headers['content-encoding'],undefined);assert.equal(compressed.headers['content-encoding'],'gzip');
+  assert.equal(compressed.headers.vary,'Accept-Encoding');assert.equal(Number(compressed.headers['content-length']),compressed.wire.length);
+  if(route.startsWith('/api/terminal')){const first=JSON.parse(plain.body),second=JSON.parse(compressed.body);for(const key of ['screen','keys','appearance','sessionID','streamID','revision'])assert.deepEqual(second[key],first[key]);}
+  else if(route==='/'){
+   const normalize=response=>{const html=response.body.toString(),nonce=html.match(/name="autoapprove-style-nonce" content="([^"]+)"/)?.[1];assert.ok(nonce);assert.ok(response.headers['content-security-policy'].includes("'nonce-"+nonce+"'"));return html.replaceAll(nonce,'TEST');};assert.equal(normalize(compressed),normalize(plain));
+  }
+  else assert.deepEqual(compressed.body,plain.body);
+  assert.ok(compressed.wire.length<plain.wire.length*0.8);finite.push({route:route.split('?')[0]+(route.includes('node=')?' (relayed)':''),plainBytes:plain.wire.length,gzipBytes:compressed.wire.length});
+ }
+ for(const encoding of [undefined,'gzip;q=0, *;q=1','br']){
+  const response=await rawRead(b,'/app.js',encoding);assert.equal(response.headers['content-encoding'],undefined);assert.deepEqual(response.body,await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/app.js'));
+ }
+ const inventory=await rawRead(b,'/api/inventory','gzip');assert.equal(inventory.headers['content-encoding'],undefined);assert.ok(/^"/.test(inventory.headers.etag),'Strong byte validators remain identity');
+ const unchanged=await rawRead(b,'/api/inventory','gzip',{'If-None-Match':inventory.headers.etag});assert.equal(unchanged.status,304);assert.equal(unchanged.wire.length,0);assert.equal(unchanged.headers['content-encoding'],undefined);
+ const network=await rawRead(b,'/api/network','gzip');assert.equal(network.headers['content-encoding'],'gzip');assert.ok(network.headers.etag.startsWith('W/'));
+ const network304=await rawRead(b,'/api/network','gzip',{'If-None-Match':network.headers.etag});assert.equal(network304.status,304);assert.equal(network304.wire.length,0);
+ await writeFile(path.join(out,'http-compression.json'),JSON.stringify({finite,checks:['Exact assets and direct/relayed screen/colors/controls','Correct compressed Content-Length and Vary','Absent encoding, explicit q=0 and unsupported br use identity','Strong inventory and weak network validators retain empty 304'],scope:'Raw finite HTTP response bodies from real Swift Core with synthetic original terminals'},null,2));
  for(const [label,gateway,node]of [['direct',b,null],['relayed',a,b.id]]){
   const route='/api/terminal/stream?'+new URLSearchParams({session:id,...(node?{node}:{})});
   const identity=collect(gateway.url+route,'identity'),gzip=collect(gateway.url+route,'gzip'),delta=collect(gateway.url+route+'&delta=1','gzip');
@@ -93,5 +118,5 @@ try{
    checks.push(name+': real mobile page EventSource applies relayed gzip patches and explicit input echoes once with original colors');
   }finally{await browser.close();}
  }
- assert.deepEqual(errors,[]);await writeFile(path.join(out,'stream-verification.json'),JSON.stringify({metrics,checks,errors,scope:'Synthetic originals, raw HTTP body bytes; comparison is current full gzip versus negotiated patch gzip; native upstream negotiates gzip; no user sessions'},null,2));console.log(JSON.stringify({metrics,checks,errors},null,2));
+ assert.deepEqual(errors,[]);await writeFile(path.join(out,'stream-verification.json'),JSON.stringify({metrics,finite,checks,errors,scope:'Synthetic originals, raw HTTP body bytes; comparison is current full gzip versus negotiated patch gzip; native upstream negotiates gzip; no user sessions'},null,2));console.log(JSON.stringify({metrics,finite,checks,errors},null,2));
 }finally{for(const c of collectors)c.close();for(const child of children)child.kill();await Promise.all(children.map(child=>child.exitCode!==null?null:new Promise(resolve=>child.once('exit',resolve))));await rm(root,{recursive:true,force:true});}

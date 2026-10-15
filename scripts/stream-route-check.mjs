@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID,randomBytes } from 'node:crypto';
+import {createConnection} from 'node:net';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import {gzipSync} from 'node:zlib';
+import {gzipSync,createGzip,constants} from 'node:zlib';
 
 const { coreLinkArguments } = await import('./swift-core-link.mjs');
 const output = path.resolve('dist/qa/stream-route');
@@ -47,6 +48,21 @@ function server(backup) {
         if(mode==='denied'){const body=JSON.stringify({error:'QA explicit permission denial'});res.writeHead(403,{'Content-Length':Buffer.byteLength(body),Connection:'close'});res.end(body);return;}
       } else {stats.backupStream++;if(mode==='cancel-both')return;}
       res.useChunkedEncodingByDefault = false;
+      if(mode.startsWith('idle-')||mode==='send-stall'){
+        const fault=mode;
+        res.writeHead(200,{'Content-Type':'text/event-stream',...(fault==='idle-partial'?{'Content-Encoding':'gzip'}:{}),'X-AutoApprove-Node':id,Connection:'close'});res.flushHeaders();
+        let timer,encoder;
+        if(fault==='idle-partial'){
+          encoder=createGzip({level:1});encoder.pipe(res,{end:false});encoder.write('event: screen\ndata: {');encoder.flush(constants.Z_SYNC_FLUSH);
+          timer=setInterval(()=>{encoder.write(' ');encoder.flush(constants.Z_SYNC_FLUSH);},4000);
+        }else if(fault==='idle-heartbeat'){
+          res.write(': keepalive\n\n');timer=setInterval(()=>res.write(': keepalive\n\n'),10000);
+        }else if(fault==='send-stall'){
+          const text=randomBytes(400000).toString('base64');let sent=0;
+          const pump=()=>{while(!res.destroyed&&sent<64){sent++;if(!res.write('event: screen\ndata: '+JSON.stringify({sessionID,screen:text,revision:'blocked-'+sent,observedAt:new Date().toISOString(),keys:[]})+'\n\n')){res.once('drain',pump);return;}}};pump();
+        }
+        res.once('close',()=>{clearInterval(timer);encoder?.destroy();});return;
+      }
       if(mode.startsWith('gzip-')) {
         assert.equal(req.headers['accept-encoding'],'gzip');stats.gzipNegotiated++;
         const event=index=>'event: screen\nid: gzip-'+index+'\ndata: '+JSON.stringify({sessionID,screen:'압축 원본🙂 '+index+' '+String('x').repeat(mode==='gzip-bomb'?2_000_200:mode==='gzip-coalesced'?1_200_000:80000),revision:'gzip-'+index,keys:[],streamID:'same-gzip-original',observedAt:new Date().toISOString()})+'\n\n';
@@ -128,6 +144,39 @@ try {
     }finally{clearTimeout(timer);controller.abort();}
     await wait(100);assert.equal(activeStreams.size,0,'Ended compressed subscriptions must release the upstream socket');
   }
+  const pending=[];
+  for(const fault of ['idle-empty','idle-partial','idle-heartbeat']){
+    mode=fault;const controller=new AbortController(),started=performance.now();
+    const response=await fetch(gzipGateway.url+'/api/terminal/stream?node='+id+'&session='+sessionID,{signal:controller.signal});assert.equal(response.status,200);
+    pending.push((async()=>{
+      const timer=setTimeout(()=>controller.abort(),fault==='idle-heartbeat'?37000:41000);let text='';
+      try{for await(const part of response.body)text+=new TextDecoder().decode(part);}
+      catch(error){if(fault!=='idle-heartbeat'||!controller.signal.aborted)throw error;}
+      finally{clearTimeout(timer);controller.abort();}
+      const elapsedMs=Math.round(performance.now()-started);
+      if(fault==='idle-heartbeat'){
+        assert.ok((text.match(/: keepalive/g)||[]).length>=4);assert.ok(!text.includes('event: failure'),'Healthy idle PTY heartbeats must not hit the event deadline');
+      }else{
+        assert.match(text,/event: failure/);assert.match(text,/"retryable":true/);assert.ok(!text.includes('event: screen'),'A stalled partial JSON event must never reach the browser');
+        assert.ok(elapsedMs>=34000&&elapsedMs<40500,'Idle or trickled partial event must release within the bounded 35 second budget');
+      }
+      return {fault,elapsedMs,retryable: fault!=='idle-heartbeat'};
+    })());
+  }
+  mode='send-stall';
+  const blocked=createConnection({host:'127.0.0.1',port:new URL(gzipGateway.url).port});sockets.add(blocked);blocked.on('error',()=>{});blocked.on('close',()=>sockets.delete(blocked));
+  await new Promise(resolve=>blocked.once('connect',resolve));blocked.pause();
+  blocked.write('GET /api/terminal/stream?node='+id+'&session='+sessionID+' HTTP/1.1\r\nHost: 127.0.0.1:'+new URL(gzipGateway.url).port+'\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n');
+  const blockedStarted=performance.now();
+  pending.push((async()=>{
+    await wait(1000);assert.equal(activeStreams.size,4,'All four isolated fault/control subscriptions must be open');
+    // Idle tests above finish at 35/37 seconds. The send-window timeout must
+    // release the blocked subscriber's upstream before either idle deadline.
+    while(activeStreams.size===4&&performance.now()-blockedStarted<34000)await wait(100);
+    const elapsedMs=Math.round(performance.now()-blockedStarted);assert.equal(activeStreams.size,3,'A non-reading downstream must release its upstream source after the send deadline');
+    blocked.destroy();return {fault:'send-stall',elapsedMs,upstreamReleased:true};
+  })());
+  checks.push(...await Promise.all(pending));await wait(200);assert.equal(activeStreams.size,0);assert.equal(stats.posts,0);
   const report={result:'PASS',checks,posts:stats.posts,scope:'Release Swift Core; isolated loopback-only peers; no Bonjour, physical subnet scan or user CLI'};
   await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
 } finally {

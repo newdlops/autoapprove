@@ -1049,6 +1049,7 @@ function updateControls() {
   scheduleCursor();
 }
 const terminalResyncError = () => Object.assign(new Error('최신 원본 화면을 다시 연결합니다.'), {terminalResync:true});
+let terminalNetworkOffline = false;
 function terminalPatchScreen(update, previous) {
   const patch = update.screenPatch;
   if (!patch || typeof patch !== 'object' || !previous || typeof previous.screen !== 'string' || previous.sessionID !== update.sessionID || !update.streamID || update.streamID !== previous.streamID || patch.baseRevision !== previous.revision || update.revision === previous.revision || patch.baseLength !== previous.screen.length || typeof patch.text !== 'string' || update.screen != null) throw terminalResyncError();
@@ -1126,16 +1127,28 @@ function failTerminalStream(stream, message) {
   text($('terminal-error'), message); show($('terminal-error'), true); text($('terminal-retry'), '화면 다시 연결'); show($('terminal-retry'), true);
   terminalState('error', '연결 끊김'); updateControls();
 }
-function terminalStreamCurrent(stream) {
+function terminalStreamCurrent(stream, allowOffline = false) {
   return terminalStream === stream && selectedKey === stream.key && detailGeneration === stream.generation
-    && nativeTerminal() === stream.renderWindow && !document.hidden;
+    && nativeTerminal() === stream.renderWindow && (allowOffline || !stream.offline) && !document.hidden;
+}
+function pauseTerminalNetwork(stream) {
+  stream.offline = true; stream.reconnecting = true; stream.sseReady = false; stream.frame = null;
+  stream.source?.close(); stream.source = null;
+  clearTimeout(stream.retryTimer); stream.retryTimer = null;
+  clearTimeout(stream.watchdog); clearTimeout(stream.fallbackWatchdog); stopTerminalFallback(stream);
+  if (terminalPaint) cancelAnimationFrame(terminalPaint);
+  clearTimeout(terminalPaintTimer); terminalPaintTimer = null; terminalPaint = 0; terminalPending = null;
+  terminalState('pending', '네트워크 연결 대기'); updateControls();
+  // Browser reachability is only a hint, especially on a VPN/private hotspot.
+  // A bounded LAN read may recover even if an online event never arrives.
+  stream.pollTimer = setTimeout(() => void readTerminalFallback(stream),1500);
 }
 function stopTerminalFallback(stream) {
   clearTimeout(stream.pollTimer); stream.pollTimer = null;
   stream.pollController?.abort(); stream.pollController = null;
 }
 async function readTerminalFallback(stream) {
-  if (!terminalStreamCurrent(stream) || stream.pollController || stream.sseReady) return;
+  if (!terminalStreamCurrent(stream,true) || stream.pollController || stream.sseReady) return;
   clearTimeout(stream.pollTimer); stream.pollTimer = null;
   const controller = new AbortController(); stream.pollController = controller;
   try {
@@ -1145,7 +1158,7 @@ async function readTerminalFallback(stream) {
     // A short read can work when a hotspot/VPN buffers a long-lived SSE.
     // It stays on the selected original; it never creates or resumes a CLI.
     const update = await api('/api/terminal?' + query, undefined, controller.signal, 7000);
-    if (!terminalStreamCurrent(stream) || stream.pollController !== controller || stream.sseReady) return;
+    if (!terminalStreamCurrent(stream,true) || stream.pollController !== controller || stream.sseReady) return;
     if (terminalUpdateIsOlder(update, latestFrame)) return;
     const frame = mergeTerminalUpdate(update, latestFrame, stream.sessionID);
     const changedStream = latestFrame?.streamID && frame.streamID !== latestFrame.streamID;
@@ -1155,11 +1168,13 @@ async function readTerminalFallback(stream) {
       clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
       terminalPaint = 0; terminalPending = null; terminalPendingAt = -Infinity;
     }
+    const recoveredOffline = stream.offline;
+    if (recoveredOffline) { stream.offline = false; terminalNetworkOffline = false; stream.retries = 0; }
     stream.reconnecting = false; stream.pollFailures = 0; stream.resync = false;
     applyTerminalFrame(frame);
-    if (changedStream) openTerminalStream(stream);
+    if (changedStream || recoveredOffline) openTerminalStream(stream);
   } catch (error) {
-    if (!terminalStreamCurrent(stream) || stream.pollController !== controller || controller.signal.aborted || stream.sseReady) return;
+    if (!terminalStreamCurrent(stream,true) || stream.pollController !== controller || controller.signal.aborted || stream.sseReady) return;
     if ([400,401,403,404,409,410].includes(error.status) || !error.status && !error.retryable) {
       failTerminalStream(stream, error.message); return;
     }
@@ -1171,15 +1186,15 @@ async function readTerminalFallback(stream) {
   } finally {
     if (stream.pollController === controller) {
       stream.pollController = null;
-      if (terminalStreamCurrent(stream) && !stream.sseReady) {
-        const interval = stream.pollFailures ? Math.min(3000, 500 * 2 ** Math.min(stream.pollFailures,3)) : directMode || selectedItem?.session.phase === 'working' ? 250 : 750;
+      if (terminalStreamCurrent(stream,true) && !stream.sseReady) {
+        const interval = stream.offline ? 3000 : stream.pollFailures ? Math.min(3000, 500 * 2 ** Math.min(stream.pollFailures,3)) : directMode || selectedItem?.session.phase === 'working' ? 250 : 750;
         stream.pollTimer = setTimeout(() => void readTerminalFallback(stream), interval);
       }
     }
   }
 }
 function reconnectTerminalStream(stream, resync = false) {
-  if (terminalStream !== stream || document.hidden) return;
+  if (terminalStream !== stream || stream.offline || document.hidden) return;
   if (resync) { stream.resync = true; stream.reconnecting = true; stopTerminalFallback(stream); }
   stream.frame = null;
   if (stream.retryTimer) { updateControls(); void readTerminalFallback(stream); return; }
@@ -1199,7 +1214,7 @@ function reconnectTerminalStream(stream, resync = false) {
   updateControls();
   void readTerminalFallback(stream);
   // Retry only the read subscription. Input POSTs are never replayed here.
-  const delay = Math.min(5000, 500 * 2 ** Math.min(stream.retries++, 4));
+  const delay = Math.min(5000, 500 * 2 ** Math.min(stream.retries++, 4)) * (0.8 + Math.random()*0.2);
   stream.retryTimer = setTimeout(() => {
     stream.retryTimer = null;
     if (terminalStream === stream && !document.hidden) openTerminalStream(stream);
@@ -1221,16 +1236,17 @@ function ensureTerminalStream() {
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
   const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1' + (renderWindow ? '&view=screen' : '');
-  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false};
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false,offline:false};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
-  openTerminalStream(stream);
-  void readTerminalFallback(stream);
+  if (terminalNetworkOffline) pauseTerminalNetwork(stream);
+  else { openTerminalStream(stream); void readTerminalFallback(stream); }
 }
 function openTerminalStream(stream) {
+  if (!terminalStreamCurrent(stream)) return;
   stream.frame = null;
   const source = new EventSource(stream.url); stream.source = source;
-  const current = () => terminalStream === stream && stream.source === source && selectedKey === stream.key && detailGeneration === stream.generation && !document.hidden;
+  const current = () => terminalStreamCurrent(stream) && stream.source === source;
   watchTerminalStream(stream);
   source.addEventListener('screen', event => {
     if (!current()) return;
@@ -2108,6 +2124,24 @@ document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
   if (document.hidden) { networkController?.abort(); nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
+});
+window.addEventListener('offline', () => {
+  terminalNetworkOffline = true;
+  if (terminalStream) pauseTerminalNetwork(terminalStream);
+});
+window.addEventListener('online', () => {
+  terminalNetworkOffline = false;
+  if (document.hidden) return;
+  const stream = terminalStream;
+  if (stream?.offline || stream?.retryTimer) {
+    stream.offline = false; stream.retries = 0;
+    clearTimeout(stream.retryTimer); stream.retryTimer = null;
+    if (terminalStreamCurrent(stream)) {
+      stream.source?.close(); stopTerminalFallback(stream);
+      openTerminalStream(stream); void readTerminalFallback(stream);
+    }
+  }
+  void refreshNetwork(); void refreshFrame();
 });
 window.addEventListener('hashchange', restoreSelection);
 function openPTYDialog() {

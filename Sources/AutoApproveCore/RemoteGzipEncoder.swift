@@ -7,9 +7,10 @@ public final class RemoteGzipEncoder {
     private let stream: UnsafeMutablePointer<z_stream>
     private var finished = false
     private var scratch = [UInt8](repeating:0,count:32_768)
-    public init() throws {
+    public init(level: Int32 = 1) throws {
+        guard (1...9).contains(level) else { throw RemoteHTTPError(500,"올바르지 않은 전송 압축 설정입니다.") }
         let pointer = UnsafeMutablePointer<z_stream>.allocate(capacity:1); pointer.initialize(to:z_stream())
-        let result = deflateInit2_(pointer,Z_BEST_SPEED,Z_DEFLATED,31,8,Z_DEFAULT_STRATEGY,zlibVersion(),Int32(MemoryLayout<z_stream>.size))
+        let result = deflateInit2_(pointer,level,Z_DEFLATED,31,8,Z_DEFAULT_STRATEGY,zlibVersion(),Int32(MemoryLayout<z_stream>.size))
         guard result == Z_OK else {
             pointer.deinitialize(count:1); pointer.deallocate()
             throw RemoteHTTPError(503,"터미널 전송 압축을 준비하지 못했습니다. 다시 연결해주세요.")

@@ -255,6 +255,16 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
             guard !self.cancelled else { completion(.success(nil)); return }
             guard self.opened, self.waiter == nil else { completion(.failure(RemoteHTTPError(500, "Mac의 터미널 출력 연결을 확인해주세요."))); return }
             self.waiter = completion; self.deliver()
+            if self.waiter != nil, self.deadline == nil {
+                // Starts only while a downstream reader is asking for an
+                // event. Backpressure never consumes this idle/partial-event
+                // budget, and trickled bytes cannot keep an event open forever.
+                let timeout = DispatchWorkItem { [weak self] in
+                    guard let self, self.waiter != nil else { return }
+                    self.fail(RemoteHTTPError(504,"Mac의 터미널 출력이 멈춰 다시 연결합니다.",diagnostics:["failureKind":"streamTimeout"]))
+                }
+                self.deadline = timeout; self.queue.asyncAfter(deadline:.now()+35,execute:timeout)
+            }
         }
     }
     private func deliver() {
@@ -267,6 +277,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                 let data = buffer.subdata(in: buffer.startIndex..<boundary.upperBound)
                 buffer = buffer.subdata(in: boundary.upperBound..<buffer.endIndex)
                 compressedSinceEvent = 0
+                deadline?.cancel(); deadline = nil
                 waiter = nil; completion(.success(data)); return
             }
             guard buffer.count < Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
@@ -277,6 +288,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
             if ended {
                 if let gzip { try gzip.finish() }
                 let incomplete = !buffer.isEmpty; buffer = Data(); waiter = nil
+                deadline?.cancel(); deadline = nil
                 if let failure { completion(.failure(failure)) }
                 else if incomplete { completion(.failure(RemoteHTTPError(503,"Mac의 터미널 출력이 전송 중 끊겼습니다. 다시 연결해주세요."))) }
                 else { completion(.success(nil)) }
@@ -304,12 +316,13 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     }
     private func fail(_ error: Error) {
         guard !cancelled else { return }
+        deadline?.cancel(); deadline = nil
         if let continuation = opening {
             opening = nil; continuation.resume(throwing: error); cancelNow()
         } else {
             failure = error; ended = true; buffer = Data(); gzip = nil
             connection.cancel()
-            if !receiving { deliver() }
+            deliver()
         }
     }
     func cancel() { queue.async { self.cancelNow() } }

@@ -139,6 +139,7 @@ public struct RemoteHTTPResponse: Sendable {
     public var entityTag: String?
     public var observedAt: Date?
     var contentEncoding: String?
+    private var variesEncoding = false
     var stream: RemoteHTTPBodyStream?
     public var nodeID: String?
     public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8", location: String? = nil) {
@@ -162,6 +163,22 @@ public struct RemoteHTTPResponse: Sendable {
         var response = Self(body: initialData, contentType: "text/event-stream; charset=utf-8")
         response.stream = stream; response.nodeID = nodeID; return response
     }
+    /// Short reads and shipped web assets benefit from a complete gzip member.
+    /// Keep strong validators byte-identical and leave native/legacy clients on
+    /// identity unless they explicitly negotiate gzip. No user data is cached.
+    func preparingTransfer(method: String, acceptsGzip: Bool) -> Self {
+        let type = contentType.split(separator:";").first?.lowercased() ?? ""
+        guard method == "GET", status == 200, stream == nil, contentEncoding == nil,
+              (1024...2_100_000).contains(body.count),
+              ["application/json","application/javascript","text/javascript","text/html","text/css","image/svg+xml"].contains(type),
+              entityTag == nil || entityTag!.hasPrefix("W/") else { return self }
+        var response = self; response.variesEncoding = true
+        if acceptsGzip, let encoder = try? RemoteGzipEncoder(level:6),
+           let encoded = try? encoder.encode(body,final:true), encoded.count + 32 < body.count {
+            response.body = encoded; response.contentEncoding = "gzip"
+        }
+        return response
+    }
     var wire: Data {
         let reason = status == 200 ? "OK" : status == 302 ? "Found" : status == 304 ? "Not Modified" : "Error"
         let redirect = location.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "Location: \($0)\r\n" } ?? ""
@@ -171,7 +188,7 @@ public struct RemoteHTTPResponse: Sendable {
         let validator = entityTag.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "ETag: \($0)\r\n" } ?? ""
         let observation = observedAt.map { "X-AutoApprove-Observed-At: \($0.ISO8601Format())\r\n" } ?? ""
         let encoding = contentEncoding == "gzip" ? "Content-Encoding: gzip\r\n" : ""
-        let vary = stream != nil ? "Vary: Accept-Encoding\r\n" : ""
+        let vary = stream != nil || variesEncoding ? "Vary: Accept-Encoding\r\n" : ""
         let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(encoding)\(vary)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         return Data(headers.utf8) + body
     }
@@ -189,6 +206,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     private let queue: DispatchQueue
     private var handlerTask: Task<Void, Never>?
     private var deadline: DispatchWorkItem?
+    private var sendDeadline: DispatchWorkItem?
     private var heartbeat: DispatchSourceTimer?
     private var stream: RemoteHTTPBodyStream?
     private var gzip: RemoteGzipEncoder?
@@ -223,6 +241,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                     self.complete = true
                     self.buffer = Data(); self.monitorDisconnect()
                     let compressStream = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
+                    let method = request.method
                     self.handlerTask = Task { @MainActor in
                         let handled = await self.handler(request)
                         self.queue.async {
@@ -254,7 +273,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                                     heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
                                 }
                                 self.send(response.wire)
-                            } else { self.send(response.wire, final: true) }
+                            } else { self.send(response.preparingTransfer(method:method,acceptsGzip:compressStream).wire, final: true) }
                         }
                     }
                 } else if ended || error != nil { self.closeNow() }
@@ -274,6 +293,12 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     }
     private func send(_ data: Data, final: Bool = false) {
         guard !closed else { return }; sending = true
+        if !final, stream != nil {
+            // A disappeared reader must not hold a stream slot forever while
+            // Network.framework waits for send-window space. No writes replay.
+            let timeout = DispatchWorkItem { [weak self] in self?.closeNow() }
+            sendDeadline = timeout; queue.asyncAfter(deadline:.now()+30,execute:timeout)
+        }
         if final, deadline == nil {
             // SSE cancels the request deadline after its handshake. A final
             // error must still release its slot if the peer never disconnects.
@@ -289,6 +314,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
             guard let self else { return }
             self.queue.async {
                 guard !self.closed else { return }; self.sending = false
+                self.sendDeadline?.cancel(); self.sendDeadline = nil
                 if error != nil { self.closeNow() }
                 else if !final { self.pumpStream() }
             }
@@ -325,6 +351,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     private func closeNow() {
         guard !closed else { return }; closed = true
         deadline?.cancel(); deadline = nil; heartbeat?.cancel(); heartbeat = nil
+        sendDeadline?.cancel(); sendDeadline = nil
         handlerTask?.cancel(); handlerTask = nil
         stream?.cancel(); stream = nil; pendingResult = nil
         gzip = nil

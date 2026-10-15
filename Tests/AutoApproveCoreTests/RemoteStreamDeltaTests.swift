@@ -2,6 +2,24 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testCompleteGzipUsesNegotiatedLevelWithoutChangingBytes() throws {
+        let plain = Data((String(repeating:"원본 한글🙂 e\u{301} /fixture/module/path.swift\n",count:4000)+"\u{0000}\r\n").utf8)
+        var sizes = [Int]()
+        for level: Int32 in [1,3,6,9] {
+            let encoder = try RemoteGzipEncoder(level:level), decoder = try RemoteGzipDecoder()
+            let compressed = try encoder.encode(plain,final:true)
+            var restored = Data()
+            for offset in stride(from:0,to:compressed.count,by:17) {
+                try decoder.append(compressed.subdata(in:offset..<min(offset+17,compressed.count)))
+                while !decoder.needsInput, !decoder.ended { restored.append(try decoder.read()) }
+            }
+            try decoder.finish(); try expectEqual(restored,plain); sizes.append(compressed.count)
+            try expectThrows(try encoder.encode(Data()))
+        }
+        try expect(sizes[2] < sizes[0],"Complete web responses should benefit from level 6 without changing streaming's fast default")
+        try expectThrows(try RemoteGzipEncoder(level:0)); try expectThrows(try RemoteGzipEncoder(level:10))
+    }
+
     func testTerminalReadRecoveryIsBoundedAndNeverRetriesIdentityOrPermission() async throws {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let frame = try decoder.decode(RemoteTerminalFrame.self,from:RemoteHTTPResponse.object(["sessionID":"fixture","screen":"READY> ","revision":"verified","observedAt":"2026-10-15T00:00:00Z","keys":[]]).body)

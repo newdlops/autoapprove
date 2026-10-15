@@ -643,6 +643,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Payload reduction: peer validation storage bounds bytes, peers, routes and age", tests.testPeerInventoryValidationRetentionIsBounded),
             ("Stream compression: every SSE event flushes immediately and preserves exact bytes", tests.testSSEGzipFlushesEachEventAndPreservesExactBytes),
             ("Stream compression: encoding negotiation, bounds, heartbeat and empty opening", tests.testSSEGzipNegotiationBoundsAndEmptyStart),
+            ("HTTP compression: complete members preserve exact bytes at bounded compression levels", tests.testCompleteGzipUsesNegotiatedLevelWithoutChangingBytes),
             ("Stream deltas: UTF-16 edits preserve exact Unicode and never split surrogate pairs", tests.testTerminalScreenPatchPreservesUTF16AndExactUnicode),
             ("Peer stream compression: fragmented and coalesced events use bounded decoder pulls", tests.testPeerGzipDecoderHandlesFragmentsAndBoundedPulls),
             ("Peer stream compression: corruption, truncation, trailing bytes and input bounds", tests.testPeerGzipDecoderRejectsCorruptionTruncationAndTrailingBytes),
