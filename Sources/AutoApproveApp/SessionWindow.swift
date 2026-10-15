@@ -886,7 +886,7 @@ struct CapacityResumeStatus: View {
     let cancel: () -> Void
     var body: some View {
         if resume.phase == .scheduled {
-            TimelineView(.periodic(from: .now, by: 0.25)) { context in content(at: context.date) }
+            TimelineView(.periodic(from: .now, by: 1)) { context in content(at: context.date) }
         } else {
             content(at: .now)
         }
@@ -942,7 +942,7 @@ struct QuestionAutomationStatus: View {
     let cancel: () -> Void
     var body: some View {
         if automation.phase == .scheduled {
-            TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            TimelineView(.periodic(from: .now, by: 1)) { context in
                 content(at: context.date)
             }
         } else {

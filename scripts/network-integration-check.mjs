@@ -44,6 +44,27 @@ async function ready(node) { for (let attempt = 0; attempt < 50; attempt++) { tr
 try {
   const [first, second] = await Promise.all([start('A'), start('B')]);
   const firstState = await ready(first), secondState = await ready(second);
+  // Real HTTP framing and revalidation before discovering peers can add
+  // unrelated background inventory transitions. No user processes are used.
+  const initialInventory = await fetch(first.url + '/api/network');
+  const inventoryTag = initialInventory.headers.get('etag');
+  const fullInventoryBytes = (await initialInventory.arrayBuffer()).byteLength;
+  assert.equal(initialInventory.status,200);assert.match(inventoryTag,/^W\/"[a-f0-9]{64}"$/);
+  let conditionalBytes = 0;
+  for(let index=0;index<20;index++) {
+    const result = await fetch(first.url + '/api/network',{headers:{'If-None-Match':inventoryTag}});
+    assert.equal(result.status,304);assert.equal(result.headers.get('etag'),inventoryTag);
+    assert.equal(result.headers.get('content-length'),null,'304 must omit the representation length rather than falsely declare a zero-length 200 body');
+    assert.ok(Number.isFinite(Date.parse(result.headers.get('x-autoapprove-observed-at'))));
+    conditionalBytes += (await result.arrayBuffer()).byteLength;
+  }
+  assert.equal(conditionalBytes,0);
+  await request(first,'/api/action',{action:'pause',paused:true,requestID:randomUUID()});
+  const changedInventory = await fetch(first.url + '/api/network',{headers:{'If-None-Match':inventoryTag}});
+  assert.equal(changedInventory.status,200);assert.notEqual(changedInventory.headers.get('etag'),inventoryTag);
+  assert.equal((await changedInventory.json()).nodes.find(node=>node.id===first.id).state.snapshot.paused,true);
+  await request(first,'/api/action',{action:'pause',paused:false,requestID:randomUUID()});
+  console.log('PASS: real HTTP conditional inventory — '+JSON.stringify({reads:20,fullInventoryBytes,conditionalBytes,controlsRevalidated:true}));
   const legacyID = randomUUID(), foreignID = randomUUID();
   if (directOnly) {
     for (const legacy of [true, false]) {

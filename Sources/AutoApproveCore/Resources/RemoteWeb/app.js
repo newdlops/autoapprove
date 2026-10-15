@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const text = (element, value) => { const next = String(value ?? ''); if (element.textContent !== next) element.textContent = next; };
-const show = (element, visible) => { element.hidden = !visible; };
+const show = (element, visible) => { const hidden = !visible; if (element.hidden !== hidden) element.hidden = hidden; };
 const make = (tag, className, value) => { const element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) text(element, value); return element; };
 const uuid = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (Number(c) ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> Number(c) / 4).toString(16));
 const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
@@ -20,6 +20,9 @@ let terminalValue = null, terminalRows = [], terminalAppearanceKey = null;
 let terminalFollowScroll = null;
 let lastNetworkUpdate = null;
 let lastNetworkStartedAt = -Infinity;
+// One page-local inventory only; no disk/browser cache of terminal or input data.
+const networkValidation = {etag:'', value:null, notModified:false, observedAt:null};
+let appliedNetworkETag = '', networkController = null;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
 let composePreferred = false, composeMode = false;
 const keyboardMarker = '\u200b';
@@ -342,16 +345,32 @@ function focusKeyboard() {
   $('terminal-keyboard').focus({ preventScroll: true }); updateControls();
 }
 
-async function api(path, body, signal, timeoutMS = 20000) {
+async function api(path, body, signal, timeoutMS = 20000, validation) {
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
   if (signal?.aborted) controller.abort();
   const timeout = setTimeout(() => controller.abort(), timeoutMS);
   try {
-    const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
+    const headers = body ? {'Content-Type':'application/json'} : validation?.etag ? {'If-None-Match':validation.etag} : {};
+    const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
+    if (validation) validation.notModified = false;
+    if (response.status === 304) {
+      if (!validation?.value || !validation.etag || response.headers.get('ETag') !== validation.etag) {
+        if (validation) { validation.etag = ''; validation.value = null; }
+        throw new Error('목록 갱신 응답을 확인하지 못했습니다. 상태를 새로고침해주세요.');
+      }
+      validation.notModified = true;
+      validation.observedAt = response.headers.get('X-AutoApprove-Observed-At') || new Date().toISOString();
+      return validation.value;
+    }
     const result = await response.json();
     if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, unsent:result.diagnostics?.delivery === 'not_started', delivery:result.diagnostics?.delivery});
+    if (validation) {
+      const tag = response.headers.get('ETag') || '';
+      validation.etag = /^(?:W\/)?"[^"\r\n]{1,128}"$/.test(tag) ? tag : '';
+      validation.value = result; validation.observedAt = result.updatedAt;
+    }
     return result;
   } catch (error) {
     if (error.name === 'AbortError') {
@@ -581,12 +600,25 @@ async function sendQuestionAnswer(key, nodeID, payload, message) {
 
 async function refreshNetwork(initial = false) {
   clearTimeout(networkTimer);
-  if (loadingNetwork) return;
+  if (loadingNetwork || document.hidden) return;
   loadingNetwork = true; $('refresh').disabled = true; $('refresh').setAttribute('aria-busy', 'true');
+  const controller = new AbortController(); networkController = controller;
   const startedAt = performance.now();
   try {
     const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
-    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network');
+    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', undefined, controller.signal, 20000, initial ? undefined : networkValidation);
+    if (controller.signal.aborted || document.hidden) return;
+    if (!initial && networkValidation.notModified && connected && appliedNetworkETag === networkValidation.etag) {
+      // Still observe liveness/history and recover streams, without replacing
+      // inventory objects or invalidating the list, selected form and keyboard.
+      lastNetworkStartedAt = startedAt; lastNetworkUpdate = networkValidation.observedAt;
+      text($('connection'), `${nodes.filter(node => node.online).length}대 연결 · ${nowLabel(lastNetworkUpdate)} 갱신`);
+      if (selectedItem) {
+        renderHistory();
+        if (!selectedItem.view.pty && (terminalStream || supportsTerminalStream(selectedItem.node))) void refreshFrame();
+      }
+      return;
+    }
     connected = true;
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
     // A partial response means the read is pending, not that the peer's original
@@ -608,7 +640,8 @@ async function refreshNetwork(initial = false) {
     if (unavailable && (originalReadSelected() || originalStreamSelected()) && !allSessions.some(item => item.key === selectedKey)) {
       allSessions.push({...selectedItem, node:{...selectedItem.node, ...unavailable, state:selectedItem.node.state}});
     }
-    lastNetworkUpdate = result.updatedAt;
+    appliedNetworkETag = initial ? '' : networkValidation.etag;
+    lastNetworkUpdate = !initial && networkValidation.notModified ? networkValidation.observedAt : result.updatedAt;
     text($('connection'), `${nodes.filter(node => node.online).length}대 연결 · ${nowLabel(lastNetworkUpdate)} 갱신`);
     show($('network-error'), false);
     text($('discovery'), result.discovery || ''); show($('discovery'), !!result.discovery);
@@ -637,6 +670,7 @@ async function refreshNetwork(initial = false) {
     } else restoreSelection();
     renderInteractions();
   } catch (error) {
+    if (controller.signal.aborted) return;
     connected = false; text($('connection'), lastNetworkUpdate ? `연결 끊김 · 마지막 갱신 ${nowLabel(lastNetworkUpdate)}` : '연결 끊김 · 다시 연결 중');
     show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
@@ -646,8 +680,9 @@ async function refreshNetwork(initial = false) {
     if (!selectedItem?.view.pty && !terminalStream && !latestFrame) terminalState('pending', '다시 연결 중…');
     updateControls(); renderMachines();
   } finally {
+    if (networkController === controller) networkController = null;
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
-    if (!document.hidden) networkTimer = setTimeout(refreshNetwork, initial && connected ? 0 : connected ? 2500 : 5000);
+    if (!document.hidden) networkTimer = setTimeout(refreshNetwork, controller.signal.aborted || initial && connected ? 0 : connected ? 2500 : 5000);
   }
 }
 function renderMachines() {
@@ -2037,7 +2072,7 @@ $('add-form').addEventListener('submit', async event => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) { nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
+  if (document.hidden) { networkController?.abort(); nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('hashchange', restoreSelection);

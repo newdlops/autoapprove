@@ -136,6 +136,8 @@ public struct RemoteHTTPResponse: Sendable {
     public var contentType: String
     public var location: String?
     public var styleNonce: String?
+    public var entityTag: String?
+    public var observedAt: Date?
     var stream: RemoteHTTPBodyStream?
     var nodeID: String?
     public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8", location: String? = nil) {
@@ -159,12 +161,14 @@ public struct RemoteHTTPResponse: Sendable {
         response.stream = stream; response.nodeID = nodeID; return response
     }
     var wire: Data {
-        let reason = status == 200 ? "OK" : status == 302 ? "Found" : "Error"
+        let reason = status == 200 ? "OK" : status == 302 ? "Found" : status == 304 ? "Not Modified" : "Error"
         let redirect = location.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "Location: \($0)\r\n" } ?? ""
         let style = styleNonce.flatMap { value in value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) ? " 'nonce-\(value)'" : nil } ?? ""
-        let length = stream == nil ? "Content-Length: \(body.count)\r\n" : ""
+        let length = stream == nil && status != 304 ? "Content-Length: \(body.count)\r\n" : ""
         let identity = nodeID.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "X-AutoApprove-Node: \($0)\r\n" } ?? ""
-        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
+        let validator = entityTag.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "ETag: \($0)\r\n" } ?? ""
+        let observation = observedAt.map { "X-AutoApprove-Observed-At: \($0.ISO8601Format())\r\n" } ?? ""
+        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         return Data(headers.utf8) + body
     }
 }

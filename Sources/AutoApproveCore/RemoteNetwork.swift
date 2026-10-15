@@ -162,6 +162,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var generation = UUID()
     private var status = RemoteNetworkStatus()
     private let onStatus: (RemoteNetworkStatus) -> Void
+    private var lastEmittedStatus: RemoteNetworkStatus?
     private struct Peer {
         var id: String
         var name: String
@@ -431,7 +432,12 @@ struct RemoteTerminalUpdate: Encodable {
             return try await self.exchange(current, path: path, timeout: path == "/api/update/manifest" ? 25 : 15)
         }
     }
-    private func emitStatus() { status.peerCount = peers.values.filter(\.available).count; onStatus(status) }
+    private func emitStatus() {
+        status.peerCount = peers.values.filter(\.available).count
+        guard status != lastEmittedStatus else { return }
+        lastEmittedStatus = status
+        onStatus(status)
+    }
     private func serviceTXT(portal: Bool, port: UInt16) -> Data {
         var values = ["name": String(name.prefix(60)), "version": "1", "portal": portal ? "1" : "0", "http-port": String(port), "ipv4": lanInterfaces.prefix(4).map(\.address).joined(separator: ",")]
         if let webVersion { values["app-version"] = webVersion.version; values["app-build"] = String(webVersion.build) }
@@ -874,7 +880,9 @@ struct RemoteTerminalUpdate: Encodable {
                     var object: JSONObject = ["service": "autoapprove", "version": 1, "id": nodeID, "name": name, "urls": port.map(Self.addresses) ?? [], "port": Int(port ?? 0), "portal": namedAccess?.ownsPortal == true]
                     if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }
                     return try .object(object)
-                case "/api/network": return try await .json(dashboard(initial:request.parameter("initial") == "1",selectedNode:request.parameter("node"),client:request.clientAddress))
+                case "/api/network":
+                    let current = try await dashboard(initial:request.parameter("initial") == "1",selectedNode:request.parameter("node"),client:request.clientAddress)
+                    return try current.response(ifNoneMatch: request.headers["if-none-match"])
                 case "/api/test-screen":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }
