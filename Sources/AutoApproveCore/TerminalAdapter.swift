@@ -332,13 +332,61 @@ public enum TerminalAdapter {
     public static func screenScript(ttys: [String], includeCursor: Bool = true) throws -> String {
         let allowed = try literal(ttys)
         return """
+        (() => {
         const app = Application('com.apple.Terminal');
         const allowed = new Set(\(allowed)); const screens = []; const failures = [];
-        function recordFailure(tty, error) {
+        function checkPermission(error) {
           if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
+        }
+        function recordFailure(tty, error) {
+          checkPermission(error);
           failures.push({tty:tty, message:String(error)});
         }
         if (!app.running()) throw Error('Terminal 앱을 먼저 실행해주세요.');
+        if (!allowed.size) return JSON.stringify({screens:screens, failures:failures});
+        // Terminal evaluates the TTY predicate in one Apple event. Do not walk
+        // every unrelated tab, or cache a tab index across reads. Returned
+        // specifiers are checked against the requested TTY again below.
+        function batch() {
+          const ids = app.windows.id();
+          const ttys = Array.from(allowed);
+          // JXA rejects an _or containing fewer than two clauses.
+          const predicate = ttys.length === 1 ? {tty:ttys[0]} : {_or:ttys.map(tty => ({tty:tty}))};
+          const groups = app.windows.tabs.whose(predicate)();
+          const selected = app.windows.selectedTab.tty();
+          const names = app.windows.name();
+          const after = app.windows.id();
+          if (!Array.isArray(ids) || !Array.isArray(groups) || !Array.isArray(selected) || !Array.isArray(names)
+              || !Array.isArray(after) || ids.length !== groups.length || ids.length !== selected.length
+              || ids.length !== names.length || JSON.stringify(ids) !== JSON.stringify(after)
+              || groups.some(tabs => !Array.isArray(tabs))) throw Error('Terminal window list changed');
+          const remaining = new Set(allowed), result = {screens:[], failures:[]};
+          for (let index = 0; index < groups.length; index++) for (const tab of groups[index]) {
+            let tty = null;
+            try {
+              tty = tab.tty();
+              if (!remaining.has(tty)) continue;
+              let title = null;
+              try { title = String(tab.customTitle() || '').trim() || null; } catch (error) { checkPermission(error); }
+              if (!title && selected[index] === tty) title = String(names[index] || '').trim() || null;
+              let cursorWindow = null;
+              try {
+                if (\(includeCursor ? "true" : "false") && selected[index] === tty && tab.selected()) {
+                  const window = app.windows.byId(ids[index]);
+                  if (window.selectedTab().tty() === tty) cursorWindow = {windowID:Number(ids[index]), title:String(window.name()), bounds:window.bounds()};
+                }
+              } catch (error) { checkPermission(error); }
+              result.screens.push({tty:tty, contents:tab.contents(), title:title, cursorWindow:cursorWindow});
+              remaining.delete(tty);
+            } catch (error) {
+              checkPermission(error); result.failures.push({tty:tty, message:String(error)});
+            }
+          }
+          return result;
+        }
+        try { return JSON.stringify(batch()); } catch (error) { checkPermission(error); }
+        // A closing/reordered window or a host without collection predicates
+        // uses the original per-window reader. Never hide Automation denial.
         screenWindows: for (const window of app.windows()) {
           let tabs;
           try { tabs = window.tabs(); } catch (error) { recordFailure(null, error); continue; }
@@ -361,7 +409,8 @@ public enum TerminalAdapter {
             } catch (error) { recordFailure(tty, error); }
           }
         }
-        JSON.stringify({screens:screens, failures:failures});
+        return JSON.stringify({screens:screens, failures:failures});
+        })();
         """
     }
     public static func reveal(tty: String) throws -> TerminalWindowBounds {
