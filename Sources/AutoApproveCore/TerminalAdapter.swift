@@ -311,6 +311,7 @@ public enum TerminalAdapter {
     }
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String], includeCursor: Bool = true) throws -> TerminalSnapshot {
+        if !includeCursor, let snapshot = try TerminalAppleEvents.screens(ttys: ttys) { return snapshot }
         let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor))
         let data = Data(output.utf8)
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)

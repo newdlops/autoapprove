@@ -20,6 +20,6 @@ execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-
 const report=JSON.parse(execFileSync(binary,[path.resolve(targets)],{encoding:'utf8',timeout:60000}));
 const median=values=>values.sort((a,b)=>a-b)[Math.floor(values.length/2)];
 report.label=label;
-report.medians=Object.fromEntries(['seconds','selfCPUSeconds','childCPUSeconds'].map(key=>[key,median(report.samples.map(sample=>sample[key]))]));
+report.medians=Object.fromEntries(['seconds','selfCPUSeconds','childCPUSeconds','totalCPUSeconds'].map(key=>[key,median(report.samples.map(sample=>sample[key]))]));
 await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2)+'\n');
 console.log(JSON.stringify(report,null,2));

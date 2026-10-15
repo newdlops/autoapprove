@@ -20,9 +20,11 @@ import AutoApproveCore
             let snapshot = try TerminalAdapter.screens(ttys: ttys, includeCursor: false)
             let elapsed = ProcessInfo.processInfo.systemUptime - before
             guard Set(snapshot.screens.map(\.tty)) == Set(ttys) else { throw AppError.message("A benchmark target disappeared") }
-            samples.append(["seconds": elapsed, "selfCPUSeconds": cpu(RUSAGE_SELF) - beforeSelf,
-                "childCPUSeconds": cpu(RUSAGE_CHILDREN) - beforeChild, "screens": snapshot.screens.count,
-                "bytes": snapshot.screens.reduce(0) { $0 + $1.contents.utf8.count }, "failures": snapshot.failures.count])
+            let selfCPU = cpu(RUSAGE_SELF) - beforeSelf, childCPU = cpu(RUSAGE_CHILDREN) - beforeChild
+            samples.append(["seconds": elapsed, "selfCPUSeconds": selfCPU,
+                "childCPUSeconds": childCPU, "totalCPUSeconds": selfCPU + childCPU, "screens": snapshot.screens.count,
+                "bytes": snapshot.screens.reduce(0) { $0 + $1.contents.utf8.count }, "failures": snapshot.failures.count,
+                "titles": snapshot.screens.filter { $0.title != nil }.count])
         }
         let report: [String: Any] = ["samples": samples, "targets": ttys.count,
             "scope": "Three explicit read-only Terminal snapshots; no input, text logging or polling delay changes. Other live tasks can affect timing."]
