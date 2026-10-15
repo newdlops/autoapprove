@@ -222,10 +222,13 @@ extension ApprovalTests {
         session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
         for attempt in 1...13 {
             engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
-            try await Task.sleep(for: .milliseconds(110))
-            try expectEqual(probe.count, attempt)
+            let expected: CapacityResume.Phase = attempt == 13 ? .awaiting : .scheduled
+            let deadline = ProcessInfo.processInfo.systemUptime+3
+            while (probe.count < attempt || engine.snapshot.sessions.first?.capacityResume?.phase != expected),
+                  ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for:.milliseconds(10)) }
+            try expectEqual(probe.count, attempt,"Definite non-write retry \(attempt) must finish exactly once")
             try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, false)
-            try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, attempt == 13 ? .awaiting : .scheduled)
+            try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, expected)
         }
         engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
         try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.count, 13)

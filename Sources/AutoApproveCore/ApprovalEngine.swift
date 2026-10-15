@@ -247,6 +247,14 @@ import TerminalInputSupport
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
         self.remoteProcessVerifier = { session in
+            // A first screen already exists in the monitor. Verify its live
+            // owner without launching a second process on the handshake path.
+            // Custom readers and unsupported/background cases retain ps checks.
+            if processReader == nil, let before = try? TTYInputIdentity.capture(pid:session.pid),
+               TmuxRelay.currentProcess(pid:session.pid,started:session.started,tty:session.tty,agent:session.agent) != nil {
+                guard let after = try? TTYInputIdentity.capture(pid:session.pid), before.sameProcess(as:after) else { return false }
+                return true
+            }
             let records = try processReader.map { try $0() } ?? ProcessDiscovery.read(pid: session.pid)
             return records.contains {
                 $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/" + $0.tty == session.tty
@@ -686,7 +694,7 @@ import TerminalInputSupport
            let observed = remoteMonitorFrames[session.id], observed.generation == generation,
            (0..<2).contains(Date().timeIntervalSince(observed.observedAt)) {
             let verifier = remoteProcessVerifier
-            let verified = try await Task.detached { try verifier(session) }.value
+            let verified = try await Task.detached(priority:.userInitiated) { try verifier(session) }.value
             guard verified, let current = sessions[session.id], current.phase != .ended,
                   remoteGeneration(current, host: host) == generation, remoteCanRead(current),
                   remoteMonitorFrames[session.id]?.generation == generation else {
@@ -694,15 +702,8 @@ import TerminalInputSupport
             }
             return observed
         }
-        let pending: RemoteScreenRead
-        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
-        let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : nil
-        if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
-           existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
-            pending = existing
-        } else {
-            let reader = adapter.presentationScreens ?? adapter.screens
-            let task = Task.detached(priority: .userInitiated) {
+        func read(using reader: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot) -> Task<RemoteObservedScreen,Error> {
+            Task.detached(priority: .userInitiated) {
                 let snapshot: TerminalSnapshot
                 do { snapshot = try reader([target]) }
                 catch let error as TerminalAdapterError { throw error }
@@ -715,6 +716,31 @@ import TerminalInputSupport
                 }
                 return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(), appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents), display: screen.display?.validated())
             }
+        }
+        // A cold text subscription must not wait for JXA/Accessibility cursor
+        // collection or join another viewer's slow presentation read. Read the
+        // current text directly, then let the live stream obtain presentation.
+        // Keeping this out of the live cache also prevents suppressing that read.
+        if initial, host == .terminal, adapter.presentationScreens != nil, !userInputHasPriority(session.id) {
+            let verifier = remoteProcessVerifier
+            guard try await Task.detached(priority:.userInitiated,operation:{try verifier(session)}).value else {
+                throw RemoteHTTPError(409,"원본 터미널 연결이 바뀌었습니다. 다시 연결해주세요.")
+            }
+            let observed = try await read(using:adapter.screens).value
+            try Task.checkCancellation()
+            guard let current = sessions[session.id], remoteGeneration(current,host:host) == generation, remoteCanRead(current) else {
+                throw RemoteHTTPError(409,"원본 터미널 연결이 바뀌었습니다. 다시 연결해주세요.")
+            }
+            return observed
+        }
+        let pending: RemoteScreenRead
+        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
+        let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : nil
+        if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
+           existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
+            pending = existing
+        } else {
+            let task = read(using:adapter.presentationScreens ?? adapter.screens)
             pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
             var tracked = pending; tracked.sourceRevision = sourceRevision
             remoteScreenReads[session.id] = tracked

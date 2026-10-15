@@ -189,7 +189,8 @@ extension ApprovalTests {
         let error = "Original task\n\n■ stream disconnected before completion: network error\n\n› Ask Codex to do anything\n\n? for shortcuts"
         let start = ProcessInfo.processInfo.systemUptime
         engine.receiveScreen(sessionID: session.id, raw: error, generation: "synthetic-recovery")
-        while frames.resumeCount == 0, ProcessInfo.processInfo.systemUptime - start < 2.5 { try await Task.sleep(for: .milliseconds(10)) }
+        while (frames.resumeCount == 0 || engine.snapshot.sessions[0].capacityResume?.phase != .awaiting),
+              ProcessInfo.processInfo.systemUptime - start < 2.5 { try await Task.sleep(for: .milliseconds(10)) }
         try expectEqual(frames.resumeCount, 1, "The default transient first retry must complete without the previous five-second wait")
         try expectEqual(engine.snapshot.sessions[0].capacityResume?.phase, .awaiting)
         for _ in 0..<20 { engine.receiveScreen(sessionID: session.id, raw: error, generation: "synthetic-recovery") }

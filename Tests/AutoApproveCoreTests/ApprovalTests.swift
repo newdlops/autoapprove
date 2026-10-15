@@ -475,6 +475,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Remote terminal read stops once the exact target is found", tests.testRemoteTerminalReadStopsAtExactTarget),
             ("First terminal frame reuses only verified recent monitoring and live output remains fresh", tests.testInitialTerminalReusesOnlyVerifiedRecentMonitor),
             ("First terminal frame rejects changed original processes and ended sessions", tests.testInitialTerminalRejectsChangedOriginalProcess),
+            ("First terminal frame honors PID, lifetime, TTY, agent and read-only background ownership", tests.testInitialTerminalHonorsEveryInjectedIdentityField),
+            ("Cold first terminal text bypasses presentation without delaying live cursors or reviving disconnected originals", tests.testColdInitialTerminalReadsFreshTextBeforePresentation),
             ("Text terminals check only required live permissions and native previews retain full checks", tests.testTextTerminalChecksOnlyRequiredPermissions),
             ("Targeted original process verification matches discovery and rejects ended PIDs", tests.testTargetedOriginalProcessReadMatchesDiscovery),
             ("Command completion handles early exits, concurrent output, Unicode stdin and timeouts", tests.testCommandRunnerExitTimeoutAndConcurrentPipes),
