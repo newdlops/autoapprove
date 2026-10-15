@@ -222,6 +222,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                     if case .hostPort(let host, _) = self.connection.endpoint { request.clientAddress = String(describing:host) }
                     self.complete = true
                     self.buffer = Data(); self.monitorDisconnect()
+                    let compressStream = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
                     self.handlerTask = Task { @MainActor in
                         let handled = await self.handler(request)
                         self.queue.async {
@@ -229,7 +230,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                             self.handlerTask = nil
                             guard !self.closed else { response.stream?.cancel(); return }
                             if let stream = response.stream {
-                                if RemoteGzipEncoder.accepts(request.headers["accept-encoding"]) {
+                                if compressStream {
                                     do {
                                         let encoder = try RemoteGzipEncoder()
                                         response.body = try encoder.encode(response.body)

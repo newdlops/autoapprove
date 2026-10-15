@@ -1048,17 +1048,42 @@ function updateControls() {
   }
   scheduleCursor();
 }
+const terminalResyncError = () => Object.assign(new Error('최신 원본 화면을 다시 연결합니다.'), {terminalResync:true});
+function terminalPatchScreen(update, previous) {
+  const patch = update.screenPatch;
+  if (!patch || typeof patch !== 'object' || !previous || typeof previous.screen !== 'string' || previous.sessionID !== update.sessionID || !update.streamID || update.streamID !== previous.streamID || patch.baseRevision !== previous.revision || update.revision === previous.revision || patch.baseLength !== previous.screen.length || typeof patch.text !== 'string' || update.screen != null) throw terminalResyncError();
+  for (const value of [patch.baseLength,patch.prefix,patch.suffix,patch.length]) if (!Number.isSafeInteger(value) || value < 0 || value > 2000000) throw terminalResyncError();
+  if (patch.prefix + patch.suffix > patch.baseLength || patch.prefix + patch.text.length + patch.suffix !== patch.length) throw terminalResyncError();
+  const high = code => code >= 0xd800 && code <= 0xdbff, low = code => code >= 0xdc00 && code <= 0xdfff;
+  const boundary = offset => !offset || offset === patch.baseLength || !(high(previous.screen.charCodeAt(offset-1)) && low(previous.screen.charCodeAt(offset)));
+  if (!boundary(patch.prefix) || !boundary(patch.baseLength-patch.suffix)) throw terminalResyncError();
+  for (let i=0;i<patch.text.length;i++) {
+    const code = patch.text.charCodeAt(i);
+    if (high(code)) { if (!low(patch.text.charCodeAt(++i))) throw terminalResyncError(); }
+    else if (low(code)) throw terminalResyncError();
+  }
+  const screen = previous.screen.slice(0,patch.prefix) + patch.text + previous.screen.slice(patch.baseLength-patch.suffix);
+  if (screen.length * 3 > 2000000 && byteLength(screen) > 2000000) throw terminalResyncError();
+  return screen;
+}
 function mergeTerminalUpdate(update, previous, sessionID) {
   if (!update || update.sessionID !== sessionID || typeof update.revision !== 'string' || update.revision.length > 512 || typeof update.observedAt !== 'string' || !Number.isFinite(Date.parse(update.observedAt)) || !Array.isArray(update.keys) || update.keys.length > 64 || update.keys.some(key => typeof key !== 'string' || key.length > 64) || update.inputReason != null && typeof update.inputReason !== 'string' || update.streamID != null && typeof update.streamID !== 'string') throw new Error('터미널 화면 정보를 확인하지 못했습니다. 화면을 다시 연결해주세요.');
   if (update.outputReason != null && (typeof update.outputReason !== 'string' || update.outputReason.length > 4096)) throw new Error('원본 출력 상태를 확인하지 못했습니다.');
   if (update.sequence != null && (!Number.isSafeInteger(update.sequence) || update.sequence < 0)) throw new Error('원본 화면 순서를 확인하지 못했습니다.');
   if (update.question != null && (typeof update.question.id !== 'string' || update.question.id.length > 512 || typeof update.question.question !== 'string' || update.question.question.length > 4000 || !Array.isArray(update.question.options) || update.question.options.length < 2 || update.question.options.length > 20 || update.question.options.some(option=>typeof option!=='string'||!option||option.length>4000) || !Number.isInteger(update.question.selected) || update.question.selected<0 || update.question.selected>=update.question.options.length)) throw new Error('원본 질문의 선택지를 확인하지 못했습니다.');
-  const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string') : undefined;
-  if (typeof update.screen === 'string') return {...update, nativeDisplay};
+  const {screenPatch,appearanceUnchanged,...fields} = update;
+  const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string' && !screenPatch) : undefined;
+  if (screenPatch != null) {
+    if (appearanceUnchanged != null && appearanceUnchanged !== true) throw terminalResyncError();
+    const screen = terminalPatchScreen(update,previous);
+    return {...fields,screen,appearance:appearanceUnchanged ? previous.appearance : update.appearance,nativeDisplay};
+  }
+  if (appearanceUnchanged != null) throw terminalResyncError();
+  if (typeof update.screen === 'string') return {...fields, nativeDisplay};
   if (!previous || update.revision !== previous.revision || update.sessionID !== previous.sessionID) throw new Error('최신 화면을 다시 연결해주세요.');
   // A compact update carries current controls. Missing optional input fields
   // clear old locks/cursors/tokens while the unchanged screen and colors remain.
-  return {...previous, ...update, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, question:update.question, nativeDisplay};
+  return {...previous, ...fields, screen:previous.screen, appearance:update.appearance ?? previous.appearance, inputReason:update.inputReason, outputReason:update.outputReason, cursor:update.cursor, streamID:update.streamID, question:update.question, nativeDisplay};
 }
 function terminalUpdateIsOlder(update, previous) {
   if (!previous || update.sessionID !== previous.sessionID || !previous.streamID || update.streamID !== previous.streamID) return false;
@@ -1116,7 +1141,7 @@ async function readTerminalFallback(stream) {
   try {
     const query = new URLSearchParams({node:stream.nodeID, session:stream.sessionID});
     if (stream.renderWindow) query.set('view', 'screen');
-    if (latestFrame) query.set('revision', latestFrame.revision); else query.set('initial', '1');
+    if (latestFrame && !stream.resync) query.set('revision', latestFrame.revision); else query.set('initial', '1');
     // A short read can work when a hotspot/VPN buffers a long-lived SSE.
     // It stays on the selected original; it never creates or resumes a CLI.
     const update = await api('/api/terminal?' + query, undefined, controller.signal, 7000);
@@ -1130,7 +1155,7 @@ async function readTerminalFallback(stream) {
       clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
       terminalPaint = 0; terminalPending = null; terminalPendingAt = -Infinity;
     }
-    stream.reconnecting = false; stream.pollFailures = 0;
+    stream.reconnecting = false; stream.pollFailures = 0; stream.resync = false;
     applyTerminalFrame(frame);
     if (changedStream) openTerminalStream(stream);
   } catch (error) {
@@ -1153,8 +1178,11 @@ async function readTerminalFallback(stream) {
     }
   }
 }
-function reconnectTerminalStream(stream) {
-  if (terminalStream !== stream || document.hidden || stream.retryTimer) return;
+function reconnectTerminalStream(stream, resync = false) {
+  if (terminalStream !== stream || document.hidden) return;
+  if (resync) { stream.resync = true; stream.reconnecting = true; stopTerminalFallback(stream); }
+  stream.frame = null;
+  if (stream.retryTimer) { updateControls(); void readTerminalFallback(stream); return; }
   stream.source?.close(); clearTimeout(stream.watchdog);
   if (terminalPaint) cancelAnimationFrame(terminalPaint);
   clearTimeout(terminalPaintTimer); terminalPaintTimer = null;
@@ -1192,14 +1220,15 @@ function ensureTerminalStream() {
   const renderWindow = nativeTerminal();
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
-  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + (renderWindow ? '&view=screen' : '');
-  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false};
+  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1' + (renderWindow ? '&view=screen' : '');
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
   openTerminalStream(stream);
   void readTerminalFallback(stream);
 }
 function openTerminalStream(stream) {
+  stream.frame = null;
   const source = new EventSource(stream.url); stream.source = source;
   const current = () => terminalStream === stream && stream.source === source && selectedKey === stream.key && detailGeneration === stream.generation && !document.hidden;
   watchTerminalStream(stream);
@@ -1207,9 +1236,11 @@ function openTerminalStream(stream) {
     if (!current()) return;
     try {
       if (event.data.length > 2000000 || byteLength(event.data) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
-      const update = JSON.parse(event.data), previous = terminalPending || latestFrame;
-      if (terminalUpdateIsOlder(update, previous)) { stream.sseReady = false; void readTerminalFallback(stream); return; }
-      const frame = mergeTerminalUpdate(update, previous, stream.sessionID);
+      const update = JSON.parse(event.data);
+      if (terminalUpdateIsOlder(update, stream.frame)) { stream.sseReady = false; void readTerminalFallback(stream); return; }
+      const frame = mergeTerminalUpdate(update, stream.frame, stream.sessionID);
+      stream.frame = frame;
+      if (terminalUpdateIsOlder(frame, terminalPending || latestFrame)) { stream.sseReady = false; void readTerminalFallback(stream); return; }
       // Observe token changes immediately, even if a later frame replaces this
       // one before painting. Pending input must never cross terminal identities.
       if (directMode && (frame.streamID || null) !== directStreamID) {
@@ -1218,7 +1249,7 @@ function openTerminalStream(stream) {
       if (directMode && (!frame.keys.includes('characters') || !frame.keys.includes('backspace') || frame.inputReason)) {
         stopDirect(); inputFailure = frame.inputReason || '원본 입력 권한을 다시 연결해주세요.';
       }
-      stream.sseReady = true; stream.reconnecting = false; stream.retries = 0; stopTerminalFallback(stream); watchTerminalStream(stream);
+      stream.sseReady = true; stream.reconnecting = false; stream.resync = false; stream.retries = 0; stopTerminalFallback(stream); watchTerminalStream(stream);
       terminalPending = frame;
       terminalPendingAt = performance.now();
       if (terminalPaint) return;
@@ -1233,7 +1264,10 @@ function openTerminalStream(stream) {
       terminalPaint = requestAnimationFrame(paint);
       // A suspended animation callback must not freeze an otherwise live read.
       terminalPaintTimer = setTimeout(paint, 100);
-    } catch (error) { failTerminalStream(stream, error.message); }
+    } catch (error) {
+      if (error.terminalResync) reconnectTerminalStream(stream,true);
+      else failTerminalStream(stream,error.message);
+    }
   });
   source.addEventListener('failure', event => {
     if (!current()) return;

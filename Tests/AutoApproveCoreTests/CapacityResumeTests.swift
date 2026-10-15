@@ -248,13 +248,18 @@ extension ApprovalTests {
             engine.receiveScreen(sessionID: record.key, raw: stoppedFrame, generation: "QA")
         }
         let first = try create(); try first.setAutomatic(record.key, enabled: true)
-        turn(first, 1, "failed"); try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, 1)
+        func waitForCount(_ expected: Int, _ engine: ApprovalEngine) async throws {
+            let deadline = ProcessInfo.processInfo.systemUptime+3
+            while (probe.count < expected || engine.snapshot.sessions.first?.capacityResume?.phase != .awaiting), ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for:.milliseconds(10)) }
+            try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase,.awaiting)
+        }
+        turn(first, 1, "failed"); try await waitForCount(1,first); try expectEqual(probe.count, 1)
         first.stop()
         let restored = try create(); defer { restored.stop() }
         turn(restored, 1, "failed"); try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.count, 1)
         for number in 2...9 {
             turn(restored, number, "inProgress"); try await Task.sleep(for: .milliseconds(40)); try expectEqual(probe.count, number - 1)
-            turn(restored, number, "failed"); try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.count, number)
+            turn(restored, number, "failed"); try await waitForCount(number,restored); try expectEqual(probe.count, number)
             turn(restored, number, "failed"); try await Task.sleep(for: .milliseconds(40)); try expectEqual(probe.count, number)
         }
         for status in ["completed", "interrupted"] { turn(restored, 10, status); try await Task.sleep(for: .milliseconds(60)); try expectEqual(probe.count, 9) }

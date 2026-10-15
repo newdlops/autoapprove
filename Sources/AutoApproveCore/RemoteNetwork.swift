@@ -112,6 +112,8 @@ struct RemoteTerminalUpdate: Encodable {
     var outputReason: String?
     var sequence: Int?
     var question: TerminalChoiceQuestion?
+    var screenPatch: RemoteTerminalScreenPatch? = nil
+    var appearanceUnchanged: Bool? = nil
     init(_ frame: RemoteTerminalFrame, knownRevision: String?) {
         sessionID = frame.sessionID; revision = frame.revision; observedAt = frame.observedAt
         keys = frame.keys; inputReason = frame.inputReason
@@ -122,6 +124,15 @@ struct RemoteTerminalUpdate: Encodable {
         outputReason = frame.outputReason
         sequence = frame.sequence
         question = frame.question
+    }
+    init(_ frame: RemoteTerminalFrame, previous: RemoteTerminalFrame?, delta: Bool) {
+        let sameSource = previous?.sessionID == frame.sessionID && previous?.streamID == frame.streamID
+        self.init(frame,knownRevision:sameSource ? previous?.revision : nil)
+        guard delta, let previous, let streamID = frame.streamID, streamID == previous.streamID,
+              frame.sessionID == previous.sessionID, frame.revision != previous.revision,
+              let patch = RemoteTerminalScreenPatch.make(previous:previous.screen,current:frame.screen,baseRevision:previous.revision) else { return }
+        screen = nil; screenPatch = patch
+        if frame.appearance == previous.appearance { appearance = nil; appearanceUnchanged = true }
     }
 }
 
@@ -924,19 +935,23 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
-                    let frame = try await engine.remoteTerminal(sessionID: id, renderWindow: request.parameter("view") == "screen", initial: request.parameter("initial") == "1")
+                    let frame = try await RemoteTerminalReadRecovery.read {
+                        try await engine.remoteTerminal(sessionID:id,renderWindow:request.parameter("view") == "screen",initial:request.parameter("initial") == "1")
+                    }
                     return try .json(RemoteTerminalUpdate(frame, knownRevision: request.parameter("revision")))
                 case "/api/terminal/stream":
                     if let forwarded = try await forwardStream(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
                     let renderWindow = request.parameter("view") == "screen"
-                    let frame = try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow, initial: true)
+                    let frame = try await RemoteTerminalReadRecovery.read {
+                        try await engine.remoteTerminal(sessionID:id,realtime:true,renderWindow:renderWindow,initial:true)
+                    }
                     let tmuxObservation = try engine.remoteTmuxObservation(sessionID: id)
                     let observation = engine.remoteTerminalObservation(sessionID:id)
                     let wakeup: @Sendable (TimeInterval) async -> Void
                     if let tmuxObservation { wakeup = { interval in await tmuxObservation.waitForChange(timeout:interval) } }
                     else { wakeup = { interval in await observation.waitForChange(timeout:interval) } }
-                    let output = try RemoteTerminalBodyStream(initial: frame, emitInitial: false, waitForChange: wakeup,
+                    let output = try RemoteTerminalBodyStream(initial: frame, emitInitial: false, delta: request.parameter("delta") == "1", waitForChange: wakeup,
                         responsive: { [weak engine] in engine?.remoteTerminalNeedsResponsiveRead(id) ?? false }) { [weak engine] in
                         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
                         return try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)

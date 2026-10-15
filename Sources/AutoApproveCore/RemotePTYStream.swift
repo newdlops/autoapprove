@@ -159,6 +159,8 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private var receiving = false
     private var ended = false
     private var failure: Error?
+    private var gzip: RemoteGzipDecoder?
+    private var compressedSinceEvent = 0
     private static let eventLimit = 2_000_128
 
     init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15) throws {
@@ -166,7 +168,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
         connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
         self.expectedNodeID = expectedNodeID
         openingTimeout = max(0.05, timeout)
-        request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\nAccept: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+        request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\nAccept: text/event-stream\r\nAccept-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
     }
     deinit { connection.cancel() }
 
@@ -218,11 +220,17 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                         headers[key] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
                     }
                     if status == 200 {
+                        let encoding = headers["content-encoding"]?.lowercased()
                         guard headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "text/event-stream",
                               headers["transfer-encoding"] == nil,
-                              headers["content-encoding"] == nil || headers["content-encoding"] == "identity",
+                              encoding == nil || encoding == "identity" || encoding == "gzip",
                               headers["x-autoapprove-node"] == self.expectedNodeID else { throw RemoteHTTPError(502, "Mac의 터미널 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.", diagnostics: ["failureKind":"identity"]) }
-                        self.buffer = self.buffer.subdata(in: boundary.upperBound..<self.buffer.count)
+                        let body = self.buffer.subdata(in: boundary.upperBound..<self.buffer.count)
+                        self.buffer = Data()
+                        if encoding == "gzip" {
+                            let decoder = try RemoteGzipDecoder(); try decoder.append(body)
+                            self.gzip = decoder; self.compressedSinceEvent = body.count
+                        } else { self.buffer = body }
                         self.opened = true; self.ended = ended; self.failure = error
                         self.deadline?.cancel(); self.deadline = nil
                         let continuation = self.opening; self.opening = nil
@@ -251,43 +259,56 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     }
     private func deliver() {
         guard !cancelled, let completion = waiter else { return }
-        if let boundary = buffer.range(of: Data("\n\n".utf8)) {
-            let length = boundary.upperBound - buffer.startIndex
-            guard length <= Self.eventLimit else {
-                buffer = Data(); waiter = nil
-                completion(.failure(RemoteHTTPError(502, "Mac의 터미널 출력 이벤트가 너무 큽니다."))); return
+        do {
+          while true {
+            if let boundary = buffer.range(of: Data("\n\n".utf8)) {
+                let length = boundary.upperBound - buffer.startIndex
+                guard length <= Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
+                let data = buffer.subdata(in: buffer.startIndex..<boundary.upperBound)
+                buffer = buffer.subdata(in: boundary.upperBound..<buffer.endIndex)
+                compressedSinceEvent = 0
+                waiter = nil; completion(.success(data)); return
             }
-            let data = buffer.subdata(in: buffer.startIndex..<boundary.upperBound)
-            buffer = buffer.subdata(in: boundary.upperBound..<buffer.endIndex)
-            waiter = nil; completion(.success(data)); return
-        }
-        if ended {
-            let incomplete = !buffer.isEmpty; buffer = Data()
-            waiter = nil
-            if let failure { completion(.failure(failure)) }
-            else if incomplete { completion(.failure(RemoteHTTPError(503, "Mac의 터미널 출력이 전송 중 끊겼습니다. 다시 연결해주세요."))) }
-            else { completion(.success(nil)) }
+            guard buffer.count < Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
+            if let gzip, !gzip.needsInput, !gzip.ended {
+                buffer.append(try gzip.read(maximum:min(32_768,Self.eventLimit-buffer.count)))
+                continue
+            }
+            if ended {
+                if let gzip { try gzip.finish() }
+                let incomplete = !buffer.isEmpty; buffer = Data(); waiter = nil
+                if let failure { completion(.failure(failure)) }
+                else if incomplete { completion(.failure(RemoteHTTPError(503,"Mac의 터미널 출력이 전송 중 끊겼습니다. 다시 연결해주세요."))) }
+                else { completion(.success(nil)) }
+                return
+            }
+            guard !receiving else { return }; receiving = true
+            connection.receive(minimumIncompleteLength:1,maximumLength:gzip == nil ? min(65_536,Self.eventLimit-buffer.count) : 65_536) { [weak self] data, _, ended, error in
+                guard let self, !self.cancelled else { return }; self.receiving = false
+                do {
+                    if let data, !data.isEmpty {
+                        if let gzip = self.gzip {
+                            self.compressedSinceEvent += data.count
+                            guard self.compressedSinceEvent <= 2_200_000 else { throw RemoteHTTPError(502,"Mac의 압축 출력 이벤트가 너무 큽니다.") }
+                            try gzip.append(data)
+                        } else { self.buffer.append(data) }
+                    }
+                    if let error { self.failure = error; self.ended = true }
+                    if ended { self.ended = true }
+                    self.deliver()
+                } catch { self.fail(error) }
+            }
             return
-        }
-        guard buffer.count < Self.eventLimit else {
-            buffer = Data(); waiter = nil
-            completion(.failure(RemoteHTTPError(502, "Mac의 터미널 출력 이벤트가 너무 큽니다."))); return
-        }
-        guard !receiving else { return }; receiving = true
-        connection.receive(minimumIncompleteLength: 1, maximumLength: min(65_536, Self.eventLimit - buffer.count)) { [weak self] data, _, ended, error in
-            guard let self, !self.cancelled else { return }; self.receiving = false
-            if let data { self.buffer.append(data) }
-            if let error { self.failure = error; self.ended = true }
-            if ended { self.ended = true }
-            self.deliver()
-        }
+          }
+        } catch { fail(error) }
     }
     private func fail(_ error: Error) {
         guard !cancelled else { return }
         if let continuation = opening {
             opening = nil; continuation.resume(throwing: error); cancelNow()
         } else {
-            failure = error; ended = true
+            failure = error; ended = true; buffer = Data(); gzip = nil
+            connection.cancel()
             if !receiving { deliver() }
         }
     }
@@ -295,7 +316,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private func cancelNow() {
         guard !cancelled else { return }; cancelled = true
         deadline?.cancel(); deadline = nil
-        connection.stateUpdateHandler = nil; connection.cancel(); buffer = Data()
+        connection.stateUpdateHandler = nil; connection.cancel(); buffer = Data(); gzip = nil
         let continuation = opening; opening = nil; continuation?.resume(throwing: CancellationError())
         let completion = waiter; waiter = nil; completion?(.success(nil))
     }

@@ -2,11 +2,14 @@ import Foundation
 
 extension RemoteServerEvent {
     static func screen(_ frame: RemoteTerminalFrame, knownRevision: String? = nil) throws -> Data {
+        try screen(RemoteTerminalUpdate(frame,knownRevision:knownRevision))
+    }
+    static func screen(_ update: RemoteTerminalUpdate) throws -> Data {
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.withoutEscapingSlashes]
-        let json = try encoder.encode(RemoteTerminalUpdate(frame, knownRevision: knownRevision))
+        let json = try encoder.encode(update)
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. 화면 크기를 줄여 다시 연결해주세요.") }
-        return Data("event: screen\nid: \(frame.revision)\ndata: ".utf8) + json + Data("\n\n".utf8)
+        return Data("event: screen\nid: \(update.revision)\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
 }
 
@@ -31,6 +34,8 @@ extension RemoteServerEvent {
     private let waitForChange: (@Sendable (TimeInterval) async -> Void)?
     private let responsive: @MainActor @Sendable () -> Bool
     private var initial: RemoteTerminalFrame?
+    private var previous: RemoteTerminalFrame?
+    private let delta: Bool
     private var revision: String?
     private var controls: Controls?
     private var emittedAt = Date.distantPast
@@ -39,12 +44,12 @@ extension RemoteServerEvent {
     private var cancelled = false
     private var unchanged = 0
 
-    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
+    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
          responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
         initialEvent = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
-        self.initial = emitInitial ? initial : nil; self.read = read
+        self.initial = emitInitial ? initial : nil; self.read = read; self.delta = delta
         if !emitInitial {
-            revision = initial.revision; controls = Controls(initial); emittedAt = Date()
+            revision = initial.revision; controls = Controls(initial); emittedAt = Date(); previous = delta ? initial : nil
         }
         self.waitForChange = waitForChange
         self.responsive = responsive
@@ -66,13 +71,16 @@ extension RemoteServerEvent {
                 while !self.cancelled, !Task.isCancelled {
                     let frame: RemoteTerminalFrame
                     if let initial = self.initial { self.initial = nil; frame = initial }
-                    else { frame = try await self.read() }
+                    else { frame = try await RemoteTerminalReadRecovery.read(self.read) }
                     guard !self.cancelled, !Task.isCancelled else { self.finish(.success(nil)); return }
                     let controls = Controls(frame)
                     self.unchanged = frame.revision == self.revision && controls == self.controls ? self.unchanged + 1 : 0
                     if frame.revision != self.revision || controls != self.controls || Date().timeIntervalSince(self.emittedAt) >= 2 {
-                        let data = try RemoteServerEvent.screen(frame, knownRevision: self.revision)
+                        let data: Data
+                        if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true)) }
+                        else { data = try RemoteServerEvent.screen(frame,knownRevision:self.revision) }
                         self.revision = frame.revision; self.controls = controls; self.emittedAt = Date()
+                        if self.delta { self.previous = frame }
                         self.finish(.success(data)); return
                     }
                     // Native emulators expose screen snapshots. The engine shares
@@ -95,7 +103,7 @@ extension RemoteServerEvent {
     nonisolated func cancel() {
         Task { @MainActor [weak self] in
             guard let self, !self.cancelled else { return }
-            self.cancelled = true; self.initial = nil; self.task?.cancel()
+            self.cancelled = true; self.initial = nil; self.previous = nil; self.task?.cancel()
             self.finish(.success(nil))
         }
     }

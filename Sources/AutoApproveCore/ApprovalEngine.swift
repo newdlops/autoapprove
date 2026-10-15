@@ -722,7 +722,7 @@ import TerminalInputSupport
         do {
             let observed = try await pending.task.value
             guard remoteScreenReads[session.id]?.token == pending.token else {
-                throw RemoteHTTPError(409, "화면 연결이나 입력 상태가 바뀌었습니다. 최신 화면을 다시 확인해주세요.")
+                throw RemoteHTTPError(409, "화면 연결이나 입력 상태가 바뀌었습니다. 최신 화면을 다시 확인해주세요.", diagnostics:["failureKind":"observationChanged"])
             }
             remoteScreenReads[session.id]?.observedAt = observed.observedAt
             return observed

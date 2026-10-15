@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {gzipSync} from 'node:zlib';
 
 const { coreLinkArguments } = await import('./swift-core-link.mjs');
 const output = path.resolve('dist/qa/stream-route');
@@ -30,7 +31,7 @@ async function start(label, known = []) {
 }
 async function json(url) { const response = await fetch(url,{signal:AbortSignal.timeout(8000)}); assert.equal(response.status,200); return response.json(); }
 const id = randomUUID(), sessionID = 'isolated-audit-session';
-const stats = {primaryStream:0,backupStream:0,backupState:0,posts:0};
+const stats = {primaryStream:0,backupStream:0,backupState:0,posts:0,gzipNegotiated:0};
 const activeStreams = new Set();
 let mode='closed', template, primaryURL, backupURL;
 function server(backup) {
@@ -46,6 +47,19 @@ function server(backup) {
         if(mode==='denied'){const body=JSON.stringify({error:'QA explicit permission denial'});res.writeHead(403,{'Content-Length':Buffer.byteLength(body),Connection:'close'});res.end(body);return;}
       } else {stats.backupStream++;if(mode==='cancel-both')return;}
       res.useChunkedEncodingByDefault = false;
+      if(mode.startsWith('gzip-')) {
+        assert.equal(req.headers['accept-encoding'],'gzip');stats.gzipNegotiated++;
+        const event=index=>'event: screen\nid: gzip-'+index+'\ndata: '+JSON.stringify({sessionID,screen:'압축 원본🙂 '+index+' '+String('x').repeat(mode==='gzip-bomb'?2_000_200:mode==='gzip-coalesced'?1_200_000:80000),revision:'gzip-'+index,keys:[],streamID:'same-gzip-original',observedAt:new Date().toISOString()})+'\n\n';
+        const plain=Buffer.from(event(1)+(mode==='gzip-coalesced'?event(2):''));let wire=gzipSync(plain,{level:1});
+        if(mode==='gzip-corrupt'){wire=Buffer.from(wire);wire[wire.length-5]^=255;}
+        if(mode==='gzip-truncated')wire=wire.subarray(0,wire.length-5);
+        res.writeHead(200,{'Content-Type':'text/event-stream','Content-Encoding':'gzip','X-AutoApprove-Node':id,Connection:'close'});
+        if(mode==='gzip-fragmented'){
+          res.write(wire.subarray(0,1));setTimeout(()=>{if(!res.destroyed)res.write(wire.subarray(1,11));},5);
+          setTimeout(()=>{if(!res.destroyed)res.end(wire.subarray(11));},10);
+        }else res.end(wire);
+        return;
+      }
       res.writeHead(200,{'Content-Type':'text/event-stream','X-AutoApprove-Node':(!backup&&mode==='identity')?randomUUID():id,Connection:'close'});
       const frame = {sessionID,screen:'Isolated read-only terminal',revision:'audit-1',observedAt:new Date().toISOString(),keys:[],streamID:'audit-stream'};
       res.write('event: screen\nid: audit-1\ndata: '+JSON.stringify(frame)+'\n\n');
@@ -93,6 +107,26 @@ try {
     await wait(400);assert.equal(stats.posts,0);assert.equal(activeStreams.size,0,'Cancelled or losing subscriptions must release all upstream sockets');
     assert.equal(stats.primaryStream-before.primaryStream,1);if(fault==='cancel')assert.equal(stats.backupStream-before.backupStream,0);if(fault==='cancel-both')assert.equal(stats.backupStream-before.backupStream,1);
     checks.push({fault,firstFrameMs,elapsedMs:Math.round(performance.now()-started),primaryRequests:stats.primaryStream-before.primaryStream,backupRequests:stats.backupStream-before.backupStream});
+  }
+  const gzipGateway=await start('gzip-gateway',[{id,name:'Isolated gzip peer',address:primaryURL,urls:[primaryURL],port:primary.address().port,release:template.release,lastSeen:new Date().toISOString()}]);
+  let gzipOnline=false;
+  for(let i=0;i<50&&!gzipOnline;i++){gzipOnline=(await json(gzipGateway.url+'/api/network')).nodes.some(node=>node.id===id&&node.online);if(!gzipOnline)await wait(100);}
+  assert.ok(gzipOnline,'Compressed peer metadata must be ready before subscribing');
+  for(const fault of ['gzip-fragmented','gzip-coalesced','gzip-corrupt','gzip-truncated','gzip-bomb']){
+    mode=fault;const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000),before=stats.gzipNegotiated;
+    const events=[];let buffer='';
+    try{
+      const response=await fetch(gzipGateway.url+'/api/terminal/stream?node='+id+'&session='+sessionID,{signal:controller.signal});assert.equal(response.status,200);
+      const decoder=new TextDecoder();for await(const chunk of response.body){buffer+=decoder.decode(chunk,{stream:true});let boundary;while((boundary=buffer.indexOf('\n\n'))>=0){const text=buffer.slice(0,boundary);buffer=buffer.slice(boundary+2);const json=text.split('\n').find(line=>line.startsWith('data: '));if(json)events.push({type:text.split('\n').find(line=>line.startsWith('event: ')).slice(7),data:JSON.parse(json.slice(6))});}assert.ok(buffer.length<2_000_128);}
+      if(['gzip-fragmented','gzip-coalesced'].includes(fault)){
+        assert.equal(events.length,fault==='gzip-coalesced'?2:1);assert.ok(events.every(e=>e.type==='screen'&&e.data.screen.startsWith('압축 원본🙂')));
+      }else{
+        assert.equal(events.at(-1)?.type,'failure');assert.equal(events.at(-1).data.retryable,fault!=='gzip-bomb');
+        if(fault==='gzip-bomb')assert.equal(events.length,1,'Oversized decompressed event must never be forwarded as a partial JSON frame');
+      }
+      assert.equal(stats.gzipNegotiated-before,1);checks.push({fault,screenEvents:events.filter(e=>e.type==='screen').length,failure:events.at(-1)?.type==='failure',retryable:events.at(-1)?.data.retryable});
+    }finally{clearTimeout(timer);controller.abort();}
+    await wait(100);assert.equal(activeStreams.size,0,'Ended compressed subscriptions must release the upstream socket');
   }
   const report={result:'PASS',checks,posts:stats.posts,scope:'Release Swift Core; isolated loopback-only peers; no Bonjour, physical subnet scan or user CLI'};
   await writeFile(path.join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
