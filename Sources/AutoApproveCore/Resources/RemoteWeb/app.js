@@ -34,6 +34,8 @@ const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDra
 const interruptionRows = new Map();
 const safetyRows = new Map();
 const sessionHistories = new Map();
+// History is auxiliary: one cancelable read, and a bounded page-memory cache.
+let historyRequest = null, historyInView = !('IntersectionObserver' in window);
 let terminalLibraries = null;
 const structuredDrafts = new Map(), messageDrafts = new Map();
 const questionDeliveries = new Map(), questionEditing = new Map();
@@ -220,6 +222,7 @@ function terminalFocus(enabled) {
   $('terminal-heading').title = selectedItem?.view.title || '';
   $('terminal-settings').open = false;
   updateViewport();
+  if (enabled) stopSessionHistory(); else renderHistory();
 }
 function sizeInput() {
   const input = $('terminal-input'); input.style.height = 'auto'; input.style.height = `${Math.min(96, Math.max(48, input.scrollHeight))}px`;
@@ -872,6 +875,7 @@ function renderList() {
 function selectSession(key, focus = false) {
   const item = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!item) return;
   if (selectedKey !== item.key) {
+    stopSessionHistory();
     stopPTY(); stopTerminalStream(true);
     nativeSessionKey = ''; nativeZoom = 1; clearNativeImage();
     stopDirect(); inputFailure = ''; composing = false;
@@ -1919,31 +1923,73 @@ $('test-screen-zoom').addEventListener('click',()=>{const zoom=$('test-screen-im
 $('stop-test-screen').addEventListener('click',async()=>{if(!sharedScreen||mutation)return;const current=sharedScreen;stopTestScreenRead();if(await action(current.node.id,{action:'stopScreenShare',shareID:current.share.id},'화면 공유를 종료했습니다.')){$('test-screen-image').removeAttribute('src');sharedScreen=null;text($('test-screen-status'),'화면 공유가 종료되었습니다.');$('stop-test-screen').disabled=true;}});
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopTestScreenRead();$('test-screen-image').removeAttribute('src');}else if(sharedScreen&&$('test-screen-dialog').open)void readTestScreen();});
 function renderHistory() {
-  const members = new Set([selectedItem.session.id, ...(selectedItem.session.backgroundSessions || []).map(item => item.id)]);
+  if (!historyVisible()) { stopSessionHistory(); return; }
   const cached = sessionHistories.get(selectedKey);
-  if (selectedItem.node.state.historyDeferred && !cached?.loading && (!cached || Date.now()-cached.at > 5000 && !cached.error)) void loadSessionHistory(selectedItem);
-  const events = (selectedItem.node.state.historyDeferred ? cached?.events || [] : selectedItem.node.state.snapshot.events || []).filter(event => members.has(event.sessionID) || members.has(event.originSessionID)).slice(0, 12);
+  const deferred = selectedItem.node.state.historyDeferred;
+  if (deferred && selectedItem.node.online && !cached?.loading && (!cached || Date.now()-cached.at > 5000 && !cached.error)) { void loadSessionHistory(selectedItem); return; }
+  const events = historyEvents(selectedItem, deferred ? cached?.events || [] : selectedItem.node.state.snapshot.events || []);
+  const loading = deferred && !!cached?.loading, error = deferred && cached?.error;
+  $('history').setAttribute('aria-busy', String(loading));
+  text($('history-status'), error || (!events.length ? loading ? '처리 내역을 불러오는 중…' : '아직 처리 내역이 없습니다.' : ''));
+  $('history-status').className = error ? 'error-text' : 'muted small';
+  show($('history-status'), !!error || !events.length);
+  show($('history-retry'), !!error); $('history-retry').disabled = loading || !selectedItem.node.online;
   const signature = JSON.stringify(events); if (signature === historySignature) return; historySignature = signature;
   const expanded = new Set(Array.from($('history').querySelectorAll('details[open]')).map(item => item.dataset.id));
   $('history').replaceChildren();
-  if (!events.length) {
-    $('history').append(make('p', 'muted small', cached?.loading ? '처리 내역을 불러오는 중…' : cached?.error || '아직 처리 내역이 없습니다.'));
-    if (cached?.error) { const retry = make('button','secondary','내역 다시 불러오기'); retry.addEventListener('click',()=>void loadSessionHistory(selectedItem)); $('history').append(retry); }
-    return;
-  }
   for (const event of events) {
     const detail = make('details', 'history-item'); detail.dataset.id = event.id; detail.open = expanded.has(event.id);
     detail.append(make('summary', '', `${nowLabel(event.date)} · ${event.outcome}`), make('pre', '', [event.request || event.summary, event.answer ? `답변: ${event.answer}` : '', event.source].filter(Boolean).join('\n\n'))); $('history').append(detail);
   }
 }
+function historyVisible(item = selectedItem) {
+  return !!item && item.key === selectedKey && historyInView && !document.hidden && document.body.classList.contains('detail-open') && !document.body.classList.contains('terminal-focus');
+}
+function historyEvents(item, events) {
+  const members = new Set([item.session.id, ...(item.session.backgroundSessions || []).map(child => child.id)]);
+  const matching = [];
+  for (const event of events) {
+    if (!members.has(event.sessionID) && !members.has(event.originSessionID)) continue;
+    matching.push(event); if (matching.length === 12) break;
+  }
+  return matching;
+}
+function rememberSessionHistory(key, value) {
+  sessionHistories.delete(key); sessionHistories.set(key,value);
+  while (sessionHistories.size > 8) sessionHistories.delete(sessionHistories.keys().next().value);
+}
+function stopSessionHistory() {
+  const request = historyRequest; if (!request) return;
+  historyRequest = null; request.controller.abort();
+  if (sessionHistories.get(request.key) === request.entry) request.entry.loading = false;
+  $('history').setAttribute('aria-busy','false');
+}
 async function loadSessionHistory(item) {
-  const cached = sessionHistories.get(item.key) || {}; if (cached.loading || !item.node.online) return;
-  sessionHistories.set(item.key,{...cached,loading:true,at:Date.now(),error:''});
+  if (!historyVisible(item) || !item.node.online || historyRequest?.key === item.key) return;
+  stopSessionHistory();
+  const cached = sessionHistories.get(item.key) || {}, entry = {...cached,loading:true,error:''};
+  rememberSessionHistory(item.key,entry);
+  const request = {key:item.key,entry,controller:new AbortController()}; historyRequest = request;
+  renderHistory();
   try {
-    const result = await api(endpoint(supportsRelease(item.node,[0,2,61,76]) ? '/api/history?session='+encodeURIComponent(item.session.id) : '/api/state',item.node.id));
-    sessionHistories.set(item.key,{events:Array.isArray(result) ? result : result.snapshot?.events || [],loading:false,at:Date.now(),error:''});
-  } catch (error) { sessionHistories.set(item.key,{...cached,loading:false,at:Date.now(),error:'처리 내역을 받지 못했습니다. '+error.message}); }
-  if (selectedKey === item.key) { historySignature = ''; renderHistory(); }
+    const result = await api(endpoint(supportsRelease(item.node,[0,2,61,76]) ? '/api/history?session='+encodeURIComponent(item.session.id) : '/api/state',item.node.id),undefined,request.controller.signal);
+    if (historyRequest !== request || !historyVisible(item)) return;
+    rememberSessionHistory(item.key,{events:historyEvents(selectedItem,Array.isArray(result) ? result : result.snapshot?.events || []),loading:false,at:Date.now(),error:''});
+  } catch (error) {
+    if (historyRequest !== request || request.controller.signal.aborted || !historyVisible(item)) return;
+    rememberSessionHistory(item.key,{...cached,loading:false,at:Date.now(),error:'처리 내역을 받지 못했습니다. '+error.message});
+  } finally {
+    if (historyRequest === request) { historyRequest = null; entry.loading = false; renderHistory(); }
+  }
+}
+$('history-retry').addEventListener('click',()=>void loadSessionHistory(selectedItem));
+if ('IntersectionObserver' in window) {
+  // Preload just before scrolling into view without synchronous layout reads.
+  const observer = new IntersectionObserver(entries=>{
+    historyInView = entries[entries.length-1].isIntersecting;
+    if (historyVisible()) renderHistory(); else stopSessionHistory();
+  },{rootMargin:'160px 0px'});
+  observer.observe($('history-section'));
 }
 
 $('search').addEventListener('input', renderList); $('node-filter').addEventListener('change', renderList);
@@ -2121,11 +2167,13 @@ $('terminal-screen').addEventListener('scroll', () => {
 }, { passive: true });
 $('jump-latest').addEventListener('click', () => { $('follow').checked = true; followTerminal(); show($('jump-latest'), false); });
 $('back').addEventListener('click', () => {
+  stopSessionHistory();
   stopPTY(); stopTerminalStream(true);
   nativeSessionKey = ''; clearNativeImage();
-  stopDirect(); composing = false; terminalFocus(false);
+  stopDirect(); composing = false;
   drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.firstChild;
   selectedKey = ''; selectedItem = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
+  terminalFocus(false);
   document.body.classList.remove('detail-open'); history.replaceState(null, '', location.pathname); show($('detail-content'), false); show($('detail-empty'), true); renderList(); previous?.focus();
 });
 $('refresh').addEventListener('click', () => { void refreshNetwork(); void refreshFrame(); });
@@ -2140,7 +2188,7 @@ $('add-form').addEventListener('submit', async event => {
 });
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) { networkController?.abort(); nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
+  if (document.hidden) { stopSessionHistory(); networkController?.abort(); nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
   if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
 });
 window.addEventListener('offline', () => {
