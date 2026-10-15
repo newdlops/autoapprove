@@ -15,7 +15,7 @@
 - 실제 CLI 작업량과 출력은 계속 달라진다. 위 수치는 Terminal/시스템 프로세스나 AutoApprove 앱 전체의 CPU 감소율이 아니며 사용자의 기존 18%와 직접 비교하지 않는다. 비공개 증거는 `.runtime/releases/0.2.88/native-read-112/paired-read.json`, `.runtime/terminal-read-bench/`에 둔다.
 - 최종 release 빌드·기존 발행자 서명·입력 서비스 메타데이터/상호 서명, 재배치한 웹/MCP/명시적 입력/PTY/포트/설정 복원, DMG 마운트/파일 일치/무결성 검사를 통과했다. 새 프론트엔드 동작/레이아웃은 없고 버전 리소스만 맞췄다. 이번에 새 브라우저/시각 검사를 수행했다고 주장하지 않는다.
 - 두 Mac **0.2.88/112**, 원본/직접 입력 지원 **20개·3개**를 LAN API에서 확인했다. 로컬 설치 전후 CLI **20개** PID·시작·TTY, 설정·기존 승인 기록 **17,170건**, 기존 root 입력 서비스 프로세스·파일을 보존했다. 다른 Mac의 원본 **3개** PID·시작·TTY도 일치했다. 시작 직후의 입력 지원 준비 상태는 후속 조회에서 해소됐다. 실제 숫자 LAN HTTP·JS 자산 일치와 설치된 앱의 4초 샘플에서 `refreshScreenHost → TerminalAppleEvents → sendEventWithOptions` 실행 경로를 확인했다. 추가 서비스 등록·권한/보안 설정 변경은 하지 않았다.
-- DMG **9,113,438바이트**, SHA-256 **6b24afb4801313f2e023a959a4e16428af95a1f27fb92e6679fd73c5ddf2f7e1**. GitHub 게시·인증 없는 다운로드 검증은 후속 기록한다.
+- [GitHub v0.2.88](https://github.com/newdlops/autoapprove/releases/tag/v0.2.88)의 정식 최신 릴리스·소스 태그 `013cd85161f22aa5d9ad3c9eb3c33a82e97bdde0`·DMG/체크섬 두 파일을 확인했다. 인증 없는 실제 다운로드가 검증한 파일의 바이트·크기·체크섬과 일치했다. DMG **9,113,438바이트**, SHA-256 **6b24afb4801313f2e023a959a4e16428af95a1f27fb92e6679fd73c5ddf2f7e1**. 게시 증거는 `.runtime/releases/0.2.88/native-read-112/github-verification.json`에 비공개로 둔다. 게시 후 두 Mac 0.2.88/112·원본/직접 입력 지원 20개·3개와 다른 Mac 원본 식별 보존을 재확인했다.
 
 ## 0.2.87 Terminal 조회 부하 · 빌드 111
 
