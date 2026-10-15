@@ -27,3 +27,20 @@ extension RemoteDashboard {
         return response
     }
 }
+
+extension RemoteNodeState {
+    public func response(ifNoneMatch: String?) throws -> RemoteHTTPResponse {
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let body = try encoder.encode(self)
+        let digest = SHA256.hash(data:body).map { String(format:"%02x",$0) }.joined()
+        let tag = "\"\(digest)\""
+        let matches = ifNoneMatch?.split(separator:",").contains {
+            let value = $0.trimmingCharacters(in:.whitespaces)
+            return value == "*" || value == tag || value == "W/"+tag
+        } ?? false
+        var response = RemoteHTTPResponse(status:matches ? 304 : 200, body:matches ? Data() : body)
+        response.entityTag = tag; response.nodeID = id
+        return response
+    }
+}

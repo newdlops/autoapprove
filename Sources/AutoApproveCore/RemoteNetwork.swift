@@ -50,6 +50,11 @@ public struct RemoteNodeState: Codable {
     public var inventory: RemoteNodeState {
         var value = self
         value.snapshot.sessions = []; value.snapshot.events = []; value.historyDeferred = true
+        value.sessions = value.sessions.map { view in
+            var view = view
+            view.session = view.session.webInventory
+            return view
+        }
         return value
     }
 }
@@ -200,6 +205,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var knownPeers: [KnownPeer] = []
     private var knownSaveTask: Task<Void, Never>?
     private let stateReads = RemotePeerStateCache()
+    private let inventoryValidation = RemotePeerInventoryCache()
     public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
@@ -342,7 +348,7 @@ struct RemoteTerminalUpdate: Encodable {
                 if interfaces != self.lanInterfaces {
                     self.lanInterfaces = interfaces
                     for id in self.peers.keys { self.peers[id]?.nextProbe = .distantPast; self.peers[id]?.preferredEndpoint = nil }
-                    self.stateReads.removeAll()
+                    self.stateReads.removeAll(); self.inventoryValidation.removeAll()
                     self.nextHintRead = .distantPast; self.nextBlindProbe = .distantPast; self.directCursor = 0
                     self.directProbedAt.removeAll(); self.pendingHints.removeAll()
                     self.startDirectDiscovery(epoch: epoch)
@@ -396,6 +402,7 @@ struct RemoteTerminalUpdate: Encodable {
             while !Task.isCancelled {
                 guard let self, self.running, self.generation == epoch else { return }
                 self.stateReads.prune(liveIDs: Set(self.peers.keys))
+                self.inventoryValidation.prune(liveIDs: Set(self.peers.keys))
                 self.refreshWebPeers()
                 await self.discoverDirectPeers(epoch: epoch)
                 self.refreshWebPeers()
@@ -412,7 +419,7 @@ struct RemoteTerminalUpdate: Encodable {
         webPeerTask?.cancel(); webPeerTask = nil
         browserRetry?.cancel(); browserRetry = nil
         knownSaveTask?.cancel(); knownSaveTask = nil; saveKnownPeers()
-        stateReads.removeAll()
+        stateReads.removeAll(); inventoryValidation.removeAll()
         directProbedAt.removeAll(); pendingHints.removeAll(); directCursor = 0
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
@@ -730,16 +737,17 @@ struct RemoteTerminalUpdate: Encodable {
             questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
             localAddressReady:LocalDashboardAddress.status() == .ready)
     }
-    private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil) async throws -> RemoteHTTPResponse {
+    private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil) async throws -> RemoteHTTPResponse {
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let primary = connectionEndpoint(peer)
         guard method == "GET", body.isEmpty else {
             let response = try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id).run()
             stateReads.remove(peer.id)
+            inventoryValidation.remove(peer.id)
             return response
         }
         let endpoints = Array(peerEndpoints(peer).prefix(2))
-        guard endpoints.count > 1 else { return try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id, timeout: timeout,
+        guard endpoints.count > 1 else { return try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id, timeout: timeout, entityTag: entityTag,
             retryReads: !["/api/state","/api/inventory"].contains(path)).run() }
         let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (["/api/state","/api/inventory"].contains(path) ? 4 : 15))
         let epoch = generation
@@ -748,11 +756,11 @@ struct RemoteTerminalUpdate: Encodable {
                 try Task.checkCancellation()
                 let remaining = max(0.05, deadline - ProcessInfo.processInfo.systemUptime)
                 let response = try await RemoteHTTPExchange(endpoint: endpoint, path: path, method: method, body: body, expectedNodeID: peer.id,
-                    timeout: index == 0 ? remaining / 2 : remaining, retryReads: false).run()
+                    timeout: index == 0 ? remaining / 2 : remaining, entityTag: entityTag, retryReads: false).run()
                 if [502,503,504].contains(response.status), index < endpoints.count - 1 {
                     throw RemoteHTTPError(response.status, "Mac의 읽기 연결을 다른 LAN 주소에서 확인합니다.")
                 }
-                if running, generation == epoch, response.status == 200, peers[peer.id]?.endpoint == peer.endpoint {
+                if running, generation == epoch, (response.status == 200 || response.status == 304 && response.nodeID == peer.id), peers[peer.id]?.endpoint == peer.endpoint {
                     peers[peer.id]?.preferredEndpoint = endpoint
                     if !Self.numericURL(endpoint).isEmpty { peers[peer.id]?.directAddress = Self.numericURL(endpoint); rememberPeer(peer.id) }
                 }
@@ -773,12 +781,22 @@ struct RemoteTerminalUpdate: Encodable {
             let result: RemoteNodeView
             do {
                 let compact = peer.release.map { $0 >= RemoteWebVersion(version:"0.2.61",build:76,api:1) } == true
-                let response = try await RemoteDashboardTraffic.shared.read { @MainActor in try await self.exchange(peer, path: compact ? "/api/inventory" : "/api/state",timeout:4) }
-                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
-                let state = try decoder.decode(RemoteNodeState.self, from: response.body)
-                guard response.status == 200, state.id == peer.id else { throw RemoteHTTPError(502, "Mac의 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
+                let tag = compact ? self.inventoryValidation.requestTag(for: peer.id, endpoint: endpoint) : nil
+                let response = try await RemoteDashboardTraffic.shared.read { @MainActor in try await self.exchange(peer, path: compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag) }
+                guard self.running, self.generation == epoch else { throw CancellationError() }
+                let state: RemoteNodeState
+                if compact {
+                    state = try self.inventoryValidation.resolve(response, requestedTag:tag, id:peer.id, endpoint:endpoint)
+                } else {
+                    let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+                    state = try decoder.decode(RemoteNodeState.self, from: response.body)
+                }
+                guard [200,304].contains(response.status), state.id == peer.id else { throw RemoteHTTPError(502, "Mac의 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
                 result = RemoteNodeView(id: peer.id, name: state.name, local: false, online: true, state: state.inventory, release: state.release ?? peer.release)
-            } catch { result = RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription, release: peer.release) }
+            } catch {
+                if self.generation == epoch { self.inventoryValidation.remove(peer.id) }
+                result = RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription, release: peer.release)
+            }
             if self.running, self.generation == epoch {
                 self.stateReads.finish(id: peer.id, token: token, endpoint: self.peers[peer.id].map(self.connectionEndpoint) ?? endpoint,
                     expires: Date().addingTimeInterval(result.online ? 3 : 2), value:result)
@@ -865,7 +883,8 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/state":
                     if let forwarded = try await forward(request) { return forwarded }
                     return try .json(localState())
-                case "/api/inventory": return try .json(localState().inventory)
+                case "/api/inventory":
+                    return try localState().inventory.response(ifNoneMatch: request.headers["if-none-match"])
                 case "/api/history":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400,"세션을 지정해주세요.") }

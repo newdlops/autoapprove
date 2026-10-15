@@ -138,17 +138,19 @@ public struct RemoteHTTPResponse: Sendable {
     public var styleNonce: String?
     public var entityTag: String?
     public var observedAt: Date?
+    var contentEncoding: String?
     var stream: RemoteHTTPBodyStream?
-    var nodeID: String?
+    public var nodeID: String?
     public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8", location: String? = nil) {
         self.status = status; self.body = body; self.contentType = contentType; self.location = location
     }
     public static func json<T: Encodable>(_ value: T, status: Int = 200) throws -> Self {
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.withoutEscapingSlashes]
         return Self(status: status, body: try encoder.encode(value))
     }
     public static func object(_ value: JSONObject, status: Int = 200) throws -> Self {
-        Self(status: status, body: try JSONSerialization.data(withJSONObject: value))
+        Self(status: status, body: try JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes]))
     }
     public static func error(_ error: Error) -> Self {
         let status = (error as? RemoteHTTPError)?.status ?? 409
@@ -168,7 +170,9 @@ public struct RemoteHTTPResponse: Sendable {
         let identity = nodeID.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         let validator = entityTag.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "ETag: \($0)\r\n" } ?? ""
         let observation = observedAt.map { "X-AutoApprove-Observed-At: \($0.ISO8601Format())\r\n" } ?? ""
-        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
+        let encoding = contentEncoding == "gzip" ? "Content-Encoding: gzip\r\n" : ""
+        let vary = stream != nil ? "Vary: Accept-Encoding\r\n" : ""
+        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(encoding)\(vary)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         return Data(headers.utf8) + body
     }
 }
@@ -187,6 +191,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     private var deadline: DispatchWorkItem?
     private var heartbeat: DispatchSourceTimer?
     private var stream: RemoteHTTPBodyStream?
+    private var gzip: RemoteGzipEncoder?
     private var nextPending = false
     private var pendingResult: Result<Data?, Error>?
     private var sending = false
@@ -218,11 +223,21 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                     self.complete = true
                     self.buffer = Data(); self.monitorDisconnect()
                     self.handlerTask = Task { @MainActor in
-                        let response = await self.handler(request)
+                        let handled = await self.handler(request)
                         self.queue.async {
+                            var response = handled
                             self.handlerTask = nil
                             guard !self.closed else { response.stream?.cancel(); return }
                             if let stream = response.stream {
+                                if RemoteGzipEncoder.accepts(request.headers["accept-encoding"]) {
+                                    do {
+                                        let encoder = try RemoteGzipEncoder()
+                                        response.body = try encoder.encode(response.body)
+                                        response.contentEncoding = "gzip"; self.gzip = encoder
+                                    } catch {
+                                        stream.cancel(); self.send(RemoteHTTPResponse.error(error).wire,final:true); return
+                                    }
+                                }
                                 self.stream = stream
                                 // The generic request deadline ends after a successful
                                 // SSE handshake; an idle terminal remains connected.
@@ -233,7 +248,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                                     heartbeat.setEventHandler { [weak self] in
                                         guard let self, !self.closed, self.stream != nil, !self.sending,
                                               self.pendingResult == nil else { return }
-                                        self.send(Data(": keepalive\n\n".utf8))
+                                        self.sendStream(Data(": keepalive\n\n".utf8))
                                     }
                                     heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
                                 }
@@ -284,10 +299,11 @@ final class RemoteHTTPConnection: @unchecked Sendable {
             pendingResult = nil
             switch result {
             case .success(let data):
-                if let data { send(data) } else { closeNow() }
+                if let data { sendStream(data) }
+                else { self.stream = nil; sendStream(Data(),final:true) }
             case .failure(let error):
                 stream.cancel(); self.stream = nil
-                send(RemoteServerEvent.failure(error), final: true)
+                sendStream(RemoteServerEvent.failure(error), final: true)
             }
             return
         }
@@ -300,12 +316,17 @@ final class RemoteHTTPConnection: @unchecked Sendable {
             }
         }
     }
+    private func sendStream(_ data: Data, final: Bool = false) {
+        do { send(try gzip?.encode(data,final:final) ?? data,final:final) }
+        catch { closeNow() } // Never splice uncompressed bytes into a gzip stream.
+    }
     func close() { queue.async { self.closeNow() } }
     private func closeNow() {
         guard !closed else { return }; closed = true
         deadline?.cancel(); deadline = nil; heartbeat?.cancel(); heartbeat = nil
         handlerTask?.cancel(); handlerTask = nil
         stream?.cancel(); stream = nil; pendingResult = nil
+        gzip = nil
         connection.stateUpdateHandler = nil; connection.cancel(); onClose()
     }
 }
@@ -324,9 +345,11 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private var phase = "connecting"
     private var responseLength: Int?
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
-    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, retryReads: Bool = true) throws {
+    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, entityTag: String? = nil, retryReads: Bool = true) throws {
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
-        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
+        guard entityTag == nil || method == "GET" && body.isEmpty && path == "/api/inventory" && entityTag!.count <= 128 && !entityTag!.contains("\r") && !entityTag!.contains("\n") else { throw RemoteHTTPError(400,"목록 조회의 조건부 요청이 올바르지 않습니다.") }
+        let validator = entityTag.map { "If-None-Match: \($0)\r\n" } ?? ""
+        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)\(validator)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
         let duration = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
         let retryRead = retryReads && method == "GET" && body.isEmpty
         try self.init(endpoint: endpoint, request: request, timeout: retryRead ? duration / 2 : duration, retryRead: retryRead)
@@ -391,8 +414,24 @@ final class RemoteHTTPExchange: @unchecked Sendable {
                 let length = lines.first { $0.lowercased().hasPrefix("content-length:") }.flatMap { Int($0.dropFirst(15).trimmingCharacters(in: .whitespaces)) }
                 self.responseLength = length
                 let status = lines.first?.split(separator: " ").dropFirst().first.flatMap { Int($0) }
+                var metadata: [String:String] = [:]
+                for line in lines.dropFirst() {
+                    guard let colon = line.firstIndex(of:":") else { continue }
+                    let key = line[..<colon].lowercased()
+                    guard ["etag","x-autoapprove-node"].contains(key) else { continue }
+                    if metadata[key] != nil { self.finish(.failure(RemoteHTTPError(502,"Mac의 목록 응답 헤더가 중복되었습니다.",diagnostics:["failureKind":"protocol"]))); return }
+                    metadata[key] = line[line.index(after:colon)...].trimmingCharacters(in:.whitespaces)
+                }
+                if status == 304 {
+                    guard self.buffer.count == boundary.upperBound else { self.finish(.failure(RemoteHTTPError(502,"Mac의 조건부 응답에 잘못된 본문이 있습니다.",diagnostics:["failureKind":"protocol"]))); return }
+                    var response = RemoteHTTPResponse(status:304,body:Data())
+                    response.entityTag = metadata["etag"]; response.nodeID = metadata["x-autoapprove-node"]
+                    self.finish(.success(response)); return
+                }
                 if let length, let status, length >= 0, length <= 4_000_000, self.buffer.count >= boundary.upperBound + length {
-                    self.finish(.success(RemoteHTTPResponse(status: status, body: self.buffer.subdata(in: boundary.upperBound..<boundary.upperBound + length))))
+                    var response = RemoteHTTPResponse(status: status, body: self.buffer.subdata(in: boundary.upperBound..<boundary.upperBound + length))
+                    response.entityTag = metadata["etag"]; response.nodeID = metadata["x-autoapprove-node"]
+                    self.finish(.success(response))
                     return
                 }
             }

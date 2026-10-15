@@ -13,7 +13,8 @@ protocol RemoteHTTPBodyStream: AnyObject, Sendable {
 
 enum RemoteServerEvent {
     static func output(_ value: ManagedPTYOutput) throws -> Data {
-        let json = try JSONEncoder().encode(value)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        let json = try encoder.encode(value)
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "터미널 화면이 너무 큽니다. 터미널 크기를 줄여 다시 연결해주세요.") }
         return Data("event: output\nid: \(value.offset)\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
@@ -219,6 +220,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                     if status == 200 {
                         guard headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "text/event-stream",
                               headers["transfer-encoding"] == nil,
+                              headers["content-encoding"] == nil || headers["content-encoding"] == "identity",
                               headers["x-autoapprove-node"] == self.expectedNodeID else { throw RemoteHTTPError(502, "Mac의 터미널 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.", diagnostics: ["failureKind":"identity"]) }
                         self.buffer = self.buffer.subdata(in: boundary.upperBound..<self.buffer.count)
                         self.opened = true; self.ended = ended; self.failure = error

@@ -3,6 +3,7 @@ import Foundation
 extension RemoteServerEvent {
     static func screen(_ frame: RemoteTerminalFrame, knownRevision: String? = nil) throws -> Data {
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.withoutEscapingSlashes]
         let json = try encoder.encode(RemoteTerminalUpdate(frame, knownRevision: knownRevision))
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. 화면 크기를 줄여 다시 연결해주세요.") }
         return Data("event: screen\nid: \(frame.revision)\ndata: ".utf8) + json + Data("\n\n".utf8)

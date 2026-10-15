@@ -62,6 +62,13 @@ private final class PreviewScreens: @unchecked Sendable {
             sessions[index].terminal = .terminal
             sessions[index].cwd = "/Users/qa/projects/" + ["autoapprove", "결제-서비스", "아주-긴-프로젝트-이름-네트워크-협력-터미널-화면-검증", "api-server", "문서-정리", "배포-작업"][index]
             state.screens[sessions[index].tty] = "AutoApprove 웹 검증 · 합성 데이터 · \(label)\n\n프로젝트: \(sessions[index].cwd)\n브랜치: feature/network-sessions\n\n✓ 연결된 터미널의 현재 화면\n실제 사용자 터미널에 입력하지 않습니다.\n\n$ pnpm test\n✓ 12 checks passed · 합성 출력\nwarning: 재연결 상태 검증 예시\nerror: 오류 강조 검증 예시\n@@ -1,2 +1,2 @@\n- 갱신 전\n+ 갱신 후\n<img src=x onerror=alert(1)> · 문자로만 표시\n\n› \n? for shortcuts"
+            if CommandLine.arguments.contains("--stream-payload") {
+                var output = ""
+                for line in 0..<600 {
+                    output += "\n[합성 빌드 \(line)] /fixture/project/src/module-\(line).swift · 검사 통과 · 출력·색상·한글🙂 보존"
+                }
+                state.screens[sessions[index].tty,default:""] += output
+            }
         }
         engine.updateDiscovery(sessions, records: records); await engine.connectTerminal()
         for index in sessions.indices {

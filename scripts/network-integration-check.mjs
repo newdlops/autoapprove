@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 
 const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-network-'));
@@ -65,6 +65,44 @@ try {
   assert.equal((await changedInventory.json()).nodes.find(node=>node.id===first.id).state.snapshot.paused,true);
   await request(first,'/api/action',{action:'pause',paused:false,requestID:randomUUID()});
   console.log('PASS: real HTTP conditional inventory — '+JSON.stringify({reads:20,fullInventoryBytes,conditionalBytes,controlsRevalidated:true}));
+  // Exercise the gateway's actual native HTTP reader, not just direct browser
+  // validation. The fixture records headers and never runs a process/input.
+  const conditionalID=randomUUID(), conditionalState={...firstState,id:conditionalID,name:'Conditional peer fixture',historyDeferred:true,
+    snapshot:{...firstState.snapshot,sessions:[],events:[]}}, conditionalCounts={full:0,notModified:0,bytes:0,unconditional:0};
+  let conditionalURL='',wrongConditionalIdentity=false;
+  const conditionalPeer=createServer((req,res)=>{
+    const route=new URL(req.url,'http://localhost').pathname;
+    if(route==='/api/discovery') {
+      res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({service:'autoapprove',version:1,id:conditionalID,name:conditionalState.name,
+        release:firstState.release,urls:[conditionalURL],port:Number(new URL(conditionalURL).port)}));return;
+    }
+    if(!['/api/inventory','/api/state'].includes(route)){res.writeHead(404,{'Content-Length':0});res.end();return;}
+    const body=JSON.stringify(conditionalState), tag='"'+createHash('sha256').update(body).digest('hex')+'"';
+    const unchanged=route==='/api/inventory'&&req.headers['if-none-match']===tag;
+    if(route==='/api/inventory') {
+      conditionalCounts[unchanged?'notModified':'full']++;conditionalCounts.bytes+=unchanged?0:Buffer.byteLength(body);
+      if(!req.headers['if-none-match'])conditionalCounts.unconditional++;
+    }
+    res.writeHead(unchanged?304:200,{'Content-Type':'application/json','ETag':tag,
+      'X-AutoApprove-Node':unchanged&&wrongConditionalIdentity?randomUUID():conditionalID,...(!unchanged?{'Content-Length':Buffer.byteLength(body)}:{})});
+    res.end(unchanged?undefined:body);
+  });
+  await new Promise(resolve=>conditionalPeer.listen(0,'127.0.0.1',resolve));probeServers.push(conditionalPeer);
+  conditionalURL='http://127.0.0.1:'+conditionalPeer.address().port;conditionalState.webURLs=[conditionalURL];conditionalState.webPort=conditionalPeer.address().port;
+  await request(first,'/api/peers',{address:conditionalURL});
+  let peerDashboard=await request(first,'/api/network');assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
+  await wait(3300);peerDashboard=await request(first,'/api/network');assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
+  assert.ok(conditionalCounts.notModified>0,'Mac-to-Mac unchanged inventory must use a conditional GET');
+  conditionalState.snapshot.paused=true;
+  await wait(3300);peerDashboard=await request(first,'/api/network');
+  assert.equal(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.state?.snapshot.paused,true);
+  wrongConditionalIdentity=true;
+  await wait(3300);peerDashboard=await request(first,'/api/network');
+  assert.equal(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online,false,'A 304 from the wrong Mac must not reuse previous data as online');
+  wrongConditionalIdentity=false;const beforeRecovery=conditionalCounts.unconditional;
+  await wait(2300);peerDashboard=await request(first,'/api/network');assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
+  assert.ok(conditionalCounts.unconditional>beforeRecovery,'A failed identity check must discard the old validator and recover with 200');
+  console.log('PASS: native Mac-to-Mac conditional inventory, changed controls, wrong-identity rejection and full-read recovery — '+JSON.stringify(conditionalCounts));
   const legacyID = randomUUID(), foreignID = randomUUID();
   if (directOnly) {
     for (const legacy of [true, false]) {

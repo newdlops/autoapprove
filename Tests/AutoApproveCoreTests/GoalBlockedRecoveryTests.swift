@@ -202,10 +202,16 @@ extension ApprovalTests {
         session.channel = .terminalScreen; engine.updateDiscovery([session], records: [record]); try engine.setAutomatic(session.id, enabled: true)
         let plain = "■ network error\n\n› Ask Codex to do anything\n\n? for shortcuts"
         engine.receiveScreen(sessionID: session.id, raw: plain, generation: "QA")
-        try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.texts, ["이어서 진행하자."])
+        // A busy build/test machine may schedule the asynchronous preflight
+        // after 120ms. Wait for the observable delivery, with a fixed upper bound.
+        func waitForDelivery(_ count: Int) async throws {
+            let deadline=ProcessInfo.processInfo.systemUptime+3
+            while probe.texts.count<count,ProcessInfo.processInfo.systemUptime<deadline {try await Task.sleep(for:.milliseconds(10))}
+        }
+        try await waitForDelivery(1); try expectEqual(probe.texts, ["이어서 진행하자."])
         let goal = plain + " · Goal stalled (/goal resume)"
         engine.receiveScreen(sessionID: session.id, raw: goal, generation: "QA")
-        try await Task.sleep(for: .milliseconds(120)); try expectEqual(probe.texts, ["이어서 진행하자.", "/goal resume"])
+        try await waitForDelivery(2); try expectEqual(probe.texts, ["이어서 진행하자.", "/goal resume"])
         engine.receiveScreen(sessionID: session.id, raw: goal, generation: "QA")
         try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.texts.count, 2)
         try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeCommand, "/goal resume")
