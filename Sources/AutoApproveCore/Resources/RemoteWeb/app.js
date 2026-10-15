@@ -556,9 +556,10 @@ function feedback(message, error = false) {
   feedbackTimer = setTimeout(() => show($('feedback'), false), error ? 14000 : 5500);
 }
 function endpoint(path, nodeID, sessionID) {
-  const query = new URLSearchParams({ node: nodeID });
-  if (sessionID) query.set('session', sessionID);
-  return `${path}?${query}`;
+  const url = new URL(path, location.href);
+  url.searchParams.set('node', nodeID);
+  if (sessionID) url.searchParams.set('session', sessionID);
+  return url.pathname + url.search;
 }
 async function action(nodeID, payload, message) {
   if (mutation) return;
@@ -1050,6 +1051,15 @@ function updateControls() {
 }
 const terminalResyncError = () => Object.assign(new Error('최신 원본 화면을 다시 연결합니다.'), {terminalResync:true});
 let terminalNetworkOffline = false;
+function terminalDeltaTextValid(text) {
+  const high = code => code >= 0xd800 && code <= 0xdbff, low = code => code >= 0xdc00 && code <= 0xdfff;
+  for (let i=0;i<text.length;i++) {
+    const code = text.charCodeAt(i);
+    if (high(code)) { if (!low(text.charCodeAt(++i))) return false; }
+    else if (low(code)) return false;
+  }
+  return true;
+}
 function terminalPatchScreen(update, previous) {
   const patch = update.screenPatch;
   if (!patch || typeof patch !== 'object' || !previous || typeof previous.screen !== 'string' || previous.sessionID !== update.sessionID || !update.streamID || update.streamID !== previous.streamID || patch.baseRevision !== previous.revision || update.revision === previous.revision || patch.baseLength !== previous.screen.length || typeof patch.text !== 'string' || update.screen != null) throw terminalResyncError();
@@ -1058,12 +1068,19 @@ function terminalPatchScreen(update, previous) {
   const high = code => code >= 0xd800 && code <= 0xdbff, low = code => code >= 0xdc00 && code <= 0xdfff;
   const boundary = offset => !offset || offset === patch.baseLength || !(high(previous.screen.charCodeAt(offset-1)) && low(previous.screen.charCodeAt(offset)));
   if (!boundary(patch.prefix) || !boundary(patch.baseLength-patch.suffix)) throw terminalResyncError();
-  for (let i=0;i<patch.text.length;i++) {
-    const code = patch.text.charCodeAt(i);
-    if (high(code)) { if (!low(patch.text.charCodeAt(++i))) throw terminalResyncError(); }
-    else if (low(code)) throw terminalResyncError();
-  }
+  if (!terminalDeltaTextValid(patch.text)) throw terminalResyncError();
   const screen = previous.screen.slice(0,patch.prefix) + patch.text + previous.screen.slice(patch.baseLength-patch.suffix);
+  if (screen.length * 3 > 2000000 && byteLength(screen) > 2000000) throw terminalResyncError();
+  return screen;
+}
+function terminalCopyScreen(update, previous) {
+  const copy = update.screenCopy;
+  if (!copy || typeof copy !== 'object' || !previous || typeof previous.screen !== 'string' || previous.sessionID !== update.sessionID || !update.streamID || update.streamID !== previous.streamID || copy.baseRevision !== previous.revision || update.revision === previous.revision || copy.baseLength !== previous.screen.length || typeof copy.head !== 'string' || typeof copy.tail !== 'string' || update.screen != null || update.screenPatch != null) throw terminalResyncError();
+  for (const value of [copy.baseLength,copy.start,copy.count,copy.length]) if (!Number.isSafeInteger(value) || value < 0 || value > 2000000) throw terminalResyncError();
+  if (!copy.count || copy.start + copy.count > copy.baseLength || copy.head.length + copy.count + copy.tail.length !== copy.length || !terminalDeltaTextValid(copy.head) || !terminalDeltaTextValid(copy.tail)) throw terminalResyncError();
+  const boundary = offset => !offset || offset === copy.baseLength || !(previous.screen.charCodeAt(offset-1) >= 0xd800 && previous.screen.charCodeAt(offset-1) <= 0xdbff && previous.screen.charCodeAt(offset) >= 0xdc00 && previous.screen.charCodeAt(offset) <= 0xdfff);
+  if (!boundary(copy.start) || !boundary(copy.start+copy.count)) throw terminalResyncError();
+  const screen = copy.head + previous.screen.slice(copy.start,copy.start+copy.count) + copy.tail;
   if (screen.length * 3 > 2000000 && byteLength(screen) > 2000000) throw terminalResyncError();
   return screen;
 }
@@ -1072,11 +1089,12 @@ function mergeTerminalUpdate(update, previous, sessionID) {
   if (update.outputReason != null && (typeof update.outputReason !== 'string' || update.outputReason.length > 4096)) throw new Error('원본 출력 상태를 확인하지 못했습니다.');
   if (update.sequence != null && (!Number.isSafeInteger(update.sequence) || update.sequence < 0)) throw new Error('원본 화면 순서를 확인하지 못했습니다.');
   if (update.question != null && (typeof update.question.id !== 'string' || update.question.id.length > 512 || typeof update.question.question !== 'string' || update.question.question.length > 4000 || !Array.isArray(update.question.options) || update.question.options.length < 2 || update.question.options.length > 20 || update.question.options.some(option=>typeof option!=='string'||!option||option.length>4000) || !Number.isInteger(update.question.selected) || update.question.selected<0 || update.question.selected>=update.question.options.length)) throw new Error('원본 질문의 선택지를 확인하지 못했습니다.');
-  const {screenPatch,appearanceUnchanged,...fields} = update;
-  const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string' && !screenPatch) : undefined;
-  if (screenPatch != null) {
+  const {screenPatch,screenCopy,appearanceUnchanged,...fields} = update;
+  const nativeDisplay = nativeTerminal() ? mergeNativeDisplay(update.nativeDisplay, previous?.nativeDisplay, typeof update.screen !== 'string' && !screenPatch && !screenCopy) : undefined;
+  if (screenPatch != null || screenCopy != null) {
+    if (screenPatch != null && screenCopy != null) throw terminalResyncError();
     if (appearanceUnchanged != null && appearanceUnchanged !== true) throw terminalResyncError();
-    const screen = terminalPatchScreen(update,previous);
+    const screen = screenCopy != null ? terminalCopyScreen(update,previous) : terminalPatchScreen(update,previous);
     return {...fields,screen,appearance:appearanceUnchanged ? previous.appearance : update.appearance,nativeDisplay};
   }
   if (appearanceUnchanged != null) throw terminalResyncError();
@@ -1235,7 +1253,7 @@ function ensureTerminalStream() {
   const renderWindow = nativeTerminal();
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
-  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1' + (renderWindow ? '&view=screen' : '');
+  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1&copy=1' + (renderWindow ? '&view=screen' : '');
   const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false,offline:false};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }

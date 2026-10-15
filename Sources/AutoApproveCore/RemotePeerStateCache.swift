@@ -18,8 +18,12 @@ import Network
         return entry.task
     }
     public func insert(_ task: Task<RemoteNodeView, Never>, id: String, token: UUID, endpoint: NWEndpoint) {
+        if let previous = entries[id], previous.task != task { previous.task.cancel() }
         entries[id] = Entry(token: token, endpoint: endpoint, task: task, expires: .distantFuture)
     }
+    /// Async readers must still own the reservation before mutating shared
+    /// validators. A replaced/cancelled read may finish after its successor.
+    public func isCurrent(id: String, token: UUID) -> Bool { entries[id]?.token == token }
     public func finish(id: String, token: UUID, endpoint: NWEndpoint, expires: Date, value: RemoteNodeView? = nil) {
         guard entries[id]?.token == token else { return }
         entries[id]?.endpoint = endpoint; entries[id]?.expires = expires; entries[id]?.value = value

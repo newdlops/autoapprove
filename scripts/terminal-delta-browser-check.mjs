@@ -24,12 +24,20 @@ function edit(id,position,removed,text,extra={}){
  return next;
 }
 function malformed(id,patch){for(const client of clients)if(client.id===id)send(client,{...frames.get(id),revision:'invalid-'+frames.get(id).sequence,screen:undefined,screenPatch:patch});}
+function copySpan(id,start,count,head,tail){
+ const before=frames.get(id),screen=head+before.screen.slice(start,start+count)+tail;
+ const next={...before,screen,revision:String(before.sequence+1),sequence:before.sequence+1,observedAt:new Date().toISOString(),cursor:{offset:screen.length-1,padding:0,visible:true,style:'bar',blink:false}};frames.set(id,next);
+ const {screen:_,appearance,...fields}=next;
+ for(const client of clients)if(client.id===id)send(client,{...fields,screenCopy:{baseRevision:before.revision,baseLength:before.screen.length,start,count,head,tail,length:screen.length},appearanceUnchanged:true});
+ return next;
+}
+function malformedCopy(id,copy){for(const client of clients)if(client.id===id)send(client,{...frames.get(id),revision:'invalid-copy-'+frames.get(id).sequence,screen:undefined,screenCopy:copy});}
 const state=()=>({updatedAt:new Date().toISOString(),nodes:[{id:'mac',name:'변경분 QA Mac',local:true,online,state:{release:{version:'0.2.94',build:118,api:1},snapshot:{paused:false,events:[]},sessions:views}}]});
 const server=createServer(async(req,res)=>{
  const url=new URL(req.url,'http://localhost'),json=(status,value)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
  if(url.pathname==='/api/network')return json(200,state());
  if(url.pathname==='/api/terminal/stream'){
-  requests.stream++;assert.equal(url.searchParams.get('delta'),'1');if(!online)return json(503,{error:'synthetic connection outage'});
+  requests.stream++;assert.equal(url.searchParams.get('delta'),'1');assert.equal(url.searchParams.get('copy'),'1');if(!online)return json(503,{error:'synthetic connection outage'});
   res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store'});res.flushHeaders();
   const client={id:url.searchParams.get('session'),res};clients.add(client);send(client,frames.get(client.id));
   const timer=setInterval(()=>{const {screen,appearance,...controls}=frames.get(client.id);send(client,controls);},2000);timers.add(timer);
@@ -57,6 +65,9 @@ try{
  browser=await playwright[engine].launch({headless:true,...(engine==='chromium'&&process.env.AUTOAPPROVE_CHROMIUM_PATH?{executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH}:{})});
  const page=await browser.newPage({viewport:{width:390,height:844},hasTouch:true,isMobile:true});page.setDefaultTimeout(8000);page.on('pageerror',error=>errors.push(error.message));
  await page.goto('http://127.0.0.1:'+server.address().port);await page.locator('.session-row').first().click();await page.waitForFunction(()=>terminalStream?.sseReady&&latestFrame?.sessionID==='one');
+ const historyRoute=await page.evaluate(()=>endpoint('/api/history?session='+encodeURIComponent('원본+🙂?#&'),'mac+한글'));
+ const historyURL=new URL(historyRoute,'http://localhost');assert.equal(historyURL.searchParams.get('session'),'원본+🙂?#&');assert.equal(historyURL.searchParams.get('node'),'mac+한글');
+ assert.equal(historyURL.pathname,'/api/history');checks.push('Existing query parameters preserve exact Unicode, plus and delimiters when adding the target Mac');
  async function exact(frame){await page.waitForFunction(frame=>latestFrame?.revision===frame.revision&&latestFrame.screen===frame.screen&&$('terminal-screen').textContent===frame.screen,frame);}
  const initialStreams=requests.stream;
  let frame=edit('one',head.length+9,0,'한글·🙂·e\u0301');await exact(frame);assert.deepEqual(await page.evaluate(()=>latestFrame.appearance),frame.appearance);
@@ -69,6 +80,15 @@ try{
  await page.locator('#terminal-questions').click();await page.getByRole('radio',{name:'검증',exact:true}).check();
  assert.equal(await page.getByRole('radio',{name:'검증',exact:true}).isChecked(),true);await page.locator('#close-interaction').click();
  assert.deepEqual(await page.evaluate(()=>latestFrame.cursor),frame.cursor);assert.deepEqual(await page.evaluate(()=>latestFrame.question.options),['개발','검증']);checks.push('Questions, selection UI, input controls and cursor remain current in a patch');
+ const copyStreams=requests.stream;
+ await page.evaluate(()=>{window.qaRAF=requestAnimationFrame;window.requestAnimationFrame=()=>999999;});
+ const down=frames.get('one'),drop=down.screen.indexOf('\n')+1;frame=copySpan('one',drop,down.screen.length-drop,'','\n스크롤 새 출력🙂');
+ const up=frames.get('one');frame=copySpan('one',0,up.screen.lastIndexOf('\n'),'앞부분 복원🙃\n','');
+ frame=edit('one',frame.screen.length,0,'\n복사 뒤 일반 변경분');
+ await exact(frame);await page.evaluate(()=>window.requestAnimationFrame=window.qaRAF);
+ assert.equal(requests.stream,copyStreams);assert.deepEqual(await page.evaluate(()=>latestFrame.appearance),frame.appearance);
+ assert.deepEqual(await page.evaluate(()=>latestFrame.cursor),frame.cursor);assert.deepEqual(await page.evaluate(()=>latestFrame.question),frame.question);
+ checks.push('Down/up scroll spans and ordinary patches before paint preserve exact text, colors, cursor and question without reconnecting');
  frame=edit('one',frames.get('one').screen.length,0,'\n색상 제거',{appearance:undefined,question:undefined,keys});await exact(frame);
  assert.equal(await page.evaluate(()=>latestFrame.appearance),undefined);assert.equal(await page.evaluate(()=>latestFrame.question),undefined);checks.push('Missing current optional appearance and question clear their previous values');
  await page.evaluate(()=>{$('terminal-settings').open=true;});await page.locator('#compose-input').check();await page.locator('#terminal-input').fill('전송하지 않은 초안🙂');
@@ -82,6 +102,14 @@ try{
  const failures=[{prefix:-1,suffix:0,text:'bad',length:2},{prefix:0,suffix:stable.screen.length+1,text:'',length:stable.screen.length+1},{prefix:0,suffix:0,text:'\ud800',length:1},{prefix:split,suffix:stable.screen.length-split,text:'x',length:stable.screen.length+1}];
  for(const invalid of failures){const f=frames.get('one'),reads=requests.fullReads;malformed('one',{baseRevision:f.revision,baseLength:f.screen.length,...invalid});await until(()=>requests.fullReads>reads,'Malformed patch must trigger a fresh full read');await page.waitForFunction(()=>terminalStream?.sseReady&&!terminalStream.reconnecting);}
  checks.push('Invalid ranges and malformed surrogate replacements never alter the display and recover automatically');
+ const copyFailures=[{baseRevision:'missing-copy-base'},{start:-1},{count:stable.screen.length+1},{count:0},{head:'\ud800',length:stable.screen.length+1},{start:split,count:stable.screen.length-split,length:stable.screen.length-split}];
+ for(const invalid of copyFailures){
+  const f=frames.get('one'),reads=requests.fullReads;
+  malformedCopy('one',{baseRevision:f.revision,baseLength:f.screen.length,start:0,count:f.screen.length,head:'',tail:'',length:f.screen.length,...invalid});
+  await until(()=>requests.fullReads>reads,'Malformed scroll copy must trigger full resynchronization');await page.waitForFunction(()=>terminalStream?.sseReady&&!terminalStream.reconnecting);
+  assert.equal(await page.locator('#terminal-input').inputValue(),'전송하지 않은 초안🙂');await exact(f);
+ }
+ checks.push('Invalid scroll bases, bounds, empty spans and broken Unicode preserve the draft and automatically resynchronize');
  // An independently newer HTTP display must not replace the SSE patch baseline.
  const wire=frames.get('one');await page.evaluate(frame=>applyTerminalFrame({...frame,revision:'newer-http',sequence:frame.sequence+10,screen:frame.screen+'\nHTTP-AHEAD'}),wire);
  frame=edit('one',wire.screen.length,0,'\nWIRE-ONE');await page.waitForTimeout(80);

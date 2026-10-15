@@ -7,10 +7,23 @@ import AutoApproveCore
 private final class PreviewScreens: @unchecked Sendable {
     private let lock = NSLock()
     var screens: [String: String] = [:]
+    private var nextScrollLine = 1000
+    static func scrollLine(_ index: Int) -> String {
+        var bits = UInt64(index) &+ 0x9e3779b97f4a7c15, words = ""
+        for _ in 0..<4 { bits = bits &* 2862933555777941757 &+ 3037000493; words += String(format:"%016llx",bits) }
+        return String(format:"%05d",index)+" 합성 Codex 한글🙂 e\u{301} /fixture/ "+words+"\n"
+    }
     func read(_ tty: String) -> String { lock.lock(); defer { lock.unlock() }; return screens[tty] ?? "" }
     func input(_ target: ScreenTarget, _ expected: String, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         guard screens[target.tty] == expected else { return .screenChanged }
+        if CommandLine.arguments.contains("--scroll-payload"), input.bytes.hasPrefix("SCROLL-") {
+            let lines = expected.split(separator:"\n",omittingEmptySubsequences:false).dropLast()
+            let added = (nextScrollLine..<(nextScrollLine+3)).map(Self.scrollLine).joined(); nextScrollLine += 3
+            if input.bytes.hasPrefix("SCROLL-UP-") { screens[target.tty] = added+lines.dropLast(3).joined(separator:"\n")+"\n" }
+            else { screens[target.tty] = lines.dropFirst(3).joined(separator:"\n")+"\n"+added }
+            return .sent
+        }
         screens[target.tty, default: ""] += "\n[검증용 입력] " + ([.text, .submit, .characters].contains(input.kind) ? input.bytes : input.kind.rawValue)
         return .sent
     }
@@ -18,6 +31,9 @@ private final class PreviewScreens: @unchecked Sendable {
 
 @main struct RemotePreview {
     static func fixtureAppearance(_ screen: String) -> TerminalAppearance {
+        if CommandLine.arguments.contains("--scroll-payload") {
+            return TerminalAppearance(runs:[.init(offset:0,length:8,fg:"#87d7ff",bold:true),.init(offset:20,length:6,fg:"#a6e3a1")])
+        }
         // Explicit synthetic cell attributes, not production keyword highlighting.
         let text = screen as NSString
         let samples: [(String, String, String?, Bool, Bool)] = [
@@ -69,6 +85,7 @@ private final class PreviewScreens: @unchecked Sendable {
                 }
                 state.screens[sessions[index].tty,default:""] += output
             }
+            if CommandLine.arguments.contains("--scroll-payload") { state.screens[sessions[index].tty] = (0..<600).map(PreviewScreens.scrollLine).joined() }
         }
         engine.updateDiscovery(sessions, records: records); await engine.connectTerminal()
         for index in sessions.indices {

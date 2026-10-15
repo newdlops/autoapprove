@@ -180,12 +180,17 @@ extension ApprovalTests {
         for session in sessions { engine.receiveScreen(sessionID: session.id, raw: blockedGoalFrame(), generation: "QA") }
         try await Task.sleep(for: .milliseconds(100)); try expectEqual(probe.texts, [])
         try engine.setPaused(false)
-        // Resuming global automation leaves the existing five-second cancellation grace.
-        try await Task.sleep(for: .milliseconds(5250))
+        // Keep the five-second cancellation grace; wait for actual delivery
+        // within a bound instead of relying on a 250ms scheduling margin.
+        func waitForDelivery(_ count: Int, seconds: TimeInterval) async throws {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while probe.texts.count < count, ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        try await waitForDelivery(1,seconds:7)
         try expectEqual(probe.texts, ["/dev/ttys902:/goal resume"], "Pending answers and a manual session cannot be resumed by another session")
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: sessions[0].id, questions: [])])
         engine.receiveScreen(sessionID: sessions[0].id, raw: blockedGoalFrame(), generation: "QA")
-        try await Task.sleep(for: .milliseconds(150))
+        try await waitForDelivery(2,seconds:2)
         try expectEqual(probe.texts, ["/dev/ttys902:/goal resume", "/dev/ttys901:/goal resume"])
     }
 

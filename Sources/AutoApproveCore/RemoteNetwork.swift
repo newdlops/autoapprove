@@ -113,6 +113,7 @@ struct RemoteTerminalUpdate: Encodable {
     var sequence: Int?
     var question: TerminalChoiceQuestion?
     var screenPatch: RemoteTerminalScreenPatch? = nil
+    var screenCopy: RemoteTerminalScreenCopy? = nil
     var appearanceUnchanged: Bool? = nil
     init(_ frame: RemoteTerminalFrame, knownRevision: String?) {
         sessionID = frame.sessionID; revision = frame.revision; observedAt = frame.observedAt
@@ -125,13 +126,19 @@ struct RemoteTerminalUpdate: Encodable {
         sequence = frame.sequence
         question = frame.question
     }
-    init(_ frame: RemoteTerminalFrame, previous: RemoteTerminalFrame?, delta: Bool) {
+    init(_ frame: RemoteTerminalFrame, previous: RemoteTerminalFrame?, delta: Bool, copy: Bool = false) {
         let sameSource = previous?.sessionID == frame.sessionID && previous?.streamID == frame.streamID
         self.init(frame,knownRevision:sameSource ? previous?.revision : nil)
-        guard delta, let previous, let streamID = frame.streamID, streamID == previous.streamID,
-              frame.sessionID == previous.sessionID, frame.revision != previous.revision,
-              let patch = RemoteTerminalScreenPatch.make(previous:previous.screen,current:frame.screen,baseRevision:previous.revision) else { return }
-        screen = nil; screenPatch = patch
+        guard delta, let previous, let streamID = frame.streamID, !streamID.isEmpty, streamID == previous.streamID,
+              frame.sessionID == previous.sessionID, frame.revision != previous.revision else { return }
+        let patch = RemoteTerminalScreenPatch.make(previous:previous.screen,current:frame.screen,baseRevision:previous.revision)
+        let replacementBytes = patch?.text.utf8.count ?? frame.screen.utf8.count
+        if copy, replacementBytes > 1024,
+           let span = RemoteTerminalScreenCopy.make(previous:previous.screen,current:frame.screen,baseRevision:previous.revision),
+           span.head.utf8.count + span.tail.utf8.count + 256 < replacementBytes {
+            screen = nil; screenCopy = span
+        } else if let patch { screen = nil; screenPatch = patch }
+        else { return }
         if frame.appearance == previous.appearance { appearance = nil; appearanceUnchanged = true }
     }
 }
@@ -834,10 +841,13 @@ struct RemoteTerminalUpdate: Encodable {
             guard let self else { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: "웹 연결이 종료되었습니다.", release: peer.release) }
             let result: RemoteNodeView
             do {
+                try Task.checkCancellation()
+                guard self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
                 let compact = peer.release.map { $0 >= RemoteWebVersion(version:"0.2.61",build:76,api:1) } == true
                 let tag = compact ? self.inventoryValidation.requestTag(for: peer.id, endpoint: endpoint) : nil
                 let response = try await RemoteDashboardTraffic.shared.read { @MainActor in try await self.exchange(peer, path: compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag) }
-                guard self.running, self.generation == epoch else { throw CancellationError() }
+                try Task.checkCancellation()
+                guard self.running, self.generation == epoch, self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
                 let state: RemoteNodeState
                 if compact {
                     state = try self.inventoryValidation.resolve(response, requestedTag:tag, id:peer.id, endpoint:endpoint)
@@ -848,7 +858,7 @@ struct RemoteTerminalUpdate: Encodable {
                 guard [200,304].contains(response.status), state.id == peer.id else { throw RemoteHTTPError(502, "Mac의 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
                 result = RemoteNodeView(id: peer.id, name: state.name, local: false, online: true, state: state.inventory, release: state.release ?? peer.release)
             } catch {
-                if self.generation == epoch { self.inventoryValidation.remove(peer.id) }
+                if self.generation == epoch, self.stateReads.isCurrent(id:peer.id,token:token) { self.inventoryValidation.remove(peer.id) }
                 result = RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: error.localizedDescription, release: peer.release)
             }
             if self.running, self.generation == epoch {
@@ -995,7 +1005,7 @@ struct RemoteTerminalUpdate: Encodable {
                     let wakeup: @Sendable (TimeInterval) async -> Void
                     if let tmuxObservation { wakeup = { interval in await tmuxObservation.waitForChange(timeout:interval) } }
                     else { wakeup = { interval in await observation.waitForChange(timeout:interval) } }
-                    let output = try RemoteTerminalBodyStream(initial: frame, emitInitial: false, delta: request.parameter("delta") == "1", waitForChange: wakeup,
+                    let output = try RemoteTerminalBodyStream(initial: frame, emitInitial: false, delta: request.parameter("delta") == "1", copy: request.parameter("copy") == "1", waitForChange: wakeup,
                         responsive: { [weak engine] in engine?.remoteTerminalNeedsResponsiveRead(id) ?? false }) { [weak engine] in
                         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
                         return try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)

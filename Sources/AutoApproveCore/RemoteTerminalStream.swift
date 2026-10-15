@@ -36,6 +36,7 @@ extension RemoteServerEvent {
     private var initial: RemoteTerminalFrame?
     private var previous: RemoteTerminalFrame?
     private let delta: Bool
+    private let copyEnabled: Bool
     private var revision: String?
     private var controls: Controls?
     private var emittedAt = Date.distantPast
@@ -44,10 +45,11 @@ extension RemoteServerEvent {
     private var cancelled = false
     private var unchanged = 0
 
-    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
+    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, copy: Bool = false, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
          responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
         initialEvent = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
         self.initial = emitInitial ? initial : nil; self.read = read; self.delta = delta
+        copyEnabled = delta && copy
         if !emitInitial {
             revision = initial.revision; controls = Controls(initial); emittedAt = Date(); previous = delta ? initial : nil
         }
@@ -77,7 +79,7 @@ extension RemoteServerEvent {
                     self.unchanged = frame.revision == self.revision && controls == self.controls ? self.unchanged + 1 : 0
                     if frame.revision != self.revision || controls != self.controls || Date().timeIntervalSince(self.emittedAt) >= 2 {
                         let data: Data
-                        if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true)) }
+                        if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true,copy:self.copyEnabled)) }
                         else { data = try RemoteServerEvent.screen(frame,knownRevision:self.revision) }
                         self.revision = frame.revision; self.controls = controls; self.emittedAt = Date()
                         if self.delta { self.previous = frame }
