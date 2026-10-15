@@ -641,6 +641,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Payload reduction: JSON paths, controls, Unicode and base64 round-trip without slash escapes", tests.testWireJSONPreservesStringsWithoutSlashEscapes),
             ("Payload reduction: peer reuse requires a fresh identity-pinned matching 304", tests.testPeerInventoryReusesOnlyFreshIdentityPinned304),
             ("Payload reduction: peer validation storage bounds bytes, peers, routes and age", tests.testPeerInventoryValidationRetentionIsBounded),
+            ("Payload reduction: gzip inventory pins strong validators to the selected representation and reuses verified 304", tests.testPeerInventoryCompressionKeepsRepresentationValidatorsAndCache),
+            ("Payload reduction: inventory compression preserves legacy, size bounds and cancellation", tests.testPeerInventoryCompressionKeepsBoundsLegacyAndCancellation),
             ("Stream compression: every SSE event flushes immediately and preserves exact bytes", tests.testSSEGzipFlushesEachEventAndPreservesExactBytes),
             ("Stream compression: encoding negotiation, bounds, heartbeat and empty opening", tests.testSSEGzipNegotiationBoundsAndEmptyStart),
             ("HTTP compression: complete members preserve exact bytes at bounded compression levels", tests.testCompleteGzipUsesNegotiatedLevelWithoutChangingBytes),

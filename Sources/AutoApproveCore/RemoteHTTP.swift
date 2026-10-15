@@ -164,8 +164,9 @@ public struct RemoteHTTPResponse: Sendable {
         response.stream = stream; response.nodeID = nodeID; return response
     }
     /// Short reads and shipped web assets benefit from a complete gzip member.
-    /// Keep strong validators byte-identical and leave native/legacy clients on
-    /// identity unless they explicitly negotiate gzip. No user data is cached.
+    /// Already assigned strong validators stay byte-identical. Inventory selects
+    /// its representation before assigning one. Native/legacy clients negotiate
+    /// gzip explicitly; no user data is cached here.
     func preparingTransfer(method: String, acceptsGzip: Bool) -> Self {
         let type = contentType.split(separator:";").first?.lowercased() ?? ""
         guard method == "GET", status == 200, stream == nil, contentEncoding == nil,

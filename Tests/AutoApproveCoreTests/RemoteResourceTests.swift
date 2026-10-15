@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import AutoApproveCore
 import Network
 
@@ -104,6 +105,61 @@ extension ApprovalTests {
         _ = try cache.resolve(large,requestedTag:nil,id:state.id,endpoint:endpoint)
         try expect(cache.requestTag(for:state.id,endpoint:endpoint) == nil)
         cache.prune(liveIDs:[state.id],at:Date().addingTimeInterval(301));try expectEqual(cache.count,0)
+    }
+
+    @MainActor func testPeerInventoryCompressionKeepsRepresentationValidatorsAndCache() async throws {
+        var state = try await payloadState("compressed").inventory
+        state.name = String(repeating:"합성 이름🙂 e\u{301} /fixture/path ",count:500)
+        let identity = try state.response(ifNoneMatch:nil)
+        let compressed = try await state.response(ifNoneMatch:nil,acceptsGzip:true)
+        let json = JSONDecoder();json.dateDecodingStrategy = .iso8601
+        let received = try json.decode(RemoteNodeState.self,from:identity.body)
+        try expectEqual(compressed.status,200); try expectEqual(compressed.nodeID,state.id)
+        try expect(compressed.body.count*4 < identity.body.count)
+        try expectEqual(try RemoteGzipDecoder.complete(compressed.body),identity.body,"Compress the exact sorted JSON; preserve every field and Unicode byte")
+        for response in [identity,compressed] {
+            let hash = SHA256.hash(data:response.body).map { String(format:"%02x",$0) }.joined()
+            try expectEqual(response.entityTag,"\""+hash+"\"","A strong validator identifies the selected wire bytes")
+        }
+        guard let tag = compressed.entityTag else { throw AppError.message("Missing compressed inventory validator") }
+        try expect(tag != identity.entityTag)
+        let endpoint = NWEndpoint.hostPort(host:"127.0.0.1",port:8765), cache = RemotePeerInventoryCache()
+        let decoder = RemotePeerResponseDecoder(expectedNodeID:state.id,acceptsGzip:true)
+        let wire = Data("HTTP/1.1 200 OK\r\nContent-Length: \(compressed.body.count)\r\nContent-Encoding: gzip\r\nETag: \(tag)\r\nX-AutoApprove-Node: \(state.id)\r\n\r\n".utf8)+compressed.body
+        guard let decoded = try decoder.append(wire) else { throw AppError.message("Missing decoded inventory") }
+        try decoder.finish()
+        _ = try cache.resolve(decoded,requestedTag:nil,id:state.id,endpoint:endpoint)
+        try expectEqual(cache.requestTag(for:state.id,endpoint:endpoint),tag)
+        for condition in [tag,"W/"+tag,"\"another\", "+tag,"*"] {
+            let same = try await state.response(ifNoneMatch:condition,acceptsGzip:true)
+            try expectEqual(same.status,304); try expect(same.body.isEmpty); try expectEqual(same.entityTag,tag)
+            if condition == tag {
+                let reused = try cache.resolve(same,requestedTag:tag,id:state.id,endpoint:endpoint)
+                try expectEqual(reused.name,received.name);try expectEqual(reused.sessions[0].session,received.sessions[0].session)
+            }
+        }
+        try expectEqual(try await state.response(ifNoneMatch:identity.entityTag,acceptsGzip:true).status,200)
+        try expectEqual(try state.response(ifNoneMatch:tag).status,200)
+        state.snapshot.paused.toggle()
+        let changed = try await state.response(ifNoneMatch:tag,acceptsGzip:true)
+        try expectEqual(changed.status,200);try expect(changed.entityTag != tag)
+        var decodedChanged = changed;decodedChanged.body = try RemoteGzipDecoder.complete(changed.body)
+        let updated = try cache.resolve(decodedChanged,requestedTag:tag,id:state.id,endpoint:endpoint)
+        try expectEqual(updated.snapshot.paused,state.snapshot.paused)
+    }
+
+    @MainActor func testPeerInventoryCompressionKeepsBoundsLegacyAndCancellation() async throws {
+        var state = try await payloadState("compression-bounds").inventory
+        let legacy = try state.response(ifNoneMatch:nil)
+        let explicitIdentity = try await state.response(ifNoneMatch:nil,acceptsGzip:false)
+        try expectEqual(explicitIdentity.body,legacy.body);try expectEqual(explicitIdentity.entityTag,legacy.entityTag)
+        state.name = String(repeating:"x",count:2_100_001)
+        let identity = try state.response(ifNoneMatch:nil), bounded = try await state.response(ifNoneMatch:nil,acceptsGzip:true)
+        try expectEqual(bounded.body,identity.body);try expectEqual(bounded.entityTag,identity.entityTag,"Oversized responses retain identity without unbounded compression")
+        let cancelled = Task { try await state.response(ifNoneMatch:nil,acceptsGzip:true) }
+        cancelled.cancel()
+        do { _ = try await cancelled.value; throw AppError.message("Cancelled inventory must not be published") }
+        catch is CancellationError {}
     }
 
     @MainActor func testDashboardValidatorIncludesAllContentButNotObservationTime() async throws {

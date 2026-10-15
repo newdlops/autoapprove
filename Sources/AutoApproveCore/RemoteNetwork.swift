@@ -917,7 +917,8 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forward(request) { return forwarded }
                     return try .json(localState())
                 case "/api/inventory":
-                    return try localState().inventory.response(ifNoneMatch: request.headers["if-none-match"])
+                    return try await localState().inventory.response(ifNoneMatch:request.headers["if-none-match"],
+                        acceptsGzip:RemoteGzipEncoder.accepts(request.headers["accept-encoding"]))
                 case "/api/history":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400,"세션을 지정해주세요.") }

@@ -30,17 +30,50 @@ extension RemoteDashboard {
 
 extension RemoteNodeState {
     public func response(ifNoneMatch: String?) throws -> RemoteHTTPResponse {
+        try encodedInventory().validatingInventory(ifNoneMatch:ifNoneMatch,acceptsGzip:false)
+    }
+    /// Select the actual representation before assigning its strong validator.
+    /// Compression and hashing run away from the engine/UI actor; only the
+    /// already-encoded, immutable response crosses the task boundary.
+    public func response(ifNoneMatch: String?, acceptsGzip: Bool) async throws -> RemoteHTTPResponse {
+        try Task.checkCancellation()
+        let encoded = try encodedInventory()
+        let work = Task.detached(priority:.userInitiated) {
+            try Task.checkCancellation()
+            let response = encoded.validatingInventory(ifNoneMatch:ifNoneMatch,acceptsGzip:acceptsGzip)
+            try Task.checkCancellation()
+            return response
+        }
+        return try await withTaskCancellationHandler {
+            let response = try await work.value
+            try Task.checkCancellation()
+            return response
+        } onCancel: { work.cancel() }
+    }
+    private func encodedInventory() throws -> RemoteHTTPResponse {
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let body = try encoder.encode(self)
-        let digest = SHA256.hash(data:body).map { String(format:"%02x",$0) }.joined()
+        var response = RemoteHTTPResponse(body:try encoder.encode(self))
+        response.nodeID = id
+        return response
+    }
+}
+
+extension RemoteHTTPResponse {
+    fileprivate func validatingInventory(ifNoneMatch: String?, acceptsGzip: Bool) -> Self {
+        var response = preparingTransfer(method:"GET",acceptsGzip:acceptsGzip)
+        // Identity and gzip have distinct strong ETags. Hash the selected wire
+        // bytes, so a change of encoding cannot produce an incorrect 304.
+        let digest = SHA256.hash(data:response.body).map { String(format:"%02x",$0) }.joined()
         let tag = "\"\(digest)\""
         let matches = ifNoneMatch?.split(separator:",").contains {
             let value = $0.trimmingCharacters(in:.whitespaces)
             return value == "*" || value == tag || value == "W/"+tag
         } ?? false
-        var response = RemoteHTTPResponse(status:matches ? 304 : 200, body:matches ? Data() : body)
-        response.entityTag = tag; response.nodeID = id
+        response.entityTag = tag
+        if matches {
+            response.status = 304; response.body = Data(); response.contentEncoding = nil
+        }
         return response
     }
 }

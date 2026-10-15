@@ -63,11 +63,12 @@ try{
  for(const encoding of [undefined,'gzip;q=0, *;q=1','br']){
   const response=await rawRead(b,'/app.js',encoding);assert.equal(response.headers['content-encoding'],undefined);assert.deepEqual(response.body,await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/app.js'));
  }
- const inventory=await rawRead(b,'/api/inventory','gzip');assert.equal(inventory.headers['content-encoding'],undefined);assert.ok(/^"/.test(inventory.headers.etag),'Strong byte validators remain identity');
+ const inventoryIdentity=await rawRead(b,'/api/inventory','identity'),inventory=await rawRead(b,'/api/inventory','gzip');assert.equal(inventory.headers['content-encoding'],'gzip');assert.ok(/^"/.test(inventory.headers.etag));assert.notEqual(inventory.headers.etag,inventoryIdentity.headers.etag);assert.deepEqual(inventory.body,inventoryIdentity.body);
+ finite.push({route:'/api/inventory',plainBytes:inventoryIdentity.wire.length,gzipBytes:inventory.wire.length});
  const unchanged=await rawRead(b,'/api/inventory','gzip',{'If-None-Match':inventory.headers.etag});assert.equal(unchanged.status,304);assert.equal(unchanged.wire.length,0);assert.equal(unchanged.headers['content-encoding'],undefined);
  const network=await rawRead(b,'/api/network','gzip');assert.equal(network.headers['content-encoding'],'gzip');assert.ok(network.headers.etag.startsWith('W/'));
  const network304=await rawRead(b,'/api/network','gzip',{'If-None-Match':network.headers.etag});assert.equal(network304.status,304);assert.equal(network304.wire.length,0);
- await writeFile(path.join(out,'http-compression.json'),JSON.stringify({finite,checks:['Exact assets and direct/relayed screen/colors/controls','Correct compressed Content-Length and Vary','Absent encoding, explicit q=0 and unsupported br use identity','Strong inventory and weak network validators retain empty 304'],scope:'Raw finite HTTP response bodies from real Swift Core with synthetic original terminals'},null,2));
+ await writeFile(path.join(out,'http-compression.json'),JSON.stringify({finite,checks:['Exact assets and direct/relayed screen/colors/controls','Correct compressed Content-Length and Vary','Absent encoding, explicit q=0 and unsupported br use identity','Representation-specific strong inventory and weak network validators retain empty 304'],scope:'Raw finite HTTP response bodies from real Swift Core with synthetic original terminals'},null,2));
  for(const [label,gateway,node]of [['direct',b,null],['relayed',a,b.id]]){
   const route='/api/terminal/stream?'+new URLSearchParams({session:id,...(node?{node}:{})});
   const identity=collect(gateway.url+route,'identity'),gzip=collect(gateway.url+route,'gzip'),delta=collect(gateway.url+route+'&delta=1','gzip');

@@ -35,12 +35,28 @@ import AutoApproveCore
         let first = try current.response(ifNoneMatch:nil)
         let repeated = try current.response(ifNoneMatch:first.entityTag)
         guard repeated.status == 304, repeated.body.isEmpty else { throw AppError.message("Conditional inventory did not suppress repeated body") }
+        let compressed = try await current.response(ifNoneMatch:nil,acceptsGzip:true)
+        let compressedRepeated = try await current.response(ifNoneMatch:compressed.entityTag,acceptsGzip:true)
+        guard try RemoteGzipDecoder.complete(compressed.body) == first.body,
+              compressed.entityTag != first.entityTag, compressedRepeated.status == 304,
+              compressedRepeated.body.isEmpty else { throw AppError.message("Negotiated inventory changed data or conditional semantics") }
+        var timings = [String:[Double]]()
+        // Alternate the encodings; this measures complete response preparation,
+        // including encoding, task handoff, compression and hashing, not UI CPU.
+        for index in 0..<30 {
+            for gzip in index.isMultiple(of:2) ? [false,true] : [true,false] {
+                let started = ProcessInfo.processInfo.systemUptime
+                _ = try await current.response(ifNoneMatch:gzip ? compressed.entityTag : first.entityTag,acceptsGzip:gzip)
+                timings[gzip ? "gzipMS" : "identityMS",default:[]].append((ProcessInfo.processInfo.systemUptime-started)*1000)
+            }
+        }
         let base64 = Data((0..<65536).map { UInt8($0 % 256) }).base64EncodedString()
         let sample = ["image":base64,"path":"/fixture/project/src/main.swift","text":"한글 🙂\n</script> /usr/bin/env"]
         let escaped = try legacy.encode(sample), wire = try RemoteHTTPResponse.json(sample).body
         guard try JSONDecoder().decode([String:String].self,from:wire) == sample else { throw AppError.message("Wire codec changed strings") }
         let report: [String:Any] = ["sessions":24,"nativeNotices":24*41,"webSafetyNotices":24,
             "previousInventoryBytes":before.count,"currentInventoryBytes":after.count,"unchangedPeerReads":20,"previousPeerBodyBytes":20*after.count,"conditionalPeerBodyBytes":20*repeated.body.count,
+            "identityRepresentationBytes":first.body.count,"gzipRepresentationBytes":compressed.body.count,"unchangedGzipBodyBytes":compressedRepeated.body.count,"responsePreparation":timings,
             "slashSampleBefore":escaped.count,"slashSampleAfter":wire.count,"scope":"Same synthetic state, previous inventory projection/encoding versus current production projection/encoding; no user content or CPU claim"]
         print(String(decoding:try JSONSerialization.data(withJSONObject:report,options:[.sortedKeys]),as:UTF8.self))
     }
