@@ -921,13 +921,29 @@ struct RemoteTerminalUpdate: Encodable {
             if let result = stateReads.value(for:peer.id,endpoint:endpoint) { completed[peer.id] = (endpoint,result) }
             return completed[peer.id].flatMap { $0.0 == endpoint ? $0.1 : nil }
         }
-        func waitForReads(_ peers: [Peer]) async throws {
+        func waitForReads(_ peers: [Peer], progressive: Bool = false) async throws {
             for peer in peers { _ = peerStateTask(peer,foreground:peer.id == selectedNode) }
-            // A dead or old Mac must not hold every healthy Mac behind a full timeout.
-            // Reads keep their single in-flight reservation and finish in the background.
+            // Keep the first usable inventory independent of slow peers. Once
+            // one arrives, allow a short burst for its healthy neighbours.
+            // A selected Mac retains its own full bounded wait instead.
+            let selected = selectedNode.flatMap { id in peers.first { $0.id == id } }
+            if progressive, selected == nil, peers.contains(where: { value($0)?.online == true }) { return }
             let until = ProcessInfo.processInfo.systemUptime + 0.35
-            while peers.contains(where:{value($0) == nil}), ProcessInfo.processInfo.systemUptime < until {
-                try await Task.sleep(for:.milliseconds(20))
+            var readyUntil: TimeInterval?
+            while true {
+                try Task.checkCancellation()
+                let revision = stateReads.revision
+                guard peers.contains(where: { value($0) == nil }) else { return }
+                if progressive {
+                    if let selected {
+                        if value(selected) != nil { return }
+                    } else if peers.contains(where: { value($0)?.online == true }), readyUntil == nil {
+                        readyUntil = ProcessInfo.processInfo.systemUptime + 0.008
+                    }
+                }
+                let remaining = min(until,readyUntil ?? until) - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { return }
+                await stateReads.waitForChange(after: revision, timeout: remaining)
             }
         }
         if initial {
@@ -940,7 +956,7 @@ struct RemoteTerminalUpdate: Encodable {
                 updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(client:client),partial:true)
         }
         let requested = Array(candidates.prefix(100))
-        try await waitForReads(requested)
+        try await waitForReads(requested,progressive:true)
         let other = requested.map { peer in value(peer) ?? RemoteNodeView(id:peer.id,name:peer.name,local:false,online:false,release:peer.release,loading:true) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         for node in other {

@@ -645,6 +645,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Local dashboard address maps self and preserves other names, backup, permissions and inode", tests.testLocalDashboardNamePreservesHostFileAndOnlyMapsSelf),
             ("Local dashboard alias accepts its exact origin and rejects unrelated sites", tests.testLocalDashboardOriginKeepsExactSameOriginRules),
             ("Cold dashboard publishes healthy Macs and bookmarked local pages before six stalled reads", tests.testColdDashboardPublishesHealthyPeerBeforeStalledReads),
+            ("Peer inventory completion waits isolate cancellation and preserve revision, shutdown and timeout boundaries", tests.testPeerCacheCompletionWaitPreservesSharedReadsAndClosesRaces),
             ("Dashboard resource use: validators cover controls and identity, excluding only observation time", tests.testDashboardValidatorIncludesAllContentButNotObservationTime),
             ("Dashboard resource use: conditional reads revalidate origin, identity and current controls", tests.testConditionalDashboardRevalidatesIdentityOriginAndControls),
             ("Dashboard resource use: repeated reads do not republish unchanged native web status", tests.testRepeatedDashboardReadsDoNotRepublishNativeWebStatus),

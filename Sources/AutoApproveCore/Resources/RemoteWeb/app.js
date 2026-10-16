@@ -8,6 +8,7 @@ const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
 const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', tmux: 'tmux', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
 let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter = 'all', latestFrame = null;
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
+let partialNetwork = false, partialNetworkRefreshes = 0;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
 let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalPaintTimer = null, terminalStreamFailed = '';
@@ -640,6 +641,8 @@ async function refreshNetwork(initial = false) {
       }
       return;
     }
+    partialNetwork = result.partial === true;
+    if (!partialNetwork) partialNetworkRefreshes = 0;
     connected = true;
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
     // A partial response means the read is pending, not that the peer's original
@@ -692,6 +695,7 @@ async function refreshNetwork(initial = false) {
     renderInteractions();
   } catch (error) {
     if (controller.signal.aborted) return;
+    partialNetwork = false; partialNetworkRefreshes = 0;
     connected = false; text($('connection'), lastNetworkUpdate ? `연결 끊김 · 마지막 갱신 ${nowLabel(lastNetworkUpdate)}` : '연결 끊김 · 다시 연결 중');
     show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
@@ -703,7 +707,13 @@ async function refreshNetwork(initial = false) {
   } finally {
     if (networkController === controller) networkController = null;
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
-    if (!document.hidden) networkTimer = setTimeout(refreshNetwork, controller.signal.aborted || initial && connected ? 0 : connected ? 2500 : 5000);
+    if (!document.hidden) {
+      let delay = controller.signal.aborted || initial && connected ? 0 : connected ? 2500 : 5000;
+      // Complete a progressive inventory promptly, without leaving an offline
+      // neighbour on a permanent fast poll. 304 retains the same bounded count.
+      if (delay > 0 && connected && partialNetwork && partialNetworkRefreshes < 4) delay = 150 * 2 ** partialNetworkRefreshes++;
+      networkTimer = setTimeout(refreshNetwork, delay);
+    }
   }
 }
 function renderMachines() {

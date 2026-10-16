@@ -3,6 +3,40 @@ import Network
 import AutoApproveCore
 
 extension ApprovalTests {
+    @MainActor func testPeerCacheCompletionWaitPreservesSharedReadsAndClosesRaces() async throws {
+        let cache = RemotePeerStateCache(), endpoint = NWEndpoint.hostPort(host:"127.0.0.1",port:8765), token = UUID()
+        let view = try JSONDecoder().decode(RemoteNodeView.self,from:Data("{\"id\":\"peer\",\"name\":\"QA\",\"local\":false,\"online\":true}".utf8))
+        let source = Task { try? await Task.sleep(for:.seconds(30)); return view }
+        defer { source.cancel(); cache.removeAll() }
+        cache.insert(source,id:"peer",token:token,endpoint:endpoint)
+        let before = cache.revision
+        var firstWaiting = false, secondWaiting = false
+        let first = Task { firstWaiting = true; await cache.waitForChange(after:before,timeout:1) }
+        let second = Task { secondWaiting = true; await cache.waitForChange(after:before,timeout:1) }
+        while !firstWaiting || !secondWaiting { await Task.yield() }
+        first.cancel(); await first.value
+        try expect(!source.isCancelled,"Cancelling one browser's completion wait cannot cancel a shared peer read")
+        cache.finish(id:"peer",token:UUID(),endpoint:endpoint,expires:.distantPast,value:view)
+        try expectEqual(cache.revision,before,"A replaced read's late completion cannot wake current inventory waiters")
+        cache.finish(id:"peer",token:token,endpoint:endpoint,expires:Date().addingTimeInterval(3),value:view)
+        await second.value
+        try expect(cache.value(for:"peer",endpoint:endpoint)?.online == true)
+        try expect(!source.isCancelled)
+        let began = ProcessInfo.processInfo.systemUptime
+        await cache.waitForChange(after:before,timeout:1)
+        try expect(ProcessInfo.processInfo.systemUptime-began<0.5,"A completion before subscription must return immediately, not lose its notification")
+        let current = cache.revision
+        let stopped = Task { await cache.waitForChange(after:current,timeout:1) }
+        await Task.yield(); cache.removeAll(); await stopped.value
+        try expect(source.isCancelled); try expectEqual(cache.count,0)
+        let revision = cache.revision
+        await cache.waitForChange(after:revision,timeout:0.02)
+        try expectEqual(cache.revision,revision,"A bounded wait expiring cannot invent a new cache result")
+        let cancelled = Task { await cache.waitForChange(after:revision,timeout:1) }
+        cancelled.cancel(); await cancelled.value
+        _ = await source.value
+    }
+
     @MainActor func testPeerCachePrunesExpiredRemovedAndPreservesPending() async throws {
         let cache = RemotePeerStateCache(), endpoint = NWEndpoint.hostPort(host:"127.0.0.1",port:8765)
         let now = Date(), token = UUID()
