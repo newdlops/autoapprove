@@ -58,7 +58,7 @@ import AutoApproveCore
                 guard arguments.count == 2 else { throw AppError.message("세션 ID를 지정해주세요. autoapprove status로 확인할 수 있습니다.") }
                 try printJSON(SocketClient.request(path: paths.socket, message: ["method": "automatic", "params": ["sessionID": arguments[1], "enabled": command == "enable"]]))
             case "serve":
-                let engine = try ApprovalEngine(paths: paths)
+                let engine = try ApprovalEngine(paths: paths, webLoopbackOnly: arguments.contains("--loopback"))
                 try engine.start(webByDefault: true)
                 if arguments.contains("--web") {
                     var port: UInt16?
@@ -109,6 +109,7 @@ import AutoApproveCore
                   autoapprove terminal-timings  터미널 연결 구간별 시간·병합 횟수 (내용 없는 메모리 통계)
                   autoapprove serve         UI 없이 엔진·웹 관리·Mac 자동 발견 실행
                   autoapprove serve --web   저장된 OFF 설정에도 웹 관리 켜기 (기본 포트 8765)
+                  autoapprove serve --loopback  이 Mac의 127.0.0.1에서만 웹 열기·Mac 검색 안 함
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
                   autoapprove enable ID     연결된 세션 자동 승인 켜기
                   autoapprove disable ID    자동 승인 끄기

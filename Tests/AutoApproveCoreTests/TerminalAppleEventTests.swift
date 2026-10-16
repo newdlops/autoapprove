@@ -15,6 +15,13 @@ private func terminalTarget(_ query: NSAppleEventDescriptor) -> String? {
     query.forKeyword(terminalCode("from"))?.forKeyword(terminalCode("seld"))?
         .forKeyword(terminalCode("obj2"))?.stringValue
 }
+private func terminalBatchTargets(_ query: NSAppleEventDescriptor) -> [String]? {
+    guard let predicate = query.forKeyword(terminalCode("from"))?.forKeyword(terminalCode("seld")),
+          predicate.descriptorType == terminalCode("logi"),
+          predicate.forKeyword(terminalCode("logc"))?.enumCodeValue == terminalCode("OR  "),
+          let terms = predicate.forKeyword(terminalCode("term")), terms.numberOfItems > 1 else { return nil }
+    return (1...terms.numberOfItems).compactMap { terms.atIndex($0)?.forKeyword(terminalCode("obj2"))?.stringValue }
+}
 
 extension ApprovalTests {
     func testNativeTerminalFirstTextSkipsAllPresentationQueries() throws {
@@ -75,7 +82,7 @@ extension ApprovalTests {
         let ttys = (0..<20).map { "/dev/native-\($0)" }
         var contentTargets = [String](), queries = 0
         let raw = "한글 é 🙂\n\u{1b}[31moriginal\u{1b}[0m\u{0}\n"
-        let reader = TerminalAppleEventReader { query, budget in
+        let reader = TerminalAppleEventReader(batchTitles: false) { query, budget in
             queries += 1
             try expect(budget > 0 && budget <= 8)
             try expectEqual(query.descriptorType, terminalCode("obj "))
@@ -110,6 +117,103 @@ extension ApprovalTests {
         let empty = try reader.screens(ttys: [])
         try expect(empty.screens.isEmpty)
         try expectEqual(queries, beforeEmpty)
+    }
+
+    func testNativeTerminalBatchesOnlyRequestedTitlesWithStableIdentities() throws {
+        let ttys = (0..<20).map { "/dev/batch-\($0)" }
+        var queries = 0, bulkQueries = 0, contents: [String] = []
+        let reader = TerminalAppleEventReader { query, _ in
+            queries += 1
+            let property = terminalProperty(query)
+            if let targets = terminalBatchTargets(query) {
+                bulkQueries += 1
+                try expectEqual(targets, ttys, "Only unique enrolled TTYs may enter the OR predicate")
+                let tabs = query.forKeyword(terminalCode("from"))!
+                try expectEqual(tabs.forKeyword(terminalCode("want"))?.typeCodeValue, terminalCode("ttab"))
+                let windows = tabs.forKeyword(terminalCode("from"))!
+                try expectEqual(windows.forKeyword(terminalCode("seld"))?.descriptorType, terminalCode("abso"))
+                let terms = tabs.forKeyword(terminalCode("seld"))!.forKeyword(terminalCode("term"))!
+                for index in 1...terms.numberOfItems {
+                    let comparison = terms.atIndex(index)!
+                    try expectEqual(comparison.descriptorType, terminalCode("cmpd"))
+                    try expectEqual(terminalProperty(comparison.forKeyword(terminalCode("obj1"))!), terminalCode("ttty"))
+                }
+                if property == terminalCode("ttty") { return terminalList([terminalList([]), terminalStrings(ttys)]) }
+                try expectEqual(property, terminalCode("titl"), "No contents query may be batched")
+                return terminalList([terminalList([]), terminalStrings(ttys.indices.map { $0 == 1 ? " Custom 🧪 " : "" })])
+            }
+            if let tty = terminalTarget(query) {
+                try expectEqual(property, terminalCode("pcnt"), "Custom titles must come from the verified batch")
+                try expect(ttys.contains(tty)); contents.append(tty)
+                return terminalStrings(["Original\n\u{1b}[31m한글🙂\u{0}" + tty])
+            }
+            if property == terminalCode("ID  ") { return terminalList((1...20).map { .init(int32: Int32($0)) }) }
+            if property == terminalCode("ttty") { return terminalStrings(ttys) }
+            try expectEqual(property, terminalCode("pnam"))
+            return terminalStrings(ttys.indices.map { "Window \($0)" })
+        }
+        let result = try reader.screens(ttys: ttys + ttys)
+        try expectEqual(contents, ttys); try expectEqual(bulkQueries, 3)
+        try expectEqual(queries, 27, "20 exact contents + three custom-title metadata + four window metadata events")
+        try expectEqual(result.screens.map(\.contents), ttys.map { "Original\n\u{1b}[31m한글🙂\u{0}" + $0 })
+        try expectEqual(result.screens[0].title, "Window 0"); try expectEqual(result.screens[1].title, "Custom 🧪")
+        try expect(result.failures.isEmpty)
+    }
+
+    func testNativeTerminalTitleBatchRejectsUnstableAndUnsupportedMetadata() throws {
+        let ttys = (0..<4).map { "/dev/batch-\($0)" }
+        for mode in ["reordered", "duplicate", "count", "unknown", "unsupported", "malformed", "closed"] {
+            var bulk = 0, exactTitles = 0, unavailable = 0
+            let reader = TerminalAppleEventReader(titleBatchUnavailable: { unavailable += 1 }) { query, _ in
+                let property = terminalProperty(query)
+                if let _ = terminalBatchTargets(query) {
+                    bulk += 1
+                    if mode == "unsupported" { throw NSError(domain: NSOSStatusErrorDomain, code: -1708) }
+                    if mode == "closed" { throw NSError(domain: NSOSStatusErrorDomain, code: -1728) }
+                    if property == terminalCode("titl") {
+                        return terminalStrings(Array(repeating: "Unverified neighbour title", count: mode == "count" ? 3 : 4))
+                    }
+                    if mode == "malformed" { return .init(int32: 42) }
+                    if mode == "duplicate" { return terminalStrings([ttys[0], ttys[0], ttys[2], ttys[3]]) }
+                    if mode == "unknown" { return terminalStrings(ttys.dropLast() + ["/dev/unrelated"]) }
+                    return terminalStrings(mode == "reordered" && bulk == 3 ? Array(ttys.reversed()) : ttys)
+                }
+                guard let tty = terminalTarget(query) else { throw AppError.message("Missing exact fallback target") }
+                try expect(ttys.contains(tty), "Fallback must preserve the exact original target")
+                if property == terminalCode("titl") { exactTitles += 1; return terminalStrings(["Exact " + tty]) }
+                try expectEqual(property, terminalCode("pcnt"))
+                return terminalStrings(["Original " + tty])
+            }
+            let result = try reader.screens(ttys: ttys)
+            try expectEqual(result.screens.map(\.contents), ttys.map { "Original " + $0 })
+            try expectEqual(result.screens.map(\.title), ttys.map { "Exact " + $0 })
+            try expectEqual(exactTitles, 4); try expect(result.failures.isEmpty)
+            try expectEqual(unavailable, ["unsupported", "malformed"].contains(mode) ? 1 : 0)
+            try expectEqual(bulk, ["unsupported", "closed"].contains(mode) ? 1 : 3)
+        }
+    }
+
+    func testNativeTerminalTitleBatchStopsOnDenialDeadlineAndCancellation() async throws {
+        let ttys = (0..<4).map { "/dev/batch-\($0)" }
+        for status in [-1743, -1744, -1712] {
+            var queries = 0, unavailable = 0
+            let reader = TerminalAppleEventReader(titleBatchUnavailable: { unavailable += 1 }) { _, _ in
+                queries += 1; throw NSError(domain: NSOSStatusErrorDomain, code: status)
+            }
+            var error: Error?
+            do { _ = try reader.screens(ttys: ttys) } catch let caught { error = caught }
+            try expectNotNil(error); try expectEqual(queries, 1); try expectEqual(unavailable, 0)
+            if status != -1712 { try expectEqual(error as? TerminalAdapterError, .permissionDenied) }
+        }
+        var now = 0.0, queries = 0
+        let reader = TerminalAppleEventReader(timeout: 1, clock: { now }) { _, _ in
+            queries += 1; now = 2; return terminalStrings(ttys)
+        }
+        try expectThrows(reader.screens(ttys: ttys)); try expectEqual(queries, 1)
+        let cancelled = Task { _ = try reader.screens(ttys: ttys) }; cancelled.cancel()
+        do { try await cancelled.value; try expect(false, "Cancelled batch must stop before transport") }
+        catch is CancellationError {}
+        try expectEqual(queries, 1)
     }
 
     func testNativeTerminalReadIsolatesClosedAndAmbiguousTargetsAndStopsOnDenial() throws {

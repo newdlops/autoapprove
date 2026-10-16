@@ -47,8 +47,7 @@ enum NativeProcessReader {
             let tty: String
             if let value = devices[device] { tty = value }
             else {
-                var name = [CChar](repeating: 0, count: 128)
-                tty = device != -1 && devname_r(device, mode_t(S_IFCHR), &name, Int32(name.count)) != nil ? String(cString: name) : "??"
+                tty = NativeTerminalDevice.name(device)
                 devices[device] = tty
             }
             return ProcessRecord(pid: process.p_pid, parent: parent, tty: tty, processGroup: group,

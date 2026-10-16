@@ -8,6 +8,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
+import { networkInterfaces } from 'node:os';
 
 // macOS Unix-domain sockets have a short path limit.
 const root = await mkdtemp('/private/tmp/aa-web-');
@@ -16,6 +17,16 @@ await chmod(root, 0o755);
 const app = path.join(root, 'RelocatedAutoApprove.app');
 const home = path.join(root, 'isolated-profile');
 const run = promisify(execFile), wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+// PortManager's documented host-local rendezvous list preserves this fixture's
+// literal listen/connect endpoints without changing its other routing or hooks.
+function preserveFixturePort(port) {
+  if (process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS === undefined) return;
+  const previous = process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS || '';
+  if (!previous.split(',').map(value => value.trim()).includes(String(port))) {
+    process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS = previous ? previous + ',' + port : String(port);
+  }
+}
+preserveFixturePort(8765);
 let child, mcp, stderr = '';
 const preferredPortBlocker = createServer();
 async function reserveDefaultPort() {
@@ -26,7 +37,7 @@ async function reserveDefaultPort() {
 }
 async function start() {
   stderr = '';
-  child = spawn(path.join(app, 'Contents/MacOS/autoapprove'), ['serve', '--home', home], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: home, ZDOTDIR: home } });
+  child = spawn(path.join(app, 'Contents/MacOS/autoapprove'), ['serve', '--loopback', '--home', home], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: home, ZDOTDIR: home } });
   child.stdout.resume(); child.stderr.on('data', data => { stderr += data; });
 }
 async function stop() {
@@ -64,6 +75,7 @@ try {
   await start();
   const on = await status(value => value.enabled && value.ready);
   const port = on.port;
+  preserveFixturePort(port);
   assert.ok(port > 0 && port !== 8765, 'A busy default port must automatically choose an available port');
   let url = 'http://127.0.0.1:' + port;
   const css = await fetch(url + '/app.css'); assert.equal(css.status, 200);
@@ -71,6 +83,12 @@ try {
   const first = await (await fetch(url + '/api/state')).json();
   assert.deepEqual(first.release, versionMarker, 'Relocated helper must read its bundled version, not the build machine resources');
   assert.deepEqual((await (await fetch(url + '/api/discovery')).json()).release, versionMarker);
+  assert.deepEqual(on.urls, [url], 'The disposable package must publish only its loopback address');
+  assert.equal((await (await fetch(url + '/api/network')).json()).nodes.length, 1, 'An isolated package must not discover the real Macs');
+  const localLANs = [...new Set(Object.entries(networkInterfaces()).filter(([name]) => /^en\d+$/.test(name))
+    .flatMap(([, addresses]) => addresses.filter(address => address.family === 'IPv4' && !address.internal).map(address => address.address)))];
+  for (const address of localLANs) await assert.rejects(fetch(`http://${address}:${port}/api/discovery`, { signal: AbortSignal.timeout(1500) }),
+    'The disposable package must not be reachable over a physical LAN');
   assert.ok(first.sessions.every(view => !view.session.automatic), 'Isolated profile must never enable existing sessions');
   for (const resource of ['/pty.js', '/vendor/xterm.js', '/vendor/xterm-fit.js', '/vendor/xterm.css']) {
     const response = await fetch(url + resource);
@@ -103,6 +121,7 @@ try {
   await start();
   const restarted = await status(value => value.enabled && value.ready);
   assert.ok(restarted.port > 0);
+  preserveFixturePort(restarted.port);
   url = 'http://127.0.0.1:' + restarted.port;
   const restored = await (await fetch(url + '/api/state')).json();
   assert.equal(restored.id, first.id, 'Mac identity must survive restart');
@@ -135,7 +154,7 @@ try {
   await assert.rejects(fetch(url + '/api/state', { signal: AbortSignal.timeout(1500) }));
   await stop(); await start();
   assert.equal((await status(value => !value.enabled)).ready, false);
-  console.log('PASS: relocated packaged resources/signature, stdio MCP question/explicit answer/disconnect, real packaged PTY and local xterm assets, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
+  console.log('PASS: relocated packaged resources/signature, loopback-only listener without LAN discovery/advertising, stdio MCP question/explicit answer/disconnect, real packaged PTY and local xterm assets, automatic web publishing on first run, busy-port fallback, persisted port preference/identity/ON, immediate OFF and respected persisted OFF');
 } finally {
   if (mcp && mcp.exitCode===null) { mcp.stdin.end(); mcp.kill(); }
   await stop();

@@ -9,6 +9,7 @@ import TerminalInputSupport
     @Published public private(set) var lanUpdate = LANUpdateStatus()
     public var finishLANUpdate: @MainActor () -> Void = {}
     public private(set) var webService: RemoteNetworkService?
+    private let webLoopbackOnly: Bool
     public let managedPTY: ManagedPTYManager
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
@@ -232,8 +233,10 @@ import TerminalInputSupport
 
     public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0, includeCursor: false) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
-                codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live) throws {
+                codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
+                webLoopbackOnly: Bool = false) throws {
         self.paths = paths
+        self.webLoopbackOnly = webLoopbackOnly
         self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
         self.powerControl = powerControl
@@ -433,7 +436,7 @@ import TerminalInputSupport
             }
             let nodeID = store.value("webNodeID") ?? UUID().uuidString
             try store.set("webNodeID", nodeID)
-            let service = RemoteNetworkService(engine: self, nodeID: nodeID, bonjourEnabled: bonjourEnabled, discoveryAddresses: discoveryAddresses) { [weak self] status in
+            let service = RemoteNetworkService(engine: self, nodeID: nodeID, bonjourEnabled: bonjourEnabled, loopbackOnly: webLoopbackOnly, discoveryAddresses: discoveryAddresses) { [weak self] status in
                 guard let self else { return }
                 self.webStatus = status
                 if status.ready, let actualPort = status.port { try? self.store.set("webPort", String(actualPort)) }

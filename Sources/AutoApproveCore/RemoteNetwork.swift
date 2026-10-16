@@ -168,6 +168,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var nextBlindProbe = Date.distantPast
     private var lanInterfaces: [RemoteLANInterface] = []
     private let bonjourEnabled: Bool
+    private let loopbackOnly: Bool
     private let advertisement: RemoteServiceAdvertising
     private let discoveryAddresses: () -> [String]
     private let discoveryHints: @Sendable () -> [String]
@@ -229,11 +230,12 @@ struct RemoteTerminalUpdate: Encodable {
     private var foregroundStateReads: [String:UUID] = [:]
     private let inventoryValidation = RemotePeerInventoryCache()
     private var readTimingEpoch = UUID()
-    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
+    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, loopbackOnly: Bool = false, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
         updateReceiver = LANUpdateReceiver(engine: engine)
-        self.bonjourEnabled = bonjourEnabled
+        self.loopbackOnly = loopbackOnly
+        self.bonjourEnabled = bonjourEnabled && !loopbackOnly
         self.advertisement = advertisement ?? RemoteServiceAdvertisement()
         self.discoveryAddresses = discoveryAddresses ?? RemotePeerDiscovery.addresses
         if let discoveryHints { self.discoveryHints = discoveryHints }
@@ -247,7 +249,7 @@ struct RemoteTerminalUpdate: Encodable {
         knownURL = engine.paths.directory.appendingPathComponent("web-known-peers.json")
         receipts = (try? JSONDecoder().decode([Receipt].self, from: Data(contentsOf: receiptsURL))) ?? []
         manualPeers = (try? JSONDecoder().decode([ManualPeer].self, from: Data(contentsOf: manualURL))) ?? []
-        for peer in manualPeers {
+        for peer in manualPeers where !loopbackOnly {
             if let endpoint = try? RemoteNetworkAddress.endpoint(peer.address), peer.id != nodeID {
                 peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: endpoint, available: true, manual: true, directAddress: peer.address)
             }
@@ -256,7 +258,7 @@ struct RemoteTerminalUpdate: Encodable {
         knownPeers = ((try? decoder.decode([KnownPeer].self, from: Data(contentsOf: knownURL))) ?? []).filter {
             UUID(uuidString: $0.id) != nil && $0.id != nodeID && Date().timeIntervalSince($0.lastSeen) < 7 * 86400 && (try? RemoteNetworkAddress.endpoint($0.address)) != nil
         }.prefix(100).map { $0 }
-        for peer in knownPeers where peers[peer.id] == nil {
+        for peer in knownPeers where !loopbackOnly && peers[peer.id] == nil {
             peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: try! RemoteNetworkAddress.endpoint(peer.address), available: false, manual: false,
                 directAddress: peer.address, release: peer.release, webURLs: Array(peer.urls.prefix(16)), webPort: peer.port)
         }
@@ -264,8 +266,10 @@ struct RemoteTerminalUpdate: Encodable {
     public func start(port preferredPort: UInt16 = 8765, allowPortFallback: Bool = false) throws {
         guard !running else { return }
         let port = preferredPort
-        let parameters = RemoteLAN.tcpParameters()
-        lanInterfaces = RemoteLAN.interfaces(refresh: true)
+        let parameters = listenerParameters()
+        lanInterfaces = loopbackOnly ? [] : RemoteLAN.interfaces(refresh: true)
+        // Constrain the address here; NWListener remains the single source of
+        // the selected port, including persisted ports and busy-port recovery.
         let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
         let epoch = UUID(); generation = epoch; running = true; self.listener = listener
         listenerPort = port; allowListenerPortFallback = allowPortFallback; listenerRetryDelay = 1
@@ -274,6 +278,12 @@ struct RemoteTerminalUpdate: Encodable {
         status.enabled = true; status.detail = "웹 접속과 같은 네트워크의 Mac을 연결하고 있습니다."
         listener.start(queue: queue)
         startDiscovery(parameters: parameters, epoch: epoch)
+    }
+
+    private func listenerParameters() -> NWParameters {
+        let parameters = RemoteLAN.tcpParameters()
+        if loopbackOnly { parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any) }
+        return parameters
     }
 
     private func configureListener(_ listener: NWListener, port: UInt16, epoch: UUID) {
@@ -307,7 +317,8 @@ struct RemoteTerminalUpdate: Encodable {
                 guard let self, let listener, self.running, self.generation == epoch, self.listener === listener else { return }
                 switch state {
                 case .ready:
-                    self.status.ready = true; self.status.detail = "같은 네트워크의 휴대폰과 Mac에서 접속할 수 있습니다."
+                    self.status.ready = true
+                    self.status.detail = self.loopbackOnly ? "이 Mac의 127.0.0.1에서만 접속할 수 있습니다." : "같은 네트워크의 휴대폰과 Mac에서 접속할 수 있습니다."
                     self.status.port = listener.port?.rawValue ?? port
                     self.listenerPort = self.status.port ?? port
                     self.listenerRetry?.cancel(); self.listenerRetry = nil; self.listenerRetryDelay = 1
@@ -339,7 +350,7 @@ struct RemoteTerminalUpdate: Encodable {
             // Accepted requests and durable receipts remain alive while the acceptor recovers.
             self.listener?.cancel(); self.listener = nil
             do {
-                let listener = try NWListener(using: RemoteLAN.tcpParameters(), on: NWEndpoint.Port(rawValue: self.listenerPort)!)
+                let listener = try NWListener(using: self.listenerParameters(), on: NWEndpoint.Port(rawValue: self.listenerPort)!)
                 self.listener = listener
                 self.configureListener(listener, port: self.listenerPort, epoch: epoch)
                 listener.start(queue: self.queue)
@@ -361,6 +372,7 @@ struct RemoteTerminalUpdate: Encodable {
     }
 
     private func startDiscovery(parameters: NWParameters, epoch: UUID) {
+        guard !loopbackOnly else { return }
         if bonjourEnabled {
             startBrowser(parameters: parameters, epoch: epoch)
         }
@@ -558,6 +570,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
     }
     private func saveKnownPeers() {
+        guard !loopbackOnly else { return }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         if let data = try? encoder.encode(knownPeers) {
             try? data.write(to: knownURL, options: .atomic)
@@ -652,6 +665,7 @@ struct RemoteTerminalUpdate: Encodable {
     }
     private func updateNamedAddresses() {
         guard running, status.ready, let port = status.port, !updatingNamedAccess else { return }
+        if loopbackOnly { status.urls = ["http://127.0.0.1:\(port)"]; return }
         guard bonjourEnabled else { status.urls = Self.addresses(port: port); return }
         updatingNamedAccess = true
         defer { updatingNamedAccess = false }
@@ -1108,6 +1122,7 @@ struct RemoteTerminalUpdate: Encodable {
             let object = try request.json()
             switch request.path {
             case "/api/peers":
+                guard !loopbackOnly else { throw RemoteHTTPError(403, "로컬 전용 실행에서는 다른 Mac을 연결하지 않습니다.") }
                 guard let address = object["address"] as? String else { throw RemoteHTTPError(400, "Mac 주소가 필요합니다.") }
                 let endpoint = try RemoteNetworkAddress.endpoint(address)
                 let response = try await RemoteHTTPExchange(endpoint: endpoint, path: "/api/state", method: "GET", body: Data()).run()

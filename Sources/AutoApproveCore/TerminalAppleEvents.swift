@@ -16,9 +16,13 @@ public struct TerminalAppleEventReader {
     private let send: Sender
     private let clock: () -> TimeInterval
     private let timeout: TimeInterval
+    private let batchTitles: Bool
+    private let titleBatchUnavailable: () -> Void
 
-    public init(timeout: TimeInterval = 8, clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }, send: @escaping Sender) {
+    public init(timeout: TimeInterval = 8, clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                batchTitles: Bool = true, titleBatchUnavailable: @escaping () -> Void = {}, send: @escaping Sender) {
         self.timeout = timeout; self.clock = clock; self.send = send
+        self.batchTitles = batchTitles; self.titleBatchUnavailable = titleBatchUnavailable
     }
 
     private func object(_ kind: String, form: String, selector: NSAppleEventDescriptor, container: NSAppleEventDescriptor = .null()) throws -> NSAppleEventDescriptor {
@@ -36,13 +40,30 @@ public struct TerminalAppleEventReader {
     }
 
     private func matching(_ kind: String, property path: [String], tty: String, container: NSAppleEventDescriptor = .null()) throws -> NSAppleEventDescriptor {
+        try matching(kind, property: path, ttys: [tty], container: container)
+    }
+
+    private func matching(_ kind: String, property path: [String], ttys: [String], container: NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
         guard var left = NSAppleEventDescriptor(descriptorType: aeCode("exmn"), data: Data()) else { throw TerminalReadEventError.incompatible }
         for name in path { left = try property(name, of: left) }
-        let comparison = NSAppleEventDescriptor.record()
-        comparison.setDescriptor(.init(enumCode: aeCode("=   ")), forKeyword: aeCode("relo"))
-        comparison.setDescriptor(left, forKeyword: aeCode("obj1"))
-        comparison.setDescriptor(.init(string: tty), forKeyword: aeCode("obj2"))
-        guard let test = comparison.coerce(toDescriptorType: aeCode("cmpd")) else { throw TerminalReadEventError.incompatible }
+        let terms = NSAppleEventDescriptor.list()
+        for tty in ttys {
+            let comparison = NSAppleEventDescriptor.record()
+            comparison.setDescriptor(.init(enumCode: aeCode("=   ")), forKeyword: aeCode("relo"))
+            comparison.setDescriptor(left, forKeyword: aeCode("obj1"))
+            comparison.setDescriptor(.init(string: tty), forKeyword: aeCode("obj2"))
+            guard let term = comparison.coerce(toDescriptorType: aeCode("cmpd")) else { throw TerminalReadEventError.incompatible }
+            terms.insert(term, at: terms.numberOfItems + 1)
+        }
+        let test: NSAppleEventDescriptor
+        if terms.numberOfItems == 1 { test = terms.atIndex(1)! }
+        else {
+            let logical = NSAppleEventDescriptor.record()
+            logical.setDescriptor(.init(enumCode: aeCode("OR  ")), forKeyword: aeCode("logc"))
+            logical.setDescriptor(terms, forKeyword: aeCode("term"))
+            guard let value = logical.coerce(toDescriptorType: aeCode("logi")) else { throw TerminalReadEventError.incompatible }
+            test = value
+        }
         return try object(kind, form: "test", selector: test, container: container)
     }
 
@@ -96,7 +117,38 @@ public struct TerminalAppleEventReader {
             }
             let windows = try object("cwin", form: "indx", selector: all)
             var result = TerminalSnapshot(), seen = Set<String>()
-            for tty in ttys where seen.insert(tty).inserted {
+            let targets = ttys.filter { seen.insert($0).inserted }
+            var titlesByTTY: [String: String] = [:]
+            if includeTitles, batchTitles, targets.count >= 4, targets.count <= 256 {
+                do {
+                    // Read only requested tabs' presentation metadata. Contents
+                    // and input binding still use their own exact-TTY predicate.
+                    let tabs = try matching("ttab", property: ["ttty"], ttys: targets, container: windows)
+                    let values = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { () -> [String: String] in
+                        let before = try getValue(property("ttty", of: tabs))
+                        let names = try get(property("titl", of: tabs))
+                        let after = try getValue(property("ttty", of: tabs))
+                        let selected = try strings(before)
+                        guard before.descriptorType == after.descriptorType, before.data == after.data,
+                              selected.count == names.count, Set(selected).count == selected.count,
+                              selected.allSatisfy({ seen.contains($0) }) else { return [:] }
+                        return Dictionary(uniqueKeysWithValues: zip(selected, names))
+                    }
+                    titlesByTTY = values
+                } catch {
+                    let status = (error as NSError).code
+                    if [-1743, -1744].contains(status) { throw TerminalAdapterError.permissionDenied }
+                    if status == -1712 { throw TerminalReadEventError.timedOut }
+                    if error is TerminalAdapterError || error is CancellationError { throw error }
+                    if case TerminalReadEventError.timedOut = error { throw error }
+                    if case TerminalReadEventError.incompatible = error { titleBatchUnavailable() }
+                    else if [-1700, -1708].contains(status) { titleBatchUnavailable() }
+                    else if status != -1728 { throw error }
+                    // Unsupported bulk metadata does not disable the native
+                    // exact contents reader or start a second script process.
+                }
+            }
+            for tty in targets {
                 do {
                     let tab = try matching("ttab", property: ["ttty"], tty: tty, container: windows)
                     let contents = try RemoteTerminalPerformance.shared.measure(.terminalContents) { try get(property("pcnt", of: tab)) }
@@ -104,7 +156,7 @@ public struct TerminalAppleEventReader {
                     guard let screen = contents.first else { continue }
                     var title: String?
                     if includeTitles { do {
-                        let titles = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try get(property("titl", of: tab)) }
+                        let titles = try titlesByTTY[tty].map { [$0] } ?? RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try get(property("titl", of: tab)) }
                         if titles.count == 1 { title = titles[0].trimmingCharacters(in: .whitespacesAndNewlines) }
                     } catch {
                         // A title may disappear after the screen was read. The
@@ -179,6 +231,7 @@ enum TerminalAppleEvents {
     private static let lock = NSLock()
     private static var incompatiblePID: pid_t?
     private static var incompatiblePresentationPID: pid_t?
+    private static var incompatibleTitlesPID: pid_t?
 
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.
@@ -188,7 +241,10 @@ enum TerminalAppleEvents {
         }
         guard !ttys.isEmpty else { return TerminalSnapshot() }
         let pid = application.processIdentifier
-        lock.lock(); let unsupported = incompatiblePID == pid || (includeCursor && incompatiblePresentationPID == pid); lock.unlock()
+        lock.lock()
+        let unsupported = incompatiblePID == pid || (includeCursor && incompatiblePresentationPID == pid)
+        let batchTitles = incompatibleTitlesPID != pid
+        lock.unlock()
         if unsupported { return nil }
         let target = NSAppleEventDescriptor(processIdentifier: pid)
         // Never request a new permission from a background read. Explicit setup
@@ -197,7 +253,9 @@ enum TerminalAppleEvents {
         if access == errAEEventNotPermitted { throw TerminalAdapterError.permissionDenied }
         if access == errAEEventWouldRequireUserConsent { return nil }
         guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
-        let reader = TerminalAppleEventReader { subject, timeout in
+        let reader = TerminalAppleEventReader(batchTitles: batchTitles, titleBatchUnavailable: {
+            lock.lock(); incompatibleTitlesPID = pid; lock.unlock()
+        }) { subject, timeout in
             let event = NSAppleEventDescriptor(eventClass: aeCode("core"), eventID: aeCode("getd"),
                 targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid), returnID: -1, transactionID: 0)
             event.setParam(subject, forKeyword: aeCode("----"))
