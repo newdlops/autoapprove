@@ -56,9 +56,9 @@ public struct CodexReplyTransport: Sendable {
                   let record = try ProcessDiscovery.read(pid: session.pid).first(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw RemoteHTTPError(409, "Codex 실행이나 대화 선택을 다시 확인해주세요.")
             }
-            let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
+            let files = try ProcessOpenFiles.paths(pid: session.pid, expectedStart: session.started)
             var homes = Set<String>()
-            for path in CodexThreadLocation.openFiles(files.output)[session.pid] ?? [] {
+            for path in files {
                 let url = URL(fileURLWithPath: path)
                 // Daemon-backed CLIs keep only the log database open locally.
                 guard ["state_5.sqlite", "thread_history_1.sqlite", "queue_1.sqlite", "logs_2.sqlite"].contains(url.lastPathComponent),
@@ -84,8 +84,8 @@ public struct CodexReplyTransport: Sendable {
             guard records.contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw AppError.message("이 Codex 실행이 종료되었거나 바뀌었습니다.")
             }
-            let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
-            let location = try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[session.pid] ?? [])
+            let files = try ProcessOpenFiles.paths(pid: session.pid, expectedStart: session.started)
+            let location = try CodexThreadLocation.locate(paths: files)
             let home = URL(fileURLWithPath: location.database).deletingLastPathComponent().path
             return CodexReplyTarget(executable: "", home: home, threadID: location.threadID, queueAvailable: CodexQueueTransport.isAvailable(home: home))
         }.value
@@ -96,8 +96,8 @@ public struct CodexReplyTransport: Sendable {
             guard records.contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
                 throw AppError.message("이 Codex 세션이 종료되었거나 바뀌었습니다. 목록을 새로고침해주세요.")
             }
-            let files = try CommandRunner.run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(session.pid), "-Fpn"], timeout: 4)
-            let location = try CodexThreadLocation.locate(paths: CodexThreadLocation.openFiles(files.output)[session.pid] ?? [])
+            let files = try ProcessOpenFiles.paths(pid: session.pid, expectedStart: session.started)
+            let location = try CodexThreadLocation.locate(paths: files)
             let questions = try CodexHistoryReader().read(location)
             guard location.threadID == question.threadID,
                   let current = questions.first(where: { $0.isSameRequest(as: question) }) else {

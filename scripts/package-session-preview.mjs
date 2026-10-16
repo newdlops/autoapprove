@@ -14,7 +14,7 @@ execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-pa
   '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build),
   ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)),
   'Sources/AutoApproveApp/TerminalHighlighter.swift', 'Sources/AutoApproveApp/TerminalNavigator.swift',
-  'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/WindowViewUpdates.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',
+  'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/WindowViewUpdates.swift', 'Sources/AutoApproveApp/QRCodeImageCache.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',
   'Sources/AutoApproveApp/AppInformation.swift', 'Sources/AutoApproveApp/AppCommands.swift', 'Sources/AutoApproveApp/HelpWindow.swift',
   'Sources/AutoApproveApp/SessionWindow.swift', 'Sources/AutoApproveApp/SessionCustomizationEditor.swift', 'Sources/AutoApproveApp/ConnectionSettings.swift', 'Sources/AutoApproveApp/RemoteAccessSettings.swift',
   'Tests/fixtures/session-preview.swift', '-o', path.join(app, 'Contents/MacOS/SessionPreview')], { stdio: 'inherit' });

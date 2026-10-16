@@ -1,11 +1,11 @@
 import SwiftUI
 import AppKit
-import CoreImage.CIFilterBuiltins
 import AutoApproveCore
 
 @MainActor struct RemoteAccessSettings: View {
     let engine: ApprovalEngine
     @StateObject private var viewUpdates = WindowViewUpdates()
+    @State private var qrCodes = QRCodeImageCache()
     @State private var error: String?
     @State private var selectedURL = ""
     @State private var localAddressStatus = LocalDashboardAddress.status()
@@ -67,7 +67,7 @@ import AutoApproveCore
             }.padding(.vertical,4)
             if let url, let address = URL(string: url) {
                 HStack(alignment: .top, spacing: 16) {
-                    if let qr = qrCode(url) {
+                    if let qr = qrCodes.image(for: url) {
                         Image(nsImage: qr).interpolation(.none).resizable().frame(width: 116, height: 116)
                             .padding(8).background(.white).clipShape(RoundedRectangle(cornerRadius: 8))
                             .accessibilityLabel("휴대폰 카메라로 스캔할 웹 접속 QR 코드")
@@ -135,10 +135,5 @@ import AutoApproveCore
             .windowUpdates(viewUpdates, sources: [engine.objectWillChange])
             .onChange(of: viewUpdates.isVisible) { _, visible in if visible { localAddressStatus = LocalDashboardAddress.status() } }
             .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) {_ in if viewUpdates.isVisible { localAddressStatus = LocalDashboardAddress.status() } }
-    }
-    private func qrCode(_ text: String) -> NSImage? {
-        let filter = CIFilter.qrCodeGenerator(); filter.message = Data(text.utf8)
-        guard let output = filter.outputImage, let cg = CIContext().createCGImage(output, from: output.extent) else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 }
