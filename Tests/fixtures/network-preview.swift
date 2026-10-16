@@ -13,7 +13,11 @@ private final class PreviewScreens: @unchecked Sendable {
         for _ in 0..<4 { bits = bits &* 2862933555777941757 &+ 3037000493; words += String(format:"%016llx",bits) }
         return String(format:"%05d",index)+" 합성 Codex 한글🙂 e\u{301} /fixture/ "+words+"\n"
     }
-    func read(_ tty: String) -> String { lock.lock(); defer { lock.unlock() }; return screens[tty] ?? "" }
+    func read(_ tty: String) -> String {
+        lock.lock(); defer { lock.unlock() }
+        if CommandLine.arguments.contains("--connection-performance") { Thread.sleep(forTimeInterval:0.08) }
+        return screens[tty] ?? ""
+    }
     func input(_ target: ScreenTarget, _ expected: String, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         guard screens[target.tty] == expected else { return .screenChanged }
@@ -55,6 +59,7 @@ private final class PreviewScreens: @unchecked Sendable {
         let directory = URL(fileURLWithPath: CommandLine.arguments[1])
         let label = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "A"
         let directOnly = CommandLine.arguments.contains("--direct-only")
+        let connectionPerformance = CommandLine.arguments.contains("--connection-performance")
         let releaseOption = CommandLine.arguments.first(where: { $0.hasPrefix("--web-version=") })?.dropFirst("--web-version=".count)
         let releaseParts = releaseOption?.split(separator: ":")
         let webVersion = releaseOption == "legacy" ? nil : releaseParts.flatMap { parts in
@@ -65,12 +70,20 @@ private final class PreviewScreens: @unchecked Sendable {
             "\(82000 + index) 1 ttys0\(80 + index) \(82000 + index) \(82000 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/codex"
         }.joined(separator: "\n"))
         let transport = CodexReplyTransport(prepare: { _, question in CodexReplyTarget(executable: "/fixture/codex", home: directory.path, threadID: question.threadID) }, send: { _, _ in UUID().uuidString })
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map {
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map {
             TerminalScreen(tty: $0.tty, contents: state.read($0.tty), title: "검증용 \(label) · " + $0.tty,
                 appearance: Self.fixtureAppearance(state.read($0.tty)))
         }) }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, expected, _, input in state.input(target, expected, input) })
+        if connectionPerformance {
+            adapter.presentationScreens = { targets in TerminalSnapshot(screens:targets.map {
+                TerminalScreen(tty:$0.tty,contents:state.read($0.tty),cursor:TerminalCursor(offset:0))
+            }) }
+        }
+        let capture = connectionPerformance ? TerminalWindowCapture(permissions:{TerminalWindowPermissions(screen:false,keyboard:false,automation:true)},
+            automationQuery:{Thread.sleep(forTimeInterval:0.12);return true}) : nil
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
-            claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter])
+            claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
+            terminalInputAvailable:connectionPerformance ? { @Sendable in false } : nil)
         try engine.start(poll: false)
         var sessions = ProcessDiscovery.sessions(records)
         sessions[0].id += "+한글 검증"

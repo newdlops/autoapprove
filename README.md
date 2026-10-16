@@ -449,7 +449,10 @@ node scripts/screen-integration-check.mjs .build/release/autoapprove --race
 .build/debug/autoapprove scan
 .build/debug/autoapprove doctor
 .build/debug/autoapprove status
+.build/debug/autoapprove terminal-timings
 ```
+
+`terminal-timings`는 실행 중인 앱의 터미널 연결 구간별 중앙값·p95·최댓값과 최초 읽기 병합 횟수를 표시합니다. 각 구간의 최근 256개 시간만 메모리에 보관하고 앱을 종료하면 지워집니다. 화면·입력·세션 식별자·주소를 기록하지 않습니다. 같은 관리 페이지 주소의 `GET /api/terminal/timings`로도 읽을 수 있으며 `node`로 다른 Mac을 지정할 수 있습니다. 구간은 서로 포함될 수 있어 단순히 합산하면 안 됩니다. `initialWrite`는 네트워크 프레임워크의 송신 처리 완료이며 휴대폰의 표시 완료를 뜻하지 않습니다.
 
 앱 설정과 승인 내역은 `~/Library/Application Support/AutoApprove/state.sqlite`에 저장됩니다. 화면과 요청은 외부 서버로 전송하지 않습니다. 로컬 소켓은 같은 사용자만 연결할 수 있습니다.
 

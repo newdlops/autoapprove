@@ -5,11 +5,14 @@ extension RemoteServerEvent {
         try screen(RemoteTerminalUpdate(frame,knownRevision:knownRevision))
     }
     static func screen(_ update: RemoteTerminalUpdate) throws -> Data {
+        let start = RemoteTerminalPerformance.now; var succeeded = false
+        defer { RemoteTerminalPerformance.shared.observe(.responseEncoding,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.withoutEscapingSlashes]
         let json = try encoder.encode(update)
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. 화면 크기를 줄여 다시 연결해주세요.") }
-        return Data("event: screen\nid: \(update.revision)\ndata: ".utf8) + json + Data("\n\n".utf8)
+        let data = Data("event: screen\nid: \(update.revision)\ndata: ".utf8) + json + Data("\n\n".utf8)
+        succeeded = true; return data
     }
 }
 

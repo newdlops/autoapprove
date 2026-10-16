@@ -6,6 +6,13 @@ import ScreenCaptureKit
 import ImageIO
 import UniformTypeIdentifiers
 
+private final class AutomationQueryCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    var isFinished: Bool { lock.lock(); defer { lock.unlock() }; return finished }
+    func finish() { lock.lock(); finished = true; lock.unlock() }
+}
+
 public struct TerminalNativeImage: Codable, Equatable, Sendable {
     public var data: String
     public var width: Int
@@ -64,6 +71,9 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
     private let requiresAccessibilityForMetadata: Bool
     private let permissions: @MainActor @Sendable () -> TerminalWindowPermissions
     private let automationPermission: @MainActor @Sendable () -> Bool
+    private let automationQuery: (@Sendable () -> Bool)?
+    private var automationEpoch: UInt64 = 0
+    private var pendingAutomation: (token: UUID, task: Task<Bool,Error>, completion: AutomationQueryCompletion)?
     private let keyboardPermission: @MainActor @Sendable () -> Bool
     private let request: @MainActor @Sendable () -> Void
     private let metadata: @Sendable (String) async throws -> TerminalWindowMetadata?
@@ -83,6 +93,7 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
                 requiresAccessibilityForMetadata: Bool = false,
                 permissions: (@MainActor @Sendable () -> TerminalWindowPermissions)? = nil,
                 automationPermission: (@MainActor @Sendable () -> Bool)? = nil,
+                automationQuery: (@Sendable () -> Bool)? = nil,
                 keyboardPermission: (@MainActor @Sendable () -> Bool)? = nil,
                 requestPermissions: (@MainActor @Sendable () -> Void)? = nil,
                 metadata: (@Sendable (String) async throws -> TerminalWindowMetadata?)? = nil,
@@ -94,6 +105,11 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         if let automationPermission { self.automationPermission = automationPermission }
         else if let permissions { self.automationPermission = { permissions().automation } }
         else { self.automationPermission = { Self.liveAutomationPermission(host) } }
+        // AppKit-bound injected permission providers keep their actor contract.
+        // The production non-prompting system query runs off the main actor.
+        if let automationQuery { self.automationQuery = automationQuery }
+        else if automationPermission == nil && permissions == nil { self.automationQuery = { Self.liveAutomationPermission(host) } }
+        else { self.automationQuery = nil }
         if let keyboardPermission { self.keyboardPermission = keyboardPermission }
         else if let permissions { self.keyboardPermission = { permissions().keyboard } }
         else { self.keyboardPermission = { TerminalKeyboard.isAvailable } }
@@ -104,11 +120,37 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         self.metadata = metadata ?? { tty in try await Task.detached { try TerminalAdapter.windowMetadata(tty: tty, host: host) }.value }
         self.captureImage = capture ?? { try await Self.captureVerifiedWindow($0, ownerBundleID: expectedOwner) }
     }
-    deinit { for value in pending.values { value.task.cancel(); value.validation?.task.cancel() } }
+    deinit { pendingAutomation?.task.cancel(); for value in pending.values { value.task.cancel(); value.validation?.task.cancel() } }
     public var keyboardPermissionGranted: Bool { keyboardPermission() }
     public var nonpromptAutomationGranted: Bool { automationPermission() }
+    public func checkAutomationPermission() async throws -> Bool {
+        try Task.checkCancellation()
+        guard let query = automationQuery else { return automationPermission() }
+        let epoch = automationEpoch, task: Task<Bool,Error>
+        if let pendingAutomation, !pendingAutomation.completion.isFinished { task = pendingAutomation.task }
+        else {
+            let token = UUID(), completion = AutomationQueryCompletion()
+            let worker = Task.detached(priority:.userInitiated) {
+                defer { completion.finish() }
+                return RemoteTerminalPerformance.shared.measure(.automationQuery,query)
+            }
+            task = Task { @MainActor [weak self] in
+                defer { if self?.pendingAutomation?.token == token { self?.pendingAutomation = nil } }
+                let result = await withTaskCancellationHandler(operation:{await worker.value},onCancel:{worker.cancel()})
+                try Task.checkCancellation()
+                guard self?.automationEpoch == epoch else { throw CancellationError() }
+                return result
+            }
+            pendingAutomation = (token,task,completion)
+        }
+        let result = try await task.value
+        try Task.checkCancellation()
+        guard automationEpoch == epoch else { throw CancellationError() }
+        return result
+    }
     public func requestPermissions() { request(); invalidate() }
     public func invalidate() {
+        automationEpoch &+= 1; pendingAutomation?.task.cancel(); pendingAutomation = nil
         for value in pending.values { value.task.cancel(); value.validation?.task.cancel() }; pending.removeAll()
     }
     public func permissionState() -> TerminalNativeDisplay? { Self.permissionState(permissions(), host: host, requiresAccessibility: requiresAccessibilityForMetadata) }
@@ -121,7 +163,7 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         return TerminalNativeDisplay(state: .permissionRequired,
             message: "Mac의 시스템 설정 → 개인정보 보호 및 보안에서 AutoApprove의 \(missing.joined(separator: " · ")) 권한을 허용해주세요. 연결 버튼을 누르면 원래 터미널에 다시 연결합니다.")
     }
-    private static func liveAutomationPermission(_ host: ScreenHost) -> Bool {
+    nonisolated private static func liveAutomationPermission(_ host: ScreenHost) -> Bool {
         let descriptor = NSAppleEventDescriptor(bundleIdentifier: host.bundleID)
         // This preflight cannot open the app or ask for Automation consent.
         return AEDeterminePermissionToAutomateTarget(descriptor.aeDesc, typeWildCard, typeWildCard, false) == noErr

@@ -52,6 +52,7 @@ import AutoApproveCore
                     print(result.message)
                 }
             case "status": try printJSON(SocketClient.request(path: paths.socket, message: ["method": "status"]))
+            case "terminal-timings": try printJSON(SocketClient.request(path:paths.socket,message:["method":"terminalTimings"]))
             case "pause", "resume": try printJSON(SocketClient.request(path: paths.socket, message: ["method": "pause", "params": ["paused": command == "pause"]]))
             case "enable", "disable":
                 guard arguments.count == 2 else { throw AppError.message("세션 ID를 지정해주세요. autoapprove status로 확인할 수 있습니다.") }
@@ -105,6 +106,7 @@ import AutoApproveCore
                   autoapprove terminal-input prepare  원본 입력 서비스 등록 정보 확인 (읽기 전용 JSON)
                   autoapprove terminal-input install  기존 직접 입력 연결 확인 (새 등록은 Mac 앱에서)
                   autoapprove status        앱의 세션 및 승인 내역
+                  autoapprove terminal-timings  터미널 연결 구간별 시간·병합 횟수 (내용 없는 메모리 통계)
                   autoapprove serve         UI 없이 엔진·웹 관리·Mac 자동 발견 실행
                   autoapprove serve --web   저장된 OFF 설정에도 웹 관리 켜기 (기본 포트 8765)
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기

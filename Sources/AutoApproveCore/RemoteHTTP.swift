@@ -214,6 +214,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     private var nextPending = false
     private var pendingResult: Result<Data?, Error>?
     private var sending = false
+    private var terminalWriteStarted: TimeInterval?
     init(_ connection: NWConnection, queue: DispatchQueue, handler: @escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse, onClose: @escaping () -> Void) {
         self.connection = connection; self.queue = queue; self.handler = handler; self.onClose = onClose
     }
@@ -243,9 +244,14 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                     self.buffer = Data(); self.monitorDisconnect()
                     let compressStream = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
                     let method = request.method
+                    let measured = method == "GET" && ["/api/terminal","/api/terminal/stream"].contains(request.path)
+                    let queuedAt = RemoteTerminalPerformance.now
                     self.handlerTask = Task { @MainActor in
+                        if measured { RemoteTerminalPerformance.shared.observe(.mainQueue,elapsed:RemoteTerminalPerformance.now-queuedAt) }
                         let handled = await self.handler(request)
                         self.queue.async {
+                            let preparationStart = RemoteTerminalPerformance.now
+                            defer { if measured { RemoteTerminalPerformance.shared.observe(.transferPreparation,elapsed:RemoteTerminalPerformance.now-preparationStart,succeeded:handled.status < 400) } }
                             var response = handled
                             self.handlerTask = nil
                             guard !self.closed else { response.stream?.cancel(); return }
@@ -273,8 +279,14 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                                     }
                                     heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
                                 }
-                                self.send(response.wire)
-                            } else { self.send(response.preparingTransfer(method:method,acceptsGzip:compressStream).wire, final: true) }
+                                let data = response.wire
+                                if measured { self.terminalWriteStarted = RemoteTerminalPerformance.now }
+                                self.send(data)
+                            } else {
+                                let data = response.preparingTransfer(method:method,acceptsGzip:compressStream).wire
+                                if measured { self.terminalWriteStarted = RemoteTerminalPerformance.now }
+                                self.send(data,final:true)
+                            }
                         }
                     }
                 } else if ended || error != nil { self.closeNow() }
@@ -310,8 +322,10 @@ final class RemoteHTTPConnection: @unchecked Sendable {
         // Finish the HTTP write side with FIN, then let the reader disconnect.
         // Cancelling immediately after contentProcessed can tear down the
         // connection while a peer is still receiving a large response.
+        let terminalWrite = terminalWriteStarted; terminalWriteStarted = nil
         connection.send(content: data, contentContext: final ? .finalMessage : .defaultMessage,
                         isComplete: true, completion: .contentProcessed { [weak self] error in
+            if let terminalWrite { RemoteTerminalPerformance.shared.observe(.initialWrite,elapsed:RemoteTerminalPerformance.now-terminalWrite,succeeded:error == nil) }
             guard let self else { return }
             self.queue.async {
                 guard !self.closed else { return }; self.sending = false

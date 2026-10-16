@@ -986,13 +986,18 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "Codex 세션을 지정해주세요.") }
                     return try await .json(engine.remoteCodexConversations(sessionID: id))
+                case "/api/terminal/timings":
+                    if let forwarded = try await forward(request) { return forwarded }
+                    return try .json(RemoteTerminalPerformance.shared.snapshot())
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
                     let frame = try await RemoteTerminalReadRecovery.read {
                         try await engine.remoteTerminal(sessionID:id,renderWindow:request.parameter("view") == "screen",initial:request.parameter("initial") == "1")
                     }
-                    return try .json(RemoteTerminalUpdate(frame, knownRevision: request.parameter("revision")))
+                    return try RemoteTerminalPerformance.shared.measure(.responseEncoding) {
+                        try .json(RemoteTerminalUpdate(frame, knownRevision:request.parameter("revision")))
+                    }
                 case "/api/terminal/stream":
                     if let forwarded = try await forwardStream(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
@@ -1087,13 +1092,21 @@ struct RemoteTerminalUpdate: Encodable {
     private func forward(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
-        return try await exchange(peer, path: forwardedPath(request), method: request.method, body: request.body)
+        let measured = request.method == "GET" && request.path == "/api/terminal"
+        let start = RemoteTerminalPerformance.now; var succeeded = false
+        defer { if measured { RemoteTerminalPerformance.shared.observe(.relayHTTP,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) } }
+        let response = try await exchange(peer,path:forwardedPath(request),method:request.method,body:request.body)
+        succeeded = response.status < 400
+        return response
     }
     private enum PeerStreamResult: Sendable { case stagger; case opened(Int,RemotePTYPeerBodyStream,TimeInterval) }
     private func forwardStream(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
         guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
+        let measured = request.path == "/api/terminal/stream", start = RemoteTerminalPerformance.now
+        var succeeded = false
+        defer { if measured { RemoteTerminalPerformance.shared.observe(.relayStreamOpen,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) } }
         let epoch = generation
         let endpoints = Array(peerEndpoints(peer).prefix(2)), deadline = ProcessInfo.processInfo.systemUptime + 7
         let timingEpoch = readTimingEpoch
@@ -1140,6 +1153,7 @@ struct RemoteTerminalUpdate: Encodable {
                 peers[peer.id]?.readTiming.observe(route: String(describing: endpoints[opened.0]), kind: .stream, elapsed: opened.2)
             }
         }
+        succeeded = true
         return .eventStream(opened.1, nodeID: nodeID)
     }
     private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
