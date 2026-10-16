@@ -9,6 +9,8 @@
 - 두 Mac **0.2.106/132**, 원본 **22개·3개**·직접 입력 지원을 확인했다. 로컬 설정·승인 기록 **20,129건**·기존 root 입력 서비스 프로세스/파일을 보존했다. 사용자 원본 입력·CLI 재시작 0건이다. VPN·보안·OS 권한과 자동 승인 정책을 바꾸지 않았다.
 - 비공개 성능 `.runtime/performance/dashboard-wake-106/`, 배포/백업 `.runtime/releases/0.2.106/dashboard-wake-132/`. **이번 deploy.py도 이미 실행했으므로 재실행하지 않는다.** 새 재현 도구 `dashboard-latency-check.mjs`, `dashboard-latency-browser-check.mjs`. DMG **9,564,696B**, SHA-256 `601beafa3da61ae3242e95e04008efe0513c37258b13720b538bb8a24a6d0177`. 게시 결과는 실제 확인 후 기록하며 태그를 이동하지 않는다. runtime·사용자·서명 자료와 기존 `.codeidx/`·`.vscode/` 변경을 공개하지 않는다.
 
+- [GitHub v0.2.106](https://github.com/newdlops/autoapprove/releases/tag/v0.2.106)의 최신 정식 릴리스·주석 태그·소스 `ce2f4ef8b6987a0fe537f0e5ac01a4251b79cbac`·두 자산과 인증 없는 실제 다운로드 바이트/해시를 검증했다. 최종 배포 폴더의 `source-manifest.json`·`github-verification.json`이 근거다. 게시 후 문서만 별도 커밋하며 태그는 유지한다.
+
 ## 2026-10-16 많은 기기의 검색·다른 Mac 원본 연결 · 0.2.105/131
 
 - 사용자가 말한 재실행은 휴대폰 웹의 다시 열기/재연결이다. 최근 저장 Mac 우선·메타데이터 개별 반영·이웃 캐시 힌트 중복 제거·선택 목록의 예약 읽기 슬롯·offline 저장 원본의 명시적 GET/SSE를 구현했다. 정확한 node/원본/권한 확인 후 표시하며 기존 탐색 한도·POST 검증·단일 전송을 유지한다. 최근 검증된 읽기를 뒤늦은 메타데이터 실패만으로 offline 처리하지 않는다.

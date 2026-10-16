@@ -13,6 +13,8 @@
 - 두 Mac **0.2.106/132**, 기존 원본 **22개·3개**의 PID·시작·TTY와 직접 입력 지원을 확인했다. 로컬 설정·승인 기록 **20,129건**·기존 root 입력 서비스 프로세스/파일을 보존했다. 사용자 원본 입력·CLI 재시작은 0건이다. VPN/보안/OS 권한·자동 승인 정책을 변경하지 않았다.
 - 비공개 성능 `.runtime/performance/dashboard-wake-106/`, 배포/백업 `.runtime/releases/0.2.106/dashboard-wake-132/`. **이번 deploy.py도 이미 실행했으므로 다시 실행하지 않는다.** 공개 재현 도구 `scripts/dashboard-latency-check.mjs [--baseline --core-build=<old build>]`, `scripts/dashboard-latency-browser-check.mjs [--baseline-ui]`. GitHub 게시 결과는 실제 확인 후 추가하며 runtime·사용자·서명 자료와 무관한 `.codeidx/`·`.vscode/` 변경은 공개하지 않는다.
 
+- [GitHub v0.2.106](https://github.com/newdlops/autoapprove/releases/tag/v0.2.106)의 최신 정식 릴리스·주석 태그·소스 커밋 `ce2f4ef8b6987a0fe537f0e5ac01a4251b79cbac`·DMG/체크섬 두 자산을 확인했다. TLS 검증을 유지한 인증 없는 실제 다운로드의 크기·바이트·SHA-256이 로컬과 일치한다. 검증한 소스/검사/문서 11개와 태그가 일치하며 게시 결과 문서만 별도 커밋한다. 태그는 이동하지 않는다. 최종 배포 폴더의 `source-manifest.json`·`github-verification.json`이 근거다.
+
 ## 0.2.105 많은 기기의 검색·휴대폰 웹 원본 재연결 · 빌드 131
 
 - 사용자가 말한 재실행은 **휴대폰 웹에서 터미널 다시 열기·재연결**이다. 최근 확인한 저장 Mac을 우선하고, 두 메타데이터 조회의 배치 전체를 기다리던 부분을 동시 2개 작업의 개별 완료 반영으로 바꿨다. 세대/토큰·원래 endpoint·더 최근의 확인을 비교해 오래된 결과를 버린다. 네트워크 변경/서버 OFF는 이전 작업을 취소한다. 이미 아는 주소는 이웃 캐시 힌트에서 중복 탐색하지 않으며 새 주소 탐색의 **초당 4회·동시 2개** 한도를 유지한다.
