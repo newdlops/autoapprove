@@ -19,7 +19,7 @@ enum RemoteReadRecovery {
     }
 }
 
-/// A bounded, single-request HTTP connection. No cookies, CORS or socket-bridge passthrough.
+/// One bounded HTTP message. No cookies, CORS or socket-bridge passthrough.
 public struct RemoteHTTPRequest {
     public let method: String
     public let target: String
@@ -27,6 +27,8 @@ public struct RemoteHTTPRequest {
     public let body: Data
     /// Supplied by the accepted socket, never by a browser header.
     public var clientAddress: String? = nil
+    // Parsed from this message, never inherited from a previous request.
+    var allowsConnectionReuse = false
     public var components: URLComponents { URLComponents(string: "http://localhost" + target)! }
     public var path: String { components.path }
     public func parameter(_ name: String) -> String? {
@@ -76,7 +78,11 @@ public struct RemoteHTTPRequest {
         if start[0] == "POST", headers["content-length"] == nil { throw RemoteHTTPError(411, "요청 길이가 필요합니다.") }
         guard data.count >= boundary.upperBound + length else { return nil }
         guard data.count == boundary.upperBound + length else { throw RemoteHTTPError(400, "한 연결에는 한 요청만 보낼 수 있습니다.") }
-        return RemoteHTTPRequest(method: String(start[0]), target: String(start[1]), headers: headers, body: data.subdata(in: boundary.upperBound..<data.count))
+        var request = RemoteHTTPRequest(method: String(start[0]), target: String(start[1]), headers: headers, body: data.subdata(in: boundary.upperBound..<data.count))
+        let options = headers["connection"]?.split(separator:",").map { $0.trimmingCharacters(in:.whitespaces).lowercased() } ?? []
+        request.allowsConnectionReuse = start[2] == "HTTP/1.1" && start[0] == "GET" && length == 0
+            && !options.contains("close") && headers["upgrade"] == nil
+        return request
     }
     public func validateOrigin() throws {
         guard let host = headers["host"], let authority = URLComponents(string: "http://" + host),
@@ -180,7 +186,8 @@ public struct RemoteHTTPResponse: Sendable {
         }
         return response
     }
-    var wire: Data {
+    var wire: Data { wire(reuse:false) }
+    func wire(reuse: Bool) -> Data {
         let reason = status == 200 ? "OK" : status == 302 ? "Found" : status == 304 ? "Not Modified" : "Error"
         let redirect = location.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "Location: \($0)\r\n" } ?? ""
         let style = styleNonce.flatMap { value in value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) ? " 'nonce-\(value)'" : nil } ?? ""
@@ -190,7 +197,8 @@ public struct RemoteHTTPResponse: Sendable {
         let observation = observedAt.map { "X-AutoApprove-Observed-At: \($0.ISO8601Format())\r\n" } ?? ""
         let encoding = contentEncoding == "gzip" ? "Content-Encoding: gzip\r\n" : ""
         let vary = stream != nil || variesEncoding ? "Vary: Accept-Encoding\r\n" : ""
-        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(encoding)\(vary)Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
+        let persistence = reuse ? "Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n" : "Connection: close\r\n"
+        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(encoding)\(vary)\(persistence)Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         return Data(headers.utf8) + body
     }
 }
@@ -202,6 +210,9 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     var buffer = Data()
     var complete = false
     private var closed = false
+    private var receiving = false
+    private var reuseAfterSend = false
+    private var completedRequests = 0
     let handler: @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse
     let onClose: () -> Void
     private let queue: DispatchQueue
@@ -227,81 +238,100 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                 default: break
                 }
             }
-            let deadline = DispatchWorkItem { [weak self] in self?.closeNow() }
-            self.deadline = deadline
-            self.queue.asyncAfter(deadline: .now() + 30, execute: deadline)
+            self.armDeadline(30)
             self.connection.start(queue: self.queue); self.receive()
         }
     }
     private func receive() {
+        guard !closed, !receiving else { return }; receiving = true
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] data, _, ended, error in
-            guard let self, !self.complete, !self.closed else { return }
-            if let data { self.buffer.append(data) }
-            do {
-                if var request = try RemoteHTTPRequest.parse(self.buffer) {
-                    if case .hostPort(let host, _) = self.connection.endpoint { request.clientAddress = String(describing:host) }
-                    self.complete = true
-                    self.buffer = Data(); self.monitorDisconnect()
-                    let compressStream = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
-                    let method = request.method
-                    let measured = method == "GET" && ["/api/terminal","/api/terminal/stream"].contains(request.path)
-                    let queuedAt = RemoteTerminalPerformance.now
-                    self.handlerTask = Task { @MainActor in
-                        if measured { RemoteTerminalPerformance.shared.observe(.mainQueue,elapsed:RemoteTerminalPerformance.now-queuedAt) }
-                        let handled = await self.handler(request)
-                        self.queue.async {
-                            let preparationStart = RemoteTerminalPerformance.now
-                            defer { if measured { RemoteTerminalPerformance.shared.observe(.transferPreparation,elapsed:RemoteTerminalPerformance.now-preparationStart,succeeded:handled.status < 400) } }
-                            var response = handled
-                            self.handlerTask = nil
-                            guard !self.closed else { response.stream?.cancel(); return }
-                            if let stream = response.stream {
-                                if compressStream {
-                                    do {
-                                        let encoder = try RemoteGzipEncoder()
-                                        response.body = try encoder.encode(response.body)
-                                        response.contentEncoding = "gzip"; self.gzip = encoder
-                                    } catch {
-                                        stream.cancel(); self.send(RemoteHTTPResponse.error(error).wire,final:true); return
-                                    }
-                                }
-                                self.stream = stream
-                                // The generic request deadline ends after a successful
-                                // SSE handshake; an idle terminal remains connected.
-                                self.deadline?.cancel(); self.deadline = nil
-                                if stream.needsHeartbeat {
-                                    let heartbeat = DispatchSource.makeTimerSource(queue: self.queue)
-                                    self.heartbeat = heartbeat
-                                    heartbeat.setEventHandler { [weak self] in
-                                        guard let self, !self.closed, self.stream != nil, !self.sending,
-                                              self.pendingResult == nil else { return }
-                                        self.sendStream(Data(": keepalive\n\n".utf8))
-                                    }
-                                    heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
-                                }
-                                let data = response.wire
-                                if measured { self.terminalWriteStarted = RemoteTerminalPerformance.now }
-                                self.send(data)
-                            } else {
-                                let data = response.preparingTransfer(method:method,acceptsGzip:compressStream).wire
-                                if measured { self.terminalWriteStarted = RemoteTerminalPerformance.now }
-                                self.send(data,final:true)
-                            }
-                        }
-                    }
-                } else if ended || error != nil { self.closeNow() }
-                else { self.receive() }
-            } catch {
-                self.complete = true
-                self.send(RemoteHTTPResponse.error(error).wire, final: true)
+            guard let self, !self.closed else { return }; self.receiving = false
+            if ended || error != nil { self.closeNow(); return }
+            if let data, !data.isEmpty {
+                // Read disconnects while the handler/source is pending. Only a
+                // reusable response already being sent may receive the next
+                // message early; it is never dispatched before send completion.
+                guard !self.complete || self.reuseAfterSend else { self.closeNow(); return }
+                if self.buffer.isEmpty, !self.complete, self.completedRequests > 0 { self.armDeadline(30) }
+                self.buffer.append(data)
             }
+            guard !self.complete else {
+                if self.buffer.count > 280_000 { self.closeNow() } else { self.receive() }
+                return
+            }
+            self.readRequest(); self.receive()
         }
     }
-    private func monitorDisconnect() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self] data, _, ended, error in
-            guard let self, !self.closed else { return }
-            if ended || error != nil || data?.isEmpty == false { self.closeNow() }
-            else { self.monitorDisconnect() }
+    private func armDeadline(_ seconds: TimeInterval) {
+        deadline?.cancel()
+        let deadline = DispatchWorkItem { [weak self] in self?.closeNow() }
+        self.deadline = deadline; queue.asyncAfter(deadline:.now()+seconds,execute:deadline)
+    }
+    private func readRequest() {
+        guard !closed, !complete else { return }
+        do {
+            if var request = try RemoteHTTPRequest.parse(self.buffer) {
+                if case .hostPort(let host, _) = self.connection.endpoint { request.clientAddress = String(describing:host) }
+                self.complete = true
+                self.completedRequests += 1; self.buffer = Data()
+                let compressStream = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
+                let allowsReuse = request.allowsConnectionReuse
+                let method = request.method
+                let measured = method == "GET" && ["/api/terminal","/api/terminal/stream"].contains(request.path)
+                let queuedAt = RemoteTerminalPerformance.now
+                self.handlerTask = Task { @MainActor in
+                    if measured { RemoteTerminalPerformance.shared.observe(.mainQueue,elapsed:RemoteTerminalPerformance.now-queuedAt) }
+                    let handled = await self.handler(request)
+                    self.queue.async {
+                        let preparationStart = RemoteTerminalPerformance.now
+                        defer { if measured { RemoteTerminalPerformance.shared.observe(.transferPreparation,elapsed:RemoteTerminalPerformance.now-preparationStart,succeeded:handled.status < 400) } }
+                        var response = handled
+                        self.handlerTask = nil
+                        guard !self.closed else { response.stream?.cancel(); return }
+                        if let stream = response.stream {
+                            if compressStream {
+                                do {
+                                    let encoder = try RemoteGzipEncoder()
+                                    response.body = try encoder.encode(response.body)
+                                    response.contentEncoding = "gzip"; self.gzip = encoder
+                                } catch {
+                                    stream.cancel(); self.send(RemoteHTTPResponse.error(error).wire,final:true); return
+                                }
+                            }
+                            self.stream = stream
+                            // The generic request deadline ends after a successful
+                            // SSE handshake; an idle terminal remains connected.
+                            self.deadline?.cancel(); self.deadline = nil
+                            if stream.needsHeartbeat {
+                                let heartbeat = DispatchSource.makeTimerSource(queue: self.queue)
+                                self.heartbeat = heartbeat
+                                heartbeat.setEventHandler { [weak self] in
+                                    guard let self, !self.closed, self.stream != nil, !self.sending,
+                                          self.pendingResult == nil else { return }
+                                    self.sendStream(Data(": keepalive\n\n".utf8))
+                                }
+                                heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
+                            }
+                            let data = response.wire
+                            if measured { self.terminalWriteStarted = RemoteTerminalPerformance.now }
+                            self.send(data)
+                        } else {
+                            // No HTTP pipelining, handler parallelism or write
+                            // replay. Every message repeats origin/node/source
+                            // checks. Idle sockets are bounded by the existing
+                            // 32 connection slots, five seconds and 32 reads.
+                            self.reuseAfterSend = allowsReuse && self.completedRequests < 32
+                                && (response.status == 200 || response.status == 304 && response.body.isEmpty)
+                            let data = response.preparingTransfer(method:method,acceptsGzip:compressStream).wire(reuse:self.reuseAfterSend)
+                            if measured { self.terminalWriteStarted = RemoteTerminalPerformance.now }
+                            self.send(data,final:!self.reuseAfterSend)
+                        }
+                    }
+                }
+            }
+        } catch {
+            self.complete = true
+            self.send(RemoteHTTPResponse.error(error).wire, final: true)
         }
     }
     private func send(_ data: Data, final: Bool = false) {
@@ -331,6 +361,11 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                 guard !self.closed else { return }; self.sending = false
                 self.sendDeadline?.cancel(); self.sendDeadline = nil
                 if error != nil { self.closeNow() }
+                else if self.reuseAfterSend {
+                    self.reuseAfterSend = false; self.complete = false
+                    self.armDeadline(self.buffer.isEmpty ? 5 : 30)
+                    self.readRequest(); self.receive()
+                }
                 else if !final { self.pumpStream() }
             }
         })
@@ -370,6 +405,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
         handlerTask?.cancel(); handlerTask = nil
         stream?.cancel(); stream = nil; pendingResult = nil
         gzip = nil
+        buffer = Data()
         connection.stateUpdateHandler = nil; connection.cancel(); onClose()
     }
 }
