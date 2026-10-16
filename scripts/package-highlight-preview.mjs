@@ -9,7 +9,7 @@ execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-pa
   '-I', path.resolve('.build/release/Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(path.resolve('.build/release')),
   ...(await readdir('.build/release/AutoApproveCore.build')).filter(name => name.endsWith('.swift.o')).map(name => path.resolve('.build/release/AutoApproveCore.build', name)),
   'Sources/AutoApproveApp/TerminalHighlighter.swift', 'Sources/AutoApproveApp/TerminalNavigator.swift', 'Sources/AutoApproveApp/QuestionNotifications.swift',
-  'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',
+  'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/WindowViewUpdates.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',
   'Sources/AutoApproveApp/SessionWindow.swift', 'Sources/AutoApproveApp/SessionCustomizationEditor.swift', 'Sources/AutoApproveApp/ConnectionSettings.swift', 'Sources/AutoApproveApp/RemoteAccessSettings.swift', 'Tests/fixtures/highlight-preview.swift',
   '-o', path.join(app, 'Contents/MacOS/HighlightPreview')], { stdio: 'inherit' });
 await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>

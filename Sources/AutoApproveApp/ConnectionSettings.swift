@@ -2,9 +2,10 @@ import SwiftUI
 import AppKit
 import AutoApproveCore
 
-struct ConnectionSettings: View {
-    @ObservedObject var engine: ApprovalEngine
-    @ObservedObject var notifications: QuestionNotifications
+@MainActor struct ConnectionSettings: View {
+    let engine: ApprovalEngine
+    let notifications: QuestionNotifications
+    @StateObject private var viewUpdates = WindowViewUpdates()
     @Environment(\.dismiss) private var dismiss
     @State private var busy = false
     @State private var notice: String?
@@ -133,9 +134,11 @@ struct ConnectionSettings: View {
                 }.padding(24)
             }
         }.frame(width: 600, height: 660)
+            .windowUpdates(viewUpdates, sources: [engine.objectWillChange, notifications.objectWillChange])
             .onAppear { questionDelayText = String(engine.snapshot.questionNotificationDelay); refreshTerminalPermissions() }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in refreshTerminalPermissions() }
-            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in refreshTerminalPermissions() }
+            .onChange(of: viewUpdates.isVisible) { _, visible in if visible { refreshTerminalPermissions() } }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in if viewUpdates.isVisible { refreshTerminalPermissions() } }
+            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in if viewUpdates.isVisible { refreshTerminalPermissions() } }
             .onChange(of: questionDelayText) { _, _ in questionDelayError = nil }
     }
     private func saveQuestionDelay() {

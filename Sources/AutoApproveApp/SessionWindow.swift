@@ -7,9 +7,10 @@ import SwiftUI
 import AppKit
 import AutoApproveCore
 
-struct SessionWindow: View {
-    @ObservedObject var engine: ApprovalEngine
-    @ObservedObject var notifications: QuestionNotifications
+@MainActor struct SessionWindow: View {
+    let engine: ApprovalEngine
+    let notifications: QuestionNotifications
+    @StateObject private var viewUpdates = WindowViewUpdates()
     var openTerminal: (AgentSession, ApprovalEngine) async throws -> Void = TerminalNavigator.open
     @Environment(\.openWindow) private var openWindow
     @State private var selection: Set<String> = []
@@ -200,6 +201,7 @@ struct SessionWindow: View {
     }
     var body: some View {
         content.frame(minWidth: 780, minHeight: 560)
+        .windowUpdates(viewUpdates, sources: [engine.objectWillChange, notifications.objectWillChange])
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { openWindow(id: "help") } label: { Label("도움말", systemImage: "questionmark.circle") }
@@ -233,6 +235,7 @@ struct SessionWindow: View {
         }
         .onAppear { showing = true; readVisibleNotifications() }
         .onDisappear { showing = false }
+        .onChange(of: viewUpdates.isVisible) { _, visible in if visible { readVisibleNotifications() } }
         .onChange(of: selection) { _, _ in readVisibleNotifications() }
         .onChange(of: selectedUnreadIDs) { _, _ in readVisibleNotifications() }
         .onChange(of: selectedNotificationKeys) { _, _ in readVisibleNotifications() }
@@ -299,7 +302,7 @@ struct SessionWindow: View {
     private func readVisibleNotifications() {
         Task { @MainActor in
             await Task.yield()
-            guard showing, editingSession == nil, error == nil, NSApp.isActive,
+            guard showing, viewUpdates.isVisible, editingSession == nil, error == nil, NSApp.isActive,
                   NSApp.keyWindow?.identifier?.rawValue == "main", selection.count == 1,
                   let id = selection.first else { return }
             perform { try engine.markNotificationsRead(id) }

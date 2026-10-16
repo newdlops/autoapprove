@@ -417,6 +417,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("History cache: compact projection matches raw decisions and old-row edits", tests.testCodexHistoryCompactCacheMatchesRawDecisionsAndOldEdits),
             ("Local socket: fragmented Unicode, large lines, buffered order and permissions", tests.testLocalSocketFragmentedUnicodeAndBufferedOrdering),
             ("Local socket: malformed and oversized peers, bounded connections and single disconnect", tests.testLocalSocketMalformedOversizedAndBoundedPeers),
             ("Local socket: restart descriptor lifetime and path ownership", tests.testLocalSocketRestartAndPathOwnership),

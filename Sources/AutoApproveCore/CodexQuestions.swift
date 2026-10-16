@@ -64,6 +64,39 @@ public enum CodexQuestionHistory {
         public var json: JSONObject
         public init(ordinal: Int64, json: JSONObject) { self.ordinal = ordinal; self.json = json }
     }
+    private static let ordinaryUserProjection: JSONObject = ["type": "userMessage", "content": [["type": "text", "text": "input"]]]
+
+    /// Only question fields and quote matchers affect pending decisions. This
+    /// private cache representation is never sent as user input or displayed.
+    /// In particular, a long ordinary message needs only a nonempty-input flag.
+    fileprivate static func projection(_ item: JSONObject) -> JSONObject? {
+        if item["type"] as? String == "agentMessage", item["delivery"] as? String == "async",
+           let id = item["id"] as? String, !id.isEmpty {
+            var value: JSONObject = ["type": "agentMessage", "delivery": "async", "id": id]
+            if let questions = item["questions"] as? [JSONObject] {
+                // Preserve positions, including invalid questions: they are part
+                // of the request ID. A missing array must still consume seenID.
+                value["questions"] = questions.map { question -> JSONObject in
+                    guard let title = question["title"] as? String, !normalized(title).isEmpty else { return [:] }
+                    var result: JSONObject = ["title": title]
+                    if let options = question["options"] as? [String] { result["options"] = options }
+                    if let multi = question["multiSelect"] as? Bool { result["multiSelect"] = multi }
+                    return result
+                }
+            }
+            return value
+        }
+        guard item["type"] as? String == "userMessage", let content = item["content"] as? [JSONObject] else { return nil }
+        let text = content.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
+        let quotes = answeredQuotes(text)
+        if !quotes.isEmpty {
+            // Keep exact normalized matchers and their answered status, without
+            // retaining the answer or any unrelated text around the quotes.
+            let matchers = quotes.map { "> \($0)\nanswer" }.joined(separator: "\n")
+            return ["type": "userMessage", "content": [["type": "text", "text": matchers]]]
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : ordinaryUserProjection
+    }
     public static func pending(threadID: String, items: [Item]) -> [QueuedQuestion] {
         var pending: [QueuedQuestion] = []
         var seen = Set<String>()
@@ -210,12 +243,19 @@ public final class CodexHistoryReader {
         sqlite3_bind_int64(statement, 2, from); sqlite3_bind_int64(statement, 3, from)
         var status = sqlite3_step(statement)
         while status == SQLITE_ROW {
-            guard let rawID = sqlite3_column_text(statement, 0), let raw = sqlite3_column_text(statement, 2),
-                  let json = try? JSONSerialization.jsonObject(with: Data(String(cString: raw).utf8)) as? JSONObject else {
-                throw CodexHistoryReadError(.invalidData, subject: "질문")
+            let (id, ordinal, value) = try autoreleasepool { () throws -> (String, Int64, JSONObject?) in
+                guard let rawID = sqlite3_column_text(statement, 0), let raw = sqlite3_column_text(statement, 2),
+                      let json = try? JSONSerialization.jsonObject(with: Data(String(cString: raw).utf8)) as? JSONObject else {
+                    throw CodexHistoryReadError(.invalidData, subject: "질문")
+                }
+                return (String(cString: rawID), sqlite3_column_int64(statement, 1), CodexQuestionHistory.projection(json))
             }
-            updated[String(cString: rawID)] = CodexQuestionHistory.Item(ordinal: sqlite3_column_int64(statement, 1), json: json)
-            changed = true
+            if let value {
+                let unchanged = updated[id].map { $0.ordinal == ordinal && NSDictionary(dictionary: $0.json).isEqual(to: value) } ?? false
+                if !unchanged { updated[id] = CodexQuestionHistory.Item(ordinal: ordinal, json: value); changed = true }
+            } else if updated.removeValue(forKey: id) != nil {
+                changed = true
+            }
             status = sqlite3_step(statement)
         }
         guard status == SQLITE_DONE else { throw CodexHistoryAccess.failure(db, subject: "질문", result: status) }

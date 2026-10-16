@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import AutoApproveCore
 
 @MainActor final class AppContainer: ObservableObject {
@@ -72,11 +73,25 @@ import AutoApproveCore
 }
 
 private struct StatusMenuLabel: View {
-    @ObservedObject var engine: ApprovalEngine
+    @StateObject private var state: StatusMenuSummary
+    init(engine: ApprovalEngine) { _state = StateObject(wrappedValue: StatusMenuSummary(engine: engine)) }
     var body: some View {
-        let count = engine.snapshot.attentionCount
-        Label(count > 0 ? "\(count)" : "", systemImage: engine.snapshot.paused ? "pause.circle" : "checkmark.bubble")
-            .help("AutoApprove\(engine.snapshot.paused ? " · 자동 승인 일시정지" : "") · 대기 중 \(engine.snapshot.idleCount)개 · 응답 필요 \(count)개\n눌러서 관리 창·승인 내역을 열거나 자동 승인을 일시정지합니다.")
+        let value = state.value, count = value.attention
+        Label(count > 0 ? "\(count)" : "", systemImage: value.paused ? "pause.circle" : "checkmark.bubble")
+            .help("AutoApprove\(value.paused ? " · 자동 승인 일시정지" : "") · 대기 중 \(value.idle)개 · 응답 필요 \(count)개\n눌러서 관리 창·승인 내역을 열거나 자동 승인을 일시정지합니다.")
+    }
+}
+
+@MainActor private final class StatusMenuSummary: ObservableObject {
+    struct Value: Equatable {
+        let paused: Bool, idle: Int, attention: Int
+        init(_ snapshot: EngineSnapshot) { paused = snapshot.paused; idle = snapshot.idleCount; attention = snapshot.attentionCount }
+    }
+    @Published private(set) var value: Value
+    private var subscription: AnyCancellable?
+    init(engine: ApprovalEngine) {
+        value = Value(engine.snapshot)
+        subscription = engine.$snapshot.map(Value.init).removeDuplicates().dropFirst().sink { [weak self] in self?.value = $0 }
     }
 }
 

@@ -2,8 +2,10 @@ import SwiftUI
 import AppKit
 import AutoApproveCore
 
-struct AuditHistoryWindow: View {
-    @ObservedObject var engine: ApprovalEngine
+@MainActor struct AuditHistoryWindow: View {
+    let engine: ApprovalEngine
+    @StateObject private var viewUpdates = WindowViewUpdates()
+    @State private var hasBeenVisible = false
     @State private var search = ""
     @State private var filter: AuditResult?
     @State private var events: [AuditEvent] = []
@@ -95,6 +97,17 @@ struct AuditHistoryWindow: View {
             }
         }
         .frame(minWidth: 780, minHeight: 560)
+        .windowUpdates(viewUpdates, sources: [engine.objectWillChange])
+        .onChange(of: viewUpdates.isVisible) { _, visible in
+            guard visible else { return }
+            if hasBeenVisible {
+                if offset == 0 { reload() }
+                else {
+                    hasNew = hasNew || engine.snapshot.events.contains { $0.date > through }
+                    Task { await load(at: offset) }
+                }
+            } else { hasBeenVisible = true }
+        }
         .toolbar {
             Button { reload() } label: { Label("새로고침", systemImage: "arrow.clockwise") }.disabled(loading).keyboardShortcut("r")
                 .help(loading ? "승인 내역을 불러오고 있습니다." : "최신 내역을 다시 불러오고 첫 페이지로 돌아갑니다. ⌘R")
@@ -104,6 +117,7 @@ struct AuditHistoryWindow: View {
             through = Date(); await load(at: 0)
         }
         .onChange(of: engine.snapshot.events) { _, _ in
+            guard viewUpdates.isVisible else { return }
             if offset == 0 { reload() } else { hasNew = true }
         }
         .onChange(of: selectedID) { _, _ in copied = false }

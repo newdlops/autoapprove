@@ -3,6 +3,59 @@ import JavaScriptCore
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testCodexHistoryCompactCacheMatchesRawDecisionsAndOldEdits() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-history-projection-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = root.appendingPathComponent("history.sqlite").path
+        func sql(_ text: String) throws {
+            let result = try CommandRunner.run("/usr/bin/sqlite3", [database], input: Data(text.utf8))
+            try expectEqual(result.status, 0, result.error)
+        }
+        try sql("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_ordinal INTEGER); INSERT INTO thread_history_projection_state VALUES('root',1); CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT);")
+        let location = CodexThreadLocation(threadID: "root", database: database), reader = CodexHistoryReader()
+        var rows: [(String, CodexQuestionHistory.Item)] = [], revision: Int64 = 100
+        func check() throws {
+            try expectEqual(try reader.read(location), CodexQuestionHistory.pending(threadID: "root", items: rows.map(\.1)),
+                "Cached decisions must equal the raw transcript, including old-row edits")
+        }
+        func apply(_ key: String, _ item: CodexQuestionHistory.Item) throws {
+            revision += 10
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: item.json), as: UTF8.self).replacingOccurrences(of: "'", with: "''")
+            let type = item.json["type"] as! String
+            try sql("DELETE FROM thread_items WHERE item_id='\(key)'; INSERT INTO thread_items VALUES('root','\(key)',\(item.ordinal),'\(type)',\(revision),'\(json)'); UPDATE thread_history_projection_state SET next_rollout_ordinal=\(revision + 1) WHERE thread_id='root';")
+            if let index = rows.firstIndex(where: { $0.0 == key }) { rows[index] = (key, item) }
+            else { rows.append((key, item)) }
+            try check()
+        }
+        let title = "예시  질문"
+        var first = asyncQuestion("main", title, ordinal: 1)
+        first.json["unused"] = String(repeating: "unused agent metadata ", count: 10_000)
+        try apply("main", first)
+        try apply("user", answer(String(repeating: "ordinary content ", count: 4_096), ordinal: 2))
+        try expectEqual(try reader.read(location)[0].hasLaterUserMessage, true)
+        try apply("user", answer(" \r\n\t", ordinal: 2))
+        try expectNil(try reader.read(location)[0].hasLaterUserMessage)
+        let bundle = CodexQuestionHistory.Item(ordinal: 3, json: ["type":"agentMessage","id":"bundle","delivery":"async",
+            "questions":[[:],["title":"둘째 질문","options":["하나","둘"],"multiSelect":true],["title":" \n","unused":"ignored"]]])
+        try apply("bundle", bundle)
+        try expectEqual(try reader.read(location).last?.id, "codex:root:bundle:1", "Invalid positions must not renumber valid requests")
+        let consumesID = CodexQuestionHistory.Item(ordinal: 4, json: ["type":"agentMessage","id":"consumed","delivery":"async"])
+        try apply("consumes", consumesID)
+        try apply("duplicate", asyncQuestion("consumed", "다시 보이는 질문", ordinal: 5))
+        try expectEqual(try reader.read(location).count, 2, "Missing question arrays must still preserve duplicate-ID handling")
+        try apply("reply", answer("> 예시 질문\n답변\n> 둘째 질문\n둘", ordinal: 6))
+        try expect(try reader.read(location).isEmpty)
+        try apply("reply", answer("> 예시 질문", ordinal: 6))
+        try expectEqual(try reader.read(location).count, 2, "Editing an old answer back to a quote must restore the unanswered requests")
+        try apply("consumes", answer("", ordinal: 4))
+        try expectEqual(try reader.read(location).count, 3, "An old ID-suppression row may change into an ineffective user row")
+        try apply("late", asyncQuestion("late", "나중 질문", ordinal: 7))
+        try apply("empty-quote", answer(">\nanswer", ordinal: 8))
+        try expect(try reader.read(location).last?.hasLaterUserMessage == nil, "An answered empty quote is not ordinary unquoted input")
+        try sql("UPDATE thread_history_projection_state SET next_rollout_ordinal=0 WHERE thread_id='root';")
+        try check()
+    }
     private func asyncQuestion(_ id: String, _ title: String, ordinal: Int64, options: [String] = ["하나", "둘", "셋"]) -> CodexQuestionHistory.Item {
         .init(ordinal: ordinal, json: ["type": "agentMessage", "id": id, "delivery": "async", "questions": [["title": title, "options": options]]])
     }

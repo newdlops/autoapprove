@@ -3,8 +3,9 @@ import AppKit
 import CoreImage.CIFilterBuiltins
 import AutoApproveCore
 
-struct RemoteAccessSettings: View {
-    @ObservedObject var engine: ApprovalEngine
+@MainActor struct RemoteAccessSettings: View {
+    let engine: ApprovalEngine
+    @StateObject private var viewUpdates = WindowViewUpdates()
     @State private var error: String?
     @State private var selectedURL = ""
     @State private var localAddressStatus = LocalDashboardAddress.status()
@@ -131,7 +132,9 @@ struct RemoteAccessSettings: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let error { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.red) }
         }.frame(maxWidth: .infinity, alignment: .leading)
-            .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) {_ in localAddressStatus = LocalDashboardAddress.status()}
+            .windowUpdates(viewUpdates, sources: [engine.objectWillChange])
+            .onChange(of: viewUpdates.isVisible) { _, visible in if visible { localAddressStatus = LocalDashboardAddress.status() } }
+            .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) {_ in if viewUpdates.isVisible { localAddressStatus = LocalDashboardAddress.status() } }
     }
     private func qrCode(_ text: String) -> NSImage? {
         let filter = CIFilter.qrCodeGenerator(); filter.message = Data(text.utf8)
