@@ -13,6 +13,8 @@
 - 두 Mac **0.2.105/131**, 기존 원본 **21개·3개**의 PID·시작·TTY와 직접 입력 지원을 확인했다. 로컬 설정·기존 승인 기록 **19,982건**·실행 중 root 입력 서비스의 프로세스/파일을 보존했다. 원본 입력은 보내지 않았으며 입력 검사는 격리 fixture만 사용했다.
 - 비공개 검증 `.runtime/performance/discovery-reopen-105/`, 최종 배포/백업 `.runtime/releases/0.2.105/native-source-131/`. 이전 검사본 빌드 130 백업도 보존했고 **두 deploy.py 모두 이미 실행했으므로 재실행하지 않는다**. GitHub 게시 결과는 실제 확인 후 별도 기록하며 runtime·사용자 화면·서명 자료와 무관한 `.codeidx/`·`.vscode/` 변경은 공개하지 않는다.
 
+- [GitHub v0.2.105](https://github.com/newdlops/autoapprove/releases/tag/v0.2.105)의 최신 정식 릴리스·주석 태그·소스 커밋 `a835df81e360e32496f18fa81043ae572d3e5d92`와 DMG/체크섬 두 자산을 확인했다. TLS 검증을 유지한 인증 없는 실제 다운로드의 크기·바이트·SHA-256이 로컬 패키지와 일치한다. 검증된 15개 소스/검사/문서 파일이 태그와 일치하며 게시 결과 문서만 별도 커밋한다. 배포 태그는 이동하지 않는다. 근거는 최종 배포 폴더의 `source-manifest.json`·`github-verification.json`이다.
+
 ## 0.2.104 일반 HTTP 조회 연결 재사용 · 빌드 129
 
 - 사용자의 “더 빠르고 가볍게” 요청에 따라 유한 HTTP/1.1 응답의 TCP 연결을 재사용한다. 본문 없는 GET의 200·본문 없는 304만 유지하고 최대 32회, 미사용 5초, 다음 요청 읽기·처리 전체 30초 한도를 둔다. HTTP/1.0·대소문자를 포함한 close 토큰·입력 POST·오류·SSE는 기존 close 의미를 유지한다. 한 소켓에 handler와 receive가 각각 하나이며, 다음 메시지는 이전 송신 완료 후 처리한다. 원래의 16KiB 헤더/280KB 전체 요청·32소켓/12스트림 상한과 출처·node·원본·권한 검증을 유지한다. 요청 파서는 여러 메시지를 한꺼번에 받는 pipelining과 중복 길이·전송 형식의 모호성을 거부한다. 응답 본문·권한 허용을 캐시하거나 입력을 재전송하지 않는다. [HTTP/1.1 메시지 수명 기준](https://www.rfc-editor.org/rfc/rfc9112.html#name-persistence)을 참고했다.

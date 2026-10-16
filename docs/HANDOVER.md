@@ -9,6 +9,8 @@
 - 두 Mac **0.2.105/131**, 원본 **21개·3개**와 직접 입력 지원을 확인했다. 로컬 설정·승인 기록 **19,982건**·기존 root 입력 서비스 프로세스/파일을 보존했다. 사용자 원본 입력·CLI 재시작 0건이다.
 - 비공개 성능/검사 `.runtime/performance/discovery-reopen-105/`, 최종 배포 `.runtime/releases/0.2.105/native-source-131/`, 이전 검사본/백업 `discovery-reopen-130/`. **두 deploy.py 모두 이미 실행했으므로 다시 실행하지 않는다.** 재현 도구 `scripts/discovery-reopen-check.mjs [--baseline --core-build=<old build>]`. DMG **9,552,553B**, SHA-256 `7e07c5a4869354b36189d3a0c08671a362179b593dd904bfb444480101a50475`. 게시 결과는 실제 확인 후 기록하며 태그를 이동하지 않는다. runtime·사용자·서명 자료와 기존 `.codeidx/`·`.vscode/` 변경을 공개하지 않는다.
 
+- [GitHub v0.2.105](https://github.com/newdlops/autoapprove/releases/tag/v0.2.105)의 최신 정식 릴리스·주석 태그·소스 `a835df81e360e32496f18fa81043ae572d3e5d92`·두 자산과 인증 없는 실제 다운로드 바이트/해시를 검증했다. 최종 배포 폴더의 `source-manifest.json`·`github-verification.json`이 근거다. 게시 후 문서만 별도 커밋하며 태그를 유지한다.
+
 ## 2026-10-16 일반 HTTP 조회 연결 재사용 · 0.2.104/129
 
 - 사용자는 추가 속도·부하 개선을 요청했다. `RemoteHTTP.swift`가 정상적인 유한 HTTP/1.1 GET의 TCP 연결을 최대 32회·유휴 5초 재사용한다. 요청마다 origin/node/원본 검증을 반복하며 handler/receive는 각각 하나다. HTTP/1.0·close·POST·오류·SSE의 수명, 32개 소켓/12개 스트림·요청 크기 상한을 유지한다. 입력 POST는 재전송하지 않으며 UI·자동 승인/원본 감시 주기·원본 CLI·보안/네트워크 설정은 바꾸지 않았다.
