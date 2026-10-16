@@ -158,6 +158,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var interfaceMonitors: [NWPathMonitor] = []
     private var discoveryTask: Task<Void, Never>?
     private var webPeerTask: Task<Void, Never>?
+    private var webPeerToken = UUID()
     private var browserRetry: Task<Void, Never>?
     private var browserRetryDelay: TimeInterval = 1
     private var directCursor = 0
@@ -225,6 +226,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var knownPeers: [KnownPeer] = []
     private var knownSaveTask: Task<Void, Never>?
     private let stateReads = RemotePeerStateCache()
+    private var foregroundStateReads: [String:UUID] = [:]
     private let inventoryValidation = RemotePeerInventoryCache()
     private var readTimingEpoch = UUID()
     public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
@@ -376,6 +378,8 @@ struct RemoteTerminalUpdate: Encodable {
                         self.peers[id]?.readTiming = RemoteReadTiming()
                     }
                     self.stateReads.removeAll(); self.inventoryValidation.removeAll()
+                    self.foregroundStateReads.removeAll()
+                    self.webPeerToken = UUID(); self.webPeerTask?.cancel(); self.webPeerTask = nil
                     self.nextHintRead = .distantPast; self.nextBlindProbe = .distantPast; self.directCursor = 0
                     self.directProbedAt.removeAll(); self.pendingHints.removeAll()
                     self.startDirectDiscovery(epoch: epoch)
@@ -444,6 +448,7 @@ struct RemoteTerminalUpdate: Encodable {
         discoveryTask?.cancel(); discoveryTask = nil
         listenerRetry?.cancel(); listenerRetry = nil; advertisement.stop()
         webPeerTask?.cancel(); webPeerTask = nil
+        webPeerToken = UUID(); foregroundStateReads.removeAll()
         browserRetry?.cancel(); browserRetry = nil
         knownSaveTask?.cancel(); knownSaveTask = nil; saveKnownPeers()
         stateReads.removeAll(); inventoryValidation.removeAll()
@@ -561,44 +566,64 @@ struct RemoteTerminalUpdate: Encodable {
     }
     private func refreshWebPeers() {
         guard webPeerTask == nil else { return }
-        let epoch = generation
-        let candidates = Array(peers.values.filter { $0.nextProbe <= Date() }.sorted { $0.nextProbe < $1.nextProbe }.prefix(100))
+        let epoch = generation, token = UUID()
+        let remembered = Dictionary(knownPeers.map { ($0.id,$0.lastSeen) },uniquingKeysWith:max)
+        func recent(_ peer: Peer) -> Date {
+            max(peer.directlySeen ?? .distantPast,peer.webVerifiedAt ?? .distantPast,remembered[peer.id] ?? .distantPast)
+        }
+        let candidates = Array(peers.values.filter { $0.nextProbe <= Date() }.sorted {
+            if $0.failures != $1.failures { return $0.failures < $1.failures }
+            if recent($0) != recent($1) { return recent($0) > recent($1) }
+            if $0.manual != $1.manual { return $0.manual }
+            if $0.nextProbe != $1.nextProbe { return $0.nextProbe < $1.nextProbe }
+            return $0.id < $1.id
+        }.prefix(100))
         guard !candidates.isEmpty else { return }
+        webPeerToken = token
         webPeerTask = Task { [weak self] in
             guard let self else { return }
-            for offset in stride(from: 0, to: candidates.count, by: 2) {
-                guard self.running, self.generation == epoch, !Task.isCancelled else { return }
-                let found = await withTaskGroup(of: RemotePeerDiscovery.Found?.self, returning: [RemotePeerDiscovery.Found].self) { group in
-                    for peer in candidates[offset..<min(offset + 2, candidates.count)] {
-                        let endpoints = self.peerEndpoints(peer)
-                        group.addTask {
-                            for endpoint in endpoints {
-                                guard !Task.isCancelled else { return nil }
-                                if let value = await RemotePeerDiscovery.probe(endpoint, expectedID: peer.id, address: Self.numericURL(endpoint)) { return value }
-                            }
-                            return nil
+            defer { if self.webPeerToken == token { self.webPeerTask = nil } }
+            typealias Result = (id:String,endpoint:NWEndpoint,started:Date,found:RemotePeerDiscovery.Found?)
+            @MainActor func query(_ peer: Peer) -> @Sendable () async -> Result {
+                let endpoints = self.peerEndpoints(peer), id = peer.id, original = peer.endpoint
+                return {
+                    let started = Date()
+                    for endpoint in endpoints {
+                        guard !Task.isCancelled else { break }
+                        if let found = await RemotePeerDiscovery.probe(endpoint,expectedID:id,address:Self.numericURL(endpoint)) {
+                            return (id,original,started,found)
                         }
                     }
-                    var result: [RemotePeerDiscovery.Found] = []
-                    for await value in group { if let value { result.append(value) } }
-                    return result
+                    return (id,original,started,nil)
                 }
-                guard self.running, self.generation == epoch, !Task.isCancelled else { return }
-                for value in found {
-                    guard let original = candidates.first(where: { $0.id == value.id }), self.peers[value.id]?.endpoint == original.endpoint else { continue }
-                    self.acceptWebMetadata(value)
-                }
-                for peer in candidates[offset..<min(offset + 2, candidates.count)] where !found.contains(where: { $0.id == peer.id }) {
-                    guard self.peers[peer.id]?.endpoint == peer.endpoint else { continue }
-                    let failures = min(5, (self.peers[peer.id]?.failures ?? 0) + 1)
-                    self.peers[peer.id]?.failures = failures
-                    self.peers[peer.id]?.nextProbe = Date().addingTimeInterval(pow(2, Double(failures)))
-                    self.peers[peer.id]?.webVerifiedAt = nil
-                    if !peer.bonjour && !peer.manual && peer.webVerifiedAt.map({ Date().timeIntervalSince($0) < 60 }) != true { self.peers[peer.id]?.available = false }
-                }
-                self.updateNamedAddresses(); self.emitStatus()
             }
-            self.webPeerTask = nil
+            await withTaskGroup(of:Result.self) { group in
+                var next = min(2,candidates.count)
+                for peer in candidates.prefix(next) { group.addTask(operation:query(peer)) }
+                // Consume each completion immediately; one slow address cannot
+                // hold its healthy neighbour or the next queued peer in a batch.
+                while let result = await group.next() {
+                    guard self.running, self.generation == epoch, self.webPeerToken == token, !Task.isCancelled else { group.cancelAll(); return }
+                    if let current = self.peers[result.id], current.endpoint == result.endpoint,
+                       (current.directlySeen ?? .distantPast) <= result.started,
+                       (current.webVerifiedAt ?? .distantPast) <= result.started {
+                        if let found = result.found { self.acceptWebMetadata(found) }
+                        else {
+                            let failures = min(5,current.failures+1)
+                            self.peers[result.id]?.failures = failures
+                            self.peers[result.id]?.nextProbe = Date().addingTimeInterval(pow(2,Double(failures)))
+                            self.peers[result.id]?.webVerifiedAt = nil
+                            if !current.bonjour && !current.manual,
+                               current.webVerifiedAt.map({Date().timeIntervalSince($0)<60}) != true,
+                               current.directlySeen.map({Date().timeIntervalSince($0)<60}) != true {
+                                self.peers[result.id]?.available = false
+                            }
+                        }
+                        self.updateNamedAddresses(); self.emitStatus()
+                    }
+                    if next < candidates.count { group.addTask(operation:query(candidates[next])); next += 1 }
+                }
+            }
         }
     }
     private func newerWebPeers() -> [Peer] {
@@ -712,7 +737,8 @@ struct RemoteTerminalUpdate: Encodable {
             nextHintRead = Date().addingTimeInterval(15)
             let read = discoveryHints, hints = await Task.detached(priority: .utility) { read() }.value
             guard running, generation == epoch, !Task.isCancelled else { return }
-            pendingHints = Array(hints.prefix(64)).filter { directProbedAt[$0].map { Date().timeIntervalSince($0) < 60 } != true }
+            let known = Set(peers.values.flatMap { [$0.directAddress].compactMap {$0} + $0.webURLs })
+            pendingHints = Array(hints.prefix(64)).filter { !known.contains($0) && directProbedAt[$0].map { Date().timeIntervalSince($0) < 60 } != true }
         }
         var addresses: [String] = []
         if !pendingHints.isEmpty { addresses = Array(pendingHints.prefix(2)); pendingHints.removeFirst(addresses.count) }
@@ -775,8 +801,8 @@ struct RemoteTerminalUpdate: Encodable {
             localAddressReady:LocalDashboardAddress.status() == .ready)
     }
     private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse,TimeInterval) }
-    private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil) async throws -> RemoteHTTPResponse {
-        guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
+    private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil, allowUnavailableRead: Bool = false) async throws -> RemoteHTTPResponse {
+        guard running, peer.available || allowUnavailableRead && method == "GET" && body.isEmpty else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let primary = connectionEndpoint(peer)
         guard method == "GET", body.isEmpty else {
             let response = try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id).run()
@@ -835,19 +861,28 @@ struct RemoteTerminalUpdate: Encodable {
         }
         return response
     }
-    private func peerStateTask(_ peer: Peer) -> Task<RemoteNodeView, Never> {
+    private func peerStateTask(_ peer: Peer, foreground: Bool = false) -> Task<RemoteNodeView, Never> {
         let endpoint = connectionEndpoint(peer)
+        // A selected bookmark may replace a queued background/negative read.
+        // Existing fresh success and simultaneous selected readers still share.
+        if foreground, foregroundStateReads[peer.id] == nil, stateReads.value(for:peer.id,endpoint:endpoint)?.online != true {
+            stateReads.remove(peer.id)
+        }
         if let task = stateReads.task(for: peer.id, endpoint: endpoint) { return task }
         let epoch = generation, token = UUID()
+        foregroundStateReads[peer.id] = foreground ? token : nil
         let task = Task { @MainActor [weak self] () -> RemoteNodeView in
             guard let self else { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: "웹 연결이 종료되었습니다.", release: peer.release) }
+            defer { if self.foregroundStateReads[peer.id] == token { self.foregroundStateReads.removeValue(forKey:peer.id) } }
             let result: RemoteNodeView
             do {
                 try Task.checkCancellation()
                 guard self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
                 let compact = peer.release.map { $0 >= RemoteWebVersion(version:"0.2.61",build:76,api:1) } == true
                 let tag = compact ? self.inventoryValidation.requestTag(for: peer.id, endpoint: endpoint) : nil
-                let response = try await RemoteDashboardTraffic.shared.read { @MainActor in try await self.exchange(peer, path: compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag) }
+                let response = try await RemoteDashboardTraffic.shared.read(foreground:foreground) { @MainActor in
+                    try await self.exchange(peer,path:compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag,allowUnavailableRead:foreground)
+                }
                 try Task.checkCancellation()
                 guard self.running, self.generation == epoch, self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
                 let state: RemoteNodeState
@@ -858,6 +893,7 @@ struct RemoteTerminalUpdate: Encodable {
                     state = try decoder.decode(RemoteNodeState.self, from: response.body)
                 }
                 guard [200,304].contains(response.status), state.id == peer.id else { throw RemoteHTTPError(502, "Mac의 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.") }
+                self.markPeerRead(peer)
                 result = RemoteNodeView(id: peer.id, name: state.name, local: false, online: true, state: state.inventory, release: state.release ?? peer.release)
             } catch {
                 if self.generation == epoch, self.stateReads.isCurrent(id:peer.id,token:token) { self.inventoryValidation.remove(peer.id) }
@@ -886,7 +922,7 @@ struct RemoteTerminalUpdate: Encodable {
             return completed[peer.id].flatMap { $0.0 == endpoint ? $0.1 : nil }
         }
         func waitForReads(_ peers: [Peer]) async throws {
-            for peer in peers { _ = peerStateTask(peer) }
+            for peer in peers { _ = peerStateTask(peer,foreground:peer.id == selectedNode) }
             // A dead or old Mac must not hold every healthy Mac behind a full timeout.
             // Reads keep their single in-flight reservation and finish in the background.
             let until = ProcessInfo.processInfo.systemUptime + 0.35
@@ -1104,13 +1140,24 @@ struct RemoteTerminalUpdate: Encodable {
             }
         } catch { return .error(error) }
     }
+    private func markPeerRead(_ peer: Peer) {
+        guard running, !Task.isCancelled, peers[peer.id]?.endpoint == peer.endpoint else { return }
+        peers[peer.id]?.available = true; peers[peer.id]?.directlySeen = Date(); peers[peer.id]?.failures = 0
+    }
     private func forward(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
         let measured = request.method == "GET" && request.path == "/api/terminal"
         let start = RemoteTerminalPerformance.now; var succeeded = false
         defer { if measured { RemoteTerminalPerformance.shared.observe(.relayHTTP,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) } }
-        let response = try await exchange(peer,path:forwardedPath(request),method:request.method,body:request.body)
+        let read = request.method == "GET" && request.body.isEmpty
+        let response = try await exchange(peer,path:forwardedPath(request),method:request.method,body:request.body,allowUnavailableRead:read)
+        // Only an exact fresh identity can restore a saved/offline read route.
+        // Legacy peers without the header still use metadata discovery first.
+        if !peer.available, response.nodeID != peer.id {
+            throw RemoteHTTPError(502,"저장한 주소의 Mac을 확인하지 못했습니다. 목록을 새로고침해주세요.",diagnostics:["failureKind":"identity"])
+        }
+        if read, response.status == 200, response.nodeID == peer.id { markPeerRead(peer) }
         succeeded = response.status < 400
         return response
     }
@@ -1118,7 +1165,7 @@ struct RemoteTerminalUpdate: Encodable {
     private func forwardStream(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
-        guard running, peer.available else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
+        guard running else { throw RemoteHTTPError(503, "이 Mac이 네트워크에서 연결 해제되었습니다.") }
         let measured = request.path == "/api/terminal/stream", start = RemoteTerminalPerformance.now
         var succeeded = false
         defer { if measured { RemoteTerminalPerformance.shared.observe(.relayStreamOpen,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) } }
@@ -1168,6 +1215,7 @@ struct RemoteTerminalUpdate: Encodable {
                 peers[peer.id]?.readTiming.observe(route: String(describing: endpoints[opened.0]), kind: .stream, elapsed: opened.2)
             }
         }
+        markPeerRead(peer)
         succeeded = true
         return .eventStream(opened.1, nodeID: nodeID)
     }

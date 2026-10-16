@@ -437,21 +437,23 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at:directory) }
         let records = ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /usr/local/bin/codex")
         var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .terminal
-        let plain = RemoteReadProbe(), rich = RemoteCursorProbe()
+        let plain = RemoteReadProbe(), cold = RemoteReadProbe(), rich = RemoteCursorProbe()
         let adapter = ScreenHostAdapter(screens:{TerminalSnapshot(screens:$0.map{plain.read($0.tty)})},approve:{_,_,_ in .missingTarget},reveal:{_ in nil},
-            presentationScreens:{TerminalSnapshot(screens:$0.map{rich.screen($0.tty)})})
+            presentationScreens:{TerminalSnapshot(screens:$0.map{rich.screen($0.tty)})},
+            initialScreens:{TerminalSnapshot(screens:$0.map{cold.read($0.tty)})})
         let engine = try ApprovalEngine(paths:AppPaths(directory:directory),processReader:{records},screenAdapters:[.terminal:adapter])
         defer { engine.stop() }
         engine.updateDiscovery([session],records:records); await engine.connectTerminal()
         try await Task.sleep(for:.milliseconds(2100))
-        let before = plain.count()
+        let before = cold.count(), monitorBefore = plain.count()
         let first = try await engine.remoteTerminal(sessionID:session.id,realtime:true,initial:true)
-        try expectEqual(plain.count(),before+1); try expect(first.screen.contains("합성 데이터")); try expectNil(first.cursor)
+        try expectEqual(cold.count(),before+1); try expectEqual(plain.count(),monitorBefore,"First frames must use the text-only adapter rather than wait for background title queries")
+        try expect(first.screen.contains("합성 데이터")); try expectNil(first.cursor)
         let live = try await engine.remoteTerminal(sessionID:session.id,realtime:true)
         try expect(live.screen.contains("Working 10%")); try expect(live.cursor != nil,"A fresh text-only first screen cannot delay the live cursor read through its cache")
-        let count = plain.count()
+        let count = cold.count()
         let pending = Task { try await engine.remoteTerminal(sessionID:session.id,initial:true) }
-        for _ in 0..<100 where plain.count() == count { try await Task.sleep(for:.milliseconds(2)) }
+        for _ in 0..<100 where cold.count() == count { try await Task.sleep(for:.milliseconds(2)) }
         engine.disconnectTerminal()
         do { _ = try await pending.value;throw AppError.message("A disconnected initial text read was accepted") }
         catch let error as RemoteHTTPError { try expectEqual(error.status,409) }

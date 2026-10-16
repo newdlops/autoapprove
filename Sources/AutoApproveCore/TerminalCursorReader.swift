@@ -4,15 +4,27 @@ import ApplicationServices
 
 /// Reads an authoritative insertion range only from the exact selected Terminal window.
 enum TerminalCursorReader {
+    /// The native Terminal predicate supplies the selected window ID. Core
+    /// Graphics supplies its current bounds without another Terminal event or
+    /// screen capture. Ambiguous AX windows are rejected below.
+    static func snapshot(screen: String, windowID: UInt32) -> TerminalTextSnapshot? {
+        snapshot(screen: screen, windowID: windowID, title: nil, bounds: nil)
+    }
     static func snapshot(screen: String, windowID: UInt32, title: String, bounds: TerminalWindowBounds) -> TerminalTextSnapshot? {
+        snapshot(screen: screen, windowID: windowID, title: Optional(title), bounds: Optional(bounds))
+    }
+    private static func snapshot(screen: String, windowID: UInt32, title: String?, bounds: TerminalWindowBounds?) -> TerminalTextSnapshot? {
         guard AXIsProcessTrusted(), !screen.isEmpty,
               let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else { return nil }
         // Native tab groups also expose hidden virtual windows as selected.
         // Their titles/bounds can coincide. CG metadata identifies the actual
         // on-screen window without capturing pixels or requesting recording.
         let visible = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        guard visible.contains(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID
-            && ($0[kCGWindowOwnerPID as String] as? Int32) == app.processIdentifier }) else { return nil }
+        guard let window = visible.first(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID
+            && ($0[kCGWindowOwnerPID as String] as? Int32) == app.processIdentifier }),
+              let rectangle = window[kCGWindowBounds as String] as? NSDictionary,
+              let currentBounds = CGRect(dictionaryRepresentation: rectangle), currentBounds.width > 0, currentBounds.height > 0 else { return nil }
+        let bounds = bounds ?? TerminalWindowBounds(x: currentBounds.minX, y: currentBounds.minY, width: currentBounds.width, height: currentBounds.height)
         let deadline = Date().addingTimeInterval(0.35)
         func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
             guard Date() < deadline else { return nil }
@@ -34,7 +46,7 @@ enum TerminalCursorReader {
         AXUIElementSetMessagingTimeout(application, 0.2)
         let windows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] ?? []
         let matches = windows.filter { window in
-            guard attribute(window, kAXTitleAttribute) as? String == title,
+            guard (title == nil || attribute(window, kAXTitleAttribute) as? String == title),
                   let position = point(attribute(window, kAXPositionAttribute)), let dimensions = size(attribute(window, kAXSizeAttribute)) else { return false }
             return abs(position.x - bounds.x) < 2 && abs(position.y - bounds.y) < 2
                 && abs(dimensions.width - bounds.width) < 2 && abs(dimensions.height - bounds.height) < 2

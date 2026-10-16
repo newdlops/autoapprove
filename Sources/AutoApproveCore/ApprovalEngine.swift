@@ -745,7 +745,7 @@ import TerminalInputSupport
             } else {
                 cancelRemoteInitialRead(session.id)
                 pending = RemoteScreenRead(token:UUID(),target:target,generation:generation,
-                    task:read(using:adapter.screens,stage:.textRead,verifyOriginal:true))
+                    task:read(using:adapter.initialScreens ?? adapter.screens,stage:.textRead,verifyOriginal:true))
                 remoteInitialReads[session.id] = RemoteInitialRead(read:pending,waiters:[waiter])
                 RemoteTerminalPerformance.shared.increment(.initialReads)
             }

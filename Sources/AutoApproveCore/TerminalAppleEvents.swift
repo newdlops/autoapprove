@@ -60,7 +60,24 @@ public struct TerminalAppleEventReader {
         return [text]
     }
 
-    public func screens(ttys: [String]) throws -> TerminalSnapshot {
+    private func windowIDs(_ value: NSAppleEventDescriptor, depth: Int = 0) throws -> [UInt32] {
+        guard depth < 8, value.numberOfItems <= 4096 else { throw TerminalReadEventError.incompatible }
+        if value.descriptorType == aeCode("list") {
+            guard value.numberOfItems > 0 else { return [] }
+            return try (1...value.numberOfItems).flatMap { index in
+                guard let item = value.atIndex(index) else { throw TerminalReadEventError.incompatible }
+                return try windowIDs(item, depth: depth + 1)
+            }
+        }
+        guard value.descriptorType == aeCode("long"), value.int32Value > 0 else { throw TerminalReadEventError.incompatible }
+        return [UInt32(value.int32Value)]
+    }
+
+    /// First frames need only contents. Live frames may obtain the selected
+    /// window's ID in one exact-TTY event, without a JXA process or a
+    /// scan of unrelated titles. The callback independently verifies visibility.
+    public func screens(ttys: [String], includeTitles: Bool = true,
+                        presentation: ((String, UInt32) -> TerminalTextSnapshot?)? = nil) throws -> TerminalSnapshot {
         try autoreleasepool {
             guard !ttys.isEmpty else { return TerminalSnapshot() }
             let deadline = clock() + max(0, timeout)
@@ -82,20 +99,39 @@ public struct TerminalAppleEventReader {
             for tty in ttys where seen.insert(tty).inserted {
                 do {
                     let tab = try matching("ttab", property: ["ttty"], tty: tty, container: windows)
-                    let contents = try get(property("pcnt", of: tab))
+                    let contents = try RemoteTerminalPerformance.shared.measure(.terminalContents) { try get(property("pcnt", of: tab)) }
                     guard contents.count <= 1 else { throw TerminalReadEventError.ambiguous }
                     guard let screen = contents.first else { continue }
                     var title: String?
-                    do {
-                        let titles = try get(property("titl", of: tab))
+                    if includeTitles { do {
+                        let titles = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try get(property("titl", of: tab)) }
                         if titles.count == 1 { title = titles[0].trimmingCharacters(in: .whitespacesAndNewlines) }
                     } catch {
                         // A title may disappear after the screen was read. The
                         // contents still came from this exact TTY, not a neighbour.
                         if error is TerminalAdapterError || error is CancellationError || error is TerminalReadEventError { throw error }
                         if (error as NSError).code != -1728 { throw error }
+                    } }
+                    var output = TerminalScreen(tty: tty, contents: screen, title: title?.isEmpty == false ? title : nil)
+                    if let presentation {
+                        let selectedWindow = try matching("cwin", property: ["tcnt", "ttty"], tty: tty)
+                        let ids = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try getValue(property("ID  ", of: selectedWindow)) }
+                        var displays: [(UInt32, TerminalTextSnapshot)] = []
+                        for id in Set(try windowIDs(ids)) {
+                            try Task.checkCancellation()
+                            if let display = presentation(screen, id) { displays.append((id, display)) }
+                        }
+                        // Native tab groups expose hidden virtual windows too.
+                        // Never choose an arbitrary match or infer a cursor.
+                        if displays.count == 1 {
+                            let confirmed = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try windowIDs(getValue(property("ID  ", of: selectedWindow))) }
+                            if confirmed.contains(displays[0].0) {
+                                output.display = displays[0].1
+                                if displays[0].1.screen == screen { output.cursor = displays[0].1.cursor }
+                            }
+                        }
                     }
-                    result.screens.append(TerminalScreen(tty: tty, contents: screen, title: title?.isEmpty == false ? title : nil))
+                    result.screens.append(output)
                 } catch {
                     if error is TerminalAdapterError || error is CancellationError { throw error }
                     if case TerminalReadEventError.incompatible = error { throw error }
@@ -107,7 +143,7 @@ public struct TerminalAppleEventReader {
                     result.failures.append(TerminalReadFailure(tty: tty, message: "원본 Terminal 탭을 읽지 못했습니다. (\(status))"))
                 }
             }
-            if result.screens.contains(where: { $0.title == nil }) {
+            if includeTitles, result.screens.contains(where: { $0.title == nil }) {
                 do {
                     let before = try getValue(property("ID  ", of: windows))
                     let selected = try get(property("ttty", of: property("tcnt", of: windows)))
@@ -142,16 +178,17 @@ public struct TerminalAppleEventReader {
 enum TerminalAppleEvents {
     private static let lock = NSLock()
     private static var incompatiblePID: pid_t?
+    private static var incompatiblePresentationPID: pid_t?
 
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.
-    static func screens(ttys: [String]) throws -> TerminalSnapshot? {
+    static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false) throws -> TerminalSnapshot? {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
             throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
         }
         guard !ttys.isEmpty else { return TerminalSnapshot() }
         let pid = application.processIdentifier
-        lock.lock(); let unsupported = incompatiblePID == pid; lock.unlock()
+        lock.lock(); let unsupported = incompatiblePID == pid || (includeCursor && incompatiblePresentationPID == pid); lock.unlock()
         if unsupported { return nil }
         let target = NSAppleEventDescriptor(processIdentifier: pid)
         // Never request a new permission from a background read. Explicit setup
@@ -177,9 +214,12 @@ enum TerminalAppleEvents {
             guard let value = reply.paramDescriptor(forKeyword: aeCode("----")) else { throw TerminalReadEventError.incompatible }
             return value
         }
-        do { return try reader.screens(ttys: ttys) }
+        do { return try reader.screens(ttys: ttys, includeTitles: includeTitles,
+            presentation: includeCursor ? { TerminalCursorReader.snapshot(screen: $0, windowID: $1) } : nil) }
         catch TerminalReadEventError.incompatible {
-            lock.lock(); incompatiblePID = pid; lock.unlock()
+            lock.lock()
+            if includeCursor { incompatiblePresentationPID = pid } else { incompatiblePID = pid }
+            lock.unlock()
             return nil
         }
         catch TerminalReadEventError.timedOut { throw AppError.message("Terminal 화면 조회 시간이 초과되었습니다.") }

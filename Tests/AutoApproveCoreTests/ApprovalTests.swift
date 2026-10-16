@@ -714,6 +714,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Terminal batch preserves cursor identity and isolates closed tabs", tests.testTerminalBatchPreservesCursorAndIsolatesClosedTabs),
             ("Terminal batch falls back on topology changes and propagates denial", tests.testTerminalBatchRetriesChangedWindowTopologyWithoutHidingDenial),
             ("Native Terminal reads keep exact predicates and original Unicode text", tests.testNativeTerminalReadUsesExactPredicatesAndPreservesText),
+            ("Native Terminal first text skips every presentation query", tests.testNativeTerminalFirstTextSkipsAllPresentationQueries),
+            ("Native Terminal live presentation binds and rechecks exact selected windows", tests.testNativeTerminalPresentationBindsAndRechecksSelectedWindow),
             ("Native Terminal reads isolate closed/ambiguous targets and stop on denial", tests.testNativeTerminalReadIsolatesClosedAndAmbiguousTargetsAndStopsOnDenial),
             ("Native Terminal reads budget cancellation and reject reordered metadata", tests.testNativeTerminalReadBudgetsCancellationAndRejectsReorderedMetadata),
             ("Terminal permission error propagation", tests.testTerminalPermissionFailureIsNotHidden),

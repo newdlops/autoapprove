@@ -64,6 +64,7 @@ public struct ScreenTarget: Equatable, Sendable {
 public struct ScreenHostAdapter: Sendable {
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
     public var presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
+    public var initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var approve: @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery
     /// nil means the host revealed the tab but reports no window frame to highlight.
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
@@ -80,9 +81,11 @@ public struct ScreenHostAdapter: Sendable {
                 completeResume: (@Sendable (ScreenTarget, CodexCapacityStop) throws -> ResumeDelivery)? = nil,
                 restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)? = nil,
                 input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget },
-                presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
+                presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
+                initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
+        self.initialScreens = initialScreens
     }
     public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
         switch host {
@@ -94,7 +97,8 @@ public struct ScreenHostAdapter: Sendable {
                 completeResume: { try TerminalAdapter.completeResume(target: $0, stop: $1) },
                 restart: { try TerminalAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) },
-                presentationScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty)) })
+                presentationScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeTitles: false) },
+                initialScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false, includeTitles: false) })
         case .iterm:
             return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
@@ -310,8 +314,8 @@ public enum TerminalAdapter {
         try AutomationScript.run(body, app: "Terminal", denied: .permissionDenied)
     }
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
-    public static func screens(ttys: [String], includeCursor: Bool = true) throws -> TerminalSnapshot {
-        if !includeCursor, let snapshot = try TerminalAppleEvents.screens(ttys: ttys) { return snapshot }
+    public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true) throws -> TerminalSnapshot {
+        if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles, includeCursor: includeCursor) { return snapshot }
         let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor))
         let data = Data(output.utf8)
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)

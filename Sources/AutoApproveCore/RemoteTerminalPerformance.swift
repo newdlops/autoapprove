@@ -6,6 +6,7 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
     public static let shared = RemoteTerminalPerformance()
     public enum Stage: String, CaseIterable, Codable, Sendable {
         case mainQueue, automation, automationQuery, identity, textRead, presentationRead
+        case terminalContents, terminalMetadata
         case firstFrame, liveFrame, responseEncoding, transferPreparation, initialWrite
         case relayHTTP, relayStreamOpen
     }

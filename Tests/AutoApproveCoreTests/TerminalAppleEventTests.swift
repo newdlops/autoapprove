@@ -17,6 +17,60 @@ private func terminalTarget(_ query: NSAppleEventDescriptor) -> String? {
 }
 
 extension ApprovalTests {
+    func testNativeTerminalFirstTextSkipsAllPresentationQueries() throws {
+        var queries = 0
+        let raw = "원본 é 🙂\n\u{1b}[31mtext\u{1b}[0m\u{0}\n"
+        let reader = TerminalAppleEventReader { query, _ in
+            queries += 1
+            try expectEqual(terminalProperty(query), terminalCode("pcnt"), "A cold text read must not wait for any title, window or cursor metadata")
+            try expectEqual(terminalTarget(query), "/dev/first")
+            return terminalStrings([raw])
+        }
+        let result = try reader.screens(ttys: ["/dev/first", "/dev/first"], includeTitles: false)
+        try expectEqual(queries, 1)
+        try expectEqual(result.screens.first?.contents, raw)
+        try expectNil(result.screens.first?.title); try expectNil(result.screens.first?.cursor)
+    }
+
+    func testNativeTerminalPresentationBindsAndRechecksSelectedWindow() throws {
+        for mode in ["visible", "changed", "ambiguous", "denied", "unselected"] {
+            var metadata = 0, callbacks: [UInt32] = []
+            let reader = TerminalAppleEventReader { query, _ in
+                if terminalProperty(query) == terminalCode("pcnt") {
+                    try expectEqual(terminalTarget(query), "/dev/first")
+                    return terminalStrings(["original"])
+                }
+                metadata += 1
+                try expectEqual(terminalProperty(query), terminalCode("ID  "))
+                let window = query.forKeyword(terminalCode("from"))!
+                try expectEqual(window.forKeyword(terminalCode("want"))?.typeCodeValue, terminalCode("cwin"))
+                let predicate = window.forKeyword(terminalCode("seld"))!
+                try expectEqual(predicate.forKeyword(terminalCode("obj2"))?.stringValue, "/dev/first")
+                let tty = predicate.forKeyword(terminalCode("obj1"))!
+                try expectEqual(terminalProperty(tty), terminalCode("ttty"))
+                try expectEqual(terminalProperty(tty.forKeyword(terminalCode("from"))!), terminalCode("tcnt"))
+                if mode == "denied" { throw NSError(domain: NSOSStatusErrorDomain, code: -1743) }
+                let ids: [Int32] = mode == "unselected" ? [] : metadata == 2 && mode == "changed" ? [9] : [7, 8, 7]
+                return terminalList(ids.map { .init(int32: $0) })
+            }
+            do {
+                let result = try reader.screens(ttys: ["/dev/first"], includeTitles: false, presentation: { text, id in
+                    callbacks.append(id)
+                    if id == 8 && mode != "ambiguous" { return nil } // Hidden native tab group.
+                    return TerminalTextSnapshot(screen: text, cursor: TerminalCursor(offset: 1))
+                })
+                try expect(mode != "denied", "A denied metadata read cannot return even an already read screen")
+                try expectEqual(result.screens.first?.contents, "original")
+                try expectEqual(result.screens.first?.cursor != nil, mode == "visible")
+                try expectEqual(result.screens.first?.display != nil, mode == "visible")
+                try expectEqual(metadata, ["visible", "changed"].contains(mode) ? 2 : 1)
+                try expectEqual(Set(callbacks).count, callbacks.count, "Duplicate window IDs cannot duplicate Accessibility reads")
+            } catch let error as TerminalAdapterError {
+                try expectEqual(mode, "denied"); try expectEqual(error, .permissionDenied)
+            }
+        }
+    }
+
     func testNativeTerminalReadUsesExactPredicatesAndPreservesText() throws {
         let ttys = (0..<20).map { "/dev/native-\($0)" }
         var contentTargets = [String](), queries = 0
