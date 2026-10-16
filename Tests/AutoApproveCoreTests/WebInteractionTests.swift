@@ -85,6 +85,9 @@ extension ApprovalTests {
         try expectEqual((initialize?["result"] as? JSONObject)?["protocolVersion"] as? String, "2025-11-25")
         let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": "list", "method": "tools/list"]) { _, _ in [:] }
         try expectEqual(((list?["result"] as? JSONObject)?["tools"] as? [JSONObject])?.count, 5)
+        var modifiedSchema = AutoApproveMCPServer.tools
+        modifiedSchema[0]["name"] = "changed"
+        try expectEqual(AutoApproveMCPServer.tools[0]["name"] as? String, "ask_user", "A caller must not mutate the shared schema")
         try expectNil(AutoApproveMCPServer.response(["jsonrpc": "2.0", "method": "notifications/initialized"]) { _, _ in [:] })
         let success = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": ["name": "ask_user", "arguments": ["questions": formFields]]]) { name, input in
             try expectEqual(name, "ask_user"); try expectEqual((input["questions"] as? [JSONObject])?.count, 2); return ["phase": "waiting"]

@@ -30,6 +30,7 @@ public enum RemoteLAN {
         let lock = NSLock()
         var until = Date.distantPast
         var interfaces: [RemoteLANInterface] = []
+        var types = RemoteLANInterfaceTypeCache<RemoteLANInterface.Kind>()
     }
     private static let cache = Cache()
 
@@ -39,21 +40,14 @@ public enum RemoteLAN {
     public static func interfaces(refresh: Bool = false) -> [RemoteLANInterface] {
         cache.lock.lock(); defer { cache.lock.unlock() }
         if !refresh && Date() < cache.until { return cache.interfaces }
-        var kinds: [String: RemoteLANInterface.Kind] = [:]
-        for interface in SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] ?? [] {
-            guard let name = SCNetworkInterfaceGetBSDName(interface) as String?,
-                  let type = SCNetworkInterfaceGetInterfaceType(interface) else { continue }
-            if type == kSCNetworkInterfaceTypeIEEE80211 { kinds[name] = .wifi }
-            else if type == kSCNetworkInterfaceTypeEthernet { kinds[name] = .ethernet }
-        }
         var first: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&first) == 0 else { cache.until = .distantPast; cache.interfaces = []; return [] }
         defer { freeifaddrs(first) }
-        var result: [RemoteLANInterface] = [], cursor = first
+        var addresses: [(name: String, address: String, netmask: String)] = [], cursor = first
         while let entry = cursor {
             defer { cursor = entry.pointee.ifa_next }
             let name = String(cString: entry.pointee.ifa_name)
-            guard isPhysicalInterface(name: name, flags: entry.pointee.ifa_flags), let kind = kinds[name],
+            guard isPhysicalInterface(name: name, flags: entry.pointee.ifa_flags),
                   let address = entry.pointee.ifa_addr, address.pointee.sa_family == AF_INET,
                   let mask = entry.pointee.ifa_netmask else { continue }
             func numeric(_ value: UnsafeMutablePointer<sockaddr>) -> String? {
@@ -62,8 +56,22 @@ public enum RemoteLAN {
                 return String(cString: text)
             }
             guard let ip = numeric(address), let netmask = numeric(mask), RemoteNetworkAddress.isLocalHost(ip) else { continue }
-            let interface = RemoteLANInterface(name: name, address: ip, netmask: netmask, kind: kind)
-            if interface.mask != nil { result.append(interface) }
+            addresses.append((name, ip, netmask))
+        }
+        let kinds = cache.types.resolve(names: Set(addresses.map(\.name)), refresh: refresh, at: ProcessInfo.processInfo.systemUptime) {
+            var result: [String: RemoteLANInterface.Kind] = [:]
+            for interface in SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] ?? [] {
+                guard let name = SCNetworkInterfaceGetBSDName(interface) as String?,
+                      let type = SCNetworkInterfaceGetInterfaceType(interface) else { continue }
+                if type == kSCNetworkInterfaceTypeIEEE80211 { result[name] = .wifi }
+                else if type == kSCNetworkInterfaceTypeEthernet { result[name] = .ethernet }
+            }
+            return result
+        }
+        let result = addresses.compactMap { value -> RemoteLANInterface? in
+            guard let kind = kinds[value.name] else { return nil }
+            let interface = RemoteLANInterface(name: value.name, address: value.address, netmask: value.netmask, kind: kind)
+            return interface.mask != nil ? interface : nil
         }
         cache.interfaces = ordered(result); cache.until = Date().addingTimeInterval(1)
         return cache.interfaces

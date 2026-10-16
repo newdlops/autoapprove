@@ -3,7 +3,8 @@ import Darwin
 
 /// Local stdio MCP facade. The GUI owns questions and captures; this process never injects keys or captures independently.
 public enum AutoApproveMCPServer {
-    public static var tools: [JSONObject] {
+    public static var tools: [JSONObject] { toolSchema }
+    private static let toolSchema: [JSONObject] = {
         let string: JSONObject = ["type": "string"]
         let option: JSONObject = ["type": "object", "properties": ["label": string, "description": string], "required": ["label"], "additionalProperties": false]
         let field: JSONObject = ["type": "object", "properties": ["id": string, "question": string,
@@ -22,7 +23,7 @@ public enum AutoApproveMCPServer {
                  ["title": string, "scope": ["type": "string", "enum": ["display", "window"]], "sourceID": ["type": "integer", "minimum": 1], "durationSeconds": ["type": "integer", "minimum": 30, "maximum": 900]]),
             tool("stop_screen_share", "이 MCP 연결에서 시작한 화면 공유를 종료하고 보관한 이미지를 폐기합니다.", ["shareID": string], ["shareID"])
         ]
-    }
+    }()
     public static func response(_ message: JSONObject, call: (String, JSONObject) throws -> JSONObject) -> JSONObject? {
         guard let id = message["id"] else { return nil }
         func result(_ value: JSONObject) -> JSONObject { ["jsonrpc": "2.0", "id": id, "result": value] }
@@ -55,15 +56,23 @@ public enum AutoApproveMCPServer {
             ProcessDiscovery.ancestors(of: getppid(), records: records).first(where: { $0.agent == .codex || $0.agent == .claude })?.key
         }
         defer { _ = try? SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": ["tool": "disconnect", "owner": owner]], timeout: 2) }
-        while let line = readLine() {
-            guard line.utf8.count <= 256_000, let data = line.data(using: .utf8), let message = (try? JSONSerialization.jsonObject(with: data)) as? JSONObject else {
-                write(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); continue
+        let input = MCPInputReader(descriptor: STDIN_FILENO)
+        while autoreleasepool(invoking: { () -> Bool in
+            guard let frame = try? input.next() else { return false }
+            // JSONSerialization auto-detects UTF-16/32. A raw NUL cannot occur
+            // in valid UTF-8 JSON and must not switch this NDJSON wire format.
+            guard case .message(let data) = frame, !data.contains(0), String(data: data, encoding: .utf8) != nil,
+                  let message = (try? JSONSerialization.jsonObject(with: data)) as? JSONObject else {
+                write(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); return true
             }
             if let reply = response(message, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
                 if let sessionID { params["sessionID"] = sessionID }
                 return try SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: 20)
             }) { write(reply) }
+            return true
+        }) {
+            // Drain temporary Foundation objects before the next blocking read.
         }
     }
     private static func write(_ object: JSONObject) {
