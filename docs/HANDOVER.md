@@ -5,7 +5,7 @@
 - 사용자는 추가 속도·부하 개선을 요청했다. `RemoteHTTP.swift`가 정상적인 유한 HTTP/1.1 GET의 TCP 연결을 최대 32회·유휴 5초 재사용한다. 요청마다 origin/node/원본 검증을 반복하며 handler/receive는 각각 하나다. HTTP/1.0·close·POST·오류·SSE의 수명, 32개 소켓/12개 스트림·요청 크기 상한을 유지한다. 입력 POST는 재전송하지 않으며 UI·자동 승인/원본 감시 주기·원본 CLI·보안/네트워크 설정은 바꾸지 않았다.
 - 실제 Core 합성 96회×3번에서 연결 **96→3**, 응답 중앙값의 중앙값 **3.427→1.193ms**다. 본문 크기는 같고 loopback 소수 표본으로 실제 휴대폰·전체 CPU/VPN의 개선율이 아니다. 새 HTTP **12조건**, 최종 Core **305/305**, 직접/중계 gzip+Chromium/WebKit **4조건**, 스트림 경로 **16조건**, 서명·입력 메타데이터·격리 패키지·DMG 검사가 통과했다. 프런트 변경/새 시각 QA는 없다. 상세 범위는 [VALIDATION.md](../VALIDATION.md).
 - 두 Mac **0.2.104/129**·기존 원본 **21개·3개**와 직접 입력 지원을 확인했다. 로컬 설정·기존 승인 기록 **19,899건**·실행 중 root 입력 서비스 프로세스/파일을 보존했고, 실제 두 Mac의 원본 화면은 읽기만 확인했다. 사용자 원본 입력은 0건이다.
-- 비공개 검증 `.runtime/performance/http-reuse-104/`, 배포 `.runtime/releases/0.2.104/http-reuse-129/`. 새 `http-reuse-check.mjs`가 재현 도구다. DMG **9,520,631B**, SHA-256 `dfcd31b7eb8d030969bc42b0cf1e964696027801a7a17a4de4e3599425b4c48f`. **이번 deploy.py도 이미 실행했으므로 다시 실행하지 않는다.** GitHub 게시·다운로드 결과는 실제 확인 후 기록한다.
+- 비공개 검증 `.runtime/performance/http-reuse-104/`, 배포 `.runtime/releases/0.2.104/http-reuse-129/`. 새 `http-reuse-check.mjs`가 재현 도구다. DMG **9,520,631B**, SHA-256 `dfcd31b7eb8d030969bc42b0cf1e964696027801a7a17a4de4e3599425b4c48f`. **이번 deploy.py도 이미 실행했으므로 다시 실행하지 않는다.** [GitHub v0.2.104](https://github.com/newdlops/autoapprove/releases/tag/v0.2.104)의 최신 정식 릴리스·소스 태그 `f7caac6cebf8f13e83866cac5828d72835e34342`·두 자산과 인증 없는 실제 다운로드 바이트/해시를 확인했다. 게시 후 문서만 별도 커밋하며 태그는 유지한다. runtime·사용자·서명 자료와 기존 `.codeidx/`·`.vscode/` 변경은 배포하지 않았다.
 
 ## 2026-10-16 터미널 연속 연결 · 0.2.103/128
 
