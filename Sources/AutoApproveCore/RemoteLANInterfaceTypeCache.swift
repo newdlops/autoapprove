@@ -12,7 +12,9 @@ struct RemoteLANInterfaceTypeCache<Value> {
         guard !requested.isEmpty else { return [:] }
         if !refresh, now < until, requested.isSubset(of: names) { return values }
         values = load()
-        names = Set(values.keys).union(requested)
+        // A missing classification can be a transient OS inventory failure.
+        // Retry it at the next IP refresh rather than caching that absence.
+        names = Set(values.keys)
         until = now + 30
         return values
     }

@@ -12,15 +12,19 @@ import Foundation
         precondition(cache.resolve(names: ["en0", "en7"], refresh: false, at: 1, load: load)["en7"] == "ethernet" && reads == 1)
         inventory["en8"] = "ethernet"
         precondition(cache.resolve(names: ["en8"], refresh: false, at: 2, load: load)["en8"] == "ethernet" && reads == 2)
-        // Unknown/unsupported devices are negative-cached only for the same
-        // bounded interval; they must never acquire a guessed LAN type.
+        // Missing classifications must never acquire a guessed LAN type or
+        // delay recovery from a transient OS inventory failure.
         precondition(cache.resolve(names: ["en9"], refresh: false, at: 3, load: load)["en9"] == nil && reads == 3)
-        precondition(cache.resolve(names: ["en9"], refresh: false, at: 4, load: load)["en9"] == nil && reads == 3)
-        inventory.removeValue(forKey: "en0")
-        precondition(cache.resolve(names: ["en0"], refresh: true, at: 5, load: load)["en0"] == nil && reads == 4)
+        precondition(cache.resolve(names: ["en9"], refresh: false, at: 4, load: load)["en9"] == nil && reads == 4)
         inventory["en0"] = "ethernet"
-        precondition(cache.resolve(names: ["en0"], refresh: false, at: 34.999, load: load)["en0"] == nil && reads == 4)
-        precondition(cache.resolve(names: ["en0"], refresh: false, at: 35, load: load)["en0"] == "ethernet" && reads == 5)
-        print("{\"passed\":9,\"verified\":[\"empty LAN\",\"initial inventory\",\"known second adapter\",\"new adapter\",\"unknown rejection\",\"bounded negative cache\",\"forced path refresh\",\"before expiry\",\"exact expiry reload\"]}")
+        precondition(cache.resolve(names: ["en0"], refresh: true, at: 5, load: load)["en0"] == "ethernet" && reads == 5)
+        inventory["en0"] = "wifi"
+        precondition(cache.resolve(names: ["en0"], refresh: false, at: 34.999, load: load)["en0"] == "ethernet" && reads == 5)
+        precondition(cache.resolve(names: ["en0"], refresh: false, at: 35, load: load)["en0"] == "wifi" && reads == 6)
+        inventory = [:]
+        precondition(cache.resolve(names: ["en0"], refresh: true, at: 36, load: load)["en0"] == nil && reads == 7)
+        inventory["en0"] = "wifi"
+        precondition(cache.resolve(names: ["en0"], refresh: false, at: 37, load: load)["en0"] == "wifi" && reads == 8)
+        print("{\"passed\":11,\"verified\":[\"empty LAN\",\"initial inventory\",\"known second adapter\",\"new adapter\",\"unknown rejection\",\"unknown retry\",\"forced path refresh\",\"before expiry\",\"exact expiry reload\",\"failed inventory invalidates old classification\",\"next-read recovery\"]}")
     }
 }
