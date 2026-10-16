@@ -9,6 +9,7 @@
 - 물리 LAN 6회씩의 읽기는 두 버전 모두 6/6회 성공했다. 목록 중앙값 **69→64ms**, 첫 화면 **37→61ms**로 실제 첫 화면이 빨라졌다는 근거는 없다. 시점별 부하·모니터링/캐시 상태가 달라 회귀율이나 개선율로 해석하지 않으며, 다음 단계에서 원본 읽기와 보관 비용을 별도로 측정한다.
 - 설치 후 5초 표본에서 로컬 소켓 수신 대기 thread 블록 **23→0개**를 확인했다. physical footprint는 전후 **102.6M→110.8M**(도구 표기)로, 수명·화면/네트워크 작업이 다른 관측이므로 전체 메모리 감소를 주장하지 않는다. 다음 조사 대상은 긴 Codex 대화의 전체 user/async 메시지 JSON을 유지하는 기록 캐시다. 오래된 행의 수정·답변 연결을 놓치지 않는 projection과 실제 비용을 검토해야 한다.
 - 비공개 측정 `.runtime/performance/lightweight-goal/`·`.runtime/local-resource-bench/`·`.runtime/native-history-bench/`, 배포/백업 `.runtime/releases/0.2.107/lightweight-133/`. **deploy.py는 이미 실행했으므로 재실행하지 않는다.** DMG **9,586,257B**, SHA-256 `6a16247439bd07d128572b4d17eb5ab2317b4cab2d1e099b9f7e0d1ec4da24fb`. GitHub 게시 결과는 실제 확인 뒤 후속 문서 커밋으로 기록하며 태그를 이동하지 않는다. 런타임·사용자 원본·서명 자료 및 기존 `.codeidx/`·`.vscode/` 변경을 공개하지 않는다.
+- [GitHub v0.2.107](https://github.com/newdlops/autoapprove/releases/tag/v0.2.107)의 최신 정식 릴리스·주석 태그·소스 `3b5385bef776f5a1325ddcd12598e26c3414d270`·두 자산과 인증 없는 실제 다운로드의 바이트/체크섬을 검증했다. 근거는 배포 폴더의 `source-manifest.json`·`github-verification.json`이며 이 게시 결과만 별도 문서 커밋으로 기록한다.
 
 ## 2026-10-16 네트워크 목록 완료 알림·점진 반영 · 0.2.106/132
 
