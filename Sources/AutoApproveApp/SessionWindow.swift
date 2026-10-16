@@ -703,20 +703,24 @@ struct ApprovalEventDisclosure: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             DisclosureGroup(isExpanded: $expanded) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(event.source + (event.tool.map { " · " + $0 } ?? ""))
-                        .font(.caption).foregroundStyle(.secondary)
-                    if let answer = event.answer {
-                        Text("전달한 답변: \(answer)").font(.callout.weight(.medium)).textSelection(.enabled)
+                // A collapsed native disclosure still builds its content. Keep
+                // long request text out of the layout tree until it is opened.
+                if expanded {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(event.source + (event.tool.map { " · " + $0 } ?? ""))
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let answer = event.answer {
+                            Text("전달한 답변: \(answer)").font(.callout.weight(.medium)).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text("전체 요청").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(event.requestText).font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(AppHelp.result(event.result)).font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Text("전체 요청").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(event.requestText).font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(AppHelp.result(event.result)).font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }.padding(.top, 8).padding(.bottom, 4).frame(maxWidth: .infinity, alignment: .leading)
+                    }.padding(.top, 8).padding(.bottom, 4).frame(maxWidth: .infinity, alignment: .leading)
+                }
             } label: {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(event.outcome).font(.callout.weight(.medium))

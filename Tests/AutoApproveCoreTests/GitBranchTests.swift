@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import AutoApproveCore
 
 private final class GitBranchFixture {
@@ -20,6 +21,31 @@ private final class GitBranchFixture {
 }
 
 extension ApprovalTests {
+    func testGitBranchMetadataBoundsAndPackedReferenceIdentity() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"])
+        let config = repository.appendingPathComponent(".git/config"), savedConfig = try Data(contentsOf: config)
+        var launches = 0
+        func read() -> GitBranchState { GitBranchReader.read(directory: repository.path) { _, _ in launches += 1; return result } }
+        try expectEqual(read().name, "main"); _ = read(); try expectEqual(launches, 1)
+        try FileManager.default.removeItem(at: config); try expectEqual(mkfifo(config.path, 0o600), 0)
+        let start = ProcessInfo.processInfo.systemUptime
+        _ = read(); _ = read(); try expectEqual(launches, 3)
+        try expect(ProcessInfo.processInfo.systemUptime - start < 0.25, "A FIFO must never block metadata reads")
+        try FileManager.default.removeItem(at: config); try savedConfig.write(to: config)
+        _ = read(); _ = read(); try expectEqual(launches, 3, "Restored identical bytes may reuse the last verified branch")
+        try Data(repeating: 0x20, count: 131_073).write(to: config)
+        _ = read(); _ = read(); try expectEqual(launches, 5, "Oversized metadata must remain a miss")
+        try savedConfig.write(to: config)
+        let packed = repository.appendingPathComponent(".git/packed-refs"), date = Date(timeIntervalSince1970: 1_000)
+        try Data((String(repeating: "a", count: 40) + " refs/heads/other\n").utf8).write(to: packed)
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: packed.path)
+        _ = read(); _ = read(); try expectEqual(launches, 6)
+        let handle = try FileHandle(forWritingTo: packed)
+        try handle.write(contentsOf: Data((String(repeating: "b", count: 40) + " refs/heads/other\n").utf8)); try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: packed.path)
+        _ = read(); try expectEqual(launches, 7, "Same-size packed refs with restored mtime must still invalidate")
+    }
     /// 반복 읽기에서 프로세스를 만들지 않으면서 브랜치·간접 참조 변경은 바로 반영하는지 검증한다.
     func testGitBranchCacheAvoidsProcessLaunchAndTracksReferences() throws {
         let fixture = try GitBranchFixture(), repository = fixture.repository

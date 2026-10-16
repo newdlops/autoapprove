@@ -1,7 +1,18 @@
 import Foundation
+import Darwin
 
 /// Git으로 확인한 브랜치 이름을 메타데이터가 그대로인 동안 재사용해 주기적인 프로세스 생성을 줄인다.
 enum GitBranchCache {
+    struct FileIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let changedSeconds: Int
+        let changedNanoseconds: Int
+    }
+    private enum MetadataError: Error { case missing, unreadable, tooLarge }
     struct Fingerprint: Equatable {
         let branch: String
         let gitDirectory: String
@@ -10,7 +21,7 @@ enum GitBranchCache {
         let commonMarker: Data?
         let head: Data
         let looseReference: Data?
-        let packedReferences: String
+        let packedReferences: FileIdentity?
         let config: Data?
         let worktreeConfig: Data?
     }
@@ -87,27 +98,46 @@ enum GitBranchCache {
 
     /// 비정상적으로 큰 메타데이터를 전부 읽지 않도록 상한보다 한 바이트까지만 읽는다.
     private static func smallFile(_ url: URL, limit: Int) throws -> Data {
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular else { throw CocoaError(.fileReadUnknown) }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: limit + 1) ?? Data()
-        guard data.count <= limit else { throw CocoaError(.fileReadTooLarge) }
-        return data
+        // Foundation attributes also query extended attributes. Only a regular
+        // file and its bytes are needed, and the check must refer to the opened
+        // descriptor. Nonblocking/no-follow prevents a replaced FIFO or symlink
+        // from turning periodic metadata reads into a blocking operation.
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw errno == ENOENT ? MetadataError.missing : .unreadable }
+        defer { Darwin.close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw MetadataError.unreadable }
+        guard info.st_size <= limit else { throw MetadataError.tooLarge }
+        var data = Data()
+        data.reserveCapacity(max(0, Int(info.st_size)))
+        return try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: min(8192, limit + 1)) { bytes in
+            while data.count <= limit {
+                let count = Darwin.read(descriptor, bytes.baseAddress, min(bytes.count, limit + 1 - data.count))
+                if count < 0 && errno == EINTR { continue }
+                guard count >= 0 else { throw MetadataError.unreadable }
+                if count == 0 { return data }
+                data.append(bytes.baseAddress!, count: count)
+            }
+            throw MetadataError.tooLarge
+        }
     }
 
     /// 없는 선택 파일과 읽기 실패를 구분해, 실패한 메타데이터를 캐시 적중으로 취급하지 않는다.
     private static func optionalFile(_ url: URL, limit: Int) throws -> Data? {
         do { return try smallFile(url, limit: limit) }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        catch MetadataError.missing { return nil }
     }
 
     /// 큰 packed-refs는 내용 대신 inode·수정 시각·크기를 비교해 갱신을 감지한다.
-    private static func fileIdentity(_ url: URL) throws -> String {
-        do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970.bitPattern ?? 0
-            return "\(attributes[.systemFileNumber] ?? ""):\(attributes[.size] ?? ""):\(modified)"
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return "absent" }
+    private static func fileIdentity(_ url: URL) throws -> FileIdentity? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            if errno == ENOENT { return nil }
+            throw MetadataError.unreadable
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else { throw MetadataError.unreadable }
+        return FileIdentity(device: info.st_dev, inode: info.st_ino, size: info.st_size,
+            modifiedSeconds: info.st_mtimespec.tv_sec, modifiedNanoseconds: info.st_mtimespec.tv_nsec,
+            changedSeconds: info.st_ctimespec.tv_sec, changedNanoseconds: info.st_ctimespec.tv_nsec)
     }
 }

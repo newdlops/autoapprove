@@ -417,6 +417,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         let cases: [(String, () async throws -> Void)] = [
+            ("Local socket: fragmented Unicode, large lines, buffered order and permissions", tests.testLocalSocketFragmentedUnicodeAndBufferedOrdering),
+            ("Local socket: malformed and oversized peers, bounded connections and single disconnect", tests.testLocalSocketMalformedOversizedAndBoundedPeers),
+            ("Local socket: restart descriptor lifetime and path ownership", tests.testLocalSocketRestartAndPathOwnership),
             ("History processing: metadata chunks, exact bytes and read bound", tests.testRolloutHeaderStopsAtFirstLineAndKeepsByteLimit),
             ("History processing: fresh long metadata and incomplete header rejection", tests.testRolloutBindingReadsFreshLongMetadataAndRejectsIncompleteHeaders),
             ("History processing: unchanged queries, delta, reset, thread switch and failure", tests.testUnchangedHistoryStillChecksUpdatesResetsAndFailures),
@@ -542,6 +545,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session customization save failure and ended-session rejection", tests.testCustomizationFailureDoesNotPublishOrReviveSessions),
             ("Git unborn, nested, linked worktree, branch switch and detached HEAD", tests.testGitBranchWorktreeAndRefresh),
             ("Git unchanged branch avoids processes and follows reference changes", tests.testGitBranchCacheAvoidsProcessLaunchAndTracksReferences),
+            ("Git metadata: nonblocking special files, read bounds and packed-reference identity", tests.testGitBranchMetadataBoundsAndPackedReferenceIdentity),
             ("Git non-repository, missing directory and inherited environment isolation", tests.testGitBranchNonRepositoryAndEnvironmentIsolation),
             ("Git metadata binds to live sessions and their current directories", tests.testGitBranchesBindToCurrentSessionDirectory),
             ("Codex locked database, preserved questions and automatic recovery", tests.testCodexHistoryContentionAndRecovery),
