@@ -14,6 +14,31 @@ extension RemoteServerEvent {
         let data = Data("event: screen\nid: \(update.revision)\ndata: ".utf8) + json + Data("\n\n".utf8)
         succeeded = true; return data
     }
+    static func terminalAlive(_ frame: RemoteTerminalFrame) throws -> Data {
+        struct Alive: Encodable {
+            let streamID: String?, revision: String, sequence: Int?, observedAt: Date
+        }
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        let json = try encoder.encode(Alive(streamID:frame.streamID,revision:frame.revision,sequence:frame.sequence,observedAt:frame.observedAt))
+        RemoteTerminalPerformance.shared.increment(.compactPulses)
+        return Data("event: alive\ndata: ".utf8) + json + Data("\n\n".utf8)
+    }
+}
+
+struct RemoteTerminalControls: Equatable {
+    let keys: [String]
+    let reason: String?
+    let streamID: String?
+    let nativeState: TerminalNativeDisplay.State?
+    let nativeMessage: String?
+    let outputReason: String?
+    let cursor: TerminalCursor?
+    let question: TerminalChoiceQuestion?
+    init(_ frame: RemoteTerminalFrame) {
+        keys = frame.keys; reason = frame.inputReason; streamID = frame.streamID
+        nativeState = frame.nativeDisplay?.state; nativeMessage = frame.nativeDisplay?.message
+        outputReason = frame.outputReason; cursor = frame.cursor; question = frame.question
+    }
 }
 
 /// Synchronizes an emulator's existing session. It never creates, resumes or
@@ -22,17 +47,6 @@ extension RemoteServerEvent {
 @MainActor final class RemoteTerminalBodyStream: RemoteHTTPBodyStream {
     nonisolated let needsHeartbeat = true
     let initialEvent: Data
-    private struct Controls: Equatable {
-        let keys: [String]
-        let reason: String?
-        let streamID: String?
-        let nativeState: TerminalNativeDisplay.State?
-        let nativeMessage: String?
-        init(_ frame: RemoteTerminalFrame) {
-            keys = frame.keys; reason = frame.inputReason; streamID = frame.streamID
-            nativeState = frame.nativeDisplay?.state; nativeMessage = frame.nativeDisplay?.message
-        }
-    }
     private let read: @MainActor @Sendable () async throws -> RemoteTerminalFrame
     private let waitForChange: (@Sendable (TimeInterval) async -> Void)?
     private let responsive: @MainActor @Sendable () -> Bool
@@ -40,21 +54,28 @@ extension RemoteServerEvent {
     private var previous: RemoteTerminalFrame?
     private let delta: Bool
     private let copyEnabled: Bool
+    private let compact: Bool
+    private let paced: Bool
+    private var onCancel: (@MainActor () -> Void)?
     private var revision: String?
-    private var controls: Controls?
+    private var controls: RemoteTerminalControls?
     private var emittedAt = Date.distantPast
     private var task: Task<Void, Never>?
     private var waiter: RemoteHTTPStreamCompletion?
     private var cancelled = false
     private var unchanged = 0
 
-    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, copy: Bool = false, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
+    init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, copy: Bool = false,
+         resume: RemoteTerminalFrame? = nil, compact: Bool = false, paced: Bool = false,
+         onCancel: (@MainActor () -> Void)? = nil, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
          responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
-        initialEvent = try RemoteServerEvent.screen(initial) // Reject oversized screens before SSE headers.
+        // A resume basis affects only output encoding. The initial frame above
+        // has already passed fresh original/permission checks.
+        initialEvent = try RemoteServerEvent.screen(RemoteTerminalUpdate(initial,previous:resume,delta:delta,copy:copy))
         self.initial = emitInitial ? initial : nil; self.read = read; self.delta = delta
-        copyEnabled = delta && copy
+        copyEnabled = delta && copy; self.compact = compact; self.paced = paced; self.onCancel = onCancel
         if !emitInitial {
-            revision = initial.revision; controls = Controls(initial); emittedAt = Date(); previous = delta ? initial : nil
+            revision = initial.revision; controls = RemoteTerminalControls(initial); emittedAt = Date(); previous = delta ? initial : nil
         }
         self.waitForChange = waitForChange
         self.responsive = responsive
@@ -78,16 +99,20 @@ extension RemoteServerEvent {
                     if let initial = self.initial { self.initial = nil; frame = initial }
                     else { frame = try await RemoteTerminalReadRecovery.read(self.read) }
                     guard !self.cancelled, !Task.isCancelled else { self.finish(.success(nil)); return }
-                    let controls = Controls(frame)
+                    let controls = RemoteTerminalControls(frame)
                     self.unchanged = frame.revision == self.revision && controls == self.controls ? self.unchanged + 1 : 0
                     if frame.revision != self.revision || controls != self.controls || Date().timeIntervalSince(self.emittedAt) >= 2 {
                         let data: Data
-                        if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true,copy:self.copyEnabled)) }
+                        if self.compact, frame.streamID != nil, frame.revision == self.revision, controls == self.controls {
+                            data = try RemoteServerEvent.terminalAlive(frame)
+                        }
+                        else if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true,copy:self.copyEnabled)) }
                         else { data = try RemoteServerEvent.screen(frame,knownRevision:self.revision) }
                         self.revision = frame.revision; self.controls = controls; self.emittedAt = Date()
                         if self.delta { self.previous = frame }
                         self.finish(.success(data)); return
                     }
+                    if self.paced { continue } // Shared producer already waits for source changes.
                     // Native emulators expose screen snapshots. The engine shares
                     // their in-flight read/cache across viewers; VS Code's latest
                     // snapshot already arrives on its existing bridge connection.
@@ -103,12 +128,14 @@ extension RemoteServerEvent {
         }
     }
     private func finish(_ result: Result<Data?, Error>) {
+        if case .failure = result { onCancel?(); onCancel = nil }
         let completion = waiter; waiter = nil; task = nil; completion?(result)
     }
     nonisolated func cancel() {
         Task { @MainActor [weak self] in
             guard let self, !self.cancelled else { return }
             self.cancelled = true; self.initial = nil; self.previous = nil; self.task?.cancel()
+            self.onCancel?(); self.onCancel = nil
             self.finish(.success(nil))
         }
     }

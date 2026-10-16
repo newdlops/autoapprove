@@ -181,6 +181,7 @@ struct RemoteTerminalUpdate: Encodable {
     private let queue = DispatchQueue(label: "autoapprove.web.listener")
     private var connections: [UUID: RemoteHTTPConnection] = [:]
     private var streamConnections: Set<UUID> = []
+    private let terminalFeeds = RemoteTerminalFeeds()
     private var running = false
     private var generation = UUID()
     private var status = RemoteNetworkStatus()
@@ -454,6 +455,7 @@ struct RemoteTerminalUpdate: Encodable {
         pathMonitor?.cancel(); pathMonitor = nil
         interfaceMonitors.forEach {$0.cancel()}; interfaceMonitors.removeAll()
         let clients = Array(connections.values); connections.removeAll(); streamConnections.removeAll(); clients.forEach { $0.close() }
+        terminalFeeds.stop()
         peers = peers.filter { $0.value.manual }
         for id in Array(peers.keys) { peers[id]?.portal = false; peers[id]?.webVerifiedAt = nil }
         status = RemoteNetworkStatus(); emitStatus()
@@ -1002,19 +1004,32 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forwardStream(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
                     let renderWindow = request.parameter("view") == "screen"
-                    let frame = try await RemoteTerminalReadRecovery.read {
-                        try await engine.remoteTerminal(sessionID:id,realtime:true,renderWindow:renderWindow,initial:true)
+                    let key = RemoteTerminalFeeds.Key(session:id,window:renderWindow)
+                    let subscription = try await terminalFeeds.subscribe(key:key,initial:{ [weak engine] in
+                        guard let engine else { throw RemoteHTTPError(503,"앱이 종료되었습니다.") }
+                        return try await engine.remoteTerminal(sessionID:id,realtime:true,renderWindow:renderWindow,initial:true)
+                    },observation:{ [weak engine] in
+                        if let tmux = try engine?.remoteTmuxObservation(sessionID:id) {
+                            return { interval in await tmux.waitForChange(timeout:interval) }
+                        }
+                        let observation = engine?.remoteTerminalObservation(sessionID:id)
+                        return { interval in
+                            if let observation { await observation.waitForChange(timeout:interval) }
+                            else { try? await Task.sleep(for:.seconds(interval)) }
+                        }
+                    },responsive:{ [weak engine] in engine?.remoteTerminalNeedsResponsiveRead(id) ?? false }) { [weak engine] in
+                        guard let engine else { throw RemoteHTTPError(503,"앱이 종료되었습니다.") }
+                        return try await engine.remoteTerminal(sessionID:id,realtime:true,renderWindow:renderWindow)
                     }
-                    let tmuxObservation = try engine.remoteTmuxObservation(sessionID: id)
-                    let observation = engine.remoteTerminalObservation(sessionID:id)
-                    let wakeup: @Sendable (TimeInterval) async -> Void
-                    if let tmuxObservation { wakeup = { interval in await tmuxObservation.waitForChange(timeout:interval) } }
-                    else { wakeup = { interval in await observation.waitForChange(timeout:interval) } }
-                    let output = try RemoteTerminalBodyStream(initial: frame, emitInitial: false, delta: request.parameter("delta") == "1", copy: request.parameter("copy") == "1", waitForChange: wakeup,
-                        responsive: { [weak engine] in engine?.remoteTerminalNeedsResponsiveRead(id) ?? false }) { [weak engine] in
-                        guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
-                        return try await engine.remoteTerminal(sessionID: id, realtime: true, renderWindow: renderWindow)
-                    }
+                    let frame = subscription.initial
+                    let delta = request.parameter("delta") == "1"
+                    let base = delta ? terminalFeeds.base(key:key,revision:request.parameter("revision"),stream:request.parameter("stream"),current:frame) : nil
+                    let output: RemoteTerminalBodyStream
+                    do {
+                        output = try RemoteTerminalBodyStream(initial:frame,emitInitial:false,delta:delta,copy:request.parameter("copy") == "1",
+                            resume:base,compact:request.parameter("compact") == "1" && !renderWindow,paced:true,
+                            onCancel:{ subscription.cancel() }) { try await subscription.next() }
+                    } catch { subscription.cancel(); throw error }
                     // The verified first event is ready. Send it with the headers,
                     // without another main-actor hop or a second small TCP write.
                     return .eventStream(output, nodeID: nodeID, initialData: output.initialEvent)

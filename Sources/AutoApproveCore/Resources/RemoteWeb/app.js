@@ -12,7 +12,24 @@ let detailGeneration = 0, questionSignature = '', historySignature = '';
 let frameController = null, quietFrames = 0, fastFrameUntil = 0;
 let terminalStream = null, terminalPending = null, terminalPaint = 0, terminalPaintTimer = null, terminalStreamFailed = '';
 let terminalFrameReceivedAt = -Infinity, terminalPendingAt = -Infinity;
-const terminalFrameFresh = () => !!latestFrame && !terminalStream?.reconnecting && performance.now() - terminalFrameReceivedAt < 10000;
+const terminalFrameFresh = () => !document.hidden && !!latestFrame && !terminalStream?.reconnecting && performance.now() - terminalFrameReceivedAt < 10000;
+// One short-lived text basis in page memory. Never stores terminal data on disk
+// or carries permission/freshness across a phone background transition.
+let terminalWarm = null, terminalWarmTimer = null;
+const terminalOriginalIdentity = item => JSON.stringify([item?.node.id,item?.session.id,item?.session.pid,item?.session.started,item?.session.tty,item?.session.terminal,item?.session.bridgeID,item?.session.terminalID,item?.session.orcaHandle,item?.session.tmuxHandle]);
+function clearTerminalWarm() { clearTimeout(terminalWarmTimer); terminalWarmTimer = null; terminalWarm = null; }
+function rememberTerminalWarm() {
+  clearTerminalWarm();
+  if (!selectedItem || selectedItem.view.pty || nativeTerminal() || !latestFrame?.streamID || sessionEnded(selectedItem)) return;
+  terminalWarm = {key:selectedKey,identity:terminalOriginalIdentity(selectedItem),frame:latestFrame,until:performance.now()+30000};
+  terminalWarmTimer = setTimeout(clearTerminalWarm,30000);
+}
+function restoreTerminalWarm() {
+  const saved = terminalWarm;
+  if (!saved || saved.key !== selectedKey || saved.identity !== terminalOriginalIdentity(selectedItem) || performance.now() >= saved.until || !selectedItem?.view.canRead || sessionEnded(selectedItem)) { clearTerminalWarm(); return false; }
+  latestFrame = saved.frame; terminalFrameReceivedAt = -Infinity;
+  terminalState('pending','연결 확인 중…'); updateControls(); return true;
+}
 let nativeSessionKey = '', nativeZoom = 1, nativeZoomLimit = 4, nativeImageValue = null, nativeConnectingKey = '';
 const nativeTerminal = () => !!selectedItem && !selectedItem.view.pty && nativeSessionKey === selectedKey;
 const nativeConnection = () => !!selectedItem && !selectedItem.view.pty && selectedItem.session.terminal !== 'tmux' && (supportsNativeTerminal(selectedItem.node) || !!latestFrame?.nativeDisplay);
@@ -875,6 +892,7 @@ function renderList() {
 function selectSession(key, focus = false) {
   const item = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!item) return;
   if (selectedKey !== item.key) {
+    clearTerminalWarm();
     stopSessionHistory();
     stopPTY(); stopTerminalStream(true);
     nativeSessionKey = ''; nativeZoom = 1; clearNativeImage();
@@ -1114,6 +1132,7 @@ function terminalUpdateIsOlder(update, previous) {
   return false; // Legacy Mac clocks can change; observation time is not an ordering token.
 }
 function applyTerminalFrame(frame, receivedAt = performance.now()) {
+  clearTerminalWarm();
   const previous = latestFrame;
   if (directMode && (frame.streamID || null) !== directStreamID) {
     stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
@@ -1145,6 +1164,7 @@ function stopTerminalStream(resetFailure = false) {
 }
 function failTerminalStream(stream, message) {
   if (terminalStream !== stream) return;
+  clearTerminalWarm();
   stopTerminalStream(); terminalStreamFailed = stream.key; latestFrame = null; stopDirect();
   text($('terminal-error'), message); show($('terminal-error'), true); text($('terminal-retry'), '화면 다시 연결'); show($('terminal-retry'), true);
   terminalState('error', '연결 끊김'); updateControls();
@@ -1154,7 +1174,7 @@ function terminalStreamCurrent(stream, allowOffline = false) {
     && nativeTerminal() === stream.renderWindow && (allowOffline || !stream.offline) && !document.hidden;
 }
 function pauseTerminalNetwork(stream) {
-  stream.offline = true; stream.reconnecting = true; stream.sseReady = false; stream.frame = null;
+  stream.offline = true; stream.reconnecting = true; stream.sseReady = false;
   stream.source?.close(); stream.source = null;
   clearTimeout(stream.retryTimer); stream.retryTimer = null;
   clearTimeout(stream.watchdog); clearTimeout(stream.fallbackWatchdog); stopTerminalFallback(stream);
@@ -1172,7 +1192,7 @@ function stopTerminalFallback(stream) {
 async function readTerminalFallback(stream) {
   if (!terminalStreamCurrent(stream,true) || stream.pollController || stream.sseReady) return;
   clearTimeout(stream.pollTimer); stream.pollTimer = null;
-  const controller = new AbortController(); stream.pollController = controller;
+  const controller = new AbortController(), started = performance.now(); stream.pollController = controller;
   try {
     const query = new URLSearchParams({node:stream.nodeID, session:stream.sessionID});
     if (stream.renderWindow) query.set('view', 'screen');
@@ -1183,6 +1203,8 @@ async function readTerminalFallback(stream) {
     if (!terminalStreamCurrent(stream,true) || stream.pollController !== controller || stream.sseReady) return;
     if (terminalUpdateIsOlder(update, latestFrame)) return;
     const frame = mergeTerminalUpdate(update, latestFrame, stream.sessionID);
+    const elapsed = performance.now()-started;
+    stream.readRTT = stream.readRTT == null ? elapsed : stream.readRTT*0.75+elapsed*0.25;
     const changedStream = latestFrame?.streamID && frame.streamID !== latestFrame.streamID;
     if (changedStream) {
       stream.source?.close(); stream.source = null; clearTimeout(stream.retryTimer); stream.retryTimer = null;
@@ -1218,7 +1240,7 @@ async function readTerminalFallback(stream) {
 function reconnectTerminalStream(stream, resync = false) {
   if (terminalStream !== stream || stream.offline || document.hidden) return;
   if (resync) { stream.resync = true; stream.reconnecting = true; stopTerminalFallback(stream); }
-  stream.frame = null;
+  if (resync) stream.frame = null;
   if (stream.retryTimer) { updateControls(); void readTerminalFallback(stream); return; }
   stream.source?.close(); clearTimeout(stream.watchdog);
   if (terminalPaint) cancelAnimationFrame(terminalPaint);
@@ -1236,29 +1258,50 @@ function reconnectTerminalStream(stream, resync = false) {
   updateControls();
   void readTerminalFallback(stream);
   // Retry only the read subscription. Input POSTs are never replayed here.
-  const delay = Math.min(5000, 500 * 2 ** Math.min(stream.retries++, 4)) * (0.8 + Math.random()*0.2);
+  const attempt = stream.retries++;
+  const delay = attempt === 0 ? 0 : Math.min(5000,250*2**Math.min(attempt-1,5))*(0.8+Math.random()*0.2);
   stream.retryTimer = setTimeout(() => {
     stream.retryTimer = null;
     if (terminalStream === stream && !document.hidden) openTerminalStream(stream);
   }, delay);
 }
+function terminalSilenceBudget(stream) {
+  // Allow two fresh-source heartbeats plus measured source/network jitter.
+  // A slow VPN gets more room; a healthy LAN no longer waits a fixed 8 s.
+  return Math.min(12000,Math.max(4500,2*(stream.eventGap || 2000)+Math.max(500,4*(stream.eventJitter || 0)),3*(stream.readRTT || 0)+2500));
+}
+function terminalEventReceived(stream) {
+  const now = performance.now();
+  if (stream.sourceEventAt != null) {
+    const gap = now-stream.sourceEventAt, average = stream.eventGap || 2000;
+    stream.eventJitter = (stream.eventJitter || 0)*0.75+Math.abs(gap-average)*0.25;
+    stream.eventGap = average*0.75+gap*0.25;
+  }
+  stream.sourceEventAt = now;
+  // A single frame from a flapping connection must not erase its backoff.
+  if (now-stream.sourceOpenedAt >= 1500) stream.retries = 0;
+  stream.sseReady = true; stream.reconnecting = false; stream.resync = false;
+  stopTerminalFallback(stream); watchTerminalStream(stream);
+}
 function watchTerminalStream(stream) {
   clearTimeout(stream.watchdog); clearTimeout(stream.fallbackWatchdog);
+  const silence = terminalSilenceBudget(stream);
   stream.fallbackWatchdog = setTimeout(() => {
     if (!terminalStreamCurrent(stream)) return;
     stream.sseReady = false;
     void readTerminalFallback(stream);
-  }, 3000);
-  // The server emits current controls at least every two seconds. Recover a
-  // half-open Wi-Fi/VPN connection even when EventSource emits no error.
-  stream.watchdog = setTimeout(() => reconnectTerminalStream(stream), 8000);
+  // A source heartbeat can include up to one 800 ms idle observation interval.
+  // Do not start a redundant GET just before a healthy heartbeat arrives.
+  }, Math.min(5000,Math.max(3000,silence*0.6)));
+  // Both legacy controls and compact alive events require a fresh source read.
+  stream.watchdog = setTimeout(() => reconnectTerminalStream(stream),silence);
 }
 function ensureTerminalStream() {
   const renderWindow = nativeTerminal();
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
-  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1&copy=1' + (renderWindow ? '&view=screen' : '');
-  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0, reconnecting:false, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false,offline:false};
+  const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1&copy=1&compact=1' + (renderWindow ? '&view=screen' : '');
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0,reconnecting:!!latestFrame, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false,offline:false};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
   if (terminalNetworkOffline) pauseTerminalNetwork(stream);
@@ -1266,8 +1309,13 @@ function ensureTerminalStream() {
 }
 function openTerminalStream(stream) {
   if (!terminalStreamCurrent(stream)) return;
-  stream.frame = null;
-  const source = new EventSource(stream.url); stream.source = source;
+  const url = new URL(stream.url,location.href);
+  let basis = !stream.renderWindow && !stream.resync ? stream.frame || latestFrame : null;
+  if (basis && latestFrame && basis.streamID === latestFrame.streamID && terminalUpdateIsOlder(basis,latestFrame)) basis = latestFrame;
+  stream.frame = basis;
+  if (basis?.sessionID === stream.sessionID && basis.streamID) { url.searchParams.set('revision',basis.revision); url.searchParams.set('stream',basis.streamID); }
+  stream.sourceEventAt = null; stream.sourceOpenedAt = performance.now();
+  const source = new EventSource(url.href); stream.source = source;
   const current = () => terminalStreamCurrent(stream) && stream.source === source;
   watchTerminalStream(stream);
   source.addEventListener('screen', event => {
@@ -1287,7 +1335,7 @@ function openTerminalStream(stream) {
       if (directMode && (!frame.keys.includes('characters') || !frame.keys.includes('backspace') || frame.inputReason)) {
         stopDirect(); inputFailure = frame.inputReason || '원본 입력 권한을 다시 연결해주세요.';
       }
-      stream.sseReady = true; stream.reconnecting = false; stream.resync = false; stream.retries = 0; stopTerminalFallback(stream); watchTerminalStream(stream);
+      terminalEventReceived(stream);
       terminalPending = frame;
       terminalPendingAt = performance.now();
       if (terminalPaint) return;
@@ -1306,6 +1354,27 @@ function openTerminalStream(stream) {
       if (error.terminalResync) reconnectTerminalStream(stream,true);
       else failTerminalStream(stream,error.message);
     }
+  });
+  source.addEventListener('alive', event => {
+    if (!current()) return;
+    try {
+      if (event.data.length > 2048) throw terminalResyncError();
+      const pulse = JSON.parse(event.data), basis = stream.frame;
+      if (!pulse || typeof pulse.streamID !== 'string' || pulse.streamID.length > 512 || typeof pulse.revision !== 'string' || pulse.revision.length > 512 || !Number.isSafeInteger(pulse.sequence) || pulse.sequence < 0 || typeof pulse.observedAt !== 'string' || !Number.isFinite(Date.parse(pulse.observedAt)) || !basis || pulse.streamID !== basis.streamID || pulse.revision !== basis.revision) throw terminalResyncError();
+      if (terminalUpdateIsOlder({...pulse,sessionID:stream.sessionID},basis)) return;
+      stream.frame = {...basis,sequence:pulse.sequence,observedAt:pulse.observedAt};
+      if (terminalUpdateIsOlder(stream.frame,latestFrame)) return;
+      terminalEventReceived(stream);
+      // No parsing, diffing, question rebuild or terminal repaint while idle.
+      // Controls are inherited only from the exact freshly confirmed basis.
+      if (latestFrame?.streamID === pulse.streamID && latestFrame.revision === pulse.revision) {
+        latestFrame = {...latestFrame,sequence:pulse.sequence,observedAt:pulse.observedAt}; terminalFrameReceivedAt = performance.now();
+        terminalState('live',latestFrame.screen.trim() ? '연결됨' : '연결됨 · 빈 화면');
+        show($('terminal-error'),false); show($('terminal-retry'),false);
+        text($('terminal-time'),nowLabel(pulse.observedAt)); updateControls();
+        if (directMode && directQueue.length && !directSending) void pumpDirect();
+      }
+    } catch (_) { reconnectTerminalStream(stream,true); }
   });
   source.addEventListener('failure', event => {
     if (!current()) return;
@@ -1374,12 +1443,13 @@ async function sendInput(kind, value = '', quiet = false) {
     const result = await api(endpoint('/api/input', item.node.id), { sessionID: item.session.id, revision: frame.revision, kind, text: value, requestID: uuid(), ...(relay ? {relay: true, streamID: frame.streamID} : {}) });
     sent = true; if (selectedKey === item.key) inputFailure = ''; if (!quiet) feedback(result.message);
   } catch (error) {
-    if (selectedKey === item.key) inputFailure = error.message;
+    const message = !error.status && !error.unsent ? '입력 전달 결과를 확인하지 못했습니다. 원본 화면에서 반영 여부를 확인해주세요.' : error.message;
+    if (selectedKey === item.key) inputFailure = message;
     if (consumedDraft) {
       if (selectedKey === item.key && directMode) stopDirect(true, value);
       else restoreDirectDraft(value, item.key);
     }
-    feedback(error.message, true);
+    feedback(message, true);
   }
   finally {
     // Keep the consumed frame only as the binding for its pending successor.
@@ -2186,11 +2256,18 @@ $('add-form').addEventListener('submit', async event => {
   catch (error) { text($('add-error'), error.message); show($('add-error'), true); $('mac-address').focus(); }
   finally { button.disabled = false; text(button, 'Mac 연결'); }
 });
+function resumeTerminalPage() {
+  if (document.hidden) return;
+  restoreTerminalWarm();
+  void refreshFrame(); void refreshNetwork();
+}
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
-  if (document.hidden) { stopSessionHistory(); networkController?.abort(); nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; stopDirect(); stopPTY(); updateControls(); }
-  if (!document.hidden) { void refreshNetwork(); void refreshFrame(); }
+  if (document.hidden) { rememberTerminalWarm(); stopSessionHistory(); networkController?.abort(); nativeSessionKey = ''; clearNativeImage(); frameController?.abort(); stopTerminalStream(); latestFrame = null; terminalFrameReceivedAt = -Infinity; stopDirect(); stopPTY(); updateControls(); }
+  else resumeTerminalPage();
 });
+window.addEventListener('pageshow',event=>{ if (event.persisted) resumeTerminalPage(); });
+document.addEventListener('resume',resumeTerminalPage);
 window.addEventListener('offline', () => {
   terminalNetworkOffline = true;
   if (terminalStream) pauseTerminalNetwork(terminalStream);
