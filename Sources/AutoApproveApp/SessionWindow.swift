@@ -328,6 +328,43 @@ private struct SessionRow: View {
     let selected: Bool
     let setAutomatic: (Bool) -> Void
     let reveal: () -> Void
+    @StateObject private var actions = SessionRowActions()
+
+    var body: some View {
+        // Update the live handlers even when the display value is unchanged.
+        // The box belongs to this row, not to the parent captured by a handler.
+        let _ = actions.update(automatic: setAutomatic, reveal: reveal)
+        SessionRowDisplay(session: session, paused: paused, selected: selected, actions: actions).equatable()
+    }
+}
+
+@MainActor
+private final class SessionRowActions: ObservableObject, Equatable {
+    private var automaticHandler: ((Bool) -> Void)?
+    private var revealHandler: (() -> Void)?
+
+    func update(automatic: @escaping (Bool) -> Void, reveal: @escaping () -> Void) {
+        automaticHandler = automatic; revealHandler = reveal
+    }
+    func setAutomatic(_ value: Bool) { automaticHandler?(value) }
+    func reveal() { revealHandler?() }
+    nonisolated static func == (lhs: SessionRowActions, rhs: SessionRowActions) -> Bool { lhs === rhs }
+}
+
+/// Display equality never freezes the handlers above. Only timestamps that no
+/// row label, control or help text reads are removed from the display value.
+private struct SessionRowDisplay: View, Equatable {
+    let session: AgentSession
+    let paused: Bool
+    let selected: Bool
+    let actions: SessionRowActions
+
+    init(session: AgentSession, paused: Bool, selected: Bool, actions: SessionRowActions) {
+        var display = session
+        display.lastActivity = .distantPast
+        display.codexQuestionsObservedAt = nil
+        self.session = display; self.paused = paused; self.selected = selected; self.actions = actions
+    }
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
@@ -380,12 +417,12 @@ private struct SessionRow: View {
             }
             Spacer(minLength: 4)
             if session.agent != .shell {
-                Toggle("\(session.project) 자동 승인", isOn: Binding(get: { session.automatic }, set: setAutomatic))
+                Toggle("\(session.project) 자동 승인", isOn: Binding(get: { session.automatic }, set: actions.setAutomatic))
                     .labelsHidden().toggleStyle(.switch).controlSize(.small)
                     .disabled(!session.canApprove && !session.automatic).help(AppHelp.automatic(session, paused: paused))
             }
         }.accessibilityElement(children: .contain)
-            .accessibilityAction(named: Text("터미널 열기"), reveal)
+            .accessibilityAction(named: Text("터미널 열기")) { actions.reveal() }
     }
 }
 
