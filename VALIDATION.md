@@ -19,7 +19,8 @@
 - 두 Mac **123/150**·원본22/3개의 PID/시작/TTY·문자 입력 지원과 직접/중계 HTTP200을 확인했다. 초기 로컬 입력 지원0과 준비 후22개, 상대0과1.08초 뒤3개를 구분한다. 로컬 설정·기존 승인 기록 **22,598건**·root PID649/실행 횟수1/파일을 보존했다. 현재 관리 앱 PID25269이며 **150 deploy.py는 이미 실행했으므로 재실행하지 않는다.** 이전147/148/149 설치 스크립트도 재실행하지 않는다.
 - 실제 상대 원본3개를30초 연결해 이벤트 **33/43/15개**·오류0, 감시1개 생성·2개 공유·종료 후1개 해제를 확인했다. 첫 화면30.5~32.0ms는 앞선 읽기 검사 뒤 관측이며 콜드 스타트나 휴대폰 측정이 아니다. 원본 테스트 입력과 보관한 터미널 내용은0이다.
 - 본체15초 관찰의 설치 전/후 CPU는 **1.008670/1.400257초**, footprint **99.7~102.1/101.0~104.8MB**다. 원본 작업량·관찰/재시작/연결 시점이 달라 전체 CPU/RAM 절감률로 해석하지 않는다. 새5초 스택에 화면 길이의 외부 UTF-8 거리 계산(`ApprovalEngine.swift:3416`)이1표본 남아 있다. 추가 프로파일로 우선순위를 판단한다. UI 배치와 새 시각 QA는 포함하지 않는다.
-- 근거 `.runtime/performance/lightweight-123/`, `.runtime/screen-match-check/`, `.runtime/screen-match-engine-check/`, 배포 `.runtime/releases/0.2.123/lightweight-150/`다. GitHub 게시와 외부 다운로드 검증을 남겨둔다. 전체 경량화 목표는 active이며 UI·원본/설정·보안/VPN/TCC·root 서비스·전원/잠금·삭제한 Wi-Fi 기능은 보존한다.
+- [GitHub v0.2.123](https://github.com/newdlops/autoapprove/releases/tag/v0.2.123)의 최신 정식 릴리스·주석 태그·소스 `b3128e7047cdbdf9997050a2da47b456c38f22ba`·자산2개를 확인했다. 정상 TLS/IPv4 익명 다운로드의 크기/바이트/SHA-256이 검증한 DMG/체크섬과 일치한다. 공개 소스9개의 manifest/태그 일치와 atomic push를 확인했다. 게시 결과 문서만 후속 커밋하고 태그는 유지한다.
+- 근거 `.runtime/performance/lightweight-123/`, `.runtime/screen-match-check/`, `.runtime/screen-match-engine-check/`, 배포 `.runtime/releases/0.2.123/lightweight-150/`다. 전체 경량화 목표는 active이며 UI·원본/설정·보안/VPN/TCC·root 서비스·전원/잠금·삭제한 Wi-Fi 기능은 보존한다.
 
 ## 0.2.122 긴 화면의 작업 상태 판정 경량화 · 빌드 149
 
