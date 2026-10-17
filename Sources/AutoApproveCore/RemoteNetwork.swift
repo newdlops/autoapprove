@@ -229,6 +229,7 @@ struct RemoteTerminalUpdate: Encodable {
     private let stateReads = RemotePeerStateCache()
     private var foregroundStateReads: [String:UUID] = [:]
     private let inventoryValidation = RemotePeerInventoryCache()
+    private let readConnections = RemoteHTTPReadPool()
     private var readTimingEpoch = UUID()
     public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, loopbackOnly: Bool = false, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
@@ -390,6 +391,7 @@ struct RemoteTerminalUpdate: Encodable {
                         self.peers[id]?.readTiming = RemoteReadTiming()
                     }
                     self.stateReads.removeAll(); self.inventoryValidation.removeAll()
+                    self.readConnections.removeAll()
                     self.foregroundStateReads.removeAll()
                     self.webPeerToken = UUID(); self.webPeerTask?.cancel(); self.webPeerTask = nil
                     self.nextHintRead = .distantPast; self.nextBlindProbe = .distantPast; self.directCursor = 0
@@ -464,6 +466,7 @@ struct RemoteTerminalUpdate: Encodable {
         browserRetry?.cancel(); browserRetry = nil
         knownSaveTask?.cancel(); knownSaveTask = nil; saveKnownPeers()
         stateReads.removeAll(); inventoryValidation.removeAll()
+        readConnections.removeAll()
         readTimingEpoch = UUID()
         for id in peers.keys { peers[id]?.readTiming = RemoteReadTiming() }
         directProbedAt.removeAll(); pendingHints.removeAll(); directCursor = 0
@@ -825,17 +828,18 @@ struct RemoteTerminalUpdate: Encodable {
             return response
         }
         let endpoints = Array(peerEndpoints(peer).prefix(2))
-        guard endpoints.count > 1 else { return try await RemoteHTTPExchange(endpoint: primary, path: path, method: method, body: body, expectedNodeID: peer.id, timeout: timeout, entityTag: entityTag,
-            retryReads: !["/api/state","/api/inventory"].contains(path)).run() }
+        guard endpoints.count > 1 else { return try await readConnections.read(endpoint:primary,path:path,expectedNodeID:peer.id,timeout:timeout,entityTag:entityTag,
+            retryReads:!["/api/state","/api/inventory"].contains(path)) }
         let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? (["/api/state","/api/inventory"].contains(path) ? 4 : 15))
         let epoch = generation
         let timingEpoch = readTimingEpoch, kind = RemoteReadTiming.Kind.finite(path: path)
         let delay = peer.readTiming.delay(route: String(describing: endpoints[0]), kind: kind)
         let expectedID = peer.id
+        let readConnections = self.readConnections
         let read: @Sendable (Int) async throws -> PeerReadResult = { index in
             let started = ProcessInfo.processInfo.systemUptime
-            let response = try await RemoteHTTPExchange(endpoint:endpoints[index],path:path,method:method,body:body,expectedNodeID:expectedID,
-                timeout:max(0.05,deadline-ProcessInfo.processInfo.systemUptime),entityTag:entityTag,retryReads:false).run()
+            let response = try await readConnections.read(endpoint:endpoints[index],path:path,expectedNodeID:expectedID,
+                timeout:max(0.05,deadline-ProcessInfo.processInfo.systemUptime),entityTag:entityTag,retryReads:false)
             if [502,503,504].contains(response.status) { throw RemoteHTTPError(response.status,"Mac의 읽기 연결을 다른 LAN 주소에서 확인합니다.") }
             return .response(index,response,ProcessInfo.processInfo.systemUptime-started)
         }

@@ -11,6 +11,8 @@ public final class RemotePeerResponseDecoder {
     private var complete = false
     public private(set) var receivedBytes = 0
     public private(set) var expectedBytes: Int?
+    private var reusable = false
+    public var allowsConnectionReuse: Bool { complete && reusable }
     public init(expectedNodeID: String? = nil, acceptsGzip: Bool = false) {
         self.expectedNodeID = expectedNodeID; self.acceptsGzip = acceptsGzip
     }
@@ -53,6 +55,10 @@ public final class RemotePeerResponseDecoder {
             }
             guard code != 304 || length == 0 else { throw invalid("Mac의 조건부 응답에 잘못된 본문이 있습니다.") }
             status = code; expectedBytes = length; headers = fields
+            let options = fields["connection"]?.split(separator:",").map { $0.trimmingCharacters(in:.whitespaces).lowercased() } ?? []
+            reusable = first[0] == "HTTP/1.1" && [200,304].contains(code)
+                && expectedNodeID != nil && fields["x-autoapprove-node"] == expectedNodeID
+                && options.contains("keep-alive") && !options.contains("close")
             buffer = buffer.subdata(in:boundary.upperBound..<buffer.endIndex)
         }
         guard let fields = headers, let length = expectedBytes else { return nil }
