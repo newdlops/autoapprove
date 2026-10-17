@@ -1,5 +1,7 @@
 # AutoApprove
 
+**같은 터미널 화면의 반복 비교 경량화 · 0.2.123 빌드 150:** macOS에서 받은 화면이 같을 때 UTF-8 문자를 반복 순회하는 비용을 줄였습니다. 77,187개 사례의 바이트·에이전트 구분을 유지했습니다. 같은 합성 화면의 실제 Core 16세션·24회 갱신 CPU는 예열 뒤3쌍 교대 측정에서 **4.10→1.86초**였습니다. 해당 작업량의 결과이며 전체 앱·휴대폰의 절감률은 아닙니다. [검증 및 인계](docs/HANDOVER.md).
+
 **긴 터미널 화면의 작업 상태 판정 경량화 · 0.2.122 빌드 149:** 긴 출력은 끝에서 필요한 18개 줄만 읽고, 짧은 화면은 기존 처리 경로를 사용합니다. 같은 합성 긴 화면160회 판정 CPU는 이전/수정 코드를3회씩 교대 측정해 Swift 문자열 **0.791→0.059초**, UTF-16 Foundation 문자열 **3.119→0.073초**였습니다. 2,927개 사례의 판정 결과를 유지했습니다. 해당 분석 경로의 측정이며 전체 앱 절감률이나 짧은 화면의 속도 향상률은 아닙니다. [검증 및 인계](docs/HANDOVER.md).
 
 **터미널 중계의 첫 전송·수신 처리 경량화 · 0.2.121 빌드 148:** 준비된 첫 화면을 연결 응답과 함께 보내 추가 전송을 줄이고, 조각난 큰 화면에서 이미 읽은 부분을 반복 검색하지 않습니다. 합성 1.8MB 압축 화면의 같은 중계 처리 CPU 중앙값은 12쌍 교대 측정에서 **28.3→4.0ms**였습니다. 실제 휴대폰 지연이나 원본 Terminal 화면 읽기의 지연 감소를 뜻하지 않습니다. 원본 확인·입력 단일 전송과 연결 오류 처리는 유지합니다. [검증 및 인계](docs/HANDOVER.md).
@@ -425,6 +427,9 @@ swift build --disable-sandbox --cache-path .build/cache
 .build/debug/autoapprove-checks
 node scripts/remote-traffic-check.mjs
 node scripts/discovery-update-check.mjs
+swift build -c release
+node scripts/screen-match-check.mjs --assert-efficient
+node scripts/screen-match-engine-check.mjs
 npm --prefix extensions/vscode test
 node scripts/terminal-window-check.mjs --release --visual
 node scripts/terminal-view-check.mjs --release

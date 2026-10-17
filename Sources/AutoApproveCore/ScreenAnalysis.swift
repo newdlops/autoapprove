@@ -31,6 +31,12 @@ struct ScreenAnalysis: Sendable {
     }
 
     func matches(_ raw: String, agent: AgentKind) -> Bool {
-        self.agent == agent && self.raw.utf8.elementsEqual(raw.utf8)
+        guard self.agent == agent else { return false }
+        // Cocoa screen strings can compare their literal UTF-16 storage directly,
+        // avoiding a bridged scalar lookup for every UTF-8 byte of an unchanged frame.
+        if (!self.raw.isContiguousUTF8 || !raw.isContiguousUTF8),
+           (self.raw as NSString).isEqual(to: raw) { return true }
+        // Keep the original byte contract, including repaired foreign surrogates.
+        return self.raw.utf8.elementsEqual(raw.utf8)
     }
 }
