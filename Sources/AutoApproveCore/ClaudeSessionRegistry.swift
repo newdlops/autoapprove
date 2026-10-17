@@ -37,17 +37,18 @@ public enum ClaudeSessionRegistry {
         let directory = directory ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
         let zone = ProcessInfo.processInfo.environment["TZ"].flatMap(TimeZone.init(identifier:)) ?? .current
+        var dates = RegistryDates(zone:zone)
         return records.filter { $0.agent == .claude }.compactMap { process in
             let file = directory.appendingPathComponent("sessions/\(process.pid).json")
             guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 262_144,
                   let data = try? Data(contentsOf: file) else { return nil }
-            guard var registration = decode(data, process: process, processTimeZone: zone) else { return nil }
+            guard var registration = decode(data, process: process, dates:&dates) else { return nil }
             if registration.kind == "bg", let job = registration.jobID, let activity = registration.activity,
                activity.status == "waiting", activity.waitingFor == "input needed" {
                 let state = directory.appendingPathComponent("jobs/\(job)/state.json")
                 if let size = try? state.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 262_144,
                    let data = try? Data(contentsOf: state) {
-                    registration.activity?.questionSummary = questionSummary(data, jobID: job, activity: activity)
+                    registration.activity?.questionSummary = questionSummary(data, jobID: job, activity: activity, dates:&dates)
                 }
             }
             return registration
@@ -55,6 +56,10 @@ public enum ClaudeSessionRegistry {
     }
 
     public static func decode(_ data: Data, process: ProcessRecord, processTimeZone: TimeZone) -> ClaudeSessionRegistration? {
+        var dates = RegistryDates(zone:processTimeZone)
+        return decode(data,process:process,dates:&dates)
+    }
+    private static func decode(_ data: Data, process: ProcessRecord, dates: inout RegistryDates) -> ClaudeSessionRegistration? {
         guard process.agent == .claude, data.count <= 262_144,
               let json = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
               (json["pid"] as? NSNumber)?.int32Value == process.pid,
@@ -63,13 +68,7 @@ public enum ClaudeSessionRegistry {
               let kind = json["kind"] as? String, ["interactive", "bg"].contains(kind) else { return nil }
         // Claude's procStart is UTC. ps lstart, and therefore persisted AutoApprove IDs,
         // use the host time zone. Do not change those IDs when joining the registry.
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        guard let date = formatter.date(from: started) else { return nil }
-        formatter.timeZone = processTimeZone
-        guard normalize(formatter.string(from: date)) == normalize(process.started) else { return nil }
+        guard let date = dates.start(utc:started,local:process.started) else { return nil }
         func identifier(_ key: String) -> String? {
             guard let value = json[key] as? String, !value.isEmpty, value.count <= 128,
                   value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else { return nil }
@@ -90,15 +89,17 @@ public enum ClaudeSessionRegistry {
     /// Jobs are not a stable Claude API. Use their optional structured question only
     /// after matching the live registry's job and conversation; never use it to reply.
     public static func questionSummary(_ data: Data, jobID: String, activity: ClaudeSessionActivity) -> String? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var dates = RegistryDates(zone:TimeZone(secondsFromGMT:0)!)
+        return questionSummary(data,jobID:jobID,activity:activity,dates:&dates)
+    }
+    private static func questionSummary(_ data: Data, jobID: String, activity: ClaudeSessionActivity, dates: inout RegistryDates) -> String? {
         guard data.count <= 262_144, activity.status == "waiting", activity.waitingFor == "input needed",
               let json = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
               json["daemonShort"] as? String == jobID, json["backend"] as? String == "daemon",
               json["state"] as? String == "working", json["tempo"] as? String == "blocked",
               (json["resumeSessionId"] as? String ?? json["sessionId"] as? String) == activity.providerID,
               let timestamp = json["updatedAt"] as? String,
-              let updated = formatter.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp),
+              let updated = dates.question(timestamp),
               updated >= activity.changedAt, updated <= Date().addingTimeInterval(60),
               let block = json["block"] as? JSONObject, let questions = block["questions"] as? [JSONObject],
               !questions.isEmpty, questions.count <= 16,
@@ -111,6 +112,39 @@ public enum ClaudeSessionRegistry {
     }
 
     private static func normalize(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+
+    /// Formatting state only, scoped to one synchronous read. No process, file
+    /// contents, parsed result or permission is reused across observations.
+    private struct RegistryDates {
+        let zone: TimeZone
+        private var utc: DateFormatter?
+        private var local: DateFormatter?
+        private var fractional: ISO8601DateFormatter?
+        private var basic: ISO8601DateFormatter?
+        init(zone: TimeZone) { self.zone = zone }
+        private static func formatter(_ zone: TimeZone) -> DateFormatter {
+            let value = DateFormatter()
+            value.locale = Locale(identifier:"en_US_POSIX")
+            value.dateFormat = "EEE MMM d HH:mm:ss yyyy"; value.timeZone = zone
+            return value
+        }
+        mutating func start(utc text: String, local expected: String) -> Date? {
+            if utc == nil { utc = Self.formatter(TimeZone(secondsFromGMT:0)!) }
+            guard let date = utc?.date(from:text) else { return nil }
+            if local == nil { local = Self.formatter(zone) }
+            guard let local, ClaudeSessionRegistry.normalize(local.string(from:date)) == ClaudeSessionRegistry.normalize(expected) else { return nil }
+            return date
+        }
+        mutating func question(_ text: String) -> Date? {
+            if fractional == nil {
+                let value = ISO8601DateFormatter()
+                value.formatOptions = [.withInternetDateTime,.withFractionalSeconds]; fractional = value
+            }
+            if let date = fractional?.date(from:text) { return date }
+            if basic == nil { basic = ISO8601DateFormatter() }
+            return basic?.date(from:text)
+        }
+    }
 
     public static func parents(sessions: [AgentSession], records: [ProcessRecord], registrations: [ClaudeSessionRegistration]) -> [String: String] {
         let live = Dictionary(sessions.filter { $0.agent == .claude && $0.phase != .ended }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })

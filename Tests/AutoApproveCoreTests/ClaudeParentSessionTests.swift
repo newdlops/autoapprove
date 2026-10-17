@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import AutoApproveCore
 
 private let parentRecords = ProcessDiscovery.parse("""
@@ -109,6 +110,60 @@ extension ApprovalTests {
         engine.updateDiscovery(parentSessions.filter { $0.id != childID }, records: parentRecords.filter { $0.pid != 21 }, claudeRegistrations: registrations)
         try expectEqual(engine.snapshot.sessions.first { $0.id == mainID }?.backgroundChildren.count, 0)
         try expect(engine.snapshot.events.isEmpty)
+    }
+
+    func testClaudeRegistryBatchTimezonesAndMalformedSiblings() throws {
+        let root = URL(fileURLWithPath:"/private/tmp/aa-registry-dates-"+UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let previous = getenv("TZ").map { String(cString:$0) }
+        defer { if let previous { setenv("TZ",previous,1) } else { unsetenv("TZ") } }
+        let utc = DateFormatter(); utc.locale = Locale(identifier:"en_US_POSIX")
+        utc.dateFormat = "EEE MMM d HH:mm:ss yyyy"; utc.timeZone = TimeZone(secondsFromGMT:0)
+        let starts = ["Sun Mar 9 06:59:59 2025","Sun Mar 9 07:00:00 2025",
+            "Sun Nov 2 05:59:59 2025","Sun Nov 2 06:00:00 2025"]
+        for zone in ["UTC","Asia/Seoul","America/New_York","Pacific/Chatham"] {
+            setenv("TZ",zone,1)
+            let directory = root.appendingPathComponent(zone.replacingOccurrences(of:"/",with:"-"))
+            try FileManager.default.createDirectory(at:directory.appendingPathComponent("sessions"),withIntermediateDirectories:true)
+            let local = DateFormatter(); local.locale = utc.locale; local.dateFormat = utc.dateFormat
+            local.timeZone = TimeZone(identifier:zone)
+            let fractional = ISO8601DateFormatter(); fractional.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
+            let basic = ISO8601DateFormatter()
+            var records: [ProcessRecord] = [], expectedDates: [Date] = []
+            var firstState: JSONObject = [:]
+            for (index,start) in starts.enumerated() {
+                let date = utc.date(from:start)!, changed = utc.date(from:start)!.addingTimeInterval(30)
+                let pid = 7000+index, job = "fixture-\(index)"
+                let process = ProcessDiscovery.parse("\(pid) 1 ttys901 \(pid) \(pid) \(local.string(from:date)) /fixture/claude")[0]
+                records.append(process); expectedDates.append(changed)
+                let row: JSONObject = ["pid":pid,"pidDomain":"darwin","procStart":start,"kind":"bg","jobId":job,
+                    "sessionId":"fixture-session-\(index)","status":"waiting","waitingFor":"input needed","statusUpdatedAt":changed.timeIntervalSince1970*1000]
+                try JSONSerialization.data(withJSONObject:row).write(to:directory.appendingPathComponent("sessions/\(pid).json"))
+                let jobDirectory = directory.appendingPathComponent("jobs/"+job)
+                try FileManager.default.createDirectory(at:jobDirectory,withIntermediateDirectories:true)
+                let block: JSONObject = ["questions":[["question":"Fixture question","options":[["label":"A"],["label":"B"]]]]]
+                let state: JSONObject = ["daemonShort":job,"backend":"daemon","state":"working","tempo":"blocked",
+                    "resumeSessionId":"fixture-session-\(index)","updatedAt":index.isMultiple(of:2) ? fractional.string(from:changed) : basic.string(from:changed),"block":block]
+                try JSONSerialization.data(withJSONObject:state).write(to:jobDirectory.appendingPathComponent("state.json"))
+                if index == 0 { firstState = state }
+            }
+            var bad = records[0]; bad.pid = 6999
+            let malformed: JSONObject = ["pid":6999,"pidDomain":"darwin","procStart":"invalid date","kind":"interactive"]
+            try JSONSerialization.data(withJSONObject:malformed).write(to:directory.appendingPathComponent("sessions/6999.json"))
+            records.insert(bad,at:0)
+            let values = ClaudeSessionRegistry.read(records:records,directory:directory)
+            try expectEqual(values.count,4,"A malformed first date cannot poison valid siblings in \(zone)")
+            for (index,value) in values.enumerated() {
+                try expectEqual(value.processID,records[index+1].key)
+                try expectEqual(value.activity?.changedAt,expectedDates[index])
+                try expect(value.activity?.questionSummary?.contains("Fixture question") == true)
+            }
+            firstState["updatedAt"] = "invalid timestamp"
+            try JSONSerialization.data(withJSONObject:firstState).write(to:directory.appendingPathComponent("jobs/fixture-0/state.json"))
+            let changed = ClaudeSessionRegistry.read(records:records,directory:directory)
+            try expectEqual(changed.count,4); try expectNil(changed[0].activity?.questionSummary)
+            try expect(changed.dropFirst().allSatisfy {$0.activity?.questionSummary?.contains("Fixture question") == true},"Fresh malformed job metadata cannot reuse a prior summary or poison sibling dates")
+        }
     }
 
     func testClaudeRecoveryMetadataIdentityAndStaleness() throws {
