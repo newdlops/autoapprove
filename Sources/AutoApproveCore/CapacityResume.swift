@@ -119,10 +119,12 @@ public enum CodexResumeCheck {
     }
     /// The last error cell on screen through the composer below it.
     public static func activeRegion(_ screen: String, heading: String) -> String? {
-        let rows = rows(screen)
+        activeRegionRows(rows(screen), heading: heading)?.joined(separator: "\n")
+    }
+    private static func activeRegionRows(_ rows: [String], heading: String) -> [String]? {
         guard let start = rows.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces) == heading }),
               let end = rows[(start + 1)...].firstIndex(where: isComposer) else { return nil }
-        return rows[start...end].joined(separator: "\n")
+        return Array(rows[start...end])
     }
     public static func ready(_ screen: String, region: String, text: String? = nil) -> Bool {
         let expected = rows(region), current = rows(screen)
@@ -165,7 +167,10 @@ public enum CodexResumeCheck {
             let compact = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
             guard PromptDetector.fingerprint(transcript) == stop.identity || compact == stop.continuationIdentity else { return false }
         }
-        let tail = current.indices.filter { $0 > composer && !current[$0].trimmingCharacters(in: .whitespaces).isEmpty }
+        // The continuation lives after the composer. Avoid scanning every row in
+        // potentially large scrollback to discover those few trailing rows.
+        let tail = current[current.index(after: composer)..<current.endIndex].indices
+            .filter { !current[$0].trimmingCharacters(in: .whitespaces).isEmpty }
         let text = stop.continuationText.precomposedStringWithCanonicalMapping
         let ownedBody = footerVariants(footer, agent: stop.agent).contains { expectedFooter in
             guard tail.count >= expectedFooter.count,
@@ -177,7 +182,7 @@ public enum CodexResumeCheck {
         guard ownedBody else { return false }
         if goalStalled(expected) { return goalStalled(current) }
         let heading = expected.first?.trimmingCharacters(in: .whitespaces) ?? ""
-        guard let active = activeRegion(screen, heading: heading).map(rows), active.last == current[composer] else { return false }
+        guard let active = activeRegionRows(current, heading: heading), active.last == current[composer] else { return false }
         let filled: ([String]) -> [String] = { $0.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
         return filled(Array(active.dropLast())) == filled(Array(expected.dropLast()))
     }

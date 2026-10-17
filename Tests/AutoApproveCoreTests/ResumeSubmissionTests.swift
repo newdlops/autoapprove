@@ -61,6 +61,16 @@ extension ApprovalTests {
         }
     }
 
+    func testOwnedResumeDraftWithLargeScrollback() throws {
+        let history = String(repeating: "synthetic Codex history /workspace/src/Generated.swift\n", count: 40_000)
+        let before = history + submissionFrame()
+        let stop = CodexCapacityStop.detect(before, agent: .codex)!
+        let draft = submissionDraft(before, stop)
+        try expect(CodexResumeCheck.draftReady(draft, stop: stop), "Large scrollback keeps the same owned draft valid")
+        try expectFalse(CodexResumeCheck.draftReady(draft.replacingOccurrences(of: "? for shortcuts", with: "user note\n? for shortcuts"), stop: stop),
+            "Large scrollback must not weaken the complete-composer ownership check")
+    }
+
     @MainActor func testResumeSubmissionSurvivesNewlinesAndRestart() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-submit-restart-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
