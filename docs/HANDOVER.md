@@ -8,7 +8,8 @@
 - 같은 실제 상대119/145에 불변 이전 Core와 수정 Core로 번갈아 접속한 첫 화면 HTTP 조회는3쌍 예열/12쌍 측정 중앙값 **35.23→24.58ms**다. 최대94.0/98.6ms로 꼬리 지연 개선을 주장하지 않는다. SSE/휴대폰 지연이나 전체 CPU/RAM 절감률이 아니다. 원본 입력과 내용 보관은0이다.
 - 최종 배포 Core의12개 통합 검사·서명/입력 봉인·stdio14/14·격리 패키지·DMG가 통과했고 App/CLI 각35개 섹션·웹13개가 일치한다. 두 Mac120/146·원본22/3개·직접/중계 HTTP200·문자 입력 지원, 설정·기존 기록22,331건·root 프로세스/실행 횟수/파일 보존을 확인했다. 최초22/0과1.15초 뒤22/3을 구분한다. 현재 관리 앱 PID7277이며 **120 deploy.py도 이미 실행했으므로 재실행하지 않는다.** DMG9,790,570B·SHA-256 `47ff8bcebaa1b994e0c7bf52ea75c7bdbbb34e9fa099108587e82147d09fbef1`이다.
 - 실제3원본 동시30초 이벤트32/32/13·오류/조기 종료0, 감시1생성/2공유/종료 후1해제를 확인했다. 설치 직후 유한 HTTP 중앙값38.44ms·간격을 둔 SSE6/6·27.8~54.3ms, 목록 최대107.5ms가 남아 있다. gzip10,512/11,274/25,989B·이어진 세304본문0B도 확인했다. 전체60.1초에서 본체94.0~130.9MB/CPU6.847초·마지막5표본94.0~94.2MB, 독립 보조29개106.4MB/CPU 증가0·root 공개 CPU 증가0이다. 업데이트 직후/읽기/스트림과 보조 수가 달라 전체 절감률을 주장하지 않는다.
-- 비공개 근거 `.runtime/performance/lightweight-120/`, `.runtime/peer-http-reuse/`, 새 배포 `.runtime/releases/0.2.120/lightweight-146/`다.119와120의 설치 스크립트는 재실행하지 않는다. GitHub 결과는 확인 뒤 추가한다. UI와 사용자 설정·승인 기록·기존 root 서비스·원본 CLI·보안/VPN/TCC·전원/잠금·취소한 Wi-Fi 기능은 변경하지 않았다. 전체 프로그램 경량화 목표는 active다.
+- [GitHub v0.2.120](https://github.com/newdlops/autoapprove/releases/tag/v0.2.120)의 최신 정식 릴리스·주석 태그·소스 `a720971bd005b14009462f34ef708a07dbf71e88`·두 자산과 정상 TLS/IPv4 익명 다운로드의 크기/바이트/SHA-256 일치를 확인했다. 공개 소스8개 manifest/태그 일치와 atomic push도 확인했다. 결과 문서만 후속 커밋하고 태그를 이동하지 않는다.
+- 비공개 근거 `.runtime/performance/lightweight-120/`, `.runtime/peer-http-reuse/`, 새 배포 `.runtime/releases/0.2.120/lightweight-146/`다.119와120의 설치 스크립트는 재실행하지 않는다. UI와 사용자 설정·승인 기록·기존 root 서비스·원본 CLI·보안/VPN/TCC·전원/잠금·취소한 Wi-Fi 기능은 변경하지 않았다. 전체 프로그램 경량화 목표는 active다. 이번 범위와 미적용 후보는 `.runtime/performance/lightweight-120/full-scope-progress.json`에 기록했다.
 
 ## 2026-10-17 여러 웹 터미널의 변경 감시 공유 · 0.2.119/145
 
