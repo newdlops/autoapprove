@@ -1,5 +1,7 @@
 # AutoApprove
 
+**혼잡한 네트워크의 요청 대기 경량화 · 0.2.116 빌드 142:** 연결 슬롯이 비면 기다리던 Mac 조회를 바로 깨우고, 검색 간격 타이머는 하나만 공유합니다. 같은 실제 요청 대기열 코드를 3회씩 교대 측정해 슬롯 인계 중앙값 **38.7→0.016ms**, 96개 요청의 대기 CPU **0.00713→0.000096초**를 확인했습니다. 전송 완료만 대체한 격리 시험이며 전체 앱·휴대폰 속도의 향상률은 아닙니다. 기존 동시 연결 수·검색 간격·원본 확인·입력 일회 전송은 유지합니다. [검증 및 인계](docs/HANDOVER.md).
+
 **접속 실패 대기 구분 · 0.2.115 빌드 141:** macOS가 로컬 네트워크를 명시적으로 거절하면 긴 타임아웃 대신 허용 상태를 안내합니다. 일시적인 Wi-Fi·VPN 단절의 기존 복구는 유지합니다. 업데이트 후 실제 두 Mac의 중계가 복구됐고, 상대 터미널 첫 화면 **6/6·30~63ms**, 원본 세 개의 동시 스트림 **30초·오류 없음**을 확인했습니다. 재시작 뒤 OS 경로 회복과 코드의 효과를 구분하며 휴대폰 측정이나 전체 향상률로 확대하지 않습니다. [검증 및 인계](docs/HANDOVER.md).
 
 **MCP 초기화·프로젝트 이름 경량화 · 0.2.114 빌드 140:** MCP 연결 시 전체 프로세스 검색을 없애고, 질문·화면 공유에 필요한 부모 체인만 최신 정보로 두 번 확인합니다. 같은 Mac의 새 보조 프로세스를 3회씩 교대 측정해 초기화 중앙값 **38.8→22.0ms**, 초기 footprint **6.52→3.10MB**를 확인했습니다. 358개 경로의 표시 이름은 UTF-8 바이트까지 유지하며, 실제 세션/내역 이름 계산 CPU는 **19%/24% 감소**했습니다. 개별 경로·새 프로세스 측정이며 전체 앱이나 이미 실행 중인 보조 프로세스의 개선율은 아닙니다. [검증 및 인계](docs/HANDOVER.md).
@@ -409,6 +411,7 @@ NODE_OPTIONS=--use-system-ca bash scripts/build.sh
 ```sh
 swift build --disable-sandbox --cache-path .build/cache
 .build/debug/autoapprove-checks
+node scripts/remote-traffic-check.mjs
 npm --prefix extensions/vscode test
 node scripts/terminal-window-check.mjs --release --visual
 node scripts/terminal-view-check.mjs --release
