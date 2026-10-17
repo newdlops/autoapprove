@@ -104,6 +104,29 @@ public enum ProcessDiscovery {
         let byID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
         return ancestors(of: pid, byPID: byID)
     }
+    /// Fresh metadata for an MCP connection's nearest enclosing CLI. Read only
+    /// its bounded parent chain, then reject an identity/parent/exec/TTY change.
+    /// This is attribution, never permission to send input to that process.
+    public static func enclosingAgent(of pid: Int32, reader: (Int32) throws -> [ProcessRecord] = { try read(pid: $0) }) throws -> ProcessRecord? {
+        var current = pid, seen: Set<Int32> = [], chain: [ProcessRecord] = []
+        while current > 0, chain.count < 60, seen.insert(current).inserted {
+            let values = try reader(current)
+            guard values.count == 1, let record = values.first, record.pid == current else { return nil }
+            chain.append(record)
+            if record.agent != nil {
+                for original in chain.reversed() {
+                    let latest = try reader(original.pid)
+                    guard latest.count == 1, let value = latest.first,
+                          value.pid == original.pid, value.parent == original.parent,
+                          value.started == original.started, value.tty == original.tty,
+                          value.executable.utf8.elementsEqual(original.executable.utf8) else { return nil }
+                }
+                return record
+            }
+            current = record.parent
+        }
+        return nil
+    }
     static func ancestors(of pid: Int32, byPID byID: [Int32: ProcessRecord]) -> [ProcessRecord] {
         var current = pid, seen: Set<Int32> = [], result: [ProcessRecord] = []
         while let record = byID[current], seen.insert(current).inserted, result.count < 60 {

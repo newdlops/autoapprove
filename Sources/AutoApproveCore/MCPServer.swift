@@ -52,9 +52,6 @@ public enum AutoApproveMCPServer {
     }
     public static func run(paths: AppPaths) {
         let owner = UUID().uuidString
-        let sessionID = (try? ProcessDiscovery.read()).flatMap { records in
-            ProcessDiscovery.ancestors(of: getppid(), records: records).first(where: { $0.agent == .codex || $0.agent == .claude })?.key
-        }
         defer { _ = try? SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": ["tool": "disconnect", "owner": owner]], timeout: 2) }
         let input = MCPInputReader(descriptor: STDIN_FILENO)
         while autoreleasepool(invoking: { () -> Bool in
@@ -67,7 +64,14 @@ public enum AutoApproveMCPServer {
             }
             if let reply = response(message, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
-                if let sessionID { params["sessionID"] = sessionID }
+                // Handshake/list/ping and owner-scoped replies need no process
+                // scan. Resolve attribution freshly only when it is used.
+                if tool == "ask_user" || tool == "start_screen_share" {
+                    let parent = getppid()
+                    if let agent = try? ProcessDiscovery.enclosingAgent(of: parent), getppid() == parent {
+                        params["sessionID"] = agent.key
+                    }
+                }
                 return try SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: 20)
             }) { write(reply) }
             return true

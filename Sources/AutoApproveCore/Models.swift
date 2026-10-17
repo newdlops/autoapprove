@@ -75,6 +75,23 @@ public enum ApprovalChannel: String, Codable {
     public var isScreen: Bool { self == .vscodeScreen || ScreenHost(channel: self) != nil }
 }
 
+/// Display only: identity and input validation keep the original cwd. Foundation
+/// normalizes some Unicode bytes, so only plain ASCII absolute names skip it.
+private func directoryProjectName(_ directory: String) -> String {
+    let leaf: String? = directory.utf8.withContiguousStorageIfAvailable { bytes -> String? in
+        guard bytes.first == 47, bytes.allSatisfy({ $0 > 0 && $0 < 128 }) else { return nil }
+        var end = bytes.count
+        while end > 0 && bytes[end - 1] == 47 { end -= 1 }
+        if end == 0 { return "/" }
+        var start = end
+        while start > 0 && bytes[start - 1] != 47 { start -= 1 }
+        let name = String(decoding: bytes[start..<end], as: UTF8.self)
+        return name == "." || name == ".." ? nil : name
+    } ?? nil
+    if let leaf { return leaf }
+    return URL(fileURLWithPath: directory, isDirectory: true).lastPathComponent
+}
+
 public struct AgentSession: Identifiable, Codable, Equatable {
     public var id: String
     public var agent: AgentKind
@@ -155,7 +172,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
         default: return terminal.title
         }
     }
-    public var project: String { cwd.isEmpty ? "프로젝트 확인 중" : URL(fileURLWithPath: cwd).lastPathComponent }
+    public var project: String { cwd.isEmpty ? "프로젝트 확인 중" : directoryProjectName(cwd) }
 
     public init(id: String, agent: AgentKind, pid: Int32, started: String, tty: String, cwd: String, terminal: TerminalKind) {
         self.id = id; self.agent = agent; self.pid = pid; self.started = started
@@ -192,7 +209,7 @@ public struct AuditContext: Codable, Equatable {
     public var cwd: String
     public var tty: String
     public var pid: Int32
-    public var project: String { cwd.isEmpty ? "프로젝트 미확인" : URL(fileURLWithPath: cwd).lastPathComponent }
+    public var project: String { cwd.isEmpty ? "프로젝트 미확인" : directoryProjectName(cwd) }
     public init(session: AgentSession) { agent = session.agent; cwd = session.cwd; tty = session.tty; pid = session.pid }
 }
 
