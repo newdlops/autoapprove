@@ -178,6 +178,10 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                 queue.async {
                     guard !self.cancelled else { continuation.resume(throwing: CancellationError()); return }
                     self.opening = continuation
+                    self.connection.pathUpdateHandler = { [weak self] path in
+                        guard let self, !self.cancelled, let error = RemoteLAN.localNetworkError(path) else { return }
+                        self.fail(error)
+                    }
                     self.connection.stateUpdateHandler = { [weak self] state in
                         guard let self, !self.cancelled else { return }
                         switch state {
@@ -187,7 +191,9 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                                 guard let self, !self.cancelled else { return }
                                 if let error { self.fail(error) } else { self.receiveHeaders() }
                             })
-                        case .failed(let error): self.fail(error)
+                        case .waiting:
+                            if let error = RemoteLAN.localNetworkError(self.connection.currentPath) { self.fail(error) }
+                        case .failed(let error): self.fail(RemoteLAN.localNetworkError(self.connection.currentPath) ?? error)
                         default: break
                         }
                     }
@@ -317,6 +323,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private func fail(_ error: Error) {
         guard !cancelled else { return }
         deadline?.cancel(); deadline = nil
+        connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil
         if let continuation = opening {
             opening = nil; continuation.resume(throwing: error); cancelNow()
         } else {
@@ -329,7 +336,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private func cancelNow() {
         guard !cancelled else { return }; cancelled = true
         deadline?.cancel(); deadline = nil
-        connection.stateUpdateHandler = nil; connection.cancel(); buffer = Data(); gzip = nil
+        connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil; connection.cancel(); buffer = Data(); gzip = nil
         let continuation = opening; opening = nil; continuation?.resume(throwing: CancellationError())
         let completion = waiter; waiter = nil; completion?(.success(nil))
     }

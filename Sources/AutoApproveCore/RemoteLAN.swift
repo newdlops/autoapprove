@@ -137,6 +137,16 @@ public enum RemoteLAN {
         parameters.prohibitedInterfaceTypes = [.other, .cellular]
         return parameters
     }
+    /// Only an explicit OS privacy denial is terminal. An unavailable network,
+    /// Wi-Fi policy or inactive VPN keeps the existing bounded read recovery.
+    public static func localNetworkError(status: NWPath.Status, reason: NWPath.UnsatisfiedReason) -> RemoteHTTPError? {
+        guard status == .unsatisfied, reason == .localNetworkDenied else { return nil }
+        return RemoteHTTPError(403, "이 Mac의 로컬 네트워크 접근이 macOS에서 거절되었습니다. Mac의 시스템 설정 → 개인정보 보호 및 보안 → 로컬 네트워크에서 AutoApprove 허용을 확인해주세요.", diagnostics: ["failureKind":"permission"])
+    }
+    static func localNetworkError(_ path: NWPath?) -> RemoteHTTPError? {
+        guard let path else { return nil }
+        return localNetworkError(status:path.status,reason:path.unsatisfiedReason)
+    }
     /// Use a verified peer's published physical address before resolving Bonjour
     /// again. A service can advertise both Ethernet and Wi-Fi (and IPv6), while
     /// only one of those networks is shared with the requesting Mac.

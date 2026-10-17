@@ -670,6 +670,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Stream compression: every SSE event flushes immediately and preserves exact bytes", tests.testSSEGzipFlushesEachEventAndPreservesExactBytes),
             ("Stream compression: encoding negotiation, bounds, heartbeat and empty opening", tests.testSSEGzipNegotiationBoundsAndEmptyStart),
             ("HTTP compression: complete members preserve exact bytes at bounded compression levels", tests.testCompleteGzipUsesNegotiatedLevelWithoutChangingBytes),
+            ("Peer HTTP: explicit OS privacy denial stops; temporary network/VPN loss retains recovery", tests.testPeerLocalNetworkDenialIsExplicitAndDoesNotReplaceTemporaryLoss),
             ("Peer HTTP: fragmented identity/gzip responses preserve bytes and validators", tests.testPeerHTTPResponseDecodesFragmentedIdentityAndGzipExactly),
             ("Peer HTTP: ambiguous headers and wrong identity fail before selecting a route", tests.testPeerHTTPResponseRejectsAmbiguousHeadersAndWrongIdentity),
             ("Peer HTTP: truncated bodies, corrupt gzip and decompression limits are rejected", tests.testPeerHTTPResponseRequiresCompleteBoundedGzipAndBody),

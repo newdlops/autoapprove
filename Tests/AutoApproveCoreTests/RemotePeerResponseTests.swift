@@ -1,7 +1,26 @@
 import Foundation
+import Network
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testPeerLocalNetworkDenialIsExplicitAndDoesNotReplaceTemporaryLoss() async throws {
+        for status: NWPath.Status in [.satisfied,.requiresConnection,.unsatisfied] {
+            for reason: NWPath.UnsatisfiedReason in [.notAvailable,.cellularDenied,.wifiDenied,.localNetworkDenied,.vpnInactive] {
+                let error = RemoteLAN.localNetworkError(status:status,reason:reason)
+                if status == .unsatisfied, reason == .localNetworkDenied {
+                    try expectEqual(error?.status,403)
+                    try expectEqual(error?.diagnostics?["failureKind"],"permission")
+                    try expect(error?.message.contains("AutoApprove") == true)
+                    var reads = 0
+                    do {
+                        _ = try await RemoteTerminalReadRecovery.read { reads += 1; throw error! }
+                        throw AppError.message("Explicit OS denial must reach the caller")
+                    } catch let value as RemoteHTTPError { try expectEqual(value.status,403) }
+                    try expectEqual(reads,1,"A privacy denial cannot be retried as an observation race")
+                } else { try expect(error == nil,"Temporary loss, VPN/Wi-Fi policy and satisfied paths keep existing behavior") }
+            }
+        }
+    }
     func testPeerHTTPResponseDecodesFragmentedIdentityAndGzipExactly() throws {
         let body = Data((String(repeating:"원본🙂 e\u{301} /fixture/file.swift\r\n",count:4000)+"\u{0}").utf8)
         for compressed in [false,true] {

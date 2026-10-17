@@ -460,6 +460,10 @@ final class RemoteHTTPExchange: @unchecked Sendable {
             queue.async {
                 guard !self.cancelled else { continuation.resume(throwing: CancellationError()); return }
                 self.continuation = continuation
+                self.connection.pathUpdateHandler = { [weak self] path in
+                    guard let self, let error = RemoteLAN.localNetworkError(path) else { return }
+                    self.finish(.failure(error))
+                }
                 self.connection.stateUpdateHandler = { state in
                     self.phase = String(describing: state)
                     switch state {
@@ -468,7 +472,9 @@ final class RemoteHTTPExchange: @unchecked Sendable {
                         self.connection.send(content: self.request, completion: .contentProcessed { error in
                             if let error { self.finish(.failure(error)) } else { self.phase = "waiting_headers"; self.receive() }
                         })
-                    case .failed(let error): self.finish(.failure(error))
+                    case .waiting:
+                        if let error = RemoteLAN.localNetworkError(self.connection.currentPath) { self.finish(.failure(error)) }
+                    case .failed(let error): self.finish(.failure(RemoteLAN.localNetworkError(self.connection.currentPath) ?? error))
                     default: break
                     }
                 }
@@ -508,7 +514,7 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private func finish(_ result: Result<RemoteHTTPResponse, Error>) {
         guard let continuation else { return }; self.continuation = nil
         deadline?.cancel(); deadline = nil
-        connection.stateUpdateHandler = nil; connection.cancel()
+        connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil; connection.cancel()
         continuation.resume(with: result)
     }
 }
