@@ -17,10 +17,7 @@ public enum ActivityDetector {
     static func detect(_ screen: String, agent: AgentKind, permissionPrompt: () -> Bool) -> ActivityObservation {
         let unknown = ActivityObservation(phase: .unknown, detail: "현재 화면에서 작업 중인지 입력 대기 중인지 확인하지 못했습니다.")
         guard agent != .shell else { return unknown }
-        // Only the final 18 nonempty rows participate. Avoid trimming and copying the
-        // entire scrollback on every changing frame, while retaining Foundation's newline rules.
-        let tail = Array(screen.components(separatedBy: .newlines).reversed().lazy
-            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.prefix(18).reversed())
+        let tail = nonemptyTail(screen)
         guard !tail.isEmpty else { return unknown }
         let bottom = tail.suffix(8).joined(separator: "\n")
         if matches(bottom, #"(?i)(?:esc|ctrl\+c) to (?:interrupt|stop)|tab to queue"#) {
@@ -58,6 +55,35 @@ public enum ActivityDetector {
 
     private static func isBackgroundHint(_ line: String) -> Bool {
         matches(line, #"(?i)^[•·⏵▶↳\s]*[0-9]+ (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b"#)
+    }
+
+    /// Only the last 18 nonempty rows participate. Walk backwards to avoid splitting
+    /// ignored scrollback. Small frames keep the cheaper whole-split path; storage
+    /// metadata selects it without first converting a large Foundation string to UTF-8.
+    private static func nonemptyTail(_ screen: String) -> [String] {
+        let small = screen.isContiguousUTF8 ? screen.utf8.count <= 4096 : screen.utf16.count <= 2048
+        if small {
+            return Array(screen.components(separatedBy: .newlines).reversed().lazy
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.prefix(18).reversed())
+        }
+        let scalars = screen.unicodeScalars, newlines = CharacterSet.newlines
+        var position = scalars.endIndex, end = position, rows: [String] = []
+        rows.reserveCapacity(18)
+        while position != scalars.startIndex {
+            let previous = scalars.index(before: position)
+            if newlines.contains(scalars[previous]) {
+                let row = String(scalars[position..<end]).trimmingCharacters(in: .whitespaces)
+                if !row.isEmpty {
+                    rows.append(row)
+                    if rows.count == 18 { return Array(rows.reversed()) }
+                }
+                end = previous
+            }
+            position = previous
+        }
+        let row = String(scalars[..<end]).trimmingCharacters(in: .whitespaces)
+        if !row.isEmpty { rows.append(row) }
+        return Array(rows.reversed())
     }
 
     private static func matches(_ value: String, _ pattern: String) -> Bool {
