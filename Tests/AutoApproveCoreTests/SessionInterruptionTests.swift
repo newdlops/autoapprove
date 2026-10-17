@@ -32,6 +32,50 @@ private final class ExitProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    @MainActor func testDiscoveryRecoveryUsesLatestSnapshotAndExactOriginal() throws {
+        let root = URL(fileURLWithPath:"/private/tmp/aa-recovery-index-"+UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        for duplicate in [false,true] {
+            let records = ProcessDiscovery.parse("""
+            41 1 ttys901 41 42 Mon Sep 21 09:00:00 2026 /bin/zsh
+            43 1 ttys901 43 42 Mon Sep 21 09:00:00 2026 /bin/bash
+            42 41 ttys901 42 42 Mon Sep 21 09:00:01 2026 /fixture/claude
+            """)
+            let paths = AppPaths(directory:root.appendingPathComponent(duplicate ? "duplicates" : "fresh"))
+            try paths.prepare()
+            let store = try AuditStore(path:paths.database)
+            let original = records[2]
+            try store.set("automatic:"+original.key,"true"); try store.set("paused","true")
+            let error = SessionInterruption(id:"fixture-error",kind:.transport,detail:"connection error")
+            try store.set("interruption:"+original.key,String(decoding:try JSONEncoder().encode(error),as:UTF8.self))
+            let engine = try ApprovalEngine(paths:paths,claudeRegistryReader:{_ in []},processReader:{[]})
+            defer { engine.stop() }
+            let session = AgentSession(id:original.key,agent:.claude,pid:42,started:original.started,
+                tty:"/dev/ttys901",cwd:"/fixture",terminal:.terminal)
+            engine.updateDiscovery([session],records:records,claudeRegistrations:[])
+            var next = records
+            next[2].parent = 43
+            next[1].started = "Mon Sep 21 09:00:02 2026"
+            let expectedShell = next[1]
+            if duplicate {
+                var wrongShell = records[1]; wrongShell.tty = "ttys902"
+                next.append(wrongShell)
+                var reused = original; reused.started = "Mon Sep 21 10:00:00 2026"
+                next.insert(reused,at:0)
+            }
+            engine.updateDiscovery([session],records:next,claudeRegistrations:[])
+            engine.updateDiscovery([],records:next.filter {$0.pid != 42},claudeRegistrations:[])
+            let encoded = store.value("interruptedSessions") ?? "[]"
+            let plans = try JSONDecoder().decode([SessionExitRecovery].self,from:Data(encoded.utf8))
+            try expectEqual(plans.count,1)
+            try expectEqual(plans[0].shell,expectedShell,"A new snapshot replaces the old parent; ancestor duplicate policy stays first-wins")
+            try expectEqual(plans[0].session.started,original.started,"A reused PID cannot replace the exact original lifetime")
+            try expectEqual(plans[0].executable,original.executable)
+            try expect(engine.snapshot.paused)
+            try expect(engine.snapshot.events.isEmpty,"Snapshot bookkeeping never sends recovery input")
+        }
+    }
+
     @MainActor func testExitedRecoveryRetriesPastThreeNonWrites() async throws {
         let directory = URL(fileURLWithPath: "/private/tmp/aa-exit-nonwrite-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

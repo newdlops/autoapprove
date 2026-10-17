@@ -694,6 +694,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("CLI failures notify once and remain visible after process exit", tests.testInterruptionNotificationKeepsEndedFailureAndDeduplicates),
             ("Codex and Claude recover in the original CLI without replaying uncertain writes after restart", tests.testTransientRecoverySupportsClaudeAndPersistsUncertainWrites),
             ("Exited CLI recovery requires exact conversation, idle shell and original process identity", tests.testExitedRecoveryRequiresExactConversationAndIdleOriginalShell),
+            ("Discovery recovery keeps a fresh parent snapshot and the exact original across duplicate PIDs", tests.testDiscoveryRecoveryUsesLatestSnapshotAndExactOriginal),
             ("Exited Claude resumes in its original shell and app restart cannot replay the launch", tests.testExitedRecoveryRestoresExactConversationAndNeverReplays),
             ("CLI errors: exited recovery retries past three definite non-writes in the original shell", tests.testExitedRecoveryRetriesPastThreeNonWrites),
             ("Normal exit never restarts and an empty recovery schedule cannot index out of bounds", tests.testNormalExitDoesNotRestartAndEmptyRecoveryScheduleIsSafe),

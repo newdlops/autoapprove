@@ -2431,6 +2431,9 @@ import TerminalInputSupport
         ptySessionBindings = ptySessionBindings.filter { live.contains($0.key) || (try? managedPTY.terminal($0.value).isRunning) == false }
         codexCompletions.retain(sessionIDs: live)
         codexTurns = codexTurns.filter { live.contains($0.key) }
+        // One fresh ancestry index per discovery snapshot, built only when an
+        // automatic session actually has an original process to remember.
+        var recoveryProcesses: [Int32:ProcessRecord]?
         for var session in managed {
             if var existing = sessions[session.id] {
                 existing.tty = session.tty
@@ -2452,7 +2455,7 @@ import TerminalInputSupport
                 session.detail = Self.connectionGuide(session)
             }
             sessions[session.id] = session
-            rememberExitContext(session,records:records)
+            rememberExitContext(session,records:records,byPID:&recoveryProcesses)
         }
         for key in Array(sessions.keys) where key.hasPrefix("process:") && !live.contains(key) {
             let newlyEnded = sessions[key]?.phase != .ended
@@ -3754,7 +3757,8 @@ import TerminalInputSupport
         }
         let stop = analysis.capacityStop
         if let stop {
-            rememberExitContext(session,records:records)
+            var recoveryProcesses: [Int32:ProcessRecord]?
+            rememberExitContext(session,records:records,byPID:&recoveryProcesses)
             if session.interruption?.needsAttention != true || session.interruption?.kind != stop.kind {
                 sessions[id]?.interruption = SessionInterruption(id:UUID().uuidString,kind:stop.kind,detail:stop.error,date:now)
                 persistInterruption(id)
@@ -4097,10 +4101,12 @@ import TerminalInputSupport
         return .typed
     }
 
-    private func rememberExitContext(_ session: AgentSession, records: [ProcessRecord]) {
+    private func rememberExitContext(_ session: AgentSession, records: [ProcessRecord], byPID: inout [Int32:ProcessRecord]?) {
         guard session.automatic, session.phase != .ended,
-              let process = records.first(where:{$0.pid == session.pid && $0.started == session.started}),
-              let shell = ProcessDiscovery.ancestors(of:process.parent,records:records).first(where: {
+              let process = records.first(where:{$0.pid == session.pid && $0.started == session.started}) else { return }
+        if byPID == nil { byPID = Dictionary(records.map { ($0.pid,$0) },uniquingKeysWith:{first,_ in first}) }
+        guard let byPID,
+              let shell = ProcessDiscovery.ancestors(of:process.parent,byPID:byPID).first(where: {
                   $0.tty == process.tty && SessionExitRecovery.isShell($0)
               }) else { return }
         let conversation = session.agent == .codex ? questionThreadBySession[session.id] : session.providerID
