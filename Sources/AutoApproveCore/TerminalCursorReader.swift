@@ -95,6 +95,26 @@ extension TerminalCursor {
 /// A browser subscription reads the original terminal when its native text or
 /// insertion range changes. It never focuses a window or posts keyboard events.
 final class TerminalCursorObservation: @unchecked Sendable {
+    private struct Identity: Equatable { let pid: Int32; let started: Date }
+    @MainActor private static let pool = TerminalObservationPool<Identity,TerminalCursorObserver>()
+    private let lease: TerminalObservationLease<TerminalCursorObserver>
+
+    @MainActor init?(changed: @escaping @Sendable () -> Void) {
+        guard AXIsProcessTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first,
+              !app.isTerminated, let targets = TerminalCursorObserver.targets(application:app) else { return nil }
+        let identity = app.launchDate.map { Identity(pid:app.processIdentifier,started:$0) }
+        guard AXIsProcessTrusted(), !app.isTerminated else { return nil }
+        guard let lease = Self.pool.subscribe(identity:identity,canReuse:{
+            let matches = $0.matches(targets)
+            if matches { RemoteTerminalPerformance.shared.increment(.sharedNativeObservers) }
+            return matches
+        },
+            make:{ TerminalCursorObserver(application:app,targets:targets,changed:$0) },changed:changed) else { return nil }
+        self.lease = lease
+    }
+}
+
+private final class TerminalCursorObserver {
     private final class Callbacks: @unchecked Sendable {
         let lock = NSLock()
         var values: [UnsafeMutableRawPointer: @Sendable () -> Void] = [:]
@@ -112,11 +132,9 @@ final class TerminalCursorObservation: @unchecked Sendable {
     private let elements: [AXUIElement]
     private let notifications = [kAXValueChangedNotification, kAXSelectedTextChangedNotification]
 
-    @MainActor init?(changed: @escaping @Sendable () -> Void) {
-        guard AXIsProcessTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else { return nil }
-        var value: AXObserver?
-        guard AXObserverCreate(app.processIdentifier, { observer, _, _, _ in TerminalCursorObservation.callbacks.notify(observer) }, &value) == .success,
-              let value else { return nil }
+    /// Enumerate on every new subscription, even when a native observer can be
+    /// shared. New tabs/windows must retain the old fresh-target coverage.
+    @MainActor static func targets(application app: NSRunningApplication) -> [AXUIElement]? {
         let application = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(application, 0.1)
         let deadline = Date().addingTimeInterval(0.3)
@@ -134,14 +152,26 @@ final class TerminalCursorObservation: @unchecked Sendable {
             pending.append(contentsOf: (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).prefix(max(0, 256 - count - pending.count)))
         }
         guard !targets.isEmpty else { return nil }
+        return targets
+    }
+    func matches(_ targets: [AXUIElement]) -> Bool {
+        elements.count == targets.count && zip(elements,targets).allSatisfy { CFEqual($0.0,$0.1) }
+    }
+    @MainActor init?(application app: NSRunningApplication, targets: [AXUIElement], changed: @escaping @Sendable () -> Void) {
+        guard AXIsProcessTrusted(), !app.isTerminated, !targets.isEmpty else { return nil }
+        var value: AXObserver?
+        guard AXObserverCreate(app.processIdentifier, { observer, _, _, _ in TerminalCursorObserver.callbacks.notify(observer) }, &value) == .success,
+              let value else { return nil }
         observer = value; elements = targets
         Self.callbacks.set(value, changed)
         for element in targets { for name in notifications { _ = AXObserverAddNotification(value, element, name as CFString, nil) } }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(value), .commonModes)
+        RemoteTerminalPerformance.shared.increment(.nativeObservers)
     }
     deinit {
         Self.callbacks.set(observer, nil)
         for element in elements { for name in notifications { _ = AXObserverRemoveNotification(observer, element, name as CFString) } }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        RemoteTerminalPerformance.shared.increment(.releasedNativeObservers)
     }
 }
