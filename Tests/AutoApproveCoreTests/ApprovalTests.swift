@@ -644,7 +644,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Codex capacity retries continue beyond the backoff schedule without replaying old frames", tests.testCapacityRetryContinuesBeyondBackoffSchedule),
             ("Codex continue scripts type, re-read, then submit only a visible draft", tests.testCodexResumeScriptsTypeThenSubmit),
             ("Resume submission: validate the entire owned composer, footer and original conversation", tests.testOwnedResumeDraftRequiresEntireComposer),
-            ("Resume submission: large scrollback keeps ownership checks bounded to the live tail", tests.testOwnedResumeDraftWithLargeScrollback),
+            ("Resume submission: large scrollback preserves composer ownership checks", tests.testOwnedResumeDraftWithLargeScrollback),
             ("Resume submission: newline-only Return retries survive restart without retyping", tests.testResumeSubmissionSurvivesNewlinesAndRestart),
             ("Resume submission: cancellation, pause, opt-out and user edits survive restart", tests.testResumeSubmissionPreservesUserControls),
             ("Resume submission: legacy Goal drafts require the exact saved audit receipt", tests.testLegacyGoalDraftRecoversOnlyExactAuditReceipt),
