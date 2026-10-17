@@ -149,7 +149,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private let expectedNodeID: String
     private let openingTimeout: TimeInterval
     private let queue = DispatchQueue(label: "autoapprove.web.pty-peer-stream")
-    private var opening: CheckedContinuation<Void, Error>?
+    private var opening: CheckedContinuation<Data, Error>?
     private var deadline: DispatchWorkItem?
     private var buffer = Data()
     private var waiter: RemoteHTTPStreamCompletion?
@@ -162,6 +162,8 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private var gzip: RemoteGzipDecoder?
     private var compressedSinceEvent = 0
     private static let eventLimit = 2_000_128
+    private static let eventBoundary = Data([10,10])
+    private var searchedBytes = 0
 
     init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15) throws {
         guard !expectedNodeID.contains("\r"), !expectedNodeID.contains("\n") else { throw RemoteHTTPError(502, "Mac의 연결 ID가 올바르지 않습니다.") }
@@ -172,9 +174,11 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     }
     deinit { connection.cancel() }
 
-    func open() async throws {
+    /// Return only a whole event already received with the authenticated
+    /// headers. Never delay opening for another packet or retain this event.
+    func open() async throws -> Data {
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                 queue.async {
                     guard !self.cancelled else { continuation.resume(throwing: CancellationError()); return }
                     self.opening = continuation
@@ -240,7 +244,15 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                         self.opened = true; self.ended = ended; self.failure = error
                         self.deadline?.cancel(); self.deadline = nil
                         let continuation = self.opening; self.opening = nil
-                        continuation?.resume(); return
+                        let initial: Data
+                        do { initial = try self.bufferedEvent() ?? Data() }
+                        catch {
+                            // Header authentication succeeded. Body corruption
+                            // remains a stream failure after HTTP 200, just as
+                            // when the same bytes arrive in a later packet.
+                            self.fail(error); initial = Data()
+                        }
+                        continuation?.resume(returning:initial); return
                     }
                     guard let length = headers["content-length"].flatMap(Int.init), (0...256_000).contains(length) else { throw RemoteHTTPError(502, "Mac의 오류 응답이 올바르지 않습니다.") }
                     if self.buffer.count >= boundary.upperBound + length {
@@ -277,23 +289,13 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
         guard !cancelled, let completion = waiter else { return }
         do {
           while true {
-            if let boundary = buffer.range(of: Data("\n\n".utf8)) {
-                let length = boundary.upperBound - buffer.startIndex
-                guard length <= Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
-                let data = buffer.subdata(in: buffer.startIndex..<boundary.upperBound)
-                buffer = buffer.subdata(in: boundary.upperBound..<buffer.endIndex)
-                compressedSinceEvent = 0
+            if let data = try bufferedEvent() {
                 deadline?.cancel(); deadline = nil
                 waiter = nil; completion(.success(data)); return
             }
-            guard buffer.count < Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
-            if let gzip, !gzip.needsInput, !gzip.ended {
-                buffer.append(try gzip.read(maximum:min(32_768,Self.eventLimit-buffer.count)))
-                continue
-            }
             if ended {
                 if let gzip { try gzip.finish() }
-                let incomplete = !buffer.isEmpty; buffer = Data(); waiter = nil
+                let incomplete = !buffer.isEmpty; buffer = Data(); searchedBytes = 0; waiter = nil
                 deadline?.cancel(); deadline = nil
                 if let failure { completion(.failure(failure)) }
                 else if incomplete { completion(.failure(RemoteHTTPError(503,"Mac의 터미널 출력이 전송 중 끊겼습니다. 다시 연결해주세요."))) }
@@ -320,6 +322,25 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
           }
         } catch { fail(error) }
     }
+    private func bufferedEvent() throws -> Data? {
+        while true {
+            // The final inspected newline may pair with the next fragment.
+            // Previously inspected screen bytes need no further search.
+            let searchRange = (buffer.startIndex+searchedBytes)..<buffer.endIndex
+            if let boundary = buffer.range(of: Self.eventBoundary, in: searchRange) {
+                let length = boundary.upperBound-buffer.startIndex
+                guard length <= Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
+                let data = buffer.subdata(in:buffer.startIndex..<boundary.upperBound)
+                buffer = buffer.subdata(in:boundary.upperBound..<buffer.endIndex)
+                searchedBytes = 0; compressedSinceEvent = 0
+                return data
+            }
+            searchedBytes = max(0,buffer.count-1)
+            guard buffer.count < Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
+            guard let gzip, !gzip.needsInput, !gzip.ended else { return nil }
+            buffer.append(try gzip.read(maximum:min(32_768,Self.eventLimit-buffer.count)))
+        }
+    }
     private func fail(_ error: Error) {
         guard !cancelled else { return }
         deadline?.cancel(); deadline = nil
@@ -327,7 +348,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
         if let continuation = opening {
             opening = nil; continuation.resume(throwing: error); cancelNow()
         } else {
-            failure = error; ended = true; buffer = Data(); gzip = nil
+            failure = error; ended = true; buffer = Data(); searchedBytes = 0; gzip = nil
             connection.cancel()
             deliver()
         }
@@ -336,7 +357,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private func cancelNow() {
         guard !cancelled else { return }; cancelled = true
         deadline?.cancel(); deadline = nil
-        connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil; connection.cancel(); buffer = Data(); gzip = nil
+        connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil; connection.cancel(); buffer = Data(); searchedBytes = 0; gzip = nil
         let continuation = opening; opening = nil; continuation?.resume(throwing: CancellationError())
         let completion = waiter; waiter = nil; completion?(.success(nil))
     }

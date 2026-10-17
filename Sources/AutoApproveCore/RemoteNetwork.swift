@@ -1196,7 +1196,7 @@ struct RemoteTerminalUpdate: Encodable {
         succeeded = response.status < 400
         return response
     }
-    private enum PeerStreamResult: Sendable { case stagger; case opened(Int,RemotePTYPeerBodyStream,TimeInterval) }
+    private enum PeerStreamResult: Sendable { case stagger; case opened(Int,RemotePTYPeerBodyStream,TimeInterval,Data) }
     private func forwardStream(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
@@ -1215,13 +1215,13 @@ struct RemoteTerminalUpdate: Encodable {
             let output = try RemotePTYPeerBodyStream(endpoint: endpoints[index], path: path, expectedNodeID: expectedID,
                 timeout: max(0.05, deadline - started))
             do {
-                try await output.open(); try Task.checkCancellation()
-                return .opened(index,output,ProcessInfo.processInfo.systemUptime-started)
+                let initial = try await output.open(); try Task.checkCancellation()
+                return .opened(index,output,ProcessInfo.processInfo.systemUptime-started,initial)
             } catch { output.cancel(); throw error }
         }
         // Keep opening latency separate from finite bodies. Failed transports
         // wake the alternate immediately; healthy but busy peers avoid duplicates.
-        let opened = try await withThrowingTaskGroup(of: PeerStreamResult.self) { group -> (Int,RemotePTYPeerBodyStream,TimeInterval) in
+        let opened = try await withThrowingTaskGroup(of: PeerStreamResult.self) { group -> (Int,RemotePTYPeerBodyStream,TimeInterval,Data) in
             group.addTask { try await open(0) }
             if endpoints.count > 1 { group.addTask { try await Task.sleep(for: .seconds(delay)); return .stagger } }
             var alternate = endpoints.count < 2, active = 1
@@ -1229,7 +1229,7 @@ struct RemoteTerminalUpdate: Encodable {
                 do {
                     guard let result = try await group.next() else { break }
                     switch result {
-                    case .opened(let index,let output,let elapsed): group.cancelAll(); return (index,output,elapsed)
+                    case .opened(let index,let output,let elapsed,let initial): group.cancelAll(); return (index,output,elapsed,initial)
                     case .stagger:
                         if !alternate { alternate = true; active += 1; group.addTask { try await open(1) } }
                     }
@@ -1252,7 +1252,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
         markPeerRead(peer)
         succeeded = true
-        return .eventStream(opened.1, nodeID: nodeID)
+        return .eventStream(opened.1, nodeID: nodeID, initialData: opened.3)
     }
     private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
         let components = request.components

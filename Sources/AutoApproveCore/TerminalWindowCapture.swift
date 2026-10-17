@@ -164,7 +164,9 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
             message: "Mac의 시스템 설정 → 개인정보 보호 및 보안에서 AutoApprove의 \(missing.joined(separator: " · ")) 권한을 허용해주세요. 연결 버튼을 누르면 원래 터미널에 다시 연결합니다.")
     }
     nonisolated private static func liveAutomationPermission(_ host: ScreenHost) -> Bool {
-        let descriptor = NSAppleEventDescriptor(bundleIdentifier: host.bundleID)
+        guard let application = NSRunningApplication.runningApplications(withBundleIdentifier:host.bundleID).first,
+              application.processIdentifier > 0 else { return false }
+        let descriptor = NSAppleEventDescriptor(processIdentifier:application.processIdentifier)
         // This preflight cannot open the app or ask for Automation consent.
         return AEDeterminePermissionToAutomateTarget(descriptor.aeDesc, typeWildCard, typeWildCard, false) == noErr
     }
