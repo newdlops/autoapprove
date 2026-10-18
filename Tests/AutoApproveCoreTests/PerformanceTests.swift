@@ -37,6 +37,118 @@ private final class DelayedLargeScreens: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testRepeatedWebFramesBoundParsingAndKeepChangedQuestions() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-web-frame-reuse-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let record = ProcessDiscovery.parse("420000 1 ttys099 420000 420000 Mon Oct 5 09:00:00 2026 codex")[0]
+        let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started,
+            tty: "/dev/ttys099", cwd: root.path, terminal: .iterm)
+        let history = String(repeating: "Synthetic scrollback /fixture/output.swift: preserved original output.\n", count: 2_500)
+        let menu = "Which synthetic screen should we inspect?\n\n› 1. Phone layout\n  2. Desktop layout\n\nPress enter to confirm or esc to cancel"
+        let frames = PollingScreens()
+        func replace(_ raw: String) { frames.set(TerminalSnapshot(screens: [TerminalScreen(tty: session.tty, contents: raw)])) }
+        replace(history + menu)
+        let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] },
+            processReader: { [record] }, screenAdapters: [.iterm: adapter], terminalInputAvailable: { false })
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.iterm)
+        let first = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+        try expectEqual(first.question?.options, ["Phone layout", "Desktop layout"])
+        func cpu() -> Double {
+            var usage = rusage(); getrusage(RUSAGE_SELF, &usage)
+            return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+                + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        }
+        let started = cpu()
+        for _ in 0..<64 {
+            let frame = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+            try expectEqual(frame.question?.options, ["Phone layout", "Desktop layout"])
+            try expectEqual(frame.revision, first.revision)
+            try expectEqual(frame.streamID, first.streamID)
+        }
+        let elapsed = cpu() - started
+        replace(history + menu.replacingOccurrences(of: "› 1.", with: "  1.")
+            .replacingOccurrences(of: "  2. Desktop", with: "› 2. Tablet"))
+        try await Task.sleep(for: .milliseconds(200))
+        let changed = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+        try expectEqual(changed.question?.selected, 1)
+        try expectEqual(changed.question?.options, ["Phone layout", "Tablet layout"])
+        try expect(changed.revision != first.revision)
+        replace("Working\nesc to interrupt")
+        try await Task.sleep(for: .milliseconds(200))
+        let cleared = try await engine.remoteTerminal(sessionID: session.id, realtime: true)
+        try expect(cleared.question == nil, "A completed menu must not remain attached to later output")
+        try expect(engine.snapshot.events.isEmpty && engine.managedPTY.inventory.isEmpty)
+        print("METRIC repeated-web-frames 178KB 64-frames \(String(format: "%.2f", elapsed * 1000))ms-CPU")
+        try expect(elapsed < 1, "Repeated web frames must not reparse the long menu scrollback")
+    }
+
+    func testBackgroundParentLookupAvoidsUnrelatedSessionWalk() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-parent-lookup-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let records = ProcessDiscovery.parse("""
+        1 0 ?? 1 0 Sat Sep 19 16:00:00 2026 /sbin/launchd
+        10 1 ?? 10 0 Sat Sep 19 16:00:01 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+        11 10 ttys032 11 12 Sat Sep 19 16:00:02 2026 /bin/zsh
+        12 11 ttys032 12 12 Sat Sep 19 16:38:43 2026 claude
+        13 10 ttys033 13 14 Sat Sep 19 16:00:04 2026 /bin/zsh
+        14 13 ttys033 14 14 Sat Sep 19 16:00:05 2026 claude
+        20 1 ?? 20 0 Sat Sep 19 16:55:10 2026 /Users/test/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude
+        21 20 ttys037 21 21 Sat Sep 19 16:55:12 2026 claude
+        22 20 ttys038 22 22 Sat Sep 19 16:55:13 2026 claude
+        """)
+        var sessions = ProcessDiscovery.sessions(records)
+        let parentID = sessions.first { $0.pid == 12 }!.id
+        let parentIndex = sessions.firstIndex { $0.id == parentID }!
+        sessions[parentIndex].channel = .terminalScreen
+        let childID = sessions.first { $0.pid == 21 }!.id
+        let unrelated = (0..<3_000).map { index in
+            AgentSession(id: "process:\(920_000 + index):unrelated", agent: .codex, pid: Int32(920_000 + index),
+                started: "unrelated", tty: "/dev/fixture-unrelated-\(index)", cwd: "/tmp", terminal: .terminal)
+        }
+        let registrations = [
+            ClaudeSessionRegistration(processID: parentID, kind: "interactive", parkedJobID: "ca35b27f"),
+            ClaudeSessionRegistration(processID: childID, kind: "bg", jobID: "ca35b27f")
+        ]
+        try expectEqual(ClaudeSessionRegistry.parents(sessions: sessions, records: records, registrations: registrations),
+            [childID: parentID], "Fixture relationships resolve before unrelated sessions are added")
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in registrations }, processReader: { records })
+        defer { engine.stop() }
+        engine.updateDiscovery(sessions + unrelated, records: records, claudeRegistrations: registrations)
+        try expectEqual(engine.snapshot.sessions.first { $0.id == parentID }?.backgroundChildren.count, 1,
+            "Fixture must contain one verified flattened background child")
+        let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel"
+        let started = ProcessInfo.processInfo.systemUptime
+        // A background child's screen must be ignored because its hook owns replies.
+        // Looking up that child's children has no match, so the old implementation
+        // necessarily examined every session instead of sometimes finding the parent early.
+        for _ in 0..<512 { engine.receiveScreen(sessionID: childID, raw: screen, generation: "fixture", source: ApprovalChannel.terminalScreen) }
+        let elapsedMS = (ProcessInfo.processInfo.systemUptime - started) * 1000
+        print("METRIC verified-parent-lookup 3000-unrelated 512-frames \(String(format: "%.2f", elapsedMS))ms")
+        try expect(elapsedMS < 250, "A frame with one verified background child must not walk unrelated sessions")
+        try expectEqual(engine.snapshot.sessions.first { $0.id == parentID }?.backgroundChildren.first { $0.id == childID }?.pendingSummary, nil,
+            "A background child's prompt must remain owned by its hook")
+
+        // A persisted relationship table can outlive its processes. With few
+        // live sessions and many stale keys, lookup must scan the live inventory.
+        let staleRoot = FileManager.default.temporaryDirectory.appendingPathComponent("aa-parent-stale-lookup-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: staleRoot) }
+        try FileManager.default.createDirectory(at: staleRoot, withIntermediateDirectories: true)
+        let stalePaths = AppPaths(directory: staleRoot)
+        let staleStore = try AuditStore(path: stalePaths.database)
+        let staleParents = Dictionary(uniqueKeysWithValues: (0..<4_000).map { ("historical-child-\($0)", "historical-parent") })
+        try staleStore.set("claudeParents", String(decoding: try JSONEncoder().encode(staleParents), as: UTF8.self))
+        let staleEngine = try ApprovalEngine(paths: stalePaths, claudeRegistryReader: { _ in registrations }, processReader: { records })
+        defer { staleEngine.stop() }
+        staleEngine.updateDiscovery(sessions, records: records, claudeRegistrations: registrations)
+        let staleStarted = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<512 { staleEngine.receiveScreen(sessionID: childID, raw: screen, generation: "stale-fixture", source: ApprovalChannel.terminalScreen) }
+        let staleElapsedMS = (ProcessInfo.processInfo.systemUptime - staleStarted) * 1000
+        print("METRIC stale-parent-lookup 4000-stale 512-frames \(String(format: "%.2f", staleElapsedMS))ms")
+        try expect(staleElapsedMS < 250, "A large persisted stale map must not dominate lookup with few live sessions")
+    }
+
     func testLargeScreenPollKeepsUIResponsiveAndPublishesTogether() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-screen-responsive-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

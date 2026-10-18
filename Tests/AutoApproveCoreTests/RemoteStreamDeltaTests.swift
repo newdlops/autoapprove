@@ -2,6 +2,24 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testTerminalHTTPResponseEncodesOnceWithinWireBound() throws {
+        struct Frame: Codable { let sessionID: String; let screen: String; let revision: String; let observedAt: Date; let keys: [String] }
+        let original = Frame(sessionID:"fixture",screen:"READY> ",revision:"r1",observedAt:Date(),keys:[])
+        let response = try RemoteHTTPResponse.terminalJSON(original)
+        try expectEqual(response.status,200)
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Frame.self,from:response.body)
+        try expectEqual(decoded.screen,original.screen)
+
+        let oversized = Frame(sessionID:"fixture",screen:String(repeating:"\u{0001}",count:400_000),revision:"r2",observedAt:Date(),keys:[])
+        do {
+            _ = try RemoteHTTPResponse.terminalJSON(oversized)
+            throw AppError.message("Oversized terminal response was accepted")
+        } catch let error as RemoteHTTPError {
+            try expectEqual(error.status,502)
+        }
+    }
+
     func testCompleteGzipUsesNegotiatedLevelWithoutChangingBytes() throws {
         let plain = Data((String(repeating:"원본 한글🙂 e\u{301} /fixture/module/path.swift\n",count:4000)+"\u{0000}\r\n").utf8)
         var sizes = [Int]()

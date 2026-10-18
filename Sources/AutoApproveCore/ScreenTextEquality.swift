@@ -1,8 +1,16 @@
 import Foundation
 
-/// Canonical equality for display-change notifications. Exact detector identity
-/// continues to use the separate UTF-8 comparison in ScreenAnalysis.
+/// Display notifications use canonical equality; detector reuse requires exact bytes.
 enum ScreenTextEquality {
+    static func identical(_ previous: String?, _ current: String) -> Bool {
+        guard let previous else { return false }
+        // Cocoa screen strings can compare literal UTF-16 without walking their
+        // bridged UTF-8 view. Otherwise preserve the detector's exact-byte contract.
+        if (!previous.isContiguousUTF8 || !current.isContiguousUTF8),
+           (previous as NSString).isEqual(to: current) { return true }
+        return previous.utf8.elementsEqual(current.utf8)
+    }
+
     static func equal(_ previous: String?, _ current: String) -> Bool {
         guard let previous else { return false }
         if !previous.isContiguousUTF8 || !current.isContiguousUTF8 {

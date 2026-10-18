@@ -1068,7 +1068,7 @@ struct RemoteTerminalUpdate: Encodable {
                         try await engine.remoteTerminal(sessionID:id,renderWindow:request.parameter("view") == "screen",initial:request.parameter("initial") == "1")
                     }
                     return try RemoteTerminalPerformance.shared.measure(.responseEncoding) {
-                        try .json(RemoteTerminalUpdate(frame, knownRevision:request.parameter("revision")))
+                        try .terminalJSON(RemoteTerminalUpdate(frame, knownRevision:request.parameter("revision")))
                     }
                 case "/api/terminal/stream":
                     if let forwarded = try await forwardStream(request) { return forwarded }

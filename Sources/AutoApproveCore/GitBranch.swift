@@ -80,7 +80,9 @@ public enum GitBranchReader {
             let head = try git(["rev-parse", "--verify", "--short=8", "HEAD"])
             let commit = head.output.trimmingCharacters(in: .whitespacesAndNewlines)
             guard head.status == 0, !commit.isEmpty, commit.allSatisfy(\.isHexDigit) else { return failed(head) }
-            return .init(kind: .detached, name: commit)
+            let state = GitBranchState(kind: .detached, name: commit)
+            GitBranchCache.store(state, directory: directory, before: fingerprint)
+            return state
         } catch { return .init(kind: .unavailable, detail: error.localizedDescription) }
     }
 

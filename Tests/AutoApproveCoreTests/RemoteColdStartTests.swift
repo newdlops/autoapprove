@@ -43,8 +43,10 @@ extension ApprovalTests {
         guard let service = gateway.webService else {throw AppError.message("Gateway unavailable")}
         let start = ProcessInfo.processInfo.systemUptime
         let first = try await service.dashboard()
-        try expect(ProcessInfo.processInfo.systemUptime-start < 1,"Six stalled peers cannot impose their multi-second timeout on the page")
-        try expect(first.nodes.contains {$0.id == healthyService.nodeID && $0.online})
+        let elapsed = ProcessInfo.processInfo.systemUptime-start
+        try expect(elapsed < 1,"Six stalled peers cannot impose their multi-second timeout on the page")
+        let healthyNode = first.nodes.first {$0.id == healthyService.nodeID}
+        try expect(healthyNode?.online == true,"Healthy peer missing after \(Int(elapsed*1000))ms; loading=\(healthyNode?.loading == true), error=\(healthyNode?.error ?? "none")")
         try expect(first.nodes.contains {$0.loading == true});try expectEqual(first.partial,true)
         let secondStart = ProcessInfo.processInfo.systemUptime
         let selected = try await service.dashboard(initial:true,selectedNode:failedIDs[0])

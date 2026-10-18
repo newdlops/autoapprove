@@ -42,7 +42,7 @@ import TerminalInputSupport
     private var remoteMonitorFrames: [String: RemoteObservedScreen] = [:]
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
     private var remoteTerminalChanges: [String: RemoteTerminalChangeSignal] = [:]
-    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?)] = [:]
+    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?, agent: AgentKind)] = [:]
     private let orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)?
     private var remoteOrcaBindings: [String: (targetGeneration: String, binding: RemoteOrcaBinding)] = [:]
     private var remoteInputSessions = Set<String>()
@@ -134,6 +134,9 @@ import TerminalInputSupport
     private var activityTrackers: [String: ActivityTracker] = [:]
     /// Only immutable parsing results are reused. Policies, reservations and delivery checks stay live.
     private var screenAnalyses: [String: ScreenAnalysis] = [:]
+    private var screenAnalysisCacheBytes = 0
+    private let screenAnalysisCacheScreenLimit = 512 * 1_024
+    private let screenAnalysisCacheTotalLimit = 8 * 1_024 * 1_024
     private var screenPublicationDepth = 0
     private var screenPublicationPending = false
     private var screenObservedAt: [String: Date] = [:]
@@ -417,7 +420,7 @@ import TerminalInputSupport
         for pending in remoteScreenReads.values { pending.task.cancel() }
         for pending in remoteInitialReads.values { pending.read.task.cancel() }; remoteInitialReads.removeAll()
         remoteMonitorFrames.removeAll()
-        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll(); screenAnalyses.removeAll()
+        remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll(); screenAnalyses.removeAll(); screenAnalysisCacheBytes = 0
         remoteTerminalChanges.values.forEach { $0.notify() }; remoteTerminalChanges.removeAll()
         for capture in nativeWindowCaptures.values { capture.invalidate() }
         for capture in verifiedWindowCaptures.values { capture.invalidate() }
@@ -1140,13 +1143,15 @@ import TerminalInputSupport
         var frame = RemoteTerminalFrame(sessionID: sessionID, screen: screen, revision: token,
             observedAt: observedAt, keys: keys, inputReason: sourceReason ?? remoteInputReason(current), appearance: visibleAppearance,
             cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil, nativeDisplay: nativeDisplay, outputReason: outputReason, sequence: remoteFrameSequence)
-        if var question = TerminalChoiceQuestion.detect(raw, agent: current.agent) {
+        // The last frame already retains this raw screen. Reuse only immutable
+        // detection, including a negative result; replies and input checks stay live.
+        frame.question = previous?.agent == current.agent && ScreenTextEquality.identical(previous?.raw, raw)
+            ? previous?.frame.question : TerminalChoiceQuestion.detect(raw, agent: current.agent)
+        if var question = frame.question {
             question.reply = savedReply("terminalChoice:\(sessionID):\(question.id)")
             frame.question = question
         }
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        guard try encoder.encode(frame).count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. Mac에서 창 크기를 줄여주세요.") }
-        remoteFrames[sessionID] = (frame, raw, generation, orcaBinding, nativeOnly ? nativeBinding : nil)
+        remoteFrames[sessionID] = (frame, raw, generation, orcaBinding, nativeOnly ? nativeBinding : nil, current.agent)
         frameSucceeded = true
         return frame
     }
@@ -1629,7 +1634,19 @@ import TerminalInputSupport
     }
 
     private func hasBackgroundChildren(_ id: String) -> Bool {
-        sessions.keys.contains { $0 != id && ownerID($0) == id }
+        guard let root = sessions[id], root.phase != .ended else { return false }
+        if claudeParents.count <= sessions.count {
+            // The registry flattens verified child links to the live owner.
+            // Scan that small index instead of allocating an ownerID cycle set
+            // for every unrelated process session on each screen frame.
+            return claudeParents.contains { child, owner in
+                guard owner == id, let session = sessions[child], session.phase != .ended else { return false }
+                return true
+            }
+        }
+        // Persisted parent links can outlive discovery. Avoid scanning a much
+        // larger historical index when the current session inventory is smaller.
+        return sessions.keys.contains { $0 != id && ownerID($0) == id }
     }
 
     private func reconcileClaudeParents(registrations: [ClaudeSessionRegistration]) {
@@ -2594,19 +2611,24 @@ import TerminalInputSupport
             // One bounded worker per host reads and parses; no policy or input is run here.
             let worker = Task.detached(priority: .utility) {
                 let result = try reader(requests)
+                var screensByTTY: [String: TerminalScreen] = [:]
+                screensByTTY.reserveCapacity(result.screens.count)
+                for screen in result.screens where screensByTTY[screen.tty] == nil {
+                    screensByTTY[screen.tty] = screen
+                }
                 var analyses: [String: ScreenAnalysis] = [:]
                 for target in analysisTargets {
                     try Task.checkCancellation()
-                    guard let screen = result.screens.first(where: { $0.tty == target.tty }) else { continue }
+                    guard let screen = screensByTTY[target.tty] else { continue }
                     if let previous = cached[target.id], previous.matches(screen.contents, agent: target.agent) {
                         analyses[target.id] = previous
                     } else {
                         analyses[target.id] = ScreenAnalysis(raw: screen.contents, agent: target.agent)
                     }
                 }
-                return (result, analyses)
+                return (result.failures, screensByTTY, analyses)
             }
-            let (result, analyses) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+            let (failures, screensByTTY, analyses) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return }
             let targets = targets.filter { target in
                 guard let current = sessions[target.id], current.phase != .ended,
@@ -2617,7 +2639,7 @@ import TerminalInputSupport
                 }
                 return true
             }
-            let connected = targets.filter { target in result.screens.contains { $0.tty == target.tty } }.count
+            let connected = targets.reduce(into: 0) { if screensByTTY[$1.tty] != nil { $0 += 1 } }
             let missing = targets.count - connected
             updateHealth(host) { health in
                 health.connected = connected > 0 || targets.isEmpty
@@ -2626,17 +2648,17 @@ import TerminalInputSupport
                 } else if targets.isEmpty {
                     health.status = "연결됨 · \(title)에서 실행 중인 CLI 세션 없음"
                 } else {
-                    health.status = "해당 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first?.message ?? "닫힌 탭인지 확인한 후 다시 연결해주세요.")
+                    health.status = "해당 세션의 \(title) 탭을 읽지 못했습니다. " + (failures.first?.message ?? "닫힌 탭인지 확인한 후 다시 연결해주세요.")
                 }
             }
             withScreenPublicationBatch {
                 for target in targets {
-                    guard let screen = result.screens.first(where: { $0.tty == target.tty }) else {
+                    guard let screen = screensByTTY[target.tty] else {
                         if sessions[target.id]?.channel != .hook {
                             sessions[target.id]?.channel = .none
                             sessions[target.id]?.setPhase(.unknown, detail: "현재 \(title) 화면을 읽지 못했습니다.")
                             sessions[target.id]?.pendingSummary = nil
-                            sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (result.failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
+                            sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
                             clearScreen(target.id, keepRemote: true)
                         }
                         continue
@@ -3384,10 +3406,16 @@ import TerminalInputSupport
         remoteTerminalChanges[id]?.notify()
         if sessions[id] == nil || sessions[id]?.phase == .ended { remoteOrcaBindings.removeValue(forKey: id); remoteTerminalChanges.removeValue(forKey:id) }
         screens.removeValue(forKey: id); activityTrackers.removeValue(forKey: id); screenObservedAt.removeValue(forKey: id)
-        screenAnalyses.removeValue(forKey: id)
+        removeScreenAnalysis(id)
         sessions[id]?.pendingSummary = nil; sessions[id]?.pendingInTerminal = false
         sessions[id]?.pendingRequestID = nil
         sessions[id]?.systemCommandRisk = nil
+    }
+
+    private func removeScreenAnalysis(_ sessionID: String) {
+        if let analysis = screenAnalyses.removeValue(forKey: sessionID) {
+            screenAnalysisCacheBytes = max(0, screenAnalysisCacheBytes - analysis.raw.utf8.count)
+        }
     }
 
     public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil) {
@@ -3410,10 +3438,16 @@ import TerminalInputSupport
         else {
             analysis = ScreenAnalysis(raw: raw, agent: session.agent)
         }
-        screenAnalyses.removeValue(forKey: sessionID)
-        // At most one 128-KiB input per session and 32 cached sessions; larger screens
-        // still work normally. End/disconnect/stop removes their parsing cache.
-        if raw.utf8.count <= 131_072, screenAnalyses.count < 32 { screenAnalyses[sessionID] = analysis }
+        removeScreenAnalysis(sessionID)
+        // Keep repeated large scrollbacks cheap without allowing the analysis cache
+        // to grow with session count or retain one unbounded screen per session.
+        let screenBytes = analysis.raw.utf8.count
+        if screenBytes <= screenAnalysisCacheScreenLimit,
+           screenAnalyses.count < 32,
+           screenAnalysisCacheBytes + screenBytes <= screenAnalysisCacheTotalLimit {
+            screenAnalyses[sessionID] = analysis
+            screenAnalysisCacheBytes += screenBytes
+        }
         observeCapacity(sessionID,analysis:analysis,at:now)
         defer { scheduleSystemSafety(sessionID); publish() }
         if analysis.capacityStop != nil {

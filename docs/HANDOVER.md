@@ -1,5 +1,15 @@
 # AutoApprove 작업 인계
 
+## 2026-10-18 웹 프레임·감시 분석 경량화 · 0.2.125/152
+
+- 웹 스트림의 동일 원문/에이전트는 기존 `remoteFrames`의 선택형 질문 판정을 재사용한다. nil도 재사용하며 답변은 `savedReply`로 매번 새로 읽는다. 실제 입력은 탐지를 다시 수행하고 원본/권한/일회 전송 검증을 유지한다. 원문 비교 helper와 source 추출 검사 provenance를 함께 갱신했다.
+- 동일 합성 178KB·128회·3회 중앙값 CPU는 일반 출력 1.179808→0.091141초, 선택형 질문 4.602235→0.108022초다. revision·streamID·원문·선택지를 유지하고 입력/PTY 0을 확인했다. 전체 앱·실물 휴대폰 성능의 절감률로 쓰지 않는다. 이전/수정 배치는 별도 실행이며 교대 시험이 아니다. 성능 회귀는 이전 1,687ms 실패→47ms 통과였고 변경된 질문/선택·질문 종료도 확인했다.
+- 감시 분석 원문 합계 8MiB/화면 512KiB/32세션 제한, TTY 색인, 작은 부모 관계 색인 조회, detached HEAD 캐시와 HTTP/SSE 중복 인코딩 제거를 포함한다. 분석 객체 전체 RSS가 8MiB 이하라는 뜻은 아니다. 상세 근거와 한계는 [VALIDATION.md](../VALIDATION.md)에 있다.
+- 검토에서 Terminal contents 배치의 중첩 구조와 ABA 매핑 위험을 찾았고, 해당 실험은 이번 변경에서 제거했다. 실제 Terminal은 정확한 specifier 리스트도 -1700으로 거절했다. `TerminalAppleEvents.swift`와 해당 테스트는 이전 exact TTY 읽기를 그대로 유지한다. 기존 title batching은 이전 배포 상태다. 독립 검토의 최종 Critical/Important 지적은 없다.
+- 실제 비교 helper의 77,187개 바이트·에이전트 사례와 `--assert-efficient`, 최종 Release 빌드·전체 Core **329/329**가 통과했다. 첫 전체 실행의 dashboard peer 일시 실패 **328/329**와 단독/전체 재실행 통과를 구분한다. 진단 문구만 추가했으며 조건·제한 시간을 완화하거나 원인을 해결했다고 주장하지 않는다.
+- 서명/입력 봉인·발행자 호환/위조 거절·stdio **14/14**·격리 웹/MCP/PTY·DMG 검사가 통과했다. DMG **9,819,833바이트**, SHA-256 `1e1122b5400dc94dd2eb447dde2af75836046a3313efdccebbb22c754421a5fc`다. 이번 152 설치 파일은 준비됐으나 기존 Mac 설치본은 아직 교체하지 않았다.
+- 비공개 근거 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`와 패키지 `.runtime/releases/0.2.125/lightweight-152/`는 공개하지 않는다. GitHub 게시/다운로드 검증은 이어서 기록한다. 전체 경량화 목표는 active다.
+
 ## 2026-10-18 화면 변경 비교 경량화 · 0.2.124/151
 
 - 설치150의 새 스택에서 화면 변경의 정규화 비교 비용을 확인했다. `ScreenTextEquality`는 외부 문자열의 첫 ASCII 차이·literal 동일·마지막128 Character 차이를 먼저 확인하고 나머지는 기존 Swift 정규화 동등 비교를 유지한다. suffix만 같다고 전체 동일로 판정하지 않으며128 Character를 고정 바이트 상한으로 설명하지 않는다. `ScreenAnalysis`의 바이트 단위 식별과 승인 정책은 그대로다.

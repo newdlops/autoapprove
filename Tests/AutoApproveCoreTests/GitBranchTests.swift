@@ -78,6 +78,72 @@ extension ApprovalTests {
         try expectEqual(GitBranchReader.read(directory: detached.path, executeGit: execute).name, "feature/linked-new")
     }
 
+    func testGitDetachedHeadCacheAvoidsRepeatedProcessLaunchAndTracksHEADChanges() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        try fixture.git(["commit", "--quiet", "--allow-empty", "-m", "first detached commit"], at: repository)
+        try fixture.git(["checkout", "--quiet", "--detach", "HEAD"], at: repository)
+        var launches = 0
+        let execute: ([String], [String: String]) throws -> CommandResult = { arguments, environment in
+            launches += 1
+            return try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+        }
+        let first = GitBranchReader.read(directory: repository.path, executeGit: execute)
+        try expectEqual(first.kind, .detached)
+        let initial = launches
+        for _ in 0..<20 { try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute), first) }
+        try expectEqual(launches, initial, "Unchanged detached HEAD metadata must reuse its verified result")
+        let warmStart = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<100 { _ = GitBranchReader.read(directory: repository.path, executeGit: execute) }
+        let warmMilliseconds = (ProcessInfo.processInfo.systemUptime - warmStart) * 1_000
+        print("METRIC git-detached-warm 100-reads \(String(format: "%.2f", warmMilliseconds))ms 0-processes")
+
+        let config = repository.appendingPathComponent(".git/config")
+        var configData = try Data(contentsOf: config)
+        configData.append(Data("\n[autoapprove-fixture]\n\tmarker = true\n".utf8))
+        try configData.write(to: config)
+        for _ in 0..<20 { try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute), first) }
+        try expectEqual(launches, initial + 2, "Config changes must revalidate Git's detached result")
+        let afterConfig = launches
+        for _ in 0..<20 { try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute), first) }
+        try expectEqual(launches, afterConfig, "Unchanged detached metadata is cached after revalidation")
+
+        try fixture.git(["commit", "--quiet", "--allow-empty", "-m", "next detached commit"], at: repository)
+        let expected = try fixture.git(["rev-parse", "--short=8", "HEAD"], at: repository)
+        let changed = GitBranchReader.read(directory: repository.path, executeGit: execute)
+        try expectEqual(changed, .init(kind: .detached, name: expected), "A detached HEAD change must invalidate the cached result")
+        try expectEqual(launches, afterConfig + 2, "A changed detached commit is re-read once")
+        _ = GitBranchReader.read(directory: repository.path, executeGit: execute)
+        try expectEqual(launches, afterConfig + 2, "The new detached HEAD is cached after verification")
+    }
+
+    func testGitDetachedCacheRejectsHEADRace() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        try fixture.git(["commit", "--quiet", "--allow-empty", "-m", "first"] , at: repository)
+        let first = try fixture.git(["rev-parse", "HEAD"], at: repository)
+        try fixture.git(["commit", "--quiet", "--allow-empty", "-m", "second"], at: repository)
+        let second = try fixture.git(["rev-parse", "HEAD"], at: repository)
+        try fixture.git(["checkout", "--quiet", "--detach", first], at: repository)
+        var launches = 0, injectRace = true
+        let execute: ([String], [String: String]) throws -> CommandResult = { arguments, environment in
+            launches += 1
+            if injectRace && arguments.contains("--short=8") {
+                injectRace = false
+                try fixture.git(["checkout", "--quiet", "--detach", second], at: repository)
+                let result = try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+                try fixture.git(["checkout", "--quiet", "--detach", first], at: repository)
+                return result
+            }
+            return try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+        }
+        let raced = GitBranchReader.read(directory: repository.path, executeGit: execute)
+        try expectEqual(raced.kind, .detached)
+        let corrected = GitBranchReader.read(directory: repository.path, executeGit: execute)
+        try expectEqual(corrected.name, String(first.prefix(8)), "A result from an A→B→A race must not be cached under A")
+        try expectEqual(launches, 4, "The raced result is retried before it can become a cache hit")
+        _ = GitBranchReader.read(directory: repository.path, executeGit: execute)
+        try expectEqual(launches, 4, "The verified replacement result is cached")
+    }
+
     func testGitBranchWorktreeAndRefresh() throws {
         let fixture = try GitBranchFixture(), repository = fixture.repository
         try expectEqual(GitBranchReader.read(directory: repository.path), .init(kind: .branch, name: "main"), "An unborn branch still has a name")

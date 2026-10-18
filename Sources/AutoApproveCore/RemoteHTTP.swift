@@ -156,6 +156,13 @@ public struct RemoteHTTPResponse: Sendable {
         encoder.outputFormatting = [.withoutEscapingSlashes]
         return Self(status: status, body: try encoder.encode(value))
     }
+    public static func terminalJSON<T: Encodable>(_ value: T) throws -> Self {
+        let response = try json(value)
+        guard response.body.count <= 2_000_000 else {
+            throw RemoteHTTPError(502,"원본 터미널 화면이 너무 큽니다. Mac에서 창 크기를 줄여주세요.")
+        }
+        return response
+    }
     public static func object(_ value: JSONObject, status: Int = 200) throws -> Self {
         Self(status: status, body: try JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes]))
     }

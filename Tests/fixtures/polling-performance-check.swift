@@ -93,6 +93,17 @@ import AutoApproveCore
         }
         try check(engine.snapshot.sessions.filter { $0.phase == .idle }.count == 4, "Idle confirmation did not preserve four idle sessions")
 
+        let largeScrollback = String(repeating: "synthetic long scrollback /fixture/output/file.swift\n", count: 6_000)
+        frames.replace(sessions.enumerated().map { index, session in
+            TerminalScreen(tty: session.tty,
+                contents: largeScrollback + "terminal instance \(index)\n" + screen(index: index, variant: 50).contents)
+        })
+        let beforeLargeCPU = cpu(), beforeLargeWall = Date()
+        for _ in 0..<20 { await engine.refreshScreenHost(.terminal) }
+        workloads.append(["name": "large-unchanged-screens", "rounds": 20, "sessions": 16,
+            "screenBytes": largeScrollback.utf8.count, "cpuSeconds": cpu() - beforeLargeCPU,
+            "wallSeconds": Date().timeIntervalSince(beforeLargeWall)])
+
         // Real cwd reads are limited to lightweight children created by this fixture.
         var children: [Process] = []
         defer { for child in children where child.isRunning { child.terminate(); child.waitUntilExit() } }

@@ -1,5 +1,17 @@
 # AutoApprove 검증 기록
 
+## 0.2.125 웹 프레임·감시 분석 경량화 · 빌드 152
+
+- `remoteTerminal`의 선택형 질문 탐지는 마지막 프레임의 에이전트와 원문 바이트가 같을 때만 재사용한다. 질문 없음도 재사용하고, 저장된 답변은 매번 읽는다. 실제 입력은 원문/질문을 다시 판정하며 원본 PID·TTY·수명·권한·일회 전송 확인을 유지한다. 별도 화면 보관소는 추가하지 않았다.
+- `node scripts/remote-frame-performance-check.mjs --label=choice-cache-before`와 변경 후 `--label=choice-cache-after --compare=choice-cache-before`의 같은 합성 원본/fixture 3회 중앙값이다. 일반 출력 177,524바이트·128회 CPU 1.179808→0.091141초, 질문 177,623바이트·128회 CPU 4.602235→0.108022초였다. 경과 시간은 1.307057→0.097984초 / 4.927419→0.117093초다. 각 배치는 별도 실행했으며 교대 측정은 아니다. 실제 휴대폰·VPN·전체 앱 절감률을 주장하지 않는다. 원문/질문 선택지/revision/streamID 유지, 입력/PTY 0을 확인했다.
+- Release 회귀 검사는 178KB 질문 화면 64회의 CPU가 수정 전 1,687ms로 실패하고 수정 후 47ms로 통과했다. 변경된 선택지·현재 선택과 메뉴 종료도 확인한다. `ScreenTextEquality.identical`을 실제 helper와 함께 검사한 `screen-match-check --assert-efficient` 77,187개 사례의 결과 digest는 `744e002dfaf21adff3734500407dcbad6226325489b562eb48e4fcfd4f6e7f73`다. 생성 검사 소스의 helper SHA와 전체 generated SHA를 함께 보관한다.
+- 감시 분석 캐시는 원문 화면당 512KiB/합계 8MiB/32세션으로 제한한다. 이 합계는 원문 바이트 예산이며 분석 객체 전체의 실제 RSS 상한은 아니다. 큰 동일 합성 화면 16세션·20회에서 이전/수정 3회 중앙값 CPU 8.860→1.503초, 경과 11.649→1.936초였다. 일반 화면 표본은 변동이 커 추가 가속 근거로 쓰지 않았다. TTY 색인과 부모 관계 조회, detached HEAD 캐시도 실제 동작 검사로 보호한다.
+- HTTP의 2MB 상한을 최종 JSON 본문 경계로 옮겨 중복 인코딩을 없앴다. SSE의 최종 JSON 크기 확인은 유지한다. 실제 Core loopback HTTP/SSE의 직접/중계·원본 읽기 병합 검사가 통과했다. 총 지연은 표본 간 변동으로 가속 근거로 쓰지 않았다.
+- 독립 검토에서 순서 기반 Terminal contents 배치의 중첩 결과/ABA 위험을 확인해 해당 실험과 검사 2개를 전부 제거했다. 기존 exact TTY별 화면 읽기를 유지한다. exact specifier 리스트의 실제 Terminal 읽기 전용 시험은 정순/역순 모두 `-1700` 미지원이었다. 입력과 내용 로그는 0이다.
+- 최종 Release 빌드와 전체 Core **329/329**가 통과했다. 앞선 전체 실행은 건강한 peer의 첫 dashboard 응답 검사 1개가 실패해 **328/329**였고, 해당 검사 단독 실행과 진단 문구만 추가한 뒤의 전체 실행은 통과했다. 조건과 제한 시간을 완화하지 않았으며 일시 실패의 원인을 해결했다고 주장하지 않는다.
+- 최종 서명 앱의 입력 봉인 메타데이터·발행자 호환/위조 거절·stdio **14/14**·격리 웹/MCP/PTY·포트/설정 복원·DMG 무결성/읽기 전용 마운트 검사가 통과했다. DMG **9,819,833바이트**, SHA-256 `1e1122b5400dc94dd2eb447dde2af75836046a3313efdccebbb22c754421a5fc`다. 이번 검사로 기존 설치본이나 원본 터미널을 교체하지 않았다.
+- 비공개 측정 근거는 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`, 패키지는 `.runtime/releases/0.2.125/lightweight-152/`에 보관한다. GitHub 태그·자산·다운로드 확인은 게시 후 기록한다.
+
 ## 0.2.124 터미널 화면 변경의 정규화 비교 경량화 · 빌드 151
 
 - 설치150의 새10초 스택에서 `ApprovalEngine.receiveScreen`의 화면 변경 비교에 정규화/비교55표본을 확인했다. 이 표시 알림의 비교는 기존 Swift의 **정규화 동등성**을 보존한다. 외부 Cocoa 문자열이 있으면 서로 다른 첫 ASCII 문자를 먼저 거절하고, literal 비교가 같은 경우 바로 반환한다. 끝128개 Character가 서로 다를 때만 변경으로 판정하며 나머지는 기존 전체 `String ==`다. 같은 suffix만으로 같은 화면이라고 판단하지 않는다. `ScreenAnalysis`의 바이트 단위 캐시 식별은 변경하지 않았다.

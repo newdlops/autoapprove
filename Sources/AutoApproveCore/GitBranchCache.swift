@@ -14,12 +14,14 @@ enum GitBranchCache {
     }
     private enum MetadataError: Error { case missing, unreadable, tooLarge }
     struct Fingerprint: Equatable {
-        let branch: String
+        let branch: String?
+        let detached: Bool
         let gitDirectory: String
         let commonDirectory: String
         let marker: Data?
         let commonMarker: Data?
         let head: Data
+        let objectStore: [String: FileIdentity]?
         let looseReference: Data?
         let packedReferences: FileIdentity?
         let config: Data?
@@ -41,9 +43,13 @@ enum GitBranchCache {
         return entry.state
     }
 
-    /// Git 실행 도중 메타데이터가 바뀌지 않은 일반 브랜치만 저장하며 항목 수를 제한한다.
+    /// Git 실행 도중 메타데이터가 바뀌지 않은 브랜치 또는 detached HEAD만 저장한다.
     static func store(_ state: GitBranchState, directory: String, before: Fingerprint?) {
-        guard state.kind == .branch, let before, state.name == before.branch,
+        guard let before,
+              let fullHead = String(data: before.head, encoding: .utf8)?.trimmingCharacters(in: .newlines),
+              (state.kind == .branch && !before.detached && state.name == before.branch) ||
+                (state.kind == .detached && before.detached && before.branch == nil &&
+                    state.name.map { fullHead.hasPrefix($0) } == true),
               fingerprint(directory: directory) == before else { return }
         lock.lock(); defer { lock.unlock() }
         if entries.count >= 256, entries[directory] == nil { entries.removeAll(keepingCapacity: true) }
@@ -77,12 +83,30 @@ enum GitBranchCache {
                 commonDirectory = resolve(path, relativeTo: gitDirectory)
             } else { commonDirectory = gitDirectory }
             let head = try smallFile(gitDirectory.appendingPathComponent("HEAD"), limit: 4096)
-            guard let rawHead = String(data: head, encoding: .utf8), rawHead.hasPrefix("ref: refs/heads/") else { return nil }
-            let branch = String(rawHead.dropFirst("ref: refs/heads/".count)).trimmingCharacters(in: .newlines)
-            guard !branch.isEmpty, !branch.contains("\0"), !branch.contains(".."), !branch.contains("\n"), !branch.contains("\r") else { return nil }
-            return Fingerprint(branch: branch, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
-                marker: marker, commonMarker: commonMarker, head: head,
-                looseReference: try optionalFile(commonDirectory.appendingPathComponent("refs/heads/" + branch), limit: 4096),
+            guard let rawHead = String(data: head, encoding: .utf8) else { return nil }
+            let headValue = rawHead.trimmingCharacters(in: .newlines)
+            let branch: String?, detached: Bool
+            if headValue.hasPrefix("ref: refs/heads/") {
+                let name = String(headValue.dropFirst("ref: refs/heads/".count))
+                guard !name.isEmpty, !name.contains("\0"), !name.contains(".."), !name.contains("\n"), !name.contains("\r") else { return nil }
+                branch = name; detached = false
+            } else if !headValue.hasPrefix("ref:"), [40, 64].contains(headValue.utf8.count), headValue.allSatisfy(\.isHexDigit) {
+                branch = nil; detached = true
+            } else { return nil }
+            if detached {
+                // Retain config identity because invalid repository format or
+                // extensions must continue to surface Git's diagnostic result.
+                guard let objectStore = try objectStoreIdentity(gitDirectory.appendingPathComponent("objects")) else { return nil }
+                return Fingerprint(branch: nil, detached: true, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
+                    marker: marker, commonMarker: commonMarker, head: head, objectStore: objectStore, looseReference: nil,
+                    packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs")),
+                    config: try optionalFile(commonDirectory.appendingPathComponent("config"), limit: 131072),
+                    worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree"), limit: 131072))
+            }
+            guard let branch else { return nil }
+            let looseReference = try optionalFile(commonDirectory.appendingPathComponent("refs/heads/" + branch), limit: 4096)
+            return Fingerprint(branch: branch, detached: detached, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
+                marker: marker, commonMarker: commonMarker, head: head, objectStore: nil, looseReference: looseReference,
                 packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs")),
                 config: try optionalFile(commonDirectory.appendingPathComponent("config"), limit: 131072),
                 worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree"), limit: 131072))
@@ -139,5 +163,35 @@ enum GitBranchCache {
         return FileIdentity(device: info.st_dev, inode: info.st_ino, size: info.st_size,
             modifiedSeconds: info.st_mtimespec.tv_sec, modifiedNanoseconds: info.st_mtimespec.tv_nsec,
             changedSeconds: info.st_ctimespec.tv_sec, changedNanoseconds: info.st_ctimespec.tv_nsec)
+    }
+
+    /// Detached abbreviations are unique within the object database. Track its
+    /// shallow directory entries so new loose objects or packs invalidate them.
+    /// Alternates can change elsewhere, so repositories using them stay uncached.
+    private static func objectStoreIdentity(_ objects: URL) throws -> [String: FileIdentity]? {
+        let alternates = objects.appendingPathComponent("info/alternates")
+        var alternateInfo = stat()
+        if lstat(alternates.path, &alternateInfo) == 0 { return nil }
+        guard errno == ENOENT else { throw MetadataError.unreadable }
+        let names = try FileManager.default.contentsOfDirectory(atPath: objects.path)
+        var result: [String: FileIdentity] = [:]
+        func add(_ url: URL, key: String) throws {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { throw MetadataError.unreadable }
+            guard info.st_mode & S_IFMT == S_IFDIR || info.st_mode & S_IFMT == S_IFREG else { throw MetadataError.unreadable }
+            result[key] = FileIdentity(device: info.st_dev, inode: info.st_ino, size: info.st_size,
+                modifiedSeconds: info.st_mtimespec.tv_sec, modifiedNanoseconds: info.st_mtimespec.tv_nsec,
+                changedSeconds: info.st_ctimespec.tv_sec, changedNanoseconds: info.st_ctimespec.tv_nsec)
+        }
+        for name in names.sorted() {
+            let url = objects.appendingPathComponent(name)
+            try add(url, key: name)
+            if name == "pack" {
+                for child in try FileManager.default.contentsOfDirectory(atPath: url.path).sorted() {
+                    try add(url.appendingPathComponent(child), key: "pack/" + child)
+                }
+            }
+        }
+        return result
     }
 }
