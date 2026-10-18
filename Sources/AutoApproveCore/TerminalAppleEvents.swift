@@ -235,7 +235,8 @@ enum TerminalAppleEvents {
 
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.
-    static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false) throws -> TerminalSnapshot? {
+    static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false,
+                        preflight: Bool = true) throws -> TerminalSnapshot? {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
             throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
         }
@@ -246,13 +247,14 @@ enum TerminalAppleEvents {
         let batchTitles = incompatibleTitlesPID != pid
         lock.unlock()
         if unsupported { return nil }
-        let target = NSAppleEventDescriptor(processIdentifier: pid)
         // Never request a new permission from a background read. Explicit setup
         // retains the existing osascript consent behaviour if it is needed.
-        let access = AEDeterminePermissionToAutomateTarget(target.aeDesc!, aeCode("core"), aeCode("getd"), false)
-        if access == errAEEventNotPermitted { throw TerminalAdapterError.permissionDenied }
-        if access == errAEEventWouldRequireUserConsent { return nil }
-        guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
+        if preflight {
+            let access = readAccess(pid: pid)
+            if access == errAEEventNotPermitted { throw TerminalAdapterError.permissionDenied }
+            if access == errAEEventWouldRequireUserConsent { return nil }
+            guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
+        }
         let reader = TerminalAppleEventReader(batchTitles: batchTitles, titleBatchUnavailable: {
             lock.lock(); incompatibleTitlesPID = pid; lock.unlock()
         }) { subject, timeout in
@@ -281,5 +283,19 @@ enum TerminalAppleEvents {
             return nil
         }
         catch TerminalReadEventError.timedOut { throw AppError.message("Terminal 화면 조회 시간이 초과되었습니다.") }
+    }
+    /// A compatibility read must obtain a fresh result; no completed grant is cached.
+    static func readPermission() throws -> Bool {
+        guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
+            throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
+        }
+        let access = readAccess(pid: application.processIdentifier)
+        if access == errAEEventNotPermitted || access == errAEEventWouldRequireUserConsent { return false }
+        guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
+        return true
+    }
+    private static func readAccess(pid: pid_t) -> OSStatus {
+        let target = NSAppleEventDescriptor(processIdentifier: pid)
+        return AEDeterminePermissionToAutomateTarget(target.aeDesc!, aeCode("core"), aeCode("getd"), false)
     }
 }

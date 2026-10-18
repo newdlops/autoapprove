@@ -742,6 +742,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Terminal text-only legacy reads skip titles and retain identity, cursor and denial checks", tests.testTerminalTextOnlyLegacyReadsSkipTitlesWithoutWeakeningIdentity),
             ("Native Terminal reads keep exact predicates and original Unicode text", tests.testNativeTerminalReadUsesExactPredicatesAndPreservesText),
             ("Native Terminal first text skips every presentation query", tests.testNativeTerminalFirstTextSkipsAllPresentationQueries),
+            ("Remote native reads retain authorization, exact fallback and revocation", tests.testRemoteNativeReadKeepsAuthorizationAndExactFallback),
+            ("Remote native reads stop at every cancellation boundary", tests.testRemoteNativeReadCancellationStopsEveryBoundary),
             ("Native Terminal live presentation binds and rechecks exact selected windows", tests.testNativeTerminalPresentationBindsAndRechecksSelectedWindow),
             ("Native Terminal reads isolate closed/ambiguous targets and stop on denial", tests.testNativeTerminalReadIsolatesClosedAndAmbiguousTargetsAndStopsOnDenial),
             ("Native Terminal reads budget cancellation and reject reordered metadata", tests.testNativeTerminalReadBudgetsCancellationAndRejectsReorderedMetadata),

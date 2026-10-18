@@ -97,8 +97,8 @@ public struct ScreenHostAdapter: Sendable {
                 completeResume: { try TerminalAdapter.completeResume(target: $0, stop: $1) },
                 restart: { try TerminalAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) },
-                presentationScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeTitles: false) },
-                initialScreens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false, includeTitles: false) })
+                presentationScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty)) },
+                initialScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty), includeCursor: false) })
         case .iterm:
             return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
@@ -316,6 +316,20 @@ public enum TerminalAdapter {
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true) throws -> TerminalSnapshot {
         if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles, includeCursor: includeCursor) { return snapshot }
+        return try scriptScreens(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles)
+    }
+    /// The engine has just checked Automation, including before cached frames.
+    /// Each native send still enforces current OS permission without prompting.
+    static func remoteScreens(ttys: [String], includeCursor: Bool = true) throws -> TerminalSnapshot {
+        try TerminalRemoteRead.read(native: {
+            try TerminalAppleEvents.screens(ttys: ttys, includeTitles: false, includeCursor: includeCursor, preflight: false)
+        }, fallbackPermission: {
+            try TerminalAppleEvents.readPermission()
+        }, script: {
+            try scriptScreens(ttys: ttys, includeCursor: includeCursor, includeTitles: false)
+        })
+    }
+    private static func scriptScreens(ttys: [String], includeCursor: Bool, includeTitles: Bool) throws -> TerminalSnapshot {
         let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles))
         let data = Data(output.utf8)
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
