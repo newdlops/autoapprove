@@ -24,6 +24,20 @@ private func terminalBatchTargets(_ query: NSAppleEventDescriptor) -> [String]? 
 }
 
 extension ApprovalTests {
+    func testNativeTerminalDiagnosticsTagExactSendWithoutRetainingSourceText() throws {
+        let timing = RemoteTerminalPerformance()
+        let reader = TerminalAppleEventReader(diagnostics:timing,purpose:.validation) { _,_ in
+            throw NSError(domain:NSOSStatusErrorDomain,code:-1712,userInfo:[NSLocalizedDescriptionKey:"PRIVATE_SOURCE_TEXT"])
+        }
+        try expectThrows(try reader.screens(ttys:["/dev/PRIVATE_TTY"],includeTitles:false))
+        let events = timing.snapshot().nativeReads!.events
+        try expectEqual(events.count,1)
+        try expectEqual(events.first?.purpose,.validation); try expectEqual(events.first?.query,.text)
+        try expectEqual(events.first?.targets,1); try expectEqual(events.first?.failure,.timeout)
+        let text = String(decoding:try JSONEncoder().encode(timing.snapshot()),as:UTF8.self)
+        try expect(!text.contains("PRIVATE"))
+    }
+
     func testNativeTerminalFirstTextSkipsAllPresentationQueries() throws {
         var queries = 0
         let raw = "원본 é 🙂\n\u{1b}[31mtext\u{1b}[0m\u{0}\n"

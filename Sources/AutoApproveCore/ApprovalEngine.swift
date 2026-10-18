@@ -234,7 +234,7 @@ import TerminalInputSupport
         var reviewDetail: String?
     }
 
-    public init(paths: AppPaths = AppPaths(), terminalReader: @escaping @Sendable ([String]) throws -> TerminalSnapshot = { try TerminalAdapter.screens(ttys: $0, includeCursor: false) }, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
+    public init(paths: AppPaths = AppPaths(), terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
                 webLoopbackOnly: Bool = false) throws {
@@ -245,8 +245,7 @@ import TerminalInputSupport
         self.powerControl = powerControl
         mouseActivity = MouseActivity(control: mouseActivityControl)
         keepAwakeSwitch = KeepAwakeSwitch(control: powerControl, marker: paths.directory.appendingPathComponent("keep-awake.hold").path)
-        var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0)) })
-        adapters[.terminal]?.screens = { targets in try terminalReader(targets.map(\.tty)) }
+        var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0, terminalReader:terminalReader)) })
         adapters[.pty] = managedPTY.adapter
         adapters[.tmux] = tmuxRelay.adapter
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
@@ -3601,7 +3600,7 @@ import TerminalInputSupport
     private func safetyRead(_ original: AgentSession) async throws -> String {
         if let host = ScreenHost(channel: original.channel), let adapter = screenAdapters[host] {
             let target = ScreenTarget(tty: original.tty, handle: original.screenHandle, sourcePID: original.pid, sourceStarted: original.started)
-            let snapshot = try await Task.detached { try adapter.screens([target]) }.value
+            let snapshot = try await Task.detached { try adapter.readForValidation([target]) }.value
             guard let screen = snapshot.screens.first(where: { $0.tty == original.tty }) else { throw AppError.message("원본 화면 연결이 필요합니다.") }
             return screen.contents
         }
@@ -3626,7 +3625,7 @@ import TerminalInputSupport
             guard fresh == expected, safetyInputAllowed(original, noticeID: noticeID) else { return .screenChanged }
             return try await Task.detached {
                 // Relay keys ordinarily tolerate output changes; safety actions don't.
-                guard try adapter.screens([target]).screens.first(where: { $0.tty == target.tty })?.contents == expected else { return TerminalDelivery.screenChanged }
+                guard try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents == expected else { return TerminalDelivery.screenChanged }
                 guard try reader().contains(where: { $0.pid == original.pid && $0.started == original.started && $0.agent == original.agent
                     && "/dev/" + $0.tty == original.tty && $0.isForeground }) else { return .agentMissing }
                 return try adapter.input(target, expected, original.agent, input)
@@ -4299,7 +4298,7 @@ import TerminalInputSupport
                 exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); publish(); return
             }
             let target = ScreenTarget(tty:context.session.tty,handle:context.session.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
-            let first = try await Task.detached { try adapter.screens([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            let first = try await Task.detached { try adapter.readForValidation([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
             guard mayLaunch() else { return }
             guard let first, SessionExitRecovery.emptyShellPrompt(first) else {
                 exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
@@ -4316,7 +4315,7 @@ import TerminalInputSupport
             guard mayLaunch() else { return }
             let fresh = try await Task.detached { try reader() }.value
             guard mayLaunch(), context.verifiedShell(in:fresh) != nil else { return }
-            let screen = try await Task.detached { try adapter.screens([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            let screen = try await Task.detached { try adapter.readForValidation([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
             guard mayLaunch() else { return }
             guard screen == first else { exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); return }
             context.state = "launching"; context.deadline = Date(); context.attempts += 1; exitRecoveries[id] = context

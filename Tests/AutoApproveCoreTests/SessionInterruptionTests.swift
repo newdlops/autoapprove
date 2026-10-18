@@ -22,6 +22,7 @@ private final class ExitProbe: @unchecked Sendable {
     var commands: [String] = []
     var uncertain = false
     var replies: [TerminalDelivery] = []
+    var validationReads = 0
     var screen = "To continue this session, run codex resume 00000000-0000-4000-8000-000000000061\nqa% "
     func read() -> [ProcessRecord] { lock.lock(); defer {lock.unlock()}; return records }
     func launch(_ command: String) throws -> TerminalDelivery {
@@ -273,7 +274,10 @@ extension ApprovalTests {
             42 41 ttys901 42 42 Mon Sep 21 09:00:01 2026 /usr/local/bin/claude
             """)
             let probe = ExitProbe(); probe.records = records; probe.uncertain = uncertain
-            let adapter = ScreenHostAdapter(screens:{ targets in TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:probe.screen)}) },approve:{_,_,_ in .sent},reveal:{_ in nil},restart:{_,_,command in try probe.launch(command)})
+            let adapter = ScreenHostAdapter(screens:{ targets in TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:probe.screen)}) },approve:{_,_,_ in .sent},reveal:{_ in nil},restart:{_,_,command in try probe.launch(command)},
+                validationScreens:{ targets in
+                    probe.lock.withLock { probe.validationReads += 1 }
+                    return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:probe.screen)}) })
             let paths = AppPaths(directory:directory)
             let engine = try ApprovalEngine(paths:paths,claudeRegistryReader:{_ in []},processReader:{probe.read()},screenAdapters:[.terminal:adapter])
             await engine.connectScreenHost(.terminal)
@@ -286,6 +290,7 @@ extension ApprovalTests {
             engine.updateDiscovery([],records:[shell]); try await Task.sleep(for:.milliseconds(30)); engine.updateDiscovery([],records:[shell])
             try await Task.sleep(for:.milliseconds(1400))
             try expectEqual(probe.commands.count,1)
+            try expect(probe.lock.withLock { probe.validationReads } >= 2, "Exit recovery must freshly compare the original contents twice")
             try expect(probe.commands[0].contains("'--resume' '00000000-0000-4000-8000-000000000061'"))
             try expectEqual(engine.snapshot.sessions.first?.interruption?.recoveryStatus,uncertain ? "review" : "awaiting")
             engine.stop()

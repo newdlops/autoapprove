@@ -1,6 +1,13 @@
 import Foundation
 import AutoApproveCore
 
+private final class NativeTimingClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 0
+    func now() -> TimeInterval { lock.withLock { value } }
+    func set(_ value: TimeInterval) { lock.withLock { self.value = value } }
+}
+
 private final class ConnectionReadGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var blocked = false, allowed = true, total = 0, completed = 0, mainThread = false, expired = false
@@ -26,6 +33,95 @@ private final class ConnectionReadGate: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testCustomTerminalReaderRemainsTheOnlyValidationChannel() throws {
+        let target = ScreenTarget(tty:"/dev/fixture-injected"), probe = ConnectionReadGate()
+        let adapter = ScreenHostAdapter.live(.terminal,terminalReader:{ targets in
+            _ = probe.read()
+            guard targets == [target.tty] else { throw AppError.message("Injected identity changed") }
+            throw TerminalAdapterError.permissionDenied
+        })
+        // Fail before any platform callback if a custom reader retained a live
+        // native validation channel. This regression fixture never sends AEs.
+        try expect(adapter.validationScreens == nil,"A custom reader must replace the platform validation channel")
+        for _ in 0..<2 {
+            do { _ = try adapter.readForValidation([target]); throw AppError.message("Injected denial was ignored") }
+            catch TerminalAdapterError.permissionDenied {}
+        }
+        try expectEqual(probe.count,2,"Each validation must freshly call the injected reader")
+    }
+
+    func testNativeQueryDiagnosticsRetainOnlyBoundedSlowOrFailedReads() throws {
+        let clock = NativeTimingClock(), timing = RemoteTerminalPerformance(clock: { clock.now() })
+        // A fast successful send must not allocate a retained event.
+        let fast = timing.measureNativeQuery(purpose:.firstFrame,query:.text,targets:1,remaining:8) { clock.set(0.1); return 42 }
+        try expectEqual(fast,42); try expect(timing.snapshot().nativeReads!.events.isEmpty)
+        for index in 0..<40 {
+            clock.set(Double(index))
+            timing.measureNativeQuery(purpose:.monitor,query:.bulkTitle,targets:17,remaining:7,
+                reply:{ _ in .init(kind:123,items:17) }) { clock.set(Double(index)+0.5) }
+        }
+        let native = timing.snapshot().nativeReads!
+        try expectEqual(native.events.count,32); try expectEqual(native.events.first?.started,8)
+        try expectEqual(native.events.last?.started,39); try expectEqual(native.active,0)
+        try expectEqual(native.maximumActive,1)
+        let event = native.events.last!
+        try expectEqual(event.durationMS,500); try expectEqual(event.remainingMS,7000)
+        try expectEqual(event.purpose,.monitor); try expectEqual(event.query,.bulkTitle)
+        try expectEqual(event.targets,17); try expectEqual(event.reply?.items,17)
+        try expectEqual(event.reply?.kind,123); try expect(!event.overlapped)
+        let payload = try JSONEncoder().encode(timing.snapshot()), text = String(decoding:payload,as:UTF8.self)
+        for privateField in ["sessionID","tty","contents","address","pid","cwd"] { try expect(!text.contains(privateField)) }
+        // Older diagnostics remain decodable without the new optional section.
+        let old = try JSONDecoder().decode(RemoteTerminalPerformance.Snapshot.self,
+            from:Data("{\"sampleLimit\":256,\"stages\":{},\"counters\":{}}".utf8))
+        try expect(old.nativeReads == nil)
+    }
+
+    func testNativeQueryDiagnosticsPreserveErrorsAndReleaseOverlappingReads() throws {
+        let clock = NativeTimingClock(), timing = RemoteTerminalPerformance(clock:{clock.now()})
+        timing.measureNativeQuery(purpose:.monitor,query:.bulkBefore,targets:4,remaining:8) {
+            clock.set(1)
+            timing.measureNativeQuery(purpose:.liveFrame,query:.selectedWindow,targets:1,remaining:6) { clock.set(1.5) }
+            clock.set(2)
+        }
+        let overlap = timing.snapshot().nativeReads!
+        try expectEqual(overlap.maximumActive,2); try expectEqual(overlap.active,0)
+        try expectEqual(overlap.events.count,2); try expect(overlap.events.allSatisfy(\.overlapped))
+        try expectEqual(overlap.events.map(\.inFlightAtStart),[2,1])
+        for (index,error) in [NSError(domain:NSOSStatusErrorDomain,code:-1743),NSError(domain:NSOSStatusErrorDomain,code:-1712)].enumerated() {
+            clock.set(Double(index)+3)
+            do {
+                try timing.measureNativeQuery(purpose:.validation,query:.text,targets:1,remaining:4) { throw error }
+                throw AppError.message("The original error must propagate")
+            } catch let received as NSError { try expect(received === error) }
+        }
+        do { try timing.measureNativeQuery(purpose:.other,query:.text,targets:1,remaining:4) { throw CancellationError() } }
+        catch is CancellationError {}
+        let failures = timing.snapshot().nativeReads!.events.suffix(3)
+        try expectEqual(failures.map(\.failure),[.permission,.timeout,.cancelled])
+        // An unusable measurement must still release its in-flight slot.
+        timing.measureNativeQuery(purpose:.other,query:.other,targets:0,remaining:.infinity) { clock.set(.nan) }
+        try expectEqual(timing.snapshot().nativeReads!.active,0)
+        try expectEqual(timing.snapshot().nativeReads!.events.count,5)
+    }
+
+    func testValidationReadPrefersExactChannelAndDoesNotFallbackAfterFailure() throws {
+        let target = ScreenTarget(tty:"/dev/fixture-validation",handle:"pane",jobPIDs:[42],sourcePID:42,sourceStarted:"fixture")
+        let expected = TerminalSnapshot(screens:[TerminalScreen(tty:target.tty,contents:"Fresh original")])
+        let error = NSError(domain:"fixture",code:19)
+        var adapter = ScreenHostAdapter(screens:{ _ in throw error },approve:{_,_,_ in .missingTarget},reveal:{_ in nil},
+            validationScreens:{ targets in
+                guard targets == [target] else { throw AppError.message("Target identity changed") }
+                return expected
+            })
+        try expectEqual(try adapter.readForValidation([target]).screens.first?.contents,"Fresh original")
+        adapter.screens = { _ in expected }; adapter.validationScreens = { _ in throw error }
+        do { _ = try adapter.readForValidation([target]); throw AppError.message("A validation error must not fall back") }
+        catch let received as NSError { try expect(received === error) }
+        adapter.validationScreens = nil
+        try expectEqual(try adapter.readForValidation([target]).screens.first?.contents,"Fresh original")
+    }
+
     private func awaitConnectionCondition(_ predicate: () -> Bool) async throws {
         let deadline = ProcessInfo.processInfo.systemUptime+2
         while !predicate(), ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for:.milliseconds(5)) }
@@ -48,7 +144,7 @@ extension ApprovalTests {
         try expect(abs(sample.medianMS-895) < 0.00001); try expect(abs(sample.p95MS-1011) < 0.00001)
         try expect(abs(sample.maximumMS-1023) < 0.00001)
         let data = try JSONEncoder().encode(snapshot), object = try JSONSerialization.jsonObject(with:data) as! [String:Any]
-        try expectEqual(Set(object.keys),Set(["stages","counters","sampleLimit"]))
+        try expectEqual(Set(object.keys),Set(["stages","counters","sampleLimit","nativeReads"]))
         let serialized = String(decoding:data,as:UTF8.self)
         for field in ["sessionID","tty","contents","address","pid","cwd"] { try expect(!serialized.contains(field)) }
         try expectEqual(snapshot.counters["sharedInitialReads"],1)

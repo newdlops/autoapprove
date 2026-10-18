@@ -239,7 +239,7 @@ public enum RemoteTerminalAdapter {
     public static func input(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput) throws -> TerminalDelivery {
         try input.validate()
         if input.kind == .choice, host == .terminal {
-            let latest = try TerminalAdapter.screens(ttys: [target.tty], includeCursor: false, includeTitles: false)
+            let latest = try TerminalAdapter.screens(ttys: [target.tty], includeCursor: false, includeTitles: false, purpose: .validation)
             guard latest.screens.first(where: { $0.tty == target.tty })?.contents == expected else { return .screenChanged }
         }
         if host == .terminal, input.isRelay || ![.text, .submit, .enter].contains(input.kind) {

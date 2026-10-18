@@ -65,6 +65,7 @@ public struct ScreenHostAdapter: Sendable {
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
     public var presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
+    public var validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var approve: @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery
     /// nil means the host revealed the tab but reports no window frame to highlight.
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
@@ -82,15 +83,22 @@ public struct ScreenHostAdapter: Sendable {
                 restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)? = nil,
                 input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget },
                 presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
-                initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
+                initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
+                validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
         self.initialScreens = initialScreens
+        self.validationScreens = validationScreens
     }
-    public static func live(_ host: ScreenHost) -> ScreenHostAdapter {
+    /// Validation consumes only fresh text. A channel failure must propagate;
+    /// retrying through presentation could compare a different original frame.
+    public func readForValidation(_ targets: [ScreenTarget]) throws -> TerminalSnapshot {
+        try (validationScreens ?? screens)(targets)
+    }
+    public static func live(_ host: ScreenHost, terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil) -> ScreenHostAdapter {
         switch host {
         case .terminal:
-            return ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false) },
+            var adapter = ScreenHostAdapter(screens: { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false, purpose: .monitor) },
                 approve: { try TerminalAdapter.approve(tty: $0.tty, expectedScreen: $1, agent: $2) },
                 reveal: { try TerminalAdapter.reveal(tty: $0.tty) },
                 resume: { try TerminalAdapter.resume(target: $0, region: $1, text: $2) },
@@ -98,7 +106,13 @@ public struct ScreenHostAdapter: Sendable {
                 restart: { try TerminalAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) },
                 presentationScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty)) },
-                initialScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty), includeCursor: false) })
+                initialScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty), includeCursor: false) },
+                validationScreens: { try TerminalAdapter.screens(ttys:$0.map(\.tty),includeCursor:false,includeTitles:false,purpose:.validation) })
+            if let terminalReader {
+                adapter.screens = { try terminalReader($0.map(\.tty)) }
+                adapter.validationScreens = nil
+            }
+            return adapter
         case .iterm:
             return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
@@ -185,7 +199,7 @@ public enum TerminalAdapter {
         return bound
     }
     private static func resumeRead(_ target: ScreenTarget) throws -> String {
-        guard let screen = try screens(ttys: [target.tty], includeCursor: false, includeTitles: false).screens.first(where: { $0.tty == target.tty }) else {
+        guard let screen = try screens(ttys: [target.tty], includeCursor: false, includeTitles: false, purpose: .validation).screens.first(where: { $0.tty == target.tty }) else {
             throw AppError.message("재시도할 원본 터미널 화면을 확인하지 못했습니다.")
         }
         return screen.contents
@@ -314,15 +328,17 @@ public enum TerminalAdapter {
         try AutomationScript.run(body, app: "Terminal", denied: .permissionDenied)
     }
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
-    public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true) throws -> TerminalSnapshot {
-        if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles, includeCursor: includeCursor) { return snapshot }
+    public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true,
+                               purpose: RemoteTerminalPerformance.NativePurpose = .other) throws -> TerminalSnapshot {
+        if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles, includeCursor: includeCursor, purpose: purpose) { return snapshot }
         return try scriptScreens(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles)
     }
     /// The engine has just checked Automation, including before cached frames.
     /// Each native send still enforces current OS permission without prompting.
     static func remoteScreens(ttys: [String], includeCursor: Bool = true) throws -> TerminalSnapshot {
         try TerminalRemoteRead.read(native: {
-            try TerminalAppleEvents.screens(ttys: ttys, includeTitles: false, includeCursor: includeCursor, preflight: false)
+            try TerminalAppleEvents.screens(ttys: ttys, includeTitles: false, includeCursor: includeCursor, preflight: false,
+                purpose: includeCursor ? .liveFrame : .firstFrame)
         }, fallbackPermission: {
             try TerminalAppleEvents.readPermission()
         }, script: {

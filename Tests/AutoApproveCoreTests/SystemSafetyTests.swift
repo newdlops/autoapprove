@@ -22,6 +22,9 @@ private final class SafetyProbe: @unchecked Sendable {
     var screen = safetyPrompt(), records = safetyRecords
     var inputs: [RemoteTerminalInput] = [], approvals = 0, newlineFirst = false, userDraft = false, uncertain = false
     var afterCancel: (() -> Void)?
+    var validationOnly = false
+    private var validationReads = 0
+    var validationReadCount: Int { lock.withLock { validationReads } }
     var counts: [Int] { lock.withLock { [inputs.filter { $0.kind == .escape }.count, inputs.filter { $0.kind == .characters }.count, inputs.filter { $0.kind == .enter }.count, approvals] } }
     func read() -> String { lock.withLock { screen } }
     func processes() -> [ProcessRecord] { lock.withLock { records } }
@@ -46,9 +49,14 @@ private final class SafetyProbe: @unchecked Sendable {
         }
     }
     var adapter: ScreenHostAdapter {
-        ScreenHostAdapter(screens: { [self] targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: read()) }) },
+        ScreenHostAdapter(screens: { [self] targets in
+            if lock.withLock({ validationOnly }) { throw AppError.message("Fixture presentation read is unavailable") }
+            return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: read()) }) },
             approve: { [self] _,_,_ in lock.withLock { approvals += 1 }; return .sent }, reveal: { _ in nil },
-            input: { [self] _,expected,_,input in try write(expected,input) })
+            input: { [self] _,expected,_,input in try write(expected,input) },
+            validationScreens: { [self] targets in
+                lock.withLock { validationReads += 1 }
+                return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: read()) }) })
     }
 }
 @MainActor private func safetyEngine(_ paths: AppPaths, probe: SafetyProbe) throws -> ApprovalEngine {
@@ -184,12 +192,13 @@ extension ApprovalTests {
     @MainActor func testSystemSafetyScreenRedirectHandlesNewlineWithoutApproval() async throws {
         let paths = AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent("aa-safety-screen-" + UUID().uuidString))
         defer { try? FileManager.default.removeItem(at: paths.directory) }
-        let probe = SafetyProbe(); probe.newlineFirst = true
+        let probe = SafetyProbe(); probe.newlineFirst = true; probe.validationOnly = true
         let engine = try safetyEngine(paths, probe: probe); defer { engine.stop() }
         try engine.setAutomatic(safetyCodex.key, enabled: true)
         engine.receiveScreen(sessionID: safetyCodex.key, raw: probe.read(), generation: "fixture-original")
         try await waitSafety { engine.snapshot.sessions.first?.systemSafety?.phase == .guided }
         try expectEqual(probe.counts, [1, 1, 2, 0], "Escape, one guidance text and Enter-only retry; never Yes")
+        try expect(probe.validationReadCount >= 3, "Safety reads and immediate write rechecks use the content-only channel")
         try expectEqual(engine.snapshot.sessions.first?.pid, safetyCodex.pid)
         try expect(engine.snapshot.events.contains { $0.outcome == "안전한 대안 안내 전달 확인" })
         try expectEqual(engine.snapshot.sessions.first?.notices?.first?.isSystemSafety, true, "Strong warning is immediate without the ordinary question delay")

@@ -1,5 +1,15 @@
 # AutoApprove 검증 기록
 
+## 0.2.131 원본 터미널 검증 경량화 · 빌드 158
+
+- 안전 안내의 읽기·쓰기 직전 재검사와 종료 오류 복구의 전후 읽기, 네 contents-only 소비 경로를 별도 검증 reader로 연결했다. Terminal은 제목·커서를 생략하며 기존 fresh-read 횟수, PID·시작·TTY·foreground·권한·stale 검사와 단일 입력/복구 receipt를 유지한다. 다른 호스트는 기존 reader를 사용한다. 기본 감시 제목과 웹 첫 화면·실시간 표시 경로는 유지한다.
+- `terminalReader` 주입은 기본 `nil`과 구별한다. 주입 reader의 권한 거부를 native 검증으로 우회하던 초기 후보를 코드 검토에서 발견해 수정했다. 해당 회귀는 플랫폼 콜백 전에 RED를 확인했고, 주입 reader의 exact-target·최신 거부와 명시적 adapter 우선순위를 보존한다.
+- 실제 native send 중 250ms 이상이거나 실패한 조회만 메모리 ring32개에 보관하고 기존 명시적 timings API에 표시한다. 목적·조회 종류·대상 수·시간·남은 기한·동시 실행·숫자 응답 구조·오류 분류만 저장한다. 화면/TTY/경로/원문 오류를 기록하지 않으며 일반 상태·터미널 스트림 payload는 바꾸지 않는다. send 전 취소/기한과 send 후 decode 실패는 ring 범위 밖이고, 권한 오류의 code는 Swift NSError 변환 값일 수 있어 원시 OSStatus로 해석하지 않는다.
+- 기존 동작의 RED6개와 custom-reader RED1개를 확인한 뒤 전체 Release **341/341**이 통과했다. 독립 최종 검토에 Critical/Important 지적은 없다. 기존 SMJobBless 폐기 예정 경고는 남아 있다. 합성 read-only reader4096회·warmup 후 ABBA 각6표본의 CPU 중앙값은 진단 없음46.9475ms/있음46.334ms, checksum49,152·빠른 이벤트 저장0이다. 차이는 변동 범위로 보며 성능 개선율이나 실제 AE/앱/네트워크 결과로 확대하지 않는다. 최초 측정 도구의 C 모듈 검색 경로 누락은 비공개 실패 기록에 남겼다.
+- 설치157의17개 고유 원본을 읽는 native helper24회 ABBA에서는 모두 성공했다. batch12회 중앙값360.945ms·20events와 개별12회587.541ms·34events여서 batch는 유지한다. helper가 실제 앱의8초 지연을 재현하지 못했고 wrapper/프로세스 식별·추가 부하가 다르다. 실제 앱 per-send 진단으로 다음 원인을 좁히며8초 꼬리 지연의 해결을 주장하지 않는다.
+- 비공개 근거는 `.runtime/performance/lightweight-131/`, 전용 패키지/배포는 `.runtime/releases/0.2.131/lightweight-158/`다. 적용 전 두 Mac130/157·원본18/4를 확인했다. **157 및 이전 deploy.py를 재실행하지 않는다.**158도 실행 후 한 번만 사용한다. 원본 입력 테스트, 보안/VPN/TCC·root 서비스·전원/잠금·삭제한 Wi-Fi 기능 변경은 하지 않는다. 패키지/GitHub/적용 결과는 완료 후 기록한다. UI 변경과 새 브라우저·실물 휴대폰 검사는 없고 전체 목표는 active다.
+- 최종 버전 복사 뒤 링크된 Core89객체·모듈·검사 파일/변경 Swift 입력 동일성과 관련7검사가 통과했다. 서명 stdio15/15·입력 봉인·발행자 호환/위조 거절·격리 Claude 훅/웹/MCP/PTY·DMG 무결성/읽기 전용 마운트도 통과했다. App/CLI 각각35섹션과 웹13파일·공개 입력443개를 고정했다. DMG9,902,092바이트, SHA-256 `9efd82f010910276dc4f81fa41363bf74e6678a560b8d694751986e6ade27eaf`다. GitHub 게시와 실제 적용은 이어서 확인한다.
+
 ## 0.2.130 원본 웹 터미널의 중복 권한 예비 조회 제거 · 빌드 157
 
 - 원본 웹 터미널의 첫 텍스트·실시간 표시만 별도 읽기 경로를 사용한다. 성공한 native 읽기에서는 중복 `AEDeterminePermissionToAutomateTarget` 1회를 생략한다. 엔진의 최신 권한 확인은 캐시 응답 전에도 유지되며, 실제 native 전송의 `neverInteract`·`kAEDoNotPromptForUserConsent`와 권한 오류 전파도 유지한다. 기본 감시·설정·입력/재개 읽기와 정확한 TTY·프로세스·커서 검증은 바꾸지 않는다.

@@ -18,11 +18,16 @@ public struct TerminalAppleEventReader {
     private let timeout: TimeInterval
     private let batchTitles: Bool
     private let titleBatchUnavailable: () -> Void
+    private let diagnostics: RemoteTerminalPerformance?
+    private let purpose: RemoteTerminalPerformance.NativePurpose
 
     public init(timeout: TimeInterval = 8, clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-                batchTitles: Bool = true, titleBatchUnavailable: @escaping () -> Void = {}, send: @escaping Sender) {
+                batchTitles: Bool = true, titleBatchUnavailable: @escaping () -> Void = {},
+                diagnostics: RemoteTerminalPerformance? = nil, purpose: RemoteTerminalPerformance.NativePurpose = .other,
+                send: @escaping Sender) {
         self.timeout = timeout; self.clock = clock; self.send = send
         self.batchTitles = batchTitles; self.titleBatchUnavailable = titleBatchUnavailable
+        self.diagnostics = diagnostics; self.purpose = purpose
     }
 
     private func object(_ kind: String, form: String, selector: NSAppleEventDescriptor, container: NSAppleEventDescriptor = .null()) throws -> NSAppleEventDescriptor {
@@ -101,23 +106,28 @@ public struct TerminalAppleEventReader {
                         presentation: ((String, UInt32) -> TerminalTextSnapshot?)? = nil) throws -> TerminalSnapshot {
         try autoreleasepool {
             guard !ttys.isEmpty else { return TerminalSnapshot() }
+            var seen = Set<String>()
+            let targets = ttys.filter { seen.insert($0).inserted }
             let deadline = clock() + max(0, timeout)
-            func getValue(_ subject: NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
+            func getValue(_ subject: NSAppleEventDescriptor, _ query: RemoteTerminalPerformance.NativeQuery) throws -> NSAppleEventDescriptor {
                 try Task.checkCancellation()
                 let remaining = deadline - clock()
                 guard remaining > 0.02 else { throw TerminalReadEventError.timedOut }
+                if let diagnostics {
+                    return try diagnostics.measureNativeQuery(purpose:purpose,query:query,targets:targets.count,remaining:remaining,
+                        reply:{ .init(kind:$0.descriptorType,items:$0.numberOfItems) }) { try send(subject,remaining) }
+                }
                 return try send(subject, remaining)
             }
-            func get(_ subject: NSAppleEventDescriptor) throws -> [String] {
-                try strings(getValue(subject))
+            func get(_ subject: NSAppleEventDescriptor, _ query: RemoteTerminalPerformance.NativeQuery) throws -> [String] {
+                try strings(getValue(subject,query))
             }
             // An absolute ordinal has type 'abso', not a generic enumeration.
             guard let all = NSAppleEventDescriptor(descriptorType: aeCode("abso"), data: NSAppleEventDescriptor(enumCode: aeCode("all ")).data) else {
                 throw TerminalReadEventError.incompatible
             }
             let windows = try object("cwin", form: "indx", selector: all)
-            var result = TerminalSnapshot(), seen = Set<String>()
-            let targets = ttys.filter { seen.insert($0).inserted }
+            var result = TerminalSnapshot()
             var titlesByTTY: [String: String] = [:]
             if includeTitles, batchTitles, targets.count >= 4, targets.count <= 256 {
                 do {
@@ -125,9 +135,9 @@ public struct TerminalAppleEventReader {
                     // and input binding still use their own exact-TTY predicate.
                     let tabs = try matching("ttab", property: ["ttty"], ttys: targets, container: windows)
                     let values = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { () -> [String: String] in
-                        let before = try getValue(property("ttty", of: tabs))
-                        let names = try get(property("titl", of: tabs))
-                        let after = try getValue(property("ttty", of: tabs))
+                        let before = try getValue(property("ttty", of: tabs),.bulkBefore)
+                        let names = try get(property("titl", of: tabs),.bulkTitle)
+                        let after = try getValue(property("ttty", of: tabs),.bulkAfter)
                         let selected = try strings(before)
                         guard before.descriptorType == after.descriptorType, before.data == after.data,
                               selected.count == names.count, Set(selected).count == selected.count,
@@ -151,12 +161,12 @@ public struct TerminalAppleEventReader {
             for tty in targets {
                 do {
                     let tab = try matching("ttab", property: ["ttty"], tty: tty, container: windows)
-                    let contents = try RemoteTerminalPerformance.shared.measure(.terminalContents) { try get(property("pcnt", of: tab)) }
+                    let contents = try RemoteTerminalPerformance.shared.measure(.terminalContents) { try get(property("pcnt", of: tab),.text) }
                     guard contents.count <= 1 else { throw TerminalReadEventError.ambiguous }
                     guard let screen = contents.first else { continue }
                     var title: String?
                     if includeTitles { do {
-                        let titles = try titlesByTTY[tty].map { [$0] } ?? RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try get(property("titl", of: tab)) }
+                        let titles = try titlesByTTY[tty].map { [$0] } ?? RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try get(property("titl", of: tab),.customTitle) }
                         if titles.count == 1 { title = titles[0].trimmingCharacters(in: .whitespacesAndNewlines) }
                     } catch {
                         // A title may disappear after the screen was read. The
@@ -167,7 +177,7 @@ public struct TerminalAppleEventReader {
                     var output = TerminalScreen(tty: tty, contents: screen, title: title?.isEmpty == false ? title : nil)
                     if let presentation {
                         let selectedWindow = try matching("cwin", property: ["tcnt", "ttty"], tty: tty)
-                        let ids = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try getValue(property("ID  ", of: selectedWindow)) }
+                        let ids = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try getValue(property("ID  ", of: selectedWindow),.selectedWindow) }
                         var displays: [(UInt32, TerminalTextSnapshot)] = []
                         for id in Set(try windowIDs(ids)) {
                             try Task.checkCancellation()
@@ -176,7 +186,7 @@ public struct TerminalAppleEventReader {
                         // Native tab groups expose hidden virtual windows too.
                         // Never choose an arbitrary match or infer a cursor.
                         if displays.count == 1 {
-                            let confirmed = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try windowIDs(getValue(property("ID  ", of: selectedWindow))) }
+                            let confirmed = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { try windowIDs(getValue(property("ID  ", of: selectedWindow),.selectedConfirm)) }
                             if confirmed.contains(displays[0].0) {
                                 output.display = displays[0].1
                                 if displays[0].1.screen == screen { output.cursor = displays[0].1.cursor }
@@ -197,10 +207,10 @@ public struct TerminalAppleEventReader {
             }
             if includeTitles, result.screens.contains(where: { $0.title == nil }) {
                 do {
-                    let before = try getValue(property("ID  ", of: windows))
-                    let selected = try get(property("ttty", of: property("tcnt", of: windows)))
-                    let names = try get(property("pnam", of: windows))
-                    let after = try getValue(property("ID  ", of: windows))
+                    let before = try getValue(property("ID  ", of: windows),.windowBefore)
+                    let selected = try get(property("ttty", of: property("tcnt", of: windows)),.windowSelection)
+                    let names = try get(property("pnam", of: windows),.windowName)
+                    let after = try getValue(property("ID  ", of: windows),.windowAfter)
                     // Pair names only while the window identity/order is stable.
                     // This is presentation metadata, never an input binding.
                     if before.descriptorType == aeCode("list"), after.descriptorType == aeCode("list"),
@@ -236,7 +246,7 @@ enum TerminalAppleEvents {
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.
     static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false,
-                        preflight: Bool = true) throws -> TerminalSnapshot? {
+                        preflight: Bool = true, purpose: RemoteTerminalPerformance.NativePurpose = .other) throws -> TerminalSnapshot? {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
             throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
         }
@@ -257,7 +267,7 @@ enum TerminalAppleEvents {
         }
         let reader = TerminalAppleEventReader(batchTitles: batchTitles, titleBatchUnavailable: {
             lock.lock(); incompatibleTitlesPID = pid; lock.unlock()
-        }) { subject, timeout in
+        }, diagnostics: .shared, purpose: purpose) { subject, timeout in
             let event = NSAppleEventDescriptor(eventClass: aeCode("core"), eventID: aeCode("getd"),
                 targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid), returnID: -1, transactionID: 0)
             event.setParam(subject, forKeyword: aeCode("----"))
