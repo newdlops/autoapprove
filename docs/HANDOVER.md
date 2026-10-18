@@ -1,5 +1,13 @@
 # AutoApprove 작업 인계
 
+## 2026-10-18 원본 입력 검증의 제목 조회 경량화 · 0.2.129/156
+
+- 선택지 입력 검증과 오류 재개의 `resumeRead`가 사용하지 않는 제목을 읽지 않도록 했다. 기존 `includeTitles` 옵션을 JXA 호환 경로에도 전달한다. 기본 제목·커서 표시, 전후 창 ID와 정확한 TTY/내용/입력 검증은 유지한다. 필수 메타데이터의 null 응답과 의도한 생략을 구별한다.
+- 이전 동작의 제목 생략 회귀 실패와 후보 null 처리의 회귀 실패를 보존하고 수정했다. 전체 Release334/334·버전 복사 후 Core88객체/모듈/검사 파일 SHA 일치·관련13검사·서명 stdio15/15·입력 봉인/발행자 호환/위조 거절·격리 Claude/웹/MCP/PTY가 통과했다. 독립 검토에 차단 지적은 없다. 상세 범위와 실패한 검증 도구 실행은 [VALIDATION.md](../VALIDATION.md)에 있다.
+- 설치155에서 읽기 전용 native helper6회가18개 원본의17개 고유 TTY를 읽었다. 약8초의 실제 앱 메타데이터 지연은 helper에서 재현되지 않았으며 여전히 조사 대상이다. 전체 앱 CPU/메모리나 휴대폰 지연 개선율을 주장하지 않는다. 원본 입력/내용 기록0이다. SwiftPM이 Git 감시 응답을 기다리면 해당 명령에만 `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`를 적용한다.
+- 근거는 `.runtime/performance/lightweight-129/`, 전용 배포는 `.runtime/releases/0.2.129/lightweight-156/`다. 적용 전 두 Mac128/155·원본18/4다. **155 및 이전 배포 스크립트는 재실행하지 않는다.**156도 실행 후 한 번만 사용한 것으로 기록한다. 보안/VPN/TCC·root 서비스·전원/잠금·삭제한 Wi-Fi 기능과 무관한 편집기 변경을 보존한다. 게시/적용 결과는 완료 후 아래에 추가한다. 전체 목표는 active다.
+- DMG9,828,005바이트·SHA-256 `286ad8c7709f4cbf20e7a7c0186aa2210f85e52aac60433e383b61c83276c4de`이며 소스 입력441개와 App/CLI35개 섹션/웹13파일의 일치를 확인했다. DMG 검증/읽기 전용 마운트도 통과했다.
+
 ## 2026-10-18 웹 터미널 문자 한도 처리 경량화 · 0.2.128/155
 
 - `remoteTerminal`의 `presented`가 연속 UTF-8이면 바이트 수, 외부 Cocoa면 UTF-16 단위 수로 Character 수의 상한을 확인한다.160,000 이하일 때 전체 문자열을 사용하고, 나머지는 기존과 동일한 Character suffix다. 한도·원본·커서/색상·revision/stream·질문·입력/승인/권한 검증과 감시 주기는 유지하며 새 캐시는 없다.

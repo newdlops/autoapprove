@@ -104,4 +104,74 @@ extension ApprovalTests {
             try expectEqual(denied.evaluateScript("calls.enumerations")!.toInt32(), 0, "Automation denial must not trigger a fallback or more reads")
         }
     }
+
+    func testTerminalTextOnlyLegacyReadsSkipTitlesWithoutWeakeningIdentity() throws {
+        for count in [1, 20] {
+            for changed in [false, true] {
+                let context = batchTerminalContext("changing = \(changed ? "true" : "false");")
+                let ttys = (0..<count).map { "/dev/fixture-\($0)" }
+                let value = context.evaluateScript(try TerminalAdapter.screenScript(ttys: ttys + ttys, includeCursor: false, includeTitles: false))!
+                try expectNil(context.exception)
+                let snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: Data(value.toString().utf8))
+                try expectEqual(snapshot.screens.map(\.tty), ttys)
+                try expectEqual(snapshot.screens.map(\.contents), (0..<count).map { "Exact original \($0)" })
+                try expect(snapshot.screens.allSatisfy { $0.title == nil })
+                try expect(snapshot.failures.isEmpty)
+                try expectEqual(context.evaluateScript("calls.title")!.toInt32(), 0, "Fresh input validation cannot wait on custom-title reads")
+                try expectEqual(context.evaluateScript("calls.bulk")!.toInt32(), 3, "Keep both window identity reads and the predicate; skip selected-TTY and window-name metadata")
+                try expectEqual(context.evaluateScript("calls.enumerations")!.toInt32(), changed ? 1 : 0)
+                try expectEqual(context.evaluateScript("calls.contents")!.toInt32(), Int32(count))
+                try expectEqual(context.evaluateScript("calls.byID")!.toInt32(), 0)
+            }
+        }
+        for stage in ["bulk", "contents"] {
+            let context = batchTerminalContext("denied = '\(stage)';")
+            context.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture-0"], includeCursor: false, includeTitles: false))
+            try expectNotNil(context.exception)
+            context.exception = nil
+            try expectEqual(context.evaluateScript("calls.enumerations")!.toInt32(), 0, "A denied content or identity read must stop, with no fallback")
+            try expectEqual(context.evaluateScript("calls.title")!.toInt32(), 0)
+        }
+        let closed = batchTerminalContext("closed = true;")
+        let value = closed.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture-0", "/dev/fixture-1", "/dev/missing"], includeCursor: false, includeTitles: false))!
+        try expectNil(closed.exception)
+        let snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: Data(value.toString().utf8))
+        try expectEqual(snapshot.screens.map(\.tty), ["/dev/fixture-1"])
+        try expectEqual(snapshot.failures.map(\.tty), ["/dev/fixture-0"])
+
+        let cursor = batchTerminalContext()
+        let cursorValue = cursor.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture-1"], includeCursor: true, includeTitles: false))!
+        try expectNil(cursor.exception)
+        let object = try JSONSerialization.jsonObject(with: Data(cursorValue.toString().utf8)) as! JSONObject
+        let screen = (object["screens"] as! [JSONObject])[0]
+        try expect(screen["title"] is NSNull)
+        try expectEqual((screen["cursorWindow"] as? JSONObject)?["windowID"] as? Int, 2, "Skipping labels must retain exact selected-window cursor metadata")
+        try expectEqual(cursor.evaluateScript("calls.title")!.toInt32(), 0)
+
+        // A requested metadata collection returning null is invalid, not the
+        // same as deliberately omitting that collection for a text-only read.
+        for titles in [false, true] {
+            for field in titles ? ["selected", "names"] : ["selected"] {
+                let context = batchTerminalContext("""
+                const originalApplication = Application;
+                Application = () => {
+                  const app = originalApplication();
+                  \(field == "selected" ? "app.windows.selectedTab.tty = () => null;" : "Object.defineProperty(app.windows, 'name', {value:() => null});")
+                  return app;
+                };
+                """)
+                let value = context.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture-0"], includeCursor: true, includeTitles: titles))!
+                try expectNil(context.exception)
+                let data = Data(value.toString().utf8)
+                let snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
+                try expectEqual(snapshot.screens.count, 1)
+                try expectEqual(snapshot.screens[0].contents, "Exact original 0")
+                try expectEqual(snapshot.screens[0].title, titles ? "Window 0" : nil)
+                try expectEqual(context.evaluateScript("calls.enumerations")!.toInt32(), 1, "Malformed required metadata must retain the fresh per-window fallback")
+                let object = try JSONSerialization.jsonObject(with: data) as! JSONObject
+                let screen = (object["screens"] as! [JSONObject])[0]
+                try expectEqual((screen["cursorWindow"] as? JSONObject)?["windowID"] as? Int, 1)
+            }
+        }
+    }
 }

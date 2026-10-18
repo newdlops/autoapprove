@@ -185,7 +185,7 @@ public enum TerminalAdapter {
         return bound
     }
     private static func resumeRead(_ target: ScreenTarget) throws -> String {
-        guard let screen = try screens(ttys: [target.tty], includeCursor: false).screens.first(where: { $0.tty == target.tty }) else {
+        guard let screen = try screens(ttys: [target.tty], includeCursor: false, includeTitles: false).screens.first(where: { $0.tty == target.tty }) else {
             throw AppError.message("재시도할 원본 터미널 화면을 확인하지 못했습니다.")
         }
         return screen.contents
@@ -316,7 +316,7 @@ public enum TerminalAdapter {
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true) throws -> TerminalSnapshot {
         if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles, includeCursor: includeCursor) { return snapshot }
-        let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor))
+        let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles))
         let data = Data(output.utf8)
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
         guard includeCursor else { return snapshot }
@@ -334,12 +334,13 @@ public enum TerminalAdapter {
         return snapshot
     }
     /// Exposed for contract tests against Terminal's scripting dictionary, without sending Apple events.
-    public static func screenScript(ttys: [String], includeCursor: Bool = true) throws -> String {
+    public static func screenScript(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true) throws -> String {
         let allowed = try literal(ttys)
         return """
         (() => {
         const app = Application('com.apple.Terminal');
         const allowed = new Set(\(allowed)); const screens = []; const failures = [];
+        const readTitles = \(includeTitles ? "true" : "false"), readCursor = \(includeCursor ? "true" : "false");
         function checkPermission(error) {
           if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
         }
@@ -358,12 +359,13 @@ public enum TerminalAdapter {
           // JXA rejects an _or containing fewer than two clauses.
           const predicate = ttys.length === 1 ? {tty:ttys[0]} : {_or:ttys.map(tty => ({tty:tty}))};
           const groups = app.windows.tabs.whose(predicate)();
-          const selected = app.windows.selectedTab.tty();
-          const names = app.windows.name();
+          const selected = readTitles || readCursor ? app.windows.selectedTab.tty() : null;
+          const names = readTitles ? app.windows.name() : null;
           const after = app.windows.id();
-          if (!Array.isArray(ids) || !Array.isArray(groups) || !Array.isArray(selected) || !Array.isArray(names)
-              || !Array.isArray(after) || ids.length !== groups.length || ids.length !== selected.length
-              || ids.length !== names.length || JSON.stringify(ids) !== JSON.stringify(after)
+          if (!Array.isArray(ids) || !Array.isArray(groups) || !Array.isArray(after) || ids.length !== groups.length
+              || (readTitles || readCursor) && (!Array.isArray(selected) || ids.length !== selected.length)
+              || readTitles && (!Array.isArray(names) || ids.length !== names.length)
+              || JSON.stringify(ids) !== JSON.stringify(after)
               || groups.some(tabs => !Array.isArray(tabs))) throw Error('Terminal window list changed');
           const remaining = new Set(allowed), result = {screens:[], failures:[]};
           for (let index = 0; index < groups.length; index++) for (const tab of groups[index]) {
@@ -372,11 +374,13 @@ public enum TerminalAdapter {
               tty = tab.tty();
               if (!remaining.has(tty)) continue;
               let title = null;
-              try { title = String(tab.customTitle() || '').trim() || null; } catch (error) { checkPermission(error); }
-              if (!title && selected[index] === tty) title = String(names[index] || '').trim() || null;
+              if (readTitles) {
+                try { title = String(tab.customTitle() || '').trim() || null; } catch (error) { checkPermission(error); }
+                if (!title && selected[index] === tty) title = String(names[index] || '').trim() || null;
+              }
               let cursorWindow = null;
               try {
-                if (\(includeCursor ? "true" : "false") && selected[index] === tty && tab.selected()) {
+                if (readCursor && selected[index] === tty && tab.selected()) {
                   const window = app.windows.byId(ids[index]);
                   if (window.selectedTab().tty() === tty) cursorWindow = {windowID:Number(ids[index]), title:String(window.name()), bounds:window.bounds()};
                 }
@@ -402,12 +406,14 @@ public enum TerminalAdapter {
               if (!allowed.has(tty)) continue;
               // A tab has customTitle, not name. Window name belongs only to its selected tab.
               let title = null;
-              try { title = String(tab.customTitle() || '').trim() || null; } catch (_) {}
-              if (!title) try {
-                if (tabs.length === 1 || tab.selected()) title = String(window.name() || '').trim() || null;
-              } catch (_) {}
+              if (readTitles) {
+                try { title = String(tab.customTitle() || '').trim() || null; } catch (_) {}
+                if (!title) try {
+                  if (tabs.length === 1 || tab.selected()) title = String(window.name() || '').trim() || null;
+                } catch (_) {}
+              }
               let cursorWindow = null;
-              try { if (\(includeCursor ? "true" : "false") && tab.selected()) cursorWindow = {windowID:Number(window.id()), title:String(window.name()), bounds:window.bounds()}; } catch (_) {}
+              try { if (readCursor && tab.selected()) cursorWindow = {windowID:Number(window.id()), title:String(window.name()), bounds:window.bounds()}; } catch (_) {}
               screens.push({tty:tty, contents:tab.contents(), title:title, cursorWindow:cursorWindow});
               allowed.delete(tty);
               if (!allowed.size) break screenWindows;
