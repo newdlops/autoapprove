@@ -7,6 +7,9 @@
 - 설치155에서 읽기 전용 native helper6회가18개 원본의17개 고유 TTY를 읽었다. 약8초의 실제 앱 메타데이터 지연은 helper에서 재현되지 않았으며 여전히 조사 대상이다. 전체 앱 CPU/메모리나 휴대폰 지연 개선율을 주장하지 않는다. 원본 입력/내용 기록0이다. SwiftPM이 Git 감시 응답을 기다리면 해당 명령에만 `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`를 적용한다.
 - 근거는 `.runtime/performance/lightweight-129/`, 전용 배포는 `.runtime/releases/0.2.129/lightweight-156/`다. 적용 전 두 Mac128/155·원본18/4다. **155 및 이전 배포 스크립트는 재실행하지 않는다.**156도 실행 후 한 번만 사용한 것으로 기록한다. 보안/VPN/TCC·root 서비스·전원/잠금·삭제한 Wi-Fi 기능과 무관한 편집기 변경을 보존한다. 게시/적용 결과는 완료 후 아래에 추가한다. 전체 목표는 active다.
 - DMG9,828,005바이트·SHA-256 `286ad8c7709f4cbf20e7a7c0186aa2210f85e52aac60433e383b61c83276c4de`이며 소스 입력441개와 App/CLI35개 섹션/웹13파일의 일치를 확인했다. DMG 검증/읽기 전용 마운트도 통과했다.
+- [GitHub v0.2.129](https://github.com/newdlops/autoapprove/releases/tag/v0.2.129)의 최신 정식 게시·주석 태그·소스 `8cb7bbc6cb5df42999a84bdf26deef124fc69bd9`·자산2개·원자적 push와441개 tag/manifest를 확인했다. 정상 TLS/IPv4 익명 다운로드 바이트·크기·SHA도 같다. 태그는 고정하고 게시 결과 문서만 후속 커밋한다. `verify-source.py`는 릴리스 소스 HEAD에서 실행했으므로 문서 커밋 뒤 HEAD와 태그 차이를 구분한다.
+- **156 deploy.py도 이미 한 번 실행됐으므로 재실행하지 않는다.** 두 Mac129/156·원본18/4·준비된 입력 지원18/4·직접/중계 HTTP200·로컬 자산을 확인했다. 기존 설정/승인 기록/root 프로세스·실행 횟수·파일을 보존했다. 초기 지원0은 별도 startup 결과에 남겼다. 이전 배포 스크립트도 재실행하지 않는다.
+- 상대 원본3개 동시30초는 전송 오류/조기 종료0·이벤트11/17/17회·HTTP 본문10,333바이트였다. 사전 읽기 뒤 첫 프레임0.992~1.277초이며 콜드 스타트/휴대폰/장기 성능으로 확대하지 않는다. 상대의 메타데이터 최대7,990ms·내용 최대7,644ms·각 실패3건과 live frame 중앙값1.534초는 별도 남은 병목이다. 로컬 메타데이터 최대53ms와 구분해 **다음은 상대 Mac의 native AE/커서 조회를 분리**한다. 근거는156 폴더의 `stability-streams.json`·`stage-timings-postinstall-streams.json`이며 stage 수집은 label 인수를 전달한다. 원본 입력/내용 저장0이고 전체 목표는 active다.
 
 ## 2026-10-18 웹 터미널 문자 한도 처리 경량화 · 0.2.128/155
 
