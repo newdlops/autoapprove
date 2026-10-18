@@ -129,6 +129,106 @@ extension ApprovalTests {
         try expect(bridgeAnswer(try afterLostResponse.handleClaudeHook(permission, at: now.addingTimeInterval(4)))!.isEmpty)
     }
 
+    func testClaudeSavedResponseValidatesWholePayloadAndAcknowledgement() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try hookEngine(paths), now = Date(), payload = hookPayload(now)
+        defer { engine.stop() }
+        _ = try engine.handleClaudeHook(payload, at: now)
+        try engine.answerClaudeApproval(sessionID: hookSession(21), requestID: payload["requestID"] as! String, at: now)
+        let answer = bridgeAnswer(try engine.handleClaudeHook(payload, at: now))!
+        let mutations: [(inout JSONObject) -> Void] = [
+            { $0["tool_input"] = ["questions": []] },
+            { $0["cwd"] = "/different/fixture" },
+            { $0["hook_event_name"] = "PermissionRequest" },
+            { $0["session_id"] = "another-provider" },
+            { $0["agentPID"] = 22 },
+            { $0["agentStarted"] = "another-start" },
+            { $0["tty"] = "/dev/ttys038" },
+            { $0["autoapproveExpiresAt"] = now.addingTimeInterval(599).timeIntervalSince1970 },
+            { $0["tool_name"] = "Read" },
+            { $0["tool_use_id"] = "another-tool" },
+            { $0["extra"] = "e\u{301} 🤖 /\u{0000}\u{0004}" }
+        ]
+        for mutate in mutations {
+            var changed = payload; mutate(&changed)
+            try expectThrows(try engine.handleClaudeHook(changed, at: now))
+            try engine.acknowledgeClaudeHook(changed, at: now)
+            try expectEqual(engine.snapshot.events.first?.outcome, "답변 대기열 등록", "A changed envelope cannot acknowledge the saved answer")
+        }
+        let invalid: [(inout JSONObject) -> Void] = [
+            { $0["autoapproveProtocol"] = 2 },
+            { $0["requestID"] = "not-a-uuid" },
+            { $0.removeValue(forKey: "hook_event_name") },
+            { $0.removeValue(forKey: "session_id") },
+            { $0["session_id"] = "" },
+            { $0["autoapproveExpiresAt"] = now.timeIntervalSince1970 },
+            { $0["autoapproveExpiresAt"] = now.addingTimeInterval(611).timeIntervalSince1970 },
+            { $0["autoapproveExpiresAt"] = Double.infinity },
+            { $0["autoapproveExpiresAt"] = Double.nan }
+        ]
+        for mutate in invalid {
+            var changed = payload; mutate(&changed)
+            try expect(bridgeAnswer(try engine.handleClaudeHook(changed, at: now))!.isEmpty)
+            try engine.acknowledgeClaudeHook(changed, at: now)
+            try expectEqual(engine.snapshot.events.first?.outcome, "답변 대기열 등록")
+        }
+        try engine.acknowledgeClaudeHook(payload, at: now)
+        try engine.acknowledgeClaudeHook(payload, at: now)
+        try expectEqual(engine.snapshot.events.count, 1)
+        try expectEqual(engine.snapshot.events.first?.outcome, "질문 응답 전달")
+        let repeated = bridgeAnswer(try engine.handleClaudeHook(payload, at: now))!
+        try expectEqual(try JSONSerialization.data(withJSONObject: repeated, options: .sortedKeys),
+                        try JSONSerialization.data(withJSONObject: answer, options: .sortedKeys))
+    }
+
+    func testPendingClaudeHookRechecksChangedInstallerSource() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try hookEngine(paths), now = Date()
+        defer { engine.stop() }
+        let tools = paths.directory.appendingPathComponent("tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let script = tools.appendingPathComponent("install_fixture.py")
+        try "print('synthetic report')".write(to: script, atomically: true, encoding: .utf8)
+        var request = hookPayload(now)
+        request["hook_event_name"] = "PermissionRequest"; request["tool_name"] = "Bash"
+        request["cwd"] = paths.directory.path
+        request["tool_input"] = ["command": "python3 tools/install_fixture.py --install"]
+        try expect(bridgeWaiting(try engine.handleClaudeHook(request, at: now)))
+        func risk() -> SystemCommandRisk? {
+            engine.snapshot.sessions.first { $0.id == hookSession(12) }?.backgroundChildren
+                .first { $0.id == hookSession(21) }?.claudeApprovals?.first?.systemCommandRisk
+        }
+        try expectNil(risk())
+        // Write text only: this synthetic installer is never executed.
+        try "Path.home().joinpath('Library/LaunchAgents/com.fixture.test.plist').write_text('fixture')"
+            .write(to: script, atomically: true, encoding: .utf8)
+        try expect(bridgeWaiting(try engine.handleClaudeHook(request, at: now.addingTimeInterval(1))))
+        try expectEqual(risk()?.kind, .persistence, "An undecided request must inspect current installer source again")
+        try expect(engine.snapshot.events.isEmpty)
+    }
+
+    func testClaudeHookPreparationRespectsEffectiveSessionDirectory() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try hookEngine(paths), now = Date()
+        defer { engine.stop() }
+        let tools = paths.directory.appendingPathComponent("tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        try "Path.home().joinpath('Library/LaunchAgents/com.fixture.test.plist').write_text('fixture')"
+            .write(to: tools.appendingPathComponent("install_fixture.py"), atomically: true, encoding: .utf8)
+        var start = hookPayload(now)
+        start["hook_event_name"] = "SessionStart"; start["cwd"] = paths.directory.path
+        _ = try engine.handleClaudeHook(start, at: now)
+        try engine.setAutomatic(hookSession(12), enabled: true)
+        var request = hookPayload(now)
+        request["tool_name"] = "Bash"; request.removeValue(forKey: "cwd")
+        request["tool_input"] = ["command": "python3 tools/install_fixture.py --install"]
+        let response = bridgeAnswer(try engine.handleClaudeHook(request, at: now))
+        let output = response?["hookSpecificOutput"] as? JSONObject
+        try expectEqual(output?["permissionDecision"] as? String, "deny",
+                        "A missing payload cwd must use the current session directory for installer inspection")
+        try expectEqual(engine.snapshot.events.first?.outcome, "시스템 변경 거절 · 안전한 대안 안내")
+    }
+
     func testClaudeHookPauseManualAndConcurrentIsolation() throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date()

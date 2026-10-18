@@ -13,6 +13,15 @@ const children = [], connections = new Set();
 let daemon, proxy, dropped = false, dropApprovalResponse = false, diagnostics = '';
 const helperCalls = [];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Keep the fixture's advertised loopback port literal in managed runtimes,
+// including when a restarted listener reuses its saved port preference.
+function preserveFixturePort(port) {
+  if (process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS === undefined) return;
+  const ports = process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS || '';
+  if (!ports.split(',').map(value => value.trim()).includes(String(port))) {
+    process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS = ports ? ports + ',' + port : String(port);
+  }
+}
 function request(method, params = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(path.join(state, 'bridge.sock'));
@@ -39,8 +48,14 @@ function start(executable, args, options = {}) {
   child.stderr.on('data', chunk => { diagnostics += chunk; }); children.push(child); return child;
 }
 async function startServer() {
-  daemon = start(binary, ['serve', '--home', state], { env: { ...process.env, CLAUDE_CONFIG_DIR: path.join(root, 'config') } });
+  daemon = start(binary, ['serve', '--loopback', '--home', state], { env: { ...process.env, CLAUDE_CONFIG_DIR: path.join(root, 'config') } });
   await until(async () => { try { return await request('status'); } catch { return false; } }, 'server');
+  const web = await until(async () => { const value = await request('web'); return value.ready && value; }, 'isolated web listener');
+  preserveFixturePort(web.port);
+  assert.deepEqual(web.urls, ['http://127.0.0.1:' + web.port], 'The hook fixture must remain loopback-only');
+  assert.equal(web.peerCount, 0, 'The hook fixture must not discover physical Macs');
+  const network = await (await fetch(web.urls[0] + '/api/network')).json();
+  assert.equal(network.nodes.length, 1, 'The hook fixture must not publish or join the physical LAN');
 }
 async function stop(child) {
   if (child.exitCode === null && child.signalCode === null) { child.kill('SIGTERM'); await new Promise(resolve => child.once('close', resolve)); }
@@ -58,6 +73,9 @@ function helper(session, index, home = state) {
     if (code !== 0) reject(Error(`Helper exited ${code}: ${diagnostics}`));
     else { try { resolve(JSON.parse(output)); } catch (error) { reject(error); } }
   }));
+  // Cleanup can terminate a pending helper after another assertion failed.
+  // Keep that rejection from hiding the original failure; awaiting still rejects.
+  completion.catch(() => {});
   child.stdin.end(JSON.stringify(payload));
   return { child, completion, question, ended: () => ended };
 }
@@ -132,7 +150,7 @@ try {
   const handoff = helper(session, 5), pending = await current(session);
   await request('claudeRelease', { sessionID: session.id, requestID: pending.id });
   assert.deepEqual(await handoff.completion, {});
-  console.log(`PASS real helper: 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts and terminal handoff`);
+  console.log(`PASS loopback-isolated real helper: no LAN peers, 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts and terminal handoff`);
 } finally {
   for (const socket of connections) socket.destroy();
   if (proxy) await new Promise(resolve => proxy.close(resolve));

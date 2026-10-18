@@ -28,6 +28,35 @@ struct ClaudeHookReceipt: Codable {
     var acknowledged = false
 }
 
+/// Validate the complete wire identity before reading a receipt. Saved replies
+/// and ACKs do not need to rebuild questions, summaries or command analysis.
+struct ClaudeHookEnvelope {
+    let payload: JSONObject
+    let id: String
+    let fingerprint: String
+    let sessionID: String
+    let expiresAt: Date
+    let event: String
+    let providerID: String
+    var isQuestion: Bool { payload["tool_name"] as? String == "AskUserQuestion" }
+
+    init?(_ payload: JSONObject, at now: Date) {
+        guard payload["autoapproveProtocol"] as? Int == 1,
+              let id = payload["requestID"] as? String, UUID(uuidString: id) != nil,
+              let event = payload["hook_event_name"] as? String,
+              let provider = payload["session_id"] as? String, !provider.isEmpty,
+              let expiry = payload["autoapproveExpiresAt"] as? Double, expiry.isFinite,
+              expiry > now.timeIntervalSince1970, expiry <= now.timeIntervalSince1970 + 610,
+              let bytes = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return nil }
+        self.payload = payload; self.id = id; self.event = event; providerID = provider
+        fingerprint = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let pid = (payload["agentPID"] as? NSNumber)?.int32Value ?? 0
+        let started = payload["agentStarted"] as? String ?? ""
+        sessionID = pid > 0 && !started.isEmpty ? "process:\(pid):\(started)" : "claude:\(provider)"
+        expiresAt = Date(timeIntervalSince1970: expiry)
+    }
+}
+
 struct ClaudeHookRequest {
     let payload: JSONObject
     let id: String
@@ -50,19 +79,13 @@ struct ClaudeHookRequest {
     var isQuestion: Bool { tool == "AskUserQuestion" }
 
     init?(_ payload: JSONObject, at now: Date) {
-        guard payload["autoapproveProtocol"] as? Int == 1,
-              let id = payload["requestID"] as? String, UUID(uuidString: id) != nil,
-              let event = payload["hook_event_name"] as? String,
-              let provider = payload["session_id"] as? String, !provider.isEmpty,
-              let expiry = payload["autoapproveExpiresAt"] as? Double, expiry.isFinite,
-              expiry > now.timeIntervalSince1970, expiry <= now.timeIntervalSince1970 + 610,
-              let bytes = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return nil }
+        guard let envelope = ClaudeHookEnvelope(payload, at: now) else { return nil }
+        self.init(envelope)
+    }
+    init(_ envelope: ClaudeHookEnvelope) {
+        let payload = envelope.payload, id = envelope.id, event = envelope.event, provider = envelope.providerID
         self.payload = payload; self.id = id
-        fingerprint = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-        let pid = (payload["agentPID"] as? NSNumber)?.int32Value ?? 0
-        let started = payload["agentStarted"] as? String ?? ""
-        sessionID = pid > 0 && !started.isEmpty ? "process:\(pid):\(started)" : "claude:\(provider)"
-        expiresAt = Date(timeIntervalSince1970: expiry)
+        fingerprint = envelope.fingerprint; sessionID = envelope.sessionID; expiresAt = envelope.expiresAt
         tool = payload["tool_name"] as? String ?? ""
         let input = payload["tool_input"] as? JSONObject ?? [:]
         questions = tool == "AskUserQuestion" && ["PreToolUse", "PermissionRequest"].contains(event) && (input["answers"] as? JSONObject)?.isEmpty != false

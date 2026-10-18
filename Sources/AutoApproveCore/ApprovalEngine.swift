@@ -2763,6 +2763,9 @@ import TerminalInputSupport
 
     /// Legacy helpers pass unanswered requests back to Claude. New helpers use the durable bridge below.
     public func handleHook(_ payload: JSONObject, deferApproval: Bool = false) -> JSONObject {
+        handleHook(payload, deferApproval: deferApproval, prepared: nil)
+    }
+    private func handleHook(_ payload: JSONObject, deferApproval: Bool, prepared: ClaudeHookRequest?) -> JSONObject {
         guard let event = payload["hook_event_name"] as? String,
               let providerID = payload["session_id"] as? String, !providerID.isEmpty,
               let requestID = payload["requestID"] as? String else { return [:] }
@@ -2797,11 +2800,18 @@ import TerminalInputSupport
         if !lineageVerified { session.detail = "메인 세션의 실행 상태를 확인하지 못해 백그라운드 자동 승인을 멈췄습니다." }
         let tool = payload["tool_name"] as? String ?? ""
         let input = payload["tool_input"] as? JSONObject ?? [:]
-        let summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
-        let request = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
+        let summary = prepared?.summary ?? QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
+        let request: String?
+        if let prepared { request = prepared.inputJSON }
+        else { request = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) } }
         let needsAnswer = ["AskUserQuestion", "ExitPlanMode", "EnterPlanMode"].contains(tool)
-        let risk = ["PreToolUse", "PermissionRequest"].contains(event)
+        let risk: SystemCommandRisk?
+        // A missing/empty payload cwd can inherit a different session cwd.
+        // Reinspect in that effective directory; never cache installer sources.
+        if let prepared, (payload["cwd"] as? String ?? "") == session.cwd { risk = prepared.systemCommandRisk }
+        else { risk = ["PreToolUse", "PermissionRequest"].contains(event)
             ? SystemCommandRisk.detect(tool: tool, input: input, summary: summary, cwd: session.cwd) : nil
+        }
         if event != "Notification" { session.systemCommandRisk = risk }
         if ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest"].contains(event) {
             if event == "UserPromptSubmit" || claudeWorkIDs[key] == nil { claudeWorkIDs[key] = UUID().uuidString }
@@ -2969,19 +2979,20 @@ import TerminalInputSupport
 
     /// Polls carry the original UUID and full input, so a restarted app can resume the exact hook.
     public func handleClaudeHook(_ payload: JSONObject, at now: Date = Date()) throws -> JSONObject {
-        guard let request = ClaudeHookRequest(payload, at: now) else { return bridgeResponse([:]) }
-        var receipt: ClaudeHookReceipt
-        if let saved = try store.claudeHook(id: request.id) {
-            guard saved.fingerprint == request.fingerprint else { throw AppError.message("같은 요청 ID의 내용이 달라 응답하지 않았습니다.") }
-            receipt = saved
+        guard let envelope = ClaudeHookEnvelope(payload, at: now) else { return bridgeResponse([:]) }
+        let saved = try store.claudeHook(id: envelope.id)
+        if let saved {
+            guard saved.fingerprint == envelope.fingerprint else { throw AppError.message("같은 요청 ID의 내용이 달라 응답하지 않았습니다.") }
             if let response = saved.response {
-                removeLiveClaudeHook(request.id)
+                removeLiveClaudeHook(envelope.id)
                 publish()
                 return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
             }
-        } else {
-            receipt = ClaudeHookReceipt(id: request.id, fingerprint: request.fingerprint, sessionID: request.sessionID,
+        }
+        let request = ClaudeHookRequest(envelope)
+        var receipt = saved ?? ClaudeHookReceipt(id: request.id, fingerprint: request.fingerprint, sessionID: request.sessionID,
                 logicalID: request.logicalID, createdAt: now, expiresAt: request.expiresAt)
+        if saved == nil {
             if let logicalID = request.logicalID, let previous = try store.claudeHook(logicalID: logicalID), previous.expiresAt > now {
                 // PreToolUse -> PermissionRequest is the same tool call, not another approval.
                 if previous.audit?.outcome.hasPrefix("시스템 변경 거절") == true,
@@ -2998,13 +3009,13 @@ import TerminalInputSupport
         }
         if request.response == nil && request.questions == nil && request.safetyResponse == nil {
             invalidateClaudeHooks(for: payload, sessionID: request.sessionID)
-            let response = handleHook(payload)
+            let response = handleHook(request.payload, deferApproval: false, prepared: request)
             receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
             try saveClaudeReceipt(receipt)
             return bridgeResponse(response)
         }
         if liveClaudeHooks[request.id] == nil {
-            _ = handleHook(payload, deferApproval: true)
+            _ = handleHook(request.payload, deferApproval: true, prepared: request)
             // Never offer a button for a guessed process or an already-ended session.
             guard sessions[request.sessionID]?.phase != .ended,
                   records.contains(where: { $0.key == request.sessionID && $0.agent == .claude }) else {
@@ -3135,7 +3146,7 @@ import TerminalInputSupport
     }
 
     public func acknowledgeClaudeHook(_ payload: JSONObject, at now: Date = Date()) throws {
-        guard let request = ClaudeHookRequest(payload, at: now), var receipt = try store.claudeHook(id: request.id),
+        guard let request = ClaudeHookEnvelope(payload, at: now), var receipt = try store.claudeHook(id: request.id),
               receipt.fingerprint == request.fingerprint, receipt.response != nil, !receipt.acknowledged else { return }
         receipt.acknowledged = true
         if receipt.audit?.outcome == "답변 대기열 등록" {
