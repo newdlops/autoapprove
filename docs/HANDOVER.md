@@ -7,9 +7,12 @@
 - 감시 분석 원문 합계 8MiB/화면 512KiB/32세션 제한, TTY 색인, 작은 부모 관계 색인 조회, detached HEAD 캐시와 HTTP/SSE 중복 인코딩 제거를 포함한다. 분석 객체 전체 RSS가 8MiB 이하라는 뜻은 아니다. 상세 근거와 한계는 [VALIDATION.md](../VALIDATION.md)에 있다.
 - 검토에서 Terminal contents 배치의 중첩 구조와 ABA 매핑 위험을 찾았고, 해당 실험은 이번 변경에서 제거했다. 실제 Terminal은 정확한 specifier 리스트도 -1700으로 거절했다. `TerminalAppleEvents.swift`와 해당 테스트는 이전 exact TTY 읽기를 그대로 유지한다. 기존 title batching은 이전 배포 상태다. 독립 검토의 최종 Critical/Important 지적은 없다.
 - 실제 비교 helper의 77,187개 바이트·에이전트 사례와 `--assert-efficient`, 최종 Release 빌드·전체 Core **329/329**가 통과했다. 첫 전체 실행의 dashboard peer 일시 실패 **328/329**와 단독/전체 재실행 통과를 구분한다. 진단 문구만 추가했으며 조건·제한 시간을 완화하거나 원인을 해결했다고 주장하지 않는다.
-- 서명/입력 봉인·발행자 호환/위조 거절·stdio **14/14**·격리 웹/MCP/PTY·DMG 검사가 통과했다. DMG **9,819,833바이트**, SHA-256 `1e1122b5400dc94dd2eb447dde2af75836046a3313efdccebbb22c754421a5fc`다. 이번 152 설치 파일은 준비됐으나 기존 Mac 설치본은 아직 교체하지 않았다.
+- 서명/입력 봉인·발행자 호환/위조 거절·stdio **14/14**·격리 웹/MCP/PTY·DMG 검사가 통과했다. DMG **9,819,833바이트**, SHA-256 `1e1122b5400dc94dd2eb447dde2af75836046a3313efdccebbb22c754421a5fc`다. 게시 당시에는 미설치였고, 아래 후속 단계에서 두 Mac에 적용했다.
 - 비공개 근거 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`와 패키지 `.runtime/releases/0.2.125/lightweight-152/`는 공개하지 않는다. 전체 경량화 목표는 active다.
 - [GitHub v0.2.125](https://github.com/newdlops/autoapprove/releases/tag/v0.2.125)의 최신 정식 릴리스·주석 태그·소스 `7ff2f5228eda80f63be403bb6b83b3bf0acc2da3`·자산 2개·원자적 push를 확인했다. 소스 입력 **435개**의 태그/manifest 일치와 정상 TLS/IPv4 익명 다운로드 바이트·크기·SHA-256을 확인했다. 게시 결과 문서만 후속 커밋하며 태그는 유지한다. 검증 당시 이 Mac 설치본 **0.2.124/151**과 GitHub 배포 **0.2.125/152**를 혼동하지 않는다. 원본 터미널·설정·root 서비스·권한/보안/VPN·전원/잠금·삭제한 Wi-Fi 기능과 무관한 편집기 변경을 보존했다.
+- 후속으로 두 Mac **125/152**·현재 Mac의 원본 프로세스 **21개**와 상대 원본 **3개**·직접 입력 지원·직접/중계 HTTP200을 확인했다. 로컬 설정·기존 승인 기록 **22,980건**·기존 root 프로세스/실행 횟수/파일을 보존했다. 현재 관리 앱 PID는 **91440**이다. **152 deploy.py는 이미 실행했으므로 재실행하지 않는다.** 이전147~151 설치 스크립트도 재실행하지 않는다. 입력 지원은 시작 직후 0과 준비 뒤21/3을 구분한다. 원본 입력0이다.
+- 실제 순차 6회 첫 화면 **31.2~45.2ms/6회 성공**과 별도 동시3개 **30초/오류0·이벤트5/6/6회**를 확인했다. 하지만 동시 첫 화면 **3.41~4.69초**가 남았으며 상대의 새 textRead 3회 중앙값 **3,552ms**와 대응한다. 대시보드/시간 조회는 수십 ms다. 네트워크·VPN·SentinelOne 원인으로 단정하지 말고 다음에는 이 원본 읽기의 동시 대기를 분리한다. 원문 읽기 배치를 다시 도입하거나 관찰의 유효 시간/입력 검증을 늘려 해결하지 않는다.
+- 새10초 스택에는 원본 Apple-event 대기와 ScreenAnalysis 생성이 보인다. 표본 수를 CPU 시간으로 해석하지 않는다. 실제 본체20초 CPU 설치 전/후 **0.870/1.066초**는 작업 시점이 달라 절감률 근거가 아니다. 152 본체 footprint는15초 **111.67~111.71MB**, 별도 스트림30초 **95.45~96.26MB**였다. 독립 stdio/root를 전체 자원 합계에 넣지 않았으며 전체 RAM/장기 누수 결론은 내리지 않는다. 근거 `.runtime/performance/lightweight-125/`와 배포 폴더의 `live-network-installed152.json`, `stability-streams.json`, `stage-timings-after-concurrent.json`을 함께 읽는다. 전체 목표는 active다.
 
 ## 2026-10-18 화면 변경 비교 경량화 · 0.2.124/151
 
