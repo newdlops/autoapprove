@@ -23,13 +23,14 @@ if(process.argv.includes('--reuse-binary')){
  const tailStart=activity.indexOf('        let tail ='),tailEnd=activity.indexOf('\n        guard !tail.isEmpty',tailStart);assert.ok(tailStart>=0&&tailEnd>tailStart);
  const tailProbe='\nextension ActivityDetector { static func fixtureTail(_ screen:String)->[String] {\n'+activity.slice(tailStart,tailEnd)+'\nreturn tail\n} }\n';
  const generated=path.join(directory,'ActivityTailCheck.swift');
- await writeFile(generated,'import AutoApproveCore\n'+activity+tailProbe+'\nprivate enum CodexResumeCheck {\n'+composer+'\n'+helpers.slice(start,end)+'\n}\n'+await readFile(fixture,'utf8'));
+ const generatedSource='import AutoApproveCore\n'+activity+tailProbe+'\nprivate enum CodexResumeCheck {\n'+composer+'\n'+helpers.slice(start,end)+'\n}\n'+await readFile(fixture,'utf8');
+ await writeFile(generated,generatedSource);
  const cache=path.resolve('.build/cache/ActivityTailCheck');await mkdir(cache,{recursive:true});
  const objectNames=(await readdir(build+'/AutoApproveCore.build')).filter(n=>n.endsWith('.swift.o')).sort();
  const objects=Object.fromEntries(await Promise.all(objectNames.map(async name=>[name,sha(await readFile(build+'/AutoApproveCore.build/'+name))])));
  execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),
   ...objectNames.map(n=>build+'/AutoApproveCore.build/'+n),generated,'-o',binary],{stdio:'inherit',timeout:120000});
- provenance={activitySourceSHA256:sha(activity),capacitySourceSHA256:sha(helpers),fixtureSHA256:sha(await readFile(fixture)),binarySHA256:sha(await readFile(binary)),
+ provenance={activitySourceSHA256:sha(activity),capacitySourceSHA256:sha(helpers),generatedSHA256:sha(generatedSource),fixtureSHA256:sha(await readFile(fixture)),binarySHA256:sha(await readFile(binary)),
   coreObjects:objects,coreFingerprint:sha(JSON.stringify(objects)),coreModuleSHA256:sha(await readFile(build+'/Modules/AutoApproveCore.swiftmodule')),
   scope:'Activity source copied verbatim; exact tail statement and isComposer/footer/goalStalled helpers. Other detector calls use the fingerprinted release Core.'};
  await writeFile(path.join(directory,'provenance.json'),JSON.stringify(provenance,null,2)+'\n',{mode:0o600});
@@ -37,9 +38,10 @@ if(process.argv.includes('--reuse-binary')){
 const result=JSON.parse(execFileSync(binary,[],{encoding:'utf8',timeout:60000,maxBuffer:2*1024*1024}));
 const median=values=>[...values].sort((a,b)=>a-b)[Math.floor(values.length/2)];
 const workloads=result.workloads.map(w=>({...w,cpuSeconds:median(w.trials.map(t=>t.cpuSeconds)),wallSeconds:median(w.trials.map(t=>t.wallSeconds))}));
-const report={label,...result,workloads,provenance};
+const tailWorkloads=(result.tailWorkloads??[]).map(w=>({...w,cpuSeconds:median(w.trials.map(t=>t.cpuSeconds)),wallSeconds:median(w.trials.map(t=>t.wallSeconds))}));
+const report={label,...result,workloads,tailWorkloads,provenance};
 await writeFile(path.join(directory,'report.json'),JSON.stringify(report,null,2)+'\n',{mode:0o600});
-console.log(JSON.stringify({...report,provenance:{...provenance,coreObjects:undefined},workloads:workloads.map(({trials,...w})=>w)}));
+console.log(JSON.stringify({...report,provenance:{...provenance,coreObjects:undefined},workloads:workloads.map(({trials,...w})=>w),tailWorkloads:tailWorkloads.map(({trials,...w})=>w)}));
 const reference=option('reference');
 if(reference){const old=JSON.parse(await readFile(reference,'utf8'));assert.equal(report.correctnessCases,old.correctnessCases);assert.equal(report.observationSHA256,old.observationSHA256,'All observations must remain byte-identical');assert.equal(provenance.fixtureSHA256,old.provenance.fixtureSHA256);}
 if(process.argv.includes('--assert-bounded')) for(const storage of ['swift','foundation'])for(const scenario of ['reused','changing']){

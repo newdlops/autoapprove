@@ -60,6 +60,22 @@ try {
     assert.deepEqual(values[2].result.tools.map(tool => tool.name), ['ask_user','get_user_answers','list_screens','start_screen_share','stop_screen_share']);
     assert.equal(values[3].error.code, -32601);
   });
+  const metadataIDs=[101,'다른 e\u0301 🤖/\u0000\u0004',null,true,['nested'],{id:'object'}];
+  await check('metadata keeps each ID and validates JSON-RPC before replying', [Buffer.concat([
+    ...metadataIDs.map(id=>line(message(id,'tools/list'))),
+    line({jsonrpc:'1.0',id:'wrong-version',method:'tools/list'}),
+    line({jsonrpc:2,id:'wrong-type',method:'tools/list'}),
+    line({jsonrpc:'2.0',method:'tools/list'}),line(message('after-metadata'))
+  ])], values=>{
+    assert.equal(values.length,metadataIDs.length+3);
+    for(let index=0;index<metadataIDs.length;index++){
+      assert.deepEqual(values[index].id,metadataIDs[index]);
+      assert.deepEqual(values[index].result.tools.map(t=>t.name),['ask_user','get_user_answers','list_screens','start_screen_share','stop_screen_share']);
+      for(const tool of values[index].result.tools){assert.equal(tool.annotations.destructiveHint,false);assert.equal(tool.annotations.openWorldHint,false);}
+    }
+    for(const index of [metadataIDs.length,metadataIDs.length+1])assert.equal(values[index].error.code,-32600);
+    assert.deepEqual(values.at(-1),result('after-metadata'));
+  });
   const unicode = line(message('한글🧪'));
   const split = unicode.indexOf(Buffer.from('한')) + 1;
   await check('UTF-8 split inside a scalar', [unicode.subarray(0, split), unicode.subarray(split, split+2), unicode.subarray(split+2)], values => assert.deepEqual(values, [result('한글🧪')]));

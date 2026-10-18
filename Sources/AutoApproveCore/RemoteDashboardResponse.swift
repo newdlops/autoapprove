@@ -2,6 +2,8 @@ import Foundation
 import CryptoKit
 
 extension RemoteDashboard {
+    private static let canonicalDateSuffix = Data(#","updatedAt":"1970-01-01T00:00:00Z"}"#.utf8)
+    private static let observationDateMember = Data(#","updatedAt":"#.utf8)
     /// Revalidate a newly read inventory, never a time-based server cache. Only
     /// the response's observation time is excluded; every session/control,
     /// peer failure, release and gateway identity participates in the validator.
@@ -10,8 +12,9 @@ extension RemoteDashboard {
         comparable.updatedAt = Date(timeIntervalSince1970: 0)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys]
-        let digest = SHA256.hash(data: try encoder.encode(comparable))
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        var encoded = try encoder.encode(comparable)
+        let digest = SHA256.hash(data: encoded)
             .map { String(format: "%02x", $0) }.joined()
         // updatedAt changes independently of content: use a weak validator.
         let tag = "W/\"\(digest)\""
@@ -21,7 +24,15 @@ extension RemoteDashboard {
         } ?? false
         var response: RemoteHTTPResponse
         if matches { response = RemoteHTTPResponse(status: 304, body: Data()) }
-        else { response = try .json(self) }
+        else if encoded.suffix(Self.canonicalDateSuffix.count) == Self.canonicalDateSuffix {
+            // sortedKeys puts this root member last. Reuse the encoded content
+            // rather than traverse every node/session a second time. Validate
+            // the exact suffix; future schema/encoder changes fall back safely.
+            encoded.removeLast(Self.canonicalDateSuffix.count)
+            encoded.append(Self.observationDateMember)
+            encoded.append(try encoder.encode(updatedAt)); encoded.append(125)
+            response = RemoteHTTPResponse(body: encoded)
+        } else { response = try .json(self) }
         response.entityTag = tag
         response.observedAt = updatedAt
         return response

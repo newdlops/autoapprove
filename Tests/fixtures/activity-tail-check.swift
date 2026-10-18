@@ -27,6 +27,10 @@ import CoreFoundation
         ActivityDetector.detect(screen, agent: .codex, permissionPrompt: { permission })
     }
 
+    @inline(never) static func tail(_ screen: String) -> [String] {
+        ActivityDetector.fixtureTail(screen)
+    }
+
     static func foundationString(_ text: String) -> String {
         let units = Array(text.utf16)
         let value = CFStringCreateWithCharacters(kCFAllocatorDefault, units, units.count)!
@@ -107,6 +111,32 @@ import CoreFoundation
             _ = ActivityDetector.detect(text, agent: agent, permissionPrompt: { invoked += 1; return false })
             try check(invoked == calls, "Permission detection order changed"); cases += 1
         }
+        // Exact repaired UTF-8 output, including surrogate pairs spanning a read
+        // boundary. These expectations are independent of either tail algorithm.
+        let malformed: [([UInt16], [String], Bool)] = [
+            ([0xD800, 0x000A, 0x0061], ["�", "a"], false),
+            ([0x0061, 0x000D, 0x000A, 0xDC00], ["a", "�"], false),
+            ([0xD83E, 0xDD16, 0x2028, 0x0065, 0x0301], ["🤖", "e\u{301}"], false),
+            ([0x0000, 0x000A, 0x200B, 0x000A, 0xFEFF], ["\u{0000}", "\u{FEFF}"], false),
+            ([0x000A, 0xD800, 0xD800, 0x000B, 0xDC00, 0x000C], ["��", "�"], true)
+        ]
+        for (units, lastRows, trailingBreak) in malformed {
+          for padding in [0, 239, 250, 251, 252, 253, 255, 256, 511] {
+            let oldRows = (1...18).map { "older row \($0)" }
+            let prefix = String(repeating: "unrelated output\n", count: 512) + oldRows.joined(separator: "\n") + "\n"
+            let pad = String(repeating: "x", count: padding), suffix = units + Array(pad.utf16)
+            let input = CFStringCreateWithCharacters(kCFAllocatorDefault, Array(prefix.utf16) + suffix, prefix.utf16.count + suffix.count)!
+            let text = unsafeBitCast(input, to: NSString.self) as String
+            var expectedLast = lastRows
+            if trailingBreak { if !pad.isEmpty { expectedLast.append(pad) } }
+            else { expectedLast[expectedLast.count - 1] += pad }
+            let expected = Array((oldRows + expectedLast).suffix(18))
+            let actual = tail(text)
+            try check(actual.map { Array($0.utf8) } == expected.map { Array($0.utf8) }, "Foreign UTF-16 repair/row boundary changed in case \(cases)")
+            for row in actual { digest.update(data: Data(row.utf8)); digest.update(data: Data([0])) }
+            cases += 1
+          }
+        }
         return (cases, digest.finalize().map { String(format: "%02x", $0) }.joined())
     }
 
@@ -114,7 +144,26 @@ import CoreFoundation
         let (cases, digest) = try correctness()
         let row = "Synthetic ignored output: 한글 Ω e\u{301} 👨‍👩‍👧‍👦 completed fixture step with unchanged state.\n"
         let tail = "Recent synthetic result\n›\n? for shortcuts\n"
-        var workloads: [[String: Any]] = [], checksum = 0
+        var workloads: [[String: Any]] = [], tailWorkloads: [[String: Any]] = [], checksum = 0
+        for repetitions in [8, 64] {
+          let row = String(repeating: "Tail 한글 e\u{301} 🤖 ", count: repetitions)
+          let original = String(repeating: "Ignored synthetic output\n", count: 4096)
+            + (1...18).map { "\($0) " + row }.joined(separator: "\n")
+          for bridged in [false, true] {
+            let text = bridged ? foundationString(original) : original
+            try check(text.isContiguousUTF8 != bridged, "Tail control must use both string storage forms")
+            var trials: [[String: Double]] = []
+            for _ in 0..<3 {
+              autoreleasepool {
+                let beforeCPU = cpu(), beforeWall = ProcessInfo.processInfo.systemUptime
+                for _ in 0..<256 { let rows = Self.tail(text); checksum += rows.count + rows[0].utf8.count }
+                trials.append(["cpuSeconds": cpu() - beforeCPU, "wallSeconds": ProcessInfo.processInfo.systemUptime - beforeWall])
+              }
+            }
+            tailWorkloads.append(["storage": bridged ? "foundation" : "swift", "rowRepetitions": repetitions,
+                "rounds": 256, "trials": trials])
+          }
+        }
         for bridged in [false, true] {
           for scenario in ["reused", "changing"] {
             let rounds = scenario == "reused" ? 160 : 32
@@ -145,7 +194,7 @@ import CoreFoundation
           }
         }
         var usage = rusage(); getrusage(RUSAGE_SELF, &usage)
-        let report: [String: Any] = ["correctnessCases": cases, "observationSHA256": digest, "workloads": workloads,
+        let report: [String: Any] = ["correctnessCases": cases, "observationSHA256": digest, "workloads": workloads, "tailWorkloads": tailWorkloads,
             "checksum": checksum, "peakResidentBytes": usage.ru_maxrss, "inputPosts": 0,
             "scope": "Exact production ActivityDetector and linked Core dependencies, fixed synthetic screens; permission parsing is shared as in ScreenAnalysis. Not whole-app or physical network performance."]
         print(String(decoding: try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]), as: UTF8.self))
