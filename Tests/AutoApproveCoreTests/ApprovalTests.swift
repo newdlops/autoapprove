@@ -474,6 +474,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Live relay accepts changing output with automation on and binds the exact target", tests.testRemoteRelayWithAutomaticApprovalAndChangedOutput),
             ("Native approval writes serialize with live user input", tests.testRemoteInputSerializesNativeApproval),
             ("Remote original ANSI attributes, bounds and color-only frames", tests.testRemoteOriginalTerminalAttributesAndColorOnlyFrames),
+            ("Remote frame character budget preserves foreign storage and Unicode output", tests.testRemoteFrameCharacterBudgetPreservesForeignAndUnicodeOutput),
             ("Native viewport text and Codex Unicode cursor are captured together", tests.testNativeTextSnapshotKeepsCodexCursorOnSameViewport),
             ("Codex and Claude cursor/display changes preserve the original input and lifetime", tests.testNativePresentationAndCursorPreserveOriginalInput),
             ("Remote terminal read stops once the exact target is found", tests.testRemoteTerminalReadStopsAtExactTarget),

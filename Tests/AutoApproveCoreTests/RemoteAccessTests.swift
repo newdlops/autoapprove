@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import JavaScriptCore
 import AutoApproveCore
 import Network
@@ -64,6 +65,53 @@ private final class RemoteCursorProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testRemoteFrameCharacterBudgetPreservesForeignAndUnicodeOutput() async throws {
+        let paths = AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent("aa-frame-budget-" + UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let record = ProcessDiscovery.parse("82999 1 ttys082 82999 82999 Sun Oct 18 09:00:00 2026 codex")[0]
+        var session = ProcessDiscovery.sessions([record])[0]
+        session.terminal = .vscode; session.channel = .vscodeScreen
+        session.bridgeID = "budget-fixture"; session.terminalID = "budget-fixture"
+        let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { _ in [] }, processReader: { [record] },
+            terminalInputAvailable: { false }, terminalInputIdentity: { _ in nil })
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: [record])
+        func foreign(_ units: [UniChar]) -> String {
+            unsafeBitCast(CFStringCreateWithCharacters(kCFAllocatorDefault, units, units.count)!, to: NSString.self) as String
+        }
+        let cases = ["", "ASCII\r\n", "한글 \u{1100}\u{1161} e\u{301} 👩🏽‍💻 🇰🇷", "\u{0000}\u{0004}\u{001B}[31mred\u{001B}[0m",
+            String(repeating: "x", count: 159_999), String(repeating: "x", count: 160_000), String(repeating: "x", count: 160_001),
+            String(repeating: "x", count: 159_999) + "👩🏽‍💻", String(repeating: "x", count: 160_000) + "e\u{301}",
+            String(repeating: "\r\n", count: 160_001), "e" + String(repeating: "\u{301}", count: 160_001)]
+        for (index, value) in cases.enumerated() {
+            let stores = [value, NSAppleEventDescriptor(string: value).stringValue!, foreign(Array(value.utf16))]
+            for raw in stores {
+                let expected = String(raw.suffix(160_000)), cursor = TerminalCursor(offset: raw.utf16.count)
+                engine.receiveScreen(sessionID: session.id, raw: raw, generation: "budget-\(index)", cursor: cursor)
+                let frame = try await engine.remoteTerminal(sessionID: session.id)
+                try expectEqual(Data(frame.screen.utf8), Data(expected.utf8), "Character clipping changed actual Unicode bytes")
+                let decoded = try JSONDecoder().decode(RemoteTerminalFrame.self, from: JSONEncoder().encode(frame))
+                try expectEqual(Data(decoded.screen.utf8), Data(expected.utf8))
+                try expectEqual(frame.cursor, expected == raw ? cursor.validated(for: raw) : nil)
+                let repeated = try await engine.remoteTerminal(sessionID: session.id)
+                try expectEqual(repeated.revision, frame.revision)
+                try expectEqual(repeated.streamID, frame.streamID)
+            }
+        }
+        // Malformed UTF-16 is repaired by Swift's String view; clipping must
+        // retain the same repaired bytes as the previous Character operation.
+        for units: [UniChar] in [[0xD800], [0xDC00], [0xD800, 0x61, 0xDC00], [0xD800, 0xD800, 0xDC00]] {
+            let raw = foreign(units), expected = String(raw.suffix(160_000))
+            engine.receiveScreen(sessionID: session.id, raw: raw, generation: UUID().uuidString)
+            let frame = try await engine.remoteTerminal(sessionID: session.id)
+            try expectEqual(Data(frame.screen.utf8), Data(expected.utf8))
+            let decoded = try JSONDecoder().decode(RemoteTerminalFrame.self, from: JSONEncoder().encode(frame))
+            try expectEqual(Data(decoded.screen.utf8), Data(expected.utf8))
+        }
+        try expect(engine.snapshot.events.isEmpty)
+        try expect(engine.managedPTY.inventory.isEmpty)
+    }
+
     func testNativeTextSnapshotKeepsCodexCursorOnSameViewport() throws {
         let history = "이전 출력\n", visible = "Working 20%\n› 한글🧪ab\nCodex footer"
         let insertion = history.utf16.count + "Working 20%\n› 한글🧪".utf16.count

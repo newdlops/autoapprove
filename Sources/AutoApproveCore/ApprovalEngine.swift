@@ -1116,7 +1116,11 @@ import TerminalInputSupport
         // An actual screen/generation change or a consumed frame gets a new token.
         let previous = remoteFrames[sessionID]
         let presented = display?.screen ?? raw
-        let screen = String(presented.suffix(160_000)), visibleAppearance = screen == raw ? appearance : nil
+        // Byte/code-unit counts bound Character count without walking short
+        // foreign strings by grapheme. Larger inputs keep the exact old suffix.
+        let units = presented.isContiguousUTF8 ? presented.utf8.count : presented.utf16.count
+        let screen = units <= 160_000 ? presented : String(presented.suffix(160_000))
+        let visibleAppearance = screen == raw ? appearance : nil
         let visibleCursor = screen == presented ? (display?.cursor ?? cursor)?.validated(for: screen) : nil
         let token = previous?.raw == raw && previous?.frame.screen == screen && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor && previous?.frame.nativeDisplay == nativeDisplay && previous?.frame.outputReason == outputReason ? previous!.frame.revision : UUID().uuidString
         let inputIdentity = [.terminal, .tmux].contains(current.terminal) ? terminalInputIdentity(current.pid) : nil
