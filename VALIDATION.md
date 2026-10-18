@@ -10,7 +10,8 @@
 - 독립 검토에서 순서 기반 Terminal contents 배치의 중첩 결과/ABA 위험을 확인해 해당 실험과 검사 2개를 전부 제거했다. 기존 exact TTY별 화면 읽기를 유지한다. exact specifier 리스트의 실제 Terminal 읽기 전용 시험은 정순/역순 모두 `-1700` 미지원이었다. 입력과 내용 로그는 0이다.
 - 최종 Release 빌드와 전체 Core **329/329**가 통과했다. 앞선 전체 실행은 건강한 peer의 첫 dashboard 응답 검사 1개가 실패해 **328/329**였고, 해당 검사 단독 실행과 진단 문구만 추가한 뒤의 전체 실행은 통과했다. 조건과 제한 시간을 완화하지 않았으며 일시 실패의 원인을 해결했다고 주장하지 않는다.
 - 최종 서명 앱의 입력 봉인 메타데이터·발행자 호환/위조 거절·stdio **14/14**·격리 웹/MCP/PTY·포트/설정 복원·DMG 무결성/읽기 전용 마운트 검사가 통과했다. DMG **9,819,833바이트**, SHA-256 `1e1122b5400dc94dd2eb447dde2af75836046a3313efdccebbb22c754421a5fc`다. 이번 검사로 기존 설치본이나 원본 터미널을 교체하지 않았다.
-- 비공개 측정 근거는 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`, 패키지는 `.runtime/releases/0.2.125/lightweight-152/`에 보관한다. GitHub 태그·자산·다운로드 확인은 게시 후 기록한다.
+- 비공개 측정 근거는 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`, 패키지는 `.runtime/releases/0.2.125/lightweight-152/`에 보관한다.
+- [GitHub v0.2.125](https://github.com/newdlops/autoapprove/releases/tag/v0.2.125)의 최신 정식 릴리스·주석 태그·소스 `7ff2f5228eda80f63be403bb6b83b3bf0acc2da3`·자산 2개를 확인했다. 원자적 push와 소스 입력 **435개**의 태그/manifest 일치, 정상 TLS/IPv4의 로그인 없는 공개 다운로드 바이트·크기·SHA-256 일치를 검증했다. 근거는 해당 패키지 폴더의 `source-manifest.json`과 `github-verification.json`에 보관한다. 게시 결과 문서만 후속 커밋하며 태그는 이동하지 않는다. 검증 당시 이 Mac의 설치본은 **0.2.124/151**이다.
 
 ## 0.2.124 터미널 화면 변경의 정규화 비교 경량화 · 빌드 151
 

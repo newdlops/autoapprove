@@ -8,7 +8,8 @@
 - 검토에서 Terminal contents 배치의 중첩 구조와 ABA 매핑 위험을 찾았고, 해당 실험은 이번 변경에서 제거했다. 실제 Terminal은 정확한 specifier 리스트도 -1700으로 거절했다. `TerminalAppleEvents.swift`와 해당 테스트는 이전 exact TTY 읽기를 그대로 유지한다. 기존 title batching은 이전 배포 상태다. 독립 검토의 최종 Critical/Important 지적은 없다.
 - 실제 비교 helper의 77,187개 바이트·에이전트 사례와 `--assert-efficient`, 최종 Release 빌드·전체 Core **329/329**가 통과했다. 첫 전체 실행의 dashboard peer 일시 실패 **328/329**와 단독/전체 재실행 통과를 구분한다. 진단 문구만 추가했으며 조건·제한 시간을 완화하거나 원인을 해결했다고 주장하지 않는다.
 - 서명/입력 봉인·발행자 호환/위조 거절·stdio **14/14**·격리 웹/MCP/PTY·DMG 검사가 통과했다. DMG **9,819,833바이트**, SHA-256 `1e1122b5400dc94dd2eb447dde2af75836046a3313efdccebbb22c754421a5fc`다. 이번 152 설치 파일은 준비됐으나 기존 Mac 설치본은 아직 교체하지 않았다.
-- 비공개 근거 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`와 패키지 `.runtime/releases/0.2.125/lightweight-152/`는 공개하지 않는다. GitHub 게시/다운로드 검증은 이어서 기록한다. 전체 경량화 목표는 active다.
+- 비공개 근거 `.runtime/remote-frame-performance-check/`, `.runtime/polling-performance-check/`, `.runtime/screen-match-check/choice-cache-helper/`와 패키지 `.runtime/releases/0.2.125/lightweight-152/`는 공개하지 않는다. 전체 경량화 목표는 active다.
+- [GitHub v0.2.125](https://github.com/newdlops/autoapprove/releases/tag/v0.2.125)의 최신 정식 릴리스·주석 태그·소스 `7ff2f5228eda80f63be403bb6b83b3bf0acc2da3`·자산 2개·원자적 push를 확인했다. 소스 입력 **435개**의 태그/manifest 일치와 정상 TLS/IPv4 익명 다운로드 바이트·크기·SHA-256을 확인했다. 게시 결과 문서만 후속 커밋하며 태그는 유지한다. 검증 당시 이 Mac 설치본 **0.2.124/151**과 GitHub 배포 **0.2.125/152**를 혼동하지 않는다. 원본 터미널·설정·root 서비스·권한/보안/VPN·전원/잠금·삭제한 Wi-Fi 기능과 무관한 편집기 변경을 보존했다.
 
 ## 2026-10-18 화면 변경 비교 경량화 · 0.2.124/151
 
