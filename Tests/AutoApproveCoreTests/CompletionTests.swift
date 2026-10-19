@@ -1,5 +1,10 @@
 import Foundation
+import CSQLite
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 
 extension ApprovalTests {
     func testClaudeCompletionLifecycle() throws {
@@ -122,13 +127,40 @@ extension ApprovalTests {
         func sql(_ value: String) throws {
             let result = try CommandRunner.run("/usr/bin/sqlite3", [db, value]); try expectEqual(result.status, 0, result.error)
         }
-        try sql("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, completed_at INTEGER, rollout_ordinal INTEGER, final_agent_item_id TEXT); CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, item_id TEXT, item_json TEXT);")
+        try sql("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, completed_at INTEGER, rollout_ordinal INTEGER, final_agent_item_id TEXT); CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, item_id TEXT, updated_at_ordinal INTEGER, item_json TEXT);")
         let location = CodexThreadLocation(threadID: "root", database: db)
         try expectNil(try CodexTurnReader.read(location).turnID)
-        try sql("INSERT INTO thread_turns VALUES ('root','one','completed',1000,1,'answer'); INSERT INTO thread_items VALUES ('root','one','answer','{\"type\":\"agentMessage\",\"text\":\"검증 완료\"}'); INSERT INTO thread_turns VALUES ('child','two','completed',1001,9,'answer'); INSERT INTO thread_items VALUES ('child','two','answer','{\"type\":\"agentMessage\",\"text\":\"하위 작업\"}');")
+        try sql("INSERT INTO thread_turns VALUES ('root','one','completed',1000,1,'answer'); INSERT INTO thread_items VALUES ('root','one','answer',5,'{\"type\":\"agentMessage\",\"text\":\"검증 완료\"}'); INSERT INTO thread_turns VALUES ('child','two','completed',1001,9,'answer'); INSERT INTO thread_items VALUES ('child','two','answer',9,'{\"type\":\"agentMessage\",\"text\":\"하위 작업\"}');")
         let completed = try CodexTurnReader.read(location)
         try expectEqual(completed.turnID, "one"); try expectEqual(completed.summary, "검증 완료")
         try expectEqual(completed.completedAt, Date(timeIntervalSince1970: 1000))
+#if DEBUG
+        var reusableDB: OpaquePointer?
+        try expectEqual(sqlite3_open_v2(db, &reusableDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil), SQLITE_OK)
+        defer { sqlite3_close_v2(reusableDB) }
+        let statementCache = CodexTurnStatementCache()
+        let firstCached = try CodexTurnReader.read(location, database: reusableDB!, statements: statementCache)
+        try expectEqual(firstCached.summary, completed.summary)
+        try expectEqual(statementCache.debugPrepareCount, 2, "The turn and final-message statements prepare once")
+        _ = try CodexTurnReader.read(location, database: reusableDB!, previous: firstCached, statements: statementCache)
+        try expectEqual(statementCache.debugPrepareCount, 2, "An unchanged completion poll reuses its prepared statements")
+        try sql("UPDATE thread_items SET item_json='invalid JSON' WHERE item_id='answer';")
+        var cachedDB: OpaquePointer?
+        try expectEqual(sqlite3_open_v2(db, &cachedDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil), SQLITE_OK)
+        defer { sqlite3_close(cachedDB) }
+        let cached = try CodexTurnReader.read(location, database: cachedDB!, previous: completed)
+        try expectEqual(cached.summary, completed.summary, "An unchanged turn reuses its decoded summary without reading the item JSON")
+        sqlite3_close(cachedDB); cachedDB = nil
+#endif
+        try sql("UPDATE thread_items SET updated_at_ordinal=6,item_json='{\"type\":\"agentMessage\",\"text\":\"갱신된 결과\"}' WHERE item_id='answer';")
+#if DEBUG
+        var updatedDB: OpaquePointer?
+        try expectEqual(sqlite3_open_v2(db, &updatedDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil), SQLITE_OK)
+        defer { sqlite3_close(updatedDB) }
+        let updated = try CodexTurnReader.read(location, database: updatedDB!, previous: completed)
+        try expectEqual(updated.summary, "갱신된 결과", "A changed final item ordinal invalidates the cached summary")
+        sqlite3_close(updatedDB); updatedDB = nil
+#endif
         try sql("INSERT INTO thread_turns VALUES ('root','next','inProgress',NULL,10,NULL);")
         try expectEqual(try CodexTurnReader.read(location).status, "inProgress", "Use latest turn, not latest successful turn")
         try expectNil(try CodexTurnReader.read(location).completedAt)

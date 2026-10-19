@@ -12,7 +12,7 @@ extension ApprovalTests {
             let result = try CommandRunner.run("/usr/bin/sqlite3", [database], input: Data(text.utf8))
             try expectEqual(result.status, 0, result.error)
         }
-        try sql("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_ordinal INTEGER); INSERT INTO thread_history_projection_state VALUES('root',1); CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT);")
+        try sql("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_ordinal INTEGER); INSERT INTO thread_history_projection_state VALUES('root',1); CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT); CREATE INDEX idx_thread_items_page ON thread_items(thread_id,rollout_ordinal); CREATE INDEX idx_thread_items_updated_page ON thread_items(thread_id,updated_at_ordinal);")
         let location = CodexThreadLocation(threadID: "root", database: database), reader = CodexHistoryReader()
         var rows: [(String, CodexQuestionHistory.Item)] = [], revision: Int64 = 100
         func check() throws {
@@ -84,7 +84,7 @@ extension ApprovalTests {
         try expectEqual(partial.count, 1); try expectEqual(partial[0].title, "둘째 질문")
     }
 
-    func testCodexHistoryReadOnlyAndIncremental() throws {
+    func testCodexHistoryReadOnlyAndIncremental() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-codex-history-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -98,7 +98,7 @@ extension ApprovalTests {
             let id = item.json["id"] as! String, type = item.json["type"] as! String
             try sql("INSERT INTO thread_items VALUES ('\(thread)','\(id)',\(item.ordinal),'\(type)',\(item.ordinal),'\(json)');")
         }
-        try sql("CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_ordinal INTEGER); CREATE TABLE thread_items (thread_id TEXT, item_id TEXT, rollout_ordinal INTEGER, item_type TEXT, updated_at_ordinal INTEGER, item_json TEXT); INSERT INTO thread_history_projection_state VALUES ('root',4);")
+        try sql("CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_ordinal INTEGER); CREATE TABLE thread_items (thread_id TEXT, item_id TEXT, rollout_ordinal INTEGER, item_type TEXT, updated_at_ordinal INTEGER, item_json TEXT); CREATE INDEX idx_thread_items_page ON thread_items(thread_id,rollout_ordinal); CREATE INDEX idx_thread_items_updated_page ON thread_items(thread_id,updated_at_ordinal); INSERT INTO thread_history_projection_state VALUES ('root',4);")
         try insert(asyncQuestion("a", "첫 질문", ordinal: 1))
         try insert(asyncQuestion("b", "둘째 질문", ordinal: 2))
         try insert(asyncQuestion("unrelated", "다른 터미널", ordinal: 3), thread: "other")
@@ -117,6 +117,22 @@ extension ApprovalTests {
         try expectFalse(FileManager.default.fileExists(atPath: missing), "Read-only access must never create a Codex database")
         try sql("DROP TABLE thread_items;")
         try expectThrows(try reader.read(location))
+#if DEBUG
+        try testCodexHistoryConnectionsAreReusedAndBounded()
+        try testUnchangedDatabaseVersionSkipsSessionHistoryQueriesAndExternalCommitInvalidatesIt()
+        try testCodexHistoryConnectionCacheReopensReplacedDatabase()
+        try testSessionHistoryProjectionRebuildsWhenDatabaseFileIsReplaced()
+        try testHistoryStatementsArePreparedOncePerReusedConnection()
+        try testSessionHistoryReaderReleasesStatementsForInactiveDatabase()
+        try testIncrementalHistoryQueryUsesAppendAndRewriteIndexes()
+        try testUnchangedHistoryQueryCostDoesNotScaleWithThreadRows()
+        try await testCodexCollectorRebuildsProjectionAfterHistoryFileReplacement()
+        try testIncrementalHistoryQueryOmitsSynchronousAgentBodies()
+        try testHistoryCacheRetainsQuestionsNotOrdinaryMessagesAndReplaysOldEdits()
+        try testRewriteFromAsyncQuestionToSynchronousAgentMessageClearsPendingQuestion()
+        try testCodexOpenFileReadersAllocateOnlyRequiredPaths()
+        try testDescriptorPathReaderSkipsOnlyTransientFDPathErrors()
+#endif
     }
 
     func testCodexThreadBinding() throws {
@@ -134,6 +150,8 @@ extension ApprovalTests {
         let location = try CodexThreadLocation.locate(paths: files[42]!)
         try expectEqual(location.threadID, "root")
         try expectEqual(location.database, home.appendingPathComponent("thread_history_1.sqlite").path)
+        try expectEqual(try CodexThreadLocation.locate(paths: [root, root]), location,
+            "Duplicate descriptor paths should parse the rollout header once and preserve binding")
         try expectThrows(try CodexThreadLocation.locate(paths: [child]))
         let other = try rollout("other", source: "cli")
         try expectThrows(try CodexThreadLocation.locate(paths: [root, other]))
