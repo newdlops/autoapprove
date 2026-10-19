@@ -13,6 +13,8 @@ private final class HistoryFixture {
             PRAGMA journal_mode=DELETE;
             CREATE TABLE thread_history_projection_state(thread_id TEXT, next_rollout_ordinal INTEGER);
             CREATE TABLE thread_items(thread_id TEXT, turn_id TEXT, item_id TEXT, rollout_ordinal INTEGER, item_type TEXT, updated_at_ordinal INTEGER, item_json TEXT);
+            CREATE INDEX idx_thread_items_page ON thread_items(thread_id,rollout_ordinal);
+            CREATE INDEX idx_thread_items_updated_page ON thread_items(thread_id,updated_at_ordinal);
             CREATE TABLE thread_turns(thread_id TEXT, turn_id TEXT, status TEXT, completed_at INTEGER, rollout_ordinal INTEGER, final_agent_item_id TEXT);
             INSERT INTO thread_history_projection_state VALUES('root',2);
             INSERT INTO thread_items VALUES('root','turn','q1',1,'agentMessage',1,'{"type":"agentMessage","id":"q1","delivery":"async","questions":[{"title":"첫 질문"}]}');
