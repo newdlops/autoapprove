@@ -45,7 +45,9 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         // scan avoids running the full policy regex set when no protected
         // command, system path or persistence marker exists. Whitespace is
         // stripped first so wrapped paths stay inside the conservative path.
-        guard matches(compact(), riskCandidatePattern) else { return nil }
+        let candidate = compact()
+        guard riskCandidates.contains(candidate) != false,
+              matches(candidate, riskCandidatePattern) else { return nil }
         let command = commandText(text)
         // Only complete, simple read-only commands get this exception. Compound
         // shell input still goes through all mutation checks.
@@ -129,7 +131,14 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
 
     private static let protectedStartupPattern = #"(?i)(?:(?:~|\$(?:HOME|\{HOME\}))[/\\]+Library[/\\]+(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])(?:/Users/[^/\r\n]+)?/Library/(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])/etc/(?:cron|systemd)|(?:~|\$(?:HOME|\{HOME\}))[/\\]+\.config[/\\]+autostart)"#
     private static let writePattern = #"(?i)\b(?:cp|mv|rm|install|tee|touch|mkdir|chmod|chown|ln|write_bytes|write_text|writeFile|copyFile|copyfile|copy2|copy|replace|rename|unlink|remove)\b|>>?|--install|--register|등록|설치|생성|수정|삭제"#
-    private static let riskCandidatePattern = #"(?i)(?:launchctl|crontab|systemctl|service|launchagents|launchdaemons|startupitems|privilegedhelpertools|cron|systemd|autostart|spctl|csrutil|tccutil|security|dscl|chmod|sudo|defaults|pmset|networksetup|systemsetup|administratorprivileges|etc/|system/|library/(?:preferences|security)/|--install|--register|install_)"#
+    private static let riskCandidateWords = [
+        "launchctl", "crontab", "systemctl", "service", "launchagents", "launchdaemons", "startupitems",
+        "privilegedhelpertools", "cron", "systemd", "autostart", "spctl", "csrutil", "tccutil", "security", "dscl",
+        "chmod", "sudo", "defaults", "pmset", "networksetup", "systemsetup", "administratorprivileges",
+        "etc/", "system/", "library/preferences/", "library/security/", "--install", "--register", "install_"
+    ]
+    private static let riskCandidatePattern = "(?i)(?:" + riskCandidateWords.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|") + ")"
+    private static let riskCandidates = RiskCandidateMatcher(words: riskCandidateWords)
     private static let compiledPatterns: [String: NSRegularExpression] = {
         let patterns = [
             #"(?i)\blaunchctl\s+(?:bootstrap|bootout|load|unload|enable|disable|kickstart|submit|setenv|unsetenv|config)\b|\bcrontab\s+|\b(?:systemctl|service)\s+(?:enable|disable|start|stop|restart)\b"#,

@@ -85,6 +85,22 @@ private func safetyHook(_ date: Date, event: String = "PermissionRequest", comma
 }
 
 extension ApprovalTests {
+    func testSystemRiskCandidateSearchPreservesCaseFoldingAndUnicodeBarriers() throws {
+        for command in ["sudo id", "SUDO id", "ſudo id", "syﬆemctl start fixture", "SyStemCtl start fixture",
+            "한글 e\u{301} 👩🏽‍💻\nsudo id", "cp fixture ~/Library/LaunchA\ngents/a.plist",
+            "write_text /Library/Preferences/com.fixture.plist", "tccutil reset Accessibility"] {
+            try expectNotNil(SystemCommandRisk.detect(command), command)
+        }
+        for command in ["npm test", "su👩🏽‍💻do id", "su\u{0378}do id", "l\u{200d}aunchctl bootstrap fixture",
+            "echo e\u{301} 한글 👩🏽‍💻", "cat ~/Library/LaunchAgents/fixture.plist", "networksetup -getairportpower en0"] {
+            try expect(SystemCommandRisk.detect(command) == nil, command)
+        }
+        let ordinary = String(repeating: "합성 출력 e\u{301} 👩🏽‍💻 completed local checks\n", count: 128)
+        try expectNil(SystemCommandRisk.detect(ordinary))
+        try expectEqual(SystemCommandRisk.detect(ordinary + "\nsudo id")?.kind, .privileged)
+        try expectEqual(SystemCommandRisk.detect(NSAppleEventDescriptor(string: ordinary + "\nsudo id").stringValue!)?.kind, .privileged)
+    }
+
     func testSystemRiskMutationsAndReadOnlyBoundaries() throws {
         for command in ["launchctl bootstrap gui/501 a.plist", "launchctl kickstart gui/501/a", "crontab tasks.txt",
             "cp a.plist ~/Library/LaunchAgents/a.plist", "mkdir -p ~/Library/LaunchDaemons", "echo payload > /Library/LaunchDaemons/a.plist",
