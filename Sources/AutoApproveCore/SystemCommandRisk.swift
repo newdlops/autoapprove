@@ -108,6 +108,10 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
 
     public static func detect(tool: String, input: JSONObject, summary: String = "", cwd: String = "") -> SystemCommandRisk? {
         if ["Read", "Glob", "Grep", "LS"].contains(tool) { return nil }
+        // A general question only asks for a user's choice; its text is not an
+        // operation to deny or replace automatically. Actual tool permissions
+        // and yes/no requests still pass through the system-change guard.
+        if tool == "AskUserQuestion", YesNoConfirmation.detect(input) == nil { return nil }
         if let command = input["command"] as? String {
             if isReadOnly(command) { return nil }
             return detect(command + (summary.isEmpty ? "" : "\n" + summary), cwd: cwd)

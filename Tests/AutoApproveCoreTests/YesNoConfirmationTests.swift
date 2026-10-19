@@ -74,7 +74,6 @@ extension ApprovalTests {
         let cases: [([String], Int)] = [
             (["Deny", "Allow"], 1), (["allow (Recommended)", "Don't allow"], 0),
             (["Do not allow", "ALLOW!"], 1), (["Don’t allow (esc)", "Allow (a)"], 1),
-            (["Allow — 이번 작업을 진행합니다.", "No"], 0),
             (["Allow once", "Deny"], 0), (["Allow this request only", "Don't allow"], 0),
             (["Always allow", "Deny", "Allow once (Recommended)"], 2),
             (["Allow for this session", "Allow", "Don't allow"], 1),
@@ -205,9 +204,9 @@ extension ApprovalTests {
             try expectEqual(try JSONSerialization.data(withJSONObject: updated["questions"]!, options: [.sortedKeys]),
                             try JSONSerialization.data(withJSONObject: input["questions"]!, options: [.sortedKeys]))
         }
-        for labels in [["예 — git 상태·브랜치·미커밋 변경을 훑습니다.", "아니오 — 기다립니다."],
-                       ["네, 진행해주세요", "아니요, 기다려주세요"], ["YES!", "NO."], ["예 (권장)", "아니오"],
-                       ["Yes (Recommended)", "No"], ["Yes (y)", "No (esc)"], ["네".decomposedStringWithCanonicalMapping, "아니요"]] {
+        for labels in [["네, 진행해주세요", "아니요"], ["YES!", "NO."], ["예 (권장)", "아니오"],
+                       ["Yes (Recommended)", "No"], ["Yes (y)", "No (esc)"], ["네".decomposedStringWithCanonicalMapping, "아니요"],
+                       ["응", "아니오"], ["응 (추천)", "아니요"], ["응", "아니오"].map(\.decomposedStringWithCanonicalMapping)] {
             try expectEqual(YesNoConfirmation.detect(startInput(labels: labels))?.answer, labels[0])
         }
         for input in [startInput("  \n"), startInput(labels: ["예시", "아니오"]),
@@ -224,6 +223,38 @@ extension ApprovalTests {
         try expectNil(YesNoConfirmation.detect(input))
         input = startInput(); input["answers"] = [startQuestion: "아니오"]
         try expect(YesNoConfirmation.detect(input) == nil, "Do not overwrite an existing answer")
+    }
+
+    func testConfirmationMenusNeverChooseTasksOrMultipleAnswers() throws {
+        let choices = [
+            ["개발", "운영"], ["권장 작업", "다른 작업"],
+            ["Yes, use staging", "No, use production"], ["Yes: deploy now", "No"],
+            ["Allow — 이번 작업을 진행합니다.", "No"], ["Allow: production", "Deny"],
+            ["Yes", "No, use another project"], ["Yes", "Cancel — run tests instead"],
+            ["예 — git 상태·브랜치·미커밋 변경을 훑습니다.", "아니오 — 기다립니다."],
+            ["응, 운영에 배포", "아니오"], ["응", "아니오, 다른 환경을 선택"],
+            ["Allow", "Always allow", "Deny, use production"],
+            ["Yes, use staging", "Yes, don't ask again", "No"]
+        ]
+        for labels in choices {
+            for labels in [labels, Array(labels.reversed()), labels.map(\.decomposedStringWithCanonicalMapping)] {
+                try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "Keep task choices manual: \(labels)")
+                let queued = QueuedQuestion(id: "manual", threadID: "fixture", title: startQuestion, options: labels)
+                try expectNil(YesNoConfirmation.detect(queued))
+            }
+            for agent: AgentKind in [.claude, .codex] {
+                let heading = agent == .claude ? "Do you want to proceed?" : "Would you like to run the following command?"
+                let rows = labels.enumerated().map { "\($0.offset == 0 ? "❯" : " ") \($0.offset + 1). \($0.element)" }
+                let screen = ([heading] + rows + ["Press enter to confirm or esc to cancel"]).joined(separator: "\n")
+                try expect(PromptDetector.detect(screen, agent: agent) == nil, "Screen fallback cannot answer task choices: \(labels)")
+                try expectNotNil(QuestionDetector.detect(screen, agent: agent))
+            }
+        }
+        var multiple = QueuedQuestion(id: "multi", threadID: "fixture", title: startQuestion, options: ["Yes", "No"])
+        multiple.multiSelect = true
+        try expectNil(YesNoConfirmation.detect(multiple))
+        multiple.multiSelect = false
+        try expectEqual(YesNoConfirmation.detect(multiple)?.answer, "Yes")
     }
 
     func testYesNoConfirmationHookAndAudit() throws {

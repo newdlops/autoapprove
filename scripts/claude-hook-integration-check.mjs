@@ -60,11 +60,11 @@ async function startServer() {
 async function stop(child) {
   if (child.exitCode === null && child.signalCode === null) { child.kill('SIGTERM'); await new Promise(resolve => child.once('close', resolve)); }
 }
-function helper(session, index, home = state) {
-  const question = `[${index}] 이 작업을 허용할까요?`;
-  const payload = { hook_event_name: 'PreToolUse', session_id: 'fixture', agentPID: session.pid, agentStarted: session.started,
+function helper(session, index, home = state, {event = 'PreToolUse', toolInput} = {}) {
+  const question = toolInput?.questions[0].question ?? `[${index}] 이 작업을 허용할까요?`;
+  const payload = { hook_event_name: event, session_id: 'fixture', agentPID: session.pid, agentStarted: session.started,
     tty: session.tty, cwd: session.cwd, tool_name: 'AskUserQuestion', tool_use_id: randomUUID(),
-    tool_input: { questions: [{ question, multiSelect: false, options: [{ label: '거부' }, { label: '항상 허용' }, { label: '허용' }] }] } };
+    tool_input: toolInput ?? { questions: [{ question, multiSelect: false, options: [{ label: '거부' }, { label: '항상 허용' }, { label: '허용' }] }] } };
   const child = start(binary, ['hook', '--home', home], { stdio: ['pipe', 'pipe', 'pipe'] });
   let output = '', ended = false;
   child.stdout.on('data', chunk => { output += chunk; });
@@ -150,7 +150,35 @@ try {
   const handoff = helper(session, 5), pending = await current(session);
   await request('claudeRelease', { sessionID: session.id, requestID: pending.id });
   assert.deepEqual(await handoff.completion, {});
-  console.log(`PASS loopback-isolated real helper: no LAN peers, 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts and terminal handoff`);
+
+  await request('automatic', {sessionID: session.id, enabled: true});
+  const web = await request('web');
+  const manualChoices = [
+    {question:'Which environment?', options:[{label:'Yes, use staging'}, {label:'No, use production'}]},
+    {question:'Which task?', options:[{label:'Yes'}, {label:'No, run tests instead'}]},
+    {question:'여러 항목을 선택하세요', multiSelect:true, options:[{label:'응'}, {label:'아니오'}]},
+    {question:'cp fixture ~/Library/LaunchAgents/com.fixture.plist 대신 어떤 예약 방법을 쓸까요?', options:[{label:'프로젝트 타이머'}, {label:'수동 실행'}]}
+  ];
+  let manualCount = 0;
+  for (const event of ['PreToolUse','PermissionRequest']) for (const field of manualChoices) {
+    const toolInput = {questions:[field]};
+    const choice = helper(session, 'choice-'+manualCount, state, {event, toolInput});
+    const pending = await current(session);
+    assert.equal(pending.automaticAt, undefined, 'A task question cannot schedule a default answer');
+    assert.equal(pending.isQuestion, true);
+    await delay(1200);
+    assert.equal(choice.ended(), false, 'An automatic session must keep a general question waiting');
+    const response = await fetch(web.urls[0]+'/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({requestID:randomUUID(),action:'replyClaudeQuestions',sessionID:session.id,requestIDForApproval:pending.id,
+        answers:{'0':{choices:[field.options[1].label],text:''}}}), signal:AbortSignal.timeout(6000)});
+    const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result));
+    const output = (await choice.completion).hookSpecificOutput;
+    const updated = (event === 'PreToolUse' ? output : output.decision).updatedInput;
+    assert.deepEqual(updated.questions, toolInput.questions, 'Return the complete original question unchanged');
+    assert.deepEqual(updated.answers, {[field.question]:field.options[1].label}, 'Only the explicit web choice is answered');
+    manualCount++;
+  }
+  console.log(`PASS loopback-isolated real helper: no LAN peers, 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts, terminal handoff and ${manualCount} task/multiselect questions kept pending until an explicit HTTP web answer`);
 } finally {
   for (const socket of connections) socket.destroy();
   if (proxy) await new Promise(resolve => proxy.close(resolve));

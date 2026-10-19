@@ -5,12 +5,13 @@ import Foundation
 public struct YesNoConfirmation {
     public let question: String
     public let answer: String
-    private static let affirmativeWords = "예|네|허용|yes|allow"
+    private static let affirmativeWords = "예|네|응|허용|yes|allow"
     private static let denialWords = "아니오|아니요|거부|취소|no|deny|cancel|don't allow|do not allow"
 
     public static func detect(_ question: QueuedQuestion) -> YesNoConfirmation? {
         detect(["questions": [[
             "question": question.title,
+            "multiSelect": question.multiSelect ?? false,
             "options": question.options.map { ["label": $0] }
         ]]])
     }
@@ -28,29 +29,22 @@ public struct YesNoConfirmation {
         }
         let labels = options.compactMap { $0["label"] as? String }
         guard labels.count == options.count else { return nil }
-        if labels.count > 2 {
-            guard let index = singleApprovalIndex(labels, descriptions: options.map { $0["description"] as? String ?? "" }) else { return nil }
-            // Hook answers identify an option by its label, not by its position.
-            let answer = labels[index].precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard labels.filter({ $0.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == answer }).count == 1 else { return nil }
-            return YesNoConfirmation(question: question, answer: labels[index])
-        }
-        let yes = labels.indices.filter { index in
-            let label = permissionLabel(labels[index])
-            guard let tail = affirmativeTail(label),
-                  !isRepeatedPermission(tail), !isRepeatedPermission("allow " + tail),
-                  !isRepeatedPermission(options[index]["description"] as? String ?? "") else { return false }
-            return hasAnswer(label, words: affirmativeWords) || isCurrentPermission(tail) || isCurrentPermission("allow " + tail)
-        }
-        let no = labels.indices.filter { hasAnswer(permissionLabel(labels[$0]), words: denialWords) }
-        guard yes.count == 1, no.count == 1, yes[0] != no[0] else { return nil }
-        return YesNoConfirmation(question: question, answer: labels[yes[0]])
+        // Two options are not inherently a confirmation: "Yes, use staging" /
+        // "No, use production" still chooses a task. Apply the same complete-label
+        // permission rules to every menu, regardless of its option count.
+        guard let index = singleApprovalIndex(labels, descriptions: options.map { $0["description"] as? String ?? "" }) else { return nil }
+        // Hook answers identify an option by its label, not by its position.
+        let answer = labels[index].precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard labels.filter({ $0.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == answer }).count == 1 else { return nil }
+        return YesNoConfirmation(question: question, answer: labels[index])
     }
 
-    private static func hasAnswer(_ label: String, words: String) -> Bool {
-        let text = label.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines)
-        let pattern = "(?i)^(?:" + words + #")(?:\s*[.!。！]?\s*|\s*\((?:추천|권장|recommended)\)\s*|\s*[,，:：—–-]\s*\S[\s\S]*)$"#
-        return text.range(of: pattern, options: .regularExpression) != nil
+    private static func isDenial(_ label: String) -> Bool {
+        let text = cleaned(label)
+        if text.range(of: "(?i)^(?:" + denialWords + ")$", options: .regularExpression) != nil { return true }
+        // The CLI's fixed rejection action is still No. Arbitrary explanations
+        // after No/Cancel must not turn a different task into a permission menu.
+        return text.range(of: #"(?i)^no\s*[,，:：—–-]\s*and tell (?:codex|claude|the agent) what to do differently$"#, options: .regularExpression) != nil
     }
 
     private static func cleaned(_ value: String) -> String {
@@ -127,7 +121,7 @@ public struct YesNoConfirmation {
         var current: [Int] = [], denials = 0
         for (index, label) in labels.enumerated() {
             let label = permissionLabel(label)
-            if hasAnswer(label, words: denialWords) { denials += 1; continue }
+            if isDenial(label) { denials += 1; continue }
             if isRepeatedPermission(label) { continue }
             guard let tail = affirmativeTail(label) else { return nil }
             if isRepeatedPermission(tail) || isRepeatedPermission("allow " + tail) { continue }

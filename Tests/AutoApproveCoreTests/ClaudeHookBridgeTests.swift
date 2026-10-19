@@ -31,6 +31,73 @@ private func bridgeAnswer(_ value: JSONObject) -> JSONObject? { (value["autoappr
 private func fixturePaths() -> AppPaths { AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent("aa-hook-" + UUID().uuidString)) }
 
 extension ApprovalTests {
+    func testClaudeTaskChoicesStayManualWhileConfirmationsContinue() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try hookEngine(paths), now = Date()
+        defer { engine.stop() }
+        var start = hookPayload(now, pid: 12); start["hook_event_name"] = "SessionStart"
+        _ = try engine.handleClaudeHook(start, at: now)
+        try engine.setAutomatic(hookSession(12), enabled: true)
+        let cases: [(String, [String], Bool)] = [
+            ("어떤 환경을 사용할까요?", ["개발 (추천)", "운영"], false),
+            ("Which environment?", ["Yes, use staging", "No, use production"], false),
+            ("What should run?", ["Allow: deploy", "Deny"], false),
+            ("Which task?", ["Yes", "No, run tests instead"], false),
+            ("여러 항목을 고르세요", ["응", "아니오"], true),
+            ("cp fixture ~/Library/LaunchAgents/com.fixture.plist 대신 어떤 예약 방법을 쓸까요?", ["프로젝트 타이머", "수동 실행"], false)
+        ]
+        for event in ["PreToolUse", "PermissionRequest"] {
+            for (title, labels, multiSelect) in cases {
+                var payload = hookPayload(now)
+                payload["hook_event_name"] = event
+                let input: JSONObject = ["questions": [["question": title, "multiSelect": multiSelect,
+                    "options": labels.map { ["label": $0, "description": "선택한 항목으로 진행합니다."] }]]]
+                payload["tool_input"] = input
+                try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now)))
+                try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(6))))
+                try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(60))), "An automatic session never expires a task choice into a default answer")
+                let requestID = payload["requestID"] as! String
+                let approval = engine.snapshot.sessions.first { $0.id == hookSession(12) }?.backgroundChildren
+                    .first { $0.id == hookSession(21) }?.claudeApprovals?.first { $0.id == requestID }
+                try expectNotNil(approval)
+                try expectEqual(approval?.isQuestion, true)
+                try expectNil(approval?.automaticAt)
+                try expectEqual(approval?.answer, "")
+                try expectEqual(approval?.questions?.first?.options.map(\.label), labels)
+                try expect(approval?.systemCommandRisk == nil, "Question text is not an attempted system operation")
+                let events = engine.snapshot.events.count
+                try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: requestID,
+                    answers: ["0": ["choices": [labels.last!], "text": ""]], at: now.addingTimeInterval(61))
+                let output = bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(62)))!["hookSpecificOutput"] as! JSONObject
+                let decision = event == "PreToolUse" ? output : output["decision"] as! JSONObject
+                let updated = decision["updatedInput"] as! JSONObject
+                try expectEqual(updated["answers"] as? [String: String], [title: labels.last!])
+                try expectEqual(try JSONSerialization.data(withJSONObject: updated["questions"]!, options: [.sortedKeys]),
+                    try JSONSerialization.data(withJSONObject: input["questions"]!, options: [.sortedKeys]))
+                try expectEqual(engine.snapshot.events.count, events + 1, "Only an explicit web answer creates a reply")
+                try engine.acknowledgeClaudeHook(payload, at: now.addingTimeInterval(62))
+            }
+            var confirmation = hookPayload(now, pid: 22)
+            confirmation["hook_event_name"] = event
+            confirmation["tool_input"] = ["questions": [["question": "계속 진행할까요?", "options": [["label": "아니오"], ["label": "응"]]]]]
+            try expect(bridgeWaiting(try engine.handleClaudeHook(confirmation, at: now)))
+            let output = bridgeAnswer(try engine.handleClaudeHook(confirmation, at: now.addingTimeInterval(5)))!["hookSpecificOutput"] as! JSONObject
+            let decision = event == "PreToolUse" ? output : output["decision"] as! JSONObject
+            try expectEqual((decision["updatedInput"] as? JSONObject)?["answers"] as? [String: String], ["계속 진행할까요?": "응"])
+            try engine.acknowledgeClaudeHook(confirmation, at: now.addingTimeInterval(5))
+        }
+        var riskyConfirmation = hookPayload(now)
+        riskyConfirmation["hook_event_name"] = "PermissionRequest"
+        riskyConfirmation["tool_input"] = ["questions": [["question": "sudo id 명령을 실행할까요?", "options": [["label": "Yes"], ["label": "No"]]]]]
+        let riskyOutput = bridgeAnswer(try engine.handleClaudeHook(riskyConfirmation, at: now))?["hookSpecificOutput"] as? JSONObject
+        try expectEqual((riskyOutput?["decision"] as? JSONObject)?["behavior"] as? String, "deny", "A risky yes/no request still receives safe redirection")
+        var operation = hookPayload(now)
+        operation["hook_event_name"] = "PermissionRequest"; operation["tool_name"] = "Bash"
+        operation["tool_input"] = ["command": "cp fixture ~/Library/LaunchAgents/com.fixture.plist"]
+        let output = bridgeAnswer(try engine.handleClaudeHook(operation, at: now))?["hookSpecificOutput"] as? JSONObject
+        try expectEqual((output?["decision"] as? JSONObject)?["behavior"] as? String, "deny", "Actual system changes still receive safe redirection")
+    }
+
     func testClaudeAppApprovalThenThirtySequentialQuestions() throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date(), first = hookPayload(now)
