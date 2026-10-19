@@ -6,11 +6,12 @@ import assert from 'node:assert/strict';
 
 const label=process.argv.find(value=>value.startsWith('--label='))?.slice(8)||'current';
 assert.match(label,/^[a-z0-9-]+$/);
+const build=path.resolve(process.argv.find(value=>value.startsWith('--core-build='))?.slice(13)||'.build/release');
+const moduleCache=path.resolve(process.argv.find(value=>value.startsWith('--module-cache='))?.slice(15)||path.join('/private/tmp','aa-session-processing-'+label+'-module-cache'));
 const directory=path.resolve('.runtime/session-processing-bench',label),binary=path.join(directory,'check');
 await mkdir(directory,{recursive:true});
 if(!process.argv.includes('--reuse-binary')){
- const build=path.resolve('.build/release');
- execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',path.resolve('.build/cache/SessionProcessingBench'),
+ execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',moduleCache,
   '-I',path.join(build,'Modules'),'-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),
   ...(await readdir(path.join(build,'AutoApproveCore.build'))).filter(name=>name.endsWith('.swift.o')).map(name=>path.join(build,'AutoApproveCore.build',name)),
   'Tests/fixtures/session-processing-bench.swift','-o',binary],{stdio:'inherit'});
@@ -29,7 +30,14 @@ const comparison=process.argv.find(value=>value.startsWith('--compare='))?.slice
 if(comparison){
  assert.match(comparison,/^[a-z0-9-]+$/);
  const before=JSON.parse(await readFile(path.resolve('.runtime/session-processing-bench',comparison,'report.json'),'utf8'));
- result.comparison=result.workloads.map((workload,index)=>({name:workload.name,cpuReductionPercent:100*(1-workload.cpuSeconds/before.workloads[index].cpuSeconds)}));
+ result.comparison=result.workloads.flatMap(workload=>{
+  const reference=before.workloads.find(value=>value.name===workload.name);
+  if(!reference)return [];
+  assert.equal(reference.rounds,workload.rounds,'Reference workload rounds differ');
+  assert.equal(reference.checksum,workload.checksum,'Reference workload result differs');
+  return [{name:workload.name,cpuReductionPercent:100*(1-workload.cpuSeconds/reference.cpuSeconds)}];
+ });
+ result.workloadsWithoutReference=result.workloads.filter(workload=>!before.workloads.some(value=>value.name===workload.name)).map(value=>value.name);
 }
 await writeFile(path.join(directory,'report.json'),JSON.stringify({...result,reports},null,2)+'\n');
 console.log(JSON.stringify(result,null,2));

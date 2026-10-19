@@ -121,10 +121,12 @@ extension ApprovalTests {
         let question = SessionInbox.Candidate(key: "question", kind: .question, summary: "계속 진행할까요?")
         let completion = SessionInbox.Candidate(key: "completion", kind: .completion, summary: "작업을 마쳤습니다.")
         var inbox = SessionInbox()
-        inbox.update([question, completion], at: start)
-        inbox.update([question, completion], at: start.addingTimeInterval(0.7))
+        try expect(inbox.update([question, completion], at: start))
+        try expect(!inbox.update([question, completion], at: start.addingTimeInterval(0.7)),
+            "An unchanged polling pass should report no inbox mutation")
         try expect(inbox.entries.isEmpty)
-        inbox.update([question, completion], at: start.addingTimeInterval(0.9))
+        try expect(inbox.update([question, completion], at: start.addingTimeInterval(0.9)),
+            "Crossing the question debounce must report a changed inbox")
         try expectEqual(inbox.entries.count, 1)
         try expectEqual(inbox.entries.first?.isRead, false)
         inbox.markRead()

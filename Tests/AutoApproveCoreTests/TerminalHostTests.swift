@@ -47,6 +47,15 @@ extension ApprovalTests {
         11 10 ttys001 11 12 Mon Sep 21 09:00:02 2026 /bin/zsh
         """)
         try expectEqual(server?.terminal, .iterm, "iTermServer reparents shells away from iTerm.app")
+        var environmentReads = 0
+        let serverSession = ProcessDiscovery.sessions(ProcessDiscovery.parse("""
+        1 0 ?? 1 0 Mon Sep 21 09:00:00 2026 /sbin/launchd
+        10 1 ?? 10 0 Mon Sep 21 09:00:01 2026 /Users/fixture/Library/Application Support/iTerm2/iTermServer-3.7.3
+        11 10 ttys001 11 12 Mon Sep 21 09:00:02 2026 /bin/zsh
+        12 11 ttys001 12 12 Mon Sep 21 09:00:03 2026 /usr/local/bin/codex
+        """), environment: { _ in environmentReads += 1; return [:] }).first
+        try expectEqual(serverSession?.terminal, .iterm)
+        try expectEqual(environmentReads, 0, "An iTermServer ancestry match does not need a KERN_PROCARGS2 environment read")
         let orca = host(["TERM_PROGRAM": "Orca", "ORCA_TERMINAL_HANDLE": "term_a", "__CFBundleIdentifier": "com.stablyai.orca"])
         try expectEqual(orca?.terminal, .orca); try expectEqual(orca?.orcaHandle, "term_a"); try expect(orca?.canReveal == true)
         let dropped = host(["ORCA_TERMINAL_HANDLE": "term_b", "__CFBundleIdentifier": "com.stablyai.orca"])

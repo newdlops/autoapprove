@@ -5,6 +5,7 @@
 // FORM: The native split view established in the user-approved DESIGN.md; no new visual direction.
 import SwiftUI
 import AppKit
+import Combine
 import AutoApproveCore
 
 @MainActor struct SessionWindow: View {
@@ -201,7 +202,11 @@ import AutoApproveCore
     }
     var body: some View {
         content.frame(minWidth: 780, minHeight: 560)
-        .windowUpdates(viewUpdates, sources: [engine.objectWillChange, notifications.objectWillChange])
+        .windowUpdates(viewUpdates, sources: [
+            engine.$snapshot.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            engine.$initialDiscoveryComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            notifications.objectWillChange.eraseToAnyPublisher()
+        ])
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { openWindow(id: "help") } label: { Label("도움말", systemImage: "questionmark.circle") }
@@ -929,20 +934,23 @@ struct CapacityResumeStatus: View {
     let resume: CapacityResume
     let cancel: () -> Void
     var body: some View {
-        if resume.phase == .scheduled {
-            TimelineView(.periodic(from: .now, by: 1)) { context in content(at: context.date) }
-        } else {
-            content(at: .now)
-        }
+        content
     }
-    private func content(at date: Date) -> some View {
+    private var content: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) { status(at: date); cancelButton }
+            HStack(alignment: .firstTextBaseline, spacing: 10) { status; cancelButton }
                 .fixedSize(horizontal: true, vertical: false)
-            VStack(alignment: .leading, spacing: 6) { status(at: date); cancelButton }
+            VStack(alignment: .leading, spacing: 6) { status; cancelButton }
         }
     }
-    private func status(at date: Date) -> some View {
+    @ViewBuilder private var status: some View {
+        if resume.phase == .scheduled {
+            TimelineView(.periodic(from: .now, by: 5)) { context in statusLabel(at: context.date) }
+        } else {
+            statusLabel(at: .now)
+        }
+    }
+    private func statusLabel(at date: Date) -> some View {
         Label(message(at: date), systemImage: icon)
             .font(.caption).monospacedDigit().foregroundStyle(attention ? .orange : .secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -985,22 +993,23 @@ struct QuestionAutomationStatus: View {
     let questionTitle: String
     let cancel: () -> Void
     var body: some View {
-        if automation.phase == .scheduled {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                content(at: context.date)
-            }
-        } else {
-            content(at: .now)
-        }
+        content
     }
-    private func content(at date: Date) -> some View {
+    private var content: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) { status(at: date); cancelButton }
+            HStack(alignment: .firstTextBaseline, spacing: 10) { status; cancelButton }
                 .fixedSize(horizontal: true, vertical: false)
-            VStack(alignment: .leading, spacing: 6) { status(at: date); cancelButton }
+            VStack(alignment: .leading, spacing: 6) { status; cancelButton }
         }
     }
-    private func status(at date: Date) -> some View {
+    @ViewBuilder private var status: some View {
+        if automation.phase == .scheduled {
+                TimelineView(.periodic(from: .now, by: 1)) { context in statusLabel(at: context.date) }
+        } else {
+            statusLabel(at: .now)
+        }
+    }
+    private func statusLabel(at date: Date) -> some View {
         Label(message(at: date), systemImage: automation.phase == .scheduled ? "clock" : "pause.circle")
             .font(.caption).monospacedDigit().foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)

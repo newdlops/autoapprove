@@ -330,7 +330,13 @@ public enum TerminalAdapter {
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true,
                                purpose: RemoteTerminalPerformance.NativePurpose = .other) throws -> TerminalSnapshot {
-        if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles, includeCursor: includeCursor, purpose: purpose) { return snapshot }
+        // Background monitoring immediately sends a no-consent Apple Event,
+        // which itself checks current TCC authorization. Avoid a separate
+        // synchronous AEDeterminePermissionToAutomateTarget XPC round trip on
+        // every poll; explicit, validation and compatibility reads still
+        // perform their fresh preflight.
+        if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles,
+            includeCursor: includeCursor, preflight: purpose != .monitor, purpose: purpose) { return snapshot }
         return try scriptScreens(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles)
     }
     /// The engine has just checked Automation, including before cached frames.
@@ -351,12 +357,19 @@ public enum TerminalAdapter {
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
         guard includeCursor else { return snapshot }
         let records = (try? JSONSerialization.jsonObject(with: data) as? JSONObject)?["screens"] as? [JSONObject] ?? []
+        var recordsByTTY: [String: JSONObject] = [:]
+        recordsByTTY.reserveCapacity(records.count)
+        for record in records {
+            if let tty = record["tty"] as? String, recordsByTTY[tty] == nil { recordsByTTY[tty] = record }
+        }
         for index in snapshot.screens.indices {
-            guard let metadata = records.first(where: { $0["tty"] as? String == snapshot.screens[index].tty })?["cursorWindow"] as? JSONObject,
+            guard let metadata = recordsByTTY[snapshot.screens[index].tty]?["cursorWindow"] as? JSONObject,
                   let windowID = metadata["windowID"] as? UInt32,
-                  let title = metadata["title"] as? String, let boundsObject = metadata["bounds"],
-                  let boundsData = try? JSONSerialization.data(withJSONObject: boundsObject),
-                  let bounds = try? JSONDecoder().decode(TerminalWindowBounds.self, from: boundsData) else { continue }
+                  let title = metadata["title"] as? String, let boundsObject = metadata["bounds"] as? JSONObject,
+                  let x = boundsObject["x"] as? NSNumber, let y = boundsObject["y"] as? NSNumber,
+                  let width = boundsObject["width"] as? NSNumber, let height = boundsObject["height"] as? NSNumber else { continue }
+            let bounds = TerminalWindowBounds(x: x.doubleValue, y: y.doubleValue,
+                width: width.doubleValue, height: height.doubleValue)
             let visible = TerminalCursorReader.snapshot(screen: snapshot.screens[index].contents, windowID: windowID, title: title, bounds: bounds)
             snapshot.screens[index].display = visible
             if visible?.screen == snapshot.screens[index].contents { snapshot.screens[index].cursor = visible?.cursor }

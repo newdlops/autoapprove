@@ -25,8 +25,12 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
     /// Notes/freeform overlays also block ordinary conversational messages;
     /// they must never receive a queued question's quoted reply as editor input.
     public static func hasCodexOverlay(_ screen: String) -> Bool {
-        let lines = DetectionLines(screen).trimmedSuffix(300)
-        guard let header = codexHeader(lines), lines[..<header].filter({ $0.hasPrefix("```") }).count % 2 == 0 else { return false }
+        hasCodexOverlay(prepared: DetectionLines(screen))
+    }
+    static func hasCodexOverlay(prepared: DetectionLines) -> Bool {
+        let suffix = prepared.normalizedSuffix(300)
+        let lines = suffix.rows.map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let header = codexHeader(lines), !prepared.hasOpenCodeFence(beforeSuffixRow: header, in: suffix) else { return false }
         return codexFooter(lines, after: header, optionsOnly: false) != nil
     }
     public func command(for index: Int) -> String {
@@ -41,10 +45,19 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
     }
 
     public static func detect(_ screen: String, agent: AgentKind) -> Self? {
-        guard agent != .shell, PromptDetector.detect(screen, agent: agent) == nil else { return nil }
-        let request = QuestionDetector.detect(screen, agent: agent)
+        let prepared = DetectionLines(screen)
+        let prompt = PromptDetector.detect(screen, agent: agent, prepared: prepared)
+        guard prompt == nil else { return nil }
+        let request = QuestionDetector.detect(agent: agent, prepared: prepared)
+        return detect(screen, agent: agent, prepared: prepared, permissionPrompt: prompt, request: request)
+    }
+
+    static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines,
+                       permissionPrompt: ApprovalPrompt?, request: PendingScreenRequest?) -> Self? {
+        guard agent != .shell, permissionPrompt == nil else { return nil }
         guard request?.phase != .approval else { return nil }
-        let all = DetectionLines(screen).raw, raw = Array(all.suffix(300)), lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
+        let suffix = prepared.normalizedSuffix(300), raw = suffix.rows
+        let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
         let header = agent == .codex ? codexHeader(lines) : nil
         guard let first = lines.lastIndex(where: { $0.range(of: #"^[›❯»>]?\s*1\.\s+"#, options: .regularExpression) != nil }),
               let last = lines.lastIndex(where: PromptDetector.isOption),
@@ -59,7 +72,7 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
             while index > 0, !lines[index - 1].isEmpty, !PromptDetector.isOption(lines[index - 1]), !lines[index - 1].allSatisfy({ "─━╌- ".contains($0) }) { index -= 1 }
             start = index
         }
-        guard lines[..<start].filter({ $0.hasPrefix("```") }).count % 2 == 0,
+        guard !prepared.hasOpenCodeFence(beforeSuffixRow: start, in: suffix),
               !lines[start...].contains(where: { $0.contains("```") }) else { return nil }
         var options: [String] = [], selected: Int?
         let indents = raw.map { $0.prefix(while: \.isWhitespace).count }
@@ -86,7 +99,9 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
         let question = lines[start..<first].filter { !$0.isEmpty }.joined(separator: "\n")
         // Include visible conversation context to distinguish identical labels
         // in successive questions. Selection movement and line wrapping are cosmetic.
-        let context = all[..<(all.count - raw.count + footer)].map { line -> String in
+        let all = prepared.raw
+        let suffixStart = max(0, all.count - raw.count)
+        let context = all[..<(suffixStart + footer)].map { line -> String in
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if let prefix = trimmed.range(of: PromptDetector.optionPrefix, options: .regularExpression) {
                 return trimmed[prefix].filter(\.isNumber) + "." + String(trimmed[prefix.upperBound...])

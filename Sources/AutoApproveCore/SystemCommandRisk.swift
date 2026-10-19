@@ -34,15 +34,6 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
 
     public static func detect(_ text: String, cwd: String = "") -> SystemCommandRisk? {
         let text = text.precomposedStringWithCanonicalMapping
-        let command = commandText(text)
-        // Only complete, simple read-only commands get this exception. Compound
-        // shell input still goes through all mutation checks.
-        if isReadOnly(command) { return nil }
-        if matches(command, #"(?i)\blaunchctl\s+(?:bootstrap|bootout|load|unload|enable|disable|kickstart|submit|setenv|unsetenv|config)\b|\bcrontab\s+|\b(?:systemctl|service)\s+(?:enable|disable|start|stop|restart)\b"#) {
-            return Self(kind: .persistence, evidence: "자동 실행 서비스 등록·해제 또는 실행 제어")
-        }
-        let protectedStartup = #"(?i)(?:(?:~|\$(?:HOME|\{HOME\}))[/\\]+Library[/\\]+(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])(?:/Users/[^/\r\n]+)?/Library/(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])/etc/(?:cron|systemd)|(?:~|\$(?:HOME|\{HOME\}))[/\\]+\.config[/\\]+autostart)"#
-        let write = #"(?i)\b(?:cp|mv|rm|install|tee|touch|mkdir|chmod|chown|ln|write_bytes|write_text|writeFile|copyFile|copyfile|copy2|copy|replace|rename|unlink|remove)\b|>>?|--install|--register|등록|설치|생성|수정|삭제"#
         var compactValue: String?
         func compact() -> String {
             if let compactValue { return compactValue }
@@ -50,13 +41,25 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             compactValue = value
             return value
         }
+        // Most tool events are ordinary project commands. A single candidate
+        // scan avoids running the full policy regex set when no protected
+        // command, system path or persistence marker exists. Whitespace is
+        // stripped first so wrapped paths stay inside the conservative path.
+        guard matches(compact(), riskCandidatePattern) else { return nil }
+        let command = commandText(text)
+        // Only complete, simple read-only commands get this exception. Compound
+        // shell input still goes through all mutation checks.
+        if isReadOnly(command) { return nil }
+        if matches(command, #"(?i)\blaunchctl\s+(?:bootstrap|bootout|load|unload|enable|disable|kickstart|submit|setenv|unsetenv|config)\b|\bcrontab\s+|\b(?:systemctl|service)\s+(?:enable|disable|start|stop|restart)\b"#) {
+            return Self(kind: .persistence, evidence: "자동 실행 서비스 등록·해제 또는 실행 제어")
+        }
         func targetsStartup() -> Bool {
-            if matches(text, protectedStartup) { return true }
+            if matches(text, protectedStartupPattern) { return true }
             var wrappedValue: String?
             if text.utf8.contains(10) {
                 let wrapped = text.replacingOccurrences(of: #"\n[ \t]*"#, with: "", options: .regularExpression)
                 if !wrapped.utf8.elementsEqual(text.utf8) {
-                    if matches(wrapped, protectedStartup) { return true }
+                    if matches(wrapped, protectedStartupPattern) { return true }
                     wrappedValue = wrapped
                 }
             }
@@ -65,12 +68,12 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             // No result, command or local installer source survives this call.
             guard !value.utf8.elementsEqual(text.utf8),
                   wrappedValue.map({ !value.utf8.elementsEqual($0.utf8) }) ?? true else { return false }
-            return matches(value, protectedStartup)
+            return matches(value, protectedStartupPattern)
         }
         let computedHome = matches(command, #"(?i)(?:python[\w/.-]*|node|ruby|osascript)\s+(?:-[ce]|--eval)\b"#)
             && matches(command, #"Path\.home\(|NSHomeDirectory\(|expanduser\(|(?:HOME|home_dir|homeDirectory)"#)
             && matches(command, #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools"#)
-        if (computedHome || targetsStartup()), (matches(text, write) || matches(compact(), #"--install|--register|write_bytes|write_text|writeFile|copyFile|등록|설치|생성|수정|삭제"#)) {
+        if (computedHome || targetsStartup()), (matches(text, writePattern) || matches(compact(), #"--install|--register|write_bytes|write_text|writeFile|copyFile|등록|설치|생성|수정|삭제"#)) {
             return Self(kind: .persistence, evidence: "자동 실행 항목 또는 관리자 입력 서비스 경로 변경")
         }
         if matches(text, #"(?i)\b(?:spctl|csrutil|tccutil)\s+(?:(?:authenticated-root)\s+)?(?:--master-disable|--global-disable|disable|reset)\b|\b(?:security|dscl)\s+(?:add-|delete-|authorizationdb|create|passwd)|\bchmod\s+(?:-\S+\s+)*(?:777|666)\b|with\s+administrator\s+privileges"#) {
@@ -80,7 +83,7 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             return Self(kind: .privileged, evidence: "sudo를 통한 관리자 권한 명령")
         }
         if matches(command, #"(?i)\b(?:defaults\s+(?:write|delete)\b|pmset\s+-[abcu](?:\s|$)|networksetup\s+-set[A-Za-z]+|systemsetup\s+-set[A-Za-z]+)"#) ||
-            (matches(text, #"(?:^|[\s\"'=])(?:(?:/private)?/etc/|/System/|/Library/(?:Preferences|Security)/)"#) && matches(command, write)) {
+            (matches(text, #"(?:^|[\s\"'=])(?:(?:/private)?/etc/|/System/|/Library/(?:Preferences|Security)/)"#) && matches(command, writePattern)) {
             return Self(kind: .settings, evidence: "Mac 전역 설정 또는 시스템 파일 쓰기")
         }
         // Script filenames hide the operation from the terminal permission text.
@@ -88,11 +91,19 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         // this to explicit installation flags and a file within the request's cwd.
         if matches(command, #"(?i)--(?:install|register)|\binstall_[^\s]+\.py\b"#),
            let script = localScript(command, cwd: cwd),
-           (matches(script, protectedStartup) || (matches(script, #"Path\.home\(|NSHomeDirectory\(|expanduser\(|(?:HOME|home_dir|homeDirectory)"#) && matches(script, #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools|\.config/autostart"#))),
-           matches(script, write) {
+           (matches(script, protectedStartupPattern) || (matches(script, #"Path\.home\(|NSHomeDirectory\(|expanduser\(|(?:HOME|home_dir|homeDirectory)"#) && matches(script, #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools|\.config/autostart"#))),
+           matches(script, writePattern) {
             return Self(kind: .persistence, evidence: "설치 스크립트가 시스템 자동 실행 경로를 변경합니다")
         }
         return nil
+    }
+
+    /// A waiting approval rechecks only commands that can inspect a local
+    /// installer source. Ordinary hook heartbeats avoid rereading scripts.
+    static func mayReferenceInstaller(_ command: String) -> Bool {
+        let value = command.lowercased()
+        return value.contains("--install") || value.contains("--register") ||
+            (value.contains("install_") && value.contains(".py"))
     }
 
     public static func detect(tool: String, input: JSONObject, summary: String = "", cwd: String = "") -> SystemCommandRisk? {
@@ -112,8 +123,39 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         return detect(operation + encoded + "\n" + summary, cwd: cwd)
     }
 
+    private static let protectedStartupPattern = #"(?i)(?:(?:~|\$(?:HOME|\{HOME\}))[/\\]+Library[/\\]+(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])(?:/Users/[^/\r\n]+)?/Library/(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])/etc/(?:cron|systemd)|(?:~|\$(?:HOME|\{HOME\}))[/\\]+\.config[/\\]+autostart)"#
+    private static let writePattern = #"(?i)\b(?:cp|mv|rm|install|tee|touch|mkdir|chmod|chown|ln|write_bytes|write_text|writeFile|copyFile|copyfile|copy2|copy|replace|rename|unlink|remove)\b|>>?|--install|--register|등록|설치|생성|수정|삭제"#
+    private static let riskCandidatePattern = #"(?i)(?:launchctl|crontab|systemctl|service|launchagents|launchdaemons|startupitems|privilegedhelpertools|cron|systemd|autostart|spctl|csrutil|tccutil|security|dscl|chmod|sudo|defaults|pmset|networksetup|systemsetup|administratorprivileges|etc/|system/|library/(?:preferences|security)/|--install|--register|install_)"#
+    private static let compiledPatterns: [String: NSRegularExpression] = {
+        let patterns = [
+            #"(?i)\blaunchctl\s+(?:bootstrap|bootout|load|unload|enable|disable|kickstart|submit|setenv|unsetenv|config)\b|\bcrontab\s+|\b(?:systemctl|service)\s+(?:enable|disable|start|stop|restart)\b"#,
+            Self.protectedStartupPattern, Self.writePattern, riskCandidatePattern,
+            #"(?i)(?:python[\w/.-]*|node|ruby|osascript)\s+(?:-[ce]|--eval)\b"#,
+            #"Path\.home\(|NSHomeDirectory\(|expanduser\(|(?:HOME|home_dir|homeDirectory)"#,
+            #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools"#,
+            #"--install|--register|write_bytes|write_text|writeFile|copyFile|등록|설치|생성|수정|삭제"#,
+            #"(?i)\b(?:spctl|csrutil|tccutil)\s+(?:(?:authenticated-root)\s+)?(?:--master-disable|--global-disable|disable|reset)\b|\b(?:security|dscl)\s+(?:add-|delete-|authorizationdb|create|passwd)|\bchmod\s+(?:-\S+\s+)*(?:777|666)\b|with\s+administrator\s+privileges"#,
+            #"(?i)(?:^|[\s;&|])(?:/usr/bin/|/bin/)?sudo\b"#,
+            #"(?i)\b(?:defaults\s+(?:write|delete)\b|pmset\s+-[abcu](?:\s|$)|networksetup\s+-set[A-Za-z]+|systemsetup\s+-set[A-Za-z]+)"#,
+            #"(?:^|[\s\"'=])(?:(?:/private)?/etc/|/System/|/Library/(?:Preferences|Security)/)"#,
+            #"(?i)--(?:install|register)|\binstall_[^\s]+\.py\b"#,
+            #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools|\.config/autostart"#,
+            #"[;&|`\n\r]|\$\(|[<>]"#,
+            #"^(?:(?:/usr/bin/|/bin/)?(?:cat|stat|ls|head|tail)\s+|(?:/usr/bin/)?plutil\s+-(?:p|lint)\s+|(?:/bin/)?launchctl\s+(?:print|list|help)\b|(?:/usr/bin/)?(?:crontab\s+-l\b|defaults\s+read|pmset\s+-g|networksetup\s+-get|systemsetup\s+-get))"#
+        ]
+        var result: [String: NSRegularExpression] = [:]
+        result.reserveCapacity(patterns.count)
+        for pattern in patterns {
+            if let expression = try? NSRegularExpression(pattern: pattern) { result[pattern] = expression }
+        }
+        return result
+    }()
+
     private static func matches(_ text: String, _ pattern: String) -> Bool {
-        text.range(of: pattern, options: .regularExpression) != nil
+        guard let expression = compiledPatterns[pattern] else {
+            return text.range(of: pattern, options: .regularExpression) != nil
+        }
+        return expression.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)) != nil
     }
     private static func commandText(_ text: String) -> String {
         let rows = text.components(separatedBy: .newlines)

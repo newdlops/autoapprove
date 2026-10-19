@@ -312,7 +312,7 @@ public struct EngineSnapshot: Codable {
     }
     public var idleCount: Int { sessions.filter { $0.phase == .idle }.count }
     public var monitoringCount: Int { sessions.filter(\.isMonitoring).count }
-    public var attentionCount: Int { sessions.reduce(0) { $0 + AttentionRequest.candidates($1, paused: paused).count } }
+    public var attentionCount: Int { sessions.reduce(0) { $0 + AttentionRequest.count($1, paused: paused) } }
 }
 
 public struct AppPaths {

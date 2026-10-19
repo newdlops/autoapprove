@@ -31,7 +31,7 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
     }
     public enum NativePurpose: String, Codable, Sendable { case monitor, validation, firstFrame, liveFrame, other }
     public enum NativeQuery: String, Codable, Sendable {
-        case text, bulkBefore, bulkTitle, bulkAfter, customTitle
+        case text, bulkContentsBefore, bulkContents, bulkContentsAfter, bulkBefore, bulkTitle, bulkAfter, customTitle
         case selectedWindow, selectedConfirm, windowBefore, windowSelection, windowName, windowAfter, other
     }
     public enum NativeFailure: String, Codable, Sendable { case permission, timeout, cancelled, other }

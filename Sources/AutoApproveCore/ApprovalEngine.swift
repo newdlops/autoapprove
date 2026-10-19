@@ -2,11 +2,22 @@ import Foundation
 import Combine
 import TerminalInputSupport
 
+private struct ScreenAnalysisStorageKey: Hashable {
+    let address: UInt
+    let byteCount: Int
+    let agent: String
+}
+
 @MainActor public final class ApprovalEngine: ObservableObject {
-    @Published public private(set) var snapshot: EngineSnapshot
+    @Published public private(set) var snapshot: EngineSnapshot {
+        didSet { remoteDashboardRevision &+= 1 }
+    }
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
-    @Published public private(set) var lanUpdate = LANUpdateStatus()
+    @Published public private(set) var lanUpdate = LANUpdateStatus() {
+        didSet { remoteDashboardRevision &+= 1 }
+    }
+    private(set) var remoteDashboardRevision: UInt64 = 0
     public var finishLANUpdate: @MainActor () -> Void = {}
     public private(set) var webService: RemoteNetworkService?
     private let webLoopbackOnly: Bool
@@ -42,7 +53,8 @@ import TerminalInputSupport
     private var remoteMonitorFrames: [String: RemoteObservedScreen] = [:]
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
     private var remoteTerminalChanges: [String: RemoteTerminalChangeSignal] = [:]
-    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?, agent: AgentKind)] = [:]
+    private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, usesRawPresentation: Bool, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?, agent: AgentKind)] = [:]
+    private var nextRemoteFramePruneAt: TimeInterval = 0
     private let orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)?
     private var remoteOrcaBindings: [String: (targetGeneration: String, binding: RemoteOrcaBinding)] = [:]
     private var remoteInputSessions = Set<String>()
@@ -80,6 +92,9 @@ import TerminalInputSupport
     private let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
+    private let discoveryReader: @Sendable () throws -> [ProcessRecord]
+    private var workingDirectoriesBySession: [String: String] = [:]
+    private var workingDirectoryReadAt: [String: TimeInterval] = [:]
     private let remoteProcessVerifier: @Sendable (AgentSession) throws -> Bool
     private var claudeParents: [String: String] = [:]
     private var recoveredClaudeStates = Set<String>()
@@ -88,14 +103,18 @@ import TerminalInputSupport
         var request: ClaudeHookRequest
         var receipt: ClaudeHookReceipt
         var lastContact: Date
+        var questionEditing = false
     }
     private var liveClaudeHooks: [String: LiveClaudeHook] = [:]
+    private var projectedClaudeApprovalSessionIDs = Set<String>()
     private var claudeHookSignals: [String: RemoteTerminalChangeSignal] = [:]
     private var claudeHookWaitTasks: [String: (token: UUID, task: Task<Void, Never>)] = [:]
     private var parentSaveFailed = false
     private let codexQuestions = CodexQuestionCollector()
     private var codexCompletions = CodexCompletionTracker()
     private var codexTurns: [String: (state: CodexTurnState, observedAt: Date)] = [:]
+    private var retainedDiscoverySessionIDs: Set<String>?
+    private var retainedTmuxHandles: Set<String>?
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private let codexQueue: CodexQueueTransport
@@ -106,12 +125,52 @@ import TerminalInputSupport
     private var questionThreadBySession: [String: String] = [:]
     private var restoredQuestionIDs = Set<String>()
     private var questionAutomationOverrides: [String: QuestionAutomation.Phase] = [:]
+    private struct QuestionConfirmationKey: Hashable {
+        let sessionID: String
+        let title: String
+        let options: [String]
+        init(sessionID: String, question: QueuedQuestion) {
+            self.sessionID = sessionID; title = question.title; options = question.options
+        }
+    }
+    private struct QuestionConfirmationCache {
+        private var detected: [QuestionConfirmationKey: YesNoConfirmation] = [:]
+        private var checked = Set<QuestionConfirmationKey>()
+#if DEBUG
+        private(set) var detectionCount = 0
+#endif
+        mutating func confirmation(sessionID: String, question: QueuedQuestion) -> YesNoConfirmation? {
+            let key = QuestionConfirmationKey(sessionID: sessionID, question: question)
+            if checked.contains(key) { return detected[key] }
+            checked.insert(key)
+#if DEBUG
+            detectionCount += 1
+#endif
+            let result = YesNoConfirmation.detect(question)
+            if let result { detected[key] = result }
+            return result
+        }
+    }
+#if DEBUG
+    public private(set) var debugQuestionConfirmationDetections = 0
+#endif
+    private struct PersistedQuestionSettings {
+        var dismissalLoaded = false
+        var dismissed = false
+        var automationLoaded = false
+        var automation: QuestionAutomation.Phase?
+    }
+    private var persistedQuestionSettings: [String: PersistedQuestionSettings] = [:]
+    private static let persistedQuestionSettingsLimit = 2_048
+    private var cachedDuplicateQuestionIDsBySession: [String: Set<String>] = [:]
+    private var duplicateQuestionIDsDirty = true
     private var automaticQuestionReplies: [String: AutomaticQuestionReply] = [:]
     private var questionAutomationStopped = false
     private struct AutomaticQuestionReply {
         var token: UUID
         var sessionID: String
         var question: QueuedQuestion
+        var answer: String
         var sending = false
         var deadline: Date
         var task: Task<Void, Never>
@@ -124,10 +183,13 @@ import TerminalInputSupport
     private var pollTask: Task<Void, Never>?
     private var historyPollTask: Task<Void, Never>?
     private var screenPollTasks: [ScreenHost: Task<Void, Never>] = [:]
+    private var unchangedScreenReads: [ScreenHost: Int] = [:]
     private var observationEpoch: UInt64 = 0
     private let historyPollSignal = RemoteTerminalChangeSignal()
     private let screenPollSignals = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, RemoteTerminalChangeSignal()) })
     private var gitBranchTask: Task<Void, Never>?
+    private var gitBranchTargets: [String: String] = [:]
+    private var gitBranchRefreshUptime: TimeInterval = 0
     private var peers: [String: SocketConnection] = [:]
     private var bridges: [String: [JSONObject]] = [:]
     private var screens: [String: ScreenState] = [:]
@@ -186,6 +248,7 @@ import TerminalInputSupport
         var submitOnly = false
     }
     private var capacityStates: [String: CapacityState] = [:]
+    private var projectedCapacityResumeIDs = Set<String>()
     private var legacyResumeDraftReceipts: [String: [CodexCapacityStop]] = [:]
     private var exitRecoveries: [String: SessionExitRecovery] = [:]
     private var exitRecoveryTasks: [String: UUID] = [:]
@@ -216,6 +279,7 @@ import TerminalInputSupport
     /// Set by `stop()`: a check that resumes afterwards changes nothing.
     private var keepAwakeStopped = false
     private var keepAwakeTask: Task<Void, Never>?
+    private let keepAwakeSignal = RemoteTerminalChangeSignal()
     private var keepAwakeActivity: NSObjectProtocol?
     private let mouseActivity: MouseActivity
     private var mouseActivityTask: Task<Void, Never>?
@@ -253,6 +317,7 @@ import TerminalInputSupport
         self.codexQueue = codexQueue
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
+        self.discoveryReader = processReader ?? { try ProcessDiscovery.readSessions() }
         self.remoteProcessVerifier = { session in
             // A first screen already exists in the monitor. Verify its live
             // owner without launching a second process on the handshake path.
@@ -357,7 +422,11 @@ import TerminalInputSupport
         keepAwakeStopped = false
         mouseActivity.setEnabled(store.value("mouseActivity") == "true")
         snapshot.mouseActivity = mouseActivity.status
-        reconcileAutomaticQuestionReplies()
+        var confirmations = QuestionConfirmationCache()
+        reconcileAutomaticQuestionReplies(duplicatesBySession: duplicateQuestionIDsBySession(), confirmations: &confirmations)
+#if DEBUG
+        debugQuestionConfirmationDetections += confirmations.detectionCount
+#endif
         let savedWeb = store.value("webEnabled")
         if savedWeb == "true" || (savedWeb == nil && webByDefault) {
             do { try setWebEnabled(true) }
@@ -367,13 +436,6 @@ import TerminalInputSupport
             }
         }
         if poll {
-            // Independent of keep-awake's work, battery, heat and asynchronous privilege checks.
-            mouseActivityTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    self?.evaluateMouseActivity()
-                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { break }
-                }
-            }
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refreshDiscovery()
@@ -381,11 +443,17 @@ import TerminalInputSupport
                     do { try await Task.sleep(for: .seconds(4)) } catch { break }
                 }
             }
+            // The opt-in pulse task sleeps until its one-minute deadline and does not run while disabled.
+            startMouseActivityPolling()
             // Screen reads can take many seconds; battery, heat and idle checks keep their own pace.
+            let observation = keepAwakeSignal.observe()
             keepAwakeTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    await self?.evaluateKeepAwake()
-                    do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { break }
+                await observation.waitForChange(timeout: 0)
+                while !Task.isCancelled, let self {
+                    await self.evaluateKeepAwake()
+                    let interval = KeepAwake.evaluationInterval(enabled: self.keepAwakeEnabled,
+                        ownsSleepHold: self.keepAwakeSwitch.owned)
+                    await observation.waitForChange(timeout: interval)
                 }
             }
         }
@@ -476,17 +544,29 @@ import TerminalInputSupport
     }
 
     public func remoteSessionViews() -> [RemoteSessionView] {
-        snapshot.sessions.filter { $0.phase != .ended || $0.interruption?.needsAttention == true ||
-            ($0.interruption?.resumedSessionID != nil && Date().timeIntervalSince($0.interruption?.recoveredAt ?? .distantPast) < 300) }.compactMap { session -> RemoteSessionView? in
+        let candidates = snapshot.sessions.filter { $0.phase != .ended || $0.interruption?.needsAttention == true ||
+            ($0.interruption?.resumedSessionID != nil && Date().timeIntervalSince($0.interruption?.recoveredAt ?? .distantPast) < 300) }
+        // The helper status is shared by every Terminal tab. Read its cached
+        // state lazily once per inventory instead of locking the XPC client for
+        // each session or probing it when no readable Terminal tab exists.
+        var terminalKeysAvailable: Bool?
+        return candidates.compactMap { session -> RemoteSessionView? in
             let canRead = remoteCanRead(session) || nativeWindowCapture(for: session) != nil || usesOrcaSnapshot(session)
             let ptyID = session.id.hasPrefix("pty:") ? String(session.id.dropFirst(4)) : ptySessionBindings[session.id]
             let terminal = ptyID.flatMap { try? managedPTY.terminal($0) }
             if let terminal, !terminal.isRunning { return nil }
             let pty = terminal?.descriptor
+            let keys: [String]
+            if canRead && (!usesOrcaSnapshot(session) || remoteCanRead(session)) {
+                if session.terminal == .terminal {
+                    if terminalKeysAvailable == nil { terminalKeysAvailable = self.terminalInputAvailable() }
+                    keys = remoteKeys(session, terminalInputAvailable: terminalKeysAvailable)
+                } else { keys = remoteKeys(session) }
+            } else { keys = [] }
             return RemoteSessionView(session: session,
                 title: session.customization?.title.isEmpty == false ? session.customization!.title : session.terminalTitle ?? session.project,
                 phaseTitle: session.phaseTitle, canApprove: session.canApprove, canReveal: session.canReveal,
-                canRead: canRead, inputReason: remoteInputReason(session), keys: canRead && (!usesOrcaSnapshot(session) || remoteCanRead(session)) ? remoteKeys(session) : [],
+                canRead: canRead, inputReason: remoteInputReason(session), keys: keys,
                 ptyID: pty?.ptyID, pty: pty)
         }
     }
@@ -650,6 +730,7 @@ import TerminalInputSupport
         for key in ptySessionBindings.keys where ptySessionBindings[key] == id {
             sessions[key]?.setPhase(.ended, detail: "PTY가 종료되었습니다.")
             sessions[key]?.channel = .none; sessions[key]?.automatic = false
+            if sessions[key]?.queuedQuestions?.isEmpty == false { invalidateDuplicateQuestionIDs() }
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
             clearScreen(key); capacityStates.removeValue(forKey: key)
         }
@@ -666,11 +747,11 @@ import TerminalInputSupport
         return try tmuxRelay.observe(ScreenTarget(tty: session.tty, handle: session.tmuxHandle))
     }
     private func usesOrcaSnapshot(_ session: AgentSession) -> Bool { session.terminal == .orca && orcaSnapshotReader != nil }
-    private func remoteKeys(_ session: AgentSession) -> [String] {
+    private func remoteKeys(_ session: AgentSession, terminalInputAvailable inputAvailable: Bool? = nil) -> [String] {
         let basic = ["text", "enter", "escape", "interrupt", "up", "down", "tab"]
         let interactive = ["submit", "characters", "left", "right", "backspace", "delete", "home", "end", "choice"]
         if session.terminal == .terminal {
-            return terminalInputAvailable() ? basic + interactive + ["message"] : ["text", "submit", "enter"]
+            return (inputAvailable ?? terminalInputAvailable()) ? basic + interactive + ["message"] : ["text", "submit", "enter"]
         }
         if session.terminal == .tmux { return basic + interactive + ["message"] }
         if usesOrcaSnapshot(session) {
@@ -1115,13 +1196,36 @@ import TerminalInputSupport
         // An actual screen/generation change or a consumed frame gets a new token.
         let previous = remoteFrames[sessionID]
         let presented = display?.screen ?? raw
-        // Byte/code-unit counts bound Character count without walking short
-        // foreign strings by grapheme. Larger inputs keep the exact old suffix.
-        let units = presented.isContiguousUTF8 ? presented.utf8.count : presented.utf16.count
-        let screen = units <= 160_000 ? presented : String(presented.suffix(160_000))
-        let visibleAppearance = screen == raw ? appearance : nil
-        let visibleCursor = screen == presented ? (display?.cursor ?? cursor)?.validated(for: screen) : nil
-        let token = previous?.raw == raw && previous?.frame.screen == screen && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor && previous?.frame.nativeDisplay == nativeDisplay && previous?.frame.outputReason == outputReason ? previous!.frame.revision : UUID().uuidString
+        // A cached observation carries the same timestamp and immutable source
+        // text. Reuse the prior projections without rescanning the full screen.
+        let sameSourceText = ScreenTextEquality.identical(previous?.raw, raw)
+        let sameObservation = display == nil && capture == nil && previous?.usesRawPresentation == true &&
+            previous?.generation == generation && previous?.frame.observedAt == observedAt && sameSourceText
+        // A repeated oversized frame already owns the exact truncated view.
+        // Reusing it avoids walking and copying 160k graphemes on every browser
+        // poll; native display text still takes the normal path because it may
+        // change independently of the underlying terminal frame.
+        let usesRawPresentation = display == nil
+        let reusableScreen = usesRawPresentation && previous?.usesRawPresentation == true &&
+            previous?.generation == generation && sameSourceText
+        let screen: String
+        if reusableScreen, let previous { screen = previous.frame.screen }
+        else {
+            // Byte/code-unit counts bound Character count without walking short
+            // foreign strings by grapheme. Larger inputs keep the exact old suffix.
+            let units = presented.isContiguousUTF8 ? presented.utf8.count : presented.utf16.count
+            if units <= 160_000 {
+                // Foundation bridge strings can traverse their NSString-backed
+                // storage again on every JSON encode. The screen is already
+                // captured as an immutable revision, so copy that text once to
+                // native UTF-8 storage before retaining it in the frame cache.
+                screen = presented.isContiguousUTF8 ? presented : String(decoding: presented.utf8, as: UTF8.self)
+            } else { screen = String(presented.suffix(160_000)) }
+        }
+        let visibleAppearance = ScreenTextEquality.identical(screen, raw) ? appearance : nil
+        let visibleCursor = ScreenTextEquality.identical(screen, presented) ? (display?.cursor ?? cursor)?.validated(for: screen) : nil
+        let sameSource = sameObservation || sameSourceText && ScreenTextEquality.identical(previous?.frame.screen, screen)
+        let token = sameSource && previous?.generation == generation && previous?.frame.appearance == visibleAppearance && previous?.frame.cursor == visibleCursor && previous?.frame.nativeDisplay == nativeDisplay && previous?.frame.outputReason == outputReason ? previous!.frame.revision : UUID().uuidString
         let inputIdentity = [.terminal, .tmux].contains(current.terminal) ? terminalInputIdentity(current.pid) : nil
         if let inputIdentity, inputIdentity.pid != current.pid || inputIdentity.processStart != current.started {
             throw RemoteHTTPError(409, "원래 CLI의 실행 식별자가 바뀌었습니다. 목록을 새로고침해주세요.")
@@ -1148,13 +1252,13 @@ import TerminalInputSupport
             cursor: visibleCursor, streamID: relaySupported ? remoteStreams[sessionID]?.token : nil, nativeDisplay: nativeDisplay, outputReason: outputReason, sequence: remoteFrameSequence)
         // The last frame already retains this raw screen. Reuse only immutable
         // detection, including a negative result; replies and input checks stay live.
-        frame.question = previous?.agent == current.agent && ScreenTextEquality.identical(previous?.raw, raw)
+        frame.question = previous?.agent == current.agent && sameSourceText
             ? previous?.frame.question : TerminalChoiceQuestion.detect(raw, agent: current.agent)
         if var question = frame.question {
             question.reply = savedReply("terminalChoice:\(sessionID):\(question.id)")
             frame.question = question
         }
-        remoteFrames[sessionID] = (frame, raw, generation, orcaBinding, nativeOnly ? nativeBinding : nil, current.agent)
+        remoteFrames[sessionID] = (frame, raw, generation, usesRawPresentation, orcaBinding, nativeOnly ? nativeBinding : nil, current.agent)
         frameSucceeded = true
         return frame
     }
@@ -1400,6 +1504,10 @@ import TerminalInputSupport
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
         let observation = remoteTerminalChanges[sessionID]!.observe()
+        if let host = sessions[sessionID].flatMap({ ScreenHost(kind: $0.terminal) }) {
+            unchangedScreenReads[host] = 0
+            screenPollSignals[host]?.notify()
+        }
         if sessions[sessionID]?.terminal == .terminal {
             observation.observeNativeCursor { [weak self] in
                 Task { @MainActor [weak self] in self?.invalidateRemoteRead(sessionID) }
@@ -1408,7 +1516,10 @@ import TerminalInputSupport
         return observation
     }
     func remoteTerminalNeedsResponsiveRead(_ id: String) -> Bool {
-        userInputHasPriority(id) || automaticInputBusy(id) || sessions[id]?.phase == .working
+        // New screen contents arrive through the host's change signal. Force
+        // short confirmation reads only while a user or approval input is in
+        // flight, not merely because the CLI is doing work in the background.
+        userInputHasPriority(id) || automaticInputBusy(id)
     }
 
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
@@ -1533,7 +1644,9 @@ import TerminalInputSupport
                   let pending = liveClaudeHooks[request], pending.request.sessionID == id, pending.receipt.response == nil else {
                 throw RemoteHTTPError(409, "질문이 이미 처리되었습니다.")
             }
-            try store.set("claudeQuestionEditing:" + request, "true"); publish()
+            try store.set("claudeQuestionEditing:" + request, "true")
+            var editing = pending; editing.questionEditing = true; liveClaudeHooks[request] = editing
+            publish()
         case "sendMessage":
             if object["transport"] as? String == "terminal" { return try await sendOriginalTerminalMessage(session, object: object) }
             guard session.agent == .codex, let message = object["text"] as? String,
@@ -1608,7 +1721,8 @@ import TerminalInputSupport
         guard !remoteInputStopped, let current = sessions[session.id], current.phase != .ended,
               current.pid == session.pid, current.started == session.started, current.tty == session.tty, current.cwd == session.cwd,
               threadID == nil || questionThreadBySession[session.id] == nil || questionThreadBySession[session.id] == threadID,
-              try processReader().contains(where: { $0.key == session.id && $0.agent == .codex && "/dev/" + $0.tty == session.tty }) else {
+              session.id == "process:\(session.pid):\(session.started)",
+              try remoteProcessVerifier(session) else {
             throw RemoteHTTPError(409, "Codex 실행이나 대화가 바뀌었습니다. 현재 목록을 다시 확인해주세요.")
         }
     }
@@ -1670,12 +1784,50 @@ import TerminalInputSupport
     }
 
     private func presentedSessions() -> [AgentSession] {
-        // Resolve current ownership once per publication, including missing/ended
-        // parents and cycles. This map never survives a state change or an await.
-        let owners = Dictionary(uniqueKeysWithValues: sessions.keys.compactMap { id in
-            ownerID(id).map { (id, $0) }
-        })
-        let raw = sessions.values.map { value -> AgentSession in
+        // Most installs have no verified Claude parent/child relationships.
+        // In that common case the ownership graph cannot alter any row, so skip
+        // building active-ID, owner, and child indexes for every publication.
+        if claudeParents.isEmpty { return Array(sessions.values) }
+        // Persisted links can outlive their child process. When no linked child
+        // is active, the graph is irrelevant; preserve only the old projection's
+        // behavior of disabling automatic mode on ended child rows.
+        if !claudeParents.keys.contains(where: { child in
+            guard let session = sessions[child] else { return false }
+            return session.phase != .ended
+        }) {
+            return sessions.values.map { value in
+                guard value.phase == .ended, claudeParents[value.id] != nil else { return value }
+                var endedChild = value
+                endedChild.automatic = false
+                return endedChild
+            }
+        }
+        // Resolve ownership once per publication, reusing each traversed chain.
+        // Most sessions have no parent and need no temporary Set allocation.
+        let activeIDs = Set(sessions.values.lazy.filter { $0.phase != .ended }.map(\.id))
+        var owners: [String: String] = [:], unresolved = Set<String>()
+        for id in sessions.keys {
+            guard activeIDs.contains(id) else { continue }
+            if claudeParents[id] == nil { owners[id] = id; continue }
+            guard owners[id] == nil, !unresolved.contains(id) else { continue }
+            var current = id, path: [String] = [], seen = Set<String>()
+            var owner: String?
+            while true {
+                guard activeIDs.contains(current) else { break }
+                if let cached = owners[current] { owner = cached; break }
+                guard !unresolved.contains(current), seen.insert(current).inserted else { break }
+                path.append(current)
+                guard let parent = claudeParents[current] else { owner = current; break }
+                current = parent
+            }
+            if let owner {
+                for member in path { owners[member] = owner }
+            } else { unresolved.formUnion(path) }
+        }
+        var raw: [AgentSession] = []
+        raw.reserveCapacity(sessions.count)
+        var childrenByOwner: [String: [AgentSession]] = [:]
+        for value in sessions.values {
             var session = value
             if claudeParents[value.id] != nil {
                 session.automatic = !parentSaveFailed && owners[value.id].flatMap { sessions[$0]?.automatic } == true
@@ -1683,20 +1835,22 @@ import TerminalInputSupport
             if claudeParents[value.id] != nil && owners[value.id] == nil && value.phase != .ended {
                 session.detail = "메인 세션이 종료되었거나 연결을 확인할 수 없어 자동 승인을 멈췄습니다. 독립적으로 처리하려면 이 세션의 자동 승인을 다시 켜세요."
             }
-            return session
+            raw.append(session)
+            if let owner = owners[value.id], owner != value.id {
+                childrenByOwner[owner, default: []].append(session)
+            }
         }
         func priority(_ phase: SessionPhase) -> Int {
             switch phase { case .input: return 6; case .approval: return 5; case .working: return 4; case .unknown: return 3; case .idle: return 2; case .ended: return 0 }
         }
-        let childrenByOwner = Dictionary(grouping: raw.filter { owners[$0.id] != nil && owners[$0.id] != $0.id }, by: { owners[$0.id]! })
         return raw.compactMap { value in
             if let root = owners[value.id], root != value.id { return nil }
             var parent = value
-            let children = (childrenByOwner[value.id] ?? []).sorted {
+            guard let unsortedChildren = childrenByOwner[value.id], !unsortedChildren.isEmpty else { return parent }
+            let children = unsortedChildren.sorted {
                 if priority($0.phase) != priority($1.phase) { return priority($0.phase) > priority($1.phase) }
                 return $0.id < $1.id
             }
-            guard !children.isEmpty else { return parent }
             parent.backgroundSessions = children; parent.ownPhase = value.phase
             parent.detail = "메인과 백그라운드의 질문·알림을 함께 표시합니다. 백그라운드 질문은 연결된 Claude 훅으로 처리합니다."
             if let lead = children.first, value.phase == .unknown || priority(lead.phase) > priority(value.phase) {
@@ -1704,8 +1858,10 @@ import TerminalInputSupport
                 parent.backgroundMonitoring = lead.backgroundMonitoring
                 parent.activityDetail = lead.activityDetail
             }
-            parent.lastActivity = ([value] + children).map(\.lastActivity).max() ?? value.lastActivity
-            parent.notices = ([value] + children).flatMap { $0.notices ?? [] }.sorted { $0.date > $1.date }
+            parent.lastActivity = children.reduce(value.lastActivity) { max($0, $1.lastActivity) }
+            var notices = value.notices ?? []
+            for child in children { notices.append(contentsOf: child.notices ?? []) }
+            parent.notices = notices.sorted { $0.date > $1.date }
             if parentSaveFailed {
                 parent.detail = "메인·백그라운드 연결을 저장하지 못해 백그라운드 자동 승인을 멈췄습니다. 저장 상태를 확인해주세요."
             }
@@ -1769,12 +1925,20 @@ import TerminalInputSupport
         if screenPublicationDepth > 0 { screenPublicationPending = true; return }
         projectClaudeApprovals()
         projectCapacityResumes()
-        reconcileAutomaticQuestionReplies()
-        updateQuestionAutomationStates()
+        let duplicatesBySession = duplicateQuestionIDsBySession()
+        var confirmations = QuestionConfirmationCache()
+        reconcileAutomaticQuestionReplies(duplicatesBySession: duplicatesBySession, confirmations: &confirmations)
+        updateQuestionAutomationStates(duplicatesBySession: duplicatesBySession, confirmations: &confirmations)
+#if DEBUG
+        debugQuestionConfirmationDetections += confirmations.detectionCount
+#endif
         updateInboxes()
-        let ranks = Dictionary(uniqueKeysWithValues: sessionOrder.enumerated().map { ($0.element, $0.offset) })
+        var ranks: [String: Int] = [:]
+        ranks.reserveCapacity(sessionOrder.count)
+        for (rank, id) in sessionOrder.enumerated() { ranks[id] = rank }
         let rows = presentedSessions()
-        let projects = Dictionary(uniqueKeysWithValues: rows.filter { ranks[$0.id] == nil }.map { ($0.id, $0.project) })
+        var projects: [String: String] = [:]
+        for row in rows where ranks[row.id] == nil { projects[row.id] = row.project }
         let presented = rows.sorted {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
             let left = ranks[$0.id] ?? Int.max, right = ranks[$1.id] ?? Int.max
@@ -1924,14 +2088,22 @@ import TerminalInputSupport
         let now = Date()
         for id in Array(sessions.keys) {
             guard var session = sessions[id] else { continue }
-            session.automatic = effectiveAutomatic(id)
-            var candidates = AttentionRequest.candidates(session, paused: snapshot.paused).map {
-                SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary,
-                    isInterruption: $0.kind == .interruption, isSystemSafety: $0.kind == .systemChange)
+            let recentCompletion = session.phase != .ended && session.completion.map { now.timeIntervalSince($0.date) <= 300 } == true
+            let hasAttentionInputs = session.systemSafety != nil || session.interruption != nil ||
+                session.queuedQuestions?.contains(where: \.needsAnswer) == true ||
+                session.claudeApprovals?.isEmpty == false || session.pendingSummary != nil || !session.backgroundChildren.isEmpty
+            var candidates: [SessionInbox.Candidate] = []
+            if session.agent != .shell && hasAttentionInputs {
+                session.automatic = effectiveAutomatic(id)
+                candidates = AttentionRequest.candidates(session, paused: snapshot.paused).map {
+                    SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary,
+                        isInterruption: $0.kind == .interruption, isSystemSafety: $0.kind == .systemChange)
+                }
             }
-            if session.phase != .ended, let completion = session.completion, now.timeIntervalSince(completion.date) <= 300 {
+            if recentCompletion, let completion = session.completion {
                 candidates.append(.init(key: SessionNotice.key(.completion, completion.id), kind: .completion, summary: completion.summary))
             }
+            if candidates.isEmpty && inboxes[id] == nil { continue }
             var inbox = inboxes[id] ?? SessionInbox()
             let observed = session.phase == .ended || (session.phase != .unknown &&
                 (session.agent != .codex || (session.codexQuestionsObservedAt != nil && session.codexQuestionsError == nil)))
@@ -1947,68 +2119,150 @@ import TerminalInputSupport
 
     public func refresh() async {
         await refreshDiscovery()
-        async let questions: Void = refreshCodexHistory()
+        async let questions = refreshCodexHistory()
         await refreshScreens()
-        await questions
+        _ = await questions
         publish()
     }
 
     private func refreshDiscovery() async {
         guard !discovering else { return }
         discovering = true
+        var publishedDiscovery = false
         let epoch = observationEpoch
         defer {
             discovering = false
             if !initialDiscoveryComplete { initialDiscoveryComplete = true }
         }
         do {
-            let reader = processReader
+            let reader = discoveryReader
             let discovered = try await Task.detached(priority: .utility) { try reader() }.value
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             let found = ProcessDiscovery.sessions(discovered)
-            let directories = await Task.detached(priority: .utility) {
-                let paths = ProcessDiscovery.workingDirectories(pids: found.map(\.pid))
-                return Dictionary(found.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
-            }.value
+            let identities = found.map(\.id)
+            let dueIDs = Set(ProcessDiscovery.workingDirectoryRefreshIDs(identities,
+                lastRead: workingDirectoryReadAt, now: ProcessInfo.processInfo.systemUptime))
+            let directoryTargets = found.filter { dueIDs.contains($0.id) }
+            let directories: [String: String]
+            if directoryTargets.isEmpty { directories = [:] }
+            else {
+                directories = await Task.detached(priority: .utility) {
+                    let paths = ProcessDiscovery.workingDirectories(pids: directoryTargets.map(\.pid))
+                    return Dictionary(directoryTargets.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
+                }.value
+            }
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
-            updateDiscovery(found, records: discovered, directories: directories)
+            let readAt = ProcessInfo.processInfo.systemUptime
+            let liveIDs = Set(identities)
+            workingDirectoryReadAt = workingDirectoryReadAt.filter { liveIDs.contains($0.key) }
+            workingDirectoriesBySession = workingDirectoriesBySession.filter { liveIDs.contains($0.key) }
+            for session in directoryTargets { workingDirectoryReadAt[session.id] = readAt }
+            workingDirectoriesBySession.merge(directories) { _, latest in latest }
             if snapshot.health.discoveryError != nil { snapshot.health.discoveryError = nil }
+            updateDiscovery(found, records: discovered, directories: workingDirectoriesBySession)
+            publishedDiscovery = true
         } catch {
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             if snapshot.health.discoveryError != error.localizedDescription { snapshot.health.discoveryError = error.localizedDescription }
         }
         refreshGitBranches()
-        publish()
+        // updateDiscovery publishes the complete successful snapshot itself.
+        // Re-running publish here would repeat question reconciliation, inbox
+        // projection, session sorting and remote-row construction every poll.
+        if !publishedDiscovery { publish() }
     }
 
-    private func refreshCodexHistory() async {
+    private func refreshCodexHistory() async -> (targetCount: Int, responsive: Bool)? {
         let epoch = observationEpoch
-        let codexTargets = Array(sessions.values).filter { $0.agent == .codex && $0.phase != .ended }
+        let codexTargets = sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
         let updates = await codexQuestions.collect(codexTargets)
-        guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
+        guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
         updateCodexQuestions(updates)
+        let responsive = codexTargets.contains { target in
+            guard let current = sessions[target.id] else { return false }
+            return current.unansweredQuestions.contains(where: { $0.hasLaterUserMessage != true }) ||
+                capacityStates[target.id].map { $0.phase == .waiting && $0.deadline.timeIntervalSinceNow <= 2 } == true
+        }
+        return (codexTargets.count, responsive)
+    }
+
+    private func reserveQuestionSettingsCacheEntry(_ id: String) {
+        if persistedQuestionSettings[id] == nil, persistedQuestionSettings.count >= Self.persistedQuestionSettingsLimit {
+            persistedQuestionSettings.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func persistedQuestionIsDismissed(_ id: String) -> Bool {
+        reserveQuestionSettingsCacheEntry(id)
+        var settings = persistedQuestionSettings[id] ?? PersistedQuestionSettings()
+        if !settings.dismissalLoaded {
+            settings.dismissed = store.value("dismissedQuestion:\(id)") == "true"
+            settings.dismissalLoaded = true
+            persistedQuestionSettings[id] = settings
+        }
+        return settings.dismissed
+    }
+
+    private func persistedQuestionAutomation(_ id: String) -> QuestionAutomation.Phase? {
+        reserveQuestionSettingsCacheEntry(id)
+        var settings = persistedQuestionSettings[id] ?? PersistedQuestionSettings()
+        if !settings.automationLoaded {
+            if let saved = store.value("questionAutomation:\(id)"),
+               let phase = QuestionAutomation.Phase(rawValue: saved), [.editing, .cancelled].contains(phase) {
+                settings.automation = phase
+            }
+            settings.automationLoaded = true
+            persistedQuestionSettings[id] = settings
+        }
+        return settings.automation
     }
 
     private func pollingTargets(_ host: ScreenHost) -> [AgentSession] {
         sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
     }
 
-    private func pollingIdentities() -> [ScreenHost: Set<String>] {
-        Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { host in
-            (host, Set(pollingTargets(host).map { $0.id + ":" + $0.tty + ":" + ($0.screenHandle ?? "") }))
-        })
+    private struct ScreenPollingIdentity: Hashable {
+        let sessionID: String
+        let tty: String
+        let screenHandle: String?
+    }
+    private func pollingIdentities() -> [ScreenHost: Set<ScreenPollingIdentity>] {
+        var result = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, Set<ScreenPollingIdentity>()) })
+        for session in sessions.values where session.agent != .shell && session.phase != .ended {
+            guard let host = ScreenHost(kind: session.terminal) else { continue }
+            result[host, default: []].insert(ScreenPollingIdentity(sessionID: session.id, tty: session.tty, screenHandle: session.screenHandle))
+        }
+        return result
     }
 
-    private func screenPollInterval(_ host: ScreenHost) -> TimeInterval {
-        let targets = pollingTargets(host)
+    private func screenPollInterval(_ host: ScreenHost, targets: [AgentSession]) -> TimeInterval {
         guard !targets.isEmpty, screenConnections[host]?.enabled == true,
               screenConnections[host]?.permissionBlocked != true else { return 8 }
-        if targets.contains(where: { userInputHasPriority($0.id) || automaticInputBusy($0.id) }) { return 0.35 }
-        if snapshot.paused || !targets.contains(where: { effectiveAutomatic($0.id) }) { return 4 }
-        if targets.contains(where: { $0.phase == .approval || $0.phase == .input }) { return 0.5 }
-        if targets.contains(where: { capacityStates[$0.id].map { $0.phase == .waiting && $0.deadline.timeIntervalSinceNow <= 2 } == true }) { return 0.5 }
-        if targets.contains(where: { $0.interruption?.needsAttention == true }) { return 2 }
-        return targets.contains(where: { $0.phase == .working || $0.phase == .unknown }) ? 1.5 : 3
+        var priorityInput = false, automatic = false, waitingForModel = false
+        var approval = false, interrupted = false, active = false
+        let now = Date()
+        // The slow part of automaticInputBusy is scanning pendingActions for a
+        // matching session. Index those few actions once instead of doing that
+        // search once per terminal target.
+        let pendingActionSessions = Set(pendingActions.values.lazy.map(\.sessionID))
+        for target in targets {
+            let id = target.id
+            let hasPriorityInput = remoteInputSessions.contains(id) || remoteInputUntil[id].map { now < $0 } == true
+            let hasAutomaticInput = automaticInputSessions.contains(id) || systemSafetyTasks.contains(id) ||
+                capacityStates[id]?.phase == .sending || pendingActionSessions.contains(id)
+            priorityInput = priorityInput || hasPriorityInput || hasAutomaticInput
+            automatic = automatic || effectiveAutomatic(target.id)
+            approval = approval || target.phase == .approval || target.phase == .input
+            interrupted = interrupted || target.interruption?.needsAttention == true
+            active = active || target.phase == .working || target.phase == .unknown
+            if let capacity = capacityStates[target.id], capacity.phase == .waiting,
+               capacity.deadline.timeIntervalSince(now) <= 2 { waitingForModel = true }
+        }
+        if priorityInput { return 0.35 }
+        if snapshot.paused || !automatic { return 4 }
+        if approval || waitingForModel { return 0.5 }
+        if interrupted { return 2 }
+        return active ? RemoteTerminalPolling.activeScreenInterval(unchangedReads: unchangedScreenReads[host] ?? 0) : 3
     }
 
     private func startObservationPolling() {
@@ -2019,13 +2273,18 @@ import TerminalInputSupport
                 await observation.waitForChange(timeout: 0)
                 while !Task.isCancelled, let self, !self.remoteInputStopped {
                     let started = ProcessInfo.processInfo.systemUptime
-                    await self.refreshCodexHistory()
-                    let targets = self.sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
-                    let responsive = targets.contains { target in
-                        target.unansweredQuestions.contains(where: { $0.hasLaterUserMessage != true }) ||
-                            self.capacityStates[target.id].map { $0.phase == .waiting && $0.deadline.timeIntervalSinceNow <= 2 } == true
+                    let state = await self.refreshCodexHistory()
+                    if let state, state.targetCount == 0 {
+                        // The empty collection closes retained SQLite handles.
+                        // With no Codex session, discovery signals the next
+                        // useful read; an eight-second timer only repeats the
+                        // same empty query and reopens no useful work.
+                        await observation.waitForChange()
+                        continue
                     }
-                    let interval: TimeInterval = targets.isEmpty ? 8 : responsive && !self.snapshot.paused ? 1 : 2
+                    let interval: TimeInterval
+                    if state?.responsive == true && !self.snapshot.paused { interval = 1 }
+                    else { interval = 2 }
                     await observation.waitForChange(timeout: max(0.1, interval - (ProcessInfo.processInfo.systemUptime - started)))
                 }
             }
@@ -2036,8 +2295,26 @@ import TerminalInputSupport
                 await observation.waitForChange(timeout: 0)
                 while !Task.isCancelled, let self, !self.remoteInputStopped {
                     let started = ProcessInfo.processInfo.systemUptime
-                    if !self.pollingTargets(host).isEmpty { await self.refreshScreenHost(host) }
-                    await observation.waitForChange(timeout: max(0.1, self.screenPollInterval(host) - (ProcessInfo.processInfo.systemUptime - started)))
+                    guard self.screenConnections[host]?.enabled == true,
+                          self.screenConnections[host]?.permissionBlocked != true else {
+                        await observation.waitForChange()
+                        continue
+                    }
+                    if let retryAfter = self.screenConnections[host]?.retryAfter,
+                       retryAfter > Date() {
+                        await observation.waitForChange(timeout: min(8,retryAfter.timeIntervalSinceNow))
+                        continue
+                    }
+                    let targets = self.pollingTargets(host)
+                    guard !targets.isEmpty else {
+                        await observation.waitForChange()
+                        continue
+                    }
+                    await self.refreshScreenHost(host, reportConnecting:false, targets:targets)
+                    let currentTargets = self.pollingTargets(host)
+                    let cadence = self.screenPollInterval(host, targets: currentTargets)
+                    let elapsed = ProcessInfo.processInfo.systemUptime - started
+                    await observation.waitForChange(timeout: RemoteTerminalPolling.delayAfterRead(interval: cadence, elapsed: elapsed))
                 }
             }
         }
@@ -2045,9 +2322,15 @@ import TerminalInputSupport
 
     private func refreshGitBranches() {
         guard gitBranchTask == nil else { return }
-        let targets = Array(sessions.values)
+        let branchTargets = sessions.values.filter { $0.agent != .shell && $0.phase != .ended && !$0.cwd.isEmpty }
+        let directories = Dictionary(branchTargets.map { ($0.id, $0.cwd) }, uniquingKeysWith: { _, latest in latest })
+        guard !directories.isEmpty else { gitBranchTargets = [:]; return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard directories != gitBranchTargets || now - gitBranchRefreshUptime >= 15 else { return }
+        gitBranchTargets = directories
+        gitBranchRefreshUptime = now
         gitBranchTask = Task { [weak self] in
-            let updates = await GitBranchReader.collect(targets)
+            let updates = await GitBranchReader.collect(branchTargets)
             guard !Task.isCancelled, let self else { return }
             self.updateGitBranches(updates)
             self.gitBranchTask = nil
@@ -2067,9 +2350,14 @@ import TerminalInputSupport
     }
 
     public func updateCodexQuestions(_ updates: [CodexQuestionUpdate], at date: Date = Date()) {
+        var needsPublish = false
         for update in updates {
             guard var session = sessions[update.sessionID], session.agent == .codex, session.phase != .ended else { continue }
+            let wasReadable = readableQuestionSessions.contains(session.id)
             let previousQuestions = session.queuedQuestions, previousError = session.codexQuestionsError
+            let previousCompletion = session.completion, previousCompletionError = session.completionError
+            let previousObservedAt = session.codexQuestionsObservedAt
+            var questionsChanged = false
             session.codexQuestionsError = update.error
             session.completionError = update.completionError ?? (update.turn == nil && !update.completionReadPending ? update.error : nil)
             if let turn = update.turn {
@@ -2090,41 +2378,66 @@ import TerminalInputSupport
                 if threadChanged {
                     restoredQuestionIDs.formUnion(questions.map(\.id))
                     questionThreadBySession[session.id] = threadID
+                    needsPublish = true
                 }
-                session.queuedQuestions = questions.filter { store.value("dismissedQuestion:\($0.id)") != "true" }.map { question in
-                    var question = question
-                    if questionAutomationOverrides[question.id] == nil,
-                       let saved = store.value("questionAutomation:\(question.id)"),
-                       let phase = QuestionAutomation.Phase(rawValue: saved), [.editing, .cancelled].contains(phase) {
-                        questionAutomationOverrides[question.id] = phase
+                var previousByID: [String: QueuedQuestion] = [:]
+                if let previousQuestions {
+                    previousByID.reserveCapacity(previousQuestions.count)
+                    for previous in previousQuestions where previousByID[previous.id] == nil {
+                        previousByID[previous.id] = previous
                     }
-                    if let previous = session.questions.first(where: { $0.id == question.id }) {
-                        question.reply = previous.isSameRequest(as: question) ? previous.reply : nil
-                        if previous.isSameRequest(as: question) { question.automation = previous.automation }
+                }
+                var reconciled: [QueuedQuestion] = []
+                reconciled.reserveCapacity(questions.count)
+                for var question in questions {
+                    guard !persistedQuestionIsDismissed(question.id) else { continue }
+                    if questionAutomationOverrides[question.id] == nil,
+                       let phase = persistedQuestionAutomation(question.id) {
+                        questionAutomationOverrides[question.id] = phase
+                        needsPublish = true
+                    }
+                    if let previous = previousByID[question.id] {
+                        let sameRequest = previous.isSameRequest(as: question)
+                        question.reply = sameRequest ? previous.reply : nil
+                        if sameRequest { question.automation = previous.automation }
                     } else {
                         question.reply = savedReply(question.id)
                     }
-                    return question
+                    reconciled.append(question)
                 }
+                session.queuedQuestions = reconciled
+                questionsChanged = session.queuedQuestions != previousQuestions
+                if questionsChanged { invalidateDuplicateQuestionIDs() }
                 // Successful reads remain authoritative privately; an unchanged
                 // list must not repaint every window just to tick a timestamp.
-                if session.codexQuestionsObservedAt == nil || session.queuedQuestions != previousQuestions || previousError != nil || threadChanged {
+                if session.codexQuestionsObservedAt == nil || questionsChanged || previousError != nil || threadChanged {
                     session.codexQuestionsObservedAt = date
                 }
                 readableQuestionSessions.insert(session.id)
             } else {
                 readableQuestionSessions.remove(session.id)
             }
+            if questionsChanged || session.codexQuestionsError != previousError ||
+               session.completion != previousCompletion || session.completionError != previousCompletionError ||
+               session.codexQuestionsObservedAt != previousObservedAt ||
+               readableQuestionSessions.contains(session.id) != wasReadable {
+                needsPublish = true
+            }
             sessions[session.id] = session
         }
-        publish()
+        if needsPublish { publish() }
     }
 
     public func dismissQuestion(sessionID: String, questionID: String) throws {
         guard let session = sessions[sessionID], session.phase != .ended,
               session.questions.contains(where: { $0.id == questionID }) else { return }
         try store.set("dismissedQuestion:\(questionID)", "true")
+        reserveQuestionSettingsCacheEntry(questionID)
+        var settings = persistedQuestionSettings[questionID] ?? PersistedQuestionSettings()
+        settings.dismissalLoaded = true; settings.dismissed = true
+        persistedQuestionSettings[questionID] = settings
         sessions[sessionID]?.queuedQuestions?.removeAll { $0.id == questionID }
+        invalidateDuplicateQuestionIDs()
         publish()
     }
 
@@ -2217,6 +2530,10 @@ import TerminalInputSupport
         cancelAutomaticQuestionReply(questionID)
         publish()
         try store.set("questionAutomation:\(questionID)", phase.rawValue)
+        reserveQuestionSettingsCacheEntry(questionID)
+        var settings = persistedQuestionSettings[questionID] ?? PersistedQuestionSettings()
+        settings.automationLoaded = true; settings.automation = phase
+        persistedQuestionSettings[questionID] = settings
     }
 
     private func duplicateQuestionIDs(_ questions: [QueuedQuestion]) -> Set<String> {
@@ -2230,6 +2547,20 @@ import TerminalInputSupport
         return duplicates
     }
 
+    private func duplicateQuestionIDsBySession() -> [String: Set<String>] {
+        guard duplicateQuestionIDsDirty else { return cachedDuplicateQuestionIDsBySession }
+        var result: [String: Set<String>] = [:]
+        for (id, session) in sessions {
+            guard let questions = session.queuedQuestions, !questions.isEmpty else { continue }
+            result[id] = duplicateQuestionIDs(questions)
+        }
+        cachedDuplicateQuestionIDsBySession = result
+        duplicateQuestionIDsDirty = false
+        return result
+    }
+
+    private func invalidateDuplicateQuestionIDs() { duplicateQuestionIDsDirty = true }
+
     private func questionAutomationBlock(_ question: QueuedQuestion, duplicates: Set<String>) -> QuestionAutomation.Phase? {
         if let override = questionAutomationOverrides[question.id] { return override }
         if duplicates.contains(question.id) { return .duplicate }
@@ -2238,45 +2569,63 @@ import TerminalInputSupport
         return nil
     }
 
-    private func updateQuestionAutomationStates() {
+    private func automaticQuestionAnswer(sessionID: String, question: QueuedQuestion,
+                                         confirmations: inout QuestionConfirmationCache) -> String? {
+        // The reservation already owns the exact parsed answer for this request.
+        // Unrelated publications must not repeat its label/permission analysis.
+        if let pending = automaticQuestionReplies[question.id], pending.sessionID == sessionID,
+           pending.question.isSameRequest(as: question) { return pending.answer }
+        return confirmations.confirmation(sessionID: sessionID, question: question)?.answer
+    }
+
+    private func updateQuestionAutomationStates(duplicatesBySession: [String: Set<String>],
+                                                confirmations: inout QuestionConfirmationCache) {
         for (id, session) in sessions {
             guard let questions = session.queuedQuestions else { continue }
-            let duplicates = duplicateQuestionIDs(questions)
-            sessions[id]?.queuedQuestions = questions.map { question in
-                var question = question
+            let duplicates = duplicatesBySession[id] ?? []
+            var updated: [QueuedQuestion]?
+            for (index, original) in questions.enumerated() {
+                var question = original
                 question.automation = nil
-                guard session.phase != .ended, question.reply == nil || question.reply?.phase == .cancelled else { return question }
-                if let block = questionAutomationBlock(question, duplicates: duplicates) {
-                    question.automation = QuestionAutomation(phase: block)
-                } else if let confirmation = YesNoConfirmation.detect(question), session.automatic {
-                    if snapshot.paused {
-                        question.automation = QuestionAutomation(phase: .paused, answer: confirmation.answer)
-                    } else if let pending = automaticQuestionReplies[question.id] {
-                        question.automation = QuestionAutomation(phase: .scheduled, deadline: pending.deadline, answer: confirmation.answer)
-                    } else if !session.canApprove || session.codexQuestionsError != nil || !readableQuestionSessions.contains(id) {
-                        question.automation = QuestionAutomation(phase: .unavailable, answer: confirmation.answer)
+                if session.phase != .ended && (question.reply == nil || question.reply?.phase == .cancelled) {
+                    if let block = questionAutomationBlock(question, duplicates: duplicates) {
+                        question.automation = QuestionAutomation(phase: block)
+                    } else if session.automatic,
+                              let answer = automaticQuestionAnswer(sessionID: id, question: question, confirmations: &confirmations) {
+                        if snapshot.paused {
+                            question.automation = QuestionAutomation(phase: .paused, answer: answer)
+                        } else if let pending = automaticQuestionReplies[question.id] {
+                            question.automation = QuestionAutomation(phase: .scheduled, deadline: pending.deadline, answer: answer)
+                        } else if !session.canApprove || session.codexQuestionsError != nil || !readableQuestionSessions.contains(id) {
+                            question.automation = QuestionAutomation(phase: .unavailable, answer: answer)
+                        }
                     }
                 }
-                return question
+                if question != original {
+                    if updated == nil { updated = questions }
+                    updated?[index] = question
+                }
             }
+            if let updated { sessions[id]?.queuedQuestions = updated }
         }
     }
 
-    private func reconcileAutomaticQuestionReplies() {
+    private func reconcileAutomaticQuestionReplies(duplicatesBySession: [String: Set<String>],
+                                                   confirmations: inout QuestionConfirmationCache) {
         var candidates: [String: (sessionID: String, question: QueuedQuestion, answer: String)] = [:]
         if !questionAutomationStopped, !snapshot.paused {
             for session in sessions.values where session.agent == .codex && session.automatic && session.canApprove
                 && session.codexQuestionsError == nil && readableQuestionSessions.contains(session.id) {
-                let duplicates = duplicateQuestionIDs(session.questions)
+                let duplicates = duplicatesBySession[session.id] ?? []
                 for var question in session.questions {
                     let pending = automaticQuestionReplies[question.id]
                     // Keep our reservation during preflight, but never automatically retry
                     // a failed, uncertain, queued, or manually submitted response.
                     guard questionAutomationBlock(question, duplicates: duplicates) == nil,
                           question.reply == nil || question.reply?.phase == .cancelled || (question.reply?.phase == .sending && pending?.sending == true),
-                          let confirmation = YesNoConfirmation.detect(question) else { continue }
+                          let answer = automaticQuestionAnswer(sessionID: session.id, question: question, confirmations: &confirmations) else { continue }
                     question.reply = nil; question.automation = nil
-                    candidates[question.id] = (session.id, question, confirmation.answer)
+                    candidates[question.id] = (session.id, question, answer)
                 }
             }
         }
@@ -2305,7 +2654,7 @@ import TerminalInputSupport
                     answer: candidate.answer, automaticToken: token)
             }
             automaticQuestionReplies[id] = AutomaticQuestionReply(token: token, sessionID: candidate.sessionID,
-                question: candidate.question, deadline: deadline, task: task)
+                question: candidate.question, answer: candidate.answer, deadline: deadline, task: task)
         }
     }
 
@@ -2427,8 +2776,9 @@ import TerminalInputSupport
     }
 
     public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil) {
+        pruneExpiredRemoteFrames()
         let previousPolling = pollingIdentities()
-        let previousCodex = Set(sessions.values.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id))
+        let previousCodex = Set(sessions.values.lazy.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id))
         self.records = records
         // Ordinary terminals do not belong in the inventory or its status counts.
         let managed = found.filter { value in
@@ -2446,11 +2796,24 @@ import TerminalInputSupport
             } else { ptySessionBindings.removeValue(forKey: session.id) }
             return session
         }
-        let live = Set(managed.map(\.id))
-        tmuxRelay.retain(handles: Set(managed.compactMap(\.tmuxHandle)))
+        var live = Set<String>(), liveCodex = Set<String>()
+        live.reserveCapacity(managed.count); liveCodex.reserveCapacity(managed.count)
+        for session in managed {
+            live.insert(session.id)
+            if session.agent == .codex { liveCodex.insert(session.id) }
+        }
+        let liveTmuxHandles = Set(managed.compactMap(\.tmuxHandle))
+        if retainedTmuxHandles != liveTmuxHandles {
+            tmuxRelay.retain(handles: liveTmuxHandles)
+            retainedTmuxHandles = liveTmuxHandles
+        }
         ptySessionBindings = ptySessionBindings.filter { live.contains($0.key) || (try? managedPTY.terminal($0.value).isRunning) == false }
-        codexCompletions.retain(sessionIDs: live)
-        codexTurns = codexTurns.filter { live.contains($0.key) }
+        if retainedDiscoverySessionIDs != live {
+            codexCompletions.retain(sessionIDs: live)
+            codexTurns = codexTurns.filter { live.contains($0.key) }
+            claudeHookObservedAt = claudeHookObservedAt.filter { live.contains($0.key) }
+            retainedDiscoverySessionIDs = live
+        }
         // One fresh ancestry index per discovery snapshot, built only when an
         // automatic session actually has an original process to remember.
         var recoveryProcesses: [Int32:ProcessRecord]?
@@ -2481,6 +2844,7 @@ import TerminalInputSupport
             let newlyEnded = sessions[key]?.phase != .ended
             if newlyEnded { prepareExitRecovery(key) }
             sessions[key]?.setPhase(.ended, detail: "프로세스가 종료되었습니다."); sessions[key]?.channel = .none; sessions[key]?.automatic = false
+            if sessions[key]?.queuedQuestions?.isEmpty == false { invalidateDuplicateQuestionIDs() }
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
             claudeWorkIDs.removeValue(forKey: key)
             clearScreen(key); capacityStates.removeValue(forKey: key)
@@ -2498,9 +2862,18 @@ import TerminalInputSupport
         }
         synchronizePTYContainers()
         let nextPolling = pollingIdentities()
-        for host in ScreenHost.allCases where previousPolling[host] != nextPolling[host] { screenPollSignals[host]?.notify() }
-        if previousCodex != Set(sessions.values.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id)) { historyPollSignal.notify() }
-        for id in Array(exitRecoveries.keys) where sessions[id]?.phase == .ended { advanceExitRecovery(id,records:records) }
+        for host in ScreenHost.allCases where previousPolling[host] != nextPolling[host] {
+            unchangedScreenReads[host] = 0
+            screenPollSignals[host]?.notify()
+        }
+        if previousCodex != liveCodex {
+            readableQuestionSessions.formIntersection(liveCodex)
+            questionThreadBySession = questionThreadBySession.filter { liveCodex.contains($0.key) }
+            historyPollSignal.notify()
+        }
+        for id in Array(exitRecoveries.keys) where sessions[id]?.phase == .ended {
+            advanceExitRecovery(id, records: records, byPID: &recoveryProcesses)
+        }
         publish()
     }
 
@@ -2527,7 +2900,10 @@ import TerminalInputSupport
         if enabled {
             for member in groupIDs(target) {
                 scheduleSystemSafety(member); scheduleScreenApproval(member)
-                if let current = sessions[member], let host = ScreenHost(kind: current.terminal) { screenPollSignals[host]?.notify() }
+                if let current = sessions[member], let host = ScreenHost(kind: current.terminal) {
+                    unchangedScreenReads[host] = 0
+                    screenPollSignals[host]?.notify()
+                }
             }
             historyPollSignal.notify()
             claudeHookSignals.values.forEach { $0.notify() }
@@ -2549,7 +2925,10 @@ import TerminalInputSupport
             }
         }
         publish()
-        if !paused { screenPollSignals.values.forEach { $0.notify() }; historyPollSignal.notify() }
+        if !paused {
+            for host in ScreenHost.allCases { unchangedScreenReads[host] = 0 }
+            screenPollSignals.values.forEach { $0.notify() }; historyPollSignal.notify()
+        }
         claudeHookSignals.values.forEach { $0.notify() }
         Task { await evaluateKeepAwake() }
     }
@@ -2569,12 +2948,16 @@ import TerminalInputSupport
         do { try store.set(Self.enabledKey(host), "true") }
         catch { updateHealth(host) { $0.status = "연결 설정 저장 실패: \(error.localizedDescription)" }; return }
         screenConnections[host, default: ScreenConnection()].enabled = true
+        unchangedScreenReads[host] = 0
         screenConnections[host]?.permissionBlocked = false; screenConnections[host]?.retryAfter = .distantPast
         updateHealth(host) { $0.requested = true; $0.status = "연결 확인 중…" }
         await refreshScreenHost(host, reportConnecting: true); publish()
+        screenPollSignals[host]?.notify()
     }
     public func disconnectScreenHost(_ host: ScreenHost) {
         screenConnections[host]?.enabled = false; revision &+= 1
+        screenPollSignals[host]?.notify()
+        unchangedScreenReads[host] = 0
         if host == .tmux { tmuxRelay.stop() }
         for id in sessions.keys where sessions[id]?.terminal == host.kind {
             cancelRemoteInitialRead(id)
@@ -2591,8 +2974,13 @@ import TerminalInputSupport
         publish()
     }
     public func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool = false) async {
+        _ = await refreshScreenHost(host, reportConnecting:reportConnecting, targets:nil)
+    }
+
+    @discardableResult
+    private func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool, targets suppliedTargets: [AgentSession]?) async -> Bool? {
         guard !remoteInputStopped, let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
-              Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return }
+              Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return nil }
         screenConnections[host]?.polling = true
         let epoch = observationEpoch
         let announceConnection = reportConnecting || !snapshot.health.screen(host).connected
@@ -2602,13 +2990,26 @@ import TerminalInputSupport
             if observationEpoch != epoch { screenPollSignals[host]?.notify() }
             else if announceConnection { updateHealth(host) { $0.connecting = false } }
         }
-        let targets = sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
+        let targets = suppliedTargets ?? sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
         do {
             let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
             let reader = adapter.screens
             let readStartedAt = Date()
-            let cached = screenAnalyses
+            // The worker needs only this host's active sessions. Retaining the
+            // entire cross-host cache pins unrelated terminal scrollback for
+            // the duration of a potentially slow Apple Event read.
+            var cached: [String: (analysis: ScreenAnalysis?, raw: String, observedAt: Date?)] = [:]
+            cached.reserveCapacity(targets.count)
+            for target in targets {
+                // Prefer the detector's last observed frame. The remote monitor
+                // may advance while hook-owned input intentionally skips analysis.
+                if let previous = remoteObservedScreens[target.id] {
+                    cached[target.id] = (screenAnalyses[target.id], previous.raw, previous.observedAt)
+                } else if let previous = remoteMonitorFrames[target.id] {
+                    cached[target.id] = (screenAnalyses[target.id], previous.raw, nil)
+                }
+            }
             let analysisTargets = targets.map { (id: $0.id, tty: $0.tty, agent: $0.agent) }
             // A large scrollback in many tabs must not monopolize the UI actor.
             // One bounded worker per host reads and parses; no policy or input is run here.
@@ -2620,19 +3021,40 @@ import TerminalInputSupport
                     screensByTTY[screen.tty] = screen
                 }
                 var analyses: [String: ScreenAnalysis] = [:]
+                var sharedAnalyses: [ScreenAnalysisStorageKey: (raw: String, analysis: ScreenAnalysis)] = [:]
+                var changedIDs = Set<String>()
+                var unchangedObservedAt: [String: Date] = [:]
                 for target in analysisTargets {
                     try Task.checkCancellation()
                     guard let screen = screensByTTY[target.tty] else { continue }
-                    if let previous = cached[target.id], previous.matches(screen.contents, agent: target.agent) {
-                        analyses[target.id] = previous
+                    if let previous = cached[target.id],
+                       previous.analysis?.agent == nil || previous.analysis?.agent == target.agent,
+                       ScreenTextEquality.identical(previous.raw, screen.contents) {
+                        analyses[target.id] = previous.analysis ?? ScreenAnalysis(raw: screen.contents, agent: target.agent)
+                        if let observedAt = previous.observedAt { unchangedObservedAt[target.id] = observedAt }
                     } else {
-                        analyses[target.id] = ScreenAnalysis(raw: screen.contents, agent: target.agent)
+                        changedIDs.insert(target.id)
+                        var storageKey: ScreenAnalysisStorageKey?
+                        _ = screen.contents.utf8.withContiguousStorageIfAvailable { bytes in
+                            if let address = bytes.baseAddress {
+                                storageKey = ScreenAnalysisStorageKey(address: UInt(bitPattern: address),
+                                    byteCount: bytes.count, agent: target.agent.rawValue)
+                            }
+                        }
+                        if let storageKey, let shared = sharedAnalyses[storageKey],
+                           ScreenTextEquality.identical(shared.raw, screen.contents) {
+                            analyses[target.id] = shared.analysis
+                        } else {
+                            let analysis = ScreenAnalysis(raw: screen.contents, agent: target.agent)
+                            analyses[target.id] = analysis
+                            if let storageKey { sharedAnalyses[storageKey] = (screen.contents, analysis) }
+                        }
                     }
                 }
-                return (result.failures, screensByTTY, analyses)
+                return (result.failures, screensByTTY, analyses, changedIDs, unchangedObservedAt)
             }
-            let (failures, screensByTTY, analyses) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
-            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return }
+            let (failures, screensByTTY, analyses, changedIDs, unchangedObservedAt) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return nil }
             let targets = targets.filter { target in
                 guard let current = sessions[target.id], current.phase != .ended,
                       current.pid == target.pid, current.started == target.started,
@@ -2642,6 +3064,10 @@ import TerminalInputSupport
                 }
                 return true
             }
+            let unchanged = !targets.isEmpty && targets.allSatisfy { screensByTTY[$0.tty] != nil && !changedIDs.contains($0.id) }
+            let hasLiveViewer = targets.contains { remoteTerminalChanges[$0.id]?.hasObservers == true }
+            unchangedScreenReads[host] = unchanged && !hasLiveViewer
+                ? min(unchangedScreenReads[host, default: 0] + 1, 16) : 0
             let connected = targets.reduce(into: 0) { if screensByTTY[$1.tty] != nil { $0 += 1 } }
             let missing = targets.count - connected
             updateHealth(host) { health in
@@ -2655,33 +3081,64 @@ import TerminalInputSupport
                 }
             }
             withScreenPublicationBatch {
+                var sessionProjectionChanged = false
                 for target in targets {
                     guard let screen = screensByTTY[target.tty] else {
                         if sessions[target.id]?.channel != .hook {
-                            sessions[target.id]?.channel = .none
-                            sessions[target.id]?.setPhase(.unknown, detail: "현재 \(title) 화면을 읽지 못했습니다.")
-                            sessions[target.id]?.pendingSummary = nil
-                            sessions[target.id]?.detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
-                            clearScreen(target.id, keepRemote: true)
+                            let detail = "이 세션의 \(title) 탭을 읽지 못했습니다. " + (failures.first(where: { $0.tty == target.tty })?.message ?? "탭이 열려 있는지 확인해주세요.")
+                            let phaseDetail = "현재 \(title) 화면을 읽지 못했습니다."
+                            if sessions[target.id].map({ $0.channel != .none }) == true || sessions[target.id]?.phase != .unknown ||
+                                sessions[target.id]?.pendingSummary != nil || sessions[target.id]?.pendingInTerminal == true ||
+                                sessions[target.id]?.pendingRequestID != nil || sessions[target.id]?.systemCommandRisk != nil ||
+                                sessions[target.id]?.detail != detail || sessions[target.id]?.activityDetail != phaseDetail {
+                                sessions[target.id]?.channel = .none
+                                sessions[target.id]?.setPhase(.unknown, detail: phaseDetail)
+                                sessions[target.id]?.pendingSummary = nil
+                                sessions[target.id]?.detail = detail
+                                sessionProjectionChanged = true
+                            }
+                            let needsClear = screens[target.id] != nil || activityTrackers[target.id] != nil ||
+                                screenObservedAt[target.id] != nil || screenAnalyses[target.id] != nil || remoteMonitorFrames[target.id] != nil ||
+                                sessions[target.id]?.pendingInTerminal == true || sessions[target.id]?.pendingRequestID != nil ||
+                                sessions[target.id]?.systemCommandRisk != nil
+                            if needsClear { clearScreen(target.id, keepRemote: true) }
                         }
                         continue
                     }
-                    sessions[target.id]?.terminalTitle = screen.title
+                    // Preserve the last known display label when an optional
+                    // title Apple Event is unavailable; the fresh screen below
+                    // remains authoritative for detection and approval.
+                    if let title = screen.title, sessions[target.id]?.terminalTitle != title {
+                        sessions[target.id]?.terminalTitle = title
+                        sessionProjectionChanged = true
+                    }
                     if [.terminal, .iterm].contains(host) {
                         remoteMonitorFrames[target.id] = RemoteObservedScreen(raw: screen.contents,
                             generation: remoteGeneration(target, host: host), observedAt: readStartedAt,
                             appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents), display: screen.display?.validated())
                     }
                     if sessions[target.id]?.channel != .hook || sessions[target.id]?.pendingInTerminal == true {
-                        if sessions[target.id]?.channel != .hook { sessions[target.id]?.channel = host.channel }
-                        sessions[target.id]?.detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
-                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor, display: screen.display, precomputed: analyses[target.id])
+                        if sessions[target.id]?.channel != .hook, sessions[target.id]?.channel != host.channel {
+                            sessions[target.id]?.channel = host.channel
+                            sessionProjectionChanged = true
+                        }
+                        let detail = "화면의 실행 권한 확인을 감지합니다. 일반 질문은 직접 답해주세요."
+                        if sessions[target.id]?.detail != detail {
+                            sessions[target.id]?.detail = detail
+                            sessionProjectionChanged = true
+                        }
+                        // Another actor task may have observed a newer frame while
+                        // this host read was suspended; only trust the skip if the
+                        // captured observation timestamp still owns the current one.
+                        let contentsUnchanged = unchangedObservedAt[target.id].map { $0 == remoteObservedScreens[target.id]?.observedAt } ?? false
+                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor, display: screen.display, precomputed: analyses[target.id], screenContentsUnchanged: contentsUnchanged)
                     }
                 }
-                publish()
+                if sessionProjectionChanged { publish() }
             }
+            return unchanged
         } catch {
-            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
             // Denied Automation stays blocked until the user reconnects; other failures retry.
             let blocked = error is TerminalAdapterError
             screenConnections[host]?.permissionBlocked = blocked
@@ -2691,11 +3148,13 @@ import TerminalInputSupport
                 sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id, keepRemote: !blocked)
             }
             publish()
+            unchangedScreenReads[host] = 0
+            return nil
         }
     }
 
     public func reveal(_ session: AgentSession) async throws -> TerminalWindowBounds? {
-        let live = try await Task.detached { try ProcessDiscovery.read() }.value
+        let live = try await Task.detached { try ProcessDiscovery.read(pid: session.pid) }.value
         guard let current = sessions[session.id], current.canReveal, current.pid == session.pid,
               current.started == session.started, current.tty == session.tty,
               live.contains(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent
@@ -2754,13 +3213,17 @@ import TerminalInputSupport
         return event
     }
 
+    private func rememberAuditEvent(_ event: AuditEvent) {
+        if let index = snapshot.events.firstIndex(where: { $0.id == event.id }) { snapshot.events[index] = event }
+        else { snapshot.events.insert(event, at: 0) }
+        if snapshot.events.count > 200 { snapshot.events.removeLast(snapshot.events.count - 200) }
+    }
+
     @discardableResult private func log(_ event: AuditEvent, session: AgentSession? = nil) -> Bool {
         let event = contextualEvent(event, session: session)
         do { try store.append(event); snapshot.health.auditError = nil }
         catch { snapshot.health.auditError = error.localizedDescription; return false }
-        if let index = snapshot.events.firstIndex(where: { $0.id == event.id }) { snapshot.events[index] = event }
-        else { snapshot.events.insert(event, at: 0) }
-        if snapshot.events.count > 200 { snapshot.events.removeLast(snapshot.events.count - 200) }
+        rememberAuditEvent(event)
         return true
     }
 
@@ -2976,13 +3439,57 @@ import TerminalInputSupport
             try store.saveClaudeHook(receipt)
             if receipt.response != nil { claudeHookSignals[receipt.id]?.notify() }
             snapshot.health.auditError = nil
-            if receipt.audit != nil { snapshot.events = store.recent() }
+            if let audit = receipt.audit { rememberAuditEvent(audit) }
         } catch { snapshot.health.auditError = error.localizedDescription; throw error }
     }
 
     /// Polls carry the original UUID and full input, so a restarted app can resume the exact hook.
     public func handleClaudeHook(_ payload: JSONObject, at now: Date = Date()) throws -> JSONObject {
         guard let envelope = ClaudeHookEnvelope(payload, at: now) else { return bridgeResponse([:]) }
+        return try handleClaudeHook(envelope, at: now)
+    }
+
+    /// Reuse an immutable, already fingerprinted request across hookWait
+    /// heartbeats. Recheck its deadline on every wake; never reserialize and
+    /// hash the complete tool input just to establish the same identity again.
+    private func handleClaudeHook(_ envelope: ClaudeHookEnvelope, at now: Date) throws -> JSONObject {
+        guard envelope.expiresAt > now else { return bridgeResponse([:]) }
+        // A live receipt is authoritative within this process: every in-process
+        // write updates it before notifying the waiter. Avoid a SQLite read and
+        // JSON decode on each helper retry; restart recovery still reads below.
+        if var pending = liveClaudeHooks[envelope.id] {
+            guard pending.receipt.fingerprint == envelope.fingerprint else { throw AppError.message("같은 요청 ID의 내용이 달라 응답하지 않았습니다.") }
+            if let response = pending.receipt.response {
+                removeLiveClaudeHook(envelope.id)
+                publish()
+                return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
+            }
+            if pending.request.systemCommandRisk == nil, pending.request.tool == "Bash",
+               let input = envelope.payload["tool_input"] as? JSONObject,
+               let command = input["command"] as? String, SystemCommandRisk.mayReferenceInstaller(command) {
+                let suppliedCWD = envelope.payload["cwd"] as? String
+                let cwd = suppliedCWD.flatMap { $0.isEmpty ? nil : $0 } ?? sessions[pending.request.sessionID]?.cwd ?? ""
+                if let risk = SystemCommandRisk.detect(tool: pending.request.tool, input: input,
+                                                       summary: pending.request.summary, cwd: cwd) {
+                    // The helper is retrying the same pending request, but a
+                    // local installer may have changed since it first arrived.
+                    // Reclassify it before any automatic or manual answer.
+                    pending.request.systemCommandRisk = risk
+                    _ = handleHook(envelope.payload, deferApproval: true, prepared: pending.request)
+                }
+            }
+            pending.lastContact = now
+            liveClaudeHooks[envelope.id] = pending
+            try answerClaudeHookIfEligible(pending, at: now)
+            if let response = liveClaudeHooks[envelope.id]?.receipt.response {
+                removeLiveClaudeHook(envelope.id)
+                publish()
+                return bridgeResponse((try JSONSerialization.jsonObject(with: Data(response.utf8))) as? JSONObject ?? [:])
+            }
+            publish()
+            return bridgeResponse()
+        }
+        let payload = envelope.payload
         let saved = try store.claudeHook(id: envelope.id)
         if let saved {
             guard saved.fingerprint == envelope.fingerprint else { throw AppError.message("같은 요청 ID의 내용이 달라 응답하지 않았습니다.") }
@@ -3027,12 +3534,10 @@ import TerminalInputSupport
             }
             try saveClaudeReceipt(receipt)
         }
-        liveClaudeHooks[request.id] = LiveClaudeHook(request: request, receipt: receipt, lastContact: now)
-        if request.safetyResponse != nil, effectiveAutomatic(request.sessionID), !snapshot.paused {
-            try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
-        } else if request.response != nil, store.value("claudeQuestionEditing:" + request.id) != "true", now.timeIntervalSince(receipt.createdAt) >= confirmationDelay, effectiveAutomatic(request.sessionID), !snapshot.paused {
-            try answerClaudeApproval(sessionID: request.sessionID, requestID: request.id, automatically: true, at: now)
-        }
+        let pending = LiveClaudeHook(request: request, receipt: receipt, lastContact: now,
+            questionEditing: store.value("claudeQuestionEditing:" + request.id) == "true")
+        liveClaudeHooks[request.id] = pending
+        try answerClaudeHookIfEligible(pending, at: now)
         if let response = liveClaudeHooks[request.id]?.receipt.response {
             removeLiveClaudeHook(request.id)
             publish()
@@ -3042,33 +3547,50 @@ import TerminalInputSupport
         return bridgeResponse()
     }
 
+    private func answerClaudeHookIfEligible(_ pending: LiveClaudeHook, at now: Date) throws {
+        if pending.request.safetyResponse != nil, effectiveAutomatic(pending.request.sessionID), !snapshot.paused {
+            try answerClaudeApproval(sessionID: pending.request.sessionID, requestID: pending.request.id, automatically: true, at: now)
+        } else if pending.request.response != nil, !pending.questionEditing,
+                  now.timeIntervalSince(pending.receipt.createdAt) >= confirmationDelay,
+                  effectiveAutomatic(pending.request.sessionID), !snapshot.paused {
+            try answerClaudeApproval(sessionID: pending.request.sessionID, requestID: pending.request.id, automatically: true, at: now)
+        }
+    }
+
     /// Keep the helper's existing socket waiting for its exact saved response.
     /// Fifteen-second heartbeats retain reconnect/expiry checks without 400ms
     /// polling. The original confirmation deadline wakes the wait precisely.
     private func waitForClaudeHook(_ payload: JSONObject) async throws -> JSONObject {
         guard payload["autoapproveProtocol"] as? Int == 1 else { throw AppError.message("지원하는 Claude 응답 프로토콜이 필요합니다.") }
-        var result = try handleClaudeHook(payload)
-        guard let id = payload["requestID"] as? String,
+        guard let envelope = ClaudeHookEnvelope(payload, at: Date()) else { return bridgeResponse([:]) }
+        let id = envelope.id
+        let result = try handleClaudeHook(envelope, at: Date())
+        guard
               (result["autoapproveBridge"] as? JSONObject)?["waiting"] as? Bool == true,
               liveClaudeHooks[id] != nil else { return result }
         let signal = claudeHookSignals[id] ?? RemoteTerminalChangeSignal(); claudeHookSignals[id] = signal
         let observation = signal.observe(), epoch = observationEpoch, heartbeat = Date().addingTimeInterval(15)
         await observation.waitForChange(timeout: 0)
         while !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch {
-            guard let pending = liveClaudeHooks[id] else { return try handleClaudeHook(payload) }
-            if pending.receipt.response != nil { return try handleClaudeHook(payload) }
-            var interval = min(heartbeat, pending.receipt.expiresAt).timeIntervalSinceNow
-            guard interval > 0 else { return try handleClaudeHook(payload) }
+            guard let pending = liveClaudeHooks[id] else { return try handleClaudeHook(envelope, at: Date()) }
+            if pending.receipt.response != nil { return try handleClaudeHook(envelope, at: Date()) }
+            let now = Date()
+            guard pending.receipt.expiresAt > now else { return bridgeResponse([:]) }
+            var interval = min(heartbeat, pending.receipt.expiresAt).timeIntervalSince(now)
             if pending.request.response != nil, !snapshot.paused, effectiveAutomatic(pending.request.sessionID),
-               store.value("claudeQuestionEditing:" + id) != "true" {
+               !pending.questionEditing {
                 let untilConfirmation = pending.receipt.createdAt.addingTimeInterval(confirmationDelay).timeIntervalSinceNow
                 if untilConfirmation > 0 { interval = min(interval, untilConfirmation) }
             }
             await observation.waitForChange(timeout: interval)
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return bridgeResponse() }
-            result = try handleClaudeHook(payload)
-            guard (result["autoapproveBridge"] as? JSONObject)?["waiting"] as? Bool == true else { return result }
-            if Date() >= heartbeat { return result }
+            let resumedAt = Date()
+            guard let current = liveClaudeHooks[id] else { return try handleClaudeHook(envelope, at: resumedAt) }
+            if current.receipt.response != nil { return try handleClaudeHook(envelope, at: resumedAt) }
+            guard current.receipt.expiresAt > resumedAt else { return bridgeResponse([:]) }
+            try answerClaudeHookIfEligible(current, at: resumedAt)
+            if liveClaudeHooks[id]?.receipt.response != nil { return try handleClaudeHook(envelope, at: resumedAt) }
+            if resumedAt >= heartbeat { return result }
         }
         return bridgeResponse()
     }
@@ -3202,14 +3724,29 @@ import TerminalInputSupport
             try? saveClaudeReceipt(receipt)
             removeLiveClaudeHook(id, terminal: true)
         }
-        for id in Array(sessions.keys) {
-            let pending = liveClaudeHooks.values.filter { $0.request.sessionID == id }.sorted { $0.receipt.createdAt < $1.receipt.createdAt }
+        // Group once instead of scanning every live hook for each discovered
+        // session on every screen publication.
+        let approvalsBySession = Dictionary(grouping: liveClaudeHooks.values, by: { $0.request.sessionID })
+        var projectedIDs = projectedClaudeApprovalSessionIDs
+        projectedIDs.formUnion(approvalsBySession.keys)
+        for id in projectedIDs {
+            guard sessions[id] != nil else {
+                projectedClaudeApprovalSessionIDs.remove(id)
+                continue
+            }
+            guard let sessionApprovals = approvalsBySession[id], !sessionApprovals.isEmpty else {
+                if sessions[id]?.claudeApprovals != nil { sessions[id]?.claudeApprovals = nil }
+                projectedClaudeApprovalSessionIDs.remove(id)
+                continue
+            }
+            projectedClaudeApprovalSessionIDs.insert(id)
+            let pending = sessionApprovals.sorted { $0.receipt.createdAt < $1.receipt.createdAt }
             let automatic = effectiveAutomatic(id) && !snapshot.paused
             sessions[id]?.claudeApprovals = pending.isEmpty ? nil : pending.map { item in
                 let risk = item.request.systemCommandRisk
                 return ClaudeApproval(id: item.request.id, summary: item.request.summary, answer: item.request.answer,
                     isQuestion: item.request.isQuestion, sending: item.receipt.response != nil, expiresAt: item.receipt.expiresAt,
-                    automaticAt: automatic && risk == nil && item.request.response != nil && store.value("claudeQuestionEditing:" + item.request.id) != "true" ? item.receipt.createdAt.addingTimeInterval(confirmationDelay) : nil,
+                    automaticAt: automatic && risk == nil && item.request.response != nil && !item.questionEditing ? item.receipt.createdAt.addingTimeInterval(confirmationDelay) : nil,
                     questions: item.request.questions, systemCommandRisk: risk)
             }
             if let first = pending.first, sessions[id]?.phase != .ended {
@@ -3428,18 +3965,30 @@ import TerminalInputSupport
 
     private func removeScreenAnalysis(_ sessionID: String) {
         if let analysis = screenAnalyses.removeValue(forKey: sessionID) {
-            screenAnalysisCacheBytes = max(0, screenAnalysisCacheBytes - analysis.raw.utf8.count)
+            screenAnalysisCacheBytes = max(0, screenAnalysisCacheBytes - analysis.sourceByteCount)
         }
     }
 
-    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil) {
-        receiveScreen(sessionID: sessionID, raw: raw, generation: generation, source: source, at: now, appearance: appearance, cursor: cursor, display: display, precomputed: nil)
+    private func pruneExpiredRemoteFrames() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= nextRemoteFramePruneAt else { return }
+        nextRemoteFramePruneAt = now + 1
+        guard !remoteFrames.isEmpty else { return }
+        let date = Date()
+        let expired = remoteFrames.compactMap { id, value in
+            date.timeIntervalSince(value.frame.observedAt) >= 10 ? id : nil
+        }
+        for id in expired { remoteFrames.removeValue(forKey: id) }
     }
 
-    private func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil, precomputed: ScreenAnalysis?) {
+    public func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil) {
+        receiveScreen(sessionID: sessionID, raw: raw, generation: generation, source: source, at: now, appearance: appearance, cursor: cursor, display: display, precomputed: nil, screenContentsUnchanged: false)
+    }
+
+    private func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil, precomputed: ScreenAnalysis?, screenContentsUnchanged: Bool) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
         let previousFrame = remoteObservedScreens[sessionID]
-        if !ScreenTextEquality.equal(previousFrame?.raw, raw) || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance || previousFrame?.display != display { remoteTerminalChanges[sessionID]?.notify() }
+        if (!screenContentsUnchanged && !ScreenTextEquality.equal(previousFrame?.raw, raw)) || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance || previousFrame?.display != display { remoteTerminalChanges[sessionID]?.notify() }
         remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw), display: display?.validated())
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
@@ -3448,22 +3997,34 @@ import TerminalInputSupport
         guard !hasBackgroundChildren(sessionID), claudeParents[sessionID] == nil else { return }
         let analysis: ScreenAnalysis
         if let precomputed { analysis = precomputed }
-        else if let cached = screenAnalyses[sessionID], cached.matches(raw, agent: session.agent) { analysis = cached }
+        else if let cached = screenAnalyses[sessionID], cached.agent == session.agent,
+                let previousFrame, ScreenTextEquality.identical(previousFrame.raw, raw) { analysis = cached }
         else {
             analysis = ScreenAnalysis(raw: raw, agent: session.agent)
         }
         removeScreenAnalysis(sessionID)
         // Keep repeated large scrollbacks cheap without allowing the analysis cache
         // to grow with session count or retain one unbounded screen per session.
-        let screenBytes = analysis.raw.utf8.count
+        let screenBytes = analysis.sourceByteCount
         if screenBytes <= screenAnalysisCacheScreenLimit,
            screenAnalyses.count < 32,
            screenAnalysisCacheBytes + screenBytes <= screenAnalysisCacheTotalLimit {
             screenAnalyses[sessionID] = analysis
             screenAnalysisCacheBytes += screenBytes
         }
-        observeCapacity(sessionID,analysis:analysis,at:now)
-        defer { scheduleSystemSafety(sessionID); publish() }
+        let sessionBeforeScreen = session
+        let capacityBeforeScreen = capacityResumeProjection(for: sessionID)
+        observeCapacity(sessionID,analysis:analysis,raw:raw,at:now)
+        defer {
+            scheduleSystemSafety(sessionID)
+            // Native screen polling can deliver the same frame every 1–2 s.
+            // Keep freshness and detector state current, but don't rebuild all
+            // question, inbox and session projections unless this observation
+            // changed something the UI can see.
+            if sessions[sessionID] != sessionBeforeScreen || capacityResumeProjection(for: sessionID) != capacityBeforeScreen {
+                publish()
+            }
+        }
         if analysis.capacityStop != nil {
             sessions[sessionID]?.systemCommandRisk = nil
             // An error's empty composer accepts text, not the numeric permission answer.
@@ -3774,8 +4335,7 @@ import TerminalInputSupport
         }
     }
 
-    private func observeCapacity(_ id: String, analysis: ScreenAnalysis, at now: Date) {
-        let raw = analysis.raw
+    private func observeCapacity(_ id: String, analysis: ScreenAnalysis, raw: String, at now: Date) {
         restoreLegacyResumeDraft(id, raw: raw)
         guard let session = sessions[id], session.agent != .shell, session.phase != .ended else { return }
         // A newline is not a submitted continuation. An exact saved owned draft
@@ -4150,10 +4710,16 @@ import TerminalInputSupport
     }
 
     private func rememberExitContext(_ session: AgentSession, records: [ProcessRecord], byPID: inout [Int32:ProcessRecord]?) {
-        guard session.automatic, session.phase != .ended,
-              let process = records.first(where:{$0.pid == session.pid && $0.started == session.started}) else { return }
-        if byPID == nil { byPID = Dictionary(records.map { ($0.pid,$0) },uniquingKeysWith:{first,_ in first}) }
+        guard session.automatic, session.phase != .ended else { return }
+        if byPID == nil { byPID = ProcessDiscovery.index(records) }
         guard let byPID,
+              // A fresh process snapshot can briefly contain both sides of PID
+              // reuse. The ancestry index intentionally keeps its first entry,
+              // but the managed session must bind to its exact start identity.
+              let indexedProcess = byPID[session.pid],
+              let process = indexedProcess.started == session.started
+                ? indexedProcess
+                : records.first(where: { $0.pid == session.pid && $0.started == session.started }),
               let shell = ProcessDiscovery.ancestors(of:process.parent,byPID:byPID).first(where: {
                   $0.tty == process.tty && SessionExitRecovery.isShell($0)
               }) else { return }
@@ -4184,7 +4750,7 @@ import TerminalInputSupport
         let eligible = session.automatic && error.kind.retryable && error.resumeUncertain != true && capacityStates[id]?.phase != .cancelled
         if var context = exitRecoveries[id] {
             context.session = sessions[id] ?? session
-            context.conversationID = context.conversationID ?? SessionExitRecovery.conversation(in:screenAnalyses[id]?.raw ?? "")
+            context.conversationID = context.conversationID ?? SessionExitRecovery.conversation(in:remoteObservedScreens[id]?.raw ?? "")
             context.state = eligible ? "scheduled" : "review"
             context.deadline = Date().addingTimeInterval(recoveryDelays(for: error.kind).first ?? 5)
             exitRecoveries[id] = context
@@ -4214,7 +4780,7 @@ import TerminalInputSupport
         catch { snapshot.health.auditError = "종료된 세션의 복구 상태를 저장하지 못했습니다. \(error.localizedDescription)"; return false }
     }
 
-    private func advanceExitRecovery(_ id: String, records: [ProcessRecord]) {
+    private func advanceExitRecovery(_ id: String, records: [ProcessRecord], byPID: inout [Int32: ProcessRecord]?) {
         guard let context = exitRecoveries[id], sessions[id]?.interruption?.needsAttention == true else { return }
         // A connection that was unavailable at exit can return later. Recheck the
         // original shell/conversation then; never require another app restart.
@@ -4233,9 +4799,11 @@ import TerminalInputSupport
                 sessions[id]?.interruption?.recoveryStatus = "review"
                 sessions[id]?.interruption?.recoveryDetail = "복구 명령은 전달했지만 같은 대화의 실행을 확인하지 못했습니다. Mac의 원본 터미널을 확인해주세요."
             }
+            if byPID == nil { byPID = ProcessDiscovery.index(records) }
+            guard let byPID else { return }
             let candidates = records.filter { process in
                 process.agent == context.session.agent && process.tty == context.shell.tty && process.key != id &&
-                ProcessDiscovery.ancestors(of:process.parent,records:records).contains {$0.pid == context.shell.pid && $0.started == context.shell.started}
+                ProcessDiscovery.ancestors(of: process.parent, byPID: byPID).contains { $0.pid == context.shell.pid && $0.started == context.shell.started }
             }
             guard candidates.count == 1, let process = candidates.first, let next = sessions[process.key],
                   conversationReads.insert(id).inserted else { return }
@@ -4375,6 +4943,21 @@ import TerminalInputSupport
         try store.set("mouseActivity", enabled ? "true" : "false")
         mouseActivity.setEnabled(enabled)
         snapshot.mouseActivity = mouseActivity.status
+        if enabled { startMouseActivityPolling() }
+        else {
+            mouseActivityTask?.cancel(); mouseActivityTask = nil
+        }
+    }
+
+    private func startMouseActivityPolling() {
+        guard mouseActivityTask == nil, pollTask != nil, mouseActivity.nextEvaluationDelay != nil else { return }
+        mouseActivityTask = Task { [weak self] in
+            while !Task.isCancelled, let self {
+                self.evaluateMouseActivity()
+                guard let delay = self.mouseActivity.nextEvaluationDelay else { return }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            }
+        }
     }
 
     public func requestMouseActivityPermission() {
@@ -4407,6 +4990,7 @@ import TerminalInputSupport
         try store.set("keepAwake", enabled ? "true" : "false")
         keepAwakeEnabled = enabled
         keepAwakeFailure = nil; keepAwakeRetryAfter = .distantPast
+        keepAwakeSignal.notify()
         await evaluateKeepAwake()
     }
 
@@ -4417,6 +5001,7 @@ import TerminalInputSupport
         let control = powerControl
         try await Task.detached(priority: .userInitiated) { try control.removeRule() }.value
         keepAwakeRule = nil
+        keepAwakeSignal.notify()
         await evaluateKeepAwake()
     }
 
@@ -4541,29 +5126,47 @@ import TerminalInputSupport
     }
 
     private func projectCapacityResumes() {
-        for id in Array(sessions.keys) {
-            var presented: CapacityResume?
-            if let state = capacityStates[id], sessions[id]?.phase != .ended {
-                let phase: CapacityResume.Phase
-                switch state.phase {
-                case .waiting: phase = snapshot.paused ? .paused : .scheduled
-                case .sending: phase = .sending
-                case .sent: phase = .awaiting
-                case .unavailable: phase = .unavailable
-                case .review: phase = .review
-                case .cancelled: phase = .cancelled
-                }
-                presented = CapacityResume(phase: phase, attempt: state.attempt, limit:0, deadline: phase == .scheduled ? state.deadline : nil, message:state.stop.continuationText)
-                presented?.reason = state.stop.kind.title
-            } else if let recovery = exitRecoveries[id], sessions[id]?.phase == .ended,
-                      sessions[id]?.interruption?.needsAttention == true, recovery.state != "ready" {
-                let phase = snapshot.paused && recovery.state == "scheduled" ? CapacityResume.Phase.paused :
-                    CapacityResume.Phase(rawValue:sessions[id]?.interruption?.recoveryStatus ?? recovery.state) ?? .review
-                presented = CapacityResume(phase:phase,attempt:max(1,recovery.attempts),limit:0,deadline:phase == .scheduled ? recovery.deadline : nil)
-                presented?.reason = sessions[id]?.interruption?.kind.title
+        var ids = projectedCapacityResumeIDs
+        ids.formUnion(capacityStates.keys)
+        ids.formUnion(exitRecoveries.keys)
+        for id in ids {
+            guard sessions[id] != nil else {
+                projectedCapacityResumeIDs.remove(id)
+                continue
             }
+            let presented = capacityResumeProjection(for: id)
             if sessions[id]?.capacityResume != presented { sessions[id]?.capacityResume = presented }
+            if presented == nil { projectedCapacityResumeIDs.remove(id) }
+            else { projectedCapacityResumeIDs.insert(id) }
         }
+    }
+
+    private func capacityResumeProjection(for id: String) -> CapacityResume? {
+        if let state = capacityStates[id], sessions[id]?.phase != .ended {
+            let phase: CapacityResume.Phase
+            switch state.phase {
+            case .waiting: phase = snapshot.paused ? .paused : .scheduled
+            case .sending: phase = .sending
+            case .sent: phase = .awaiting
+            case .unavailable: phase = .unavailable
+            case .review: phase = .review
+            case .cancelled: phase = .cancelled
+            }
+            var presented = CapacityResume(phase: phase, attempt: state.attempt, limit: 0,
+                deadline: phase == .scheduled ? state.deadline : nil, message: state.stop.continuationText)
+            presented.reason = state.stop.kind.title
+            return presented
+        }
+        if let recovery = exitRecoveries[id], sessions[id]?.phase == .ended,
+           sessions[id]?.interruption?.needsAttention == true, recovery.state != "ready" {
+            let phase = snapshot.paused && recovery.state == "scheduled" ? CapacityResume.Phase.paused :
+                CapacityResume.Phase(rawValue: sessions[id]?.interruption?.recoveryStatus ?? recovery.state) ?? .review
+            var presented = CapacityResume(phase: phase, attempt: max(1, recovery.attempts), limit: 0,
+                deadline: phase == .scheduled ? recovery.deadline : nil)
+            presented.reason = sessions[id]?.interruption?.kind.title
+            return presented
+        }
+        return nil
     }
 
     private func retryUnsentApproval(_ id: String, dispatchID: UUID, generation: String) {

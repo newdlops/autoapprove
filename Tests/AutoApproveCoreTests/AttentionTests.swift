@@ -2,6 +2,101 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testAttentionCountsAndExistencePreserveCandidateLifecycle() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-attention-count-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root))
+        defer { engine.stop() }
+        func session(_ id: String) -> AgentSession {
+            var value = AgentSession(id: id, agent: .codex, pid: 42, started: "fixture", tty: "/dev/fixture",
+                cwd: "/tmp/project", terminal: .terminal)
+            value.automatic = true; value.phase = .input; value.channel = .terminalScreen
+            return value
+        }
+        func question(_ id: String) -> QueuedQuestion {
+            QueuedQuestion(id: id, threadID: "fixture", title: "\(id) e\u{301} 질문?", options: ["첫 번째", "둘째 🤖"])
+        }
+        let risk = SystemCommandRisk.detect("launchctl bootstrap gui/501 /fixture/test.plist")!
+        func approval(_ id: String, automatic: Bool = false, sending: Bool = false, unsafe: Bool = false) throws -> ClaudeApproval {
+            var input: JSONObject = ["id": id, "summary": "\(id) 승인", "answer": "Yes", "isQuestion": false,
+                "sending": sending, "expiresAt": 1000]
+            if automatic { input["automaticAt"] = 900 }
+            if unsafe { input["systemCommandRisk"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(risk)) }
+            return try JSONDecoder().decode(ClaudeApproval.self, from: JSONSerialization.data(withJSONObject: input))
+        }
+        func check(_ value: AgentSession, paused: Bool = false, keys: [String]) throws {
+            let full = AttentionRequest.candidates(value, paused: paused)
+            try expectEqual(full.map(\.key), keys)
+            try expectEqual(AttentionRequest.count(value, paused: paused), keys.count)
+            try expectEqual(AttentionRequest.needsAttention(value, paused: paused), !keys.isEmpty)
+            var snapshot = engine.snapshot; snapshot.sessions = [value]; snapshot.paused = paused
+            try expectEqual(snapshot.attentionCount, keys.count)
+        }
+        var main = session("main"), child = session("child"), grand = session("grand")
+        var scheduled = question("scheduled"); scheduled.automation = QuestionAutomation(phase: .scheduled)
+        var sending = question("sending"); sending.reply = QuestionReply(phase: .sending, answer: "first", message: "fixture")
+        var queued = question("queued"); queued.reply = QuestionReply(phase: .queued, answer: "first", message: "fixture")
+        var cancelled = question("cancelled"); cancelled.reply = QuestionReply(phase: .cancelled, answer: "first", message: "fixture")
+        let plain = question("plain")
+        main.queuedQuestions = [plain, scheduled, sending, queued, cancelled]
+        main.pendingSummary = plain.summary; main.pendingRequestID = "duplicate-terminal"
+        child.queuedQuestions = [question("child-question")]
+        child.claudeApprovals = try [approval("manual"), approval("automatic", automatic: true),
+            approval("sending", sending: true), approval("unsafe", unsafe: true)]
+        grand.pendingSummary = "원본 터미널 질문"; grand.pendingRequestID = "terminal:grand"
+        child.backgroundSessions = [grand]; main.backgroundSessions = [child]
+        main.systemSafety = SystemSafetyNotice(id: "warning", risk: risk, request: "fixture only")
+        main.interruption = SessionInterruption(id: "failure", kind: .transport, detail: "fixture error")
+        var inbox = SessionInbox()
+        let notice = SessionInbox.Candidate(key: SessionNotice.key(.question, "systemSafety:warning"),
+            kind: .question, summary: "fixture warning", isSystemSafety: true)
+        inbox.update([notice]); main.notices = inbox.entries
+        let own = ["systemSafety:warning", "interruption:failure", "plain", "cancelled"]
+        let grouped = ["child\nchild-question", "child\nbridge:manual", "child\ngrand\nterminal:grand"]
+        try check(main, keys: own + grouped)
+        let values = AttentionRequest.candidates(main, paused: false)
+        try expectEqual(values.map(\.sourceSessionID), ["main", "main", "main", "main", "child", "child", "grand"])
+        try expectEqual(values.last?.sourceKey, "terminal:grand")
+        try expectEqual(values[2].summary, plain.summary)
+        try expectEqual(Array(values.prefix(2)).map(\.kind), [.systemChange, .interruption])
+        try check(main, paused: true, keys: ["systemSafety:warning", "interruption:failure", "plain", "scheduled", "cancelled",
+            "child\nchild-question", "child\nbridge:manual", "child\nbridge:automatic", "child\ngrand\nterminal:grand"])
+        var ended = main; ended.phase = .ended
+        try check(ended, keys: Array(own.prefix(2)))
+        inbox.markRead(); main.notices = inbox.entries; main.interruption?.acknowledgedAt = Date()
+        try check(main, keys: Array(own.suffix(2)) + grouped)
+        ended.notices = inbox.entries; ended.interruption?.recoveredAt = Date()
+        try check(ended, keys: [])
+        var shell = main; shell.agent = .shell
+        try check(shell, keys: [])
+        var reserved = child
+        reserved.queuedQuestions = []; reserved.backgroundSessions = nil
+        reserved.claudeApprovals = try [approval("automatic", automatic: true)]
+        reserved.pendingSummary = "승인 목록이 있는 동안 터미널 폴백을 만들지 않는다"
+        reserved.pendingInTerminal = true
+        try check(reserved, keys: [])
+        try check(reserved, paused: true, keys: ["bridge:automatic"])
+    }
+
+    func testAttentionNotificationDeadlinesAvoidPollingAndPreserveElapsedDelay() throws {
+        let observed = Date(timeIntervalSince1970: 1_000)
+        try expectEqual(AttentionNotificationSchedule.deadline(kind: .question, observedAt: observed, questionDelay: 10),
+            observed.addingTimeInterval(10))
+        try expectEqual(AttentionNotificationSchedule.deadline(kind: .question, observedAt: observed, questionDelay: 3600),
+            observed.addingTimeInterval(3600))
+        try expectEqual(AttentionNotificationSchedule.deadline(kind: .question, observedAt: observed, questionDelay: 0),
+            observed.addingTimeInterval(1), "Invalid live values stay within the supported notification delay range")
+        try expectEqual(AttentionNotificationSchedule.deadline(kind: .completion, observedAt: observed, questionDelay: 10),
+            observed.addingTimeInterval(3))
+        for kind in [AttentionRequest.Kind.interruption, .systemChange] {
+            try expectEqual(AttentionNotificationSchedule.deadline(kind: kind, observedAt: observed, questionDelay: 10), observed)
+        }
+        let settingChangedAt = observed.addingTimeInterval(4)
+        let changedDelay = AttentionNotificationSchedule.deadline(kind: .question, observedAt: observed, questionDelay: 20)
+        try expectEqual(changedDelay.timeIntervalSince(settingChangedAt), 16,
+            "Recalculating from the original observation preserves elapsed time when the setting changes")
+    }
+
     func testQuestionNotificationDelayPersistenceAndValidation() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-notification-delay-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

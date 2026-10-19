@@ -41,6 +41,9 @@ public struct TerminalHost: Equatable {
         let terminalParents = parents.prefix { $0.tty == "??" || $0.tty == record.tty }
         if terminalParents.contains(where: { $0.executable.contains("Visual Studio Code.app/") }) { return TerminalHost(kind: .vscode, bundleID: "com.microsoft.VSCode") }
         if terminalParents.contains(where: { $0.executable.hasSuffix("Terminal.app/Contents/MacOS/Terminal") }) { return TerminalHost(kind: .terminal, bundleID: "com.apple.Terminal") }
+        if parents.contains(where: { $0.executable.contains("/iTerm2/iTermServer") }) {
+            return TerminalHost(kind: .iterm, name: "iTerm2", bundleID: "com.googlecode.iterm2")
+        }
         // A PTY opened inside another terminal session (script, expect, a nested emulator) is not a host tab.
         if let owner = parents.first(where: { $0.tty != record.tty }), owner.tty != "??" { return TerminalHost(kind: .unknown) }
         let env = environment()
@@ -62,7 +65,7 @@ public struct TerminalHost: Equatable {
         }
         // Orca drops TERM_PROGRAM for some agent environments but always exports its pane handle.
         if handle != nil || bundle == "com.stablyai.orca" { return orca(handle) }
-        if env["ITERM_SESSION_ID"] != nil || parents.contains(where: { $0.executable.contains("/iTerm2/iTermServer") }) {
+        if env["ITERM_SESSION_ID"] != nil {
             return TerminalHost(kind: .iterm, name: "iTerm2", bundleID: "com.googlecode.iterm2")
         }
         if let bundle { return TerminalHost(kind: .unknown, name: names[bundle] ?? bundle, bundleID: bundle) }
@@ -146,6 +149,11 @@ final class ProcessEnvironmentCache: @unchecked Sendable {
         return value
     }
     func retain(_ keys: Set<String>) {
-        lock.lock(); values = values.filter { keys.contains($0.key) }; lock.unlock()
+        lock.lock()
+        if values.count == keys.count && values.keys.allSatisfy({ keys.contains($0) }) {
+            lock.unlock(); return
+        }
+        values = values.filter { keys.contains($0.key) }
+        lock.unlock()
     }
 }

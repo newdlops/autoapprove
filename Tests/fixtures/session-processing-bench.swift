@@ -62,9 +62,33 @@ import AutoApproveCore
             engine.refreshNotices()
             return engine.snapshot.sessions.count + engine.snapshot.sessions.reduce(0) { $0 + $1.backgroundChildren.count }
         }
+        let agents = records.filter { $0.agent != nil }
+        measure("agent-only-classification", rounds: 2000) {
+            agents.reduce(0) { $0 + ($1.agent == nil ? 0 : 1) }
+        }
+        let bare = records.filter { $0.agent == nil }.map { record -> ProcessRecord in
+            var value = record
+            value.executable = "worker-\(record.pid)"
+            return value
+        }
+        measure("bare-name-classification", rounds: 200) {
+            bare.reduce(0) { $0 + ($1.agent == nil ? 0 : 1) }
+        }
+        let foreign = agents.enumerated().map { index, record -> ProcessRecord in
+            var value = record
+            let path = index.isMultiple(of: 2) ? "/fixture/한글 e\u{301}/codex" : "/fixture/claude/versions/٤.٢"
+            value.executable = (NSMutableString(string: path) as NSString) as String
+            return value
+        }
+        measure("unicode-agent-classification", rounds: 2000) {
+            foreign.reduce(0) { $0 + ($1.agent == nil ? 0 : 1) }
+        }
         guard reports[0]["checksum"] as? Int == 4800,
               reports[1]["checksum"] as? Int == 2400,
               reports[2]["checksum"] as? Int == 4800,
+              reports[3]["checksum"] as? Int == 48_000,
+              reports[4]["checksum"] as? Int == 0,
+              reports[5]["checksum"] as? Int == 48_000,
               publications == 0, engine.snapshot.events.isEmpty,
               engine.snapshot.sessions.first(where: { $0.id == claude[0].id })?.backgroundChildren.count == 11 else {
             throw AppError.message("Synthetic classification/projection changed")

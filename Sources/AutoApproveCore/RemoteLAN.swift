@@ -73,7 +73,11 @@ public enum RemoteLAN {
             let interface = RemoteLANInterface(name: value.name, address: value.address, netmask: value.netmask, kind: kind)
             return interface.mask != nil ? interface : nil
         }
-        cache.interfaces = ordered(result); cache.until = Date().addingTimeInterval(1)
+        // Dashboard requests reuse these routes many times per second. The
+        // path monitors explicitly force a refresh on interface changes, so a
+        // longer steady-state cache avoids repeatedly walking SystemConfiguration
+        // and the I/O registry (notably expensive on VPN-managed Macs).
+        cache.interfaces = ordered(result); cache.until = Date().addingTimeInterval(10)
         return cache.interfaces
     }
     public static func ordered(_ interfaces: [RemoteLANInterface]) -> [RemoteLANInterface] {

@@ -1,6 +1,10 @@
 import Foundation
 import JavaScriptCore
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 
 @MainActor struct ApprovalTests {
     private let codex = """
@@ -23,6 +27,53 @@ import AutoApproveCore
         try expectNil(PromptDetector.detect(codex.replacingOccurrences(of: "› 1.", with: "  1."), agent: .codex))
         try expectNil(PromptDetector.detect(codex, agent: .claude))
     }
+#if DEBUG
+    func testOrdinaryScrollbackDoesNotMaterializeTrimmedRows() throws {
+        let history = String(repeating: "completed build step /fixture/output.swift\n", count: 45_000)
+        let ordinary = history + "Working\nesc to interrupt"
+        let prepared = DetectionLines(ordinary)
+        try expectNil(PromptDetector.detect(ordinary, agent: .codex, prepared: prepared))
+        try expectFalse(prepared.debugHasMaterializedRawRows,
+            "Ordinary screen analysis must leave its 45,000-row transcript unmaterialized")
+        try expectFalse(prepared.debugHasMaterializedTrimmedRows,
+            "Ordinary screen analysis must avoid a second full array of 45,000 trimmed rows")
+        try expectNil(QuestionDetector.detect(agent: .codex, prepared: prepared))
+        try expectFalse(prepared.debugHasMaterializedRawRows,
+            "A missing menu should only read the bounded screen tail")
+        try expectFalse(prepared.debugHasMaterializedTrimmedRows,
+            "Menu inspection should trim only its bounded visible tail")
+
+        let permissionLines = DetectionLines(codex)
+        try expectNotNil(PromptDetector.detect(codex, agent: .codex, prepared: permissionLines))
+        try expect(permissionLines.debugHasMaterializedTrimmedRows,
+            "A real dialog retains its full normalized and trimmed context for exact validation")
+    }
+
+    func testScreenAnalysisPreservesSourceUTF8ByteCountAcrossLinePreparation() throws {
+        let samples = [
+            "ASCII\r\ntrailing spaces  \n",
+            "e\u{301}\r\n🙂\u{2028}text\r",
+            "한글\n\t \n",
+            String(repeating: "old output 🙂 e\u{301}\r\n", count: 256)
+        ]
+        for sample in samples {
+            let bridged = String(NSString(string: sample))
+            let prepared = PromptDetector.normalizedLinesAndUTF8ByteCount(bridged)
+            try expectEqual(prepared.lines, PromptDetector.normalizedLines(bridged),
+                "Counted normalization preserves the existing CR/LF and canonical row output")
+            try expectEqual(prepared.byteCount, bridged.utf8.count,
+                "Source bytes count original decomposed scalars, CRLF and trailing whitespace")
+            let analysis = ScreenAnalysis(raw: bridged, agent: .shell)
+            try expectEqual(analysis.sourceByteCount, bridged.utf8.count,
+                "Screen cache budgeting uses the exact original UTF-8 size")
+        }
+
+        let contiguous = DetectionLines(samples[0])
+        try expectEqual(contiguous.sourceByteCount, samples[0].utf8.count)
+        try expectFalse(contiguous.debugHasMaterializedRawRows,
+            "Reading the byte budget alone must not materialize normalized line arrays")
+    }
+#endif
     func testClaudePromptAndDifferentSelection() throws {
         let prompt = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\nEsc to cancel"
         try expectNotNil(PromptDetector.detect(prompt, agent: .claude))
@@ -199,9 +250,26 @@ import AutoApproveCore
         try expectEqual(ActivityDetector.detect("› Please fix this\n? for shortcuts", agent: .codex).phase, .input)
         let history = String(repeating: "Old output\n", count: 2000)
         for newline in ["\n", "\r\n", "\r", "\u{000B}", "\u{000C}", "\u{0085}", "\u{2028}", "\u{2029}"] {
-            try expectEqual(ActivityDetector.detect(history + idle.replacingOccurrences(of: "\n", with: newline), agent: .codex).phase, .idle)
+            let screen = history + idle.replacingOccurrences(of: "\n", with: newline)
+            try expectEqual(ActivityDetector.detect(screen, agent: .codex).phase, .idle)
+            var tracker = ActivityTracker()
+            let now = Date(timeIntervalSince1970: 10_000)
+            try expectEqual(tracker.observe(screen, agent: .codex, generation: "same", at: now).phase, .unknown)
+            try expectEqual(tracker.observe(screen, agent: .codex, generation: "same", at: now.addingTimeInterval(2)).phase, .idle,
+                "Prepared-tail activity detection and readiness fingerprinting preserve every supported newline form")
         }
         try expectEqual(ActivityDetector.detect("esc to interrupt\n" + history + idle, agent: .codex).phase, .idle, "Old working hints outside the visible tail cannot change the phase")
+    }
+    func testPromptLineNormalizationPreservesNewlinesAndCanonicalText() throws {
+        for (screen, expected) in [
+            ("", []),
+            ("a\r\nb\rc\n", ["a", "b", "c"]),
+            ("\r\r\n", []),
+            ("row\n   \n\t", ["row"]),
+            ("e\u{301}\u{2028}x\r\n", ["é\u{2028}x"]),
+        ] {
+            try expectEqual(PromptDetector.normalizedLines(screen), expected)
+        }
     }
     func testIdleConfirmationAndGenerationChange() throws {
         let idle = "Done.\n›\n? for shortcuts"
@@ -416,7 +484,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
-        let cases: [(String, () async throws -> Void)] = [
+        var cases: [(String, () async throws -> Void)] = [
             ("History cache: compact projection matches raw decisions and old-row edits", tests.testCodexHistoryCompactCacheMatchesRawDecisionsAndOldEdits),
             ("Local socket: fragmented Unicode, large lines, buffered order and permissions", tests.testLocalSocketFragmentedUnicodeAndBufferedOrdering),
             ("Local socket: malformed and oversized peers, bounded connections and single disconnect", tests.testLocalSocketMalformedOversizedAndBoundedPeers),
@@ -474,6 +542,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Live relay accepts changing output with automation on and binds the exact target", tests.testRemoteRelayWithAutomaticApprovalAndChangedOutput),
             ("Native approval writes serialize with live user input", tests.testRemoteInputSerializesNativeApproval),
             ("Remote original ANSI attributes, bounds and color-only frames", tests.testRemoteOriginalTerminalAttributesAndColorOnlyFrames),
+            ("Remote frames preserve exact bridged Unicode and cache native UTF-8", tests.testForeignScreenFramesKeepExactUnicodeAndCacheNativeUTF8),
             ("Remote frame character budget preserves foreign storage and Unicode output", tests.testRemoteFrameCharacterBudgetPreservesForeignAndUnicodeOutput),
             ("Native viewport text and Codex Unicode cursor are captured together", tests.testNativeTextSnapshotKeepsCodexCursorOnSameViewport),
             ("Codex and Claude cursor/display changes preserve the original input and lifetime", tests.testNativePresentationAndCursorPreserveOriginalInput),
@@ -495,6 +564,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Text terminals check only required live permissions and native previews retain full checks", tests.testTextTerminalChecksOnlyRequiredPermissions),
             ("Targeted original process verification matches discovery and rejects ended PIDs", tests.testTargetedOriginalProcessReadMatchesDiscovery),
             ("Native processes: fresh metadata and original terminal host parity", tests.testNativeProcessMetadataAndOriginalHostParity),
+            ("Native processes: agent name prefilter preserves Foundation classification", tests.testProcessAgentNamePrefilterKeepsFoundationClassification),
+            ("Native processes: filtered ancestor lookup revalidates the complete chain", tests.testFilteredAgentAncestryRevalidatesTheCompleteParentChain),
             ("Native processes: current open files prepare questions without input", tests.testNativeQuestionPreparationUsesCurrentProcessAndOpenFiles),
             ("Native processes: cancellation and missing identity", tests.testNativeProcessCancellationAndMissingIdentity),
             ("Command completion handles early exits, concurrent output, Unicode stdin and timeouts", tests.testCommandRunnerExitTimeoutAndConcurrentPipes),
@@ -510,6 +581,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Repeated web frames bound parsing and keep changed questions", tests.testRepeatedWebFramesBoundParsingAndKeepChangedQuestions),
             ("Background screen results reject replaced targets, disconnects and cancellation", tests.testBackgroundScreenResultsRejectChangedTargetsDisconnectAndCancellation),
             ("Native cwd reads preserve valid paths with duplicate and missing processes", tests.testWorkingDirectoryReadsKeepValidPathsWithDuplicateAndMissingPIDs),
+            ("Working directory refreshes cache between process polls", tests.testWorkingDirectoryRefreshReadsNewSessionsImmediatelyAndCachesBriefly),
+            ("Keep-awake idle polling sleeps while disabled", tests.testKeepAwakeEvaluationIntervalBacksOffWhenInactive),
             ("Native cwd reads follow a Unicode child's directory changes", tests.testWorkingDirectoryFollowsUnicodeChildDirectoryChanges),
             ("Duplicate indexing preserves Unicode, thread identity and manual overrides", tests.testQuestionDuplicateIndexPreservesCanonicalAndThreadIdentity),
             ("Claude app approval continues through thirty separately timed requests", tests.testClaudeAppApprovalThenThirtySequentialQuestions),
@@ -610,11 +683,16 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Codex read-only history, incremental updates and restart", tests.testCodexHistoryReadOnlyAndIncremental),
             ("Managed Mac load: native file metadata follows live descriptors and exact Unicode", tests.testNativeOpenFilesFollowDescriptorChangesAndUnicode),
             ("Managed Mac load: native file metadata rejects bounds, stale identity and cancellation", tests.testNativeOpenFilesRejectBoundsChangedIdentityAndCancellation),
+            ("Process identity: cached start-time formatting preserves concurrent results", tests.testTTYProcessStartFormattingIsStableUnderConcurrentReads),
             ("Managed Mac load: per-process file failures do not block healthy current Codex questions", tests.testCodexCollectorIsolatesFileFailuresAndFollowsCurrentRollout),
             ("Codex root-thread binding excludes children and ambiguous processes", tests.testCodexThreadBinding),
             ("concurrent question alerts, errors, dismissal and session exit", tests.testConcurrentCodexAttentionAndDismissal),
             ("Terminal custom and window titles with isolated failures", tests.testTerminalTitleContract),
-            ("Native Terminal title batch uses exact targets and stable metadata", tests.testNativeTerminalBatchesOnlyRequestedTitlesWithStableIdentities),
+            ("Native Terminal content and title batches use exact targets and stable metadata", tests.testNativeTerminalBatchesOnlyRequestedContentsAndTitlesWithStableIdentities),
+            ("Native Terminal small multi-tab reads use exact TTY events", tests.testNativeTerminalKeepsSmallMultiTabReadsIndividual),
+            ("Native Terminal refreshes titles only for stale TTYs", tests.testNativeTerminalReadsTitlesOnlyForExpiredTTYs),
+            ("Native Terminal slow contents identity lookup temporarily falls back to exact TTY reads", tests.testSlowBulkContentsIdentityQueryRequestsTemporaryPerTTYFallback),
+            ("Native Terminal slow title batches temporarily use cached titles", tests.testSlowBulkTitleQueriesRequestTemporaryTitleFallback),
             ("Native Terminal title batch rejects unstable and unsupported metadata", tests.testNativeTerminalTitleBatchRejectsUnstableAndUnsupportedMetadata),
             ("Native Terminal title batch stops on denial, deadline and cancellation", tests.testNativeTerminalTitleBatchStopsOnDenialDeadlineAndCancellation),
             ("Loopback server avoids LAN advertisements, discovery and saved-peer mutations", tests.testLoopbackServerDoesNotDiscoverAdvertiseOrRewritePeers),
@@ -630,6 +708,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("question responses require enrollment, resume and the correct session", tests.testYesNoConfirmationOptInAndPause),
             ("question response requires a durable audit", tests.testYesNoConfirmationRequiresSavedAudit),
             ("manual attention, duplicate polling, resolution and repeated questions", tests.testAttentionLifecycle),
+            ("Attention counts and existence preserve safety, exact keys, grouping and lifecycle", tests.testAttentionCountsAndExistencePreserveCandidateLifecycle),
+            ("Attention notification deadlines sleep to delivery and preserve elapsed delay changes", tests.testAttentionNotificationDeadlinesAvoidPollingAndPreserveElapsedDelay),
             ("Question notification delay default, persistence, bounds and failed save", tests.testQuestionNotificationDelayPersistenceAndValidation),
             ("notification opens exact live session only", tests.testAttentionTarget),
             ("three-choice question survives Claude reminders and notifies once", tests.testThreeChoiceAttention),
@@ -675,7 +755,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Peer inventory completion waits isolate cancellation and preserve revision, shutdown and timeout boundaries", tests.testPeerCacheCompletionWaitPreservesSharedReadsAndClosesRaces),
             ("Dashboard resource use: validators cover controls and identity, excluding only observation time", tests.testDashboardValidatorIncludesAllContentButNotObservationTime),
             ("Dashboard resource use: conditional reads revalidate origin, identity and current controls", tests.testConditionalDashboardRevalidatesIdentityOriginAndControls),
+            ("Dashboard resource use: local inventory reuses validators before rebuilding an unchanged response", tests.testConditionalLocalInventoryReusesFreshValidatorBeforeEncoding),
             ("Dashboard resource use: repeated reads do not republish unchanged native web status", tests.testRepeatedDashboardReadsDoNotRepublishNativeWebStatus),
+            ("Terminal stream: unchanged screens back off while input remains responsive", tests.testTerminalStreamPollingBacksOffOnlyWhenUnchanged),
             ("Payload reduction: inventory omits unused notice history while preserving unread safety and native data", tests.testWebInventoryDropsOnlyUnusedNoticeHistory),
             ("Payload reduction: JSON paths, controls, Unicode and base64 round-trip without slash escapes", tests.testWireJSONPreservesStringsWithoutSlashEscapes),
             ("Payload reduction: peer reuse requires a fresh identity-pinned matching 304", tests.testPeerInventoryReusesOnlyFreshIdentityPinned304),
@@ -693,6 +775,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Adaptive read timing: learns load and jitter with bounded fast recovery", tests.testReadTimingLearnsLoadAndVariationWithinRecoveryBounds),
             ("Adaptive read timing: isolates routes, operation kinds, peers and expired samples", tests.testReadTimingIsolatesRoutesOperationsAndExpiredKnowledge),
             ("Adaptive read timing: rejects invalid samples and bounds storage", tests.testReadTimingRejectsInvalidSamplesAndBoundsStorage),
+            ("Active terminal polling reduces stable-frame reads and stays bounded", tests.testActiveScreenPollingEasesOffOnlyAfterStableFrames),
             ("Stream deltas: UTF-16 edits preserve exact Unicode and never split surrogate pairs", tests.testTerminalScreenPatchPreservesUTF16AndExactUnicode),
             ("Scroll copy: both directions preserve exact Unicode and periodic spans", tests.testScrollCopyPreservesExactUnicodeInBothDirections),
             ("Scroll copy: unrelated and oversized screens bound matching work", tests.testScrollCopyBoundsWorkAndRejectsUnrelatedScreens),
@@ -736,6 +819,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("only Claude/Codex terminals enter the inventory", tests.testOrdinaryTerminalsAreExcluded),
             ("agent exit excludes ordinary shells and idle counts", tests.testAgentExitDoesNotExposeShellOrCountItAsIdle),
             ("ready composer versus quiet work and unknown screens", tests.testActivityNeedsAReadyComposerNotSilence),
+            ("prompt line normalization preserves CR/LF, canonical text and trailing blank removal", tests.testPromptLineNormalizationPreservesNewlinesAndCanonicalText),
             ("stable idle confirmation and new screen generations", tests.testIdleConfirmationAndGenerationChange),
             ("idle duration, work transition, connection loss", tests.testEngineClearsIdleOnWorkAndDisconnection),
             ("Claude idle events and new input", tests.testHookIdleResetsOnNewInput),
@@ -759,6 +843,27 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("SQLite persistence", tests.testAuditPersistsSettingsAndEvents),
             ("disconnected controls and reveal capability", tests.testDisconnectedEnrollmentCanBeDisabled)
         ]
+#if DEBUG
+        cases.insert(contentsOf: [
+            ("Idle poller observations park until source change or cancellation", tests.testIdleObservationWaitsForChangeOrCancellation),
+            ("Terminal stream: reused JSON encoder preserves equivalent screen and heartbeat data", tests.testTerminalStreamEncoderReusePreservesWireBytes),
+            ("Managed Mac load: stale NFS descriptor paths do not abort open-file discovery", tests.testDescriptorPathReaderSkipsOnlyTransientFDPathErrors),
+            ("Screen parsing: ordinary scrollback stays on its bounded suffix", tests.testOrdinaryScrollbackDoesNotMaterializeTrimmedRows),
+            ("Screen parsing: source byte counting reuses bridged line normalization", tests.testScreenAnalysisPreservesSourceUTF8ByteCountAcrossLinePreparation),
+            ("Codex history: reuse bounded read-only SQLite connections", tests.testCodexHistoryConnectionsAreReusedAndBounded),
+            ("Codex history: unchanged DB version skips reads and external commits invalidate", tests.testUnchangedDatabaseVersionSkipsSessionHistoryQueriesAndExternalCommitInvalidatesIt),
+            ("Codex history: replaced database file reopens safely", tests.testCodexHistoryConnectionCacheReopensReplacedDatabase),
+            ("Codex history: replaced database rebuilds its session projection", tests.testSessionHistoryProjectionRebuildsWhenDatabaseFileIsReplaced),
+            ("Codex history: prepared statements are reused per connection", tests.testHistoryStatementsArePreparedOncePerReusedConnection),
+            ("Codex history: inactive readers release database statements", tests.testSessionHistoryReaderReleasesStatementsForInactiveDatabase),
+            ("Codex history: incremental reads seek both append and rewrite indexes", tests.testIncrementalHistoryQueryUsesAppendAndRewriteIndexes),
+            ("Codex history performance: unchanged delta reads stay bounded", tests.testUnchangedHistoryQueryCostDoesNotScaleWithThreadRows),
+            ("Codex history: collector rebuilds after database replacement", tests.testCodexCollectorRebuildsProjectionAfterHistoryFileReplacement),
+            ("Codex history: synchronous agent rewrites skip large bodies", tests.testIncrementalHistoryQueryOmitsSynchronousAgentBodies),
+            ("Codex history: retain question projections and replay old user edits", tests.testHistoryCacheRetainsQuestionsNotOrdinaryMessagesAndReplaysOldEdits),
+            ("Codex history: async-to-sync rewrites clear stale pending questions", tests.testRewriteFromAsyncQuestionToSynchronousAgentMessageClearsPendingQuestion)
+        ], at: 0)
+#endif
         let filterIndex = CommandLine.arguments.firstIndex(of: "--filter")
         let filter = filterIndex.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
         let selected = cases.filter { filter == nil || $0.0.localizedCaseInsensitiveContains(filter!) }

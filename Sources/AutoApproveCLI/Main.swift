@@ -82,7 +82,8 @@ import AutoApproveCore
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()
                     guard input.count <= 1_000_000, var payload = try JSONSerialization.jsonObject(with: input) as? JSONObject else { print("{}"); return }
-                    if let records = try? ProcessDiscovery.read(), let agent = ProcessDiscovery.ancestors(of: getppid(), records: records).first(where: { $0.agent == .claude }) {
+                    let parent = getppid()
+                    if let agent = try? ProcessDiscovery.enclosingAgent(of: parent, matching: .claude), getppid() == parent {
                         payload["agentPID"] = agent.pid; payload["agentStarted"] = agent.started
                         payload["tty"] = agent.tty == "??" ? "" : "/dev/" + agent.tty
                     }

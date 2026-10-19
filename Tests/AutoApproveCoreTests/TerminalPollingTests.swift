@@ -1,8 +1,34 @@
 import Foundation
 import JavaScriptCore
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 
 extension ApprovalTests {
+#if DEBUG
+    func testIdleObservationWaitsForChangeOrCancellation() async throws {
+        let signal = RemoteTerminalChangeSignal(), observation = signal.observe()
+        var entered = false, finished = false
+        let waiting = Task {
+            entered = true
+            await observation.waitForChange()
+            finished = true
+        }
+        while !entered { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(30))
+        try expectFalse(finished, "An inactive host poller must not wake on an idle timer")
+        signal.notify()
+        await waiting.value
+        try expect(finished, "A host state change must wake its parked poller")
+
+        let cancelled = Task { await observation.waitForChange() }
+        cancelled.cancel()
+        await cancelled.value
+    }
+#endif
+
     private func batchTerminalContext(_ setup: String = "") -> JSContext {
         let context = JSContext()!
         context.evaluateScript("""

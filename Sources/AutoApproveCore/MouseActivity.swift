@@ -91,6 +91,10 @@ private enum MouseActivityFailure: Error { case locked, permission, unavailable 
     private var nextDue: TimeInterval?
     private var stopped = false
     private var activity: NSObjectProtocol?
+    var nextEvaluationDelay: TimeInterval? {
+        guard status.enabled, !stopped, let nextDue else { return nil }
+        return max(0.01, nextDue - control.uptime())
+    }
     public init(control: MouseActivityControl = .live) { self.control = control }
 
     public func setEnabled(_ enabled: Bool) {

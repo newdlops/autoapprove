@@ -65,6 +65,25 @@ private final class RemoteCursorProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testTTYProcessStartFormattingIsStableUnderConcurrentReads() throws {
+        let seconds: UInt64 = 1_792_468_800
+        let identity = TTYInputIdentity(pid: 1, processGroup: 1, uid: getuid(), effectiveUID: geteuid(), device: 0,
+            startSeconds: seconds, startMicroseconds: 0)
+        let reference = DateFormatter()
+        reference.locale = Locale(identifier: "en_US_POSIX")
+        reference.timeZone = .current
+        reference.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        let expected = reference.string(from: Date(timeIntervalSince1970: Double(seconds)))
+        let lock = NSLock()
+        var values: [String] = []
+        values.reserveCapacity(128)
+        DispatchQueue.concurrentPerform(iterations: 128) { _ in
+            let value = identity.processStart
+            lock.lock(); values.append(value); lock.unlock()
+        }
+        try expectEqual(Set(values), [expected], "Cached formatter must preserve the process identity format under concurrent reads")
+    }
+
     func testRemoteFrameCharacterBudgetPreservesForeignAndUnicodeOutput() async throws {
         let paths = AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent("aa-frame-budget-" + UUID().uuidString))
         defer { try? FileManager.default.removeItem(at: paths.directory) }
@@ -345,6 +364,30 @@ extension ApprovalTests {
         engine.receiveScreen(sessionID: session.id, raw: raw, generation: "color-generation")
         let plain = try await engine.remoteTerminal(sessionID: session.id)
         try expectNil(plain.appearance); try expect(plain.revision != next.revision)
+    }
+
+    func testForeignScreenFramesKeepExactUnicodeAndCacheNativeUTF8() async throws {
+        let nfd = "e\u{301}" + String(repeating: " · 화면 출력 👩🏽‍💻\n", count: 1_000)
+        let foreign = NSAppleEventDescriptor(string: nfd).stringValue!
+        try expectFalse(foreign.isContiguousUTF8, "The fixture must use Foundation-backed storage")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-foreign-frame-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [] })
+        defer { engine.stop() }
+        var session = ProcessDiscovery.sessions(ProcessDiscovery.parse("81002 1 ttys082 81002 81002 Mon Sep 21 09:00:01 2026 /usr/local/bin/codex"))[0]
+        session.terminal = .vscode; session.channel = .vscodeScreen; session.bridgeID = "unicode-frame"; session.terminalID = "unicode-terminal"
+        engine.updateDiscovery([session], records: [])
+        engine.receiveScreen(sessionID: session.id, raw: foreign, generation: "same-generation")
+        let first = try await engine.remoteTerminal(sessionID: session.id)
+        try expect(first.screen.isContiguousUTF8, "A retained bridged frame should use native UTF-8 storage")
+        try expect(Array(first.screen.utf8).elementsEqual(foreign.utf8), "Storage conversion must preserve the exact original scalar sequence")
+
+        let nfc = "é" + String(repeating: " · 화면 출력 👩🏽‍💻\n", count: 1_000)
+        try expect(nfd == nfc, "The fixture must be canonically equivalent")
+        engine.receiveScreen(sessionID: session.id, raw: nfc, generation: "same-generation")
+        let changed = try await engine.remoteTerminal(sessionID: session.id)
+        try expect(Array(changed.screen.utf8).elementsEqual(nfc.utf8), "A canonical-only source change must not reuse stale bytes")
+        try expect(changed.revision != first.revision, "A byte-distinct Unicode screen receives a new revision")
     }
 
     func testRemoteTerminalCoalescingExpiryAndConditionalPayload() async throws {

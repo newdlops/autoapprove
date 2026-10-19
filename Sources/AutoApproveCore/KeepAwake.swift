@@ -78,6 +78,12 @@ public struct KeepAwakeStatus: Codable, Equatable {
 }
 
 public enum KeepAwake {
+    /// The idle check only guards a stale marker. While disabled with no owned
+    /// hold, a one-minute safety check replaces the otherwise needless 5 s wake.
+    public static func evaluationInterval(enabled: Bool, ownsSleepHold: Bool) -> TimeInterval {
+        enabled || ownsSleepHold ? 5 : 60
+    }
+
     public static let rulePath = "/private/etc/sudoers.d/autoapprove-keepawake"
     public static let sudo = "/usr/bin/sudo"
     public static let pmset = "/usr/bin/pmset"

@@ -222,11 +222,11 @@ public enum LANUpdateInstallation {
               job.release.isCompatible, UUID(uuidString: job.nodeID) != nil else { throw AppError.message("업데이트 설치 경로를 확인하지 못했습니다.") }
         try verifyPublisher(app); try verifyPublisher(candidate)
         guard try release(candidate) == job.release, try release(app) < job.release,
-              let manager = try ProcessDiscovery.read().first(where: { $0.pid == job.managerPID && $0.started == job.managerStarted }),
+              let manager = try ProcessDiscovery.read(pid: job.managerPID).first(where: { $0.started == job.managerStarted }),
               manager.executable == app.appendingPathComponent("Contents/MacOS/AutoApproveApp").path else { throw AppError.message("업데이트할 AutoApprove 실행이 바뀌었습니다.") }
         try Data("ready".utf8).write(to: directory.appendingPathComponent("helper-ready"), options: .atomic)
         let deadline = Date().addingTimeInterval(40)
-        while try ProcessDiscovery.read().contains(where: { $0.pid == job.managerPID && $0.started == job.managerStarted }) {
+        while try ProcessDiscovery.read(pid: job.managerPID).contains(where: { $0.started == job.managerStarted }) {
             guard Date() < deadline else { throw AppError.message("앱이 종료되지 않아 업데이트를 적용하지 않았습니다.") }
             try await Task.sleep(for: .milliseconds(250))
         }
@@ -337,7 +337,7 @@ public enum LANUpdateInstallation {
                 if let reason = engine.lanUpdateWaitReason {
                     self.status("waiting", reason, version: release.version); return
                 }
-                let manager = try ProcessDiscovery.read().first { $0.pid == getpid() }
+                let manager = try ProcessDiscovery.read(pid: getpid()).first
                 guard let manager, manager.executable == app.appendingPathComponent("Contents/MacOS/AutoApproveApp").path,
                       let port = engine.webStatus.port, FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path),
                       FileManager.default.isWritableFile(atPath: app.path) else { throw AppError.message("설치 위치에 쓸 수 없습니다. 설치 파일을 Applications에 적용해주세요.") }

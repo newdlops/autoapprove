@@ -4,6 +4,9 @@ import Foundation
 enum ScreenTextEquality {
     static func identical(_ previous: String?, _ current: String) -> Bool {
         guard let previous else { return false }
+        // Terminal output normally changes at the bottom. Reject those frames
+        // before comparing a possibly very large retained scrollback.
+        if !previous.utf8.suffix(128).elementsEqual(current.utf8.suffix(128)) { return false }
         // Cocoa screen strings can compare literal UTF-16 without walking their
         // bridged UTF-8 view. Otherwise preserve the detector's exact-byte contract.
         if (!previous.isContiguousUTF8 || !current.isContiguousUTF8),

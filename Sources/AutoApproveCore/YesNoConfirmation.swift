@@ -68,12 +68,9 @@ public struct YesNoConfirmation {
         return String(text[prefix.upperBound...])
     }
 
-    /// Codex renders tool permission labels and descriptions in two columns. Match
-    /// only complete known phrases. Terminal cells can wrap inside a word, so the
-    /// added line-boundary space must not change those phrases' meaning.
-    private static func permissionLabel(_ value: String) -> String {
-        let text = cleaned(value)
-        let compact = text.filter { !$0.isWhitespace }
+    // These descriptions do not depend on a request. Normalize them once rather
+    // than repeating regex/string work for every option in every permission menu.
+    private static let permissionPhrases: [(compact: String, label: String)] = {
         let descriptions = [
             ("Allow", "Run the tool and continue."),
             ("Allow for this session", "Run the tool and remember this choice for this session."),
@@ -81,10 +78,21 @@ public struct YesNoConfirmation {
             ("Allow and don't ask me again", "Run the tool and remember this choice for future tool calls."),
             ("Cancel", "Cancel this tool call.")
         ]
-        for (label, description) in descriptions {
-            for phrase in [label, cleaned(label + " " + description)] where compact.caseInsensitiveCompare(phrase.filter { !$0.isWhitespace }) == .orderedSame {
-                return label
+        return descriptions.flatMap { label, description in
+            [label, cleaned(label + " " + description)].map { phrase in
+                (compact: phrase.filter { !$0.isWhitespace }, label: label)
             }
+        }
+    }()
+
+    /// Codex renders tool permission labels and descriptions in two columns. Match
+    /// only complete known phrases. Terminal cells can wrap inside a word, so the
+    /// added line-boundary space must not change those phrases' meaning.
+    private static func permissionLabel(_ value: String) -> String {
+        let text = cleaned(value)
+        let compact = text.filter { !$0.isWhitespace }
+        for phrase in permissionPhrases where compact.caseInsensitiveCompare(phrase.compact) == .orderedSame {
+            return phrase.label
         }
         return text
     }

@@ -4,6 +4,35 @@ import AutoApproveCore
 import Network
 
 extension ApprovalTests {
+    func testTerminalStreamPollingBacksOffOnlyWhenUnchanged() throws {
+        try expectEqual(RemoteTerminalPolling.interval(unchanged: 0, responsive: true), 0.15)
+        try expectEqual(RemoteTerminalPolling.interval(unchanged: 50, responsive: true), 0.15,
+                        "Input in flight retains the responsive read interval")
+        try expectEqual(RemoteTerminalPolling.interval(unchanged: 0, responsive: false), 0.5,
+                        "After a changed frame, allow one bounded confirmation read")
+        try expectEqual(RemoteTerminalPolling.interval(unchanged: 1, responsive: false), 2,
+                        "A stable stream waits for its heartbeat or source-change signal")
+        try expectEqual(RemoteTerminalPolling.interval(unchanged: 50, responsive: false), 2,
+                        "Unchanged screens back off to the two-second compact liveness cadence")
+        try expectEqual(RemoteTerminalPolling.delayAfterRead(interval: 1.5, elapsed: 0), 1.5)
+        try expectEqual(RemoteTerminalPolling.delayAfterRead(interval: 1.5, elapsed: 1), 0.5,
+                        "Fast reads keep the existing start-to-start cadence")
+        try expectEqual(RemoteTerminalPolling.delayAfterRead(interval: 1.5, elapsed: 8), 1.5,
+                        "A slow read gets a full cooldown instead of a 100ms retry")
+        try expectEqual(RemoteTerminalPolling.delayAfterRead(interval: .infinity, elapsed: 8), 0.1)
+    }
+
+    func testActiveScreenPollingEasesOffOnlyAfterStableFrames() throws {
+        try expectEqual(RemoteTerminalPolling.activeScreenInterval(unchangedReads: 0), 1.5)
+        try expectEqual(RemoteTerminalPolling.activeScreenInterval(unchangedReads: 2), 1.5,
+            "Fresh or recently changed output keeps the existing responsive cadence")
+        try expectEqual(RemoteTerminalPolling.activeScreenInterval(unchangedReads: 3), 1.75)
+        try expectEqual(RemoteTerminalPolling.activeScreenInterval(unchangedReads: 6), 2.5)
+        try expectEqual(RemoteTerminalPolling.activeScreenInterval(unchangedReads: 100), 2.5,
+            "Stable output has a bounded maximum interval")
+        try expectEqual(RemoteTerminalPolling.activeScreenInterval(unchangedReads: -5), 1.5)
+    }
+
     @MainActor private func payloadState(_ suffix: String) async throws -> RemoteNodeState {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-payload-"+suffix+UUID().uuidString)
         defer { try? FileManager.default.removeItem(at:directory) }
@@ -223,8 +252,42 @@ extension ApprovalTests {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let value = try decoder.decode(RemoteDashboard.self, from: changed.body)
         try expectEqual(value.nodes.first?.state?.snapshot.paused, true)
+        guard let changedTag = changed.entityTag else { throw AppError.message("Missing updated inventory validator") }
+        let unchangedAgain = await service.handle(try request("If-None-Match: \(changedTag)\r\n"))
+        try expectEqual(unchangedAgain.status, 304, "An unchanged repeated conditional read can reuse its validated dashboard")
         let noValidator = await service.handle(try request())
         try expectEqual(noValidator.status, 200, "Old clients still receive the complete inventory")
+    }
+
+    @MainActor func testConditionalLocalInventoryReusesFreshValidatorBeforeEncoding() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-local-inventory-validator-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [] })
+        defer { engine.stop() }
+        let service = RemoteNetworkService(engine: engine, nodeID: UUID().uuidString, bonjourEnabled: false,
+            discoveryAddresses: { [] }, onStatus: { _ in })
+        defer { service.stop() }
+        func request(_ extra: String = "") throws -> RemoteHTTPRequest {
+            try RemoteHTTPRequest.parse(Data("GET /api/inventory HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\(extra)\r\n".utf8))!
+        }
+        let first = await service.handle(try request())
+        try expectEqual(first.status, 200)
+        guard let tag = first.entityTag else { throw AppError.message("Missing local inventory validator") }
+        let unchanged = await service.handle(try request("If-None-Match: \(tag)\r\n"))
+        try expectEqual(unchanged.status, 304)
+        try expect(unchanged.body.isEmpty)
+        try engine.setPaused(true)
+        let changed = await service.handle(try request("If-None-Match: \(tag)\r\n"))
+        try expectEqual(changed.status, 200, "A changed engine revision must encode a fresh inventory")
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        try expectEqual(try decoder.decode(RemoteNodeState.self, from: changed.body).snapshot.paused, true)
+        guard let changedTag = changed.entityTag else { throw AppError.message("Missing updated local inventory validator") }
+        try expectEqual((await service.handle(try request("If-None-Match: \(changedTag)\r\n"))).status, 304)
+        let form: JSONObject = ["title": "fixture", "questions": [["question": "Choose?", "options": [["label": "A"]]]]]
+        _ = try engine.webQuestions.create(form, owner: "fixture")
+        try expectEqual((await service.handle(try request("If-None-Match: \(changedTag)\r\n"))).status, 200,
+            "A new web question participates in the local inventory cache key")
+        try expectEqual((await service.handle(try request())).status, 200, "Legacy clients still receive the full inventory")
     }
 
     @MainActor func testRepeatedDashboardReadsDoNotRepublishNativeWebStatus() async throws {

@@ -25,7 +25,7 @@ import SwiftUI
         }
     }
 
-    func observe(_ publishers: [ObservableObjectPublisher]) {
+    func observe(_ publishers: [AnyPublisher<Void, Never>]) {
         sources = publishers.map { publisher in
             publisher.sink { [weak self] in
                 guard let self, self.isVisible else { return }
@@ -102,6 +102,9 @@ import SwiftUI
 
 extension View {
     @MainActor func windowUpdates(_ updates: WindowViewUpdates, sources: [ObservableObjectPublisher]) -> some View {
+        windowUpdates(updates, sources: sources.map { $0.eraseToAnyPublisher() })
+    }
+    @MainActor func windowUpdates(_ updates: WindowViewUpdates, sources: [AnyPublisher<Void, Never>]) -> some View {
         background(WindowUpdatesProbe(updates: updates).frame(width: 0, height: 0).accessibilityHidden(true))
             .onAppear { updates.observe(sources) }
             .onDisappear { updates.stop() }

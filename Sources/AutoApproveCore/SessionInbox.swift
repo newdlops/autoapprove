@@ -40,24 +40,30 @@ public struct SessionInbox: Codable, Equatable {
     public init() {}
 
     @discardableResult public mutating func update(_ candidates: [Candidate], at date: Date = Date(), reconcilesAbsence: Bool = true) -> Bool {
-        let previous = self
+        var changed = false
         let keys = Set(candidates.map(\.key))
         // An initial process scan has not read the questions yet. Keep restored receipts
         // until a real observation can tell us that the previous request has gone away.
-        if reconcilesAbsence { active = active.filter { keys.contains($0.key) } }
+        if reconcilesAbsence {
+            let removed = active.keys.filter { !keys.contains($0) }
+            for key in removed { active.removeValue(forKey:key) }
+            changed = changed || !removed.isEmpty
+        }
         for candidate in candidates {
-            var event = active[candidate.key] ?? Active(observedAt: date)
+            var event: Active
+            if let existing = active[candidate.key] { event = existing }
+            else { event = Active(observedAt: date); changed = true }
             let delay: TimeInterval = candidate.isSystemSafety ? 0 : candidate.kind == .completion ? 3 : 0.8
             if !event.posted && date.timeIntervalSince(event.observedAt) >= delay {
                 entries.insert(SessionNotice(id: event.id, sourceKey: candidate.key, kind: candidate.kind,
                     summary: String(candidate.summary.prefix(600)), date: date, isRead: event.acknowledged,
                     isInterruption: candidate.isInterruption ? true : nil, isSystemSafety: candidate.isSystemSafety ? true : nil), at: 0)
-                event.posted = true
+                event.posted = true; changed = true
             }
             active[candidate.key] = event
         }
-        entries = Array(entries.prefix(50))
-        return self != previous
+        if entries.count > 50 { entries.removeLast(entries.count - 50) }
+        return changed
     }
 
     @discardableResult public mutating func markRead() -> Bool {

@@ -1,7 +1,47 @@
 import Foundation
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 
 extension ApprovalTests {
+#if DEBUG
+    func testTerminalStreamEncoderReusePreservesWireBytes() throws {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let frame = try decoder.decode(RemoteTerminalFrame.self, from: RemoteHTTPResponse.object([
+            "sessionID":"fixture", "screen":"Ready> 🙂", "revision":"r1",
+            "observedAt":"2026-10-19T00:00:00Z", "keys":["enter"], "streamID":"stream-1", "sequence":7
+        ]).body)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        func normalized(_ event: Data) throws -> (header: String, json: Data) {
+            let text = String(decoding:event,as:UTF8.self)
+            guard let range = text.range(of:"data: ") else { throw AppError.message("Missing SSE payload") }
+            let payload = String(text[range.upperBound...]).trimmingCharacters(in:.newlines)
+            let object = try JSONSerialization.jsonObject(with:Data(payload.utf8),options:.fragmentsAllowed)
+            return (String(text[..<range.lowerBound]),try JSONSerialization.data(withJSONObject:object,options:[.sortedKeys,.fragmentsAllowed]))
+        }
+
+        let update = RemoteTerminalUpdate(frame, previous:nil, delta:false)
+        let freshScreen = try normalized(RemoteServerEvent.screen(update))
+        let reusedScreen = try normalized(RemoteServerEvent.screen(update, encoder:encoder))
+        try expectEqual(reusedScreen.header, freshScreen.header)
+        try expectEqual(reusedScreen.json, freshScreen.json, "A connection-scoped encoder must preserve SSE screen data")
+
+        let freshAlive = try normalized(RemoteServerEvent.terminalAlive(frame))
+        let reusedAlive = try normalized(RemoteServerEvent.terminalAlive(frame, encoder:encoder))
+        try expectEqual(reusedAlive.header, freshAlive.header)
+        try expectEqual(reusedAlive.json, freshAlive.json, "Reusing an encoder for compact heartbeats must preserve their data")
+
+        let changed = RemoteTerminalUpdate(frame, knownRevision:frame.revision)
+        let changedData = try normalized(RemoteServerEvent.screen(changed, encoder:encoder)).json
+        try expect(changedData != reusedScreen.json, "One reused encoder must encode successive, different stream events")
+    }
+#endif
+
     func testTerminalHTTPResponseEncodesOnceWithinWireBound() throws {
         struct Frame: Codable { let sessionID: String; let screen: String; let revision: String; let observedAt: Date; let keys: [String] }
         let original = Frame(sessionID:"fixture",screen:"READY> ",revision:"r1",observedAt:Date(),keys:[])

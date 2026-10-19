@@ -196,7 +196,7 @@ extension ApprovalTests {
         let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
         let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
         defer { engine.stop() }
-        let agents: [AgentKind] = [.codex, .claude, .codex, .claude, .codex, .claude, .codex]
+        let agents: [AgentKind] = [.codex, .claude, .codex, .claude, .codex, .claude, .codex, .codex]
         let sessions = agents.enumerated().map { index, agent in
             AgentSession(id: "process:\(920_000 + index):parsed-screen", agent: agent, pid: Int32(920_000 + index),
                 started: "parsed-screen", tty: "/dev/fixture-parsed-\(index)", cwd: root.path, terminal: .terminal)
@@ -210,7 +210,8 @@ extension ApprovalTests {
             "Which synthetic test?\n❯ 1. First\n  2. Second\nEnter to select",
             "Original synthetic task\n\n■ stream disconnected before completion: network error\n\n› Ask Codex to do anything\n\n? for shortcuts",
             "Working\nesc to interrupt",
-            "› 사용자가 작성한 메모 🙂\n? for shortcuts"
+            "› 사용자가 작성한 메모 🙂\n? for shortcuts",
+            "Question 1/1 (1 unanswered)\n\n다음 정보를 추가로 입력할까요?\n› Add notes\n\ntab or esc to clear notes | enter to submit answer"
         ]
         for wave in 0..<2 {
             frames.set(TerminalSnapshot(screens: sessions.enumerated().map { index, session in
@@ -230,6 +231,9 @@ extension ApprovalTests {
             try expectEqual(result[sessions[4].id]?.interruption?.kind, .transport)
             try expectEqual(result[sessions[5].id]?.phase, .working)
             try expectEqual(result[sessions[6].id]?.phase, .input, "A user draft must remain user-owned")
+            try expectEqual(result[sessions[7].id]?.phase, .input, "A Codex notes overlay remains an input request")
+            try expect(result[sessions[7].id]?.pendingSummary?.contains("Codex가 질문의 답변을 기다리고 있습니다.") == true,
+                "The shared prepared rows must preserve safe handling of an incomplete notes overlay")
             try expect(engine.snapshot.sessions.allSatisfy { !$0.automatic })
             try expect(engine.snapshot.events.allSatisfy { $0.outcome == "시스템 변경 감지 · 자동 승인 제외" })
         }

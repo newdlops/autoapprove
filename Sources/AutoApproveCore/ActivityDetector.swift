@@ -13,12 +13,28 @@ public enum ActivityDetector {
         detect(screen, agent: agent, permissionPrompt: { PromptDetector.detect(screen, agent: agent) != nil })
     }
 
+    /// Idle confirmation depends on the same visible tail as the activity
+    /// detector. Hashing a multi-megabyte scrollback on each unchanged prompt
+    /// adds work without changing the readiness decision.
+    static func readinessFingerprint(_ screen: String) -> String {
+        readinessFingerprint(tail: nonemptyTail(screen))
+    }
+
+    static func readinessFingerprint(tail: [String]) -> String {
+        PromptDetector.fingerprint(tail.joined(separator: "\n"))
+    }
+
     /// An already-analyzed frame can share its permission result without changing detection order.
     static func detect(_ screen: String, agent: AgentKind, permissionPrompt: () -> Bool) -> ActivityObservation {
+        let tail = agent == .shell ? [] : nonemptyTail(screen)
+        return detect(screen, agent: agent, preparedTail: tail, permissionPrompt: permissionPrompt)
+    }
+
+    /// Reuse the visible rows when an analysis also needs the readiness fingerprint.
+    static func detect(_ screen: String, agent: AgentKind, preparedTail tail: [String],
+                       permissionPrompt: () -> Bool) -> ActivityObservation {
         let unknown = ActivityObservation(phase: .unknown, detail: "현재 화면에서 작업 중인지 입력 대기 중인지 확인하지 못했습니다.")
-        guard agent != .shell else { return unknown }
-        let tail = nonemptyTail(screen)
-        guard !tail.isEmpty else { return unknown }
+        guard agent != .shell, !tail.isEmpty else { return unknown }
         let bottom = tail.suffix(8).joined(separator: "\n")
         if matches(bottom, #"(?i)(?:esc|ctrl\+c) to (?:interrupt|stop)|tab to queue"#) {
             return ActivityObservation(phase: .working, detail: "CLI 화면에 실행 중인 작업 또는 중단 안내가 표시되어 있습니다.")
@@ -60,7 +76,7 @@ public enum ActivityDetector {
     /// Only the last 18 nonempty rows participate. Walk backwards to avoid splitting
     /// ignored scrollback. Small frames keep the cheaper whole-split path; storage
     /// metadata selects it without first converting a large Foundation string to UTF-8.
-    private static func nonemptyTail(_ screen: String) -> [String] {
+    static func nonemptyTail(_ screen: String) -> [String] {
         let small = screen.isContiguousUTF8 ? screen.utf8.count <= 4096 : screen.utf16.count <= 2048
         if small {
             return Array(screen.components(separatedBy: .newlines).reversed().lazy
@@ -96,8 +112,11 @@ public struct ActivityTracker {
     public init() {}
 
     public mutating func observe(_ screen: String, agent: AgentKind, generation: String, at now: Date = Date()) -> ActivityObservation {
-        let observation = ActivityDetector.detect(screen, agent: agent)
-        return observe(observation, fingerprint: PromptDetector.fingerprint(screen), agent: agent, generation: generation, at: now)
+        let tail = agent == .shell ? [] : ActivityDetector.nonemptyTail(screen)
+        let observation = ActivityDetector.detect(screen, agent: agent, preparedTail: tail) {
+            PromptDetector.detect(screen, agent: agent) != nil
+        }
+        return observe(observation, fingerprint: ActivityDetector.readinessFingerprint(tail: tail), agent: agent, generation: generation, at: now)
     }
 
     /// Time and generation are checked on every observation, even when parsing is reused.

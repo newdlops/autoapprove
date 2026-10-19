@@ -159,18 +159,26 @@ struct RemoteTerminalUpdate: Encodable {
     private var discoveryTask: Task<Void, Never>?
     private var webPeerTask: Task<Void, Never>?
     private var webPeerToken = UUID()
+    private var nextWebPeerRefresh = Date.distantPast
     private var browserRetry: Task<Void, Never>?
     private var browserRetryDelay: TimeInterval = 1
     private var directCursor = 0
     private var directProbedAt: [String: Date] = [:]
+    private var nextDirectProbePrune = Date.distantPast
     private var pendingHints: [String] = []
     private var nextHintRead = Date.distantPast
     private var nextBlindProbe = Date.distantPast
+    private struct DirectDiscoveryAddress {
+        let address: String
+        let lane: String
+    }
+    private var cachedDirectAddresses: [DirectDiscoveryAddress]?
     private var lanInterfaces: [RemoteLANInterface] = []
     private let bonjourEnabled: Bool
     private let loopbackOnly: Bool
     private let advertisement: RemoteServiceAdvertising
     private let discoveryAddresses: () -> [String]
+    private let cacheDiscoveryAddresses: Bool
     private let discoveryHints: @Sendable () -> [String]
     private var namedAccess: RemoteNamedAccess?
     private var updatingNamedAccess = false
@@ -210,6 +218,69 @@ struct RemoteTerminalUpdate: Encodable {
         var readTiming = RemoteReadTiming()
     }
     private var peers: [String: Peer] = [:]
+    private struct DashboardPeerOrderKey: Equatable {
+        let id: String
+        let name: String
+        let available: Bool
+        let verified: Bool
+        let release: RemoteWebVersion?
+        let directAddress: String?
+        let webURLs: [String]
+        let webPort: UInt16?
+    }
+    private struct DashboardNodeOrderKey: Equatable {
+        let id: String
+        let name: String
+    }
+    private var dashboardPeerOrderKeys: [DashboardPeerOrderKey] = []
+    private var dashboardPeerKeysByID: [String: DashboardPeerOrderKey] = [:]
+    private var dashboardPeerOrder: [String] = []
+    private var dashboardNodeOrderKeys: [DashboardNodeOrderKey] = []
+    private var dashboardNodeOrder: [Int] = []
+    private struct DashboardGatewayKey: Equatable {
+        let id: String
+        let name: String
+        let url: String
+        let release: RemoteWebVersion
+    }
+    private struct DashboardResponseKey: Equatable {
+        let initial: Bool
+        let selectedNode: String?
+        let client: String?
+        let engineRevision: UInt64
+        let stateReadsRevision: UUID
+        let peers: [DashboardPeerOrderKey]
+        let discovery: String?
+        let webVersion: RemoteWebVersion?
+        let urls: [String]
+        let webPort: UInt16?
+        let questionForms: [WebQuestionRequest]
+        let screenShares: [TestScreenShare]
+        let update: LANUpdateStatus
+        let localAddressReady: Bool
+        let preferredGateway: DashboardGatewayKey?
+    }
+    private struct CachedDashboardValidator {
+        let key: DashboardResponseKey
+        let entityTag: String
+    }
+    private var cachedDashboardValidator: CachedDashboardValidator?
+    private struct LocalInventoryResponseKey: Equatable {
+        let engineRevision: UInt64
+        let webVersion: RemoteWebVersion?
+        let urls: [String]
+        let webPort: UInt16?
+        let questionForms: [WebQuestionRequest]
+        let screenShares: [TestScreenShare]
+        let update: LANUpdateStatus
+        let localAddressReady: Bool
+    }
+    private struct CachedLocalInventoryValidator {
+        let key: LocalInventoryResponseKey
+        let entityTag: String
+        let acceptsGzip: Bool
+    }
+    private var cachedLocalInventoryValidator: CachedLocalInventoryValidator?
     private var discoveryError: String?
     private struct Receipt: Codable {
         var id: String
@@ -239,6 +310,7 @@ struct RemoteTerminalUpdate: Encodable {
         self.bonjourEnabled = bonjourEnabled && !loopbackOnly
         self.advertisement = advertisement ?? RemoteServiceAdvertisement()
         self.discoveryAddresses = discoveryAddresses ?? RemotePeerDiscovery.addresses
+        self.cacheDiscoveryAddresses = discoveryAddresses.map { _ in false } ?? true
         if let discoveryHints { self.discoveryHints = discoveryHints }
         else if discoveryAddresses == nil { self.discoveryHints = { RemoteLAN.neighborURLs() } }
         else { self.discoveryHints = { [] } }
@@ -266,9 +338,12 @@ struct RemoteTerminalUpdate: Encodable {
     }
     public func start(port preferredPort: UInt16 = 8765, allowPortFallback: Bool = false) throws {
         guard !running else { return }
+        cachedDashboardValidator = nil
+        nextWebPeerRefresh = .distantPast
         let port = preferredPort
         let parameters = listenerParameters()
         lanInterfaces = loopbackOnly ? [] : RemoteLAN.interfaces(refresh: true)
+        cachedDirectAddresses = nil
         // Constrain the address here; NWListener remains the single source of
         // the selected port, including persisted ports and busy-port recovery.
         let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
@@ -394,8 +469,9 @@ struct RemoteTerminalUpdate: Encodable {
                     self.readConnections.removeAll()
                     self.foregroundStateReads.removeAll()
                     self.webPeerToken = UUID(); self.webPeerTask?.cancel(); self.webPeerTask = nil
+                    self.nextWebPeerRefresh = .distantPast
                     self.nextHintRead = .distantPast; self.nextBlindProbe = .distantPast; self.directCursor = 0
-                    self.directProbedAt.removeAll(); self.pendingHints.removeAll()
+                    self.directProbedAt.removeAll(); self.pendingHints.removeAll(); self.cachedDirectAddresses = nil
                     self.startDirectDiscovery(epoch: epoch)
                     self.publishService(port: port)
                 }
@@ -446,19 +522,34 @@ struct RemoteTerminalUpdate: Encodable {
             do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
             while !Task.isCancelled {
                 guard let self, self.running, self.generation == epoch else { return }
-                self.stateReads.prune(liveIDs: Set(self.peers.keys))
-                self.inventoryValidation.prune(liveIDs: Set(self.peers.keys))
+                if self.stateReads.count > 0 || self.inventoryValidation.count > 0 {
+                    let liveIDs = Set(self.peers.keys)
+                    if self.stateReads.count > 0 { self.stateReads.prune(liveIDs: liveIDs) }
+                    if self.inventoryValidation.count > 0 { self.inventoryValidation.prune(liveIDs: liveIDs) }
+                }
                 self.refreshWebPeers()
                 await self.discoverDirectPeers(epoch: epoch)
                 self.refreshWebPeers()
                 self.checkLANUpdate()
-                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                // Discovery already tracks its next useful work. Sleep until
+                // that deadline instead of waking once a second to rediscover
+                // that no probe is due; cap the idle delay for update/status
+                // maintenance and drain passive hints in small batches.
+                let delay: TimeInterval
+                if !self.pendingHints.isEmpty { delay = 0.25 }
+                else {
+                    var deadline = min(self.nextHintRead,self.nextBlindProbe)
+                    if self.webPeerTask == nil { deadline = min(deadline,self.nextWebPeerRefresh) }
+                    delay = min(5,max(0.25,deadline.timeIntervalSinceNow))
+                }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
             }
         }
     }
     public func stop() {
         updateReceiver.stop()
         running = false; generation = UUID()
+        cachedDashboardValidator = nil
         discoveryTask?.cancel(); discoveryTask = nil
         listenerRetry?.cancel(); listenerRetry = nil; advertisement.stop()
         webPeerTask?.cancel(); webPeerTask = nil
@@ -469,7 +560,7 @@ struct RemoteTerminalUpdate: Encodable {
         readConnections.removeAll()
         readTimingEpoch = UUID()
         for id in peers.keys { peers[id]?.readTiming = RemoteReadTiming() }
-        directProbedAt.removeAll(); pendingHints.removeAll(); directCursor = 0
+        directProbedAt.removeAll(); nextDirectProbePrune = .distantPast; pendingHints.removeAll(); directCursor = 0
         namedAccess?.stop(); namedAccess = nil
         listener?.cancel(); listener = nil; browser?.cancel(); browser = nil
         pathMonitor?.cancel(); pathMonitor = nil
@@ -482,7 +573,15 @@ struct RemoteTerminalUpdate: Encodable {
     }
     public func cancelLANUpdate() { updateReceiver.stop() }
     private func checkLANUpdate() {
-        guard running, let peer = newerWebPeers().first(where: { verified($0) }), let release = peer.release else { return }
+        guard running, let webVersion else { return }
+        var selected: Peer?
+        for peer in peers.values where verified(peer) {
+            guard let release = peer.release, release.isCompatible, release > webVersion else { continue }
+            if let previous = selected, let oldRelease = previous.release,
+               oldRelease > release || (oldRelease == release && previous.id < peer.id) { continue }
+            selected = peer
+        }
+        guard let peer = selected, let release = peer.release else { return }
         let epoch = generation
         updateReceiver.check(nodeID: peer.id, release: release, routeKey: peerEndpoints(peer).map { String(describing: $0) }.joined(separator: "|")) { [weak self] path in
             guard let self, self.running, self.generation == epoch, let current = self.peers[peer.id] else { throw CancellationError() }
@@ -490,7 +589,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
     }
     private func emitStatus() {
-        status.peerCount = peers.values.filter(\.available).count
+        status.peerCount = peers.values.reduce(into: 0) { if $1.available { $0 += 1 } }
         guard status != lastEmittedStatus else { return }
         lastEmittedStatus = status
         onStatus(status)
@@ -502,6 +601,83 @@ struct RemoteTerminalUpdate: Encodable {
     }
     private func verified(_ peer: Peer) -> Bool {
         peer.available && peer.release?.isCompatible == true && peer.webVerifiedAt.map { Date().timeIntervalSince($0) < 150 } == true
+    }
+    /// Peer priority rarely changes between dashboard polls. Cache the expensive
+    /// locale-aware ordering and rebuild it only when visible peer attributes do.
+    /// Check the cached projection in one allocation-free pass: dashboard keys
+    /// are requested before and after the async read as well as while building it.
+    private func refreshDashboardPeerOrderCache() {
+        let unchanged = peers.count == dashboardPeerKeysByID.count && peers.values.allSatisfy { peer in
+            dashboardPeerKeysByID[peer.id] == DashboardPeerOrderKey(id:peer.id,name:peer.name,available:peer.available,verified:verified(peer),
+                release:peer.release,directAddress:peer.directAddress,webURLs:peer.webURLs,webPort:peer.webPort)
+        }
+        if !unchanged {
+            dashboardPeerOrderKeys = peers.values.map {
+                DashboardPeerOrderKey(id:$0.id,name:$0.name,available:$0.available,verified:verified($0),
+                    release:$0.release,directAddress:$0.directAddress,webURLs:$0.webURLs,webPort:$0.webPort)
+            }.sorted { $0.id < $1.id }
+            dashboardPeerKeysByID = Dictionary(uniqueKeysWithValues: dashboardPeerOrderKeys.map { ($0.id, $0) })
+            dashboardPeerOrder = peers.values.sorted {
+                if verified($0) != verified($1) { return verified($0) }
+                if $0.available != $1.available { return $0.available }
+                let comparison = $0.name.localizedStandardCompare($1.name)
+                return comparison == .orderedSame ? $0.id < $1.id : comparison == .orderedAscending
+            }.map(\.id)
+        }
+    }
+    private func orderedDashboardPeers() -> [Peer] {
+        refreshDashboardPeerOrderCache()
+        return dashboardPeerOrder.compactMap { peers[$0] }
+    }
+    private func orderedDashboardNodes(_ nodes: [RemoteNodeView]) -> [RemoteNodeView] {
+        let keys = nodes.map { DashboardNodeOrderKey(id:$0.id,name:$0.name) }
+        if keys != dashboardNodeOrderKeys {
+            dashboardNodeOrder = nodes.indices.sorted { left, right in
+                let comparison = nodes[left].name.localizedStandardCompare(nodes[right].name)
+                return comparison == .orderedSame ? nodes[left].id < nodes[right].id : comparison == .orderedAscending
+            }
+            dashboardNodeOrderKeys = keys
+        }
+        return dashboardNodeOrder.map { nodes[$0] }
+    }
+    private func dashboardResponseKey(initial: Bool, selectedNode: String?, client: String?, localAddressReady: Bool) -> DashboardResponseKey? {
+        guard let engine else { return nil }
+        refreshDashboardPeerOrderCache()
+        let gateway = preferredGateway(client:client)
+        return DashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,
+            engineRevision:engine.remoteDashboardRevision,stateReadsRevision:stateReads.revision,
+            peers:dashboardPeerOrderKeys,discovery:discoveryError,webVersion:webVersion,
+            urls:port.map { Self.addresses(port:$0,interfaces:lanInterfaces) } ?? [],webPort:port,
+            questionForms:engine.webQuestions.pending(),screenShares:engine.testScreens.active,
+            update:engine.lanUpdate,localAddressReady:localAddressReady,
+            preferredGateway:gateway.map { DashboardGatewayKey(id:$0.id,name:$0.name,url:$0.url,release:$0.release) })
+    }
+    private func localInventoryResponseKey(localAddressReady: Bool) -> LocalInventoryResponseKey? {
+        guard let engine else { return nil }
+        return LocalInventoryResponseKey(engineRevision:engine.remoteDashboardRevision,webVersion:webVersion,
+            urls:port.map { Self.addresses(port:$0,interfaces:lanInterfaces) } ?? [],webPort:port,
+            questionForms:engine.webQuestions.pending(),screenShares:engine.testScreens.active,
+            update:engine.lanUpdate,localAddressReady:localAddressReady)
+    }
+    private func localInventoryNotModified(_ validator: String?, cached: CachedLocalInventoryValidator,
+                                           key: LocalInventoryResponseKey, acceptsGzip: Bool) -> RemoteHTTPResponse? {
+        guard cached.key == key, cached.acceptsGzip == acceptsGzip,
+              validator?.split(separator:",").contains(where: {
+                  let value = $0.trimmingCharacters(in:.whitespaces)
+                  return value == "*" || value == cached.entityTag || value == "W/" + cached.entityTag
+              }) == true else { return nil }
+        var response = RemoteHTTPResponse(status:304,body:Data())
+        response.entityTag = cached.entityTag; response.observedAt = Date()
+        return response
+    }
+    /// A conditional response may skip dashboard reconstruction only while
+    /// every peer inventory is still inside its cache TTL. Otherwise building
+    /// the dashboard must schedule the due health/read refresh.
+    private func dashboardPeerStatesFresh() -> Bool {
+        orderedDashboardPeers().allSatisfy { peer in
+            let endpoint = peers[peer.id].map(connectionEndpoint) ?? connectionEndpoint(peer)
+            return stateReads.value(for:peer.id,endpoint:endpoint) != nil
+        }
     }
     private func connectionEndpoint(_ peer: Peer) -> NWEndpoint {
         if let preferred = peer.preferredEndpoint { return preferred }
@@ -521,7 +697,7 @@ struct RemoteTerminalUpdate: Encodable {
         // Gateway/version freshness is independent of a confirmed LAN route.
         // Each request still checks the exact node ID at its destination.
         guard let port = peer.webPort else { return fallback }
-        return RemoteLAN.preferredEndpoint(fallback, addresses: peer.webURLs, port: port, interfaces: RemoteLAN.interfaces())
+        return RemoteLAN.preferredEndpoint(fallback, addresses: peer.webURLs, port: port, interfaces: lanInterfaces)
     }
     private func acceptWebMetadata(_ found: RemotePeerDiscovery.Found) {
         guard peers[found.id] != nil else { return }
@@ -540,7 +716,7 @@ struct RemoteTerminalUpdate: Encodable {
         rememberPeer(found.id)
     }
     private func peerEndpoints(_ peer: Peer) -> [NWEndpoint] {
-        let primary = connectionEndpoint(peer), interfaces = RemoteLAN.interfaces()
+        let primary = connectionEndpoint(peer), interfaces = lanInterfaces
         var result = [primary]
         for address in peer.webURLs {
             guard let endpoint = try? RemoteNetworkAddress.endpoint(address), case .hostPort(let host, _) = endpoint,
@@ -580,25 +756,37 @@ struct RemoteTerminalUpdate: Encodable {
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: knownURL.path)
         }
     }
-    private func refreshWebPeers() {
-        guard webPeerTask == nil else { return }
+    private func refreshWebPeers(force: Bool = false) {
+        let now = Date()
+        guard webPeerTask == nil, force || now >= nextWebPeerRefresh else { return }
         let epoch = generation, token = UUID()
         let remembered = Dictionary(knownPeers.map { ($0.id,$0.lastSeen) },uniquingKeysWith:max)
         func recent(_ peer: Peer) -> Date {
             max(peer.directlySeen ?? .distantPast,peer.webVerifiedAt ?? .distantPast,remembered[peer.id] ?? .distantPast)
         }
-        let candidates = Array(peers.values.filter { $0.nextProbe <= Date() }.sorted {
+        let candidates = Array(peers.values.filter { $0.nextProbe <= now }.sorted {
             if $0.failures != $1.failures { return $0.failures < $1.failures }
             if recent($0) != recent($1) { return recent($0) > recent($1) }
             if $0.manual != $1.manual { return $0.manual }
             if $0.nextProbe != $1.nextProbe { return $0.nextProbe < $1.nextProbe }
             return $0.id < $1.id
         }.prefix(100))
-        guard !candidates.isEmpty else { return }
+        guard !candidates.isEmpty else {
+            nextWebPeerRefresh = peers.values.map(\.nextProbe).filter { $0 > now }.min() ?? now.addingTimeInterval(15)
+            return
+        }
         webPeerToken = token
         webPeerTask = Task { [weak self] in
             guard let self else { return }
-            defer { if self.webPeerToken == token { self.webPeerTask = nil } }
+            defer {
+                if self.webPeerToken == token {
+                    self.webPeerTask = nil
+                    let finishedAt = Date()
+                    self.nextWebPeerRefresh = self.peers.values.contains(where: { $0.nextProbe <= finishedAt })
+                        ? .distantPast
+                        : (self.peers.values.map(\.nextProbe).filter { $0 > finishedAt }.min() ?? finishedAt.addingTimeInterval(15))
+                }
+            }
             typealias Result = (id:String,endpoint:NWEndpoint,started:Date,found:RemotePeerDiscovery.Found?)
             @MainActor func query(_ peer: Peer) -> @Sendable () async -> Result {
                 let endpoints = self.peerEndpoints(peer), id = peer.id, original = peer.endpoint
@@ -642,11 +830,6 @@ struct RemoteTerminalUpdate: Encodable {
             }
         }
     }
-    private func newerWebPeers() -> [Peer] {
-        guard let webVersion else { return [] }
-        return peers.values.filter { $0.available && $0.release?.isCompatible == true && $0.release! > webVersion }
-            .sorted { $0.release == $1.release ? $0.id < $1.id : $0.release! > $1.release! }
-    }
     private func gateway(_ peer: Peer, client: String? = nil, requireVerified: Bool = true) -> RemoteWebGateway? {
         guard (!requireVerified || verified(peer)), let release = peer.release, let port = peer.webPort else { return nil }
         // Use the proven numeric endpoint first, then physical LAN addresses advertised
@@ -664,12 +847,20 @@ struct RemoteTerminalUpdate: Encodable {
         return nil
     }
     private func preferredGateway(client: String? = nil) -> RemoteWebGateway? {
-        newerWebPeers().compactMap {gateway($0,client:client)}.first
+        guard let webVersion else { return nil }
+        var selected: (release: RemoteWebVersion, id: String, gateway: RemoteWebGateway)?
+        for peer in peers.values where verified(peer) {
+            guard let release = peer.release, release.isCompatible, release > webVersion,
+                  let candidate = gateway(peer, client:client) else { continue }
+            if let selected, selected.release > release || (selected.release == release && selected.id < peer.id) { continue }
+            selected = (release,peer.id,candidate)
+        }
+        return selected?.gateway
     }
     private func updateNamedAddresses() {
         guard running, status.ready, let port = status.port, !updatingNamedAccess else { return }
         if loopbackOnly { status.urls = ["http://127.0.0.1:\(port)"]; return }
-        guard bonjourEnabled else { status.urls = Self.addresses(port: port); return }
+        guard bonjourEnabled else { status.urls = Self.addresses(port: port, interfaces: lanInterfaces); return }
         updatingNamedAccess = true
         defer { updatingNamedAccess = false }
         if namedAccess == nil {
@@ -688,7 +879,7 @@ struct RemoteTerminalUpdate: Encodable {
             return !(verified(peer) && peer.release.map { release in webVersion.map { release < $0 } ?? false } == true)
         }
         namedAccess?.update(port: port, anotherPortal: anotherPortal, preferred: !newerPortal)
-        status.urls = (namedAccess?.urls(port: port, anotherPortal: anotherPortal) ?? []) + Self.addresses(port: port)
+        status.urls = (namedAccess?.urls(port: port, anotherPortal: anotherPortal) ?? []) + Self.addresses(port: port, interfaces: lanInterfaces)
         // Keep the same service identity while updating gateway availability.
         let ownsPortal = namedAccess?.ownsPortal == true
         if ownsPortal != publishedPortal {
@@ -747,7 +938,7 @@ struct RemoteTerminalUpdate: Encodable {
             for id in peers.values.filter({ !$0.available && !$0.manual }).prefix(peers.count - 100).map(\.id) { peers.removeValue(forKey: id); stateReads.remove(id) }
         }
         updateNamedAddresses(); emitStatus()
-        refreshWebPeers()
+        refreshWebPeers(force: true)
     }
     private func discoverDirectPeers(epoch: UUID) async {
         if Date() >= nextHintRead {
@@ -764,10 +955,30 @@ struct RemoteTerminalUpdate: Encodable {
             // metadata. Do it only when a blind probe is actually due, after
             // passive hints, rather than on every 250-ms maintenance tick.
             var seen = Set<String>()
-            let candidates = Array(discoveryAddresses().prefix(512)).filter { seen.insert($0).inserted }
-            if !candidates.isEmpty {
+            let candidates: [DirectDiscoveryAddress]
+            if cacheDiscoveryAddresses, let cachedDirectAddresses {
+                candidates = cachedDirectAddresses
+            } else {
+                let discovered = Array(discoveryAddresses().prefix(512)).filter { seen.insert($0).inserted }.map { address in
+                    DirectDiscoveryAddress(address: address, lane: RemoteLAN.discoveryLane(address, interfaces: lanInterfaces))
+                }
+                candidates = discovered
+                // The production provider derives this bounded list from the
+                // active physical LAN subnets. Those routes change through the
+                // path monitor, so don't rebuild/sort the same /24 candidates
+                // or repeat their route/lane mapping on every blind-scan tick.
+                // Injected providers remain live for deterministic tests and
+                // custom discovery sources.
+                if cacheDiscoveryAddresses { cachedDirectAddresses = discovered }
+            }
+            if candidates.isEmpty {
+                // No usable interface/subnet candidates: Bonjour and neighbor
+                // hints remain active, so retry the blind scan at a bounded
+                // cadence instead of rebuilding an empty list every tick.
+                nextBlindProbe = Date().addingTimeInterval(min(15, max(1, directDiscoveryInterval)))
+            } else {
                 let known = Set(peers.values.flatMap { [ $0.directAddress ].compactMap { $0 } + $0.webURLs })
-                let lanes = Set(candidates.map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)})
+                let lanes = Set(candidates.map(\.lane))
                 let reached = Set(peers.values.filter {verified($0)}.flatMap {peer in
                     ([peer.directAddress,peer.preferredEndpoint.map(Self.numericURL)].compactMap {$0}).map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)}
                 })
@@ -775,17 +986,33 @@ struct RemoteTerminalUpdate: Encodable {
                 nextBlindProbe = Date().addingTimeInterval(allReached ? min(5, max(0.5, directDiscoveryInterval)) : 0.5)
                 var selectedLanes = Set<String>()
                 for _ in 0..<candidates.count {
-                    let address = candidates[directCursor % candidates.count]; directCursor = (directCursor + 1) % candidates.count
-                    let lane = RemoteLAN.discoveryLane(address,interfaces:lanInterfaces)
+                    let candidate = candidates[directCursor % candidates.count]; directCursor = (directCursor + 1) % candidates.count
+                    let address = candidate.address, lane = candidate.lane
                     if !known.contains(address), !selectedLanes.contains(lane), directProbedAt[address].map({ Date().timeIntervalSince($0) >= max(10, directDiscoveryInterval) }) ?? true {
                         addresses.append(address); selectedLanes.insert(lane)
                         if addresses.count == 2 || selectedLanes.count == lanes.count { break }
                     }
                 }
+                if addresses.isEmpty && !allReached {
+                    // The sweep found no address eligible for another probe.
+                    // Sleep until the earliest per-address interval expires,
+                    // rather than rebuilding and rescanning the same subnet
+                    // every 500 ms.
+                    let interval = max(10, directDiscoveryInterval)
+                    let nextEligible = candidates.compactMap { candidate -> Date? in
+                        guard !known.contains(candidate.address), let last = directProbedAt[candidate.address] else { return nil }
+                        return last.addingTimeInterval(interval)
+                    }.min()
+                    nextBlindProbe = nextEligible ?? Date().addingTimeInterval(min(15, max(1, directDiscoveryInterval)))
+                }
             }
         }
         for address in addresses { directProbedAt[address] = Date() }
-        directProbedAt = directProbedAt.filter { Date().timeIntervalSince($0.value) < 300 }
+        let pruneAt = Date()
+        if !directProbedAt.isEmpty, pruneAt >= nextDirectProbePrune {
+            directProbedAt = directProbedAt.filter { pruneAt.timeIntervalSince($0.value) < 300 }
+            nextDirectProbePrune = pruneAt.addingTimeInterval(30)
+        }
         guard !addresses.isEmpty else { return }
         await withTaskGroup(of: RemotePeerDiscovery.Found?.self) { group in
             for address in addresses { group.addTask { await RemotePeerDiscovery.find(address) } }
@@ -806,16 +1033,17 @@ struct RemoteTerminalUpdate: Encodable {
                     peers[peer.id]?.portal = peer.portal
                 }
                 acceptWebMetadata(peer)
+                nextWebPeerRefresh = .distantPast
                 updateNamedAddresses(); emitStatus()
             }
         }
     }
-    private func localState() throws -> RemoteNodeState {
+    private func localState(localAddressReady: Bool? = nil) throws -> RemoteNodeState {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
         return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
-            release: webVersion, webURLs: port.map(Self.addresses), webPort: port,
+            release: webVersion, webURLs: port.map { Self.addresses(port: $0, interfaces: lanInterfaces) }, webPort: port,
             questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
-            localAddressReady:LocalDashboardAddress.status() == .ready)
+            localAddressReady:localAddressReady ?? (LocalDashboardAddress.status() == .ready))
     }
     private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse,TimeInterval) }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil, allowUnavailableRead: Bool = false) async throws -> RemoteHTTPResponse {
@@ -926,13 +1154,10 @@ struct RemoteTerminalUpdate: Encodable {
         stateReads.insert(task, id: peer.id, token: token, endpoint: endpoint)
         return task
     }
-    public func dashboard(initial: Bool = false, selectedNode: String? = nil, client: String? = nil) async throws -> RemoteDashboard {
-        let own = try localState().inventory
-        let candidates = Array(peers.values).sorted {
-            if verified($0) != verified($1) { return verified($0) }
-            if $0.available != $1.available { return $0.available }
-            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-        }
+    public func dashboard(initial: Bool = false, selectedNode: String? = nil, client: String? = nil,
+                          localAddressReady: Bool? = nil) async throws -> RemoteDashboard {
+        let own = try localState(localAddressReady:localAddressReady).inventory
+        let candidates = orderedDashboardPeers()
         var completed: [String:(NWEndpoint,RemoteNodeView)] = [:]
         func value(_ peer: Peer) -> RemoteNodeView? {
             let endpoint = peers[peer.id].map(connectionEndpoint) ?? connectionEndpoint(peer)
@@ -975,8 +1200,9 @@ struct RemoteTerminalUpdate: Encodable {
         }
         let requested = Array(candidates.prefix(100))
         try await waitForReads(requested,progressive:true)
-        let other = requested.map { peer in value(peer) ?? RemoteNodeView(id:peer.id,name:peer.name,local:false,online:false,release:peer.release,loading:true) }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let other = orderedDashboardNodes(requested.map { peer in
+            value(peer) ?? RemoteNodeView(id:peer.id,name:peer.name,local:false,online:false,release:peer.release,loading:true)
+        })
         for node in other {
             guard peers[node.id] != nil else { continue }
             if node.loading == true { continue } // An unfinished read is not a failed identity or route check.
@@ -1020,8 +1246,20 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forward(request) { return forwarded }
                     return try .json(localState())
                 case "/api/inventory":
-                    return try await localState().inventory.response(ifNoneMatch:request.headers["if-none-match"],
-                        acceptsGzip:RemoteGzipEncoder.accepts(request.headers["accept-encoding"]))
+                    let acceptsGzip = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
+                    let localAddressReady = LocalDashboardAddress.status() == .ready
+                    let before = localInventoryResponseKey(localAddressReady:localAddressReady)
+                    if let before, let cached = cachedLocalInventoryValidator,
+                       let unchanged = localInventoryNotModified(request.headers["if-none-match"],cached:cached,
+                           key:before,acceptsGzip:acceptsGzip) { return unchanged }
+                    let inventory = try localState(localAddressReady:localAddressReady).inventory
+                    let response = try await inventory.response(ifNoneMatch:nil,acceptsGzip:acceptsGzip)
+                    let afterReady = LocalDashboardAddress.status() == .ready
+                    let after = localInventoryResponseKey(localAddressReady:afterReady)
+                    if before == after, let after, let entityTag = response.entityTag {
+                        cachedLocalInventoryValidator = CachedLocalInventoryValidator(key:after,entityTag:entityTag,acceptsGzip:acceptsGzip)
+                    }
+                    return response
                 case "/api/history":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400,"세션을 지정해주세요.") }
@@ -1033,12 +1271,39 @@ struct RemoteTerminalUpdate: Encodable {
                     guard let hash = request.parameter("sha256"), let value = request.parameter("offset"), let offset = Int(value) else { throw RemoteHTTPError(400, "업데이트 파일과 위치를 지정해주세요.") }
                     return RemoteHTTPResponse(body: try await updateArchive.chunk(hash: hash, offset: offset), contentType: "application/zip")
                 case "/api/discovery":
-                    var object: JSONObject = ["service": "autoapprove", "version": 1, "id": nodeID, "name": name, "urls": port.map(Self.addresses) ?? [], "port": Int(port ?? 0), "portal": namedAccess?.ownsPortal == true]
+                    var object: JSONObject = ["service": "autoapprove", "version": 1, "id": nodeID, "name": name,
+                        "urls": port.map { Self.addresses(port: $0, interfaces: lanInterfaces) } ?? [], "port": Int(port ?? 0), "portal": namedAccess?.ownsPortal == true]
                     if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }
                     return try .object(object)
                 case "/api/network":
-                    let current = try await dashboard(initial:request.parameter("initial") == "1",selectedNode:request.parameter("node"),client:request.clientAddress)
-                    return try current.response(ifNoneMatch: request.headers["if-none-match"])
+                    let initial = request.parameter("initial") == "1", selectedNode = request.parameter("node")
+                    let client = request.clientAddress, validator = request.headers["if-none-match"]
+                    let localAddressReady = LocalDashboardAddress.status() == .ready
+                    let before = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
+                    // A matching key proves the complete dashboard inputs are
+                    // unchanged. Return before rebuilding the local inventory,
+                    // sorting peers, or waiting for their bounded reads. The
+                    // key is checked again after a fresh build on cache misses.
+                    if dashboardPeerStatesFresh(), let before, let cached = cachedDashboardValidator,
+                       cached.key == before, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
+                        var response = RemoteHTTPResponse(status:304,body:Data())
+                        response.entityTag = cached.entityTag; response.observedAt = Date()
+                        return response
+                    }
+                    let current = try await dashboard(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
+                    let afterReady = LocalDashboardAddress.status() == .ready
+                    let after = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:afterReady)
+                    if before == after, let after, let cached = cachedDashboardValidator,
+                       cached.key == after, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
+                        var response = RemoteHTTPResponse(status:304,body:Data())
+                        response.entityTag = cached.entityTag; response.observedAt = Date()
+                        return response
+                    }
+                    let response = try current.response(ifNoneMatch:validator)
+                    if before == after, let after, let entityTag = response.entityTag {
+                        cachedDashboardValidator = CachedDashboardValidator(key:after,entityTag:entityTag)
+                    }
+                    return response
                 case "/api/test-screen":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }
@@ -1137,7 +1402,7 @@ struct RemoteTerminalUpdate: Encodable {
                 try save(manualPeers, to: manualURL)
                 peers[state.id] = Peer(id: state.id, name: state.name, endpoint: endpoint, available: true, manual: true, directAddress: address,
                     release: state.release?.isCompatible == true ? state.release : nil, webURLs: state.webURLs ?? [], webPort: state.webPort)
-                updateNamedAddresses(); emitStatus(); refreshWebPeers()
+                updateNamedAddresses(); emitStatus(); refreshWebPeers(force: true)
                 return try .object(["id": state.id, "name": state.name])
             case "/api/action", "/api/input", "/api/terminal/connect", "/api/pty", "/api/pty/input", "/api/pty/resize", "/api/pty/close":
                 if let forwarded = try await forward(request) { return forwarded }
@@ -1288,7 +1553,7 @@ struct RemoteTerminalUpdate: Encodable {
         try JSONEncoder().encode(value).write(to: file, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
-    static func addresses(port: UInt16) -> [String] {
-        RemoteLAN.interfaces().map { "http://\($0.address):\(port)" }
+    static func addresses(port: UInt16, interfaces: [RemoteLANInterface]? = nil) -> [String] {
+        (interfaces ?? RemoteLAN.interfaces()).map { "http://\($0.address):\(port)" }
     }
 }

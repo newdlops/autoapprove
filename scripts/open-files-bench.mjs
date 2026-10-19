@@ -3,7 +3,7 @@ import {execFileSync} from 'node:child_process';
 import {mkdir,readdir,writeFile} from 'node:fs/promises';
 import path from 'node:path';
 const option=name=>process.argv.find(arg=>arg.startsWith('--'+name+'='))?.slice(name.length+3);
-const out=path.resolve(option('output')||'dist/qa/open-files'),build=path.resolve('.build/release');
+const out=path.resolve(option('output')||'dist/qa/open-files'),build=path.resolve(option('core-build')||'.build/release');
 await mkdir(out,{recursive:true});const cache=path.resolve('.build/cache/OpenFilesBench');await mkdir(cache,{recursive:true});
 const binary=path.join(out,'OpenFilesBench');
 execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...(await readdir(build+'/AutoApproveCore.build')).filter(name=>name.endsWith('.swift.o')).map(name=>build+'/AutoApproveCore.build/'+name),...(process.argv.includes('--prototype')?['Sources/AutoApproveCore/ProcessOpenFiles.swift']:[]),'Tests/fixtures/open-files-bench.swift','-o',binary],{stdio:'inherit',timeout:300000});

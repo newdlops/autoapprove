@@ -31,6 +31,7 @@ struct ClaudeHookReceipt: Codable {
 /// Validate the complete wire identity before reading a receipt. Saved replies
 /// and ACKs do not need to rebuild questions, summaries or command analysis.
 struct ClaudeHookEnvelope {
+    private static let hexadecimalDigits = Array("0123456789abcdef".utf8)
     let payload: JSONObject
     let id: String
     let fingerprint: String
@@ -49,11 +50,23 @@ struct ClaudeHookEnvelope {
               expiry > now.timeIntervalSince1970, expiry <= now.timeIntervalSince1970 + 610,
               let bytes = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return nil }
         self.payload = payload; self.id = id; self.event = event; providerID = provider
-        fingerprint = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        fingerprint = Self.hexadecimal(SHA256.hash(data: bytes))
         let pid = (payload["agentPID"] as? NSNumber)?.int32Value ?? 0
         let started = payload["agentStarted"] as? String ?? ""
         sessionID = pid > 0 && !started.isEmpty ? "process:\(pid):\(started)" : "claude:\(provider)"
         expiresAt = Date(timeIntervalSince1970: expiry)
+    }
+
+    private static func hexadecimal(_ digest: SHA256.Digest) -> String {
+        var bytes: [UInt8] = []
+        // SHA-256 always returns 32 bytes; Digest exposes Sequence here, so
+        // avoid materializing an intermediate array just to ask for its count.
+        bytes.reserveCapacity(64)
+        for byte in digest {
+            bytes.append(hexadecimalDigits[Int(byte >> 4)])
+            bytes.append(hexadecimalDigits[Int(byte & 0x0f)])
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
@@ -70,7 +83,7 @@ struct ClaudeHookRequest {
     let tool: String
     let inputJSON: String?
     let questions: [WebQuestionField]?
-    let systemCommandRisk: SystemCommandRisk?
+    var systemCommandRisk: SystemCommandRisk?
     var safetyResponse: JSONObject? {
         guard let risk = systemCommandRisk, let event = payload["hook_event_name"] as? String,
               ["PreToolUse", "PermissionRequest"].contains(event) else { return nil }
@@ -88,24 +101,35 @@ struct ClaudeHookRequest {
         fingerprint = envelope.fingerprint; sessionID = envelope.sessionID; expiresAt = envelope.expiresAt
         tool = payload["tool_name"] as? String ?? ""
         let input = payload["tool_input"] as? JSONObject ?? [:]
-        questions = tool == "AskUserQuestion" && ["PreToolUse", "PermissionRequest"].contains(event) && (input["answers"] as? JSONObject)?.isEmpty != false
+        let parsedQuestions = tool == "AskUserQuestion" && ["PreToolUse", "PermissionRequest"].contains(event) && (input["answers"] as? JSONObject)?.isEmpty != false
             ? try? WebQuestionField.parse(input["questions"]) : nil
+        questions = parsedQuestions
         summary = QuestionDetector.hookSummary(tool: tool, input: input, message: payload["message"] as? String)
-        systemCommandRisk = ["PreToolUse", "PermissionRequest"].contains(event)
+        let risk = ["PreToolUse", "PermissionRequest"].contains(event)
             ? SystemCommandRisk.detect(tool: tool, input: input, summary: summary, cwd: payload["cwd"] as? String ?? "") : nil
-        inputJSON = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
+        systemCommandRisk = risk
+        let answerValue: String
+        let responseValue: JSONObject?
         if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event), let yes = YesNoConfirmation.detect(input) {
-            answer = yes.answer
+            answerValue = yes.answer
             if event == "PreToolUse" {
-                response = ["hookSpecificOutput": ["hookEventName": event, "permissionDecision": "allow", "updatedInput": yes.updatedInput(input)]]
+                responseValue = ["hookSpecificOutput": ["hookEventName": event, "permissionDecision": "allow", "updatedInput": yes.updatedInput(input)]]
             } else {
-                response = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow", "updatedInput": yes.updatedInput(input)]]]
+                responseValue = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow", "updatedInput": yes.updatedInput(input)]]]
             }
         } else if event == "PermissionRequest", !["AskUserQuestion", "ExitPlanMode", "EnterPlanMode"].contains(tool), !tool.isEmpty {
-            answer = "허용"
-            response = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow"]]]
-        } else { answer = ""; response = nil }
-        if response != nil || questions != nil || systemCommandRisk != nil {
+            answerValue = "허용"
+            responseValue = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow"]]]
+        } else { answerValue = ""; responseValue = nil }
+        answer = answerValue; response = responseValue
+        // Only actionable requests are written to the audit trail. Routine
+        // PreToolUse/PostToolUse events are frequent and never store this field;
+        // avoid pretty-printing and allocating their full tool input each time.
+        let needsAuditInput = event == "PermissionRequest" || responseValue != nil || parsedQuestions != nil || risk != nil
+        inputJSON = needsAuditInput
+            ? (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])).map { String(decoding: $0, as: UTF8.self) }
+            : nil
+        if responseValue != nil || parsedQuestions != nil || risk != nil {
             let toolID = (payload["tool_use_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id
             logicalID = sessionID + ":" + provider + ":" + toolID
         } else { logicalID = nil }

@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import AutoApproveCore
+import TerminalInputSupport
 
 @main struct OpenFilesBench {
     static func cpu(_ who: Int32) -> Double {
@@ -30,12 +31,14 @@ import AutoApproveCore
         var header = try JSONSerialization.data(withJSONObject:["type":"session_meta","payload":["source":"cli","id":"fixture-root"]]);header.append(10)
         try header.write(to:rollout);handles.append(try FileHandle(forReadingFrom:rollout));expected.insert(rollout.path)
         let expectedLocation = CodexThreadLocation(threadID:"fixture-root",database:root.appendingPathComponent("thread_history_1.sqlite").path)
-        let start = try ProcessDiscovery.read(pid:getpid()).first!.started
+        let start = try TTYInputIdentity.capture(pid:getpid()).processStart
         var samples = [[String:Any]]()
         for round in 0..<6 {
             for native in round.isMultiple(of:2) ? [false,true] : [true,false] {
                 let own = cpu(RUSAGE_SELF),children = cpu(RUSAGE_CHILDREN),started = ProcessInfo.processInfo.systemUptime
-                let paths = native ? try ProcessOpenFiles.paths(pid:getpid(),expectedStart:start) : try legacy([getpid()])[getpid()] ?? []
+                let paths: [String]
+                do { paths = native ? try ProcessOpenFiles.paths(pid:getpid(),expectedStart:start) : try legacy([getpid()])[getpid()] ?? [] }
+                catch { throw AppError.message("Open-file benchmark failed in \(native ? "native" : "legacy") mode, round \(round): \(error.localizedDescription)") }
                 let wall = ProcessInfo.processInfo.systemUptime-started,ownCPU = cpu(RUSAGE_SELF)-own,childCPU = cpu(RUSAGE_CHILDREN)-children
                 guard expected.isSubset(of:Set(paths)),try CodexThreadLocation.locate(paths:paths) == expectedLocation else { throw AppError.message("Live descriptor/root rollout mismatch") }
                 samples.append(["mode":native ? "native" : "legacy","round":round,"wallMS":wall*1000,"selfCPUSeconds":ownCPU,"childCPUSeconds":childCPU,"commandLaunches":native ? 0 : 1])

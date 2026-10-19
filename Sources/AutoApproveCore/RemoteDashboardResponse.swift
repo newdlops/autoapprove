@@ -1,7 +1,26 @@
 import Foundation
 import CryptoKit
 
+private let responseHexDigits = Array("0123456789abcdef".utf8)
+
+private func responseDigest(_ data: Data) -> String {
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(64)
+    for value in SHA256.hash(data: data) {
+        bytes.append(responseHexDigits[Int(value >> 4)])
+        bytes.append(responseHexDigits[Int(value & 0x0f)])
+    }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
 extension RemoteDashboard {
+    static func matches(_ ifNoneMatch: String?, entityTag: String) -> Bool {
+        ifNoneMatch?.split(separator: ",").contains { candidate in
+            let value = candidate.trimmingCharacters(in: .whitespaces)
+            return value == "*" || value == entityTag || value == String(entityTag.dropFirst(2))
+        } ?? false
+    }
+
     private static let canonicalDateSuffix = Data(#","updatedAt":"1970-01-01T00:00:00Z"}"#.utf8)
     private static let observationDateMember = Data(#","updatedAt":"#.utf8)
     /// Revalidate a newly read inventory, never a time-based server cache. Only
@@ -14,14 +33,10 @@ extension RemoteDashboard {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var encoded = try encoder.encode(comparable)
-        let digest = SHA256.hash(data: encoded)
-            .map { String(format: "%02x", $0) }.joined()
+        let digest = responseDigest(encoded)
         // updatedAt changes independently of content: use a weak validator.
         let tag = "W/\"\(digest)\""
-        let matches = ifNoneMatch?.split(separator: ",").contains { candidate in
-            let value = candidate.trimmingCharacters(in: .whitespaces)
-            return value == "*" || value == tag || value == String(tag.dropFirst(2))
-        } ?? false
+        let matches = Self.matches(ifNoneMatch,entityTag:tag)
         var response: RemoteHTTPResponse
         if matches { response = RemoteHTTPResponse(status: 304, body: Data()) }
         else if encoded.suffix(Self.canonicalDateSuffix.count) == Self.canonicalDateSuffix {
@@ -75,7 +90,7 @@ extension RemoteHTTPResponse {
         var response = preparingTransfer(method:"GET",acceptsGzip:acceptsGzip)
         // Identity and gzip have distinct strong ETags. Hash the selected wire
         // bytes, so a change of encoding cannot produce an incorrect 304.
-        let digest = SHA256.hash(data:response.body).map { String(format:"%02x",$0) }.joined()
+        let digest = responseDigest(response.body)
         let tag = "\"\(digest)\""
         let matches = ifNoneMatch?.split(separator:",").contains {
             let value = $0.trimmingCharacters(in:.whitespaces)

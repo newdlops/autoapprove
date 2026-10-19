@@ -3,17 +3,19 @@ import { copyFile, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
-const app = path.resolve('dist/qa/AutomaticQuestionPreview.app');
+const build = path.resolve(process.argv.find(value => value.startsWith('--core-build='))?.slice(13) || '.build/debug');
+const app = path.resolve(process.env.AUTOAPPROVE_QA_APP || 'dist/qa/AutomaticQuestionPreview.app');
 await mkdir(path.join(app, 'Contents/MacOS'), { recursive: true });
 await mkdir(path.join(app, 'Contents/Resources'), { recursive: true });
 await copyFile('dist/AppIcon.icns', path.join(app, 'Contents/Resources/AppIcon.icns'));
 execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/AutomaticQuestionPreview'),
-  '-I', path.resolve('.build/debug/Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(path.resolve('.build/debug')),
-  ...(await readdir('.build/debug/AutoApproveCore.build')).filter(name => name.endsWith('.swift.o')).map(name => path.resolve('.build/debug/AutoApproveCore.build', name)),
+  '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build),
+  ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)),
   'Sources/AutoApproveApp/TerminalHighlighter.swift', 'Sources/AutoApproveApp/TerminalNavigator.swift',
   'Sources/AutoApproveApp/AppHelp.swift', 'Sources/AutoApproveApp/WindowViewUpdates.swift', 'Sources/AutoApproveApp/QRCodeImageCache.swift', 'Sources/AutoApproveApp/AuditHistoryWindow.swift',
   'Sources/AutoApproveApp/AppInformation.swift', 'Sources/AutoApproveApp/AppCommands.swift', 'Sources/AutoApproveApp/HelpWindow.swift',
   'Sources/AutoApproveApp/SessionWindow.swift', 'Sources/AutoApproveApp/SessionCustomizationEditor.swift', 'Sources/AutoApproveApp/ConnectionSettings.swift', 'Sources/AutoApproveApp/RemoteAccessSettings.swift',
+  'Sources/AutoApproveApp/TerminalSharingSettings.swift', 'Sources/AutoApproveApp/TmuxSharingSettings.swift', 'Sources/AutoApproveApp/MouseActivitySettings.swift',
   'Tests/fixtures/automatic-question-preview.swift', '-o', path.join(app, 'Contents/MacOS/AutomaticQuestionPreview')], { stdio: 'inherit' });
 await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -61,7 +61,13 @@ public final class TmuxRelay: @unchecked Sendable {
     public static let shared = TmuxRelay()
     private let lock = NSLock()
     private var links: [String: TmuxControlConnection] = [:]
-    private var cached: [String: (UInt64, Date, TerminalScreen)] = [:]
+    private struct CachedScreen {
+        let handle: String
+        let version: UInt64
+        let at: Date
+        let screen: TerminalScreen
+    }
+    private var cached: [String: CachedScreen] = [:]
     public init() {}
     public static var executable: String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -152,7 +158,7 @@ public final class TmuxRelay: @unchecked Sendable {
         let key = handle.encoded + ":" + target.tty
         let version = link.version
         lock.lock(); let previous = cached[key]; lock.unlock()
-        if !fresh, let previous, previous.0 == version, Date().timeIntervalSince(previous.1) < 1 { return previous.2 }
+        if !fresh, let previous, previous.version == version, Date().timeIntervalSince(previous.at) < 1 { return previous.screen }
         // Capture and cursor metadata are queued together on the existing
         // control connection, each with its own begin/end response.
         let output = try link.command("capture-pane -p -e -t \(handle.pane) ; display-message -p -t \(handle.pane) '\(Self.metadataFormat)'", responses: 2)
@@ -169,7 +175,7 @@ public final class TmuxRelay: @unchecked Sendable {
         }
         result.title = "tmux \(handle.pane)"
         try handle.validate()
-        lock.lock(); cached[key] = (version, Date(), result); lock.unlock()
+        lock.lock(); cached[key] = CachedScreen(handle: handle.encoded, version: version, at: Date(), screen: result); lock.unlock()
         return result
     }
     public func observe(_ target: ScreenTarget) throws -> TmuxRelayObservation {
@@ -185,7 +191,7 @@ public final class TmuxRelay: @unchecked Sendable {
         lock.lock()
         let obsolete = links.filter { key, _ in !handles.contains(key) }
         for key in obsolete.keys { links.removeValue(forKey: key) }
-        cached = cached.filter { key, _ in handles.contains(where: { key.hasPrefix($0 + ":") }) }
+        cached = cached.filter { _, value in handles.contains(value.handle) }
         lock.unlock()
         for link in obsolete.values { link.stop() }
     }

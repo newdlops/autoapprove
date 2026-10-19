@@ -32,11 +32,16 @@ public final class ManagedPTY: @unchecked Sendable {
     private let lock = NSRecursiveLock()
     private let queue = DispatchQueue(label: "autoapprove.pty.output")
     private var source: DispatchSourceRead?
+    private var processWatcher: (any DispatchSourceProcess)?
     private var master: Int32
     private let terminal: OpaquePointer
     private var info: ManagedPTYDescriptor
     private var output = Data()
     private var outputBase = 0
+    // Reuse buffers across read events; PTY output can arrive in many small
+    // bursts, so allocating these on every event creates avoidable churn.
+    private var readBuffer = [UInt8](repeating: 0, count: 32_768)
+    private var vtReplyBuffer = [CChar](repeating: 0, count: 4096)
     private var writer: String?
     private var writerUntil = Date.distantPast
     private var writerExpiry: DispatchSourceTimer?
@@ -82,20 +87,14 @@ public final class ManagedPTY: @unchecked Sendable {
             if Date() >= self.writerUntil { self.notifyOutputObservers() }
         }
         expiry.schedule(deadline: .distantFuture); expiry.resume()
-        // Reaping and termination share the lock. An owned PID cannot be reused
-        // between a waitpid result and a delayed termination signal.
-        DispatchQueue.global(qos: .utility).async { [self] in
-            while true {
-                lock.lock()
-                var status: Int32 = 0
-                let result = waitpid(pid, &status, WNOHANG)
-                if result == pid || result < 0 && errno != EINTR {
-                    finished(status: result == pid ? ((status & 127) == 0 ? Int((status >> 8) & 255) : 128 + Int(status & 127)) : 255)
-                    lock.unlock(); return
-                }
-                lock.unlock(); usleep(50_000)
-            }
-        }
+        // Wake only when the child exits instead of polling waitpid 20 times/s.
+        // Reaping and explicit close share the lock, so a PID cannot be reused
+        // between waitpid and a delayed signal sent by close().
+        let watcher = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit,
+            queue: DispatchQueue.global(qos: .utility))
+        processWatcher = watcher
+        watcher.setEventHandler { [self] in reapExitedProcess(pid) }
+        watcher.resume()
     }
     deinit { close(); ap_vt_free(terminal) }
     public var descriptor: ManagedPTYDescriptor { lock.lock(); defer { lock.unlock() }; return info }
@@ -107,24 +106,37 @@ public final class ManagedPTY: @unchecked Sendable {
     private func readAvailable() {
         lock.lock(); defer { lock.unlock() }
         guard master >= 0 else { return }
-        var bytes = [UInt8](repeating: 0, count: 32_768)
         var consumed = 0
         // Continuous output must yield the lock so the user's Ctrl C can run.
         while consumed < 262_144 {
-            let count = Darwin.read(master, &bytes, bytes.count)
+            let count = readBuffer.withUnsafeMutableBufferPointer { buffer in
+                Darwin.read(master, buffer.baseAddress, buffer.count)
+            }
             if count < 0 && errno == EINTR { continue }
             guard count > 0 else { break }
             consumed += count
-            let data = Data(bytes.prefix(count)); output.append(data)
-            data.withUnsafeBytes { memory in ap_vt_feed(terminal, memory.baseAddress?.assumingMemoryBound(to: CChar.self), data.count) }
+            output.append(contentsOf: readBuffer.prefix(count))
+            readBuffer.withUnsafeBufferPointer { buffer in
+                ap_vt_feed(terminal, buffer.baseAddress?.withMemoryRebound(to: CChar.self, capacity: count) { $0 }, count)
+            }
             // One emulator answers DSR/DA/color queries even when no browser is open.
             // Browser xterm query handlers are suppressed to avoid double replies.
-            var replies = [CChar](repeating: 0, count: 4096)
-            let length = ap_vt_response(terminal, &replies, replies.count)
-            if length > 0 { try? writeBytes(Data(bytes: replies, count: length)) }
-            if output.count > Self.historyLimit {
-                let remove = output.count - Self.historyLimit; output.removeFirst(remove); outputBase += remove
+            let length = vtReplyBuffer.withUnsafeMutableBufferPointer { buffer in
+                ap_vt_response(terminal, buffer.baseAddress, buffer.count)
             }
+            if length > 0 {
+                let reply = vtReplyBuffer.withUnsafeBufferPointer { buffer in
+                    Data(bytes: buffer.baseAddress!, count: length)
+                }
+                try? writeBytes(reply)
+            }
+        }
+        // Trim once per readiness callback, not once per 32 KB read. A burst
+        // can contain eight chunks, and repeatedly shifting the retained 1 MB
+        // history would copy the same bytes eight times.
+        if output.count > Self.historyLimit {
+            let remove = output.count - Self.historyLimit
+            output.removeFirst(remove); outputBase += remove
         }
         if consumed > 0 { notifyOutputObservers() }
     }
@@ -138,8 +150,20 @@ public final class ManagedPTY: @unchecked Sendable {
     }
     private func disposeMaster() {
         source?.cancel(); source = nil
+        processWatcher?.cancel(); processWatcher = nil
         writerExpiry?.cancel(); writerExpiry = nil
         if master >= 0 { Darwin.close(master); master = -1 }
+    }
+    private func reapExitedProcess(_ pid: Int32) {
+        lock.lock(); defer { lock.unlock() }
+        guard pid == info.pid, info.exitCode == nil else { return }
+        var status: Int32 = 0
+        var result: Int32
+        repeat { result = waitpid(pid, &status, 0) } while result < 0 && errno == EINTR
+        let exitCode = result == pid
+            ? ((status & 127) == 0 ? Int((status >> 8) & 255) : 128 + Int(status & 127))
+            : 255
+        finished(status: exitCode)
     }
     public func close() {
         lock.lock(); defer { lock.unlock() }

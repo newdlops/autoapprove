@@ -4,8 +4,15 @@ import Foundation
 /// frame; a slow HTTP writer cannot queue snapshots or delay another viewer.
 @MainActor final class RemoteTerminalFeeds {
     struct Key: Hashable { let session: String; let window: Bool }
+    private struct HistoryFrame {
+        let frame: RemoteTerminalFrame
+        let at: TimeInterval
+        let cost: Int
+    }
     private var feeds: [Key: RemoteTerminalFeed] = [:]
-    private var history: [(key: Key, frame: RemoteTerminalFrame, at: TimeInterval, cost: Int)] = []
+    private var history: [Key: [HistoryFrame]] = [:]
+    private var historyBytes = 0
+    private var nextHistoryPrune: TimeInterval = 0
     private var expiry: Task<Void, Never>?
     private static let lifetime: TimeInterval = 30
     private static let historyLimit = 4 * 1024 * 1024
@@ -27,7 +34,7 @@ import Foundation
             feed.failed = { [weak self, weak feed] in
                 guard let self, self.feeds[key] === feed else { return }
                 self.feeds.removeValue(forKey:key)
-                self.history.removeAll { $0.key == key }
+                self.removeHistory(for: key)
             }
             feeds[key] = feed
         }
@@ -41,7 +48,7 @@ import Foundation
               let stream, !stream.isEmpty, stream.utf8.count <= 512, stream == current.streamID else {
             RemoteTerminalPerformance.shared.increment(.resumeMisses); return nil
         }
-        let frame = history.last { $0.key == key && $0.frame.revision == revision && $0.frame.streamID == stream }?.frame
+        let frame = history[key]?.last { $0.frame.revision == revision && $0.frame.streamID == stream }?.frame
         RemoteTerminalPerformance.shared.increment(frame == nil ? .resumeMisses : .resumeHits)
         return frame
     }
@@ -49,13 +56,21 @@ import Foundation
     private func remember(_ frame: RemoteTerminalFrame, key: Key) {
         guard !key.window, frame.nativeDisplay == nil, let stream = frame.streamID, !stream.isEmpty else { return }
         prune()
-        history.removeAll { $0.key == key && ($0.frame.streamID != stream || $0.frame.revision == frame.revision) }
+        var entries = history[key] ?? []
+        if entries.contains(where: { $0.frame.streamID != stream }) {
+            historyBytes -= entries.reduce(0) { $0 + $1.cost }
+            entries.removeAll(keepingCapacity: true)
+        } else if let index = entries.firstIndex(where: { $0.frame.revision == frame.revision }) {
+            historyBytes -= entries.remove(at: index).cost
+        }
         // Conservative retained-content accounting, including attributed runs
         // and option strings. No extra JSON encoding in the hot producer loop.
         var cost = frame.screen.utf8.count + 4096
         cost += (frame.appearance?.runs.count ?? 0) * 256
-        let controls: [String?] = [frame.sessionID,frame.revision,frame.streamID,frame.inputReason,frame.outputReason]
-        for value in controls { cost += value?.utf8.count ?? 0 }
+        cost += frame.sessionID.utf8.count + frame.revision.utf8.count
+        cost += frame.streamID?.utf8.count ?? 0
+        cost += frame.inputReason?.utf8.count ?? 0
+        cost += frame.outputReason?.utf8.count ?? 0
         for key in frame.keys { cost += key.utf8.count }
         if let question = frame.question {
             cost += question.id.utf8.count; cost += question.question.utf8.count
@@ -65,11 +80,24 @@ import Foundation
             cost += question.reply?.queueID?.utf8.count ?? 0
         }
         if cost <= Self.historyLimit {
-            while history.filter({$0.key == key}).count >= 6 {
-                if let index = history.firstIndex(where:{$0.key == key}) { history.remove(at:index) }
+            entries.append(HistoryFrame(frame: frame, at: RemoteTerminalPerformance.now, cost: cost))
+            historyBytes += cost
+            while entries.count > 6 {
+                historyBytes -= entries.removeFirst().cost
             }
-            history.append((key,frame,RemoteTerminalPerformance.now,cost))
-            while history.reduce(0,{$0+$1.cost}) > Self.historyLimit { history.removeFirst() }
+            history[key] = entries
+            while historyBytes > Self.historyLimit {
+                guard let oldest = history.compactMap({ key, frames in frames.first.map { (key, $0.at) } })
+                    .min(by: { $0.1 < $1.1 })?.0,
+                      var oldestFrames = history[oldest], !oldestFrames.isEmpty else { break }
+                historyBytes -= oldestFrames.removeFirst().cost
+                if oldestFrames.isEmpty { history.removeValue(forKey: oldest) }
+                else { history[oldest] = oldestFrames }
+            }
+        } else if entries.isEmpty {
+            history.removeValue(forKey: key)
+        } else {
+            history[key] = entries
         }
         if expiry == nil {
             expiry = Task { [weak self] in
@@ -83,11 +111,29 @@ import Foundation
     }
     private func prune() {
         let now = RemoteTerminalPerformance.now
-        history.removeAll { now-$0.at >= Self.lifetime }
+        guard now >= nextHistoryPrune else { return }
+        nextHistoryPrune = now + 1
+        for key in Array(history.keys) {
+            guard var entries = history[key] else { continue }
+            var removedBytes = 0
+            entries.removeAll {
+                let expired = now - $0.at >= Self.lifetime
+                if expired { removedBytes += $0.cost }
+                return expired
+            }
+            guard removedBytes > 0 else { continue }
+            historyBytes -= removedBytes
+            if entries.isEmpty { history.removeValue(forKey: key) }
+            else { history[key] = entries }
+        }
+    }
+    private func removeHistory(for key: Key) {
+        guard let removed = history.removeValue(forKey: key) else { return }
+        historyBytes -= removed.reduce(0) { $0 + $1.cost }
     }
     func stop() {
         expiry?.cancel(); expiry = nil
-        let current = Array(feeds.values); feeds.removeAll(); history.removeAll()
+        let current = Array(feeds.values); feeds.removeAll(); history.removeAll(); historyBytes = 0; nextHistoryPrune = 0
         current.forEach { $0.stop() }
     }
     deinit { expiry?.cancel() }

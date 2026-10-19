@@ -21,7 +21,7 @@ for(let trial=0;trial<trials;trial++)reports.push(JSON.parse(execFileSync(binary
 const median=values=>values.sort((a,b)=>a-b)[Math.floor(values.length/2)];
 const phases=reports[0].phases.map((phase,index)=>{
   const rows=reports.map(report=>report.phases[index]);
-  return {targeted:phase.targeted,iterations:phase.iterations,
+  return {mode:phase.mode,iterations:phase.iterations,
     ...Object.fromEntries(['wallSeconds','selfCPUSeconds','childCPUSeconds','combinedCPUSeconds','medianMS','p95MS'].map(key=>[key,median(rows.map(row=>row[key]))])),
     recordCountSumRange:[Math.min(...rows.map(row=>row.recordCountSum)),Math.max(...rows.map(row=>row.recordCountSum))]};
 });

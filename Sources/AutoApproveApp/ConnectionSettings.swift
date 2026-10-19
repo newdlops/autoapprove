@@ -138,7 +138,6 @@ import AutoApproveCore
             .onAppear { questionDelayText = String(engine.snapshot.questionNotificationDelay); refreshTerminalPermissions() }
             .onChange(of: viewUpdates.isVisible) { _, visible in if visible { refreshTerminalPermissions() } }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in if viewUpdates.isVisible { refreshTerminalPermissions() } }
-            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in if viewUpdates.isVisible { refreshTerminalPermissions() } }
             .onChange(of: questionDelayText) { _, _ in questionDelayError = nil }
     }
     private func saveQuestionDelay() {
@@ -161,7 +160,7 @@ import AutoApproveCore
                 .help(status?.enabled == true ? "끄면 잠자기 금지를 바로 해제하고 macOS의 평소 잠자기로 돌아갑니다."
                     : "켜면 자동 승인 세션이 작업하는 동안 덮개를 닫아도 잠들지 않습니다. 처음에는 관리자 암호를 묻습니다.")
             if status?.phase == .holding, let releaseAt = status?.releaseAt {
-                TimelineView(.periodic(from: .now, by: 1)) { context in
+                TimelineView(.periodic(from: .now, by: 5)) { context in
                     Text("\(max(0, Int(releaseAt.timeIntervalSince(context.date).rounded(.up))))초 뒤 평소처럼 잠듭니다.")
                         .font(.caption).monospacedDigit()
                 }

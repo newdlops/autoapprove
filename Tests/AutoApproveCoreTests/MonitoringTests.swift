@@ -41,6 +41,21 @@ extension ApprovalTests {
         try expect(tracker.observe(changed, agent: .codex, generation: "two", at: now.addingTimeInterval(7)).monitoring)
     }
 
+    func testIdleReadinessIgnoresChangesOutsideVisibleTail() throws {
+        let now = Date(timeIntervalSince1970: 2_000)
+        let visibleHistory = String(repeating: "visible stable row\n", count: 32)
+        let first = String(repeating: "old output row\n", count: 2_000) + visibleHistory + "› Ask Codex to do anything\n? for shortcuts"
+        let oldScrollbackChanged = String(repeating: "different old output row\n", count: 2_000) + visibleHistory + "› Ask Codex to do anything\n? for shortcuts"
+        var tracker = ActivityTracker()
+        try expectEqual(tracker.observe(first, agent: .codex, generation: "same", at: now).phase, .unknown)
+        try expectEqual(tracker.observe(oldScrollbackChanged, agent: .codex, generation: "same", at: now.addingTimeInterval(2)).phase, .idle,
+            "Stable visible input readiness does not rehash or reset on old scrollback changes")
+
+        let changedComposer = oldScrollbackChanged.replacingOccurrences(of: "Ask Codex to do anything", with: "Explain this codebase")
+        try expectEqual(tracker.observe(changedComposer, agent: .codex, generation: "same", at: now.addingTimeInterval(3)).phase, .unknown,
+            "A visible composer change still restarts the idle confirmation")
+    }
+
     func testMonitoringSessionLifecycleAndCompatibility() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-monitor-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

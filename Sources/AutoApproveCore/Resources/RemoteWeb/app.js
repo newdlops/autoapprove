@@ -64,10 +64,30 @@ let webFormSignature = '', screenListSignature = '', sharedScreen = null, shared
 const messageDeliveries = new Map(), messageReceiptReads = new Set();
 let messageUncertain = new Set(), interactionLinkOpened = false, messageReceiptTimer;
 const messageStorage = 'autoapprove-message-drafts-v1';
+const nonASCIIText = /[^\x00-\x7f]/;
+const byteLength = (value, limit = Infinity) => {
+  value = value === undefined ? '' : String(value); let bytes = 0;
+  // UTF-8 uses at least one byte per UTF-16 unit. A known limit violation
+  // needs no scan; long ASCII text has exactly one byte per unit.
+  if (value.length > limit) return value.length;
+  if (value.length > 256 && value.charCodeAt(0) < 128 && !nonASCIIText.test(value)) return value.length;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) bytes++;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index++; }
+      else bytes += 3; // TextEncoder replaces an unpaired surrogate with U+FFFD.
+    } else bytes += 3;
+    if (bytes > limit) return bytes;
+  }
+  return bytes;
+};
 try {
   const saved = JSON.parse(sessionStorage.getItem(messageStorage) || '{}');
-  for (const [key,value] of Object.entries(saved.drafts || {})) if(typeof value === 'string' && new TextEncoder().encode(value).length <= 32000) messageDrafts.set(key,value);
-  for (const [key,value] of Object.entries(saved.deliveries || {})) if(value && typeof value.requestID === 'string' && typeof value.text === 'string' && new TextEncoder().encode(value.text).length <= 32000 && ['busy','uncertain','failed','accepted'].includes(value.phase)) {
+  for (const [key,value] of Object.entries(saved.drafts || {})) if(typeof value === 'string' && byteLength(value,32000) <= 32000) messageDrafts.set(key,value);
+  for (const [key,value] of Object.entries(saved.deliveries || {})) if(value && typeof value.requestID === 'string' && typeof value.text === 'string' && byteLength(value.text,32000) <= 32000 && ['busy','uncertain','failed','accepted'].includes(value.phase)) {
     if(value.phase === 'busy') value.phase = 'uncertain';
     messageDeliveries.set(key,value); if(value.phase === 'uncertain') messageUncertain.add(key);
   }
@@ -197,7 +217,6 @@ const needsReview = session => unreadInterruption(session) || ['approval', 'inpu
 const interruptionReads = new Set();
 const interruptionReadKey = item => item.key + '/' + item.session.interruption?.id;
 const inputKeys = () => latestFrame?.keys || selectedItem?.view.keys || [];
-const byteLength = value => new TextEncoder().encode(value).length;
 const bundledWebVersion = document.querySelector('meta[name="autoapprove-web-version"]')?.content.split(':');
 const loadedWebVersion = bundledWebVersion?.length === 3 ? { version: bundledWebVersion[0], build: Number(bundledWebVersion[1]), api: Number(bundledWebVersion[2]) } : null;
 const versionNumbers = release => release?.api === 1 && Number.isInteger(release.build) && release.build > 0 && release.build <= 1000000 && /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/.test(release.version) ? [...release.version.split('.').map(Number), release.build] : null;
@@ -1070,7 +1089,7 @@ function updateControls() {
   text($('input-help'), originalDraftOnly ? '이 연결은 작성 전송을 지원하지 않습니다. 작성 내용은 초안으로 보관합니다.' : composeMode ? 'Enter로 전송하고 Shift Enter로 줄을 바꿉니다. 한글 조합을 끝낸 뒤 전송하세요.' : !canDirect ? 'Mac의 원본 입력 권한을 연결한 뒤 직접 입력할 수 있습니다.' : '키보드의 문자·Enter·방향키를 직접 보냅니다. Shift Tab으로 포커스를 빠져나갑니다.');
   const nativeInput = !native || (composeMode ? composedSupported && (!!$('terminal-input').value || supported.includes('enter')) : canDirect);
   const queueEnabled = directMode && base && canDirect && !composeMode && (retainKeyboard || directSending);
-  $('send-input').disabled = originalDraftOnly || !nativeInput || !(inputEnabled || queueEnabled) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value) > 8000;
+  $('send-input').disabled = originalDraftOnly || !nativeInput || !(inputEnabled || queueEnabled) || composing || inputInFlight && !directMode || byteLength($('terminal-input').value,8000) > 8000;
   text($('send-input'), inputInFlight && !directMode ? '전달 중' : 'Enter');
   const recoveryHelp = composeMode ? '원래 터미널에 재연결 중입니다. 작성 내용은 유지됩니다. 연결 확인 후 전송하세요.' : '원래 터미널에 재연결 중입니다. 작성한 입력은 보관하고 연결 확인 후 순서대로 전달합니다.';
   text($('input-reason'), inputFailure || reason || (recovering ? recoveryHelp : fresh ? '현재 화면과 대상 CLI를 확인한 뒤 입력합니다.' : '최신 화면을 연결하면 입력할 수 있습니다.'));
@@ -1102,7 +1121,7 @@ function terminalPatchScreen(update, previous) {
   if (!boundary(patch.prefix) || !boundary(patch.baseLength-patch.suffix)) throw terminalResyncError();
   if (!terminalDeltaTextValid(patch.text)) throw terminalResyncError();
   const screen = previous.screen.slice(0,patch.prefix) + patch.text + previous.screen.slice(patch.baseLength-patch.suffix);
-  if (screen.length * 3 > 2000000 && byteLength(screen) > 2000000) throw terminalResyncError();
+  if (screen.length * 3 > 2000000 && byteLength(screen,2000000) > 2000000) throw terminalResyncError();
   return screen;
 }
 function terminalCopyScreen(update, previous) {
@@ -1113,7 +1132,7 @@ function terminalCopyScreen(update, previous) {
   const boundary = offset => !offset || offset === copy.baseLength || !(previous.screen.charCodeAt(offset-1) >= 0xd800 && previous.screen.charCodeAt(offset-1) <= 0xdbff && previous.screen.charCodeAt(offset) >= 0xdc00 && previous.screen.charCodeAt(offset) <= 0xdfff);
   if (!boundary(copy.start) || !boundary(copy.start+copy.count)) throw terminalResyncError();
   const screen = copy.head + previous.screen.slice(copy.start,copy.start+copy.count) + copy.tail;
-  if (screen.length * 3 > 2000000 && byteLength(screen) > 2000000) throw terminalResyncError();
+  if (screen.length * 3 > 2000000 && byteLength(screen,2000000) > 2000000) throw terminalResyncError();
   return screen;
 }
 function mergeTerminalUpdate(update, previous, sessionID) {
@@ -1331,7 +1350,7 @@ function openTerminalStream(stream) {
   source.addEventListener('screen', event => {
     if (!current()) return;
     try {
-      if (event.data.length > 2000000 || byteLength(event.data) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
+      if (event.data.length > 2000000 || byteLength(event.data,2000000) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
       const update = JSON.parse(event.data);
       if (terminalUpdateIsOlder(update, stream.frame)) { stream.sseReady = false; void readTerminalFallback(stream); return; }
       const frame = mergeTerminalUpdate(update, stream.frame, stream.sessionID);
@@ -1475,9 +1494,9 @@ async function sendInput(kind, value = '', quiet = false) {
 }
 function queueDirect(kind, value = '') {
   if (!directMode || messageBusy(selectedKey) || $('terminal-keyboard').disabled || !inputKeys().includes(kind)) return false;
-  if (directQueue.length >= 64 || byteLength(value) > 8000) { stopDirect(); inputFailure = '입력이 많아 바로 입력을 멈췄습니다. 현재 화면과 작성한 내용을 확인해주세요.'; updateControls(); return false; }
+  if (directQueue.length >= 64 || byteLength(value,8000) > 8000) { stopDirect(); inputFailure = '입력이 많아 바로 입력을 멈췄습니다. 현재 화면과 작성한 내용을 확인해주세요.'; updateControls(); return false; }
   const previous = directQueue[directQueue.length - 1];
-  if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value) <= 8000) previous.value += value;
+  if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value,8000) <= 8000) previous.value += value;
   else directQueue.push({ key: selectedKey, kind, value, streamID: latestFrame?.streamID || null });
   clearTimeout(directTimer); directTimer = setTimeout(pumpDirect, kind === 'characters' ? 80 : 0);
   return true;
@@ -1511,7 +1530,7 @@ function captureDirectText() {
   if (composing || !directMode || !keyboardText()) return;
   const value = keyboardText();
   // Let multiline paste stay editable; a user can send it as one composed Enter action.
-  if (/[\x00-\x1f\x7f]/.test(value) || byteLength(value) > 8000) {
+  if (/[\x00-\x1f\x7f]/.test(value) || byteLength(value,8000) > 8000) {
     stopDirect(); inputFailure = '여러 줄 또는 특수 문자가 포함된 입력은 내용을 확인한 뒤 Enter로 전송하세요.'; updateControls();
     $('terminal-input').focus({ preventScroll: true }); return;
   }
@@ -1793,7 +1812,7 @@ async function submitMessage(event) {
       if (inputKeys().includes('submit')) {
         if (!await sendInput('submit',value,true)) throw new Error('메시지 전달 결과를 확인하지 못했습니다. 원본 터미널을 확인해주세요.');
       } else {
-        if (/[\r\n]/.test(value) || byteLength(value)>8000) throw Object.assign(new Error('이 원본 연결에는 8,000바이트 이내의 한 줄 메시지를 입력해주세요.'), {unsent:true});
+        if (/[\r\n]/.test(value) || byteLength(value,8000)>8000) throw Object.assign(new Error('이 원본 연결에는 8,000바이트 이내의 한 줄 메시지를 입력해주세요.'), {unsent:true});
         if (!await sendInput('characters',value,true)) throw new Error('메시지 전달 결과를 확인하지 못했습니다. 원본 터미널을 확인해주세요.');
         if (selectedKey!==key || !await freshInputFrame(key) || !await sendInput('enter','',true)) throw new Error('문자는 전달했지만 Enter 전달 결과를 확인하지 못했습니다. 원본 터미널을 확인해주세요.');
       }

@@ -9,21 +9,32 @@ import AutoApproveCore
     }
     static func main() throws {
         let own = getpid()
-        // Both old and current Core are exercised through their real public
-        // reader. Warmup is outside timing; source records are never emitted.
+        // The full table and recurring session-discovery path are exercised
+        // through the real public readers. Warmup is outside timing; source
+        // records are never emitted.
         let warm = try ProcessDiscovery.read()
         precondition(warm.contains { $0.pid == own })
         var phases: [[String: Any]] = []
-        for (target,iterations) in [(Optional<Int32>.none,12),(Optional(own),32)] {
+        let workloads: [(String, Int, () throws -> [ProcessRecord])] = [
+            ("full-process-table", 12, { try ProcessDiscovery.read() }),
+            ("session-discovery", 12, { try ProcessDiscovery.readSessions() }),
+            ("single-process", 32, { try ProcessDiscovery.read(pid: own) })
+        ]
+        for (name, iterations, read) in workloads {
             let selfBegin = usage(RUSAGE_SELF), childBegin = usage(RUSAGE_CHILDREN)
             let begin = ProcessInfo.processInfo.systemUptime
             var recordCount = 0, samples: [Double] = []
             for _ in 0..<iterations {
                 let started = ProcessInfo.processInfo.systemUptime
                 recordCount += try autoreleasepool {
-                    let rows = try target.map { try ProcessDiscovery.read(pid:$0) } ?? ProcessDiscovery.read()
-                    precondition(rows.contains { $0.pid == own })
-                    if target != nil { precondition(rows.count == 1) }
+                    let rows = try read()
+                    if name == "full-process-table" || name == "single-process" {
+                        precondition(rows.contains { $0.pid == own })
+                    }
+                    if name == "single-process" { precondition(rows.count == 1) }
+                    if name == "session-discovery" {
+                        precondition(rows.allSatisfy { $0.pid > 0 && !$0.tty.isEmpty })
+                    }
                     return rows.count
                 }
                 samples.append((ProcessInfo.processInfo.systemUptime-started)*1000)
@@ -31,7 +42,7 @@ import AutoApproveCore
             let elapsed = ProcessInfo.processInfo.systemUptime-begin
             let selfCPU = usage(RUSAGE_SELF)-selfBegin, childCPU = usage(RUSAGE_CHILDREN)-childBegin
             samples.sort()
-            phases.append(["targeted":target != nil,"iterations":iterations,"recordCountSum":recordCount,
+            phases.append(["mode":name,"iterations":iterations,"recordCountSum":recordCount,
                 "wallSeconds":elapsed,"selfCPUSeconds":selfCPU,"childCPUSeconds":childCPU,
                 "combinedCPUSeconds":selfCPU+childCPU,"medianMS":samples[samples.count/2],
                 "p95MS":samples[max(0,Int(ceil(Double(samples.count)*0.95))-1)]])

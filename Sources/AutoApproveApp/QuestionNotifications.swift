@@ -18,6 +18,9 @@ import AutoApproveCore
     private var failed = Set<String>()
     private var clearedRead = Set<String>()
     private var deliveries: [String: Task<Void, Never>] = [:]
+    private var deliveryTokens: [String: UUID] = [:]
+    private var deliveryStartedAt: [String: Date] = [:]
+    private var deliveryDeadlines: [String: Date] = [:]
     private static let category = "MANUAL_ANSWER"
     private static let completionCategory = "WORK_COMPLETED"
     private static let openAction = "OPEN_TERMINAL"
@@ -73,6 +76,7 @@ import AutoApproveCore
         if !allowed {
             for task in deliveries.values { task.cancel() }
             deliveries.removeAll()
+            deliveryTokens.removeAll()
         }
         update(engine.snapshot)
     }
@@ -89,42 +93,58 @@ import AutoApproveCore
     }
 
     private func update(_ snapshot: EngineSnapshot) {
-        let requests = tracker.update(snapshot) + AttentionRequest.completions(snapshot)
-        let next = Dictionary(uniqueKeysWithValues: requests.map { ($0.id, $0) })
+        var requests = tracker.update(snapshot)
+        requests.append(contentsOf: AttentionRequest.completions(snapshot))
+        var next: [String: AttentionRequest] = [:]
+        next.reserveCapacity(requests.count)
+        for request in requests { next[request.id] = request }
         let removed = Set(active.keys).subtracting(next.keys)
-        for id in removed { deliveries.removeValue(forKey: id)?.cancel(); submitted.remove(id); failed.remove(id) }
+        for id in removed {
+            deliveries.removeValue(forKey: id)?.cancel(); deliveryTokens.removeValue(forKey: id)
+            deliveryStartedAt.removeValue(forKey: id); deliveryDeadlines.removeValue(forKey: id)
+            submitted.remove(id); failed.remove(id)
+        }
         if !removed.isEmpty {
             center.removePendingNotificationRequests(withIdentifiers: Array(removed))
             center.removeDeliveredNotifications(withIdentifiers: Array(removed))
         }
         active = next
-        let read = requests.filter { engine.isNotificationRead(sessionID: $0.originSessionID ?? $0.sessionID, sourceKey: $0.notificationKey) }
-        for request in read {
+        var readIDs = Set<String>(), newlyRead = Set<String>()
+        for request in requests where engine.isNotificationRead(sessionID: request.originSessionID ?? request.sessionID, sourceKey: request.notificationKey) {
             deliveries.removeValue(forKey: request.id)?.cancel()
+            deliveryTokens.removeValue(forKey: request.id)
+            deliveryStartedAt.removeValue(forKey: request.id); deliveryDeadlines.removeValue(forKey: request.id)
             submitted.insert(request.id)
+            readIDs.insert(request.id)
+            if !clearedRead.contains(request.id) { newlyRead.insert(request.id) }
         }
-        let readIDs = Set(read.map(\.id)), newlyRead = readIDs.subtracting(clearedRead)
         clearedRead = readIDs
         if !newlyRead.isEmpty {
             center.removePendingNotificationRequests(withIdentifiers: Array(newlyRead))
             center.removeDeliveredNotifications(withIdentifiers: Array(newlyRead))
         }
         guard allowed else { return }
-        for request in requests where !submitted.contains(request.id) && deliveries[request.id] == nil {
-            let observedAt = Date()
+        for request in requests where !submitted.contains(request.id) {
+            let observedAt = deliveryStartedAt[request.id] ?? Date()
+            deliveryStartedAt[request.id] = observedAt
+            let deadline = AttentionNotificationSchedule.deadline(kind: request.kind, observedAt: observedAt,
+                questionDelay: snapshot.questionNotificationDelay)
+            if deliveryDeadlines[request.id] != deadline {
+                deliveries.removeValue(forKey: request.id)?.cancel()
+                deliveryTokens.removeValue(forKey: request.id)
+                deliveryDeadlines[request.id] = deadline
+            }
+            guard deliveries[request.id] == nil else { continue }
+            let token = UUID()
+            deliveryTokens[request.id] = token
             deliveries[request.id] = Task { [weak self] in
-                // Only interrupt for a sustained unanswered question. Automatic replies
-                // and short pauses resolve before this delay and cancel the task above.
-                // Re-read the setting without restarting the elapsed wait or redelivering
-                // an existing alert. Completion retains its three-second grace period.
-                while true {
-                    guard let self, self.active[request.id] != nil, self.allowed else { return }
-                    let delay = request.kind == .interruption || request.kind == .systemChange ? 0 : request.kind == .completion ? 3 : self.engine.snapshot.questionNotificationDelay
-                    let remaining = observedAt.addingTimeInterval(TimeInterval(delay)).timeIntervalSinceNow
-                    if remaining <= 0 { break }
-                    do { try await Task.sleep(nanoseconds: UInt64(min(remaining, 1) * 1_000_000_000)) } catch { return }
+                let remaining = max(0, deadline.timeIntervalSinceNow)
+                if remaining > 0 {
+                    do { try await Task.sleep(for: .seconds(remaining)) } catch { return }
                 }
-                guard let self, self.active[request.id] != nil, self.allowed,
+                guard let self, self.deliveryTokens[request.id] == token,
+                      self.deliveryDeadlines[request.id] == deadline,
+                      self.active[request.id] != nil, self.allowed,
                       !self.engine.isNotificationRead(sessionID: request.originSessionID ?? request.sessionID, sourceKey: request.notificationKey) else { return }
                 let content = UNMutableNotificationContent()
                 content.title = request.title
@@ -146,7 +166,12 @@ import AutoApproveCore
                     self.failed.insert(request.id)
                     self.error = "\(request.kind == .completion ? "작업 완료" : "응답") 알림을 보내지 못했습니다. \(error.localizedDescription)"
                 }
-                self.deliveries.removeValue(forKey: request.id)
+                if self.deliveryTokens[request.id] == token {
+                    self.deliveries.removeValue(forKey: request.id)
+                    self.deliveryTokens.removeValue(forKey: request.id)
+                    self.deliveryStartedAt.removeValue(forKey: request.id)
+                    self.deliveryDeadlines.removeValue(forKey: request.id)
+                }
             }
         }
     }

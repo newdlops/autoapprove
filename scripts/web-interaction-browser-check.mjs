@@ -8,10 +8,11 @@ import path from 'node:path';
 import readline from 'node:readline';
 import {coreLinkArguments} from './swift-core-link.mjs';
 const {chromium}=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');
-const build=path.resolve('.build',process.argv.includes('--release')?'release':'debug');
+const build=path.resolve(process.argv.find(value=>value.startsWith('--core-build='))?.slice(13)
+  || path.join('.build',process.argv.includes('--release')?'release':'debug'));
 const directory=await mkdtemp(path.join(tmpdir(),'aa-web-interaction-'));
 const baseline=process.argv.includes('--baseline-question');
-const output=path.resolve('dist/qa',baseline?'web-interaction-baseline':'web-interaction');await mkdir(output,{recursive:true});
+const output=path.resolve(process.env.AUTOAPPROVE_QA_OUTPUT || path.join('dist/qa',baseline?'web-interaction-baseline':'web-interaction'));await mkdir(output,{recursive:true});
 let fixture, browser, mcp, page;const errors=[],screenshots=[],checks=[],actions=[];
 const optionalFile=async name=>{try{return await readFile(path.join(directory,name),'utf8');}catch{return '';}};
 try {
@@ -82,7 +83,13 @@ try {
   assert.equal(replyAfterBegin,true);assert.equal((await optionalFile('messages.txt')).split('> 합성 모바일 테스트를 진행할까요?').length-1,1);
   await page.unroute('**/api/action**');checks.push('Immediate Send during a delayed editing acknowledgement delivers the selected Codex answer exactly once');
   const nodeID=await page.evaluate(()=>selectedItem.node.id);
-  await page.route('**/api/network',async route=>{const response=await route.fetch(),dashboard=await response.json();dashboard.nodes=dashboard.nodes.map(node=>node.id===nodeID?{id:node.id,name:node.name,local:node.local,online:false,error:'synthetic inventory timeout'}:node);await route.fulfill({response,json:dashboard});});
+  await page.route('**/api/network',async route=>{
+    const requestHeaders={...route.request().headers()};delete requestHeaders['if-none-match'];
+    const response=await route.fetch({headers:requestHeaders}),dashboard=await response.json();
+    dashboard.nodes=dashboard.nodes.map(node=>node.id===nodeID?{id:node.id,name:node.name,local:node.local,online:false,error:'synthetic inventory timeout'}:node);
+    const headers={...response.headers()};delete headers.etag;delete headers['content-encoding'];delete headers['content-length'];
+    await route.fulfill({response,json:dashboard,headers});
+  });
   await page.waitForFunction(()=>currentNode()?.online===false&&!loadingNetwork);
   const failedQuestion=page.locator('#questions form').filter({hasText:'한글·이모지·긴 선택지의 줄바꿈'});
   await failedQuestion.getByRole('radio',{name:'질문을 먼저 확인',exact:true}).check();await failedQuestion.locator('textarea').fill('선택한 답변과 추가 설명을 보관합니다.');

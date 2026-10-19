@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
+import Combine
 import AutoApproveCore
+
+private struct AuditHistoryRefresh: Equatable {
+    let events: [AuditEvent]
+    let error: String?
+}
 
 @MainActor struct AuditHistoryWindow: View {
     let engine: ApprovalEngine
@@ -97,7 +103,12 @@ import AutoApproveCore
             }
         }
         .frame(minWidth: 780, minHeight: 560)
-        .windowUpdates(viewUpdates, sources: [engine.objectWillChange])
+        .windowUpdates(viewUpdates, sources: [
+            engine.$snapshot
+                .map { AuditHistoryRefresh(events: $0.events, error: $0.health.auditError) }
+                .removeDuplicates().dropFirst()
+                .map { _ in () }.eraseToAnyPublisher()
+        ])
         .onChange(of: viewUpdates.isVisible) { _, visible in
             guard visible else { return }
             if hasBeenVisible {

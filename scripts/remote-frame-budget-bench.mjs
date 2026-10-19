@@ -1,15 +1,15 @@
 import{coreLinkArguments}from'./swift-core-link.mjs';
 import{execFileSync}from'node:child_process';import{mkdir,readdir,readFile,writeFile,copyFile}from'node:fs/promises';import{createHash}from'node:crypto';import assert from'node:assert/strict';import path from'node:path';
 const option=n=>process.argv.find(v=>v.startsWith('--'+n+'='))?.slice(n.length+3),label=option('label')||'current';assert.match(label,/^[a-z0-9-]+$/);
-const root=path.resolve('.runtime/remote-frame-budget-bench'),out=path.join(root,label),binary=path.join(out,'check'),build=path.resolve('.build/release'),fixture='Tests/fixtures/remote-frame-budget-bench.swift';
+const root=path.resolve('.runtime/remote-frame-budget-bench'),out=path.join(root,label),binary=path.join(out,'check'),build=path.resolve(option('core-build')||'.build/release'),fixture='Tests/fixtures/remote-frame-budget-bench.swift';
 const sha=d=>createHash('sha256').update(d).digest('hex'),median=v=>[...v].sort((a,b)=>a-b)[Math.floor(v.length/2)];await mkdir(out,{recursive:true,mode:0o700});
 let provenance;const reuse=option('reuse-from');
 if(reuse){assert.match(reuse,/^[a-z0-9-]+$/);assert.notEqual(reuse,label);const from=path.join(root,reuse);provenance=JSON.parse(await readFile(from+'/provenance.json','utf8'));assert.equal(provenance.fixtureSHA256,sha(await readFile(fixture)));assert.equal(provenance.binarySHA256,sha(await readFile(from+'/check')));await copyFile(from+'/check',binary);}
 else{
  const names=(await readdir(build+'/AutoApproveCore.build')).filter(n=>n.endsWith('.swift.o')).sort(),objects=Object.fromEntries(await Promise.all(names.map(async n=>[n,sha(await readFile(build+'/AutoApproveCore.build/'+n))])));
- const cache=path.resolve('.build/cache/RemoteFrameBudgetBench');await mkdir(cache,{recursive:true});
+ const cache=path.join('/private/tmp','aa-remote-frame-budget-'+label+'-module-cache');await mkdir(cache,{recursive:true});
  execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...names.map(n=>build+'/AutoApproveCore.build/'+n),fixture,'-o',binary],{stdio:'inherit',timeout:120000});
- provenance={fixtureSHA256:sha(await readFile(fixture)),binarySHA256:sha(await readFile(binary)),workspaceSourceSHA256:sha(await readFile('Sources/AutoApproveCore/ApprovalEngine.swift')),coreObjects:objects,coreFingerprint:sha(JSON.stringify(objects)),coreModuleSHA256:sha(await readFile(build+'/Modules/AutoApproveCore.swiftmodule')),sourceScope:'Workspace source snapshot; immutable object/module/binary hashes identify actual execution.'};
+ provenance={fixtureSHA256:sha(await readFile(fixture)),binarySHA256:sha(await readFile(binary)),workspaceSourceSHA256:sha(await readFile('Sources/AutoApproveCore/ApprovalEngine.swift')),compiledApprovalEngineSourceSHA256:sha(await readFile(option('source-file')||'Sources/AutoApproveCore/ApprovalEngine.swift')),coreObjects:objects,coreFingerprint:sha(JSON.stringify(objects)),coreModuleSHA256:sha(await readFile(build+'/Modules/AutoApproveCore.swiftmodule')),sourceScope:'Workspace and explicitly selected compiled ApprovalEngine source hashes; immutable object/module/binary hashes identify the linked execution.'};
 }
 await writeFile(out+'/provenance.json',JSON.stringify(provenance,null,2)+'\n',{mode:0o600});
 const run=p=>JSON.parse(execFileSync(p,[],{encoding:'utf8',timeout:120000,maxBuffer:2*1024*1024})),reference=option('reference'),reports=[],referenceReports=[];let old;

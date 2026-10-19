@@ -24,7 +24,7 @@ if(process.argv.includes('--reuse-binary')){
  const condition=engine.match(/^ *if ([^\n]+) \{ remoteTerminalChanges\[sessionID\]\?\.notify\(\) \}$/m);assert.ok(condition,'Expected the actual notification decision');
  // Equality tokens project the five values consumed by this exact expression;
  // metadata validation itself remains in Core and is not replaced by this probe.
- const bridge='\nstruct FrameChangeProbe {let raw:String;let generation:String;let cursor:String?;let appearance:String?;let display:String?}\nfunc notificationChanged(_ previousFrame:FrameChangeProbe?,raw:String,generation:String,cursor:String?,appearance:String?,display:String?)->Bool {return '+condition[1]+'}\n';
+ const bridge='\nstruct FrameChangeProbe {let raw:String;let generation:String;let cursor:String?;let appearance:String?;let display:String?}\nfunc notificationChanged(_ previousFrame:FrameChangeProbe?,raw:String,generation:String,cursor:String?,appearance:String?,display:String?,screenContentsUnchanged:Bool = false)->Bool {return '+condition[1]+'}\n';
  const generated=path.join(output,'ScreenDisplayEqualityCheck.swift'),text=provider+bridge+'\n'+await readFile(fixture,'utf8');await writeFile(generated,text);
  const cache=path.resolve('.build/cache/ScreenDisplayEqualityCheck');await mkdir(cache,{recursive:true});
  execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',cache,generated,'-o',binary],{stdio:'inherit',timeout:120000});

@@ -50,6 +50,9 @@ extension ApprovalTests {
         for invalid in ["```\n" + choiceMenu + "\n```", choiceMenu + "\n› 새 메시지", choiceMenu.replacingOccurrences(of: "  2.", with: "  7."), choiceMenu.replacingOccurrences(of: "Press enter to confirm or esc to cancel", with: "진행 중…")] {
             try expectNil(TerminalChoiceQuestion.detect(invalid, agent: .codex))
         }
+        let oldOpenFence = String(repeating: "completed transcript row\n", count: 350) + "```\n" + choiceMenu
+        try expectNil(QuestionDetector.detect(oldOpenFence, agent: .codex))
+        try expectNil(TerminalChoiceQuestion.detect(oldOpenFence, agent: .codex))
         try expectNil(TerminalChoiceQuestion.detect("Would you like to run this command?\n\n$ test\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel", agent: .codex))
         for delta in [-19, -1, 0, 1, 19] { let input = RemoteTerminalInput(kind: .choice, text: String(delta)); try input.validate(); try expectEqual(input.bytes.filter { $0 == "\r" }.count, 1) }
         for invalid in ["20", "-20", "01", "-0", "", "1\n", "\u{1b}", String(Int.min)] { try expectThrows(try RemoteTerminalInput(kind: .choice, text: invalid).validate()) }

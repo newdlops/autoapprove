@@ -54,13 +54,33 @@ public struct ProcessRecord: Codable, Equatable, Sendable {
         // ps supplies paths or bare process names. Avoid constructing a file URL
         // for every unrelated process on every discovery/hook. Dot/empty paths
         // retain the old relative-path resolution; never cache across exec/PID reuse.
-        let component = (executable as NSString).lastPathComponent
-        let name = component.isEmpty || component == "." || component == ".."
-            ? URL(fileURLWithPath: executable).lastPathComponent : component
         let candidate: AgentKind?
-        if name == "codex" { candidate = .codex }
-        else if name == "claude" || (name.first?.isNumber == true && executable.contains("/claude/versions/")) { candidate = .claude }
-        else { return nil }
+        if executable == "codex" { candidate = .codex }
+        else if executable == "claude" { candidate = .claude }
+        else {
+            // Restricted-process fallbacks can contain unrelated bare names.
+            guard executable.contains("/") || executable.isEmpty || executable == "." || executable == ".." else { return nil }
+            // An agent basename starts with c, or a number for versioned
+            // Claude. Reject only conclusive ASCII nonmatches without bridging
+            // each ordinary process path to NSString. Dot/empty/foreign names
+            // retain Foundation's path and Unicode handling below.
+            let unrelated = executable.utf8.withContiguousStorageIfAvailable { bytes in
+                var end = bytes.count
+                while end > 0 && bytes[end - 1] == 47 { end -= 1 }
+                guard end > 0 else { return false }
+                var start = end - 1
+                while start > 0 && bytes[start - 1] != 47 { start -= 1 }
+                let first = bytes[start]
+                return first > 0 && first < 128 && first != 99 && first != 46 && !(48...57).contains(first)
+            } ?? false
+            if unrelated { return nil }
+            let component = (executable as NSString).lastPathComponent
+            let name = component.isEmpty || component == "." || component == ".."
+                ? URL(fileURLWithPath: executable).lastPathComponent : component
+            if name == "codex" { candidate = .codex }
+            else if name == "claude" || (name.first?.isNumber == true && executable.contains("/claude/versions/")) { candidate = .claude }
+            else { return nil }
+        }
         return executable.contains("/Applications/ChatGPT.app/") ? nil : candidate
     }
     public var key: String { "process:\(pid):\(started)" }
@@ -68,6 +88,20 @@ public struct ProcessRecord: Codable, Equatable, Sendable {
 }
 
 public enum ProcessDiscovery {
+    public static let workingDirectoryRefreshInterval: TimeInterval = 15
+
+    /// Read new session directories immediately, then avoid repeating kernel
+    /// cwd queries on every process-table poll. A directory can change without
+    /// changing process identity, so cached values have a short TTL.
+    public static func workingDirectoryRefreshIDs(_ identities: [String], lastRead: [String: TimeInterval],
+                                                  now: TimeInterval, interval: TimeInterval = workingDirectoryRefreshInterval) -> [String] {
+        let ttl = interval.isFinite ? max(0, interval) : workingDirectoryRefreshInterval
+        return identities.filter { identity in
+            guard let previous = lastRead[identity], previous.isFinite else { return true }
+            return !now.isFinite || now - previous >= ttl
+        }
+    }
+
     public static func parse(_ output: String) -> [ProcessRecord] {
         output.split(separator: "\n").compactMap { line in
             let fields = line.split(maxSplits: 10, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
@@ -79,6 +113,15 @@ public enum ProcessDiscovery {
     }
     public static func read() throws -> [ProcessRecord] {
         do { return try NativeProcessReader.read() }
+        catch is CancellationError { throw CancellationError() }
+        catch { return try legacyRead() }
+    }
+    /// Periodic session discovery needs only CLI candidates and their parent
+    /// chain. Keep `read()` complete for callers that inspect arbitrary
+    /// processes, but avoid materializing every unrelated process record on
+    /// the engine's recurring discovery pass.
+    public static func readSessions() throws -> [ProcessRecord] {
+        do { return try NativeProcessReader.readSessions() }
         catch is CancellationError { throw CancellationError() }
         catch { return try legacyRead() }
     }
@@ -101,19 +144,29 @@ public enum ProcessDiscovery {
         catch { return try legacyRead(pid: pid) }
     }
     public static func ancestors(of pid: Int32, records: [ProcessRecord]) -> [ProcessRecord] {
-        let byID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        let byID = index(records)
         return ancestors(of: pid, byPID: byID)
     }
-    /// Fresh metadata for an MCP connection's nearest enclosing CLI. Read only
+    /// Build one PID lookup without the intermediate tuple array produced by
+    /// `Dictionary(records.map { ... })`. Process snapshots can contain many
+    /// unrelated processes, and this path runs during recurring discovery.
+    static func index(_ records: [ProcessRecord]) -> [Int32: ProcessRecord] {
+        var result: [Int32: ProcessRecord] = [:]
+        result.reserveCapacity(records.count)
+        for record in records where result[record.pid] == nil { result[record.pid] = record }
+        return result
+    }
+    /// Fresh metadata for a connection's nearest matching enclosing CLI. Read only
     /// its bounded parent chain, then reject an identity/parent/exec/TTY change.
     /// This is attribution, never permission to send input to that process.
-    public static func enclosingAgent(of pid: Int32, reader: (Int32) throws -> [ProcessRecord] = { try read(pid: $0) }) throws -> ProcessRecord? {
+    public static func enclosingAgent(of pid: Int32, matching: AgentKind? = nil,
+                                      reader: (Int32) throws -> [ProcessRecord] = { try read(pid: $0) }) throws -> ProcessRecord? {
         var current = pid, seen: Set<Int32> = [], chain: [ProcessRecord] = []
         while current > 0, chain.count < 60, seen.insert(current).inserted {
             let values = try reader(current)
             guard values.count == 1, let record = values.first, record.pid == current else { return nil }
             chain.append(record)
-            if record.agent != nil {
+            if let kind = record.agent, matching == nil || kind == matching {
                 for original in chain.reversed() {
                     let latest = try reader(original.pid)
                     guard latest.count == 1, let value = latest.first,
@@ -137,11 +190,20 @@ public enum ProcessDiscovery {
     static let environmentCache = ProcessEnvironmentCache()
     /// `environment` replaces the live, cached launch-variable reader (tests pass fixtures).
     public static func sessions(_ records: [ProcessRecord], environment: ((ProcessRecord) -> [String: String]?)? = nil) -> [AgentSession] {
-        let byID = Dictionary(records.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        var byID: [Int32: ProcessRecord] = [:]
+        byID.reserveCapacity(records.count)
+        // Resolve executable identity once per process snapshot. Ancestor
+        // checks below revisit the same records for sibling CLI sessions.
+        var agentByPID: [Int32: AgentKind] = [:]
+        agentByPID.reserveCapacity(min(records.count, 32))
+        for record in records {
+            if byID[record.pid] == nil { byID[record.pid] = record }
+            if let agent = record.agent { agentByPID[record.pid] = agent }
+        }
         let found: [AgentSession] = records.compactMap { record in
-            guard let agent = record.agent, record.tty != "??", !record.tty.isEmpty else { return nil }
+            guard let agent = agentByPID[record.pid], record.tty != "??", !record.tty.isEmpty else { return nil }
             let parents = ancestors(of: record.parent, byPID: byID)
-            guard !parents.contains(where: { $0.agent != nil && $0.tty == record.tty }) else { return nil }
+            guard !parents.contains(where: { agentByPID[$0.pid] != nil && $0.tty == record.tty }) else { return nil }
             // A nested PTY may belong to a background agent, not the ancestor's Terminal tab.
             let terminalParents = parents.prefix { $0.tty == "??" || $0.tty == record.tty }
             let backgroundClaude = agent == .claude && terminalParents.contains {
@@ -156,7 +218,7 @@ public enum ProcessDiscovery {
             session.tmuxHandle = host.tmuxHandle
             return session
         }
-        if environment == nil { environmentCache.retain(Set(found.map(\.id))) }
+        if environment == nil { environmentCache.retain(Set(found.lazy.map(\.id))) }
         return found
     }
     public static func cwd(pid: Int32) -> String {

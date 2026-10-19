@@ -109,6 +109,12 @@ extension ApprovalTests {
         let firstObserved = Date()
         let fixture = try AutomaticReplyFixture(root: root, name: "delay", transport: transport)
         defer { fixture.engine.stop() }
+#if DEBUG
+        let detectionsBeforeRefresh = fixture.engine.debugQuestionConfirmationDetections
+        fixture.engine.refreshNotices()
+        try expectEqual(fixture.engine.debugQuestionConfirmationDetections - detectionsBeforeRefresh, 0,
+            "An unchanged pending reply reuses its parsed answer across publications")
+#endif
         let originalDeadline = fixture.automation?.deadline
         try expectEqual(fixture.automation?.phase, .scheduled)
         var tracker = AttentionTracker()
@@ -128,7 +134,14 @@ extension ApprovalTests {
         let second = QueuedQuestion(id: "codex:delay:question:1", threadID: "delay", title: "다음 질문도 진행할까요?",
             options: ["Yes, don’t ask again (a)", "No (esc)", "Yes, proceed (y)"])
         let update = CodexQuestionUpdate(sessionID: fixture.session.id, questions: [fixture.question, second])
+#if DEBUG
+        let detectionsBeforeNewQuestion = fixture.engine.debugQuestionConfirmationDetections
+#endif
         fixture.engine.updateCodexQuestions([update])
+#if DEBUG
+        try expectEqual(fixture.engine.debugQuestionConfirmationDetections - detectionsBeforeNewQuestion, 1,
+            "Only the new question needs parsing while its sibling is already reserved")
+#endif
         try expectEqual(fixture.automation?.deadline, originalDeadline, "Repeated reads keep the displayed deadline")
         try await waitForAutomaticReply(timeout: 4) { await probe.count == 1 }
         let first = await probe.deliveries[0]
@@ -159,7 +172,7 @@ extension ApprovalTests {
             send: { target, message in await probe.send(target, message) })
         var fixtures: [String: AutomaticReplyFixture] = [:]
         defer { fixtures.values.forEach { $0.engine.stop() } }
-        for name in ["off", "disabled", "paused", "ended", "dismissed", "resolved", "error", "pending-read", "disconnected", "stopped", "manual", "choices", "resumed", "changed"] {
+        for name in ["off", "disabled", "paused", "ended", "dismissed", "resolved", "error", "pending-read", "disconnected", "stopped", "manual", "choices", "resumed", "changed", "changed-options"] {
             var fixture = try AutomaticReplyFixture(root: root, name: name, transport: transport, enabled: name != "off")
             switch name {
             case "disabled": try fixture.engine.setAutomatic(fixture.session.id, enabled: false)
@@ -182,18 +195,29 @@ extension ApprovalTests {
             }
             fixtures[name] = fixture
         }
+#if DEBUG
+        let disabled = fixtures["off"]!
+        let detectionsWhileDisabled = disabled.engine.debugQuestionConfirmationDetections
+        disabled.engine.refreshNotices()
+        try expectEqual(disabled.engine.debugQuestionConfirmationDetections, detectionsWhileDisabled,
+            "Disabled automatic approval must skip question parsing entirely")
+#endif
         try await Task.sleep(nanoseconds: 2_000_000_000)
         let resumedAt = Date()
         try fixtures["resumed"]!.engine.setPaused(false)
         fixtures["changed"]!.question.title = "변경된 질문을 진행할까요?"
         fixtures["changed"]!.observe()
+        fixtures["changed-options"]!.question.options = ["Allow once", "Don’t allow"]
+        fixtures["changed-options"]!.observe()
         try await Task.sleep(nanoseconds: 3_200_000_000)
         try expectEqual(await probe.count, 1, "Cancelled waits cannot send Yes; manual No remains available while paused")
-        try await waitForAutomaticReply(timeout: 4) { await probe.count == 3 }
+        try await waitForAutomaticReply(timeout: 4) { await probe.count == 4 }
         let deliveries = await probe.deliveries
-        try expectEqual(Set(deliveries.map(\.thread)), Set(["manual", "resumed", "changed"]))
+        try expectEqual(Set(deliveries.map(\.thread)), Set(["manual", "resumed", "changed", "changed-options"]))
         try expect(deliveries.filter { $0.thread != "manual" }.allSatisfy { $0.date.timeIntervalSince(resumedAt) >= 5 })
         try expect(deliveries.first(where: { $0.thread == "changed" })?.message.contains("변경된 질문") == true)
+        try expect(deliveries.first(where: { $0.thread == "changed-options" })?.message.hasSuffix("\n\nAllow once") == true,
+            "Changed options with the same question title must not reuse the previous reservation's answer")
         try expect(deliveries.first(where: { $0.thread == "manual" })?.message.hasSuffix("No") == true)
     }
 

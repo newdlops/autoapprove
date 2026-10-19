@@ -19,6 +19,14 @@ public enum TTYInputConfiguration {
 }
 
 public struct TTYInputIdentity: Codable, Equatable, Sendable {
+    private static let processStartFormatterLock = NSLock()
+    private static let processStartFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        return formatter
+    }()
     public var pid: Int32
     public var processGroup: Int32
     public var foregroundGroup: Int32
@@ -46,9 +54,13 @@ public struct TTYInputIdentity: Codable, Equatable, Sendable {
             device: device, start_seconds: startSeconds, start_microseconds: startMicroseconds)
     }
     public var processStart: String {
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current; formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
-        return formatter.string(from: Date(timeIntervalSince1970: Double(startSeconds)))
+        Self.processStartFormatterLock.lock()
+        defer { Self.processStartFormatterLock.unlock() }
+        // Keep an already-running app correct if the user changes time zone.
+        if Self.processStartFormatter.timeZone.identifier != TimeZone.current.identifier {
+            Self.processStartFormatter.timeZone = .current
+        }
+        return Self.processStartFormatter.string(from: Date(timeIntervalSince1970: Double(startSeconds)))
     }
     /// Foreground jobs can change while the original CLI still exists. Bind
     /// its precise lifetime/device, then check foreground ownership at delivery.

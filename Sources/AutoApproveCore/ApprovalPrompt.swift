@@ -30,6 +30,10 @@ public enum PromptDetector {
 
     static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines) -> ApprovalPrompt? {
         guard agent != .shell else { return nil }
+        // A permission heading is only accepted within the final 300 rows.
+        // Search that bounded suffix first so normal build output never creates
+        // normalized String rows for its entire scrollback.
+        guard permissionHeading(prepared, agent: agent) != nil else { return nil }
         let rawLines = prepared.raw, lines = prepared.trimmed
         guard let heading = permissionHeading(lines, agent: agent) else { return nil }
         let promptIndex = heading.index
@@ -77,9 +81,79 @@ public enum PromptDetector {
     }
 
     public static func normalizedLines(_ screen: String) -> [String] {
-        var lines = screen.precomposedStringWithCanonicalMapping.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n")
+        let scalars = screen.unicodeScalars
+        var lines: [String] = []
+        lines.reserveCapacity(64)
+        var start = scalars.startIndex
+        var index = start
+        var lineIsASCII = true
+        while index < scalars.endIndex {
+            let scalar = scalars[index]
+            if scalar.value == 10 || scalar.value == 13 {
+                let line = String(scalars[start..<index])
+                lines.append(lineIsASCII ? line : line.precomposedStringWithCanonicalMapping)
+                lineIsASCII = true
+                if scalar.value == 13 {
+                    let next = scalars.index(after: index)
+                    if next < scalars.endIndex, scalars[next].value == 10 { index = next }
+                }
+                index = scalars.index(after: index)
+                start = index
+            } else {
+                lineIsASCII = lineIsASCII && scalar.isASCII
+                index = scalars.index(after: index)
+            }
+        }
+        let line = String(scalars[start..<scalars.endIndex])
+        lines.append(lineIsASCII ? line : line.precomposedStringWithCanonicalMapping)
         while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
         return lines
+    }
+
+    /// Materialize normalized rows and preserve the exact source byte count
+    /// when a bridged/non-contiguous string already requires a scalar walk.
+    /// The byte count is for the original screen, before row normalization.
+    static func normalizedLinesAndUTF8ByteCount(_ screen: String) -> (lines: [String], byteCount: Int) {
+        let scalars = screen.unicodeScalars
+        var lines: [String] = []
+        lines.reserveCapacity(64)
+        var byteCount = 0
+        var start = scalars.startIndex
+        var index = start
+        var lineIsASCII = true
+        while index < scalars.endIndex {
+            let scalar = scalars[index]
+            byteCount += utf8Width(of: scalar.value)
+            if scalar.value == 10 || scalar.value == 13 {
+                let line = String(scalars[start..<index])
+                lines.append(lineIsASCII ? line : line.precomposedStringWithCanonicalMapping)
+                lineIsASCII = true
+                if scalar.value == 13 {
+                    let next = scalars.index(after: index)
+                    if next < scalars.endIndex, scalars[next].value == 10 {
+                        byteCount += 1
+                        index = next
+                    }
+                }
+                index = scalars.index(after: index)
+                start = index
+            } else {
+                lineIsASCII = lineIsASCII && scalar.isASCII
+                index = scalars.index(after: index)
+            }
+        }
+        let line = String(scalars[start..<scalars.endIndex])
+        lines.append(lineIsASCII ? line : line.precomposedStringWithCanonicalMapping)
+        while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
+        return (lines, byteCount)
+    }
+
+    @inline(__always)
+    private static func utf8Width(of scalar: UInt32) -> Int {
+        if scalar < 0x80 { return 1 }
+        if scalar < 0x800 { return 2 }
+        if scalar < 0x10000 { return 3 }
+        return 4
     }
     static func permissionMarkers(_ agent: AgentKind) -> [String] {
         agent == .codex
@@ -92,9 +166,19 @@ public enum PromptDetector {
     /// Join only a complete, contiguous heading prefix. This accepts word/character wrapping
     /// without completing an ellipsis, crossing blank rows or consuming menu choices.
     static func permissionHeading(_ lines: [String], agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
+        permissionHeading(count: lines.count, lineAt: { lines[$0] }, agent: agent)
+    }
+
+    static func permissionHeading(_ prepared: DetectionLines, agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
+        let suffix = prepared.normalizedSuffix(300)
+        return permissionHeading(count: suffix.rows.count, lineAt: { suffix.rows[$0] }, agent: agent)
+    }
+
+    private static func permissionHeading(count: Int, lineAt: (Int) -> String,
+                                          agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
         let headings = agent == .codex ? codexHeadings : claudeHeadings
-        for index in lines.indices.reversed() {
-            let first = lines[index].trimmingCharacters(in: .whitespaces)
+        for index in (0..<count).reversed() {
+            let first = lineAt(index).trimmingCharacters(in: .whitespaces)
             // Ordinary output and menu rows cannot start one of the ASCII headings.
             // Reject them before regex checks or rebuilding every marker for every row.
             guard let initial = first.first, headings.contains(where: { $0.compact.first == initial }) else { continue }
@@ -103,8 +187,8 @@ public enum PromptDetector {
             guard !candidates.isEmpty, !isOption(first), !first.contains("```") else { continue }
             for (marker, expected) in candidates {
                 var candidate = compact
-                for row in index..<min(lines.count, index + 8) {
-                    let line = lines[row].trimmingCharacters(in: .whitespaces)
+                for row in index..<min(count, index + 8) {
+                    let line = lineAt(row).trimmingCharacters(in: .whitespaces)
                     if row != index {
                         guard !line.isEmpty, !isOption(line), !line.contains("```") else { break }
                         candidate += line.filter { !$0.isWhitespace }
@@ -121,7 +205,7 @@ public enum PromptDetector {
                             continue
                         }
                         // `Allow ` is a word prefix, not `Allowing` or another question.
-                        if marker == "Allow ", !lines[index].hasPrefix("Allow "), lines[index] != "Allow" { break }
+                        if marker == "Allow ", !first.hasPrefix("Allow "), first != "Allow" { break }
                         return (index, row, marker)
                     }
                     if !expected.hasPrefix(candidate) { break }

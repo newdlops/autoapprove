@@ -4,22 +4,57 @@ import Darwin
 /// Read-only, fresh kernel metadata. No process, environment or executable-path
 /// cache crosses reads; callers still verify the original before sending input.
 enum NativeProcessReader {
+    private static let codexName = Array("codex".utf8)
+    private static let claudeName = Array("claude".utf8)
+    private static let nodeName = Array("node".utf8)
     static func read(pid: Int32? = nil) throws -> [ProcessRecord] {
-        try autoreleasepool { try records(pid: pid) }
+        try autoreleasepool { try records(pid: pid, sessionsOnly: false) }
     }
-    private static func records(pid: Int32?) throws -> [ProcessRecord] {
+    static func readSessions() throws -> [ProcessRecord] {
+        try autoreleasepool { try records(pid: nil, sessionsOnly: true) }
+    }
+    private static func records(pid: Int32?, sessionsOnly: Bool) throws -> [ProcessRecord] {
         let entries = try snapshot(pid: pid)
         guard !entries.isEmpty else { return [] }
-        let argumentsLimit = try argumentLimit()
-        var arguments = [UInt8](repeating: 0, count: argumentsLimit)
-        var path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = .current
-        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        // Complete and targeted reads promise the same launch name and start
+        // identity as ps, including arbitrary managers, hosts and shell PIDs.
+        // Only periodic session discovery may omit unrelated process details.
+        var detailedPIDs = Set<Int32>()
+        if sessionsOnly {
+            var candidates: [Int32] = []
+            for entry in entries where isAgentCandidate(entry) { candidates.append(entry.kp_proc.p_pid) }
+            guard !candidates.isEmpty else { return [] }
+            // Retain just PID -> parent for the ancestry walk, not another
+            // copy of every large kernel process record.
+            var byPID: [Int32: Int32] = [:]
+            byPID.reserveCapacity(entries.count)
+            for entry in entries where byPID[entry.kp_proc.p_pid] == nil {
+                byPID[entry.kp_proc.p_pid] = Int32(entry.kp_eproc.e_ppid)
+            }
+            detailedPIDs.reserveCapacity(min(entries.count, candidates.count * 8))
+            for candidate in candidates {
+                var current = candidate
+                // Process trees share long parent chains. The global set both
+                // deduplicates detail reads and stops ancestry walks already
+                // covered by an earlier candidate, avoiding one temporary Set
+                // allocation per candidate process.
+                for _ in 0..<60 where current > 0 && detailedPIDs.insert(current).inserted {
+                    guard let parent = byPID[current] else { break }
+                    current = parent
+                }
+            }
+        }
+        var arguments: [UInt8] = [], path: [UInt8] = []
+        if !sessionsOnly || !detailedPIDs.isEmpty {
+            arguments = [UInt8](repeating: 0, count: try argumentLimit())
+            path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        }
+        var formatter: DateFormatter?
         var dates: [Int64: String] = [:], devices: [dev_t: String] = [:]
         return try entries.compactMap { entry -> ProcessRecord? in
             try Task.checkCancellation()
             let process = entry.kp_proc, extra = entry.kp_eproc
+            if sessionsOnly && !detailedPIDs.contains(process.p_pid) { return nil }
             let executable = launchName(entry, buffer: &arguments, path: &path)
             var parent = extra.e_ppid, group = extra.e_pgid, foreground = extra.e_tpgid, device = extra.e_tdev
             if process.p_pid > 0 {
@@ -43,7 +78,19 @@ enum NativeProcessReader {
             let seconds = Int64(process.p_un.__p_starttime.tv_sec)
             let started: String
             if let value = dates[seconds] { started = value }
-            else { started = formatter.string(from: Date(timeIntervalSince1970: Double(seconds))); dates[seconds] = started }
+            else {
+                let dateFormatter: DateFormatter
+                if let formatter { dateFormatter = formatter }
+                else {
+                    let value = DateFormatter()
+                    value.locale = Locale(identifier: "en_US_POSIX"); value.timeZone = .current
+                    value.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+                    formatter = value; dateFormatter = value
+                }
+                let value = dateFormatter.string(from: Date(timeIntervalSince1970: Double(seconds)))
+                dates[seconds] = value
+                started = value
+            }
             let tty: String
             if let value = devices[device] { tty = value }
             else {
@@ -52,6 +99,35 @@ enum NativeProcessReader {
             }
             return ProcessRecord(pid: process.p_pid, parent: parent, tty: tty, processGroup: group,
                                  foregroundGroup: foreground, started: started, executable: executable)
+        }
+    }
+
+    private static func isAgentCandidate(_ entry: kinfo_proc) -> Bool {
+        let process = entry.kp_proc
+        // Inspect the fixed-size kernel name directly. Building a Swift String
+        // (and lowercased copy) for every process on every discovery pass is
+        // unnecessary; detailed argv/path data is fetched only for matches.
+        if shortNameMatches(process, codexName) || shortNameMatches(process, claudeName) { return true }
+        // Claude's versioned CLI can appear under its Node runtime name. Limit
+        // this fallback to TTY processes; unrelated background Node services
+        // do not need argv reads or ancestry enrichment.
+        guard entry.kp_eproc.e_tdev != -1 else { return false }
+        if shortNameMatches(process, nodeName) { return true }
+        return withUnsafeBytes(of: process.p_comm) { bytes in
+            guard let first = bytes.first else { return false }
+            return (48...57).contains(first)
+        }
+    }
+
+    private static func shortNameMatches(_ process: extern_proc, _ expected: [UInt8]) -> Bool {
+        withUnsafeBytes(of: process.p_comm) { bytes in
+            guard bytes.count > expected.count, bytes[expected.count] == 0 else { return false }
+            for index in expected.indices {
+                let value = bytes[index]
+                let lowercase = (65...90).contains(value) ? value + 32 : value
+                if lowercase != expected[index] { return false }
+            }
+            return true
         }
     }
 
@@ -72,9 +148,10 @@ enum NativeProcessReader {
             // publish a partial list as authoritative session termination.
             if status != 0 && error == ENOMEM { continue }
             guard status == 0, length <= capacity * stride, length % stride == 0 else { throw failure(error) }
-            let result = Array(values.prefix(length / stride))
-            guard pid != nil || result.contains(where: { $0.kp_proc.p_pid == getpid() }) else { throw POSIXError(.EIO) }
-            return pid.map { selected in result.filter { $0.kp_proc.p_pid == selected } } ?? result
+            let count = length / stride
+            values.removeLast(values.count - count)
+            guard pid != nil || values.contains(where: { $0.kp_proc.p_pid == getpid() }) else { throw POSIXError(.EIO) }
+            return pid.map { selected in values.filter { $0.kp_proc.p_pid == selected } } ?? values
         }
         throw POSIXError(.EOVERFLOW)
     }

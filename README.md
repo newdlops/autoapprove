@@ -453,6 +453,7 @@ node scripts/network-integration-check.mjs
 node scripts/network-package-check.mjs dist/AutoApprove.app
 node scripts/live-input-stability-check.mjs --release
 node scripts/web-interaction-browser-check.mjs --release
+node scripts/web-byte-count-check.mjs
 node scripts/codex-queue-transport-check.mjs --release
 node scripts/terminal-signing-check.mjs dist/AutoApprove.app
 node scripts/install-check.mjs

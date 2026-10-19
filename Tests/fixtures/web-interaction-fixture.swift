@@ -71,7 +71,8 @@ private actor FixtureQueue {
         })
         let engine = try ApprovalEngine(paths: paths, questionTransport: transport, claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.iterm: adapter], testScreenSharing: screen,
             codexQueue: CodexQueueTransport(list: { _ in await queue.list() }, delete: { _, ids in await queue.remove(ids) },
-                conversations: { _, _ in [CodexQueueConversation(id: thread, title: "합성 실행 중 대화 · 한글과 긴 제목")] }))
+                conversations: { _, _ in [CodexQueueConversation(id: thread, title: "합성 실행 중 대화 · 한글과 긴 제목")] }),
+            webLoopbackOnly: true)
         let sessions = [codex, claude].map { record -> AgentSession in
             var session = AgentSession(id: record.key, agent: record.agent!, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/fixture/mobile-test", terminal: .iterm)
             session.phase = .working; session.channel = .itermScreen; session.terminalTitle = record.agent == .codex ? "합성 Codex 세션" : "합성 Claude 세션"; return session
@@ -80,6 +81,9 @@ private actor FixtureQueue {
         await engine.connectScreenHost(.iterm)
         try engine.start(poll: false); try engine.setWebEnabled(true, port: 0, bonjourEnabled: false, discoveryAddresses: { [] })
         while !engine.webStatus.ready { try await Task.sleep(nanoseconds: 20_000_000) }
+        guard engine.webStatus.urls.allSatisfy({ URL(string: $0)?.host == "127.0.0.1" }), engine.webStatus.peerCount == 0 else {
+            throw AppError.message("Browser QA must stay loopback-only without peer discovery")
+        }
         try engine.setAutomatic(codex.key, enabled: true); try engine.setAutomatic(claude.key, enabled: true)
         // Keep the synthetic yes/no prompt pending while the browser inspects
         // three viewports. Manual replies must still work during an auto pause.

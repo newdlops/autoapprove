@@ -18,6 +18,12 @@ public final class AuditStore {
     private func bind(_ text: String, to statement: OpaquePointer?, at index: Int32) {
         sqlite3_bind_text(statement, index, text, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
     }
+    private func eventData(from statement: OpaquePointer?) -> Data? {
+        guard let text = sqlite3_column_text(statement, 0) else { return nil }
+        let count = Int(sqlite3_column_bytes(statement, 0))
+        guard count > 0 else { return nil }
+        return Data(bytes: text, count: count)
+    }
     public func value(_ key: String) -> String? {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
@@ -85,9 +91,10 @@ public final class AuditStore {
         defer { sqlite3_finalize(statement) }
         guard sqlite3_prepare_v2(db, "SELECT json FROM events ORDER BY date DESC LIMIT ?", -1, &statement, nil) == SQLITE_OK else { return [] }
         sqlite3_bind_int(statement, 1, Int32(limit))
+        let decoder = JSONDecoder()
         var events: [AuditEvent] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let text = sqlite3_column_text(statement, 0), let event = try? JSONDecoder().decode(AuditEvent.self, from: Data(String(cString: text).utf8)) { events.append(event) }
+            if let data = eventData(from: statement), let event = try? decoder.decode(AuditEvent.self, from: data) { events.append(event) }
         }
         return events
     }
@@ -123,11 +130,12 @@ public final class AuditStore {
         let total = Int(sqlite3_column_int64(count, 0))
         let statement = try prepare("SELECT json FROM events WHERE \(predicate) ORDER BY date DESC, id DESC LIMIT \(max(1, min(limit, 200))) OFFSET \(max(0, offset))")
         defer { sqlite3_finalize(statement) }
+        let decoder = JSONDecoder()
         var events: [AuditEvent] = []
         var status = sqlite3_step(statement)
         while status == SQLITE_ROW {
-            guard let text = sqlite3_column_text(statement, 0) else { throw AppError.message("승인 내역에 읽을 수 없는 데이터가 있습니다.") }
-            events.append(try JSONDecoder().decode(AuditEvent.self, from: Data(String(cString: text).utf8)))
+            guard let data = eventData(from: statement) else { throw AppError.message("승인 내역에 읽을 수 없는 데이터가 있습니다.") }
+            events.append(try decoder.decode(AuditEvent.self, from: data))
             status = sqlite3_step(statement)
         }
         guard status == SQLITE_DONE else { throw AppError.message("저장된 승인 내역을 읽지 못했습니다.") }

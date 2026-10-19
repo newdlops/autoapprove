@@ -16,6 +16,22 @@ enum WorkingDirectoryFixture {
 }
 
 extension ApprovalTests {
+    func testKeepAwakeEvaluationIntervalBacksOffWhenInactive() throws {
+        try expectEqual(KeepAwake.evaluationInterval(enabled: false, ownsSleepHold: false), 60)
+        try expectEqual(KeepAwake.evaluationInterval(enabled: true, ownsSleepHold: false), 5)
+        try expectEqual(KeepAwake.evaluationInterval(enabled: false, ownsSleepHold: true), 5)
+    }
+
+    func testWorkingDirectoryRefreshReadsNewSessionsImmediatelyAndCachesBriefly() throws {
+        let lastRead = ["old": 100.0, "due": 85.0]
+        try expectEqual(ProcessDiscovery.workingDirectoryRefreshIDs(["new", "old", "due"],
+            lastRead: lastRead, now: 100), ["new", "due"])
+        try expectEqual(ProcessDiscovery.workingDirectoryRefreshIDs(["old"],
+            lastRead: lastRead, now: 114), [])
+        try expectEqual(ProcessDiscovery.workingDirectoryRefreshIDs(["old"],
+            lastRead: lastRead, now: 115), ["old"])
+    }
+
     func testWorkingDirectoryFollowsUnicodeChildDirectoryChanges() throws {
         let root = URL(fileURLWithPath: "/private/tmp/aa-cwd-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

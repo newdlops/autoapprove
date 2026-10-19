@@ -96,7 +96,7 @@ extension ApprovalTests {
         let ttys = (0..<20).map { "/dev/native-\($0)" }
         var contentTargets = [String](), queries = 0
         let raw = "한글 é 🙂\n\u{1b}[31moriginal\u{1b}[0m\u{0}\n"
-        let reader = TerminalAppleEventReader(batchTitles: false) { query, budget in
+        let reader = TerminalAppleEventReader(batchTitles: false, batchContents: false) { query, budget in
             queries += 1
             try expect(budget > 0 && budget <= 8)
             try expectEqual(query.descriptorType, terminalCode("obj "))
@@ -133,14 +133,13 @@ extension ApprovalTests {
         try expectEqual(queries, beforeEmpty)
     }
 
-    func testNativeTerminalBatchesOnlyRequestedTitlesWithStableIdentities() throws {
+    func testNativeTerminalBatchesOnlyRequestedContentsAndTitlesWithStableIdentities() throws {
         let ttys = (0..<20).map { "/dev/batch-\($0)" }
-        var queries = 0, bulkQueries = 0, contents: [String] = []
+        var queries = 0, contentBatches = 0, titleBatches = 0, identityBatches = 0, individualTargets = 0
         let reader = TerminalAppleEventReader { query, _ in
             queries += 1
             let property = terminalProperty(query)
             if let targets = terminalBatchTargets(query) {
-                bulkQueries += 1
                 try expectEqual(targets, ttys, "Only unique enrolled TTYs may enter the OR predicate")
                 let tabs = query.forKeyword(terminalCode("from"))!
                 try expectEqual(tabs.forKeyword(terminalCode("want"))?.typeCodeValue, terminalCode("ttab"))
@@ -152,33 +151,166 @@ extension ApprovalTests {
                     try expectEqual(comparison.descriptorType, terminalCode("cmpd"))
                     try expectEqual(terminalProperty(comparison.forKeyword(terminalCode("obj1"))!), terminalCode("ttty"))
                 }
-                if property == terminalCode("ttty") { return terminalList([terminalList([]), terminalStrings(ttys)]) }
-                try expectEqual(property, terminalCode("titl"), "No contents query may be batched")
+                if property == terminalCode("ttty") { identityBatches += 1; return terminalList([terminalList([]), terminalStrings(ttys)]) }
+                if property == terminalCode("pcnt") { contentBatches += 1; return terminalStrings(ttys.map { "Original\n\u{1b}[31m한글🙂\u{0}" + $0 }) }
+                try expectEqual(property, terminalCode("titl"))
+                titleBatches += 1
                 return terminalList([terminalList([]), terminalStrings(ttys.indices.map { $0 == 1 ? " Custom 🧪 " : "" })])
             }
-            if let tty = terminalTarget(query) {
-                try expectEqual(property, terminalCode("pcnt"), "Custom titles must come from the verified batch")
-                try expect(ttys.contains(tty)); contents.append(tty)
-                return terminalStrings(["Original\n\u{1b}[31m한글🙂\u{0}" + tty])
-            }
+            if terminalTarget(query) != nil { individualTargets += 1; throw AppError.message("A verified batch must not fall back to a per-TTY read") }
             if property == terminalCode("ID  ") { return terminalList((1...20).map { .init(int32: Int32($0)) }) }
             if property == terminalCode("ttty") { return terminalStrings(ttys) }
             try expectEqual(property, terminalCode("pnam"))
             return terminalStrings(ttys.indices.map { "Window \($0)" })
         }
         let result = try reader.screens(ttys: ttys + ttys)
-        try expectEqual(contents, ttys); try expectEqual(bulkQueries, 3)
-        try expectEqual(queries, 27, "20 exact contents + three custom-title metadata + four window metadata events")
+        try expectEqual(contentBatches, 1); try expectEqual(titleBatches, 1); try expectEqual(identityBatches, 4)
+        try expectEqual(individualTargets, 0); try expectEqual(queries, 10, "Six contents/title batch sends plus four window metadata sends")
         try expectEqual(result.screens.map(\.contents), ttys.map { "Original\n\u{1b}[31m한글🙂\u{0}" + $0 })
         try expectEqual(result.screens[0].title, "Window 0"); try expectEqual(result.screens[1].title, "Custom 🧪")
         try expect(result.failures.isEmpty)
+    }
+
+    func testNativeTerminalDisablesStructurallyInvalidContentsBatch() throws {
+        let ttys = (0..<4).map { "/dev/partial-batch-\($0)" }
+        var unavailable = 0, batchContentReads = 0, exactReads = 0
+        let reader = TerminalAppleEventReader(batchTitles: false,
+            batchContents: true, contentsBatchUnavailable: { unavailable += 1 }) { query, _ in
+            let property = terminalProperty(query)
+            if terminalBatchTargets(query) != nil {
+                if property == terminalCode("ttty") { return terminalStrings(ttys) }
+                try expectEqual(property, terminalCode("pcnt"))
+                batchContentReads += 1
+                // Simulate Terminal returning an incomplete list. Exact reads
+                // below remain safe, but this batch must not be retried later.
+                return terminalStrings(["partial"])
+            }
+            guard let tty = terminalTarget(query) else { throw AppError.message("Expected exact TTY fallback") }
+            try expectEqual(property, terminalCode("pcnt"))
+            exactReads += 1
+            return terminalStrings(["fresh " + tty])
+        }
+        let result = try reader.screens(ttys: ttys, includeTitles: false)
+        try expectEqual(result.screens.map(\.contents), ttys.map { "fresh " + $0 })
+        try expectEqual(batchContentReads, 1)
+        try expectEqual(exactReads, ttys.count)
+        try expectEqual(unavailable, 1)
+        try expect(result.failures.isEmpty)
+    }
+
+    func testNativeTerminalKeepsSmallMultiTabReadsIndividual() throws {
+        for count in 2...3 {
+            let ttys = (0..<count).map { "/dev/small-batch-\($0)" }
+            var queries = 0, contentReads = 0, titleReads = 0
+            let reader = TerminalAppleEventReader(batchTitles:false,batchContents:false) { query, _ in
+                queries += 1
+                guard let tty = terminalTarget(query), ttys.contains(tty) else {
+                    throw AppError.message("Small multi-tab reads should use exact TTY predicates")
+                }
+                if terminalProperty(query) == terminalCode("pcnt") {
+                    contentReads += 1
+                    return terminalStrings(["screen:" + tty])
+                }
+                try expectEqual(terminalProperty(query),terminalCode("titl"))
+                titleReads += 1
+                return terminalStrings(["title:" + tty])
+            }
+            let result = try reader.screens(ttys: ttys)
+            try expectEqual(contentReads,count)
+            try expectEqual(titleReads,count)
+            try expectEqual(queries,count*2,"One exact get event per content/title beats or matches the three-event batch for \(count) TTYs")
+            try expectEqual(result.screens.map(\.contents), ttys.map { "screen:" + $0 })
+            try expectEqual(result.screens.map(\.title), ttys.map { "title:" + $0 })
+            try expect(result.failures.isEmpty)
+        }
+    }
+
+    func testNativeTerminalReadsTitlesOnlyForExpiredTTYs() throws {
+        let ttys = (0..<3).map { "/dev/title-cache-\($0)" }
+        var queries = 0, titleQueries = 0
+        let reader = TerminalAppleEventReader { query, _ in
+            queries += 1
+            let property = terminalProperty(query)
+            if let targets = terminalBatchTargets(query) {
+                try expectEqual(targets,ttys,"The screen batch still reads every exact enrolled TTY")
+                if property == terminalCode("ttty") { return terminalStrings(ttys) }
+                try expectEqual(property,terminalCode("pcnt"))
+                return terminalStrings(ttys.map { "screen:" + $0 })
+            }
+            guard let tty = terminalTarget(query) else { throw AppError.message("Expected an exact TTY query") }
+            if property == terminalCode("pcnt") { return terminalStrings(["screen:" + tty]) }
+            try expectEqual(tty,ttys[1],"Only the stale title's TTY may be queried")
+            try expectEqual(property,terminalCode("titl"))
+            titleQueries += 1
+            return terminalStrings(["fresh title"])
+        }
+        let result = try reader.screens(ttys:ttys,titleTTYS:[ttys[1]])
+        try expectEqual(result.screens.map(\.contents),ttys.map { "screen:" + $0 })
+        try expectEqual(result.screens.map(\.title),[nil,"fresh title",nil])
+        try expectEqual(titleQueries,1)
+        try expectEqual(queries,4,"A stale title must not expand into title reads for the other tabs")
+    }
+
+    func testSlowBulkContentsIdentityQueryRequestsTemporaryPerTTYFallback() throws {
+        let ttys = (0..<4).map { "/dev/slow-batch-\($0)" }
+        for mode in ["fast", "slow", "timeout"] {
+            var now = 0.0, identityReads = 0, fallbackRequests = 0
+            let reader = TerminalAppleEventReader(timeout:8, clock:{now}, batchTitles:false,
+                slowContentsBatch:{ fallbackRequests += 1 }) { query, _ in
+                guard terminalBatchTargets(query) == ttys else { throw AppError.message("Only the exact enrolled TTYs may be batched") }
+                switch terminalProperty(query) {
+                case terminalCode("ttty"):
+                    identityReads += 1
+                    if identityReads == 1, mode != "fast" { now += 2 }
+                    if identityReads == 1, mode == "timeout" { throw NSError(domain:NSOSStatusErrorDomain,code:-1712) }
+                    return terminalStrings(ttys)
+                case terminalCode("pcnt"): return terminalStrings(ttys.map { "screen:" + $0 })
+                default: throw AppError.message("Unexpected Terminal batch property")
+                }
+            }
+            if mode == "timeout" { try expectThrows(try reader.screens(ttys:ttys,includeTitles:false)) }
+            else {
+                let result = try reader.screens(ttys:ttys,includeTitles:false)
+                try expectEqual(result.screens.map(\.contents),ttys.map { "screen:" + $0 })
+            }
+            try expectEqual(fallbackRequests,mode == "fast" ? 0 : 1,
+                "Only a slow/timed-out bulk identity lookup should enter temporary exact-TTY mode")
+        }
+    }
+
+    func testSlowBulkTitleQueriesRequestTemporaryTitleFallback() throws {
+        let ttys = (0..<4).map { "/dev/slow-title-\($0)" }
+        for slowRead in 0...3 {
+            var now = 0.0, titleReads = 0, fallbackRequests = 0
+            let reader = TerminalAppleEventReader(timeout:8, clock:{now}, batchContents:false,
+                slowTitlesBatch:{ fallbackRequests += 1 }) { query, _ in
+                let property = terminalProperty(query)
+                if let targets = terminalBatchTargets(query) {
+                    try expectEqual(targets, ttys)
+                    guard property == terminalCode("ttty") || property == terminalCode("titl") else {
+                        return terminalStrings(targets)
+                    }
+                    titleReads += 1
+                    if titleReads == slowRead { now += 2 }
+                    if property == terminalCode("ttty") { return terminalStrings(ttys) }
+                    return terminalStrings(ttys.map { "title:" + $0 })
+                }
+                guard let tty = terminalTarget(query) else { throw AppError.message("Unexpected slow-title query") }
+                if property == terminalCode("pcnt") { return terminalStrings(["fresh:" + tty]) }
+                return terminalStrings([tty])
+            }
+            let result = try reader.screens(ttys:ttys)
+            try expectEqual(titleReads,3)
+            try expectEqual(fallbackRequests,slowRead == 0 ? 0 : 1)
+            try expectEqual(result.screens.map(\.contents),ttys.map { "fresh:" + $0 })
+        }
     }
 
     func testNativeTerminalTitleBatchRejectsUnstableAndUnsupportedMetadata() throws {
         let ttys = (0..<4).map { "/dev/batch-\($0)" }
         for mode in ["reordered", "duplicate", "count", "unknown", "unsupported", "malformed", "closed"] {
             var bulk = 0, exactTitles = 0, unavailable = 0
-            let reader = TerminalAppleEventReader(titleBatchUnavailable: { unavailable += 1 }) { query, _ in
+            let reader = TerminalAppleEventReader(titleBatchUnavailable: { unavailable += 1 }, batchContents: false) { query, _ in
                 let property = terminalProperty(query)
                 if let _ = terminalBatchTargets(query) {
                     bulk += 1
@@ -192,7 +324,12 @@ extension ApprovalTests {
                     if mode == "unknown" { return terminalStrings(ttys.dropLast() + ["/dev/unrelated"]) }
                     return terminalStrings(mode == "reordered" && bulk == 3 ? Array(ttys.reversed()) : ttys)
                 }
-                guard let tty = terminalTarget(query) else { throw AppError.message("Missing exact fallback target") }
+                if ["unsupported", "malformed"].contains(mode) {
+                    if property == terminalCode("ID  ") { return terminalList((1...4).map { .init(int32:Int32($0)) }) }
+                    if property == terminalCode("ttty") { return terminalStrings(ttys) }
+                    if property == terminalCode("pnam") { return terminalStrings(ttys.indices.map { "Window \($0)" }) }
+                }
+                guard let tty = terminalTarget(query) else { throw AppError.message("Missing exact fallback target for property \(property), mode \(mode), bulk \(bulk)") }
                 try expect(ttys.contains(tty), "Fallback must preserve the exact original target")
                 if property == terminalCode("titl") { exactTitles += 1; return terminalStrings(["Exact " + tty]) }
                 try expectEqual(property, terminalCode("pcnt"))
@@ -200,9 +337,13 @@ extension ApprovalTests {
             }
             let result = try reader.screens(ttys: ttys)
             try expectEqual(result.screens.map(\.contents), ttys.map { "Original " + $0 })
-            try expectEqual(result.screens.map(\.title), ttys.map { "Exact " + $0 })
-            try expectEqual(exactTitles, 4); try expect(result.failures.isEmpty)
-            try expectEqual(unavailable, ["unsupported", "malformed"].contains(mode) ? 1 : 0)
+            let expectedTitles = ["unsupported", "malformed"].contains(mode)
+                ? ttys.indices.map { "Window \($0)" } : ttys.map { "Exact " + $0 }
+            try expectEqual(result.screens.map(\.title), expectedTitles)
+            try expectEqual(exactTitles, ["unsupported", "malformed"].contains(mode) ? 0 : 4)
+            try expect(result.failures.isEmpty)
+            try expectEqual(unavailable, mode == "closed" ? 0 : 1,
+                "Every unstable or unsupported bulk title result disables future bulk attempts for this Terminal PID")
             try expectEqual(bulk, ["unsupported", "closed"].contains(mode) ? 1 : 3)
         }
     }
@@ -211,13 +352,20 @@ extension ApprovalTests {
         let ttys = (0..<4).map { "/dev/batch-\($0)" }
         for status in [-1743, -1744, -1712] {
             var queries = 0, unavailable = 0
-            let reader = TerminalAppleEventReader(titleBatchUnavailable: { unavailable += 1 }) { _, _ in
-                queries += 1; throw NSError(domain: NSOSStatusErrorDomain, code: status)
+            let reader = TerminalAppleEventReader(titleBatchUnavailable: { unavailable += 1 }, batchContents: false) { _, _ in
+                queries += 1
+                if status != -1712 || queries == 1 { throw NSError(domain: NSOSStatusErrorDomain, code: status) }
+                return terminalStrings(["fresh content"])
             }
             var error: Error?
             do { _ = try reader.screens(ttys: ttys) } catch let caught { error = caught }
-            try expectNotNil(error); try expectEqual(queries, 1); try expectEqual(unavailable, 0)
-            if status != -1712 { try expectEqual(error as? TerminalAdapterError, .permissionDenied) }
+            if status == -1712 {
+                try expect(error == nil, "A title-only timeout must preserve later exact content reads")
+                try expectEqual(queries, 2 * ttys.count + 1)
+            } else {
+                try expectNotNil(error); try expectEqual(queries, 1); try expectEqual(unavailable, 0)
+                try expectEqual(error as? TerminalAdapterError, .permissionDenied)
+            }
         }
         var now = 0.0, queries = 0
         let reader = TerminalAppleEventReader(timeout: 1, clock: { now }) { _, _ in
@@ -233,7 +381,7 @@ extension ApprovalTests {
     func testNativeTerminalReadIsolatesClosedAndAmbiguousTargetsAndStopsOnDenial() throws {
         for mode in ["closed", "ambiguous", "denied", "malformed"] {
             var queries = 0
-            let reader = TerminalAppleEventReader { query, _ in
+            let reader = TerminalAppleEventReader(batchTitles:false, batchContents:false) { query, _ in
                 queries += 1
                 let tty = terminalTarget(query)!
                 if terminalProperty(query) == terminalCode("titl") { return terminalStrings(["Custom"]) }

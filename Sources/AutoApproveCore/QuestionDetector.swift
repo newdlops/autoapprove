@@ -13,7 +13,8 @@ public enum QuestionDetector {
 
     static func detect(agent: AgentKind, prepared: DetectionLines) -> PendingScreenRequest? {
         guard agent != .shell else { return nil }
-        let lines = prepared.trimmedSuffix(300)
+        let suffix = prepared.normalizedSuffix(300)
+        let lines = suffix.rows.map { $0.trimmingCharacters(in: .whitespaces) }
         guard let last = lines.lastIndex(where: PromptDetector.isOption) else { return nil }
         guard PromptDetector.dialogFooterStart(in: lines, after: last) != nil else { return nil }
         let selected = lines[...last].lastIndex {
@@ -29,7 +30,7 @@ public enum QuestionDetector {
         let dialog = Array(lines[start...])
         guard dialog.filter(PromptDetector.isOption).count >= 2,
               !dialog.contains(where: { $0.contains("```") }),
-              lines[..<start].filter({ $0.hasPrefix("```") }).count % 2 == 0 else { return nil }
+              !prepared.hasOpenCodeFence(beforeSuffixRow: start, in: suffix) else { return nil }
         let permission = permissionHeading?.index == start
         return PendingScreenRequest(phase: permission ? .approval : .input, summary: String(dialog.joined(separator: "\n").prefix(4000)))
     }
