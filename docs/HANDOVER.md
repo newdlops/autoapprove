@@ -1,5 +1,15 @@
 # AutoApprove 작업 인계
 
+## 2026-10-20 · 0.2.134/161 · 반복 위험 명령 후보 검색 경량화
+
+- 이전 목표 턴은 progress다. 일반 Claude 선택을 수동으로 유지하는 0.2.133을 실제 배포했고, 이번에는 프로파일에서 비용이 컸던 `SystemCommandRisk`의 후보 검색을 줄였다. `RiskCandidateMatcher`는 29개 ASCII 기호의 `UInt16` Aho–Corasick 전이표를 한 번 준비한다. 기존과 같은 NFC·공백 제거 입력에서 확실한 음성 결과만 정규식을 생략한다. 후보가 있거나 case folding/미할당 Unicode가 불확실하면 기존 판정으로 돌아간다. 후보 단어와 정규식은 같은 목록에서 만들며 입력·판정·설치 스크립트 결과는 캐시하지 않는다.
+- 배포 태그 `v0.2.133`의 원본 판정과 실제 수정 소스의 kind/evidence **12,750건**이 일치했다. Unicode scalar 전체를 다섯 문맥에 넣은 정규식/후보 검사 **5,560,320건**도 통과했다. 대소문자·분해형·한글·emoji·NUL·결합 문자·미할당 문자·줄바꿈 경로·읽기 전용 예외와 실행하지 않는 설치 파일의 변경 후 재검사를 포함한다. 이는 검사한 코퍼스/문맥의 결과이며 모든 가능한 명령 문자열의 형식 증명이라는 뜻은 아니다. 관련 Unicode 동작은 [ICU 정규식](https://unicode-org.github.io/icu/userguide/strings/regexp.html)과 [UAX #44](https://www.unicode.org/reports/tr44/#Changes_When_Casefolded)를 확인했다.
+- 동일 실제 엔진 fixture에 사전 준비한 Cocoa Unicode 화면 **16개·500회**를 넣고 이전/수정 **3쌍 교대** 측정했다. CPU 중앙값은 변경 없는 화면 **1.477157→0.460311초**, 변경 화면 **9.111533→7.927057초**다. 각각 publication **0/500회**, 작업·유휴·승인·질문 상태 각 4개를 유지했다. 유휴 판정을 2.2초 미리 준비해 측정 속도가 phase 전환 횟수에 영향을 주지 않게 했다. 기준 Core module/objects는 변경 전 133 provenance와 같고, 두 fixture와 실행 파일 지문도 검증했다. 근거는 `.runtime/performance/risk-scan-20261020/{verification.json,engine-comparison.json,production-policy-report.json,production-unicode.log}`다. 원본 읽기·입력·캡처·listener가 없는 합성 workload이며 설치 앱 전체 CPU/메모리나 실제 폰 지연의 개선율은 아니다.
+- Release 전체 빌드, 시스템 보호 **13/13**, 최종 전체 **360/360**이 통과했다. 실제 패키지 훅의 일반·복수 선택 질문 **8개**는 명시적인 HTTP 웹 답변까지 대기하며, 승인 지연·일시정지 중 재시작·유실 응답 replay·중복 방지·터미널 인계도 통과했다. 이 시험의 정상 확인 응답은 0.5초 취소 여유 포함 **562ms**였다. 133의 수동 선택 정책을 유지한다. 새 브라우저 시각 QA나 실물 휴대폰 시험은 하지 않았다.
+- 기존 발행자만 재사용한 패키징과 입력 구성요소 버전/상호 서명 결합, loopback 전용 웹·MCP·합성 PTY·포트 충돌/재시작 검사가 통과했다. App/CLI 각각 **38개 Mach-O section**과 웹 리소스 **13개**가 검사한 빌드/소스와 같고 설치 앱과 서명 요구사항도 같다. 새 인증서·신뢰/ACL·보안/VPN 정책 변경, 서비스 등록, 설치 앱 교체/재시작과 원본 터미널 입력은 없다. 키체인 검색 목록 전후 지문도 같다.
+- [GitHub v0.2.134](https://github.com/newdlops/autoapprove/releases/tag/v0.2.134)은 최신 정식 릴리스다. 소스 `dbe583091292f99290e3baca748a765c0d6cca34`와 주석 태그를 atomic push했고 공개 입력 **485개**가 태그와 일치한다. DMG **10,271,125바이트**, SHA-256 `56d44aee8256f9494cb8af28ed29d6d8dc90052b31cdb589add7fad222e13e3e`이며 DMG/체크섬 두 자산과 정상 TLS 익명 다운로드가 원본과 같다. 게시 근거는 `.runtime/releases/0.2.134/release-161-20261020/{release-validation.json,tag-source-check.json,publication.json}`다. 이 게시 결과 문서만 후속 커밋하고 태그는 고정한다. 개인 편집기/코드 인덱스와 비공개 측정·서명 자료는 배포하지 않았다.
+- 앞선 `.runtime/performance/lightweight-133/deferred-risk-candidate.patch`의 사전 후보는 이번 compact DFA로 대체됐다. 그 옛 dictionary 구현 패치를 다시 적용하지 않는다. 탐색용 microbench/기준 바이너리와 초기 빌드 실패는 비공개 디렉터리에 보존했다. 다음은 현재 134 Core의 남은 화면 분석 비용을 다시 프로파일링하고 근거에 따라 최적화할 차례다. 실제 설치 앱·폰의 종합 자원/지연 검증은 남아 있으며 전체 경량화 목표는 active다.
+
 ## 2026-10-20 · 0.2.133/160 · Claude 일반 선택 질문은 수동 응답
 
 - 사용자 지시: Claude의 선택 질문을 넘기지 않고 Yes/No·예/아니오·응·Allow 같은 확인·허용 질문만 자동 처리한다. `YesNoConfirmation`의 두 선택지 전용 느슨한 분기를 제거하고 모든 메뉴에 같은 완전한 승인 문구 검사를 적용했다. `Yes, use staging`, `No, run tests instead`, 설명이 붙은 작업 선택은 수동으로 남긴다. 정해진 CLI 거절 문구와 이번 요청만 승인하는 선택은 유지하며 `응`을 추가했다. 기록 질문의 `multiSelect`도 판별기에 전달한다.
