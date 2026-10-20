@@ -38,6 +38,19 @@ import AutoApproveCore
             reveal: {}, beginReply: { _ in }, cancelAutomaticReply: { _ in })
         do { try await actions.reply("question", "답변"); preconditionFailure("Reply errors must propagate") }
         catch { precondition(error.localizedDescription == "합성 실패") }
-        print("{\"displayVariants\":\(variants.count),\"latestHandlers\":\(calls.count),\"replyErrorsPropagate\":true}")
+        let drafts = QuestionReplyDrafts()
+        let first = drafts.draft(sessionID: "first", questionID: "question")
+        first.selected = [1]; first.customAnswer = "초안 e\u{301} 🧪"; first.submitting = true; first.error = "합성 오류"
+        let retained = drafts.draft(sessionID: "first", questionID: "question")
+        precondition(first === retained && retained.selected == [1] && retained.customAnswer == "초안 e\u{301} 🧪")
+        precondition(retained.submitting && retained.error == "합성 오류")
+        let other = drafts.draft(sessionID: "second", questionID: "question")
+        precondition(other !== first && other.customAnswer.isEmpty && other.selected.isEmpty && !other.submitting)
+        drafts.retain([.init(sessionID: "second", questionID: "question")])
+        precondition(drafts.draft(sessionID: "second", questionID: "question") === other)
+        precondition(drafts.draft(sessionID: "first", questionID: "question") !== first)
+        drafts.retain([])
+        precondition(drafts.draft(sessionID: "second", questionID: "question") !== other)
+        print("{\"displayVariants\":\(variants.count),\"latestHandlers\":\(calls.count),\"replyErrorsPropagate\":true,\"draftIdentityAndState\":true,\"sessionIsolation\":true,\"removedDraftsPruned\":true}")
     }
 }

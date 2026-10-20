@@ -12,6 +12,7 @@ import AutoApproveCore
     let engine: ApprovalEngine
     let notifications: QuestionNotifications
     @StateObject private var viewUpdates = WindowViewUpdates()
+    @StateObject private var questionDrafts = QuestionReplyDrafts()
     var openTerminal: (AgentSession, ApprovalEngine) async throws -> Void = TerminalNavigator.open
     @Environment(\.openWindow) private var openWindow
     @State private var selection: Set<String> = []
@@ -22,6 +23,11 @@ import AutoApproveCore
     @State private var openingTerminal = false
     @State private var editingSession: AgentSession?
     @State private var showing = false
+    private var liveQuestionIDs: Set<QuestionReplyKey> {
+        Set(engine.snapshot.sessions.filter { $0.phase != .ended }.flatMap { session in
+            session.questions.map { QuestionReplyKey(sessionID: session.id, questionID: $0.id) }
+        })
+    }
     private var selectedUnreadIDs: [String] {
         engine.snapshot.sessions.filter { selection.contains($0.id) }.flatMap { ($0.notices ?? []).filter { !$0.isRead }.map(\.id) }
     }
@@ -200,7 +206,7 @@ import AutoApproveCore
             }
         }
     }
-    var body: some View {
+    private var windowContent: some View {
         content.frame(minWidth: 780, minHeight: 560)
         .windowUpdates(viewUpdates, sources: [
             engine.$snapshot.dropFirst().map { _ in () }.eraseToAnyPublisher(),
@@ -234,14 +240,18 @@ import AutoApproveCore
                 isAvailable: engine.snapshot.sessions.contains { $0.id == session.id && $0.phase != .ended },
                 save: { try engine.setCustomization(session.id, value: $0) })
         }
+    }
+    var body: some View {
+        windowContent
         .onChange(of: visible.map(\.id)) { _, ids in
             selection.formIntersection(ids)
             if selection.isEmpty, let first = ids.first { selection = [first] }
         }
-        .onAppear { showing = true; readVisibleNotifications() }
+        .onAppear { showing = true; questionDrafts.retain(liveQuestionIDs); readVisibleNotifications() }
         .onDisappear { showing = false }
         .onChange(of: viewUpdates.isVisible) { _, visible in if visible { readVisibleNotifications() } }
         .onChange(of: selection) { _, _ in readVisibleNotifications() }
+        .onChange(of: liveQuestionIDs) { _, keys in questionDrafts.retain(keys) }
         .onChange(of: selectedUnreadIDs) { _, _ in readVisibleNotifications() }
         .onChange(of: selectedNotificationKeys) { _, _ in readVisibleNotifications() }
         .onChange(of: editingSession?.id) { _, id in if id == nil { readVisibleNotifications() } }
@@ -274,7 +284,9 @@ import AutoApproveCore
                           cancelAutomaticReply: { questionID in perform { try engine.cancelQuestionAutomaticReply(sessionID: id, questionID: questionID) } },
                           cancelCapacityResume: { engine.cancelCapacityResume(id) },
                           approveClaude: { sourceID, requestID, automatic in try engine.answerClaudeApproval(sessionID: sourceID, requestID: requestID, enableAutomatic: automatic) },
-                          releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) })
+                          releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) },
+                          questionDrafts: questionDrafts)
+                .id(session.id)
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
                 Text("세션을 선택해 상태를 확인하고 자동 승인을 켜세요.\n처음 사용하는 경우 연결 설정부터 시작하세요.")
@@ -482,9 +494,10 @@ private struct SessionDetail: View {
     let cancelCapacityResume: () -> Void
     let approveClaude: (String, String, Bool) throws -> Void
     let releaseClaude: (String, String) throws -> Void
+    var questionDrafts: QuestionReplyDrafts? = nil
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text(session.agent.title).font(.callout.weight(.medium)).foregroundStyle(.secondary)
@@ -624,7 +637,8 @@ private struct SessionDetail: View {
                 }
                 if session.agent == .codex {
                     CodexQuestionList(session: session, openingTerminal: openingTerminal, dismiss: dismissQuestion,
-                        reply: replyQuestion, reveal: reveal, beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply)
+                        reply: replyQuestion, reveal: reveal, beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply,
+                        drafts: questionDrafts)
                     Divider()
                 }
                 if session.agent == .shell {
@@ -790,18 +804,27 @@ struct CodexQuestionList: View {
     let reveal: () -> Void
     let beginReply: (String) -> Void
     let cancelAutomaticReply: (String) -> Void
+    var drafts: QuestionReplyDrafts? = nil
     @StateObject private var actions = CodexQuestionActions()
 
     var body: some View {
+        let questions = session.questions
+        let _ = {
+            if drafts == nil {
+                actions.drafts.retain(Set(questions.map { QuestionReplyKey(sessionID: session.id, questionID: $0.id) }))
+            }
+        }()
         let _ = actions.update(dismiss: dismiss, reply: reply, reveal: reveal,
             beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply)
-        CodexQuestionListDisplay(sessionID: session.id, questions: session.questions,
+        CodexQuestionListDisplay(sessionID: session.id, questions: questions,
             connectionError: session.codexQuestionsError, observed: session.codexQuestionsObservedAt != nil,
-            canReveal: session.canReveal, openingTerminal: openingTerminal, actions: actions).equatable()
+            canReveal: session.canReveal, openingTerminal: openingTerminal, actions: actions,
+            drafts: drafts ?? actions.drafts).equatable()
     }
 }
 
 @MainActor private final class CodexQuestionActions: ObservableObject, Equatable {
+    let drafts = QuestionReplyDrafts()
     private var dismissHandler: ((String) -> Void)?
     private var replyHandler: ((String, String) async throws -> Void)?
     private var revealHandler: (() -> Void)?
@@ -832,9 +855,17 @@ private struct CodexQuestionListDisplay: View, Equatable {
     let canReveal: Bool
     let openingTerminal: Bool
     let actions: CodexQuestionActions
+    let drafts: QuestionReplyDrafts
+
+    init(sessionID: String, questions: [QueuedQuestion], connectionError: String?, observed: Bool,
+         canReveal: Bool, openingTerminal: Bool, actions: CodexQuestionActions, drafts: QuestionReplyDrafts? = nil) {
+        self.sessionID = sessionID; self.questions = questions; self.connectionError = connectionError
+        self.observed = observed; self.canReveal = canReveal; self.openingTerminal = openingTerminal
+        self.actions = actions; self.drafts = drafts ?? actions.drafts
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        LazyVStack(alignment: .leading, spacing: 12) {
             ViewThatFits(in: .horizontal) {
                 HStack { queueHeading }.fixedSize(horizontal: true, vertical: false)
                 VStack(alignment: .leading, spacing: 4) { queueHeading }
@@ -861,7 +892,9 @@ private struct CodexQuestionListDisplay: View, Equatable {
                     QuestionReplyEditor(question: question, connectionError: connectionError,
                         canReveal: canReveal, openingTerminal: openingTerminal,
                         send: { answer in try await actions.reply(question.id, answer) }, dismiss: { actions.dismiss(question.id) }, reveal: actions.reveal,
-                        beginReply: { actions.beginReply(question.id) }, cancelAutomaticReply: { actions.cancelAutomaticReply(question.id) })
+                        beginReply: { actions.beginReply(question.id) }, cancelAutomaticReply: { actions.cancelAutomaticReply(question.id) },
+                        draft: drafts.draft(sessionID: sessionID, questionID: question.id))
+                        .id(QuestionReplyKey(sessionID: sessionID, questionID: question.id))
                     if question.id != questions.last?.id { Divider() }
                 }
             }
@@ -879,6 +912,31 @@ private struct CodexQuestionListDisplay: View, Equatable {
     }
 }
 
+struct QuestionReplyKey: Hashable {
+    let sessionID: String
+    let questionID: String
+}
+
+/// UI state belongs to the window, not to an offscreen lazy row. It never
+/// supplies process identity, question contents or permission to the engine.
+@MainActor final class QuestionReplyDrafts: ObservableObject, Equatable {
+    private var entries: [QuestionReplyKey: QuestionReplyDraft] = [:]
+    func draft(sessionID: String, questionID: String) -> QuestionReplyDraft {
+        let key = QuestionReplyKey(sessionID: sessionID, questionID: questionID)
+        if let draft = entries[key] { return draft }
+        let draft = QuestionReplyDraft(); entries[key] = draft; return draft
+    }
+    func retain(_ keys: Set<QuestionReplyKey>) { entries = entries.filter { keys.contains($0.key) } }
+    nonisolated static func == (lhs: QuestionReplyDrafts, rhs: QuestionReplyDrafts) -> Bool { lhs === rhs }
+}
+
+@MainActor final class QuestionReplyDraft: ObservableObject {
+    @Published var selected = Set<Int>()
+    @Published var customAnswer = ""
+    @Published var submitting = false
+    @Published var error: String?
+}
+
 struct QuestionReplyEditor: View {
     let question: QueuedQuestion
     let connectionError: String?
@@ -889,14 +947,20 @@ struct QuestionReplyEditor: View {
     let reveal: () -> Void
     let beginReply: () -> Void
     let cancelAutomaticReply: () -> Void
-    @State private var selected = Set<Int>()
-    @State private var customAnswer = ""
-    @State private var submitting = false
-    @State private var error: String?
+    @StateObject private var draft: QuestionReplyDraft
     @FocusState private var answerFocused: Bool
+    init(question: QueuedQuestion, connectionError: String?, canReveal: Bool, openingTerminal: Bool,
+         send: @escaping (String) async throws -> Void, dismiss: @escaping () -> Void,
+         reveal: @escaping () -> Void, beginReply: @escaping () -> Void, cancelAutomaticReply: @escaping () -> Void,
+         draft: QuestionReplyDraft? = nil) {
+        self.question = question; self.connectionError = connectionError; self.canReveal = canReveal
+        self.openingTerminal = openingTerminal; self.send = send; self.dismiss = dismiss; self.reveal = reveal
+        self.beginReply = beginReply; self.cancelAutomaticReply = cancelAutomaticReply
+        _draft = StateObject(wrappedValue: draft ?? QuestionReplyDraft())
+    }
     private var answer: String {
-        (question.options.enumerated().filter { selected.contains($0.offset) }.map(\.element)
-            + [customAnswer.trimmingCharacters(in: .whitespacesAndNewlines)]).filter { !$0.isEmpty }.joined(separator: "\n")
+        (question.options.enumerated().filter { draft.selected.contains($0.offset) }.map(\.element)
+            + [draft.customAnswer.trimmingCharacters(in: .whitespacesAndNewlines)]).filter { !$0.isEmpty }.joined(separator: "\n")
     }
     private var editing: Bool { question.reply == nil || question.reply?.canRetry == true }
     var body: some View {
@@ -907,20 +971,20 @@ struct QuestionReplyEditor: View {
             }
             if editing && connectionError == nil {
                 ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
-                    Toggle(isOn: Binding(get: { selected.contains(index) }, set: { beginReply(); if $0 { selected.insert(index) } else { selected.remove(index) } })) {
+                    Toggle(isOn: Binding(get: { draft.selected.contains(index) }, set: { beginReply(); if $0 { draft.selected.insert(index) } else { draft.selected.remove(index) } })) {
                         Text(option).font(.callout).fixedSize(horizontal: false, vertical: true)
-                    }.toggleStyle(.checkbox).disabled(submitting)
-                        .help(submitting ? AppHelp.sendingAnswer : (selected.contains(index) ? "이 항목을 답변에서 뺍니다. 답변 보내기를 눌러야 전송됩니다." : "이 항목을 답변에 포함합니다. 여러 항목을 선택하거나 설명을 덧붙일 수 있습니다."))
+                    }.toggleStyle(.checkbox).disabled(draft.submitting)
+                        .help(draft.submitting ? AppHelp.sendingAnswer : (draft.selected.contains(index) ? "이 항목을 답변에서 뺍니다. 답변 보내기를 눌러야 전송됩니다." : "이 항목을 답변에 포함합니다. 여러 항목을 선택하거나 설명을 덧붙일 수 있습니다."))
                 }
                 if question.options.count > 1 {
                     Text("여러 항목을 함께 선택할 수 있습니다.").font(.caption).foregroundStyle(.secondary)
                 }
-                TextField(question.options.isEmpty ? "답변을 입력하세요" : "직접 답변하거나 설명을 덧붙이세요", text: Binding(get: { customAnswer }, set: { beginReply(); customAnswer = $0 }), axis: .vertical)
-                    .textFieldStyle(.roundedBorder).lineLimit(2...5).disabled(submitting)
+                TextField(question.options.isEmpty ? "답변을 입력하세요" : "직접 답변하거나 설명을 덧붙이세요", text: Binding(get: { draft.customAnswer }, set: { beginReply(); draft.customAnswer = $0 }), axis: .vertical)
+                    .textFieldStyle(.roundedBorder).lineLimit(2...5).disabled(draft.submitting)
                     .focused($answerFocused)
                     .onChange(of: answerFocused) { _, focused in if focused { beginReply() } }
                     .accessibilityLabel("\(question.title) 직접 답변")
-                    .help(submitting ? AppHelp.sendingAnswer : "답변을 직접 쓰거나 선택한 항목에 설명을 덧붙입니다. 답변 보내기를 눌러야 전송됩니다.")
+                    .help(draft.submitting ? AppHelp.sendingAnswer : "답변을 직접 쓰거나 선택한 항목에 설명을 덧붙입니다. 답변 보내기를 눌러야 전송됩니다.")
             } else if connectionError != nil && editing {
                 ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
                     Text("\(index + 1). \(option)").font(.callout).foregroundStyle(.secondary)
@@ -938,7 +1002,7 @@ struct QuestionReplyEditor: View {
                         .help(reply.message)
                 }
                 if !editing { Text("답변: \(reply.answer)").font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
-            } else if let error {
+            } else if let error = draft.error {
                 Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     .help(error)
@@ -952,23 +1016,23 @@ struct QuestionReplyEditor: View {
     @ViewBuilder private var actions: some View {
         if editing && connectionError == nil {
             Button("답변 보내기") {
-                guard !submitting else { return }
-                submitting = true; error = nil
+                guard !draft.submitting else { return }
+                draft.submitting = true; draft.error = nil
                 let text = answer
                 Task {
-                    defer { submitting = false }
-                    do { try await send(text) } catch { self.error = error.localizedDescription }
+                    defer { draft.submitting = false }
+                    do { try await send(text) } catch { draft.error = error.localizedDescription }
                 }
             }.buttonStyle(.borderedProminent).controlSize(.small)
-                .disabled(answer.isEmpty || submitting)
-                .help(submitting ? AppHelp.sendingAnswer : (answer.isEmpty ? "선택지를 고르거나 답변을 입력하면 보낼 수 있습니다." : "선택한 항목과 입력한 답변을 이 Codex 대화에 보냅니다. 전송 내용을 승인 내역에 저장합니다."))
+                .disabled(answer.isEmpty || draft.submitting)
+                .help(draft.submitting ? AppHelp.sendingAnswer : (answer.isEmpty ? "선택지를 고르거나 답변을 입력하면 보낼 수 있습니다." : "선택한 항목과 입력한 답변을 이 Codex 대화에 보냅니다. 전송 내용을 승인 내역에 저장합니다."))
         }
         Button(action: reveal) { Label(openingTerminal ? "여는 중…" : "터미널에서 답하기", systemImage: "arrow.up.forward.app") }
-            .controlSize(.small).disabled(!canReveal || openingTerminal || submitting)
-            .help(submitting ? AppHelp.sendingAnswer : (openingTerminal ? "해당 터미널을 열고 있습니다. 잠시 기다려주세요." : (canReveal ? "해당 터미널을 열고 강조 표시합니다." : "터미널 연결이 필요합니다. 연결 설정을 확인해주세요.")))
+            .controlSize(.small).disabled(!canReveal || openingTerminal || draft.submitting)
+            .help(draft.submitting ? AppHelp.sendingAnswer : (openingTerminal ? "해당 터미널을 열고 있습니다. 잠시 기다려주세요." : (canReveal ? "해당 터미널을 열고 강조 표시합니다." : "터미널 연결이 필요합니다. 연결 설정을 확인해주세요.")))
         Button("목록에서 정리", action: dismiss).controlSize(.small)
-            .disabled(submitting || question.reply?.phase == .sending)
-            .help(submitting || question.reply?.phase == .sending ? AppHelp.sendingAnswer : "이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
+            .disabled(draft.submitting || question.reply?.phase == .sending)
+            .help(draft.submitting || question.reply?.phase == .sending ? AppHelp.sendingAnswer : "이미 처리한 질문을 AutoApprove 목록에서 정리합니다. Codex에 답변을 보내지는 않습니다.")
     }
 }
 
