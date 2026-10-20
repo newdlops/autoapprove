@@ -491,6 +491,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Local socket: restart descriptor lifetime and path ownership", tests.testLocalSocketRestartAndPathOwnership),
             ("History processing: metadata chunks, exact bytes and read bound", tests.testRolloutHeaderStopsAtFirstLineAndKeepsByteLimit),
             ("History processing: fresh long metadata and incomplete header rejection", tests.testRolloutBindingReadsFreshLongMetadataAndRejectsIncompleteHeaders),
+            ("History processing: warm metadata still revalidates current roots and failures", tests.testCodexCollectorRevalidatesWarmRolloutMetadata),
             ("History processing: unchanged queries, delta, reset, thread switch and failure", tests.testUnchangedHistoryStillChecksUpdatesResetsAndFailures),
             ("History processing: risk variants, Unicode and fresh installer source", tests.testSystemRiskLazyVariantsRetainWhitespaceUnicodeAndFreshSource),
             ("Screen parsing: Cocoa preparation preserves prompt identity and quoted questions", tests.testCocoaLinePreparationPreservesPromptIdentityAndQuotedQuestions),
