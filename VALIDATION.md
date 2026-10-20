@@ -1,5 +1,12 @@
 # AutoApprove 검증 기록
 
+## 0.2.148 추가 실측 · 활동 정규식 재사용 후보 미채택
+
+- 현재 설치된 148/175의 45.166초 관찰은 부모 CPU 2.548초(한 코어 약 5.64%), footprint 113,706,016~122,192,928바이트, package idle wakeup 0회였다. 작업 중인 단일 관찰이므로 버전 간 개선율·유휴·누수 검증이 아니다. 근거는 `.runtime/performance/installed-148-20261020/`다.
+- 후보의 기본 Swift Regex는 Unicode 단어 경계 비교에서 실패했다. [Foundation의 정규식 캐시 구현](https://github.com/swiftlang/swift-foundation/blob/main/Sources/FoundationEssentials/String/RegexPatternCache.swift)과 같은 simple 경계를 적용한 뒤 predicate 70,328건과 실제 detector 2,972건의 바이트가 같았다. 단독 predicate 3쌍의 CPU 중앙값 0.057294→0.049597초는 이 후보의 채택 근거로 쓰지 않았다.
+- 실제 Release Core·영어/혼합 Cocoa 16세션·500회·고정 8쌍의 영어 변경 CPU 중앙값 **5.608951→5.8749315초**, 혼합 변경 **8.639018→8.651827초**는 사전 비율 한도 **0.97**에 실패했다. 변경 없는 경우는 각각 0.5601115→0.5881035초, 0.680407→0.682343초로 한도 1.10 안이었다. peak RSS 23,584,768→23,609,344바이트도 한도 안이었다. 상태 각 4개·publication 0/500회와 입력/캡처/listener 0이 같았다. 모든 표본과 실패 결과를 보존하며 기준 완화·표본 제외/추가는 없다. 앱 전체·실물 폰/VPN 개선율로 해석하지 않는다.
+- 후보 **373/373** 후 제품 소스 90개를 정확한 출시 148로 원복했고, 복원한 Core의 객체 91개·모듈이 기존 출시 검증 지문과 같으며 전체 **373/373**을 다시 통과했다. 새 Unicode 단어 경계·실제 초안 회귀만 유지한다. 최초 추가 검사의 잘못된 long-s 기대와 비교 도구의 컴파일 시간 초과는 비공개 로그에 남겼다. 현재 앱의 실행 파일 SHA·서명·148/175 API·같은 노드/포트·원본 프로세스 24개도 재확인했다. 앱 업데이트·버전 증가·새 GitHub 릴리스는 없으며 기존 v0.2.148을 유지한다. UI/시각 QA·보안/VPN/권한 변경·원본 시험 입력은 없다. 근거는 `.runtime/performance/activity-regex-149-20261020/{engine-comparison.json,decision.json,installed-check.json,restored-checks/checks-identity.json}`이다.
+
 ## 0.2.148 Release 실행 파일 심볼 정리 · 빌드 175
 
 - `package-app.mjs`는 Release의 App/CLI 복사본에만 Apple `strip -S -x`를 적용한 뒤 기존 발행자로 정상 서명한다. 입력 빌드 파일·Debug 패키지·기존 설치본은 정리하지 않는다. 해시로 구분한 진단용 원본은 앱 밖의 비공개 `.runtime/release-symbols/`에 보관한다. 실제 원본으로 로컬 Swift 함수 이름을 오프라인 복원했고 UUID가 정리한 파일과 같음을 확인했다.

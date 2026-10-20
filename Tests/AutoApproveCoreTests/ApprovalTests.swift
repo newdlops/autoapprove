@@ -271,6 +271,25 @@ import AutoApproveCore
             try expectEqual(PromptDetector.normalizedLines(screen), expected)
         }
     }
+    func testActivityHintsPreserveUnicodeWordsAndRealDrafts() throws {
+        let composer = "\n›\n? for shortcuts"
+        for prefix in ["X", "흺\u{301}", "é", "e\u{301}", "١"] {
+            let result = ActivityDetector.detect(prefix + "1 background tasks" + composer, agent: .codex)
+            try expectEqual(result.phase, .idle)
+            try expectFalse(result.monitoring, "Digits attached to a Unicode word are not a background task count")
+        }
+        for prefix in ["", "• ", "✓ ", "🙂 "] {
+            let result = ActivityDetector.detect(prefix + "1 background task" + composer, agent: .codex)
+            try expectEqual(result.phase, .idle)
+            try expect(result.monitoring)
+        }
+        for hint in ["ESC TO INTERRUPT", "ctrl+c to STOP", "TAB TO QUEUE"] {
+            try expectEqual(ActivityDetector.detect(hint + composer, agent: .codex).phase, .working, "Working hint \(hint.debugDescription)")
+        }
+        try expectEqual(ActivityDetector.detect("❯ Try “한글 e\u{301} 👨‍👩‍👧‍👦”\n? for shortcuts", agent: .claude).phase, .idle)
+        try expectEqual(ActivityDetector.detect("❯ Try “task”\0\n? for shortcuts", agent: .claude).phase, .input)
+        try expectEqual(ActivityDetector.detect("› 1. Choice\n? for shortcuts", agent: .codex).phase, .unknown)
+    }
     func testIdleConfirmationAndGenerationChange() throws {
         let idle = "Done.\n›\n? for shortcuts"
         let time = Date(timeIntervalSince1970: 1_000)
@@ -834,6 +853,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("only Claude/Codex terminals enter the inventory", tests.testOrdinaryTerminalsAreExcluded),
             ("agent exit excludes ordinary shells and idle counts", tests.testAgentExitDoesNotExposeShellOrCountItAsIdle),
             ("ready composer versus quiet work and unknown screens", tests.testActivityNeedsAReadyComposerNotSilence),
+            ("activity hints preserve Unicode words and real drafts", tests.testActivityHintsPreserveUnicodeWordsAndRealDrafts),
             ("prompt line normalization preserves CR/LF, canonical text and trailing blank removal", tests.testPromptLineNormalizationPreservesNewlinesAndCanonicalText),
             ("stable idle confirmation and new screen generations", tests.testIdleConfirmationAndGenerationChange),
             ("idle duration, work transition, connection loss", tests.testEngineClearsIdleOnWorkAndDisconnection),
