@@ -34,9 +34,10 @@ struct ScreenAnalysis: Sendable {
             } else { request = nil }
         } else { request = nil }
         self.request = request
-        // Only a complete current question parses another menu. Ordinary output
-        // never scans model names or constructs a model preference candidate.
+        // A model decision requires a model reference in its question. Reject
+        // unrelated questions before reconstructing their full menu identity.
         if agent != .shell, prompt == nil, stop == nil, request?.phase == .input,
+           let request, AutomaticQuestionDecision.mentionsModel(request.summary),
            let choice = TerminalChoiceQuestion.detect(raw, agent: agent, prepared: lines, permissionPrompt: prompt, request: request),
            AutomaticQuestionDecision.currentModelIndex(question: choice.question, options: choice.options) != nil {
             modelChoice = choice
