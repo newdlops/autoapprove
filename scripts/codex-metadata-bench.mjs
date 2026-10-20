@@ -6,6 +6,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 const option=(name,fallback)=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3)??fallback;
 const label=option('label','current');assert.match(label,/^[a-z0-9-]+$/);
+const mode=option('mode',null);
 const build=path.resolve(option('core-build','.build/release')),output=path.resolve('.runtime/codex-metadata-bench',label);
 const root=path.resolve('.runtime/codex-metadata-bench/synthetic-fixture'),binary=output+'/check';
 await mkdir(output,{recursive:true,mode:0o700});await mkdir(root,{recursive:true,mode:0o700});
@@ -39,6 +40,6 @@ const provenance={label,fixtureSHA256:createHash('sha256').update(fixture).diges
 await writeFile(output+'/provenance.json',JSON.stringify(provenance,null,2)+'\n',{mode:0o600});
 if(process.argv.includes('--package-only')){console.log(binary);process.exit(0);}
 const databaseSHA256=await sha(root+'/thread_history_1.sqlite');
-const report=JSON.parse(execFileSync(binary,process.argv.includes('--check-cache')?['--check-cache']:[root],{encoding:'utf8',timeout:120000,maxBuffer:100000}));
+const report=JSON.parse(execFileSync(binary,process.argv.includes('--check-cache')?['--check-cache']:[root,...(mode?['--mode='+mode]:[])],{encoding:'utf8',timeout:120000,maxBuffer:100000}));
 assert.equal(await sha(root+'/thread_history_1.sqlite'),databaseSHA256,'Collector must leave its source database unchanged');
 const result={...provenance,databaseSHA256,...report};await writeFile(output+'/report.json',JSON.stringify(result,null,2)+'\n',{mode:0o600});console.log(JSON.stringify(result));

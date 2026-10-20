@@ -523,6 +523,7 @@ public actor CodexQuestionCollector {
     private var readers: [String: CodexSessionHistoryReader] = [:]
     private let historyConnections = CodexHistoryConnectionCache(capacity: 4)
     private var metadata = CodexRolloutMetadataCache()
+    private var hasCollectedMetadata = false
     private let fileReader: @Sendable (AgentSession, TimeInterval) throws -> [String]
     public init(fileReader: @escaping @Sendable (AgentSession, TimeInterval) throws -> [String] = {
         try ProcessOpenFiles.codexRolloutPaths(pid:$0.pid,expectedStart:$0.started,timeout:$1)
@@ -531,7 +532,11 @@ public actor CodexQuestionCollector {
         let targets = sessions.filter { $0.agent == .codex && $0.phase != .ended }
         let liveIDs = Set(targets.map(\.id))
         readers = readers.filter { liveIDs.contains($0.key) }
-        guard !targets.isEmpty else { historyConnections.closeAll(); metadata.retain(paths: []); return [] }
+        guard !targets.isEmpty else { historyConnections.closeAll(); metadata.retain(paths: []); hasCollectedMetadata = false; return [] }
+        // A one-shot collection should release its large header buffers. Start
+        // retaining byte-verified projections only when the collector is reused.
+        let cacheMetadata = hasCollectedMetadata
+        hasCollectedMetadata = true
         // Share one bounded time budget across all process metadata reads.
         // Resolve exact open rollout paths before using the history connection.
         let deadline = ProcessInfo.processInfo.systemUptime + 4
@@ -541,10 +546,12 @@ public actor CodexQuestionCollector {
         for session in targets {
             do {
                 let files = try fileReader(session,max(0,deadline-ProcessInfo.processInfo.systemUptime))
-                locations[session.id] = try CodexThreadLocation.locate(paths:files, rootThreadID: { path, data in
-                    liveMetadataPaths.insert(path)
-                    return metadata.rootThreadID(path: path, data: data, decode: CodexThreadLocation.rootThreadID)
-                })
+                if cacheMetadata {
+                    locations[session.id] = try CodexThreadLocation.locate(paths:files, rootThreadID: { path, data in
+                        liveMetadataPaths.insert(path)
+                        return metadata.rootThreadID(path: path, data: data, decode: CodexThreadLocation.rootThreadID)
+                    })
+                } else { locations[session.id] = try CodexThreadLocation.locate(paths:files) }
             } catch { failures[session.id] = error.localizedDescription }
         }
         let activeDatabases = Set(locations.values.map(\.database))

@@ -57,7 +57,10 @@ private final class FileCalls: @unchecked Sendable {
             tty:"/dev/fixture-\($0)",cwd:root.path,terminal:.terminal) }
         let paths=Dictionary(uniqueKeysWithValues:zip(sessions.map(\.id),files.map(\.path)))
         var phases:[[String:Any]]=[]
-        for mode in ["small-steady","large-steady","large-append","large-change","large-over-capacity","cold"] {
+        let modes=["small-steady","large-steady","large-append","large-change","large-over-capacity","cold"]
+        let requested=CommandLine.arguments.first(where:{$0.hasPrefix("--mode=")}).map{String($0.dropFirst(7))}
+        if let requested { precondition(modes.contains(requested),"Unknown synthetic workload") }
+        for mode in modes where requested == nil || requested == mode {
             let large=mode != "small-steady",rounds=mode=="cold" ? 12 : ["large-change","large-over-capacity"].contains(mode) ? 30 : 60
             for index in files.indices { try header("root-\(index)",large:large,scale:mode=="large-over-capacity" ? 4 : 1).write(to:files[index]) }
             let firstHeaderBytes=try Data(contentsOf:files[0]).count-1
@@ -65,7 +68,7 @@ private final class FileCalls: @unchecked Sendable {
             func makeCollector() -> CodexQuestionCollector {
                 CodexQuestionCollector(fileReader:{ session,_ in calls.record();return paths[session.id].map{[$0]} ?? [] })
             }
-            let collector=makeCollector()
+            let collector=mode=="cold" ? nil : makeCollector()
             func verify(_ updates: [CodexQuestionUpdate]) throws {
                 guard updates.count==count else { throw AppError.message("Synthetic session count changed") }
                 for (index,update) in updates.enumerated() {
@@ -74,7 +77,7 @@ private final class FileCalls: @unchecked Sendable {
                           update.questions?.first?.title=="Synthetic question \(index)" else { throw AppError.message("Synthetic collector projection changed") }
                 }
             }
-            for _ in 0..<2 { try verify(await collector.collect(sessions)) }
+            for _ in 0..<2 { try verify(await (collector ?? makeCollector()).collect(sessions)) }
             var elapsed=0.0,consumed=0.0
             for generation in 0..<rounds {
                 try autoreleasepool {
@@ -87,7 +90,7 @@ private final class FileCalls: @unchecked Sendable {
                         }
                     }
                 }
-                let active=mode=="cold" ? makeCollector() : collector
+                let active=collector ?? makeCollector()
                 let before=cpu(),began=ProcessInfo.processInfo.systemUptime
                 let updates=await active.collect(sessions)
                 consumed+=cpu()-before;elapsed+=ProcessInfo.processInfo.systemUptime-began
