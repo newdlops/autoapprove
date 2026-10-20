@@ -790,46 +790,89 @@ struct CodexQuestionList: View {
     let reveal: () -> Void
     let beginReply: (String) -> Void
     let cancelAutomaticReply: (String) -> Void
+    @StateObject private var actions = CodexQuestionActions()
+
+    var body: some View {
+        let _ = actions.update(dismiss: dismiss, reply: reply, reveal: reveal,
+            beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply)
+        CodexQuestionListDisplay(sessionID: session.id, questions: session.questions,
+            connectionError: session.codexQuestionsError, observed: session.codexQuestionsObservedAt != nil,
+            canReveal: session.canReveal, openingTerminal: openingTerminal, actions: actions).equatable()
+    }
+}
+
+@MainActor private final class CodexQuestionActions: ObservableObject, Equatable {
+    private var dismissHandler: ((String) -> Void)?
+    private var replyHandler: ((String, String) async throws -> Void)?
+    private var revealHandler: (() -> Void)?
+    private var beginReplyHandler: ((String) -> Void)?
+    private var cancelAutomaticReplyHandler: ((String) -> Void)?
+
+    func update(dismiss: @escaping (String) -> Void, reply: @escaping (String, String) async throws -> Void,
+                reveal: @escaping () -> Void, beginReply: @escaping (String) -> Void,
+                cancelAutomaticReply: @escaping (String) -> Void) {
+        dismissHandler = dismiss; replyHandler = reply; revealHandler = reveal
+        beginReplyHandler = beginReply; cancelAutomaticReplyHandler = cancelAutomaticReply
+    }
+    func dismiss(_ id: String) { dismissHandler?(id) }
+    func reply(_ id: String, _ answer: String) async throws { try await replyHandler?(id, answer) }
+    func reveal() { revealHandler?() }
+    func beginReply(_ id: String) { beginReplyHandler?(id) }
+    func cancelAutomaticReply(_ id: String) { cancelAutomaticReplyHandler?(id) }
+    nonisolated static func == (lhs: CodexQuestionActions, rhs: CodexQuestionActions) -> Bool { lhs === rhs }
+}
+
+// Observation timestamps and activity elsewhere in the session do not change
+// this queue. Keep the editors (and their drafts) intact until its inputs change.
+private struct CodexQuestionListDisplay: View, Equatable {
+    let sessionID: String
+    let questions: [QueuedQuestion]
+    let connectionError: String?
+    let observed: Bool
+    let canReveal: Bool
+    let openingTerminal: Bool
+    let actions: CodexQuestionActions
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             ViewThatFits(in: .horizontal) {
                 HStack { queueHeading }.fixedSize(horizontal: true, vertical: false)
                 VStack(alignment: .leading, spacing: 4) { queueHeading }
             }
-            if let error = session.codexQuestionsError {
+            if let error = connectionError {
                 Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     .help("질문 기록을 읽지 못했습니다. 연결 복구 후 자동 갱신하며, 터미널에서 직접 답할 수 있습니다.\n" + error)
-                if !session.questions.isEmpty {
+                if !questions.isEmpty {
                     Text("마지막으로 수집한 질문입니다. 연결이 복구되면 갱신합니다.").font(.caption).foregroundStyle(.secondary)
                 }
-            } else if session.codexQuestionsObservedAt == nil {
+            } else if !observed {
                 HStack { ProgressView().controlSize(.small); Text("Codex 질문 기록을 확인하고 있습니다…").font(.callout).foregroundStyle(.secondary) }
                     .help("이 Codex 대화에서 답변을 기다리는 질문을 불러오고 있습니다.")
-            } else if session.questions.isEmpty {
+            } else if questions.isEmpty {
                 Text("답변을 기다리는 질문이 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
-            if !session.questions.isEmpty {
-                if !session.unansweredQuestions.isEmpty && session.codexQuestionsError == nil {
+            if !questions.isEmpty {
+                if questions.contains(where: \.needsAnswer) && connectionError == nil {
                     Text("직접 선택하거나 입력하면 해당 질문의 자동 응답을 멈춥니다. 작성한 답변은 ‘답변 보내기’를 눌러 전달하세요.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                ForEach(session.questions) { question in
-                    QuestionReplyEditor(question: question, connectionError: session.codexQuestionsError,
-                        canReveal: session.canReveal, openingTerminal: openingTerminal,
-                        send: { answer in try await reply(question.id, answer) }, dismiss: { dismiss(question.id) }, reveal: reveal,
-                        beginReply: { beginReply(question.id) }, cancelAutomaticReply: { cancelAutomaticReply(question.id) })
-                    if question.id != session.questions.last?.id { Divider() }
+                ForEach(questions) { question in
+                    QuestionReplyEditor(question: question, connectionError: connectionError,
+                        canReveal: canReveal, openingTerminal: openingTerminal,
+                        send: { answer in try await actions.reply(question.id, answer) }, dismiss: { actions.dismiss(question.id) }, reveal: actions.reveal,
+                        beginReply: { actions.beginReply(question.id) }, cancelAutomaticReply: { actions.cancelAutomaticReply(question.id) })
+                    if question.id != questions.last?.id { Divider() }
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
     @ViewBuilder private var queueHeading: some View {
         Text("질문 대기열").font(.headline)
-        Text("응답 대기 \(session.unansweredQuestions.count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+        Text("응답 대기 \(questions.filter(\.needsAnswer).count)건").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
             .help("아직 답변을 보내지 않은 Codex 질문 수입니다. 작업 진행 상태와 별도로 유지됩니다.")
-        if session.questions.contains(where: { $0.reply?.phase == .queued }) {
-            Text("전달 대기 \(session.questions.filter { $0.reply?.phase == .queued }.count)건")
+        if questions.contains(where: { $0.reply?.phase == .queued }) {
+            Text("전달 대기 \(questions.filter { $0.reply?.phase == .queued }.count)건")
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 .help("답변을 접수했습니다. 각 질문에서 실제 전달 경로와 상태를 확인할 수 있습니다.")
         }
