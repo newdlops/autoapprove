@@ -1,5 +1,16 @@
 # AutoApprove 작업 인계
 
+## 2026-10-20 · 0.2.135/162 · Cocoa 행 준비를 작은 UTF-16 버퍼로 처리
+
+- 이전 목표 턴은 progress다. 134를 실제 배포한 뒤 그 Core의 합성 16세션 변경 화면 구간만 Apple `sample`로 관찰했다. `DetectionLines.raw`→`PromptDetector.normalizedLinesAndUTF8ByteCount`의 foreign 문자열 행 복사와 scalar 접근이 큰 경로였다. 원시 자료는 `.runtime/performance/engine-profile-134-20261020/`에 보존한다. 샘플 수는 CPU 백분율이 아니며 이 프로세스의 footprint/RSS를 설치 앱 메모리로 해석하지 않는다.
+- `normalizedLinesAndUTF8ByteCount`는 최대 **4,096개 UTF-16 단위(8KiB)**를 임시 버퍼로 읽고 정상 행을 UTF-8 출력에 직접 인코딩한다. UTF-8 크기·전체 행 인코딩·남은 범위를 확인하며 잘못된 UTF-16이나 인코딩 실패에는 이전 scalar slice 동작으로 돌아간다. high/low surrogate와 CRLF 상태를 버퍼 경계에서도 유지하고 원문 바이트 예산은 NFC·끝 공백 제거 전에 센다. 별도 전체 화면 UTF-8 복사본이나 입력/행 결과 캐시는 추가하지 않았다.
+- `DetectionLines`의 원래 저장소 선택·suffix metadata·code fence 경로는 바꾸지 않았다. 특히 Cocoa를 native로 강제 변환해 suffix 경로가 달라지게 하지 않는다. 처음 시험한 전체 `makeContiguousUTF8` 복사는 제품에 적용하지 않았다. 제품 함수와 `v0.2.134` 원본의 행·바이트·저장소 상태·지연 호출 순서·코드 블록 **2,164건**, 유효 Unicode scalar **1,112,064개 전부**, 명시적 버퍼 경계 **28개**가 일치했다. 전체 scalar 입력이 descriptor에서 잘리지 않았다는 값/바이트 검사도 통과했다. Greek grave의 canonical fence와 비정상 UTF-16도 포함한다.
+- 실제 엔진에 동일한 사전 준비 Cocoa 화면 **16개·500회**를 넣어 이전/수정 **3쌍 교대** 측정했다. 변경 화면 CPU 중앙값은 **7.541357→5.106739초**, wall **7.697844→5.216132초**다. 변경 없는 화면 CPU **0.385509→0.378617초**는 비슷한 수준이며 절감률을 주장하지 않는다. 세션 상태 각 4개와 publication **0/500회**를 유지했다. 기준 Core는 134 프로파일의 module/objects와 같고 fixture/실행 파일/소스 지문도 검증했다. 근거는 `.runtime/performance/line-copy-135-20261020/{verification.json,engine-comparison.json,production-check.log}`다. 합성 처리 경로의 측정이며 실제 Mac 앱·휴대폰·VPN 종합 속도 측정이 아니다. 이전 턴의 다른 baseline과 퍼센트를 합치지 않는다.
+- Release 전체 빌드와 최종 **361/361**, Debug 내부 화면 parsing **4/4**가 통과했다. 실제 패키지 훅의 일반/복수 선택 **8개**는 명시적 HTTP 답변까지 기다렸고, 기존 승인·0.5초 취소 여유·일시정지 중 재시작·유실 응답 replay·중복 방지·터미널 인계도 통과했다. 이 합성 훅의 정상 확인 응답은 **561ms**였다. 원본 지문·NFC·인용 질문과 133의 수동 선택 정책을 유지한다. 새 브라우저 시각 QA나 실물 휴대폰 검사는 하지 않았다.
+- 새 패키지의 입력 구성요소 버전/상호 서명 결합, loopback 전용 웹·MCP·합성 PTY·포트/재시작 검사가 통과했다. App/CLI 각각 **38개 Mach-O section**, 웹 파일 **13개**가 검사한 빌드/소스와 같다. 기존 발행자만 재사용했고 키체인 검색 목록은 전후 동일하다. 신뢰/ACL·권한·보안/VPN 정책 변경, 서비스 등록, 설치 앱 교체/재시작과 원본 터미널 입력은 없다.
+- [GitHub v0.2.135](https://github.com/newdlops/autoapprove/releases/tag/v0.2.135)은 최신 정식 릴리스다. 소스 `9df1fcb2b559eb5bd71178916760a5b51f665f6f`와 주석 태그를 atomic push했고 공개 입력 **487개**가 태그와 일치한다. DMG **10,266,701바이트**, SHA-256 `1a1abc2394bd7c8ba12cca0aef39772ac4f302cebbaaccecbb8a5d1b621635ba`이며 DMG/체크섬 두 자산과 정상 TLS 익명 다운로드를 원본과 대조했다. 근거는 `.runtime/releases/0.2.135/release-162-20261020/{release-validation.json,tag-source-check.json,publication.json}`이다. 게시 결과 문서만 후속 커밋하고 태그는 고정한다. 비공개 측정/서명 자료와 개인 IDE/코드 인덱스 변경은 게시하지 않았다.
+- 전체 경량화 목표는 active다. 다음은 현재 135 Core의 남은 분석 비용을 다시 측정하고 실제 설치 앱·UI·네트워크의 종합 CPU/메모리/지연을 확인할 차례다. 프로파일 없이 다음 병목을 단정하거나 이번 합성 결과를 전체 앱 개선율로 확대하지 않는다.
+
 ## 2026-10-20 · 0.2.134/161 · 반복 위험 명령 후보 검색 경량화
 
 - 이전 목표 턴은 progress다. 일반 Claude 선택을 수동으로 유지하는 0.2.133을 실제 배포했고, 이번에는 프로파일에서 비용이 컸던 `SystemCommandRisk`의 후보 검색을 줄였다. `RiskCandidateMatcher`는 29개 ASCII 기호의 `UInt16` Aho–Corasick 전이표를 한 번 준비한다. 기존과 같은 NFC·공백 제거 입력에서 확실한 음성 결과만 정규식을 생략한다. 후보가 있거나 case folding/미할당 Unicode가 불확실하면 기존 판정으로 돌아간다. 후보 단어와 정규식은 같은 목록에서 만들며 입력·판정·설치 스크립트 결과는 캐시하지 않는다.
