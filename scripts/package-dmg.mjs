@@ -32,6 +32,7 @@ execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app], { std
 const temporary = await mkdtemp(path.join(tmpdir(), 'autoapprove-dmg-'));
 const staging = path.join(temporary, 'staging');
 const image = path.join(temporary, filename);
+const sourceImage = path.join(temporary, 'uncompressed.dmg');
 const mounted = path.join(temporary, 'mounted');
 let attached = false;
 try {
@@ -40,7 +41,9 @@ try {
   execFileSync('/usr/bin/ditto', ['--noqtn', app, path.join(staging, 'AutoApprove.app')], { stdio: 'inherit' });
   await symlink('/Applications', path.join(staging, 'Applications'));
   await writeFile(path.join(staging, guideName), guide);
-  execFileSync('/usr/bin/hdiutil', ['create', '-volname', `AutoApprove ${version}`, '-srcfolder', staging, '-fs', 'HFS+', '-format', 'UDZO', '-imagekey', 'zlib-level=9', image], { stdio: 'inherit' });
+  // Serial conversion avoids unused gaps in the compressed data fork.
+  execFileSync('/usr/bin/hdiutil', ['create', '-volname', `AutoApprove ${version}`, '-srcfolder', staging, '-fs', 'HFS+', '-format', 'UDRO', sourceImage], { stdio: 'inherit' });
+  execFileSync('/usr/bin/hdiutil', ['convert', '-format', 'ULFO', '-tasks', '1', '-o', image, sourceImage], { stdio: 'inherit' });
   execFileSync('/usr/bin/hdiutil', ['verify', image], { stdio: 'inherit' });
   execFileSync('/usr/bin/hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mounted, image], { stdio: 'inherit' });
   attached = true;

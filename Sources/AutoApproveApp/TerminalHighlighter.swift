@@ -7,49 +7,65 @@ import SwiftUI
     private var panel: HighlightPanel?
     private var lifetime: Task<Void, Never>?
     private var activationObserver: NSObjectProtocol?
+    private var generation = UUID()
+
+    static func visibleFrame(_ frame: CGRect, screens: [CGRect]) -> CGRect? {
+        guard !frame.isNull, !frame.isInfinite,
+              [frame.minX, frame.minY, frame.width, frame.height, frame.maxX, frame.maxY].allSatisfy(\.isFinite),
+              frame.width > 0, frame.height > 0 else { return nil }
+        let desktop = screens.filter { !$0.isEmpty && !$0.isInfinite && !$0.isNull }.reduce(CGRect.null) { $0.union($1) }
+        let visible = frame.intersection(desktop)
+        guard !visible.isNull, !visible.isEmpty, !visible.isInfinite,
+              [visible.minX, visible.minY, visible.width, visible.height].allSatisfy(\.isFinite) else { return nil }
+        return visible
+    }
 
     func show(frame: CGRect, project: String, detail: String, ownerBundleID: String) {
         dismiss()
-        guard frame.width > 0, frame.height > 0,
-              NSScreen.screens.contains(where: { $0.frame.intersects(frame) }) else { return }
+        guard let frame = Self.visibleFrame(frame, screens: NSScreen.screens.map(\.frame)) else { return }
+        let generation = self.generation
         lifetime = Task { [weak self] in
             // Allow activation and a minimized-window restoration to finish before marking its location.
             do { try await Task.sleep(nanoseconds: 200_000_000) } catch { return }
-            guard let self, !Task.isCancelled else { return }
-            let panel = HighlightPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            guard let self, !Task.isCancelled, self.generation == generation else { return }
+            // One reusable panel/hosting tree bounds repeated reveal allocation.
+            // Its frame is decorative and is never written to the source window.
+            let panel = self.panel ?? HighlightPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.setFrame(frame, display: false)
+            panel.alphaValue = 1
             panel.title = "선택한 터미널 · \(project)"
             panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
             panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = false
             panel.isReleasedWhenClosed = false; panel.level = .floating
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-            panel.contentView = NSHostingView(rootView: TerminalHighlight(project: project, detail: detail))
+            let content = TerminalHighlight(project: project, detail: detail)
+            if let hosting = panel.contentView as? NSHostingView<TerminalHighlight> { hosting.rootView = content }
+            else { panel.contentView = NSHostingView(rootView: content) }
             self.panel = panel
             panel.orderFrontRegardless()
             self.activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
                 let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-                if app?.bundleIdentifier != ownerBundleID { Task { @MainActor in self?.dismiss() } }
+                if app?.bundleIdentifier != ownerBundleID { Task { @MainActor in
+                    guard let self, self.generation == generation else { return }
+                    self.dismiss()
+                } }
             }
             NSAccessibility.post(element: panel, notification: .announcementRequested, userInfo: [
                 .announcement: "\(project), \(detail) 터미널을 열었습니다.", .priority: NSAccessibilityPriorityLevel.medium.rawValue
             ])
             do { try await Task.sleep(nanoseconds: 3_000_000_000) } catch { return }
             guard !Task.isCancelled else { return }
-            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-                await NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.18
-                    panel.animator().alphaValue = 0
-                }
-            }
-            guard !Task.isCancelled, self.panel === panel else { return }
+            guard !Task.isCancelled, self.generation == generation, self.panel === panel else { return }
             self.dismiss()
         }
     }
 
     func dismiss() {
+        generation = UUID()
         lifetime?.cancel(); lifetime = nil
         if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
         activationObserver = nil
-        panel?.orderOut(nil); panel?.close(); panel = nil
+        panel?.orderOut(nil)
     }
 }
 

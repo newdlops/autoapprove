@@ -33,8 +33,17 @@ public enum CommandRunner {
         group.enter()
         DispatchQueue.global().async { err = stderr.fileHandleForReading.readDataToEndOfFile(); group.leave() }
         let finished = exited.wait(timeout: .now() + max(0, timeout))
-        if finished == .timedOut && process.isRunning {
-            process.terminate()
+        if finished == .timedOut {
+            // A timed-out helper must not accumulate after ignoring SIGTERM.
+            // Only this invocation's owned child is terminated; never its
+            // caller, another terminal, or a process group.
+            if process.isRunning {
+                process.terminate()
+                if exited.wait(timeout: .now() + 0.2) == .timedOut, process.isRunning {
+                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                    _ = exited.wait(timeout: .now() + 0.2)
+                }
+            }
             throw AppError.message("명령 응답 시간이 초과되었습니다: \(URL(fileURLWithPath: executable).lastPathComponent)")
         }
         group.wait()

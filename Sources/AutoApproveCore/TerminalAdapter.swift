@@ -139,7 +139,9 @@ public struct ScreenHostAdapter: Sendable {
 
 enum AutomationScript {
     static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8) throws -> String {
-        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript", "-e", body], timeout: timeout)
+        // Keep repeated scripts and complete prompt text out of the command
+        // line. Standard input preserves their original Unicode bytes as well.
+        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript"], timeout: timeout, input: Data(body.utf8))
         guard result.status == 0 else {
             if result.error.contains("-1743") { throw denied }
             throw AppError.message("\(app) 연결 실패: \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))")
@@ -467,9 +469,18 @@ public enum TerminalAdapter {
         })();
         """
     }
-    public static func reveal(tty: String) throws -> TerminalWindowBounds {
+    public static func reveal(tty: String) throws -> TerminalWindowBounds? {
+        let owner = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first?.processIdentifier
         let output = try javascript(revealScript(tty: tty))
-        return try JSONDecoder().decode(TerminalWindowBounds.self, from: Data(output.utf8))
+        struct Revealed: Decodable { var windowID: UInt32? }
+        let revealed = try JSONDecoder().decode(Revealed.self, from: Data(output.utf8))
+        // Revealing is complete even when a virtual/closing window has no
+        // visible Quartz frame. Never ask Terminal to measure itself for a
+        // decorative marker, and never treat marker failure as an open failure.
+        guard let owner, let windowID = revealed.windowID,
+              NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first?.processIdentifier == owner,
+              let frame = TerminalCursorReader.visibleWindowBounds(TerminalCursorReader.windowInfo(windowID: windowID), windowID: windowID, ownerPID: owner) else { return nil }
+        return TerminalWindowBounds(x: frame.minX, y: frame.minY, width: frame.width, height: frame.height)
     }
     public static func revealScript(tty: String) throws -> String {
         let value = try literal(tty)
@@ -490,7 +501,9 @@ public enum TerminalAdapter {
             window.selectedTab = tab;
             window.index = 1;
             app.activate();
-            return JSON.stringify(window.bounds());
+            let id = null;
+            try { const value = Number(window.id()); if (Number.isSafeInteger(value) && value > 0 && value <= 4294967295) id = value; } catch (_) {}
+            return JSON.stringify({windowID:id});
           }
         }
         throw Error('대상 터미널이 닫혔습니다. 목록을 새로고침해주세요.');
@@ -557,7 +570,7 @@ public enum TerminalAdapter {
             return null;
           }
         }
-        // osascript receives this script as a decomposed (NFD) argument; type and compare composed text.
+        // Normalize input and the native terminal's text before comparison.
         const text = String(target.text).normalize('NFC');
         if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;

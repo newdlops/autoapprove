@@ -1,0 +1,14 @@
+import {execFileSync} from 'node:child_process';
+import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+const label=process.argv.includes('--run-on-launch')?'automatic':'manual';
+const root=path.resolve('.runtime/native-highlighter-check',label),app=root+'/HighlighterCheck.app';
+await mkdir(app+'/Contents/MacOS',{recursive:true,mode:0o700});
+const source='Sources/AutoApproveApp/TerminalHighlighter.swift',fixture='Tests/fixtures/native-highlighter-check.swift';
+execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',path.resolve('.build/cache/HighlighterCheck'),source,fixture,'-o',app+'/Contents/MacOS/HighlighterCheck'],{stdio:'inherit',timeout:180000});
+await writeFile(app+'/Contents/Info.plist',`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.autoapprove.highlighter-check.${label}</string><key>CFBundleExecutable</key><string>HighlighterCheck</string><key>CFBundleName</key><string>HighlighterCheck</string><key>CFBundlePackageType</key><string>APPL</string><key>LSMinimumSystemVersion</key><string>14.0</string><key>NSHighResolutionCapable</key><true/><key>AutoApproveRunChecks</key><${label==='automatic'?'true':'false'}/></dict></plist>`);
+execFileSync('/usr/bin/codesign',['--force','--sign','-',app],{stdio:'inherit'});
+const sha=v=>createHash('sha256').update(v).digest('hex');
+await writeFile(root+'/provenance.json',JSON.stringify({sourceSHA256:sha(await readFile(source)),fixtureSHA256:sha(await readFile(fixture)),binarySHA256:sha(await readFile(app+'/Contents/MacOS/HighlighterCheck')),scope:'Compile only; launch and click through CUA. Production highlighter on a synthetic app window; no original terminals.'},null,2)+'\n',{mode:0o600});
+console.log(app);

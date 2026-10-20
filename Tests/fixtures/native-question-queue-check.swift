@@ -7,9 +7,9 @@ import AutoApproveCore
         let question = QueuedQuestion(id: "question", threadID: "thread", title: "합성 질문", options: ["개발", "시험"])
         func display(id: String = "session", questions: [QueuedQuestion]? = nil, error: String? = nil,
                      observed: Bool = true, canReveal: Bool = true, opening: Bool = false,
-                     handlers: CodexQuestionActions? = nil) -> CodexQuestionListDisplay {
+                     handlers: CodexQuestionActions? = nil, drafts: QuestionReplyDrafts? = nil) -> CodexQuestionListDisplay {
             .init(sessionID: id, questions: questions ?? [question], connectionError: error,
-                observed: observed, canReveal: canReveal, openingTerminal: opening, actions: handlers ?? actions)
+                observed: observed, canReveal: canReveal, openingTerminal: opening, actions: handlers ?? actions, drafts: drafts)
         }
         let base = display()
         precondition(base == display())
@@ -19,7 +19,7 @@ import AutoApproveCore
         let variants = [display(id: "other"), display(questions: []), display(questions: [changed]),
             display(questions: [replying]), display(questions: [automation]), display(error: "기록 읽기 실패"),
             display(observed: false), display(canReveal: false), display(opening: true),
-            display(handlers: CodexQuestionActions())]
+            display(handlers: CodexQuestionActions()), display(drafts: QuestionReplyDrafts())]
         precondition(variants.allSatisfy { $0 != base })
 
         var calls: [String] = []

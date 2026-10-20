@@ -10,7 +10,7 @@ extension ApprovalTests {
         var targetTab = {tty: () => '/dev/ttys042'};
         var targetWindow = {tabs: () => [{tty: () => {throw Error('closed tab');}}, targetTab],
           miniaturized: true, index: 7, selectedTab: null,
-          bounds: () => ({x:-1200,y:100,width:900,height:600})};
+          id: () => 42, bounds: () => {throw Error('Terminal must not measure itself for a marker');}};
         var otherWindow = {tabs: () => [{tty: () => '/dev/ttys001'}], miniaturized: true, index: 2, selectedTab: null};
         function Application() { return {running: () => true, windows: () => [
           {tabs: () => {throw Error('closed window (-1728)');}}, otherWindow, targetWindow,
@@ -19,12 +19,19 @@ extension ApprovalTests {
         """)
         let result = context.evaluateScript(try TerminalAdapter.revealScript(tty: "/dev/ttys042"))
         try expectNil(context.exception)
-        let bounds = try JSONDecoder().decode(TerminalWindowBounds.self, from: Data(result!.toString().utf8))
-        try expectEqual(bounds.x, -1200)
-        try expectEqual(bounds.width, 900)
+        let revealed = try JSONSerialization.jsonObject(with: Data(result!.toString().utf8)) as! [String: Any]
+        try expectEqual(revealed["windowID"] as? Int, 42)
         try expect(context.evaluateScript("targetWindow.selectedTab === targetTab && targetWindow.miniaturized === false && targetWindow.index === 1")!.toBool())
         try expect(context.evaluateScript("otherWindow.selectedTab === null && otherWindow.miniaturized === true && otherWindow.index === 2")!.toBool())
         try expectEqual(context.evaluateScript("activated")!.toInt32(), 1)
+        for invalidID in ["0", "-1", "4294967296", "1.5", "NaN", "Infinity"] {
+            context.evaluateScript("targetWindow.id = () => \(invalidID)")
+            let value = context.evaluateScript(try TerminalAdapter.revealScript(tty: "/dev/ttys042"))
+            try expectNil(context.exception)
+            try expectEqual(value?.toString(), "{\"windowID\":null}", "Invalid decoration metadata must not retry or fail the completed reveal")
+        }
+        context.evaluateScript("targetWindow.id = () => {throw Error('closed metadata');}")
+        try expectEqual(context.evaluateScript(try TerminalAdapter.revealScript(tty: "/dev/ttys042"))?.toString(), "{\"windowID\":null}")
         context.evaluateScript(try TerminalAdapter.revealScript(tty: "/dev/missing"))
         try expectNotNil(context.exception)
         context.exception = nil

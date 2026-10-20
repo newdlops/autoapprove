@@ -192,7 +192,7 @@ public enum ITermAdapter {
             return null;
           }
         }
-        // osascript receives this script as a decomposed (NFD) argument; type and compare composed text.
+        // Normalize input and the native terminal's text before comparison.
         const text = String(target.text).normalize('NFC');
         if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || [])
         for (const session of skipClosed(() => tab.sessions()) || []) {
