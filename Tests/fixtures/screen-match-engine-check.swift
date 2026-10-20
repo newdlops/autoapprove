@@ -28,14 +28,18 @@ import AutoApproveCore
     static let history = String(repeating: "Synthetic output 한글 👩🏽‍💻 e\u{301} checked local source and retained the original session.\n", count: 768)
     static func screen(_ index: Int, variant: Int) -> TerminalScreen {
         let codex = index.isMultiple(of: 2), glyph = codex ? "›" : "❯"
+        let bodyChange = CommandLine.arguments.contains("--body-change")
+        let footerVariant = bodyChange ? 0 : variant
         let tail: String
         switch index / 4 {
-        case 0: tail = "Checking synthetic result \(variant)\n• Working (esc to interrupt)"
+        case 0: tail = "Checking synthetic result \(footerVariant)\n• Working (esc to interrupt)"
         case 1: tail = "\(glyph)\n? for shortcuts"
-        case 2: tail = "\(codex ? "Would you like to run the following command?" : "Do you want to proceed?")\n$ fixture-test-\(variant)\n\(glyph) 1. Yes\n  2. No\nEsc to cancel"
-        default: tail = "Which synthetic result \(variant)?\n\(glyph) 1. First\n  2. Second\nEnter to select"
+        case 2: tail = "\(codex ? "Would you like to run the following command?" : "Do you want to proceed?")\n$ fixture-test-\(footerVariant)\n\(glyph) 1. Yes\n  2. No\nEsc to cancel"
+        default: tail = "Which synthetic result \(footerVariant)?\n\(glyph) 1. First\n  2. Second\nEnter to select"
         }
-        return TerminalScreen(tty: "/dev/fixture-match-\(index)", contents: history + "\n" + tail)
+        let body = bodyChange ? history + String(format: "Synthetic body result %04d\n", variant)
+            + String(repeating: "Unchanged footer context\n", count: 16) : history + "\n"
+        return TerminalScreen(tty: "/dev/fixture-match-\(index)", contents: body + tail)
     }
     static func cpu() -> Double {
         var value = rusage(); getrusage(RUSAGE_SELF, &value)
@@ -137,6 +141,7 @@ import AutoApproveCore
         }
         var usage = rusage(); getrusage(RUSAGE_SELF, &usage)
         let report: [String: Any] = ["workloads": workloads, "peakResidentBytes": usage.ru_maxrss,
+            "bodyChange": CommandLine.arguments.contains("--body-change"),
             "preserved": ["16 exact sessions", "working, approval and question phases", "idle confirmation", "no input", "no audit events", "bounded publications", "actual foreign Cocoa strings"],
             "scope": "Actual production Core engine with isolated synthetic screen source; not whole-app or LAN latency."]
         print(String(decoding: try JSONSerialization.data(withJSONObject: report, options: .sortedKeys), as: UTF8.self))
