@@ -109,19 +109,31 @@ public enum RemoteLAN {
               let destination = route(to:address,interfaces:interfaces) else { return false }
         return source.name == destination.name
     }
-    /// Read the existing OS neighbor cache only. -n prevents DNS lookups; no ping or ARP mutation.
+    /// Read fresh passive kernel hints without launching a helper. Unsupported
+    /// snapshots retain the existing numeric-only, read-only command fallback.
     public static func neighborURLs() -> [String] {
+        do { return neighborURLs(from: try NativeNeighborCache.read(), interfaces: interfaces()) }
+        catch is CancellationError { return [] }
+        catch { /* The legacy reader remains available on unsupported hosts. */ }
         guard let result = try? CommandRunner.run("/usr/sbin/arp", ["-an"], timeout: 1), result.status == 0 else { return [] }
         return neighborURLs(from: result.output, interfaces: interfaces())
     }
     public static func neighborURLs(from text: String, interfaces: [RemoteLANInterface]) -> [String] {
         let regex = try! NSRegularExpression(pattern: #"\(([0-9.]+)\) at ([0-9a-fA-F:]+) on (en[0-9]+)\b"#)
-        var result: [String: [String]] = [:], seen = Set<String>()
+        var entries: [NativeNeighborCache.Entry] = []
         for line in text.components(separatedBy: .newlines).prefix(2048) {
             let value = line as NSString
             guard let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: value.length)) else { continue }
             let address = value.substring(with: match.range(at: 1)), hardware = value.substring(with: match.range(at: 2)), name = value.substring(with: match.range(at: 3))
-            guard hardware != "ff:ff:ff:ff:ff:ff", !interfaces.contains(where: { $0.address == address }),
+            entries.append(.init(address:address,interfaceName:name,broadcast:hardware == "ff:ff:ff:ff:ff:ff"))
+        }
+        return neighborURLs(from:entries,interfaces:interfaces)
+    }
+    private static func neighborURLs(from entries: [NativeNeighborCache.Entry], interfaces: [RemoteLANInterface]) -> [String] {
+        var result: [String: [String]] = [:], seen = Set<String>()
+        for entry in entries {
+            let address = entry.address, name = entry.interfaceName
+            guard !entry.broadcast, !interfaces.contains(where: { $0.address == address }),
                   let source = route(to: address, interfaces: interfaces), source.name == name,
                   let host = ipv4(address), let local = ipv4(source.address), let mask = source.mask,
                   host > (local & mask), host < ((local & mask) | ~mask), seen.insert(address).inserted else { continue }

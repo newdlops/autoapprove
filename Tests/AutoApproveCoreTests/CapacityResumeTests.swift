@@ -290,8 +290,20 @@ extension ApprovalTests {
             return question
         }
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: history)])
-        engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA")
-        try await Task.sleep(for: .milliseconds(180))
+        let observed = Date()
+        engine.receiveScreen(sessionID: session.id, raw: stoppedFrame, generation: "QA", at: observed)
+        let deadline = try unwrap(engine.snapshot.sessions.first?.capacityResume?.deadline)
+        try expect(abs(deadline.timeIntervalSince(observed) - 0.02) < 0.001, "Preserve the configured retry delay")
+        func waitForDelivery(_ count: Int) async throws {
+            // Delivery includes detached validation and persistence. Await its
+            // completion with a bound when the full suite is under load.
+            let until = ProcessInfo.processInfo.systemUptime + 2
+            while (probe.count < count || engine.snapshot.sessions.first?.capacityResume?.phase != .awaiting),
+                  ProcessInfo.processInfo.systemUptime < until {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        try await waitForDelivery(1)
         try expectEqual(probe.count, 1, "Historical questions followed by later user input cannot block the currently stopped capacity turn")
         try expectEqual(probe.last?.2, "이어서 진행하자.")
         try expectEqual(engine.snapshot.sessions.first?.questions.count, 29, "Do not discard historical questions or pretend they were answered")
@@ -309,7 +321,7 @@ extension ApprovalTests {
         current.hasLaterUserMessage = true; history[history.count - 1] = current
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: session.id, questions: history)])
         engine.receiveScreen(sessionID: session.id, raw: refailedFrame, generation: "QA")
-        try await Task.sleep(for: .milliseconds(180)); try expectEqual(probe.count, 2)
+        try await waitForDelivery(2); try expectEqual(probe.count, 2)
         try expectEqual(engine.snapshot.sessions.first?.questions.count, 30)
         try expectEqual(engine.snapshot.sessions.first?.capacityResume?.phase, .awaiting)
     }
