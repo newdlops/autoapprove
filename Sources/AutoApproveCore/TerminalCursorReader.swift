@@ -19,19 +19,41 @@ enum TerminalCursorReader {
         // Native tab groups also expose hidden virtual windows as selected.
         // Their titles/bounds can coincide. CG metadata identifies the actual
         // on-screen window without capturing pixels or requesting recording.
-        let visible = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        guard let window = visible.first(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID
-            && ($0[kCGWindowOwnerPID as String] as? Int32) == app.processIdentifier }),
-              let rectangle = window[kCGWindowBounds as String] as? NSDictionary,
-              let currentBounds = CGRect(dictionaryRepresentation: rectangle), currentBounds.width > 0, currentBounds.height > 0 else { return nil }
+        guard let currentBounds = visibleWindowBounds(windowInfo(windowID: windowID), windowID: windowID,
+            ownerPID: app.processIdentifier) else { return nil }
         let bounds = bounds ?? TerminalWindowBounds(x: currentBounds.minX, y: currentBounds.minY, width: currentBounds.width, height: currentBounds.height)
         let deadline = Date().addingTimeInterval(0.35)
-        func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        func attributes(_ element: AXUIElement, _ names: [String]) -> [Any]? {
             guard Date() < deadline else { return nil }
             AXUIElementSetMessagingTimeout(element, 0.05)
-            var value: CFTypeRef?
-            return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+            var values: CFArray?
+            guard AXUIElementCopyMultipleAttributeValues(element, names as CFArray, [], &values) == .success,
+                  let fields = values as? [Any], fields.count == names.count else { return nil }
+            return fields
         }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.2)
+        return accessibilitySnapshot(screen: screen, title: title, bounds: bounds, application: application,
+            deadline: deadline, attributes: attributes)
+    }
+
+    static func windowInfo(windowID: UInt32) -> [[String: Any]] {
+        guard windowID != kCGNullWindowID, let ids = CFArrayCreateMutable(nil, 1, nil) else { return [] }
+        // Quartz window-ID arrays contain unretained integer values, not CFNumbers.
+        CFArrayAppendValue(ids, UnsafeRawPointer(bitPattern: UInt(windowID)))
+        return CGWindowListCreateDescriptionFromArray(ids) as? [[String: Any]] ?? []
+    }
+    static func visibleWindowBounds(_ windows: [[String: Any]], windowID: UInt32, ownerPID: Int32) -> CGRect? {
+        guard let window = windows.first(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID
+            && ($0[kCGWindowOwnerPID as String] as? Int32) == ownerPID
+            && ($0[kCGWindowIsOnscreen as String] as? Bool) == true }),
+              let rectangle = window[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: rectangle), bounds.width > 0, bounds.height > 0 else { return nil }
+        return bounds
+    }
+    static func accessibilitySnapshot(screen: String, title: String?, bounds: TerminalWindowBounds,
+                                      application: AXUIElement, deadline: Date,
+                                      attributes: (AXUIElement, [String]) -> [Any]?) -> TerminalTextSnapshot? {
         func point(_ value: CFTypeRef?) -> CGPoint? {
             guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
             var point = CGPoint.zero
@@ -42,12 +64,12 @@ enum TerminalCursorReader {
             var size = CGSize.zero
             return AXValueGetValue(value as! AXValue, .cgSize, &size) ? size : nil
         }
-        let application = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(application, 0.2)
-        let windows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        let windows = attributes(application, [kAXWindowsAttribute])?.first as? [AXUIElement] ?? []
         let matches = windows.filter { window in
-            guard (title == nil || attribute(window, kAXTitleAttribute) as? String == title),
-                  let position = point(attribute(window, kAXPositionAttribute)), let dimensions = size(attribute(window, kAXSizeAttribute)) else { return false }
+            if let title, attributes(window, [kAXTitleAttribute])?.first as? String != title { return false }
+            guard let values = attributes(window, [kAXPositionAttribute, kAXSizeAttribute]), values.count == 2,
+                  let position = point(values[0] as CFTypeRef),
+                  let dimensions = size(values[1] as CFTypeRef) else { return false }
             return abs(position.x - bounds.x) < 2 && abs(position.y - bounds.y) < 2
                 && abs(dimensions.width - bounds.width) < 2 && abs(dimensions.height - bounds.height) < 2
         }
@@ -55,13 +77,12 @@ enum TerminalCursorReader {
         var pending = [matches[0]], checked = 0, snapshots: [TerminalTextSnapshot] = []
         while let element = pending.popLast(), checked < 256, Date() < deadline {
             checked += 1
-            if attribute(element, kAXRoleAttribute) as? String == kAXTextAreaRole {
+            let identity = attributes(element, [kAXRoleAttribute, kAXChildrenAttribute]) ?? []
+            if identity.count == 2, identity[0] as? String == kAXTextAreaRole {
                 // Codex redraws while working. One AX response keeps its visible
                 // text and insertion range on the same source snapshot.
-                var values: CFArray?
-                let names = [kAXValueAttribute, kAXSelectedTextRangeAttribute, kAXVisibleCharacterRangeAttribute] as CFArray
-                if AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
-                   let fields = values as? [Any], fields.count == 3, let value = fields[0] as? String {
+                let names = [kAXValueAttribute, kAXSelectedTextRangeAttribute, kAXVisibleCharacterRangeAttribute]
+                if let fields = attributes(element, names), fields.count == 3, let value = fields[0] as? String {
                     let selected = fields[1] as CFTypeRef, visible = fields[2] as CFTypeRef
                     var range = CFRange(), viewport = CFRange()
                     if CFGetTypeID(selected) == AXValueGetTypeID(), AXValueGetValue(selected as! AXValue, .cfRange, &range), range.length == 0 {
@@ -75,7 +96,7 @@ enum TerminalCursorReader {
                     }
                 }
             }
-            let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
+            let children = identity.count == 2 ? identity[1] as? [AXUIElement] ?? [] : []
             pending.append(contentsOf: children.prefix(max(0, 256 - pending.count - checked)))
         }
         return snapshots.count == 1 ? snapshots[0] : nil
