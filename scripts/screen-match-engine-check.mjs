@@ -29,7 +29,8 @@ if (process.argv.includes('--reuse-binary')) {
 }
 const directory = await mkdtemp('/private/tmp/aa-screen-match-');
 try {
-  const value = JSON.parse(execFileSync(binary, [directory], {encoding: 'utf8', timeout: 120000}));
+  const args = process.argv.includes('--body-change') ? [directory, '--body-change'] : [directory];
+  const value = JSON.parse(execFileSync(binary, args, {encoding: 'utf8', timeout: 120000}));
   const report = {label, ...value, provenance};
   await writeFile(path.join(output, 'report.json'), JSON.stringify(report, null, 2) + '\n', {mode: 0o600});
   console.log(JSON.stringify({label, ...value, provenance: {...provenance, coreObjects: undefined}}));
