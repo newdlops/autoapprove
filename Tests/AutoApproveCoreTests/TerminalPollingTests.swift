@@ -113,6 +113,39 @@ extension ApprovalTests {
         }
     }
 
+    func testTerminalCursorReadsNeverMeasureWindowsDuringResize() throws {
+        for fallback in [false, true] {
+            for titles in [false, true] {
+                for cursor in [false, true] {
+                    let context = batchTerminalContext("""
+                    changing = \(fallback ? "true" : "false"); calls.bounds = 0;
+                    for (const window of windows) Object.defineProperty(window, 'bounds', {
+                      get:() => { calls.bounds++; throw Error('window is resizing'); },
+                      set:() => { calls.bounds++; throw Error('must not resize the original'); }
+                    });
+                    """)
+                    let value = context.evaluateScript(try TerminalAdapter.screenScript(
+                        ttys: ["/dev/fixture-1"], includeCursor: cursor, includeTitles: titles))!
+                    try expectNil(context.exception)
+                    let data = Data(value.toString().utf8)
+                    let result = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
+                    try expectEqual(result.screens.map(\.contents), ["Exact original 1"])
+                    try expect(result.failures.isEmpty)
+                    let screen = (try JSONSerialization.jsonObject(with: data) as! JSONObject)["screens"] as! [JSONObject]
+                    if cursor {
+                        let metadata = screen[0]["cursorWindow"] as? JSONObject
+                        try expectEqual(metadata?["windowID"] as? Int, 2)
+                        try expectEqual(metadata?["title"] as? String, "Window 1")
+                        try expectNil(metadata?["bounds"])
+                    } else { try expect(screen[0]["cursorWindow"] is NSNull) }
+                    try expectEqual(context.evaluateScript("calls.bounds")!.toInt32(), 0,
+                        "Cursor discovery must not query or change the resizing source window's bounds")
+                    try expectEqual(context.evaluateScript("calls.enumerations")!.toInt32(), fallback ? 1 : 0)
+                }
+            }
+        }
+    }
+
     func testTerminalBatchRetriesChangedWindowTopologyWithoutHidingDenial() throws {
         let changed = batchTerminalContext("changing = true;")
         let value = changed.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture-0"], includeCursor: false))!

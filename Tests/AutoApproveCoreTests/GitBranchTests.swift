@@ -12,9 +12,17 @@ private final class GitBranchFixture {
     deinit { try? FileManager.default.removeItem(at: root) }
     @discardableResult func git(_ arguments: [String], at directory: URL? = nil) throws -> String {
         let environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("GIT_") }
-        let result = try CommandRunner.run("/usr/bin/git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-            "-c", "commit.gpgsign=false", "-c", "user.name=AutoApprove Fixture", "-c", "user.email=fixture@example.invalid",
-            "-C", (directory ?? root).path] + arguments, environment: environment, inheritEnvironment: false)
+        let operation = arguments.first ?? "unknown"
+        let result: CommandResult
+        do {
+            // Synthetic repository mutations need a bounded setup budget
+            // independent of the production read deadline.
+            result = try CommandRunner.run("/usr/bin/git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                "-c", "commit.gpgsign=false", "-c", "user.name=AutoApprove Fixture", "-c", "user.email=fixture@example.invalid",
+                "-C", (directory ?? root).path] + arguments, timeout: 30, environment: environment, inheritEnvironment: false)
+        } catch {
+            throw AppError.message("Git fixture \(operation): \(error.localizedDescription)")
+        }
         try expectEqual(result.status, 0, result.error)
         return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -25,7 +33,7 @@ extension ApprovalTests {
         let fixture = try GitBranchFixture(), repository = fixture.repository
         let alias = fixture.root.appendingPathComponent("경로 % # ? e\u{301}", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: repository)
-        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"])
+        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"], timeout: 30)
         var launches = 0
         func read() -> GitBranchState { GitBranchReader.read(directory: alias.path) { _, _ in launches += 1; return result } }
         try expectEqual(read().name, "main"); _ = read(); try expectEqual(launches, 1)
@@ -67,7 +75,7 @@ extension ApprovalTests {
 
     func testGitBranchMetadataBoundsAndPackedReferenceIdentity() throws {
         let fixture = try GitBranchFixture(), repository = fixture.repository
-        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"])
+        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"], timeout: 30)
         let config = repository.appendingPathComponent(".git/config"), savedConfig = try Data(contentsOf: config)
         var launches = 0
         func read() -> GitBranchState { GitBranchReader.read(directory: repository.path) { _, _ in launches += 1; return result } }
@@ -97,7 +105,7 @@ extension ApprovalTests {
         var launches = 0
         let execute: ([String], [String: String]) throws -> CommandResult = { arguments, environment in
             launches += 1
-            return try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+            return try CommandRunner.run("/usr/bin/git", arguments, timeout: 30, environment: environment, inheritEnvironment: false)
         }
         try expectEqual(GitBranchReader.read(directory: repository.path, executeGit: execute).name, "main")
         let initial = launches, warmStart = Date()
@@ -129,7 +137,7 @@ extension ApprovalTests {
         var launches = 0
         let execute: ([String], [String: String]) throws -> CommandResult = { arguments, environment in
             launches += 1
-            return try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+            return try CommandRunner.run("/usr/bin/git", arguments, timeout: 30, environment: environment, inheritEnvironment: false)
         }
         let first = GitBranchReader.read(directory: repository.path, executeGit: execute)
         try expectEqual(first.kind, .detached)
@@ -173,11 +181,11 @@ extension ApprovalTests {
             if injectRace && arguments.contains("--short=8") {
                 injectRace = false
                 try fixture.git(["checkout", "--quiet", "--detach", second], at: repository)
-                let result = try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+                let result = try CommandRunner.run("/usr/bin/git", arguments, timeout: 30, environment: environment, inheritEnvironment: false)
                 try fixture.git(["checkout", "--quiet", "--detach", first], at: repository)
                 return result
             }
-            return try CommandRunner.run("/usr/bin/git", arguments, environment: environment, inheritEnvironment: false)
+            return try CommandRunner.run("/usr/bin/git", arguments, timeout: 30, environment: environment, inheritEnvironment: false)
         }
         let raced = GitBranchReader.read(directory: repository.path, executeGit: execute)
         try expectEqual(raced.kind, .detached)

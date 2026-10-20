@@ -3,6 +3,39 @@ import JavaScriptCore
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testTerminalMetadataNeverMeasuresOrChangesWindows() throws {
+        for host in [ScreenHost.terminal, .iterm] {
+            let context = JSContext()!
+            context.evaluateScript("""
+            var boundsCalls = 0, activations = 0;
+            var wanted = {tty:() => '/dev/fixture', selected:() => true};
+            var tab = {id:() => 5, sessions:() => [wanted], currentSession:() => wanted};
+            var target = {id:() => 42, miniaturized:() => false, selectedTab:() => wanted,
+              currentTab:() => tab, tabs:() => \(host == .terminal ? "[wanted]" : "[tab]")};
+            Object.defineProperty(target, 'bounds', {
+              get:() => { boundsCalls++; throw Error('window is resizing'); },
+              set:() => { boundsCalls++; throw Error('must not resize'); }
+            });
+            function Application() { return {running:() => true, windows:() => [target], activate:() => {activations++;}}; }
+            """)
+            let script = try TerminalAdapter.windowMetadataScript(tty: "/dev/fixture", host: host)
+            for _ in 0..<12 {
+                let value = context.evaluateScript(script)!
+                try expectNil(context.exception)
+                let record = try JSONSerialization.jsonObject(with: Data(value.toString().utf8)) as! JSONObject
+                try expectEqual(record["windowID"] as? Int, 42)
+                try expectEqual(record["selected"] as? Bool, true)
+                try expectEqual(record["minimized"] as? Bool, false)
+                try expectNil(record["bounds"])
+            }
+            try expectEqual(context.evaluateScript("boundsCalls + activations")!.toInt32(), 0)
+            context.evaluateScript("target.tabs = () => {throw Object.assign(Error('denied'), {errorNumber:-1743});}")
+            context.evaluateScript(script)
+            try expect(context.exception?.toString().contains("denied") == true,
+                "Removing an optional geometry query must not hide Automation denial")
+        }
+    }
+
     func testTerminalRevealTarget() throws {
         let context = JSContext()!
         context.evaluateScript("""

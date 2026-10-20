@@ -8,12 +8,12 @@ enum TerminalCursorReader {
     /// Graphics supplies its current bounds without another Terminal event or
     /// screen capture. Ambiguous AX windows are rejected below.
     static func snapshot(screen: String, windowID: UInt32) -> TerminalTextSnapshot? {
-        snapshot(screen: screen, windowID: windowID, title: nil, bounds: nil)
+        snapshot(screen: screen, windowID: windowID, title: nil)
     }
-    static func snapshot(screen: String, windowID: UInt32, title: String, bounds: TerminalWindowBounds) -> TerminalTextSnapshot? {
-        snapshot(screen: screen, windowID: windowID, title: Optional(title), bounds: Optional(bounds))
+    static func snapshot(screen: String, windowID: UInt32, title: String) -> TerminalTextSnapshot? {
+        snapshot(screen: screen, windowID: windowID, title: Optional(title))
     }
-    private static func snapshot(screen: String, windowID: UInt32, title: String?, bounds: TerminalWindowBounds?) -> TerminalTextSnapshot? {
+    private static func snapshot(screen: String, windowID: UInt32, title: String?) -> TerminalTextSnapshot? {
         guard AXIsProcessTrusted(), !screen.isEmpty,
               let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else { return nil }
         // Native tab groups also expose hidden virtual windows as selected.
@@ -21,7 +21,9 @@ enum TerminalCursorReader {
         // on-screen window without capturing pixels or requesting recording.
         guard let currentBounds = visibleWindowBounds(windowInfo(windowID: windowID), windowID: windowID,
             ownerPID: app.processIdentifier) else { return nil }
-        let bounds = bounds ?? TerminalWindowBounds(x: currentBounds.minX, y: currentBounds.minY, width: currentBounds.width, height: currentBounds.height)
+        // Both native and script reads use this fresh Quartz frame. A Terminal
+        // bounds Apple event can race its live resize and is unnecessary here.
+        let bounds = TerminalWindowBounds(x: currentBounds.minX, y: currentBounds.minY, width: currentBounds.width, height: currentBounds.height)
         let deadline = Date().addingTimeInterval(0.35)
         func attributes(_ element: AXUIElement, _ names: [String]) -> [Any]? {
             guard Date() < deadline else { return nil }
@@ -46,9 +48,15 @@ enum TerminalCursorReader {
     static func visibleWindowBounds(_ windows: [[String: Any]], windowID: UInt32, ownerPID: Int32) -> CGRect? {
         guard let window = windows.first(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID
             && ($0[kCGWindowOwnerPID as String] as? Int32) == ownerPID
-            && ($0[kCGWindowIsOnscreen as String] as? Bool) == true }),
-              let rectangle = window[kCGWindowBounds as String] as? NSDictionary,
-              let bounds = CGRect(dictionaryRepresentation: rectangle), bounds.width > 0, bounds.height > 0 else { return nil }
+            && ($0[kCGWindowIsOnscreen as String] as? Bool) == true }) else { return nil }
+        return windowBounds(window)
+    }
+    static func windowBounds(_ window: [String: Any]) -> CGRect? {
+        guard let rectangle = window[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: rectangle),
+              !bounds.isNull, !bounds.isInfinite, !bounds.isEmpty,
+              [bounds.minX, bounds.minY, bounds.width, bounds.height, bounds.maxX, bounds.maxY].allSatisfy(\.isFinite),
+              bounds.width > 0, bounds.height > 0 else { return nil }
         return bounds
     }
     static func accessibilitySnapshot(screen: String, title: String?, bounds: TerminalWindowBounds,

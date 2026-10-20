@@ -280,15 +280,18 @@ public enum TerminalAdapter {
         let output = try AutomationScript.run(windowMetadataScript(tty: tty, host: host), app: host.title,
             denied: host == .terminal ? .permissionDenied : .automationDenied(host.title), timeout: 3)
         if output == "null" { return nil }
-        struct Selection: Decodable { var tty: String; var windowID: UInt32; var selected: Bool; var minimized: Bool; var bounds: TerminalWindowBounds? }
+        struct Selection: Decodable { var tty: String; var windowID: UInt32; var selected: Bool; var minimized: Bool }
         let selection = try JSONDecoder().decode(Selection.self, from: Data(output.utf8))
         guard selection.tty == tty, selection.windowID > 0,
-              let windows = CGWindowListCopyWindowInfo(.optionIncludingWindow, selection.windowID) as? [[String: Any]],
-              let window = windows.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == selection.windowID }),
+              let window = TerminalCursorReader.windowInfo(windowID: selection.windowID).first(where: {
+                  ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == selection.windowID }),
               let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
               let owner = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier, owner == host.bundleID else { return nil }
+        let bounds = TerminalCursorReader.windowBounds(window).map {
+            TerminalWindowBounds(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height)
+        }
         return TerminalWindowMetadata(tty: tty, windowID: selection.windowID, ownerPID: ownerPID, ownerBundleID: owner,
-            selected: selection.selected, minimized: selection.minimized, bounds: selection.bounds)
+            selected: selection.selected, minimized: selection.minimized, bounds: bounds)
     }
     public static func windowMetadataScript(tty: String, host: ScreenHost = .terminal) throws -> String {
         guard [.terminal, .iterm].contains(host) else { throw RemoteHTTPError(400, "이 앱은 정확한 원본 창 주소를 제공하지 않습니다.") }
@@ -317,7 +320,7 @@ public enum TerminalAdapter {
         function result(window, tty, selected) {
           const id = Number(skip(() => window.id()));
           if (!Number.isSafeInteger(id) || id <= 0 || id > 4294967295) return 'null';
-          return JSON.stringify({tty,windowID:id,selected,minimized:skip(() => window.miniaturized()) === true,bounds:skip(() => window.bounds())});
+          return JSON.stringify({tty,windowID:id,selected,minimized:skip(() => window.miniaturized()) === true});
         }
         if (app.running()) for (const window of app.windows()) {
           \(lookup)
@@ -367,12 +370,8 @@ public enum TerminalAdapter {
         for index in snapshot.screens.indices {
             guard let metadata = recordsByTTY[snapshot.screens[index].tty]?["cursorWindow"] as? JSONObject,
                   let windowID = metadata["windowID"] as? UInt32,
-                  let title = metadata["title"] as? String, let boundsObject = metadata["bounds"] as? JSONObject,
-                  let x = boundsObject["x"] as? NSNumber, let y = boundsObject["y"] as? NSNumber,
-                  let width = boundsObject["width"] as? NSNumber, let height = boundsObject["height"] as? NSNumber else { continue }
-            let bounds = TerminalWindowBounds(x: x.doubleValue, y: y.doubleValue,
-                width: width.doubleValue, height: height.doubleValue)
-            let visible = TerminalCursorReader.snapshot(screen: snapshot.screens[index].contents, windowID: windowID, title: title, bounds: bounds)
+                  let title = metadata["title"] as? String else { continue }
+            let visible = TerminalCursorReader.snapshot(screen: snapshot.screens[index].contents, windowID: windowID, title: title)
             snapshot.screens[index].display = visible
             if visible?.screen == snapshot.screens[index].contents { snapshot.screens[index].cursor = visible?.cursor }
         }
@@ -427,7 +426,7 @@ public enum TerminalAdapter {
               try {
                 if (readCursor && selected[index] === tty && tab.selected()) {
                   const window = app.windows.byId(ids[index]);
-                  if (window.selectedTab().tty() === tty) cursorWindow = {windowID:Number(ids[index]), title:String(window.name()), bounds:window.bounds()};
+                  if (window.selectedTab().tty() === tty) cursorWindow = {windowID:Number(ids[index]), title:String(window.name())};
                 }
               } catch (error) { checkPermission(error); }
               result.screens.push({tty:tty, contents:tab.contents(), title:title, cursorWindow:cursorWindow});
@@ -458,7 +457,7 @@ public enum TerminalAdapter {
                 } catch (_) {}
               }
               let cursorWindow = null;
-              try { if (readCursor && tab.selected()) cursorWindow = {windowID:Number(window.id()), title:String(window.name()), bounds:window.bounds()}; } catch (_) {}
+              try { if (readCursor && tab.selected()) cursorWindow = {windowID:Number(window.id()), title:String(window.name())}; } catch (_) {}
               screens.push({tty:tty, contents:tab.contents(), title:title, cursorWindow:cursorWindow});
               allowed.delete(tty);
               if (!allowed.size) break screenWindows;

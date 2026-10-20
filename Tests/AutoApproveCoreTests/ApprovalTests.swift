@@ -865,6 +865,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Terminal dictionary contract and closed-tab isolation", tests.testTerminalScriptingContractAndPartialFailure),
             ("Terminal batch reads only exact targets with constant discovery cost", tests.testTerminalBatchReadsOnlyExactTargetsWithBoundedDiscovery),
             ("Terminal batch preserves cursor identity and isolates closed tabs", tests.testTerminalBatchPreservesCursorAndIsolatesClosedTabs),
+            ("Terminal cursor reads never measure or resize the source window", tests.testTerminalCursorReadsNeverMeasureWindowsDuringResize),
+            ("Terminal and iTerm metadata never measure or change source windows", tests.testTerminalMetadataNeverMeasuresOrChangesWindows),
             ("Terminal batch falls back on topology changes and propagates denial", tests.testTerminalBatchRetriesChangedWindowTopologyWithoutHidingDenial),
             ("Terminal text-only legacy reads skip titles and retain identity, cursor and denial checks", tests.testTerminalTextOnlyLegacyReadsSkipTitlesWithoutWeakeningIdentity),
             ("Native Terminal reads keep exact predicates and original Unicode text", tests.testNativeTerminalReadUsesExactPredicatesAndPreservesText),

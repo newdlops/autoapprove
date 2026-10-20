@@ -130,7 +130,7 @@ private func cpu() -> Double {
         let bounds=CGRect(x:80,y:110,width:640,height:400)
         let valid:[String:Any]=[kCGWindowNumber as String:UInt32(17),kCGWindowOwnerPID as String:Int32(42),kCGWindowIsOnscreen as String:true,kCGWindowBounds as String:bounds.dictionaryRepresentation]
         var metadataCases=0
-        for variant in 0..<10 {
+        for variant in 0..<18 {
             var window=valid
             switch variant {
             case 1: window[kCGWindowNumber as String]=UInt32(18)
@@ -142,11 +142,25 @@ private func cpu() -> Double {
             case 7: window.removeValue(forKey:kCGWindowOwnerPID as String)
             case 8: window[kCGWindowIsOnscreen as String]="true"
             case 9: window.removeValue(forKey:kCGWindowNumber as String)
+            case 10: window[kCGWindowBounds as String]=CGRect.infinite.dictionaryRepresentation
+            case 11: window[kCGWindowBounds as String]=CGRect.null.dictionaryRepresentation
+            case 12: window[kCGWindowBounds as String]=CGRect(x:CGFloat.nan,y:0,width:640,height:400).dictionaryRepresentation
+            case 13: window[kCGWindowBounds as String]=CGRect(x:0,y:CGFloat.infinity,width:640,height:400).dictionaryRepresentation
+            case 14: window[kCGWindowBounds as String]=CGRect(x:0,y:0,width:CGFloat.nan,height:400).dictionaryRepresentation
+            case 15: window[kCGWindowBounds as String]=CGRect(x:0,y:0,width:640,height:CGFloat.infinity).dictionaryRepresentation
+            case 16: window[kCGWindowBounds as String]=CGRect(x:CGFloat.greatestFiniteMagnitude,y:0,width:CGFloat.greatestFiniteMagnitude,height:400).dictionaryRepresentation
+            case 17: window[kCGWindowBounds as String]=CGRect(x:0,y:CGFloat.greatestFiniteMagnitude,width:640,height:CGFloat.greatestFiniteMagnitude).dictionaryRepresentation
             default: break
             }
             precondition(TerminalCursorReader.visibleWindowBounds([window],windowID:17,ownerPID:42)==(variant==0 ? bounds : nil))
             metadataCases+=1
         }
+        var resized=valid
+        let resizedBounds=CGRect(x:110,y:90,width:320,height:240)
+        resized[kCGWindowBounds as String]=resizedBounds.dictionaryRepresentation
+        precondition(TerminalCursorReader.visibleWindowBounds([resized],windowID:17,ownerPID:42)==resizedBounds)
+        precondition(TerminalCursorReader.visibleWindowBounds([valid],windowID:17,ownerPID:42)==bounds)
+        metadataCases+=2
         precondition(TerminalCursorReader.windowInfo(windowID:0).isEmpty)
         var report:[String:Any]=["syntheticCases":cases,"baselineEquivalentCases":baselineCases,"metadataCases":metadataCases,
             "transportFailureCases":transportCases,"boundedTraversalQueries":denseCalls,"healthyNativeRead":example,"liveAXQueries":0]
