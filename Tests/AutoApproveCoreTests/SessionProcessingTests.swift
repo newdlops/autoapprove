@@ -3,6 +3,23 @@ import Combine
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testShellClassificationPreservesFoundationPathSemantics() throws {
+        let names = ["", ".", "..", "zsh", "bash", "sh", "fish", "dash", "ksh", "ZSH", "codex", "-zsh",
+            " zsh", "zsh ", "zsh\u{0}", "zsh\u{0}/bash", "%7Ash", "zsh?", "zsh#", "e\u{301}", "한글", "🙂"]
+        let prefixes = ["", "/", "/bin/", "./", "../", "~/", "~", "//", "/tmp/../", "one/../../",
+            "/Applications/Test app.app/Contents/MacOS/", "한글/", "a\u{0}/"]
+        let endings = ["", "/", "//", "/.", "/..", "/../zsh", "/./bash", "\u{0}"]
+        var record = ProcessDiscovery.parse("910000 1 ttys500 910000 910000 Mon Sep 21 09:00:00 2026 /bin/zsh")[0]
+        let identity = record.key
+        for prefix in prefixes { for name in names { for ending in endings {
+            let path = prefix + name + ending
+            record.executable = path
+            let expected = ["zsh", "bash", "sh", "fish", "dash", "ksh"].contains(URL(fileURLWithPath: path).lastPathComponent)
+            try expectEqual(SessionExitRecovery.isShell(record), expected, "Shell classification changed for \(path.debugDescription)")
+            try expectEqual(record.key, identity)
+        }}}
+    }
+
     func testProcessClassificationPreservesPathAndExecutableIdentity() throws {
         func legacy(_ path: String) -> AgentKind? {
             let name = URL(fileURLWithPath: path).lastPathComponent

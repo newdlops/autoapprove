@@ -40,7 +40,10 @@ public struct YesNoConfirmation {
     }
 
     static func isDenial(_ label: String) -> Bool {
-        let text = cleaned(label)
+        isDenial(cleaned: cleaned(label))
+    }
+
+    private static func isDenial(cleaned text: String) -> Bool {
         if text.range(of: "(?i)^(?:" + denialWords + ")$", options: .regularExpression) != nil { return true }
         // The CLI's fixed rejection action is still No. Arbitrary explanations
         // after No/Cancel must not turn a different task into a permission menu.
@@ -56,8 +59,7 @@ public struct YesNoConfirmation {
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!。！")))
     }
 
-    private static func affirmativeTail(_ label: String) -> String? {
-        let text = cleaned(label)
+    private static func affirmativeTail(cleaned text: String) -> String? {
         guard let prefix = text.range(of: "(?i)^(?:" + affirmativeWords + #")(?=$|[\s,，:：—–-])[\s,，:：—–-]*"#, options: .regularExpression) else { return nil }
         return String(text[prefix.upperBound...])
     }
@@ -106,7 +108,10 @@ public struct YesNoConfirmation {
     }
 
     private static func isRepeatedPermission(_ value: String) -> Bool {
-        let text = cleaned(value)
+        isRepeatedPermission(cleaned: cleaned(value))
+    }
+
+    private static func isRepeatedPermission(cleaned text: String) -> Bool {
         let english = #"(?i)^(?:and\s+)?(?:(?:don't|do not) ask(?: me)?(?: for (?:approval|permission))? again(?: (?:for:?|in|during) .+| this session)?|always allow(?: .+)?|(?:allow|approve) (?:all (?:edits|commands|changes) )?(?:for|during|in) (?:this|the) (?:session|project|folder)|allow all (?:edits|commands|changes)|allow reading from .+ (?:from this project|during this session))$"#
         // Claude Code also offers its permission modes; each changes only later prompts.
         let mode = #"(?i)^(?:and\s+)?(?:(?:switch to|use) auto mode(?: · .+)?|switch to (?:default|accept edits|auto|don't ask|plan mode|bypass permissions)(?: \([^)]*\))? for this session)$"#
@@ -116,8 +121,8 @@ public struct YesNoConfirmation {
         return [english, mode, korean, allow].contains { text.range(of: $0, options: .regularExpression) != nil }
     }
 
-    private static func isSessionPermission(_ value: String) -> Bool {
-        cleaned(value).range(of: #"(?i)^(?:allow|approve) (?:for|during|in) (?:this|the) session$"#, options: .regularExpression) != nil
+    private static func isSessionPermission(cleaned text: String) -> Bool {
+        text.range(of: #"(?i)^(?:allow|approve) (?:for|during|in) (?:this|the) session$"#, options: .regularExpression) != nil
     }
 
     /// Prefer one request. If it is not offered, an explicit session-only Allow
@@ -127,10 +132,14 @@ public struct YesNoConfirmation {
         var current: [Int] = [], sessionOnly: [Int] = [], denials = 0
         for (index, label) in labels.enumerated() {
             let label = permissionLabel(label)
-            if isDenial(label) { denials += 1; continue }
-            if isSessionPermission(label) { sessionOnly.append(index); continue }
-            if isRepeatedPermission(label) { continue }
-            guard let tail = affirmativeTail(label) else { return nil }
+            // These predicates inspect the same normalized label. Keep
+            // permissionLabel's separate first pass: cleaning is not idempotent
+            // for every nested hint and punctuation combination.
+            let text = cleaned(label)
+            if isDenial(cleaned: text) { denials += 1; continue }
+            if isSessionPermission(cleaned: text) { sessionOnly.append(index); continue }
+            if isRepeatedPermission(cleaned: text) { continue }
+            guard let tail = affirmativeTail(cleaned: text) else { return nil }
             if isRepeatedPermission(tail) || isRepeatedPermission("allow " + tail) { continue }
             guard isCurrentPermission(tail) || isCurrentPermission("allow " + tail) else { return nil }
             // Claude may put the scope in the description beneath a plain Yes label.

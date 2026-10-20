@@ -83,12 +83,48 @@ import AutoApproveCore
         measure("unicode-agent-classification", rounds: 2000) {
             foreign.reduce(0) { $0 + ($1.agent == nil ? 0 : 1) }
         }
+        let shells = records.filter { SessionExitRecovery.isShell($0) }
+        measure("shell-name-classification", rounds: 2000) {
+            shells.reduce(0) { $0 + (SessionExitRecovery.isShell($1) ? 1 : 0) }
+        }
+        let automaticPaths = AppPaths(directory: root.appendingPathComponent("automatic"))
+        try automaticPaths.prepare()
+        let automaticStore = try AuditStore(path: automaticPaths.database)
+        for session in sessions { try automaticStore.set("automatic:" + session.id, "true") }
+        let automatic = try ApprovalEngine(paths: automaticPaths, claudeRegistryReader: { _ in [] }, processReader: { [] })
+        defer { automatic.stop() }
+        automatic.updateDiscovery(sessions, records: records, claudeRegistrations: [])
+        measure("automatic-discovery", rounds: 200) {
+            automatic.updateDiscovery(sessions, records: records, claudeRegistrations: [])
+            return automatic.snapshot.sessions.count
+        }
+        let codex = sessions.filter { $0.agent == .codex }
+        automatic.updateCodexQuestions(codex.map { CodexQuestionUpdate(sessionID: $0.id, questions: [], threadID: $0.id) })
+        automatic.updateCodexQuestions(codex.map { session in
+            CodexQuestionUpdate(sessionID: session.id, questions: [QueuedQuestion(id: "manual:" + session.id,
+                threadID: session.id, title: "Choose a plan for \(session.pid)", options: ["Yes, use staging", "No, use production"])])
+        })
+        Thread.sleep(forTimeInterval: 1)
+        automatic.refreshNotices()
+        var automaticPublications = 0
+        let automaticSubscription = automatic.$snapshot.dropFirst().sink { _ in automaticPublications += 1 }
+        defer { automaticSubscription.cancel() }
+        measure("manual-question-refresh", rounds: 200) {
+            automatic.refreshNotices()
+            return automatic.snapshot.sessions.reduce(0) { $0 + $1.questions.count }
+        }
         guard reports[0]["checksum"] as? Int == 4800,
               reports[1]["checksum"] as? Int == 2400,
               reports[2]["checksum"] as? Int == 4800,
               reports[3]["checksum"] as? Int == 48_000,
               reports[4]["checksum"] as? Int == 0,
               reports[5]["checksum"] as? Int == 48_000,
+              reports[6]["checksum"] as? Int == 48_000,
+              reports[7]["checksum"] as? Int == 4800,
+              reports[8]["checksum"] as? Int == 2400,
+              automatic.snapshot.sessions.filter(\.automatic).count == 24,
+              automatic.snapshot.sessions.flatMap(\.questions).allSatisfy({ $0.reply == nil && $0.automation == nil }),
+              automatic.snapshot.events.isEmpty, automaticPublications == 0,
               publications == 0, engine.snapshot.events.isEmpty,
               engine.snapshot.sessions.first(where: { $0.id == claude[0].id })?.backgroundChildren.count == 11 else {
             throw AppError.message("Synthetic classification/projection changed")
