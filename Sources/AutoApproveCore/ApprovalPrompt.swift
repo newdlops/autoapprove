@@ -75,8 +75,13 @@ public enum PromptDetector {
         // Unknown panel layouts keep the conservative reservation until work is observed.
         let requestStart = agent == .claude ? claudePanelStart(lines, before: promptIndex, marker: heading.marker) : promptIndex
         let identityContext = rawLines[(requestStart ?? start)..<(promptIndex + selectedYes)].joined(separator: "\n")
+        let compactIdentity = identityContext.filter {
+            // Keep Character whitespace semantics for CRLF and combined scalars.
+            if let ascii = $0.asciiValue { return ascii != 32 && (ascii < 9 || ascii > 13) }
+            return !$0.isWhitespace
+        }
         return ApprovalPrompt(summary: String(context.suffix(4000)), answer: "1", fingerprint: fingerprint(screen),
-            dialog: rawLines[start...].joined(separator: "\n"), requestIdentity: fingerprint(identityContext.filter { !$0.isWhitespace }),
+            dialog: rawLines[start...].joined(separator: "\n"), requestIdentity: fingerprint(compactIdentity),
             hasRequestBoundary: requestStart != nil)
     }
 

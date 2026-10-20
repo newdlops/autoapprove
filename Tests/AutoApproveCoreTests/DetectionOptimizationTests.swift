@@ -15,6 +15,36 @@ extension ApprovalTests {
         try expect(PromptDetector.fingerprint("é") != PromptDetector.fingerprint("e\u{301}"), "Raw input identities must not silently normalize Unicode")
     }
 
+    func testRequestIdentityKeepsCharacterWhitespaceAndExactDialog() throws {
+        let payloads = ["", " \t\u{000B}\u{000C}\r\n", "\u{0085}\u{00A0}\u{1680}",
+            "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}",
+            "\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}", " \u{301}", "\t\u{301}", " \u{200D}",
+            "\t\u{200D}\n", "\r\u{301}\n", "\u{0000}\u{200B}\u{2060}\u{FEFF}",
+            "e\u{301} é 한글 👩🏽‍💻 A\u{FE0F}"]
+        for agent in [AgentKind.codex, .claude] {
+            for payload in payloads {
+                let context = agent == .codex
+                    ? "Would you like to run the following command?\n  $ echo prefix\(payload)suffix"
+                    : "Bash command\n  echo prefix\(payload)suffix\nDo you want to proceed?"
+                let screen = context + "\n\n› 1. Yes\n  2. No\n\nEnter to confirm or esc to cancel"
+                // Reference the previous Character filter. Scalar filtering would drop
+                // whitespace from combined graphemes and change saved reservations.
+                let oldIdentity = PromptDetector.fingerprint(PromptDetector.normalizedLines(context).joined(separator: "\n").filter { !$0.isWhitespace })
+                for frame in [screen, screen.decomposedStringWithCanonicalMapping,
+                              NSAppleEventDescriptor(string: screen).stringValue!] {
+                    guard let prompt = PromptDetector.detect(frame, agent: agent) else {
+                        throw AppError.message("Missing \(agent) permission in whitespace identity fixture")
+                    }
+                    try expectEqual(prompt.requestIdentity, oldIdentity, "Existing approval reservations must keep their identity")
+                    try expectEqual(Data(prompt.dialog.utf8), Data(PromptDetector.normalizedLines(frame).joined(separator: "\n").utf8),
+                        "Final validation must retain the complete normalized dialog bytes")
+                    try expectEqual(prompt.fingerprint, PromptDetector.fingerprint(frame), "The full source fingerprint is unchanged")
+                    try expectEqual(prompt.answer, "1")
+                }
+            }
+        }
+    }
+
     func testOptionPrecheckKeepsUnicodeMenusAndRejectsOrdinaryOutput() throws {
         let history = String(repeating: "Completed synthetic step: ordinary output.\n", count: 1000)
         let spaces = [" ", "\t", "\u{000B}", "\u{000C}", "\u{0085}", "\u{00A0}", "\u{1680}", "\u{2000}", "\u{2007}", "\u{2028}", "\u{2029}", "\u{202F}", "\u{205F}", "\u{3000}"]
