@@ -14,7 +14,13 @@ public struct TmuxPaneHandle: Codable, Equatable, Sendable {
         return String(decoding: try! encoder.encode(self), as: UTF8.self)
     }
     public static func isServer(_ executable: String) -> Bool {
-        URL(fileURLWithPath: executable).lastPathComponent == "tmux" || executable.hasPrefix("tmux: server")
+        if executable.hasPrefix("tmux: server") { return true }
+        let component = (executable as NSString).lastPathComponent
+        // Discovery checks every ancestor. Ordinary basenames need no file URL
+        // or directory probe; keep Foundation resolution for unusual paths.
+        let name = component.isEmpty || component == "." || component == ".." || component.hasPrefix("~") || executable.utf8.contains(0)
+            ? URL(fileURLWithPath: executable).lastPathComponent : component
+        return name == "tmux"
     }
     public static func launch(_ environment: [String: String], server: ProcessRecord) -> Self? {
         guard let value = environment["TMUX"], let pane = environment["TMUX_PANE"] else { return nil }

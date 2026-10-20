@@ -39,6 +39,24 @@ extension ApprovalTests {
     }
 
     func testTerminalHostIdentification() throws {
+        for (path, expected) in [
+            ("tmux", true), ("/opt/homebrew/bin/tmux", true), ("/opt/homebrew/bin/tmux//", true),
+            ("tmux: server (/private/tmp/tmux-fixture/default)", true), ("/tmp/한글/tmux", true),
+            ("/opt/homebrew/bin/tmux-other", false), ("/opt/homebrew/bin/TMUX", false),
+            ("/tmp/tmux\u{301}", false), ("tmux: client", false)
+        ] { try expectEqual(TmuxPaneHandle.isServer(path), expected, path) }
+        let tmuxAncestry = """
+        1 0 ?? 1 0 Mon Sep 21 09:00:00 2026 /sbin/launchd
+        9 1 ?? 9 0 Mon Sep 21 09:00:00 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+        10 9 ?? 10 0 Mon Sep 21 09:00:01 2026 /opt/homebrew/bin/tmux
+        11 10 ttys001 11 12 Mon Sep 21 09:00:02 2026 /bin/zsh
+        """
+        let shared = host(["TMUX": "/private/tmp/tmux-fixture/default,10,0", "TMUX_PANE": "%7"], ancestry: tmuxAncestry)
+        try expectEqual(shared?.terminal, .tmux, "The enclosing tmux server outranks the outer Terminal app")
+        let pane = TmuxPaneHandle(encoded: shared?.tmuxHandle ?? "")
+        try expectEqual(pane?.serverPID, 10); try expectEqual(pane?.pane, "%7")
+        try expectEqual(host(["TMUX": "/private/tmp/tmux-fixture/default,99,0", "TMUX_PANE": "%7"], ancestry: tmuxAncestry)?.terminal,
+            .unknown, "An inconsistent server identity must not fall through to the outer Terminal tab")
         let iterm = host(["TERM_PROGRAM": "iTerm.app", "__CFBundleIdentifier": "com.googlecode.iterm2", "ITERM_SESSION_ID": "w0t0p0:1"])
         try expectEqual(iterm?.terminal, .iterm); try expectEqual(iterm?.hostTitle, "iTerm2")
         let server = host([:], ancestry: """
