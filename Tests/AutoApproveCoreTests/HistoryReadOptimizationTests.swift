@@ -471,9 +471,13 @@ extension ApprovalTests {
     }
 
     func testSystemRiskLazyVariantsRetainWhitespaceUnicodeAndFreshSource() throws {
-        for separator in ["", "\n", "\n  ", "\r\n", "\t", "\u{00a0}", "\u{2007}"] {
+        for separator in ["", " ", "\t", "\n", "\r", "\u{000b}", "\u{000c}", "\r\n", "\n  ",
+                          "\u{0085}", "\u{00a0}", "\u{2007}", "\u{2028}", "\u{2029}"] {
             let text = "cp fixture ~/Library/Lau" + separator + "nchAgents/com.fixture.plist"
             try expectEqual(SystemCommandRisk.detect(text)?.kind, .persistence, text)
+        }
+        for barrier in ["\u{0000}", "\u{0301}", "\u{034f}", "\u{0378}", "\u{200d}", "👩🏽‍💻"] {
+            try expectNil(SystemCommandRisk.detect("cp fixture ~/Library/Lau" + barrier + "nchAgents/com.fixture.plist"))
         }
         for text in ["cp fixture ~/Library/LaunchAgents/a.plist", "cp fixture ~/ Library / LaunchAgents /a.plist",
             "python3 -c 'Path.home().joinpath(\"Library/LaunchAgents/a.plist\").write_text(payload)'",

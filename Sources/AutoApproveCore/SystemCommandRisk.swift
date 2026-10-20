@@ -37,7 +37,7 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         var compactValue: String?
         func compact() -> String {
             if let compactValue { return compactValue }
-            let value = text.filter { !$0.isWhitespace }
+            let value = Self.removingWhitespace(text)
             compactValue = value
             return value
         }
@@ -127,6 +127,15 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             .map { String(decoding: $0, as: UTF8.self) } ?? ""
         let operation = ["Write", "Edit", "MultiEdit"].contains(tool) ? "write_text " : ""
         return detect(operation + encoded + "\n" + summary, cwd: cwd)
+    }
+
+    /// ASCII's six whitespace characters avoid a Unicode property lookup.
+    /// Multi-scalar Characters, including CRLF, retain Character.isWhitespace.
+    private static func removingWhitespace(_ text: String) -> String {
+        text.filter {
+            if let ascii = $0.asciiValue { return ascii != 32 && (ascii < 9 || ascii > 13) }
+            return !$0.isWhitespace
+        }
     }
 
     private static let protectedStartupPattern = #"(?i)(?:(?:~|\$(?:HOME|\{HOME\}))[/\\]+Library[/\\]+(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])(?:/Users/[^/\r\n]+)?/Library/(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])/etc/(?:cron|systemd)|(?:~|\$(?:HOME|\{HOME\}))[/\\]+\.config[/\\]+autostart)"#
