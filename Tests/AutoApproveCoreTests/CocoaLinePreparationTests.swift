@@ -6,6 +6,43 @@ import AutoApproveCore
 #endif
 
 extension ApprovalTests {
+    func testCocoaBoundedSuffixPreservesCurrentAndQuotedMenus() throws {
+        for agent: AgentKind in [.codex, .claude] {
+            let heading = agent == .codex ? "Would you like to run the following command?" : "Do you want to proceed?"
+            for separator in ["\n", "\r", "\r\n"] {
+                let permission = [heading, "$ echo e\u{301} 👩🏽‍💻", "❯ 1. Yes", "  2. No", "Esc to cancel"].joined(separator: separator)
+                let menu = ["어느 환경 e\u{301}을 쓸까요?", "❯ 1. 개발", "  2. 운영", "Enter to select"].joined(separator: separator)
+                for rows in [299, 300, 301, 450] {
+                    let history = String(repeating: "old 한글 e\u{301} 👩🏽‍💻\u{2028}same row" + separator, count: rows)
+                    for body in [permission, menu, "Working" + separator + "esc to interrupt"] {
+                        let source = history + body + separator + " \t" + separator
+                        let cocoa = NSAppleEventDescriptor(string: source).stringValue!
+                        let bytes = Array(cocoa.utf8), storage = cocoa.isContiguousUTF8
+                        let native = String(decoding: bytes, as: UTF8.self)
+                        try expectEqual(PromptDetector.detect(cocoa, agent: agent), PromptDetector.detect(native, agent: agent))
+                        try expectEqual(QuestionDetector.detect(cocoa, agent: agent)?.summary, QuestionDetector.detect(native, agent: agent)?.summary)
+                        try expectEqual(TerminalChoiceQuestion.detect(cocoa, agent: agent), TerminalChoiceQuestion.detect(native, agent: agent))
+                        try expectEqual(ActivityDetector.detect(cocoa, agent: agent), ActivityDetector.detect(native, agent: agent))
+                        if body == permission { try expectNotNil(PromptDetector.detect(cocoa, agent: agent)) }
+                        if body == menu {
+                            try expectEqual(QuestionDetector.detect(cocoa, agent: agent)?.phase, .input)
+                            try expectNotNil(TerminalChoiceQuestion.detect(cocoa, agent: agent))
+                        }
+                        if body.hasPrefix("Working") { try expectEqual(ActivityDetector.detect(cocoa, agent: agent).phase, .working) }
+                        try expect(cocoa.utf8.elementsEqual(bytes) && cocoa.isContiguousUTF8 == storage)
+                    }
+                    for fence in ["```text", "```text"] {
+                        let quoted = NSAppleEventDescriptor(string: fence + separator + history + menu).stringValue!
+                        try expectNil(QuestionDetector.detect(quoted, agent: agent))
+                        try expectNil(TerminalChoiceQuestion.detect(quoted, agent: agent))
+                        let quotedPermission = NSAppleEventDescriptor(string: fence + separator + history + permission).stringValue!
+                        try expectNil(PromptDetector.detect(quotedPermission, agent: agent))
+                    }
+                }
+            }
+        }
+    }
+
     func testCocoaNormalizationRetainsUnicodeBoundariesAndCurrentDialogs() throws {
         let padding = String(repeating: "x", count: 4100) + "\n"
         let histories = [String(repeating: "é\r\n", count: 63), String(repeating: "é\r\n", count: 64),
