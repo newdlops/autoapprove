@@ -112,8 +112,13 @@ public struct AttentionRequest: Equatable, Identifiable {
             }
         } else if session.systemCommandRisk == nil, let summary = session.pendingSummary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            phase == .input || (phase == .approval && (session.pendingInTerminal || !session.automatic || paused)) {
-            let normalized = summary.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-            let alreadyQueued = phase == .input && session.questions.contains {
+            // Canonical text is needed only for queued-title comparison or a
+            // missing request ID. Count-only projections never materialize keys.
+            let comparesQueuedTitles = phase == .input && !session.questions.isEmpty
+            let needsFallbackKey = collector.includeDetails && session.pendingRequestID == nil
+            let normalized = comparesQueuedTitles || needsFallbackKey
+                ? summary.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ") : ""
+            let alreadyQueued = comparesQueuedTitles && session.questions.contains {
                 let title = $0.title.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
                 return normalized.hasPrefix(title)
             }

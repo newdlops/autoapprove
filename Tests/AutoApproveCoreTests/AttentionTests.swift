@@ -2,6 +2,50 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testAttentionTerminalFallbackKeepsExactKeysAndCanonicalDeduplication() throws {
+        let summary = " \te\u{301}\t선택?\n  1. 첫째 👩🏽‍💻 \r\n2. 둘째  "
+        let canonicalKey = "é 선택? 1. 첫째 👩🏽‍💻 2. 둘째"
+        var value = AgentSession(id: "terminal", agent: .claude, pid: 42, started: "fixture",
+            tty: "/dev/fixture", cwd: "/tmp/project", terminal: .terminal)
+        value.pendingSummary = summary; value.pendingInTerminal = true
+        func check(_ session: AgentSession, keys: [String]) throws {
+            let candidates = AttentionRequest.candidates(session, paused: false)
+            try expectEqual(candidates.count, keys.count)
+            for (candidate, expected) in zip(candidates, keys) {
+                try expect(candidate.key.utf8.elementsEqual(expected.utf8), "Keep exact request key bytes")
+                try expect(candidate.sourceKey.utf8.elementsEqual(expected.utf8), "Keep exact source key bytes")
+                try expectEqual(candidate.sourceSessionID, "terminal")
+            }
+            try expectEqual(AttentionRequest.count(session, paused: false), keys.count)
+            try expectEqual(AttentionRequest.needsAttention(session, paused: false), !keys.isEmpty)
+        }
+        let identifiers: [String?] = [nil, "", "request:e\u{301}"]
+        for phase in [SessionPhase.input, .approval] {
+            for identifier in identifiers {
+                value.phase = phase; value.pendingRequestID = identifier; value.queuedQuestions = nil
+                let key = identifier ?? canonicalKey
+                try check(value, keys: [key])
+                try expect(AttentionRequest.candidates(value, paused: false)[0].summary.utf8.elementsEqual(summary.utf8),
+                    "Canonical keys never rewrite the visible original summary")
+                value.queuedQuestions = [QueuedQuestion(id: "same", threadID: "fixture", title: "é\n 선택?")]
+                try check(value, keys: phase == .input ? ["same"] : ["same", key])
+                value.queuedQuestions?[0].reply = QuestionReply(phase: .queued, answer: "첫째", message: "fixture")
+                try check(value, keys: phase == .input ? [] : [key])
+                value.queuedQuestions = [QueuedQuestion(id: "different", threadID: "fixture", title: "é 선택? 다른 작업")]
+                try check(value, keys: ["different", key])
+                value.queuedQuestions = [QueuedQuestion(id: "empty-title", threadID: "fixture", title: "")]
+                try check(value, keys: phase == .input ? ["empty-title"] : ["empty-title", key])
+            }
+        }
+        value.phase = .working; value.ownPhase = .input; value.pendingRequestID = "grouped"
+        value.queuedQuestions = [QueuedQuestion(id: "same", threadID: "fixture", title: "é 선택?")]
+        try check(value, keys: ["same"])
+        value.queuedQuestions = []; value.pendingSummary = " \t\r\n\u{2003}"
+        try check(value, keys: [])
+        value.pendingSummary = summary
+        try check(value, keys: ["grouped"])
+    }
+
     func testAttentionCountsAndExistencePreserveCandidateLifecycle() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-attention-count-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

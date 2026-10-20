@@ -713,6 +713,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("question response requires a durable audit", tests.testYesNoConfirmationRequiresSavedAudit),
             ("manual attention, duplicate polling, resolution and repeated questions", tests.testAttentionLifecycle),
             ("Attention counts and existence preserve safety, exact keys, grouping and lifecycle", tests.testAttentionCountsAndExistencePreserveCandidateLifecycle),
+            ("Attention terminal fallback keeps exact keys and canonical queued-title deduplication", tests.testAttentionTerminalFallbackKeepsExactKeysAndCanonicalDeduplication),
             ("Attention notification deadlines sleep to delivery and preserve elapsed delay changes", tests.testAttentionNotificationDeadlinesAvoidPollingAndPreserveElapsedDelay),
             ("Question notification delay default, persistence, bounds and failed save", tests.testQuestionNotificationDelayPersistenceAndValidation),
             ("notification opens exact live session only", tests.testAttentionTarget),

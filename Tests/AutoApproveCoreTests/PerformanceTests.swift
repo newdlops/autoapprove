@@ -351,11 +351,21 @@ extension ApprovalTests {
 
     func testWorkingDirectoryReadsKeepValidPathsWithDuplicateAndMissingPIDs() throws {
         let pid = getpid()
-        let expected = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).resolvingSymlinksInPath().path
+        func expectCurrentDirectory(_ path: String) throws {
+            try expect(path.hasPrefix("/"), "A process cwd must be an absolute path")
+            var actual = stat(), expected = stat()
+            try expectEqual(Darwin.lstat(".", &expected), 0)
+            try expectEqual(path.withCString { Darwin.lstat($0, &actual) }, 0)
+            // Foundation may shorten /private/tmp while libproc preserves it.
+            // Directory identity also handles a symlinked launch directory.
+            try expectEqual(actual.st_dev, expected.st_dev)
+            try expectEqual(actual.st_ino, expected.st_ino)
+        }
         let paths = ProcessDiscovery.workingDirectories(pids: [pid, pid, Int32.max, -1])
-        try expectEqual(paths[pid], expected)
+        guard let current = paths[pid] else { throw AppError.message("Missing the current process cwd") }
+        try expectCurrentDirectory(current)
         try expectEqual(paths.count, 1, "Missing or invalid processes must not erase a valid cwd or add another process")
-        try expectEqual(ProcessDiscovery.cwd(pid: pid), expected)
+        try expectCurrentDirectory(ProcessDiscovery.cwd(pid: pid))
         try expectEqual(ProcessDiscovery.workingDirectories(pids: []), [:])
     }
 
