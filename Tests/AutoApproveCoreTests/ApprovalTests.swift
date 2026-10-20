@@ -629,6 +629,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Claude recovered waiting transitions and unavailable metadata", tests.testClaudeRecoveredWaitingTransitionsAndUnavailableMetadata),
             ("Claude recovered question metadata identity and staleness", tests.testClaudeRecoveryMetadataIdentityAndStaleness),
             ("Claude registry batches preserve timezone, DST boundaries and malformed sibling isolation", tests.testClaudeRegistryBatchTimezonesAndMalformedSiblings),
+            ("Claude registry paths preserve fresh metadata and isolate nonfiles", tests.testClaudeRegistryPathsKeepFreshMetadataAndRejectNonfiles),
             ("Background hooks inherit main policy and retain original audit context", tests.testBackgroundHookInheritsMainAndAuditsOrigin),
             ("Screen parent lookup does not walk unrelated sessions", tests.testBackgroundParentLookupAvoidsUnrelatedSessionWalk),
             ("Grouped concurrent questions, notifications, completions and read persistence", tests.testGroupedQuestionsNoticesAndReadPersistence),

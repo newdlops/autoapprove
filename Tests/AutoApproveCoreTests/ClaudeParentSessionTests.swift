@@ -112,6 +112,45 @@ extension ApprovalTests {
         try expect(engine.snapshot.events.isEmpty)
     }
 
+    func testClaudeRegistryPathsKeepFreshMetadataAndRejectNonfiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-registry-path-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("설정 % # ? e\u{301}.json", isDirectory: true)
+        let sessions = directory.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let utc = DateFormatter(); utc.locale = Locale(identifier: "en_US_POSIX"); utc.dateFormat = "EEE MMM d HH:mm:ss yyyy"; utc.timeZone = TimeZone(secondsFromGMT: 0)
+        let local = DateFormatter(); local.locale = utc.locale; local.dateFormat = utc.dateFormat
+        local.timeZone = ProcessInfo.processInfo.environment["TZ"].flatMap(TimeZone.init(identifier:)) ?? .current
+        let start = Date(timeIntervalSince1970: 1_792_000_000), changed = start.addingTimeInterval(30)
+        let process = ProcessDiscovery.parse("900000 1 ttys901 900000 900000 \(local.string(from: start)) claude")[0]
+        let file = sessions.appendingPathComponent("900000.json", isDirectory: false)
+        var row: JSONObject = ["pid": 900000, "pidDomain": "darwin", "procStart": utc.string(from: start), "kind": "interactive", "sessionId": "fixture-path", "status": "idle", "statusUpdatedAt": changed.timeIntervalSince1970 * 1000]
+        func read() -> [ClaudeSessionRegistration] { ClaudeSessionRegistry.read(records: [process], directory: directory) }
+        try expect(read().isEmpty)
+        try JSONSerialization.data(withJSONObject: row).write(to: file, options: .atomic)
+        try expectEqual(read().first?.activity?.status, "idle")
+        row["status"] = "busy"
+        try JSONSerialization.data(withJSONObject: row).write(to: file, options: .atomic)
+        try expectEqual(read().first?.activity?.status, "busy", "Atomic replacement must invalidate a warm registration")
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        try expect(read().isEmpty, "A directory named like metadata is never a registration")
+        try FileManager.default.removeItem(at: file)
+        let target = root.appendingPathComponent("metadata-target.json", isDirectory: false)
+        row["status"] = "idle"
+        try JSONSerialization.data(withJSONObject: row).write(to: target, options: .atomic)
+        try FileManager.default.createSymbolicLink(at: file, withDestinationURL: target)
+        try expectEqual(read().first?.activity?.status, "idle", "Preserve existing regular-file symlink semantics")
+        row["pid"] = 900001
+        try JSONSerialization.data(withJSONObject: row).write(to: target, options: .atomic)
+        try expect(read().isEmpty, "A rewritten symlink target still verifies current process identity")
+        try FileManager.default.removeItem(at: target)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        try expect(read().isEmpty, "A symlink to a directory cannot reuse a cached registration")
+        try FileManager.default.removeItem(at: target)
+        try expect(read().isEmpty, "Missing targets cannot reuse cached metadata")
+    }
+
     func testClaudeRegistryBatchTimezonesAndMalformedSiblings() throws {
         let root = URL(fileURLWithPath:"/private/tmp/aa-registry-dates-"+UUID().uuidString)
         defer { try? FileManager.default.removeItem(at:root) }

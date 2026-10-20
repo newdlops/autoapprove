@@ -63,12 +63,14 @@ public enum ClaudeSessionRegistry {
 
     public static func read(records: [ProcessRecord], directory: URL? = nil) -> [ClaudeSessionRegistration] {
         let directory = directory ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
         let zone = ProcessInfo.processInfo.environment["TZ"].flatMap(TimeZone.init(identifier:)) ?? .current
         var dates = RegistryDates(zone:zone)
         return records.compactMap { process in
             guard process.agent == .claude else { return nil }
-            let file = directory.appendingPathComponent("sessions/\(process.pid).json")
+            // These leaves are files. Avoid Foundation's implicit directory
+            // metadata probe; FileIdentity still checks the live target below.
+            let file = directory.appendingPathComponent("sessions/\(process.pid).json", isDirectory: false)
             guard let identity = FileIdentity(url:file) else { return nil }
             let cacheKey = file.path + "\n" + process.key + "\n" + zone.identifier
             cacheLock.lock(); let cached = cache[cacheKey]; cacheLock.unlock()
@@ -76,7 +78,7 @@ public enum ClaudeSessionRegistry {
                 let stateURL = cached.registration.flatMap { registration -> URL? in
                     guard registration.kind == "bg", let job = registration.jobID, let activity = registration.activity,
                           activity.status == "waiting", activity.waitingFor == "input needed" else { return nil }
-                    return directory.appendingPathComponent("jobs/\(job)/state.json")
+                    return directory.appendingPathComponent("jobs/\(job)/state.json", isDirectory: false)
                 }
                 let currentState = stateURL.flatMap { FileIdentity(url:$0) }
                 if currentState == cached.state { return cached.registration }
@@ -86,7 +88,7 @@ public enum ClaudeSessionRegistry {
             var stateIdentity: FileIdentity?, cacheable = true
             if let value = registration, value.kind == "bg", let job = value.jobID, let activity = value.activity,
                activity.status == "waiting", activity.waitingFor == "input needed" {
-                let state = directory.appendingPathComponent("jobs/\(job)/state.json")
+                let state = directory.appendingPathComponent("jobs/\(job)/state.json", isDirectory: false)
                 if let before = FileIdentity(url:state), let data = try? Data(contentsOf:state) {
                     registration?.activity?.questionSummary = questionSummary(data, jobID:job, activity:activity, dates:&dates)
                     let after = FileIdentity(url:state)
