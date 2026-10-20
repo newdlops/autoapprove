@@ -110,7 +110,7 @@ struct ClaudeHookRequest {
         systemCommandRisk = risk
         let answerValue: String
         let responseValue: JSONObject?
-        if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event), let yes = YesNoConfirmation.detect(input) {
+        if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event), let yes = AutomaticQuestionDecision.detect(input) {
             answerValue = yes.answer
             if event == "PreToolUse" {
                 responseValue = ["hookSpecificOutput": ["hookEventName": event, "permissionDecision": "allow", "updatedInput": yes.updatedInput(input)]]

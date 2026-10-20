@@ -92,11 +92,12 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
                 options[options.count - 1] += " " + line
             }
         }
+        let question = lines[start..<first].filter { !$0.isEmpty }.joined(separator: "\n")
+        let permissionLabels = options.allSatisfy({ $0.range(of: #"(?i)^(?:yes|no|allow|deny|cancel|always allow|don't allow|예|아니요|허가|불허)(?:\b|\s|$)"#, options: .regularExpression) != nil })
         guard options.count >= 2, let selected, options.allSatisfy({ !$0.isEmpty }),
               !numericSubmission || options.count <= 9,
               lines[start...].joined(separator: "\n").count < 4000,
-              !options.allSatisfy({ $0.range(of: #"(?i)^(?:yes|no|allow|deny|cancel|always allow|don't allow|예|아니요|허가|불허)(?:\b|\s|$)"#, options: .regularExpression) != nil }) else { return nil }
-        let question = lines[start..<first].filter { !$0.isEmpty }.joined(separator: "\n")
+              !permissionLabels || AutomaticQuestionDecision.currentModelIndex(question: question, options: options) != nil else { return nil }
         // Include visible conversation context to distinguish identical labels
         // in successive questions. Selection movement and line wrapping are cosmetic.
         let all = prepared.raw

@@ -79,7 +79,10 @@ extension ApprovalTests {
             (["Allow for this session", "Allow", "Don't allow"], 1),
             (["No", "Allow this time", "Yes, don't ask again"], 1),
             (["Allow", "Cancel"], 0),
-            (["Allow", "Allow for this session", "Always allow", "Cancel"], 0)
+            (["Allow", "Allow for this session", "Always allow", "Cancel"], 0),
+            (["Allow", "Allow for this session", "Cancel"], 0),
+            (["Allow for this session", "Deny"], 0),
+            (["Cancel", "Always allow", "Allow for this session"], 2)
         ]
         for (labels, index) in cases {
             let input = startInput(labels: labels)
@@ -90,7 +93,7 @@ extension ApprovalTests {
         }
         for labels in [["Don't allow", "Deny"], ["Allowance", "No"], ["Allowed", "No"],
                        ["Allow", "Yes", "Deny"], ["Always allow", "Deny"],
-                       ["Allow for this session", "Deny"], ["Allow, don't ask again", "No"],
+                       ["Allow, don't ask again", "No"], ["Allow for this session", "Allow for this session", "Cancel"],
                        ["Allow", "Allow another project", "Deny"], ["Allow once", "Allow this time", "Deny"]] {
             try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "Do not guess an Allow choice: \(labels)")
         }
@@ -127,6 +130,16 @@ extension ApprovalTests {
             ] { try expectNil(PromptDetector.detect(invalid, agent: .codex)) }
         }
         try expectNil(PromptDetector.detect("Which project should run first?\n" + options + "\nEnter to submit", agent: .codex))
+        for (rows, answer) in [
+            ("› 1. Allow\n  2. Allow for this session\n  3. Cancel", "1"),
+            ("› 1. Allow for this session\n  2. Cancel", "1"),
+            ("› 1. Allow for this session  Run the tool and remember this choice for this session.\n  2. Always allow  Run the tool and remember this choice for future tool calls.\n  3. Cancel  Cancel this tool call.", "1")
+        ] {
+            let screen = "Allow preview?\nTool: preview\n" + rows + "\nEnter to submit or esc to cancel"
+            try expectEqual(PromptDetector.detect(screen, agent: .codex)?.answer, answer)
+            try expectEqual(PromptDetector.detect(screen.replacingOccurrences(of: "for this session", with: "for this\n       session"), agent: .codex)?.answer, answer)
+            try expectNil(PromptDetector.detect(screen + "\nWorking...", agent: .codex))
+        }
         for labels in [["Allow preview", "Allow production", "Cancel"], ["Allow", "Run tests", "Always allow", "Cancel"], ["Allow", "Cancel", "Deny"]] {
             try expectNil(YesNoConfirmation.detect(startInput(labels: labels)))
         }

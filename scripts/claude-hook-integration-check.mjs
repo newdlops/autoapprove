@@ -153,11 +153,31 @@ try {
 
   await request('automatic', {sessionID: session.id, enabled: true});
   const web = await request('web');
+  const automaticChoices = [
+    {question:'Allow this fixture tool?', options:[{label:'Allow'}, {label:'Allow for this session'}, {label:'Cancel'}], answer:'Allow'},
+    {question:'Allow this fixture tool for the session?', options:[{label:'Allow for this session'}, {label:'Cancel'}], answer:'Allow for this session'},
+    {question:'Which model should be used?', options:[{label:'gpt-6.2 (Recommended)'}, {label:'gpt-6.1-sol (current)'}], answer:'gpt-6.1-sol (current)'},
+    {question:'어떤 모델을 사용할까요?', options:[{label:'다른 모델 사용'}, {label:'기존 모델 유지'}], answer:'기존 모델 유지'},
+    {question:'Would you like to switch to a different model?', options:[{label:'Yes'}, {label:'No'}], answer:'No'},
+    {question:'Switch to gpt-6.2?', options:[{label:'Yes'}, {label:'No'}], answer:'No'}
+  ];
+  let automaticCount = 0;
+  for (const event of ['PreToolUse','PermissionRequest']) for (const {answer,...field} of automaticChoices) {
+    const toolInput = {questions:[field]};
+    const choice = helper(session, 'automatic-choice-'+automaticCount, state, {event, toolInput});
+    const output = (await choice.completion).hookSpecificOutput;
+    const updated = (event === 'PreToolUse' ? output : output.decision).updatedInput;
+    assert.deepEqual(updated.questions, toolInput.questions, 'Automatic answers retain the complete original question');
+    assert.deepEqual(updated.answers, {[field.question]:answer}, 'Prefer one Allow or the explicitly current model');
+    automaticCount++;
+  }
   const manualChoices = [
     {question:'Which environment?', options:[{label:'Yes, use staging'}, {label:'No, use production'}]},
     {question:'Which task?', options:[{label:'Yes'}, {label:'No, run tests instead'}]},
     {question:'여러 항목을 선택하세요', multiSelect:true, options:[{label:'응'}, {label:'아니오'}]},
-    {question:'cp fixture ~/Library/LaunchAgents/com.fixture.plist 대신 어떤 예약 방법을 쓸까요?', options:[{label:'프로젝트 타이머'}, {label:'수동 실행'}]}
+    {question:'cp fixture ~/Library/LaunchAgents/com.fixture.plist 대신 어떤 예약 방법을 쓸까요?', options:[{label:'프로젝트 타이머'}, {label:'수동 실행'}]},
+    {question:'Which model?', options:[{label:'gpt-6.2 (Recommended)'}, {label:'gpt-6.1-sol'}]},
+    {question:'Which models?', multiSelect:true, options:[{label:'Keep current model'}, {label:'Switch model'}]}
   ];
   let manualCount = 0;
   for (const event of ['PreToolUse','PermissionRequest']) for (const field of manualChoices) {
@@ -178,7 +198,7 @@ try {
     assert.deepEqual(updated.answers, {[field.question]:field.options[1].label}, 'Only the explicit web choice is answered');
     manualCount++;
   }
-  console.log(`PASS loopback-isolated real helper: no LAN peers, 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts, terminal handoff and ${manualCount} task/multiselect questions kept pending until an explicit HTTP web answer`);
+  console.log(`PASS loopback-isolated real helper: no LAN peers, 5.2s idle wait with only hook+hookWait, manual app approval, automatic confirmation in ${automaticMilliseconds}ms with a 0.5s cancellation window, paused in-flight app restart, dropped response replay exactly once, delivery receipts, terminal handoff, ${automaticCount} Allow/session/current-model answers and ${manualCount} task/multiselect/unmarked-model questions kept pending until an explicit HTTP web answer`);
 } finally {
   for (const socket of connections) socket.destroy();
   if (proxy) await new Promise(resolve => proxy.close(resolve));

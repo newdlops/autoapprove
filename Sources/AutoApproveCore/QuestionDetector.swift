@@ -22,7 +22,7 @@ public enum QuestionDetector {
         }
         guard let selected else { return nil }
         let permissionHeading = PromptDetector.permissionHeading(Array(lines[..<selected]), agent: agent)
-        let questionStart = lines[..<selected].lastIndex { $0.contains("?") }
+        let questionStart = lines[..<selected].lastIndex { $0.contains("?") || AutomaticQuestionDecision.isModelHeading($0) }
         let start = permissionHeading.map { heading in
             questionStart.map { $0 > heading.end ? $0 : heading.index } ?? heading.index
         } ?? questionStart

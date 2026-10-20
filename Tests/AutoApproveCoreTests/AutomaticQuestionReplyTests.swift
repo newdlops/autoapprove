@@ -72,7 +72,8 @@ extension ApprovalTests {
         defer { fixtures.forEach { $0.0.engine.stop() } }
         for (name, options, answer) in [
             ("allow", ["Don’t allow", "Always allow", "Allow once (Recommended)"], "Allow once (Recommended)"),
-            ("korean-allow", ["항상 허용", "거부", "허용 (추천)"], "허용 (추천)")
+            ("korean-allow", ["항상 허용", "거부", "허용 (추천)"], "허용 (추천)"),
+            ("session-allow", ["Cancel", "Allow for this session"], "Allow for this session")
         ] {
             var fixture = try AutomaticReplyFixture(root: root, name: name, transport: transport)
             fixture.question.options = options
@@ -91,6 +92,25 @@ extension ApprovalTests {
             try expectEqual(fixture.reply?.phase, .queued)
             try expectEqual(fixture.engine.snapshot.events.first?.answer, answer)
         }
+    }
+
+    func testAutomaticModelQuestionRetainsOriginalLabel() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-auto-model-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = AutomaticReplyProbe()
+        let transport = CodexReplyTransport(prepare: { _, question in await probe.prepare(question) },
+            send: { target, message in await probe.send(target, message) })
+        var fixture = try AutomaticReplyFixture(root: root, name: "model", transport: transport)
+        defer { fixture.engine.stop() }
+        fixture.engine.automaticConfirmationDelay = 0.03
+        fixture.question.title = "어떤 모델을 사용할까요?"
+        fixture.question.options = ["Switch to another model", "기존 모델 유지"]
+        fixture.observe()
+        try expectEqual(fixture.automation?.answer, "기존 모델 유지")
+        try await waitForAutomaticReply { await probe.count == 1 }
+        try expectEqual(await probe.deliveries.first?.message, "> 어떤 모델을 사용할까요?\n\n기존 모델 유지")
+        fixture.observe(); try await Task.sleep(for: .milliseconds(100))
+        try expectEqual(await probe.count, 1)
     }
 
     func testAutomaticQuestionReplyWaitsFiveSecondsPerQuestion() async throws {

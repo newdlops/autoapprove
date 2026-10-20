@@ -39,7 +39,7 @@ public struct YesNoConfirmation {
         return YesNoConfirmation(question: question, answer: labels[index])
     }
 
-    private static func isDenial(_ label: String) -> Bool {
+    static func isDenial(_ label: String) -> Bool {
         let text = cleaned(label)
         if text.range(of: "(?i)^(?:" + denialWords + ")$", options: .regularExpression) != nil { return true }
         // The CLI's fixed rejection action is still No. Arbitrary explanations
@@ -93,10 +93,12 @@ public struct YesNoConfirmation {
 
     static func isToolPermissionMenu(_ labels: [String]) -> Bool {
         let labels = labels.map { permissionLabel($0).lowercased() }
-        // MCP servers without remembered permission scopes show only Allow/Cancel.
-        if labels == ["allow", "cancel"] { return true }
-        return labels.count == 4 && labels[0] == "allow" && labels[1] == "allow for this session"
-            && ["always allow", "allow and don't ask me again"].contains(labels[2]) && labels[3] == "cancel"
+        let known: Set<String> = ["allow", "allow for this session", "always allow", "allow and don't ask me again",
+                                  "cancel", "deny", "don't allow", "do not allow"]
+        // Tool capabilities determine which permission scopes are offered. Two,
+        // three and four rows are valid; an unrelated task is never a scope.
+        return (2...4).contains(labels.count) && labels.allSatisfy(known.contains)
+            && singleApprovalIndex(labels) == 0
     }
 
     private static func isCurrentPermission(_ tail: String) -> Bool {
@@ -114,14 +116,19 @@ public struct YesNoConfirmation {
         return [english, mode, korean, allow].contains { text.range(of: $0, options: .regularExpression) != nil }
     }
 
-    /// Every extra affirmative option must change only the future permission scope.
-    /// A unique current-request answer is required; task/environment alternatives remain manual.
+    private static func isSessionPermission(_ value: String) -> Bool {
+        cleaned(value).range(of: #"(?i)^(?:allow|approve) (?:for|during|in) (?:this|the) session$"#, options: .regularExpression) != nil
+    }
+
+    /// Prefer one request. If it is not offered, an explicit session-only Allow
+    /// is permitted. Never fall back to a permanent permission or a task choice.
     static func singleApprovalIndex(_ labels: [String], descriptions: [String] = []) -> Int? {
         guard labels.count >= 2 else { return nil }
-        var current: [Int] = [], denials = 0
+        var current: [Int] = [], sessionOnly: [Int] = [], denials = 0
         for (index, label) in labels.enumerated() {
             let label = permissionLabel(label)
             if isDenial(label) { denials += 1; continue }
+            if isSessionPermission(label) { sessionOnly.append(index); continue }
             if isRepeatedPermission(label) { continue }
             guard let tail = affirmativeTail(label) else { return nil }
             if isRepeatedPermission(tail) || isRepeatedPermission("allow " + tail) { continue }
@@ -130,8 +137,9 @@ public struct YesNoConfirmation {
             if descriptions.indices.contains(index), isRepeatedPermission(descriptions[index]) { continue }
             current.append(index)
         }
-        guard current.count == 1, denials == 1 else { return nil }
-        return current[0]
+        guard denials == 1 else { return nil }
+        if current.count == 1 { return current[0] }
+        return current.isEmpty && sessionOnly.count == 1 ? sessionOnly[0] : nil
     }
 
     public func updatedInput(_ input: JSONObject) -> JSONObject {

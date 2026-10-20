@@ -129,24 +129,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let sessionID: String
         let title: String
         let options: [String]
+        let multiSelect: Bool
         init(sessionID: String, question: QueuedQuestion) {
-            self.sessionID = sessionID; title = question.title; options = question.options
+            self.sessionID = sessionID; title = question.title; options = question.options; multiSelect = question.multiSelect ?? false
         }
     }
     private struct QuestionConfirmationCache {
-        private var detected: [QuestionConfirmationKey: YesNoConfirmation] = [:]
+        private var detected: [QuestionConfirmationKey: AutomaticQuestionDecision] = [:]
         private var checked = Set<QuestionConfirmationKey>()
 #if DEBUG
         private(set) var detectionCount = 0
 #endif
-        mutating func confirmation(sessionID: String, question: QueuedQuestion) -> YesNoConfirmation? {
+        mutating func confirmation(sessionID: String, question: QueuedQuestion) -> AutomaticQuestionDecision? {
             let key = QuestionConfirmationKey(sessionID: sessionID, question: question)
             if checked.contains(key) { return detected[key] }
             checked.insert(key)
 #if DEBUG
             detectionCount += 1
 #endif
-            let result = YesNoConfirmation.detect(question)
+            let result = AutomaticQuestionDecision.detect(question)
             if let result { detected[key] = result }
             return result
         }
@@ -165,6 +166,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var cachedDuplicateQuestionIDsBySession: [String: Set<String>] = [:]
     private var duplicateQuestionIDsDirty = true
     private var automaticQuestionReplies: [String: AutomaticQuestionReply] = [:]
+    private struct ModelRetentionTask {
+        let token: UUID
+        let questionID: String
+        let generation: String
+        let revision: UInt64
+        let task: Task<Void, Never>
+    }
+    private var modelRetentionTasks: [String: ModelRetentionTask] = [:]
+    private var manuallyChangedModelQuestions: [String: String] = [:]
+    private var retainedModelMenus: [String: String] = [:]
     private var questionAutomationStopped = false
     private struct AutomaticQuestionReply {
         var token: UUID
@@ -480,6 +491,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         mouseActivity.stop()
         questionAutomationStopped = true
         for id in Array(automaticQuestionReplies.keys) { cancelAutomaticQuestionReply(id) }
+        for pending in modelRetentionTasks.values { pending.task.cancel() }; modelRetentionTasks.removeAll()
+        manuallyChangedModelQuestions.removeAll()
+        retainedModelMenus.removeAll()
         server?.stop(); server = nil
         webService?.stop(); webService = nil
         for pending in remoteInputReplies.values { pending.continuation.resume(throwing: AppError.message("앱이 종료되어 입력 전달 결과를 확인하지 못했습니다.")) }
@@ -1264,8 +1278,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     public func remoteInput(_ object: JSONObject) async throws -> JSONObject {
+        if let id = object["sessionID"] as? String, let pending = modelRetentionTasks[id] {
+            manuallyChangedModelQuestions[id] = pending.generation + ":" + pending.questionID
+            cancelModelRetention(id)
+        }
+        return try await remoteInput(object, automaticAuthorization: nil)
+    }
+
+    private func remoteInput(_ object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)?) async throws -> JSONObject {
         var deliveryStarted = false
-        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted) }
+        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted, automaticAuthorization: automaticAuthorization) }
         catch {
             var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
             if diagnostics["delivery"] == nil { diagnostics["delivery"] = deliveryStarted ? "unknown" : "not_started" }
@@ -1273,7 +1295,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool) async throws -> JSONObject {
+    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool, automaticAuthorization: (@MainActor () throws -> Void)?) async throws -> JSONObject {
+        try automaticAuthorization?()
         let relay = object["relay"] as? Bool == true
         guard !remoteInputStopped, let id = object["sessionID"] as? String, let token = object["revision"] as? String,
               let kind = (object["kind"] as? String).flatMap(RemoteTerminalInput.Kind.init(rawValue:)),
@@ -1383,12 +1406,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(409, "원래 CLI의 실행 시각, TTY 또는 입력 대상이 바뀌어 입력하지 않았습니다.")
             }
         }
+        // Pause, opt-out and a replaced model question can cancel during the
+        // asynchronous process check. Web callers cannot supply this callback.
+        try automaticAuthorization?()
         // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
         if !relay { remoteFrames.removeValue(forKey: id) }
         invalidateRemoteRead(id)
         let textual = [.text, .submit, .message, .characters].contains(kind)
         var event = AuditEvent(sessionID: id, summary: textual ? String(input.text.prefix(200)) : kind.rawValue,
             outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: textual ? input.text : kind.rawValue)
+        if automaticAuthorization != nil { event.source = "현재 모델 자동 유지" }
         if kind == .choice, let question = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent), let selected = question.targetIndex(command: input.text) {
             event.summary = question.question; event.request = question.question + "\n" + question.options.joined(separator: "\n"); event.answer = question.options[selected]
         }
@@ -2441,7 +2468,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         publish()
     }
 
-    private func replyTerminalQuestion(_ session: AgentSession, object: JSONObject) async throws -> JSONObject {
+    private func replyTerminalQuestion(_ session: AgentSession, object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)? = nil) async throws -> JSONObject {
         guard let questionID = object["questionID"] as? String, let revision = object["revision"] as? String,
               let index = object["choice"] as? Int,
               let observed = remoteFrames[session.id], observed.frame.revision == revision,
@@ -2471,7 +2498,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                      "kind": "choice", "text": current.command(for: index)]
             if session.terminal == .orca, let stream = frame.streamID { input["relay"] = true; input["streamID"] = stream }
             attempted = true
-            _ = try await remoteInput(input)
+            if let automaticAuthorization { _ = try await remoteInput(input, automaticAuthorization: automaticAuthorization) }
+            else { _ = try await remoteInput(input) }
             let message = "같은 원본 터미널에서 ‘\(question.options[index])’를 선택했습니다."
             try save(QuestionReply(phase: .queued, answer: question.options[index], message: message, transport: .terminal))
             return ["ok": true, "message": message]
@@ -2890,6 +2918,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for member in groupIDs(target) { screens[member]?.scheduledID = nil }
         if !enabled {
             for member in groupIDs(target) {
+                cancelModelRetention(member)
                 cancelCapacityResume(member)
                 capacityStates.removeValue(forKey: member)
                 exitRecoveries[member]?.automaticCancelled = true
@@ -2912,6 +2941,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func setPaused(_ paused: Bool) throws {
         snapshot.paused = paused; revision &+= 1
+        if paused { for id in Array(modelRetentionTasks.keys) { cancelModelRetention(id) } }
         for id in screens.keys { screens[id]?.scheduledID = nil }
         for id in Array(capacityStates.keys) { capacityStates[id]?.scheduledID = nil }
         try store.set("paused", paused ? "true" : "false")
@@ -3308,12 +3338,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return response
         }
         if tool == "AskUserQuestion", ["PreToolUse", "PermissionRequest"].contains(event),
-           let confirmation = YesNoConfirmation.detect(input) {
+           let confirmation = AutomaticQuestionDecision.detect(input) {
             // tool_use_id joins PreToolUse and PermissionRequest for one logical question.
             let toolID = (payload["tool_use_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? requestID
             let first = rememberHook(key + ":question:" + providerID + ":" + toolID)
             if first {
-                session.setPhase(.input, detail: "Claude가 예·아니오 확인을 기다리고 있습니다.")
+                session.setPhase(.input, detail: "Claude가 자동 확인 질문의 응답을 기다리고 있습니다.")
                 session.pendingSummary = summary; session.pendingInTerminal = true
                 session.pendingRequestID = "hook:\(providerID):\(toolID)"
                 if !deferApproval, lineageVerified, effectiveAutomatic(key, fallback: session), !snapshot.paused,
@@ -3327,7 +3357,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         } else {
                             response = ["hookSpecificOutput": ["hookEventName": event, "decision": ["behavior": "allow", "updatedInput": updated]]]
                         }
-                        session.setPhase(.working, detail: "예·아니오 확인에 ‘\(confirmation.answer)’ 응답을 전달했습니다.")
+                        session.setPhase(.working, detail: "확인 질문에 ‘\(confirmation.answer)’ 응답을 전달했습니다.")
                         session.pendingSummary = nil; session.pendingInTerminal = false
                         session.pendingRequestID = nil
                     } else {
@@ -3946,6 +3976,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func clearScreen(_ id: String, keepRemote: Bool = false) {
+        cancelModelRetention(id)
+        if sessions[id] == nil || sessions[id]?.phase == .ended {
+            manuallyChangedModelQuestions.removeValue(forKey: id); retainedModelMenus.removeValue(forKey: id)
+        }
         remoteMonitorFrames.removeValue(forKey: id)
         // A failed background monitor clears approval observations, not the
         // independent exact-target web stream. Its frames still expire and
@@ -4044,6 +4078,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessions[sessionID]?.channel = source
         } else if !session.channel.isScreen { return }
         screenObservedAt[sessionID] = now
+        reconcileModelRetention(sessionID, choice: analysis.modelChoice, generation: generation,
+            resolved: analysis.request == nil && (analysis.activity.phase == .working || analysis.activity.phase == .idle))
         guard let prompt else {
             sessions[sessionID]?.systemCommandRisk = nil
             let request = analysis.request
@@ -4104,6 +4140,85 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.requestIdentity)"
         sessions[sessionID]?.lastActivity = Date()
         scheduleScreenApproval(sessionID)
+    }
+
+    private func cancelModelRetention(_ id: String) {
+        modelRetentionTasks.removeValue(forKey: id)?.task.cancel()
+    }
+
+    private func reconcileModelRetention(_ id: String, choice: TerminalChoiceQuestion?, generation: String, resolved: Bool) {
+        let savedKey = "retainedModelMenu:" + id
+        if retainedModelMenus[id] == nil { retainedModelMenus[id] = store.value(savedKey) ?? "" }
+        guard let choice else {
+            cancelModelRetention(id)
+            if resolved {
+                manuallyChangedModelQuestions.removeValue(forKey: id)
+                if retainedModelMenus[id]?.isEmpty == false {
+                    do { try store.set(savedKey, ""); retainedModelMenus[id] = "" } catch {}
+                }
+            }
+            return
+        }
+        let identity = generation + ":" + choice.id
+        let menuIdentity = PromptDetector.fingerprint(generation + "\n" + ([choice.question] + choice.options).map {
+            $0.precomposedStringWithCanonicalMapping.filter { !$0.isWhitespace }
+        }.joined(separator: "\n"))
+        if let previous = manuallyChangedModelQuestions[id], previous != identity { manuallyChangedModelQuestions.removeValue(forKey: id) }
+        if let pending = modelRetentionTasks[id] {
+            if pending.questionID == choice.id, pending.generation == generation, pending.revision == revision { return }
+            cancelModelRetention(id)
+        }
+        let receipt = "terminalChoice:\(id):\(choice.id)"
+        guard !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id),
+              retainedModelMenus[id] != menuIdentity,
+              manuallyChangedModelQuestions[id] != identity,
+              !userInputHasPriority(id), !automaticInputBusy(id),
+              let session = sessions[id], session.phase != .ended, session.channel.isScreen,
+              remoteInputReason(session) == nil,
+              savedReply(receipt) == nil || savedReply(receipt)?.canRetry == true,
+              let index = AutomaticQuestionDecision.currentModelIndex(question: choice.question, options: choice.options) else { return }
+        let token = UUID(), scheduledRevision = revision, delay = confirmationDelay
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.modelRetentionTasks[id]?.token == token { self.modelRetentionTasks.removeValue(forKey: id) } }
+            var reserved = false
+            do {
+                try await Task.sleep(for: .seconds(delay))
+                @MainActor func authorize() throws {
+                    guard !Task.isCancelled, !self.remoteInputStopped, !self.snapshot.paused,
+                          self.revision == scheduledRevision, self.effectiveAutomatic(id),
+                          self.modelRetentionTasks[id]?.token == token,
+                          self.remoteObservedScreens[id]?.generation == generation,
+                          let current = self.sessions[id], current.phase != .ended,
+                          current.pid == session.pid, current.started == session.started, current.tty == session.tty,
+                          current.channel == session.channel, current.screenHandle == session.screenHandle,
+                          current.bridgeID == session.bridgeID, current.terminalID == session.terminalID else { throw CancellationError() }
+                }
+                try authorize()
+                guard !self.userInputHasPriority(id), !self.automaticInputBusy(id) else { return }
+                let frame = try await self.remoteTerminal(sessionID: id, realtime: true)
+                try authorize()
+                guard let current = frame.question, current.id == choice.id, frame.inputReason == nil,
+                      current.options.indices.contains(index), current.options[index] == choice.options[index],
+                      AutomaticQuestionDecision.currentModelIndex(question: current.question, options: current.options) == index else { return }
+                // Persist before dispatch. Scrollback changes or an app restart
+                // cannot replay an uncertain answer to this same model menu.
+                try self.store.set(savedKey, menuIdentity); self.retainedModelMenus[id] = menuIdentity; reserved = true
+                _ = try await self.replyTerminalQuestion(session, object: ["questionID": choice.id, "revision": frame.revision, "choice": index],
+                    automaticAuthorization: authorize)
+            } catch {
+                if reserved, (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started",
+                   self.retainedModelMenus[id] == menuIdentity,
+                   self.modelRetentionTasks[id] == nil || self.modelRetentionTasks[id]?.token == token {
+                    do { try self.store.set(savedKey, ""); self.retainedModelMenus[id] = "" } catch {}
+                }
+                if !Task.isCancelled, !self.snapshot.paused, self.sessions[id]?.phase != .ended {
+                    let detail = "현재 모델 유지 입력을 완료하지 못했습니다. " + String(error.localizedDescription.prefix(1000))
+                    if self.sessions[id]?.activityDetail != detail { self.sessions[id]?.activityDetail = detail; self.publish() }
+                }
+            }
+        }
+        modelRetentionTasks[id] = ModelRetentionTask(token: token, questionID: choice.id, generation: generation, revision: revision, task: task)
     }
 
     // MARK: System changes: refuse the mutation, continue in the same conversation
