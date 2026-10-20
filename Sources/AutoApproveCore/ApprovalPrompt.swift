@@ -110,50 +110,72 @@ public enum PromptDetector {
         return lines
     }
 
-    /// Materialize normalized rows and preserve the exact source byte count
-    /// when a bridged/non-contiguous string already requires a scalar walk.
-    /// The byte count is for the original screen, before row normalization.
+    /// Bulk UTF-16 reads avoid per-scalar Objective-C calls for Cocoa frames.
+    /// Scratch storage is bounded; byte counts precede NFC and trailing-row removal.
     static func normalizedLinesAndUTF8ByteCount(_ screen: String) -> (lines: [String], byteCount: Int) {
-        let scalars = screen.unicodeScalars
-        var lines: [String] = []
-        lines.reserveCapacity(64)
-        var byteCount = 0
-        var start = scalars.startIndex
-        var index = start
-        var lineIsASCII = true
-        while index < scalars.endIndex {
-            let scalar = scalars[index]
-            byteCount += utf8Width(of: scalar.value)
-            if scalar.value == 10 || scalar.value == 13 {
-                let line = String(scalars[start..<index])
-                lines.append(lineIsASCII ? line : line.precomposedStringWithCanonicalMapping)
-                lineIsASCII = true
-                if scalar.value == 13 {
-                    let next = scalars.index(after: index)
-                    if next < scalars.endIndex, scalars[next].value == 10 {
-                        byteCount += 1
-                        index = next
+        let source = screen as NSString
+        let length = source.length
+        guard length > 0 else { return ([], 0) }
+        return withUnsafeTemporaryAllocation(of: UInt16.self, capacity: min(4096, length)) { buffer in
+            var lines: [String] = []; lines.reserveCapacity(64)
+            var totalBytes = 0, rowBytes = 0, rowStart = 0, offset = 0
+            var rowASCII = true, previousHigh = false, afterCR = false, invalid = false
+
+            func appendRow(endingAt end: Int) {
+                let range = NSRange(location: rowStart, length: end - rowStart)
+                guard range.length > 0 else { lines.append(""); return }
+                var encoded = false
+                var line = ""
+                if !invalid {
+                    line = String(unsafeUninitializedCapacity: rowBytes) { output in
+                        var used = 0, remaining = NSRange(location: 0, length: 0)
+                        let success = source.getBytes(output.baseAddress, maxLength: output.count,
+                            usedLength: &used, encoding: String.Encoding.utf8.rawValue, options: [],
+                            range: range, remaining: &remaining)
+                        encoded = success && used == rowBytes && remaining.length == 0
+                        return encoded ? used : 0
                     }
                 }
-                index = scalars.index(after: index)
-                start = index
-            } else {
-                lineIsASCII = lineIsASCII && scalar.isASCII
-                index = scalars.index(after: index)
+                if !encoded {
+                    // Preserve the previous replacement-scalar behavior without
+                    // copying an entire malformed row into a second UTF-16 array.
+                    let scalars = screen.unicodeScalars
+                    let start = String.Index(utf16Offset: range.location, in: screen)
+                    let end = String.Index(utf16Offset: range.location + range.length, in: screen)
+                    line = String(scalars[start..<end])
+                }
+                lines.append(rowASCII ? line : line.precomposedStringWithCanonicalMapping)
             }
-        }
-        let line = String(scalars[start..<scalars.endIndex])
-        lines.append(lineIsASCII ? line : line.precomposedStringWithCanonicalMapping)
-        while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
-        return (lines, byteCount)
-    }
 
-    @inline(__always)
-    private static func utf8Width(of scalar: UInt32) -> Int {
-        if scalar < 0x80 { return 1 }
-        if scalar < 0x800 { return 2 }
-        if scalar < 0x10000 { return 3 }
-        return 4
+            while offset < length {
+                let count = min(buffer.count, length - offset)
+                source.getCharacters(buffer.baseAddress!, range: NSRange(location: offset, length: count))
+                for index in 0..<count {
+                    let unit = buffer[index], position = offset + index
+                    let high = unit >= 0xd800 && unit <= 0xdbff
+                    let low = unit >= 0xdc00 && unit <= 0xdfff
+                    if (previousHigh && !low) || (low && !previousHigh) { invalid = true }
+                    // A high surrogate starts as a 3-byte replacement. A paired
+                    // low adds one byte, including pairs split across buffers.
+                    let width = unit < 0x80 ? 1 : unit < 0x800 ? 2 : low && previousHigh ? 1 : 3
+                    totalBytes += width
+                    previousHigh = high
+                    if unit == 10 || unit == 13 {
+                        if unit == 10 && afterCR { rowStart = position + 1; afterCR = false; continue }
+                        appendRow(endingAt: position)
+                        rowStart = position + 1; rowBytes = 0; rowASCII = true; invalid = false
+                        afterCR = unit == 13
+                    } else {
+                        rowBytes += width; rowASCII = rowASCII && unit < 0x80; afterCR = false
+                    }
+                }
+                offset += count
+            }
+            if previousHigh { invalid = true }
+            appendRow(endingAt: length)
+            while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
+            return (lines, totalBytes)
+        }
     }
     static func permissionMarkers(_ agent: AgentKind) -> [String] {
         agent == .codex
