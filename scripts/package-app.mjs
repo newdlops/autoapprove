@@ -2,6 +2,7 @@ import { mkdir, copyFile, writeFile, readFile, chmod, access, unlink, cp } from 
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import {prepareTerminalInputBundle} from './terminal-input-bundle.mjs';
+import {stripReleaseSymbols} from './release-symbols.mjs';
 
 const configuration = process.argv[2] ?? 'debug';
 if (!['debug', 'release'].includes(configuration)) throw new Error('Expected debug or release');
@@ -21,6 +22,11 @@ for (const binary of ['AutoApproveApp', 'autoapprove', 'AutoApproveTTYService'])
   await access(source);
   await copyFile(source, path.join(macOS, binary));
   await chmod(path.join(macOS, binary), 0o755);
+}
+if (configuration === 'release') {
+  const archiveDirectory = path.resolve('.runtime/release-symbols', `${webVersion.version}-${webVersion.build}`);
+  const symbols = stripReleaseSymbols(app, {archiveDirectory});
+  console.log(`Release executable symbols: ${symbols.savedBytes} bytes removed; diagnostic originals stay in ${archiveDirectory}`);
 }
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
 await copyFile('dist/AppIcon.icns', path.join(resources, 'AppIcon.icns'));
