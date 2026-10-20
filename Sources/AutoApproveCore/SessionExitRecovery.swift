@@ -18,7 +18,12 @@ public struct SessionExitRecovery: Codable {
         self.conversationID = conversationID.flatMap { UUID(uuidString:$0)?.uuidString.lowercased() }
     }
     public static func isShell(_ record: ProcessRecord) -> Bool {
-        ["zsh","bash","sh","fish","dash","ksh"].contains(URL(fileURLWithPath:record.executable).lastPathComponent)
+        let component = (record.executable as NSString).lastPathComponent
+        // Dot/empty paths need current-directory resolution; embedded NULs
+        // retain Foundation's legacy truncation. Ordinary names need no stat.
+        let name = component.isEmpty || component == "." || component == ".." || record.executable.utf8.contains(0)
+            ? URL(fileURLWithPath: record.executable).lastPathComponent : component
+        return ["zsh","bash","sh","fish","dash","ksh"].contains(name)
     }
     public static func conversation(in screen: String) -> String? {
         let pattern = #"^To continue this session, run codex resume ([0-9a-fA-F-]{36})\s*$"#

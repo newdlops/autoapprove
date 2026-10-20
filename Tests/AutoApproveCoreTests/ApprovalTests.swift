@@ -495,6 +495,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("History processing: risk variants, Unicode and fresh installer source", tests.testSystemRiskLazyVariantsRetainWhitespaceUnicodeAndFreshSource),
             ("Screen parsing: Cocoa preparation preserves prompt identity and quoted questions", tests.testCocoaLinePreparationPreservesPromptIdentityAndQuotedQuestions),
             ("Session processing: path equivalence and executable identity", tests.testProcessClassificationPreservesPathAndExecutableIdentity),
+            ("Session processing: shell names preserve Foundation path semantics", tests.testShellClassificationPreservesFoundationPathSemantics),
             ("Session processing: nested, orphan, cyclic and ended ownership", tests.testSessionProjectionKeepsNestedOrphanCyclicAndEndedPolicies),
             ("System safety: mutations, escaped paths and readonly boundaries", tests.testSystemRiskMutationsAndReadOnlyBoundaries),
             ("System safety: candidate search preserves Unicode case folding and barriers", tests.testSystemRiskCandidateSearchPreservesCaseFoldingAndUnicodeBarriers),
