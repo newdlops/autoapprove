@@ -34,10 +34,14 @@ try {
   page.on('request',request=>{if(request.method()==='POST')requests.push(request.postDataJSON());});
   await page.route('**/api/network*',async route=>{
     try {
-      const response=await route.fetch(),value=await response.json();
+      // This fixture replaces online/version fields. Its response must not
+      // reuse a validator for the unmodified production representation.
+      const headers={...route.request().headers()};delete headers['if-none-match'];
+      const response=await route.fetch({headers}),value=await response.json();
       if(offline)value.nodes[0].online=false;
       if(oldVersion)value.nodes[0].state.release={version:'0.2.83',build:107,api:1};
-      await route.fulfill({response,json:value});
+      const responseHeaders={...response.headers()};delete responseHeaders.etag;
+      await route.fulfill({response,headers:responseHeaders,json:value});
     } catch {try {await route.abort();} catch {}}
   });
   await page.route('**/api/action*',async route=>{
@@ -50,7 +54,7 @@ try {
   });
   const state=async()=>await(await fetch(base+'/api/state')).json();
   const live=async()=> (await state()).sessions.find(value=>value.session.id===ready.live).session;
-  const liveRead=()=>page.locator('#interruption-list').getByRole('button',{name:/오류 확인했음/});
+  const liveRead=()=>page.locator('#interruption-list .interruption-read');
   async function refresh(){await page.locator('#refresh').click();await page.waitForFunction(()=>!loadingNetwork);}
   async function capture(name){await page.screenshot({path:path.join(out,name+'.png')});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,name+' page overflow');views.push(name);}
   await page.goto(base);await page.waitForFunction(()=>allSessions.length===4);
@@ -108,9 +112,10 @@ try {
   checks.push('A newer failure reappears; an in-flight read of the previous episode returns 409 and cannot acknowledge the newer error');
   failRead=true;await liveRead().click();await page.waitForFunction(()=>document.querySelector('#feedback').textContent.includes('합성 저장 실패'));
   assert.equal(await page.locator('#interruption-list>article').count(),1);assert.equal((await live()).interruption.acknowledgedAt,undefined);await capture('mobile-save-failure');
-  failRead=false;offline=true;await refresh();assert.equal(await liveRead().isDisabled(),true);await capture('mobile-offline-receipt');
-  offline=false;oldVersion=true;await refresh();const unsupported=liveRead();assert.equal(await unsupported.isDisabled(),true);assert.match(await unsupported.getAttribute('title'),/0\.2\.84/);
-  checks.push('Save failures preserve the alert for retry; offline and older Macs cannot falsely report a saved confirmation');
+  failRead=false;offline=true;await refresh();assert.equal(await liveRead().isEnabled(),true);assert.match(await liveRead().textContent(),/표시 정리/);await capture('mobile-offline-receipt');
+  offline=false;oldVersion=true;await refresh();const unsupported=liveRead();assert.equal(await unsupported.isEnabled(),true);assert.match(await unsupported.getAttribute('title'),/이 브라우저/);
+  assert.equal((await live()).interruption.acknowledgedAt,undefined);
+  checks.push('Save failures preserve the alert for retry; offline and older Macs offer browser-local display cleanup without claiming a server read receipt');
   oldVersion=false;await refresh();await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});await page.setViewportSize({width:768,height:1024});await capture('tablet-dark-retry');
   await liveRead().click();await page.waitForFunction(()=>document.querySelector('#session-interruptions').hidden);
   assert.equal(await page.locator('#feedback').getAttribute('data-error'),'false');assert.match(await page.locator('#feedback').textContent(),/오류 확인 상태를 저장했습니다/);

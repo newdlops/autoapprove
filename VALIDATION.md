@@ -1,5 +1,13 @@
 # AutoApprove 검증 기록
 
+## 0.2.142 웹 목록·지난 메시지 정리 · 빌드 169
+
+- 연결 끊긴 Mac은 접힌 이전 연결로 모으고, 브라우저별 정리·복원, 정확한 노드 재접속 시 복귀와 서버에서 빠진 행의 DOM/Map 해제를 확인했다. 조회 중·접속한 Mac·검증된 원본 스트림은 정리 대상에서 제외한다. 경고 표시 정리는 현재 ID만 대상으로 하고 새 오류·위험 요청은 다시 표시한다. 구버전/오프라인은 브라우저 표시만 정리하며 서버 읽음 저장으로 표현하지 않는다.
+- 지난 답변 44개는 최대 10개 간단한 기록으로 표시하고 새 질문 편집기 하나는 유지한다. 이전 141의 동일한 합성 화면을 실제 렌더링한 질문 편집기 **45→1개**, 전체 질문·메시지 창 요소 **793→158개**를 확인했다. CPU·메모리·통신 지연 개선율로 확대하지 않는다. 메시지 개별/전체 정리·1분 되돌리기·다른 세션·초안·전송 중 요청·저장 실패·늦은 접수 응답을 확인했다. 작성창과 지난 기록의 스크롤 영역을 분리했다. 실제 Codex 대기 입력·Mac 감사 내역·자동 승인 정책은 바꾸지 않는다.
+- `node scripts/web-cleanup-browser-check.mjs`와 `--webkit`, `node scripts/session-error-read-browser-check.mjs --release`, `node scripts/web-message-browser-check.mjs --release`, `node scripts/web-resource-browser-check.mjs`가 통과했다. 브라우저 의존성은 기존 설치의 `AUTOAPPROVE_PLAYWRIGHT_MODULE`과 `AUTOAPPROVE_CHROMIUM_PATH`를 사용하며 새 의존성·상주 서비스는 추가하지 않았다. 초기 오류 확인 테스트는 변경한 버전 응답에 원래 ETag를 남겨 실패했고, mock의 조건부 헤더/ETag를 제거한 해당 검사만 다시 실행해 통과했다.
+- Chromium·WebKit의 390×844·768×1024·1440×900 기능 검사, 목록·경고·메시지 및 어두운 화면의 실제 렌더링을 확인했다. 가로 넘침 없이 메시지 전송 조작부가 화면 안에 있고, 새 제어는 기존 44px 버튼·키보드·포커스 표시를 사용한다. 저장 실패는 열린 메시지 창 안에도 표시한다. Impeccable 기계 검사에 지적은 없었고 후속 배치 수정은 Web Interface Guidelines와 함께 직접 검토했다. 합성 데이터·클릭·키보드와 모방 viewport의 검사이며 실물 iPhone/Safari 키보드·IME/스와이프 검사는 아니다.
+- 전체 Release **368/368**, 최종 패키지 훅 자동 12건/수동 12건과 재시작·단일 전달·웹/MCP/PTY·입력 구성요소, 기존 발행자 서명과 DMG 검사가 통과했다. App/CLI 각 38개 코드 section 및 웹 13개 파일이 최종 빌드/소스와 일치한다. 원본 사용자 터미널 시험 입력·시스템 자동 실행 등록·보안/VPN/TCC 변경은 수행하지 않았다. 근거는 `.runtime/releases/0.2.142/`, `.runtime/performance/web-cleanup-142-20261020/`다.
+
 ## 0.2.131 원본 터미널 검증 경량화 · 빌드 158
 
 - 안전 안내의 읽기·쓰기 직전 재검사와 종료 오류 복구의 전후 읽기, 네 contents-only 소비 경로를 별도 검증 reader로 연결했다. Terminal은 제목·커서를 생략하며 기존 fresh-read 횟수, PID·시작·TTY·foreground·권한·stale 검사와 단일 입력/복구 receipt를 유지한다. 다른 호스트는 기존 reader를 사용한다. 기본 감시 제목과 웹 첫 화면·실시간 표시 경로는 유지한다.

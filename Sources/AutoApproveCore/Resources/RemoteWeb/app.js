@@ -64,6 +64,58 @@ let webFormSignature = '', screenListSignature = '', sharedScreen = null, shared
 const messageDeliveries = new Map(), messageReceiptReads = new Set();
 let messageUncertain = new Set(), interactionLinkOpened = false, messageReceiptTimer;
 const messageStorage = 'autoapprove-message-drafts-v1';
+const cleanupStorage = 'autoapprove-web-cleanup-v1';
+let cleanup = {macs:new Set(),warnings:new Set(),questions:new Set()};
+let messageCleanupUndo = null, messageCleanupTimer, messageCleanupError = null;
+try {
+  const saved = JSON.parse(localStorage.getItem(cleanupStorage) || '{}');
+  for (const [kind,limit] of [['macs',128],['warnings',1024],['questions',2048]]) {
+    if (Array.isArray(saved[kind])) cleanup[kind] = new Set(saved[kind].filter(value=>typeof value==='string' && value.length<=2048).slice(-limit));
+  }
+} catch (_) {}
+function saveCleanup(changes) {
+  const value = Object.fromEntries(Object.entries(cleanup).map(([kind,entries])=>[kind,[...(changes[kind] || entries)].slice(-({macs:128,warnings:1024,questions:2048}[kind]))]));
+  try { localStorage.setItem(cleanupStorage,JSON.stringify(value)); }
+  catch (_) {
+    const message='표시 정리를 저장하지 못했습니다. 브라우저 저장 공간을 확인한 뒤 다시 시도해주세요.';
+    if($('interaction-dialog').open){messageCleanupError={sessionKey:selectedKey,message};updateInteractionControls();}
+    feedback(message,true);return false;
+  }
+  messageCleanupError=null;
+  cleanup = Object.fromEntries(Object.entries(value).map(([kind,entries])=>[kind,new Set(entries)]));
+  appliedNetworkETag = ''; updateCleanupControls(); return true;
+}
+const warningKey = (item,source,kind) => JSON.stringify([kind,item.node.id,source.id,kind==='safety' ? source.systemSafety?.id : source.interruption?.id]);
+const warningHidden = (item,source,kind) => cleanup.warnings.has(warningKey(item,source,kind));
+const pastQuestionKey = (node,source,question) => JSON.stringify([node.id,source.id,question.id,question.reply?.queueID || '']);
+function offlineMacs() {
+  return nodes.filter(node=>!node.local && !node.online && !node.loading && !(selectedItem?.node.id===node.id && (originalReadSelected() || originalStreamSelected())));
+}
+function displayedWarnings() {
+  return allSessions.flatMap(item=>[
+    ...(unreadInterruption(item.session) && !warningHidden(item,item.session,'interruption') ? [warningKey(item,item.session,'interruption')] : []),
+    ...[item.session,...(item.session.backgroundSessions || [])].filter(source=>source.systemSafety && !warningHidden(item,source,'safety')).map(source=>warningKey(item,source,'safety'))
+  ]);
+}
+function updateCleanupControls() {
+  const count = offlineMacs().length;
+  text($('clean-offline-macs'),`연결 끊긴 Mac${count ? ' '+count+'대' : ''} 정리`);
+  $('clean-offline-macs').disabled = !connected || !count;
+  $('clean-warnings').disabled = displayedWarnings().length===0;
+  $('restore-cleanup').disabled = !Object.values(cleanup).some(values=>values.size);
+}
+function cleanOfflineMacs(ids = offlineMacs().map(node=>node.id)) {
+  const eligible = new Set(offlineMacs().map(node=>node.id)), chosen = ids.filter(id=>eligible.has(id));
+  if (!connected || !chosen.length || !saveCleanup({macs:new Set([...cleanup.macs,...chosen])})) return;
+  feedback(`연결 끊긴 Mac ${chosen.length}대의 표시를 정리했습니다.`); void refreshNetwork();
+}
+function cleanWarnings(keys = displayedWarnings()) {
+  if (!keys.length || !saveCleanup({warnings:new Set([...cleanup.warnings,...keys])})) return;
+  const focusedWarning = document.activeElement?.closest('.interruption-row, #session-safety');
+  renderMachines(); renderList(); if (selectedItem) renderSessionSafety();
+  if(focusedWarning && document.activeElement===document.body)($('interruption-list').querySelector('button') || $('system-safety-list').querySelector('button') || $('search')).focus({preventScroll:true});
+  feedback('경고 표시를 정리했습니다. 새 경고는 다시 표시됩니다.');
+}
 const nonASCIIText = /[^\x00-\x7f]/;
 const byteLength = (value, limit = Infinity) => {
   value = value === undefined ? '' : String(value); let bytes = 0;
@@ -212,7 +264,7 @@ const originalStreamSelected = () => !!selectedItem && !selectedItem.view.pty &&
 const originalTerminalConnected = () => !!currentNode()?.online || originalStreamSelected();
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const unreadInterruption = session => !!session.interruption && session.interruption.recoveredAt == null && session.interruption.acknowledgedAt == null;
-const retainedError = item => item.session.phase === 'ended' && !!item.session.interruption && !unreadInterruption(item.session);
+const retainedError = item => item.session.phase === 'ended' && !!item.session.interruption && (!unreadInterruption(item.session) || warningHidden(item,item.session,'interruption'));
 const needsReview = session => unreadInterruption(session) || ['approval', 'input'].includes(session.phase) || (session.queuedQuestions || []).some(question => !['sending', 'queued'].includes(question.reply?.phase));
 const interruptionReads = new Set();
 const interruptionReadKey = item => item.key + '/' + item.session.interruption?.id;
@@ -666,7 +718,13 @@ async function refreshNetwork(initial = false) {
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
     // A partial response means the read is pending, not that the peer's original
     // sessions ended. Keep its last inventory, without claiming it is online.
-    nodes = result.nodes.map(node => node.loading && !node.state && previousNodes.get(node.id)?.state
+    const reconnected = result.nodes.filter(node=>node.online && cleanup.macs.has(node.id));
+    if (reconnected.length) {
+      for (const node of reconnected) cleanup.macs.delete(node.id);
+      // Reconnection always restores the real Mac, even if browser persistence is unavailable.
+      try { localStorage.setItem(cleanupStorage,JSON.stringify(Object.fromEntries(Object.entries(cleanup).map(([kind,values])=>[kind,[...values]])))); } catch (_) {}
+    }
+    nodes = result.nodes.filter(node=>node.online || !cleanup.macs.has(node.id)).map(node => node.loading && !node.state && previousNodes.get(node.id)?.state
       ? {...node,state:previousNodes.get(node.id).state} : node);
     lastNetworkStartedAt = startedAt;
     const inventory = nodes.flatMap(node => node.online || node.loading && node.state ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []);
@@ -736,14 +794,22 @@ async function refreshNetwork(initial = false) {
   }
 }
 function renderMachines() {
+  const live = new Set(nodes.map(node=>node.id));
+  const offline = offlineMacs(), removable = new Set(offline.map(node=>node.id));
+  show($('offline-machines'),offline.length>0);text($('offline-machine-count'),`이전 연결 · 연결 끊긴 Mac ${offline.length}대`);
+  const removedFocus = [...machineRows].some(([id,row])=>!live.has(id) && row.contains(document.activeElement));
+  for (const [id,row] of machineRows) if (!live.has(id)) { row.remove(); machineRows.delete(id); }
   if (nodes.length && $('machines').querySelector('.empty-inline')) $('machines').replaceChildren();
   text($('mac-count'), `${connected ? nodes.filter(node => node.online).length : 0}대`);
   for (const node of nodes) {
     let row = machineRows.get(node.id);
     if (!row) {
       row = make('article', 'machine'); const info = make('div', 'machine-info');
-      info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status')); row.append(info, make('button', 'secondary'));
-      row.lastChild.addEventListener('click', () => {
+      info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status'));
+      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), clean = make('button','secondary machine-clean','목록에서 정리');
+      toggle.type = clean.type = 'button'; actions.append(toggle,clean); row.append(info,actions);
+      clean.addEventListener('click',()=>cleanOfflineMacs([node.id]));
+      toggle.addEventListener('click', () => {
         const current = nodes.find(item => item.id === node.id);
         if (current?.online) void action(node.id, { action: 'pause', paused: !current.state.snapshot.paused }, current.state.snapshot.paused ? '이 Mac의 자동 승인을 재개했습니다.' : '이 Mac의 자동 승인을 일시정지했습니다.');
       });
@@ -756,13 +822,23 @@ function renderMachines() {
     const activeCount = node.state?.sessions?.filter(view => !sessionEnded({session:view.session, view}) && !sessionEnded(ptyRetained.get(keyFor(node, view.session, view)))).length || 0;
     text(status, !connected ? '연결 확인 필요' : node.loading ? node.state ? `${activeCount}개 세션 · 갱신 중…` : '세션 확인 중…' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
     status.title = node.error || '';
-    const button = row.lastChild; text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
+    const button = row.querySelector('.machine-toggle'); text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
     button.setAttribute('aria-label', `${node.name} 자동 승인 ${node.online && node.state.snapshot.paused ? '재개' : '일시정지'}`);
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
+    const target = removable.has(node.id) ? $('offline-machine-list') : $('machines');
+    if(row.parentElement!==target) {
+      const hadFocus=row.contains(document.activeElement);target.append(row);
+      if(hadFocus && target.id==='offline-machine-list' && !$('offline-machines').open)$('offline-machine-count').focus({preventScroll:true});
+    }
+    const clean = row.querySelector('.machine-clean'), canClean = removable.has(node.id);
+    show(button,!canClean); show(clean,canClean); clean.disabled = !connected;
+    clean.setAttribute('aria-label',`${node.name} 연결 끊긴 Mac 목록에서 정리`);
   }
   renderInterruptions();
   renderSystemSafety();
+  updateCleanupControls();
+  if(removedFocus && document.activeElement===document.body)$('list-cleanup').querySelector('summary').focus({preventScroll:true});
 }
 function systemSafetyTitle(risk) {
   return {persistence:'시스템 자동 실행 변경',security:'보안·접근 권한 변경',settings:'시스템 설정·파일 변경',privileged:'관리자 권한 실행'}[risk?.kind] || '시스템 변경';
@@ -774,7 +850,7 @@ function systemSafetyStatus(source, node) {
 }
 function renderSystemSafety() {
   const active = allSessions.flatMap(item => [item.session,...(item.session.backgroundSessions || [])].filter(source =>
-    source.systemSafety && (source.notices || []).some(notice => notice.isSystemSafety && !notice.isRead)
+    source.systemSafety && !warningHidden(item,source,'safety') && (source.notices || []).some(notice => notice.isSystemSafety && !notice.isRead)
   ).map(source => ({item,source,key:item.key+'/'+source.id+'/'+source.systemSafety.id})));
   const keys = new Set(active.map(value => value.key));
   for (const [key,row] of safetyRows) if (!keys.has(key)) { row.remove(); safetyRows.delete(key); }
@@ -785,18 +861,18 @@ function renderSystemSafety() {
     if (!row) {
       row = make('article','interruption-row'); const info = make('div');
       info.append(make('p','interruption-name'),make('p','small interruption-state'));
-      const button = make('button','secondary','세션 보기'); button.type = 'button';
-      button.addEventListener('click',()=>selectSession(item.key,true)); row.append(info,button);
+      const actions = make('div','interruption-actions'), button = make('button','secondary safety-view','세션 보기'), clean = make('button','secondary','경고 표시 정리'); button.type = clean.type = 'button';
+      button.addEventListener('click',()=>selectSession(item.key,true)); clean.addEventListener('click',()=>cleanWarnings([warningKey(item,source,'safety')])); actions.append(button,clean); row.append(info,actions);
       safetyRows.set(key,row); $('system-safety-list').append(row);
     }
     text(row.querySelector('.interruption-name'),`${item.node.name} · ${item.view.title} · ${systemSafetyTitle(source.systemSafety.risk)}`);
     text(row.querySelector('.interruption-state'),systemSafetyStatus(source,item.node) + (!item.node.online ? ' · Mac 연결 끊김' : ''));
-    row.lastChild.setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 시스템 변경 경고 보기`);
+    row.querySelector('.safety-view').setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 시스템 변경 경고 보기`);
   }
 }
 function renderSessionSafety() {
   const {session,node} = selectedItem, container = $('session-safety');
-  const sources = [session,...(session.backgroundSessions || [])].filter(source => source.systemSafety);
+  const sources = [session,...(session.backgroundSessions || [])].filter(source => source.systemSafety && !warningHidden(selectedItem,source,'safety'));
   const keys = new Set(sources.map(source=>source.id));
   for (const article of container.children) if (!keys.has(article.dataset.source)) article.remove();
   show(container,sources.length > 0);
@@ -808,9 +884,12 @@ function renderSessionSafety() {
       article.append(make('h3'),make('p','safety-status'));
       article.querySelector('p').setAttribute('role','status');
       const details = make('details'); details.append(make('summary','','요청과 안전한 대안'),make('pre','safety-request'),make('p','safety-alternative'));
-      article.append(details);container.append(article);
+      const clean = make('button','secondary','경고 표시 정리'); clean.type = 'button';
+      clean.addEventListener('click',()=>cleanWarnings([article.dataset.warningKey]));
+      article.append(details,clean);container.append(article);
     }
     text(article.querySelector('h3'),systemSafetyTitle(notice.risk) + (source.id !== session.id ? ' · 백그라운드 실행' : ''));
+    article.dataset.warningKey = warningKey(selectedItem,source,'safety');
     text(article.querySelector('.safety-status'),systemSafetyStatus(source,node));
     text(article.querySelector('.safety-request'),notice.request);
     text(article.querySelector('.safety-alternative'),'이미 실행 중인 프로그램의 타이머나 프로젝트 내부 작업으로 계속합니다. 시스템 자동 실행 등록·관리자 권한 상승·보안 설정 변경이나 우회는 하지 않습니다.');
@@ -824,7 +903,7 @@ function interruptionStatus(session) {
   return `${states[recovery.phase] || '복구 상태 확인 중'}${recovery.deadline ? ` · ${nowLabel(recovery.deadline)} 다시 시도` : ''}`;
 }
 function renderInterruptions() {
-  const active = allSessions.filter(item => unreadInterruption(item.session));
+  const active = allSessions.filter(item => unreadInterruption(item.session) && !warningHidden(item,item.session,'interruption'));
   const keys = new Set(active.map(item => item.key));
   for (const [key,row] of interruptionRows) if (!keys.has(key)) { row.remove(); interruptionRows.delete(key); }
   show($('session-interruptions'), active.length > 0);
@@ -845,16 +924,18 @@ function renderInterruptions() {
     text(row.querySelector('.interruption-detail'), item.session.interruption.detail);
     const [view,read] = row.querySelectorAll('button');
     view.setAttribute('aria-label',`${item.node.name}의 중단된 ${item.view.title} 세션 보기`);
-    read.setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 오류 확인했음`);
     const pending = interruptionReads.has(interruptionReadKey(item));
     const supportsReceipt = supportsRelease(item.node,[0,2,84,108]);
-    text(read,pending ? '확인 중…' : '확인했음'); read.disabled = pending || !connected || !item.node.online || !supportsReceipt;
+    const localCleanup = !connected || !item.node.online || !supportsReceipt;
+    read.setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 오류 ${localCleanup ? '표시 정리' : '확인했음'}`);
+    text(read,pending ? '확인 중…' : localCleanup ? '표시 정리' : '확인했음'); read.disabled = pending;
     read.setAttribute('aria-busy',String(pending));
-    read.title = !item.node.online ? 'Mac에 다시 연결한 뒤 확인 상태를 저장할 수 있습니다.' : !supportsReceipt ? '이 Mac을 0.2.84 이상으로 업데이트하면 오류 확인 상태를 저장할 수 있습니다.' : '오류 알림을 정리합니다. 자동 이어가기는 유지됩니다.';
+    read.title = localCleanup ? '이 브라우저에서 이 오류의 표시를 정리합니다. 목록 정리에서 다시 볼 수 있습니다.' : '오류 알림을 정리합니다. 자동 이어가기는 유지됩니다.';
   }
 }
 async function acknowledgeInterruption(item) {
-  if (!item || !item.node.online || !connected || !supportsRelease(item.node,[0,2,84,108]) || !unreadInterruption(item.session)) return;
+  if (!item || !unreadInterruption(item.session)) return;
+  if (!item.node.online || !connected || !supportsRelease(item.node,[0,2,84,108])) { cleanWarnings([warningKey(item,item.session,'interruption')]); return; }
   const key = interruptionReadKey(item), errorID = item.session.interruption.id;
   if (interruptionReads.has(key)) return;
   const restoreFocus = interruptionRows.get(item.key)?.querySelector('.interruption-read') === document.activeElement;
@@ -1561,7 +1642,7 @@ function renderQuestions() {
   const wasText = active?.tagName === 'TEXTAREA', selectionStart = wasText ? active.selectionStart : null, selectionEnd = wasText ? active.selectionEnd : null;
   const fieldIndex = wasText && activeQuestion ? Array.from(active.closest('form').querySelectorAll('textarea')).indexOf(active) : 0;
   $('questions').replaceChildren(); questionSignature = signature;
-  let count = 0;
+  let count = 0; const past = [];
   if (terminalQuestion) {
     count++; const key = `${node.id}/${session.id}/terminal:${terminalQuestion.id}`;
     const unavailable = ['sending','queued','uncertain'].includes(terminalQuestion.reply?.phase) || !latestFrame.keys.includes('choice') || !!latestFrame.inputReason;
@@ -1602,6 +1683,11 @@ function renderQuestions() {
       section.append(actions); $('questions').append(section);
     }
     for (const question of source.queuedQuestions || []) {
+      if (question.reply?.phase === 'queued') {
+        const key = pastQuestionKey(node,source,question);
+        if (!cleanup.questions.has(key)) past.push({key,question});
+        continue;
+      }
       count++; const questionKey = `${node.id}/${source.id}/${question.id}`, draft = questionDrafts.get(questionKey) || { answer: '', choices: [] };
       if (['failed','cancelled'].includes(question.reply?.phase) && !questionDeliveries.get(questionKey)?.busy && lastNetworkStartedAt > (questionDeliveries.get(questionKey)?.failedAt ?? questionDeliveries.get(questionKey)?.finishedAt ?? -Infinity)) {
         const state = questionDeliveries.get(questionKey) || {}; state.uncertain = false; state.sent = false;
@@ -1652,6 +1738,17 @@ function renderQuestions() {
       $('questions').append(section);
     }
   }
+  show($('past-questions'),past.length>0);
+  text($('past-question-count'),`지난 답변 ${past.length}개`);
+  $('past-question-list').replaceChildren();
+  for (const {key,question} of past.slice(0,10)) {
+    const row=make('li'), clean=make('button','secondary','표시 정리'); clean.type='button';
+    row.append(make('p','',question.title),make('p','muted small',question.reply.message || '답변 접수됨'));
+    if(question.reply.answer) row.append(make('p','past-answer',question.reply.answer));
+    clean.setAttribute('aria-label',`${question.title} 지난 답변 표시 정리`);
+    clean.addEventListener('click',()=>cleanPastQuestions([key])); row.append(clean); $('past-question-list').append(row);
+  }
+  $('clear-past-questions').onclick=()=>cleanPastQuestions(past.map(value=>value.key));
   show($('questions-section'), count > 0);
   text($('question-count'), count || '');
   updateInteractionControls();
@@ -1663,6 +1760,18 @@ function renderQuestions() {
     const choice = Array.from(form?.querySelectorAll('input') || []).find(input=>input.name===activeChoice.name&&input.value===activeChoice.value);
     if (choice && !choice.disabled) choice.focus({preventScroll:true});
   }
+}
+function cleanPastQuestions(keys) {
+  if (!keys.length || !saveCleanup({questions:new Set([...cleanup.questions,...keys])})) return;
+  const chosen=new Set(keys);
+  for(const source of interactionSources())for(const question of source.queuedQuestions || []) {
+    if(question.reply?.phase!=='queued' || !chosen.has(pastQuestionKey(selectedItem.node,source,question)))continue;
+    const key=`${selectedItem.node.id}/${source.id}/${question.id}`;questionDrafts.delete(key);
+    if(!questionDeliveries.get(key)?.busy){questionDeliveries.delete(key);questionEditing.delete(key);}
+  }
+  questionSignature=''; if(selectedItem)renderQuestions();
+  if(document.activeElement===document.body)$('message-input').focus({preventScroll:true});
+  feedback('지난 답변의 표시를 정리했습니다. 목록 정리에서 다시 볼 수 있습니다.');
 }
 function structuredQuestionForm(key, fields, config) {
   const form = make('form', 'question'); form.dataset.questionKey = key; form.dataset.structured = 'true'; form.dataset.nodeID = config.nodeID;
@@ -1773,15 +1882,25 @@ function updateInteractionControls() {
   show($('check-message'), uncertain && supportsRelease(selectedItem?.node,[0,2,58,73])); $('check-message').disabled = messageReceiptReads.has(delivery?.requestID);
   show($('use-original-message'), !!chosenConversation && supportsRelease(selectedItem?.node,[0,2,58,73]));
   $('use-original-message').disabled = messageSending;
-  text($('message-status'),delivery?.message || ''); text($('message-error'),delivery?.error || ''); show($('message-error'),!!delivery?.error);
-  const archives=[...messageDeliveries].filter(([key])=>key.startsWith(selectedKey+'#')).slice(-10);
+  const messageError=delivery?.error || (messageCleanupError?.sessionKey===selectedKey ? messageCleanupError.message : '');
+  text($('message-status'),delivery?.message || ''); text($('message-error'),messageError); show($('message-error'),!!messageError);
+  show($('clear-message-status'),delivery?.phase==='accepted');
+  const allArchives=[...messageDeliveries].filter(([key])=>key.startsWith(selectedKey+'#'));
+  const archives=allArchives.slice(-10);
   show($('message-history'),archives.length>0);
+  text($('message-history-summary'),`이전 메시지 · 전송 상태 ${allArchives.length}개`);
+  $('clear-message-history').disabled = !allArchives.some(([,record])=>record.phase!=='busy');
+  const undo=messageCleanupUndo?.sessionKey===selectedKey ? messageCleanupUndo : null;
+  show($('message-cleanup-result'),!!undo);
+  text($('message-cleanup-status'),undo ? `지난 전송 기록 ${undo.entries.length}개를 정리했습니다. 1분 동안 되돌릴 수 있습니다.` : '');
   const archiveSignature=JSON.stringify(archives.map(([key,record])=>[key,record.phase,record.text]));
   if($('message-history-list').dataset.signature!==archiveSignature) {
     $('message-history-list').dataset.signature=archiveSignature; $('message-history-list').replaceChildren();
-    for(const [,record] of archives) {
+    for(const [key,record] of archives) {
       const row=make('li'), label=make('p','muted small',record.phase==='accepted' ? '전달 확인' : record.phase==='failed' ? '전송 전 중단' : '전달 결과 미확인');
-      row.append(label,make('p','',record.text)); $('message-history-list').append(row);
+      const clean=make('button','secondary','기록 정리');clean.type='button';clean.disabled=record.phase==='busy';
+      clean.setAttribute('aria-label','지난 메시지 기록 정리');clean.addEventListener('click',()=>cleanMessageRecords([key]));
+      row.append(label,make('p','',record.text),clean); $('message-history-list').append(row);
     }
   }
   text($('message-help'), !present ? '목록에서 메시지를 보낼 터미널을 선택해주세요.' : uncertain ? '접수 결과를 확인하고 있습니다. 작성한 메시지는 보관하며 자동으로 다시 보내지 않습니다.' : directMessage ? !terminal ? '원본 터미널의 질문에 먼저 답변해주세요. 초안은 보관합니다.' : !available ? '원본 터미널 연결을 확인해주세요. 초안은 보관합니다.' : '작업 중이거나 대기 중인 같은 원본 터미널에 메시지를 보냅니다.' : codex && !queueSupported ? '메시지 전송은 이 Mac을 AutoApprove 0.2.46 이상으로 업데이트하면 사용할 수 있습니다.' : codex && !chosenSupported ? '선택한 Codex 대화에 메시지를 보내려면 이 Mac을 AutoApprove 0.2.51 이상으로 업데이트해주세요.' : codex && chosenConversation ? `선택한 대화 ‘${chosenConversation.title}’의 메시지 대기열로 전달합니다.` : codex ? '작업 중에도 같은 Codex 대화의 메시지 대기열로 전달합니다.' : !terminal ? '현재 터미널의 질문에 먼저 답변한 뒤 새 메시지를 보내주세요.' : !available ? '원본 터미널 입력 연결을 확인해주세요. 초안은 보관합니다.' : inputKeys().includes('submit') ? '같은 원본 터미널의 입력창에 메시지를 보냅니다.' : '이 원본 연결에서는 한 줄 메시지를 지원합니다.');
@@ -1797,6 +1916,7 @@ function openInteraction() {
 }
 async function submitMessage(event) {
   event.preventDefault(); if ($('send-message').disabled || !selectedItem) return;
+  messageCleanupError=null;
   const item = selectedItem, key = selectedKey, value=$('message-input').value; messageDrafts.set(key,value);
   const delivery = {requestID:uuid(),nodeID:item.node.id,sessionID:item.session.id,text:value,phase:'busy',error:'',message:'메시지를 전달하고 있습니다…'};
   messageDeliveries.set(key,delivery); saveMessageDrafts(); updateInteractionControls();
@@ -1826,6 +1946,7 @@ async function submitMessage(event) {
   } finally { saveMessageDrafts(); updateControls(); }
 }
 function acceptMessage(key,delivery) {
+  key = currentMessageKey(key,delivery); if (!key) return;
   delivery.phase='accepted'; delivery.error=''; messageUncertain.delete(key);
   if(messageDrafts.get(key)===delivery.text)messageDrafts.delete(key);
   if(selectedKey===key && $('message-input').value===delivery.text) $('message-input').value='';
@@ -1838,6 +1959,7 @@ async function checkMessageReceipt(key,delivery) {
   delivery.receiptChecks=(delivery.receiptChecks || 0)+1;
   try {
     const result=await api(endpoint('/api/receipt',delivery.nodeID)+'&request='+encodeURIComponent(delivery.requestID));
+    key=currentMessageKey(key,delivery); if(!key)return;
     if(result.requestID!==delivery.requestID)throw new Error('전송 요청의 접수 결과가 일치하지 않습니다.');
     if(result.phase==='completed') {
       if(result.status>=200 && result.status<300) { delivery.message=result.result?.message || '메시지 접수를 확인했습니다.'; acceptMessage(key,delivery); }
@@ -1845,8 +1967,48 @@ async function checkMessageReceipt(key,delivery) {
         delivery.phase='failed'; delivery.error=result.result?.error || '메시지가 전송 전에 거부됐습니다.'; delivery.message='전송되지 않은 메시지입니다. 수정하거나 다시 연결한 뒤 보낼 수 있습니다.'; messageUncertain.delete(key);
       } else { delivery.receiptSettled=true; delivery.message='전달 여부를 확인하지 못했습니다. 원본 터미널을 확인해주세요.'; }
     }
-  } catch (_) { delivery.message='연결이 복구되면 접수 결과를 다시 확인합니다. 작성한 메시지는 보관합니다.'; }
+  } catch (_) { if(currentMessageKey(key,delivery))delivery.message='연결이 복구되면 접수 결과를 다시 확인합니다. 작성한 메시지는 보관합니다.'; }
   finally { messageReceiptReads.delete(delivery.requestID); saveMessageDrafts(); updateInteractionControls(); scheduleMessageReceipts(); }
+}
+function currentMessageKey(key,delivery) {
+  if(messageDeliveries.get(key)===delivery)return key;
+  const archived=key+'#'+delivery.requestID;
+  return messageDeliveries.get(archived)===delivery ? archived : null;
+}
+function commitMessageRecords(next) {
+  try { sessionStorage.setItem(messageStorage,JSON.stringify({drafts:Object.fromEntries(messageDrafts),deliveries:Object.fromEntries(next)})); }
+  catch (_) {
+    const message='메시지 기록 정리를 저장하지 못했습니다. 기록은 유지했습니다.';
+    messageCleanupError={sessionKey:selectedKey,message};updateInteractionControls();feedback(message,true);return false;
+  }
+  messageCleanupError=null;
+  messageDeliveries.clear();for(const [key,value] of next)messageDeliveries.set(key,value);
+  return true;
+}
+function cleanMessageRecords(keys) {
+  if(!selectedKey)return;
+  const entries=keys.filter(key=>key.startsWith(selectedKey+'#') || key===selectedKey && messageDeliveries.get(key)?.phase==='accepted')
+    .map(key=>[key,messageDeliveries.get(key)]).filter(([,record])=>record && record.phase!=='busy');
+  if(!entries.length)return;
+  const next=new Map(messageDeliveries);for(const [key] of entries)next.delete(key);
+  if(!commitMessageRecords(next))return;
+  for(const [key] of entries)messageUncertain.delete(key);
+  messageCleanupUndo={sessionKey:selectedKey,entries};clearTimeout(messageCleanupTimer);
+  messageCleanupTimer=setTimeout(()=>{messageCleanupUndo=null;updateInteractionControls();},60000);
+  updateInteractionControls();scheduleMessageReceipts();
+  $('undo-message-cleanup').focus({preventScroll:true});
+}
+function undoMessageCleanup() {
+  const undo=messageCleanupUndo;if(!undo || undo.sessionKey!==selectedKey)return;
+  const next=new Map(messageDeliveries);
+  for(const [key,record] of undo.entries) {
+    const target=next.has(key) ? undo.sessionKey+'#'+record.requestID : key;
+    if(!next.has(target))next.set(target,record);
+  }
+  if(!commitMessageRecords(next))return;
+  for(const [key,record] of next)if(record.phase==='uncertain')messageUncertain.add(key);
+  clearTimeout(messageCleanupTimer);messageCleanupUndo=null;updateInteractionControls();scheduleMessageReceipts();
+  $('message-input').focus({preventScroll:true});
 }
 function scheduleMessageReceipts() {
   clearTimeout(messageReceiptTimer);
@@ -2092,6 +2254,16 @@ if ('IntersectionObserver' in window) {
 }
 
 $('search').addEventListener('input', renderList); $('node-filter').addEventListener('change', renderList);
+$('clean-offline-macs').addEventListener('click',()=>cleanOfflineMacs());
+$('clean-warnings').addEventListener('click',()=>cleanWarnings());
+$('restore-cleanup').addEventListener('click',()=>{
+  if(!saveCleanup({macs:new Set(),warnings:new Set(),questions:new Set()}))return;
+  questionSignature='';renderMachines();renderList();if(selectedItem){renderSessionSafety();renderQuestions();}
+  feedback('정리한 표시를 다시 불러옵니다.');void refreshNetwork();
+});
+$('clear-message-status').addEventListener('click',()=>cleanMessageRecords([selectedKey]));
+$('clear-message-history').addEventListener('click',()=>cleanMessageRecords([...messageDeliveries.keys()].filter(key=>key.startsWith(selectedKey+'#'))));
+$('undo-message-cleanup').addEventListener('click',undoMessageCleanup);
 for (const button of document.querySelectorAll('[data-filter]')) button.addEventListener('click', () => {
   filter = button.dataset.filter; for (const option of document.querySelectorAll('[data-filter]')) option.setAttribute('aria-pressed', String(option === button)); renderList();
 });

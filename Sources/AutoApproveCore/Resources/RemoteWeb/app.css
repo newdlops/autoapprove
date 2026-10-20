@@ -54,6 +54,14 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .machines { display: flex; flex-wrap: wrap; gap: 8px 24px; }
 .machine { min-width: 240px; max-width: 100%; display: flex; gap: 16px; align-items: center; padding: 8px 0; flex: 1 0 240px; border-bottom: 1px solid var(--line); }
 .machine-info { min-width: 0; flex: 1; }
+.machine-actions { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+.network > .section-heading { flex-wrap: wrap; align-items: flex-start; }
+.list-cleanup { max-width: 100%; }
+.list-cleanup > summary { min-height: 44px; padding: 10px 0; cursor: pointer; font-size: 13px; color: var(--muted); }
+.cleanup-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.list-cleanup > p { max-width: 360px; overflow-wrap: anywhere; }
+.offline-machines { margin-top: 8px; }
+.offline-machines > summary { min-height: 44px; padding: 10px 0; color: var(--muted); font-size: 13px; cursor: pointer; }
 .machine-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 .machine-version { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .interruption-row { display: flex; align-items: flex-start; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
@@ -212,7 +220,7 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .interaction-dialog .question-option { margin: 0; }
 .interaction-dialog .question > h3 { margin-bottom: 16px; }
 .interaction-dialog .question { margin-bottom: 20px; }
-.message-form { border-top: 1px solid var(--line); padding: 16px 20px; flex-shrink: 0; }
+.message-form { border-top: 1px solid var(--line); padding: 16px 20px; flex-shrink: 0; max-height: 55dvh; overflow: auto; overscroll-behavior: contain; }
 .message-form > label { margin: 0 0 8px; }
 .message-form textarea { max-height: 120px; min-height: 72px; }
 .message-form p { margin-top: 6px; font-size: 13px; }
@@ -222,6 +230,16 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .message-history ul { max-height: 120px; overflow: auto; overscroll-behavior: contain; margin: 0; padding: 0 0 0 20px; }
 .message-history li { padding: 8px 0; overflow-wrap: anywhere; }
 .message-history li p { white-space: pre-wrap; }
+.message-history > button { margin-bottom: 8px; }
+.message-history li > button { margin-top: 6px; }
+.message-cleanup-result { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.past-questions { margin: 8px 0 16px; }
+.past-questions > summary { min-height: 44px; padding: 10px 0; cursor: pointer; }
+.past-questions ul { max-height: 180px; overflow: auto; overscroll-behavior: contain; padding-left: 20px; margin: 8px 0 0; }
+.past-questions li { padding: 8px 0; overflow-wrap: anywhere; }
+.past-questions li + li { border-top: 1px solid var(--line); }
+.past-questions li p { white-space: pre-wrap; max-height: 80px; overflow: auto; }
+.past-questions li > button { margin-top: 6px; }
 .message-actions span { flex: 1; overflow-wrap: anywhere; }
 .codex-queue { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 20px; }
 .codex-queue .section-heading { flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
