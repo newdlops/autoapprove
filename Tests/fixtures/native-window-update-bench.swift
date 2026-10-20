@@ -28,6 +28,7 @@ private struct OccludedMeasurement: Error {}
 }
 @MainActor enum WindowBenchCounts {
     static var sessionBodies = 0, historyBodies = 0
+    static var queueBodies = 0, editorBodies = 0
     static var lastTitles: [String] = [], lastPaused = false, initialComplete = false
     static var historyEventIDs: [String] = [], historyError: String?
     static var notificationError: String?
@@ -76,7 +77,7 @@ private struct OccludedMeasurement: Error {}
             engine.updateDiscovery(sessions, records: [], claudeRegistrations: [])
             _ = engine.handleHook(["hook_event_name":"SessionStart","session_id":"window-audit","requestID":"begin","cwd":"/fixture/audit"])
             try engine.setAutomatic("claude:window-audit", enabled: true)
-            if CommandLine.arguments.contains("--questions") { appendQuestion() }
+            if CommandLine.arguments.contains("--questions") { appendQuestion(count: CommandLine.arguments.contains("--dense-questions") ? 44 : 1) }
         }
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -100,7 +101,10 @@ private struct OccludedMeasurement: Error {}
         let quit = NSMenuItem(title:"검증 앱 종료",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"q"); quit.target = NSApp
         appMenu.addItem(quit);appItem.submenu = appMenu;menu.addItem(appItem)
         let item = NSMenuItem(), controls = NSMenu(title:"합성 검증")
-        for (title,key,action) in [("관련 없는 상태 갱신","u",#selector(unrelated(_:))),("새 질문 추가","n",#selector(addQuestion(_:)))] {
+        for (title,key,action) in [("관련 없는 상태 갱신","u",#selector(unrelated(_:))),("새 질문 추가","n",#selector(addQuestion(_:))),
+            ("세션 제목 갱신","g",#selector(changeTitle(_:))),("질문 연결 오류","e",#selector(questionError(_:))),
+            ("질문 연결 복구","r",#selector(questionRecovery(_:))),("기본 창 크기","1",#selector(regularSize(_:))),
+            ("작은 창 크기","2",#selector(compactSize(_:)))] {
             let command = NSMenuItem(title:title,action:action,keyEquivalent:key);command.target = self
             command.keyEquivalentModifierMask = [.command,.shift];controls.addItem(command)
         }
@@ -111,11 +115,25 @@ private struct OccludedMeasurement: Error {}
         fputs("WINDOW QA unrelated action\n",stderr)
     }
     @objc func addQuestion(_ sender: Any?) { appendQuestion() }
-    func appendQuestion() {
+    @objc func changeTitle(_ sender: Any?) {
+        try? engine.setCustomization(sessions[0].id,value:.init(title:"갱신된 합성 세션 제목 \(Date().timeIntervalSince1970)",note:"합성 메모",color:.blue))
+    }
+    @objc func questionError(_ sender: Any?) {
+        engine.updateCodexQuestions([.init(sessionID:sessions[0].id,questions:nil,error:"합성 질문 연결 오류")])
+    }
+    @objc func questionRecovery(_ sender: Any?) {
+        let questions = engine.snapshot.sessions.first(where:{$0.id == sessions[0].id})?.questions ?? []
+        engine.updateCodexQuestions([.init(sessionID:sessions[0].id,questions:questions,threadID:"synthetic-window-thread")])
+    }
+    @objc func regularSize(_ sender: Any?) { window.setContentSize(NSSize(width:1040,height:700)) }
+    @objc func compactSize(_ sender: Any?) { window.setContentSize(NSSize(width:784,height:612)) }
+    func appendQuestion(count: Int = 1) {
         let thread = "synthetic-window-thread"
         var questions = engine.snapshot.sessions.first(where:{$0.id == sessions[0].id})?.questions ?? []
-        questions.append(QueuedQuestion(id:"synthetic-question-\(questions.count)",threadID:thread,
-            title:"검증용: 어느 환경을 먼저 확인할까요? \(questions.count+1)",options:["개발 환경","시험 환경"]))
+        for _ in 0..<count {
+            questions.append(QueuedQuestion(id:"synthetic-question-\(questions.count)",threadID:thread,
+                title:"검증용: 어느 환경을 먼저 확인할까요? \(questions.count+1)",options:["개발 환경","시험 환경"]))
+        }
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID:sessions[0].id,questions:questions,threadID:thread)])
         fputs("WINDOW QA synthetic questions \(engine.snapshot.sessions.first(where:{$0.id == sessions[0].id})?.questions.count ?? -1)\n",stderr)
     }
@@ -132,9 +150,13 @@ private struct OccludedMeasurement: Error {}
         guard window.occlusionState.contains(.visible), !NSApp.isHidden else { throw OccludedMeasurement() }
         fputs("WINDOW PHASE \(target) \(name) · visible \(window.occlusionState.contains(.visible))\n",stderr)
         let began = ProcessInfo.processInfo.systemUptime, before = cpu(), bodies = expectedBodies
+        let queues = WindowBenchCounts.queueBodies, editors = WindowBenchCounts.editorBodies
+        var updateTurns: [Double] = []
         var occluded = false
         for index in 0..<rounds {
+            let updateStart = ProcessInfo.processInfo.systemUptime
             try action(index); await pause(20)
+            updateTurns.append((ProcessInfo.processInfo.systemUptime-updateStart)*1_000)
             occluded = occluded || !window.occlusionState.contains(.visible) || NSApp.isHidden
         }
         await pause(150)
@@ -142,7 +164,11 @@ private struct OccludedMeasurement: Error {}
             for _ in 0..<10 where !WindowBenchCounts.lastTitles.contains("현재 합성 제목 · 갱신 59") { await pause(50) }
         }
         occluded = occluded || !window.occlusionState.contains(.visible) || NSApp.isHidden
+        updateTurns.sort()
         phases.append(["name":name,"rounds":rounds,"bodies":expectedBodies-bodies,"visibleThroughout": !occluded,
+            "queueBodies":WindowBenchCounts.queueBodies-queues,"editorBodies":WindowBenchCounts.editorBodies-editors,
+            "updateTurnMedianMs":updateTurns[updateTurns.count/2],"updateTurnP95Ms":updateTurns[min(updateTurns.count-1,Int(Double(updateTurns.count)*0.95))],
+            "updateTurnMaxMs":updateTurns.last ?? 0,
             "cpuSeconds":cpu()-before,"wallSeconds":ProcessInfo.processInfo.systemUptime-began])
         fputs("WINDOW PHASE DONE \(target) \(name) · bodies \(expectedBodies-bodies) · visible \(window.occlusionState.contains(.visible)) · active \(NSApp.isActive) · hidden \(NSApp.isHidden)\n",stderr)
         guard !occluded else { throw OccludedMeasurement() }
