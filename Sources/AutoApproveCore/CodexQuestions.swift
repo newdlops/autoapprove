@@ -175,6 +175,15 @@ public struct CodexThreadLocation: Equatable {
 
     /// Bind by the exact process's open root rollout, never by project or newest file.
     public static func locate(paths: [String]) throws -> CodexThreadLocation {
+        try locate(paths: paths, rootThreadID: { _, data in rootThreadID(data) })
+    }
+    fileprivate static func rootThreadID(_ data: Data) -> String? {
+        guard let row = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
+              row["type"] as? String == "session_meta", let meta = row["payload"] as? JSONObject,
+              meta["source"] as? String == "cli", let id = meta["id"] as? String, !id.isEmpty else { return nil }
+        return id
+    }
+    fileprivate static func locate(paths: [String], rootThreadID: (String, Data) -> String?) throws -> CodexThreadLocation {
         var seenRolloutPaths = Set<String>(), matches = Set<String>(), locations: [CodexThreadLocation] = []
         for path in paths {
             guard path.hasSuffix(".jsonl"), let slash = path.lastIndex(of: "/"),
@@ -187,9 +196,7 @@ public struct CodexThreadLocation: Equatable {
             guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
             let data = try? readMetadataLine { try handle.read(upToCount: $0) }
             try? handle.close()
-            guard let data, let row = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
-                  row["type"] as? String == "session_meta", let meta = row["payload"] as? JSONObject,
-                  meta["source"] as? String == "cli", let id = meta["id"] as? String, !id.isEmpty else { continue }
+            guard let data, let id = rootThreadID(path, data) else { continue }
             let db = home.appendingPathComponent("thread_history_1.sqlite").path
             if matches.insert(db + "\n" + id).inserted { locations.append(CodexThreadLocation(threadID: id, database: db)) }
         }
@@ -484,9 +491,38 @@ public final class CodexHistoryReader {
 
 }
 
+/// Reuse only the JSON projection of a freshly read, byte-identical header.
+/// Neither open-file identity nor a derived database location is retained here.
+private struct CodexRolloutMetadataCache {
+    private struct Entry { let data: Data; let rootID: String?; let cost: Int }
+    private var entries: [String: Entry] = [:]
+    private var bytes = 0
+    private let byteLimit = 4 * 1_048_576
+    private let capacity = 64
+
+    mutating func rootThreadID(path: String, data: Data, decode: (Data) -> String?) -> String? {
+        if let entry = entries[path], entry.data == data { return entry.rootID }
+        let id = decode(data)
+        if let old = entries.removeValue(forKey: path) { bytes -= old.cost }
+        let cost = data.count + 2 * (id?.utf16.count ?? 0)
+        guard cost <= byteLimit else { return id }
+        while entries.count >= capacity || bytes > byteLimit - cost {
+            guard let key = entries.keys.first, let old = entries.removeValue(forKey: key) else { break }
+            bytes -= old.cost
+        }
+        entries[path] = Entry(data: data, rootID: id, cost: cost); bytes += cost
+        return id
+    }
+    mutating func retain(paths: Set<String>) {
+        entries = entries.filter { paths.contains($0.key) }
+        bytes = entries.values.reduce(0) { $0 + $1.cost }
+    }
+}
+
 public actor CodexQuestionCollector {
     private var readers: [String: CodexSessionHistoryReader] = [:]
     private let historyConnections = CodexHistoryConnectionCache(capacity: 4)
+    private var metadata = CodexRolloutMetadataCache()
     private let fileReader: @Sendable (AgentSession, TimeInterval) throws -> [String]
     public init(fileReader: @escaping @Sendable (AgentSession, TimeInterval) throws -> [String] = {
         try ProcessOpenFiles.codexRolloutPaths(pid:$0.pid,expectedStart:$0.started,timeout:$1)
@@ -495,15 +531,20 @@ public actor CodexQuestionCollector {
         let targets = sessions.filter { $0.agent == .codex && $0.phase != .ended }
         let liveIDs = Set(targets.map(\.id))
         readers = readers.filter { liveIDs.contains($0.key) }
-        guard !targets.isEmpty else { historyConnections.closeAll(); return [] }
+        guard !targets.isEmpty else { historyConnections.closeAll(); metadata.retain(paths: []); return [] }
         // Share one bounded time budget across all process metadata reads.
         // Resolve exact open rollout paths before using the history connection.
         let deadline = ProcessInfo.processInfo.systemUptime + 4
         var locations = [String:CodexThreadLocation](), failures = [String:String]()
+        var liveMetadataPaths = Set<String>()
+        defer { metadata.retain(paths: liveMetadataPaths) }
         for session in targets {
             do {
                 let files = try fileReader(session,max(0,deadline-ProcessInfo.processInfo.systemUptime))
-                locations[session.id] = try CodexThreadLocation.locate(paths:files)
+                locations[session.id] = try CodexThreadLocation.locate(paths:files, rootThreadID: { path, data in
+                    liveMetadataPaths.insert(path)
+                    return metadata.rootThreadID(path: path, data: data, decode: CodexThreadLocation.rootThreadID)
+                })
             } catch { failures[session.id] = error.localizedDescription }
         }
         let activeDatabases = Set(locations.values.map(\.database))

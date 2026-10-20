@@ -366,6 +366,59 @@ extension ApprovalTests {
         }
     }
 
+    func testCodexCollectorRevalidatesWarmRolloutMetadata() async throws {
+        let fixture = try HistoryReadFixture(filename: "thread_history_1.sqlite")
+        try fixture.question("First live question"); try fixture.question("Other live question", thread: "next")
+        try fixture.sql("INSERT INTO thread_history_projection_state VALUES('next',2);")
+        let day = fixture.root.appendingPathComponent("sessions/2026/10/15")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("rollout-fixture.jsonl"), other = day.appendingPathComponent("rollout-other.jsonl")
+        func write(_ id: String, source: String = "cli", newline: Bool = true, to url: URL) throws {
+            var data = try JSONSerialization.data(withJSONObject: ["type":"session_meta", "payload":["source":source,
+                "id":id, "extra":String(repeating:"한글 e\u{301} 🧪", count:4000)]], options: [.sortedKeys])
+            if newline { data.append(10) }
+            try data.write(to: url)
+        }
+        try write("root", to: file)
+        let collector = CodexQuestionCollector(fileReader: { _, _ in [file.path, other.path] })
+        let session = AgentSession(id:"session", agent:.codex, pid:42, started:"fixture", tty:"/dev/fixture", cwd:fixture.root.path, terminal:.terminal)
+        for _ in 0..<2 {
+            let updates = await collector.collect([session])
+            try expectEqual(updates.first?.questions?.first?.title, "First live question")
+        }
+        try fixture.sql("UPDATE thread_items SET item_json=replace(item_json,'First live question','Updated live question'),updated_at_ordinal=2 WHERE thread_id='root'; UPDATE thread_history_projection_state SET next_rollout_ordinal=3 WHERE thread_id='root';")
+        let changedHistory = await collector.collect([session])
+        try expectEqual(changedHistory.first?.questions?.first?.title, "Updated live question", "An unchanged header must not skip history updates")
+        let originalDate = try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as! Date
+        try write("next", to: file)
+        try FileManager.default.setAttributes([.modificationDate:originalDate], ofItemAtPath:file.path)
+        let changedRoot = await collector.collect([session])
+        try expectEqual(changedRoot.first?.threadID, "next", "A same-size header rewrite with restored mtime must be read again")
+        try expectEqual(changedRoot.first?.questions?.first?.title, "Other live question")
+        for _ in 0..<2 {
+            try write("next", source:"mcp", to:file)
+            let invalidSource = await collector.collect([session]); try expectNotNil(invalidSource.first?.error)
+        }
+        try write("root", to:file)
+        let recovered = await collector.collect([session]); try expectEqual(recovered.first?.threadID,"root")
+        try write("root", newline:false, to:file)
+        let incomplete = await collector.collect([session]); try expectNotNil(incomplete.first?.error)
+        try Data([0xff,10]).write(to:file)
+        let invalidUTF8 = await collector.collect([session]); try expectNotNil(invalidUTF8.first?.error)
+        try write("root", to:file); try write("next", to:other)
+        let ambiguous = await collector.collect([session]); try expectNotNil(ambiguous.first?.error)
+        try FileManager.default.removeItem(at:other)
+        let singleRoot = await collector.collect([session]); try expectEqual(singleRoot.first?.threadID,"root")
+        try FileManager.default.moveItem(at:file,to:other)
+        let disappeared = await collector.collect([session])
+        try expectEqual(disappeared.first?.threadID,"root", "The current open-file list still resolves the moved root")
+        try FileManager.default.removeItem(at:other)
+        let missing = await collector.collect([session]); try expectNotNil(missing.first?.error)
+        _ = await collector.collect([])
+        try write("next", to:file)
+        let restarted = await collector.collect([session]); try expectEqual(restarted.first?.threadID,"next")
+    }
+
     func testCodexCollectorRebuildsProjectionAfterHistoryFileReplacement() async throws {
         let fixture = try HistoryReadFixture(filename: "thread_history_1.sqlite")
         try fixture.question("Original")
