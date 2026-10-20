@@ -76,13 +76,15 @@ enum GitBranchCache {
                 marker = data
                 gitDirectory = resolve(String(line.dropFirst(8)), relativeTo: root)
             }
-            let commonMarker = try optionalFile(gitDirectory.appendingPathComponent("commondir"), limit: 4096)
+            // Metadata leaves have a known file role. Skip URL's directory
+            // inference; the descriptor/type checks below remain authoritative.
+            let commonMarker = try optionalFile(gitDirectory.appendingPathComponent("commondir", isDirectory: false), limit: 4096)
             let commonDirectory: URL
             if let commonMarker {
                 guard let path = String(data: commonMarker, encoding: .utf8) else { return nil }
                 commonDirectory = resolve(path, relativeTo: gitDirectory)
             } else { commonDirectory = gitDirectory }
-            let head = try smallFile(gitDirectory.appendingPathComponent("HEAD"), limit: 4096)
+            let head = try smallFile(gitDirectory.appendingPathComponent("HEAD", isDirectory: false), limit: 4096)
             guard let rawHead = String(data: head, encoding: .utf8) else { return nil }
             let headValue = rawHead.trimmingCharacters(in: .newlines)
             let branch: String?, detached: Bool
@@ -96,27 +98,27 @@ enum GitBranchCache {
             if detached {
                 // Retain config identity because invalid repository format or
                 // extensions must continue to surface Git's diagnostic result.
-                guard let objectStore = try objectStoreIdentity(gitDirectory.appendingPathComponent("objects")) else { return nil }
+                guard let objectStore = try objectStoreIdentity(gitDirectory.appendingPathComponent("objects", isDirectory: true)) else { return nil }
                 return Fingerprint(branch: nil, detached: true, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
                     marker: marker, commonMarker: commonMarker, head: head, objectStore: objectStore, looseReference: nil,
-                    packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs")),
-                    config: try optionalFile(commonDirectory.appendingPathComponent("config"), limit: 131072),
-                    worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree"), limit: 131072))
+                    packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs", isDirectory: false)),
+                    config: try optionalFile(commonDirectory.appendingPathComponent("config", isDirectory: false), limit: 131072),
+                    worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree", isDirectory: false), limit: 131072))
             }
             guard let branch else { return nil }
-            let looseReference = try optionalFile(commonDirectory.appendingPathComponent("refs/heads/" + branch), limit: 4096)
+            let looseReference = try optionalFile(commonDirectory.appendingPathComponent("refs/heads/" + branch, isDirectory: false), limit: 4096)
             return Fingerprint(branch: branch, detached: detached, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
                 marker: marker, commonMarker: commonMarker, head: head, objectStore: nil, looseReference: looseReference,
-                packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs")),
-                config: try optionalFile(commonDirectory.appendingPathComponent("config"), limit: 131072),
-                worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree"), limit: 131072))
+                packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs", isDirectory: false)),
+                config: try optionalFile(commonDirectory.appendingPathComponent("config", isDirectory: false), limit: 131072),
+                worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree", isDirectory: false), limit: 131072))
         } catch { return nil }
     }
 
     /// gitdir·commondir의 상대 경로와 줄바꿈을 처리하되 경로 안의 공백은 보존한다.
     private static func resolve(_ path: String, relativeTo parent: URL) -> URL {
         let value = path.trimmingCharacters(in: .newlines)
-        return (value.hasPrefix("/") ? URL(fileURLWithPath: value) : parent.appendingPathComponent(value))
+        return (value.hasPrefix("/") ? URL(fileURLWithPath: value, isDirectory: true) : parent.appendingPathComponent(value, isDirectory: true))
             .standardizedFileURL.resolvingSymlinksInPath()
     }
 
@@ -169,7 +171,7 @@ enum GitBranchCache {
     /// shallow directory entries so new loose objects or packs invalidate them.
     /// Alternates can change elsewhere, so repositories using them stay uncached.
     private static func objectStoreIdentity(_ objects: URL) throws -> [String: FileIdentity]? {
-        let alternates = objects.appendingPathComponent("info/alternates")
+        let alternates = objects.appendingPathComponent("info/alternates", isDirectory: false)
         var alternateInfo = stat()
         if lstat(alternates.path, &alternateInfo) == 0 { return nil }
         guard errno == ENOENT else { throw MetadataError.unreadable }

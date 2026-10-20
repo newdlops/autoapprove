@@ -21,6 +21,50 @@ private final class GitBranchFixture {
 }
 
 extension ApprovalTests {
+    func testGitMetadataPathHintsPreserveSpecialFileAndSymlinkRevalidation() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        let alias = fixture.root.appendingPathComponent("경로 % # ? e\u{301}", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: repository)
+        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"])
+        var launches = 0
+        func read() -> GitBranchState { GitBranchReader.read(directory: alias.path) { _, _ in launches += 1; return result } }
+        try expectEqual(read().name, "main"); _ = read(); try expectEqual(launches, 1)
+        for name in ["HEAD", "config", "config.worktree", "packed-refs"] {
+            let file = repository.appendingPathComponent(".git/" + name, isDirectory: false)
+            let saved = try? Data(contentsOf: file)
+            if saved != nil { try FileManager.default.removeItem(at: file) }
+            try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+            let before = launches
+            _ = read(); _ = read()
+            try expectEqual(launches, before + 2, "A directory named \(name) cannot reuse a verified metadata cache")
+            if name == "config" { try expectEqual(GitBranchReader.read(directory: alias.path).kind, .unavailable) }
+            try FileManager.default.removeItem(at: file)
+            if let saved { try saved.write(to: file, options: .atomic) }
+            try expectEqual(read().name, "main")
+            let restored = launches; _ = read(); try expectEqual(launches, restored)
+        }
+        let config = repository.appendingPathComponent(".git/config", isDirectory: false)
+        let saved = try Data(contentsOf: config), target = fixture.root.appendingPathComponent("外部 % # config", isDirectory: false)
+        try saved.write(to: target)
+        try FileManager.default.removeItem(at: config)
+        try FileManager.default.createSymbolicLink(at: config, withDestinationURL: target)
+        let before = launches
+        _ = read(); _ = read(); try expectEqual(launches, before + 2, "No-follow metadata reads must remain misses for symlinks")
+        try expectEqual(GitBranchReader.read(directory: alias.path).name, "main", "Git's uncached valid symlink behavior remains available")
+        try Data("not a valid config\n".utf8).write(to: target, options: .atomic)
+        try expectEqual(GitBranchReader.read(directory: alias.path).kind, .unavailable, "A changed symlink target must expose Git's current error")
+        try FileManager.default.removeItem(at: config); try saved.write(to: config, options: .atomic)
+        let relative = fixture.root.appendingPathComponent("상대 gitdir % #", isDirectory: true)
+        try FileManager.default.createDirectory(at: relative, withIntermediateDirectories: false)
+        let marker = relative.appendingPathComponent(".git", isDirectory: false)
+        try Data(("gitdir: ../" + repository.lastPathComponent + "/.git\n").utf8).write(to: marker, options: .atomic)
+        try expectEqual(GitBranchReader.read(directory: relative.path).name, "main")
+        let notDirectory = fixture.root.appendingPathComponent("not-directory", isDirectory: false)
+        try Data("file\n".utf8).write(to: notDirectory)
+        try Data("gitdir: ../not-directory\n".utf8).write(to: marker, options: .atomic)
+        try expect(GitBranchReader.read(directory: relative.path).kind != .branch, "A directory hint cannot make a regular-file gitdir target valid or retain its old branch")
+    }
+
     func testGitBranchMetadataBoundsAndPackedReferenceIdentity() throws {
         let fixture = try GitBranchFixture(), repository = fixture.repository
         let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"])
