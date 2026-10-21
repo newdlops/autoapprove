@@ -21,17 +21,127 @@ public enum LocalDashboardAddress {
         }
     }
     public static func status(in text: String) -> Status {
-        var found = false
-        for line in text.components(separatedBy:.newlines) {
-            let fields = line.split(separator:"#",maxSplits:1,omittingEmptySubsequences:false)[0].split(whereSeparator:{$0.isWhitespace})
-            guard fields.count > 1, fields.dropFirst().contains(where:{
-                let name = $0.lowercased(); return (name.hasSuffix(".") ? String(name.dropLast()) : name) == hostname
-            }) else {continue}
-            found = true
-            let address = String(fields[0])
-            if address != "::1" && address != "127.0.0.1" { return .conflict }
+        guard !text.isEmpty else {return .missing}
+        let utf8 = text.utf8
+        if let result = utf8.withContiguousStorageIfAvailable({ bytes -> Status in
+            var found = false, start = 0, index = 0, ascii = true
+            while index < bytes.count {
+                let width: Int
+                let byte = bytes[index]
+                if byte >= 10 && byte <= 13 {width = 1}
+                else if byte == 0xc2 && index + 1 < bytes.count && bytes[index + 1] == 0x85 {width = 2}
+                else if byte == 0xe2 && index + 2 < bytes.count && bytes[index + 1] == 0x80,
+                        bytes[index + 2] == 0xa8 || bytes[index + 2] == 0xa9 {width = 3}
+                else {if byte >= 0x80 {ascii = false};index += 1;continue}
+                if start < index {
+                    let line: Status
+                    if ascii {line = asciiLineStatus(bytes,start:start,end:index)}
+                    else {
+                        let first = utf8.index(utf8.startIndex,offsetBy:start),last = utf8.index(utf8.startIndex,offsetBy:index)
+                        line = lineStatus(text[first..<last])
+                    }
+                    if line == .conflict {return .conflict}
+                    if line == .ready {found = true}
+                }
+                index += width;start = index;ascii = true
+            }
+            if start < bytes.count {
+                let line: Status
+                if ascii {line = asciiLineStatus(bytes,start:start,end:bytes.count)}
+                else {
+                    let first = utf8.index(utf8.startIndex,offsetBy:start)
+                    line = lineStatus(text[first..<text.endIndex])
+                }
+                if line == .conflict {return .conflict}
+                if line == .ready {found = true}
+            }
+            return found ? .ready : .missing
+        }) {return result}
+        // Foreign Cocoa storage stays UTF-16. Inspect one bounded block rather
+        // than making a complete UTF-8 copy or retaining an array of every line.
+        let cocoa = text as NSString, length = cocoa.length
+        var buffer = [unichar](repeating:0,count:min(4096,length))
+        return buffer.withUnsafeMutableBufferPointer { units in
+            var found = false, start = 0, offset = 0
+            while offset < length {
+                let count = min(units.count,length-offset)
+                cocoa.getCharacters(units.baseAddress!,range:NSRange(location:offset,length:count))
+                for position in 0..<count {
+                    let unit = units[position]
+                    guard (unit >= 10 && unit <= 13) || unit == 0x85 || unit == 0x2028 || unit == 0x2029 else {continue}
+                    let end = offset + position
+                    if start < end {
+                        let first = String.Index(utf16Offset:start,in:text),last = String.Index(utf16Offset:end,in:text)
+                        let line = lineStatus(text[first..<last])
+                        if line == .conflict {return .conflict}
+                        if line == .ready {found = true}
+                    }
+                    start = end + 1
+                }
+                offset += count
+            }
+            if start < length {
+                let first = String.Index(utf16Offset:start,in:text)
+                let line = lineStatus(text[first..<text.endIndex])
+                if line == .conflict {return .conflict}
+                if line == .ready {found = true}
+            }
+            return found ? .ready : .missing
         }
-        return found ? .ready : .missing
+    }
+    private static func asciiLineStatus(_ bytes: UnsafeBufferPointer<UInt8>,start: Int,end: Int) -> Status {
+        // Every byte in this line is ASCII, so tabs/spaces and '#' have exactly
+        // the released Character semantics. Non-ASCII lines use lineStatus.
+        var index = start
+        func token() -> Range<Int>? {
+            while index < end, bytes[index] == 9 || bytes[index] == 32 {index += 1}
+            guard index < end, bytes[index] != 35 else {return nil}
+            let first = index
+            while index < end, bytes[index] != 9, bytes[index] != 32, bytes[index] != 35 {index += 1}
+            return first..<index
+        }
+        guard let address = token() else {return .missing}
+        while let field = token() {
+            let last = bytes[field.upperBound-1] == 46 ? field.upperBound-1 : field.upperBound
+            guard last-field.lowerBound == 11 else {continue}
+            var matches = true
+            for (offset,expected) in "autoapprove".utf8.enumerated() {
+                let byte = bytes[field.lowerBound+offset]
+                if (byte >= 65 && byte <= 90 ? byte+32 : byte) != expected {matches = false;break}
+            }
+            guard matches else {continue}
+            if address.count == 3, bytes[address.lowerBound] == 58,
+               bytes[address.lowerBound+1] == 58, bytes[address.lowerBound+2] == 49 {return .ready}
+            if address.count == 9 {
+                for (offset,expected) in "127.0.0.1".utf8.enumerated() {
+                    if bytes[address.lowerBound+offset] != expected {return .conflict}
+                }
+                return .ready
+            }
+            return .conflict
+        }
+        return .missing
+    }
+    private static func lineStatus(_ line: Substring) -> Status {
+        // Keep Character-based whitespace and comment matching. A combining
+        // mark after '#' must retain exactly the released parser's meaning.
+        let end = line.firstIndex(of:"#") ?? line.endIndex, body = line[..<end]
+        var index = body.startIndex
+        func token() -> Substring? {
+            while index < end, body[index].isWhitespace {body.formIndex(after:&index)}
+            guard index < end else {return nil}
+            let start = index
+            while index < end, !body[index].isWhitespace {body.formIndex(after:&index)}
+            return body[start..<index]
+        }
+        guard let address = token() else {return .missing}
+        while let field = token() {
+            let name = field.lowercased()
+            if (name.hasSuffix(".") ? String(name.dropLast()) : name) == hostname {
+                return address == "::1" || address == "127.0.0.1" ? .ready : .conflict
+            }
+        }
+        return .missing
     }
     public static func status() -> Status {
         readStatus(file:URL(fileURLWithPath:hostsPath,isDirectory:false)).status
