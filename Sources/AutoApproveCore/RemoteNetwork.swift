@@ -671,12 +671,14 @@ struct RemoteTerminalUpdate: Encodable {
         return response
     }
     /// A conditional response may skip dashboard reconstruction only while
-    /// every peer inventory is still inside its cache TTL. Otherwise building
-    /// the dashboard must schedule the due health/read refresh.
-    private func dashboardPeerStatesFresh() -> Bool {
+    /// Every usable inventory must remain inside its TTL. A known unavailable
+    /// background peer with no read has a deterministic offline view; discovery
+    /// owns its health probes, while selecting it still requests a real read.
+    private func dashboardPeerStatesFresh(selectedNode: String?) -> Bool {
         orderedDashboardPeers().allSatisfy { peer in
-            let endpoint = peers[peer.id].map(connectionEndpoint) ?? connectionEndpoint(peer)
+            let current = peers[peer.id] ?? peer, endpoint = connectionEndpoint(current)
             return stateReads.value(for:peer.id,endpoint:endpoint) != nil
+                || (!current.available && peer.id != selectedNode && !stateReads.contains(peer.id))
         }
     }
     private func connectionEndpoint(_ peer: Peer) -> NWEndpoint {
@@ -1160,12 +1162,23 @@ struct RemoteTerminalUpdate: Encodable {
         let candidates = orderedDashboardPeers()
         var completed: [String:(NWEndpoint,RemoteNodeView)] = [:]
         func value(_ peer: Peer) -> RemoteNodeView? {
-            let endpoint = peers[peer.id].map(connectionEndpoint) ?? connectionEndpoint(peer)
+            let current = peers[peer.id] ?? peer, endpoint = connectionEndpoint(current)
             if let result = stateReads.value(for:peer.id,endpoint:endpoint) { completed[peer.id] = (endpoint,result) }
-            return completed[peer.id].flatMap { $0.0 == endpoint ? $0.1 : nil }
+            if let result = completed[peer.id].flatMap({ $0.0 == endpoint ? $0.1 : nil }) { return result }
+            // exchange already rejects this background read before any I/O.
+            // Avoid reserving a task, traffic slot and waiter just to reject it.
+            // Preserve in-flight foreground work and do not memoize this view:
+            // discovery can make the peer available while other reads suspend.
+            guard !current.available, peer.id != selectedNode,
+                  stateReads.task(for:peer.id,endpoint:endpoint) == nil else { return nil }
+            stateReads.remove(peer.id)
+            return RemoteNodeView(id:peer.id,name:current.name,local:false,online:false,
+                error:"이 Mac이 네트워크에서 연결 해제되었습니다.",release:current.release)
         }
         func waitForReads(_ peers: [Peer], progressive: Bool = false) async throws {
-            for peer in peers { _ = peerStateTask(peer,foreground:peer.id == selectedNode) }
+            for peer in peers where peer.id == selectedNode || value(peer) == nil {
+                _ = peerStateTask(peer,foreground:peer.id == selectedNode)
+            }
             // Keep the first usable inventory independent of slow peers. Once
             // one arrives, allow a short burst for its healthy neighbours.
             // A selected Mac retains its own full bounded wait instead.
@@ -1284,7 +1297,7 @@ struct RemoteTerminalUpdate: Encodable {
                     // unchanged. Return before rebuilding the local inventory,
                     // sorting peers, or waiting for their bounded reads. The
                     // key is checked again after a fresh build on cache misses.
-                    if dashboardPeerStatesFresh(), let before, let cached = cachedDashboardValidator,
+                    if dashboardPeerStatesFresh(selectedNode:selectedNode), let before, let cached = cachedDashboardValidator,
                        cached.key == before, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
                         var response = RemoteHTTPResponse(status:304,body:Data())
                         response.entityTag = cached.entityTag; response.observedAt = Date()

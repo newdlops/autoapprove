@@ -18,6 +18,7 @@ import Network
     private var waiters: [UUID: Waiter] = [:]
     public private(set) var revision = UUID()
     public var count: Int { entries.count }
+    func contains(_ id: String) -> Bool { entries[id] != nil }
     public init() {}
     public func task(for id: String, endpoint: NWEndpoint, at now: Date = Date()) -> Task<RemoteNodeView, Never>? {
         guard let entry = entries[id], entry.endpoint == endpoint, entry.expires > now else { return nil }
