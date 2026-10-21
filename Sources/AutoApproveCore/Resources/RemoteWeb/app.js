@@ -49,6 +49,8 @@ let inputGeneration = 0, terminalFontSize = 14;
 let directStreamID = null;
 let cursorLayoutPending = false, cursorLayoutTimer = null;
 const directQueue = [];
+const automationResets = new Set();
+let automationResetResult = null;
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const interruptionRows = new Map();
 // Exact saved receipts only, bounded to this page. A late inventory response
@@ -337,6 +339,20 @@ function updateViewport() {
   document.body.classList.toggle('terminal-compact', (viewport?.height || innerHeight) <= 400);
   document.documentElement.style.setProperty('--terminal-viewport-height', `${viewport?.height || innerHeight}px`);
   document.documentElement.style.setProperty('--terminal-viewport-top', `${viewport?.offsetTop || 0}px`);
+  positionTerminalSettings();
+}
+function positionTerminalSettings() {
+  const settings = $('terminal-settings');
+  if (!settings.open) return;
+  // Measure only an open menu on toggle/viewport/outer-scroll events. Keep it
+  // inside both the visible viewport and the workspace's clipping boundary.
+  const bounds = settings.getBoundingClientRect(), detail = $('detail').getBoundingClientRect(), viewport = window.visualViewport;
+  const top = Math.max(viewport?.offsetTop || 0,detail.top);
+  const bottom = Math.min((viewport?.offsetTop || 0) + (viewport?.height || innerHeight),detail.bottom);
+  const below = Math.max(0,bottom - bounds.bottom - 12), above = Math.max(0,bounds.top - top - 12);
+  const upward = below < 200 && above > below;
+  settings.dataset.placement = upward ? 'above' : 'below';
+  settings.style.setProperty('--terminal-settings-height',`${Math.max(88,Math.min(600,upward ? above : below))}px`);
 }
 function terminalFocus(enabled) {
   document.body.classList.toggle('terminal-focus', enabled);
@@ -697,6 +713,29 @@ async function action(nodeID, payload, message) {
     await refreshNetwork(); return true;
   } catch (error) { feedback(error.message, true); }
   finally { mutation = false; if (selectedItem) $('automatic').checked = selectedItem.session.automatic; updateControls(); renderMachines(); }
+}
+async function resetSelectedAutomation() {
+  const item = selectedItem, key = selectedKey;
+  if (!item || automationResets.has(key) || !connected || !currentNode()?.online || sessionEnded(item) ||
+      ptyTemporary.has(key) || !supportsRelease(item.node,[0,2,159,186])) return;
+  automationResets.add(key); automationResetResult = null;
+  // Park unsubmitted keystrokes in the existing draft. A reset never replays
+  // them, sends a cancel key, or erases an uncertain manual submission.
+  stopDirect(); clearTerminalWarm(); updateControls();
+  try {
+    const result = await api(endpoint('/api/action',item.node.id),{action:'resetAutomation',sessionID:item.session.id,requestID:uuid()});
+    const message = result.message || '자동화를 초기화했습니다. 현재 상태부터 다시 감지합니다.';
+    automationResetResult = {key,message,error:false};
+    feedback(message);
+    if (selectedKey === key) {
+      detailGeneration++; frameController?.abort();
+      latestFrame = null; terminalFrameReceivedAt = -Infinity;
+      stopTerminalStream(true); void refreshFrame();
+    }
+    await refreshNetwork();
+  } catch (error) {
+    automationResetResult = {key,message:error.message,error:true}; feedback(error.message,true);
+  } finally { automationResets.delete(key); updateControls(); }
 }
 function beginQuestionEditing(key, nodeID, payload) {
   if (questionEditing.has(key)) return;
@@ -1169,8 +1208,17 @@ function updateControls() {
   renderNativeDisplay();
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
-  const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation;
+  const resetBusy = automationResets.has(selectedKey);
+  const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation && !resetBusy;
   const temporaryPTY = ptyTemporary.has(selectedKey);
+  const resetSupported = supportsRelease(selectedItem.node,[0,2,159,186]);
+  $('reset-automation').disabled = !connected || !current?.online || !sessionPresent || sessionEnded(selectedItem) || temporaryPTY || !resetSupported || resetBusy;
+  text($('reset-automation'),resetBusy ? '자동화 초기화 중…' : '자동화 초기화·재실행'); setBusy($('reset-automation'),resetBusy);
+  text($('reset-automation-help'),!resetSupported ? '이 Mac을 AutoApprove 0.2.159 이상으로 업데이트하면 자동화를 초기화할 수 있습니다.' : '이 세션의 자동 입력 대기를 비우고 현재 상태부터 다시 감지합니다. 원본 터미널과 작성 중인 초안은 유지합니다.');
+  const resetResult = automationResetResult?.key === selectedKey ? automationResetResult : null;
+  text($('reset-automation-result'),resetBusy ? '대기 중인 자동화를 비우고 있습니다…' : resetResult?.message || '');
+  $('reset-automation-result').className = resetResult?.error ? 'error-text small' : 'muted small';
+  show($('reset-automation-result'),resetBusy || !!resetResult);
   $('automatic').disabled = !enabled || sessionEnded(selectedItem) || temporaryPTY || (!selectedItem.view.canApprove && !selectedItem.session.automatic);
   $('automatic').title = temporaryPTY ? 'PTY에서 실행 중인 CLI를 확인하는 중입니다.' : !selectedItem.view.canApprove ? 'Mac에서 이 세션의 승인 연결을 먼저 설정해주세요.' : '이 세션의 다음 지원 요청부터 적용합니다.';
   $('reveal').disabled = !enabled || !selectedItem.view.canReveal;
@@ -2328,6 +2376,7 @@ for (const button of document.querySelectorAll('[data-filter]')) button.addEvent
   filter = button.dataset.filter; for (const option of document.querySelectorAll('[data-filter]')) option.setAttribute('aria-pressed', String(option === button)); renderList();
 });
 $('automatic').addEventListener('change', () => { const enabled = $('automatic').checked; void action(selectedItem.node.id, { action: 'automatic', sessionID: selectedItem.session.id, enabled }, enabled ? '자동 승인을 켰습니다.' : '자동 승인을 껐습니다.'); });
+$('reset-automation').addEventListener('click', () => void resetSelectedAutomation());
 $('reveal').addEventListener('click', () => void action(selectedItem.node.id, { action: 'reveal', sessionID: selectedItem.session.id }, 'Mac에서 대상 터미널을 열었습니다.'));
 $('terminal-input').addEventListener('input', () => { drafts.set(selectedKey, $('terminal-input').value); sizeInput(); updateControls(); });
 $('terminal-input').addEventListener('compositionstart', () => { composing = true; updateControls(); });
@@ -2466,6 +2515,9 @@ setFontSize(terminalFontSize);
 window.visualViewport?.addEventListener('resize', updateViewport);
 window.visualViewport?.addEventListener('scroll', updateViewport);
 window.addEventListener('resize', updateViewport); updateViewport();
+$('terminal-settings').addEventListener('toggle', positionTerminalSettings);
+$('detail').addEventListener('scroll', positionTerminalSettings, {passive:true});
+window.addEventListener('scroll', positionTerminalSettings, {passive:true});
 new ResizeObserver(scheduleCursor).observe($('terminal-screen'));
 new ResizeObserver(fitNativeImage).observe($('native-screen'));
 $('terminal-screen').addEventListener('scroll', scheduleCursor, { passive: true });

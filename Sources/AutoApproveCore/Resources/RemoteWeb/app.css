@@ -164,7 +164,9 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .terminal-settings summary { list-style: none; cursor: pointer; padding: 10px 12px; min-height: 44px; font-size: 13px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .terminal-settings summary::-webkit-details-marker { display: none; }
 .terminal-settings[open] summary { color: var(--blue); border-color: var(--blue); }
-.terminal-settings .terminal-options { position: absolute; z-index: 4; right: 0; top: calc(100% + 8px); width: min(280px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 4px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.terminal-settings .terminal-options { position: absolute; z-index: 4; right: 0; top: calc(100% + 8px); width: min(280px, calc(100vw - 32px)); max-height: var(--terminal-settings-height, min(600px, calc(var(--terminal-viewport-height, 100dvh) - 112px))); overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; flex-wrap: nowrap; gap: 4px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.terminal-settings .terminal-options > * { flex-shrink: 0; }
+.terminal-settings[data-placement=above] .terminal-options { top: auto; bottom: calc(100% + 8px); }
 .terminal-font { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
 .terminal-font button { min-width: 48px; }
 .focus-only { display: none; }

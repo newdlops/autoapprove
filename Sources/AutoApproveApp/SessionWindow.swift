@@ -277,6 +277,7 @@ import AutoApproveCore
         } else if let id = selection.first, let session = engine.snapshot.sessions.first(where: { $0.id == id }) {
             SessionDetail(session: session, events: engine.snapshot.events.filter { event in event.sessionID == id || session.backgroundChildren.contains(where: { $0.id == event.sessionID }) }, paused: engine.snapshot.paused, openingTerminal: openingTerminal,
                           setAutomatic: { enabled in perform { try engine.setAutomatic(id, enabled: enabled) } },
+                          resetAutomation: { try engine.resetAutomation(id) },
                           reveal: { reveal(session) }, edit: { editingSession = session }, connect: { openWindow(id: "settings") }, showHistory: { openWindow(id: "history") },
                           dismissQuestion: { questionID in perform { try engine.dismissQuestion(sessionID: id, questionID: questionID) } },
                           replyQuestion: { questionID, answer in try await engine.replyToQuestion(sessionID: id, questionID: questionID, answer: answer) },
@@ -483,6 +484,7 @@ private struct SessionDetail: View {
     let paused: Bool
     let openingTerminal: Bool
     let setAutomatic: (Bool) -> Void
+    let resetAutomation: () throws -> AutomationResetResult
     let reveal: () -> Void
     let edit: () -> Void
     let connect: () -> Void
@@ -495,6 +497,8 @@ private struct SessionDetail: View {
     let approveClaude: (String, String, Bool) throws -> Void
     let releaseClaude: (String, String) throws -> Void
     var questionDrafts: QuestionReplyDrafts? = nil
+    @State private var automationResetMessage: String?
+    @State private var automationResetFailed = false
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
@@ -658,6 +662,17 @@ private struct SessionDetail: View {
                         .help(AppHelp.automatic(session, paused: paused))
                     Text(session.canApprove ? (paused ? "전체 일시정지 중입니다. 재개하면 자동 승인이 적용됩니다." : AppHelp.automaticDescription) : "승인 요청을 처리하려면 연결이 필요합니다.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        do { automationResetMessage = try resetAutomation().message; automationResetFailed = false }
+                        catch { automationResetMessage = error.localizedDescription; automationResetFailed = true }
+                    } label: { Label("자동화 초기화·재실행", systemImage: "arrow.clockwise") }
+                        .disabled(session.phase == .ended)
+                        .help("이 세션의 자동 입력 대기와 감지 캐시를 비우고 현재 상태부터 다시 감지합니다. 원본 터미널과 작성 중인 초안은 유지합니다.")
+                    if let automationResetMessage {
+                        Text(automationResetMessage).font(.callout)
+                            .foregroundStyle(automationResetFailed ? Color.red : Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if !session.backgroundChildren.isEmpty {
                         Text("이 터미널의 백그라운드 \(session.backgroundChildren.count)개에도 같은 자동 승인 설정이 적용됩니다.")
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

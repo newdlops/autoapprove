@@ -61,7 +61,10 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
               <button id="terminal-back" type="button" class="icon-button focus-only" aria-label="세션 목록으로 돌아가기"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
               <h3 id="terminal-heading" tabindex="-1">터미널 화면</h3>
               <button id="terminal-focus" type="button" class="secondary" aria-pressed="false">크게 보기</button>
-              <details class="terminal-settings" id="terminal-settings"><summary>화면 설정</summary><div class="terminal-options">
+              <details class="terminal-settings" id="terminal-settings"><summary>터미널 설정</summary><div class="terminal-options">
+                <button id="reset-automation" type="button" class="secondary" aria-describedby="reset-automation-help">자동화 초기화·재실행</button>
+                <p id="reset-automation-help" class="muted small">이 세션의 자동 입력 대기를 비우고 현재 상태부터 다시 감지합니다. 원본 터미널과 작성 중인 초안은 유지합니다.</p>
+                <p id="reset-automation-result" class="muted small" role="status" hidden></p>
                 <label class="small scroll-follow"><input id="terminal-wrap" type="checkbox" checked>줄바꿈</label>
                 <label class="small scroll-follow" title="터미널이 보낸 원본 글자색·배경색·서식을 표시합니다."><input id="terminal-colors" name="terminal-colors" type="checkbox" checked disabled aria-describedby="terminal-color-status">원본 색상</label>
                 <label class="small scroll-follow"><input id="follow" name="follow" type="checkbox" checked>아래로 따라가기</label>

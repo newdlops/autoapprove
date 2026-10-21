@@ -63,8 +63,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var ptyContinuations: [String: (source: String, conversation: String?, ptyID: String)] = [:]
     private var ptyContinuationTasks: [String: Task<ManagedPTYDescriptor, Error>] = [:]
     private var automaticInputSessions = Set<String>()
+    private let automationRuntime = AutomationRuntime()
+    private var automationNeedsFreshScreen = Set<String>()
+    private struct ResetApprovalReceipt {
+        let dispatchID: UUID
+        let generation: String
+        let requestIdentity: String
+    }
+    private var resetApprovalReceipts: [String: ResetApprovalReceipt] = [:]
     private var systemSafetyStates: [String: SystemSafetyState] = [:]
-    private var systemSafetyTasks = Set<String>()
+    private var systemSafetyTasks: [String: UUID] = [:]
     private var remoteInputUntil: [String: Date] = [:]
     private var remoteStreams: [String: (generation: String, token: String, identity: TTYInputIdentity?)] = [:]
     private var remoteFrameSequence = 0
@@ -471,6 +479,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func stop() {
         remoteInputStopped = true
+        automationRuntime.stop()
         observationEpoch &+= 1
         for pending in claudeHookWaitTasks.values { pending.task.cancel() }; claudeHookWaitTasks.removeAll()
         claudeHookSignals.values.forEach { $0.notify() }; claudeHookSignals.removeAll()
@@ -1457,7 +1466,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func automaticInputBusy(_ id: String) -> Bool {
-        automaticInputSessions.contains(id) || systemSafetyTasks.contains(id) || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
+        automaticInputSessions.contains(id) || systemSafetyTasks[id] != nil || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
     }
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
@@ -1614,6 +1623,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let id = object["sessionID"] as? String, let session = sessions[id],
               session.phase != .ended || ["cancelCapacity","read"].contains(action) else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
         switch action {
+        case "resetAutomation":
+            let result = try resetAutomation(id)
+            return ["ok": true, "sessionCount": result.sessionCount, "cancelledTasks": result.cancelledTasks,
+                    "awaitingDelivery": result.awaitingDelivery, "automatic": result.automatic,
+                    "paused": result.paused, "message": result.message]
         case "clearQueuedInputs":
             guard session.agent == .codex, let thread = object["threadID"] as? String,
                   let supplied = object["queueIDs"] as? [String], !supplied.isEmpty, supplied.count <= 100,
@@ -2201,10 +2215,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func refreshCodexHistory() async -> (targetCount: Int, responsive: Bool)? {
         let epoch = observationEpoch
+        let automationEpochs = automationRuntime.epochs
         let codexTargets = sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
         let updates = await codexQuestions.collect(codexTargets)
         guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
-        updateCodexQuestions(updates)
+        updateCodexQuestions(updates.filter { automationEpochs[$0.sessionID, default: 0] == automationRuntime.epoch($0.sessionID) })
         let responsive = codexTargets.contains { target in
             guard let current = sessions[target.id] else { return false }
             return current.unansweredQuestions.contains(where: { $0.hasLaterUserMessage != true }) ||
@@ -2275,7 +2290,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for target in targets {
             let id = target.id
             let hasPriorityInput = remoteInputSessions.contains(id) || remoteInputUntil[id].map { now < $0 } == true
-            let hasAutomaticInput = automaticInputSessions.contains(id) || systemSafetyTasks.contains(id) ||
+            let hasAutomaticInput = automaticInputSessions.contains(id) || systemSafetyTasks[id] != nil ||
                 capacityStates[id]?.phase == .sending || pendingActionSessions.contains(id)
             priorityInput = priorityInput || hasPriorityInput || hasAutomaticInput
             automatic = automatic || effectiveAutomatic(target.id)
@@ -2905,6 +2920,78 @@ private struct ScreenAnalysisStorageKey: Hashable {
         publish()
     }
 
+    /// Discard pending automation synchronously. The original CLI, user drafts,
+    /// saved policy and receipts for already dispatched input are not restarted.
+    @discardableResult public func resetAutomation(_ id: String) throws -> AutomationResetResult {
+        guard !remoteInputStopped, let selected = sessions[id], selected.phase != .ended else {
+            throw AppError.message("실행 중인 세션을 선택해주세요.")
+        }
+        let members = groupIDs(id)
+        let awaitingDelivery = members.contains { id in
+            automaticInputBusy(id) || remoteInputSessions.contains(id) ||
+                automaticQuestionReplies.values.contains { $0.sessionID == id && $0.sending }
+        }
+        var cancelledTasks = 0
+        for member in members {
+            cancelledTasks += automationRuntime.reset(member)
+            if let state = screens[member], let dispatchID = state.dispatchID, automaticInputBusy(member) {
+                resetApprovalReceipts[member] = ResetApprovalReceipt(dispatchID: dispatchID,
+                    generation: state.generation, requestIdentity: state.prompt.requestIdentity)
+            } else if !automaticInputBusy(member) { resetApprovalReceipts.removeValue(forKey: member) }
+            if modelRetentionTasks[member] != nil { cancelledTasks += 1 }
+            cancelModelRetention(member)
+            systemSafetyTasks.removeValue(forKey: member)
+            for (questionID, pending) in automaticQuestionReplies where pending.sessionID == member {
+                cancelledTasks += 1; cancelAutomaticQuestionReply(questionID)
+            }
+            for (requestID, pending) in liveClaudeHooks where pending.request.sessionID == member {
+                removeLiveClaudeHook(requestID)
+            }
+            // Editing/cancellation and submission receipts are user intent, not
+            // disposable automation. Reload their small caches on the next read.
+            for question in sessions[member]?.questions ?? [] {
+                persistedQuestionSettings.removeValue(forKey: question.id)
+            }
+            readableQuestionSessions.remove(member)
+            capacityStates.removeValue(forKey: member)
+            exitRecoveryTasks.removeValue(forKey: member)
+            exitRecoveries.removeValue(forKey: member)
+            remoteInputUntil.removeValue(forKey: member)
+            retainedModelMenus.removeValue(forKey: member)
+            // An interrupted safety write cannot become another Escape or paste.
+            var safetyReceipt: SystemSafetyState?
+            if var state = systemSafetyStates[member],
+               [.cancelling, .typing, .draft, .submitting].contains(state.notice.phase) {
+                state.notice.phase = .uncertain
+                state.notice.message = "자동화를 초기화했습니다. 이미 전달 중이던 보호 입력은 반복하지 않습니다. 원본 화면을 확인해주세요."
+                safetyReceipt = state
+                do { try saveSystemSafety(member, state) }
+                catch { snapshot.health.auditError = "초기화한 보호 입력의 확인 기록을 저장하지 못했습니다. " + error.localizedDescription }
+            }
+            systemSafetyStates.removeValue(forKey: member)
+            sessions[member]?.systemSafety = nil
+            // Keep this minimal receipt even if SQLite is unavailable. Losing
+            // it must never turn an unknown paste into a second write.
+            if let safetyReceipt { systemSafetyStates[member] = safetyReceipt; sessions[member]?.systemSafety = safetyReceipt.notice }
+            clearScreen(member)
+            remoteStreams.removeValue(forKey: member)
+            automationNeedsFreshScreen.insert(member)
+            if let host = sessions[member].flatMap({ ScreenHost(kind: $0.terminal) }) {
+                unchangedScreenReads[host] = 0
+                screenPollSignals[host]?.notify()
+            }
+        }
+        let result = AutomationResetResult(sessionCount: members.count, cancelledTasks: cancelledTasks,
+            awaitingDelivery: awaitingDelivery, automatic: effectiveAutomatic(id), paused: snapshot.paused)
+        sessions[id]?.activityDetail = result.message
+        _ = log(AuditEvent(sessionID: id, summary: "자동화 초기화·재실행", outcome: result.message,
+            source: "자동화 복구", context: AuditContext(session: selected)))
+        historyPollSignal.notify()
+        claudeHookSignals.values.forEach { $0.notify() }
+        publish()
+        return result
+    }
+
     public func setAutomatic(_ id: String, enabled: Bool) throws {
         let target = ownerID(id) ?? id
         guard var session = sessions[target], presentedSessions().first(where: { $0.id == target })?.canApprove == true || !enabled else { throw AppError.message("이 세션의 승인 연결을 먼저 설정해주세요.") }
@@ -3013,6 +3100,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return nil }
         screenConnections[host]?.polling = true
         let epoch = observationEpoch
+        let automationEpochs = automationRuntime.epochs
         let announceConnection = reportConnecting || !snapshot.health.screen(host).connected
         if announceConnection { updateHealth(host) { $0.connecting = true } }
         defer {
@@ -3086,7 +3174,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let (failures, screensByTTY, analyses, changedIDs, unchangedObservedAt) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return nil }
             let targets = targets.filter { target in
-                guard let current = sessions[target.id], current.phase != .ended,
+                guard automationEpochs[target.id, default: 0] == automationRuntime.epoch(target.id),
+                      let current = sessions[target.id], current.phase != .ended,
                       current.pid == target.pid, current.started == target.started,
                       current.tty == target.tty, current.terminal == host.kind else { return false }
                 if host == .pty {
@@ -3600,8 +3689,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
               liveClaudeHooks[id] != nil else { return result }
         let signal = claudeHookSignals[id] ?? RemoteTerminalChangeSignal(); claudeHookSignals[id] = signal
         let observation = signal.observe(), epoch = observationEpoch, heartbeat = Date().addingTimeInterval(15)
+        let automationEpoch = automationRuntime.epoch(envelope.sessionID)
         await observation.waitForChange(timeout: 0)
         while !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch {
+            guard automationRuntime.epoch(envelope.sessionID) == automationEpoch else { return bridgeResponse() }
             guard let pending = liveClaudeHooks[id] else { return try handleClaudeHook(envelope, at: Date()) }
             if pending.receipt.response != nil { return try handleClaudeHook(envelope, at: Date()) }
             let now = Date()
@@ -3613,7 +3704,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if untilConfirmation > 0 { interval = min(interval, untilConfirmation) }
             }
             await observation.waitForChange(timeout: interval)
-            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return bridgeResponse() }
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch,
+                  automationRuntime.epoch(envelope.sessionID) == automationEpoch else { return bridgeResponse() }
             let resumedAt = Date()
             guard let current = liveClaudeHooks[id] else { return try handleClaudeHook(envelope, at: resumedAt) }
             if current.receipt.response != nil { return try handleClaudeHook(envelope, at: resumedAt) }
@@ -4021,6 +4113,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func receiveScreen(sessionID: String, raw: String, generation: String, source: ApprovalChannel? = nil, at now: Date = Date(), appearance: TerminalAppearance? = nil, cursor: TerminalCursor? = nil, display: TerminalTextSnapshot? = nil, precomputed: ScreenAnalysis?, screenContentsUnchanged: Bool) {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
+        automationNeedsFreshScreen.remove(sessionID)
         let previousFrame = remoteObservedScreens[sessionID]
         // Registration and frame updates share this actor. A new observer starts
         // pending and reads the latest frame; an empty signal has no callback.
@@ -4076,6 +4169,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return
         }
         let prompt = analysis.prompt
+        if let receipt = resetApprovalReceipts[sessionID],
+           receipt.generation != generation || prompt.map({ $0.requestIdentity != receipt.requestIdentity && $0.hasRequestBoundary }) == true ||
+           (prompt == nil && [.working, .idle, .input].contains(analysis.activity.phase)) {
+            resetApprovalReceipts.removeValue(forKey: sessionID)
+        }
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
             guard session.phase == .approval, session.pendingInTerminal, prompt != nil,
@@ -4134,6 +4232,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 || !($0.prompt.hasRequestBoundary && prompt.hasRequestBoundary)) ? $0 : nil
         }
         var current = previous ?? ScreenState(raw: raw, prompt: prompt, generation: generation)
+        if let receipt = resetApprovalReceipts[sessionID], receipt.generation == generation,
+           receipt.requestIdentity == prompt.requestIdentity || !prompt.hasRequestBoundary {
+            current.attempted = true
+            current.reviewDetail = "초기화 전에 전달 중이던 입력의 결과를 확인해주세요. 같은 요청에는 자동으로 중복 입력하지 않습니다."
+        }
         // Coalesce render changes while process validation is in flight. The adapter
         // still receives the latest complete original dialog for its final check.
         if current.prompt.requestIdentity != prompt.requestIdentity { current.scheduledID = nil }
@@ -4175,6 +4278,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let receipt = "terminalChoice:\(id):\(choice.id)"
         guard !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id),
+              !automationNeedsFreshScreen.contains(id),
               retainedModelMenus[id] != menuIdentity,
               manuallyChangedModelQuestions[id] != identity,
               !userInputHasPriority(id), !automaticInputBusy(id),
@@ -4234,6 +4338,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func observeSystemSafety(_ id: String, risk: SystemCommandRisk, prompt: ApprovalPrompt, generation: String, at now: Date) {
+        if systemSafetyStates[id] == nil, let saved = store.value("systemSafety:" + id),
+           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)) {
+            systemSafetyStates[id] = state; sessions[id]?.systemSafety = state.notice
+        }
         let previous = systemSafetyStates[id]
         if previous?.generation == generation, previous?.promptIdentity == prompt.requestIdentity,
            previous?.notice.phase != .guided { return }
@@ -4256,20 +4364,28 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let state = systemSafetyStates[id], state.generation != nil,
               state.notice.phase != .guided, state.notice.phase != .uncertain,
               state.retryAfter.map({ $0 > Date() }) != true,
-              !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id),
+              !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id), !automationNeedsFreshScreen.contains(id),
               !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.phase != .ended, session.channel.isScreen,
               !liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) else { return }
-        systemSafetyTasks.insert(id)
-        Task { [weak self] in
-            guard let self else { return }
-            defer { self.systemSafetyTasks.remove(id); self.publish(); self.scheduleScreenApproval(id) }
-            await self.dispatchSystemSafety(session, noticeID: state.notice.id)
+        let token = UUID()
+        systemSafetyTasks[id] = token
+        automationRuntime.launch(id) { [weak self] epoch in
+            guard let self, self.systemSafetyTasks[id] == token else { return }
+            self.automaticInputSessions.insert(id)
+            defer {
+                self.automaticInputSessions.remove(id)
+                if self.systemSafetyTasks[id] == token { self.systemSafetyTasks.removeValue(forKey: id) }
+                self.publish(); self.scheduleSystemSafety(id); self.scheduleScreenApproval(id)
+            }
+            await self.dispatchSystemSafety(session, noticeID: state.notice.id, automationEpoch: epoch)
         }
     }
 
-    private func safetyInputAllowed(_ original: AgentSession, noticeID: String) -> Bool {
-        guard !remoteInputStopped, !snapshot.paused, effectiveAutomatic(original.id), !userInputHasPriority(original.id),
+    private func safetyInputAllowed(_ original: AgentSession, noticeID: String, automationEpoch: UInt64) -> Bool {
+        guard !Task.isCancelled, automationRuntime.epoch(original.id) == automationEpoch,
+              !automationNeedsFreshScreen.contains(original.id),
+              !remoteInputStopped, !snapshot.paused, effectiveAutomatic(original.id), !userInputHasPriority(original.id),
               let current = sessions[original.id], current.phase != .ended, current.pid == original.pid,
               current.started == original.started, current.tty == original.tty, current.channel == original.channel,
               current.terminal == original.terminal, current.screenHandle == original.screenHandle,
@@ -4292,9 +4408,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// This path does not impersonate a user input or reopen a CLI. Every write
     /// rechecks the original foreground job and the exact current screen.
-    private func safetyWrite(_ original: AgentSession, noticeID: String, expected: String, input: RemoteTerminalInput) async throws -> TerminalDelivery {
+    private func safetyWrite(_ original: AgentSession, noticeID: String, automationEpoch: UInt64, expected: String, input: RemoteTerminalInput) async throws -> TerminalDelivery {
         let reader = processReader, live = try await Task.detached { try reader() }.value
-        guard safetyInputAllowed(original, noticeID: noticeID),
+        guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch),
               let process = live.first(where: { $0.pid == original.pid && $0.started == original.started && $0.agent == original.agent
                 && "/dev/" + $0.tty == original.tty && $0.isForeground }) else { return .agentMissing }
         if let host = ScreenHost(channel: original.channel), let adapter = screenAdapters[host] {
@@ -4303,7 +4419,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sourceStarted: original.started, sourceIdentity: original.terminal == .terminal ? terminalInputIdentity(original.pid) : nil)
             guard original.terminal != .terminal || target.sourceIdentity != nil else { return .missingTarget }
             let fresh = try await safetyRead(original)
-            guard fresh == expected, safetyInputAllowed(original, noticeID: noticeID) else { return .screenChanged }
+            guard fresh == expected, safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch) else { return .screenChanged }
             return try await Task.detached {
                 // Relay keys ordinarily tolerate output changes; safety actions don't.
                 guard try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents == expected else { return TerminalDelivery.screenChanged }
@@ -4331,19 +4447,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return sent ? .sent : .screenChanged
     }
 
-    private func dispatchSystemSafety(_ original: AgentSession, noticeID: String) async {
+    private func dispatchSystemSafety(_ original: AgentSession, noticeID: String, automationEpoch: UInt64) async {
         let id = original.id, deadline = Date().addingTimeInterval(45)
         var wrote = false
         func update(_ phase: SystemSafetyNotice.Phase, _ message: String, retry: TimeInterval? = nil) throws {
-            guard var state = systemSafetyStates[id], state.notice.id == noticeID else { return }
+            guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch),
+                  var state = systemSafetyStates[id], state.notice.id == noticeID else { return }
             state.notice.phase = phase; state.notice.message = message; state.notice.updatedAt = Date()
             state.retryAfter = retry.map { Date().addingTimeInterval($0) }
             try saveSystemSafety(id, state); publish()
         }
         do {
-            while safetyInputAllowed(original, noticeID: noticeID), var state = systemSafetyStates[id], Date() < deadline {
+            while safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch), var state = systemSafetyStates[id], Date() < deadline {
                 let raw = try await safetyRead(original)
-                guard safetyInputAllowed(original, noticeID: noticeID) else { return }
+                guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch) else { return }
                 switch state.notice.phase {
                 case .guided, .uncertain: return
                 case .cancelling:
@@ -4357,8 +4474,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     }
                     try update(.cancelling, "이 시스템 변경 요청을 거절하고 있습니다…")
                     wrote = true
-                    let result = try await safetyWrite(original, noticeID: noticeID, expected: raw, input: RemoteTerminalInput(kind: .escape))
+                    let result = try await safetyWrite(original, noticeID: noticeID, automationEpoch: automationEpoch, expected: raw, input: RemoteTerminalInput(kind: .escape))
                     wrote = false
+                    guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch) else { return }
                     guard result == .sent else {
                         try update(.unavailable, "시스템 변경은 승인하지 않았습니다. 원본 직접 입력 연결을 확인하면 안전한 대안 안내를 다시 시도합니다.", retry: 5); return
                     }
@@ -4380,9 +4498,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     state.draft = composer; state.notice.phase = .typing; state.notice.message = "같은 원본 대화에 안전한 대안을 입력하고 있습니다…"
                     try saveSystemSafety(id, state); publish()
                     wrote = true
-                    let result = try await safetyWrite(original, noticeID: noticeID, expected: raw,
+                    let result = try await safetyWrite(original, noticeID: noticeID, automationEpoch: automationEpoch, expected: raw,
                         input: RemoteTerminalInput(kind: .characters, text: composer.text))
                     wrote = false
+                    guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch) else { return }
                     if result != .sent {
                         state = systemSafetyStates[id]!; state.draft = nil; try saveSystemSafety(id, state)
                         try update(.cancelled, "입력 전 화면이 바뀌어 대안 안내를 기다리고 있습니다.", retry: 2); return
@@ -4399,18 +4518,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     }
                     try await Task.sleep(nanoseconds: 750_000_000)
                     let fresh = try await safetyRead(original)
-                    guard composer.draftReady(fresh), safetyInputAllowed(original, noticeID: noticeID) else { continue }
+                    guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch) else { return }
+                    guard composer.draftReady(fresh) else { continue }
                     state = systemSafetyStates[id]!
                     state.submitAttempts += 1; state.notice.phase = .submitting; state.notice.message = "안내문 전송을 확인하고 있습니다…"
                     try saveSystemSafety(id, state); publish()
                     wrote = true
-                    let result = try await safetyWrite(original, noticeID: noticeID, expected: fresh, input: RemoteTerminalInput(kind: .enter, relay: true))
+                    let result = try await safetyWrite(original, noticeID: noticeID, automationEpoch: automationEpoch, expected: fresh, input: RemoteTerminalInput(kind: .enter, relay: true))
                     wrote = false
+                    guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch) else { return }
                     if result != .sent { try update(.draft, "같은 안내문을 확인한 뒤 Enter만 다시 시도합니다.", retry: 2); return }
                     try await Task.sleep(nanoseconds: 750_000_000)
                 }
             }
-            guard safetyInputAllowed(original, noticeID: noticeID), let state = systemSafetyStates[id] else { return }
+            guard safetyInputAllowed(original, noticeID: noticeID, automationEpoch: automationEpoch), let state = systemSafetyStates[id] else { return }
             if state.cancelledAt != nil && state.draft == nil {
                 try update(.cancelled, "시스템 변경을 거절했습니다. 같은 대화의 빈 입력창을 기다리고 있습니다.", retry: 2)
             } else { try update(.uncertain, "대안 안내의 전달을 확인하지 못해 입력을 반복하지 않습니다. 원본 대화를 확인해주세요.") }
@@ -4637,20 +4758,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleCapacityResume(_ id: String) {
-        guard !remoteInputStopped, systemSafetyStates[id]?.notice.isPending != true,
+        guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), systemSafetyStates[id]?.notice.isPending != true,
               let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id) else { return }
         let scheduledID = UUID(), scheduledRevision = revision
         capacityStates[id]?.scheduledID = scheduledID
         let delay = max(0, state.deadline.timeIntervalSinceNow)
-        Task { [weak self] in
-            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
-            await self?.dispatchCapacityResume(id, scheduledID: scheduledID, revision: scheduledRevision)
+        automationRuntime.launch(id) { [weak self] epoch in
+            if delay > 0 { do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return } }
+            guard !Task.isCancelled, let self, self.automationRuntime.epoch(id) == epoch else { return }
+            await self.dispatchCapacityResume(id, scheduledID: scheduledID, revision: scheduledRevision, automationEpoch: epoch)
         }
     }
 
-    private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64) async {
+    private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64, automationEpoch: UInt64) async {
         func current() -> (CapacityState, AgentSession, ScreenHostAdapter?)? {
-            guard let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
+            guard !Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !automationNeedsFreshScreen.contains(id),
+                  let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
                   // Preserve async questions in history, but do not let questions
                   // followed by later user input block a fresh error/Goal retry.
@@ -4703,7 +4826,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if superseded { scheduleCapacityResume(id) }
         }
         func ownsDelivery() -> Bool {
-            capacityStates[id]?.phase == .sending && capacityStates[id]?.dispatchID == scheduledID
+            !Task.isCancelled && automationRuntime.epoch(id) == automationEpoch &&
+                capacityStates[id]?.phase == .sending && capacityStates[id]?.dispatchID == scheduledID
                 && sessions[id]?.phase != .ended
         }
         do {
@@ -4714,7 +4838,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     delivery = try await Task.detached { try complete(target,stop) }.value
                 } else if state.submitOnly { delivery = .typed }
                 else { delivery = try await Task.detached { try adapter.resume(target,region,text) }.value }
-            } else { delivery = try await resumeBridgeSession(session,stop:state.stop,submitOnly:state.submitOnly) }
+            } else { delivery = try await resumeBridgeSession(session,stop:state.stop,submitOnly:state.submitOnly,automationEpoch:automationEpoch) }
             // Always retain the actual result, but an old callback cannot change a
             // replacement failure, a cancelled run, or a session that has ended.
             switch delivery {
@@ -4779,14 +4903,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } catch { snapshot.health.auditError = "작업 중단 상태를 저장하지 못했습니다. \(error.localizedDescription)"; return false }
     }
 
-    private func resumeBridgeSession(_ session: AgentSession, stop: CodexCapacityStop, submitOnly: Bool = false) async throws -> ResumeDelivery {
+    private func resumeBridgeSession(_ session: AgentSession, stop: CodexCapacityStop, submitOnly: Bool = false, automationEpoch: UInt64) async throws -> ResumeDelivery {
         let id = session.id
         let region = stop.region, text = stop.continuationText
         guard let before = remoteObservedScreens[id], Date().timeIntervalSince(before.observedAt) < 6,
               submitOnly ? CodexResumeCheck.draftReady(before.raw, stop: stop) : CodexResumeCheck.ready(before.raw,region:region,text:text) else { return .screenChanged }
         func write(_ observed: RemoteObservedScreen, kind: String, value: String) async throws -> Bool {
             let reader = processReader, live = try await Task.detached { try reader() }.value
-            guard !remoteInputStopped, !snapshot.paused, !userInputHasPriority(id),
+            guard !Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !remoteInputStopped, !snapshot.paused, !userInputHasPriority(id),
                   live.contains(where:{$0.pid == session.pid && $0.started == session.started && $0.agent == session.agent && "/dev/"+$0.tty == session.tty && $0.isForeground}),
                   let current = sessions[id], current.automatic, current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
                   let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID,
@@ -4854,11 +4978,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
               exitRecoveries[id]?.conversationID == nil,
               conversationReads.insert(id).inserted else { return }
         let current = records
+        let epoch = automationRuntime.epoch(id)
         Task { [weak self] in
             guard let self else { return }
             defer { conversationReads.remove(id) }
             let value = await currentPTYConversation(session,records:current)
-            guard let value, UUID(uuidString:value) != nil else { return }
+            guard !Task.isCancelled, automationRuntime.epoch(id) == epoch, let value, UUID(uuidString:value) != nil else { return }
             exitRecoveries[id]?.conversationID = value.lowercased()
             if sessions[id]?.phase == .ended { saveExitRecoveries() }
         }
@@ -5317,8 +5442,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func watchDeliveredApproval(_ id: String, dispatchID: UUID, generation: String, requestIdentity: String) {
         let deliveredAt = Date()
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
+        automationRuntime.launch(id) { [weak self] _ in
+            do { try await Task.sleep(nanoseconds: 8_000_000_000) } catch { return }
             guard let self, self.screens[id]?.prompt.requestIdentity == requestIdentity,
                   let observed = self.screenObservedAt[id], observed > deliveredAt,
                   Date().timeIntervalSince(observed) < 6 else { return }
@@ -5344,7 +5469,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func scheduleScreenApproval(_ id: String) {
         if systemSafetyStates[id]?.notice.isPending == true { scheduleSystemSafety(id); return }
-        guard !remoteInputStopped, !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
+        guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
@@ -5353,14 +5478,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
         let reader = processReader
-        Task { [weak self] in
+        automationRuntime.launch(id) { [weak self] epoch in
             if let retryAfter = state.retryAfter {
                 let delay = retryAfter.timeIntervalSinceNow
-                if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                if delay > 0 { do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return } }
             }
+            guard !Task.isCancelled else { return }
             let live = try? await Task.detached { try reader() }.value
             guard let self else { return }
-            guard self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
+            guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
+                  self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,
@@ -5399,11 +5526,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let approve = adapter.approve, raw = current.raw, kind = session.agent
                 do {
                     let delivery = try await Task.detached { try approve(target, raw, kind) }.value
+                    if Task.isCancelled || self.automationRuntime.epoch(id) != epoch {
+                        event.outcome = delivery == .sent ? "초기화 전 승인 입력 전달" : "초기화 전 입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
+                        self.log(event); return
+                    }
                     if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
                     if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
                     event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     self.log(event)
                 } catch {
+                    if Task.isCancelled || self.automationRuntime.epoch(id) != epoch {
+                        event.outcome = "초기화 전 입력 확인 필요: \(error.localizedDescription)"
+                        self.log(event); return
+                    }
                     // A transport error can occur after dispatch; never blindly repeat an uncertain write.
                     self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity,
                         detail: "승인 입력 결과를 확인하지 못했습니다. 터미널을 확인해주세요.")
