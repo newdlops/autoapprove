@@ -85,6 +85,23 @@ import CryptoKit
                 }
             }}
         }
+        // Tail rejection reads at most 129 UTF-16 units, including the
+        // predecessor of the first compared unit. Preserve the independent
+        // complete UTF-8 projection on both sides of every tail boundary.
+        for tailLength in [0, 1, 2, 125, 126, 127, 128, 129, 130, 255, 256] {
+            let before = Array(String(repeating: "stable body ", count: 70).utf16)
+            let after = Array(String(repeating: "x", count: tailLength).utf16)
+            let values = boundaryUnits.map { foreign(before + $0 + after) }
+            let bytes = values.map { Data($0.utf8) }
+            let repaired = bytes.map { String(decoding: $0, as: UTF8.self) }
+            for (i, left) in values.enumerated() { for (j, right) in values.enumerated() {
+                for (previous, current) in [(left, right), (left, repaired[j]), (repaired[i], right)] {
+                    let actual = match(ScreenMatchProbe(raw: previous, agent: .codex), current)
+                    try check(actual == (bytes[i] == bytes[j]), "Tail repair changed at \(tailLength)/\(i)/\(j)")
+                    digest.update(data: Data([actual ? 1 : 0])); cases += 1
+                }
+            }}
+        }
         try check(!ScreenTextEquality.identical(nil, ""), "A missing observation cannot reuse analysis")
         return (cases, digest.finalize().map { String(format: "%02x", $0) }.joined())
     }
