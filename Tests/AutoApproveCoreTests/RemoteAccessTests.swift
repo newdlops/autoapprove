@@ -45,6 +45,37 @@ private final class RemoteReadProbe: @unchecked Sendable {
     func change() { lock.lock(); raw += "\n새 출력"; lock.unlock() }
 }
 
+private final class RemoteReadLifetimeProbe: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var held = false, waiting = false
+    private var reads = 0
+    private var raw = "synthetic original\n› "
+    func hold() { condition.lock(); held = true; condition.unlock() }
+    func release() { condition.lock(); held = false; condition.broadcast(); condition.unlock() }
+    var blocked: Bool { condition.lock(); defer { condition.unlock() }; return waiting }
+    var count: Int { condition.lock(); defer { condition.unlock() }; return reads }
+    func change() { condition.lock(); raw += "새 출력"; condition.unlock() }
+    func snapshot(_ targets: [ScreenTarget]) -> TerminalSnapshot {
+        condition.lock(); reads += 1; waiting = held
+        let deadline = Date().addingTimeInterval(10)
+        while held && condition.wait(until: deadline) {}
+        let raw = raw; waiting = false; condition.unlock()
+        return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: raw) })
+    }
+}
+
+private actor RemoteOrcaLifetimeProbe {
+    private(set) var count = 0
+    var incarnation = "original"
+    func changeIncarnation() { incarnation = "replacement" }
+    func snapshot(owner: Int32) -> OrcaTerminalSnapshot {
+        count += 1
+        return OrcaTerminalSnapshot(ansi: "\u{1B}[31msynthetic original\u{1B}[0m\r\n> ", columns: 80, rows: 24, sequence: Int64(count),
+            runtimeID: "fixture-runtime", ptyID: "fixture-pty", incarnationID: incarnation, ownerPID: owner,
+            observedAt: Date(), alternateScreen: false)
+    }
+}
+
 @MainActor private final class RemotePermissionProbe {
     var full = 0, automation = 0, keyboard = 0
     var automationAllowed = true
@@ -65,6 +96,71 @@ private final class RemoteCursorProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testRemoteReadPruningPreservesPendingConsumersAndFreshCache() async throws {
+        for host in [ScreenHost.terminal, .iterm] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-read-prune-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let records = ProcessDiscovery.parse("86111 1 ttys181 86111 86111 Wed Oct 21 09:00:01 2026 /usr/local/bin/codex")
+            var session = ProcessDiscovery.sessions(records)[0]; session.terminal = host.kind
+            let probe = RemoteReadLifetimeProbe(); defer { probe.release() }
+            let adapter = ScreenHostAdapter(screens: { probe.snapshot($0) }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: { _ in [] },
+                processReader: { records }, screenAdapters: [host: adapter])
+            defer { engine.stop() }
+            engine.updateDiscovery([session], records: records); await engine.connectScreenHost(host)
+            let baseline = probe.count; probe.hold()
+            let readers = (0..<3).map { _ in Task { try await engine.remoteTerminal(sessionID: session.id) } }
+            for _ in 0..<200 where !probe.blocked { try await Task.sleep(for: .milliseconds(5)) }
+            try expect(probe.blocked)
+            try await Task.sleep(for: .milliseconds(1100))
+            engine.updateDiscovery([session], records: records)
+            probe.release()
+            var frames: [RemoteTerminalFrame] = []
+            for reader in readers { frames.append(try await reader.value) }
+            try expectEqual(probe.count, baseline + 1, "Discovery must not cancel or duplicate a shared in-flight read")
+            for frame in frames {
+                try expectEqual(frame.screen, "synthetic original\n› ")
+                try expectEqual(frame.revision, frames[0].revision); try expectEqual(frame.streamID, frames[0].streamID)
+                try expectEqual(frame.observedAt, frames[0].observedAt)
+            }
+            let cached = try await engine.remoteTerminal(sessionID: session.id)
+            try expectEqual(cached.observedAt, frames[0].observedAt); try expectEqual(probe.count, baseline + 1)
+            probe.change(); try await Task.sleep(for: .milliseconds(1100))
+            engine.updateDiscovery([session], records: records)
+            let current = try await engine.remoteTerminal(sessionID: session.id)
+            try expectEqual(probe.count, baseline + 2); try expect(current.screen.contains("새 출력"))
+            try expectEqual(current.streamID, frames[0].streamID, "Evicting a read result must preserve the original stream binding")
+            try expectEqual(engine.snapshot.sessions.first?.pid, session.pid)
+            try expectEqual(engine.snapshot.sessions.first?.started, session.started)
+        }
+    }
+
+    func testOrcaReadPruningPreservesOriginalIncarnationAndCachedObservation() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-orca-prune-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("86112 1 ttys182 86112 86112 Wed Oct 21 09:00:01 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .orca; session.orcaHandle = "fixture-handle"
+        let probe = RemoteOrcaLifetimeProbe()
+        let adapter = ScreenHostAdapter(screens: { TerminalSnapshot(screens: $0.map { TerminalScreen(tty: $0.tty, contents: "fixture monitor") }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: { _ in [] }, processReader: { records },
+            screenAdapters: [.orca: adapter], orcaSnapshotReader: { _ in await probe.snapshot(owner: records[0].pid) })
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records); await engine.connectScreenHost(.orca)
+        let first = try await engine.remoteTerminal(sessionID: session.id), cached = try await engine.remoteTerminal(sessionID: session.id)
+        try expect(first.screen.contains("synthetic original")); try expectNil(first.outputReason)
+        try expectEqual(await probe.count, 1); try expectEqual(first.observedAt, cached.observedAt)
+        try await Task.sleep(for: .milliseconds(1100)); engine.updateDiscovery([session], records: records)
+        let current = try await engine.remoteTerminal(sessionID: session.id)
+        try expectEqual(await probe.count, 2); try expectEqual(first.screen, current.screen)
+        try expectEqual(first.streamID, current.streamID)
+        await probe.changeIncarnation(); try await Task.sleep(for: .milliseconds(1100)); engine.updateDiscovery([session], records: records)
+        let replacement = try await engine.remoteTerminal(sessionID: session.id)
+        try expectEqual(await probe.count, 3)
+        try expect(replacement.screen.isEmpty, "Expiration must never admit another incarnation of the original handle")
+        try expect(replacement.outputReason?.contains("PTY 세대") == true)
+    }
+
     func testTTYProcessStartFormattingIsStableUnderConcurrentReads() throws {
         let seconds: UInt64 = 1_792_468_800
         let identity = TTYInputIdentity(pid: 1, processGroup: 1, uid: getuid(), effectiveUID: geteuid(), device: 0,

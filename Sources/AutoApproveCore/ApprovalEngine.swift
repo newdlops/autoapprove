@@ -39,14 +39,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var token: String { PromptDetector.fingerprint(runtimeID + "\u{0}" + ptyID + "\u{0}" + incarnationID + "\u{0}" + String(ownerPID)) }
     }
     private struct RemoteObservedScreen: Sendable { var raw: String; var generation: String; var observedAt: Date; var appearance: TerminalAppearance? = nil; var cursor: TerminalCursor? = nil; var orcaBinding: RemoteOrcaBinding? = nil; var display: TerminalTextSnapshot? = nil }
-    private struct RemoteScreenRead {
-        var token: UUID
-        var target: ScreenTarget
-        var generation: String
-        var task: Task<RemoteObservedScreen, Error>
+    private final class RemoteScreenRead {
+        let token: UUID
+        let target: ScreenTarget
+        let generation: String
+        let task: Task<RemoteObservedScreen, Error>
         var observedAt: Date?
         var sourceRevision: UInt64?
+        var activeReaders = 0
+        init(token: UUID, target: ScreenTarget, generation: String, task: Task<RemoteObservedScreen, Error>) {
+            self.token = token; self.target = target; self.generation = generation; self.task = task
+        }
     }
+    private static let remoteReadCacheLifetime: TimeInterval = 0.6
     private var remoteScreenReads: [String: RemoteScreenRead] = [:]
     private struct RemoteInitialRead { var read: RemoteScreenRead; var waiters: Set<UUID> }
     private var remoteInitialReads: [String: RemoteInitialRead] = [:]
@@ -879,7 +884,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         let pending: RemoteScreenRead
-        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
+        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
         let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : nil
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
            existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
@@ -888,9 +893,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let task = read(using:adapter.presentationScreens ?? adapter.screens,
                 stage:adapter.presentationScreens == nil ? .textRead : .presentationRead)
             pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
-            var tracked = pending; tracked.sourceRevision = sourceRevision
-            remoteScreenReads[session.id] = tracked
+            pending.sourceRevision = sourceRevision
+            remoteScreenReads[session.id] = pending
         }
+        pending.activeReaders += 1
+        defer { pending.activeReaders -= 1 }
         do {
             let observed = try await pending.task.value
             guard remoteScreenReads[session.id]?.token == pending.token else {
@@ -924,7 +931,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let target = ScreenTarget(tty: session.tty, handle: handle)
         let targetGeneration = remoteGeneration(session, host: .orca), generation = targetGeneration + ":ansi"
-        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : 0.6
+        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
         let pending: RemoteScreenRead
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
            existing.observedAt.map({ Date().timeIntervalSince($0) < cacheAge }) ?? true {
@@ -949,6 +956,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             pending = RemoteScreenRead(token: UUID(), target: target, generation: generation, task: task)
             remoteScreenReads[session.id] = pending
         }
+        pending.activeReaders += 1
+        defer { pending.activeReaders -= 1 }
         do {
             let observed = try await pending.task.value; try Task.checkCancellation()
             guard remoteScreenReads[session.id]?.token == pending.token else {
@@ -4149,8 +4158,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let now = ProcessInfo.processInfo.systemUptime
         guard now >= nextRemoteFramePruneAt else { return }
         nextRemoteFramePruneAt = now + 1
-        guard !remoteFrames.isEmpty else { return }
+        guard !remoteFrames.isEmpty || !remoteScreenReads.isEmpty else { return }
         let date = Date()
+        // A completed Task retains its full source output even after the frame
+        // expires. Keep the existing reuse window, but do not pin visited
+        // sessions indefinitely or evict a result another waiter still owns.
+        let expiredReads = remoteScreenReads.compactMap { id, read in
+            read.activeReaders == 0 && read.observedAt.map({ date.timeIntervalSince($0) >= Self.remoteReadCacheLifetime }) == true ? id : nil
+        }
+        for id in expiredReads { remoteScreenReads.removeValue(forKey: id) }
         let expired = remoteFrames.compactMap { id, value in
             date.timeIntervalSince(value.frame.observedAt) >= 10 ? id : nil
         }

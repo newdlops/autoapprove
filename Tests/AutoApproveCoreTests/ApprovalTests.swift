@@ -566,6 +566,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Stabilization: corrupt cached update is rejected", tests.testLANUpdateDownloadRejectsCorruptCompletedResume),
             ("Stabilization: accessibility and mouse event permission diagnostics", tests.testMouseReportsDistinctAXAndEventPermissions),
             ("Remote terminal coalesces reads, expires cache and omits unchanged output", tests.testRemoteTerminalCoalescingExpiryAndConditionalPayload),
+            ("Remote read pruning: shared pending consumers, fresh cache and original stream", tests.testRemoteReadPruningPreservesPendingConsumersAndFreshCache),
+            ("Remote read pruning: Orca cached observation and exact original incarnation", tests.testOrcaReadPruningPreservesOriginalIncarnationAndCachedObservation),
             ("Live relay accepts changing output with automation on and binds the exact target", tests.testRemoteRelayWithAutomaticApprovalAndChangedOutput),
             ("Native approval writes serialize with live user input", tests.testRemoteInputSerializesNativeApproval),
             ("Remote original ANSI attributes, bounds and color-only frames", tests.testRemoteOriginalTerminalAttributesAndColorOnlyFrames),
