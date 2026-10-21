@@ -801,6 +801,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("long commands and canonical Unicode dialogs", tests.testLongPermissionAndCanonicalUnicode),
             ("interactive question menus versus approval and stale text", tests.testQuestionMenus),
             ("Terminal final validation, exact single input and unreadable tab windows", tests.testTerminalApprovalValidation),
+            ("Capacity cell prefix: normal history, Goal fields, held drafts and original errors", tests.testCapacityCellPrefixPreservesGoalAndErrorFields),
             ("Codex capacity stop: real frames, wrapped cell, draft, submission and blocked composers", tests.testCodexCapacityStopDetection),
             ("Codex capacity history: old questions preserve records without blocking a new capacity retry", tests.testCapacityRetryWithHistoricalQuestions),
             ("CLI errors: all error kinds, unknown provider wording and history keep retrying beyond backoff", tests.testAllCLIErrorCellsKeepRetrying),

@@ -368,6 +368,47 @@ extension ApprovalTests {
         }
     }
 
+    func testCapacityCellPrefixPreservesGoalAndErrorFields() throws {
+        let stores: [(String) -> String] = [
+            { String(decoding: Array($0.utf8), as: UTF8.self) },
+            { NSAppleEventDescriptor(string: $0).stringValue! }
+        ]
+        let goalFooter = "? for shortcuts · Goal blocked (/goal resume)"
+        for prefix in ["A", "E", "B", "~", "!", "0", "Z", "a", "한글", " \u{301}"] {
+            let cell = prefix + " synthetic completed output\n" + String(repeating: "retained synthetic history\n", count: 160)
+            let ordinary = stoppedFrame.replacingOccurrences(of: capacityCell, with: cell)
+            let blocked = ordinary.replacingOccurrences(of: "? for shortcuts", with: goalFooter)
+            for store in stores {
+                try expectNil(CodexCapacityStop.detect(store(ordinary), agent: .codex))
+                let stop = try unwrap(CodexCapacityStop.detect(store(blocked), agent: .codex))
+                try expectEqual(stop.kind, .goalBlocked)
+                try expectEqual(stop.continuationText, CodexCapacityStop.goalResumeText)
+                try expectEqual(stop.error, "Goal blocked · /goal resume로 현재 목표의 상태를 다시 확인합니다.")
+                try expect(stop.region.contains("› Ask Codex to do anything"))
+                try expect(stop.region.contains(goalFooter))
+                try expect(!stop.region.contains("synthetic completed output"))
+                try expect(stop.composerFooter?.contains(goalFooter) == true)
+                try expect(!stop.identity.isEmpty && stop.continuationIdentity?.isEmpty == false)
+                try expectNil(CodexCapacityStop.detect(store(blocked.replacingOccurrences(of: "Goal blocked", with: "Goal paused")), agent: .codex))
+                try expectNil(CodexCapacityStop.detect(store(blocked.replacingOccurrences(of: "› Ask Codex to do anything", with: "› keep my draft")), agent: .codex))
+            }
+        }
+        for (agent, cell, kind) in [
+            (AgentKind.codex, "■Selected model is at ca\npacity.", SessionInterruption.Kind.capacity),
+            (.codex, "■ network error 403 unauthorized", .authentication),
+            (.codex, "■ 402 billing_error", .configuration),
+            (.claude, "API Error: network error", .transport),
+            (.claude, "Error: 503 overloaded", .api),
+            (.claude, "⎿ API Error: 403 unauthorized", .authentication)
+        ] {
+            let frame = agent == .codex ? stoppedFrame.replacingOccurrences(of: capacityCell, with: cell) :
+                "Synthetic task\n\n" + cell + "\n\n❯\n\n? for shortcuts"
+            for store in stores {
+                try expectEqual(CodexCapacityStop.detect(store(frame), agent: agent)?.kind, kind)
+            }
+        }
+    }
+
     func testCodexCapacityStopDetection() throws {
         let stop = try unwrap(CodexCapacityStop.detect(stoppedFrame, agent: .codex))
         for cell in ["■ Selected model is at capacity", "■ Selected model is at capacity.", "■ Selected model is at ca\npacity."] {

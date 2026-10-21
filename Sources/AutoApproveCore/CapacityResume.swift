@@ -43,7 +43,13 @@ public struct CodexCapacityStop: Codable, Equatable, Sendable {
         let end = lines[..<composer].lastIndex(where: { !$0.isEmpty })
         var start = end ?? composer
         while start > 0, end != nil, !lines[start - 1].isEmpty { start -= 1 }
-        let cell = end.map { lines[start...$0].joined(separator: " ").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ") } ?? ""
+        let cell = end.map { end -> String in
+            // Printable ASCII cannot disappear during whitespace normalization.
+            // Only A/E can begin a Claude error prefix; Codex requires its box.
+            if let first = lines[start].utf8.first, first >= 0x21, first <= 0x7e,
+               agent == .codex || (first != 0x41 && first != 0x45) { return "" }
+            return normalizedErrorCell(lines, start: start, end: end)
+        } ?? ""
         let kind: SessionInterruption.Kind
         if let errorKind = errorKind(cell, agent: agent) { kind = errorKind }
         else if agent == .codex, CodexResumeCheck.goalStalled(lines) { kind = .goalBlocked }
@@ -61,6 +67,11 @@ public struct CodexCapacityStop: Codable, Equatable, Sendable {
         return result
     }
 
+    @inline(never)
+    private static func normalizedErrorCell(_ lines: [String], start: Int, end: Int) -> String {
+        lines[start...end].joined(separator: " ").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
     private static func errorKind(_ cell: String, agent: AgentKind) -> SessionInterruption.Kind? {
         let lowercase = cell.lowercased()
         let isError = agent == .codex ? cell.hasPrefix("■ ") :
@@ -72,18 +83,24 @@ public struct CodexCapacityStop: Codable, Equatable, Sendable {
         if agent == .codex, ["■selectedmodelisatcapacity", "■selectedmodelisatcapacity.",
                             ("■ " + message).lowercased().filter({ !$0.isWhitespace })].contains(compact) { return .capacity }
         guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
+        // Use the NSString search only as a necessary prefilter. A hit still
+        // goes through the original canonical/grapheme-aware String search.
+        let searchable = compact as NSString
+        func contains(_ token: String) -> Bool {
+            searchable.range(of: token).location != NSNotFound && compact.contains(token)
+        }
         // Explicit account failures win even when wrapped in a transport error.
         if cell.range(of: #"(?i)\b(?:401|403)\b"#, options: .regularExpression) != nil ||
-            ["authentication", "unauthorized", "invalidapikey", "invalid_api_key", "oauth_org_not_allowed"].contains(where: compact.contains) { return .authentication }
+            ["authentication", "unauthorized", "invalidapikey", "invalid_api_key", "oauth_org_not_allowed"].contains(where: contains) { return .authentication }
         if cell.range(of: #"\b(?:400|402|404|422)\b"#, options: .regularExpression) != nil ||
-            ["billing_error", "billingerror", "insufficient_quota", "insufficientquota", "account_on_hold", "model_not_found", "modelnotfound", "invalid_request", "context_length_exceeded", "contextlengthexceeded"].contains(where: compact.contains) { return .configuration }
+            ["billing_error", "billingerror", "insufficient_quota", "insufficientquota", "account_on_hold", "model_not_found", "modelnotfound", "invalid_request", "context_length_exceeded", "contextlengthexceeded"].contains(where: contains) { return .configuration }
         if ["streamdisconnectedbeforecompletion", "connectionerror", "transporterror", "requesttimedout", "networkerror",
             "connectionreset", "connectionrefused", "connectionclosed", "error-decodingresponsebody", "errordecodingresponsebody",
             "failedtosendrequest", "error-sendingrequest", "errorsendingrequest", "reconnectfailed", "streamclosed", "socketclosed",
-            "requesttimeout", "deadlineexceeded", "connectionaborted", "brokenpipe"].contains(where: compact.contains) { return .transport }
+            "requesttimeout", "deadlineexceeded", "connectionaborted", "brokenpipe"].contains(where: contains) { return .transport }
         if cell.range(of: #"\b(?:408|429|500|502|503|504|529)\b"#, options: .regularExpression) != nil ||
             ["overloaded", "ratelimit", "rate_limit", "servererror", "server_error", "max_output_tokens", "maxoutputtokens",
-             "internalservererror", "temporarilyunavailable", "anerroroccurredwhileprocessingyourrequest"].contains(where: compact.contains) { return .api }
+             "internalservererror", "temporarilyunavailable", "anerroroccurredwhileprocessingyourrequest"].contains(where: contains) { return .api }
         // An actual CLI error cell can introduce a new provider wording. Keep its
         // classification generic instead of silently leaving that turn stopped.
         return .api
