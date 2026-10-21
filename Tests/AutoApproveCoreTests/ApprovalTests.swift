@@ -669,6 +669,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Git detached cache rejects HEAD races", tests.testGitDetachedCacheRejectsHEADRace),
             ("Git metadata: nonblocking special files, read bounds and packed-reference identity", tests.testGitBranchMetadataBoundsAndPackedReferenceIdentity),
             ("Git metadata: typed paths keep special-file and symlink revalidation", tests.testGitMetadataPathHintsPreserveSpecialFileAndSymlinkRevalidation),
+            ("Git metadata: failed reads release descriptors and restore the verified cache", tests.testGitMetadataFailedReadsReleaseFileDescriptors),
+            ("Git metadata: complete reads preserve size boundaries and final bytes", tests.testGitMetadataReadsPreserveSizeBoundariesAndTailBytes),
             ("Git non-repository, missing directory and inherited environment isolation", tests.testGitBranchNonRepositoryAndEnvironmentIsolation),
             ("Git metadata binds to live sessions and their current directories", tests.testGitBranchesBindToCurrentSessionDirectory),
             ("Codex locked database, preserved questions and automatic recovery", tests.testCodexHistoryContentionAndRecovery),

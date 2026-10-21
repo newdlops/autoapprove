@@ -29,6 +29,60 @@ private final class GitBranchFixture {
 }
 
 extension ApprovalTests {
+    func testGitMetadataReadsPreserveSizeBoundariesAndTailBytes() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"], timeout: 30)
+        let config = repository.appendingPathComponent(".git/config", isDirectory: false)
+        var launches = 0
+        func read() -> GitBranchState { GitBranchReader.read(directory: repository.path) { _, _ in launches += 1; return result } }
+        try expectEqual(read().name, "main")
+        for size in [0, 1, 15, 16, 17, 63, 64, 8191, 8192, 8193, 65535, 131072] {
+            var contents = Data(repeating: 0x23, count: size) // A valid comment, including without a final newline.
+            try contents.write(to: config, options: .atomic)
+            let previous = launches
+            try expectEqual(read().name, "main"); _ = read()
+            try expectEqual(launches, previous + 1, "Exact metadata of size \(size) must be read and then cached")
+            if size > 0 {
+                contents[size - 1] = 0x0a
+                try contents.write(to: config, options: .atomic)
+                let beforeTail = launches
+                try expectEqual(read().name, "main"); _ = read()
+                try expectEqual(launches, beforeTail + 1, "The last byte at size \(size) must participate in the fingerprint")
+            }
+        }
+        try Data(repeating: 0x23, count: 131073).write(to: config, options: .atomic)
+        let previous = launches
+        _ = read(); _ = read()
+        try expectEqual(launches, previous + 2, "Oversized metadata must not enter the cache")
+    }
+
+    func testGitMetadataFailedReadsReleaseFileDescriptors() throws {
+        let fixture = try GitBranchFixture(), repository = fixture.repository
+        let result = try CommandRunner.run("/usr/bin/git", ["-C", repository.path, "symbolic-ref", "HEAD"], timeout: 30)
+        let metadata = repository.appendingPathComponent(".git", isDirectory: true)
+        let common = metadata.appendingPathComponent("commondir", isDirectory: false)
+        let head = metadata.appendingPathComponent("HEAD", isDirectory: false), savedHead = try Data(contentsOf: head)
+        var launches = 0
+        func read() -> GitBranchState { GitBranchReader.read(directory: repository.path) { _, _ in launches += 1; return result } }
+        try expectEqual(read().name, "main"); _ = read(); try expectEqual(launches, 1)
+        let before = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, nil, 0)
+        try expect(before > 0)
+        for file in [common, head] {
+            try Data([0xff]).write(to: file, options: .atomic)
+            let previous = launches
+            for _ in 0..<128 { try expectEqual(read().name, "main") }
+            try expectEqual(launches, previous + 128, "Failed metadata must use the current Git executor every time")
+            if file == common { try FileManager.default.removeItem(at: common) }
+            else { try savedHead.write(to: head, options: .atomic) }
+        }
+        let after = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, nil, 0)
+        try expect(after > 0 && after <= before + Int32(2 * MemoryLayout<proc_fdinfo>.stride),
+                   "Repeated failed metadata reads must release their descriptors")
+        let previous = launches
+        try expectEqual(read().name, "main"); _ = read()
+        try expectEqual(launches, previous, "Identical restored metadata can reuse the prior verified branch")
+    }
+
     func testGitMetadataPathHintsPreserveSpecialFileAndSymlinkRevalidation() throws {
         let fixture = try GitBranchFixture(), repository = fixture.repository
         let alias = fixture.root.appendingPathComponent("경로 % # ? e\u{301}", isDirectory: true)
