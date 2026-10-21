@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 const text = (element, value) => { const next = String(value ?? ''); if (element.textContent !== next) element.textContent = next; };
 const show = (element, visible) => { const hidden = !visible; if (element.hidden !== hidden) element.hidden = hidden; };
+const setBusy = (element, value) => { const busy = String(!!value); if (element.getAttribute('aria-busy') !== busy) element.setAttribute('aria-busy',busy); };
 const make = (tag, className, value) => { const element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) text(element, value); return element; };
 const uuid = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (Number(c) ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> Number(c) / 4).toString(16));
 const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
@@ -73,6 +74,18 @@ try {
     if (Array.isArray(saved[kind])) cleanup[kind] = new Set(saved[kind].filter(value=>typeof value==='string' && value.length<=2048).slice(-limit));
   }
 } catch (_) {}
+// Presentation history only: a retry cannot promote a known offline Mac into
+// the active region. Input and connection checks still use the current node.
+const offlineMacIDs = new Set(cleanup.macs);
+const displayedOfflineMac = node => !node.online && (!node.loading || offlineMacIDs.has(node.id));
+function updateMacPlacement(incoming) {
+  const present = new Set(incoming.map(node=>node.id));
+  for (const id of offlineMacIDs) if (!present.has(id)) offlineMacIDs.delete(id);
+  for (const node of incoming) {
+    if (node.local || node.online) offlineMacIDs.delete(node.id);
+    else if (!node.loading) offlineMacIDs.add(node.id);
+  }
+}
 function saveCleanup(changes) {
   const value = Object.fromEntries(Object.entries(cleanup).map(([kind,entries])=>[kind,[...(changes[kind] || entries)].slice(-({macs:128,warnings:1024,questions:2048}[kind]))]));
   try { localStorage.setItem(cleanupStorage,JSON.stringify(value)); }
@@ -89,7 +102,7 @@ const warningKey = (item,source,kind) => JSON.stringify([kind,item.node.id,sourc
 const warningHidden = (item,source,kind) => cleanup.warnings.has(warningKey(item,source,kind));
 const pastQuestionKey = (node,source,question) => JSON.stringify([node.id,source.id,question.id,question.reply?.queueID || '']);
 function offlineMacs() {
-  return nodes.filter(node=>!node.local && !node.online && !node.loading && !(selectedItem?.node.id===node.id && (originalReadSelected() || originalStreamSelected())));
+  return nodes.filter(node=>!node.local && displayedOfflineMac(node) && !(selectedItem?.node.id===node.id && (originalReadSelected() || originalStreamSelected())));
 }
 function displayedWarnings() {
   return allSessions.flatMap(item=>[
@@ -716,6 +729,9 @@ async function refreshNetwork(initial = false) {
     if (!partialNetwork) partialNetworkRefreshes = 0;
     connected = true;
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
+    // Include hidden records so cleanup/restore during a retry keeps the same
+    // placement. Only an actual online response restores an offline card.
+    updateMacPlacement(result.nodes);
     // A partial response means the read is pending, not that the peer's original
     // sessions ended. Keep its last inventory, without claiming it is online.
     const reconnected = result.nodes.filter(node=>node.online && cleanup.macs.has(node.id));
@@ -730,9 +746,13 @@ async function refreshNetwork(initial = false) {
     const inventory = nodes.flatMap(node => node.online || node.loading && node.state ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []);
     const continuation = inventory.find(item => item.key === selectedKey)?.session.interruption?.resumedSessionID;
     const recovered = continuation && inventory.find(item => item.node.id === selectedItem?.node.id && item.session.id === continuation && !sessionEnded(item));
+    const inventoryKeys = new Set(inventory.map(item=>item.key));
     for (const item of allSessions) {
       const node = nodes.find(node => node.id === item.node.id && !node.online);
-      if (node && item.session.interruption?.recoveredAt == null && item.session.interruption) inventory.push({...item,node:{...item.node,...node,state:item.node.state}});
+      if (node && !inventoryKeys.has(item.key) && item.session.interruption?.recoveredAt == null && item.session.interruption) {
+        inventory.push({...item,node:{...item.node,...node,state:item.node.state}});
+        inventoryKeys.add(item.key);
+      }
     }
     allSessions = reconcilePTYInventory(inventory);
     const unavailable = nodes.find(node => node.id === selectedItem?.node.id && !node.online);
@@ -820,7 +840,8 @@ function renderMachines() {
     const status = row.querySelector('.machine-status');
     status.className = 'machine-status ' + (!node.online || !connected ? '' : node.state.snapshot.paused ? 'paused' : 'online');
     const activeCount = node.state?.sessions?.filter(view => !sessionEnded({session:view.session, view}) && !sessionEnded(ptyRetained.get(keyFor(node, view.session, view)))).length || 0;
-    text(status, !connected ? '연결 확인 필요' : node.loading ? node.state ? `${activeCount}개 세션 · 갱신 중…` : '세션 확인 중…' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
+    text(status, !connected ? '연결 확인 필요' : node.loading && !displayedOfflineMac(node) ? node.state ? `${activeCount}개 세션 · 갱신 중…` : '세션 확인 중…' : !node.online ? '연결 끊김 · 웹 접속과 네트워크 확인' : `${activeCount}개 세션 · ${node.state.snapshot.paused ? '자동 승인 일시정지' : '연결됨'}`);
+    setBusy(row,node.loading);
     status.title = node.error || '';
     const button = row.querySelector('.machine-toggle'); text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
@@ -866,7 +887,8 @@ function renderSystemSafety() {
       safetyRows.set(key,row); $('system-safety-list').append(row);
     }
     text(row.querySelector('.interruption-name'),`${item.node.name} · ${item.view.title} · ${systemSafetyTitle(source.systemSafety.risk)}`);
-    text(row.querySelector('.interruption-state'),systemSafetyStatus(source,item.node) + (!item.node.online ? ' · Mac 연결 끊김' : ''));
+    text(row.querySelector('.interruption-state'),systemSafetyStatus(source,item.node) + (displayedOfflineMac(item.node) ? ' · Mac 연결 끊김' : ''));
+    setBusy(row,item.node.loading);
     row.querySelector('.safety-view').setAttribute('aria-label',`${item.node.name}의 ${item.view.title} 시스템 변경 경고 보기`);
   }
 }
@@ -920,7 +942,8 @@ function renderInterruptions() {
       actions.append(button,read); row.append(info,actions); interruptionRows.set(item.key,row); $('interruption-list').append(row);
     }
     text(row.querySelector('.interruption-name'), `${item.node.name} · ${item.view.title} · ${agents[item.session.agent]}`);
-    text(row.querySelector('.interruption-state'), interruptionStatus(item.session) + (!item.node.online ? ' · Mac 연결 끊김' : ''));
+    text(row.querySelector('.interruption-state'), interruptionStatus(item.session) + (displayedOfflineMac(item.node) ? ' · Mac 연결 끊김' : ''));
+    setBusy(row,item.node.loading);
     text(row.querySelector('.interruption-detail'), item.session.interruption.detail);
     const [view,read] = row.querySelectorAll('button');
     view.setAttribute('aria-label',`${item.node.name}의 중단된 ${item.view.title} 세션 보기`);
