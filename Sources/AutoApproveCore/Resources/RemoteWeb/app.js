@@ -51,6 +51,26 @@ let cursorLayoutPending = false, cursorLayoutTimer = null;
 const directQueue = [];
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const interruptionRows = new Map();
+// Exact saved receipts only, bounded to this page. A late inventory response
+// cannot undo a successful read or revive its ended session and warning.
+const interruptionReceipts = new Map();
+const interruptionReceiptKey = (key,id) => JSON.stringify([key,id]);
+function rememberInterruptionReceipt(key,id,date) {
+  const receipt = interruptionReceiptKey(key,id);
+  interruptionReceipts.delete(receipt); interruptionReceipts.set(receipt,date);
+  while (interruptionReceipts.size > 1024) interruptionReceipts.delete(interruptionReceipts.keys().next().value);
+}
+function reconcileInterruptionReceipts(inventory) {
+  for (const item of inventory) {
+    const error = item.session.interruption;
+    if (!error) continue;
+    if (error.acknowledgedAt != null) rememberInterruptionReceipt(item.key,error.id,error.acknowledgedAt);
+    else {
+      const date = interruptionReceipts.get(interruptionReceiptKey(item.key,error.id));
+      if (date != null) error.acknowledgedAt = date;
+    }
+  }
+}
 const safetyRows = new Map();
 const sessionHistories = new Map();
 // History is auxiliary: one cancelable read, and a bounded page-memory cache.
@@ -104,6 +124,8 @@ const pastQuestionKey = (node,source,question) => JSON.stringify([node.id,source
 function offlineMacs() {
   return nodes.filter(node=>!node.local && displayedOfflineMac(node) && !(selectedItem?.node.id===node.id && (originalReadSelected() || originalStreamSelected())));
 }
+const unconfirmedMac = node => !node.local && !node.online && node.loading && !node.state
+  && !(selectedItem?.node.id===node.id && (originalReadSelected() || originalStreamSelected()));
 function displayedWarnings() {
   return allSessions.flatMap(item=>[
     ...(unreadInterruption(item.session) && !warningHidden(item,item.session,'interruption') ? [warningKey(item,item.session,'interruption')] : []),
@@ -754,6 +776,7 @@ async function refreshNetwork(initial = false) {
         inventoryKeys.add(item.key);
       }
     }
+    reconcileInterruptionReceipts(inventory);
     allSessions = reconcilePTYInventory(inventory);
     const unavailable = nodes.find(node => node.id === selectedItem?.node.id && !node.online);
     // A peer's inventory can time out before its first independent terminal
@@ -816,7 +839,8 @@ async function refreshNetwork(initial = false) {
 function renderMachines() {
   const live = new Set(nodes.map(node=>node.id));
   const offline = offlineMacs(), removable = new Set(offline.map(node=>node.id));
-  show($('offline-machines'),offline.length>0);text($('offline-machine-count'),`이전 연결 · 연결 끊긴 Mac ${offline.length}대`);
+  const folded = nodes.filter(node=>removable.has(node.id) || unconfirmedMac(node));
+  show($('offline-machines'),folded.length>0);text($('offline-machine-count'),`이전 연결 · Mac ${folded.length}대`);
   const removedFocus = [...machineRows].some(([id,row])=>!live.has(id) && row.contains(document.activeElement));
   for (const [id,row] of machineRows) if (!live.has(id)) { row.remove(); machineRows.delete(id); }
   if (nodes.length && $('machines').querySelector('.empty-inline')) $('machines').replaceChildren();
@@ -847,7 +871,7 @@ function renderMachines() {
     button.disabled = mutation || !connected || !node.online;
     button.setAttribute('aria-label', `${node.name} 자동 승인 ${node.online && node.state.snapshot.paused ? '재개' : '일시정지'}`);
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
-    const target = removable.has(node.id) ? $('offline-machine-list') : $('machines');
+    const target = removable.has(node.id) || unconfirmedMac(node) ? $('offline-machine-list') : $('machines');
     if(row.parentElement!==target) {
       const hadFocus=row.contains(document.activeElement);target.append(row);
       if(hadFocus && target.id==='offline-machine-list' && !$('offline-machines').open)$('offline-machine-count').focus({preventScroll:true});
@@ -965,10 +989,12 @@ async function acknowledgeInterruption(item) {
   interruptionReads.add(key); renderInterruptions();
   try {
     await api(endpoint('/api/action',item.node.id),{action:'read',sessionID:item.session.id,interruptionID:errorID,requestID:uuid()});
+    const readAt = new Date().toISOString();
+    rememberInterruptionReceipt(item.key,errorID,readAt);
     // Reflect only the successfully saved receipt for this exact episode. A
     // newer error received while the POST ran must still attract attention.
     for (const current of [...allSessions,selectedItem].filter(Boolean)) {
-      if (current.key === item.key && current.session.interruption?.id === errorID) current.session.interruption.acknowledgedAt = new Date().toISOString();
+      if (current.key === item.key && current.session.interruption?.id === errorID) current.session.interruption.acknowledgedAt = readAt;
     }
     renderInterruptions(); renderList();
     if (restoreFocus && document.activeElement === document.body && !interruptionRows.has(item.key)) ($('interruption-list').querySelector('button') || $('session-list').querySelector('button') || $('search')).focus({preventScroll:true});

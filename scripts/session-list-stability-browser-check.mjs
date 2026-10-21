@@ -89,7 +89,7 @@ try{
  page.on('requestfailed',request=>{if(!new URL(request.url()).pathname.startsWith('/api/'))errors.push('asset: '+request.url());});
  await page.goto('http://127.0.0.1:'+server.address().port);
  await page.waitForFunction(()=>connected&&!loadingNetwork);await page.evaluate(()=>clearTimeout(networkTimer));
- const before=await snapshot();assert.equal(before.offline.length,6);assert.equal(before.interruptions,1);
+ const before=await snapshot();assert.equal(before.offline.length,baseline?6:7);assert.equal(before.interruptions,1);
  await capture('initial');
  pending=true;peer='pending';await refresh();
  const during=await snapshot();
@@ -121,10 +121,10 @@ try{
   await page.locator('#list-cleanup>summary').click();await page.locator('#clean-offline-macs').click();
   await page.waitForFunction(()=>!nodes.some(node=>node.id.startsWith('old-mac-')));await page.evaluate(()=>clearTimeout(networkTimer));
   await page.locator('#restore-cleanup').click();await page.waitForFunction(()=>nodes.some(node=>node.id.startsWith('old-mac-')));await page.evaluate(()=>clearTimeout(networkTimer));
-  assert.equal((await snapshot()).offline.length,6);assert.ok(!(await snapshot()).main.some(name=>name.includes('old-mac-')));
+  assert.equal((await snapshot()).offline.length,7);assert.ok(!(await snapshot()).main.some(name=>name.includes('old-mac-')));
   checks.push('Expanded state and cleanup/restore keep confirmed offline placement even while reads remain pending');
   ghostOnline=true;peer='online';pending=false;await refresh();
-  assert.equal((await snapshot()).offline.length,5);assert.ok((await snapshot()).main.some(name=>name.includes(ghostIDs[0])));
+  assert.equal((await snapshot()).offline.length,6);assert.ok((await snapshot()).main.some(name=>name.includes(ghostIDs[0])));
   removeGhost=true;await refresh();assert.ok(await page.evaluate(()=>![...machineRows.values()].some(row=>row.textContent.includes('old-mac-0'))));
   checks.push('A real online confirmation restores the Mac immediately; source removal frees its DOM record');
   for(const [name,width,height]of[['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){

@@ -590,6 +590,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Targeted original process verification matches discovery and rejects ended PIDs", tests.testTargetedOriginalProcessReadMatchesDiscovery),
             ("Native processes: fresh metadata and original terminal host parity", tests.testNativeProcessMetadataAndOriginalHostParity),
             ("Native processes: agent name prefilter preserves Foundation classification", tests.testProcessAgentNamePrefilterKeepsFoundationClassification),
+            ("Native processes: concurrent target and missing-PID reads keep independent values", tests.testConcurrentNativeTargetReadsKeepIndependentValues),
+            ("Native processes: start formatting follows process-local timezone changes", tests.testNativeProcessStartFormattingFollowsCurrentTimeZone),
             ("Native processes: filtered ancestor lookup revalidates the complete chain", tests.testFilteredAgentAncestryRevalidatesTheCompleteParentChain),
             ("Native processes: current open files prepare questions without input", tests.testNativeQuestionPreparationUsesCurrentProcessAndOpenFiles),
             ("Native processes: cancellation and missing identity", tests.testNativeProcessCancellationAndMissingIdentity),

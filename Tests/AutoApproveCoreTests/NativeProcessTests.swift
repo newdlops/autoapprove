@@ -187,6 +187,57 @@ extension ApprovalTests {
         catch { try expect(!error.localizedDescription.contains("Exited process accepted")) }
     }
 
+    func testConcurrentNativeTargetReadsKeepIndependentValues() async throws {
+        let own = getpid()
+        guard let expected = try ProcessDiscovery.read(pid:own).first else { throw AppError.message("Missing native test process") }
+        let key = expected.key, executable = expected.executable, tty = expected.tty
+        let parent = expected.parent, group = expected.processGroup, foreground = expected.foregroundGroup
+        var completed = 0
+        try await withThrowingTaskGroup(of:Bool.self) { groupTasks in
+            for index in 0..<64 {
+                groupTasks.addTask {
+                    if index.isMultiple(of:2) {
+                        let rows = try ProcessDiscovery.read(pid:own)
+                        guard rows.count == 1, let row = rows.first else { return false }
+                        return row.key == key && row.executable == executable && row.tty == tty
+                            && row.parent == parent && row.processGroup == group && row.foregroundGroup == foreground
+                    }
+                    return try ProcessDiscovery.read(pid:Int32.max).isEmpty
+                }
+            }
+            for try await valid in groupTasks {
+                try expect(valid,"Concurrent target reads must retain exact independent process values")
+                completed += 1
+            }
+        }
+        try expectEqual(completed,64)
+    }
+
+    func testNativeProcessStartFormattingFollowsCurrentTimeZone() throws {
+        let own = getpid()
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        try expectEqual(proc_pidinfo(own,PROC_PIDTBSDINFO,0,&info,size),size)
+        let instant = Date(timeIntervalSince1970:Double(info.pbi_start_tvsec))
+        // Changes only this test process's Foundation timezone, never macOS settings.
+        let previous = ProcessInfo.processInfo.environment["TZ"]
+        defer {
+            if let previous { setenv("TZ",previous,1) } else { unsetenv("TZ") }
+            NSTimeZone.resetSystemTimeZone()
+        }
+        for name in ["America/Los_Angeles","Asia/Seoul","Europe/Berlin","America/Los_Angeles"] {
+            try expectEqual(setenv("TZ",name,1),0)
+            NSTimeZone.resetSystemTimeZone()
+            let zone = TimeZone.current
+            try expectEqual(zone,TimeZone(identifier:name)!,"The test must actually change the captured zone")
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier:"en_US_POSIX");formatter.timeZone = zone
+            formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+            try expectEqual(try ProcessDiscovery.read(pid:own).first?.started,formatter.string(from:instant),
+                "A reused formatter must update its timezone for the same process and seconds")
+        }
+    }
+
     func testNativeProcessCancellationAndMissingIdentity() async throws {
         try expect(try ProcessDiscovery.read(pid:Int32.max).isEmpty)
         try expectThrows(ProcessDiscovery.read(pid:-1))
