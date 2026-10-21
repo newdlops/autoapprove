@@ -150,6 +150,12 @@ extension ApprovalTests {
     }
 
     func testLargeScreenPollKeepsUIResponsiveAndPublishesTogether() async throws {
+        for independentFrames in [false, true] {
+            try await checkLargeScreenPollKeepsUIResponsiveAndPublishesTogether(independentFrames: independentFrames)
+        }
+    }
+
+    private func checkLargeScreenPollKeepsUIResponsiveAndPublishesTogether(independentFrames: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-screen-responsive-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let frames = PollingScreens()
@@ -165,7 +171,11 @@ extension ApprovalTests {
         await engine.connectScreenHost(.terminal)
         let raw = String(repeating: "synthetic build output: processed file /fixture/output.swift\n", count: 45_000)
             + "Would you like to run the following command?\n$ pwd\n› 1. Yes\n  2. No\nEsc to cancel"
-        frames.set(TerminalSnapshot(screens: sessions.map { TerminalScreen(tty: $0.tty, contents: raw) }))
+        // Retain the shared-frame case used by cached snapshots, and also force
+        // separate content/storage so all 24 long screens require analysis.
+        frames.set(TerminalSnapshot(screens: sessions.enumerated().map { index, session in
+            TerminalScreen(tty: session.tty, contents: independentFrames ? "synthetic session \(index)\n" + raw : raw)
+        }))
         var publications = [[SessionPhase]]()
         let subscription = engine.$snapshot.dropFirst().sink { publications.append($0.sessions.map(\.phase)) }
         defer { subscription.cancel() }
@@ -178,10 +188,14 @@ extension ApprovalTests {
         }
         defer { timer.cancel() }
         try await Task.sleep(for: .milliseconds(30)); heartbeat.reset()
+        let analysisStarted = ProcessInfo.processInfo.systemUptime
         await engine.refreshScreenHost(.terminal)
+        let analysisElapsed = ProcessInfo.processInfo.systemUptime - analysisStarted
         let duringAnalysis = heartbeat.ticks
         heartbeat.tick(); timer.cancel()
-        try expect(duringAnalysis >= 4, "UI tasks must run while the host analyzes many long screens")
+        print("METRIC screen-responsive \(independentFrames ? "independent" : "shared") analysis-ms \(String(format: "%.3f", analysisElapsed * 1000)) ticks \(duringAnalysis) largest-gap-ms \(String(format: "%.3f", heartbeat.largestGap * 1000))")
+        try expect(analysisElapsed < 0.04 || duringAnalysis >= 4,
+            "UI tasks must run during sustained analysis; completing before four timer periods is also responsive")
         try expect(heartbeat.largestGap < 0.75, "Long scrollback must not block the UI actor for seconds")
         try expectEqual(publications.count, 1, "Background parsing must keep one coherent host publication")
         try expect(publications[0].allSatisfy { $0 == .approval })

@@ -62,11 +62,15 @@ public struct CodexCapacityStop: Codable, Equatable, Sendable {
     }
 
     private static func errorKind(_ cell: String, agent: AgentKind) -> SessionInterruption.Kind? {
-        let compact = cell.lowercased().filter { !$0.isWhitespace }
-        if agent == .codex, ["■selectedmodelisatcapacity", "■selectedmodelisatcapacity.",
-                            ("■ " + message).lowercased().filter({ !$0.isWhitespace })].contains(compact) { return .capacity }
+        let lowercase = cell.lowercased()
         let isError = agent == .codex ? cell.hasPrefix("■ ") :
             ["API Error:", "⎿ API Error:", "Error:", "⎿ Error:"].contains(where: cell.hasPrefix)
+        // The capacity special case also accepts no space after the box.
+        // Inspect the first retained character before filtering the whole cell.
+        guard isError || (agent == .codex && lowercase.first(where: { !$0.isWhitespace }) == "■") else { return nil }
+        let compact = lowercase.filter { !$0.isWhitespace }
+        if agent == .codex, ["■selectedmodelisatcapacity", "■selectedmodelisatcapacity.",
+                            ("■ " + message).lowercased().filter({ !$0.isWhitespace })].contains(compact) { return .capacity }
         guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
         // Explicit account failures win even when wrapped in a transport error.
         if cell.range(of: #"(?i)\b(?:401|403)\b"#, options: .regularExpression) != nil ||
