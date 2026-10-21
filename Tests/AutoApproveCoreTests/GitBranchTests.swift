@@ -36,7 +36,7 @@ extension ApprovalTests {
         var launches = 0
         func read() -> GitBranchState { GitBranchReader.read(directory: repository.path) { _, _ in launches += 1; return result } }
         try expectEqual(read().name, "main")
-        for size in [0, 1, 15, 16, 17, 63, 64, 8191, 8192, 8193, 65535, 131072] {
+        for size in [0, 1, 15, 16, 17, 63, 64, 8191, 8192, 8193, 32767, 32768, 32769, 65535, 131072] {
             var contents = Data(repeating: 0x23, count: size) // A valid comment, including without a final newline.
             try contents.write(to: config, options: .atomic)
             let previous = launches
