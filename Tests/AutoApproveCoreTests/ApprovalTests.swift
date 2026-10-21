@@ -909,6 +909,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("agent exit excludes ordinary shells and idle counts", tests.testAgentExitDoesNotExposeShellOrCountItAsIdle),
             ("ready composer versus quiet work and unknown screens", tests.testActivityNeedsAReadyComposerNotSilence),
             ("activity hints preserve Unicode words and real drafts", tests.testActivityHintsPreserveUnicodeWordsAndRealDrafts),
+            ("Activity footer: hint positions and late errors", tests.testActivityFooterHintPositionsAndLateErrors),
+            ("Activity footer: goals, drafts and generation", tests.testActivityFooterGoalsDraftsAndGenerationChecks),
             ("prompt line normalization preserves CR/LF, canonical text and trailing blank removal", tests.testPromptLineNormalizationPreservesNewlinesAndCanonicalText),
             ("stable idle confirmation and new screen generations", tests.testIdleConfirmationAndGenerationChange),
             ("idle duration, work transition, connection loss", tests.testEngineClearsIdleOnWorkAndDisconnection),
