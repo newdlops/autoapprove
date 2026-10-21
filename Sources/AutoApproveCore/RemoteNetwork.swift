@@ -193,6 +193,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var streamConnections: Set<UUID> = []
     private let terminalFeeds = RemoteTerminalFeeds()
     private var running = false
+    private let dashboardEncodingPreparation: (@Sendable () async throws -> Void)?
     private var generation = UUID()
     private var status = RemoteNetworkStatus()
     private let onStatus: (RemoteNetworkStatus) -> Void
@@ -265,6 +266,32 @@ struct RemoteTerminalUpdate: Encodable {
         let entityTag: String
     }
     private var cachedDashboardValidator: CachedDashboardValidator?
+    private struct DashboardEncodingLease: Sendable {
+        let id = UUID()
+        let cancellation = RemoteDashboardEncodingCancellation()
+    }
+    @MainActor private final class DashboardEncodingWork {
+        let id: UUID
+        let key: DashboardResponseKey?
+        let epoch: UUID
+        let promise = RemoteDashboardEncodingPromise()
+        let cancellation = RemoteDashboardEncodingCancellation()
+        var preparationTask: Task<Void, Never>?
+        var validatorChecked = false
+        var waiters: [UUID: RemoteDashboardEncodingCancellation] = [:]
+        init(id: UUID, key: DashboardResponseKey?, epoch: UUID) {
+            self.id = id; self.key = key; self.epoch = epoch
+        }
+        var hasInterestedWaiter: Bool { waiters.values.contains { !$0.isCancelled() } }
+    }
+    private var dashboardEncodingWork: [UUID: DashboardEncodingWork] = [:]
+    private var joinableDashboardEncoding: UUID?
+    /// Active library request leases only; no terminal or response data is exposed.
+    public var dashboardEncodingWaiterCount: Int {
+        dashboardEncodingWork.values.reduce(0) { count, work in
+            count + work.waiters.values.reduce(0) { $0 + ($1.isCancelled() ? 0 : 1) }
+        }
+    }
     private struct LocalInventoryResponseKey: Equatable {
         let engineRevision: UInt64
         let webVersion: RemoteWebVersion?
@@ -302,7 +329,7 @@ struct RemoteTerminalUpdate: Encodable {
     private let inventoryValidation = RemotePeerInventoryCache()
     private let readConnections = RemoteHTTPReadPool()
     private var readTimingEpoch = UUID()
-    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, loopbackOnly: Bool = false, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
+    public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, loopbackOnly: Bool = false, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, dashboardEncodingPreparation: (@Sendable () async throws -> Void)? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
         updateReceiver = LANUpdateReceiver(engine: engine)
@@ -317,6 +344,7 @@ struct RemoteTerminalUpdate: Encodable {
         self.name = name ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         self.webVersion = webVersion?.isCompatible == true ? webVersion : nil
         self.onStatus = onStatus
+        self.dashboardEncodingPreparation = dashboardEncodingPreparation
         receiptsURL = engine.paths.directory.appendingPathComponent("web-requests.json")
         manualURL = engine.paths.directory.appendingPathComponent("web-peers.json")
         knownURL = engine.paths.directory.appendingPathComponent("web-known-peers.json")
@@ -339,6 +367,7 @@ struct RemoteTerminalUpdate: Encodable {
     public func start(port preferredPort: UInt16 = 8765, allowPortFallback: Bool = false) throws {
         guard !running else { return }
         cachedDashboardValidator = nil
+        cancelDashboardEncoding()
         nextWebPeerRefresh = .distantPast
         let port = preferredPort
         let parameters = listenerParameters()
@@ -550,6 +579,7 @@ struct RemoteTerminalUpdate: Encodable {
         updateReceiver.stop()
         running = false; generation = UUID()
         cachedDashboardValidator = nil
+        cancelDashboardEncoding()
         discoveryTask?.cancel(); discoveryTask = nil
         listenerRetry?.cancel(); listenerRetry = nil; advertisement.stop()
         webPeerTask?.cancel(); webPeerTask = nil
@@ -658,6 +688,84 @@ struct RemoteTerminalUpdate: Encodable {
             urls:port.map { Self.addresses(port:$0,interfaces:lanInterfaces) } ?? [],webPort:port,
             questionForms:engine.webQuestions.pending(),screenShares:engine.testScreens.active,
             update:engine.lanUpdate,localAddressReady:localAddressReady)
+    }
+    private func cancelDashboardEncoding() {
+        for work in dashboardEncodingWork.values {
+            work.cancellation.cancel(); work.preparationTask?.cancel()
+            work.promise.finish(.failure(CancellationError()))
+        }
+        dashboardEncodingWork.removeAll(); joinableDashboardEncoding = nil
+    }
+    private func releaseDashboardEncoding(_ work: DashboardEncodingWork, waiter: UUID) {
+        guard work.waiters.removeValue(forKey: waiter) != nil else { return }
+        work.promise.release(waiter)
+        guard !work.hasInterestedWaiter else { return }
+        work.cancellation.cancel(); work.preparationTask?.cancel()
+        work.promise.finish(.failure(CancellationError()))
+        dashboardEncodingWork.removeValue(forKey: work.id)
+        if joinableDashboardEncoding == work.id { joinableDashboardEncoding = nil }
+    }
+    private func reserveDashboardEncoding(_ work: DashboardEncodingWork) -> DashboardEncodingLease? {
+        let lease = DashboardEncodingLease()
+        guard work.promise.reserve(lease.id, cancellation: lease.cancellation) else { return nil }
+        work.waiters[lease.id] = lease.cancellation
+        return lease
+    }
+    private func makeDashboardEncoding(_ value: RemoteDashboard, key: DashboardResponseKey?) -> (DashboardEncodingWork, DashboardEncodingLease) {
+        let work = DashboardEncodingWork(id: UUID(), key: key, epoch: generation)
+        // Reserve before enqueue: a fast worker can complete before the HTTP
+        // continuation is installed, but cannot mistake its owner for no owner.
+        let lease = DashboardEncodingLease()
+        work.promise.reserve(lease.id, cancellation: lease.cancellation)
+        work.waiters[lease.id] = lease.cancellation
+        dashboardEncodingWork[work.id] = work
+        if key != nil { joinableDashboardEncoding = work.id }
+        let snapshot = RemoteDashboardEncodingSnapshot(value: value)
+        if let preparation = dashboardEncodingPreparation {
+            work.preparationTask = Task(priority: .userInitiated) { @MainActor [weak self] in
+                do {
+                    try Task.checkCancellation(); try await preparation(); try Task.checkCancellation()
+                    guard let self, self.generation == work.epoch else { throw RemoteHTTPError(503, "웹 연결이 다시 시작됐습니다. 현재 목록을 다시 확인해주세요.") }
+                    guard work.hasInterestedWaiter else { throw CancellationError() }
+                    RemoteDashboardResponseEncoder.shared.enqueue(snapshot, cancellation: work.cancellation, promise: work.promise)
+                } catch { work.promise.finish(.failure(error)) }
+            }
+        } else {
+            RemoteDashboardResponseEncoder.shared.enqueue(snapshot, cancellation: work.cancellation, promise: work.promise)
+        }
+        return (work, lease)
+    }
+    private func dashboardEncodingResponse(_ work: DashboardEncodingWork, lease: DashboardEncodingLease,
+                                           ifNoneMatch: String?, observedAt: Date) async throws -> RemoteHTTPResponse {
+        defer { releaseDashboardEncoding(work, waiter: lease.id) }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let content: RemoteDashboardEncodedContent
+            do {
+                content = try await withCheckedThrowingContinuation { continuation in
+                    work.promise.subscribe(lease.id, cancellation: lease.cancellation, continuation: continuation)
+                }
+            }
+            catch {
+                guard generation == work.epoch else { throw RemoteHTTPError(503, "웹 연결이 다시 시작됐습니다. 현재 목록을 다시 확인해주세요.") }
+                throw error
+            }
+            guard generation == work.epoch else { throw RemoteHTTPError(503, "웹 연결이 다시 시작됐습니다. 현재 목록을 다시 확인해주세요.") }
+            try Task.checkCancellation(); try lease.cancellation.check()
+            if !work.validatorChecked, let key = work.key {
+                let current = dashboardResponseKey(initial: key.initial, selectedNode: key.selectedNode, client: key.client, localAddressReady: key.localAddressReady)
+                try lease.cancellation.whileActive {
+                    work.validatorChecked = true
+                    if current == key { cachedDashboardValidator = CachedDashboardValidator(key: key, entityTag: content.entityTag) }
+                }
+            }
+            return try RemoteDashboardObservationEncoder.response(content, ifNoneMatch:ifNoneMatch, observedAt:observedAt)
+        } onCancel: { [weak self] in
+            // The synchronous flag also closes cancellation/cache-publication
+            // races before this actor gets to release the interested lease.
+            lease.cancellation.cancel(); work.promise.cancel(lease.id)
+            Task { @MainActor in self?.releaseDashboardEncoding(work, waiter: lease.id) }
+        }
     }
     private func localInventoryNotModified(_ validator: String?, cached: CachedLocalInventoryValidator,
                                            key: LocalInventoryResponseKey, acceptsGzip: Bool) -> RemoteHTTPResponse? {
@@ -1311,6 +1419,13 @@ struct RemoteTerminalUpdate: Encodable {
                         response.entityTag = cached.entityTag; response.observedAt = Date()
                         return response
                     }
+                    // Share only work still owned by interested requests, and
+                    // only after this request's fresh full key/peer check.
+                    if let id = joinableDashboardEncoding, let work = dashboardEncodingWork[id], let before,
+                       work.epoch == generation, work.key == before, work.hasInterestedWaiter,
+                       dashboardPeerStatesFresh(selectedNode:selectedNode), let lease = reserveDashboardEncoding(work) {
+                        return try await dashboardEncodingResponse(work, lease: lease, ifNoneMatch:validator, observedAt:Date())
+                    }
                     let current = try await dashboard(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
                     let afterReady = LocalDashboardAddress.status() == .ready
                     let after = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:afterReady)
@@ -1320,11 +1435,8 @@ struct RemoteTerminalUpdate: Encodable {
                         response.entityTag = cached.entityTag; response.observedAt = Date()
                         return response
                     }
-                    let response = try current.response(ifNoneMatch:validator)
-                    if before == after, let after, let entityTag = response.entityTag {
-                        cachedDashboardValidator = CachedDashboardValidator(key:after,entityTag:entityTag)
-                    }
-                    return response
+                    let (work, lease) = makeDashboardEncoding(current, key:before == after ? after : nil)
+                    return try await dashboardEncodingResponse(work, lease: lease, ifNoneMatch:validator, observedAt:current.updatedAt)
                 case "/api/test-screen":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }
