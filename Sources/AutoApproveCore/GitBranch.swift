@@ -27,6 +27,16 @@ public struct GitBranchUpdate: Sendable {
     }
 }
 
+/// Optional library diagnostics for the bounded, per-collection metadata pool.
+/// These counts describe the initial reads, before fresh completion validation.
+public struct GitBranchCollectionMetadataMetrics: Sendable {
+    public let retainedConfigBytes: Int
+    public let retainedConfigs: Int
+    public let participants: Int
+    public let maximumParticipants: Int
+    public let reusedConfigReads: Int
+}
+
 public enum GitBranchReader {
     /// macOS 런처의 추가 exec 대기를 피하고, 개발 도구 Git이 없으면 원래 시스템 경로를 쓴다.
     private static let gitExecutable = [
@@ -49,10 +59,15 @@ public enum GitBranchReader {
     /// - directory는 작업 폴더이고 executeGit은 격리한 인자·환경을 받는 실제 실행 함수다.
     /// - 반환값은 Git에서 확인한 브랜치·detached 상태 또는 진단 가능한 실패 상태다.
     public static func read(directory: String, executeGit: ([String], [String: String]) throws -> CommandResult) -> GitBranchState {
+        read(directory: directory, metadata: nil, executeGit: executeGit)
+    }
+
+    private static func read(directory: String, metadata: GitBranchCache.CollectionMetadata?,
+                             executeGit: ([String], [String: String]) throws -> CommandResult) -> GitBranchState {
         guard directory.hasPrefix("/"), !directory.contains("\0") else {
             return .init(kind: .unavailable, detail: "현재 폴더의 경로를 확인하지 못했습니다.")
         }
-        let fingerprint = GitBranchCache.fingerprint(directory: directory)
+        let fingerprint = GitBranchCache.fingerprint(directory: directory, metadata: metadata)
         if let cached = GitBranchCache.value(directory: directory, fingerprint: fingerprint) { return cached }
         // An app launched from a shell must not inherit a different GIT_DIR,
         // GIT_WORK_TREE, namespace or command-scope Git configuration.
@@ -87,29 +102,117 @@ public enum GitBranchReader {
     }
 
     public static func collect(_ sessions: [AgentSession]) async -> [GitBranchUpdate] {
+        await collect(sessions, executeGit: { arguments, environment in
+            try CommandRunner.run(gitExecutable, arguments, timeout: 1.5,
+                                  environment: environment, inheritEnvironment: false)
+        })
+    }
+
+    /// Shares only bounded common config bytes within this collect. The optional
+    /// observer runs off the UI after initial reads and before fresh validation.
+    /// A source changed by any observer or concurrent process is re-read normally.
+    public static func collect(_ sessions: [AgentSession],
+                               executeGit: @escaping @Sendable ([String], [String: String]) throws -> CommandResult,
+                               inspectMetadata: (@Sendable (GitBranchCollectionMetadataMetrics) -> Void)? = nil) async -> [GitBranchUpdate] {
+        await collect(sessions, shareMetadata: true, inspectMetadata: inspectMetadata) { directory, metadata in
+            read(directory: directory, metadata: metadata, executeGit: executeGit)
+        }
+    }
+
+    /// The synchronous reader runs off the UI/cooperative executor, at most four
+    /// directories at once. Cancellation stops claiming new directories; reads
+    /// already in flight finish normally. Each collect owns its queue and state.
+    public static func collect(_ sessions: [AgentSession], readDirectory: @escaping @Sendable (String) -> GitBranchState) async -> [GitBranchUpdate] {
+        await collect(sessions, shareMetadata: false, inspectMetadata: nil) { directory, _ in readDirectory(directory) }
+    }
+
+    private static func collect(_ sessions: [AgentSession], shareMetadata: Bool,
+                                inspectMetadata: (@Sendable (GitBranchCollectionMetadataMetrics) -> Void)?,
+                                readDirectory: @escaping @Sendable (String, GitBranchCache.CollectionMetadata?) -> GitBranchState) async -> [GitBranchUpdate] {
         let targets = sessions.filter { $0.agent != .shell && $0.phase != .ended && !$0.cwd.isEmpty }
-        var directories = Set(targets.map(\.cwd)).sorted().makeIterator()
-        let states = await withTaskGroup(of: (String, GitBranchState).self, returning: [String: GitBranchState].self) { group in
-            func enqueue(_ directory: String) {
-                group.addTask(priority: .utility) {
-                    // Process waiting stays off the UI and cooperative executor.
-                    await withCheckedContinuation { continuation in
-                        DispatchQueue.global(qos: .utility).async {
-                            continuation.resume(returning: (directory, read(directory: directory)))
-                        }
+        let directories = Set(targets.map(\.cwd)).sorted()
+        guard !directories.isEmpty, !Task.isCancelled else { return [] }
+        let work = GitBranchCollectionWork(directories)
+        let metadata = shareMetadata ? GitBranchCache.collectionMetadata(directories: directories) : nil
+        let states: [String: GitBranchState] = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                work.run(readDirectory: { readDirectory($0, metadata) }) {
+                    if let inspectMetadata {
+                        inspectMetadata(metadata?.metrics() ?? .init(retainedConfigBytes: 0, retainedConfigs: 0,
+                            participants: 0, maximumParticipants: 0, reusedConfigReads: 0))
                     }
+                    let invalid = metadata?.invalidatedDirectories() ?? []
+                    if work.requeue(invalid) {
+                        // A changed or unreadable shared config never supplies a
+                        // final cached answer. Retry once without any sharing.
+                        work.run(readDirectory: { readDirectory($0, nil) }) {
+                            continuation.resume(returning: work.results())
+                        }
+                    } else { continuation.resume(returning: work.results()) }
                 }
             }
-            for _ in 0..<4 { if let directory = directories.next() { enqueue(directory) } }
-            var results: [String: GitBranchState] = [:]
-            for await (directory, state) in group {
-                results[directory] = state
-                if !Task.isCancelled, let next = directories.next() { enqueue(next) }
-            }
-            return results
+        } onCancel: {
+            work.cancel()
         }
         return targets.compactMap { session in
             states[session.cwd].map { GitBranchUpdate(sessionID: session.id, cwd: session.cwd, state: $0) }
         }
+    }
+}
+
+/// One collection only: no metadata, input capability or process lifetime is
+/// cached here. The lock never spans a reader call or a process wait.
+private final class GitBranchCollectionWork: @unchecked Sendable {
+    private let lock = NSLock()
+    private var directories: [String]
+    private var position = 0
+    private var cancelled = false
+    private var states: [String: GitBranchState] = [:]
+
+    init(_ directories: [String]) {
+        self.directories = directories
+        states.reserveCapacity(directories.count)
+    }
+    func next() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled, position < directories.count else { return nil }
+        defer { position += 1 }
+        return directories[position]
+    }
+    func cancel() {
+        lock.lock(); cancelled = true; lock.unlock()
+    }
+    func store(_ results: [(String, GitBranchState)]) {
+        lock.lock(); defer { lock.unlock() }
+        for (directory, state) in results { states[directory] = state }
+    }
+    func results() -> [String: GitBranchState] {
+        lock.lock(); defer { lock.unlock() }
+        return states
+    }
+    func requeue(_ invalid: Set<String>) -> Bool {
+        guard !invalid.isEmpty else { return false }
+        lock.lock(); defer { lock.unlock() }
+        for directory in invalid { states.removeValue(forKey: directory) }
+        guard !cancelled else { return false }
+        directories = invalid.sorted(); position = 0
+        return true
+    }
+    func run(readDirectory: @escaping @Sendable (String) -> GitBranchState, completion: @escaping @Sendable () -> Void) {
+        let workers = min(4, directories.count), capacity = (directories.count + workers - 1) / workers
+        let group = DispatchGroup()
+        for _ in 0..<workers {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                var results: [(String, GitBranchState)] = []
+                results.reserveCapacity(capacity)
+                while let directory = self.next() {
+                    let state = autoreleasepool { readDirectory(directory) }
+                    results.append((directory, state))
+                }
+                self.store(results); group.leave()
+            }
+        }
+        group.notify(queue: .global(qos: .utility), execute: completion)
     }
 }

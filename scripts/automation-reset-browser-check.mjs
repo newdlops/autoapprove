@@ -38,7 +38,7 @@ try {
  const ids=inventories.map(value=>value.nodes[0].id);
  assert.notEqual(ids[0],ids[1]);
  const published=JSON.parse(await readFile(assets+'/web-version.json'));
- assert.ok(published.version==='0.2.159'&&published.build===186,'Run against the matching release assets');
+ assert.deepEqual(published,inventories[0].nodes[0].release,'Run against assets matching the compiled fixture');
  const eventCount=async index=>(await(await fetch(bases[index]+'/api/state')).json()).snapshot.events.filter(event=>event.source==='자동화 복구').length;
  server=createServer(async(req,res)=>{
   try {

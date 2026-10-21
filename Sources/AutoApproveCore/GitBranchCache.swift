@@ -35,6 +35,120 @@ enum GitBranchCache {
     private static let lock = NSLock()
     private static var entries: [String: Entry] = [:]
 
+    /// Verified entries are only grouping hints. Every participating read still
+    /// resolves its own markers, and must reach the same common directory.
+    static func collectionMetadata(directories: [String]) -> CollectionMetadata? {
+        guard directories.count >= 3 else { return nil }
+        var counts: [String: Int] = [:]
+        lock.lock()
+        for directory in directories {
+            if let common = entries[directory]?.fingerprint.commonDirectory { counts[common, default: 0] += 1 }
+        }
+        lock.unlock()
+        let shared = counts.filter { $0.value >= 3 }.keys.sorted().prefix(64)
+        return shared.isEmpty ? nil : CollectionMetadata(commonDirectories: Array(shared))
+    }
+
+    /// One collect owns these snapshots. A slow loader never holds the lock or
+    /// makes other readers wait; they can always use the original file reader.
+    final class CollectionMetadata: @unchecked Sendable {
+        private struct Snapshot { let identity: FileIdentity?; let data: Data? }
+        private final class SharedConfig {
+            let url: URL
+            var loading = false, dirty = false
+            var snapshot: Snapshot?
+            var participants: Set<String> = []
+            init(directory: String) {
+                url = URL(fileURLWithPath: directory, isDirectory: true).appendingPathComponent("config", isDirectory: false)
+            }
+        }
+        private let lock = NSLock()
+        private let configs: [String: SharedConfig]
+        private var retainedBytes = 0, reusedReads = 0
+        init(commonDirectories: [String]) {
+            configs = Dictionary(uniqueKeysWithValues: commonDirectories.map { ($0, SharedConfig(directory: $0)) })
+        }
+
+        func config(commonDirectory: String, directory: String, url: URL) throws -> Data? {
+            guard let entry = configs[commonDirectory] else { return try optionalFile(url, limit: 131072) }
+            lock.lock()
+            guard !entry.dirty, !entry.loading, entry.participants.count < 256 else {
+                lock.unlock(); return try optionalFile(url, limit: 131072)
+            }
+            if let snapshot = entry.snapshot {
+                lock.unlock()
+                let current: FileIdentity?
+                do { current = try fileIdentity(url) }
+                catch {
+                    markDirty(entry); return try optionalFile(url, limit: 131072)
+                }
+                lock.lock()
+                guard !entry.dirty, current == snapshot.identity, entry.participants.count < 256 else {
+                    if current != snapshot.identity { entry.dirty = true }
+                    lock.unlock(); return try optionalFile(url, limit: 131072)
+                }
+                entry.participants.insert(directory); reusedReads += 1
+                lock.unlock()
+                return snapshot.data
+            }
+            entry.loading = true
+            lock.unlock()
+            do {
+                let before = try fileIdentity(url)
+                let data = try optionalFile(url, limit: 131072)
+                let after = try fileIdentity(url)
+                let size = data?.count ?? 0
+                lock.lock()
+                entry.loading = false
+                guard before == after, (data == nil) == (after == nil), size <= 262144 - retainedBytes else {
+                    entry.dirty = true
+                    lock.unlock(); return try optionalFile(url, limit: 131072)
+                }
+                entry.snapshot = Snapshot(identity: after, data: data)
+                entry.participants.insert(directory); retainedBytes += size
+                lock.unlock()
+                return data
+            } catch {
+                lock.lock(); entry.loading = false; entry.dirty = true; lock.unlock()
+                throw error
+            }
+        }
+
+        private func markDirty(_ entry: SharedConfig) {
+            lock.lock(); entry.dirty = true; lock.unlock()
+        }
+
+        /// Runs after all readers finish, off the UI. Identity alone is never
+        /// sufficient to finish a collect that reused common config bytes.
+        func invalidatedDirectories() -> Set<String> {
+            var invalid: Set<String> = []
+            // No workers remain. The snapshot and participant sets are now
+            // immutable; no lock spans these fresh descriptor reads.
+            for entry in configs.values where !entry.participants.isEmpty {
+                guard !entry.dirty, let snapshot = entry.snapshot else {
+                    invalid.formUnion(entry.participants); continue
+                }
+                do {
+                    let before = try fileIdentity(entry.url)
+                    let data = try optionalFile(entry.url, limit: 131072)
+                    let after = try fileIdentity(entry.url)
+                    if before != after || after != snapshot.identity || data != snapshot.data {
+                        invalid.formUnion(entry.participants)
+                    }
+                } catch { invalid.formUnion(entry.participants) }
+            }
+            return invalid
+        }
+
+        func metrics() -> GitBranchCollectionMetadataMetrics {
+            lock.lock(); defer { lock.unlock() }
+            return .init(retainedConfigBytes: retainedBytes, retainedConfigs: configs.values.filter { $0.snapshot != nil }.count,
+                         participants: configs.values.reduce(0) { $0 + $1.participants.count },
+                         maximumParticipants: configs.values.map { $0.participants.count }.max() ?? 0,
+                         reusedConfigReads: reusedReads)
+        }
+    }
+
     /// 같은 폴더의 HEAD·참조·설정이 마지막 확인 때와 같으면 검증된 브랜치 상태를 반환한다.
     static func value(directory: String, fingerprint: Fingerprint?) -> GitBranchState? {
         guard let fingerprint else { return nil }
@@ -57,7 +171,7 @@ enum GitBranchCache {
     }
 
     /// 저장소 루트와 연결된 worktree의 작은 메타데이터만 읽는다. 알 수 없는 구조는 Git에 맡긴다.
-    static func fingerprint(directory: String) -> Fingerprint? {
+    static func fingerprint(directory: String, metadata: CollectionMetadata? = nil) -> Fingerprint? {
         let manager = FileManager.default
         let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
@@ -84,6 +198,11 @@ enum GitBranchCache {
                 guard let path = String(data: commonMarker, encoding: .utf8) else { return nil }
                 commonDirectory = resolve(path, relativeTo: gitDirectory)
             } else { commonDirectory = gitDirectory }
+            func config() throws -> Data? {
+                let url = commonDirectory.appendingPathComponent("config", isDirectory: false)
+                if let metadata { return try metadata.config(commonDirectory: commonDirectory.path, directory: directory, url: url) }
+                return try optionalFile(url, limit: 131072)
+            }
             let head = try smallFile(gitDirectory.appendingPathComponent("HEAD", isDirectory: false), limit: 4096)
             guard let rawHead = String(data: head, encoding: .utf8) else { return nil }
             let headValue = rawHead.trimmingCharacters(in: .newlines)
@@ -102,7 +221,7 @@ enum GitBranchCache {
                 return Fingerprint(branch: nil, detached: true, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
                     marker: marker, commonMarker: commonMarker, head: head, objectStore: objectStore, looseReference: nil,
                     packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs", isDirectory: false)),
-                    config: try optionalFile(commonDirectory.appendingPathComponent("config", isDirectory: false), limit: 131072),
+                    config: try config(),
                     worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree", isDirectory: false), limit: 131072))
             }
             guard let branch else { return nil }
@@ -110,7 +229,7 @@ enum GitBranchCache {
             return Fingerprint(branch: branch, detached: detached, gitDirectory: gitDirectory.path, commonDirectory: commonDirectory.path,
                 marker: marker, commonMarker: commonMarker, head: head, objectStore: nil, looseReference: looseReference,
                 packedReferences: try fileIdentity(commonDirectory.appendingPathComponent("packed-refs", isDirectory: false)),
-                config: try optionalFile(commonDirectory.appendingPathComponent("config", isDirectory: false), limit: 131072),
+                config: try config(),
                 worktreeConfig: try optionalFile(gitDirectory.appendingPathComponent("config.worktree", isDirectory: false), limit: 131072))
         } catch { return nil }
     }
