@@ -754,18 +754,26 @@ async function refreshNetwork(initial = false) {
     // Include hidden records so cleanup/restore during a retry keeps the same
     // placement. Only an actual online response restores an offline card.
     updateMacPlacement(result.nodes);
-    // A partial response means the read is pending, not that the peer's original
-    // sessions ended. Keep its last inventory, without claiming it is online.
+    // A pending or failed inventory read is not an authoritative empty list.
+    // Keep its last presentation; the current node still controls connectivity.
     const reconnected = result.nodes.filter(node=>node.online && cleanup.macs.has(node.id));
     if (reconnected.length) {
       for (const node of reconnected) cleanup.macs.delete(node.id);
       // Reconnection always restores the real Mac, even if browser persistence is unavailable.
       try { localStorage.setItem(cleanupStorage,JSON.stringify(Object.fromEntries(Object.entries(cleanup).map(([kind,values])=>[kind,[...values]])))); } catch (_) {}
     }
-    nodes = result.nodes.filter(node=>node.online || !cleanup.macs.has(node.id)).map(node => node.loading && !node.state && previousNodes.get(node.id)?.state
+    nodes = result.nodes.filter(node=>node.online || !cleanup.macs.has(node.id)).map(node => !node.online && !node.state && previousNodes.get(node.id)?.state
       ? {...node,state:previousNodes.get(node.id).state} : node);
     lastNetworkStartedAt = startedAt;
-    const inventory = nodes.flatMap(node => node.online || node.loading && node.state ? (node.state?.sessions || []).map(view => ({ node, view, session: view.session, key: keyFor(node, view.session, view) })) : []);
+    // Peer completion order can change on each progressive response. Preserve
+    // existing Mac groups, while respecting each Mac's current session order.
+    // These IDs live only in the current inventory, not a second history cache.
+    const inventoryNodes = new Map(nodes.map(node=>[node.id,node]));
+    const nodeOrder = new Set([...allSessions.map(item=>item.node.id),...inventoryNodes.keys()]);
+    const inventory = Array.from(nodeOrder).flatMap(id => {
+      const node = inventoryNodes.get(id);
+      return (node?.state?.sessions || []).map(view => ({node,view,session:view.session,key:keyFor(node,view.session,view)}));
+    });
     const continuation = inventory.find(item => item.key === selectedKey)?.session.interruption?.resumedSessionID;
     const recovered = continuation && inventory.find(item => item.node.id === selectedItem?.node.id && item.session.id === continuation && !sessionEnded(item));
     const inventoryKeys = new Set(inventory.map(item=>item.key));
@@ -823,7 +831,7 @@ async function refreshNetwork(initial = false) {
     // Inventory and terminal connections are independent. A failed list request
     // cannot invalidate a verified original stream or close its mobile keyboard.
     if (!selectedItem?.view.pty && !terminalStream && !latestFrame) terminalState('pending', '다시 연결 중…');
-    updateControls(); renderMachines();
+    updateControls(); renderMachines(); renderList();
   } finally {
     if (networkController === controller) networkController = null;
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
@@ -1039,7 +1047,10 @@ function renderList() {
     const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
     text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
     text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
-    const phase = row.querySelector('.phase'); text(phase, item.view.phaseTitle); phase.dataset.phase = item.session.interruption && item.session.interruption.recoveredAt == null ? 'error' : item.session.phase;
+    const phase = row.querySelector('.phase'), unavailable = !connected || !item.node.online;
+    text(phase, unavailable ? item.node.loading ? '갱신 중…' : '연결 끊김' : item.view.phaseTitle);
+    phase.dataset.phase = unavailable ? 'unknown' : item.session.interruption && item.session.interruption.recoveredAt == null ? 'error' : item.session.phase;
+    phase.title = unavailable ? '마지막 확인: '+item.view.phaseTitle : '';
     text(row.querySelector('.row-auto'), item.session.automatic ? item.node.state.snapshot.paused ? '자동 승인 · 정지' : '자동 승인 켜짐' : '자동 승인 꺼짐');
     const atPosition = $('session-list').children[index];
     if (atPosition !== row) $('session-list').insertBefore(row, atPosition || null);
