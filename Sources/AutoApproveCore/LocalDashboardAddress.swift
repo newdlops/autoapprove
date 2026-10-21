@@ -34,9 +34,56 @@ public enum LocalDashboardAddress {
         return found ? .ready : .missing
     }
     public static func status() -> Status {
-        guard let data = try? Data(contentsOf:URL(fileURLWithPath:hostsPath)), data.count <= 1_048_576,
-              let text = String(data:data,encoding:.utf8) else {return .unavailable}
-        return status(in:text)
+        readStatus(file:URL(fileURLWithPath:hostsPath,isDirectory:false)).status
+    }
+    /// Counts only bytes read by this invocation; no contents or result survive
+    /// it. The file argument also supports isolated library diagnostics.
+    public struct StatusReading: Equatable {
+        public let status: Status
+        public let bytesRead: Int
+    }
+    public static let maximumStatusBytes = 1_048_576
+    public static func readStatus(file: URL) -> StatusReading {
+        guard file.isFileURL else {return StatusReading(status:.unavailable,bytesRead:0)}
+        // Nonblocking open avoids waiting on a substituted FIFO. Follow normal
+        // symlinks as before, then validate the opened object itself.
+        let fd = file.withUnsafeFileSystemRepresentation { path in
+            path.map { Darwin.open($0,O_RDONLY | O_CLOEXEC | O_NONBLOCK) } ?? -1
+        }
+        guard fd >= 0 else {return StatusReading(status:.unavailable,bytesRead:0)}
+        defer {_ = Darwin.close(fd)}
+        var before = stat()
+        guard fstat(fd,&before) == 0, before.st_mode & S_IFMT == S_IFREG,
+              before.st_size >= 0, before.st_size <= maximumStatusBytes else {
+            return StatusReading(status:.unavailable,bytesRead:0)
+        }
+        // The extra byte detects growth even when it happens after fstat.
+        // Every read shares this fixed allowance; neither memory nor I/O grows
+        // with a concurrently growing file.
+        let allowance = Int(before.st_size) + 1
+        var data = Data(count:allowance), count = 0
+        let succeeded = data.withUnsafeMutableBytes { buffer -> Bool in
+            guard let base = buffer.baseAddress else {return false}
+            while count < allowance {
+                let amount = Darwin.read(fd,base.advanced(by:count),allowance-count)
+                if amount > 0 {count += amount}
+                else if amount == 0 {return true}
+                else if errno != EINTR {return false}
+            }
+            return true
+        }
+        var after = stat()
+        guard succeeded, count == before.st_size, fstat(fd,&after) == 0,
+              after.st_size == before.st_size,
+              after.st_mtimespec.tv_sec == before.st_mtimespec.tv_sec,
+              after.st_mtimespec.tv_nsec == before.st_mtimespec.tv_nsec,
+              after.st_ctimespec.tv_sec == before.st_ctimespec.tv_sec,
+              after.st_ctimespec.tv_nsec == before.st_ctimespec.tv_nsec else {
+            return StatusReading(status:.unavailable,bytesRead:count)
+        }
+        data.count = count
+        guard let text = String(data:data,encoding:.utf8) else {return StatusReading(status:.unavailable,bytesRead:count)}
+        return StatusReading(status:status(in:text),bytesRead:count)
     }
     public static func prepared(_ text: String) throws -> String {
         guard text.utf8.count <= 1_048_576 else {throw AppError.message("Mac 주소 설정 파일이 너무 큽니다.")}
