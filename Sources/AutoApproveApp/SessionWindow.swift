@@ -19,6 +19,7 @@ import AutoApproveCore
     @State private var search = ""
     @State private var filter = "전체"
     @State private var error: String?
+    @State private var allAutomationResetMessage: String?
     @State private var refreshing = false
     @State private var openingTerminal = false
     @State private var editingSession: AgentSession?
@@ -71,6 +72,17 @@ import AutoApproveCore
     }
     private var content: some View {
         VStack(spacing: 0) {
+            if let allAutomationResetMessage {
+                HStack(spacing: 10) {
+                    Label(allAutomationResetMessage, systemImage: "checkmark.circle")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button { self.allAutomationResetMessage = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.borderless).accessibilityLabel("자동화 초기화 안내 닫기")
+                        .help("초기화 결과 안내를 닫습니다.")
+                }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10)
+                    .background(Color.secondary.opacity(0.08)).accessibilityElement(children: .contain)
+            }
             if notifications.authorization == .denied || notifications.error != nil {
                 HStack(spacing: 10) {
                     Image(systemName: "bell.slash")
@@ -221,6 +233,13 @@ import AutoApproveCore
                     .help(AppHelp.history)
                 Button { openWindow(id: "settings") } label: { Label("연결 설정", systemImage: "point.3.connected.trianglepath.dotted") }
                     .help(AppHelp.connections)
+                Button {
+                    do { allAutomationResetMessage = try engine.resetAllAutomation().message }
+                    catch { self.error = error.localizedDescription }
+                } label: { Label("전체 초기화", systemImage: "arrow.counterclockwise") }
+                    .labelStyle(.titleAndIcon)
+                    .accessibilityLabel("모든 세션의 자동화 초기화·재실행")
+                    .help("이 Mac의 모든 세션에 쌓인 자동화 대기와 감지 상태를 비우고 다시 감지합니다. 원본 터미널·초안·자동 승인 설정은 유지합니다.")
                 Button {
                     refreshing = true
                     Task { await engine.refresh(); refreshing = false }

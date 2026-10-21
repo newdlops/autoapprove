@@ -1610,6 +1610,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let paused = object["paused"] as? Bool else { throw RemoteHTTPError(400, "일시정지 값을 지정해주세요.") }
             try setPaused(paused); return ["paused": snapshot.paused]
         }
+        if action == "resetAllAutomation" {
+            let result = try resetAllAutomation()
+            return ["ok": true, "allSessions": true, "sessionCount": result.sessionCount,
+                    "cancelledTasks": result.cancelledTasks, "awaitingDelivery": result.awaitingDelivery,
+                    "automatic": result.automatic, "paused": result.paused, "message": result.message]
+        }
         if action == "questionDelay" {
             guard let seconds = object["seconds"] as? Int else { throw RemoteHTTPError(400, "대기 시간을 지정해주세요.") }
             try setQuestionNotificationDelay(seconds); return ["seconds": snapshot.questionNotificationDelay]
@@ -2216,10 +2222,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func refreshCodexHistory() async -> (targetCount: Int, responsive: Bool)? {
         let epoch = observationEpoch
         let automationEpochs = automationRuntime.epochs
+        let automationDefaultEpoch = automationRuntime.defaultEpoch
         let codexTargets = sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
         let updates = await codexQuestions.collect(codexTargets)
         guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
-        updateCodexQuestions(updates.filter { automationEpochs[$0.sessionID, default: 0] == automationRuntime.epoch($0.sessionID) })
+        updateCodexQuestions(updates.filter { (automationEpochs[$0.sessionID] ?? automationDefaultEpoch) == automationRuntime.epoch($0.sessionID) })
         let responsive = codexTargets.contains { target in
             guard let current = sessions[target.id] else { return false }
             return current.unansweredQuestions.contains(where: { $0.hasLaterUserMessage != true }) ||
@@ -2926,31 +2933,57 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !remoteInputStopped, let selected = sessions[id], selected.phase != .ended else {
             throw AppError.message("실행 중인 세션을 선택해주세요.")
         }
-        let members = groupIDs(id)
-        let awaitingDelivery = members.contains { id in
-            automaticInputBusy(id) || remoteInputSessions.contains(id) ||
-                automaticQuestionReplies.values.contains { $0.sessionID == id && $0.sending }
-        }
-        var cancelledTasks = 0
+        return resetAutomation(members: Set(groupIDs(id)), selected: selected, allSessions: false)
+    }
+
+    /// One actor transaction for every session, including orphaned/ended work.
+    /// This never restarts the original CLIs or changes their saved policy.
+    @discardableResult public func resetAllAutomation() throws -> AutomationResetResult {
+        guard !remoteInputStopped else { throw AppError.message("앱이 종료 중입니다. 다시 실행한 뒤 초기화해주세요.") }
+        var members = Set(sessions.keys)
+        members.formUnion(automationRuntime.sessionIDs)
+        members.formUnion(screens.keys); members.formUnion(screenAnalyses.keys)
+        members.formUnion(activityTrackers.keys); members.formUnion(screenObservedAt.keys)
+        members.formUnion(capacityStates.keys); members.formUnion(exitRecoveries.keys)
+        members.formUnion(exitRecoveryTasks.keys); members.formUnion(modelRetentionTasks.keys)
+        members.formUnion(systemSafetyStates.keys); members.formUnion(systemSafetyTasks.keys)
+        members.formUnion(resetApprovalReceipts.keys); members.formUnion(remoteInputUntil.keys)
+        members.formUnion(remoteStreams.keys); members.formUnion(retainedModelMenus.keys)
+        members.formUnion(remoteScreenReads.keys); members.formUnion(remoteInitialReads.keys)
+        members.formUnion(remoteObservedScreens.keys); members.formUnion(remoteFrames.keys)
+        members.formUnion(remoteMonitorFrames.keys)
+        members.formUnion(automaticQuestionReplies.values.map(\.sessionID))
+        members.formUnion(liveClaudeHooks.values.map { $0.request.sessionID })
+        return resetAutomation(members: members, selected: nil, allSessions: true)
+    }
+
+    private func resetAutomation(members: Set<String>, selected: AgentSession?, allSessions: Bool) -> AutomationResetResult {
+        var busy = automaticInputSessions
+        busy.formUnion(systemSafetyTasks.keys)
+        busy.formUnion(capacityStates.compactMap { $0.value.phase == .sending ? $0.key : nil })
+        busy.formUnion(pendingActions.values.map(\.sessionID))
+        let awaitingDelivery = !members.isDisjoint(with: busy.union(remoteInputSessions)) ||
+            automaticQuestionReplies.values.contains { members.contains($0.sessionID) && $0.sending }
+        var cancelledTasks = allSessions ? automationRuntime.resetAll() : 0
+        let questionIDs = automaticQuestionReplies.compactMap { members.contains($0.value.sessionID) ? $0.key : nil }
+        for questionID in questionIDs { cancelledTasks += 1; cancelAutomaticQuestionReply(questionID) }
+        let hookIDs = liveClaudeHooks.compactMap { members.contains($0.value.request.sessionID) ? $0.key : nil }
+        for requestID in hookIDs { removeLiveClaudeHook(requestID) }
+        if allSessions { automationNeedsFreshScreen.removeAll(); persistedQuestionSettings.removeAll() }
+        var hosts = Set<ScreenHost>()
         for member in members {
-            cancelledTasks += automationRuntime.reset(member)
-            if let state = screens[member], let dispatchID = state.dispatchID, automaticInputBusy(member) {
+            if !allSessions { cancelledTasks += automationRuntime.reset(member) }
+            if let state = screens[member], let dispatchID = state.dispatchID, busy.contains(member) {
                 resetApprovalReceipts[member] = ResetApprovalReceipt(dispatchID: dispatchID,
                     generation: state.generation, requestIdentity: state.prompt.requestIdentity)
-            } else if !automaticInputBusy(member) { resetApprovalReceipts.removeValue(forKey: member) }
+            } else if !busy.contains(member) { resetApprovalReceipts.removeValue(forKey: member) }
             if modelRetentionTasks[member] != nil { cancelledTasks += 1 }
             cancelModelRetention(member)
             systemSafetyTasks.removeValue(forKey: member)
-            for (questionID, pending) in automaticQuestionReplies where pending.sessionID == member {
-                cancelledTasks += 1; cancelAutomaticQuestionReply(questionID)
-            }
-            for (requestID, pending) in liveClaudeHooks where pending.request.sessionID == member {
-                removeLiveClaudeHook(requestID)
-            }
             // Editing/cancellation and submission receipts are user intent, not
             // disposable automation. Reload their small caches on the next read.
-            for question in sessions[member]?.questions ?? [] {
-                persistedQuestionSettings.removeValue(forKey: question.id)
+            if !allSessions {
+                for question in sessions[member]?.questions ?? [] { persistedQuestionSettings.removeValue(forKey: question.id) }
             }
             readableQuestionSessions.remove(member)
             capacityStates.removeValue(forKey: member)
@@ -2959,7 +2992,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             remoteInputUntil.removeValue(forKey: member)
             retainedModelMenus.removeValue(forKey: member)
             // An interrupted safety write cannot become another Escape or paste.
-            var safetyReceipt: SystemSafetyState?
+            var safetyReceipt = systemSafetyStates[member].flatMap { $0.notice.phase == .uncertain ? $0 : nil }
             if var state = systemSafetyStates[member],
                [.cancelling, .typing, .draft, .submitting].contains(state.notice.phase) {
                 state.notice.phase = .uncertain
@@ -2975,17 +3008,33 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let safetyReceipt { systemSafetyStates[member] = safetyReceipt; sessions[member]?.systemSafety = safetyReceipt.notice }
             clearScreen(member)
             remoteStreams.removeValue(forKey: member)
-            automationNeedsFreshScreen.insert(member)
-            if let host = sessions[member].flatMap({ ScreenHost(kind: $0.terminal) }) {
-                unchangedScreenReads[host] = 0
-                screenPollSignals[host]?.notify()
-            }
+            if let session = sessions[member], session.phase != .ended {
+                automationNeedsFreshScreen.insert(member)
+                if let host = ScreenHost(kind: session.terminal) { hosts.insert(host) }
+            } else { automationNeedsFreshScreen.remove(member) }
         }
-        let result = AutomationResetResult(sessionCount: members.count, cancelledTasks: cancelledTasks,
-            awaitingDelivery: awaitingDelivery, automatic: effectiveAutomatic(id), paused: snapshot.paused)
-        sessions[id]?.activityDetail = result.message
-        _ = log(AuditEvent(sessionID: id, summary: "자동화 초기화·재실행", outcome: result.message,
-            source: "자동화 복구", context: AuditContext(session: selected)))
+        if allSessions {
+            // Release the empty tables too, rather than keeping the capacity
+            // allocated by many previous sessions. Delivery receipts stay live.
+            screens.removeAll(); screenAnalyses.removeAll(); screenAnalysisCacheBytes = 0
+            activityTrackers.removeAll(); screenObservedAt.removeAll()
+            remoteStreams.removeAll(); remoteMonitorFrames.removeAll()
+            remoteObservedScreens.removeAll(); remoteFrames.removeAll()
+            remoteScreenReads.removeAll(); remoteInitialReads.removeAll()
+            capacityStates.removeAll(); exitRecoveries.removeAll(); exitRecoveryTasks.removeAll()
+            modelRetentionTasks.removeAll(); systemSafetyTasks.removeAll()
+            automaticQuestionReplies.removeAll(); retainedModelMenus.removeAll()
+            remoteInputUntil.removeAll(); readableQuestionSessions.removeAll()
+            unchangedScreenReads.removeAll(); hosts.formUnion(screenConnections.keys)
+        }
+        for host in hosts { unchangedScreenReads[host] = 0; screenPollSignals[host]?.notify() }
+        let count = allSessions ? sessions.values.filter { $0.phase != .ended }.count : members.count
+        let automatic = selected.map { effectiveAutomatic($0.id) } ?? sessions.values.contains { $0.phase != .ended && effectiveAutomatic($0.id) }
+        let result = AutomationResetResult(sessionCount: count, cancelledTasks: cancelledTasks,
+            awaitingDelivery: awaitingDelivery, automatic: automatic, paused: snapshot.paused, allSessions: allSessions)
+        if let selected { sessions[selected.id]?.activityDetail = result.message }
+        _ = log(AuditEvent(sessionID: selected?.id ?? "all-sessions", summary: allSessions ? "모든 세션 자동화 초기화·재실행" : "자동화 초기화·재실행", outcome: result.message,
+            source: "자동화 복구", context: selected.map { AuditContext(session: $0) }))
         historyPollSignal.notify()
         claudeHookSignals.values.forEach { $0.notify() }
         publish()
@@ -3101,6 +3150,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         screenConnections[host]?.polling = true
         let epoch = observationEpoch
         let automationEpochs = automationRuntime.epochs
+        let automationDefaultEpoch = automationRuntime.defaultEpoch
         let announceConnection = reportConnecting || !snapshot.health.screen(host).connected
         if announceConnection { updateHealth(host) { $0.connecting = true } }
         defer {
@@ -3174,7 +3224,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let (failures, screensByTTY, analyses, changedIDs, unchangedObservedAt) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return nil }
             let targets = targets.filter { target in
-                guard automationEpochs[target.id, default: 0] == automationRuntime.epoch(target.id),
+                guard (automationEpochs[target.id] ?? automationDefaultEpoch) == automationRuntime.epoch(target.id),
                       let current = sessions[target.id], current.phase != .ended,
                       current.pid == target.pid, current.started == target.started,
                       current.tty == target.tty, current.terminal == host.kind else { return false }

@@ -9,6 +9,7 @@ import path from 'node:path';
 import {coreLinkArguments} from './swift-core-link.mjs';
 const {chromium,webkit}=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');
 const engine=process.argv.includes('--webkit')?'webkit':'chromium';
+const allReset=process.argv.includes('--all');
 const build=path.resolve(process.env.AUTOAPPROVE_QA_BUILD||'.build/release');
 const assets=path.resolve(process.env.AUTOAPPROVE_QA_ASSETS||'Sources/AutoApproveCore/Resources/RemoteWeb');
 const out=path.resolve(process.env.AUTOAPPROVE_QA_OUTPUT||'dist/qa/automation-reset');
@@ -16,6 +17,7 @@ const root=await mkdtemp('/private/tmp/aa-reset-web-');
 await mkdir(out,{recursive:true});
 const children=[],errors=[],checks=[],views=[],posts=[];
 let browser,server,holdReset=null,releaseReset=null,failReset=false,peerOnline=true,peerOld=false;
+let holdAllReset=null,releaseAllReset=null,failAllNode=-1,networkFail=false,selfOnline=true;
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function state(base){const response=await fetch(base+'/api/network');assert.equal(response.status,200);return response.json();}
@@ -44,8 +46,9 @@ try {
   try {
    const url=new URL(req.url,'http://localhost'),json=(code,value)=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
    if(url.pathname==='/api/network'){
+    if(networkFail)return json(503,{error:'합성 네트워크 오류'});
     const [a,b]=await Promise.all(bases.map(state));
-    const own=a.nodes[0],peer=b.nodes[0];own.name='합성 Mac A';own.state.name=own.name;
+    const own=a.nodes[0],peer=b.nodes[0];own.name='합성 Mac A';own.state.name=own.name;own.online=selfOnline;
     peer.name='합성 Mac B';peer.state.name=peer.name;peer.local=false;peer.online=peerOnline;
     if(peerOld)peer.release=peer.state.release={version:'0.2.158',build:185,api:1};
     return json(200,{...a,partial:false,nodes:[own,peer]});
@@ -54,7 +57,8 @@ try {
     const node=url.searchParams.get('node'),index=node===ids[1]?1:0;url.searchParams.delete('node');
     const body=req.method==='POST'?await new Promise((resolve,reject)=>{let text='';req.on('data',v=>text+=v);req.on('end',()=>resolve(text));req.on('error',reject);}):undefined;
     const payload=body?JSON.parse(body):null;
-    if(payload){posts.push({index,path:url.pathname,...payload});assert.equal(url.pathname,'/api/action');assert.ok(['resetAutomation','beginQuestion','automatic'].includes(payload.action),'Unexpected mutation '+payload.action);}
+    if(payload){posts.push({index,path:url.pathname,...payload});assert.equal(url.pathname,'/api/action');assert.ok(['resetAutomation','resetAllAutomation','beginQuestion','automatic'].includes(payload.action),'Unexpected mutation '+payload.action);}
+    if(payload?.action==='resetAllAutomation'&&failAllNode===index){failAllNode=-1;return json(503,{error:'합성 전체 초기화 연결 오류 · 이 Mac에서 다시 시도해주세요.'});}
     if(payload?.action==='resetAutomation'&&failReset){failReset=false;return json(503,{error:'합성 연결 오류 · 현재 상태를 확인한 뒤 다시 시도해주세요.'});}
     if(url.pathname==='/api/terminal/stream'){
      const controller=new AbortController();res.once('close',()=>controller.abort());
@@ -69,6 +73,7 @@ try {
     const upstream=await fetch(bases[index]+url.pathname+url.search,{method:req.method,...(body?{body,headers:{'Content-Type':'application/json'}}:{})});
     const bytes=Buffer.from(await upstream.arrayBuffer());
     if(payload?.action==='resetAutomation'&&holdReset)await holdReset;
+    if(payload?.action==='resetAllAutomation'&&holdAllReset)await holdAllReset;
     res.writeHead(upstream.status,{'Content-Type':upstream.headers.get('content-type')||'application/json','Cache-Control':'no-store'});res.end(bytes);return;
    }
    const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
@@ -103,6 +108,72 @@ try {
     assert.equal(await page.locator('#terminal-settings .terminal-options').evaluate(el=>getComputedStyle(el).flexWrap),'nowrap');
    }
   }
+
+  if(allReset){
+   assert.ok(published.build>=188,'All-session reset needs the matching new Core');
+   async function refresh(){await page.evaluate(async()=>{await refreshNetwork();clearTimeout(networkTimer);});}
+   const allButton=page.locator('#reset-all-automation');
+   assert.equal(await allButton.isDisabled(),false);assert.equal(await allButton.getAttribute('aria-describedby'),'reset-all-automation-help');
+   await select(0);await settings();await page.locator('#compose-input').check();
+   await page.locator('#terminal-input').fill('전체 초기화에도 보관할 초안 👩🏽‍💻');
+   const draftKey=await page.evaluate(()=>selectedKey);
+   if(await page.locator('#terminal-back').isVisible())await page.locator('#terminal-back').click();
+   await page.locator('#terminal-settings').evaluate(element=>element.open=false);
+   await allButton.scrollIntoViewIfNeeded();await allButton.focus();await capture('all-ready');
+   assert.equal(await allButton.evaluate(element=>element.getBoundingClientRect().height>=44),true);
+   const startA=await eventCount(0),startB=await eventCount(1),startPosts=posts.length;
+   holdAllReset=new Promise(resolve=>releaseAllReset=resolve);
+   await allButton.dblclick();
+   await page.waitForFunction(()=>automationResetNodes.size===2);
+   assert.equal(await allButton.getAttribute('aria-busy'),'true');
+   assert.equal(await page.locator('#machines .machine-reset:disabled').count(),2);
+   await select(0);await settings();
+   assert.equal(await page.locator('#reset-automation').isDisabled(),true);
+   await capture('all-pending');
+   releaseAllReset();holdAllReset=null;releaseAllReset=null;
+   await page.waitForFunction(()=>!automationResetNodes.size&&allAutomationResetResult&&!allAutomationResetResult.error);
+   const dispatched=posts.slice(startPosts);assert.equal(dispatched.length,2);assert.ok(dispatched.every(value=>value.action==='resetAllAutomation'&&!value.sessionID));
+   assert.equal(new Set(dispatched.map(value=>value.index)).size,2);
+   assert.equal(await eventCount(0),startA+1);assert.equal(await eventCount(1),startB+1);
+   assert.equal(await page.evaluate(key=>drafts.get(key),draftKey),'전체 초기화에도 보관할 초안 👩🏽‍💻');
+   assert.ok((await Promise.all(bases.map(state))).every(value=>value.nodes[0].state.snapshot.paused));
+   if(await page.locator('#terminal-back').isVisible())await page.locator('#terminal-back').click();
+   await page.locator('#terminal-settings').evaluate(element=>element.open=false);
+   await allButton.scrollIntoViewIfNeeded();
+   await capture('all-success');
+   const first=await eventCount(0),second=await eventCount(1);failAllNode=1;
+   await allButton.click();await page.waitForFunction(()=>!automationResetNodes.size&&allAutomationResetResult?.error);
+   assert.equal(await eventCount(0),first+1);assert.equal(await eventCount(1),second);
+   assert.match(await page.locator('#reset-all-automation-result').textContent(),/1대 완료 · 1대 실패/);
+   const peerReset=page.locator('#machines .machine').nth(1).locator('.machine-reset');
+   assert.match(await page.locator('#machines .machine-reset-result').nth(1).textContent(),/합성 전체 초기화 연결 오류/);
+   await capture('all-partial-failure');
+   const retryPosts=posts.length;await peerReset.click();
+   await page.waitForFunction(()=>!automationResetNodes.size&&allAutomationResetResult&&!allAutomationResetResult.error);
+   assert.equal(posts.length,retryPosts+1);assert.equal(posts.at(-1).index,1);
+   assert.equal(await eventCount(0),first+1);assert.equal(await eventCount(1),second+1);
+   assert.equal(await page.locator('#machines .machine-reset-result:not([hidden])').count(),0);
+   await capture('all-retry');
+   peerOld=true;await refresh();assert.equal(await allButton.isDisabled(),true);
+   assert.match(await page.locator('#reset-all-automation-help').textContent(),/0\.2\.161/);
+   assert.equal(await peerReset.isDisabled(),true);assert.equal(await page.locator('#machines .machine-reset').first().isDisabled(),false);
+   await capture('all-old-peer');
+   peerOld=false;peerOnline=false;await refresh();assert.equal(await allButton.isDisabled(),false);
+   assert.match(await page.locator('#reset-all-automation-help').textContent(),/연결이 끊긴 Mac/);
+   const offlinePosts=posts.length,offlineB=await eventCount(1);await allButton.click();
+   await page.waitForFunction(()=>!automationResetNodes.size&&allAutomationResetResult&&!allAutomationResetResult.error);
+   assert.equal(posts.length,offlinePosts+1);assert.equal(posts.at(-1).index,0);assert.equal(await eventCount(1),offlineB);
+   await capture('all-offline-peer');
+   selfOnline=false;await refresh();assert.equal(await allButton.isDisabled(),true);
+   assert.match(await page.locator('#reset-all-automation-help').textContent(),/Mac이 연결되면/);await capture('all-no-target');
+   selfOnline=true;peerOnline=true;await refresh();
+   networkFail=true;await refresh();assert.equal(await allButton.isDisabled(),true);
+   assert.equal(await page.evaluate(()=>connected),false);await capture('all-network-error');
+   networkFail=false;await refresh();assert.equal(await allButton.isDisabled(),false);
+   assert.equal(await page.evaluate(key=>drafts.get(key),draftKey),'전체 초기화에도 보관할 초안 👩🏽‍💻');
+   checks.push(label+': all-session and all-Mac reset, exact one POST per Mac, pause/draft preservation, single-node retry after partial failure, old/offline/empty/network recovery');
+  }
+
   await select(0);await settings();assert.equal(await page.locator('#reset-automation').isDisabled(),false);
   await page.locator('#reset-automation').focus();await capture('ready');
   assert.equal(await page.locator('#reset-automation').evaluate(el=>el.getBoundingClientRect().height>=44),true);
@@ -156,7 +227,7 @@ try {
  await writeFile(path.join(out,engine+'-report.json'),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
 }catch(error){await writeFile(path.join(out,engine+'-failure.json'),JSON.stringify({error:error.message,errors,checks,views,posts},null,2)+'\n');throw error;}
 finally{
- releaseReset?.();await browser?.close();
+ releaseReset?.();releaseAllReset?.();await browser?.close();
  if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
  for(const child of children)if(child.exitCode===null)child.kill('SIGTERM');
  await Promise.all(children.map(child=>child.exitCode!==null?null:new Promise(resolve=>{child.once('exit',resolve);setTimeout(resolve,2000);})));await rm(root,{recursive:true,force:true});

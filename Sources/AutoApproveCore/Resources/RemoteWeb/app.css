@@ -55,6 +55,11 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .machine { min-width: 240px; max-width: 100%; display: flex; gap: 16px; align-items: center; padding: 8px 0; flex: 1 0 240px; border-bottom: 1px solid var(--line); }
 .machine-info { min-width: 0; flex: 1; }
 .machine-actions { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+.machine-reset { max-width: 160px; }
+.machine-reset-result { overflow-wrap: anywhere; margin-top: 6px; }
+.automation-reset-all { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.automation-reset-all p { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+#reset-all-automation-result { margin-bottom: 12px; overflow-wrap: anywhere; }
 .network > .section-heading { flex-wrap: wrap; align-items: flex-start; }
 .list-cleanup { max-width: 100%; }
 .list-cleanup > summary { min-height: 44px; padding: 10px 0; cursor: pointer; font-size: 13px; color: var(--muted); }

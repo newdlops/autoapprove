@@ -62,9 +62,9 @@ private let workingScreen = codexScreen([1: "  >_ OpenAI Codex (v0.158.0)", 7: "
 private let idleScreen = codexScreen([1: "  >_ OpenAI Codex (v0.158.0)", 7: "› 테스트를 고치자.", 12: "• 테스트를 모두 고쳤습니다.",
     26: "› Ask Codex to do anything", 28: "  gpt-5.5 high · ~/project/demo", 29: "  ← for agents · ? for shortcuts"])
 
-private func waitUntil(_ seconds: Double = 20, _ condition: () -> Bool) -> Bool {
+@MainActor private func waitUntil(_ seconds: Double = 20, _ condition: () -> Bool) async throws -> Bool {
     let end = Date().addingTimeInterval(seconds)
-    while Date() < end { if condition() { return true }; Thread.sleep(forTimeInterval: 0.05) }
+    while Date() < end { if condition() { return true }; try await Task.sleep(for: .milliseconds(50)) }
     return condition()
 }
 
@@ -282,7 +282,7 @@ extension ApprovalTests {
         engine.stop()
     }
 
-    func testKeepAwakeGuardScript() throws {
+    func testKeepAwakeGuardScript() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-guard-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -304,7 +304,9 @@ extension ApprovalTests {
         }
         // The real guard only parses here; it never runs.
         try expect(KeepAwake.guardScript().contains("'/usr/bin/sudo' -n '/usr/bin/pmset' -a disablesleep 0"))
-        let syntax = try CommandRunner.run("/bin/sh", ["-n", "-c", KeepAwake.guardScript()])
+        // Process exit delivery must be able to run while this main-actor test
+        // waits. Keep the original runner deadline and guard assertions.
+        let syntax = try await Task.detached { try CommandRunner.run("/bin/sh", ["-n", "-c", KeepAwake.guardScript()]) }.value
         try expectEqual(syntax.status, 0, syntax.error)
 
         func write(_ text: String, _ file: String) throws { try text.write(toFile: file, atomically: true, encoding: .utf8) }
@@ -327,13 +329,15 @@ extension ApprovalTests {
         let app = Process()
         app.executableURL = URL(fileURLWithPath: "/bin/sleep"); app.arguments = ["30"]
         try app.run()
+        defer { if app.isRunning { app.terminate() } }
         var marker = try hold("exit.hold")
         let exitWatcher = try KeepAwake.launchGuard(script: script, marker: marker, floor: 20, app: app.processIdentifier)
         watchers.append(exitWatcher)
-        Thread.sleep(forTimeInterval: 0.4)
+        try await Task.sleep(for: .milliseconds(400))
         try expectEqual(logged(), "", "Nothing changes while AutoApprove runs on power")
-        app.terminate(); app.waitUntilExit()
-        try expect(waitUntil { !exitWatcher.isRunning() }, "The guard ends after releasing")
+        app.terminate()
+        try expect(try await waitUntil { !app.isRunning }, "The owned fixture app exits")
+        try expect(try await waitUntil { !exitWatcher.isRunning() }, "The guard ends after releasing")
         try expectEqual(logged(), release + sleep); try expectFalse(FileManager.default.fileExists(atPath: marker))
 
         // The battery floor ends the hold while AutoApprove still runs; an open lid is not slept.
@@ -342,10 +346,10 @@ extension ApprovalTests {
         marker = try hold("battery.hold")
         let batteryWatcher = try KeepAwake.launchGuard(script: script, marker: marker, floor: 20)
         watchers.append(batteryWatcher)
-        Thread.sleep(forTimeInterval: 0.4)
+        try await Task.sleep(for: .milliseconds(400))
         try expectEqual(logged(), "", "21% is above the floor")
         try write(onBattery(20), battery)
-        try expect(waitUntil { !batteryWatcher.isRunning() })
+        try expect(try await waitUntil { !batteryWatcher.isRunning() })
         try expectEqual(logged(), release); try expectFalse(FileManager.default.fileExists(atPath: marker))
 
         // AutoApprove released it itself: the guard leaves without touching anything.
@@ -355,17 +359,17 @@ extension ApprovalTests {
         let quietWatcher = try KeepAwake.launchGuard(script: script, marker: marker, floor: 20)
         watchers.append(quietWatcher)
         try FileManager.default.removeItem(atPath: marker)
-        try expect(waitUntil { !quietWatcher.isRunning() }); try expectEqual(logged(), "")
+        try expect(try await waitUntil { !quietWatcher.isRunning() }); try expectEqual(logged(), "")
 
         // A heartbeat that stopped means a hung AutoApprove; a failed release is tried again.
         try write("", failure)
         marker = try hold("stale.hold", age: 30)
         let staleWatcher = try KeepAwake.launchGuard(script: stale, marker: marker, floor: 20)
         watchers.append(staleWatcher)
-        try expect(waitUntil { logged().components(separatedBy: "disablesleep 0").count > 2 }, "A failed release is tried again")
+        try expect(try await waitUntil { logged().components(separatedBy: "disablesleep 0").count > 2 }, "A failed release is tried again")
         try expect(FileManager.default.fileExists(atPath: marker)); try expect(staleWatcher.isRunning())
         try FileManager.default.removeItem(atPath: failure)
-        try expect(waitUntil { !staleWatcher.isRunning() }); try expectFalse(FileManager.default.fileExists(atPath: marker))
+        try expect(try await waitUntil { !staleWatcher.isRunning() }); try expectFalse(FileManager.default.fileExists(atPath: marker))
         try expect(logged().hasSuffix(release))
     }
 

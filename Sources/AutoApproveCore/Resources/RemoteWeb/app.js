@@ -51,6 +51,8 @@ let cursorLayoutPending = false, cursorLayoutTimer = null;
 const directQueue = [];
 const automationResets = new Set();
 let automationResetResult = null;
+const automationResetNodes = new Set(), automationResetNodeErrors = new Map();
+let allAutomationResetResult = null;
 const rows = new Map(), machineRows = new Map(), drafts = new Map(), questionDrafts = new Map();
 const interruptionRows = new Map();
 // Exact saved receipts only, bounded to this page. A late inventory response
@@ -716,12 +718,12 @@ async function action(nodeID, payload, message) {
 }
 async function resetSelectedAutomation() {
   const item = selectedItem, key = selectedKey;
-  if (!item || automationResets.has(key) || !connected || !currentNode()?.online || sessionEnded(item) ||
+  if (!item || automationResets.has(key) || automationResetNodes.has(item.node.id) || !connected || !currentNode()?.online || sessionEnded(item) ||
       ptyTemporary.has(key) || !supportsRelease(item.node,[0,2,159,186])) return;
   automationResets.add(key); automationResetResult = null;
   // Park unsubmitted keystrokes in the existing draft. A reset never replays
   // them, sends a cancel key, or erases an uncertain manual submission.
-  stopDirect(); clearTerminalWarm(); updateControls();
+  stopDirect(); clearTerminalWarm(); updateControls(); renderMachines();
   try {
     const result = await api(endpoint('/api/action',item.node.id),{action:'resetAutomation',sessionID:item.session.id,requestID:uuid()});
     const message = result.message || '자동화를 초기화했습니다. 현재 상태부터 다시 감지합니다.';
@@ -735,7 +737,44 @@ async function resetSelectedAutomation() {
     await refreshNetwork();
   } catch (error) {
     automationResetResult = {key,message:error.message,error:true}; feedback(error.message,true);
-  } finally { automationResets.delete(key); updateControls(); }
+  } finally { automationResets.delete(key); updateControls(); renderMachines(); }
+}
+function updateAllAutomationResetControls() {
+  const online = nodes.filter(node=>node.online), old = online.filter(node=>!supportsRelease(node,[0,2,161,188]));
+  const busy = automationResetNodes.size > 0;
+  $('reset-all-automation').disabled = !connected || !online.length || old.length > 0 || busy || automationResets.size > 0 || mutation;
+  text($('reset-all-automation'),busy ? '모든 자동화 초기화 중…' : '연결된 Mac 모두 초기화');
+  setBusy($('reset-all-automation'),busy);
+  text($('reset-all-automation-help'),old.length ? `Mac ${old.length}대를 0.2.161 이상으로 업데이트하면 함께 초기화할 수 있습니다.` : !connected ? '연결을 확인한 뒤 다시 시도해주세요.' : !online.length ? 'Mac이 연결되면 모든 세션의 자동화를 초기화할 수 있습니다.' : `연결된 Mac ${online.length}대의 모든 세션을 초기화합니다. 원본 터미널·초안·일시정지는 유지합니다.${nodes.some(node=>!node.online) ? ' 연결이 끊긴 Mac은 다시 연결한 뒤 초기화해주세요.' : ''}`);
+  text($('reset-all-automation-result'),allAutomationResetResult?.message || '');
+  $('reset-all-automation-result').className = allAutomationResetResult?.error ? 'error-text small' : 'muted small';
+  show($('reset-all-automation-result'),!!allAutomationResetResult);
+}
+async function resetAllAutomations(nodeID = null) {
+  if (!connected || mutation || automationResetNodes.size || automationResets.size) return;
+  const targets = nodes.filter(node=>node.online && (nodeID === null || node.id === nodeID));
+  if (!targets.length || targets.some(node=>!supportsRelease(node,[0,2,161,188]))) return;
+  const ids = new Set(targets.map(node=>node.id));
+  for (const id of ids) { automationResetNodes.add(id); automationResetNodeErrors.delete(id); }
+  allAutomationResetResult = {message:`Mac ${targets.length}대의 자동화 대기를 비우고 있습니다…`,error:false};
+  if (selectedItem && ids.has(selectedItem.node.id)) { stopDirect(); clearTerminalWarm(); automationResetResult=null; }
+  updateControls(); renderMachines();
+  const results = await Promise.allSettled(targets.map(node=>api(endpoint('/api/action',node.id),{action:'resetAllAutomation',requestID:uuid()})));
+  let completed = 0, failed = 0;
+  for (let index=0;index<results.length;index++) {
+    const result=results[index],node=targets[index];
+    automationResetNodes.delete(node.id);
+    if (result.status === 'fulfilled') completed++;
+    else { failed++; automationResetNodeErrors.set(node.id,result.reason?.message || '초기화 결과를 확인하지 못했습니다. 연결을 확인한 뒤 다시 시도해주세요.'); }
+  }
+  const message = failed ? `Mac ${completed}대 완료 · ${failed}대 실패. 실패한 Mac의 ‘모든 세션 초기화’로 다시 시도해주세요.` : `Mac ${completed}대의 모든 자동화를 초기화했습니다. 각 세션의 현재 상태부터 다시 감지합니다.`;
+  allAutomationResetResult = {message,error:failed>0}; feedback(message,failed>0);
+  if (selectedItem && ids.has(selectedItem.node.id)) {
+    detailGeneration++; frameController?.abort(); latestFrame=null; terminalFrameReceivedAt=-Infinity;
+    stopTerminalStream(true); void refreshFrame();
+  }
+  updateControls(); renderMachines();
+  await refreshNetwork();
 }
 function beginQuestionEditing(key, nodeID, payload) {
   if (questionEditing.has(key)) return;
@@ -884,7 +923,9 @@ async function refreshNetwork(initial = false) {
   }
 }
 function renderMachines() {
+  updateAllAutomationResetControls();
   const live = new Set(nodes.map(node=>node.id));
+  for (const id of automationResetNodeErrors.keys()) if (!live.has(id)) automationResetNodeErrors.delete(id);
   const offline = offlineMacs(), removable = new Set(offline.map(node=>node.id));
   const folded = nodes.filter(node=>removable.has(node.id) || unconfirmedMac(node));
   show($('offline-machines'),folded.length>0);text($('offline-machine-count'),`이전 연결 · Mac ${folded.length}대`);
@@ -896,9 +937,11 @@ function renderMachines() {
     let row = machineRows.get(node.id);
     if (!row) {
       row = make('article', 'machine'); const info = make('div', 'machine-info');
-      info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status'));
-      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), clean = make('button','secondary machine-clean','목록에서 정리');
-      toggle.type = clean.type = 'button'; actions.append(toggle,clean); row.append(info,actions);
+      const resetResult=make('p','error-text small machine-reset-result');resetResult.setAttribute('role','status');resetResult.hidden=true;
+      info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status'),resetResult);
+      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), reset=make('button','secondary machine-reset','모든 세션 초기화'), clean = make('button','secondary machine-clean','목록에서 정리');
+      toggle.type = reset.type = clean.type = 'button'; actions.append(toggle,reset,clean); row.append(info,actions);
+      reset.addEventListener('click',()=>void resetAllAutomations(node.id));
       clean.addEventListener('click',()=>cleanOfflineMacs([node.id]));
       toggle.addEventListener('click', () => {
         const current = nodes.find(item => item.id === node.id);
@@ -918,6 +961,12 @@ function renderMachines() {
     button.disabled = mutation || !connected || !node.online;
     button.setAttribute('aria-label', `${node.name} 자동 승인 ${node.online && node.state.snapshot.paused ? '재개' : '일시정지'}`);
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
+    const reset = row.querySelector('.machine-reset'), resetBusy=automationResetNodes.has(node.id), resetSupported=supportsRelease(node,[0,2,161,188]);
+    text(reset,resetBusy ? '모든 자동화 초기화 중…' : '모든 세션 초기화');setBusy(reset,resetBusy);
+    reset.disabled = !connected || !node.online || !resetSupported || mutation || automationResetNodes.size>0 || automationResets.size>0;
+    reset.setAttribute('aria-label',`${node.name}의 모든 세션 자동화 초기화·재실행`);
+    reset.title = !resetSupported ? '이 Mac을 AutoApprove 0.2.161 이상으로 업데이트해주세요.' : '이 Mac의 모든 세션에 쌓인 자동화 대기를 비우고 다시 감지합니다. 원본 터미널과 설정은 유지합니다.';
+    const resetError=row.querySelector('.machine-reset-result');text(resetError,automationResetNodeErrors.get(node.id)||'');show(resetError,automationResetNodeErrors.has(node.id));
     const target = removable.has(node.id) || unconfirmedMac(node) ? $('offline-machine-list') : $('machines');
     if(row.parentElement!==target) {
       const hadFocus=row.contains(document.activeElement);target.append(row);
@@ -1202,13 +1251,14 @@ function updateTerminalRecovery() {
   show($('terminal-recovery-actions'),!$('terminal-retry').hidden || available);
 }
 function updateControls() {
+  updateAllAutomationResetControls();
   updateInteractionControls();
   updateTerminalRecovery();
   if (!selectedItem) return;
   renderNativeDisplay();
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
-  const resetBusy = automationResets.has(selectedKey);
+  const resetBusy = automationResets.has(selectedKey) || automationResetNodes.has(selectedItem.node.id);
   const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation && !resetBusy;
   const temporaryPTY = ptyTemporary.has(selectedKey);
   const resetSupported = supportsRelease(selectedItem.node,[0,2,159,186]);
@@ -2377,6 +2427,7 @@ for (const button of document.querySelectorAll('[data-filter]')) button.addEvent
 });
 $('automatic').addEventListener('change', () => { const enabled = $('automatic').checked; void action(selectedItem.node.id, { action: 'automatic', sessionID: selectedItem.session.id, enabled }, enabled ? '자동 승인을 켰습니다.' : '자동 승인을 껐습니다.'); });
 $('reset-automation').addEventListener('click', () => void resetSelectedAutomation());
+$('reset-all-automation').addEventListener('click', () => void resetAllAutomations());
 $('reveal').addEventListener('click', () => void action(selectedItem.node.id, { action: 'reveal', sessionID: selectedItem.session.id }, 'Mac에서 대상 터미널을 열었습니다.'));
 $('terminal-input').addEventListener('input', () => { drafts.set(selectedKey, $('terminal-input').value); sizeInput(); updateControls(); });
 $('terminal-input').addEventListener('compositionstart', () => { composing = true; updateControls(); });
