@@ -8,8 +8,17 @@ public struct CommandResult {
 }
 
 public enum CommandRunner {
+    public static let maximumOutputBytes = 64 * 1024 * 1024
+    public static let maximumErrorBytes = 8 * 1024 * 1024
     /// `input` reaches the child on standard input, which keeps text composed; arguments arrive decomposed (NFD).
-    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:], inheritEnvironment: Bool = true, input: Data? = nil) throws -> CommandResult {
+    /// Complete results are bounded by raw and decoded UTF-8 bytes; overflow is
+    /// an error, never a truncated successful response. One deadline covers all pipes.
+    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:], inheritEnvironment: Bool = true, input: Data? = nil,
+                           outputLimit: Int = maximumOutputBytes, errorLimit: Int = maximumErrorBytes) throws -> CommandResult {
+        guard timeout.isFinite, timeout <= Double(Int.max / 1_000_000_000 - 1),
+              (0...maximumOutputBytes).contains(outputLimit), (0...maximumErrorBytes).contains(errorLimit) else {
+            throw AppError.message("명령 시간 또는 출력 크기 제한이 올바르지 않습니다.")
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -17,37 +26,43 @@ public enum CommandRunner {
         let stdout = Pipe(), stderr = Pipe(), stdin = input.map { _ in Pipe() }
         process.standardOutput = stdout; process.standardError = stderr
         if let stdin { process.standardInput = stdin }
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal() }
+        let completion = CommandPipeCompletion(input:input != nil)
+        let io = try CommandPipeIO(stdout:stdout.fileHandleForReading,stderr:stderr.fileHandleForReading,
+                                   stdin:stdin?.fileHandleForWriting,data:input,outputLimit:outputLimit,errorLimit:errorLimit,completion:completion)
+        defer { io.close() }
+        process.terminationHandler = { completion.didExit($0.terminationStatus) }
         try process.run()
-        if let stdin, let input {
-            DispatchQueue.global().async {
-                try? stdin.fileHandleForWriting.write(contentsOf: input)
-                try? stdin.fileHandleForWriting.close()
+        let deadline = DispatchTime.now()+max(0,timeout)
+        io.start()
+        while true {
+            let state = completion.snapshot()
+            if let failure = state.failure { try fail(failure) }
+            if let status = state.status, state.remaining == 0 {
+                let (output,error) = io.take()
+                return CommandResult(output:output,error:error,status:status)
             }
+            if completion.changed.wait(timeout:deadline) == .timedOut { try fail(.timeout) }
         }
-        let group = DispatchGroup()
-        var out = Data(), err = Data()
-        group.enter()
-        DispatchQueue.global().async { out = stdout.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        group.enter()
-        DispatchQueue.global().async { err = stderr.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        let finished = exited.wait(timeout: .now() + max(0, timeout))
-        if finished == .timedOut {
+        func fail(_ failure: CommandPipeFailure) throws -> Never {
+            completion.fail(failure); io.close()
             // A timed-out helper must not accumulate after ignoring SIGTERM.
             // Only this invocation's owned child is terminated; never its
             // caller, another terminal, or a process group.
             if process.isRunning {
                 process.terminate()
-                if exited.wait(timeout: .now() + 0.2) == .timedOut, process.isRunning {
+                if completion.exited.wait(timeout: .now() + 0.2) == .timedOut, process.isRunning {
                     _ = Darwin.kill(process.processIdentifier, SIGKILL)
-                    _ = exited.wait(timeout: .now() + 0.2)
+                    _ = completion.exited.wait(timeout: .now() + 0.2)
                 }
             }
-            throw AppError.message("명령 응답 시간이 초과되었습니다: \(URL(fileURLWithPath: executable).lastPathComponent)")
+            let name = URL(fileURLWithPath:executable).lastPathComponent
+            switch failure {
+            case .timeout: throw AppError.message("명령 응답 시간이 초과되었습니다: \(name)")
+            case .outputLimit: throw AppError.message("명령 출력이 허용된 크기를 넘었습니다: \(name)")
+            case .errorLimit: throw AppError.message("명령 오류 출력이 허용된 크기를 넘었습니다: \(name)")
+            case .read: throw AppError.message("명령 파이프를 읽지 못했습니다: \(name)")
+            }
         }
-        group.wait()
-        return CommandResult(output: String(decoding: out, as: UTF8.self), error: String(decoding: err, as: UTF8.self), status: process.terminationStatus)
     }
 }
 
