@@ -670,15 +670,15 @@ struct RemoteTerminalUpdate: Encodable {
         response.entityTag = cached.entityTag; response.observedAt = Date()
         return response
     }
-    /// A conditional response may skip dashboard reconstruction only while
-    /// Every usable inventory must remain inside its TTL. A known unavailable
+    /// A conditional response may skip reconstruction while every usable
+    /// inventory remains inside its TTL. A known unavailable
     /// background peer with no read has a deterministic offline view; discovery
     /// owns its health probes, while selecting it still requests a real read.
     private func dashboardPeerStatesFresh(selectedNode: String?) -> Bool {
         orderedDashboardPeers().allSatisfy { peer in
-            let current = peers[peer.id] ?? peer, endpoint = connectionEndpoint(current)
-            return stateReads.value(for:peer.id,endpoint:endpoint) != nil
-                || (!current.available && peer.id != selectedNode && !stateReads.contains(peer.id))
+            let current = peers[peer.id] ?? peer
+            if !current.available, peer.id != selectedNode, !stateReads.contains(peer.id) { return true }
+            return stateReads.value(for:peer.id,endpoint:connectionEndpoint(current)) != nil
         }
     }
     private func connectionEndpoint(_ peer: Peer) -> NWEndpoint {
@@ -1156,13 +1156,22 @@ struct RemoteTerminalUpdate: Encodable {
         stateReads.insert(task, id: peer.id, token: token, endpoint: endpoint)
         return task
     }
+    private func unavailablePeerState(_ peer: Peer) -> RemoteNodeView {
+        RemoteNodeView(id:peer.id,name:peer.name,local:false,online:false,
+            error:"이 Mac이 네트워크에서 연결 해제되었습니다.",release:peer.release)
+    }
     public func dashboard(initial: Bool = false, selectedNode: String? = nil, client: String? = nil,
                           localAddressReady: Bool? = nil) async throws -> RemoteDashboard {
         let own = try localState(localAddressReady:localAddressReady).inventory
         let candidates = orderedDashboardPeers()
         var completed: [String:(NWEndpoint,RemoteNodeView)] = [:]
         func value(_ peer: Peer) -> RemoteNodeView? {
-            let current = peers[peer.id] ?? peer, endpoint = connectionEndpoint(current)
+            let current = peers[peer.id] ?? peer
+            // With no cached or in-flight read, an unavailable background
+            // peer's view cannot depend on a parsed/resolved network route.
+            if !current.available, peer.id != selectedNode, completed[peer.id] == nil,
+               !stateReads.contains(peer.id) { return unavailablePeerState(current) }
+            let endpoint = connectionEndpoint(current)
             if let result = stateReads.value(for:peer.id,endpoint:endpoint) { completed[peer.id] = (endpoint,result) }
             if let result = completed[peer.id].flatMap({ $0.0 == endpoint ? $0.1 : nil }) { return result }
             // exchange already rejects this background read before any I/O.
@@ -1172,8 +1181,7 @@ struct RemoteTerminalUpdate: Encodable {
             guard !current.available, peer.id != selectedNode,
                   stateReads.task(for:peer.id,endpoint:endpoint) == nil else { return nil }
             stateReads.remove(peer.id)
-            return RemoteNodeView(id:peer.id,name:current.name,local:false,online:false,
-                error:"이 Mac이 네트워크에서 연결 해제되었습니다.",release:current.release)
+            return unavailablePeerState(current)
         }
         func waitForReads(_ peers: [Peer], progressive: Bool = false) async throws {
             for peer in peers where peer.id == selectedNode || value(peer) == nil {
