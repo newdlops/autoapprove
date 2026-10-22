@@ -1,5 +1,15 @@
 # AutoApprove 작업 인계
 
+## 2026-10-22 · 0.2.170 유지 · 덮개 제어 한계 재확인·ASCII 식별자 후보 미채택
+
+- 사용자는 AutoApprove가 덮개에 따른 작업 중단을 막아야 한다고 다시 요청했다. 20:02 읽기 전용 확인에서 설치본은 **168/195·PID62270**, `SleepDisabled=Yes`, `AppleClamshellState=No`였고 AutoApprove의 유휴 시스템 잠자기 방지 assertion도 있었다. Amphetamine의 시스템/화면 유휴 방지도 있었다. 방지 설정이 꺼져서 생긴 현상이라고 결론 내리지 않는다.
+- [Apple QA1340](https://developer.apple.com/library/archive/qa/qa1340/_index.html)과 [화면 유휴 잠자기 API 문서](https://developer.apple.com/documentation/iokit/kiopmassertiontypepreventuseridledisplaysleep), 로컬 공식 SDK를 확인했다. 일반 앱의 유휴 방지는 덮개에 따른 강제 잠자기·내장 화면 꺼짐을 보장해서 차단하지 않는다.169부터 앱의 명시적 강제 잠자기 요청을 제거했으며 최신 공개170에도 포함된다. 현재 설치본에는 미적용이다. 설치·재시작 질문은 계속 미응답이며 이번 요청을 이전 전원/시스템 변경 제한의 철회로 해석하지 않는다. 원본 터미널·수동 잠금·전원·보안/VPN 설정과 설치본은 변경하지 않았고 macOS 덮개 오감지 해결을 주장하지 않는다.
+- 진행 중인 경량화는 권한 요청 식별자의 **전체 ASCII UTF8 경로**를 새 후보로 검사했다.147에 이미 채택된 Character별 ASCII 공백 판정과 다른 가설이다. 모든 ASCII triple·Unicode scalar·긴 문자열·Cocoa·잘못된 UTF16 복구와 저장소 보존을 포함한 **3,209,496사례·foreign84**가 바이트 단위로 일치했다. 실제 Core의 관련25검사도 통과했다. 첫 빌드는 컴파일러 캐시 거부로 실패했고 허용된 빌드는92.222초·exit0이다. 초기화16검사 중 샌드박스 소켓 거부2건은 로그를 보존했으며 같은 바이너리의 허용된16/16 재검사로 확인했다.
+- private `performance/request-ascii-171-20261022/`의 사전 고정 계획대로 새 **16프로세스·8쌍·128회·16세션·4저장소 모드**를 모두 마쳤다. 상태4종·발행 횟수는 전부 일치했지만 **17기준 중5개 실패**해 미채택했다. ASCII native 변경 CPU0.92921배·wall0.94786배, ASCII Cocoa 변경 CPU0.95410배·wall0.94667배였다. 혼합문자 native 변경 CPU1.08986배와 Cocoa1.05686배가1.05 한도를 넘었고, ASCII Cocoa 미변경 CPU1.13487배·wall1.13506배가1.10 한도를 넘었다. ASCII Cocoa 변경 CPU도0.95 요구를 충족하지 못했다. 최대 RSS29,802,496→29,048,832바이트는 통과했지만 다른 실패를 상쇄하지 않는다. 외부 부하나 컴파일러를 원인으로 단정하거나 기준·표본을 바꿔 재시도하지 않는다.
+- exec68449는 미완료가 아니라 전체 비교 완료 후 기준 실패(exit1)다. 독립 원본 표본/17기준/390입력·양쪽94Core객체/16추가 링크 객체 검토와 복원은 모두exit0이다. 제품 소스와 추가한2검사 파일을 정식170 바이트로 복원했고 새 버전·배포는 없다. 후보 소스·로그·검사·실행 파일·94객체/모듈은 private `rejected-build/`와 `candidate-sources/`에 보존했다. 변경 Core객체는 ApprovalEngine·ApprovalPrompt·Models·QuestionDetector·TerminalChoiceQuestion의5개였고 NativeProcessReader는 정식170 바이트였다.
+- **현재 canonical scratch의 소스는170이지만 컴파일 산출물은 미채택 ASCII 후보**다. 모듈236a4247…을 정식170의8abc674a…로 취급하지 않는다. 유효한170 비교 기준은 private `ancestry-stop-171-20261022/baseline-build`이며 설치/포장에는 이미 검증된 공개170 설치 파일만 사용한다. 다음 후보를 빌드할 때 복원된 소스를 반드시 다시 컴파일해야 한다. 관련 전체448검사·GitHub170 게시/다운로드를 불필요하게 반복하지 않는다.
+- 전체 경량화 목표는active이며 이번 턴은progress다. 다음에는 요청 식별자의 임시 문자열/바이트 복사와 해시 비용 또는 상태 반영 비용을 별도 진단해 새 가설과 기준을 먼저 고정한다. 이미 거절한 전체 ASCII 필터를 그대로 반복하지 않는다. 개인 `.codeidx`/`.vscode`와 이전 미커밋 fixture는 보존한다.
+
 ## 2026-10-22 · 0.2.170 유지 · 화면 분석과 상태 반영의 진단용 단계 계측
 
 - 직전 goal 턴은 반복 종료 후보의 실제Core 회귀를 확인해 복원하고, 문자열 생성 비용을 제외한16세션 변경 화면 비용을 구분한 **progress**였다. 전체 경량화 목표는active이며 설치·재시작 질문은 미응답이다.
