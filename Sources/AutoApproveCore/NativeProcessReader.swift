@@ -14,47 +14,25 @@ enum NativeProcessReader {
         try autoreleasepool { try records(pid: nil, sessionsOnly: true) }
     }
     private static func records(pid: Int32?, sessionsOnly: Bool) throws -> [ProcessRecord] {
-        let entries = try snapshot(pid: pid)
+        let all = try snapshot(pid: pid)
+        let entries: [kinfo_proc]
+        if sessionsOnly {
+            // Keep the snapshot's original order, but materialize and enrich
+            // only the CLI candidates and their shared parent chains.
+            let indices = try sessionIndices(all)
+            entries = indices.map { all[$0] }
+        } else { entries = all }
         guard !entries.isEmpty else { return [] }
         // Complete and targeted reads promise the same launch name and start
         // identity as ps, including arbitrary managers, hosts and shell PIDs.
         // Only periodic session discovery may omit unrelated process details.
-        var detailedPIDs = Set<Int32>()
-        if sessionsOnly {
-            var candidates: [Int32] = []
-            for entry in entries where isAgentCandidate(entry) { candidates.append(entry.kp_proc.p_pid) }
-            guard !candidates.isEmpty else { return [] }
-            // Retain just PID -> parent for the ancestry walk, not another
-            // copy of every large kernel process record.
-            var byPID: [Int32: Int32] = [:]
-            byPID.reserveCapacity(entries.count)
-            for entry in entries where byPID[entry.kp_proc.p_pid] == nil {
-                byPID[entry.kp_proc.p_pid] = Int32(entry.kp_eproc.e_ppid)
-            }
-            detailedPIDs.reserveCapacity(min(entries.count, candidates.count * 8))
-            for candidate in candidates {
-                var current = candidate
-                // Process trees share long parent chains. The global set both
-                // deduplicates detail reads and stops ancestry walks already
-                // covered by an earlier candidate, avoiding one temporary Set
-                // allocation per candidate process.
-                for _ in 0..<60 where current > 0 && detailedPIDs.insert(current).inserted {
-                    guard let parent = byPID[current] else { break }
-                    current = parent
-                }
-            }
-        }
-        var arguments: [UInt8] = [], path: [UInt8] = []
-        if !sessionsOnly || !detailedPIDs.isEmpty {
-            arguments = [UInt8](repeating: 0, count: try argumentLimit())
-            path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        }
+        var arguments = [UInt8](repeating: 0, count: try argumentLimit())
+        var path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
         var formatter: DateFormatter?
         var dates: [Int64: String] = [:], devices: [dev_t: String] = [:]
         return try entries.compactMap { entry -> ProcessRecord? in
             try Task.checkCancellation()
             let process = entry.kp_proc, extra = entry.kp_eproc
-            if sessionsOnly && !detailedPIDs.contains(process.p_pid) { return nil }
             let executable = launchName(entry, buffer: &arguments, path: &path)
             var parent = extra.e_ppid, group = extra.e_pgid, foreground = extra.e_tpgid, device = extra.e_tdev
             if process.p_pid > 0 {
@@ -100,6 +78,42 @@ enum NativeProcessReader {
             return ProcessRecord(pid: process.p_pid, parent: parent, tty: tty, processGroup: group,
                                  foregroundGroup: foreground, started: started, executable: executable)
         }
+    }
+
+    /// The same bounded, shared-ancestor selection as discovery, expressed as
+    /// indices so the detail pass never visits unrelated kernel entries.
+    static func sessionIndices(_ entries: [kinfo_proc]) throws -> [Int] {
+        var candidates: [Int32] = []
+        for (index, entry) in entries.enumerated() {
+            if index % 64 == 0 { try Task.checkCancellation() }
+            if isAgentCandidate(entry) { candidates.append(entry.kp_proc.p_pid) }
+        }
+        guard !candidates.isEmpty else { return [] }
+        var byPID: [Int32: Int] = [:]
+        byPID.reserveCapacity(entries.count)
+        var duplicates = false
+        for index in entries.indices {
+            let pid = entries[index].kp_proc.p_pid
+            if byPID[pid] == nil { byPID[pid] = index }
+            else { duplicates = true }
+        }
+        var selected = Set<Int32>(), indices: [Int] = []
+        selected.reserveCapacity(min(entries.count, candidates.count * 8))
+        for candidate in candidates {
+            var current = candidate
+            for _ in 0..<60 where current > 0 && selected.insert(current).inserted {
+                guard let index = byPID[current] else { break }
+                indices.append(index)
+                current = Int32(entries[index].kp_eproc.e_ppid)
+            }
+        }
+        try Task.checkCancellation()
+        // A kernel table normally has unique PIDs. Preserve the previous
+        // behavior even for a duplicate snapshot rather than selecting only
+        // its first record or changing the first-parent ancestry rule.
+        if duplicates { return entries.indices.filter { selected.contains(entries[$0].kp_proc.p_pid) } }
+        indices.sort()
+        return indices
     }
 
     private static func isAgentCandidate(_ entry: kinfo_proc) -> Bool {

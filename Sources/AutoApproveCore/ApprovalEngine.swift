@@ -105,6 +105,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
+    private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
     private let discoveryReader: @Sendable () throws -> [ProcessRecord]
     private var workingDirectoriesBySession: [String: String] = [:]
     private var workingDirectoryReadAt: [String: TimeInterval] = [:]
@@ -325,7 +326,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public init(paths: AppPaths = AppPaths(), terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
-                webLoopbackOnly: Bool = false) throws {
+                webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil) throws {
         self.paths = paths
         self.webLoopbackOnly = webLoopbackOnly
         self.testScreens = testScreenSharing ?? TestScreenSharing()
@@ -341,6 +342,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.codexQueue = codexQueue
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
+        // Native window checks need one original process, not a system-wide
+        // snapshot. Keep injected readers authoritative and every check fresh.
+        if let singleProcessReader { self.singleProcessReader = singleProcessReader }
+        else if let processReader { self.singleProcessReader = { _ in try processReader() } }
+        else { self.singleProcessReader = { try ProcessDiscovery.read(pid: $0) } }
         self.discoveryReader = processReader ?? { try ProcessDiscovery.readSessions() }
         self.remoteProcessVerifier = { session in
             // A first screen already exists in the monitor. Verify its live
@@ -1030,9 +1036,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         "\(binding.peerID):native:\(binding.terminalID):\(binding.generation):\(binding.ownerPID):\(binding.windowToken)"
     }
     private func nativeIdentity(_ session: AgentSession) -> @Sendable () throws -> Bool {
-        let reader = processReader, pid = session.pid, started = session.started, tty = session.tty.replacingOccurrences(of: "/dev/", with: ""), agent = session.agent.rawValue
+        let reader = singleProcessReader, pid = session.pid, started = session.started, tty = session.tty.replacingOccurrences(of: "/dev/", with: ""), agent = session.agent.rawValue
         return {
-            try reader().contains { $0.pid == pid && $0.started == started && $0.tty == tty && $0.agent?.rawValue == agent && $0.isForeground }
+            try reader(pid).contains { $0.pid == pid && $0.started == started && $0.tty == tty && $0.agent?.rawValue == agent && $0.isForeground }
         }
     }
     private func nativeWindowCapture(for session: AgentSession) -> TerminalWindowCapture? {
