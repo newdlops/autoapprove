@@ -1,13 +1,15 @@
 # AutoApprove 작업 인계
 
-## 2026-10-22 · 0.2.169/196 배포 준비 · 잘못된 덮개 신호와 명시적 강제 잠자기 제거
+## 2026-10-22 · 0.2.169/196 배포 완료 · 잘못된 덮개 신호와 명시적 강제 잠자기 제거
 
 - 사용자는 덮개가 실제로 열려 있는데 Mac 자체 화면이 반복해서 꺼지거나 잠긴다고 보고했다. 노트북·자석 물체를 떨어뜨려도 계속되며, AutoApprove가 덮개에 따른 작업 중단을 방지해야 한다고 요청했다. 전체 경량화 목표는 active지만 이 결함을 먼저 처리한다.
 - 읽기 전용 진단에서 macOS26.4의 `AppleClamshellState`가 Yes였다가 No로 바뀌었고, powerd가 닫힘/열림 상태를 WindowServer로 보낸 기록을 확인했다. 설치본168/195는 기존 잠자기 방지 holding·작업7개였으며 `SleepDisabled=Yes`, 별도로 실행 중이던 Amphetamine의 유휴 시스템/화면 방지 assertion과 AutoApprove의 실제 마우스 tickle도 확인했다. 기존 방지가 없거나 손쉬운 사용 권한만의 문제라고 결론 내리지 않는다. 센서 고장·특정 macOS 결함·AutoApprove가 반복 꺼짐의 유일한 원인이라는 증명은 아니다.
 - 로컬 공식 SDK에서 `PreventUserIdleSystemSleep`·`PreventUserIdleDisplaySleep`은 덮개 닫힘을 보장해서 막지 않고, `PreventSystemSleep`은10.9부터 미지원/사용 금지로 문서화돼 있다. 따라서 같은 유휴 assertion 추가로 덮개 오감지에 따른 내장 화면 꺼짐을 고쳤다고 주장하지 않는다. private API·root 우회·새 상주 서비스는 사용하지 않는다.
 - 소스에서 엔진의 `release(sleep:)` 및 guard의 `ioreg`→`sleepnow` 경로, PowerControl의 명시적 잠자기 동작과 새 sudo 규칙의 `sleepnow` 권한을 제거했다. 기존 방지만 해제하며 OS가 잠자기를 결정한다. 이미 설치된 규칙·시스템 전원 설정은 변경하지 않았다. 작업 중 상태 반복과 단일 guard 유지, 종료/배터리/끊긴 heartbeat·실패 후 재시도를 가짜 전원 도구로 검사한다. 기존 배터리/온도·유예·수동 잠금 정책은 유지한다.
 - 버전 자원은169/196으로 증가했다. 첫 샌드박스 실행 exec87932는 캐시 접근 거부로exit1, 허용된 exec60186의 Release 빌드는163.514초로 성공했다. 첫 전체444/445는 기존 UI 타이머 검사에서48.298ms 동안3tick인 경우였으며 실패 로그를 보존했다. exec55968·exit0에서 같은 바이너리·기준의 단독1/1과 전체 **445/445·240.413초**를 확인했다. 고정385입력·94객체·모듈 **7c0830a4…**·검사 실행 파일 **9200cc25…**가 전후 일치한다. private 진단 launcher3개는 빌드에 사용하지 않으며 공개하지 않는다.
-- exec55124·exit0에서 기존 발행자로 서명했고 exec61109·exit0에서 패키지 통합3종·DMG 읽기 전용 검증·코드 section/runtime/웹13파일 일치가 통과했다. DMG7,694,326바이트·SHA **c09a18b543d87760beb647ccedd8d21b13c010d1495c60e7680e94659063aaf8**, 기존 서명 요구식과 키체인 검색 목록은 동일하다. 새 신뢰/ACL/인증서와 실제 전원 명령은 없다. 아직 이 문서 작성 시 GitHub 게시/익명 다운로드 검증 전이며 동일 소스 commit/tag·DMG/체크섬 게시를 끝내야 한다. 현재 소유 도구 작업은 모두 끝났다. 설치본168/195와 PID12791은 재시작하지 않았으며 원본 터미널을 조작하지 않았다.
+- exec55124·exit0에서 기존 발행자로 서명했고 exec61109·exit0에서 패키지 통합3종·DMG 읽기 전용 검증·코드 section/runtime/웹13파일 일치가 통과했다. DMG7,694,326바이트·SHA **c09a18b543d87760beb647ccedd8d21b13c010d1495c60e7680e94659063aaf8**, 기존 서명 요구식과 키체인 검색 목록은 동일하다. 새 신뢰/ACL/인증서와 실제 전원 명령은 없다.
+- [v0.2.169](https://github.com/newdlops/autoapprove/releases/tag/v0.2.169)는 **ab8c04e59c2f740fe00a203b59b622ae6a16b75b**에 고정했다. 소스387개 일치 후 atomic push(exec45493), 정식 릴리스/두 자산 게시(exec30921), 익명 정상 TLS 다운로드(exec17652), GitHub 최신 게시/태그/digest와 다운로드 바이트 대조(exec98519)가 모두exit0이다. 공개 게시 시각은2026-10-22T09:00:49Z다. 게시된 태그·설치 파일을 다시 만들거나 이동하지 않는다.
+- 현재 설치본은168/195로 유지했다. 구버전 앱의 정상 종료가 기존 `disablesleep` 설정을 해제하므로, 사용자의 ‘시스템 변경을 실행하지 말라’는 지시에 따라 자동 설치·재시작을 보류했다. 이미 준비·검증한 수정본은 private `releases/0.2.169/release-196-20261022/AutoApprove.app` 및 공개 DMG다. 현재 소유 작업은 모두 종료했고 원본 터미널 조작은0이다. 실제 덮개 신호 오감지·WindowServer 내장 화면 꺼짐의 해결을 주장하지 않는다.
 - 직전 최적화의 targeted 시작 시각 formatter 재사용 후보는 새16프로세스·8쌍을 모두 마쳤다. targeted CPU0.43814배·병렬 targeted CPU0.49880배이나 전체 표 wall1.10327배·발견1.13472배·병렬 발견1.30379배가 기존1.10 한도에 실패했다. exec61405 exit1은 불완전 실행이 아닌 정상 완료 후 기준 실패다. exec94506 exit0으로28기준/원본 표본/493입력/양쪽94객체를 대조해 미채택하고 NativeProcessReader를 정식168 SHA23d5eece…로 복원했다. 원본 로그·후보 모듈a9560e…/94객체는 private `performance/targeted-start-169-20261022/rejected-build/`에 보존했다. 기존 d530… 후보도 이전 private root에 별도 보존돼 있다. 이전 섹션의 canonical 모듈과 소유 작업 진행 표시는 과거 상태다.
 - 이후 최적화 후보는 `ApprovalEngine.nativeIdentity`의 단일 PID 검증에 전체 프로세스 표를 읽는 경로다. 아직 구현·측정하지 않았다. 새 가설·검사 기준을 먼저 고정하고 기존 시작/TTY/agent/foreground·PID 재사용 검증을 유지해야 한다. 오래된 실패 후보나 이미 끝난 비교·복원·168설치/배포를 반복하지 않는다. 개인 `.codeidx`/`.vscode` 변경과 기존 진단 fixture는 보존한다.
 
