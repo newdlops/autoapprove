@@ -39,15 +39,14 @@ public struct PowerControl: Sendable {
     public var installRule: @Sendable () throws -> Void
     public var removeRule: @Sendable () throws -> Void
     public var setSleepDisabled: @Sendable (Bool) throws -> Void
-    public var sleepNow: @Sendable () throws -> Void
     /// Watches a hold from outside AutoApprove: `marker`, then the battery floor.
     public var startGuard: @Sendable (String, Int) throws -> KeepAwakeGuard
     public init(read: @escaping @Sendable () -> PowerReading, ruleInstalled: @escaping @Sendable () -> Bool, ruleFile: @escaping @Sendable () -> Bool,
                 installRule: @escaping @Sendable () throws -> Void, removeRule: @escaping @Sendable () throws -> Void,
-                setSleepDisabled: @escaping @Sendable (Bool) throws -> Void, sleepNow: @escaping @Sendable () throws -> Void,
+                setSleepDisabled: @escaping @Sendable (Bool) throws -> Void,
                 startGuard: @escaping @Sendable (String, Int) throws -> KeepAwakeGuard) {
         self.read = read; self.ruleInstalled = ruleInstalled; self.ruleFile = ruleFile; self.installRule = installRule
-        self.removeRule = removeRule; self.setSleepDisabled = setSleepDisabled; self.sleepNow = sleepNow; self.startGuard = startGuard
+        self.removeRule = removeRule; self.setSleepDisabled = setSleepDisabled; self.startGuard = startGuard
     }
 
     public static let live = PowerControl(
@@ -57,7 +56,6 @@ public struct PowerControl: Sendable {
         installRule: { try KeepAwake.runAsAdministrator(KeepAwake.installScript(user: NSUserName()), prompt: KeepAwake.installPrompt) },
         removeRule: { try KeepAwake.runAsAdministrator(KeepAwake.removeScript, prompt: KeepAwake.removePrompt) },
         setSleepDisabled: { try KeepAwake.pmsetAsRoot(["-a", "disablesleep", $0 ? "1" : "0"]) },
-        sleepNow: { try KeepAwake.pmsetAsRoot(["sleepnow"]) },
         startGuard: { try KeepAwake.launchGuard(script: KeepAwake.guardScript(), marker: $0, floor: $1) })
 }
 
@@ -88,8 +86,8 @@ public enum KeepAwake {
     public static let sudo = "/usr/bin/sudo"
     public static let pmset = "/usr/bin/pmset"
     /// The only commands the rule runs without a password.
-    public static let commands = ["\(pmset) -a disablesleep 0", "\(pmset) -a disablesleep 1", "\(pmset) sleepnow"]
-    static let installPrompt = "AutoApprove가 덮개를 닫아도 작업을 계속할 수 있도록, 잠자기 금지 설정(pmset disablesleep)과 잠자기만 실행할 수 있는 권한 규칙을 설치합니다."
+    public static let commands = ["\(pmset) -a disablesleep 0", "\(pmset) -a disablesleep 1"]
+    static let installPrompt = "AutoApprove가 덮개를 닫아도 작업을 계속할 수 있도록, 잠자기 금지 설정(pmset disablesleep)을 변경할 수 있는 권한 규칙을 설치합니다."
     static let removePrompt = "AutoApprove가 설치한 잠자기 금지 권한 규칙을 제거합니다."
 
     /// Sessions that keep the Mac awake: auto-approved while not paused, and visibly working, waiting for an approval
@@ -163,31 +161,27 @@ public enum KeepAwake {
     public struct GuardTools: Sendable {
         public var sudo: String
         public var pmset: String
-        public var ioreg: String
         public var interval: Double
         /// A hung AutoApprove stops touching the marker; this long without a touch also ends the hold.
         public var heartbeatLimit: Int
-        public init(sudo: String = KeepAwake.sudo, pmset: String = KeepAwake.pmset, ioreg: String = "/usr/sbin/ioreg",
+        public init(sudo: String = KeepAwake.sudo, pmset: String = KeepAwake.pmset,
                     interval: Double = 10, heartbeatLimit: Int = 300) {
-            self.sudo = sudo; self.pmset = pmset; self.ioreg = ioreg; self.interval = interval; self.heartbeatLimit = heartbeatLimit
+            self.sudo = sudo; self.pmset = pmset; self.interval = interval; self.heartbeatLimit = heartbeatLimit
         }
     }
 
-    /// Ends the hold when AutoApprove exits, stops its heartbeat or the battery reaches the floor, then sleeps a Mac
-    /// whose closed lid would have slept it. Arguments: the marker, AutoApprove's PID, the battery floor.
+    /// Ends the hold when AutoApprove exits, stops its heartbeat or the battery reaches the floor.
+    /// macOS decides when to sleep; a lid reading must never become an explicit sleep command.
+    /// Arguments: the marker, AutoApprove's PID, the battery floor.
     /// A failed release keeps the marker and tries again on the next round.
     public static func guardScript(_ tools: GuardTools = GuardTools()) -> String {
-        let sudo = shellQuoted(tools.sudo), pmset = shellQuoted(tools.pmset), ioreg = shellQuoted(tools.ioreg)
+        let sudo = shellQuoted(tools.sudo), pmset = shellQuoted(tools.pmset)
         return """
         marker=$1 app=$2 floor=$3
         release() {
           [ -f "$marker" ] || exit 0
           \(sudo) -n \(pmset) -a disablesleep 0 >/dev/null 2>&1 || return 1
           /bin/rm -f "$marker"
-          lid=$(\(ioreg) -r -k AppleClamshellState -d 1 2>/dev/null)
-          case $lid in *'"AppleClamshellState" = Yes'*)
-            case $lid in *'"AppleClamshellCausesSleep" = Yes'*) \(sudo) -n \(pmset) sleepnow >/dev/null 2>&1;; esac;;
-          esac
           exit 0
         }
         while [ -f "$marker" ]; do
@@ -277,14 +271,12 @@ final class KeepAwakeSwitch: @unchecked Sendable {
     /// A hold from an earlier run, or a guard that exited: keep one watching.
     func keepWatching(floor: Int) async throws { try await perform { try self.watch(floor) } }
 
-    /// The change first, then the marker, so a failed release is retried. Returns why a requested sleep failed.
-    func release(sleep: Bool) async throws -> String? {
+    /// The change first, then the marker, so a failed release is retried. Releasing never requests sleep.
+    func release() async throws {
         try await perform {
             try self.control.setSleepDisabled(false)
             try? FileManager.default.removeItem(atPath: self.marker)
             self.watchdog?.stop(); self.watchdog = nil
-            guard sleep else { return nil }
-            do { try self.control.sleepNow(); return nil } catch { return error.localizedDescription }
         }
     }
 

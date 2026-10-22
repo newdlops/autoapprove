@@ -10,8 +10,8 @@ private final class FakePower: @unchecked Sendable {
     private var file = true
     private var installFailure: String?
     private var failing = false
-    private var log: (changes: [Bool], attempts: Int, sleeps: Int, reads: Int, installs: Int, removals: Int, floors: [Int], running: Bool) =
-        ([], 0, 0, 0, 0, 0, [], false)
+    private var log: (changes: [Bool], attempts: Int, reads: Int, installs: Int, removals: Int, floors: [Int], running: Bool) =
+        ([], 0, 0, 0, 0, [], false)
     private func locked<T>(_ body: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body() }
     var reading: PowerReading { get { locked { state } } set { locked { state = newValue } } }
     var rule: Bool { get { locked { installed } } set { locked { installed = newValue } } }
@@ -20,7 +20,6 @@ private final class FakePower: @unchecked Sendable {
     var failChanges: Bool { get { locked { failing } } set { locked { failing = newValue } } }
     var changes: [Bool] { locked { log.changes } }
     var attempts: Int { locked { log.attempts } }
-    var sleeps: Int { locked { log.sleeps } }
     var reads: Int { locked { log.reads } }
     var installs: Int { locked { log.installs } }
     var removals: Int { locked { log.removals } }
@@ -46,7 +45,6 @@ private final class FakePower: @unchecked Sendable {
                     self.log.changes.append(value); self.state.sleepDisabled = value
                 }
             },
-            sleepNow: { self.locked { self.log.sleeps += 1 } },
             startGuard: { _, floor in
                 self.locked { self.log.floors.append(floor); self.log.running = true }
                 return KeepAwakeGuard(isRunning: { self.locked { self.log.running } }, stop: { self.locked { self.log.running = false } })
@@ -165,28 +163,39 @@ extension ApprovalTests {
         await pass(5)
         try expectEqual(power.changes, [true], "A held Mac is not changed again"); try expectEqual(power.guardFloors, [20])
 
-        // The turn ends: the hold lasts through the grace period, then ends. An open lid is not slept.
+        // A faulty or changing lid reading cannot interrupt a working hold or launch more guards.
+        for closed in [true, false, true, false, true] {
+            power.reading.lidClosed = closed
+            power.reading.lidCausesSleep = true
+            await pass(5)
+            try expectEqual(power.changes, [true], "Lid changes do not release an active hold")
+            try expectEqual(power.guardFloors, [20], "Lid changes do not accumulate guards")
+            try expectEqual(phase(), .holding)
+        }
+        power.reading.lidClosed = false
+
+        // The turn ends: the hold lasts through the grace period, then ends.
         finish()
         await pass(1)
         try expectEqual(power.changes, [true]); try expectEqual(phase(), .holding)
         try expectNotNil(engine.snapshot.keepAwake?.releaseAt, "A finished hold shows when it ends")
         await pass(engine.keepAwakeGrace)
-        try expectEqual(power.changes, [true, false]); try expectEqual(power.sleeps, 0)
+        try expectEqual(power.changes, [true, false])
         try expectFalse(held()); try expectFalse(power.guardRunning); try expectEqual(phase(), .ready)
 
-        // A closed lid that would have slept the Mac sleeps it once the work is done.
+        // Even a reported closed lid only releases the hold; the app has no explicit sleep operation.
         show(workingScreen); await pass(1)
         power.reading.lidClosed = true
         finish(); await pass(engine.keepAwakeGrace + 1)
-        try expectEqual(power.changes, [true, false, true, false]); try expectEqual(power.sleeps, 1)
-        // An external display on power keeps a closed Mac awake by itself: released, not slept.
+        try expectEqual(power.changes, [true, false, true, false]); try expectFalse(held())
+        // An external display does not change the release operation.
         power.reading.lidCausesSleep = false
         show(workingScreen); await pass(1)
         finish(); await pass(engine.keepAwakeGrace + 1)
-        try expectEqual(Array(power.changes.suffix(2)), [true, false]); try expectEqual(power.sleeps, 1)
+        try expectEqual(Array(power.changes.suffix(2)), [true, false]); try expectFalse(held())
         power.reading.lidClosed = false; power.reading.lidCausesSleep = true
 
-        // Battery floor: at 20% on battery the work no longer holds, and a closed lid sleeps.
+        // Battery floor: at 20% on battery the hold ends regardless of the lid reading.
         show(workingScreen); await pass(1)
         try expectEqual(power.changes.last, true)
         power.reading.onBattery = true; power.reading.batteryPercent = 21
@@ -194,7 +203,7 @@ extension ApprovalTests {
         try expectEqual(power.changes.last, true, "Above the floor the hold stays")
         power.reading.batteryPercent = 20; power.reading.lidClosed = true
         await pass(5)
-        try expectEqual(power.changes.last, false); try expectEqual(power.sleeps, 2); try expectEqual(phase(), .lowBattery)
+        try expectEqual(power.changes.last, false); try expectFalse(held()); try expectEqual(phase(), .lowBattery)
         power.reading.onBattery = false; power.reading.lidClosed = false
         await pass(5)
         try expectEqual(power.changes.last, true, "On power again, the work holds again"); try expectEqual(phase(), .holding)
@@ -245,11 +254,10 @@ extension ApprovalTests {
         await pass(engine.keepAwakeRetryDelay)
         try expectEqual(power.changes.last, true); try expectEqual(phase(), .holding)
 
-        // Quitting releases at once and never sleeps a closed Mac.
+        // Quitting releases at once, regardless of the lid reading.
         power.reading.lidClosed = true
-        let sleeps = power.sleeps
         engine.stop()
-        try expectEqual(power.changes.last, false); try expectEqual(power.sleeps, sleeps); try expectFalse(held())
+        try expectEqual(power.changes.last, false); try expectFalse(held())
 
         // A hold left by a crashed run is adopted while work remains, then released.
         power = FakePower()
@@ -288,7 +296,7 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         func path(_ name: String) -> String { directory.appendingPathComponent(name).path }
         func quoted(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let log = path("log"), battery = path("battery"), lid = path("lid"), failure = path("fail")
+        let log = path("log"), battery = path("battery"), failure = path("fail")
         func stub(_ name: String, _ body: String) throws -> String {
             try ("#!/bin/sh\n" + body + "\n").write(toFile: path(name), atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path(name))
@@ -296,14 +304,15 @@ extension ApprovalTests {
         }
         let sudo = try stub("sudo", "printf '%s\\n' \"$*\" >> \(quoted(log))\n[ -f \(quoted(failure)) ] && exit 1\nexit 0")
         let pmset = try stub("pmset", "[ \"$1\" = -g ] && cat \(quoted(battery))\nexit 0")
-        let ioreg = try stub("ioreg", "cat \(quoted(lid))")
-        let script = KeepAwake.guardScript(.init(sudo: sudo, pmset: pmset, ioreg: ioreg, interval: 0.1, heartbeatLimit: 60))
-        let stale = KeepAwake.guardScript(.init(sudo: sudo, pmset: pmset, ioreg: ioreg, interval: 0.1, heartbeatLimit: 2))
+        let script = KeepAwake.guardScript(.init(sudo: sudo, pmset: pmset, interval: 0.1, heartbeatLimit: 60))
+        let stale = KeepAwake.guardScript(.init(sudo: sudo, pmset: pmset, interval: 0.1, heartbeatLimit: 2))
         for stubbed in [script, stale] {
             try expectFalse(stubbed.contains("/usr/bin/sudo") || stubbed.contains("/usr/bin/pmset"), "A stubbed guard can't reach real sudo or pmset")
         }
         // The real guard only parses here; it never runs.
         try expect(KeepAwake.guardScript().contains("'/usr/bin/sudo' -n '/usr/bin/pmset' -a disablesleep 0"))
+        try expectFalse(KeepAwake.guardScript().contains("sleepnow") || KeepAwake.guardScript().contains("ioreg"),
+            "The guard only releases its hold; it cannot turn a lid reading into a sleep request")
         // Process exit delivery must be able to run while this main-actor test
         // waits. Keep the original runner deadline and guard assertions.
         let syntax = try await Task.detached { try CommandRunner.run("/bin/sh", ["-n", "-c", KeepAwake.guardScript()]) }.value
@@ -316,16 +325,14 @@ extension ApprovalTests {
             try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: path(name))
             return path(name)
         }
-        let release = "-n \(pmset) -a disablesleep 0\n", sleep = "-n \(pmset) sleepnow\n"
+        let release = "-n \(pmset) -a disablesleep 0\n"
         let power = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t80%; charging; 1:00 remaining present: true\n"
         func onBattery(_ percent: Int) -> String { "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t\(percent)%; discharging; 0:40 remaining present: true\n" }
-        let closed = "      \"AppleClamshellCausesSleep\" = Yes\n      \"AppleClamshellState\" = Yes\n"
-        let open = "      \"AppleClamshellCausesSleep\" = Yes\n      \"AppleClamshellState\" = No\n"
         var watchers: [KeepAwakeGuard] = []
         defer { watchers.forEach { $0.stop() } }
 
-        // AutoApprove exits: the guard releases the hold and sleeps the closed Mac.
-        try write(power, battery); try write(closed, lid)
+        // AutoApprove exits: the guard releases only its hold.
+        try write(power, battery)
         let app = Process()
         app.executableURL = URL(fileURLWithPath: "/bin/sleep"); app.arguments = ["30"]
         try app.run()
@@ -338,11 +345,11 @@ extension ApprovalTests {
         app.terminate()
         try expect(try await waitUntil { !app.isRunning }, "The owned fixture app exits")
         try expect(try await waitUntil { !exitWatcher.isRunning() }, "The guard ends after releasing")
-        try expectEqual(logged(), release + sleep); try expectFalse(FileManager.default.fileExists(atPath: marker))
+        try expectEqual(logged(), release); try expectFalse(FileManager.default.fileExists(atPath: marker))
 
-        // The battery floor ends the hold while AutoApprove still runs; an open lid is not slept.
+        // The battery floor ends the hold while AutoApprove still runs.
         try FileManager.default.removeItem(atPath: log)
-        try write(open, lid); try write(onBattery(21), battery)
+        try write(onBattery(21), battery)
         marker = try hold("battery.hold")
         let batteryWatcher = try KeepAwake.launchGuard(script: script, marker: marker, floor: 20)
         watchers.append(batteryWatcher)
@@ -378,7 +385,8 @@ extension ApprovalTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let rule = try KeepAwake.rule(user: "lky")
-        try expect(rule.hasSuffix("\nlky ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset sleepnow\n"))
+        try expect(rule.hasSuffix("\nlky ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1\n"))
+        try expectFalse(rule.contains("sleepnow"), "New rules do not grant permission to put the Mac to sleep")
         for name in ["", "a b", "a,b", "a=b", "a'b", "-x", "root\nALL"] { try expectThrows(try KeepAwake.rule(user: name)) }
         // visudo checks the syntax as this user; nothing is installed.
         let file = directory.appendingPathComponent("rule").path

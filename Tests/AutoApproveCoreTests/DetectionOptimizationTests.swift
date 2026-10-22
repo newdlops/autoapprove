@@ -3,6 +3,26 @@ import CryptoKit
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testFingerprintKeepsRepairedCocoaAndChunkBoundaries() throws {
+        for count in [0,1,4095,4096,16380,16383,16384,16385,32767,65535] {
+            for ending: [UInt16] in [[0xd800],[0xdc00],[0xd800,0xd800,0xdc00],[0xdc00,0xd800],[0xd800,10,0xdc00],[0xd800,0xdc00],[0xffff,0xfffd,0,27]] {
+                let units = Array(repeating: UInt16(120), count: count) + ending + [13,10,0xac00]
+                let cocoa = units.withUnsafeBufferPointer { NSString(characters: $0.baseAddress!, length: $0.count) as String }
+                let native = String(decoding: units, as: UTF16.self)
+                for text in [native, cocoa] {
+                    let storage = text.isContiguousUTF8, bytes = Array(text.utf8)
+                    let original = SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
+                    try expectEqual(PromptDetector.fingerprint(text), original, "Saved identities use exact repaired UTF-8, without normalization")
+                    try expect(text.utf8.elementsEqual(bytes) && text.isContiguousUTF8 == storage)
+                }
+            }
+        }
+        let large = NSAppleEventDescriptor(string: String(repeating: "원문 e\u{301} 👩🏽‍💻\r\n", count: 65536)).stringValue!
+        try expect(!large.isContiguousUTF8)
+        let original = SHA256.hash(data: Data(large.utf8)).map { String(format: "%02x", $0) }.joined()
+        try expectEqual(PromptDetector.fingerprint(large), original)
+    }
+
     func testFingerprintEncodingKeepsExistingReceipts() throws {
         try expectEqual(PromptDetector.fingerprint(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         try expectEqual(PromptDetector.fingerprint("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")

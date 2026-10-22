@@ -5366,12 +5366,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if wanted { _ = await changeKeepAwake(at: now) { try await $0.hold(floor: floor) } }
                 else if owned { await keepAwakeSwitch.forget() }
             } else if owned {
-                // A closed lid would have slept the Mac had AutoApprove not held it, so it sleeps now.
-                let sleep = reading.lidClosed && reading.lidCausesSleep
                 if wanted { _ = await changeKeepAwake(at: now) { try await $0.keepWatching(floor: floor) } }
-                else if let failure = await changeKeepAwake(at: now, { try await $0.release(sleep: sleep) }) ?? nil {
-                    keepAwakeFailure = "덮개가 닫혀 있지만 잠자기를 실행하지 못했습니다. \(failure)"
-                }
+                else { _ = await changeKeepAwake(at: now) { try await $0.release() } }
             }
             reading = powerControl.read()
         }

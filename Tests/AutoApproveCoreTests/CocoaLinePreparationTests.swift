@@ -6,6 +6,58 @@ import AutoApproveCore
 #endif
 
 extension ApprovalTests {
+    func testLargeCocoaMenuKeepsNormalizedFenceSemantics() throws {
+        let history = String(repeating: "Completed synthetic step: retained original 한글 e\u{301} context and no input.\n", count: 1200)
+        for agent in [AgentKind.codex, .claude] {
+            let menu = "Which result?\n› 1. One\n2. Two\nEnter to select"
+            for opening in ["```", "```", "```\u{301}", "  ```", "x\u{301}```", "```"] {
+                let opens = opening.precomposedStringWithCanonicalMapping.hasPrefix("```")
+                for closed in [false, true] {
+                    let text = opening + "\n" + history + (closed ? "```\n" : "") + menu
+                    let cocoa = NSAppleEventDescriptor(string: text).stringValue!
+                    try expect(!cocoa.isContiguousUTF8)
+                    try expect((cocoa as NSString).length > 64 * 1024)
+                    let actual = QuestionDetector.detect(cocoa, agent: agent)
+                    if opens != closed { try expectNil(actual) }
+                    else { try expectEqual(actual?.phase, .input) }
+                    try expectNil(PromptDetector.detect(cocoa, agent: agent))
+                }
+            }
+        }
+    }
+
+    func testCocoaFusedTrailingBlanksKeepCurrentRequestsAndFenceContext() throws {
+        for agent in [AgentKind.codex, .claude] {
+            let heading = agent == .codex ? "Would you like to run the following command?" : "Do you want to proceed?"
+            for separator in ["\n", "\r", "\r\n"] {
+                let history = String(repeating: "old e\u{301} 한글 👩🏽‍💻" + separator, count: 450)
+                let permission = [heading, "$ echo fixture", "❯ 1. Yes", "  2. No", "Esc to cancel"].joined(separator: separator)
+                let menu = ["어느 환경을 쓸까요?", "❯ 1. 개발", "  2. 운영", "Enter to select"].joined(separator: separator)
+                for blankCount in [299,300,301,1500] {
+                    let trailing = separator + String(repeating: " \t\u{2000}\u{2001}" + separator, count: blankCount)
+                    for body in [permission,menu,"Working" + separator + "esc to interrupt"] {
+                        let cocoa = NSAppleEventDescriptor(string: history + body + trailing).stringValue!
+                        let bytes = Array(cocoa.utf8), storage = cocoa.isContiguousUTF8
+                        let native = String(decoding: bytes, as: UTF8.self)
+                        try expectEqual(PromptDetector.detect(cocoa, agent: agent), PromptDetector.detect(native, agent: agent))
+                        try expectEqual(QuestionDetector.detect(cocoa, agent: agent)?.phase, QuestionDetector.detect(native, agent: agent)?.phase)
+                        try expectEqual(TerminalChoiceQuestion.detect(cocoa, agent: agent), TerminalChoiceQuestion.detect(native, agent: agent))
+                        try expectEqual(ActivityDetector.detect(cocoa, agent: agent), ActivityDetector.detect(native, agent: agent))
+                        if body == permission { try expectNotNil(PromptDetector.detect(cocoa, agent: agent)) }
+                        if body == menu { try expectNotNil(TerminalChoiceQuestion.detect(cocoa, agent: agent)) }
+                        try expect(cocoa.utf8.elementsEqual(bytes) && cocoa.isContiguousUTF8 == storage)
+                        if body != permission && body != menu { continue }
+                        for fence in ["```text", "```text"] {
+                            let quoted = NSAppleEventDescriptor(string: fence + separator + history + body + trailing).stringValue!
+                            try expectNil(PromptDetector.detect(quoted, agent: agent))
+                            try expectNil(TerminalChoiceQuestion.detect(quoted, agent: agent))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testCocoaBoundedSuffixPreservesCurrentAndQuotedMenus() throws {
         for agent: AgentKind in [.codex, .claude] {
             let heading = agent == .codex ? "Would you like to run the following command?" : "Do you want to proceed?"

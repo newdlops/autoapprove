@@ -33,6 +33,33 @@ private final class ChoiceProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testTerminalChoicePreflightKeepsUnicodeSpacingAndTrailingBlankRows() throws {
+        for agent in [AgentKind.codex, .claude] {
+            for separator in ["\n", "\r\n", "\r"] {
+                for space in [" ", "\t", "\u{0085}", "\u{00a0}", "\u{2001}", "\u{202f}", "\u{3000}"] {
+                    let history = String(repeating: "Earlier e\u{301} output" + separator, count: 350)
+                    let menu = ["Which result?", "› 1." + space + "First", "  2." + space + "Second", "Enter to select"].joined(separator: separator)
+                    for count in [0, 301, 1500] {
+                        let text = history + menu + separator + String(repeating: " \t\u{2000}\u{2001}" + separator, count: count)
+                        let expected = TerminalChoiceQuestion.detect(text, agent: agent)
+                        try expectEqual(expected?.options, ["First", "Second"])
+                        try expectEqual(expected?.selected, 0)
+                        let cocoa = NSAppleEventDescriptor(string: text).stringValue!
+                        let bytes = Array(cocoa.utf8), storage = cocoa.isContiguousUTF8
+                        try expectEqual(TerminalChoiceQuestion.detect(cocoa, agent: agent), expected)
+                        try expect(cocoa.utf8.elementsEqual(bytes) && cocoa.isContiguousUTF8 == storage)
+                    }
+                }
+            }
+            let historical = choiceMenu + "\n" + String(repeating: "Ordinary output\n", count: 600) + "Working (esc to interrupt)"
+            try expectNil(TerminalChoiceQuestion.detect(historical, agent: agent))
+            try expectNil(TerminalChoiceQuestion.detect(NSAppleEventDescriptor(string: historical).stringValue!, agent: agent))
+        }
+        let notes = "Question 1/2 (1 unanswered)\n한국어 메모\ntab or esc to clear notes | enter to submit answer"
+        try expect(TerminalChoiceQuestion.hasCodexOverlay(notes), "Freeform overlays still block conversational input without numbered options")
+        try expectNil(TerminalChoiceQuestion.detect(notes, agent: .codex))
+    }
+
     func testTerminalChoiceDetectionAndBounds() throws {
         let question = try choiceValue(TerminalChoiceQuestion.detect(choiceMenu, agent: .codex))
         try expectEqual(question.question, "어떤 화면을 테스트할까요?")
