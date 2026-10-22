@@ -1,5 +1,15 @@
 # AutoApprove 작업 인계
 
+## 2026-10-22 · 0.2.170 유지 · 화면 분석과 상태 반영의 진단용 단계 계측
+
+- 직전 goal 턴은 반복 종료 후보의 실제Core 회귀를 확인해 복원하고, 문자열 생성 비용을 제외한16세션 변경 화면 비용을 구분한 **progress**였다. 전체 경량화 목표는active이며 설치·재시작 질문은 미응답이다.
+- 제품 `Sources/`와 canonical 임시 빌드는 이번 진단에서 변경하지 않았다. private `screen-stage-170-20261022/project/`에 정식170의 검증된233입력만 복사하고, **그 복사본에만** ScreenAnalysis 단계9개·worker/state publication/attention subscriber의 `CLOCK_THREAD_CPUTIME_ID` 계측을 넣었다. 고정 합성 문자열 생성은 시간에서 계속 제외한다. thread CPU는 동기 구간에서만 재며 포함 구간은 중첩되므로 단순 합산하지 않는다. 계측과 코드 생성 변화는 비용에 영향을 줄 수 있어 채택용 성능 결과가 아닌 원인 진단이다.
+- exec8589의 private clone 빌드110.920초·fixture연결4.072초·측정2.583초는 각각exit0이다. launcher가 새 분석을800회로 잘못 기대해 전체exit1이었고, 기존 fixture의16개 중4개 idle본문은variant를 쓰지 않는다는 원문을 확인했다. 새 분석은12×50=600회가 맞다. **완료한 측정은 다시 실행하지 않았다.** 별도 finish-review·exit0에서233원래입력·진단변경3개·95객체/C연결 객체·모듈·fixture와 원본JSON을 대조하고 분석프레임 **0/600/16**, 단계·idle확인·수동정책·입력0/audit0·소유cwd를 확인했다. 실패 로그와 원래800예상도 보존했다.
+- 진단 복사본의 변경50회(16세션·실제 새 분석600회)는 프로세스CPU488.524ms, ScreenAnalysis 스레드CPU359.952ms였다. permission151.143ms·activity138.251ms·question43.925ms·model13.844ms·activity-tail11.547ms였다. worker 포함369.359ms, state/publication 포함109.120ms, 그 안의attention subscriber2.580ms다. permission/activity는 이 진단 프로세스CPU의30.9%/28.3%, 상태포함22.3%, 그 안의알림0.53%다. 중첩값은 합산하지 않는다. 동일50회는 새 분석0·프로세스CPU32.829ms·state포함26.640ms였다. 큰동일20회는 새 분석16·CPU88.198ms이며 permission39.944ms가 포함됐다. **단일 계측 진단**이고 원래 비계측629.479ms와 비교해 개선율을 주장하지 않는다. 관련 raw/report/summary/provenance는 이root에 있다.
+- 기존 실패를 재확인했다.149의 Swift Regex 재사용은 실제Core4조건 CPU 기준 실패,165의footer slice/hint 재사용은Cocoa비변경CPU·최대RSS 실패라 그대로 다시 적용하지 않는다. 다음 후보는 비용이 큰 permission 경로의 **요청 식별자 공백 제거에서 전체ASCII를 UTF-8 바이트로 처리하고, Unicode/비연속저장소는 기존Character 필터로 돌아가는 방법**이다.147은 개별Character의ASCII공백만 빠르게 판별한 이미 배포된 변경이며, 이 전체문자열 경로와 구분한다. 아직 새 후보의 계획·바이트/저장소 oracle·구현·실제Core 비교를 수행하지 않았다. NFC·CRLF·combining·Unicode 공백·기존 request/receipt ID와 모든 원본 검증이 같아야 한다. 먼저147자료와 현재 비용 안에서 실제로 이 부분이 차지하는 시간을 좁히고, 새 가설/기준을 고정한 뒤 진행한다.
+- 이번 goal 턴은 진단을 실제로 구현·검증해 권한/활동 판별과 상태/알림 비용을 구분한 **progress**다. 전체 경량화 목표는active이며 현재 소유 작업은 모두 종료했다. 제품 Sources/버전/설치/게시에는 변경이 없고 원본 터미널·권한/전원/보안/VPN 조작은0이다. 이미 끝난 진단·이전 비교·170게시/설치를 다시 실행하지 않는다.
+- 진단본은 **절대 패키징/설치하지 않는다**. canonical/tmp 빌드는 여전히 앞선 미채택 Native 루프 객체를 포함하므로 모듈8abc…만으로 정식170으로 간주하지 않는다. 원래170 baseline은 `ancestry-stop-171-20261022/baseline-build`다. 이번 private clone은 별도 경로여서 그 객체와 제품 작업트리는 유지한다. 끝난 이전 비교·복원·170게시·설치를 재실행하지 않는다.
+
 ## 2026-10-22 · 0.2.170 유지 · 반복 종료 후보 미채택·변경 화면 비용 진단
 
 - 직전 goal 턴은170 원본 검증/탐색 인덱스 채택과448검사·GitHub 배포/다운로드 검증을 마친 **progress**다. 전체 경량화 목표는active다. 설치·재시작 허용 질문은 여전히 미응답이며 현재 설치본168/195와 시스템·전원·보안/VPN·원본 터미널은 건드리지 않는다.
