@@ -27,6 +27,11 @@ final class DetectionLines {
 
     var raw: [String] {
         if let rawRows { return rawRows }
+        if screen.isContiguousUTF8, let reused = completeNativeSuffixRows() {
+            rawRows = reused
+            cachedSourceByteCount = screen.utf8.count
+            return reused
+        }
         if let prepared = screen.utf8.withContiguousStorageIfAvailable({ bytes in
             (PromptDetector.normalizedLines(screen), bytes.count)
         }) {
@@ -38,6 +43,14 @@ final class DetectionLines {
         rawRows = prepared.lines
         cachedSourceByteCount = prepared.byteCount
         return prepared.lines
+    }
+
+    // Keep optional suffix metadata and its ARC work out of the common
+    // foreign getter. A complete native scan owns the exact full row array.
+    @inline(never)
+    private func completeNativeSuffixRows() -> [String]? {
+        guard let suffix300, suffix300.rows.isEmpty || suffix300.byteStarts?.first == 0 else { return nil }
+        return suffix300.rows
     }
 
     var trimmed: [String] {

@@ -618,6 +618,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Detection optimization preserves exact persisted fingerprints and raw Unicode bytes", tests.testFingerprintEncodingKeepsExistingReceipts),
             ("Fingerprint preparation preserves repaired Cocoa and raw chunk boundaries", tests.testFingerprintKeepsRepairedCocoaAndChunkBoundaries),
             ("Request identity preserves Character whitespace, original reservations and exact dialog bytes", tests.testRequestIdentityKeepsCharacterWhitespaceAndExactDialog),
+            ("Complete suffix reuse: exact permission history and300-row boundaries", tests.testCompleteSuffixReuseKeepsExactPermissionBoundaries),
             ("Cocoa normalization: Unicode boundaries preserve current dialogs and quoted permissions", tests.testCocoaNormalizationRetainsUnicodeBoundariesAndCurrentDialogs),
             ("Detection optimization preserves Unicode option spacing and ordinary-output rejection", tests.testOptionPrecheckKeepsUnicodeMenusAndRejectsOrdinaryOutput),
             ("Repeated screens retain time, generation, changed requests and ended-process checks", tests.testRepeatedScreensPreserveTimeGenerationAndChangedRequests),

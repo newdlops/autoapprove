@@ -3,6 +3,37 @@ import CryptoKit
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testCompleteSuffixReuseKeepsExactPermissionBoundaries() throws {
+        for agent in [AgentKind.codex, .claude] {
+            for count in [0,1,292,293,294,295,296,297,298,299,300,301,384,4096] {
+                for payload in ["fixture ASCII", "e\u{301} 한글 👩🏽‍💻 \\\"\\u{4}\\\""] {
+                    let history = String(repeating: "Old normalized row: " + payload + "\r\n", count: count)
+                    let heading = agent == .codex ? "Would you like to run the following command?" : "Do you want to proceed?"
+                    let context = heading + "\n  $ echo " + payload
+                    let body = context + "\n› 1. Yes\n  2. No\nEsc to cancel"
+                    let raw = history + body
+                    for text in [raw, NSAppleEventDescriptor(string: raw).stringValue!] {
+                        let bytes = Array(text.utf8), storage = text.isContiguousUTF8
+                        guard let prompt = PromptDetector.detect(text, agent: agent) else {
+                            throw AppError.message("Missing original permission at the complete-suffix boundary")
+                        }
+                        let expectedDialog = PromptDetector.normalizedLines(agent == .codex ? body : text).joined(separator: "\n")
+                        let expectedContext = PromptDetector.normalizedLines(agent == .codex ? context : history + context).joined(separator: "\n")
+                        try expect(prompt.dialog.utf8.elementsEqual(expectedDialog.utf8), "Keep the complete original dialog and earlier Claude history")
+                        try expectEqual(prompt.requestIdentity, PromptDetector.fingerprint(expectedContext.filter { !$0.isWhitespace }))
+                        try expectEqual(prompt.fingerprint, PromptDetector.fingerprint(text))
+                        try expectEqual(prompt.hasRequestBoundary, agent == .codex)
+                        try expectEqual(prompt.answer, "1")
+                        try expect(text.utf8.elementsEqual(bytes) && text.isContiguousUTF8 == storage)
+                    }
+                    for fence in ["```\n", "  ```\n", "\u{1fef}\u{1fef}\u{1fef}\n"] {
+                        try expect(PromptDetector.detect(fence + raw, agent: agent) == nil, "An earlier open fence is preserved across300 rows")
+                    }
+                }
+            }
+        }
+    }
+
     func testFingerprintKeepsRepairedCocoaAndChunkBoundaries() throws {
         for count in [0,1,4095,4096,16380,16383,16384,16385,32767,65535] {
             for ending: [UInt16] in [[0xd800],[0xdc00],[0xd800,0xd800,0xdc00],[0xdc00,0xd800],[0xd800,10,0xdc00],[0xd800,0xdc00],[0xffff,0xfffd,0,27]] {
