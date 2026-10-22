@@ -85,6 +85,33 @@ private func safetyHook(_ date: Date, event: String = "PermissionRequest", comma
 }
 
 extension ApprovalTests {
+    func testSystemRiskByteCompactionKeepsControlPathsAndLateCandidates() throws {
+        let whitespace: Set<UInt8> = [9, 10, 11, 12, 13, 32]
+        for byte in UInt8(0)..<128 {
+            let separator = String(decoding: [byte], as: UTF8.self)
+            let text = "cp fixture ~/Library/Lau" + separator + "nchAgents/com.fixture.plist"
+            let expected: SystemCommandRisk.Kind? = whitespace.contains(byte) ? .persistence : nil
+            for source in [text, NSAppleEventDescriptor(string: text).stringValue!] {
+                let original = Array(source.utf8), storage = source.isContiguousUTF8
+                try expectEqual(SystemCommandRisk.detect(source)?.kind, expected, "Preserve control byte \(byte) in a startup path")
+                try expect(source.utf8.elementsEqual(original) && source.isContiguousUTF8 == storage)
+            }
+        }
+        let history = String(repeating: "Completed ordinary local project checks.\n", count: 160)
+        for prefix in ["", history, "한글 e\u{301} 👩🏽‍💻\n" + history] {
+            for source in [prefix + "\nsudo id", NSAppleEventDescriptor(string: prefix + "\nsudo id").stringValue!] {
+                try expectEqual(SystemCommandRisk.detect(source)?.kind, .privileged, "Preserve candidates after a long history")
+            }
+            try expectNil(SystemCommandRisk.detect(prefix + "\nnpm test"))
+        }
+        try expectEqual(SystemCommandRisk.detect("sudo")?.kind, .privileged)
+        try expectNil(SystemCommandRisk.detect(String(repeating: "fixture", count: 1024)))
+        try expectNil(SystemCommandRisk.detect(String(repeating: " \t\r\n\u{000b}\u{000c}", count: 1024)))
+        for command in ["ſudo id", "syﬆemctl start fixture", "cp fixture ~/Library/LaunchA\ngents/a.plist"] {
+            try expectNotNil(SystemCommandRisk.detect(command), "Preserve Unicode and wrapped candidates")
+        }
+    }
+
     func testSystemRiskCandidateSearchPreservesCaseFoldingAndUnicodeBarriers() throws {
         for command in ["sudo id", "SUDO id", "ſudo id", "syﬆemctl start fixture", "SyStemCtl start fixture",
             "한글 e\u{301} 👩🏽‍💻\nsudo id", "cp fixture ~/Library/LaunchA\ngents/a.plist",

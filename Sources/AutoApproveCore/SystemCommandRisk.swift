@@ -132,7 +132,25 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
     /// ASCII's six whitespace characters avoid a Unicode property lookup.
     /// Multi-scalar Characters, including CRLF, retain Character.isWhitespace.
     private static func removingWhitespace(_ text: String) -> String {
-        text.filter {
+        let compactASCII = text.utf8.withContiguousStorageIfAvailable { bytes -> String? in
+            var count = 0
+            for byte in bytes {
+                guard byte < 128 else { return nil }
+                if byte != 32 && (byte < 9 || byte > 13) { count += 1 }
+            }
+            if count == 0 { return "" }
+            if count == bytes.count { return text }
+            return String(unsafeUninitializedCapacity: count) { output in
+                var written = 0
+                for byte in bytes where byte != 32 && (byte < 9 || byte > 13) {
+                    output[written] = byte
+                    written += 1
+                }
+                return written
+            }
+        } ?? nil
+        if let compactASCII { return compactASCII }
+        return text.filter {
             if let ascii = $0.asciiValue { return ascii != 32 && (ascii < 9 || ascii > 13) }
             return !$0.isWhitespace
         }
