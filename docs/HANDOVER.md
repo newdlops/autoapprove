@@ -1,5 +1,15 @@
 # AutoApprove 작업 인계
 
+## 2026-10-23 · 0.2.175 유지 · 두 문자열 처리 후보 미채택
+
+- 이번 goal 작업은 두 후보의 실제 비교·독립 원자료 검토·미채택·정식 복원을 마친 progress이며 전체 경량화 목표는 active다. main의 제품 버전과 최신 정식 태그는175이고176으로 올리지 않았다. 덮개 설정과 앱 업데이트/재시작의 예외 허용 질문은 미응답이며 goal 이어가기를 승인으로 해석하지 않는다.
+- 정식175 소유 합성 worker의 mixed native/Cocoa 두3초/10ms 표본은 report.json·summary.json에 보존했다. 표본의 inclusive node 합계는 중첩되므로 exclusive CPU나 개선율이 아니다. 다음에는 행별 NFC의 String↔NSString 변환 비용을 더 좁힌다. bulk/global NFC169·trim 배열 공유174·과거 foreign tail·Swift Regex/NSRegularExpression 직접 대체를 재적용하지 않는다.
+- empty-composer-176-20261023: 빈 composer의2정규식 생략은2,972개 exact digest와각576개 경로·관련79검사를 통과했다. 새16프로세스/512구간에서변경 CPU0.999477/0.996518/0.991643/1.002832배,17기준중7실패로제외했다. planSHA4d6f8d7a7dba824eb21fd22ab04cb61f0b0e50b677c455a8442f8e0012f549d1·protocolSHAadf6f6d31208daf59bf5f48b281280b2dfac3a3f521765c77a8ba39ec96a3f36다.
+- suffix-blank-scan-176-20261023: 첫 내용 행 이후불필요blank trim만생략했다. scalar1,112,064·storage2,253·허가1,920/감지768·checksum16066818104591319445·관련79검사가통과했다. 새16프로세스/512구간의native변경 CPU0.976671/0.984273배가고정0.97기준2개에실패해제외했다. planSHA0e43199f762ad6931a9d83c64f3c0f78eaa98702f1ef392616cced5e3febf1a9·protocolSHA7aa6d0341ab02fe86936efea64c37f8f951ae08d4505f8a6bb7218e63930a6aa다.
+- 두 비교는모든측정을마쳤고runner는기준실패로exit1,32개합성worker는exit0이었다. review는32개작업로그/1,024구간과17기준을재계산했다. 모든표본보존·시간재사용/기준완화없음이다. candidate-sources·rejected-build·baseline-sources·정합성·비교·review·restoration.json을남겼다. 이미끝난실험을다시시작하지않는다. 상세8행/두RSS는VALIDATION에있다.
+- 두제품소스를원복하고canonical /private/tmp/autoapprove-discovery-worktree-20261020/.build/release를정식175로새빌드복원했다. **407입력·94Core·모듈dd0f54a10d4a7558063dffcf0043e90b7e08defe9076be60ac73ce3c46093d0a는정식175와바이트동일**하다. 최초4실행파일전체해시동일조건은App/CLI/checks재연결3개때문에실패했고기록을보존했다. App/CLI의38/38코드구간·UUID외runtime/loader/globals가같으며복원검사10/10이통과했다. 실행파일전체동일을주장하지않고새4해시를restored-build.json에남긴다. 복원job은exit0이고소유실행작업은모두종료다. 추가전체451검사/175게시/설치는없다.
+- 설치앱·원본입력/조회/캡처/크기/초기화/재시작/잠금해제·실제전원·자동실행/별도서비스·관리자/시스템/보안/TCC/VPN과UI를변경하지않았다. 현재미커밋IDE/인덱스·activity-footer fixture와기존진단파일은그대로보존한다. 다음후보는새정합성/성능계획으로검증하며채택/버전증가시GitHub패키지배포와익명다운로드까지완료한다.
+
 ## 2026-10-23 · 0.2.175 / 202 배포 완료 · Cocoa 판별 채택
 
 - 직전 goal 턴은174/201 게시·태그/자산/익명 다운로드 검증을 마친progress다. 이번도Cocoa 구현·정합성·실제Core 비교·채택·최종451검사/패키지검증을 마친progress이며 전체 목표는active다. 설치·재시작 질문은 여전히미응답이며 goal 지시를 승인으로 해석하지 않는다.
