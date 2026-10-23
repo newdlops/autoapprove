@@ -20,7 +20,14 @@ final class DetectionLines {
 
     var sourceByteCount: Int {
         if let cachedSourceByteCount { return cachedSourceByteCount }
-        let count = screen.utf8.count
+        let count: Int
+        if screen.isContiguousUTF8 { count = screen.utf8.count }
+        else {
+            // Exact non-external UTF-8 length, without building normalized rows.
+            // An unconvertible NSString keeps Swift's original repair behavior.
+            let encoded = (screen as NSString).lengthOfBytes(using: String.Encoding.utf8.rawValue)
+            count = encoded > 0 ? encoded : screen.utf8.count
+        }
         cachedSourceByteCount = count
         return count
     }
@@ -112,7 +119,7 @@ final class DetectionLines {
     /// neither necessary row occurs in the same bounded window as the detectors.
     func mayContainInteractiveRows(agent: AgentKind) -> Bool {
         guard agent != .shell else { return false }
-        guard screen.isContiguousUTF8 else { return true }
+        guard screen.isContiguousUTF8 else { return mayContainCocoaInteractiveRows(agent: agent) }
         return screen.utf8.withContiguousStorageIfAvailable { bytes in
             var end = bytes.count, count = 0, skippingTrailingBlanks = true
             while count < 300 {
@@ -132,6 +139,66 @@ final class DetectionLines {
     }
 
     private enum InteractiveRow: Equatable { case blank, ordinary, possible }
+
+    /// Foreign strings keep their original UTF-16 storage. One aligned buffer
+    /// supports backward row scans and forward prefix checks without per-unit
+    /// Objective-C messages or a full UTF-8 copy.
+    private func mayContainCocoaInteractiveRows(agent: AgentKind) -> Bool {
+        let source = screen as NSString, length = source.length
+        guard length > 0 else { return false }
+        let codex = agent == .codex
+        return withUnsafeTemporaryAllocation(of: UInt16.self, capacity: min(4096, length)) { buffer in
+            var loadedStart = -1, loadedEnd = -1
+            func unit(_ position: Int) -> UInt16 {
+                if position < loadedStart || position >= loadedEnd {
+                    loadedStart = position / buffer.count * buffer.count
+                    loadedEnd = min(length, loadedStart + buffer.count)
+                    source.getCharacters(buffer.baseAddress!, range: NSRange(location: loadedStart, length: loadedEnd - loadedStart))
+                }
+                return buffer[position - loadedStart]
+            }
+            func row(_ start: Int, _ end: Int) -> InteractiveRow {
+                var index = start
+                while index < end, unit(index) == 32 || unit(index) == 9 { index += 1 }
+                guard index < end else { return .blank }
+                let first = unit(index)
+                if first >= 33, first < 127 {
+                    if codex, first == 81 { return .possible }
+                    if first != 62 { return .ordinary }
+                    index += 1
+                    while index < end, unit(index) == 32 || unit(index) == 9 { index += 1 }
+                    guard index < end else { return .ordinary }
+                    let next = unit(index)
+                    if next >= 49, next <= 57 { return .possible }
+                    if next >= 33, next < 127 { return .ordinary }
+                }
+                // Scalar slicing preserves the normalizer's repaired UTF-16
+                // behavior; row boundaries never split a valid surrogate pair.
+                let scalars = screen.unicodeScalars
+                let from = String.Index(utf16Offset: start, in: screen)
+                let to = String.Index(utf16Offset: end, in: screen)
+                let value = String(scalars[from..<to])
+                if value.trimmingCharacters(in: .whitespaces).isEmpty { return .blank }
+                let line = value.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespaces)
+                if codex, line.hasPrefix("Question") { return .possible }
+                return line.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) == nil ? .ordinary : .possible
+            }
+            var end = length, count = 0, skippingTrailingBlanks = true
+            while count < 300 {
+                var start = end
+                while start > 0, unit(start - 1) != 10, unit(start - 1) != 13 { start -= 1 }
+                let value = row(start, end)
+                if value == .possible { return true }
+                if value != .blank { skippingTrailingBlanks = false }
+                if !skippingTrailingBlanks { count += 1 }
+                guard start > 0 else { break }
+                let delimiter = start - 1
+                end = unit(delimiter) == 10 && delimiter > 0 && unit(delimiter - 1) == 13
+                    ? delimiter - 1 : delimiter
+            }
+            return false
+        }
+    }
 
     private static func interactiveRow(_ bytes: UnsafeBufferPointer<UInt8>, start: Int, end: Int, codex: Bool) -> InteractiveRow {
         var index = start
