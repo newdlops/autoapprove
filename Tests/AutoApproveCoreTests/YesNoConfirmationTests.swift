@@ -9,6 +9,31 @@ private func startInput(_ question: String = startQuestion, labels: [String] = [
 }
 
 extension ApprovalTests {
+    func testPermissionCleanupKeepsASCIIHintOrderAndTaskRejection() throws {
+        let cases: [([String], String)] = [
+            (["Yes", "No"], "Yes"), (["Allow", "Cancel"], "Allow"),
+            (["Yes (y).", "No"], "Yes (y)."), (["Allow [a]!", "Deny"], "Allow [a]!"),
+            (["!Yes!", "No"], "!Yes!"), (["Yes  (recommended) [y]", "No"], "Yes  (recommended) [y]"),
+            ([" Allow\tthis request only\n", "Cancel"], " Allow\tthis request only\n"),
+            (["Allow", "Allow for this session", "Always allow", "Cancel"], "Allow"),
+            (["Allow for this session", "Deny"], "Allow for this session")
+        ]
+        for (labels, expected) in cases {
+            for values in [labels, labels.map { NSAppleEventDescriptor(string: $0).stringValue! }] {
+                let bytes = values.map { Array($0.utf8) }, storage = values.map { $0.isContiguousUTF8 }
+                try expectEqual(YesNoConfirmation.detect(startInput(labels: values))?.answer, expected)
+                for index in values.indices {
+                    try expect(values[index].utf8.elementsEqual(bytes[index]) && values[index].isContiguousUTF8 == storage[index])
+                }
+            }
+        }
+        for labels in [["Yes [y].", "Yes", "No"], ["Yes, use staging", "No, use production"],
+                       ["Always allow", "No"], ["Allow", "Other project", "Deny"], ["Allow preview", "Allow production", "Cancel"]] {
+            try expect(YesNoConfirmation.detect(startInput(labels: labels)) == nil, "Cleanup cannot select a task or permanent permission")
+        }
+    }
+
+
     func testKoreanPermissionLabels() throws {
         let cases: [([String], Int)] = [
             (["허용", "항상 허용", "거부"], 0),

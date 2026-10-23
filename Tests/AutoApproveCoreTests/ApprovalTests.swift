@@ -780,6 +780,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Loopback server avoids LAN advertisements, discovery and saved-peer mutations", tests.testLoopbackServerDoesNotDiscoverAdvertiseOrRewritePeers),
             ("varied yes/no questions, exact labels and ambiguous alternatives", tests.testYesNoConfirmationSelection),
             ("confirmation menus never choose tasks or multiple answers", tests.testConfirmationMenusNeverChooseTasksOrMultipleAnswers),
+            ("Permission cleanup: ASCII identities preserve hint order and task rejection", tests.testPermissionCleanupKeepsASCIIHintOrderAndTaskRejection),
             ("Allow, Deny and Don't allow labels preserve one-time scope", tests.testAllowConfirmationLabels),
             ("Current model: only an explicit unique existing model is retained", tests.testCurrentModelQuestionPolicy),
             ("Current model: Claude hooks retain opt-in, pause, exact answer and audit", tests.testCurrentModelHookPreservesOptInPauseAndAudit),

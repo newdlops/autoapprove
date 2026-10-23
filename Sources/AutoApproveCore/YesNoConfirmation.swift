@@ -50,7 +50,23 @@ public struct YesNoConfirmation {
         return text.range(of: #"(?i)^no\s*[,，:：—–-]\s*and tell (?:codex|claude|the agent) what to do differently$"#, options: .regularExpression) != nil
     }
 
+    private static func isUnchangedASCII(_ value: String) -> Bool {
+        value.utf8.withContiguousStorageIfAvailable { bytes in
+            guard let first = bytes.first, let last = bytes.last else { return true }
+            guard first != 32, first != 33, first != 46,
+                  last != 32, last != 33, last != 46 else { return false }
+            var previousSpace = false
+            for byte in bytes {
+                guard byte >= 32, byte < 127, byte != 40, byte != 91 else { return false }
+                if byte == 32 && previousSpace { return false }
+                previousSpace = byte == 32
+            }
+            return true
+        } ?? false
+    }
+
     private static func cleaned(_ value: String) -> String {
+        if isUnchangedASCII(value) { return value }
         let hint = #"(?:추천|권장|recommended|[a-z]|esc|shift\s*\+\s*tab)"#
         return value.precomposedStringWithCanonicalMapping
             .replacingOccurrences(of: #"[‘’ʼ]"#, with: "'", options: .regularExpression)
