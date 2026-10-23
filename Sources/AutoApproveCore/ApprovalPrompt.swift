@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreFoundation
 
 public struct ApprovalPrompt: Equatable, Sendable {
     public var summary: String
@@ -129,6 +130,21 @@ public enum PromptDetector {
             func appendRow(endingAt end: Int) {
                 let range = NSRange(location: rowStart, length: end - rowStart)
                 guard range.length > 0 else { lines.append(""); return }
+                if !rowASCII, !invalid {
+                    if rowStart >= offset, end <= offset + buffer.count,
+                       let normalized = CFStringCreateMutable(kCFAllocatorDefault, 0) {
+                        // Copy a complete row from the loaded chunk into owned
+                        // storage before this scratch buffer is reused.
+                        CFStringAppendCharacters(normalized, buffer.baseAddress!.advanced(by: rowStart - offset), range.length)
+                        CFStringNormalize(normalized, .C)
+                        lines.append(normalized as String)
+                    } else {
+                        // Rows crossing chunks retain their original Cocoa
+                        // storage until the same per-row NFC operation.
+                        lines.append(source.substring(with: range).precomposedStringWithCanonicalMapping)
+                    }
+                    return
+                }
                 var encoded = false
                 var line = ""
                 if !invalid {
