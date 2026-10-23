@@ -92,6 +92,11 @@ final class DetectionLines {
         return normalizedSuffix(count).rows.map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
+    func nativeCodexDialog() -> PromptDetector.NativeCodexDialog? {
+        guard screen.isContiguousUTF8 else { return nil }
+        return screen.utf8.withContiguousStorageIfAvailable { PromptDetector.nativeCodexDialog($0) }
+    }
+
     /// Whether an unmatched code fence occurs before a row of a bounded suffix.
     /// This is called only after a possible menu/overlay was detected.
     func hasOpenCodeFence(beforeSuffixRow row: Int, in suffix: DetectionLineSuffix) -> Bool {

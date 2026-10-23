@@ -32,10 +32,21 @@ public enum PromptDetector {
     static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines) -> ApprovalPrompt? {
         guard agent != .shell else { return nil }
         // A permission heading is only accepted within the final 300 rows.
-        // Search that bounded suffix first so normal build output never creates
-        // normalized String rows for its entire scrollback.
-        guard permissionHeading(prepared, agent: agent) != nil else { return nil }
-        let rawLines = prepared.raw, lines = prepared.trimmed
+        // Codex validates only the dialog after its heading. Earlier rows are
+        // needed for code-fence parity, not for its command or request identity.
+        let rawLines: [String], lines: [String]
+        if agent == .codex, let native = prepared.nativeCodexDialog() {
+            switch native {
+            case .absent: return nil
+            case .rows(let rows):
+                rawLines = rows
+                lines = rows.map { $0.trimmingCharacters(in: .whitespaces) }
+            }
+        } else {
+            guard permissionHeading(prepared, agent: agent) != nil else { return nil }
+            rawLines = prepared.raw
+            lines = prepared.trimmed
+        }
         guard let heading = permissionHeading(lines, agent: agent) else { return nil }
         let promptIndex = heading.index
         // A long command can push its title beyond the old 32-line window.
@@ -217,10 +228,87 @@ public enum PromptDetector {
         return permissionHeading(count: suffix.rows.count, lineAt: { suffix.rows[$0] }, agent: agent)
     }
 
+    enum NativeCodexDialog {
+        case absent
+        case rows([String])
+    }
+
+    /// A known ASCII initial is only a negative filter. Controls, Unicode
+    /// spacing and possible canonical compositions use the original operation.
+    static func nativeASCIIRowInitial(_ bytes: UnsafeBufferPointer<UInt8>, start: Int, end: Int) -> UInt8? {
+        var index = start
+        while index < end, bytes[index] == 32 || bytes[index] == 9 { index += 1 }
+        guard index < end else { return 0 }
+        let first = bytes[index]
+        return first >= 33 && first < 127 ? first : nil
+    }
+
+    private static func nativeNormalizedRow(_ bytes: UnsafeBufferPointer<UInt8>, range: Range<Int>) -> String {
+        let row = bytes[range]
+        let value = String(decoding: row, as: UTF8.self)
+        return row.allSatisfy { $0 < 0x80 } ? value : value.precomposedStringWithCanonicalMapping
+    }
+
+    /// Unlike the untrimmed fence check for questions, permission dialogs count
+    /// normalized, whitespace-trimmed fences in all preceding transcript rows.
+    static func nativeCodexPrefixHasOpenFence(_ bytes: UnsafeBufferPointer<UInt8>, before end: Int) -> Bool {
+        var index = 0, start = 0, open = false
+        let limit = min(end, bytes.count)
+        func isFence(_ end: Int) -> Bool {
+            if let initial = nativeASCIIRowInitial(bytes, start: start, end: end), initial != 96 { return false }
+            return nativeNormalizedRow(bytes, range: start..<end)
+                .trimmingCharacters(in: .whitespaces).hasPrefix("```")
+        }
+        while index < limit {
+            let byte = bytes[index]
+            guard byte == 10 || byte == 13 else { index += 1; continue }
+            if isFence(index) { open.toggle() }
+            if byte == 13, index + 1 < limit, bytes[index + 1] == 10 { index += 1 }
+            index += 1
+            start = index
+        }
+        if start < limit, isFence(limit) { open.toggle() }
+        return open
+    }
+
+    static func nativeCodexDialog(_ bytes: UnsafeBufferPointer<UInt8>) -> NativeCodexDialog {
+        var end = bytes.count, spans: [Range<Int>] = []
+        spans.reserveCapacity(300)
+        var skippingTrailingBlanks = true
+        while spans.count < 300 {
+            var start = end
+            while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
+            if skippingTrailingBlanks {
+                let value = String(decoding: bytes[start..<end], as: UTF8.self)
+                skippingTrailingBlanks = value.trimmingCharacters(in: .whitespaces).isEmpty
+            }
+            if !skippingTrailingBlanks { spans.append(start..<end) }
+            guard start > 0 else { break }
+            let delimiter = start - 1
+            end = bytes[delimiter] == 10 && delimiter > 0 && bytes[delimiter - 1] == 13
+                ? delimiter - 1 : delimiter
+        }
+        spans.reverse()
+        var normalized = [String?](repeating: nil, count: spans.count)
+        func row(_ index: Int) -> String {
+            if let value = normalized[index] { return value }
+            let value = nativeNormalizedRow(bytes, range: spans[index])
+            normalized[index] = value
+            return value
+        }
+        let heading = permissionHeading(count: spans.count, lineAt: row, agent: .codex, mayStart: { index in
+            guard let initial = nativeASCIIRowInitial(bytes, start: spans[index].lowerBound, end: spans[index].upperBound) else { return true }
+            return initial == 65 || initial == 87 // Allow / Approve / Would
+        })
+        guard let heading, !nativeCodexPrefixHasOpenFence(bytes, before: spans[heading.index].lowerBound) else { return .absent }
+        return .rows((heading.index..<spans.count).map(row))
+    }
+
     private static func permissionHeading(count: Int, lineAt: (Int) -> String,
-                                          agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
+                                          agent: AgentKind, mayStart: ((Int) -> Bool)? = nil) -> (index: Int, end: Int, marker: String)? {
         let headings = agent == .codex ? codexHeadings : claudeHeadings
         for index in (0..<count).reversed() {
+            if let mayStart, !mayStart(index) { continue }
             let first = lineAt(index).trimmingCharacters(in: .whitespaces)
             // Ordinary output and menu rows cannot start one of the ASCII headings.
             // Reject them before regex checks or rebuilding every marker for every row.
