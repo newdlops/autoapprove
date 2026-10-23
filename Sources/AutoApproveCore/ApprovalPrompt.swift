@@ -243,7 +243,7 @@ public enum PromptDetector {
         return first >= 33 && first < 127 ? first : nil
     }
 
-    private static func nativeNormalizedRow(_ bytes: UnsafeBufferPointer<UInt8>, range: Range<Int>) -> String {
+    static func nativeNormalizedRow(_ bytes: UnsafeBufferPointer<UInt8>, range: Range<Int>) -> String {
         let row = bytes[range]
         let value = String(decoding: row, as: UTF8.self)
         return row.allSatisfy { $0 < 0x80 } ? value : value.precomposedStringWithCanonicalMapping
@@ -272,23 +272,7 @@ public enum PromptDetector {
     }
 
     static func nativeCodexDialog(_ bytes: UnsafeBufferPointer<UInt8>) -> NativeCodexDialog {
-        var end = bytes.count, spans: [Range<Int>] = []
-        spans.reserveCapacity(300)
-        var skippingTrailingBlanks = true
-        while spans.count < 300 {
-            var start = end
-            while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
-            if skippingTrailingBlanks {
-                let value = String(decoding: bytes[start..<end], as: UTF8.self)
-                skippingTrailingBlanks = value.trimmingCharacters(in: .whitespaces).isEmpty
-            }
-            if !skippingTrailingBlanks { spans.append(start..<end) }
-            guard start > 0 else { break }
-            let delimiter = start - 1
-            end = bytes[delimiter] == 10 && delimiter > 0 && bytes[delimiter - 1] == 13
-                ? delimiter - 1 : delimiter
-        }
-        spans.reverse()
+        let spans = DetectionLines.nativeSuffixRanges(bytes)
         var normalized = [String?](repeating: nil, count: spans.count)
         func row(_ index: Int) -> String {
             if let value = normalized[index] { return value }
@@ -304,7 +288,7 @@ public enum PromptDetector {
         return .rows((heading.index..<spans.count).map(row))
     }
 
-    private static func permissionHeading(count: Int, lineAt: (Int) -> String,
+    static func permissionHeading(count: Int, lineAt: (Int) -> String,
                                           agent: AgentKind, mayStart: ((Int) -> Bool)? = nil) -> (index: Int, end: Int, marker: String)? {
         let headings = agent == .codex ? codexHeadings : claudeHeadings
         for index in (0..<count).reversed() {

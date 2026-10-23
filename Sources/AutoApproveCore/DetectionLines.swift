@@ -97,6 +97,35 @@ final class DetectionLines {
         return screen.utf8.withContiguousStorageIfAvailable { PromptDetector.nativeCodexDialog($0) }
     }
 
+    func nativeCodexQuestion() -> QuestionDetector.NativeCodexQuestion? {
+        // Reuse rows another detector has already materialized.
+        guard rawRows == nil, suffix300 == nil, screen.isContiguousUTF8 else { return nil }
+        return screen.utf8.withContiguousStorageIfAvailable { QuestionDetector.detectNativeCodex($0) }
+    }
+
+    /// Retained raw row boundaries for synchronous native menu detection.
+    /// No pointer or normalized row survives the caller's borrowed-byte scope.
+    static func nativeSuffixRanges(_ bytes: UnsafeBufferPointer<UInt8>) -> [Range<Int>] {
+        var end = bytes.count, spans: [Range<Int>] = []
+        spans.reserveCapacity(300)
+        var skippingTrailingBlanks = true
+        while spans.count < 300 {
+            var start = end
+            while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
+            if skippingTrailingBlanks {
+                let value = String(decoding: bytes[start..<end], as: UTF8.self)
+                skippingTrailingBlanks = value.trimmingCharacters(in: .whitespaces).isEmpty
+            }
+            if !skippingTrailingBlanks { spans.append(start..<end) }
+            guard start > 0 else { break }
+            let delimiter = start - 1
+            end = bytes[delimiter] == 10 && delimiter > 0 && bytes[delimiter - 1] == 13
+                ? delimiter - 1 : delimiter
+        }
+        spans.reverse()
+        return spans
+    }
+
     /// Whether an unmatched code fence occurs before a row of a bounded suffix.
     /// This is called only after a possible menu/overlay was detected.
     func hasOpenCodeFence(beforeSuffixRow row: Int, in suffix: DetectionLineSuffix) -> Bool {
@@ -253,7 +282,7 @@ final class DetectionLines {
         return DetectionLineSuffix(rows: Array(reversedRows.reversed()), byteStarts: Array(reversedStarts.reversed()), normalizedLineOffset: 0)
     }
 
-    private static func codeFenceParity(_ bytes: UnsafeBufferPointer<UInt8>, before end: Int) -> Bool {
+    static func codeFenceParity(_ bytes: UnsafeBufferPointer<UInt8>, before end: Int) -> Bool {
         var index = 0, lineStart = 0, count = 0
         let limit = min(end, bytes.count)
         while index < limit {
