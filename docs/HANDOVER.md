@@ -1,5 +1,15 @@
 # AutoApprove 작업 인계
 
+## 2026-10-23 · 0.2.176 유지 · native 행 변환 후보 미채택·BOM 의미 차이
+
+- 직전goal턴은176/203 게시/다운로드까지완료한progress다. 이번도새샘플·UTF8의미차이진단·실제Core후보의정합성/성능비교·미채택/원복을마친progress이며경량화목표는active다. 덮개/설치·재시작예외질문은미응답이고goal이어가기를승인으로해석하지않는다.
+- worker-sample-176-20261023의mixed native/Cocoa 각3초/10ms 샘플은실제176과같은94Core를연결한소유worker만대상이다. CF UTF8 decode의BOM소비2/9를독립probe로확인했고후보는선두EF BB BF와decode실패를기존NFC로돌렸다. 이BOM차이를잊고directCFdecode를적용하지않는다.
+- native-row-177-20261023은2파일후보였다. native non-ASCII를owned CF/NFC로변환하고보존할suffix행을직접decode했다. native전체정규화7,066,786행(2,802입력/foreign1,383)/예산·원문·suffix행/offset/byteStarts/fence·모든scalar/UTF16·BOM/손상/4MiB±1·기존suffix/허가·관련79검사가통과했다. 체크섬10039685347430037637/16066818104591319445다.
+- 새16프로세스/8쌍/512구간의mixed-native변경 CPU0.964175608/경과0.964451688배가고정0.90/0.95기준2개에실패해미채택이다. worker들은0·비교runner는1로끝났고review17기준과원본log/구간/94객체/실행파일을검토했다. planSHA48d59fe4f986dbe36a1c9392fed7f040ca8a68b4a0e31bb86d6a6e6e8a50745b·protocolSHA58b823b3a8cc9bb1ed2c5b95c0aafd81647f5bf44b3e5707687d8b74d1d86806다. 시간재사용/제외/기준완화없음이며끝난실험은다시시작하지않는다.
+- 제품2파일은176으로원복했고canonical /private/tmp/autoapprove-discovery-worktree-20261020/.build/release도정식176의409입력·94객체·모듈dd0f54a10d4a7558063dffcf0043e90b7e08defe9076be60ac73ce3c46093d0a와바이트동일하다. App/CLI38/38코드구간/UUID외runtime·복원10검사도통과했다. 새4실행파일해시는restored-build.json에있으며전체binary동일은주장하지않는다. 후보의소스/94객체·binaries는rejected-build에보존한다. 현재소유실행작업은모두종료·버전증가/새177배포없음이다.
+- 다음은정규화할행범위를줄일수있는지먼저분석한다. permissionHeading은normalizedSuffix300을먼저만들고,실제prompt는raw/trimmed전체·앞fence검사와Claude의전체context를사용한다. QuestionDetector/TerminalChoice도같은suffix와fence를쓴다. 원문검증·Claude context·코드블록/메뉴·모델/허가/오류정책을짧게잘라내지말고,필요행과field의의존성을증명한뒤새가설/기준으로진행한다. 아직새지연정규화후보는구현하지않았다.
+- 설치앱/원본조회·입력·캡처·크기·초기화·재시작·잠금해제/실제전원·자동실행/별도서비스·관리자/시스템/보안/TCC/VPN·UI를변경하지않았다. 기존IDE/인덱스·activity-footer fixture·진단파일은그대로보존한다. 새버전증가시에는검사/패키징·소스/tag/자산·정상TLS익명다운로드까지완료한다.
+
 ## 2026-10-23 · 0.2.176 / 203 배포 완료 · Cocoa 행 정규화
 
 - 이번 goal 작업은 substring 단독 후보의미채택과버퍼후보의채택·최종451검사/패키지검증을마친progress이며전체경량화목표는active다. 덮개/설치·재시작예외질문은여전히미응답이며goal진행을승인으로해석하지않는다.

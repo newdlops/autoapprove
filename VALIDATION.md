@@ -1,5 +1,30 @@
 # AutoApprove 검증 기록
 
+## 2026-10-23 · 0.2.176 유지 · native 행 변환 후보 미채택·BOM 의미 차이
+
+정식176 Core를 쓴 소유 합성 worker의 mixed native/Cocoa를 각각3초·10ms로 새 관측했다. native suffix의 NSString 정규화·UTF16 offset/breadcrumbs·재인코딩이 남아 있었다. 스택 node 합계는 중첩되므로 CPU 시간/비율이나175와의 개선율로 해석하지 않는다. 실제 사용자 앱에는 sample을 붙이지 않았다.
+
+작은 UTF8 정규화 진단9개에서 CFStringCreateWithBytes의 UTF8 decoder가 행 앞BOM을 소비하는 차이2개를 확인했다. EF BB BF만 있는 입력과EF BB BF + abc가 각각빈문자열/abc가 되지만 Swift의 기존 NFC는BOM을보존했다. non-external flag가false여도관측됐다. 후보는이prefix와변환실패를원래Swift NFC로돌렸다. 일반codepoint목록으로정규화를생략하지않았다.
+
+후보는 정상native non-ASCII 행을owned CF 문자열에디코딩·복사한뒤NFC하고, native suffix는처음내용행을찾은뒤보존할행을바로정규화했다. raw UTF8예산·원문저장소·byteStarts/offset·code-fence·CR/LF/CRLF/끝빈행·foreign bulk와허가/질문/모델/오류/Goal·캐시/타이머는유지했다.
+
+정식176의 native 전체정규화와새구현을Unicode scalar1,112,064개·3문맥·native/foreign·모든UTF16단위65,536개로비교했다. 2,802입력(foreign1,383)의7,066,786행과원문예산·300행suffix의정확한행/byteStarts/offset·fence가같았다. checksum10039685347430037637이다. BOM/손상surrogate/청크/4MiB±1과기존complete-suffix scalar1,112,064·storage2,253(foreign364)·허가1,920/감지768·checksum16066818104591319445, 실제관련79검사도통과했다.
+
+새16프로세스·8쌍·512구간의모든worker는exit0, 비교runner는고정기준실패로exit1이었다. 8개ABBA/BAAB구간비율중앙값→8쌍중앙값으로후보/정식비율을계산하고원본job/구간·94객체/연결객체/실행파일을별도검토했다. 상태4종·16세션·읽기/게시·입력0과native/Cocoa형태를보존했다. 시간재사용·표본제외·기준완화는없다.
+
+| 입력 | 같은 화면 CPU | 같은 화면 경과 | 변경 CPU | 변경 경과 |
+|---|---:|---:|---:|---:|
+| ascii-native | 1.007915 | 1.001984 | 0.983969 | 0.997269 |
+| mixed-native | 1.015154 | 1.007265 | 0.964176 | 0.964452 |
+| ascii-cocoa | 1.034825 | 1.032439 | 1.010802 | 0.998474 |
+| mixed-cocoa | 1.012772 | 1.011346 | 0.998448 | 0.993264 |
+
+mixed-native 변경CPU0.964176·경과0.964452배(각약3.6%감소)였지만, 미리정한CPU0.90·경과0.95한도2개를통과하지못해제외했다. 다른지표는기준안이고최대RSS는30,654,464→29,999,104바이트(한도33,719,910.4)였다. 앱전체/휴대폰/네트워크·VPN·보안도구의개선율이나제품메모리절감으로채택하지않는다.
+
+후보소스·빌드를보관하고제품2파일을정식176으로원복했다. 임시Release복원도409입력·94Core객체·모듈 dd0f54a10d4a7558063dffcf0043e90b7e08defe9076be60ac73ce3c46093d0a가정식176과바이트동일하다. App/CLI의38/38코드구간·UUID외runtime/loader/globals가같고복원검사10/10이통과했다. 재연결된App/CLI/checks3개의전체해시차이는영수증에기록하며실행파일전체동일을주장하지않는다. 후보모듈은aa5dd1308dd5ab9d33afa68aa1f1145d3441735c0fc928bb3dc725f15125c403·객체5개변경이었다.
+
+버전은176/203이고새177태그/패키지/릴리스·설치/재시작은없다. 이미검증한176 전체451검사/게시를다시실행하지않았다. 원자료는 .runtime/performance/worker-sample-176-20261023과 .runtime/performance/native-row-177-20261023의계획·생성소스/지문·oracle·16jobs/512구간·검토·rejected-build·복원영수증에보존하며게시하지않는다. 원본터미널·실제전원·자동실행/새서비스·관리자/시스템/보안/TCC/VPN과UI를변경하지않았고새브라우저/실물폰QA도없다.
+
 ## 2026-10-23 · 0.2.176 / 203 · Cocoa 행 정규화의 중간 변환 감소
 
 - ApprovalPrompt 한 파일에서 정상 non-ASCII 행이 현재4096 UTF16버퍼 안에 있으면 owned CFMutableString에 복사한 뒤 행별NFC를 적용한다. 경계 행은 Cocoa substring, 손상UTF16은 원래복구·ASCII/native는기존경로다. 원문예산·행경계/끝빈행·허가/질문/모델·오류/Goal·최종검증과캐시/타이머를유지한다.
