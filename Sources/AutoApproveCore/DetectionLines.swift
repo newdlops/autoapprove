@@ -107,6 +107,56 @@ final class DetectionLines {
 
     init(_ screen: String) { self.screen = screen }
 
+    /// All accepted permission/choice menus contain a selected numbered row.
+    /// Codex notes overlays instead require a Question header. Reject only when
+    /// neither necessary row occurs in the same bounded window as the detectors.
+    func mayContainInteractiveRows(agent: AgentKind) -> Bool {
+        guard agent != .shell else { return false }
+        guard screen.isContiguousUTF8 else { return true }
+        return screen.utf8.withContiguousStorageIfAvailable { bytes in
+            var end = bytes.count, count = 0, skippingTrailingBlanks = true
+            while count < 300 {
+                var start = end
+                while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
+                let row = Self.interactiveRow(bytes, start: start, end: end, codex: agent == .codex)
+                if row == .possible { return true }
+                if row != .blank { skippingTrailingBlanks = false }
+                if !skippingTrailingBlanks { count += 1 }
+                guard start > 0 else { break }
+                let delimiter = start - 1
+                end = bytes[delimiter] == 10 && delimiter > 0 && bytes[delimiter - 1] == 13
+                    ? delimiter - 1 : delimiter
+            }
+            return false
+        } ?? true
+    }
+
+    private enum InteractiveRow: Equatable { case blank, ordinary, possible }
+
+    private static func interactiveRow(_ bytes: UnsafeBufferPointer<UInt8>, start: Int, end: Int, codex: Bool) -> InteractiveRow {
+        var index = start
+        while index < end, bytes[index] == 32 || bytes[index] == 9 { index += 1 }
+        guard index < end else { return .blank }
+        let first = bytes[index]
+        if first >= 33, first < 127 {
+            if codex, first == 81 { return .possible } // Question header
+            if first != 62 { return .ordinary }
+            index += 1
+            while index < end, bytes[index] == 32 || bytes[index] == 9 { index += 1 }
+            guard index < end else { return .ordinary }
+            let next = bytes[index]
+            if next >= 49, next <= 57 { return .possible }
+            if next >= 33, next < 127 { return .ordinary }
+        }
+        // Unicode starts, other controls and Unicode spacing use exactly the
+        // existing per-row normalization and selected-option regex semantics.
+        let value = String(decoding: bytes[start..<end], as: UTF8.self)
+        if value.trimmingCharacters(in: .whitespaces).isEmpty { return .blank }
+        let line = value.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespaces)
+        if codex, line.hasPrefix("Question") { return .possible }
+        return line.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) == nil ? .ordinary : .possible
+    }
+
     private static func scanSuffix(_ bytes: UnsafeBufferPointer<UInt8>, count: Int) -> DetectionLineSuffix {
         var cursorEnd = bytes.count
         var reversedRows: [String] = [], reversedStarts: [Int] = []

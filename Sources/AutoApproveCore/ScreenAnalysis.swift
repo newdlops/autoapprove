@@ -17,7 +17,8 @@ struct ScreenAnalysis: Sendable {
     init(raw: String, agent: AgentKind) {
         let lines = DetectionLines(raw)
         self.agent = agent
-        let prompt = PromptDetector.detect(raw, agent: agent, prepared: lines)
+        let mayHaveInteractiveRows = lines.mayContainInteractiveRows(agent: agent)
+        let prompt: ApprovalPrompt? = mayHaveInteractiveRows ? PromptDetector.detect(raw, agent: agent, prepared: lines) : nil
         self.prompt = prompt
         let activityTail = agent == .shell ? [] : ActivityDetector.nonemptyTail(raw)
         let activity = ActivityDetector.detect(raw, agent: agent, preparedTail: activityTail, permissionPrompt: { prompt != nil })
@@ -25,7 +26,7 @@ struct ScreenAnalysis: Sendable {
         let stop = CodexCapacityStop.detect(raw, agent: agent, activity: activity, prepared: lines)
         capacityStop = stop
         let request: PendingScreenRequest?
-        if prompt == nil, stop == nil {
+        if mayHaveInteractiveRows, prompt == nil, stop == nil {
             if let detected = QuestionDetector.detect(agent: agent, prepared: lines) { request = detected }
             else if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(prepared: lines) {
                 let question = TerminalChoiceQuestion.detect(raw, agent: agent, prepared: lines,
