@@ -91,12 +91,12 @@ Cloudflare 연결 도구는 외부 **TCP 7844** 연결이 필요하다. 해당 �
 [Cloudflare 방화벽 요구사항](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/).
 
 ```sh
-swift build -c release --scratch-path .build/tunnel
-.build/tunnel/release/autoapprove-checks
-node scripts/tunnel-browser-check.mjs --build=.build/tunnel/release
-node scripts/tunnel-browser-check.mjs --build=.build/tunnel/release --webkit
-node scripts/tunnel-browser-check.mjs --build=.build/tunnel/release --public
-node scripts/tunnel-settings-preview.mjs --build=.build/tunnel/release
+swift build -c release --scratch-path .build/tunnel-setup
+.build/tunnel-setup/release/autoapprove-checks
+node scripts/tunnel-browser-check.mjs --build=.build/tunnel-setup/release
+node scripts/tunnel-browser-check.mjs --build=.build/tunnel-setup/release --webkit
+node scripts/tunnel-browser-check.mjs --build=.build/tunnel-setup/release --public
+node scripts/tunnel-settings-preview.mjs --build=.build/tunnel-setup/release
 node scripts/tunnel-setup-ui-preview.mjs --build=.build/tunnel-setup/release
 ```
 
