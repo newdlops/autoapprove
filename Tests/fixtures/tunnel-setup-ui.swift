@@ -29,7 +29,9 @@ import AutoApproveCore
         Task { @MainActor in
             do {
                 let output=Bundle.main.bundleURL.deletingLastPathComponent(),root=output.appendingPathComponent("ui-profile")
-                let engine=try ApprovalEngine(paths:AppPaths(directory:root),claudeRegistryReader:{_ in []},processReader:{[]},webLoopbackOnly:true)
+                let fixture=CloudflareFixture();fixture.loginDelay=1_000_000_000
+                fixture.pages=[[CloudflareFixture.domain(),CloudflareFixture.domain("registered-example.net",id:CloudflareFixture.otherZone),CloudflareFixture.domain("long-registered-domain-for-layout-verification.example.org",id:String(repeating:"d",count:32))]]
+                let engine=try ApprovalEngine(paths:AppPaths(directory:root),claudeRegistryReader:{_ in []},processReader:{[]},webLoopbackOnly:true,cloudflareServices:fixture.services)
                 delegate.engine=engine;try engine.start(poll:false)
                 let view=SetupRoot(engine:engine)
                 let window=NSWindow(contentRect:NSRect(x:0,y:0,width:680,height:760),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
@@ -44,7 +46,7 @@ import AutoApproveCore
                         NSPasteboard.general.clearContents();NSPasteboard.general.setString("sudo cloudflared service install SyntheticToken0123456789abcdef",forType:.string)
                         try? FileManager.default.removeItem(at:output.appendingPathComponent("ui-control"))
                     }
-                    let value:JSONObject=["phase":engine.tunnelStatus.phase,"detail":engine.tunnelStatus.detail,"webReady":engine.webStatus.ready,"toolInstalled":engine.tunnelToolPath != nil,"enabled":engine.tunnelConfiguration.enabled,"sessions":engine.snapshot.sessions.count]
+                    let value:JSONObject=["phase":engine.tunnelStatus.phase,"detail":engine.tunnelStatus.detail,"webReady":engine.webStatus.ready,"toolInstalled":engine.tunnelToolPath != nil,"enabled":engine.tunnelConfiguration.enabled,"sessions":engine.snapshot.sessions.count,"cloudflarePhase":engine.cloudflareStatus.phase,"authorized":engine.cloudflareStatus.authorized,"domains":engine.cloudflareStatus.domains.map(\.name),"syntheticAPI":fixture.summary]
                     let data=try JSONSerialization.data(withJSONObject:value,options:.sortedKeys)
                     if data != previous {try data.write(to:output.appendingPathComponent("ui-status.json"),options:.atomic);previous=data}
                     try await Task.sleep(for:.milliseconds(100))

@@ -1,6 +1,45 @@
 import Foundation
 
 extension ApprovalEngine {
+    public var hasTunnelConfiguration:Bool {store.value("remoteTunnel") != nil}
+    private func cloudflare() throws -> CloudflareOnboarding {
+        if let cloudflareClient {return cloudflareClient}
+        let owner:String
+        if let saved=store.value("cloudflareOwner"),UUID(uuidString:saved) != nil {owner=saved}
+        else {owner=UUID().uuidString.lowercased();try store.set("cloudflareOwner",owner)}
+        let client=CloudflareOnboarding(directory:paths.directory,owner:owner,services:cloudflareServices,onStatus:{[weak self] status in self?.cloudflareStatus=status})
+        cloudflareClient=client;return client
+    }
+    public var cloudflareApprovalURL:URL? {cloudflareClient?.approvalURL}
+    public func cloudflareAddress(domainID:String)->String? {cloudflareClient?.proposedURL(for:domainID)}
+    public func loadCloudflareDomains() async throws {try await cloudflare().restore()}
+    public func authorizeCloudflare(executable:String = "") async throws {
+        guard !tunnelStatus.active else {throw AppError.message("진행 중인 터널 연결을 종료한 뒤 승인해주세요.")}
+        do {
+            var tool=executable.isEmpty ? tunnelToolPath : executable
+            if tool == nil {
+                cloudflareStatus.phase="installing";cloudflareStatus.detail="Cloudflare 연결 도구를 준비하고 있습니다…"
+                tool=try await RemoteTunnelTool.install(directory:paths.directory)
+            }
+            try Task.checkCancellation()
+            guard let tool,FileManager.default.isExecutableFile(atPath:tool) else {throw AppError.message("Cloudflare 연결 도구를 실행할 수 없습니다.")}
+            try await cloudflare().authorize(executable:tool)
+        } catch {
+            if error is CancellationError || Task.isCancelled {cancelCloudflareSetup();throw CancellationError()}
+            cloudflareStatus.phase="failed";cloudflareStatus.detail=error.localizedDescription;throw error
+        }
+    }
+    public func cancelCloudflareSetup() {
+        if let cloudflareClient {cloudflareClient.cancel()} else {cloudflareStatus=CloudflareSetupStatus()}
+    }
+    public func connectCloudflare(domainID:String,executable:String = "") async throws {
+        guard !tunnelStatus.active else {throw AppError.message("진행 중인 터널 연결을 종료한 뒤 도메인을 선택해주세요.")}
+        let connection=try await cloudflare().provision(domainID:domainID)
+        try Task.checkCancellation()
+        var configuration=RemoteTunnelConfiguration();configuration.provider = .managed
+        configuration.tunnelID=connection.tunnelID;configuration.publicURL=connection.publicURL;configuration.executable=executable
+        try await connectTunnel(configuration)
+    }
     public var tunnelConfiguration: RemoteTunnelConfiguration {
         guard let raw=store.value("remoteTunnel"), let data=raw.data(using:.utf8), let value=try? JSONDecoder().decode(RemoteTunnelConfiguration.self,from:data) else { return RemoteTunnelConfiguration() }
         return value
@@ -67,7 +106,10 @@ extension ApprovalEngine {
             return await service.handle(request)
         },onStatus:{ [weak self] status in self?.tunnelStatus=status })
         tunnelController=controller
-        try await controller.start(configuration,token:secret)
+        let credential:Data?
+        if configuration.provider == .managed,let id=configuration.tunnelID {credential=try cloudflareServices.readSecret(paths.directory,"cloudflare-tunnel:"+id.lowercased())}
+        else {credential=nil}
+        try await controller.start(configuration,token:secret,credentials:credential)
     }
     public func stopTunnel() throws {
         tunnelSetupID=nil

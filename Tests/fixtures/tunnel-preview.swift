@@ -60,11 +60,16 @@ private final class TunnelOriginal: @unchecked Sendable {
                         try stream.setOrigin("https://rotated.tunnel-qa.invalid")
                     case "stop": stream.stop();polling.stop();expiry.stop();controller.stop(waitForExit:true)
                     case "install": _ = try await RemoteTunnelTool.install(directory:root)
-                    case "quick", "named":
+                    case "quick", "named", "managed":
                         var configuration=RemoteTunnelConfiguration();configuration.port=UInt16(command["port"] as? Int ?? 28966)
-                        configuration.provider=command["action"] as? String == "quick" ? .quick : .named
-                        configuration.publicURL="https://named.tunnel-qa.invalid";configuration.executable=command["executable"] as? String ?? ""
-                        try await controller.start(configuration,token:command["token"] as? String ?? "")
+                        configuration.provider=RemoteTunnelProvider(rawValue:command["action"] as? String ?? "") ?? .quick
+                        configuration.publicURL="https://\(configuration.provider == .managed ? "managed" : "named").tunnel-qa.invalid";configuration.executable=command["executable"] as? String ?? ""
+                        var credentials:Data?
+                        if configuration.provider == .managed {
+                            configuration.tunnelID="11111111-2222-3333-4444-555555555555"
+                            credentials=try JSONSerialization.data(withJSONObject:["AccountTag":String(repeating:"a",count:32),"TunnelID":configuration.tunnelID!,"TunnelSecret":command["secret"] as? String ?? ""])
+                        }
+                        try await controller.start(configuration,token:command["token"] as? String ?? "",credentials:credentials)
                     case "stop-controller":controller.stop()
                     case "verify-address":controller.checkPublicURL()
                     default:break

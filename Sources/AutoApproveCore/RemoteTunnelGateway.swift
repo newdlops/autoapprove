@@ -4,9 +4,9 @@ import CryptoKit
 import Security
 
 public enum RemoteTunnelProvider: String, Codable, CaseIterable, Sendable {
-    case quick, named, external
+    case managed, quick, named, external
     public var title: String {
-        switch self { case .quick: return "Cloudflare 임시 주소"; case .named: return "Cloudflare 고정 도메인"; case .external: return "기존 로컬 터널 연결" }
+        switch self {case .managed:return "Cloudflare 고정 주소";case .quick:return "Cloudflare 임시 주소";case .named:return "Cloudflare 토큰 직접 입력";case .external:return "기존 로컬 터널 연결"}
     }
 }
 
@@ -16,6 +16,7 @@ public struct RemoteTunnelConfiguration: Codable, Equatable, Sendable {
     public var executable = ""
     public var port: UInt16 = 8766
     public var enabled = false
+    public var tunnelID: String?
     public init() {}
     public static func origin(_ value: String) throws -> String {
         guard var url = URLComponents(string:value.trimmingCharacters(in:.whitespacesAndNewlines)), url.scheme == "https",
@@ -32,6 +33,7 @@ public struct RemoteTunnelConfiguration: Codable, Equatable, Sendable {
         var value=self
         guard port > 0 else { throw AppError.message("터널 연결 포트는 1~65535로 입력해주세요.") }
         if provider != .quick { value.publicURL=try Self.origin(publicURL) }
+        if provider == .managed, tunnelID.flatMap(UUID.init(uuidString:)) == nil {throw AppError.message("Cloudflare 승인을 마치고 등록된 도메인에 연결해주세요.")}
         if !executable.isEmpty {
             guard executable.hasPrefix("/"), !executable.contains("\0"), FileManager.default.isExecutableFile(atPath:executable) else { throw AppError.message("실행 가능한 cloudflared 파일을 선택해주세요.") }
         }

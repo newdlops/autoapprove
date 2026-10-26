@@ -42,6 +42,7 @@ enum RemoteTunnelCredentials {
     private var startedAt:TimeInterval=0
     private var checkingURL: String?
     private var edgeConnectionFailed=false
+    private var managedCredentials:Data?
     public private(set) var status=RemoteTunnelStatus()
     public var accessKey: String? { gateway?.accessKey }
     public var shareURL: URL? {
@@ -57,14 +58,14 @@ enum RemoteTunnelCredentials {
     private func publish(_ phase: String,_ detail: String) {
         status.phase=phase; status.detail=detail; onStatus(status)
     }
-    public func start(_ supplied: RemoteTunnelConfiguration, token: String = "") async throws {
-        stop(); configuration=try supplied.validated(); self.token=token; retries=0
+    public func start(_ supplied: RemoteTunnelConfiguration, token: String = "",credentials:Data? = nil) async throws {
+        stop(); configuration=try supplied.validated(); self.token=token;managedCredentials=credentials;retries=0
         let epoch=UUID(); generation=epoch; status.provider=configuration.provider
         publish("starting","인증 접속을 준비하고 있습니다…")
         do {
             let gateway=try RemoteTunnelGateway(polling:configuration.provider == .quick,handler:handler)
             self.gateway=gateway
-            try await gateway.start(port:configuration.provider == .quick ? 0 : configuration.port)
+            try await gateway.start(port:[.quick,.managed].contains(configuration.provider) ? 0 : configuration.port)
             guard generation == epoch else { gateway.stop(); throw CancellationError() }
             guard let port=gateway.port else { throw AppError.message("터널 연결 포트를 열지 못했습니다.") }
             status.localURL="http://127.0.0.1:\(port)"
@@ -80,7 +81,7 @@ enum RemoteTunnelCredentials {
     public func stop(waitForExit:Bool = false) {
         generation=UUID(); task?.cancel(); task=nil; checkingURL=nil
         let child=process, pipe=output, scratch=runDirectory
-        process=nil; output=nil; runDirectory=nil; logBuffer=""; token=""
+        process=nil; output=nil; runDirectory=nil; logBuffer=""; token="";managedCredentials=nil
         pipe?.fileHandleForReading.readabilityHandler=nil
         child?.terminationHandler=nil
         if let child, child.isRunning {
@@ -113,7 +114,23 @@ enum RemoteTunnelCredentials {
         let root=directory.appendingPathComponent("tunnel-runs/"+UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]); runDirectory=root
         var arguments=["tunnel","--no-autoupdate","--protocol","http2","--edge-ip-version","4","--metrics","127.0.0.1:0"]
-        if configuration.provider == .quick { arguments += ["--url",localURL] }
+        if configuration.provider == .managed {
+            guard let id=configuration.tunnelID,let data=managedCredentials,data.count <= 65536,
+                  let value=try? JSONSerialization.jsonObject(with:data) as? JSONObject,
+                  (value["TunnelID"] as? String)?.lowercased() == id.lowercased(),
+                  let account=value["AccountTag"] as? String,account.range(of:#"^[a-fA-F0-9]{32}$"#,options:.regularExpression) != nil,
+                  let secret=value["TunnelSecret"] as? String,Data(base64Encoded:secret)?.count == 32,
+                  let host=URLComponents(string:configuration.publicURL)?.host else {throw AppError.message("이 Mac의 Cloudflare 터널 정보를 읽지 못했습니다. 도메인을 선택하고 다시 연결해주세요.")}
+            let credential=root.appendingPathComponent("credentials.json"),config=root.appendingPathComponent("config.json")
+            let settings:JSONObject=["tunnel":id,"credentials-file":credential.path,"ingress":[["hostname":host,"service":localURL],["service":"http_status:404"]]]
+            guard FileManager.default.createFile(atPath:credential.path,contents:data,attributes:[.posixPermissions:0o600]),
+                  // cloudflared reads this through YAML: JSON's optional \/
+                  // escape is not accepted by its YAML parser.
+                  FileManager.default.createFile(atPath:config.path,contents:try JSONSerialization.data(withJSONObject:settings,options:.withoutEscapingSlashes),attributes:[.posixPermissions:0o600]) else {throw AppError.message("Cloudflare 연결 설정을 준비하지 못했습니다.")}
+            arguments.insert(contentsOf:["--config",config.path],at:1)
+            arguments += ["run","--credentials-file",credential.path,id]
+            status.publicURL=configuration.publicURL;try gateway?.setOrigin(configuration.publicURL)
+        } else if configuration.provider == .quick { arguments += ["--url",localURL] }
         else {
             guard !token.isEmpty, token.utf8.count <= 16384, !token.contains("\n"), !token.contains("\0") else { throw AppError.message("Cloudflare 터널 토큰을 확인해주세요.") }
             let file=root.appendingPathComponent("token")
@@ -193,8 +210,12 @@ enum RemoteTunnelCredentials {
                 self.stop();self.publish("failed","공개 주소에서 이 Mac을 확인하지 못했습니다 (\(failure)). 인터넷 연결을 확인한 뒤 다시 시도해주세요.")
             } else {
                 self.checkingURL=nil
-                let provider=self.configuration.provider == .named ? "Cloudflare의 게시된 애플리케이션 경로" : "사용 중인 터널"
-                self.publish("routeRequired","연결 도구가 준비됐습니다. \(provider)에 서비스 URL을 지정한 뒤 ‘공개 주소 확인’을 눌러주세요 (\(failure)).")
+                if self.configuration.provider == .managed {
+                    self.publish("routeRequired","터널과 DNS 설정을 마쳤습니다. DNS 반영을 잠시 기다린 뒤 ‘공개 주소 확인’을 눌러주세요 (\(failure)).")
+                } else {
+                    let provider=self.configuration.provider == .named ? "Cloudflare의 게시된 애플리케이션 경로" : "사용 중인 터널"
+                    self.publish("routeRequired","연결 도구가 준비됐습니다. \(provider)에 서비스 URL을 지정한 뒤 ‘공개 주소 확인’을 눌러주세요 (\(failure)).")
+                }
             }
         }
     }

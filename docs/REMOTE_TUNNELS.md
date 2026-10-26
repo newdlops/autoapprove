@@ -22,9 +22,33 @@ Cloudflare의 임시 터널은 가동 시간 보장과 SSE 지원이 없으므�
 원본 식별과 불확실한 쓰기의 재전송 금지는 유지한다. 고정 터널은 기존 실시간
 비트 스트림을 사용한다. [Cloudflare 임시 터널 공식 설명](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
 
-## 고정 도메인
+## Cloudflare 고정 주소 · 승인 → 도메인 선택 → 연결
 
-1. 앱에서 **Cloudflare 고정 도메인 → Cloudflare 터널 열기**를 누른다.
+0.2.186부터 새 설정의 기본 방식이다. 별도 서버나 토큰 복사 없이 진행한다.
+
+1. **Cloudflare에서 승인**을 누른다. 필요한 공식 연결 도구를 준비하고 브라우저의
+   Cloudflare 로그인·도메인 승인 화면을 연다. 사용자가 직접 로그인하고 허용한다.
+2. 앱의 **등록된 도메인**에서 사용할 도메인을 선택한다. 승인된 계정의 활성 도메인을
+   표시한다. Cloudflare 승인이 선택한 도메인만 조회하도록 제한된 경우 그 도메인을 표시한다.
+3. **연결**을 누른다. 앱이 이 Mac의 터널과 `autoapprove-<Mac 식별자>.도메인` 주소를
+   만들고 DNS·내부 포트·웹 접속을 자동 설정한다. 공개 주소가 이 Mac의 인증 게이트웨이에
+   연결되는지 확인한 뒤 접속 링크·QR을 제공한다.
+
+Cloudflare에 이미 등록되어 활성화된 도메인이 필요하다. 승인 인증서는 계정의 터널
+관리와 도메인 연결을 허용한다. 승인 정보는 이 Mac의 앱 전용 키체인에 보관하며,
+연결 도구에는 해당 터널만 실행할 수 있는 정보만 `0600` 임시 파일로 전달한다.
+승인 파일은 앱 전용 임시 HOME에서 읽고 삭제한다. 기존 `~/.cloudflared` 설정은 사용하지 않는다.
+[공식 로컬 관리 터널 설정](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/create-local-tunnel/),
+[승인 인증서와 실행 인증 정보의 권한](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/tunnel-permissions/).
+
+기존 DNS 기록은 변경하거나 삭제하지 않는다. 주소가 이미 사용 중이면 `-2`부터 다른
+주소를 찾는다. 생성 응답을 받지 못해 다시 연결할 때는 저장한 생성 의도와 실행 정보를
+이용해 이전 결과부터 확인한다. 준비 중 **취소**하면 이 앱의 승인·연결 작업을 중지한다.
+DNS 반영이 늦으면 연결 도구를 유지하며 **공개 주소 확인**으로 재검사할 수 있다.
+
+## Cloudflare 토큰 직접 입력 · 기존 수동 설정
+
+1. 앱에서 **Cloudflare 토큰 직접 입력 → Cloudflare 터널 열기**를 누른다.
    Cloudflare의 **Networking → Tunnels**에서 터널을 만들고 macOS 설치 명령을 복사한다.
 2. 앱의 **설치 명령 또는 터널 토큰**에 복사한 명령 전체를 붙여넣는다. 앱은 명령을
    실행하지 않고 토큰만 추출한다. 이미 저장한 토큰을 쓰려면 비워 둘 수 있다.
@@ -91,19 +115,22 @@ Cloudflare 연결 도구는 외부 **TCP 7844** 연결이 필요하다. 해당 �
 [Cloudflare 방화벽 요구사항](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/).
 
 ```sh
-swift build -c release --scratch-path .build/tunnel-setup
-.build/tunnel-setup/release/autoapprove-checks
-node scripts/tunnel-browser-check.mjs --build=.build/tunnel-setup/release
-node scripts/tunnel-browser-check.mjs --build=.build/tunnel-setup/release --webkit
-node scripts/tunnel-browser-check.mjs --build=.build/tunnel-setup/release --public
-node scripts/tunnel-settings-preview.mjs --build=.build/tunnel-setup/release
-node scripts/tunnel-setup-ui-preview.mjs --build=.build/tunnel-setup/release
+swift build -c release --scratch-path .build/cloudflare-approval
+.build/cloudflare-approval/release/autoapprove-checks
+node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-approval/release
+node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-approval/release --webkit
+node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-approval/release --public
+node scripts/tunnel-settings-preview.mjs --build=.build/cloudflare-approval/release
+node scripts/tunnel-setup-ui-preview.mjs --build=.build/cloudflare-approval/release --output=.runtime/cf-approval-186
 ```
 
 브라우저 검사는 합성 HTTPS 호스트·실제 인증 게이트웨이·격리 PTY를 사용한다.
+`--validate-cli=/검증한/cloudflared`를 추가하면 생성한 로컬 설정과 실행 옵션을 해당
+공식 도구의 `ingress validate`·`run --help`로 검사하며 외부 연결은 시작하지 않는다.
 `--public`은 공식 도구를 임시 폴더에 설치하고 합성 데이터만 있는 실제 임시 주소를
 검사한 뒤 종료한다. 사용자 터미널이나 Cloudflare 계정 토큰은 사용하지 않는다.
 실물 휴대폰·모든 인터넷 환경·사용자 계정의 고정 도메인 검증과 구분한다.
-네이티브 조작용 미리보기는 빈 loopback 프로필과 외부 통신이 없는 합성 연결 도구를
-사용한다. 자동 도구 다운로드의 원본은 기존 고정 SHA-256 검증 설치기이며, 이 조작
-fixture에서는 실제 공개 터널이나 사용자 계정 토큰을 사용하지 않는다.
+네이티브 조작용 미리보기는 빈 loopback 프로필·합성 계정/DNS API·외부 통신이 없는
+합성 연결 도구를 사용한다. 승인·도메인 선택·연결·취소·재시도를 실제 네이티브 조작으로
+검사할 수 있다. 실제 Cloudflare 계정 승인과 도메인 생성·인터넷 경유 연결 검증은
+이 합성 검사와 별개이며 사용자 승인 후 완료해야 한다.

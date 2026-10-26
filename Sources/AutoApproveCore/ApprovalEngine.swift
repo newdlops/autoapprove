@@ -18,6 +18,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     var tunnelController: RemoteTunnelController?
     var tunnelRestoreAttempted = false
     var tunnelSetupID: UUID?
+    @Published public internal(set) var cloudflareStatus=CloudflareSetupStatus()
+    var cloudflareClient:CloudflareOnboarding?
+    let cloudflareServices:CloudflareServices
     @Published public private(set) var lanUpdate = LANUpdateStatus() {
         didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
@@ -332,8 +335,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public init(paths: AppPaths = AppPaths(), terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
-                webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil) throws {
+                webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live) throws {
         self.paths = paths
+        self.cloudflareServices=cloudflareServices
         self.webLoopbackOnly = webLoopbackOnly
         self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
@@ -496,6 +500,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func stop() {
         tunnelSetupID=nil
+        cloudflareClient?.cancel()
         tunnelController?.stop(waitForExit:true); tunnelController=nil
         noticeKeyCache = nil
         remoteInputStopped = true

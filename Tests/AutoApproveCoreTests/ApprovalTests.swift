@@ -504,6 +504,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Cloudflare: approved domain pagination and account isolation",tests.testCloudflareApprovalFiltersAndPaginatesRegisteredDomains),
+            ("Cloudflare: selected zone permission fallback",tests.testCloudflareApprovalSelectedZoneFallbackAndPermissions),
+            ("Cloudflare: malformed approval and oversized response rejection",tests.testCloudflareApprovalRejectsMalformedAndOversizedAccountData),
+            ("Cloudflare: preserve DNS and reuse owned tunnel",tests.testCloudflareProvisionPreservesDNSAndReusesOwnedResources),
+            ("Cloudflare: reconcile lost creation replies across restart",tests.testCloudflareProvisionReconcilesLostCreateReplies),
+            ("Cloudflare: cancellation rejects late approval",tests.testCloudflareCancellationRejectsLateApprovalAndUnknownDomain),
+            ("Cloudflare: isolated login and owned child cleanup",tests.testCloudflareLiveLoginUsesPrivateHomeAndCleansOwnedChild),
             ("Tunnel: HTTPS authority and private-address isolation", tests.testTunnelOriginsRejectAuthorityConfusionAndPrivateAddresses),
             ("Tunnel: default off and credential-free persisted configuration", tests.testTunnelConfigurationDefaultsOffAndRoundTripsWithoutCredentials),
             ("Tunnel setup: domain completion retains origin restrictions", tests.testTunnelSetupNormalizesDomainsWithoutWeakeningOriginRules),

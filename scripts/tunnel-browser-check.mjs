@@ -10,8 +10,8 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {coreLinkArguments} from './swift-core-link.mjs';
 const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3);
-const build=path.resolve(option('build')||'.build/tunnel/release'),engine=process.argv.includes('--webkit')?'webkit':'chromium';
-const out=path.resolve(option('output')||'.runtime/tunnel-check/'+engine);await mkdir(out,{recursive:true,mode:0o700});
+const build=path.resolve(option('build')||'.build/cloudflare-approval/release'),engine=process.argv.includes('--webkit')?'webkit':'chromium';
+const out=path.resolve(option('output')||'.runtime/cf-approval-186/'+engine);await mkdir(out,{recursive:true,mode:0o700});
 const root=await mkdtemp('/private/tmp/aa-tunnel-'),wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,timeout=15000){const end=performance.now()+timeout;while(!await test()){assert.ok(performance.now()<end,label);await wait(20);}}
 const checks=[],errors=[],shutdownDiagnostics=[],traffic=[],sockets=new Set();let browser,fixture,tls,proxy,info,page,stage='startup',drop=null;
@@ -71,6 +71,34 @@ try{
   assert.equal(JSON.parse(await readFile(root+'/controller-status.json','utf8')).phase,'off');assert.equal(await stat(tokenFile).then(()=>true,()=>false),false);
  }
  checks.push('named token file permissions, no token in argv/status despite child diagnostics, public-route setup retains connector and supports explicit verification, owned connector termination, fresh access key and invalidated old cookie/key on restart');
+ stage='approved managed connector lifecycle';
+ const managedSecret=Buffer.alloc(32,91).toString('base64'),managed=await control('managed',{executable:fake,secret:managedSecret});
+ let managedRun;await until(async()=>{for(const entry of await readdir(root+'/tunnel-runs')){const directory=root+'/tunnel-runs/'+entry;try{await stat(directory+'/credentials.json');await stat(directory+'/pid');managedRun=directory;return true;}catch{}}return false;},'Managed connector files');
+ const managedArgs=(await readFile(managedRun+'/arguments.bin')).toString().split('\0').filter(Boolean);
+ assert.ok(managedArgs.includes('--config')&&managedArgs.includes('--credentials-file'));assert.ok(!managedArgs.some(v=>v.includes(managedSecret)));
+ const configText=await readFile(managedRun+'/config.json','utf8');assert.ok(!configText.includes('\\/'),'cloudflared YAML parser must not receive JSON slash escapes');
+ const managedConfig=JSON.parse(configText),managedCredential=JSON.parse(await readFile(managedRun+'/credentials.json','utf8'));
+ let officialConfigValidated=false;
+ if(option('validate-cli')){
+  const official=path.resolve(option('validate-cli')),prefix=managedArgs.slice(1,managedArgs.indexOf('run'));
+  const options={encoding:'utf8',timeout:15000,env:{HOME:managedRun,PATH:'/usr/bin:/bin:/usr/sbin:/sbin'}};
+  assert.match(execFileSync(official,[...prefix,'ingress','validate'],options),/OK|valid/i);
+  assert.match(execFileSync(official,[...prefix,'run','--help'],options),/--credentials-file/);
+  officialConfigValidated=true;
+ }
+ assert.equal(managedCredential.TunnelSecret,managedSecret);assert.equal(managedCredential.apiToken,undefined);
+ assert.equal(managedConfig.ingress[0].hostname,'managed.tunnel-qa.invalid');assert.match(managedConfig.ingress[0].service,/^http:\/\/127\.0\.0\.1:\d+$/);
+ assert.deepEqual(managedConfig.ingress[1],{service:'http_status:404'});
+ for(const file of ['config.json','credentials.json'])assert.equal((await stat(managedRun+'/'+file)).mode&0o777,0o600);
+ assert.equal((await stat(managedRun)).mode&0o777,0o700);assert.equal(managed.shareURL,'','No share link before public nonce verification');
+ const managedPort=Number(new URL(managedConfig.ingress[0].service).port);preservePort(managedPort);
+ assert.equal((await rawAt(managedPort,'/api/state',null,{Host:'managed.tunnel-qa.invalid'})).status,401);
+ const managedLogin=await rawAt(managedPort,'/auth/login',{key:managed.accessKey},{Host:'managed.tunnel-qa.invalid',Origin:'https://managed.tunnel-qa.invalid'});assert.equal(managedLogin.status,200);
+ assert.equal((await rawAt(managedPort,'/api/state',null,{Host:'managed.tunnel-qa.invalid',Cookie:managedLogin.headers.get('set-cookie').split(';')[0]})).status,200);
+ const managedPID=Number(await readFile(managedRun+'/pid','utf8'));await control('stop-controller');
+ await until(()=>{try{process.kill(managedPID,0);return false;}catch{return true;}},'Managed child shutdown');
+ await until(async()=>!await stat(managedRun).then(()=>true,()=>false),'Managed credential cleanup');
+ checks.push('approved managed connector: dynamic authenticated loopback port, single-host ingress plus 404 catch-all, 0700/0600 files, per-tunnel secret without account token or argv exposure, withheld share before nonce proof, owned child and credential cleanup');
  stage='raw authentication';
  assert.equal((await raw('stream','/api/state')).status,401);
  assert.equal((await raw('stream','/api/input',{sessionID:'fake'})).status,401);
@@ -172,7 +200,7 @@ try{
  }
  assert.deepEqual(errors,[]);await control('stop');
  await rm(out+'/failure.json',{force:true});await rm(out+'/failure.png',{force:true});
- const report={result:'PASS',engine,checks,errors,shutdownDiagnostics,requests:traffic.length,scope:'Synthetic HTTPS hosts on a local CONNECT proxy, production Swift gateway and real private PTYs; optional official public tunnel exposes only this synthetic fixture. No user token/CLI.'};
+ const report={result:'PASS',engine,checks,errors,shutdownDiagnostics,officialConfigValidated,requests:traffic.length,scope:'Synthetic HTTPS hosts on a local CONNECT proxy, production Swift gateway and real private PTYs; optional official public tunnel exposes only this synthetic fixture. No user token/CLI.'};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
 }catch(error){await page?.screenshot({path:out+'/failure.png'}).catch(()=>{});await writeFile(out+'/failure.json',JSON.stringify({stage,controlGeneration,namedPort,error:error.message},null,2));throw error;}
 finally{

@@ -12,11 +12,12 @@ import AutoApproveCore
     @State private var copied:String?
     @State private var busy=false
     @State private var attempted=false
+    @State private var cloudflareDomain=""
     @State private var connectionTask:Task<Void,Never>?
     @State private var qrCodes=QRCodeImageCache()
     @FocusState private var focused:Field?
     private enum Field {case address,token}
-    private var validPort:Bool {configuration.provider == .quick || (UInt16(port).map {$0 > 0} ?? false)}
+    private var validPort:Bool {[.quick,.managed].contains(configuration.provider) || (UInt16(port).map {$0 > 0} ?? false)}
     private var addressError:String? {
         guard configuration.provider != .quick,attempted || !configuration.publicURL.isEmpty else {return nil}
         return (try? RemoteTunnelSetup.origin(configuration.publicURL)) == nil ? "공개 도메인을 입력하세요. 예: terminal.example.com" : nil
@@ -30,12 +31,16 @@ import AutoApproveCore
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             Picker("연결 방식",selection:$configuration.provider) {
                 ForEach(RemoteTunnelProvider.allCases,id:\.self) {Text($0.title).tag($0)}
-            }.disabled(busy || status.active).accessibilityIdentifier("tunnel-provider")
+            }.disabled(busy || status.active || engine.cloudflareStatus.busy).accessibilityIdentifier("tunnel-provider")
             if configuration.provider == .quick {
                 Text("‘임시 주소 만들기’를 누르면 연결 도구 설치와 웹 접속을 자동으로 준비합니다. 계정이나 도메인은 필요 없습니다.")
                     .font(.callout).fixedSize(horizontal:false,vertical:true)
                 Text("다시 만들면 주소가 바뀝니다. 임시 주소는 화면을 순서대로 조회하며 고정 도메인은 실시간 스트림을 사용합니다.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            } else if configuration.provider == .managed {
+                CloudflareApprovalSteps(state:engine.cloudflareStatus,tunnelActive:status.active,approvalURL:engine.cloudflareApprovalURL,
+                                        address:engine.cloudflareAddress(domainID:cloudflareDomain),domainID:$cloudflareDomain,busy:busy,
+                                        approve:approveCloudflare,reload:{Task {try? await engine.loadCloudflareDomains()}})
             } else {
                 if configuration.provider == .named {
                     Text("1. Cloudflare에서 터널 만들기").font(.callout.weight(.medium))
@@ -81,18 +86,18 @@ import AutoApproveCore
             }
             HStack {
                 if !status.active {
-                    Button(busy ? "준비 중…" : status.phase == "failed" ? "다시 연결" : configuration.provider == .quick ? "임시 주소 만들기" : configuration.provider == .named ? "고정 도메인 연결" : "터널 연결 확인") {connect()}
-                        .buttonStyle(.bordered).disabled(busy || !validPort)
+                    Button(busy ? "준비 중…" : status.phase == "failed" ? "다시 연결" : configuration.provider == .managed ? "연결" : configuration.provider == .quick ? "임시 주소 만들기" : configuration.provider == .named ? "고정 도메인 연결" : "터널 연결 확인") {connect()}
+                        .buttonStyle(.bordered).disabled(busy || !validPort || engine.cloudflareStatus.busy || (configuration.provider == .managed && (!engine.cloudflareStatus.authorized || cloudflareDomain.isEmpty)))
                         .accessibilityIdentifier("tunnel-connect")
                 }
                 if status.phase == "routeRequired" {
                     Button("공개 주소 확인") {engine.checkTunnelAddress()}.accessibilityIdentifier("tunnel-verify")
                 }
-                if busy || status.phase != "off" {
+                if busy || status.phase != "off" || engine.cloudflareStatus.busy {
                     Button(status.ready ? "연결 종료" : status.phase == "failed" ? "닫기" : "취소") {cancel()}
                         .accessibilityIdentifier("tunnel-stop")
                 }
-                if busy || status.active && !status.ready && status.phase != "routeRequired" {
+                if busy || engine.cloudflareStatus.busy || status.active && !status.ready && status.phase != "routeRequired" {
                     ProgressView().controlSize(.small).accessibilityLabel("터널 연결 준비 중")
                 }
             }.padding(.top,4)
@@ -115,11 +120,11 @@ import AutoApproveCore
             if let error {Label(error,systemImage:"exclamationmark.circle").font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)}
             DisclosureGroup("연결 세부 설정") {
                 VStack(alignment:.leading,spacing:8) {
-                    if configuration.provider != .quick { HStack {
+                    if ![.quick,.managed].contains(configuration.provider) { HStack {
                         Text("서비스 포트");TextField("8766",text:$port).textFieldStyle(.roundedBorder).frame(width:90)
                             .accessibilityLabel("터널 서비스 포트").disabled(busy || status.active)
                         if !validPort {Text("1~65535").font(.caption).foregroundStyle(.red)}
-                    }} else {Text("임시 주소의 서비스 포트는 자동으로 배정합니다.").font(.caption).foregroundStyle(.secondary)}
+                    }} else {Text("서비스 포트는 자동으로 배정합니다.").font(.caption).foregroundStyle(.secondary)}
                     if configuration.provider != .external {
                         Text(engine.tunnelToolPath != nil || !configuration.executable.isEmpty ? "Cloudflare 연결 도구 준비됨" : "연결을 시작할 때 Cloudflare 도구를 자동으로 설치합니다.")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
@@ -135,8 +140,16 @@ import AutoApproveCore
             }.font(.callout)
         }.frame(maxWidth:.infinity,alignment:.leading)
             .windowUpdates(updates,sources:[engine.objectWillChange])
-            .onAppear {configuration=engine.tunnelConfiguration;port=String(configuration.port)}
+            .onAppear {configuration=engine.tunnelConfiguration;if !engine.hasTunnelConfiguration {configuration.provider = .managed};port=String(configuration.port)}
             .onChange(of:configuration.provider) {attempted=false;error=nil}
+            .onChange(of:engine.cloudflareStatus.domains) {_,domains in
+                if !domains.contains(where:{$0.id == cloudflareDomain}) {
+                    cloudflareDomain=domains.count == 1 ? domains[0].id : domains.first(where:{configuration.publicURL.hasSuffix("."+$0.name)})?.id ?? ""
+                }
+            }
+            .task(id:configuration.provider) { [provider=configuration.provider] in
+                if provider == .managed && !Task.isCancelled && !engine.cloudflareStatus.busy {try? await engine.loadCloudflareDomains()}
+            }
             .task(id:copied) {if copied != nil {try? await Task.sleep(for:.seconds(2));if !Task.isCancelled {copied=nil}}}
     }
     private var copyServiceButton:some View {Button(copied == "service" ? "복사됨" : "서비스 주소 복사") {copy(serviceURL,kind:"service")}.disabled(!validPort)}
@@ -158,15 +171,18 @@ import AutoApproveCore
     private func connect() {
         guard !busy,!engine.tunnelStatus.active else {return}
         attempted=true;error=nil
-        guard addressError == nil else {focused = .address;return}
-        let selectedPort:UInt16? = configuration.provider == .quick ? 8766 : UInt16(port)
+        guard configuration.provider == .managed || addressError == nil else {focused = .address;return}
+        let selectedPort:UInt16? = [.quick,.managed].contains(configuration.provider) ? 8766 : UInt16(port)
         guard let number=selectedPort,number > 0 else {return}
         configuration.port=number;busy=true
         let secret=token;token=""
         connectionTask=Task {
-            do {try await engine.connectTunnel(configuration,token:secret)}
+            do {
+                if configuration.provider == .managed {try await engine.connectCloudflare(domainID:cloudflareDomain,executable:configuration.executable)}
+                else {try await engine.connectTunnel(configuration,token:secret)}
+            }
             catch is CancellationError {} catch {
-                if engine.tunnelStatus.phase != "failed" {self.error=error.localizedDescription}
+                if engine.tunnelStatus.phase != "failed" && engine.cloudflareStatus.phase != "failed" {self.error=error.localizedDescription}
                 if configuration.provider == .named {focused = .token}
             }
             busy=false;connectionTask=nil
@@ -174,7 +190,17 @@ import AutoApproveCore
     }
     private func cancel() {
         connectionTask?.cancel()
-        do {try engine.stopTunnel();error=nil} catch {self.error=error.localizedDescription}
+        engine.cancelCloudflareSetup()
+        do {if engine.tunnelStatus.phase != "off" {try engine.stopTunnel()};error=nil} catch {self.error=error.localizedDescription}
+    }
+    private func approveCloudflare() {
+        guard !busy,!engine.cloudflareStatus.busy else {return}
+        busy=true;error=nil
+        connectionTask=Task {
+            do {try await engine.authorizeCloudflare(executable:configuration.executable)}
+            catch is CancellationError {} catch {if engine.cloudflareStatus.phase != "failed" {self.error=error.localizedDescription}}
+            busy=false;connectionTask=nil
+        }
     }
     private func chooseExecutable() {
         let panel=NSOpenPanel();panel.canChooseFiles=true;panel.canChooseDirectories=false;panel.allowsMultipleSelection=false
