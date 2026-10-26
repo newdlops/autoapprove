@@ -42,6 +42,8 @@ public final class ManagedPTY: @unchecked Sendable {
     // bursts, so allocating these on every event creates avoidable churn.
     private var readBuffer = [UInt8](repeating: 0, count: 32_768)
     private var vtReplyBuffer = [CChar](repeating: 0, count: 4096)
+    private var writingInput = false
+    private var deferredVTReplies = Data()
     private var writer: String?
     private var writerUntil = Date.distantPast
     private var writerExpiry: DispatchSourceTimer?
@@ -128,7 +130,11 @@ public final class ManagedPTY: @unchecked Sendable {
                 let reply = vtReplyBuffer.withUnsafeBufferPointer { buffer in
                     Data(bytes: buffer.baseAddress!, count: length)
                 }
-                try? writeBytes(reply)
+                if writingInput {
+                    // A query response must not split a user's UTF-8 bytes.
+                    // Bound replies from a hostile/noisy foreground process.
+                    if deferredVTReplies.count + reply.count <= 65_536 { deferredVTReplies.append(reply) }
+                } else { try? writeBytes(reply) }
             }
         }
         // Trim once per readiness callback, not once per 32 KB read. A burst
@@ -266,18 +272,34 @@ public final class ManagedPTY: @unchecked Sendable {
     }
     private func writeBytes(_ data: Data) throws {
         guard master >= 0 else { throw RemoteHTTPError(409, "PTY 연결이 종료되었습니다.") }
-        var written = 0
-        let deadline = Date().addingTimeInterval(1)
-        try data.withUnsafeBytes { memory in
-            while written < data.count {
-                let count = Darwin.write(master, memory.baseAddress!.advanced(by: written), data.count - written)
-                if count > 0 { written += count; continue }
-                if count < 0 && errno == EINTR { continue }
-                if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK), Date() < deadline {
-                    var item = pollfd(fd: master, events: Int16(POLLOUT), revents: 0); _ = poll(&item, 1, 20); continue
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        writingInput = true
+        defer { writingInput = false; deferredVTReplies.removeAll(keepingCapacity: true) }
+        func writeAll(_ bytes: Data) throws {
+            var written = 0
+            try bytes.withUnsafeBytes { memory in
+                while written < bytes.count {
+                    let count = Darwin.write(master, memory.baseAddress!.advanced(by: written), bytes.count - written)
+                    if count > 0 { written += count; continue }
+                    if count < 0 && errno == EINTR { continue }
+                    if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK), ProcessInfo.processInfo.systemUptime < deadline {
+                        // The child may be blocked echoing while our input fills
+                        // its queue. The regular reader shares this lock, so drain
+                        // output here before waiting for more input capacity.
+                        // Retain the exact FD, writer and reserved sequence.
+                        readAvailable()
+                        var item = pollfd(fd: master, events: Int16(POLLOUT), revents: 0); _ = poll(&item, 1, 5); continue
+                    }
+                    throw AppError.message("PTY 입력 결과를 확인하지 못했습니다. 다시 보내지 말고 화면을 확인해주세요.")
                 }
-                throw AppError.message("PTY 입력 결과를 확인하지 못했습니다. 다시 보내지 말고 화면을 확인해주세요.")
             }
+        }
+        try writeAll(data)
+        // Native terminal replies follow the complete input, never its prefix.
+        // A reply failure cannot change the receipt of fully delivered user data.
+        while !deferredVTReplies.isEmpty, ProcessInfo.processInfo.systemUptime < deadline {
+            let replies = deferredVTReplies; deferredVTReplies.removeAll(keepingCapacity: true)
+            do { try writeAll(replies) } catch { break }
         }
     }
     public func approve(expected: String, agent: AgentKind, jobPIDs: [Int32]) throws -> TerminalDelivery {

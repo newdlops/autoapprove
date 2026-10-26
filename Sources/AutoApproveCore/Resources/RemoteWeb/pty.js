@@ -189,12 +189,23 @@ window.AutoApprovePTY = class {
     if (!this.ready || this.disposed || !bytes.length) return;
     if (this.queue.reduce((sum, item) => sum + item.length, 0) + bytes.length > 128000) { this.fail(new Error('미전달 입력이 너무 많아 입력을 멈췄습니다. 화면을 확인해주세요.')); return; }
     for (let at = 0; at < bytes.length; at += 16000) this.queue.push(bytes.slice(at, at + 16000));
-    clearTimeout(this.inputTimer); this.inputTimer = setTimeout(() => void this.flush(), 15);
+    // A fixed short window coalesces one event-loop burst without starving
+    // continuous typing. The active writer drains everything arriving in flight.
+    if (!this.sending && this.inputTimer == null) this.inputTimer = setTimeout(() => { this.inputTimer = null; void this.flush(); }, 4);
   }
   async flush() {
     if (this.sending || this.disposed || !this.ready || !this.queue.length) return;
+    clearTimeout(this.inputTimer); this.inputTimer = null;
     this.sending = true;
-    const next = this.queue.shift();
+    // Merge only unsent bytes, within the server's existing per-request limit.
+    // Keep one acknowledged request in flight; an uncertain write is never replayed.
+    const length = Math.min(16000, this.queue.reduce((sum, item) => sum + item.length, 0));
+    const next = new Uint8Array(length);
+    for (let at = 0; at < length;) {
+      const item = this.queue[0], count = Math.min(item.length, length - at);
+      next.set(item.subarray(0, count), at); at += count;
+      if (count === item.length) this.queue.shift(); else this.queue[0] = item.slice(count);
+    }
     try {
       const data = btoa(Array.from(next, byte => String.fromCharCode(byte)).join(''));
       const sequence = ++this.sequence;
@@ -204,6 +215,7 @@ window.AutoApprovePTY = class {
     finally { this.sending = false; if (this.ready && !this.disposed && this.queue.length) void this.flush(); }
   }
   fail(error) {
+    clearTimeout(this.inputTimer); this.inputTimer = null;
     clearTimeout(this.retryTimer); this.retryTimer = null;
     this.closeStream(); this.outputQueue = []; this.outputBytes = 0;
     this.blocked = true; this.ready = false; this.error = error.message; this.term.options.disableStdin = true;

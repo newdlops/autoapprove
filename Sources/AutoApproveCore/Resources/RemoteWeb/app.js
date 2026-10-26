@@ -45,12 +45,12 @@ let lastNetworkStartedAt = -Infinity;
 const networkValidation = {etag:'', value:null, notModified:false, observedAt:null};
 let appliedNetworkETag = '', networkController = null;
 let networkFailures = 0, networkRefreshRequested = false;
-let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
+let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer = null, directTimerDue = Infinity, inputFailure = '';
 let composePreferred = false, composeMode = false;
 const keyboardMarker = '\u200b';
 let inputGeneration = 0, terminalFontSize = 14;
 let directStreamID = null;
-let cursorLayoutPending = false, cursorLayoutTimer = null;
+let cursorLayoutPending = false, cursorLayoutTimer = null, cursorLayoutFrame = null;
 const directQueue = [];
 const automationResets = new Set();
 let automationResetResult = null;
@@ -388,8 +388,13 @@ function setFontSize(value) {
 function scheduleCursor() {
   if (cursorLayoutPending) return;
   cursorLayoutPending = true;
-  const layout = () => { if (!cursorLayoutPending) return; cursorLayoutPending = false; clearTimeout(cursorLayoutTimer); positionCursor(); };
-  requestAnimationFrame(layout); cursorLayoutTimer = setTimeout(layout, 100);
+  cursorLayoutFrame = requestAnimationFrame(layoutCursor); cursorLayoutTimer = setTimeout(layoutCursor, 100);
+}
+function layoutCursor() {
+  if (!cursorLayoutPending) return;
+  cursorLayoutPending = false; cancelAnimationFrame(cursorLayoutFrame); clearTimeout(cursorLayoutTimer);
+  cursorLayoutFrame = null; cursorLayoutTimer = null;
+  positionCursor();
 }
 function positionCursor() {
   const pre = $('terminal-screen'), caret = $('terminal-cursor'), cursor = latestFrame?.cursor;
@@ -475,7 +480,7 @@ function restoreDirectDraft(value, key = selectedKey) {
   if (key === selectedKey) { $('terminal-input').value = draft; composePreferred = true; sizeInput(); }
 }
 function stopDirect(preserve = true, failedText = '') {
-  clearTimeout(directTimer); inputGeneration++;
+  clearTimeout(directTimer); directTimer = null; directTimerDue = Infinity; inputGeneration++;
   if (preserve && selectedKey) {
     const pending = failedText + directQueue.filter(item => item.key === selectedKey && item.kind === 'characters').map(item => item.value).join('') + keyboardText();
     restoreDirectDraft(pending);
@@ -1645,7 +1650,9 @@ function openTerminalStream(stream) {
         terminalPaint = 0;
         if (!current()) { terminalPending = null; return; }
         const frame = terminalPending, receivedAt = terminalPendingAt; terminalPending = null;
-        try { if (frame) applyTerminalFrame(frame, receivedAt); } catch (error) { failTerminalStream(stream, error.message); }
+        try {
+          if (frame) { applyTerminalFrame(frame, receivedAt); layoutCursor(); }
+        } catch (error) { failTerminalStream(stream, error.message); }
       };
       terminalPaint = requestAnimationFrame(paint);
       // A suspended animation callback must not freeze an otherwise live read.
@@ -1769,11 +1776,21 @@ function queueDirect(kind, value = '') {
   const previous = directQueue[directQueue.length - 1];
   if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value,8000) <= 8000) previous.value += value;
   else directQueue.push({ key: selectedKey, kind, value, streamID: latestFrame?.streamID || null });
-  clearTimeout(directTimer); directTimer = setTimeout(pumpDirect, kind === 'characters' ? 80 : 0);
+  scheduleDirect(kind === 'characters' ? 8 : 0);
   return true;
+}
+function scheduleDirect(delay) {
+  if (directSending || !directMode) return;
+  const due = performance.now() + delay;
+  // Bound the first character's wait. Later keystrokes may accelerate a batch,
+  // but must never postpone it until the user stops typing.
+  if (directTimer !== null && directTimerDue <= due) return;
+  clearTimeout(directTimer); directTimerDue = due;
+  directTimer = setTimeout(() => { directTimer = null; directTimerDue = Infinity; void pumpDirect(); }, delay);
 }
 async function pumpDirect() {
   if (directSending || !directMode) return;
+  clearTimeout(directTimer); directTimer = null; directTimerDue = Infinity;
   directSending = true;
   const generation = inputGeneration;
   try {
@@ -1794,7 +1811,7 @@ async function pumpDirect() {
     }
   } finally {
     directSending = false; updateControls();
-    if (directMode && directQueue.length) { clearTimeout(directTimer); directTimer = setTimeout(pumpDirect, 250); }
+    if (directMode && directQueue.length) scheduleDirect(250);
   }
 }
 function captureDirectText() {

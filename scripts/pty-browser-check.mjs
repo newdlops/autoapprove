@@ -1,6 +1,6 @@
 // Actual browser + actual controlling PTY; only inert private CLI fixtures.
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 const {chromium}=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE || 'playwright');
@@ -9,6 +9,7 @@ const server=spawn(process.execPath,['scripts/pty-integration-check.mjs','--rele
 let browser;
 const errors=[],checks=[],screenshots=[],latencies=[],expectedLeaseResponses=[];
 const creationBodies=[];
+const inputBodies=[]; // Private inert fixture only; useful for byte-order failures.
 const requests={stream:0,output:0,attach:0,input:0};
 const closedOnly=process.argv.includes('--closed-pty-only');
 const endedViewportOnly=process.argv.includes('--ended-viewport-only');
@@ -26,7 +27,7 @@ try {
     const location=message.location().url;
     if(message.text().includes('status of 409')&&location.includes('/api/pty/resize'))expectedLeaseResponses.push(message.text());else errors.push(message.text());
   });
-  page.on('request',request=>{const pathname=new URL(request.url()).pathname;if(pathname==='/api/pty/stream')requests.stream++;if(pathname==='/api/pty/output')requests.output++;if(pathname==='/api/pty'&&request.method()==='POST'){requests.attach++;creationBodies.push(request.postDataJSON());}if(pathname==='/api/pty/input')requests.input++;});
+  page.on('request',request=>{const pathname=new URL(request.url()).pathname;if(pathname==='/api/pty/stream')requests.stream++;if(pathname==='/api/pty/output')requests.output++;if(pathname==='/api/pty'&&request.method()==='POST'){requests.attach++;creationBodies.push(request.postDataJSON());}if(pathname==='/api/pty/input'){requests.input++;const body=request.postDataJSON();inputBodies.push({sequence:body.sequence,text:Buffer.from(body.data,'base64').toString()});}});
   const contents=()=>page.evaluate(()=>{const buffer=ptyClient?.term.buffer.active;if(!buffer)return '';let text='';for(let row=0;row<buffer.length;row++){const line=buffer.getLine(row);text+=(line?.isWrapped?'':'\n')+(line?.translateToString(true)||'');}return text;});
   async function visible(pattern){ const deadline=Date.now()+10000;while(Date.now()<deadline){if(pattern.test(await contents()))return;await page.waitForTimeout(50);}console.error(JSON.stringify(await page.evaluate(()=>({focus:document.activeElement?.className,ready:ptyClient?.ready,blocked:ptyClient?.blocked,queue:ptyClient?.queue.length,sequence:ptyClient?.sequence,disabled:ptyClient?.term.options.disableStdin,textarea:ptyClient?.term.textarea.value,error:ptyClient?.error}))),errors);assert.match(await contents(),pattern); }
   async function ready(){await page.waitForFunction(()=>ptyClient?.ready===true);}
@@ -149,7 +150,9 @@ try {
   checks.push('actual screen input, UTF-8, no compose field');await capture('mobile-direct-shell');
   await type("printf 'AB\\n'");await page.keyboard.press('ArrowLeft');await page.keyboard.press('ArrowLeft');await page.keyboard.press('ArrowLeft');await page.keyboard.press('ArrowLeft');await page.keyboard.insertText('X');await enter();await visible(/(?:^|\n)AXB[ \t]*(?:\n|$)/);
   await type("printf 'BACKSPACE=ab\\n'");for(let n=0;n<4;n++)await page.keyboard.press('ArrowLeft');await page.keyboard.press('Backspace');await enter();await visible(/(?:^|\n)BACKSPACE=b[ \t]*(?:\n|$)/);
-  await type("printf '\\033[31mORIGINAL-RED\\033[0m\\n\\033[2;8HCURSOR-HERE'\r");await visible(/ORIGINAL-RED/);
+  // Put the proof on a stable row. The following absolute cursor move and zsh's
+  // prompt clear may erase a transient red line below row two in one fast write.
+  await type("printf '\\033[2J\\033[H\\033[31mORIGINAL-RED\\033[0m\\n\\033[2;8HCURSOR-HERE'\r");await visible(/ORIGINAL-RED/);
   checks.push('real line editor cursor arrows, Backspace and ANSI output');await capture('mobile-ansi-cursor');
   const cursor=await page.evaluate(()=>({row:ptyClient.term.buffer.active.cursorY,col:ptyClient.term.buffer.active.cursorX}));assert.ok(cursor.row>=0&&cursor.col>=0);
   // Slow the renderer while the actual shell produces output. Receiving must
@@ -273,6 +276,13 @@ try {
   assert.deepEqual(errors,[],'No browser or CSP errors');
   await writeFile(path.join(output,closedOnly?'closed-report.json':endedViewportOnly?'viewport-report.json':naturalOnly?'natural-report.json':'report.json'),JSON.stringify({checks,screenshots,errors,expectedLeaseResponses,requests,creationBodies,streamingLatencyMs:latencies,outputBackpressure,physicalPhoneSafariIME:'not tested'},null,2)+'\n');
   console.log(JSON.stringify({result:'PASS',checks,screenshots,errors,expectedLeaseResponses,requests,creationBodies,streamingLatencyMs:latencies,outputBackpressure}));
+  await rm(path.join(output,'failure-inputs.json'),{force:true});
+} catch(error) {
+  const page=browser?.contexts()[0]?.pages()[0];
+  const state=await page?.evaluate(()=>({descriptor:ptyClient?.descriptor,offset:ptyClient?.offset,columns:ptyClient?.term.cols,rows:ptyClient?.term.rows})).catch(()=>null);
+  let nativeOutput;
+  if(state?.descriptor)try{const url=new URL('/api/pty/output',page.url());url.search=new URLSearchParams({pty:state.descriptor.ptyID,stream:state.descriptor.streamID,offset:'0'});const result=await (await fetch(url)).json();nativeOutput={...result,text:Buffer.from(result.data||'','base64').toString()};delete nativeOutput.data;}catch{}
+  await writeFile(path.join(output,'failure-inputs.json'),JSON.stringify({scope:'Only private inert fixture input/output',error:error.message,inputs:inputBodies,state,nativeOutput},null,2));throw error;
 } finally {
   await browser?.close();server.kill('SIGTERM');await new Promise(resolve=>{if(server.exitCode!==null||server.signalCode!==null)resolve();else server.once('exit',resolve);});
 }
