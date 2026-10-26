@@ -1,4 +1,4 @@
-# Terminal wire version 2
+# Terminal wire versions 2 and 3
 
 This is the output transport for existing terminal snapshots and managed PTYs.
 Input requests,source identity checks,permissions and committed PTY offsets use
@@ -6,16 +6,20 @@ their existing APIs. The transport does not create a terminal session.
 
 ## Negotiation and compatibility
 
-The dashboard and the owning Mac must both advertise `terminalWireVersion: 2`
-before the browser requests `wire=2`. The response media type is
-`application/vnd.autoapprove.terminal-v2`. Without negotiation,the server retains
+`terminalWireVersion` advertises the highest supported version (2 or 3). The
+browser requests the minimum supported by its gateway and owning Mac,using
+`wire=2` or `wire=3`. Version 3 retains version 2 support. The response media
+types are `application/vnd.autoapprove.terminal-v2` and
+`application/vnd.autoapprove.terminal-v3`. Without negotiation,the server retains
 `text/event-stream` and the browser retains native `EventSource`. A negotiated
-fetch also accepts an SSE response. Existing gzip streaming remains per
+fetch also accepts an SSE response; a v3 fetch accepts a v2 response too. A
+gateway forwards only a version allowed by the request and preserves the
+authenticated owner's response format. Existing gzip streaming remains per
 connection,with an incremental flush after each logical event.
 
 ## Envelope
 
-Each record is `41 41 02`,one mode byte,a canonical unsigned base-128 varint
+Each record is `41 41 02` (v2) or `41 41 03` (v3),one mode byte,a canonical unsigned base-128 varint
 payload length,and exactly that many payload bytes. The payload limit is
 2,000,000 bytes. Length and integer decoding reject noncanonical continuation,
 overflow,truncation and unsupported modes. A partial record at EOF is an error.
@@ -32,7 +36,7 @@ Bit 7 on modes 0–3 means the entire payload is UTF-8 JSON. Unsupported Encodab
 representations use this whole-value fallback with the existing JSONEncoder.
 This preserves legacy JSON behavior for representations such as unsafe JS
 integers rather than rounding them in the typed decoder. The heartbeat is the
-five bytes `41 41 02 04 00`.
+five bytes `41 41 02 04 00` or `41 41 03 04 00`.
 
 ## Typed payload
 
@@ -90,6 +94,39 @@ value nodes to 100,000,and applies a 2,000,000-byte string budget. Unknown extra
 keys remain ordinary own enumerable properties,including names such as
 `__proto__`. Screen patch/copy and cursor offsets retain their UTF-16 units.
 
+## Version 3 compact snapshots
+
+The root mask,field order and v2 typed values are unchanged. V3 adds five
+fixed schemas in previously invalid Float64 low nibbles. A v2 decoder still
+rejects these values. The encoder uses them only for matching native DTO types;
+other objects retain ordinary typed objects or whole-value JSON fallback.
+
+| Byte | Snapshot | Body,in order |
+| --- | --- | --- |
+| `51` | attribute run | unsigned offset,length,flags; optional typed fg,bg strings |
+| `52` | cursor | control byte; unsigned offset,padding |
+| `53` | appearance | color-presence byte; optional typed foreground,background strings; unsigned run count; run bodies without `51` prefixes |
+| `54` | screen patch | typed baseRevision; unsigned baseLength,prefix,suffix; typed text; unsigned length |
+| `55` | screen copy | typed baseRevision; unsigned baseLength,start,count; typed head,tail; unsigned length |
+
+Bytes above are hexadecimal. Unsigned fields use the existing canonical
+base-128 varint and JavaScript safe-integer bounds. RGB strings retain the
+existing exact-case packing,including ordinary UTF-8 for mixed case.
+
+Run flag bits 0–8 indicate fg,bg,bold,dim,italic,underline,strike,inverse,hidden
+presence. Bits 9–15 hold the seven boolean values in the same order. A true
+bit without its presence bit is invalid. Thus absent,false and true remain
+distinct without per-property names or boolean bytes. Flags above bit 15 are
+invalid. Cursor bits 0 and 1 mean visible and blink; bits 2–3 select block (0),
+bar (1) or underline (2). Other cursor bits/styles are invalid. Appearance bits
+0–1 indicate foreground/background; all other bits are invalid.
+
+Runs are bounded to 8,000. Static schemas charge their logical keys,values,
+strings and depth against the same receiver limits as ordinary v2 objects.
+Negative or unsafe offsets,unrecognized colors and other unsupported values
+retain the general encoding/fallback behavior. PTY root flags and raw output
+bytes remain unchanged,so compact snapshots do not add overhead to PTY data.
+
 ## Browser ownership and backpressure
 
 The parser accepts split headers,bodies and coalesced records. It borrows a
@@ -103,12 +140,30 @@ network chunk. Default decoding and JSON/SSE fallback keep string data. Queue
 limits and the rule that only a fully rendered offset is resumable are shared
 by both paths. No keyboard input is replayed by this output transport.
 
+Before a source delivers its first event,an unsupported or malformed format
+can retry v3 → v2 → SSE on the same selected identity. Temporary HTTP 503 or a
+transport failure keeps the negotiated format. First original-screen opening
+allows at least 10 seconds,independently of its faster established-source
+watchdog and bounded fallback GETs.
+
+A disconnected PTY resumes output only after all accepted bytes are rendered.
+Input stays disabled until the new source confirms its controls; old queued
+frames cannot restore permission. Read retries back off from 0/250/500ms to
+5 seconds. An in-flight or queued input,changed identity,nonretryable failure
+or permanent status stops automatic recovery. Pending input is never replayed.
+Intentional bounded renderer backpressure retains the existing writer controls
+so Ctrl C can stop an output flood while the renderer drains.
+
 ## Reproduction
 
 From the checkout root,build the matching release Core,then run:
 
 ```sh
 node scripts/terminal-wire-check.mjs --build=.build/release
+node scripts/terminal-wire-check.mjs --v3 --build=.build/release
+node scripts/peer-stream-buffer-check.mjs --build=.build/release
+node scripts/terminal-wire-transport-check.mjs --build=.build/release
+node scripts/terminal-wire-browser-check.mjs --vectors=PATH_TO_V3_EMIT_STDOUT
 ```
 
 `--source-root`,`--cache` and `--output` accept alternate directories. Output
@@ -116,6 +171,16 @@ must be a new directory. The fixture creates synthetic data only. Release
 optimization can omit externally callable internal encoder symbols,so the
 check compiles the exact encoder source without edits. The terminal DTO,
 patch/copy and gzip implementations are linked from the matching Core objects.
+
+The v3 check emits paired v2/v3 vectors from the same values and compares actual
+Core gzip streams. It includes all 2,187 optional-boolean combinations,cursor
+flags,colors,large offsets,logical limits and reserved-schema rejection.
+The browser check uses those synthetic vectors with the current rendered UI,
+real xterm completion and controlled loopback failures. Its seven-sample
+receiver medians exclude painting,whole-app CPU and physical-network latency.
+`--webkit` selects WebKit; Chromium is the default. Set the existing
+`AUTOAPPROVE_PLAYWRIGHT_MODULE`/`AUTOAPPROVE_CHROMIUM_PATH` environment variables
+when the browser installation is external to this checkout.
 
 The Node VM check covers full values,default/raw decoding,all representative
 splits,malformed/unsafe integers,EOF/cancellation,ordinary object properties,

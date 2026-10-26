@@ -5,7 +5,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 const {chromium}=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE || 'playwright');
 const output=path.resolve('dist/qa/pty'); await mkdir(output,{recursive:true});
-const server=spawn(process.execPath,['scripts/pty-integration-check.mjs','--release','--serve'],{stdio:['ignore','pipe','inherit']});
+const server=spawn(process.execPath,['scripts/pty-integration-check.mjs','--release','--serve',...process.argv.slice(2).filter(value=>value.startsWith('--build='))],{stdio:['ignore','pipe','inherit']});
 let browser;
 const errors=[],checks=[],screenshots=[],latencies=[],expectedLeaseResponses=[];
 const creationBodies=[];
@@ -20,6 +20,7 @@ try {
   console.log('PTY browser fixture ready; Swift compile cache released');
   browser=await chromium.launch({headless:true,executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH || undefined});
   const page=await browser.newPage({viewport:endedViewportOnly?{width:1440,height:900}:{width:390,height:844},isMobile:!endedViewportOnly,hasTouch:!endedViewportOnly});
+  assert.equal(await (await fetch(info.url+'/pty.js')).text(),await (await import('node:fs/promises')).readFile('Sources/AutoApproveCore/Resources/RemoteWeb/pty.js','utf8'),'Build current browser resources before PTY QA');
   page.setDefaultTimeout(12000);page.on('pageerror',error=>errors.push(error.message));page.on('console',message=>{
     if(message.type()!=='error')return;
     const location=message.location().url;
@@ -227,7 +228,7 @@ try {
   assert.ok(requests.input>inputsBefore);
   checks.push('live byte streaming latency and bounded read request count');
   const beforeFailure={...requests};
-  await page.evaluate(()=>{ptyClient.enqueue('NO-AUTO-REPLAY');ptyClient.source.dispatchEvent(new Event('error'));});
+  await page.evaluate(()=>{ptyClient.enqueue('NO-AUTO-REPLAY');if(ptyClient.source.emit)ptyClient.source.onerror(new Error('Synthetic interruption'));else ptyClient.source.dispatchEvent(new Event('error'));});
   await page.waitForFunction(()=>ptyClient?.blocked&&!ptyClient.ready);
   assert.equal(await page.locator('#send-input').isDisabled(),true);
   assert.equal(await page.locator('#terminal-retry').isVisible(),true);

@@ -215,7 +215,10 @@ const supportsRelease = (node, minimum) => {
 };
 const supportsPTYStream = node => supportsRelease(node, [0, 2, 41, 48]);
 const supportsTerminalStream = node => supportsRelease(node, [0, 2, 42, 49]);
-const supportsTerminalWire = node => gatewayTerminalWireVersion === 2 && node?.state?.terminalWireVersion === 2;
+const supportsTerminalWire = node => {
+  const owner = node?.state?.terminalWireVersion;
+  return [2,3].includes(gatewayTerminalWireVersion) && [2,3].includes(owner) ? Math.min(gatewayTerminalWireVersion,owner) : 0;
+};
 const supportsNativeTerminal = node => supportsRelease(node, [0, 2, 43, 51]);
 function reconcilePTYInventory(inventory) {
   inventory = inventory.filter(item => (!sessionEnded(item) || item.session.interruption?.recoveredAt == null && !!item.session.interruption) && !sessionEnded(ptyRetained.get(item.key)));
@@ -838,7 +841,7 @@ async function refreshNetwork(initial = false, restart = false) {
       return;
     }
     partialNetwork = result.partial === true;
-    gatewayTerminalWireVersion = result.terminalWireVersion === 2 ? 2 : null;
+    gatewayTerminalWireVersion = [2,3].includes(result.terminalWireVersion) ? result.terminalWireVersion : null;
     if (!partialNetwork) partialNetworkRefreshes = 0;
     connected = true;
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
@@ -1554,6 +1557,10 @@ function terminalSilenceBudget(stream) {
   // A slow VPN gets more room; a healthy LAN no longer waits a fixed 8 s.
   return Math.min(12000,Math.max(4500,2*(stream.eventGap || 2000)+Math.max(500,4*(stream.eventJitter || 0)),3*(stream.readRTT || 0)+2500));
 }
+function downgradeUnstartedTerminalWire(stream,error) {
+  const source = stream.source;
+  if (source?.version && !source.received && (!error || error.wireFormat || [406,415].includes(error.status))) stream.wireVersion = source.version === 3 ? 2 : 0;
+}
 function terminalEventReceived(stream) {
   const now = performance.now();
   if (stream.sourceEventAt != null) {
@@ -1569,7 +1576,9 @@ function terminalEventReceived(stream) {
 }
 function watchTerminalStream(stream) {
   clearTimeout(stream.watchdog); clearTimeout(stream.fallbackWatchdog);
-  const silence = terminalSilenceBudget(stream);
+  // Opening includes discovery, source observation and a bounded LAN relay.
+  // Keep the established-source watchdog fast without cancelling slow opens.
+  const silence = Math.max(stream.sourceEventAt == null ? 10000 : 0,terminalSilenceBudget(stream));
   stream.fallbackWatchdog = setTimeout(() => {
     if (!terminalStreamCurrent(stream)) return;
     stream.sseReady = false;
@@ -1578,14 +1587,14 @@ function watchTerminalStream(stream) {
   // Do not start a redundant GET just before a healthy heartbeat arrives.
   }, Math.min(5000,Math.max(3000,silence*0.6)));
   // Both legacy controls and compact alive events require a fresh source read.
-  stream.watchdog = setTimeout(() => reconnectTerminalStream(stream),silence);
+  stream.watchdog = setTimeout(() => { downgradeUnstartedTerminalWire(stream); reconnectTerminalStream(stream); },silence);
 }
 function ensureTerminalStream() {
   const renderWindow = nativeTerminal();
   if (terminalStreamFailed === selectedKey || terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration && terminalStream.renderWindow === renderWindow) return;
   stopTerminalStream();
   const item = selectedItem, streamURL = endpoint('/api/terminal/stream', item.node.id, item.session.id) + '&delta=1&copy=1&compact=1' + (renderWindow ? '&view=screen' : '');
-  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, source:null, frame:null, resync:false, retries:0,reconnecting:!!latestFrame, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false,offline:false};
+  const stream = {key:selectedKey, generation:detailGeneration, renderWindow, url:streamURL, nodeID:item.node.id, sessionID:item.session.id, wireVersion:supportsTerminalWire(item.node), source:null, frame:null, resync:false, retries:0,reconnecting:!!latestFrame, retryTimer:null, watchdog:null, fallbackWatchdog:null, pollTimer:null, pollController:null, pollFailures:0, sseReady:false,offline:false};
   terminalStream = stream;
   if (!latestFrame) { terminalState('pending', '연결 중…'); updateControls(); }
   if (terminalNetworkOffline) pauseTerminalNetwork(stream);
@@ -1599,7 +1608,8 @@ function openTerminalStream(stream) {
   stream.frame = basis;
   if (basis?.sessionID === stream.sessionID && basis.streamID) { url.searchParams.set('revision',basis.revision); url.searchParams.set('stream',basis.streamID); }
   stream.sourceEventAt = null; stream.sourceOpenedAt = performance.now();
-  const source = window.AutoApproveTerminalWire?.open(url.href,supportsTerminalWire(currentNode() || selectedItem?.node)) || new EventSource(url.href); stream.source = source;
+  const version = Math.min(stream.wireVersion,supportsTerminalWire(currentNode() || selectedItem?.node));
+  const source = window.AutoApproveTerminalWire?.open(url.href,version) || new EventSource(url.href); stream.source = source;
   const current = () => terminalStreamCurrent(stream) && stream.source === source;
   watchTerminalStream(stream);
   source.addEventListener('screen', event => {
@@ -1672,7 +1682,7 @@ function openTerminalStream(stream) {
     } catch (_) {}
     failTerminalStream(stream, message);
   });
-  source.onerror = () => { if (current()) reconnectTerminalStream(stream); };
+  source.onerror = error => { if (current()) { downgradeUnstartedTerminalWire(stream,error); reconnectTerminalStream(stream); } };
 }
 async function refreshFrame() {
   clearTimeout(frameTimer);
@@ -2655,6 +2665,7 @@ window.addEventListener('offline', () => {
 window.addEventListener('online', () => {
   terminalNetworkOffline = false;
   if (document.hidden) return;
+  ptyClient?.resumeNetwork();
   const stream = terminalStream;
   if (stream?.offline || stream?.retryTimer) {
     stream.offline = false; stream.retries = 0;

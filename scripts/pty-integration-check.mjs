@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { coreLinkArguments } from './swift-core-link.mjs';
 import { startPTYStreamPeer } from '../Tests/fixtures/pty-stream-peer.mjs';
 
-const build = path.resolve('.build', process.argv.includes('--release') ? 'release' : 'debug');
+const build = path.resolve(process.argv.find(value=>value.startsWith('--build='))?.slice(8) || path.join('.build',process.argv.includes('--release')?'release':'debug'));
 const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-real-pty-'));
 await writeFile(path.join(root,'.zshrc'),"PROMPT='QA> '\n");
 const conversationID = randomUUID();

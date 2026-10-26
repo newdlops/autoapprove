@@ -177,8 +177,8 @@ public struct RemoteHTTPResponse: Sendable {
         if let diagnostics = (error as? RemoteHTTPError)?.diagnostics { value["diagnostics"] = diagnostics }
         return (try? object(value, status: status)) ?? Self(status: 500, body: Data())
     }
-    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String, initialData: Data = Data(), binary: Bool = false) -> Self {
-        var response = Self(body: initialData, contentType: binary ? RemoteTerminalWire.contentType : "text/event-stream; charset=utf-8")
+    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String, initialData: Data = Data(), binary: Bool = false, wireVersion: Int = 2) -> Self {
+        var response = Self(body: initialData, contentType: binary ? RemoteTerminalWire.contentType(for:wireVersion) : "text/event-stream; charset=utf-8")
         response.stream = stream; response.nodeID = nodeID; return response
     }
     /// Short reads and shipped web assets benefit from a complete gzip member.
@@ -293,7 +293,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     private var sendExpiresAt: UInt64 = 0
     private var heartbeat: DispatchSourceTimer?
     private var stream: RemoteHTTPBodyStream?
-    private var binaryStream = false
+    private var wireVersion: Int?
     private var gzip: RemoteGzipEncoder?
     private var nextPending = false
     private var pendingResult: Result<Data?, Error>?
@@ -388,7 +388,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                                 }
                             }
                             self.stream = stream
-                            self.binaryStream = response.contentType == RemoteTerminalWire.contentType
+                            self.wireVersion = RemoteTerminalWire.version(for:response.contentType)
                             // The generic request deadline ends after a successful
                             // SSE handshake; an idle terminal remains connected.
                             // Reuse the shared checkpoint for the imminent first send.
@@ -399,7 +399,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                                 heartbeat.setEventHandler { [weak self] in
                                     guard let self, !self.closed, self.stream != nil, !self.sending,
                                           self.pendingResult == nil else { return }
-                                    self.sendStream(self.binaryStream ? RemoteTerminalWire.heartbeat : Data(": keepalive\n\n".utf8))
+                                    self.sendStream(self.wireVersion.map { RemoteTerminalWire.heartbeat(version:$0) } ?? Data(": keepalive\n\n".utf8))
                                 }
                                 heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
                             }
@@ -474,7 +474,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                 else { self.stream = nil; sendStream(Data(),final:true) }
             case .failure(let error):
                 stream.cancel(); self.stream = nil
-                sendStream(RemoteServerEvent.failure(error,binary:binaryStream), final: true)
+                sendStream(RemoteServerEvent.failure(error,binary:wireVersion != nil,wireVersion:wireVersion ?? 2), final: true)
             }
             return
         }

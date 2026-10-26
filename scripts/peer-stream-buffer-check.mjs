@@ -38,6 +38,17 @@ verify();execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-Xfro
   cases['boundary-valid']={frames:[frame(2_000_128)]};
   cases['boundary-over']={frames:[],raw:frame(2_000_129),error:502};
   cases.empty={frames:[]};
+  const variable=value=>{const result=[];do{const byte=value&127;value=Math.floor(value/128);result.push(byte|(value?128:0));}while(value);return result;};
+  for(const version of [2,3]){
+    const record=index=>{const json=Buffer.from(JSON.stringify({screen:'합성 한글 🧪 '+index,revision:String(index)}));return Buffer.concat([Buffer.from([65,65,version,128,...variable(json.length)]),json]);};
+    const frames=Array.from({length:513},(_,index)=>record(index));
+    for(const [suffix,extra]of Object.entries({plain:{},gzip:{gzip:true},fragmented:{fragmented:true},incomplete:{suffix:record(999).subarray(0,17),error:503},'gzip-truncated':{gzip:true,truncated:true,error:503,allowPrefix:true},identity:{identity:false,status:502}}))cases['wire'+version+'-'+suffix]={frames,version,requestVersion:version,...extra};
+    cases['wire'+version+'-header-only']={frames:[record(1)],version,requestVersion:version,headerOnly:true};
+  }
+  cases['wire3-request-v2-response']={frames:cases['wire2-plain'].frames,version:2,requestVersion:3};
+  cases['wire2-request-v3-rejected']={frames:[],raw:Buffer.from([65,65,3,4,0]),version:3,requestVersion:2,status:502};
+  cases['wire3-request-sse-response']={frames:[frame(32)],requestVersion:3};
+  cases['wire3-mixed-version']={frames:[Buffer.from([65,65,3,4,0])],suffix:Buffer.from([65,65,2,4,0]),version:3,requestVersion:3,error:502,allowPrefix:true};
   for(const entry of Object.values(cases)){
     const plain=entry.raw??Buffer.concat([...entry.frames,...(entry.suffix?[entry.suffix]:[])]);entry.plain=plain;entry.wire=entry.gzip?gzipSync(plain,{level:1}):plain;
     if(entry.corrupt){entry.wire=Buffer.from(entry.wire);entry.wire[entry.wire.length-5]^=255;}
@@ -45,7 +56,8 @@ verify();execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-Xfro
   }
   const sockets=new Set(),children=[],requests={},server=createServer((req,res)=>{
     const name=new URL(req.url,'http://localhost').searchParams.get('mode'),entry=cases[name];assert.ok(entry,'Unexpected metadata or LAN request '+req.url);assert.equal(req.method,'GET');assert.equal(req.headers['x-autoapprove-node'],owner);requests[name]=(requests[name]??0)+1;
-    res.useChunkedEncodingByDefault=false;res.writeHead(200,{'Content-Type':'text/event-stream','X-AutoApprove-Node':entry.identity===false?'wrong-owner':owner,'Connection':'close',...(entry.gzip?{'Content-Encoding':'gzip'}:{})});
+    if(entry.requestVersion)assert.ok(req.headers.accept.includes('terminal-v'+entry.requestVersion));
+    res.useChunkedEncodingByDefault=false;res.writeHead(200,{'Content-Type':entry.version?'application/vnd.autoapprove.terminal-v'+entry.version:'text/event-stream','X-AutoApprove-Node':entry.identity===false?'wrong-owner':owner,'Connection':'close',...(entry.gzip?{'Content-Encoding':'gzip'}:{})});
     if(entry.headerOnly||entry.fragmented){if(entry.headerOnly)res.flushHeaders();else res.write(entry.wire.subarray(0,entry.wire.length-1));const timer=setTimeout(()=>res.end(entry.headerOnly?entry.wire:entry.wire.subarray(entry.wire.length-1)),entry.headerOnly?250:30);res.once('close',()=>clearTimeout(timer));}
     else res.end(entry.wire);
   });
@@ -70,12 +82,12 @@ verify();execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-Xfro
       for(const label of ['candidate']){
         const target=await worker('check-'+label,label,url);await target.ready;
         try{for(const name of [...Object.keys(cases),'backpressure','cancel']){
-          const entry=cases[name]??cases.small,mode=cases[name]?name:'small',result=await target.request({id:label+'/'+name,mode,check:true,pause:name==='backpressure',cancel:name==='cancel'});
+          const entry=cases[name]??cases.small,mode=cases[name]?name:'small',result=await target.request({id:label+'/'+name,mode,check:true,pause:name==='backpressure',cancel:name==='cancel',wireVersion:entry.requestVersion});
           assert.equal(result.status,entry.status??200,name);
           if(result.status===200){
             const prefix=entry.allowPrefix||name==='cancel';assert.ok(prefix?result.events<=entry.frames.length:result.events===entry.frames.length,name+' events');
             const expected=entry.frames.slice(0,result.events);assert.equal(result.bytes,expected.reduce((sum,b)=>sum+b.length,0));assert.equal(result.trace,trace(expected));assert.equal(result.callerOutputsRetainedExactly,true);
-            assert.equal(result.error?.status,entry.error,name+' body error');if(name==='fragmented'||name==='header-only')assert.equal(result.initialBytes,0);
+            assert.equal(result.error?.status,entry.error,name+' body error');if(entry.headerOnly||entry.fragmented&&entry.frames.length===1)assert.equal(result.initialBytes,0);
             assert.ok(result.chunks<=result.events,'Chunks cannot exceed complete logical records');
             if(['small','medium','gzip-small','long'].includes(name))assert.ok(result.chunks>0,'Actual Core output must remain nonempty');
           }else assert.equal(result.events,0);
@@ -88,4 +100,4 @@ verify();execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-Xfro
   }finally{for(const child of children)if(child.exitCode===null&&child.signalCode===null)child.kill();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));}
 
 verify();
-console.log('PEER_STREAM_BUFFER actual Core cases 21; exact events/errors; retained bytes; bounded logical prefix; cancellation/backpressure');
+console.log('PEER_STREAM_BUFFER actual Core; SSE and binary v2/v3; exact events/errors; retained bytes; bounded logical prefix; cancellation/backpressure');

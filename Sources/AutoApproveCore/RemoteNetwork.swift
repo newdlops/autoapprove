@@ -1520,17 +1520,18 @@ struct RemoteTerminalUpdate: Encodable {
                         return try await engine.remoteTerminal(sessionID:id,realtime:true,renderWindow:renderWindow)
                     }
                     let frame = subscription.initial
-                    let delta = request.parameter("delta") == "1", binary = request.parameter("wire") == "2"
+                    let delta = request.parameter("delta") == "1", wireVersion = RemoteTerminalWire.negotiated(request.parameter("wire"))
+                    let binary = wireVersion != nil
                     let base = delta ? terminalFeeds.base(key:key,revision:request.parameter("revision"),stream:request.parameter("stream"),current:frame) : nil
                     let output: RemoteTerminalBodyStream
                     do {
                         output = try RemoteTerminalBodyStream(initial:frame,emitInitial:false,delta:delta,copy:request.parameter("copy") == "1",
-                            resume:base,compact:request.parameter("compact") == "1" && !renderWindow,paced:true,binary:binary,
+                            resume:base,compact:request.parameter("compact") == "1" && !renderWindow,paced:true,binary:binary,wireVersion:wireVersion ?? 2,
                             onCancel:{ subscription.cancel() }) { try await subscription.next() }
                     } catch { subscription.cancel(); throw error }
                     // The verified first event is ready. Send it with the headers,
                     // without another main-actor hop or a second small TCP write.
-                    return .eventStream(output, nodeID: nodeID, initialData: output.initialEvent,binary:binary)
+                    return .eventStream(output, nodeID: nodeID, initialData: output.initialEvent,binary:binary,wireVersion:wireVersion ?? 2)
                 case "/api/pty/stream", "/api/pty/output":
                     if request.path == "/api/pty/stream" {
                         if let forwarded = try await forwardStream(request) { return forwarded }
@@ -1543,8 +1544,8 @@ struct RemoteTerminalUpdate: Encodable {
                     let offset = supplied.flatMap(Int.init)
                     let client = request.parameter("client")
                     if request.path == "/api/pty/stream" {
-                        let binary = request.parameter("wire") == "2"
-                        return .eventStream(try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client,binary:binary), nodeID: nodeID,binary:binary)
+                        let wireVersion = RemoteTerminalWire.negotiated(request.parameter("wire")), binary = wireVersion != nil
+                        return .eventStream(try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client,binary:binary,wireVersion:wireVersion ?? 2), nodeID: nodeID,binary:binary,wireVersion:wireVersion ?? 2)
                     }
                     let output = try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client, emitInitial: false)
                     defer { output.cancel() }
@@ -1637,12 +1638,13 @@ struct RemoteTerminalUpdate: Encodable {
         let endpoints = Array(peerEndpoints(peer).prefix(2)), deadline = ProcessInfo.processInfo.systemUptime + 7
         let timingEpoch = readTimingEpoch
         let delay = peer.readTiming.delay(route: String(describing: endpoints[0]), kind: .stream)
-        let path = forwardedPath(request), expectedID = peer.id, allowsBinary = request.parameter("wire") == "2"
+        let path = forwardedPath(request), expectedID = peer.id, wireVersion = RemoteTerminalWire.negotiated(request.parameter("wire"))
+        let allowsBinary = wireVersion != nil
         let open: @Sendable (Int) async throws -> PeerStreamResult = { index in
             try Task.checkCancellation()
             let started = ProcessInfo.processInfo.systemUptime
             let output = try RemotePTYPeerBodyStream(endpoint: endpoints[index], path: path, expectedNodeID: expectedID,
-                timeout: max(0.05, deadline - started),allowsBinary:allowsBinary)
+                timeout: max(0.05, deadline - started),allowsBinary:allowsBinary,maximumWireVersion:wireVersion ?? 2)
             do {
                 let initial = try await output.openContent(); try Task.checkCancellation()
                 return .opened(index,output,ProcessInfo.processInfo.systemUptime-started,initial)
@@ -1681,7 +1683,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
         markPeerRead(peer)
         succeeded = true
-        return .eventStream(opened.1, nodeID: nodeID, initialData: opened.3.data,binary:opened.3.binary)
+        return .eventStream(opened.1, nodeID: nodeID, initialData: opened.3.data,binary:opened.3.binary,wireVersion:opened.3.wireVersion)
     }
     private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
         let components = request.components

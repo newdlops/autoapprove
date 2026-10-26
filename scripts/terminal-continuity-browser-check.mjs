@@ -17,12 +17,12 @@ try{
  server=createServer(async(req,res)=>{
   const url=new URL(req.url,'http://fixture');
   const stream=url.pathname==='/api/terminal/stream',read=url.pathname==='/api/terminal';
-  if(stream)streamQueries.push({revision:url.searchParams.get('revision'),stream:url.searchParams.get('stream'),compact:url.searchParams.get('compact')});
+  if(stream)streamQueries.push({revision:url.searchParams.get('revision'),stream:url.searchParams.get('stream'),compact:url.searchParams.get('compact'),wire:url.searchParams.get('wire')});
   if(read)counts.reads++;
   if(url.pathname==='/api/input')counts.inputs++;
   if(url.pathname.startsWith('/api/pty'))counts.ptys++;
   // Load the exact current UI while the linked Core controls all API behavior.
-  if(['/','/index.html','/app.js','/app.css'].includes(url.pathname)){
+  if(['/','/index.html','/app.js','/app.css','/terminal-wire.js'].includes(url.pathname)){
    const file=url.pathname==='/'?'index.html':url.pathname.slice(1);
    const body=await readFile(path.join(webRoot,file));
    res.writeHead(200,{'Content-Type':file.endsWith('.html')?'text/html':file.endsWith('.css')?'text/css':'text/javascript','Cache-Control':'no-store'});res.end(body);return;
@@ -36,9 +36,11 @@ try{
   const upstream=request(target,{method:req.method,headers},response=>{
    const drop=url.pathname==='/api/input'&&loseInput;if(drop)loseInput=false;
    if(!drop)res.writeHead(response.statusCode,response.headers);
+   else {res.writeHead(200,{'Content-Type':'application/json','Content-Length':'256'});res.flushHeaders();}
    if(stream){
     streams.set(number,res);
-    const timer=setInterval(()=>{if(held.has(number)&&!res.destroyed)res.write(': proxy-alive-is-not-source-alive\n\n');},500);
+    const version=response.headers['content-type']?.endsWith('terminal-v3')?3:response.headers['content-type']?.endsWith('terminal-v2')?2:0;
+    const timer=setInterval(()=>{if(held.has(number)&&!res.destroyed)res.write(version?Buffer.from([65,65,version,4,0]):': proxy-alive-is-not-source-alive\n\n');},500);
     response.on('data',chunk=>{if(!held.has(number)&&!res.destroyed)res.write(chunk);});
     res.on('close',()=>{clearInterval(timer);streams.delete(number);upstream.destroy();});
    }else response.on('data',chunk=>{if(!drop&&!res.destroyed)res.write(chunk);});
@@ -52,6 +54,7 @@ try{
  const page=await browser.newPage({viewport:{width:390,height:844},hasTouch:true,isMobile:true});page.setDefaultTimeout(10000);page.on('pageerror',e=>errors.push(e.message));
  await page.goto('http://127.0.0.1:'+server.address().port);await page.locator('.session-row').first().click();
  await page.waitForFunction(()=>terminalStream?.sseReady&&terminalFrameFresh());
+ if(!baseline)assert.equal(await page.evaluate(()=>terminalStream.source.version),3,'Actual Core must negotiate v3 without a silent format fallback');
  const initial=await page.evaluate(()=>({screen:latestFrame.screen,revision:latestFrame.revision,streamID:latestFrame.streamID}));
  await page.waitForTimeout(500);
  await page.evaluate(()=>{window.qaPaints=0;window.qaPulses=0;window.qaScreens=0;window.qaRender=renderTerminal;renderTerminal=(...args)=>{qaPaints++;return qaRender(...args);};terminalStream.source.addEventListener('alive',()=>qaPulses++);terminalStream.source.addEventListener('screen',()=>qaScreens++);});
@@ -88,7 +91,7 @@ try{
  if(!baseline){
   const reads=counts.reads,opens=counts.streams;
   await page.evaluate(()=>window.qaOldSource=terminalStream.source);
-  await page.evaluate(()=>qaOldSource.dispatchEvent(new MessageEvent('alive',{data:JSON.stringify({streamID:'another-original',revision:latestFrame.revision,sequence:999999,observedAt:new Date().toISOString()})})));
+  await page.evaluate(()=>{const value={streamID:'another-original',revision:latestFrame.revision,sequence:999999,observedAt:new Date().toISOString()};if(qaOldSource.emit)qaOldSource.emit({type:'alive',value});else qaOldSource.dispatchEvent(new MessageEvent('alive',{data:JSON.stringify(value)}));});
   await until(()=>counts.streams>opens&&counts.reads>reads,'An invalid pulse triggers full resync');await page.waitForFunction(()=>terminalStream?.sseReady&&terminalFrameFresh());
   checks.push('An invalid liveness source cannot refresh controls and triggers a full read of the selected original');
   await page.evaluate(()=>{terminalStream.retries=5;reconnectTerminalStream(terminalStream);});const online=performance.now();

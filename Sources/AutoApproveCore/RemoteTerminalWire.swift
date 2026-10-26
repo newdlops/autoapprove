@@ -4,19 +4,25 @@ import Darwin
 /// Only response snapshots enter this encoder. Nothing is cached between
 /// events. Unsupported representations retain the existing JSON encoder.
 enum RemoteTerminalWire {
-    static let version = 2
+    static let version = 3
     static let contentType = "application/vnd.autoapprove.terminal-v2"
+    static let compactContentType = "application/vnd.autoapprove.terminal-v3"
     static let byteLimit = 2_000_000
     static let heartbeat = Data([65,65,2,4,0])
     static let fields = ["sessionID","screen","revision","observedAt","keys","inputReason","appearance","cursor","streamID","nativeDisplay","outputReason","sequence","question","screenPatch","screenCopy","appearanceUnchanged","ptyID","offset","data","reset","columns","rows","exitCode","canInput"]
     static let fieldIndices = Dictionary(uniqueKeysWithValues: fields.enumerated().map { ($0.element,$0.offset) })
+    static func negotiated(_ value: String?) -> Int? { value == "3" ? 3 : value == "2" ? 2 : nil }
+    static func contentType(for version: Int) -> String { version == 3 ? compactContentType : contentType }
+    static func version(for contentType: String?) -> Int? { contentType == compactContentType ? 3 : contentType == self.contentType ? 2 : nil }
+    static func heartbeat(version: Int) -> Data { version == 3 ? Data([65,65,3,4,0]) : heartbeat }
 }
 
 final class RemoteTerminalWireEncoder {
     private enum RetryFoundation: Error { case required }
     private static let nodeLimit = 100_000, byteLimit = RemoteTerminalWire.byteLimit, depthLimit = 64
     private let reference: JSONEncoder
-    init(jsonEncoder: JSONEncoder) { reference = jsonEncoder }
+    private let version: Int
+    init(jsonEncoder: JSONEncoder, version: Int = 2) { precondition(version == 2 || version == 3); reference = jsonEncoder; self.version = version }
 
     func encode<T: Encodable>(_ value: T, event: UInt8) throws -> Data {
         precondition(event < 4)
@@ -26,11 +32,11 @@ final class RemoteTerminalWireEncoder {
             guard json.count <= Self.byteLimit else { throw RemoteHTTPError(502,"터미널 화면이 너무 큽니다. 화면 크기를 줄여 다시 연결해주세요.") }
             let out = try Output(hint:json.count)
             try json.withUnsafeBytes { try out.append($0) }
-            return out.takeData(event:event | 128)
+            return out.takeData(event:event | 128,version:version)
         }
     }
     private func attempt<T: Encodable>(_ value: T, event: UInt8) throws -> Data {
-        let arena = Arena(reference:reference, reserveHint:64), root = arena.add()
+        let arena = Arena(reference:reference, reserveHint:64,compact:version == 3), root = arena.add()
         try Cursor(arena:arena,slot:root,parent:nil,key:nil).put(value)
         try arena.check()
         let fields: [(String,Int)]
@@ -64,11 +70,92 @@ final class RemoteTerminalWireEncoder {
         }
         try out.uint(UInt64(extra.count))
         for (key,id) in extra { try out.string(key); try arena.write(id,to:out,depth:0) }
-        return out.takeData(event:event)
+        return out.takeData(event:event,version:version)
     }
     private final class ObjectValues { var fields: [(String,Int)] = [] }
     private final class ArrayValues { var elements: [Int] = [] }
-    private enum Atom { case empty, null, bool(Bool), string(String), unsigned(UInt64), negative(UInt64), double(Double), object(ObjectValues), array(ArrayValues) }
+    private enum Atom { case empty, null, bool(Bool), string(String), unsigned(UInt64), negative(UInt64), double(Double), object(ObjectValues), array(ArrayValues), packed(PackedValue) }
+    /// Known value snapshots bypass per-key strings and temporary encoder nodes.
+    /// The box keeps the general Atom stride small, including on legacy v2.
+    private final class PackedValue {
+        enum Value { case cursor(TerminalCursor), run(TerminalAppearance.Run), appearance(TerminalAppearance), patch(RemoteTerminalScreenPatch), copy(RemoteTerminalScreenCopy) }
+        let value: Value
+        let extraNodes: Int, jsonBound: Int, wireBound: Int, depth: Int
+        init(_ value: Value,nodes: Int,json: Int,wire: Int,depth: Int) { self.value=value;extraNodes=nodes;jsonBound=json;wireBound=wire;self.depth=depth }
+        static func unsigned(_ value: Int) -> Bool { value >= 0 && value <= 9_007_199_254_740_991 }
+        static func color(_ value: String?) -> Bool {
+            guard let value else { return true }
+            return value.utf8.count == 7 && value.utf8.first == 35 && value.utf8.dropFirst().allSatisfy {
+                (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+            }
+        }
+        static func runFields(_ value: TerminalAppearance.Run) -> Int {
+            2 + (runFlags(value) & 511).nonzeroBitCount
+        }
+        static func runFlags(_ value: TerminalAppearance.Run) -> UInt64 {
+            var flags: UInt64 = (value.fg == nil ? 0:1) | (value.bg == nil ? 0:2)
+            if let b=value.bold { flags |= 4;if b { flags |= 512 } }
+            if let b=value.dim { flags |= 8;if b { flags |= 1024 } }
+            if let b=value.italic { flags |= 16;if b { flags |= 2048 } }
+            if let b=value.underline { flags |= 32;if b { flags |= 4096 } }
+            if let b=value.strike { flags |= 64;if b { flags |= 8192 } }
+            if let b=value.inverse { flags |= 128;if b { flags |= 16384 } }
+            if let b=value.hidden { flags |= 256;if b { flags |= 32768 } }
+            return flags
+        }
+        static func valid(_ value: TerminalAppearance.Run) -> Bool { unsigned(value.offset) && unsigned(value.length) && color(value.fg) && color(value.bg) }
+        static func cursor(_ value: TerminalCursor) -> PackedValue? {
+            guard unsigned(value.offset), unsigned(value.padding) else { return nil }
+            return PackedValue(.cursor(value),nodes:10,json:150,wire:20,depth:1)
+        }
+        static func run(_ value: TerminalAppearance.Run) -> PackedValue? {
+            guard valid(value) else { return nil }
+            return PackedValue(.run(value),nodes:2*runFields(value),json:240,wire:48,depth:1)
+        }
+        static func appearance(_ value: TerminalAppearance) -> PackedValue? {
+            guard value.runs.count <= 8000, color(value.foreground), color(value.background) else { return nil }
+            var nodes=2*(1+(value.foreground == nil ? 0:1)+(value.background == nil ? 0:1))
+            for run in value.runs { guard valid(run) else { return nil };nodes += 1+2*runFields(run) }
+            return PackedValue(.appearance(value),nodes:nodes,json:100+value.runs.count*241,wire:32+value.runs.count*48,depth:value.runs.isEmpty ? 1:3)
+        }
+        static func patch(_ value: RemoteTerminalScreenPatch,valid: (String)->Bool) -> PackedValue? {
+            guard unsigned(value.baseLength), unsigned(value.prefix), unsigned(value.suffix), unsigned(value.length),valid(value.baseRevision),valid(value.text) else { return nil }
+            let bytes=value.baseRevision.utf8.count+value.text.utf8.count
+            return PackedValue(.patch(value),nodes:12,json:200+bytes*6,wire:64+bytes,depth:1)
+        }
+        static func copy(_ value: RemoteTerminalScreenCopy,valid: (String)->Bool) -> PackedValue? {
+            guard unsigned(value.baseLength), unsigned(value.start), unsigned(value.count), unsigned(value.length),valid(value.baseRevision),valid(value.head),valid(value.tail) else { return nil }
+            let bytes=value.baseRevision.utf8.count+value.head.utf8.count+value.tail.utf8.count
+            return PackedValue(.copy(value),nodes:14,json:220+bytes*6,wire:72+bytes,depth:1)
+        }
+        private func run(_ value: TerminalAppearance.Run,to out: Output) throws {
+            try out.uint(UInt64(value.offset));try out.uint(UInt64(value.length))
+            try out.uint(Self.runFlags(value))
+            if let color=value.fg { try out.string(color) };if let color=value.bg { try out.string(color) }
+        }
+        func write(to out: Output) throws {
+            switch value {
+            case .cursor(let value):
+                try out.byte(0x52)
+                let style: UInt8 = value.style == .block ? 0 : value.style == .bar ? 1:2
+                try out.byte((value.visible ? 1:0) | (value.blink ? 2:0) | style << 2)
+                try out.uint(UInt64(value.offset));try out.uint(UInt64(value.padding))
+            case .run(let value): try out.byte(0x51);try run(value,to:out)
+            case .appearance(let value):
+                try out.byte(0x53);try out.byte((value.foreground == nil ? 0:1) | (value.background == nil ? 0:2))
+                if let color=value.foreground { try out.string(color) };if let color=value.background { try out.string(color) }
+                try out.uint(UInt64(value.runs.count));for value in value.runs { try run(value,to:out) }
+            case .patch(let value):
+                try out.byte(0x54);try out.string(value.baseRevision)
+                try out.uint(UInt64(value.baseLength));try out.uint(UInt64(value.prefix));try out.uint(UInt64(value.suffix))
+                try out.string(value.text);try out.uint(UInt64(value.length))
+            case .copy(let value):
+                try out.byte(0x55);try out.string(value.baseRevision)
+                try out.uint(UInt64(value.baseLength));try out.uint(UInt64(value.start));try out.uint(UInt64(value.count))
+                try out.string(value.head);try out.string(value.tail);try out.uint(UInt64(value.length))
+            }
+        }
+    }
     private struct PathKey: CodingKey {
         private let name: String?
         let intValue: Int?
@@ -82,14 +169,15 @@ final class RemoteTerminalWireEncoder {
     private final class Arena {
         // JSON admission and binary capacity have separate upper bounds.
         // UUID/RGB/base64 packing can only reduce the UTF-8 bound below.
-        var values: [Atom] = [], estimate = 0, wireBound = 0, keyCount = 0, unsupported = false
+        var values: [Atom] = [], estimate = 0, wireBound = 0, keyCount = 0, packedNodes = 0, unsupported = false
         let reference: JSONEncoder
-        init(reference: JSONEncoder,reserveHint:Int) { self.reference=reference; values.reserveCapacity(reserveHint) }
+        let compact: Bool
+        init(reference: JSONEncoder,reserveHint:Int,compact:Bool) { self.reference=reference;self.compact=compact;values.reserveCapacity(reserveHint) }
         func add() -> Int {
             guard values.count < nodeLimit else { unsupported=true;return 0 }
             let id=values.count;values.append(.empty);wireBound+=1;return id
         }
-        func check() throws { if unsupported || estimate > byteLimit || values.count+keyCount > nodeLimit { throw RetryFoundation.required } }
+        func check() throws { if unsupported || estimate > byteLimit || values.count+keyCount+packedNodes > nodeLimit { throw RetryFoundation.required } }
         func set(_ atom:Atom,at id:Int,estimated:Int,wire:Int) throws { try check();values[id]=atom;estimate+=estimated;wireBound+=wire-1;try check() }
         func object(_ id:Int) -> ObjectValues {
             if case .object(let object)=values[id] { return object }
@@ -146,6 +234,16 @@ final class RemoteTerminalWireEncoder {
             else { throw RetryFoundation.required }
         }
         func primitive<T:Encodable>(_ value:T,at id:Int) throws -> Bool {
+            if compact {
+                let packed: PackedValue?
+                if T.self == TerminalCursor.self { packed=PackedValue.cursor(value as! TerminalCursor) }
+                else if T.self == TerminalAppearance.self { packed=PackedValue.appearance(value as! TerminalAppearance) }
+                else if T.self == TerminalAppearance.Run.self { packed=PackedValue.run(value as! TerminalAppearance.Run) }
+                else if T.self == RemoteTerminalScreenPatch.self { packed=PackedValue.patch(value as! RemoteTerminalScreenPatch,valid:validString) }
+                else if T.self == RemoteTerminalScreenCopy.self { packed=PackedValue.copy(value as! RemoteTerminalScreenCopy,valid:validString) }
+                else { packed=nil }
+                if let packed { packedNodes+=packed.extraNodes;try set(.packed(packed),at:id,estimated:packed.jsonBound,wire:packed.wireBound);return true }
+            }
             if #available(macOS 15.0, *) {
                 if T.self == Int128.self { try number(value as! Int128,at:id);return true }
                 if T.self == UInt128.self { try number(value as! UInt128,at:id);return true }
@@ -200,6 +298,9 @@ final class RemoteTerminalWireEncoder {
                     guard seen.insert(key).inserted else { throw RetryFoundation.required }
                     try out.string(key);try write(child,to:out,depth:depth+1)
                 }
+            case .packed(let value):
+                guard depth+value.depth <= depthLimit else { throw RetryFoundation.required }
+                try value.write(to:out)
             }
         }
     }
@@ -270,10 +371,10 @@ final class RemoteTerminalWireEncoder {
                 try head(6,count);try append(UnsafeRawBufferPointer(bytes))
             }) else { throw RetryFoundation.required }
         }
-        func takeData(event:UInt8) -> Data {
+        func takeData(event:UInt8,version:Int) -> Data {
             let length=count-7,headerCount=length<128 ? 5 : length<16384 ? 6 : 7,owned=pointer!
             if headerCount<7 { memmove(owned.advanced(by:headerCount),owned.advanced(by:7),length) }
-            let bytes=owned.assumingMemoryBound(to:UInt8.self);bytes[0]=65;bytes[1]=65;bytes[2]=2;bytes[3]=event
+            let bytes=owned.assumingMemoryBound(to:UInt8.self);bytes[0]=65;bytes[1]=65;bytes[2]=UInt8(version);bytes[3]=event
             var rest=length,index=4
             repeat { bytes[index]=UInt8(rest&127) | (rest>=128 ? 128 : 0);rest >>= 7;index+=1 } while rest>0
             pointer=nil;return Data(bytesNoCopy:owned,count:headerCount+length,deallocator:.free)

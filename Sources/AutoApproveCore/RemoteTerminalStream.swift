@@ -91,7 +91,7 @@ struct RemoteTerminalControls: Equatable {
     private var unchanged = 0
 
     init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, copy: Bool = false,
-         resume: RemoteTerminalFrame? = nil, compact: Bool = false, paced: Bool = false, binary: Bool = false,
+         resume: RemoteTerminalFrame? = nil, compact: Bool = false, paced: Bool = false, binary: Bool = false, wireVersion: Int = 2,
          onCancel: (@MainActor () -> Void)? = nil, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
          responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
         // A resume basis affects only output encoding. The initial frame above
@@ -100,7 +100,7 @@ struct RemoteTerminalControls: Equatable {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.withoutEscapingSlashes]
         eventEncoder = encoder
-        let wire = binary ? RemoteTerminalWireEncoder(jsonEncoder:encoder) : nil
+        let wire = binary ? RemoteTerminalWireEncoder(jsonEncoder:encoder,version:wireVersion) : nil
         wireEncoder = wire
         initialEvent = try RemoteServerEvent.screen(RemoteTerminalUpdate(initial,previous:resume,delta:delta,copy:copy), encoder:encoder,wire:wire)
         self.initial = emitInitial ? initial : nil; self.read = read; self.delta = delta

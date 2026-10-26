@@ -20,17 +20,17 @@ enum RemoteServerEvent {
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "터미널 화면이 너무 큽니다. 터미널 크기를 줄여 다시 연결해주세요.") }
         return Data("event: output\nid: \(value.offset)\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
-    static func failure(_ error: Error, binary: Bool = false) -> Data {
+    static func failure(_ error: Error, binary: Bool = false, wireVersion: Int = 2) -> Data {
         let status = (error as? RemoteHTTPError)?.status
         let retryable = error is NWError || status == 503 || status == 504
         if binary {
             struct Failure: Encodable { let error: String, retryable: Bool }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
-            let wire = RemoteTerminalWireEncoder(jsonEncoder:encoder)
+            let wire = RemoteTerminalWireEncoder(jsonEncoder:encoder,version:wireVersion)
             if let data = try? wire.encode(Failure(error:error.localizedDescription,retryable:retryable),event:3) { return data }
             // This constant is a complete JSON-fallback binary frame.
             let json = Data("{\"error\":\"Stream failed\",\"retryable\":false}".utf8)
-            return Data([65,65,2,131,UInt8(json.count)]) + json
+            return Data([65,65,UInt8(wireVersion),131,UInt8(json.count)]) + json
         }
         let json = (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription, "retryable": retryable])) ?? Data("{\"error\":\"Stream failed\"}".utf8)
         return Data("event: failure\ndata: ".utf8) + json + Data("\n\n".utf8)
@@ -67,11 +67,11 @@ final class RemotePTYBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private var ended: Bool
     private var cancelled = false
 
-    init(terminal: ManagedPTY, offset: Int?, client: String?, emitInitial: Bool = true, binary: Bool = false) throws {
+    init(terminal: ManagedPTY, offset: Int?, client: String?, emitInitial: Bool = true, binary: Bool = false, wireVersion: Int = 2) throws {
         let initial = try terminal.read(after: offset, client: client)
         self.terminal = terminal; self.client = client; self.offset = initial.offset
         let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
-        let wire = binary ? RemoteTerminalWireEncoder(jsonEncoder:encoder) : nil
+        let wire = binary ? RemoteTerminalWireEncoder(jsonEncoder:encoder,version:wireVersion) : nil
         wireEncoder = wire
         _ = try RemoteServerEvent.output(initial,wire:wire) // Validate before stream headers.
         initialOutput = emitInitial || !initial.data.isEmpty || initial.exitCode != nil ? initial : nil
@@ -155,7 +155,10 @@ final class RemotePTYBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
 /// A gateway keeps one live LAN connection to the owning Mac. It assembles one
 /// batch of complete SSE events per downstream send, so fragmentation or failure
 /// cannot splice a gateway error into the middle of an upstream JSON line.
-struct RemotePeerStreamOpening: Sendable { let data: Data, binary: Bool }
+struct RemotePeerStreamOpening: Sendable {
+    let data: Data, binary: Bool
+    var wireVersion: Int = 2
+}
 
 final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     // Upstream comments are already relayed. Inserting a gateway heartbeat
@@ -166,7 +169,9 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private let expectedNodeID: String
     private let openingTimeout: TimeInterval
     private let allowsBinary: Bool
+    private let maximumWireVersion: Int
     private var binary = false
+    private var wireVersion = 2
     private let queue = DispatchQueue(label: "autoapprove.web.pty-peer-stream")
     private var opening: CheckedContinuation<RemotePeerStreamOpening, Error>?
     private var deadline: DispatchWorkItem?
@@ -183,13 +188,15 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private static let eventLimit = 2_000_128
     private var searchedBytes = 0
 
-    init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15, allowsBinary: Bool = false) throws {
+    init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15, allowsBinary: Bool = false, maximumWireVersion: Int = 2) throws {
         guard !expectedNodeID.contains("\r"), !expectedNodeID.contains("\n") else { throw RemoteHTTPError(502, "Mac의 연결 ID가 올바르지 않습니다.") }
         connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
         self.expectedNodeID = expectedNodeID
         openingTimeout = max(0.05, timeout)
         self.allowsBinary = allowsBinary
-        let accept = allowsBinary ? RemoteTerminalWire.contentType + ", text/event-stream" : "text/event-stream"
+        self.maximumWireVersion = maximumWireVersion
+        let types = maximumWireVersion == 3 ? RemoteTerminalWire.compactContentType + ", " + RemoteTerminalWire.contentType : RemoteTerminalWire.contentType
+        let accept = allowsBinary ? types + ", text/event-stream" : "text/event-stream"
         request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\nAccept: \(accept)\r\nAccept-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
     }
     deinit { connection.cancel() }
@@ -255,11 +262,12 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                     if status == 200 {
                         let encoding = headers["content-encoding"]?.lowercased()
                         let type = headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased()
-                        guard type == "text/event-stream" || self.allowsBinary && type == RemoteTerminalWire.contentType,
+                        let version = RemoteTerminalWire.version(for:type)
+                        guard type == "text/event-stream" || self.allowsBinary && version != nil && version! <= self.maximumWireVersion,
                               headers["transfer-encoding"] == nil,
                               encoding == nil || encoding == "identity" || encoding == "gzip",
                               headers["x-autoapprove-node"] == self.expectedNodeID else { throw RemoteHTTPError(502, "Mac의 터미널 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.", diagnostics: ["failureKind":"identity"]) }
-                        self.binary = type == RemoteTerminalWire.contentType
+                        self.binary = version != nil; self.wireVersion = version ?? 2
                         let body = self.buffer.subdata(in: boundary.upperBound..<self.buffer.count)
                         self.buffer = Data()
                         if encoding == "gzip" {
@@ -277,7 +285,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                             // when the same bytes arrive in a later packet.
                             self.fail(error); initial = Data()
                         }
-                        continuation?.resume(returning:RemotePeerStreamOpening(data:initial,binary:self.binary)); return
+                        continuation?.resume(returning:RemotePeerStreamOpening(data:initial,binary:self.binary,wireVersion:self.wireVersion)); return
                     }
                     guard let length = headers["content-length"].flatMap(Int.init), (0...256_000).contains(length) else { throw RemoteHTTPError(502, "Mac의 오류 응답이 올바르지 않습니다.") }
                     if self.buffer.count >= boundary.upperBound + length {
@@ -385,7 +393,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
             func endAt(_ offset: Int) throws -> Int? {
                 let available = bytes.count-offset
                 for index in 0..<min(3,available) {
-                    guard bytes[offset+index] == [65,65,2][index] else { throw RemoteHTTPError(502,"Mac의 터미널 전송 버전이 다릅니다.") }
+                    guard bytes[offset+index] == (index == 2 ? UInt8(wireVersion) : 65) else { throw RemoteHTTPError(502,"Mac의 터미널 전송 버전이 다릅니다.") }
                 }
                 guard available >= 4 else { return nil }
                 let mode = bytes[offset+3]

@@ -11,6 +11,7 @@ private final class QueueDrain: @unchecked Sendable {
     private let stream: any RemoteHTTPBodyStream
     private let initial: Data
     private let check: Bool, candidate: Bool, pause: Bool, cancel: Bool
+    private let wireVersion: Int?
     private let queue=DispatchQueue(label:"owned.synthetic.http-consumer")
     private let sourceQueue: DispatchQueue?
     private let completion: @Sendable (Result<[String:Any],Error>)->Void
@@ -18,9 +19,9 @@ private final class QueueDrain: @unchecked Sendable {
     private var pending=false,finished=false,events=0,chunks=0,maxChunk=0,bytes=0,checksum:UInt64=0
     private var trace=SHA256(),outputs=[Data](),previous:PeerTailWorker.BufferState?
     private var aliases=0,compactions=0,maxPrefix=0,maxBuffered=0
-    init(stream:any RemoteHTTPBodyStream,initial:Data,check:Bool,candidate:Bool,pause:Bool,cancel:Bool,
+    init(stream:any RemoteHTTPBodyStream,initial:Data,check:Bool,candidate:Bool,pause:Bool,cancel:Bool,wireVersion:Int? = nil,
          completion:@escaping @Sendable (Result<[String:Any],Error>)->Void) {
-        self.stream=stream;self.initial=initial;self.check=check;self.candidate=candidate;self.pause=pause;self.cancel=cancel;self.completion=completion
+        self.stream=stream;self.initial=initial;self.check=check;self.candidate=candidate;self.pause=pause;self.cancel=cancel;self.wireVersion=wireVersion;self.completion=completion
         sourceQueue=check ? PeerTailWorker.owned(stream,"queue",DispatchQueue.self):nil
     }
     func start() {
@@ -69,6 +70,22 @@ private final class QueueDrain: @unchecked Sendable {
         try PeerTailWorker.require(data.startIndex==0,"Returned chunk index changed")
         return try data.withUnsafeBytes { (raw:UnsafeRawBufferPointer) in
             var ranges=[Range<Int>](),start=0,index=0
+            if let wireVersion {
+                while index<raw.count {
+                    start=index
+                    try PeerTailWorker.require(raw.count-index>=5 && raw[index]==65 && raw[index+1]==65 && raw[index+2]==wireVersion,"Partial binary header")
+                    index+=4;var size=0,shift=0
+                    while true {
+                        try PeerTailWorker.require(index<raw.count && shift<=21,"Partial binary length")
+                        let byte=raw[index];index+=1;size |= Int(byte&127)<<shift
+                        if byte&128==0 {break};shift+=7
+                    }
+                    try PeerTailWorker.require(size<=2_000_000 && size<=raw.count-index,"Partial binary body")
+                    index+=size;ranges.append(start..<index)
+                }
+                try PeerTailWorker.require(!ranges.isEmpty && (data.count<=65536 || ranges.count==1),"Invalid binary batch")
+                return ranges
+            }
             while index+1<raw.count {
                 if raw[index]==10 && raw[index+1]==10 {let end=index+2;ranges.append(start..<end);start=end;index=end}
                 else {index+=1}
@@ -140,13 +157,15 @@ private final class QueueDrain: @unchecked Sendable {
         for monitor in owned(service,"interfaceMonitors",[NWPathMonitor].self) ?? [] {monitor.cancel()}
         defer {service.stop();withExtendedLifetime(engine){}}
 
-        func run(_ mode:String,check:Bool=false,pause:Bool=false,cancel:Bool=false) async throws -> [String:Any] {
-            let request=try RemoteHTTPRequest.parse(Data(("GET /api/terminal/stream?node="+owner+"&session=synthetic&mode="+mode+" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").utf8))!
+        func run(_ mode:String,check:Bool=false,pause:Bool=false,cancel:Bool=false,wireVersion:Int? = nil) async throws -> [String:Any] {
+            let wire=wireVersion.map { "&wire=\($0)" } ?? ""
+            let request=try RemoteHTTPRequest.parse(Data(("GET /api/terminal/stream?node="+owner+"&session=synthetic&mode="+mode+wire+" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").utf8))!
             let response=await service.handle(request)
             guard response.status==200,let stream=response.stream else{return ["status":response.status,"events":0,"bytes":0,"checksum":0]}
             defer {stream.cancel()}
             return try await withCheckedThrowingContinuation { continuation in
-                QueueDrain(stream:stream,initial:response.body,check:check,candidate:candidate,pause:pause,cancel:cancel) {
+                QueueDrain(stream:stream,initial:response.body,check:check,candidate:candidate,pause:pause,cancel:cancel,
+                    wireVersion:response.contentType.hasSuffix("terminal-v3") ? 3 : response.contentType.hasSuffix("terminal-v2") ? 2:nil) {
                     continuation.resume(with:$0)
                 }.start()
             }
@@ -155,7 +174,7 @@ private final class QueueDrain: @unchecked Sendable {
         while let line=readLine() {
             let input=try JSONSerialization.jsonObject(with:Data(line.utf8)) as! [String:Any],id=input["id"] as! String,mode=input["mode"] as! String
             if input["check"] as? Bool==true {
-                var result=try await run(mode,check:true,pause:input["pause"] as? Bool ?? false,cancel:input["cancel"] as? Bool ?? false);result["id"]=id;result["mode"]=mode;try emit(result);continue
+                var result=try await run(mode,check:true,pause:input["pause"] as? Bool ?? false,cancel:input["cancel"] as? Bool ?? false,wireVersion:input["wireVersion"] as? Int);result["id"]=id;result["mode"]=mode;try emit(result);continue
             }
             throw Failure.invalid("Only functional check requests are accepted")
         }

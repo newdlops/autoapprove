@@ -7,6 +7,7 @@ window.AutoApprovePTY = class {
     this.binary = binary;
     this.clientID = uuid(); this.sequence = 0; this.offset = null; this.queue = []; this.sending = false; this.disposed = false; this.ready = false; this.blocked = false;
     this.outputQueue = []; this.outputBytes = 0; this.writing = false; this.outputPaused = false; this.source = null;
+    this.sourceEpoch = 0; this.retries = 0; this.reconnecting = false;
     this.maxOutputBytes = 512000; this.maxSnapshotBytes = 2097152; this.maxOutputEvents = 64;
     this.term = new Terminal({ cols: descriptor.columns, rows: descriptor.rows, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize, lineHeight: 1.25, cursorBlink: !matchMedia('(prefers-reduced-motion: reduce)').matches, scrollback: 4000, disableStdin: true, theme: { background: '#171a20', foreground: '#e5e8ee', cursor: '#e5e8ee', selectionBackground: '#315782' } });
     this.fitAddon = new FitAddon.FitAddon(); this.term.loadAddon(this.fitAddon); this.term.open(container);
@@ -41,7 +42,7 @@ window.AutoApprovePTY = class {
     if (this.term.cols !== columns || this.term.rows !== rows) this.term.resize(columns, rows);
   }
   async resize() {
-    if (this.disposed || !this.streaming || this.resizing || this.ending || this.descriptor.exitCode != null) return;
+    if (this.disposed || this.reconnecting || !this.streaming || this.resizing || this.ending || this.descriptor.exitCode != null) return;
     this.resizing = true;
     const columns = this.term.cols, rows = this.term.rows;
     try { if (columns !== this.descriptor.columns || rows !== this.descriptor.rows) { await this.post('/api/pty/resize', {columns, rows}); this.descriptor.columns = columns; this.descriptor.rows = rows; } }
@@ -62,7 +63,43 @@ window.AutoApprovePTY = class {
       if (!this.disposed) this.receive(update);
     } catch (error) { if (!this.disposed) this.fail(error); }
   }
-  closeStream() { this.source?.close(); this.source = null; }
+  closeStream(preserveControls=false) {
+    clearTimeout(this.streamWatchdog); this.source?.close(); this.source = null;
+    if (!preserveControls) { this.sourceEpoch = (this.sourceEpoch || 0) + 1; this.ready = false; this.term.options.disableStdin = true; }
+  }
+  reconnect(error) {
+    if (this.disposed || this.blocked || this.ending) return;
+    // A pending write may already have reached the Mac. Never replay it or
+    // silently resume input while its result is uncertain.
+    if (this.sending || this.queue.length || error.failureKind === 'identity' || [400,401,403,404,409,410].includes(error.status)) { this.fail(error); return; }
+    const source = this.source;
+    if (source?.version && !source.received && (error.wireFormat || error.wireTimeout || [406,415].includes(error.status))) this.binary = source.version === 3 ? 2 : 0;
+    this.closeStream(); this.ready = false; this.term.options.disableStdin = true; this.reconnecting = true;
+    this.report('waiting', 'PTY 다시 연결 중…', this);
+    if (this.retryTimer) return;
+    const attempt = this.retries++;
+    const delay = attempt === 0 ? 0 : Math.min(5000,250 * 2 ** Math.min(attempt-1,5));
+    this.retryTimer = setTimeout(() => { this.retryTimer = null; this.resumeOutput(); },delay);
+  }
+  resumeOutput() {
+    // Commit every queued byte before choosing the next HTTP offset.
+    if (this.disposed || this.blocked || this.ending || this.retryTimer || this.writing || this.outputQueue.length) return;
+    if (this.outputPaused || this.reconnecting) { this.outputPaused = false; this.openStream(); }
+  }
+  resumeNetwork() {
+    if (!this.reconnecting || this.disposed || this.blocked) return;
+    clearTimeout(this.retryTimer); this.retryTimer = null; this.retries = 0; this.resumeOutput();
+  }
+  watchStream(source) {
+    clearTimeout(this.streamWatchdog);
+    const budget = this.sourceReceived ? 35000 : 10000;
+    const remaining = Math.max(1,budget-Math.max(0,Date.now()-Math.max(this.openedAt,source.lastActivity || 0)));
+    this.streamWatchdog = setTimeout(() => {
+      if (this.source !== source || this.disposed) return;
+      if (source.version && Date.now()-Math.max(this.openedAt,source.lastActivity || 0)<budget) { this.watchStream(source); return; }
+      if (source.version || !this.sourceReceived) this.reconnect(Object.assign(new Error('PTY 출력 응답을 기다리다 시간이 지났습니다.'),{wireTimeout:true}));
+    },remaining);
+  }
   openStream() {
     if (this.disposed || this.blocked || !this.streaming || document.hidden || this.source) return;
     try {
@@ -72,22 +109,30 @@ window.AutoApprovePTY = class {
       if (this.offset !== null) query.set('offset', String(this.offset));
       const url = '/api/pty/stream?' + query;
       const source = window.AutoApproveTerminalWire?.open(url,this.binary,true) || new EventSource(url); this.source = source;
+      this.openedAt = Date.now(); this.sourceReceived = false; const epoch = this.sourceEpoch;
+      this.watchStream(source);
       source.addEventListener('output', event => {
         if (this.disposed || this.source !== source) return;
-        try { this.receive(Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data)); } catch (error) { this.fail(error); }
+        try {
+          this.receive(Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data),epoch);
+          this.sourceReceived = true;
+          this.watchStream(source);
+          if (Date.now()-this.openedAt >= 1500) this.retries = 0;
+        } catch (error) { this.fail(error); }
       });
       source.addEventListener('failure', event => {
         if (this.disposed || this.source !== source) return;
-        let message;
-        try { message = (Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data)).error; } catch (_) {}
-        this.fail(new Error(message || 'PTY 출력 연결이 끊겼습니다. 화면을 다시 연결해주세요.'));
+        let failure;
+        try { failure = Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data); } catch (_) {}
+        const error = new Error(failure?.error || 'PTY 출력 연결이 끊겼습니다. 화면을 다시 연결해주세요.');
+        if (failure?.retryable === true) this.reconnect(error); else this.fail(error);
       });
-      source.onerror = () => {
-        if (!this.disposed && this.source === source) this.fail(new Error('PTY 출력 연결이 끊겼습니다. 화면을 다시 연결해주세요.'));
+      source.onerror = error => {
+        if (!this.disposed && this.source === source) this.reconnect(error instanceof Error ? error : new Error('PTY 출력 연결이 끊겼습니다.'));
       };
     } catch (error) { this.fail(error); }
   }
-  receive(update) {
+  receive(update,epoch=this.sourceEpoch) {
     if (update.streamID !== this.descriptor.streamID || update.ptyID !== this.descriptor.ptyID || !Number.isSafeInteger(update.offset) || update.offset < 0 || typeof update.data !== 'string' && !(update.data instanceof Uint8Array)) throw new Error('PTY 연결이 바뀌었습니다. 다시 연결해주세요.');
     const singleLimit = update.reset ? this.maxSnapshotBytes : this.maxOutputBytes;
     if (typeof update.data === 'string' && update.data.length > Math.ceil(singleLimit / 3) * 4) throw new Error('터미널 출력이 너무 큽니다. 화면을 다시 연결해주세요.');
@@ -96,11 +141,13 @@ window.AutoApprovePTY = class {
     if (this.outputBytes + bytes.length > this.maxOutputBytes && (this.writing || this.outputQueue.length) || this.outputQueue.length >= this.maxOutputEvents) {
       // Stop receiving before xterm's own async write queue can grow. Drain the
       // bounded queue, then resume its committed offset or the native snapshot.
-      this.closeStream(); this.outputPaused = true;
+      // This deliberate read pause retains the current writer permission so
+      // Ctrl C can still stop a flood while the bounded renderer drains.
+      this.closeStream(true); this.outputPaused = true;
       this.report('waiting', '터미널 출력 반영 중…', this);
       return;
     }
-    this.outputQueue.push({update, bytes}); this.outputBytes += bytes.length;
+    this.outputQueue.push({update, bytes, epoch}); this.outputBytes += bytes.length;
     if (update.exitCode != null) { this.closeStream(); this.ending = true; this.ready = false; this.term.options.disableStdin = true; }
     void this.renderOutput();
   }
@@ -109,7 +156,7 @@ window.AutoApprovePTY = class {
     this.writing = true;
     try {
       while (this.outputQueue.length && !this.disposed) {
-        const {update, bytes} = this.outputQueue.shift();
+        const {update, bytes, epoch} = this.outputQueue.shift();
         if (!update.reset && (this.offset === null || update.offset - this.offset !== bytes.length)) throw new Error('PTY 출력 순서가 바뀌었습니다. 화면을 다시 연결해주세요.');
         if (update.reset) {
           if (update.exitCode != null) {
@@ -124,8 +171,9 @@ window.AutoApprovePTY = class {
         if (this.disposed) return;
         this.outputBytes = Math.max(0, this.outputBytes - bytes.length); this.offset = update.offset; this.descriptor.exitCode = update.exitCode;
         if (update.reset && update.exitCode != null) this.fit();
-        this.ready = this.streaming && !this.blocked && !this.ending && update.exitCode == null && update.canInput !== false; this.term.options.disableStdin = !this.ready;
-        this.report(update.exitCode != null ? 'ended' : this.blocked ? 'blocked' : !this.streaming ? 'readonly' : this.outputPaused || !this.ready ? 'waiting' : 'live', update.exitCode != null ? 'PTY 종료 · 코드 ' + update.exitCode : this.blocked ? this.error : !this.streaming ? '화면 보기 · Mac 업데이트 필요' : this.ending ? 'PTY 마지막 출력 반영 중…' : this.outputPaused ? '터미널 출력 반영 중…' : this.ready ? 'PTY 실시간 연결됨' : '출력 연결됨 · 다른 브라우저 입력 대기', this);
+        if (epoch === this.sourceEpoch && !this.outputPaused) this.reconnecting = false;
+        this.ready = this.streaming && epoch === this.sourceEpoch && !this.reconnecting && !this.blocked && !this.ending && update.exitCode == null && update.canInput !== false; this.term.options.disableStdin = !this.ready;
+        this.report(update.exitCode != null ? 'ended' : this.blocked ? 'blocked' : !this.streaming ? 'readonly' : !this.ready ? 'waiting' : 'live', update.exitCode != null ? 'PTY 종료 · 코드 ' + update.exitCode : this.blocked ? this.error : !this.streaming ? '화면 보기 · Mac 업데이트 필요' : this.ending ? 'PTY 마지막 출력 반영 중…' : this.reconnecting ? 'PTY 다시 연결 중…' : this.outputPaused ? '터미널 출력 반영 중…' : this.ready ? 'PTY 실시간 연결됨' : '출력 연결됨 · 다른 브라우저 입력 대기', this);
         if (this.ready && this.resizePending) { this.resizePending = false; void this.resize(); }
         if (this.ready && this.queue.length) void this.flush();
         if (update.exitCode != null) { this.term.options.cursorBlink = false; return; }
@@ -133,7 +181,7 @@ window.AutoApprovePTY = class {
     } catch (error) { if (!this.disposed) this.fail(error); }
     finally {
       this.writing = false;
-      if (!this.disposed && !this.blocked && this.outputPaused) { this.outputPaused = false; this.openStream(); }
+      this.resumeOutput();
     }
   }
   enqueue(data) { this.enqueueBytes(new TextEncoder().encode(data)); }
@@ -156,6 +204,7 @@ window.AutoApprovePTY = class {
     finally { this.sending = false; if (this.ready && !this.disposed && this.queue.length) void this.flush(); }
   }
   fail(error) {
+    clearTimeout(this.retryTimer); this.retryTimer = null;
     this.closeStream(); this.outputQueue = []; this.outputBytes = 0;
     this.blocked = true; this.ready = false; this.error = error.message; this.term.options.disableStdin = true;
     const bytes = this.queue.flatMap(item => Array.from(item)); this.queue = [];
@@ -171,7 +220,7 @@ window.AutoApprovePTY = class {
   focus() { if (this.ready) this.term.focus(); }
   font(value) { this.term.options.fontSize = value; this.fit(); }
   dispose() {
-    this.disposed = true; this.closeStream(); this.outputQueue = []; this.outputBytes = 0; clearTimeout(this.inputTimer); clearTimeout(this.resizeTimer); this.observer.disconnect();
+    this.disposed = true; this.closeStream(); this.outputQueue = []; this.outputBytes = 0; clearTimeout(this.retryTimer); clearTimeout(this.inputTimer); clearTimeout(this.resizeTimer); this.observer.disconnect();
     this.container.removeEventListener('pointerup', this.focusListener);
     this.container.removeEventListener('pointerdown', this.pointerListener);
     const remaining = this.queue.flatMap(item => Array.from(item)); this.queue = [];
