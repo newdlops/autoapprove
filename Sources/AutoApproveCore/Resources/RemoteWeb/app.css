@@ -1,4 +1,6 @@
 :root { color-scheme: light dark; --bg: #f5f5f7; --surface: #fff; --subtle: #f0f1f4; --fg: #202124; --muted: #60636b; --line: #dcdde2; --blue: #1264d8; --on-blue: #fff; --selected: #eaf2ff; --green: #187440; --orange: #96510c; --red: #b32628; --error-bg: #fff0ef; --terminal: #171a20; --terminal-fg: #e5e8ee; --terminal-muted: #b1b7c4; --radius: 8px; }
+.tunnel-access { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.tunnel-access span { flex: 1; min-width: 180px; }
 .new-pty { margin-top: 12px; width: 100%; flex-shrink: 0; }
 .pty-screen { height: 360px; min-width: 0; min-height: 0; padding: 8px; overflow: hidden; background: #171a20; }
 .pty-screen .xterm { height: 100%; padding: 0; }

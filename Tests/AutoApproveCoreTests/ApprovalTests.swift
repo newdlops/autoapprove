@@ -504,6 +504,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Tunnel: HTTPS authority and private-address isolation", tests.testTunnelOriginsRejectAuthorityConfusionAndPrivateAddresses),
+            ("Tunnel: default off and credential-free persisted configuration", tests.testTunnelConfigurationDefaultsOffAndRoundTripsWithoutCredentials),
             ("History cache: compact projection matches raw decisions and old-row edits", tests.testCodexHistoryCompactCacheMatchesRawDecisionsAndOldEdits),
             ("Local socket: fragmented Unicode, large lines, buffered order and permissions", tests.testLocalSocketFragmentedUnicodeAndBufferedOrdering),
             ("Local socket: malformed and oversized peers, bounded connections and single disconnect", tests.testLocalSocketMalformedOversizedAndBoundedPeers),

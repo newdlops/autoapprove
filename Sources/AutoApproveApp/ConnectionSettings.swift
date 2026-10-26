@@ -29,6 +29,8 @@ import AutoApproveCore
                 VStack(alignment: .leading, spacing: 24) {
                     RemoteAccessSettings(engine: engine)
                     Divider()
+                    TunnelSettings(engine: engine)
+                    Divider()
                     section("tmux로 같은 터미널 공유", icon: "terminal", status: engine.snapshot.health.screen(.tmux).status) {
                         TmuxSharingSettings(installed: TmuxRelay.executable != nil, health: engine.snapshot.health.screen(.tmux),
                             command: TmuxRelay.startCommand,

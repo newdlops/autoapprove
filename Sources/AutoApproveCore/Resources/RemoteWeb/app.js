@@ -1,9 +1,23 @@
 'use strict';
+const tunnelAccess=document.querySelector('meta[name="autoapprove-tunnel"]')?.content || '';
+let tunnelAuthExpired=false;
+if(tunnelAccess){
+  const clearSharedKey=()=>{const fragment=new URLSearchParams(location.hash.slice(1));if(fragment.has('access')){fragment.delete('access');history.replaceState(null,'',location.pathname+location.search+(fragment.size?'#'+fragment.toString():''));}};
+  window.addEventListener('hashchange',clearSharedKey);clearSharedKey();
+}
 const $ = id => document.getElementById(id);
 const text = (element, value) => { const next = String(value ?? ''); if (element.textContent !== next) element.textContent = next; };
 const show = (element, visible) => { const hidden = !visible; if (element.hidden !== hidden) element.hidden = hidden; };
 const setBusy = (element, value) => { const busy = String(!!value); if (element.getAttribute('aria-busy') !== busy) element.setAttribute('aria-busy',busy); };
 const make = (tag, className, value) => { const element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) text(element, value); return element; };
+if(tunnelAccess){
+  show($('tunnel-access'),true);text($('tunnel-access-state'),tunnelAccess==='polling'?'외부 접속 · 임시 터널 화면 조회':'외부 접속 · 실시간 터널');
+  $('tunnel-logout').addEventListener('click',async()=>{
+    const button=$('tunnel-logout');button.disabled=true;
+    try{await api('/auth/logout',{});location.replace('/auth');}
+    catch(error){text($('tunnel-access-state'),error.message);button.disabled=false;}
+  });
+}
 const uuid = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (Number(c) ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> Number(c) / 4).toString(16));
 const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
 const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', tmux: 'tmux', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
@@ -215,7 +229,7 @@ const supportsRelease = (node, minimum) => {
   return true;
 };
 const supportsPTYStream = node => supportsRelease(node, [0, 2, 41, 48]);
-const supportsTerminalStream = node => supportsRelease(node, [0, 2, 42, 49]);
+const supportsTerminalStream = node => tunnelAccess !== 'polling' && supportsRelease(node, [0, 2, 42, 49]);
 const supportsTerminalWire = node => {
   const owner = node?.state?.terminalWireVersion;
   return [2,3].includes(gatewayTerminalWireVersion) && [2,3].includes(owner) ? Math.min(gatewayTerminalWireVersion,owner) : 0;
@@ -296,7 +310,7 @@ async function ensurePTY() {
   }
   if (selectedKey !== item.key || document.hidden || ptyClient?.sessionKey === item.key) return;
   stopPTY();
-  ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming, supportsTerminalWire(item.node));
+  ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming, supportsTerminalWire(item.node), tunnelAccess === 'polling');
   ptyClient.sessionKey = item.key;
 }
 const currentNode = () => nodes.find(node => node.id === selectedItem?.node.id);
@@ -307,7 +321,7 @@ const originalReadSelected = () => !!selectedItem && !selectedItem.view.pty && !
 const originalStreamSelected = () => !!selectedItem && !selectedItem.view.pty && !sessionEnded(selectedItem)
   && latestFrame?.sessionID === selectedItem.session.id && terminalStreamFailed !== selectedKey
   && (terminalStream?.key === selectedKey && terminalStream.generation === detailGeneration || inputInFlight);
-const originalTerminalConnected = () => !!currentNode()?.online || originalStreamSelected();
+const originalTerminalConnected = () => !tunnelAuthExpired && (!!currentNode()?.online || originalStreamSelected());
 const nowLabel = date => new Date(date).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const unreadInterruption = session => !!session.interruption && session.interruption.recoveredAt == null && session.interruption.acknowledgedAt == null;
 const retainedError = item => item.session.phase === 'ended' && !!item.session.interruption && (!unreadInterruption(item.session) || warningHidden(item,item.session,'interruption'));
@@ -325,6 +339,7 @@ const newerVersion = (left, right) => {
   return false;
 };
 function updateWebVersion(result) {
+  if(tunnelAccess){show($('web-update'),false);return;}
   const loaded = versionNumbers(loadedWebVersion) ? loadedWebVersion : result.gatewayRelease;
   let gateway = result.preferredGateway;
   if (!gateway && newerVersion(result.gatewayRelease, loaded)) gateway = { id: result.gatewayID, name: '이 Mac', url: location.origin + '/', release: result.gatewayRelease };
@@ -510,7 +525,13 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
   const timeout = setTimeout(() => controller.abort(), timeoutMS);
   try {
     const headers = body ? {'Content-Type':'application/json'} : validation?.etag ? {'If-None-Match':validation.etag,...(validation.wait ? {Prefer:'wait=15'} : {})} : {};
-    const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
+    const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: tunnelAccess ? 'same-origin' : 'omit' });
+    if(response.status === 401 && tunnelAccess){
+      tunnelAuthExpired=true;
+      stopDirect();
+      if(ptyClient && !ptyClient.blocked)ptyClient.fail(new Error('접속 시간이 끝났습니다. 접속 키로 다시 연결해주세요.'));
+      text($('tunnel-access-state'),'접속 시간이 끝났습니다. 미전달 입력을 확인하고 다시 연결해주세요.');show($('tunnel-relogin'),true);
+    }
     if (validation) validation.waitApplied = response.headers.get('Preference-Applied') === 'wait';
     if (validation) validation.notModified = false;
     if (response.status === 304) {
@@ -535,7 +556,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
       if (signal?.aborted) throw error;
       throw Object.assign(new Error('연결 응답이 늦습니다. 입력을 다시 보내기 전에 터미널 화면을 확인해주세요.'), {retryable: !body});
     }
-    if (error instanceof TypeError) throw Object.assign(new Error('Mac과의 연결이 끊겼습니다. 같은 핫스팟과 Mac의 웹 접속 설정을 확인해주세요.'), {retryable: !body});
+    if (error instanceof TypeError) throw Object.assign(new Error(tunnelAccess ? '외부 연결이 끊겼습니다. 인터넷 연결과 Mac의 터널 설정을 확인해주세요.' : 'Mac과의 연결이 끊겼습니다. 같은 핫스팟과 Mac의 웹 접속 설정을 확인해주세요.'), {retryable: !body});
     throw error;
   } finally { clearTimeout(timeout); signal?.removeEventListener('abort', abort); }
 }
@@ -1253,6 +1274,7 @@ function renderDetail() {
   renderQuestions(); renderHistory(); updateControls();
 }
 function originalPageURL(item, pageURL = location.href) {
+  if(tunnelAccess)return null;
   if (!item || item.node.local || item.view.pty || sessionEnded(item)) return null;
   const current = (()=>{try{return new URL(pageURL);}catch(_){return null;}})();
   const localPage = current && (current.hostname === 'localhost' || current.hostname.startsWith('127.'));
@@ -1276,9 +1298,10 @@ function updateTerminalRecovery() {
   const link = $('terminal-direct-page'), url = originalPageURL(selectedItem);
   const available = !!url && allSessions.some(item=>item.key===selectedKey) && (!latestFrame || terminalStream?.reconnecting || !currentNode()?.online || document.activeElement===link);
   show(link,available);show($('terminal-direct-help'),available);
+  show($('tunnel-terminal-relogin'),!!tunnelAccess&&tunnelAuthExpired);
   if (available) { link.href=url.href;link.setAttribute('aria-label',`${selectedItem.node.name}의 같은 세션을 새 탭에서 열기`); }
   else link.removeAttribute('href');
-  show($('terminal-recovery-actions'),!$('terminal-retry').hidden || available);
+  show($('terminal-recovery-actions'),!$('terminal-retry').hidden || available || !!tunnelAccess&&tunnelAuthExpired);
 }
 function updateControls() {
   updateAllAutomationResetControls();

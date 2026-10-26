@@ -150,6 +150,8 @@ public struct RemoteHTTPResponse: Sendable {
     public var entityTag: String?
     public var observedAt: Date?
     public var waitApplied = false
+    /// Only the separate authenticated tunnel gateway assigns this header.
+    public var setCookie: String?
     var contentEncoding: String?
     private var variesEncoding = false
     var stream: RemoteHTTPBodyStream?
@@ -209,11 +211,15 @@ public struct RemoteHTTPResponse: Sendable {
         let validator = entityTag.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "ETag: \($0)\r\n" } ?? ""
         let observation = observedAt.map { "X-AutoApprove-Observed-At: \($0.ISO8601Format())\r\n" } ?? ""
         let preference = waitApplied ? "Preference-Applied: wait\r\n" : ""
+        let cookie = setCookie.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "Set-Cookie: \($0)\r\n" } ?? ""
         let encoding = contentEncoding == "gzip" ? "Content-Encoding: gzip\r\n" : ""
         let vary = stream != nil || variesEncoding ? "Vary: Accept-Encoding\r\n" : ""
         let persistence = reuse ? "Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n" : "Connection: close\r\n"
         let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(preference)\(encoding)\(vary)\(persistence)Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
-        return Data(headers.utf8) + body
+        // CRLF is one Swift Character. Insert the optional cookie by its byte-
+        // independent delimiter; never trim graphemes from HTTP framing.
+        let withCookie = cookie.isEmpty ? headers : headers.replacingOccurrences(of:"\r\nContent-Type:",with:"\r\n"+cookie+"Content-Type:")
+        return Data(withCookie.utf8) + body
     }
 }
 

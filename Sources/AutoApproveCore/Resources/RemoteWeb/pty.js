@@ -1,9 +1,10 @@
 'use strict';
 // Raw PTY bytes are interpreted by xterm, never inserted as HTML or locally echoed.
 window.AutoApprovePTY = class {
-  constructor(container, descriptor, nodeID, api, uuid, report, fontSize = 14, streaming = true, binary = false) {
+  constructor(container, descriptor, nodeID, api, uuid, report, fontSize = 14, streaming = true, binary = false, polling = false) {
     this.container = container; this.descriptor = descriptor; this.nodeID = nodeID; this.api = api; this.uuid = uuid; this.report = report;
     this.streaming = streaming;
+    this.polling = polling && streaming;
     this.binary = binary;
     this.clientID = uuid(); this.sequence = 0; this.offset = null; this.queue = []; this.sending = false; this.disposed = false; this.ready = false; this.blocked = false;
     this.outputQueue = []; this.outputBytes = 0; this.writing = false; this.outputPaused = false; this.source = null;
@@ -51,7 +52,7 @@ window.AutoApprovePTY = class {
   }
   run() {
     if (this.disposed || this.blocked || document.hidden) return;
-    if (this.streaming) { this.openStream(); void this.resize(); }
+    if (this.streaming) { if(this.polling)void this.pollOutput();else this.openStream(); void this.resize(); }
     else void this.readSnapshot();
   }
   async readSnapshot() {
@@ -63,7 +64,25 @@ window.AutoApprovePTY = class {
       if (!this.disposed) this.receive(update);
     } catch (error) { if (!this.disposed) this.fail(error); }
   }
+  async pollOutput() {
+    if(this.pollRunning||this.disposed||this.blocked||this.ending||document.hidden)return;
+    this.pollRunning=true;
+    const controller=new AbortController(),epoch=this.sourceEpoch;this.pollController=controller;
+    try{
+      while(!controller.signal.aborted&&!this.disposed&&!this.blocked&&!this.ending&&!document.hidden&&epoch===this.sourceEpoch){
+        const query=new URLSearchParams({node:this.nodeID,pty:this.descriptor.ptyID,stream:this.descriptor.streamID,client:this.clientID});
+        if(this.offset!==null)query.set('offset',String(this.offset));
+        const update=await this.api('/api/pty/output?'+query,undefined,controller.signal,10000);
+        if(controller.signal.aborted||this.disposed||epoch!==this.sourceEpoch)return;
+        this.reconnecting=false;this.receive(update,epoch);
+        while(!this.disposed&&(this.writing||this.outputQueue.length))await new Promise(resolve=>setTimeout(resolve,8));
+        if(!update.data.length)await new Promise(resolve=>setTimeout(resolve,25));
+      }
+    }catch(error){if(!controller.signal.aborted&&!this.disposed)this.reconnect(error);}
+    finally{if(this.pollController===controller)this.pollController=null;this.pollRunning=false;this.resumeOutput();}
+  }
   closeStream(preserveControls=false) {
+    this.pollController?.abort();this.pollController=null;
     clearTimeout(this.streamWatchdog); this.source?.close(); this.source = null;
     if (!preserveControls) { this.sourceEpoch = (this.sourceEpoch || 0) + 1; this.ready = false; this.term.options.disableStdin = true; }
   }
@@ -84,6 +103,7 @@ window.AutoApprovePTY = class {
   resumeOutput() {
     // Commit every queued byte before choosing the next HTTP offset.
     if (this.disposed || this.blocked || this.ending || this.retryTimer || this.writing || this.outputQueue.length) return;
+    if(this.polling){if(!document.hidden){this.outputPaused=false;void this.pollOutput();}return;}
     if (this.outputPaused || this.reconnecting) { this.outputPaused = false; this.openStream(); }
   }
   resumeNetwork() {
@@ -101,7 +121,7 @@ window.AutoApprovePTY = class {
     },remaining);
   }
   openStream() {
-    if (this.disposed || this.blocked || !this.streaming || document.hidden || this.source) return;
+    if (this.disposed || this.blocked || !this.streaming || this.polling || document.hidden || this.source) return;
     try {
       const query = new URLSearchParams({ node: this.nodeID, pty: this.descriptor.ptyID, stream: this.descriptor.streamID, client: this.clientID });
       // Only a fully rendered offset is safe to resume. A new xterm starts from

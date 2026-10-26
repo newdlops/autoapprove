@@ -14,6 +14,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
+    @Published public internal(set) var tunnelStatus = RemoteTunnelStatus()
+    var tunnelController: RemoteTunnelController?
+    var tunnelRestoreAttempted = false
     @Published public private(set) var lanUpdate = LANUpdateStatus() {
         didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
@@ -103,7 +106,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var remoteInputReplies: [String: (peerID: String, continuation: CheckedContinuation<Bool, Error>)] = [:]
     private var remoteRevealReplies: [String: (peerID: String, terminalID: String, continuation: CheckedContinuation<String?, Error>)] = [:]
     public let paths: AppPaths
-    private let store: AuditStore
+    let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
@@ -491,6 +494,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        tunnelController?.stop(waitForExit:true); tunnelController=nil
         noticeKeyCache = nil
         remoteInputStopped = true
         automationRuntime.stop()
@@ -539,6 +543,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if enabled {
             if webService != nil {
                 guard port != nil else { return }
+                tunnelController?.stop(); tunnelController=nil; tunnelRestoreAttempted=false
                 webService?.stop(); webService = nil
             }
             let nodeID = store.value("webNodeID") ?? UUID().uuidString
@@ -547,6 +552,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard let self else { return }
                 self.webStatus = status
                 if status.ready, let actualPort = status.port { try? self.store.set("webPort", String(actualPort)) }
+                if status.ready { self.restoreTunnelIfRequested() }
             }
             let preferredPort = port ?? store.value("webPort").flatMap(UInt16.init) ?? 8765
             try service.start(port: preferredPort, allowPortFallback: port == nil)
@@ -554,6 +560,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             catch { service.stop(); throw error }
             webService = service
         } else {
+            try stopTunnel()
             try store.set("webEnabled", "false")
             testScreens.stopAll()
             webService?.stop(); webService = nil
@@ -568,6 +575,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
     var lanUpdateWaitReason: String? {
+        if tunnelStatus.active { return "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||
             !sendingMessages.isEmpty || !replyingQuestions.isEmpty || !clearingCodexQueues.isEmpty ||

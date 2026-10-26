@@ -1,0 +1,13 @@
+.tunnel-login { display: block; width: min(100% - 40px, 440px); margin: 10vh auto 40px; padding: 0; min-height: 0; }
+.tunnel-login header { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 650; }
+.tunnel-login h1 { margin: 32px 0 12px; font-size: 26px; line-height: 1.25; }
+.tunnel-login p { margin: 0 0 24px; overflow-wrap: anywhere; }
+.tunnel-login form { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
+.tunnel-login label { font-size: 14px; font-weight: 600; }
+.tunnel-login input { width: 100%; min-height: 48px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--fg); }
+.tunnel-login input[aria-invalid=true] { border-color: var(--red); }
+.tunnel-login button { margin-top: 8px; min-height: 48px; }
+.tunnel-login form p { margin: 4px 0; }
+.tunnel-login .muted { font-size: 14px; }
+@media (max-height: 500px) { .tunnel-login { margin-top: 24px; } .tunnel-login h1 { margin-top: 20px; } }
+@media (prefers-reduced-motion: reduce) { .tunnel-login button { transition: none; } }

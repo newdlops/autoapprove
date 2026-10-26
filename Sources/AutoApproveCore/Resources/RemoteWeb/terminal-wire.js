@@ -213,7 +213,7 @@
     close() { if(this.closed)return;this.closed=true;this.controller.abort();void this.reader?.cancel().catch(()=>{}); }
     async run() {
       try {
-        const response=await fetch(this.url,{signal:this.controller.signal,cache:'no-store',credentials:'omit',headers:{Accept:(this.version===3?compactType+', ':'')+type+', text/event-stream'}});
+        const response=await fetch(this.url,{signal:this.controller.signal,cache:'no-store',credentials:typeof document!=='undefined'&&document.querySelector('meta[name="autoapprove-tunnel"]')?'same-origin':'omit',headers:{Accept:(this.version===3?compactType+', ':'')+type+', text/event-stream'}});
         if(!response.ok) { let message='터미널 연결을 확인해주세요.',failureKind;try{const value=await response.json();if(typeof value.error==='string')message=value.error;failureKind=value.diagnostics?.failureKind;}catch(_){}throw Object.assign(new Error(message),{status:response.status,failureKind}); }
         const content=response.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
         if(content!==type&&content!=='text/event-stream'&&!(this.version===3&&content===compactType))throw Object.assign(new Error('터미널 전송 형식을 확인하지 못했습니다.'),{wireFormat:true});
