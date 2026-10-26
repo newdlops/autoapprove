@@ -14,7 +14,7 @@ const build=path.resolve(option('build')||'.build/tunnel/release'),engine=proces
 const out=path.resolve(option('output')||'.runtime/tunnel-check/'+engine);await mkdir(out,{recursive:true,mode:0o700});
 const root=await mkdtemp('/private/tmp/aa-tunnel-'),wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,timeout=15000){const end=performance.now()+timeout;while(!await test()){assert.ok(performance.now()<end,label);await wait(20);}}
-const checks=[],errors=[],traffic=[],sockets=new Set();let browser,fixture,tls,proxy,info,page,stage='startup',drop=null;
+const checks=[],errors=[],shutdownDiagnostics=[],traffic=[],sockets=new Set();let browser,fixture,tls,proxy,info,page,stage='startup',drop=null;
 let controlGeneration=0;
 function preservePort(port){if(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS!==undefined){const previous=process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS||'';if(!previous.split(',').includes(String(port)))process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS=previous?previous+','+port:String(port);}}
 // Preserve the fixed rendezvous before spawning Swift as well as Node. A later
@@ -57,12 +57,20 @@ try{
   assert.equal((await stat(tokenFile)).mode&0o777,0o600);assert.equal((await stat(active)).mode&0o777,0o700);
   await wait(100);assert.ok(!(await readFile(root+'/controller-status.json','utf8')).includes(secret),'Child diagnostic must never be published');
   const pid=Number(await readFile(active+'/pid','utf8'));
+  if(run===0){
+   let route;
+   try {await until(async()=>{route=JSON.parse(await readFile(root+'/controller-status.json','utf8'));return route.phase==='routeRequired';},'Named connector remains available while its public route is missing',45000);}
+   catch {throw Error('Named public route did not enter setup state: '+JSON.stringify(route));}
+   process.kill(pid,0);await control('verify-address');
+   assert.ok(['checking','routeRequired'].includes(JSON.parse(await readFile(root+'/controller-status.json','utf8')).phase));
+   process.kill(pid,0);
+  }
   if(previousKey){assert.notEqual(result.accessKey,previousKey);assert.equal((await rawAt(namedPort,'/api/state',null,{Host:'named.tunnel-qa.invalid',Cookie:previousCookie})).status,401);assert.equal((await rawAt(namedPort,'/auth/login',{key:previousKey},{Host:'named.tunnel-qa.invalid',Origin:'https://named.tunnel-qa.invalid'})).status,401);}
   const logged=await rawAt(namedPort,'/auth/login',{key:result.accessKey},{Host:'named.tunnel-qa.invalid',Origin:'https://named.tunnel-qa.invalid'});assert.equal(logged.status,200);previousCookie=logged.headers.get('set-cookie').split(';')[0];previousKey=result.accessKey;
   await control('stop-controller');await until(()=>{try{process.kill(pid,0);return false;}catch{return true;}},'Owned connector shutdown');await wait(250);
   assert.equal(JSON.parse(await readFile(root+'/controller-status.json','utf8')).phase,'off');assert.equal(await stat(tokenFile).then(()=>true,()=>false),false);
  }
- checks.push('named token file permissions, no token in argv/status despite child diagnostics, owned connector termination, fresh access key and invalidated old cookie/key on restart');
+ checks.push('named token file permissions, no token in argv/status despite child diagnostics, public-route setup retains connector and supports explicit verification, owned connector termination, fresh access key and invalidated old cookie/key on restart');
  stage='raw authentication';
  assert.equal((await raw('stream','/api/state')).status,401);
  assert.equal((await raw('stream','/api/input',{sessionID:'fake'})).status,401);
@@ -102,7 +110,14 @@ try{
  for(const mode of ['stream','poll']){
   await control('reset-original');
   stage=mode+' login';const context=await browser.newContext({proxy:{server:'http://127.0.0.1:'+proxy.address().port},ignoreHTTPSErrors:true,viewport:{width:390,height:844},isMobile:true,hasTouch:true});
-  page=await context.newPage();page.setDefaultTimeout(15000);page.on('pageerror',error=>errors.push(error.message));const url='https://'+mode+'.tunnel-qa.invalid';
+  page=await context.newPage();page.setDefaultTimeout(15000);const url='https://'+mode+'.tunnel-qa.invalid';let loggingOut=false;
+  page.on('pageerror',error=>{
+   const cancelled=[url+'/api/network due to access control checks.','/'+mode+'.tunnel-qa.invalid/api/network due to access control checks.'];
+   // WebKit can report the revoked document's held fetch after logout. Keep
+   // this exact shutdown diagnostic separate; all other page errors still fail.
+   if(engine==='webkit'&&loggingOut&&cancelled.includes(error.message))shutdownDiagnostics.push({mode,phase:'logout',message:error.message});
+   else errors.push(error.message);
+  });
   await page.goto(url);await page.locator('#tunnel-key').waitFor();assert.equal(await page.locator('.session-row').count(),0);
   await page.locator('#tunnel-key').fill('wrong');await page.locator('#tunnel-login-submit').click();await page.locator('#tunnel-login-error').waitFor({state:'visible'});
   assert.equal(await page.locator('#tunnel-key').getAttribute('aria-invalid'),'true');
@@ -136,7 +151,7 @@ try{
   held.release();await page.waitForFunction(()=>ptyClient.blocked);await page.waitForTimeout(300);
   assert.equal(await page.evaluate(()=>ptyClient.unsent),'PRESERVE');assert.equal(traffic.filter(v=>v.mode===mode&&v.path==='/api/pty/input').length-before,1);
   await fetch(info.owner+'/api/pty/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestID:randomUUID(),ptyID:descriptor.ptyID,streamID:descriptor.streamID})});
-  stage=mode+' logout';if(await page.locator('#terminal-back').isVisible())await page.locator('#terminal-back').click();await page.locator('#tunnel-logout').click();await page.locator('#tunnel-key').waitFor();
+  stage=mode+' logout';loggingOut=true;if(await page.locator('#terminal-back').isVisible())await page.locator('#terminal-back').click();await page.locator('#tunnel-logout').click();await page.locator('#tunnel-key').waitFor();
   const state=await page.request.get(url+'/api/state');assert.equal(state.status(),401);
   assert.equal(traffic.some(item=>item.url.includes(info[mode].key)),false,'Shared keys must never appear in request URLs');
   checks.push(mode+': responsive login/error/fragment authentication, HttpOnly cookie, original identity and exact Unicode input, actual PTY/cursor, no uncertain replay, unsent preservation, logout');
@@ -157,7 +172,7 @@ try{
  }
  assert.deepEqual(errors,[]);await control('stop');
  await rm(out+'/failure.json',{force:true});await rm(out+'/failure.png',{force:true});
- const report={result:'PASS',engine,checks,errors,requests:traffic.length,scope:'Synthetic HTTPS hosts on a local CONNECT proxy, production Swift gateway and real private PTYs; optional official public tunnel exposes only this synthetic fixture. No user token/CLI.'};
+ const report={result:'PASS',engine,checks,errors,shutdownDiagnostics,requests:traffic.length,scope:'Synthetic HTTPS hosts on a local CONNECT proxy, production Swift gateway and real private PTYs; optional official public tunnel exposes only this synthetic fixture. No user token/CLI.'};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
 }catch(error){await page?.screenshot({path:out+'/failure.png'}).catch(()=>{});await writeFile(out+'/failure.json',JSON.stringify({stage,controlGeneration,namedPort,error:error.message},null,2));throw error;}
 finally{

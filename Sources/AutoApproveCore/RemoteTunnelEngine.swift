@@ -8,6 +8,41 @@ extension ApprovalEngine {
     public var tunnelShareURL: URL? { tunnelController?.shareURL }
     public var tunnelAccessKey: String? { tunnelController?.accessKey }
     public var tunnelToolPath: String? { RemoteTunnelController.executable(directory:paths.directory) }
+    /// One explicit user action prepares prerequisites and starts the tunnel.
+    public func connectTunnel(_ supplied:RemoteTunnelConfiguration,token:String = "") async throws {
+        try Task.checkCancellation()
+        guard !tunnelStatus.active else {throw AppError.message("진행 중인 연결을 종료한 뒤 다시 시작해주세요.")}
+        var configuration=supplied
+        if configuration.provider != .quick {configuration.publicURL=try RemoteTunnelSetup.origin(configuration.publicURL)}
+        configuration=try configuration.validated()
+        let secret=configuration.provider == .named ? try RemoteTunnelSetup.token(token) : ""
+        let id=UUID();tunnelSetupID=id;tunnelRestoreAttempted=true
+        defer {if tunnelSetupID == id {tunnelSetupID=nil}}
+        func current() throws {try Task.checkCancellation();guard tunnelSetupID == id else {throw CancellationError()}}
+        func progress(_ phase:String,_ detail:String) {tunnelStatus.provider=configuration.provider;tunnelStatus.phase=phase;tunnelStatus.detail=detail}
+        do {
+            if configuration.provider != .external, configuration.executable.isEmpty, tunnelToolPath == nil {
+                progress("installing","Cloudflare 연결 도구를 내려받고 확인하고 있습니다…")
+                _ = try await RemoteTunnelTool.install(directory:paths.directory)
+                try current();objectWillChange.send()
+            }
+            if !webStatus.ready {
+                progress("preparing","이 Mac의 웹 접속을 준비하고 있습니다…")
+                try setWebEnabled(true)
+                for _ in 0..<200 where !webStatus.ready {try current();try await Task.sleep(for:.milliseconds(25))}
+                try current()
+                guard webStatus.ready else {throw AppError.message("웹 접속을 열지 못했습니다. 연결 설정의 웹 접속 상태를 확인하고 다시 시도해주세요.")}
+            }
+            try current();try await startTunnel(configuration,token:secret)
+        } catch {
+            if tunnelSetupID == id {
+                if error is CancellationError {try? stopTunnel()}
+                else {tunnelStatus.phase="failed";tunnelStatus.detail=error.localizedDescription}
+            }
+            throw error
+        }
+    }
+    public func checkTunnelAddress() {tunnelController?.checkPublicURL()}
     public func installTunnelTool() async throws {
         guard !tunnelStatus.active else { throw AppError.message("터널 연결을 종료한 뒤 도구를 설치해주세요.") }
         _ = try await RemoteTunnelTool.install(directory:paths.directory)
@@ -20,7 +55,7 @@ extension ApprovalEngine {
         let secret:String
         if configuration.provider == .named {
             if !token.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
-                let value=token.trimmingCharacters(in:.whitespacesAndNewlines)
+                let value=try RemoteTunnelSetup.token(token)
                 guard value.utf8.count <= 16384, !value.contains("\0"), !value.contains("\n") else { throw AppError.message("Cloudflare 터널 토큰을 확인해주세요.") }
                 try RemoteTunnelCredentials.save(value,directory:paths.directory); secret=value
             } else { secret=try RemoteTunnelCredentials.read(paths.directory) }
@@ -35,6 +70,7 @@ extension ApprovalEngine {
         try await controller.start(configuration,token:secret)
     }
     public func stopTunnel() throws {
+        tunnelSetupID=nil
         var configuration=tunnelConfiguration; configuration.enabled=false
         tunnelRestoreAttempted=true
         tunnelController?.stop(); tunnelController=nil; tunnelStatus=RemoteTunnelStatus()

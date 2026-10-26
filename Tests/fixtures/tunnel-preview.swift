@@ -66,6 +66,7 @@ private final class TunnelOriginal: @unchecked Sendable {
                         configuration.publicURL="https://named.tunnel-qa.invalid";configuration.executable=command["executable"] as? String ?? ""
                         try await controller.start(configuration,token:command["token"] as? String ?? "")
                     case "stop-controller":controller.stop()
+                    case "verify-address":controller.checkPublicURL()
                     default:break
                     }
                     try JSONSerialization.data(withJSONObject:["generation":next,"ok":true,"shareURL":controller.shareURL?.absoluteString ?? "","accessKey":controller.accessKey ?? ""]).write(to:root.appendingPathComponent("control-result.json"),options:.atomic)

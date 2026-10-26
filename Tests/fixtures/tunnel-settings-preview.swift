@@ -20,7 +20,7 @@ import AutoApproveCore
                     .background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,scheme)
                 let host=NSHostingView(rootView:view);host.frame=NSRect(x:0,y:0,width:600,height:660)
                 host.appearance=NSAppearance(named:scheme == .dark ? .darkAqua : .aqua)
-                let window=NSWindow(contentRect:host.frame,styleMask:[.borderless],backing:.buffered,defer:false);window.contentView=host
+                let window=NSWindow(contentRect:host.frame,styleMask:[.borderless],backing:.buffered,defer:false);window.isReleasedWhenClosed=false;window.contentView=host
                 // Allow onAppear and the view's ordinary state update to finish.
                 try await Task.sleep(for:.milliseconds(120))
                 host.layoutSubtreeIfNeeded();host.displayIfNeeded()

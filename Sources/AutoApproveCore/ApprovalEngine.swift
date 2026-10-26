@@ -17,6 +17,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     @Published public internal(set) var tunnelStatus = RemoteTunnelStatus()
     var tunnelController: RemoteTunnelController?
     var tunnelRestoreAttempted = false
+    var tunnelSetupID: UUID?
     @Published public private(set) var lanUpdate = LANUpdateStatus() {
         didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
@@ -494,6 +495,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        tunnelSetupID=nil
         tunnelController?.stop(waitForExit:true); tunnelController=nil
         noticeKeyCache = nil
         remoteInputStopped = true

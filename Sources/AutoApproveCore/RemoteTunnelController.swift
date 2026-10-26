@@ -64,7 +64,7 @@ enum RemoteTunnelCredentials {
         do {
             let gateway=try RemoteTunnelGateway(polling:configuration.provider == .quick,handler:handler)
             self.gateway=gateway
-            try await gateway.start(port:configuration.port)
+            try await gateway.start(port:configuration.provider == .quick ? 0 : configuration.port)
             guard generation == epoch else { gateway.stop(); throw CancellationError() }
             guard let port=gateway.port else { throw AppError.message("터널 연결 포트를 열지 못했습니다.") }
             status.localURL="http://127.0.0.1:\(port)"
@@ -128,8 +128,16 @@ enum RemoteTunnelCredentials {
             if let value=ProcessInfo.processInfo.environment[key] { environment[key]=value }
         }
         child.environment=environment; child.standardInput=FileHandle.nullDevice; child.standardOutput=pipe; child.standardError=pipe
+        let readFD=pipe.fileHandleForReading.fileDescriptor
+        let flags=fcntl(readFD,F_GETFL)
+        if flags >= 0 {_ = fcntl(readFD,F_SETFL,flags | O_NONBLOCK)}
         pipe.fileHandleForReading.readabilityHandler={ [weak self,weak child] handle in
-            guard let data=try? handle.read(upToCount:4096), !data.isEmpty else { return }
+            // FileHandle.read(upToCount:) can wait for a full buffer on pipes.
+            // A connector emitting only its registration line must advance now.
+            var bytes=[UInt8](repeating:0,count:4096)
+            let count=bytes.withUnsafeMutableBytes {Darwin.read(readFD,$0.baseAddress,4096)}
+            guard count > 0 else {if count == 0 {handle.readabilityHandler=nil};return}
+            let data=Data(bytes.prefix(count))
             Task { @MainActor in guard let self, let child, self.process === child else { return }; self.readLog(data,epoch:epoch) }
         }
         child.terminationHandler={ [weak self] child in Task { @MainActor in self?.exited(child,epoch:epoch) } }
@@ -166,7 +174,7 @@ enum RemoteTunnelCredentials {
             let session=URLSession(configuration:.ephemeral,delegate:TunnelRedirectPolicy(),delegateQueue:nil)
             defer { session.invalidateAndCancel() }
             var failure="응답 없음"
-            for _ in 0..<20 {
+            for _ in 0..<(self.configuration.provider == .quick ? 20 : 5) {
                 guard !Task.isCancelled, self.generation == epoch, let gateway=self.gateway else { return }
                 do {
                     var request=URLRequest(url:URL(string:url+"/auth/probe")!); request.timeoutInterval=3
@@ -181,8 +189,18 @@ enum RemoteTunnelCredentials {
                 do { try await Task.sleep(for:.seconds(1)) } catch { return }
             }
             guard self.generation == epoch else { return }
-            self.stop(); self.publish("failed","공개 주소에서 이 Mac을 확인하지 못했습니다 (\(failure)). 터널의 서비스 URL을 확인한 뒤 다시 연결해주세요.")
+            if self.configuration.provider == .quick {
+                self.stop();self.publish("failed","공개 주소에서 이 Mac을 확인하지 못했습니다 (\(failure)). 인터넷 연결을 확인한 뒤 다시 시도해주세요.")
+            } else {
+                self.checkingURL=nil
+                let provider=self.configuration.provider == .named ? "Cloudflare의 게시된 애플리케이션 경로" : "사용 중인 터널"
+                self.publish("routeRequired","연결 도구가 준비됐습니다. \(provider)에 서비스 URL을 지정한 뒤 ‘공개 주소 확인’을 눌러주세요 (\(failure)).")
+            }
         }
+    }
+    public func checkPublicURL() {
+        guard status.phase == "routeRequired",let url=status.publicURL,gateway != nil else {return}
+        checkingURL=nil;verify(url,epoch:generation)
     }
     private func exited(_ child:Process,epoch:UUID) {
         guard generation == epoch, process === child else { return }

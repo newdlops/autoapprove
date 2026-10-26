@@ -9,130 +9,179 @@ import AutoApproveCore
     @State private var token=""
     @State private var port="8766"
     @State private var error:String?
+    @State private var copied:String?
     @State private var busy=false
-    @State private var installing=false
+    @State private var attempted=false
+    @State private var connectionTask:Task<Void,Never>?
     @State private var qrCodes=QRCodeImageCache()
-    private var validPort:Bool { UInt16(port).map { $0 > 0 } ?? false }
-    var body: some View {
+    @FocusState private var focused:Field?
+    private enum Field {case address,token}
+    private var validPort:Bool {configuration.provider == .quick || (UInt16(port).map {$0 > 0} ?? false)}
+    private var addressError:String? {
+        guard configuration.provider != .quick,attempted || !configuration.publicURL.isEmpty else {return nil}
+        return (try? RemoteTunnelSetup.origin(configuration.publicURL)) == nil ? "공개 도메인을 입력하세요. 예: terminal.example.com" : nil
+    }
+    private var serviceURL:String {"http://127.0.0.1:"+port}
+    var body:some View {
         let status=engine.tunnelStatus
         VStack(alignment:.leading,spacing:10) {
             Label("다른 네트워크에서 접속",systemImage:"network").font(.headline)
-            Text("외부 HTTPS 주소에서 이 Mac과 연결된 Mac의 터미널을 엽니다. 접속 링크와 키를 가진 사람은 화면과 입력을 제어할 수 있으므로 본인 기기에만 공유하세요.")
+            Text("다른 기기에서 이 Mac과 연결된 Mac의 터미널을 엽니다. 접속 링크와 QR은 본인 기기에만 공유하세요.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             Picker("연결 방식",selection:$configuration.provider) {
-                ForEach(RemoteTunnelProvider.allCases,id:\.self) { Text($0.title).tag($0) }
-            }.disabled(busy || status.active)
-            if configuration.provider != .quick {
-                TextField("공개 HTTPS 주소 · https://terminal.example.com",text:$configuration.publicURL)
-                    .textFieldStyle(.roundedBorder).accessibilityLabel("터널의 공개 HTTPS 주소")
-                    .disabled(busy || status.active)
-                if configuration.provider == .named {
-                    SecureField("Cloudflare 터널 토큰 · 저장한 토큰은 생략",text:$token)
-                        .textFieldStyle(.roundedBorder).accessibilityLabel("Cloudflare 터널 토큰")
-                        .disabled(busy || status.active)
-                    Text("Cloudflare에서 터널과 공개 도메인을 만들고 아래 서비스 URL을 지정하세요. 토큰은 이 Mac의 키체인에 저장합니다.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-                    Link("Cloudflare 설정 안내",destination:URL(string:"https://developers.cloudflare.com/tunnel/get-started/")!)
-                } else {
-                    Text("사용 중인 로컬 터널의 서비스 URL을 아래 주소로 지정하고 공개 HTTPS 주소를 입력하세요. 터널 도구는 별도로 실행합니다.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-                }
-                Text("서비스 URL: http://127.0.0.1:\(port)").font(.system(.callout,design:.monospaced))
-                    .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+                ForEach(RemoteTunnelProvider.allCases,id:\.self) {Text($0.title).tag($0)}
+            }.disabled(busy || status.active).accessibilityIdentifier("tunnel-provider")
+            if configuration.provider == .quick {
+                Text("‘임시 주소 만들기’를 누르면 연결 도구 설치와 웹 접속을 자동으로 준비합니다. 계정이나 도메인은 필요 없습니다.")
+                    .font(.callout).fixedSize(horizontal:false,vertical:true)
+                Text("다시 만들면 주소가 바뀝니다. 임시 주소는 화면을 순서대로 조회하며 고정 도메인은 실시간 스트림을 사용합니다.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             } else {
-                Text("계정·도메인 없이 임시 주소를 만듭니다. 주소는 다시 연결할 때 바뀝니다. 임시 터널에서는 화면을 순서대로 조회하며 고정 도메인에서 실시간 스트림을 사용할 수 있습니다.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-            }
-            if configuration.provider != .external {
-                HStack {
-                    Label(engine.tunnelToolPath != nil || !configuration.executable.isEmpty ? "Cloudflare 연결 도구 준비됨" : "Cloudflare 연결 도구 필요",systemImage:engine.tunnelToolPath != nil || !configuration.executable.isEmpty ? "checkmark.circle" : "arrow.down.circle")
-                        .font(.caption)
-                    Spacer()
-                    Button(installing ? "설치 중…" : "연결 도구 설치") {
-                        busy=true; installing=true; error=nil
-                        Task {
-                            do { try await engine.installTunnelTool(); configuration.executable="" }
-                            catch { self.error=error.localizedDescription }
-                            busy=false; installing=false
-                        }
-                    }.disabled(busy || status.active).help("Cloudflare 공식 파일과 고정 SHA-256을 확인한 뒤 이 앱 전용 폴더에 설치합니다. 관리자 권한은 사용하지 않습니다.")
-                }
-            }
-            DisclosureGroup("연결 세부 설정") {
-                HStack {
-                    Text("서비스 포트"); TextField("8766",text:$port).textFieldStyle(.roundedBorder).frame(width:90)
-                        .accessibilityLabel("터널 서비스 포트").disabled(busy || status.active)
-                    if !validPort { Text("1~65535").font(.caption).foregroundStyle(.red) }
-                }
-                if configuration.provider != .external {
+                if configuration.provider == .named {
+                    Text("1. Cloudflare에서 터널 만들기").font(.callout.weight(.medium))
+                    Text("Networking → Tunnels에서 터널을 만들고 macOS 설치 명령을 복사하세요.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    HStack(spacing:12) {
+                        Link("Cloudflare 터널 열기",destination:RemoteTunnelSetup.dashboardURL)
+                        Link("설정 안내",destination:RemoteTunnelSetup.guideURL)
+                    }.font(.callout)
+                    Text("2. 이 Mac 연결하기").font(.callout.weight(.medium)).padding(.top,4)
                     HStack {
-                        Button("cloudflared 파일 선택") { chooseExecutable() }.disabled(busy || status.active)
-                        if !configuration.executable.isEmpty { Button("기본 도구 사용") { configuration.executable="" }.disabled(busy || status.active) }
+                        SecureField("설치 명령 또는 터널 토큰",text:$token)
+                            .textFieldStyle(.roundedBorder).focused($focused,equals:.token)
+                            .accessibilityLabel("Cloudflare 설치 명령 또는 터널 토큰").accessibilityIdentifier("tunnel-token")
+                            .onSubmit {connect()}.disabled(busy || status.active)
+                        Button("붙여넣기") {token=NSPasteboard.general.string(forType:.string) ?? "";error=nil}
+                            .disabled(busy || status.active).help("복사한 설치 명령에서 토큰만 읽어 연결합니다.")
                     }
-                    if !configuration.executable.isEmpty { Text(configuration.executable).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true) }
+                    Text("명령을 통째로 붙여넣을 수 있습니다. 토큰은 Mac 키체인에 저장하며 저장한 토큰을 쓰려면 비워 두세요.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                } else {
+                    Text("사용 중인 로컬 터널의 서비스 주소를 아래 값으로 지정하고 공개 도메인을 입력하세요. 터널 프로그램은 별도로 실행합니다.")
+                        .font(.callout).fixedSize(horizontal:false,vertical:true)
                 }
-                Text("서비스 포트는 이 Mac 안에서만 열립니다. 연결을 켠 설정은 앱 재실행 후 복원하며, 접속 키는 새로 발급합니다. 종료하면 외부 연결과 기존 접속도 해제합니다.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                VStack(alignment:.leading,spacing:4) {
+                    Text("공개 도메인").font(.callout.weight(.medium))
+                    TextField("terminal.example.com",text:$configuration.publicURL)
+                        .textFieldStyle(.roundedBorder).focused($focused,equals:.address)
+                        .accessibilityLabel("터널의 공개 도메인").accessibilityIdentifier("tunnel-address")
+                        .onSubmit {connect()}.disabled(busy || status.active)
+                    if let addressError {Text(addressError).font(.caption).foregroundStyle(.red)}
+                    else {Text("도메인만 입력하면 HTTPS 주소로 연결합니다.").font(.caption).foregroundStyle(.secondary)}
+                }
+                if configuration.provider == .named {
+                    Text("3. Cloudflare에 공개 경로 추가").font(.callout.weight(.medium)).padding(.top,4)
+                    Text("아래 연결 버튼을 누른 뒤 Cloudflare에서 터널의 Routes → Published application에 위 도메인과 아래 서비스 주소를 지정하세요.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                ViewThatFits(in:.horizontal) {
+                    HStack {Text(serviceURL).font(.system(.callout,design:.monospaced)).textSelection(.enabled);copyServiceButton}
+                    VStack(alignment:.leading,spacing:6) {Text(serviceURL).font(.system(.callout,design:.monospaced)).textSelection(.enabled);copyServiceButton}
+                }.accessibilityElement(children:.contain)
             }
             HStack {
                 if !status.active {
-                    Button(status.phase == "failed" ? "다시 연결" : "연결 시작") { connect() }
-                        .disabled(busy || !validPort || !engine.webStatus.ready)
-                        .help(engine.webStatus.ready ? "인증 접속 키와 외부 주소를 만듭니다." : "먼저 같은 네트워크에서 웹 접속을 켜주세요.")
+                    Button(busy ? "준비 중…" : status.phase == "failed" ? "다시 연결" : configuration.provider == .quick ? "임시 주소 만들기" : configuration.provider == .named ? "고정 도메인 연결" : "터널 연결 확인") {connect()}
+                        .buttonStyle(.bordered).disabled(busy || !validPort)
+                        .accessibilityIdentifier("tunnel-connect")
                 }
-                if status.phase != "off" {
-                    Button("연결 종료") { do { try engine.stopTunnel(); error=nil } catch { self.error=error.localizedDescription } }
-                        .disabled(busy).help("터널과 모든 외부 접속을 해제합니다. 기존 원본 CLI는 유지합니다.")
+                if status.phase == "routeRequired" {
+                    Button("공개 주소 확인") {engine.checkTunnelAddress()}.accessibilityIdentifier("tunnel-verify")
                 }
-                if status.active && !status.ready || busy { ProgressView().controlSize(.small).accessibilityLabel("터널 연결 작업 중") }
+                if busy || status.phase != "off" {
+                    Button(status.ready ? "연결 종료" : status.phase == "failed" ? "닫기" : "취소") {cancel()}
+                        .accessibilityIdentifier("tunnel-stop")
+                }
+                if busy || status.active && !status.ready && status.phase != "routeRequired" {
+                    ProgressView().controlSize(.small).accessibilityLabel("터널 연결 준비 중")
+                }
+            }.padding(.top,4)
+            if status.phase != "off" {
+                Text(status.detail).font(.callout).foregroundStyle(status.phase == "failed" ? .red : .secondary)
+                    .textSelection(.enabled).fixedSize(horizontal:false,vertical:true).accessibilityIdentifier("tunnel-status")
             }
-            Text(status.detail).font(.callout).foregroundStyle(status.phase == "failed" ? .red : .secondary)
-                .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-            if !engine.webStatus.ready { Text("같은 네트워크에서 웹 접속을 먼저 켜주세요.").font(.caption).foregroundStyle(.secondary) }
-            if let link=engine.tunnelShareURL, let address=status.publicURL {
-                HStack(alignment:.top,spacing:16) {
-                    if let qr=qrCodes.image(for:link.absoluteString) {
-                        Image(nsImage:qr).interpolation(.none).resizable().frame(width:116,height:116).padding(8).background(.white)
-                            .clipShape(RoundedRectangle(cornerRadius:8)).accessibilityLabel("인증 키가 포함된 외부 접속 QR 코드")
-                    }
-                    VStack(alignment:.leading,spacing:8) {
-                        Text(address).font(.system(.callout,design:.monospaced)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-                        ShareLink(item:link) { Label("접속 링크 공유",systemImage:"square.and.arrow.up") }
-                        HStack {
-                            Button("접속 링크 복사") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(link.absoluteString,forType:.string) }
-                            Link("웹에서 열기",destination:link)
-                        }
-                        Text("QR과 접속 링크에 키가 포함됩니다. 브라우저 접속은 최대 8시간 유지됩니다.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-                    }
+            if let link=engine.tunnelShareURL,let address=status.publicURL {
+                ViewThatFits(in:.horizontal) {
+                    HStack(alignment:.top,spacing:16) {qr(link);share(link,address:address)}
+                    VStack(alignment:.leading,spacing:10) {qr(link);share(link,address:address)}
                 }
                 DisclosureGroup("접속 키 직접 입력") {
                     if let key=engine.tunnelAccessKey {
                         Text(key).font(.system(.caption,design:.monospaced)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-                        Button("접속 키 복사") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(key,forType:.string) }
+                        Button(copied == "key" ? "복사됨" : "접속 키 복사") {copy(key,kind:"key")}
                     }
                 }.font(.caption)
             }
-            if let error { Label(error,systemImage:"exclamationmark.circle").font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true) }
+            if let error {Label(error,systemImage:"exclamationmark.circle").font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)}
+            DisclosureGroup("연결 세부 설정") {
+                VStack(alignment:.leading,spacing:8) {
+                    if configuration.provider != .quick { HStack {
+                        Text("서비스 포트");TextField("8766",text:$port).textFieldStyle(.roundedBorder).frame(width:90)
+                            .accessibilityLabel("터널 서비스 포트").disabled(busy || status.active)
+                        if !validPort {Text("1~65535").font(.caption).foregroundStyle(.red)}
+                    }} else {Text("임시 주소의 서비스 포트는 자동으로 배정합니다.").font(.caption).foregroundStyle(.secondary)}
+                    if configuration.provider != .external {
+                        Text(engine.tunnelToolPath != nil || !configuration.executable.isEmpty ? "Cloudflare 연결 도구 준비됨" : "연결을 시작할 때 Cloudflare 도구를 자동으로 설치합니다.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                        HStack {
+                            Button("cloudflared 파일 선택") {chooseExecutable()}.disabled(busy || status.active)
+                            if !configuration.executable.isEmpty {Button("기본 도구 사용") {configuration.executable=""}.disabled(busy || status.active)}
+                        }
+                        if !configuration.executable.isEmpty {Text(configuration.executable).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
+                    }
+                    Text("웹 접속과 연결 도구는 시작할 때 준비합니다. 켜 둔 연결은 앱 재실행 후 복원하며 새 접속 키를 발급합니다. 연결을 종료하면 외부 접속을 해제합니다.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }.padding(.top,4)
+            }.font(.callout)
         }.frame(maxWidth:.infinity,alignment:.leading)
             .windowUpdates(updates,sources:[engine.objectWillChange])
-            .onAppear { configuration=engine.tunnelConfiguration; port=String(configuration.port) }
+            .onAppear {configuration=engine.tunnelConfiguration;port=String(configuration.port)}
+            .onChange(of:configuration.provider) {attempted=false;error=nil}
+            .task(id:copied) {if copied != nil {try? await Task.sleep(for:.seconds(2));if !Task.isCancelled {copied=nil}}}
     }
-    private func connect() {
-        guard let number=UInt16(port), number > 0 else { return }
-        configuration.port=number; busy=true; error=nil
-        let secret=token; token=""
-        Task {
-            do { try await engine.startTunnel(configuration,token:secret) }
-            catch is CancellationError {} catch { self.error=error.localizedDescription }
-            busy=false
+    private var copyServiceButton:some View {Button(copied == "service" ? "복사됨" : "서비스 주소 복사") {copy(serviceURL,kind:"service")}.disabled(!validPort)}
+    private func copy(_ value:String,kind:String) {NSPasteboard.general.clearContents();NSPasteboard.general.setString(value,forType:.string);copied=kind}
+    private func qr(_ link:URL)->some View {
+        Group {if let image=qrCodes.image(for:link.absoluteString) {
+            Image(nsImage:image).interpolation(.none).resizable().frame(width:116,height:116).padding(8).background(.white)
+                .clipShape(RoundedRectangle(cornerRadius:8)).accessibilityLabel("인증 키가 포함된 외부 접속 QR 코드")
+        }}
+    }
+    private func share(_ link:URL,address:String)->some View {
+        VStack(alignment:.leading,spacing:8) {
+            Text(address).font(.system(.callout,design:.monospaced)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+            ShareLink(item:link) {Label("접속 링크 공유",systemImage:"square.and.arrow.up")}
+            HStack {Button(copied == "link" ? "복사됨" : "접속 링크 복사") {copy(link.absoluteString,kind:"link")};Link("웹에서 열기",destination:link)}
+            Text("QR과 링크에 접속 키가 포함됩니다. 브라우저 접속은 최대 8시간 유지됩니다.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
         }
     }
+    private func connect() {
+        guard !busy,!engine.tunnelStatus.active else {return}
+        attempted=true;error=nil
+        guard addressError == nil else {focused = .address;return}
+        let selectedPort:UInt16? = configuration.provider == .quick ? 8766 : UInt16(port)
+        guard let number=selectedPort,number > 0 else {return}
+        configuration.port=number;busy=true
+        let secret=token;token=""
+        connectionTask=Task {
+            do {try await engine.connectTunnel(configuration,token:secret)}
+            catch is CancellationError {} catch {
+                if engine.tunnelStatus.phase != "failed" {self.error=error.localizedDescription}
+                if configuration.provider == .named {focused = .token}
+            }
+            busy=false;connectionTask=nil
+        }
+    }
+    private func cancel() {
+        connectionTask?.cancel()
+        do {try engine.stopTunnel();error=nil} catch {self.error=error.localizedDescription}
+    }
     private func chooseExecutable() {
-        let panel=NSOpenPanel(); panel.canChooseFiles=true; panel.canChooseDirectories=false; panel.allowsMultipleSelection=false
+        let panel=NSOpenPanel();panel.canChooseFiles=true;panel.canChooseDirectories=false;panel.allowsMultipleSelection=false
         panel.message="cloudflared 실행 파일을 선택하세요."
-        if panel.runModal() == .OK, let url=panel.url {
-            if FileManager.default.isExecutableFile(atPath:url.path) { configuration.executable=url.path; error=nil }
-            else { error="실행 가능한 cloudflared 파일을 선택해주세요." }
+        if panel.runModal() == .OK,let url=panel.url {
+            if FileManager.default.isExecutableFile(atPath:url.path) {configuration.executable=url.path;error=nil}
+            else {error="실행 가능한 cloudflared 파일을 선택해주세요."}
         }
     }
 }
