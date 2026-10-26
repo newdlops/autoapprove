@@ -4,10 +4,12 @@ import CryptoKit
 import Security
 
 public enum RemoteTunnelProvider: String, Codable, CaseIterable, Sendable {
-    case managed, quick, named, external
+    case https, managed, quick, named, external
     public var title: String {
-        switch self {case .managed:return "Cloudflare 고정 주소";case .quick:return "Cloudflare 임시 주소";case .named:return "Cloudflare 토큰 직접 입력";case .external:return "기존 로컬 터널 연결"}
+        switch self {case .https:return "Cloudflare HTTPS (443)";case .managed:return "Cloudflare Tunnel (자동)";case .quick:return "Cloudflare 임시 주소";case .named:return "Cloudflare 토큰 직접 입력";case .external:return "기존 로컬 터널 연결"}
     }
+    public var managedAddress:Bool {self == .managed || self == .https}
+    public var usesCloudflared:Bool {[.managed,.quick,.named].contains(self)}
 }
 
 public struct RemoteTunnelConfiguration: Codable, Equatable, Sendable {

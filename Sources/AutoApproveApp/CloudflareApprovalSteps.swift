@@ -10,6 +10,7 @@ import AutoApproveCore
     @Binding var subdomain:String
     let subdomainError:String?
     let busy:Bool
+    var https=false
     let approve:()->Void
     let reload:()->Void
     let connect:()->Void
@@ -23,7 +24,7 @@ import AutoApproveCore
                 Button(state.authorized ? "다시 승인" : "Cloudflare에서 승인") {approve()}
                     .disabled(locked).accessibilityIdentifier("cloudflare-approve")
             }
-            Text("브라우저에서 한 번 로그인하고 이 Mac에 Cloudflare 계정의 터널 관리와 도메인 연결을 허용하세요.")
+            Text(https ? "브라우저에서 한 번 로그인하고 Workers 관리와 도메인 연결을 허용하세요. HTTPS 443 포트를 사용하며 별도 서버는 필요 없습니다.":"브라우저에서 한 번 로그인하고 이 Mac에 Cloudflare 계정의 터널 관리와 도메인 연결을 허용하세요.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             if state.phase == "authorizing",let url=approvalURL {
                 Link("승인 화면 열기",destination:url).font(.callout)
@@ -59,7 +60,7 @@ import AutoApproveCore
                     .fixedSize(horizontal:false,vertical:true).accessibilityLabel("접속 주소 \(address)")
             }
             Text("3. 연결").font(.callout.weight(.medium)).padding(.top,4)
-            Text("연결을 누르면 이 Mac의 터널·DNS·웹 접속을 자동으로 설정하고 접속 링크와 QR을 준비합니다.")
+            Text(https ? "연결을 누르면 계정에 HTTPS 중계와 도메인을 설정합니다. 이 Mac의 연결을 확인한 뒤 접속 링크와 QR을 표시합니다.":"연결을 누르면 이 Mac의 터널·DNS·웹 접속을 자동으로 설정하고 접속 링크와 QR을 준비합니다.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             if state.phase != "idle" {
                 Text(state.detail).font(.callout).foregroundStyle(state.phase == "failed" ? .red : .secondary)

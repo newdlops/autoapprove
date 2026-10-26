@@ -17,7 +17,7 @@ let package = Package(
         .target(name: "CTTYInput"),
         .target(name: "CLocalDashboard"),
         .target(name: "TerminalInputSupport", dependencies: ["CTTYInput"]),
-        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "TerminalInputSupport"], resources: [.copy("Resources/RemoteWeb")]),
+        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "TerminalInputSupport"], resources: [.copy("Resources/RemoteWeb"), .copy("Resources/CloudflareRelay")]),
         .executableTarget(name: "AutoApproveTTYService", dependencies: ["TerminalInputSupport"]),
         .executableTarget(name: "AutoApproveApp", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveCLI", dependencies: ["AutoApproveCore"]),

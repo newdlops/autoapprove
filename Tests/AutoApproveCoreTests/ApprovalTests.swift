@@ -504,6 +504,11 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Workers: OAuth, SQLite migration and uncertain upload recovery",tests.testWorkersApprovalProvisionAndUncertainUpload),
+            ("Workers: protect foreign DNS, script and invalid names",tests.testWorkersForeignResourcesAndInvalidNamesArePreserved),
+            ("Workers: cancellation and sanitized permission errors",tests.testWorkersCancelledAuthorizationAndSanitizedPermissionError),
+            ("Workers: binary bounds and fixed loopback isolation",tests.testRelayBinaryFramingBoundsAndLoopbackIsolation),
+            ("Workers: owned process group cleanup preserves unrelated child",tests.testOwnedWorkerToolCancellationPreservesUnrelatedProcess),
             ("Cloudflare: approved domain pagination and account isolation",tests.testCloudflareApprovalFiltersAndPaginatesRegisteredDomains),
             ("Cloudflare: subdomain validation and legacy address recovery",tests.testCloudflareSubdomainValidationAndLegacyAddressRecovery),
             ("Cloudflare: invalid subdomain never creates remote resources",tests.testCloudflareInvalidSubdomainCannotCreateRemoteResources),

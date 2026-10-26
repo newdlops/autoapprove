@@ -16,11 +16,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     @Published public internal(set) var tunnelStatus = RemoteTunnelStatus()
     var tunnelController: RemoteTunnelController?
+    var relayController:CloudflareRelayController?
     var tunnelRestoreAttempted = false
     var tunnelSetupID: UUID?
     @Published public internal(set) var cloudflareStatus=CloudflareSetupStatus()
     var cloudflareClient:CloudflareOnboarding?
     let cloudflareServices:CloudflareServices
+    let workersServices:CloudflareWorkersServices,relayServices:CloudflareRelayServices
+    var workersClient:CloudflareWorkersOnboarding?
+    var cloudflareSetupProvider:RemoteTunnelProvider = .managed
     @Published public private(set) var lanUpdate = LANUpdateStatus() {
         didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
@@ -335,9 +339,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public init(paths: AppPaths = AppPaths(), terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
-                webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live) throws {
+                webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
+                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live) throws {
         self.paths = paths
         self.cloudflareServices=cloudflareServices
+        self.workersServices=workersServices;self.relayServices=relayServices
         self.webLoopbackOnly = webLoopbackOnly
         self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
@@ -501,7 +507,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func stop() {
         tunnelSetupID=nil
         cloudflareClient?.cancel()
+        workersClient?.cancel()
         tunnelController?.stop(waitForExit:true); tunnelController=nil
+        relayController?.stop();relayController=nil
         noticeKeyCache = nil
         remoteInputStopped = true
         automationRuntime.stop()
@@ -551,6 +559,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if webService != nil {
                 guard port != nil else { return }
                 tunnelController?.stop(); tunnelController=nil; tunnelRestoreAttempted=false
+                relayController?.stop();relayController=nil
                 webService?.stop(); webService = nil
             }
             let nodeID = store.value("webNodeID") ?? UUID().uuidString
@@ -582,6 +591,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
     var lanUpdateWaitReason: String? {
+        if cloudflareStatus.busy {return "Cloudflare 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
         if tunnelStatus.active { return "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||

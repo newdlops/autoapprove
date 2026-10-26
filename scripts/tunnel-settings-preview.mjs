@@ -7,5 +7,5 @@ const build=path.resolve(option('build')||'.build/cloudflare-address/release'),o
 const objects=(await readdir(build+'/AutoApproveCore.build')).filter(v=>v.endsWith('.swift.o')).map(v=>build+'/AutoApproveCore.build/'+v),cache=path.resolve('.build/cache/TunnelSettingsPreview');await mkdir(cache,{recursive:true});
 const binary=out+'/TunnelSettingsPreview';
 execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,
- 'Sources/AutoApproveApp/WindowViewUpdates.swift','Sources/AutoApproveApp/QRCodeImageCache.swift','Sources/AutoApproveApp/CloudflareApprovalSteps.swift','Sources/AutoApproveApp/TunnelSettings.swift','Tests/AutoApproveCoreTests/CloudflareFixture.swift','Tests/fixtures/tunnel-settings-preview.swift','-o',binary],{stdio:'inherit',timeout:300000});
+ 'Sources/AutoApproveApp/WindowViewUpdates.swift','Sources/AutoApproveApp/QRCodeImageCache.swift','Sources/AutoApproveApp/CloudflareApprovalSteps.swift','Sources/AutoApproveApp/TunnelSettings.swift','Tests/AutoApproveCoreTests/CloudflareFixture.swift','Tests/AutoApproveCoreTests/WorkersFixture.swift','Tests/fixtures/tunnel-settings-preview.swift','-o',binary],{stdio:'inherit',timeout:300000});
 execFileSync(binary,[out],{stdio:'inherit',timeout:20000});

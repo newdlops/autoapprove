@@ -3,6 +3,7 @@
 dist/
 .runtime/
 node_modules/
+.wrangler/
 extensions/vscode/out/
 *.vsix
 .DS_Store

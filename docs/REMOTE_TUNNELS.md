@@ -5,6 +5,42 @@ AutoApprove의 **연결 설정 → 다른 네트워크에서 접속**에서 켠�
 이 Mac의 웹 접속을 자동으로 준비한다.
 기존 LAN의 연결 코드 없는 사용과 외부 접속의 인증은 별개다.
 
+## HTTPS 443 연결 · 승인 → 도메인 선택 → 연결
+
+0.2.188부터 새 설정의 기본은 **Cloudflare HTTPS (443)**다.
+Tunnel의 UDP/TCP 7844가 막혀 있고 HTTPS·WebSocket 443이 허용된 네트워크에서 사용한다.
+기존 Tunnel 실패 화면의 **HTTPS (443)로 연결** 버튼으로 전환할 수도 있다.
+
+1. **Cloudflare에서 승인**을 누른다. 공식 Wrangler 도구를 앱 전용 폴더에 준비한다.
+   브라우저에서 사용자가 직접 Workers 관리와 도메인 연결을 승인한다.
+   기존 Tunnel 승인과 Workers 승인은 권한이 달라 최초 한 번 더 필요하다.
+2. 등록된 도메인을 선택하고 `a`, `cp`, `term`처럼 원하는 **서브도메인**을 입력한다.
+3. **연결**을 누른다. 앱이 계정에 Worker·SQLite Durable Object와 도메인을 설정하고,
+   이 Mac까지 공개 주소를 검증한 뒤 접속 링크와 QR을 표시한다.
+
+별도 서버 운영이나 토큰 복사는 필요 없다. 앱과 Workers 사이는 네이티브 지속 WSS 443이며
+터미널의 기존 비트 스트림을 중계한다. 작은 바이너리 출력도 줄바꿈을 기다리지 않고 전달한다.
+공개 주소에는 기존 접속 키와 Secure/HttpOnly/SameSite 쿠키 인증이 적용된다.
+중계 연결의 비밀은 별도로 발급하고 Worker에는 그 해시만 둔다.
+재접속 중에는 진행 중 요청을 버리고 입력을 자동 재전송하지 않는다.
+
+승인 정보와 중계 비밀은 앱 전용 Mac 키체인에 저장한다. 공식 도구는 승인·갱신에만 사용하며
+기존 `~/.wrangler` 설정은 읽거나 수정하지 않는다. 승인 중 임시 파일은 `0700/0600`으로
+제한하고 작업 완료·취소 시 삭제한다. 공식 OAuth의 이 Mac 콜백은 `localhost:8976`이다.
+외부 통신 포트가 아니며, 이 포트를 다른 앱이 사용하면 해당 앱을 닫고 다시 승인한다.
+유효한 Node가 없으면 체크섬을 고정한 공식 Node LTS도 앱 전용 폴더에 준비한다.
+
+기존 다른 DNS/Worker는 덮어쓰지 않는다. 충돌 시 다른 이름을 선택한다.
+첫 연결이 도메인 충돌로 실패하면 이 앱 소유의 미연결 Worker만 계정에 남을 수 있으며,
+재시도할 때 같은 Worker를 재사용한다. 이름을 바꾸면 이전 DNS를 삭제하지 않지만
+이전 주소의 접속은 보장하지 않으므로 새 링크를 사용한다.
+연결을 종료하면 Mac의 외부 접속을 닫고, 원격 Worker와 도메인 설정은 재사용을 위해 남긴다.
+
+Workers Free에서 사용하는 SQLite Durable Object를 구성하며 유료 요금제를 자동 신청하지 않는다.
+Cloudflare 계정의 사용량 한도가 적용되고, 방화벽이 HTTPS의 WebSocket까지 차단하면 연결할 수 없다.
+[공식 WebSocket 연결](https://developers.cloudflare.com/durable-objects/best-practices/websockets/),
+[Workers 요금·한도](https://developers.cloudflare.com/workers/platform/pricing/).
+
 ## 임시 주소
 
 1. **Cloudflare 임시 주소**를 선택한다.
@@ -24,7 +60,7 @@ Cloudflare의 임시 터널은 가동 시간 보장과 SSE 지원이 없으므�
 
 ## Cloudflare 고정 주소 · 승인 → 도메인 선택 → 연결
 
-0.2.186부터 새 설정의 기본 방식이다. 별도 서버나 토큰 복사 없이 진행한다.
+**Cloudflare Tunnel (자동)**을 선택한다. 0.2.186에서 추가한 기존 방식이며 별도 서버나 토큰 복사 없이 진행한다.
 
 1. **Cloudflare에서 승인**을 누른다. 필요한 공식 연결 도구를 준비하고 브라우저의
    Cloudflare 로그인·도메인 승인 화면을 연다. 사용자가 직접 로그인하고 허용한다.
