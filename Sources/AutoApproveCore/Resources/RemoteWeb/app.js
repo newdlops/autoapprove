@@ -9,6 +9,7 @@ const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
 const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', tmux: 'tmux', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
 let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter = 'all', latestFrame = null;
 let gatewayTerminalWireVersion = null;
+let gatewayNetworkWaitVersion = null;
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
 let partialNetwork = false, partialNetworkRefreshes = 0;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
@@ -503,8 +504,9 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
   if (signal?.aborted) controller.abort();
   const timeout = setTimeout(() => controller.abort(), timeoutMS);
   try {
-    const headers = body ? {'Content-Type':'application/json'} : validation?.etag ? {'If-None-Match':validation.etag} : {};
+    const headers = body ? {'Content-Type':'application/json'} : validation?.etag ? {'If-None-Match':validation.etag,...(validation.wait ? {Prefer:'wait=15'} : {})} : {};
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: 'omit' });
+    if (validation) validation.waitApplied = response.headers.get('Preference-Applied') === 'wait';
     if (validation) validation.notModified = false;
     if (response.status === 304) {
       if (!validation?.value || !validation.etag || response.headers.get('ETag') !== validation.etag) {
@@ -821,12 +823,14 @@ async function refreshNetwork(initial = false, restart = false) {
   }
   // Recover with the small local inventory before waiting for other Macs.
   initial ||= !connected;
-  loadingNetwork = true; $('refresh').disabled = true; $('refresh').setAttribute('aria-busy', 'true');
+  const waiting = !initial && !restart && !partialNetwork && gatewayNetworkWaitVersion === 1 && !!networkValidation.etag;
+  networkValidation.wait = waiting;
+  loadingNetwork = true; $('refresh').disabled = !waiting; $('refresh').setAttribute('aria-busy', String(!waiting));
   const controller = new AbortController(); networkController = controller;
   const startedAt = performance.now();
   try {
     const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
-    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', undefined, controller.signal, 10000, initial ? undefined : networkValidation);
+    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', undefined, controller.signal, waiting ? 20000 : 10000, initial ? undefined : networkValidation);
     if (controller.signal.aborted || document.hidden) return;
     if (!initial && networkValidation.notModified && connected && appliedNetworkETag === networkValidation.etag) {
       // Still observe liveness/history and recover streams, without replacing
@@ -842,6 +846,7 @@ async function refreshNetwork(initial = false, restart = false) {
     }
     partialNetwork = result.partial === true;
     gatewayTerminalWireVersion = [2,3].includes(result.terminalWireVersion) ? result.terminalWireVersion : null;
+    gatewayNetworkWaitVersion = result.networkWaitVersion === 1 ? 1 : null;
     if (!partialNetwork) partialNetworkRefreshes = 0;
     connected = true;
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
@@ -933,11 +938,12 @@ async function refreshNetwork(initial = false, restart = false) {
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
     const requested = networkRefreshRequested; networkRefreshRequested = false;
     if (!document.hidden) {
-      let delay = requested || controller.signal.aborted || initial && connected ? 0 : connected ? 2500 : Math.min(5000,500*2**Math.max(0,networkFailures-1));
+      const nextWait = gatewayNetworkWaitVersion === 1 && !!networkValidation.etag && !partialNetwork && (!waiting || networkValidation.waitApplied);
+      let delay = requested || controller.signal.aborted || initial && connected ? 0 : connected ? nextWait ? 100 : 2500 : Math.min(5000,500*2**Math.max(0,networkFailures-1));
       // Complete a progressive inventory promptly, without leaving an offline
       // neighbour on a permanent fast poll. 304 retains the same bounded count.
       if (delay > 0 && connected && partialNetwork && partialNetworkRefreshes < 4) delay = 150 * 2 ** partialNetworkRefreshes++;
-      networkTimer = setTimeout(refreshNetwork, delay);
+      networkTimer = setTimeout(() => void refreshNetwork(false,requested), delay);
     }
   }
 }
@@ -2636,7 +2642,7 @@ $('back').addEventListener('click', () => {
   terminalFocus(false);
   document.body.classList.remove('detail-open'); history.replaceState(null, '', location.pathname); show($('detail-content'), false); show($('detail-empty'), true); renderList(); previous?.focus();
 });
-$('refresh').addEventListener('click', () => { void refreshNetwork(); void refreshFrame(); });
+$('refresh').addEventListener('click', () => { void refreshNetwork(false,true); void refreshFrame(); });
 $('add-mac').addEventListener('click', () => { show($('add-error'), false); $('add-dialog').showModal(); $('mac-address').focus(); });
 $('close-dialog').addEventListener('click', () => $('add-dialog').close());
 $('add-form').addEventListener('submit', async event => {

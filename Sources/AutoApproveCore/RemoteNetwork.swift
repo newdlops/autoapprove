@@ -48,6 +48,7 @@ public struct RemoteNodeState: Codable {
     /// This name resolves on this Mac only, and is not a LAN address for peers or phones.
     public var localAddressReady: Bool? = nil
     public var terminalWireVersion: Int? = nil
+    public var networkWaitVersion: Int? = nil
     public var inventory: RemoteNodeState {
         var value = self
         value.snapshot.sessions = []; value.snapshot.events = []; value.historyDeferred = true
@@ -81,6 +82,7 @@ public struct RemoteDashboard: Codable {
     public var preferredGateway: RemoteWebGateway? = nil
     public var partial: Bool? = nil
     public var terminalWireVersion: Int? = nil
+    public var networkWaitVersion: Int? = nil
 }
 
 public struct RemoteTerminalFrame: Codable, Sendable {
@@ -332,7 +334,16 @@ struct RemoteTerminalUpdate: Encodable {
     private let inventoryValidation = RemotePeerInventoryCache()
     private let readConnections = RemoteHTTPReadPool()
     private var readTimingEpoch = UUID()
+    private let inventoryChanges = RemoteTerminalChangeSignal()
+    private let engineInventorySignal: RemoteTerminalChangeSignal
+    private var engineInventoryObserver: UUID?
+    private var inventoryWaiters = 0, dashboardWaiters = 0
+    private var inventoryWatches: [String:(UUID,Task<Void,Never>)] = [:]
+    private var inventoryWatchReads: [String:UUID] = [:]
+    private var inventoryWatchDelay: [String:TimeInterval] = [:]
+    private var inventoryWatchRetirement: Task<Void,Never>?
     public init(engine: ApprovalEngine, nodeID: String, name: String? = nil, bonjourEnabled: Bool = true, loopbackOnly: Bool = false, discoveryAddresses: (() -> [String])? = nil, discoveryHints: (@Sendable () -> [String])? = nil, webVersion: RemoteWebVersion? = RemoteWebVersion.current, advertisement: RemoteServiceAdvertising? = nil, dashboardEncodingPreparation: (@Sendable () async throws -> Void)? = nil, onStatus: @escaping (RemoteNetworkStatus) -> Void) {
+        engineInventorySignal = engine.remoteInventoryChanges
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
         updateReceiver = LANUpdateReceiver(engine: engine)
@@ -366,6 +377,73 @@ struct RemoteTerminalUpdate: Encodable {
             peers[peer.id] = Peer(id: peer.id, name: peer.name, endpoint: try! RemoteNetworkAddress.endpoint(peer.address), available: false, manual: false,
                 directAddress: peer.address, release: peer.release, webURLs: Array(peer.urls.prefix(16)), webPort: peer.port)
         }
+        let changes = inventoryChanges
+        engineInventoryObserver = engine.remoteInventoryChanges.add { [weak changes] in changes?.notify() }
+        stateReads.onChange = { [weak changes] in changes?.notify() }
+    }
+    deinit { if let engineInventoryObserver { engineInventorySignal.remove(engineInventoryObserver) } }
+
+    private func stopInventoryWatches() {
+        inventoryWatchRetirement?.cancel(); inventoryWatchRetirement = nil
+        for (_,task) in inventoryWatches.values { task.cancel() }; inventoryWatches.removeAll()
+        for (id,token) in inventoryWatchReads where stateReads.isCurrent(id:id,token:token) { stateReads.remove(id) }
+        inventoryWatchReads.removeAll(); inventoryWatchDelay.removeAll()
+    }
+    private func beginInventoryWatches() {
+        inventoryWatchRetirement?.cancel(); inventoryWatchRetirement = nil
+        for peer in orderedDashboardPeers().filter({$0.available}).prefix(8) {
+            let endpoint = connectionEndpoint(peer)
+            guard inventoryWatches[peer.id] == nil, stateReads.value(for:peer.id,endpoint:endpoint)?.state?.networkWaitVersion == 1 else { continue }
+            let token = UUID(), epoch = generation
+            let task = Task { @MainActor [weak self] in
+                defer { if self?.inventoryWatches[peer.id]?.0 == token { self?.inventoryWatches.removeValue(forKey:peer.id) } }
+                while !Task.isCancelled {
+                    guard let self,self.running,self.generation == epoch,let current=self.peers[peer.id],current.available else { return }
+                    let value = await self.peerStateTask(current,watch:true).value
+                    guard !Task.isCancelled else { return }
+                    let delay = value.online ? self.inventoryWatchDelay[peer.id] ?? 2.5 : 2.5
+                    do { try await Task.sleep(for:.seconds(delay)) } catch { return }
+                }
+            }
+            inventoryWatches[peer.id] = (token,task)
+        }
+    }
+    private func endInventoryWatches() {
+        guard dashboardWaiters == 0 else { return }
+        // Bridge the browser's response/next-request gap, then release every
+        // owned upstream read when its last visible subscriber leaves.
+        inventoryWatchRetirement?.cancel()
+        inventoryWatchRetirement = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for:.milliseconds(250)) } catch { return }
+            guard let self,self.dashboardWaiters == 0 else { return };self.stopInventoryWatches()
+        }
+    }
+    private func waitForInventory(_ request:RemoteHTTPRequest,dashboard:Bool,read:() async throws -> RemoteHTTPResponse) async throws -> RemoteHTTPResponse {
+        let requested = request.headers["prefer"]?.split(separator:",").compactMap { part -> Int? in
+            let field=part.trimmingCharacters(in:.whitespaces)
+            return field.hasPrefix("wait=") ? Int(field.dropFirst(5)) : nil
+        }.first ?? 0
+        guard requested > 0,request.headers["if-none-match"] != nil,
+              (dashboard ? dashboardWaiters : inventoryWaiters) < 8 else { return try await read() }
+        let epoch=generation,observation=inventoryChanges.observe(),until=ProcessInfo.processInfo.systemUptime+Double(min(dashboard ? 15:6,requested))
+        if dashboard { dashboardWaiters+=1;beginInventoryWatches() } else { inventoryWaiters+=1 }
+        defer { if dashboard { dashboardWaiters-=1;endInventoryWatches() } else { inventoryWaiters-=1 } }
+        await observation.waitForChange(timeout:0)
+        var response=try await read(),lastRead=ProcessInfo.processInfo.systemUptime
+        while response.status == 304 {
+            try Task.checkCancellation()
+            guard running,generation == epoch else { throw RemoteHTTPError(503,"웹 연결이 다시 시작됐습니다.") }
+            let remaining=until-ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 { break }
+            await observation.waitForChange(timeout:min(1,remaining))
+            try Task.checkCancellation()
+            guard running,generation == epoch else { throw RemoteHTTPError(503,"웹 연결이 다시 시작됐습니다.") }
+            let coalesce=0.08-(ProcessInfo.processInfo.systemUptime-lastRead)
+            if coalesce > 0 { try await Task.sleep(for:.seconds(coalesce)) }
+            response=try await read();lastRead=ProcessInfo.processInfo.systemUptime
+            if dashboard { beginInventoryWatches() }
+        }
+        response.waitApplied=true;return response
     }
     public func start(port preferredPort: UInt16 = 8765, allowPortFallback: Bool = false) throws {
         guard !running else { return }
@@ -585,6 +663,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
     }
     public func stop() {
+        stopInventoryWatches(); inventoryChanges.notify()
         updateReceiver.stop()
         running = false; generation = UUID()
         cachedDashboardValidator = nil
@@ -631,6 +710,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
     }
     private func emitStatus() {
+        inventoryChanges.notify()
         status.peerCount = peers.values.reduce(into: 0) { if $1.available { $0 += 1 } }
         guard status != lastEmittedStatus else { return }
         lastEmittedStatus = status
@@ -1182,7 +1262,7 @@ struct RemoteTerminalUpdate: Encodable {
         return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
             release: webVersion, webURLs: port.map { Self.addresses(port: $0, interfaces: lanInterfaces) }, webPort: port,
             questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
-            localAddressReady:localAddressReady ?? (LocalDashboardAddress.status() == .ready),terminalWireVersion:RemoteTerminalWire.version)
+            localAddressReady:localAddressReady ?? (LocalDashboardAddress.status() == .ready),terminalWireVersion:RemoteTerminalWire.version,networkWaitVersion:1)
     }
     private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse,TimeInterval) }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil, allowUnavailableRead: Bool = false) async throws -> RemoteHTTPResponse {
@@ -1246,27 +1326,40 @@ struct RemoteTerminalUpdate: Encodable {
         }
         return response
     }
-    private func peerStateTask(_ peer: Peer, foreground: Bool = false) -> Task<RemoteNodeView, Never> {
+    private func peerStateTask(_ peer: Peer, foreground: Bool = false, watch: Bool = false) -> Task<RemoteNodeView, Never> {
         let endpoint = connectionEndpoint(peer)
         // A selected bookmark may replace a queued background/negative read.
         // Existing fresh success and simultaneous selected readers still share.
         if foreground, foregroundStateReads[peer.id] == nil, stateReads.value(for:peer.id,endpoint:endpoint)?.online != true {
             stateReads.remove(peer.id)
         }
-        if let task = stateReads.task(for: peer.id, endpoint: endpoint) { return task }
+        let retained = stateReads.value(for:peer.id,endpoint:endpoint)
+        let wait = watch && retained?.online == true && retained?.state?.networkWaitVersion == 1 ? 6 : 0
+        if let task = stateReads.task(for: peer.id, endpoint: endpoint), wait == 0 || inventoryWatchReads[peer.id] != nil { return task }
         let epoch = generation, token = UUID()
         foregroundStateReads[peer.id] = foreground ? token : nil
         let task = Task { @MainActor [weak self] () -> RemoteNodeView in
             guard let self else { return RemoteNodeView(id: peer.id, name: peer.name, local: false, online: false, error: "웹 연결이 종료되었습니다.", release: peer.release) }
-            defer { if self.foregroundStateReads[peer.id] == token { self.foregroundStateReads.removeValue(forKey:peer.id) } }
+            defer {
+                if self.foregroundStateReads[peer.id] == token { self.foregroundStateReads.removeValue(forKey:peer.id) }
+                if self.inventoryWatchReads[peer.id] == token { self.inventoryWatchReads.removeValue(forKey:peer.id) }
+            }
             let result: RemoteNodeView
             do {
                 try Task.checkCancellation()
                 guard self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
                 let compact = peer.release.map { $0 >= RemoteWebVersion(version:"0.2.61",build:76,api:1) } == true
                 let tag = compact ? self.inventoryValidation.requestTag(for: peer.id, endpoint: endpoint) : nil
-                let response = try await RemoteDashboardTraffic.shared.read(foreground:foreground) { @MainActor in
-                    try await self.exchange(peer,path:compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag,allowUnavailableRead:foreground)
+                let response: RemoteHTTPResponse
+                if wait > 0, let tag {
+                    // One bounded watch per peer; keep ordinary GET traffic slots
+                    // available. A healthy held response must not trigger hedges.
+                    response = try await self.readConnections.read(endpoint:endpoint,path:"/api/inventory",expectedNodeID:peer.id,timeout:7,entityTag:tag,retryReads:false,wait:wait)
+                    self.inventoryWatchDelay[peer.id] = response.waitApplied ? 0.08 : 2.5
+                } else {
+                    response = try await RemoteDashboardTraffic.shared.read(foreground:foreground) { @MainActor in
+                        try await self.exchange(peer,path:compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag,allowUnavailableRead:foreground)
+                    }
                 }
                 try Task.checkCancellation()
                 guard self.running, self.generation == epoch, self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
@@ -1290,7 +1383,8 @@ struct RemoteTerminalUpdate: Encodable {
             }
             return result
         }
-        stateReads.insert(task, id: peer.id, token: token, endpoint: endpoint)
+        if wait > 0 { inventoryWatchReads[peer.id] = token }
+        stateReads.insert(task, id: peer.id, token: token, endpoint: endpoint,preservingValue:wait > 0)
         return task
     }
     private func unavailablePeerState(_ peer: Peer) -> RemoteNodeView {
@@ -1354,7 +1448,7 @@ struct RemoteTerminalUpdate: Encodable {
                 if let index = nodes.firstIndex(where:{$0.id == selectedNode}), let completed = value(peer) { nodes[index] = completed }
             }
             return RemoteDashboard(gatewayID:nodeID,nodes:[RemoteNodeView(id:nodeID,name:name,local:true,online:true,state:own,release:own.release)]+nodes,
-                updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(client:client),partial:true,terminalWireVersion:RemoteTerminalWire.version)
+                updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(client:client),partial:true,terminalWireVersion:RemoteTerminalWire.version,networkWaitVersion:1)
         }
         let requested = Array(candidates.prefix(100))
         try await waitForReads(requested,progressive:true)
@@ -1378,7 +1472,57 @@ struct RemoteTerminalUpdate: Encodable {
         }
         updateNamedAddresses(); emitStatus()
         return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own, release: own.release)] + other, updatedAt: Date(), discovery: discoveryError,
-            gatewayRelease: webVersion, preferredGateway: preferredGateway(client:client),partial:other.contains(where:{$0.loading == true}) ? true : nil,terminalWireVersion:RemoteTerminalWire.version)
+            gatewayRelease: webVersion, preferredGateway: preferredGateway(client:client),partial:other.contains(where:{$0.loading == true}) ? true : nil,terminalWireVersion:RemoteTerminalWire.version,networkWaitVersion:1)
+    }
+    private func inventoryResponse(_ request:RemoteHTTPRequest) async throws -> RemoteHTTPResponse {
+        let acceptsGzip = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
+        let localAddressReady = LocalDashboardAddress.status() == .ready
+        let before = localInventoryResponseKey(localAddressReady:localAddressReady)
+        if let before, let cached = cachedLocalInventoryValidator,
+           let unchanged = localInventoryNotModified(request.headers["if-none-match"],cached:cached,
+               key:before,acceptsGzip:acceptsGzip) { return unchanged }
+        let inventory = try localState(localAddressReady:localAddressReady).inventory
+        let response = try await inventory.response(ifNoneMatch:request.headers["if-none-match"],acceptsGzip:acceptsGzip)
+        let afterReady = LocalDashboardAddress.status() == .ready
+        let after = localInventoryResponseKey(localAddressReady:afterReady)
+        if before == after, let after, let entityTag = response.entityTag {
+            cachedLocalInventoryValidator = CachedLocalInventoryValidator(key:after,entityTag:entityTag,acceptsGzip:acceptsGzip)
+        }
+        return response
+    }
+    private func dashboardResponse(_ request:RemoteHTTPRequest) async throws -> RemoteHTTPResponse {
+        let initial = request.parameter("initial") == "1", selectedNode = request.parameter("node")
+        let client = request.clientAddress, validator = request.headers["if-none-match"]
+        let localAddressReady = LocalDashboardAddress.status() == .ready
+        let before = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
+        // A matching key proves the complete dashboard inputs are
+        // unchanged. Return before rebuilding the local inventory,
+        // sorting peers, or waiting for their bounded reads. The
+        // key is checked again after a fresh build on cache misses.
+        if dashboardPeerStatesFresh(selectedNode:selectedNode), let before, let cached = cachedDashboardValidator,
+           cached.key == before, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
+            var response = RemoteHTTPResponse(status:304,body:Data())
+            response.entityTag = cached.entityTag; response.observedAt = Date()
+            return response
+        }
+        // Share only work still owned by interested requests, and
+        // only after this request's fresh full key/peer check.
+        if let id = joinableDashboardEncoding, let work = dashboardEncodingWork[id], let before,
+           work.epoch == generation, work.key == before, work.hasInterestedWaiter,
+           dashboardPeerStatesFresh(selectedNode:selectedNode), let lease = reserveDashboardEncoding(work) {
+            return try await dashboardEncodingResponse(work, lease: lease, ifNoneMatch:validator, observedAt:Date())
+        }
+        let current = try await dashboard(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
+        let afterReady = LocalDashboardAddress.status() == .ready
+        let after = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:afterReady)
+        if before == after, let after, let cached = cachedDashboardValidator,
+           cached.key == after, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
+            var response = RemoteHTTPResponse(status:304,body:Data())
+            response.entityTag = cached.entityTag; response.observedAt = Date()
+            return response
+        }
+        let (work, lease) = makeDashboardEncoding(current, key:before == after ? after : nil)
+        return try await dashboardEncodingResponse(work, lease: lease, ifNoneMatch:validator, observedAt:current.updatedAt)
     }
     public func handle(_ request: RemoteHTTPRequest) async -> RemoteHTTPResponse {
         do {
@@ -1405,20 +1549,7 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forward(request) { return forwarded }
                     return try .json(localState())
                 case "/api/inventory":
-                    let acceptsGzip = RemoteGzipEncoder.accepts(request.headers["accept-encoding"])
-                    let localAddressReady = LocalDashboardAddress.status() == .ready
-                    let before = localInventoryResponseKey(localAddressReady:localAddressReady)
-                    if let before, let cached = cachedLocalInventoryValidator,
-                       let unchanged = localInventoryNotModified(request.headers["if-none-match"],cached:cached,
-                           key:before,acceptsGzip:acceptsGzip) { return unchanged }
-                    let inventory = try localState(localAddressReady:localAddressReady).inventory
-                    let response = try await inventory.response(ifNoneMatch:nil,acceptsGzip:acceptsGzip)
-                    let afterReady = LocalDashboardAddress.status() == .ready
-                    let after = localInventoryResponseKey(localAddressReady:afterReady)
-                    if before == after, let after, let entityTag = response.entityTag {
-                        cachedLocalInventoryValidator = CachedLocalInventoryValidator(key:after,entityTag:entityTag,acceptsGzip:acceptsGzip)
-                    }
-                    return response
+                    return try await waitForInventory(request,dashboard:false) { try await self.inventoryResponse(request) }
                 case "/api/history":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400,"세션을 지정해주세요.") }
@@ -1435,38 +1566,7 @@ struct RemoteTerminalUpdate: Encodable {
                     if let webVersion { object["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webVersion)) }
                     return try .object(object)
                 case "/api/network":
-                    let initial = request.parameter("initial") == "1", selectedNode = request.parameter("node")
-                    let client = request.clientAddress, validator = request.headers["if-none-match"]
-                    let localAddressReady = LocalDashboardAddress.status() == .ready
-                    let before = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
-                    // A matching key proves the complete dashboard inputs are
-                    // unchanged. Return before rebuilding the local inventory,
-                    // sorting peers, or waiting for their bounded reads. The
-                    // key is checked again after a fresh build on cache misses.
-                    if dashboardPeerStatesFresh(selectedNode:selectedNode), let before, let cached = cachedDashboardValidator,
-                       cached.key == before, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
-                        var response = RemoteHTTPResponse(status:304,body:Data())
-                        response.entityTag = cached.entityTag; response.observedAt = Date()
-                        return response
-                    }
-                    // Share only work still owned by interested requests, and
-                    // only after this request's fresh full key/peer check.
-                    if let id = joinableDashboardEncoding, let work = dashboardEncodingWork[id], let before,
-                       work.epoch == generation, work.key == before, work.hasInterestedWaiter,
-                       dashboardPeerStatesFresh(selectedNode:selectedNode), let lease = reserveDashboardEncoding(work) {
-                        return try await dashboardEncodingResponse(work, lease: lease, ifNoneMatch:validator, observedAt:Date())
-                    }
-                    let current = try await dashboard(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:localAddressReady)
-                    let afterReady = LocalDashboardAddress.status() == .ready
-                    let after = dashboardResponseKey(initial:initial,selectedNode:selectedNode,client:client,localAddressReady:afterReady)
-                    if before == after, let after, let cached = cachedDashboardValidator,
-                       cached.key == after, RemoteDashboard.matches(validator,entityTag:cached.entityTag) {
-                        var response = RemoteHTTPResponse(status:304,body:Data())
-                        response.entityTag = cached.entityTag; response.observedAt = Date()
-                        return response
-                    }
-                    let (work, lease) = makeDashboardEncoding(current, key:before == after ? after : nil)
-                    return try await dashboardEncodingResponse(work, lease: lease, ifNoneMatch:validator, observedAt:current.updatedAt)
+                    return try await waitForInventory(request,dashboard:true) { try await self.dashboardResponse(request) }
                 case "/api/test-screen":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }

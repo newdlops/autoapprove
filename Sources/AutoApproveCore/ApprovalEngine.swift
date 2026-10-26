@@ -10,14 +10,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
 @MainActor public final class ApprovalEngine: ObservableObject {
     @Published public private(set) var snapshot: EngineSnapshot {
-        didSet { remoteDashboardRevision &+= 1 }
+        didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     @Published public private(set) var lanUpdate = LANUpdateStatus() {
-        didSet { remoteDashboardRevision &+= 1 }
+        didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
     private(set) var remoteDashboardRevision: UInt64 = 0
+    let remoteInventoryChanges = RemoteTerminalChangeSignal()
     public var finishLANUpdate: @MainActor () -> Void = {}
     public private(set) var webService: RemoteNetworkService?
     private let webLoopbackOnly: Bool
@@ -893,7 +894,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let pending: RemoteScreenRead
         let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
-        let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : nil
+        let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : remoteTerminalChanges[session.id]?.revision
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
            existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
             pending = existing

@@ -3,6 +3,8 @@ import Foundation
 final class RemoteTerminalChangeSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var observers: [UUID: @Sendable () -> Void] = [:]
+    private var value: UInt64 = 0
+    var revision: UInt64 { lock.lock(); defer { lock.unlock() }; return value }
     var hasObservers: Bool { lock.lock(); defer { lock.unlock() }; return !observers.isEmpty }
     func add(_ callback: @escaping @Sendable () -> Void) -> UUID {
         lock.lock(); defer { lock.unlock() }; let id = UUID(); observers[id] = callback; return id
@@ -10,6 +12,7 @@ final class RemoteTerminalChangeSignal: @unchecked Sendable {
     func remove(_ id: UUID) { lock.lock(); observers.removeValue(forKey:id); lock.unlock() }
     func notify() {
         lock.lock()
+        value &+= 1
         guard !observers.isEmpty else { lock.unlock(); return }
         let callbacks = Array(observers.values)
         lock.unlock()

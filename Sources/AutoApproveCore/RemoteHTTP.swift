@@ -149,6 +149,7 @@ public struct RemoteHTTPResponse: Sendable {
     public var styleNonce: String?
     public var entityTag: String?
     public var observedAt: Date?
+    public var waitApplied = false
     var contentEncoding: String?
     private var variesEncoding = false
     var stream: RemoteHTTPBodyStream?
@@ -207,10 +208,11 @@ public struct RemoteHTTPResponse: Sendable {
         let identity = nodeID.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         let validator = entityTag.flatMap { $0.contains("\r") || $0.contains("\n") ? nil : "ETag: \($0)\r\n" } ?? ""
         let observation = observedAt.map { "X-AutoApprove-Observed-At: \($0.ISO8601Format())\r\n" } ?? ""
+        let preference = waitApplied ? "Preference-Applied: wait\r\n" : ""
         let encoding = contentEncoding == "gzip" ? "Content-Encoding: gzip\r\n" : ""
         let vary = stream != nil || variesEncoding ? "Vary: Accept-Encoding\r\n" : ""
         let persistence = reuse ? "Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n" : "Connection: close\r\n"
-        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(encoding)\(vary)\(persistence)Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
+        let headers = "HTTP/1.1 \(status) \(reason)\r\n\(redirect)Content-Type: \(contentType)\r\n\(length)\(identity)\(validator)\(observation)\(preference)\(encoding)\(vary)\(persistence)Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'\(style); img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         return Data(headers.utf8) + body
     }
 }
@@ -519,13 +521,14 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private var phase = "connecting"
     private var requestSent = false
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
-    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, entityTag: String? = nil, retryReads: Bool = true) throws {
+    convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, entityTag: String? = nil, retryReads: Bool = true, wait: Int = 0) throws {
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
         guard entityTag == nil || method == "GET" && body.isEmpty && path == "/api/inventory" && entityTag!.count <= 128 && !entityTag!.contains("\r") && !entityTag!.contains("\n") else { throw RemoteHTTPError(400,"목록 조회의 조건부 요청이 올바르지 않습니다.") }
         let validator = entityTag.map { "If-None-Match: \($0)\r\n" } ?? ""
         let acceptsGzip = method == "GET" && body.isEmpty
         let encoding = acceptsGzip ? "Accept-Encoding: gzip\r\n" : ""
-        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)\(validator)\(encoding)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
+        let preference = acceptsGzip && path == "/api/inventory" && wait > 0 ? "Prefer: wait=\(min(6,wait))\r\n" : ""
+        let request = Data("\(method) \(path) HTTP/1.1\r\nHost: autoapprove.local\r\n\(identity)\(validator)\(preference)\(encoding)Content-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8) + body
         let duration = timeout ?? (method == "GET" && path == "/api/state" ? 4 : 15)
         let retryRead = retryReads && method == "GET" && body.isEmpty
         try self.init(endpoint: endpoint, request: request, timeout: retryRead ? duration / 2 : duration, retryRead: retryRead, expectedNodeID:expectedNodeID, acceptsGzip:acceptsGzip)

@@ -17,6 +17,7 @@ import Network
     }
     private var waiters: [UUID: Waiter] = [:]
     public private(set) var revision = UUID()
+    var onChange: (() -> Void)?
     public var count: Int { entries.count }
     func contains(_ id: String) -> Bool { entries[id] != nil }
     public init() {}
@@ -24,9 +25,10 @@ import Network
         guard let entry = entries[id], entry.endpoint == endpoint, entry.expires > now else { return nil }
         return entry.task
     }
-    public func insert(_ task: Task<RemoteNodeView, Never>, id: String, token: UUID, endpoint: NWEndpoint) {
+    public func insert(_ task: Task<RemoteNodeView, Never>, id: String, token: UUID, endpoint: NWEndpoint, preservingValue: Bool = false) {
+        let retained = preservingValue && entries[id]?.endpoint == endpoint ? entries[id]?.value : nil
         if let previous = entries[id], previous.task != task { previous.task.cancel() }
-        entries[id] = Entry(token: token, endpoint: endpoint, task: task, expires: .distantFuture)
+        entries[id] = Entry(token: token, endpoint: endpoint, task: task, expires: .distantFuture, value:retained)
         changed()
     }
     /// Async readers must still own the reservation before mutating shared
@@ -51,6 +53,7 @@ import Network
     }
     private func changed() {
         revision = UUID()
+        onChange?()
         let current = waiters; waiters.removeAll()
         for waiter in current.values { waiter.timeout.cancel(); waiter.continuation.resume() }
     }

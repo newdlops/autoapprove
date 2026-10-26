@@ -69,6 +69,7 @@ public final class RemotePeerResponseDecoder {
         let body = status != 304 && fields["content-encoding"]?.lowercased() == "gzip" ? try RemoteGzipDecoder.complete(buffer) : buffer
         var response = RemoteHTTPResponse(status:status,body:body,contentType:fields["content-type"] ?? "application/json; charset=utf-8")
         response.entityTag = fields["etag"]; response.nodeID = fields["x-autoapprove-node"]
+        response.waitApplied = fields["preference-applied"] == "wait"
         complete = true; buffer = Data(); return response
     }
     private static let headerEnd = Data([13,10,13,10])

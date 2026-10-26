@@ -16,7 +16,7 @@ final class RemoteHTTPReadPool: @unchecked Sendable {
     private let expiryQueue = DispatchQueue(label:"autoapprove.web.peer-idle")
 
     func read(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval? = nil,
-              entityTag: String? = nil, retryReads: Bool = true) async throws -> RemoteHTTPResponse {
+              entityTag: String? = nil, retryReads: Bool = true, wait: Int = 0) async throws -> RemoteHTTPResponse {
         try Task.checkCancellation()
         guard UUID(uuidString:expectedNodeID) != nil, path.hasPrefix("/"), !path.contains("\r"), !path.contains("\n"),
               entityTag == nil || path == "/api/inventory" && entityTag!.count <= 128 && !entityTag!.contains("\r") && !entityTag!.contains("\n") else {
@@ -32,7 +32,8 @@ final class RemoteHTTPReadPool: @unchecked Sendable {
         let duration = timeout ?? (path == "/api/state" ? 4 : 15)
         let started = ProcessInfo.processInfo.systemUptime
         let validator = entityTag.map { "If-None-Match: \($0)\r\n" } ?? ""
-        let request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\n\(validator)Accept-Encoding: gzip\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".utf8)
+        let preference = path == "/api/inventory" && wait > 0 ? "Prefer: wait=\(min(6,wait))\r\n" : ""
+        let request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\n\(validator)\(preference)Accept-Encoding: gzip\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".utf8)
         do {
             let response = try await channel.read(request,expectedNodeID:expectedNodeID,timeout:retryReads ? duration/2 : duration)
             try Task.checkCancellation(); return response
@@ -48,7 +49,7 @@ final class RemoteHTTPReadPool: @unchecked Sendable {
             // One fresh fallback within the original budget, for GET only.
             // POST and SSE do not enter this type or acquire these sockets.
             return try await RemoteHTTPExchange(endpoint:endpoint,path:path,method:"GET",body:Data(),
-                expectedNodeID:expectedNodeID,timeout:remaining,entityTag:entityTag,retryReads:false).run()
+                expectedNodeID:expectedNodeID,timeout:remaining,entityTag:entityTag,retryReads:false,wait:wait).run()
         }
     }
     /// A route is the complete multiset of physical interface values. Usually

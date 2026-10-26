@@ -46,6 +46,7 @@ private final class ContinuityOriginal: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return ["reads":reads,"queries":queries,"inputs":inputs,"allowed":allowed]
     }
+    func text() -> String { lock.lock();defer { lock.unlock() };return screen }
 }
 
 @main struct TerminalContinuityPreview {
@@ -87,6 +88,10 @@ private final class ContinuityOriginal: @unchecked Sendable {
             if let data = try? Data(contentsOf:control), let value = try? JSONSerialization.jsonObject(with:data) as? JSONObject,
                let next = value["generation"] as? Int, next != generation {
                 original.change(value)
+                if let paused=value["paused"] as? Bool { try engine.setPaused(paused) }
+                if value["notify"] as? Bool == true,let id=ProcessDiscovery.sessions(initialRecords).first?.id {
+                    engine.receiveScreen(sessionID:id,raw:original.text(),generation:"fixture-change-\(next)")
+                }
                 if let enabled = value["storm"] as? Bool { storm = enabled }
                 if let epoch = value["epoch"] as? Int { discover(records(epoch)) }
                 if value["disconnect"] as? Bool == true { engine.stop() }

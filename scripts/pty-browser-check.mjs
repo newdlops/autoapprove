@@ -33,7 +33,7 @@ try {
   async function type(value){await page.locator('#terminal-keyboard-toggle').click();for(const fragment of value.split(/([\r\x03])/)){if(fragment==='\r')await page.keyboard.press('Enter');else if(fragment==='\x03')await page.keyboard.press('Control+c');else if(fragment)await page.keyboard.type(fragment);}}
   async function enter(){await page.locator('#send-input').click();}
   async function capture(name){await page.screenshot({path:path.join(output,name+'.png')});screenshots.push(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,name+' must fit');}
-  async function refreshInventory(){await page.waitForFunction(()=>!loadingNetwork);await page.evaluate(()=>refreshNetwork());}
+  async function refreshInventory(){const before=await page.evaluate(()=>lastNetworkStartedAt);await page.evaluate(()=>refreshNetwork(false,true));await page.waitForFunction(before=>connected&&lastNetworkStartedAt>before,before);}
   async function selectOriginal(original,target=page){
     await target.waitForFunction(id=>allSessions.some(item=>item.session.id===id&&!item.view.pty),original.session.id);
     await target.evaluate(expected=>{const item=allSessions.find(item=>item.session.id===expected.id&&!item.view.pty);rows.get(item.key).firstChild.dataset.qaOriginal=String(expected.pid);},original.session);
@@ -128,7 +128,7 @@ try {
   if(endedOnly){
     let holdInventory=closedOnly;const held=[];
     await page.route(/\/api\/network(?:\?.*)?$/,async route=>{if(holdInventory)held.push(route);else await route.continue();});
-    await page.evaluate(()=>void refreshNetwork());await page.waitForTimeout(100);
+    await page.evaluate(()=>void refreshNetwork(false,true));await page.waitForTimeout(100);
     const attached=await createIndependentPTY();
     assert.notEqual(attached.pid,original.session.pid);assert.notEqual(attached.tty,original.session.tty);
     if(endedViewportOnly){await page.locator('#terminal-focus').click();await ready();await page.waitForTimeout(300);}
@@ -159,7 +159,10 @@ try {
     client.qaReceive=client.receive.bind(client);client.receive=update=>{client.qaReceive(update);client.qaFlow.maxBytes=Math.max(client.qaFlow.maxBytes,client.outputBytes);client.qaFlow.maxEvents=Math.max(client.qaFlow.maxEvents,client.outputQueue.length);if(client.outputPaused)client.qaFlow.pauses++;};
     client.qaWrite=client.term.write.bind(client.term);client.term.write=(bytes,callback)=>client.qaWrite(bytes,()=>{if(!client.qaFlow.released&&!client.qaHeld)client.qaHeld=callback;else callback();});
   });
-  await type('yes BROWSER-FLOOD\r');await page.waitForTimeout(600);await page.locator('[data-key="interrupt"]').click();
+  // Pace below the native history wrap rate: an unbounded yes can repeatedly
+  // choose tiny current-screen resets instead of filling the client byte cap.
+  await type("while :; do printf 'BROWSER-FLOOD-%01024d\\n' 0; sleep 0.002; done\r");
+  await page.waitForFunction(()=>ptyClient?.qaFlow.pauses>0,null,{timeout:10000});await page.locator('[data-key="interrupt"]').click();
   await type("printf 'AFTER-BROWSER-FLOOD\\n'\r");
   await page.evaluate(()=>{const client=ptyClient;client.qaFlow.released=true;client.term.write=client.qaWrite;const callback=client.qaHeld;client.qaHeld=null;callback?.();});
   await visible(/(?:^|\n)AFTER-BROWSER-FLOOD[ \t]*(?:\n|$)/);
@@ -175,7 +178,7 @@ try {
   const oldPage=await browser.newPage({viewport:{width:768,height:1024}}),oldRequests={attach:0,stream:0,output:0,input:0,resize:0};
   oldPage.on('pageerror',error=>errors.push(error.message));
   oldPage.on('request',request=>{const url=new URL(request.url()),name=url.pathname;if(name==='/api/pty')oldRequests.attach++;if(name==='/api/pty/stream')oldRequests.stream++;if(name==='/api/pty/output'){oldRequests.output++;assert.equal(url.searchParams.has('client'),false,'Old snapshot viewing must not claim a writer');}if(name==='/api/pty/input')oldRequests.input++;if(name==='/api/pty/resize')oldRequests.resize++;});
-  await oldPage.route(/\/api\/network(?:\?.*)?$/,async route=>{const response=await route.fetch(),data=await response.json();for(const node of data.nodes)if(node.state?.release)node.state.release={version:'0.2.41',build:47,api:1};await route.fulfill({response,json:data});});
+  await oldPage.route(/\/api\/network(?:\?.*)?$/,async route=>{const response=await route.fetch({headers:{...route.request().headers(),prefer:'wait=0'}}),data=await response.json();delete data.networkWaitVersion;for(const node of data.nodes)if(node.state?.release){node.state.release={version:'0.2.41',build:47,api:1};delete node.state.networkWaitVersion;}await route.fulfill({response,json:data});});
   await oldPage.goto(info.url);await selectOriginal(original,oldPage);
   assert.equal(oldRequests.attach,0,'Build 47 must keep original sessions in mirror mode');
   await oldPage.evaluate(id=>selectSession(allSessions.find(item=>item.view.ptyID===id).key,true),info.pty.ptyID);
@@ -191,7 +194,7 @@ try {
   // delay an explicit independent PTY while original selection stays original.
   let holdInventory=true;const held=[];
   await page.route(/\/api\/network(?:\?.*)?$/,async route=>{if(holdInventory)held.push(route);else await route.continue();});
-  await page.evaluate(()=>void refreshNetwork());
+  await page.evaluate(()=>void refreshNetwork(false,true));
   const holdDeadline=Date.now()+3000;while(!held.length&&Date.now()<holdDeadline)await page.waitForTimeout(20);assert.ok(held.length);
   await selectOriginal(original);await originalSelected(original);
   assert.equal(requests.attach,0,'Original selection while inventory is slow must create zero PTYs');
