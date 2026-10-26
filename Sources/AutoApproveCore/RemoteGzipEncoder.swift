@@ -6,7 +6,6 @@ private import zlib
 public final class RemoteGzipEncoder {
     private let stream: UnsafeMutablePointer<z_stream>
     private var finished = false
-    private var scratch = [UInt8](repeating:0,count:32_768)
     public init(level: Int32 = 1) throws {
         guard (1...9).contains(level) else { throw RemoteHTTPError(500,"올바르지 않은 전송 압축 설정입니다.") }
         let pointer = UnsafeMutablePointer<z_stream>.allocate(capacity:1); pointer.initialize(to:z_stream())
@@ -20,26 +19,28 @@ public final class RemoteGzipEncoder {
     deinit { deflateEnd(stream); stream.deinitialize(count:1); stream.deallocate() }
     public func encode(_ data: Data, final: Bool = false) throws -> Data {
         guard !finished, data.count <= 2_100_000 else { throw RemoteHTTPError(502,"터미널 전송 압축 상태를 확인하지 못했습니다.") }
-        var output = Data()
-        try data.withUnsafeBytes { input in
-            stream.pointee.next_in = UnsafeMutablePointer(mutating:input.bindMemory(to:UInt8.self).baseAddress)
-            stream.pointee.avail_in = uInt(input.count)
-            defer { stream.pointee.next_in = nil; stream.pointee.next_out = nil }
-            while true {
-                let result = scratch.withUnsafeMutableBytes { buffer -> Int32 in
-                    stream.pointee.next_out = buffer.bindMemory(to:UInt8.self).baseAddress
+        // Keep the same output capacity without retaining it for an idle stream.
+        // The standard library falls back to scoped heap storage when needed.
+        return try withUnsafeTemporaryAllocation(of: UInt8.self, capacity:32_768) { buffer in
+            var output = Data()
+            try data.withUnsafeBytes { input in
+                stream.pointee.next_in = UnsafeMutablePointer(mutating:input.bindMemory(to:UInt8.self).baseAddress)
+                stream.pointee.avail_in = uInt(input.count)
+                // Clear C pointers before either input or temporary output expires.
+                defer { stream.pointee.next_in = nil; stream.pointee.next_out = nil }
+                while true {
+                    stream.pointee.next_out = buffer.baseAddress
                     stream.pointee.avail_out = uInt(buffer.count)
-                    let status = deflate(stream,final ? Z_FINISH : Z_SYNC_FLUSH)
-                    output.append(buffer.bindMemory(to:UInt8.self).baseAddress!,count:buffer.count-Int(stream.pointee.avail_out))
-                    return status
+                    let result = deflate(stream,final ? Z_FINISH : Z_SYNC_FLUSH)
+                    output.append(buffer.baseAddress!,count:buffer.count-Int(stream.pointee.avail_out))
+                    guard output.count <= 2_200_000 else { throw RemoteHTTPError(502,"터미널 전송 데이터가 너무 큽니다.") }
+                    if result == Z_STREAM_END { finished = true; break }
+                    if !final, stream.pointee.avail_in == 0, stream.pointee.avail_out > 0, result == Z_OK || result == Z_BUF_ERROR { break }
+                    guard result == Z_OK else { throw RemoteHTTPError(502,"터미널 전송을 압축하지 못했습니다. 다시 연결해주세요.") }
                 }
-                guard output.count <= 2_200_000 else { throw RemoteHTTPError(502,"터미널 전송 데이터가 너무 큽니다.") }
-                if result == Z_STREAM_END { finished = true; break }
-                if !final, stream.pointee.avail_in == 0, stream.pointee.avail_out > 0, result == Z_OK || result == Z_BUF_ERROR { break }
-                guard result == Z_OK else { throw RemoteHTTPError(502,"터미널 전송을 압축하지 못했습니다. 다시 연결해주세요.") }
             }
+            return output
         }
-        return output
     }
     public static func accepts(_ header: String?) -> Bool {
         guard let header else { return false }

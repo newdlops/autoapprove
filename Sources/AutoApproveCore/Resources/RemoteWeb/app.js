@@ -8,6 +8,7 @@ const uuid = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID()
 const agents = { codex: 'Codex', claude: 'Claude Code', shell: '셸' };
 const hosts = { terminal: 'Terminal', iterm: 'iTerm2', orca: 'Orca', tmux: 'tmux', pty: 'PTY', vscode: 'VS Code', claudeBackground: 'Claude 백그라운드', unknown: '터미널 미확인' };
 let nodes = [], allSessions = [], selectedKey = '', selectedItem = null, filter = 'all', latestFrame = null;
+let gatewayTerminalWireVersion = null;
 let connected = false, loadingNetwork = false, loadingFrame = false, mutation = false, networkTimer, frameTimer, feedbackTimer;
 let partialNetwork = false, partialNetworkRefreshes = 0;
 let detailGeneration = 0, questionSignature = '', historySignature = '';
@@ -42,6 +43,7 @@ let lastNetworkStartedAt = -Infinity;
 // One page-local inventory only; no disk/browser cache of terminal or input data.
 const networkValidation = {etag:'', value:null, notModified:false, observedAt:null};
 let appliedNetworkETag = '', networkController = null;
+let networkFailures = 0, networkRefreshRequested = false;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer, inputFailure = '';
 let composePreferred = false, composeMode = false;
 const keyboardMarker = '\u200b';
@@ -213,6 +215,7 @@ const supportsRelease = (node, minimum) => {
 };
 const supportsPTYStream = node => supportsRelease(node, [0, 2, 41, 48]);
 const supportsTerminalStream = node => supportsRelease(node, [0, 2, 42, 49]);
+const supportsTerminalWire = node => gatewayTerminalWireVersion === 2 && node?.state?.terminalWireVersion === 2;
 const supportsNativeTerminal = node => supportsRelease(node, [0, 2, 43, 51]);
 function reconcilePTYInventory(inventory) {
   inventory = inventory.filter(item => (!sessionEnded(item) || item.session.interruption?.recoveredAt == null && !!item.session.interruption) && !sessionEnded(ptyRetained.get(item.key)));
@@ -289,7 +292,7 @@ async function ensurePTY() {
   }
   if (selectedKey !== item.key || document.hidden || ptyClient?.sessionKey === item.key) return;
   stopPTY();
-  ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming);
+  ptyClient = new AutoApprovePTY($('pty-screen'), {...item.view.pty}, item.node.id, api, uuid, ptyReport, terminalFontSize, streaming, supportsTerminalWire(item.node));
   ptyClient.sessionKey = item.key;
 }
 const currentNode = () => nodes.find(node => node.id === selectedItem?.node.id);
@@ -804,15 +807,23 @@ async function sendQuestionAnswer(key, nodeID, payload, message) {
   } finally { state.busy = false; updateInteractionControls(); }
 }
 
-async function refreshNetwork(initial = false) {
+async function refreshNetwork(initial = false, restart = false) {
   clearTimeout(networkTimer);
-  if (loadingNetwork || document.hidden) return;
+  if (document.hidden) return;
+  if (loadingNetwork) {
+    // Connectivity/foreground notifications supersede the old network path.
+    // Let its finally block release ownership before starting one fresh GET.
+    if (restart) { networkRefreshRequested = true; networkController?.abort(); }
+    return;
+  }
+  // Recover with the small local inventory before waiting for other Macs.
+  initial ||= !connected;
   loadingNetwork = true; $('refresh').disabled = true; $('refresh').setAttribute('aria-busy', 'true');
   const controller = new AbortController(); networkController = controller;
   const startedAt = performance.now();
   try {
     const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
-    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', undefined, controller.signal, 20000, initial ? undefined : networkValidation);
+    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', undefined, controller.signal, 10000, initial ? undefined : networkValidation);
     if (controller.signal.aborted || document.hidden) return;
     if (!initial && networkValidation.notModified && connected && appliedNetworkETag === networkValidation.etag) {
       // Still observe liveness/history and recover streams, without replacing
@@ -823,9 +834,11 @@ async function refreshNetwork(initial = false) {
         renderHistory();
         if (!selectedItem.view.pty && (terminalStream || supportsTerminalStream(selectedItem.node))) void refreshFrame();
       }
+      networkFailures = 0;
       return;
     }
     partialNetwork = result.partial === true;
+    gatewayTerminalWireVersion = result.terminalWireVersion === 2 ? 2 : null;
     if (!partialNetwork) partialNetworkRefreshes = 0;
     connected = true;
     const previousNodes = new Map(nodes.map(node => [node.id,node]));
@@ -899,8 +912,10 @@ async function refreshNetwork(initial = false) {
       else restoreSelection();
     } else restoreSelection();
     renderInteractions();
+    networkFailures = 0;
   } catch (error) {
     if (controller.signal.aborted) return;
+    networkFailures = Math.min(5,networkFailures+1);
     partialNetwork = false; partialNetworkRefreshes = 0;
     connected = false; text($('connection'), lastNetworkUpdate ? `연결 끊김 · 마지막 갱신 ${nowLabel(lastNetworkUpdate)}` : '연결 끊김 · 다시 연결 중');
     show($('web-update'), false);
@@ -913,8 +928,9 @@ async function refreshNetwork(initial = false) {
   } finally {
     if (networkController === controller) networkController = null;
     loadingNetwork = false; $('refresh').disabled = false; $('refresh').removeAttribute('aria-busy');
+    const requested = networkRefreshRequested; networkRefreshRequested = false;
     if (!document.hidden) {
-      let delay = controller.signal.aborted || initial && connected ? 0 : connected ? 2500 : 5000;
+      let delay = requested || controller.signal.aborted || initial && connected ? 0 : connected ? 2500 : Math.min(5000,500*2**Math.max(0,networkFailures-1));
       // Complete a progressive inventory promptly, without leaving an offline
       // neighbour on a permanent fast poll. 304 retains the same bounded count.
       if (delay > 0 && connected && partialNetwork && partialNetworkRefreshes < 4) delay = 150 * 2 ** partialNetworkRefreshes++;
@@ -1583,14 +1599,14 @@ function openTerminalStream(stream) {
   stream.frame = basis;
   if (basis?.sessionID === stream.sessionID && basis.streamID) { url.searchParams.set('revision',basis.revision); url.searchParams.set('stream',basis.streamID); }
   stream.sourceEventAt = null; stream.sourceOpenedAt = performance.now();
-  const source = new EventSource(url.href); stream.source = source;
+  const source = window.AutoApproveTerminalWire?.open(url.href,supportsTerminalWire(currentNode() || selectedItem?.node)) || new EventSource(url.href); stream.source = source;
   const current = () => terminalStreamCurrent(stream) && stream.source === source;
   watchTerminalStream(stream);
   source.addEventListener('screen', event => {
     if (!current()) return;
     try {
-      if (event.data.length > 2000000 || byteLength(event.data,2000000) > 2000000) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
-      const update = JSON.parse(event.data);
+      if (!Object.hasOwn(event,'value') && (event.data.length > 2000000 || byteLength(event.data,2000000) > 2000000)) throw new Error('터미널 화면이 너무 큽니다. 화면을 다시 연결해주세요.');
+      const update = Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data);
       if (terminalUpdateIsOlder(update, stream.frame)) { stream.sseReady = false; void readTerminalFallback(stream); return; }
       const frame = mergeTerminalUpdate(update, stream.frame, stream.sessionID);
       stream.frame = frame;
@@ -1626,8 +1642,8 @@ function openTerminalStream(stream) {
   source.addEventListener('alive', event => {
     if (!current()) return;
     try {
-      if (event.data.length > 2048) throw terminalResyncError();
-      const pulse = JSON.parse(event.data), basis = stream.frame;
+      if (!Object.hasOwn(event,'value') && event.data.length > 2048) throw terminalResyncError();
+      const pulse = Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data), basis = stream.frame;
       if (!pulse || typeof pulse.streamID !== 'string' || pulse.streamID.length > 512 || typeof pulse.revision !== 'string' || pulse.revision.length > 512 || !Number.isSafeInteger(pulse.sequence) || pulse.sequence < 0 || typeof pulse.observedAt !== 'string' || !Number.isFinite(Date.parse(pulse.observedAt)) || !basis || pulse.streamID !== basis.streamID || pulse.revision !== basis.revision) throw terminalResyncError();
       if (terminalUpdateIsOlder({...pulse,sessionID:stream.sessionID},basis)) return;
       stream.frame = {...basis,sequence:pulse.sequence,observedAt:pulse.observedAt};
@@ -1648,8 +1664,8 @@ function openTerminalStream(stream) {
     if (!current()) return;
     let message = 'Mac의 터미널 연결이 끊겼습니다. 원래 터미널을 확인한 뒤 화면을 다시 연결해주세요.';
     try {
-      if (event.data.length <= 8192) {
-        const failure = JSON.parse(event.data);
+      if (Object.hasOwn(event,'value') || event.data.length <= 8192) {
+        const failure = Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data);
         if (failure.retryable === true) { reconnectTerminalStream(stream); return; }
         if (typeof failure.error === 'string') message = failure.error;
       }
@@ -2623,7 +2639,7 @@ $('add-form').addEventListener('submit', async event => {
 function resumeTerminalPage() {
   if (document.hidden) return;
   restoreTerminalWarm();
-  void refreshFrame(); void refreshNetwork();
+  void refreshFrame(); void refreshNetwork(false,true);
 }
 document.addEventListener('visibilitychange', () => {
   clearTimeout(networkTimer); clearTimeout(frameTimer);
@@ -2648,7 +2664,7 @@ window.addEventListener('online', () => {
       openTerminalStream(stream); void readTerminalFallback(stream);
     }
   }
-  void refreshNetwork(); void refreshFrame();
+  void refreshNetwork(false,true); void refreshFrame();
 });
 window.addEventListener('hashchange', restoreSelection);
 function openPTYDialog() {

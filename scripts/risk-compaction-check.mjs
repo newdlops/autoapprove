@@ -27,6 +27,10 @@ try{
  execFileSync('/usr/bin/xcrun',['swiftc','-O','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...links,...objects,output+'/Reference.swift',output+'/Candidate.swift','Tests/fixtures/risk-compaction-check.swift','-o',output+'/check'],{stdio:'inherit',timeout:180000});
  fs.mkdirSync(output+'/files');const report=execFileSync(output+'/check',[output+'/files'],{encoding:'utf8',timeout:180000});
  assert.match(report,/ASCII_COMPACTION triples 2097152; scalars 1112064; policies 6642; tools 2040; normalizations 5480262; foreign 1359; sourceChanges 56; digest f2f98b6bfc54d1c650ab753b7176e20ce16a4de4e2f8f939dfefd709a8faf9ae/);
+ assert.match(report,/RESERVED_BUILDER edges 960; foreign 620/);
+ assert.match(report,/ASCII_SPANS triples 2097152; caps 54; foreign 36/);
+ assert.match(report,/ASCII_SPAN_LONG cases 180; foreign 120/);
+ assert.match(report,/CHARACTER_RUN_SCALARS scalars 1112064; batches 13032; foreign 8688/);
  for(const[file,digest]of Object.entries(frozen))assert.equal(sha(file),digest,file);
  for(const name of files)assert.equal(sha('Sources/AutoApproveCore/'+name),sourceHashes.Candidate[name],name);
  console.log(report.trim());console.log(JSON.stringify({reference,sourceHashes,coreObjects:objects.length,originalTerminalActions:0}));

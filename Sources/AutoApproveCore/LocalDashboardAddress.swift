@@ -144,7 +144,9 @@ public enum LocalDashboardAddress {
         return .missing
     }
     public static func status() -> Status {
-        readStatus(file:URL(fileURLWithPath:hostsPath,isDirectory:false)).status
+        // The live path is fixed. Keep every open/read/stat fresh without
+        // reconstructing and decoding a URL for the same literal path.
+        readStatus(descriptor:Darwin.open(hostsPath,O_RDONLY | O_CLOEXEC | O_NONBLOCK)).status
     }
     /// Counts only bytes read by this invocation; no contents or result survive
     /// it. The file argument also supports isolated library diagnostics.
@@ -160,6 +162,9 @@ public enum LocalDashboardAddress {
         let fd = file.withUnsafeFileSystemRepresentation { path in
             path.map { Darwin.open($0,O_RDONLY | O_CLOEXEC | O_NONBLOCK) } ?? -1
         }
+        return readStatus(descriptor:fd)
+    }
+    private static func readStatus(descriptor fd: Int32) -> StatusReading {
         guard fd >= 0 else {return StatusReading(status:.unavailable,bytesRead:0)}
         defer {_ = Darwin.close(fd)}
         var before = stat()

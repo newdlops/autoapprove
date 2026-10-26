@@ -9,8 +9,8 @@ public struct AutomaticQuestionDecision {
     public let kind: Kind
 
     public static func detect(_ question: QueuedQuestion) -> Self? {
-        detect(["questions": [["question": question.title, "multiSelect": question.multiSelect ?? false,
-                                "options": question.options.map { ["label": $0] }]]])
+        guard question.multiSelect != true else { return nil }
+        return detect(question: question.title, labels: question.options, descriptions: [])
     }
 
     public static func detect(_ input: JSONObject) -> Self? {
@@ -23,13 +23,23 @@ public struct AutomaticQuestionDecision {
         if let multi = item["multiSelect"] { guard let value = multi as? Bool, !value else { return nil } }
         let labels = options.compactMap { $0["label"] as? String }
         guard labels.count == options.count else { return nil }
-        if let index = currentModelIndex(question: title, options: labels,
-                descriptions: options.map { $0["description"] as? String ?? "" }) {
-            return Self(question: title, answer: labels[index], kind: .keepCurrentModel)
+        return detect(question: title, labels: labels,
+            descriptions: options.map { $0["description"] as? String ?? "" })
+    }
+
+    /// Typed queues and validated hook input share the same decision rules.
+    /// Every model rule first requires mentionsModel, so a negative result
+    /// skips all three model paths without repeating the same string searches.
+    private static func detect(question title: String, labels: [String], descriptions: [String]) -> Self? {
+        if mentionsModel(title) {
+            if let index = currentModelIndex(question: title, options: labels, descriptions: descriptions) {
+                return Self(question: title, answer: labels[index], kind: .keepCurrentModel)
+            }
+            // Model changes are never an ordinary affirmative confirmation.
+            guard !isModelChange(title), !isModelPicker(title) else { return nil }
         }
-        // Model changes are never an ordinary affirmative confirmation.
-        guard !isModelChange(title), !isModelPicker(title),
-              let confirmation = YesNoConfirmation.detect(input) else { return nil }
+        guard let confirmation = YesNoConfirmation.detect(question: title, labels: labels,
+            descriptions: descriptions) else { return nil }
         return Self(question: confirmation.question, answer: confirmation.answer, kind: .confirmation)
     }
 
@@ -38,7 +48,31 @@ public struct AutomaticQuestionDecision {
     }
 
     static func mentionsModel(_ text: String) -> Bool {
-        text.contains("모델") || modelWords.contains { text.range(of: $0, options: .caseInsensitive) != nil }
+        // Short native ASCII titles need only a byte scan. Keep Foundation's
+        // case-fold behavior for every other representation.
+        if let result = text.utf8.withContiguousStorageIfAvailable({ bytes -> Bool? in
+            guard bytes.count <= 4096, bytes.allSatisfy({ $0 < 128 }) else { return nil }
+            // Match the six fixed modelWords, including punctuation and spaces.
+            for offset in bytes.indices {
+                switch bytes[offset] | 32 {
+                case 109: // "model"
+                    if bytes.count - offset >= 5 && bytes[offset + 1] | 32 == 111 && bytes[offset + 2] | 32 == 100 && bytes[offset + 3] | 32 == 101 && bytes[offset + 4] | 32 == 108 { return true }
+                case 103: // "gpt-"
+                    if bytes.count - offset >= 4 && bytes[offset + 1] | 32 == 112 && bytes[offset + 2] | 32 == 116 && bytes[offset + 3] == 45 { return true }
+                case 99: // "claude"
+                    if bytes.count - offset >= 6 && bytes[offset + 1] | 32 == 108 && bytes[offset + 2] | 32 == 97 && bytes[offset + 3] | 32 == 117 && bytes[offset + 4] | 32 == 100 && bytes[offset + 5] | 32 == 101 { return true }
+                case 115: // "sonnet "
+                    if bytes.count - offset >= 7 && bytes[offset + 1] | 32 == 111 && bytes[offset + 2] | 32 == 110 && bytes[offset + 3] | 32 == 110 && bytes[offset + 4] | 32 == 101 && bytes[offset + 5] | 32 == 116 && bytes[offset + 6] == 32 { return true }
+                case 111: // "opus "
+                    if bytes.count - offset >= 5 && bytes[offset + 1] | 32 == 112 && bytes[offset + 2] | 32 == 117 && bytes[offset + 3] | 32 == 115 && bytes[offset + 4] == 32 { return true }
+                case 104: // "haiku "
+                    if bytes.count - offset >= 6 && bytes[offset + 1] | 32 == 97 && bytes[offset + 2] | 32 == 105 && bytes[offset + 3] | 32 == 107 && bytes[offset + 4] | 32 == 117 && bytes[offset + 5] == 32 { return true }
+                default: break
+                }
+            }
+            return false
+        }) ?? nil { return result }
+        return text.contains("모델") || modelWords.contains { text.range(of: $0, options: .caseInsensitive) != nil }
     }
     private static let modelWords = ["model", "gpt-", "claude", "sonnet ", "opus ", "haiku "]
 

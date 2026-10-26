@@ -4,7 +4,7 @@ import Network
 /// Only verified, finite GET transports are retained. Values/permissions are
 /// never cached here: every request has a new decoder and exact node header.
 final class RemoteHTTPReadPool: @unchecked Sendable {
-    private struct Key: Hashable { let endpoint: NWEndpoint; let node: String; let route: String }
+    private struct Key: Hashable { let endpoint: NWEndpoint; let node: String; let route: [RemoteLANInterface] }
     private struct Idle {
         let channel: RemoteHTTPReadConnection
         let until: TimeInterval
@@ -26,7 +26,7 @@ final class RemoteHTTPReadPool: @unchecked Sendable {
         // Re-evaluate the physical route even when a socket is available. A VPN
         // or interface/address change cannot borrow a different route's socket.
         let parameters = try RemoteLAN.tcpParameters(to:endpoint,interfaces:interfaces)
-        let route = interfaces.map { "\($0.name):\($0.address):\($0.netmask):\($0.kind)" }.sorted().joined(separator:"|")
+        let route = Self.routeKey(interfaces)
         let key = Key(endpoint:endpoint,node:expectedNodeID,route:route)
         let (channel,reused) = take(key,parameters:parameters)
         let duration = timeout ?? (path == "/api/state" ? 4 : 15)
@@ -50,6 +50,25 @@ final class RemoteHTTPReadPool: @unchecked Sendable {
             return try await RemoteHTTPExchange(endpoint:endpoint,path:path,method:"GET",body:Data(),
                 expectedNodeID:expectedNodeID,timeout:remaining,entityTag:entityTag,retryReads:false).run()
         }
+    }
+    /// A route is the complete multiset of physical interface values. Usually
+    /// RemoteLAN's snapshot is already canonical,so share its immutable storage.
+    /// Mask ties and arbitrary input ordering retain a complete canonical sort.
+    static func routeKey(_ interfaces: [RemoteLANInterface]) -> [RemoteLANInterface] {
+        guard interfaces.count > 1 else { return interfaces }
+        for index in 1..<interfaces.count {
+            if routePrecedes(interfaces[index],interfaces[index - 1]) {
+                return interfaces.sorted(by: routePrecedes)
+            }
+        }
+        return interfaces
+    }
+    private static func routeRank(_ kind: RemoteLANInterface.Kind) -> Int {
+        switch kind { case .wifi: return 0; case .ethernet: return 1 }
+    }
+    private static func routePrecedes(_ left: RemoteLANInterface, _ right: RemoteLANInterface) -> Bool {
+        (routeRank(left.kind),left.name,left.address,left.netmask)
+            < (routeRank(right.kind),right.name,right.address,right.netmask)
     }
     private func take(_ key: Key, parameters: NWParameters) -> (RemoteHTTPReadConnection,Bool) {
         lock.lock()

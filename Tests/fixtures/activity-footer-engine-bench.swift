@@ -24,7 +24,8 @@ import AutoApproveCore
     static func screen(index: Int, variant: Int, kind: String) -> TerminalScreen {
         let agent: AgentKind = index.isMultiple(of: 2) ? .codex : .claude
         let detail = kind.hasPrefix("mixed") ? "합성 출력 e\u{301} 👩🏽‍💻" : "ASCII output"
-        let history = (0..<160).map { "Completed synthetic step \($0): checked \(detail) local output and retained the original session." }.joined(separator: "\n")
+        let historyRows = CommandLine.arguments.count > 4 ? Int(CommandLine.arguments[4])! : 160
+        let history = (0..<historyRows).map { "Completed synthetic step \($0): checked \(detail) local output and retained the original session." }.joined(separator: "\n")
         let heading = agent == .codex ? "Would you like to run the following command?" : "Do you want to proceed?"
         let glyph = agent == .codex ? "›" : "❯"
         let body: String
@@ -48,7 +49,7 @@ import AutoApproveCore
     @MainActor static func main() async {
         do {
             let original = ["ascii-native", "mixed-native", "ascii-cocoa", "mixed-cocoa"]
-            let offset = Int(CommandLine.arguments.last!)! % original.count
+            let offset = Int(CommandLine.arguments[3])! % original.count
             let kinds = Array(original[offset...] + original[..<offset])
             var reports: [[String: Any]] = []
             for kind in kinds { reports.append(try await run(kind: kind)) }
@@ -83,9 +84,29 @@ import AutoApproveCore
         try check(foreignFrames == (kind.hasSuffix("cocoa") ? 32 : 0), "Frame banks must preserve selected storage")
         print("PROFILE_READY"); fflush(stdout)
         try await Task.sleep(for: .milliseconds(2200))
-        await engine.refreshScreenHost(.terminal)
+        // A fixed delay alone does not prove the real idle tracker has settled.
+        // Verify the same measured starting state on both binaries, outside CPU/
+        // wall timing. Never weaken the production two-second confirmation.
+        let expectedPhases = ["working":4,"approval":4,"input":4,"idle":4]
+        let readinessStarted = ProcessInfo.processInfo.systemUptime
+        var readyStreak = 0
+        var readiness: [[String: Any]] = []
+        while readyStreak < 2 {
+            let beforePublications = publications
+            await engine.refreshScreenHost(.terminal)
+            let phases = Dictionary(grouping: engine.snapshot.sessions, by: { $0.phase.rawValue }).mapValues(\.count)
+            let quiet = publications == beforePublications
+            readiness.append(["elapsed":ProcessInfo.processInfo.systemUptime-readinessStarted,
+                "phaseCounts":phases,"quiet":quiet])
+            readyStreak = phases == expectedPhases && (readyStreak == 0 || quiet) ? readyStreak + 1 : 0
+            try check(ProcessInfo.processInfo.systemUptime - readinessStarted < 15,
+                "Synthetic readiness did not settle: \(readiness)")
+            if readyStreak < 2 { try await Task.sleep(for: .milliseconds(50)) }
+        }
         var workloads: [[String: Any]] = []
         for changed in [false, true] {
+            try check(Dictionary(grouping: engine.snapshot.sessions, by: { $0.phase.rawValue }).mapValues(\.count) == expectedPhases,
+                "Measured workload must start with the same settled phases")
             if changed { print("PROFILE_CHANGING"); fflush(stdout) }
             publications = 0
             let beforeCPU = cpu(), beforeWall = Date()
@@ -100,6 +121,7 @@ import AutoApproveCore
             try check(phases["working"] == 4, "Working phase count: \(phases)")
             try check(phases["approval"] == 4, "Approval phase count: \(phases)")
             try check(phases["input"] == 4, "Input phase count: \(phases)")
+            try check(phases["idle"] == 4, "Idle phase count: \(phases)")
             try check(engine.snapshot.sessions.allSatisfy { !$0.automatic }, "Unexpected automatic policy")
             try check(engine.snapshot.events.isEmpty, "Unexpected audit event")
         }
@@ -108,6 +130,7 @@ import AutoApproveCore
         try check(engine.managedPTY.inventory.isEmpty, "Unexpected PTY")
         var usage = rusage(); getrusage(RUSAGE_SELF, &usage)
         let report: [String: Any] = ["workloads": workloads, "peakResidentBytes": usage.ru_maxrss,
+            "readiness":readiness,
             "terminalInputs": 0, "captures": 0, "scope": "Release Core comparison, 16 synthetic Terminal adapters, two prebuilt Cocoa screen banks; no engine start/listener/native reads/input."]
         return report.merging(["kind": kind, "foreignFrames": foreignFrames]) { _, fresh in fresh }
     }

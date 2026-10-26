@@ -71,7 +71,7 @@ try{
  if(!baseline){assert.ok(found,'The recently used Mac is checked before 32 stale identities');assert.ok(performance.now()-discoveryStart<2000);}
  checks.push('Recent saved identities precede stale peers while known URLs are excluded from passive blind probes');
  if(!baseline){
-  assert.equal(requests.filter(v=>!v.pinned).length,0,'Known hint addresses must not consume blind discovery slots');
+  assert.ok(requests.filter(v=>!v.pinned).length<=children.length,'A repeatedly failed saved address may be re-identified once per gateway, within its discovery cooldown');
   let metadataStarted=false;
   const slowMetadata=await server((req,res)=>{
    if(req.url==='/api/discovery'){metadataStarted=true;return;}

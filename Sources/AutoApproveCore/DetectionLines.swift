@@ -110,8 +110,7 @@ final class DetectionLines {
         spans.reserveCapacity(300)
         var skippingTrailingBlanks = true
         while spans.count < 300 {
-            var start = end
-            while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
+            let start = Self.nativeRowStart(bytes, endingAt: end)
             if skippingTrailingBlanks {
                 let value = String(decoding: bytes[start..<end], as: UTF8.self)
                 skippingTrailingBlanks = value.trimmingCharacters(in: .whitespaces).isEmpty
@@ -157,8 +156,7 @@ final class DetectionLines {
         return screen.utf8.withContiguousStorageIfAvailable { bytes in
             var end = bytes.count, count = 0, skippingTrailingBlanks = true
             while count < 300 {
-                var start = end
-                while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
+                let start = Self.nativeRowStart(bytes, endingAt: end)
                 let row = Self.interactiveRow(bytes, start: start, end: end, codex: agent == .codex)
                 if row == .possible { return true }
                 if row != .blank { skippingTrailingBlanks = false }
@@ -258,20 +256,66 @@ final class DetectionLines {
         return line.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) == nil ? .ordinary : .possible
     }
 
+    @inline(__always) private static func nativeRowStart(_ bytes: UnsafeBufferPointer<UInt8>, endingAt end: Int) -> Int {
+        var start = end
+        while start >= 8 {
+            let word = UInt64(littleEndian: UnsafeRawPointer(bytes.baseAddress! + start - 8).loadUnaligned(as: UInt64.self))
+            let mask = suffixZeroByteMask(word ^ 0x0a0a0a0a0a0a0a0a)
+                | suffixZeroByteMask(word ^ 0x0d0d0d0d0d0d0d0d)
+            if mask != 0 { return start - mask.leadingZeroBitCount / 8 }
+            start -= 8
+        }
+        while start > 0 {
+            let byte = bytes[start - 1]
+            if byte == 10 || byte == 13 { break }
+            start -= 1
+        }
+        return start
+    }
+
+    @inline(__always) private static func suffixZeroByteMask(_ word: UInt64) -> UInt64 {
+        // Each masked byte is at most127 before adding127, so carries cannot
+        // cross byte boundaries. Only an exactly-zero byte leaves its high bit.
+        ~(((word & 0x7f7f7f7f7f7f7f7f) &+ 0x7f7f7f7f7f7f7f7f) | word | 0x7f7f7f7f7f7f7f7f)
+    }
+
     private static func scanSuffix(_ bytes: UnsafeBufferPointer<UInt8>, count: Int) -> DetectionLineSuffix {
         var cursorEnd = bytes.count
         var reversedRows: [String] = [], reversedStarts: [Int] = []
         reversedRows.reserveCapacity(min(count, 300)); reversedStarts.reserveCapacity(min(count, 300))
         var skippingTrailingBlankRows = true
         while reversedRows.count < count {
-            var start = cursorEnd
-            while start > 0, bytes[start - 1] != 10, bytes[start - 1] != 13 { start -= 1 }
-            let lineBytes = bytes[start..<cursorEnd]
-            let value = String(decoding: lineBytes, as: UTF8.self)
-            let isBlank = value.trimmingCharacters(in: .whitespaces).isEmpty
+            var start = cursorEnd, isASCII = true
+            while start > 0 {
+                if start >= 8 {
+                    let word = UInt64(littleEndian: UnsafeRawPointer(bytes.baseAddress! + start - 8).loadUnaligned(as: UInt64.self))
+                    let mask = suffixZeroByteMask(word ^ 0x0a0a0a0a0a0a0a0a)
+                        | suffixZeroByteMask(word ^ 0x0d0d0d0d0d0d0d0d)
+                    if mask != 0 {
+                        // The most significant marked byte is the last CR/LF.
+                        // Classify only bytes after it, then finish this row.
+                        let trailing = mask.leadingZeroBitCount / 8
+                        if isASCII, trailing > 0 {
+                            let tail = word >> (64 - trailing * 8)
+                            isASCII = tail & 0x8080808080808080 == 0
+                        }
+                        start -= trailing
+                        break
+                    }
+                    isASCII = isASCII && word & 0x8080808080808080 == 0
+                    start -= 8
+                    continue
+                }
+                let byte = bytes[start - 1]
+                if byte == 10 || byte == 13 { break }
+                isASCII = isASCII && byte < 0x80
+                start -= 1
+            }
+            let value = String(decoding: bytes[start..<cursorEnd], as: UTF8.self)
+            let isBlank = skippingTrailingBlankRows && value.trimmingCharacters(in: .whitespaces).isEmpty
             if !isBlank { skippingTrailingBlankRows = false }
             if !skippingTrailingBlankRows || !isBlank {
-                reversedRows.append(lineBytes.allSatisfy { $0 < 0x80 } ? value : value.precomposedStringWithCanonicalMapping)
+                reversedRows.append(isASCII ? value : value.precomposedStringWithCanonicalMapping)
                 reversedStarts.append(start)
             }
             guard start > 0 else { break }

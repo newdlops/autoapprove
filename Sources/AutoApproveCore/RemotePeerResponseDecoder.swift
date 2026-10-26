@@ -7,6 +7,7 @@ public final class RemotePeerResponseDecoder {
     private let acceptsGzip: Bool
     private var buffer = Data()
     private var headers: [String:String]?
+    // With no accepted headers this is the relative search offset; afterwards it is the HTTP status.
     private var status = 0
     private var complete = false
     public private(set) var receivedBytes = 0
@@ -24,8 +25,9 @@ public final class RemotePeerResponseDecoder {
         receivedBytes += data.count; buffer.append(data)
         guard receivedBytes <= 4_016_388 else { throw invalid("Mac의 응답이 너무 큽니다.") }
         if headers == nil {
-            guard let boundary = buffer.range(of:Data("\r\n\r\n".utf8)) else {
+            guard let boundary = status == 0 ? buffer.range(of:Data("\r\n\r\n".utf8)) : headerBoundary(from:status) else {
                 guard buffer.count <= 16_384 else { throw invalid("Mac의 응답 헤더가 너무 큽니다.") }
+                status = max(0,buffer.count-3)
                 return nil
             }
             guard boundary.lowerBound <= 16_384, let text = String(data:buffer[..<boundary.lowerBound],encoding:.utf8) else { throw invalid("Mac의 응답 헤더를 읽지 못했습니다.") }
@@ -68,6 +70,29 @@ public final class RemotePeerResponseDecoder {
         var response = RemoteHTTPResponse(status:status,body:body,contentType:fields["content-type"] ?? "application/json; charset=utf-8")
         response.entityTag = fields["etag"]; response.nodeID = fields["x-autoapprove-node"]
         complete = true; buffer = Data(); return response
+    }
+    private static let headerEnd = Data([13,10,13,10])
+    // Resumed scans overlap three bytes. Keep this cold path out of first receives
+    // and body appends; accepted headers overwrite the offset with their status.
+    @inline(never) private func headerBoundary(from offset: Int) -> Range<Data.Index>? {
+        let remaining = buffer.count-offset
+        guard remaining >= 4 else { return nil }
+        if remaining >= 32 {
+            let start = buffer.index(buffer.startIndex,offsetBy:offset)
+            return buffer.range(of:Self.headerEnd,in:start..<buffer.endIndex)
+        }
+        let position = buffer.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
+            var index = offset
+            while index <= bytes.count-4 {
+                if bytes[index] == 13 && bytes[index+1] == 10 && bytes[index+2] == 13 && bytes[index+3] == 10 { return index }
+                index += 1
+            }
+            return nil
+        }
+        return position.map { index in
+            let start = buffer.index(buffer.startIndex,offsetBy:index)
+            return start..<buffer.index(start,offsetBy:4)
+        }
     }
     public func finish() throws {
         guard complete else { throw RemoteHTTPError(503,"Mac의 응답이 전송 중 끊겼습니다. 같은 원본을 다시 확인합니다.") }

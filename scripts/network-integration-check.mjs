@@ -8,7 +8,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 
 const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-network-'));
-const build = path.resolve('.build', process.argv.includes('--release') ? 'release' : 'debug');
+const build = path.resolve(process.argv.find(value=>value.startsWith('--build='))?.slice(8) || path.join('.build',process.argv.includes('--release') ? 'release' : 'debug'));
 const binary = path.resolve('.build/qa/RemotePreview');
 await mkdir(path.dirname(binary), { recursive: true });
 execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/RemotePreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build), ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
@@ -41,6 +41,18 @@ async function request(node, route, body, headers = {}) {
 }
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function ready(node) { for (let attempt = 0; attempt < 50; attempt++) { try { const result = await request(node, '/api/state'); if (result.status === 200) return result.data; } catch {} await wait(100); } throw new Error('HTTP listener was not ready'); }
+async function settledPeer(node,id) {
+  const deadline=performance.now()+5000;let result;
+  do {
+    result=await request(node,'/api/network');
+    const peer=result.data.nodes.find(value=>value.id===id);
+    // Healthy neighbours may make the first inventory return progressively.
+    // Wait for this exact peer's bounded read, including a real offline result.
+    if(peer&&peer.loading!==true)return result;
+    await wait(50);
+  }while(performance.now()<deadline);
+  throw Error('Peer inventory did not settle: '+JSON.stringify(result?.data.nodes.find(value=>value.id===id)));
+}
 try {
   const [first, second] = await Promise.all([start('A'), start('B')]);
   const firstState = await ready(first), secondState = await ready(second);
@@ -90,17 +102,17 @@ try {
   await new Promise(resolve=>conditionalPeer.listen(0,'127.0.0.1',resolve));probeServers.push(conditionalPeer);
   conditionalURL='http://127.0.0.1:'+conditionalPeer.address().port;conditionalState.webURLs=[conditionalURL];conditionalState.webPort=conditionalPeer.address().port;
   await request(first,'/api/peers',{address:conditionalURL});
-  let peerDashboard=await request(first,'/api/network');assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
-  await wait(3300);peerDashboard=await request(first,'/api/network');assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
+  let peerDashboard=await settledPeer(first,conditionalID);assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
+  await wait(3300);peerDashboard=await settledPeer(first,conditionalID);assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
   assert.ok(conditionalCounts.notModified>0,'Mac-to-Mac unchanged inventory must use a conditional GET');
   conditionalState.snapshot.paused=true;
-  await wait(3300);peerDashboard=await request(first,'/api/network');
+  await wait(3300);peerDashboard=await settledPeer(first,conditionalID);
   assert.equal(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.state?.snapshot.paused,true);
   wrongConditionalIdentity=true;
-  await wait(3300);peerDashboard=await request(first,'/api/network');
+  await wait(3300);peerDashboard=await settledPeer(first,conditionalID);
   assert.equal(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online,false,'A 304 from the wrong Mac must not reuse previous data as online');
   wrongConditionalIdentity=false;const beforeRecovery=conditionalCounts.unconditional;
-  await wait(2300);peerDashboard=await request(first,'/api/network');assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
+  await wait(2300);peerDashboard=await settledPeer(first,conditionalID);assert.ok(peerDashboard.data.nodes.find(node=>node.id===conditionalID)?.online);
   assert.ok(conditionalCounts.unconditional>beforeRecovery,'A failed identity check must discard the old validator and recover with 200');
   console.log('PASS: native Mac-to-Mac conditional inventory, changed controls, wrong-identity rejection and full-read recovery — '+JSON.stringify(conditionalCounts));
   const legacyID = randomUUID(), foreignID = randomUUID();
@@ -127,18 +139,19 @@ try {
   for (const [gateway, peer] of [[first, second], [second, first]]) {
     const page = await fetch(gateway.url,{redirect:'manual'});
     assert.ok([200,302].includes(page.status), 'Every client must publish its own page or the verified newer gateway');
-    let discovered = false;
+    let discovered = false, lastPeer;
     for (let attempt = 0; attempt < (directOnly ? 180 : 15); attempt++) {
       const result = await request(gateway, '/api/network');
+      lastPeer=result.data.nodes.find(node=>node.id===peer.id);
       if ([gateway.id, peer.id].every(id => result.data.nodes.some(node => node.id === id && node.online))) { discovered = true; break; }
       await wait(300);
     }
     if(!discovered) {
       const label=gateway.id===first.id?'A':'B',trace=await readFile(path.join(root,label,'route-trace.txt'),'utf8').catch(()=> '');
       await mkdir('.runtime/discovery-debug',{recursive:true,mode:0o700});
-      await writeFile('.runtime/discovery-debug/failure.json',JSON.stringify({stage:'initial',gateway:{id:gateway.id,url:gateway.url},peer:{id:peer.id,url:peer.url},trace},null,2));
+      await writeFile('.runtime/discovery-debug/failure.json',JSON.stringify({stage:'initial',gateway:{id:gateway.id,url:gateway.url},peer:{id:peer.id,url:peer.url},peerView:lastPeer&&{online:lastPeer.online,loading:lastPeer.loading,error:lastPeer.error},trace},null,2));
     }
-    assert.equal(discovered, true, 'Every client must automatically discover its peer and serve the complete list');
+    assert.equal(discovered, true, 'Every client must automatically discover its peer and serve the complete list: '+JSON.stringify(lastPeer&&{online:lastPeer.online,loading:lastPeer.loading,error:lastPeer.error}));
   }
   console.log(`PASS: ${directOnly ? 'Bonjour disabled, direct HTTP discovery' : 'Bonjour'} — both clients publish pages and discover the same Mac list without manual registration`);
   if (directOnly) {
@@ -155,7 +168,7 @@ try {
     console.log('PASS: legacy state-only client discovery and unrelated HTTP service rejection');
   }
   const manual = await request(first, '/api/peers', { address: second.url }); assert.equal(manual.status, 200);
-  const dashboard = await request(first, '/api/network'); assert.ok(dashboard.data.nodes.find(node => node.id === second.id)?.online);
+  const dashboard = await settledPeer(first,second.id); assert.ok(dashboard.data.nodes.find(node => node.id === second.id)?.online);
   const wrongMac = await request(second, '/api/action', { action: 'pause', paused: true, requestID: randomUUID() }, { 'X-AutoApprove-Node': first.id });
   assert.equal(wrongMac.status, 409); assert.equal((await request(second, '/api/state')).data.snapshot.paused, false);
   const paused = await request(first, `/api/action?node=${second.id}`, { action: 'pause', paused: true, requestID: randomUUID() }); assert.equal(paused.status, 200);
@@ -231,7 +244,11 @@ try {
   assert.ok(firstReadClosed,'The stalled socket must close before the replacement read completes');
   assert.ok(performance.now()-readAt<14000,'The retry must stay within the original 15-second budget');
   const uncertain=await request(first,'/api/input?node='+retryID,{...input,requestID:randomUUID()});
-  assert.ok([409,502,504].includes(uncertain.status));assert.equal(writeAttempts,1,'An uncertain input must never be replayed');
+  assert.ok([409,502,503,504].includes(uncertain.status),JSON.stringify(uncertain));
+  // A graceful EOF without response headers is the decoder's existing 503.
+  // Do not accept an unavailable-route 503 that never sent the synthetic input.
+  if(uncertain.status===503)assert.match(uncertain.data.error,/Mac의 응답이 전송 중 끊겼습니다/);
+  assert.equal(writeAttempts,1,'An uncertain input must never be replayed');
   console.log('PASS: a stalled GET recovers on one fresh connection within its original budget; uncertain POST input is sent once');
   for (let index = 0; index < 70; index++) assert.equal((await request(first, '/api/state')).status, 200, 'Repeated polling must not exhaust the listener');
   const denied = await request(first, '/api/action', { action: 'pause', paused: true, requestID: randomUUID() }, { Origin: 'https://unrelated.example' }); assert.equal(denied.status, 403);

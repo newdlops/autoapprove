@@ -7,7 +7,16 @@ public struct TerminalTextSnapshot: Codable, Equatable, Sendable {
     public var cursor: TerminalCursor
     public init(screen: String, cursor: TerminalCursor) { self.screen = screen; self.cursor = cursor }
     public func validated() -> Self? {
-        guard screen.utf8.count <= 200_000, cursor.validated(for: screen) != nil else { return nil }
+        let withinBudget: Bool
+        if screen.isContiguousUTF8 {
+            withinBudget = screen.utf8.count <= 200_000
+        } else {
+            // Each repaired UTF-16 unit needs between one and three UTF-8
+            // bytes. Cocoa supplies its UTF-16 length without transcoding.
+            let count = screen.utf16.count
+            withinBudget = count <= 200_000 && (count <= 200_000 / 3 || screen.utf8.count <= 200_000)
+        }
+        guard withinBudget, cursor.validated(for: screen) != nil else { return nil }
         return self
     }
     public static func fromAccessibility(value: String, insertion: Int, visible: NSRange) -> Self? {
@@ -15,9 +24,11 @@ public struct TerminalTextSnapshot: Codable, Equatable, Sendable {
         guard visible.location != NSNotFound, visible.location >= 0, visible.length > 0,
               visible.location <= text.length, visible.length <= text.length - visible.location,
               insertion >= visible.location, insertion - visible.location <= visible.length else { return nil }
-        let units = Array(value.utf16), end = visible.location + visible.length
-        guard !(0xdc00...0xdfff).contains(units[visible.location]),
-              end == units.count || !(0xdc00...0xdfff).contains(units[end]) else { return nil }
+        let units = value.utf16
+        let start = units.index(units.startIndex, offsetBy: visible.location)
+        let end = units.index(start, offsetBy: visible.length)
+        guard !(0xdc00...0xdfff).contains(units[start]),
+              end == units.endIndex || !(0xdc00...0xdfff).contains(units[end]) else { return nil }
         return Self(screen: text.substring(with: visible), cursor: TerminalCursor(offset: insertion - visible.location)).validated()
     }
 }
@@ -34,10 +45,13 @@ public struct TerminalCursor: Codable, Equatable, Sendable {
         self.offset = offset; self.padding = padding; self.visible = visible; self.style = style; self.blink = blink
     }
     public func validated(for screen: String) -> TerminalCursor? {
-        let units = Array(screen.utf16)
-        guard offset >= 0, offset <= units.count, padding >= 0, padding <= 500,
-              offset == 0 || offset == units.count || !(0xdc00...0xdfff).contains(units[offset]) else { return nil }
-        return self
+        guard offset >= 0, padding >= 0, padding <= 500 else { return nil }
+        if offset == 0 { return self }
+        let units = screen.utf16, count = units.count
+        guard offset <= count else { return nil }
+        if offset == count { return self }
+        let index = units.index(units.startIndex, offsetBy: offset)
+        return (0xdc00...0xdfff).contains(units[index]) ? nil : self
     }
     static func decode(_ object: Any?, screen: String) -> TerminalCursor? {
         guard let object, JSONSerialization.isValidJSONObject(object),
@@ -84,17 +98,32 @@ public struct TerminalAppearance: Codable, Equatable, Sendable {
             }
         }
         guard runs.count <= 8_000, color(foreground), color(background) else { return nil }
-        let units = Array(screen.utf16)
-        func boundary(_ index: Int) -> Bool {
-            index == 0 || index == units.count || !(0xdc00...0xdfff).contains(units[index])
+        if runs.isEmpty { return self }
+        @inline(__always) func validate(count: Int, boundary: (Int) -> Bool) -> Self? {
+            var end = 0
+            for run in runs {
+                guard run.offset >= end, run.offset <= count, run.length > 0, run.length <= count - run.offset,
+                      boundary(run.offset), boundary(run.offset + run.length), color(run.fg), color(run.bg) else { return nil }
+                end = run.offset + run.length
+            }
+            return self
         }
-        var end = 0
-        for run in runs {
-            guard run.offset >= end, run.offset <= units.count, run.length > 0, run.length <= units.count - run.offset,
-                  boundary(run.offset), boundary(run.offset + run.length), color(run.fg), color(run.bg) else { return nil }
-            end = run.offset + run.length
+        // Dense attributes amortize one contiguous array over many lookups.
+        if runs.count > 64 {
+            let units = Array(screen.utf16)
+            return validate(count: units.count) { index in
+                index == 0 || index == units.count || !(0xdc00...0xdfff).contains(units[index])
+            }
         }
-        return self
+        let units = screen.utf16, count = units.count
+        var position = units.startIndex, offset = 0
+        return validate(count: count) { index in
+            if index == 0 || index == count { return true }
+            // Validated, nonoverlapping runs visit boundaries in order.
+            units.formIndex(&position, offsetBy: index - offset)
+            offset = index
+            return !(0xdc00...0xdfff).contains(units[position])
+        }
     }
     static func decode(_ object: Any?, screen: String) -> TerminalAppearance? {
         guard let object, JSONSerialization.isValidJSONObject(object),

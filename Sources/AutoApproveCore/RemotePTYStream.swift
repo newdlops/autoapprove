@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Darwin
 
 typealias RemoteHTTPStreamCompletion = @Sendable (Result<Data?, Error>) -> Void
 
@@ -12,15 +13,25 @@ protocol RemoteHTTPBodyStream: AnyObject, Sendable {
 }
 
 enum RemoteServerEvent {
-    static func output(_ value: ManagedPTYOutput) throws -> Data {
+    static func output(_ value: ManagedPTYOutput, wire: RemoteTerminalWireEncoder? = nil) throws -> Data {
+        if let wire { return try wire.encode(value,event:2) }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
         let json = try encoder.encode(value)
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "터미널 화면이 너무 큽니다. 터미널 크기를 줄여 다시 연결해주세요.") }
         return Data("event: output\nid: \(value.offset)\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
-    static func failure(_ error: Error) -> Data {
+    static func failure(_ error: Error, binary: Bool = false) -> Data {
         let status = (error as? RemoteHTTPError)?.status
         let retryable = error is NWError || status == 503 || status == 504
+        if binary {
+            struct Failure: Encodable { let error: String, retryable: Bool }
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+            let wire = RemoteTerminalWireEncoder(jsonEncoder:encoder)
+            if let data = try? wire.encode(Failure(error:error.localizedDescription,retryable:retryable),event:3) { return data }
+            // This constant is a complete JSON-fallback binary frame.
+            let json = Data("{\"error\":\"Stream failed\",\"retryable\":false}".utf8)
+            return Data([65,65,2,131,UInt8(json.count)]) + json
+        }
         let json = (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription, "retryable": retryable])) ?? Data("{\"error\":\"Stream failed\"}".utf8)
         return Data("event: failure\ndata: ".utf8) + json + Data("\n\n".utf8)
     }
@@ -41,6 +52,7 @@ final class RemotePTYBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
         }
     }
     private let terminal: ManagedPTY
+    private let wireEncoder: RemoteTerminalWireEncoder?
     private let client: String?
     private let queue = DispatchQueue(label: "autoapprove.web.pty-stream")
     private let wakeLock = NSLock()
@@ -55,10 +67,13 @@ final class RemotePTYBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private var ended: Bool
     private var cancelled = false
 
-    init(terminal: ManagedPTY, offset: Int?, client: String?, emitInitial: Bool = true) throws {
+    init(terminal: ManagedPTY, offset: Int?, client: String?, emitInitial: Bool = true, binary: Bool = false) throws {
         let initial = try terminal.read(after: offset, client: client)
         self.terminal = terminal; self.client = client; self.offset = initial.offset
-        _ = try RemoteServerEvent.output(initial) // Validate before SSE headers.
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        let wire = binary ? RemoteTerminalWireEncoder(jsonEncoder:encoder) : nil
+        wireEncoder = wire
+        _ = try RemoteServerEvent.output(initial,wire:wire) // Validate before stream headers.
         initialOutput = emitInitial || !initial.data.isEmpty || initial.exitCode != nil ? initial : nil
         controls = Controls(initial); ended = initial.exitCode != nil
         observer = terminal.observeOutput { [weak self] in self?.wake() }
@@ -70,7 +85,7 @@ final class RemotePTYBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
             guard !self.cancelled else { completion(.success(nil)); return }
             guard self.waiter == nil else { completion(.failure(RemoteHTTPError(500, "중복된 터미널 출력 요청입니다."))); return }
             self.waiter = { result in
-                do { completion(.success(try result.get().map(RemoteServerEvent.output))) }
+                do { completion(.success(try result.get().map { try RemoteServerEvent.output($0,wire:self.wireEncoder) })) }
                 catch { completion(.failure(error)) }
             }
             self.deliver()
@@ -138,8 +153,10 @@ final class RemotePTYBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
 }
 
 /// A gateway keeps one live LAN connection to the owning Mac. It assembles one
-/// bounded SSE event per downstream send, so TCP fragmentation or failure
+/// batch of complete SSE events per downstream send, so fragmentation or failure
 /// cannot splice a gateway error into the middle of an upstream JSON line.
+struct RemotePeerStreamOpening: Sendable { let data: Data, binary: Bool }
+
 final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     // Upstream comments are already relayed. Inserting a gateway heartbeat
     // between arbitrary TCP fragments could split the upstream JSON data line.
@@ -148,8 +165,10 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private let request: Data
     private let expectedNodeID: String
     private let openingTimeout: TimeInterval
+    private let allowsBinary: Bool
+    private var binary = false
     private let queue = DispatchQueue(label: "autoapprove.web.pty-peer-stream")
-    private var opening: CheckedContinuation<Data, Error>?
+    private var opening: CheckedContinuation<RemotePeerStreamOpening, Error>?
     private var deadline: DispatchWorkItem?
     private var buffer = Data()
     private var waiter: RemoteHTTPStreamCompletion?
@@ -162,23 +181,27 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
     private var gzip: RemoteGzipDecoder?
     private var compressedSinceEvent = 0
     private static let eventLimit = 2_000_128
-    private static let eventBoundary = Data([10,10])
     private var searchedBytes = 0
 
-    init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15) throws {
+    init(endpoint: NWEndpoint, path: String, expectedNodeID: String, timeout: TimeInterval = 15, allowsBinary: Bool = false) throws {
         guard !expectedNodeID.contains("\r"), !expectedNodeID.contains("\n") else { throw RemoteHTTPError(502, "Mac의 연결 ID가 올바르지 않습니다.") }
         connection = NWConnection(to: endpoint, using: try RemoteLAN.tcpParameters(to: endpoint, interfaces: RemoteLAN.interfaces()))
         self.expectedNodeID = expectedNodeID
         openingTimeout = max(0.05, timeout)
-        request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\nAccept: text/event-stream\r\nAccept-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+        self.allowsBinary = allowsBinary
+        let accept = allowsBinary ? RemoteTerminalWire.contentType + ", text/event-stream" : "text/event-stream"
+        request = Data("GET \(path) HTTP/1.1\r\nHost: autoapprove.local\r\nX-AutoApprove-Node: \(expectedNodeID)\r\nAccept: \(accept)\r\nAccept-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
     }
     deinit { connection.cancel() }
 
-    /// Return only a whole event already received with the authenticated
-    /// headers. Never delay opening for another packet or retain this event.
+    /// Return only whole events already received with the authenticated
+    /// headers. Never delay opening for another packet or retain this batch.
     func open() async throws -> Data {
+        try await openContent().data
+    }
+    func openContent() async throws -> RemotePeerStreamOpening {
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<RemotePeerStreamOpening, Error>) in
                 queue.async {
                     guard !self.cancelled else { continuation.resume(throwing: CancellationError()); return }
                     self.opening = continuation
@@ -231,10 +254,12 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                     }
                     if status == 200 {
                         let encoding = headers["content-encoding"]?.lowercased()
-                        guard headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "text/event-stream",
+                        let type = headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased()
+                        guard type == "text/event-stream" || self.allowsBinary && type == RemoteTerminalWire.contentType,
                               headers["transfer-encoding"] == nil,
                               encoding == nil || encoding == "identity" || encoding == "gzip",
                               headers["x-autoapprove-node"] == self.expectedNodeID else { throw RemoteHTTPError(502, "Mac의 터미널 연결 정보가 바뀌었습니다. 주소를 다시 추가해주세요.", diagnostics: ["failureKind":"identity"]) }
+                        self.binary = type == RemoteTerminalWire.contentType
                         let body = self.buffer.subdata(in: boundary.upperBound..<self.buffer.count)
                         self.buffer = Data()
                         if encoding == "gzip" {
@@ -245,14 +270,14 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
                         self.deadline?.cancel(); self.deadline = nil
                         let continuation = self.opening; self.opening = nil
                         let initial: Data
-                        do { initial = try self.bufferedEvent() ?? Data() }
+                        do { initial = try self.bufferedEvents() ?? Data() }
                         catch {
                             // Header authentication succeeded. Body corruption
                             // remains a stream failure after HTTP 200, just as
                             // when the same bytes arrive in a later packet.
                             self.fail(error); initial = Data()
                         }
-                        continuation?.resume(returning:initial); return
+                        continuation?.resume(returning:RemotePeerStreamOpening(data:initial,binary:self.binary)); return
                     }
                     guard let length = headers["content-length"].flatMap(Int.init), (0...256_000).contains(length) else { throw RemoteHTTPError(502, "Mac의 오류 응답이 올바르지 않습니다.") }
                     if self.buffer.count >= boundary.upperBound + length {
@@ -289,7 +314,7 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
         guard !cancelled, let completion = waiter else { return }
         do {
           while true {
-            if let data = try bufferedEvent() {
+            if let data = try bufferedEvents() {
                 deadline?.cancel(); deadline = nil
                 waiter = nil; completion(.success(data)); return
             }
@@ -322,16 +347,94 @@ final class RemotePTYPeerBodyStream: RemoteHTTPBodyStream, @unchecked Sendable {
           }
         } catch { fail(error) }
     }
-    private func bufferedEvent() throws -> Data? {
+    /// Search only inspected-byte overlap and new bytes. memchr never scans
+    /// the last byte by itself; its successor is always inside this borrow.
+    private func eventBoundary() throws -> Range<Data.Index>? {
+        if binary { return try binaryBoundary() }
+        let start = buffer.startIndex, offset = searchedBytes
+        return buffer.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            guard let base = bytes.baseAddress, bytes.count-offset >= 2 else { return nil }
+            var index = offset
+            while index < bytes.count-1 {
+                guard let found = memchr(base.advanced(by:index),10,bytes.count-index-1) else { return nil }
+                let position = base.distance(to:UnsafeRawPointer(found))
+                if bytes[position+1] == 10 {
+                    // Coalesce only complete events already in this borrow.
+                    // Never read or wait to fill a batch. A first event larger
+                    // than64KiB keeps its existing individual event limit.
+                    var end = position+2, next = end
+                    let limit = min(bytes.count,min(65_536,Self.eventLimit))
+                    while next < limit-1 {
+                        guard let found = memchr(base.advanced(by:next),10,limit-next-1) else { break }
+                        let position = base.distance(to:UnsafeRawPointer(found))
+                        if bytes[position+1] == 10 { end = position+2; next = end }
+                        else { next = position+1 }
+                    }
+                    return (start+end-2)..<(start+end)
+                }
+                index = position+1
+            }
+            return nil
+        }
+    }
+    /// Envelope headers have at most ten varint bytes. Incomplete payloads need
+    /// no body scan; only complete, bounded frames enter a downstream batch.
+    private func binaryBoundary() throws -> Range<Data.Index>? {
+        let start = buffer.startIndex
+        return try buffer.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            func endAt(_ offset: Int) throws -> Int? {
+                let available = bytes.count-offset
+                for index in 0..<min(3,available) {
+                    guard bytes[offset+index] == [65,65,2][index] else { throw RemoteHTTPError(502,"Mac의 터미널 전송 버전이 다릅니다.") }
+                }
+                guard available >= 4 else { return nil }
+                let mode = bytes[offset+3]
+                guard mode < 5 || (128...131).contains(mode) else { throw RemoteHTTPError(502,"Mac의 터미널 이벤트가 올바르지 않습니다.") }
+                var length: UInt64 = 0
+                for index in 0..<10 {
+                    guard available > 4+index else { return nil }
+                    let byte = bytes[offset+4+index]
+                    guard index < 9 || byte <= 1 else { throw RemoteHTTPError(502,"Mac의 터미널 길이가 올바르지 않습니다.") }
+                    length |= UInt64(byte & 127) << (index*7)
+                    if byte & 128 == 0 {
+                        guard index == 0 || byte != 0, length <= RemoteTerminalWire.byteLimit,
+                              mode != 4 || length == 0 else { throw RemoteHTTPError(502,"Mac의 터미널 프레임이 너무 크거나 올바르지 않습니다.") }
+                        let end = offset+5+index+Int(length)
+                        return end <= bytes.count ? end : nil
+                    }
+                }
+                throw RemoteHTTPError(502,"Mac의 터미널 헤더가 너무 깁니다.")
+            }
+            guard var end = try endAt(0) else { return nil }
+            let limit = min(bytes.count,65_536)
+            while end < limit {
+                // Deliver an already complete prefix before reporting corrupt
+                // data that follows it, as for a later fragmented packet.
+                do { guard let next = try endAt(end), next <= limit else { break };end = next }
+                catch { break }
+            }
+            return (start+end-1)..<(start+end)
+        }
+    }
+    private func bufferedEvents() throws -> Data? {
         while true {
             // The final inspected newline may pair with the next fragment.
             // Previously inspected screen bytes need no further search.
-            let searchRange = (buffer.startIndex+searchedBytes)..<buffer.endIndex
-            if let boundary = buffer.range(of: Self.eventBoundary, in: searchRange) {
+            if let boundary = try eventBoundary() {
                 let length = boundary.upperBound-buffer.startIndex
                 guard length <= Self.eventLimit else { throw RemoteHTTPError(502,"Mac의 터미널 출력 이벤트가 너무 큽니다.") }
                 let data = buffer.subdata(in:buffer.startIndex..<boundary.upperBound)
-                buffer = buffer.subdata(in:boundary.upperBound..<buffer.endIndex)
+                // Keep a view until an empty tail releases storage, or a
+                // consumed prefix can pay for one bounded compaction. Data's
+                // nonzero startIndex tracks that prefix across later appends.
+                if boundary.upperBound == buffer.endIndex {
+                    buffer = Data()
+                } else if boundary.upperBound >= 65_536,
+                          boundary.upperBound >= buffer.endIndex-boundary.upperBound {
+                    buffer = buffer.subdata(in:boundary.upperBound..<buffer.endIndex)
+                } else {
+                    buffer = buffer[boundary.upperBound...]
+                }
                 searchedBytes = 0; compressedSinceEvent = 0
                 return data
             }

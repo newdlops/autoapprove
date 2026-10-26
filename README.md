@@ -1,5 +1,7 @@
 # AutoApprove
 
+**네트워크 검색·연결 복구 · 0.2.179 빌드 206:** 같은 LAN의 두 번째 Mac과 검색 후보 뒤쪽의 Mac 발견을 늦추던 제한을 수정했습니다. 웹 전체의 로딩 정지·네트워크 복귀·일시 단절 복구도 개선하고, 기존 전송 압축과 터미널 처리 경량화를 포함합니다. [변경·검증·설치 파일](docs/releases/v0.2.179.md), [전송 형식·공개 재현](docs/TERMINAL_WIRE.md).
+
 **Codex 질문 처리 경량화 · 0.2.178 빌드 205:** 질문 판별에 필요한 행만 정규화합니다. 합성 실제 Core의 혼합문자 native 변경 화면 CPU **8.4%**, 경과 시간 **7.3%** 감소와 일반 질문·모델 선택 API의 별도 비용 검증을 포함한26개 기준·전체451검사·패키지 검증을 통과했습니다. [측정 범위·재현·설치 파일](docs/releases/v0.2.178.md).
 
 **Codex 허가창 처리 경량화 · 0.2.177 빌드 204:** 제목 이전 로그의 불필요한 정규화를 줄였습니다. 합성 실제 Core의 혼합문자 native 변경 화면 CPU **7.4%**, 경과 시간 **6.9%** 감소와17개 기준·전체451검사·패키지 검증을 통과했습니다. Claude 전체 문맥·코드 블록 보호·원문 검증을 유지합니다. [측정 범위·재현·설치 파일](docs/releases/v0.2.177.md).
@@ -585,6 +587,10 @@ node scripts/screen-integration-check.mjs .build/release/autoapprove --race
 `terminal-timings`는 실행 중인 앱의 터미널 연결 구간별 중앙값·p95·최댓값과 최초 읽기 병합 횟수를 표시합니다. 0.2.103부터 공유 감시 시작·live 읽기·구독 합류·재개 기준 적중/누락·작은 상태 확인 메시지 횟수도 고정 카운터로 제공합니다. 각 구간의 최근 256개 시간만 메모리에 보관하고 앱을 종료하면 지워집니다. 화면·입력·세션 식별자·주소를 기록하지 않습니다. 같은 관리 페이지 주소의 `GET /api/terminal/timings`로도 읽을 수 있으며 `node`로 다른 Mac을 지정할 수 있습니다. 구간은 서로 포함될 수 있어 단순히 합산하면 안 됩니다. `initialWrite`는 네트워크 프레임워크의 송신 처리 완료이며 휴대폰의 표시 완료를 뜻하지 않습니다.
 
 `node scripts/terminal-continuity-check.mjs`는 실제 Core 직접/중계 HTTP·gzip SSE에서 재접속 변경분, 권한 철회, 공유 감시·취소·기준 만료를 검사합니다. `node scripts/terminal-continuity-browser-check.mjs`와 `--webkit`은 합성 원본의 짧은 앱 전환, 조용히 멈춘 연결, 초안과 미확인 입력 보호를 실제 브라우저로 검사합니다. 설치된 Playwright와 Chromium은 기존 `AUTOAPPROVE_PLAYWRIGHT_MODULE`·`AUTOAPPROVE_CHROMIUM_PATH`로 지정할 수 있습니다. 검사 입력은 합성 원본에만 전달합니다.
+
+`node scripts/network-recovery-browser-check.mjs`와 `--webkit`은 보조 전송 스크립트의 무응답, 멈춘 목록 요청, 네트워크 복귀, 응답 제한 시간, 일시·지속 단절과 화면 복귀를 검사합니다. 정상 상태의 조건부 조회·갱신 주기와 모바일·태블릿·데스크톱 화면도 확인합니다. `--case=optional-codec`, `--case=online-recovery`, `--case=deadline-recovery`, `--case=sustained-outage`, `--case=transient-recovery`로 각각 실행할 수 있습니다. 실제 Mac 간 HTTP 검사는 `node scripts/network-integration-check.mjs --release --direct-only`로 실행하며, `--build=경로`로 별도 빌드를 지정할 수 있습니다. 두 검사는 사용자 터미널을 조작하지 않습니다.
+
+`node scripts/discovery-latency-check.mjs --build=.build/release`는 응답 없는 주소 16개 뒤의 머신, 이미 한 대를 찾은 LAN의 두 번째 머신, 저장된 IP를 새로 받은 머신을 같은 5.5초 예산으로 확인합니다. `node scripts/discovery-integration-check.mjs --release --build=.build/release`는 저장된 머신 복구, 검색 동시성·시작 간격, 여러 인터페이스의 검색 공정성과 단일 입력 전송을 검사합니다. 격리된 loopback 서버만 사용하므로 실물 네트워크의 지연 측정과 구분합니다.
 
 앱 설정과 승인 내역은 `~/Library/Application Support/AutoApprove/state.sqlite`에 저장됩니다. 화면과 요청은 외부 서버로 전송하지 않습니다. 로컬 소켓은 같은 사용자만 연결할 수 있습니다.
 

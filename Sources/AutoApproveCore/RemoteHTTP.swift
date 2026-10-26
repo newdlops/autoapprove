@@ -108,6 +108,11 @@ public struct RemoteHTTPRequest {
 
 public enum RemoteNetworkAddress {
     public static func isLocalHost(_ value: String) -> Bool {
+        if let address = RemoteLAN.canonicalIPv4(value) {
+            let first = address >> 24, second = (address >> 16) & 255
+            return first == 10 || first == 127 || (first == 192 && second == 168)
+                || (first == 172 && (16...31).contains(second)) || (first == 169 && second == 254)
+        }
         let host = value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         if host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".local.") { return true }
         if let address = IPv4Address(host) {
@@ -172,8 +177,8 @@ public struct RemoteHTTPResponse: Sendable {
         if let diagnostics = (error as? RemoteHTTPError)?.diagnostics { value["diagnostics"] = diagnostics }
         return (try? object(value, status: status)) ?? Self(status: 500, body: Data())
     }
-    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String, initialData: Data = Data()) -> Self {
-        var response = Self(body: initialData, contentType: "text/event-stream; charset=utf-8")
+    static func eventStream(_ stream: RemoteHTTPBodyStream, nodeID: String, initialData: Data = Data(), binary: Bool = false) -> Self {
+        var response = Self(body: initialData, contentType: binary ? RemoteTerminalWire.contentType : "text/event-stream; charset=utf-8")
         response.stream = stream; response.nodeID = nodeID; return response
     }
     /// Short reads and shipped web assets benefit from a complete gzip member.
@@ -210,6 +215,64 @@ public struct RemoteHTTPResponse: Sendable {
     }
 }
 
+// The listener queue owns every entry and callback. One timer serves all
+// server connections; entries hold weak clients and are removed on close.
+final class RemoteHTTPDeadlines: @unchecked Sendable {
+    private struct Entry {
+        weak var client: RemoteHTTPConnection?
+        let expiration: UInt64
+    }
+    private let queue: DispatchQueue
+    private var entries: [ObjectIdentifier:Entry] = [:]
+    private var timer: DispatchSourceTimer?
+    private var armedAt: UInt64 = 0
+    private var firing = false, stopped = false
+    init(queue: DispatchQueue) { self.queue = queue }
+    deinit { timer?.setEventHandler {}; timer?.cancel() }
+    func arm(_ client: RemoteHTTPConnection, at expiration: UInt64) {
+        guard !stopped else { return }
+        entries[ObjectIdentifier(client)] = Entry(client:client,expiration:expiration)
+        if !firing { reschedule() }
+    }
+    func remove(_ client: RemoteHTTPConnection) {
+        guard entries.removeValue(forKey:ObjectIdentifier(client)) != nil else { return }
+        if !firing { reschedule() }
+    }
+    func stop() {
+        stopped = true; entries.removeAll()
+        timer?.setEventHandler {}; timer?.cancel(); timer = nil; armedAt = 0
+    }
+    private func reschedule() {
+        guard !stopped else { return }
+        guard !entries.isEmpty else {
+            if armedAt != 0 { timer?.schedule(deadline:.distantFuture); armedAt = 0 }
+            return
+        }
+        var next = UInt64.max
+        for entry in entries.values { next = min(next,entry.expiration) }
+        guard timer == nil || next != armedAt else { return }
+        if timer == nil {
+            let source = DispatchSource.makeTimerSource(queue:queue)
+            timer = source
+            source.setEventHandler { [weak self] in self?.fire() }
+            source.schedule(deadline:DispatchTime(uptimeNanoseconds:next))
+            source.resume()
+        } else { timer?.schedule(deadline:DispatchTime(uptimeNanoseconds:next)) }
+        armedAt = next
+    }
+    private func fire() {
+        guard !stopped else { return }
+        // An already queued event may follow a later reschedule. Clear the
+        // checkpoint so even an early event rearms the current minimum.
+        armedAt = 0; firing = true
+        let now = DispatchTime.now().uptimeNanoseconds
+        var due: [ObjectIdentifier] = []
+        for (id,entry) in entries where entry.expiration <= now { due.append(id) }
+        for id in due { entries.removeValue(forKey:id)?.client?.checkDeadline() }
+        firing = false; reschedule()
+    }
+}
+
 // Connection state is confined to the listener's serial queue. Streams have
 // one pending source read and one network send, with no unbounded byte queue.
 final class RemoteHTTPConnection: @unchecked Sendable {
@@ -224,17 +287,20 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     let onClose: () -> Void
     private let queue: DispatchQueue
     private var handlerTask: Task<Void, Never>?
-    private var deadline: DispatchWorkItem?
-    private var sendDeadline: DispatchWorkItem?
+    private let deadlines: RemoteHTTPDeadlines
+    private var deadlineScheduled = false
+    private var deadlineExpiresAt: UInt64 = 0
+    private var sendExpiresAt: UInt64 = 0
     private var heartbeat: DispatchSourceTimer?
     private var stream: RemoteHTTPBodyStream?
+    private var binaryStream = false
     private var gzip: RemoteGzipEncoder?
     private var nextPending = false
     private var pendingResult: Result<Data?, Error>?
     private var sending = false
     private var terminalWriteStarted: TimeInterval?
-    init(_ connection: NWConnection, queue: DispatchQueue, handler: @escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse, onClose: @escaping () -> Void) {
-        self.connection = connection; self.queue = queue; self.handler = handler; self.onClose = onClose
+    init(_ connection: NWConnection, queue: DispatchQueue, deadlines: RemoteHTTPDeadlines, handler: @escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse, onClose: @escaping () -> Void) {
+        self.connection = connection; self.queue = queue; self.deadlines = deadlines; self.handler = handler; self.onClose = onClose
     }
     func start() {
         queue.async {
@@ -270,9 +336,25 @@ final class RemoteHTTPConnection: @unchecked Sendable {
         }
     }
     private func armDeadline(_ seconds: TimeInterval) {
-        deadline?.cancel()
-        let deadline = DispatchWorkItem { [weak self] in self?.closeNow() }
-        self.deadline = deadline; queue.asyncAfter(deadline:.now()+seconds,execute:deadline)
+        deadlineExpiresAt = (DispatchTime.now()+seconds).uptimeNanoseconds
+        scheduleDeadline(at:sendExpiresAt == 0 ? deadlineExpiresAt : min(deadlineExpiresAt,sendExpiresAt))
+    }
+    private func scheduleDeadline(at expiration: UInt64) {
+        deadlineScheduled = true; deadlines.arm(self,at:expiration)
+    }
+    fileprivate func checkDeadline() {
+        deadlineScheduled = false
+        guard !closed else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if deadlineExpiresAt != 0 && now >= deadlineExpiresAt
+            || sendExpiresAt != 0 && now >= sendExpiresAt { closeNow(); return }
+        let next = deadlineExpiresAt == 0 ? sendExpiresAt
+            : sendExpiresAt == 0 ? deadlineExpiresAt : min(deadlineExpiresAt,sendExpiresAt)
+        if next != 0 { scheduleDeadline(at:next) }
+    }
+    private func cancelDeadline() {
+        if deadlineScheduled { deadlines.remove(self) }
+        deadlineScheduled = false; deadlineExpiresAt = 0; sendExpiresAt = 0
     }
     private func readRequest() {
         guard !closed, !complete else { return }
@@ -306,16 +388,18 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                                 }
                             }
                             self.stream = stream
+                            self.binaryStream = response.contentType == RemoteTerminalWire.contentType
                             // The generic request deadline ends after a successful
                             // SSE handshake; an idle terminal remains connected.
-                            self.deadline?.cancel(); self.deadline = nil
+                            // Reuse the shared checkpoint for the imminent first send.
+                            self.deadlineExpiresAt = 0
                             if stream.needsHeartbeat {
                                 let heartbeat = DispatchSource.makeTimerSource(queue: self.queue)
                                 self.heartbeat = heartbeat
                                 heartbeat.setEventHandler { [weak self] in
                                     guard let self, !self.closed, self.stream != nil, !self.sending,
                                           self.pendingResult == nil else { return }
-                                    self.sendStream(Data(": keepalive\n\n".utf8))
+                                    self.sendStream(self.binaryStream ? RemoteTerminalWire.heartbeat : Data(": keepalive\n\n".utf8))
                                 }
                                 heartbeat.schedule(deadline: .now() + 15, repeating: 15); heartbeat.resume()
                             }
@@ -346,15 +430,12 @@ final class RemoteHTTPConnection: @unchecked Sendable {
         if !final, stream != nil {
             // A disappeared reader must not hold a stream slot forever while
             // Network.framework waits for send-window space. No writes replay.
-            let timeout = DispatchWorkItem { [weak self] in self?.closeNow() }
-            sendDeadline = timeout; queue.asyncAfter(deadline:.now()+30,execute:timeout)
+            armSendDeadline()
         }
-        if final, deadline == nil {
+        if final, deadlineExpiresAt == 0 {
             // SSE cancels the request deadline after its handshake. A final
             // error must still release its slot if the peer never disconnects.
-            let deadline = DispatchWorkItem { [weak self] in self?.closeNow() }
-            self.deadline = deadline
-            queue.asyncAfter(deadline: .now() + 5, execute: deadline)
+            armDeadline(5)
         }
         // Finish the HTTP write side with FIN, then let the reader disconnect.
         // Cancelling immediately after contentProcessed can tear down the
@@ -366,7 +447,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
             guard let self else { return }
             self.queue.async {
                 guard !self.closed else { return }; self.sending = false
-                self.sendDeadline?.cancel(); self.sendDeadline = nil
+                self.sendExpiresAt = 0
                 if error != nil { self.closeNow() }
                 else if self.reuseAfterSend {
                     self.reuseAfterSend = false; self.complete = false
@@ -376,6 +457,12 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                 else if !final { self.pumpStream() }
             }
         })
+    }
+    // One shared checkpoint serves request, idle/final and send windows. Writes
+    // only advance their expiration;they do not allocate or rearm per frame.
+    private func armSendDeadline() {
+        sendExpiresAt = (DispatchTime.now()+30).uptimeNanoseconds
+        if !deadlineScheduled { scheduleDeadline(at:sendExpiresAt) }
     }
     private func pumpStream() {
         guard !closed, !sending, let stream else { return }
@@ -387,7 +474,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                 else { self.stream = nil; sendStream(Data(),final:true) }
             case .failure(let error):
                 stream.cancel(); self.stream = nil
-                sendStream(RemoteServerEvent.failure(error), final: true)
+                sendStream(RemoteServerEvent.failure(error,binary:binaryStream), final: true)
             }
             return
         }
@@ -407,8 +494,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     func close() { queue.async { self.closeNow() } }
     private func closeNow() {
         guard !closed else { return }; closed = true
-        deadline?.cancel(); deadline = nil; heartbeat?.cancel(); heartbeat = nil
-        sendDeadline?.cancel(); sendDeadline = nil
+        cancelDeadline(); heartbeat?.setEventHandler {}; heartbeat?.cancel(); heartbeat = nil
         handlerTask?.cancel(); handlerTask = nil
         stream?.cancel(); stream = nil; pendingResult = nil
         gzip = nil

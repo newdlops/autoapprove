@@ -10,6 +10,7 @@ actor RemoteDiscoveryTraffic {
         let continuation: CheckedContinuation<Void,Error>
     }
     private var active = 0
+    private var blindActive = 0
     private var nextStart: TimeInterval = 0
     private var waiters: [Waiter] = []
     private var wake: (id: UUID, task: Task<Void,Never>)?
@@ -18,9 +19,9 @@ actor RemoteDiscoveryTraffic {
     private func enter(known: Bool) async throws {
         try Task.checkCancellation()
         let now = ProcessInfo.processInfo.systemUptime
-        if waiters.isEmpty, active < 2, now >= nextStart {
-            active += 1; nextStart = now+0.25
-            if !known { lastBlindStart = now }
+        if waiters.isEmpty, active < 8, known || blindActive < 6, now >= nextStart {
+            active += 1; nextStart = now+0.05
+            if !known { blindActive += 1; lastBlindStart = now }
             return
         }
         let id = UUID()
@@ -38,7 +39,7 @@ actor RemoteDiscoveryTraffic {
         drain()
     }
     private func drain() {
-        guard active < 2, !waiters.isEmpty else { wake?.task.cancel(); wake = nil; return }
+        guard active < 8, !waiters.isEmpty else { wake?.task.cancel(); wake = nil; return }
         let now = ProcessInfo.processInfo.systemUptime
         if now < nextStart {
             guard wake == nil else { return }
@@ -54,12 +55,14 @@ actor RemoteDiscoveryTraffic {
             return
         }
         wake?.task.cancel(); wake = nil
-        let knownWaiting = waiters.contains(where:{$0.known})
-        // Preserve saved-identity priority and an occasional blind probe.
-        guard let index = waiters.firstIndex(where:{$0.known || !knownWaiting || now-lastBlindStart >= 2}) else { return }
+        let known = waiters.firstIndex(where:{$0.known})
+        let blind = blindActive < 6 ? waiters.firstIndex(where:{!$0.known}) : nil
+        // Reserve two sockets for saved identities, and give a queued subnet
+        // probe an explicit turn even when known-peer checks keep arriving.
+        guard let index = blind.flatMap({ known == nil || now-lastBlindStart >= 0.5 ? $0 : nil }) ?? known ?? blind else { return }
         let waiter = waiters.remove(at:index)
-        active += 1; nextStart = now+0.25
-        if !waiter.known { lastBlindStart = now }
+        active += 1; nextStart = now+0.05
+        if !waiter.known { blindActive += 1; lastBlindStart = now }
         waiter.continuation.resume()
         drain()
     }
@@ -68,7 +71,9 @@ actor RemoteDiscoveryTraffic {
         wake = nil; drain()
     }
     func get(_ endpoint: NWEndpoint, path: String, expectedID: String? = nil, timeout: TimeInterval = 1) async throws -> RemoteHTTPResponse {
-        try await enter(known:expectedID != nil); defer { active -= 1; drain() }
+        let known = expectedID != nil
+        try await enter(known:known)
+        defer { active -= 1; if !known { blindActive -= 1 }; drain() }
         try Task.checkCancellation()
         // A later scheduled probe is preferable to hidden retries during discovery.
         return try await RemoteHTTPExchange(endpoint: endpoint, path: path, method: "GET", body: Data(), expectedNodeID: expectedID, timeout: timeout, retryReads: false).run()

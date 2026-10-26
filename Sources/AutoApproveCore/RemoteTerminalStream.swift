@@ -11,9 +11,10 @@ extension RemoteServerEvent {
     static func screen(_ frame: RemoteTerminalFrame, knownRevision: String? = nil) throws -> Data {
         try screen(RemoteTerminalUpdate(frame,knownRevision:knownRevision))
     }
-    static func screen(_ update: RemoteTerminalUpdate, encoder suppliedEncoder: JSONEncoder? = nil) throws -> Data {
+    static func screen(_ update: RemoteTerminalUpdate, encoder suppliedEncoder: JSONEncoder? = nil, wire: RemoteTerminalWireEncoder? = nil) throws -> Data {
         let start = RemoteTerminalPerformance.now; var succeeded = false
         defer { RemoteTerminalPerformance.shared.observe(.responseEncoding,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) }
+        if let wire { let data = try wire.encode(update,event:0); succeeded = true; return data }
         let encoder = suppliedEncoder ?? makeEncoder()
         let json = try encoder.encode(update)
         guard json.count <= 2_000_000 else { throw RemoteHTTPError(502, "원본 터미널 화면이 너무 큽니다. 화면 크기를 줄여 다시 연결해주세요.") }
@@ -28,9 +29,15 @@ extension RemoteServerEvent {
         data.append(contentsOf: "data: ".utf8); data.append(json); data.append(contentsOf: "\n\n".utf8)
         return data
     }
-    static func terminalAlive(_ frame: RemoteTerminalFrame, encoder suppliedEncoder: JSONEncoder? = nil) throws -> Data {
+    static func terminalAlive(_ frame: RemoteTerminalFrame, encoder suppliedEncoder: JSONEncoder? = nil, wire: RemoteTerminalWireEncoder? = nil) throws -> Data {
         struct Alive: Encodable {
             let streamID: String?, revision: String, sequence: Int?, observedAt: Date
+        }
+        let value = Alive(streamID:frame.streamID,revision:frame.revision,sequence:frame.sequence,observedAt:frame.observedAt)
+        if let wire {
+            let data = try wire.encode(value,event:1)
+            RemoteTerminalPerformance.shared.increment(.compactPulses)
+            return data
         }
         let encoder = suppliedEncoder ?? makeEncoder()
         let json = try encoder.encode(Alive(streamID:frame.streamID,revision:frame.revision,sequence:frame.sequence,observedAt:frame.observedAt))
@@ -65,6 +72,7 @@ struct RemoteTerminalControls: Equatable {
     // A stream emits one event at a time, so its encoder can be reused safely
     // instead of allocating and configuring another JSONEncoder per heartbeat.
     private let eventEncoder: JSONEncoder
+    private let wireEncoder: RemoteTerminalWireEncoder?
     private let waitForChange: (@Sendable (TimeInterval) async -> Void)?
     private let responsive: @MainActor @Sendable () -> Bool
     private var initial: RemoteTerminalFrame?
@@ -83,7 +91,7 @@ struct RemoteTerminalControls: Equatable {
     private var unchanged = 0
 
     init(initial: RemoteTerminalFrame, emitInitial: Bool = true, delta: Bool = false, copy: Bool = false,
-         resume: RemoteTerminalFrame? = nil, compact: Bool = false, paced: Bool = false,
+         resume: RemoteTerminalFrame? = nil, compact: Bool = false, paced: Bool = false, binary: Bool = false,
          onCancel: (@MainActor () -> Void)? = nil, waitForChange: (@Sendable (TimeInterval) async -> Void)? = nil,
          responsive: @escaping @MainActor @Sendable () -> Bool = { true }, read: @escaping @MainActor @Sendable () async throws -> RemoteTerminalFrame) throws {
         // A resume basis affects only output encoding. The initial frame above
@@ -92,7 +100,9 @@ struct RemoteTerminalControls: Equatable {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.withoutEscapingSlashes]
         eventEncoder = encoder
-        initialEvent = try RemoteServerEvent.screen(RemoteTerminalUpdate(initial,previous:resume,delta:delta,copy:copy), encoder:encoder)
+        let wire = binary ? RemoteTerminalWireEncoder(jsonEncoder:encoder) : nil
+        wireEncoder = wire
+        initialEvent = try RemoteServerEvent.screen(RemoteTerminalUpdate(initial,previous:resume,delta:delta,copy:copy), encoder:encoder,wire:wire)
         self.initial = emitInitial ? initial : nil; self.read = read; self.delta = delta
         copyEnabled = delta && copy; self.compact = compact; self.paced = paced; self.onCancel = onCancel
         if !emitInitial {
@@ -125,10 +135,10 @@ struct RemoteTerminalControls: Equatable {
                     if frame.revision != self.revision || controls != self.controls || Date().timeIntervalSince(self.emittedAt) >= 2 {
                         let data: Data
                         if self.compact, frame.streamID != nil, frame.revision == self.revision, controls == self.controls {
-                            data = try RemoteServerEvent.terminalAlive(frame,encoder:self.eventEncoder)
+                            data = try RemoteServerEvent.terminalAlive(frame,encoder:self.eventEncoder,wire:self.wireEncoder)
                         }
-                        else if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true,copy:self.copyEnabled),encoder:self.eventEncoder) }
-                        else { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,knownRevision:self.revision),encoder:self.eventEncoder) }
+                        else if self.delta { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,previous:self.previous,delta:true,copy:self.copyEnabled),encoder:self.eventEncoder,wire:self.wireEncoder) }
+                        else { data = try RemoteServerEvent.screen(RemoteTerminalUpdate(frame,knownRevision:self.revision),encoder:self.eventEncoder,wire:self.wireEncoder) }
                         self.revision = frame.revision; self.controls = controls; self.emittedAt = Date()
                         if self.delta { self.previous = frame }
                         self.finish(.success(data)); return

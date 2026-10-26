@@ -7,7 +7,7 @@ import {randomUUID} from 'node:crypto';
 import path from 'node:path';
 import {coreLinkArguments} from './swift-core-link.mjs';
 
-const build=path.resolve('.build',process.argv.includes('--release')?'release':'debug');
+const build=path.resolve(process.argv.find(value=>value.startsWith('--build='))?.slice(8)||path.join('.build',process.argv.includes('--release')?'release':'debug'));
 const root=await mkdtemp('/private/tmp/aa-discovery-'),children=[],servers=[],checks=[];
 const output=path.resolve('dist/qa/discovery');await mkdir(output,{recursive:true});
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -70,7 +70,7 @@ try {
   const times=traffic.times.sort((a,b)=>a-b);let peakRate=0;
   for(const at of times)peakRate=Math.max(peakRate,times.filter(time=>time>=at&&time<at+1000).length);
   console.log(JSON.stringify({trafficRequests:times.length,peakRate,peakConcurrent:traffic.peak}));
-  assert.ok(times.length>4&&times.length<30);assert.ok(peakRate<=4,'Discovery wire rate must stay bounded');assert.ok(traffic.peak<=2,'Discovery must use at most two sockets');
+  assert.ok(times.length>4&&times.length<30);assert.ok(peakRate<=20,'Discovery starts at most twenty reads per second');assert.ok(traffic.peak<=6,'Blind discovery reserves two of the eight sockets for known peers');
   assert.ok((await get(limited,'/api/network')).data.nodes.length===1,'Unrelated HTTP replies must not be enrolled');
   checks.push({check:'512-address fallback and passive hints stay bounded without broadcast',requests:times.length,peakPerSecond:peakRate,peakConcurrent:traffic.peak});
   const backup=await fake(template),primary=await fake(template);primary.setURLs([backup.url]);

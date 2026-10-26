@@ -203,6 +203,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var sessions: [String: AgentSession] = [:]
     private var sessionOrder: [String] = []
     private var inboxes: [String: SessionInbox] = [:]
+    private var noticeKeyCache: SessionNotice.KeyCache?
     private var records: [ProcessRecord] = []
     private var server: SocketServer?
     private var pollTask: Task<Void, Never>?
@@ -489,6 +490,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        noticeKeyCache = nil
         remoteInputStopped = true
         automationRuntime.stop()
         observationEpoch &+= 1
@@ -1983,6 +1985,56 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
+    /// Validate cheap guards first, then compare current scalar fields. Lazy
+    /// project reads preserve the phase/rank short circuits of the sort policy.
+    private func reusingPresentationOrder(_ rows: [AgentSession], ranks: [String: Int], projects: [String: String],
+                                         precedes _: (AgentSession, AgentSession) -> Bool) -> [AgentSession]? {
+        guard rows.count > 1 else { return rows }
+        let previous = snapshot.sessions
+        guard previous.count == rows.count else { return nil }
+        var positions: [String: Int] = [:]
+        positions.reserveCapacity(rows.count)
+        for index in rows.indices {
+            guard positions.updateValue(index, forKey: rows[index].id) == nil else { return nil }
+        }
+        for oldIndex in previous.indices {
+            guard let index = positions[previous[oldIndex].id],
+                  previous[oldIndex].cwd == rows[index].cwd,
+                  (previous[oldIndex].phase == .ended) == (rows[index].phase == .ended) else { return nil }
+        }
+        var result: [AgentSession] = []
+        result.reserveCapacity(rows.count)
+        var lastIndex: Int?, lastProject: String?
+        var lastID = "", lastEnded = false, lastRank = Int.max
+        for oldIndex in previous.indices {
+            guard let index = positions.removeValue(forKey: previous[oldIndex].id) else { return nil }
+            let id = rows[index].id, ended = rows[index].phase == .ended, rank = ranks[id] ?? Int.max
+            var project: String?
+            if let leftIndex = lastIndex {
+                if lastEnded != ended {
+                    guard !lastEnded else { return nil }
+                } else if lastRank != rank {
+                    guard lastRank < rank else { return nil }
+                } else {
+                    let leftProject = lastProject ?? projects[lastID] ?? rows[leftIndex].project
+                    let rightProject = projects[id] ?? rows[index].project
+                    if leftProject != rightProject {
+                        guard leftProject.localizedStandardCompare(rightProject) == .orderedAscending else { return nil }
+                    } else {
+                        guard lastID < id,
+                              leftProject.utf8.elementsEqual(rightProject.utf8),
+                              leftProject.utf16.elementsEqual(rightProject.utf16) else { return nil }
+                    }
+                    project = rightProject
+                }
+            }
+            result.append(rows[index])
+            lastIndex = index; lastID = id; lastEnded = ended; lastRank = rank; lastProject = project
+        }
+        guard positions.isEmpty else { return nil }
+        return result
+    }
+
     private func publish() {
         if screenPublicationDepth > 0 { screenPublicationPending = true; return }
         projectClaudeApprovals()
@@ -2001,7 +2053,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let rows = presentedSessions()
         var projects: [String: String] = [:]
         for row in rows where ranks[row.id] == nil { projects[row.id] = row.project }
-        let presented = rows.sorted {
+        let precedes: (AgentSession, AgentSession) -> Bool = {
             if ($0.phase == .ended) != ($1.phase == .ended) { return $0.phase != .ended }
             let left = ranks[$0.id] ?? Int.max, right = ranks[$1.id] ?? Int.max
             if left != right { return left < right }
@@ -2009,6 +2061,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if leftProject != rightProject { return leftProject.localizedStandardCompare(rightProject) == .orderedAscending }
             return $0.id < $1.id
         }
+        let presented = reusingPresentationOrder(rows, ranks: ranks, projects: projects, precedes: precedes)
+            ?? rows.sorted(by: precedes)
         // Heartbeats still reconcile timers and notices, but identical state must
         // not invalidate every SwiftUI window and notification subscription.
         if snapshot.sessions != presented { snapshot.sessions = presented }
@@ -2146,6 +2200,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func updateInboxes() {
+        noticeKeyCache?.beginPass()
+        defer { if noticeKeyCache?.finishPass() == false { noticeKeyCache = nil } }
         var saveError: String?
         let now = Date()
         for id in Array(sessions.keys) {
@@ -2154,22 +2210,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let hasAttentionInputs = session.systemSafety != nil || session.interruption != nil ||
                 session.queuedQuestions?.contains(where: \.needsAnswer) == true ||
                 session.claudeApprovals?.isEmpty == false || session.pendingSummary != nil || !session.backgroundChildren.isEmpty
-            var candidates: [SessionInbox.Candidate] = []
-            if session.agent != .shell && hasAttentionInputs {
-                session.automatic = effectiveAutomatic(id)
-                candidates = AttentionRequest.candidates(session, paused: snapshot.paused).map {
-                    SessionInbox.Candidate(key: SessionNotice.key(.question, $0.key), kind: .question, summary: $0.summary,
-                        isInterruption: $0.kind == .interruption, isSystemSafety: $0.kind == .systemChange)
-                }
-            }
-            if recentCompletion, let completion = session.completion {
-                candidates.append(.init(key: SessionNotice.key(.completion, completion.id), kind: .completion, summary: completion.summary))
-            }
-            if candidates.isEmpty && inboxes[id] == nil { continue }
+            if (session.agent == .shell || !hasAttentionInputs) && !recentCompletion && inboxes[id] == nil { continue }
             var inbox = inboxes[id] ?? SessionInbox()
             let observed = session.phase == .ended || (session.phase != .unknown &&
                 (session.agent != .codex || (session.codexQuestionsObservedAt != nil && session.codexQuestionsError == nil)))
-            guard inbox.update(candidates, at: now, reconcilesAbsence: observed) else { continue }
+            var update = SessionInbox.Update(moving: &inbox, at: now, reconcilesAbsence: observed)
+            if session.agent != .shell && hasAttentionInputs {
+                session.automatic = effectiveAutomatic(id)
+                AttentionRequest.collectInbox(session, paused: snapshot.paused, into: &update, keyCache: &noticeKeyCache)
+            }
+            if recentCompletion, let completion = session.completion {
+                if noticeKeyCache == nil { noticeKeyCache = SessionNotice.KeyCache() }
+                update.append(key: noticeKeyCache!.key(.completion, completion.id), kind: .completion, summary: completion.summary)
+            }
+            if update.count == 0 && inboxes[id] == nil { continue }
+            guard update.finish(into: &inbox) else { continue }
             do {
                 try store.set("inbox:\(id)", String(decoding: try JSONEncoder().encode(inbox), as: UTF8.self))
                 inboxes[id] = inbox
@@ -2645,8 +2700,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func updateQuestionAutomationStates(duplicatesBySession: [String: Set<String>],
                                                 confirmations: inout QuestionConfirmationCache) {
-        for (id, session) in sessions {
-            guard let questions = session.queuedQuestions else { continue }
+        // The map includes every nonempty queue, even if its duplicate set is
+        // empty. Rows without questions have no automation state to project.
+        for id in duplicatesBySession.keys {
+            guard let session = sessions[id], let questions = session.queuedQuestions else { continue }
             let duplicates = duplicatesBySession[id] ?? []
             var updated: [QueuedQuestion]?
             for (index, original) in questions.enumerated() {
@@ -2677,6 +2734,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func reconcileAutomaticQuestionReplies(duplicatesBySession: [String: Set<String>],
                                                    confirmations: inout QuestionConfirmationCache) {
+        // A candidate needs a readable source with nonempty questions. Keep
+        // processing existing reservations so a lost source cancels at once.
+        guard !automaticQuestionReplies.isEmpty ||
+            (!readableQuestionSessions.isEmpty && !duplicatesBySession.isEmpty) else { return }
         var candidates: [String: (sessionID: String, question: QueuedQuestion, answer: String)] = [:]
         if !questionAutomationStopped, !snapshot.paused {
             for session in sessions.values where session.agent == .codex && session.automatic && session.canApprove
@@ -2895,6 +2956,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             if session.phase == .ended { session.setPhase(.unknown, detail: "새 상태를 확인하고 있습니다."); session.channel = .none; session.automatic = false }
             if sessions[session.id] == nil {
+                // Discovery can supply a fresh queue before the history reader.
+                // Keep the cached queue index complete for that ingress too.
+                if session.queuedQuestions?.isEmpty == false { invalidateDuplicateQuestionIDs() }
                 restorePreferences(&session)
                 if let owned = managedPTY.owned(tty: session.tty), ptyAutomatic[owned.descriptor.ptyID] == true {
                     session.automatic = true
@@ -2973,6 +3037,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func resetAutomation(members: Set<String>, selected: AgentSession?, allSessions: Bool) -> AutomationResetResult {
+        noticeKeyCache = nil
         var busy = automaticInputSessions
         busy.formUnion(systemSafetyTasks.keys)
         busy.formUnion(capacityStates.compactMap { $0.value.phase == .sending ? $0.key : nil })
@@ -4225,7 +4290,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             // Keep freshness and detector state current, but don't rebuild all
             // question, inbox and session projections unless this observation
             // changed something the UI can see.
-            if sessions[sessionID] != sessionBeforeScreen || capacityResumeProjection(for: sessionID) != capacityBeforeScreen {
+            // Compare the unwrapped value directly, keeping every session field
+            // in equality without promoting another 1 KiB value to Optional.
+            let sessionChanged: Bool
+            if let current = sessions[sessionID] {
+                sessionChanged = current != sessionBeforeScreen
+            } else {
+                sessionChanged = true
+            }
+            if sessionChanged || capacityResumeProjection(for: sessionID) != capacityBeforeScreen {
                 publish()
             }
         }

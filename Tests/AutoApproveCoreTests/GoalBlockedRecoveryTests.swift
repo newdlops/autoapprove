@@ -211,7 +211,10 @@ extension ApprovalTests {
         // after 120ms. Wait for the observable delivery, with a fixed upper bound.
         func waitForDelivery(_ count: Int) async throws {
             let deadline=ProcessInfo.processInfo.systemUptime+3
-            while probe.texts.count<count,ProcessInfo.processInfo.systemUptime<deadline {try await Task.sleep(for:.milliseconds(10))}
+            while (probe.texts.count<count || engine.snapshot.sessions.first?.interruption?.resumeConfirmedAt == nil),
+                  ProcessInfo.processInfo.systemUptime<deadline {try await Task.sleep(for:.milliseconds(10))}
+            try expect(probe.texts.count>=count && engine.snapshot.sessions.first?.interruption?.resumeConfirmedAt != nil,
+                "Wait for the engine's persisted confirmation, not only adapter entry")
         }
         try await waitForDelivery(1); try expectEqual(probe.texts, ["이어서 진행하자."])
         let goal = plain + " · Goal stalled (/goal resume)"

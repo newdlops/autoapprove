@@ -6,7 +6,7 @@ import {chmodSync,copyFileSync,mkdirSync,mkdtempSync,readFileSync,rmSync} from '
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 
-export function prepareTerminalInputBundle(app, configuration, version) {
+export function prepareTerminalInputBundle(app, configuration, version, buildDirectory) {
   const service='local.autoapprove.tty-input';
   const directory=mkdtempSync(path.join(tmpdir(),'autoapprove-tty-bundle-'));
   const run=(binary,args,input)=>execFileSync(binary,args,{input,stdio:['pipe','pipe','pipe'],timeout:30000});
@@ -29,7 +29,7 @@ export function prepareTerminalInputBundle(app, configuration, version) {
     if(launch.Label!==service||launch.BundleProgram!=='Contents/MacOS/AutoApproveTTYService')throw Error('Unexpected input service executable');
     delete launch.BundleProgram;
     writePlist(launchPlist,launch);
-    const build=path.resolve('.build',configuration);
+    const build=path.resolve(buildDirectory||path.join('.build',configuration));
     const architecture=run('/usr/bin/lipo',['-archs',path.join(build,'AutoApproveTTYService')]).toString().trim();
     if(!['arm64','x86_64'].includes(architecture))throw Error('Package each helper architecture before creating a universal bundle');
     const objects=readFileSync(path.join(build,'AutoApproveTTYService.product/Objects.LinkFileList'),'utf8').trim().split('\n');

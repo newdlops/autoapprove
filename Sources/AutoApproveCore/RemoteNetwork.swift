@@ -47,6 +47,7 @@ public struct RemoteNodeState: Codable {
     public var historyDeferred: Bool? = nil
     /// This name resolves on this Mac only, and is not a LAN address for peers or phones.
     public var localAddressReady: Bool? = nil
+    public var terminalWireVersion: Int? = nil
     public var inventory: RemoteNodeState {
         var value = self
         value.snapshot.sessions = []; value.snapshot.events = []; value.historyDeferred = true
@@ -79,6 +80,7 @@ public struct RemoteDashboard: Codable {
     public var gatewayRelease: RemoteWebVersion? = nil
     public var preferredGateway: RemoteWebGateway? = nil
     public var partial: Bool? = nil
+    public var terminalWireVersion: Int? = nil
 }
 
 public struct RemoteTerminalFrame: Codable, Sendable {
@@ -189,6 +191,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var allowListenerPortFallback = false
     public var port: UInt16? { listener?.port?.rawValue }
     private let queue = DispatchQueue(label: "autoapprove.web.listener")
+    private var httpDeadlines: RemoteHTTPDeadlines?
     private var connections: [UUID: RemoteHTTPConnection] = [:]
     private var streamConnections: Set<UUID> = []
     private let terminalFeeds = RemoteTerminalFeeds()
@@ -401,7 +404,10 @@ struct RemoteTerminalUpdate: Encodable {
                       case .hostPort(let host, _) = connection.endpoint,
                       RemoteNetworkAddress.isLocalHost(String(describing: host)) else { connection.cancel(); return }
                 let id = UUID()
-                let client = RemoteHTTPConnection(connection, queue: self.queue, handler: { [weak self] request in
+                let deadlines: RemoteHTTPDeadlines
+                if let existing = self.httpDeadlines { deadlines = existing }
+                else { deadlines = RemoteHTTPDeadlines(queue:self.queue); self.httpDeadlines = deadlines }
+                let client = RemoteHTTPConnection(connection, queue: self.queue, deadlines:deadlines, handler: { [weak self] request in
                     guard let self, !Task.isCancelled, self.running, self.generation == epoch, self.connections[id] != nil else { return .error(RemoteHTTPError(503, "웹 접속이 꺼졌거나 연결이 종료되었습니다.")) }
                     if request.method == "GET", ["/api/pty/stream", "/api/terminal/stream"].contains(request.path) {
                         do { try request.validateOrigin() } catch { return .error(error) }
@@ -569,7 +575,10 @@ struct RemoteTerminalUpdate: Encodable {
                 else {
                     var deadline = min(self.nextHintRead,self.nextBlindProbe)
                     if self.webPeerTask == nil { deadline = min(deadline,self.nextWebPeerRefresh) }
-                    delay = min(5,max(0.25,deadline.timeIntervalSinceNow))
+                    // A probe can finish with an earlier retry/discovery
+                    // deadline. Observe that completion before a long idle
+                    // sleep, while retaining the quiet five-second cap at rest.
+                    delay = min(self.webPeerTask == nil ? 5 : 0.25,max(0.25,deadline.timeIntervalSinceNow))
                 }
                 do { try await Task.sleep(for: .seconds(delay)) } catch { return }
             }
@@ -596,6 +605,9 @@ struct RemoteTerminalUpdate: Encodable {
         pathMonitor?.cancel(); pathMonitor = nil
         interfaceMonitors.forEach {$0.cancel()}; interfaceMonitors.removeAll()
         let clients = Array(connections.values); connections.removeAll(); streamConnections.removeAll(); clients.forEach { $0.close() }
+        if let deadlines = httpDeadlines {
+            httpDeadlines = nil; queue.async { deadlines.stop() }
+        }
         terminalFeeds.stop()
         peers = peers.filter { $0.value.manual }
         for id in Array(peers.keys) { peers[id]?.portal = false; peers[id]?.webVerifiedAt = nil }
@@ -912,7 +924,7 @@ struct RemoteTerminalUpdate: Encodable {
                 }
             }
             await withTaskGroup(of:Result.self) { group in
-                var next = min(2,candidates.count)
+                var next = min(4,candidates.count)
                 for peer in candidates.prefix(next) { group.addTask(operation:query(peer)) }
                 // Consume each completion immediately; one slow address cannot
                 // hold its healthy neighbour or the next queued peer in a batch.
@@ -927,6 +939,12 @@ struct RemoteTerminalUpdate: Encodable {
                             self.peers[result.id]?.failures = failures
                             self.peers[result.id]?.nextProbe = Date().addingTimeInterval(pow(2,Double(failures)))
                             self.peers[result.id]?.webVerifiedAt = nil
+                            if failures == 2 {
+                                // DHCP can give an old saved address to a new
+                                // machine. Re-identify it through discovery;
+                                // original reads remain pinned to the old ID.
+                                self.nextHintRead = .distantPast; self.nextBlindProbe = .distantPast
+                            }
                             if !current.bonjour && !current.manual,
                                current.webVerifiedAt.map({Date().timeIntervalSince($0)<60}) != true,
                                current.directlySeen.map({Date().timeIntervalSince($0)<60}) != true {
@@ -1036,6 +1054,8 @@ struct RemoteTerminalUpdate: Encodable {
             // A restarted listener can keep its version and service ID while changing ports.
             // Fresh DNS-SD metadata must supersede an old numeric/manual address.
             let unchanged = previous?.release == advertised && (advertisedPort == nil || previous?.webPort == advertisedPort)
+                && (advertisedURLs.isEmpty || previous?.webURLs == advertisedURLs)
+            if !unchanged { stateReads.remove(id); inventoryValidation.remove(id) }
             let direct = unchanged && previous?.directlySeen.map { Date().timeIntervalSince($0) < 150 } == true
                 ? previous?.directAddress.flatMap { try? RemoteNetworkAddress.endpoint($0) } : nil
             peers[id] = Peer(id: id, name: peerName, endpoint: direct ?? result.endpoint, available: true, manual: previous?.manual ?? false, portal: portal, bonjour: true, directlySeen: previous?.directlySeen, directAddress: previous?.directAddress,
@@ -1055,11 +1075,11 @@ struct RemoteTerminalUpdate: Encodable {
             nextHintRead = Date().addingTimeInterval(15)
             let read = discoveryHints, hints = await Task.detached(priority: .utility) { read() }.value
             guard running, generation == epoch, !Task.isCancelled else { return }
-            let known = Set(peers.values.flatMap { [$0.directAddress].compactMap {$0} + $0.webURLs })
+            let known = knownDiscoveryAddresses()
             pendingHints = Array(hints.prefix(64)).filter { !known.contains($0) && directProbedAt[$0].map { Date().timeIntervalSince($0) < 60 } != true }
         }
         var addresses: [String] = []
-        if !pendingHints.isEmpty { addresses = Array(pendingHints.prefix(2)); pendingHints.removeFirst(addresses.count) }
+        if !pendingHints.isEmpty { addresses = Array(pendingHints.prefix(8)); pendingHints.removeFirst(addresses.count) }
         else if Date() >= nextBlindProbe {
             // Preparing hundreds of subnet candidates also reads interface
             // metadata. Do it only when a blind probe is actually due, after
@@ -1087,23 +1107,27 @@ struct RemoteTerminalUpdate: Encodable {
                 // cadence instead of rebuilding an empty list every tick.
                 nextBlindProbe = Date().addingTimeInterval(min(15, max(1, directDiscoveryInterval)))
             } else {
-                let known = Set(peers.values.flatMap { [ $0.directAddress ].compactMap { $0 } + $0.webURLs })
+                let known = knownDiscoveryAddresses()
                 let lanes = Set(candidates.map(\.lane))
-                let reached = Set(peers.values.filter {verified($0)}.flatMap {peer in
-                    ([peer.directAddress,peer.preferredEndpoint.map(Self.numericURL)].compactMap {$0}).map {RemoteLAN.discoveryLane($0,interfaces:lanInterfaces)}
-                })
-                let allReached = !lanes.isEmpty && lanes.isSubset(of:reached)
-                nextBlindProbe = Date().addingTimeInterval(allReached ? min(5, max(0.5, directDiscoveryInterval)) : 0.5)
-                var selectedLanes = Set<String>()
-                for _ in 0..<candidates.count {
-                    let candidate = candidates[directCursor % candidates.count]; directCursor = (directCursor + 1) % candidates.count
-                    let address = candidate.address, lane = candidate.lane
-                    if !known.contains(address), !selectedLanes.contains(lane), directProbedAt[address].map({ Date().timeIntervalSince($0) >= max(10, directDiscoveryInterval) }) ?? true {
-                        addresses.append(address); selectedLanes.insert(lane)
-                        if addresses.count == 2 || selectedLanes.count == lanes.count { break }
+                // Finding one Mac does not finish discovery on that LAN. Sweep
+                // every candidate at the same bounded cadence; its own probe
+                // timestamp supplies the idle interval after a complete sweep.
+                nextBlindProbe = Date().addingTimeInterval(0.5)
+                var selected = Set<String>()
+                for _ in 0..<8 {
+                    var selectedLanes = Set<String>(), added = false
+                    for _ in 0..<candidates.count {
+                        let candidate = candidates[directCursor % candidates.count]; directCursor = (directCursor + 1) % candidates.count
+                        let address = candidate.address, lane = candidate.lane
+                        if !known.contains(address), !selected.contains(address), !selectedLanes.contains(lane),
+                           directProbedAt[address].map({ Date().timeIntervalSince($0) >= max(10, directDiscoveryInterval) }) ?? true {
+                            addresses.append(address); selected.insert(address); selectedLanes.insert(lane); added = true
+                            if addresses.count == 8 || selectedLanes.count == lanes.count { break }
+                        }
                     }
+                    if !added || addresses.count == 8 { break }
                 }
-                if addresses.isEmpty && !allReached {
+                if addresses.isEmpty {
                     // The sweep found no address eligible for another probe.
                     // Sleep until the earliest per-address interval expires,
                     // rather than rebuilding and rescanning the same subnet
@@ -1148,12 +1172,17 @@ struct RemoteTerminalUpdate: Encodable {
             }
         }
     }
+    private func knownDiscoveryAddresses() -> Set<String> {
+        // A repeatedly failed identity is no longer proof of who owns its IP.
+        // A healthy peer at that same address still excludes redundant probes.
+        Set(peers.values.filter { $0.failures < 2 }.flatMap { [$0.directAddress].compactMap { $0 } + $0.webURLs })
+    }
     private func localState(localAddressReady: Bool? = nil) throws -> RemoteNodeState {
         guard let engine else { throw RemoteHTTPError(503, "앱이 종료되었습니다.") }
         return RemoteNodeState(id: nodeID, name: name, snapshot: engine.snapshot, sessions: engine.remoteSessionViews(),
             release: webVersion, webURLs: port.map { Self.addresses(port: $0, interfaces: lanInterfaces) }, webPort: port,
             questionForms: engine.webQuestions.pending(), screenShares: engine.testScreens.active, update: engine.lanUpdate,
-            localAddressReady:localAddressReady ?? (LocalDashboardAddress.status() == .ready))
+            localAddressReady:localAddressReady ?? (LocalDashboardAddress.status() == .ready),terminalWireVersion:RemoteTerminalWire.version)
     }
     private enum PeerReadResult: Sendable { case stagger; case response(Int,RemoteHTTPResponse,TimeInterval) }
     private func exchange(_ peer: Peer, path: String, method: String = "GET", body: Data = Data(), timeout: TimeInterval? = nil, entityTag: String? = nil, allowUnavailableRead: Bool = false) async throws -> RemoteHTTPResponse {
@@ -1325,7 +1354,7 @@ struct RemoteTerminalUpdate: Encodable {
                 if let index = nodes.firstIndex(where:{$0.id == selectedNode}), let completed = value(peer) { nodes[index] = completed }
             }
             return RemoteDashboard(gatewayID:nodeID,nodes:[RemoteNodeView(id:nodeID,name:name,local:true,online:true,state:own,release:own.release)]+nodes,
-                updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(client:client),partial:true)
+                updatedAt:Date(),discovery:discoveryError,gatewayRelease:webVersion,preferredGateway:preferredGateway(client:client),partial:true,terminalWireVersion:RemoteTerminalWire.version)
         }
         let requested = Array(candidates.prefix(100))
         try await waitForReads(requested,progressive:true)
@@ -1349,7 +1378,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
         updateNamedAddresses(); emitStatus()
         return RemoteDashboard(gatewayID: nodeID, nodes: [RemoteNodeView(id: nodeID, name: name, local: true, online: true, state: own, release: own.release)] + other, updatedAt: Date(), discovery: discoveryError,
-            gatewayRelease: webVersion, preferredGateway: preferredGateway(client:client),partial:other.contains(where:{$0.loading == true}) ? true : nil)
+            gatewayRelease: webVersion, preferredGateway: preferredGateway(client:client),partial:other.contains(where:{$0.loading == true}) ? true : nil,terminalWireVersion:RemoteTerminalWire.version)
     }
     public func handle(_ request: RemoteHTTPRequest) async -> RemoteHTTPResponse {
         do {
@@ -1367,6 +1396,7 @@ struct RemoteTerminalUpdate: Encodable {
                     return try asset("index.html", type: "text/html; charset=utf-8")
                 case "/app.css": return try asset("app.css", type: "text/css; charset=utf-8")
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")
+                case "/terminal-wire.js": return try asset("terminal-wire.js", type: "text/javascript; charset=utf-8")
                 case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
                 case "/vendor/xterm.js", "/vendor/xterm-fit.js": return try asset(String(request.path.dropFirst()), type: "text/javascript; charset=utf-8")
                 case "/vendor/xterm.css": return try asset("vendor/xterm.css", type: "text/css; charset=utf-8")
@@ -1490,17 +1520,17 @@ struct RemoteTerminalUpdate: Encodable {
                         return try await engine.remoteTerminal(sessionID:id,realtime:true,renderWindow:renderWindow)
                     }
                     let frame = subscription.initial
-                    let delta = request.parameter("delta") == "1"
+                    let delta = request.parameter("delta") == "1", binary = request.parameter("wire") == "2"
                     let base = delta ? terminalFeeds.base(key:key,revision:request.parameter("revision"),stream:request.parameter("stream"),current:frame) : nil
                     let output: RemoteTerminalBodyStream
                     do {
                         output = try RemoteTerminalBodyStream(initial:frame,emitInitial:false,delta:delta,copy:request.parameter("copy") == "1",
-                            resume:base,compact:request.parameter("compact") == "1" && !renderWindow,paced:true,
+                            resume:base,compact:request.parameter("compact") == "1" && !renderWindow,paced:true,binary:binary,
                             onCancel:{ subscription.cancel() }) { try await subscription.next() }
                     } catch { subscription.cancel(); throw error }
                     // The verified first event is ready. Send it with the headers,
                     // without another main-actor hop or a second small TCP write.
-                    return .eventStream(output, nodeID: nodeID, initialData: output.initialEvent)
+                    return .eventStream(output, nodeID: nodeID, initialData: output.initialEvent,binary:binary)
                 case "/api/pty/stream", "/api/pty/output":
                     if request.path == "/api/pty/stream" {
                         if let forwarded = try await forwardStream(request) { return forwarded }
@@ -1513,7 +1543,8 @@ struct RemoteTerminalUpdate: Encodable {
                     let offset = supplied.flatMap(Int.init)
                     let client = request.parameter("client")
                     if request.path == "/api/pty/stream" {
-                        return .eventStream(try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client), nodeID: nodeID)
+                        let binary = request.parameter("wire") == "2"
+                        return .eventStream(try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client,binary:binary), nodeID: nodeID,binary:binary)
                     }
                     let output = try RemotePTYBodyStream(terminal: terminal, offset: offset, client: client, emitInitial: false)
                     defer { output.cancel() }
@@ -1594,7 +1625,7 @@ struct RemoteTerminalUpdate: Encodable {
         succeeded = response.status < 400
         return response
     }
-    private enum PeerStreamResult: Sendable { case stagger; case opened(Int,RemotePTYPeerBodyStream,TimeInterval,Data) }
+    private enum PeerStreamResult: Sendable { case stagger; case opened(Int,RemotePTYPeerBodyStream,TimeInterval,RemotePeerStreamOpening) }
     private func forwardStream(_ request: RemoteHTTPRequest) async throws -> RemoteHTTPResponse? {
         guard let target = request.parameter("node"), target != nodeID else { return nil }
         guard let peer = peers[target] else { throw RemoteHTTPError(404, "이 Mac을 찾지 못했습니다. 목록을 새로고침해주세요.") }
@@ -1606,20 +1637,20 @@ struct RemoteTerminalUpdate: Encodable {
         let endpoints = Array(peerEndpoints(peer).prefix(2)), deadline = ProcessInfo.processInfo.systemUptime + 7
         let timingEpoch = readTimingEpoch
         let delay = peer.readTiming.delay(route: String(describing: endpoints[0]), kind: .stream)
-        let path = forwardedPath(request), expectedID = peer.id
+        let path = forwardedPath(request), expectedID = peer.id, allowsBinary = request.parameter("wire") == "2"
         let open: @Sendable (Int) async throws -> PeerStreamResult = { index in
             try Task.checkCancellation()
             let started = ProcessInfo.processInfo.systemUptime
             let output = try RemotePTYPeerBodyStream(endpoint: endpoints[index], path: path, expectedNodeID: expectedID,
-                timeout: max(0.05, deadline - started))
+                timeout: max(0.05, deadline - started),allowsBinary:allowsBinary)
             do {
-                let initial = try await output.open(); try Task.checkCancellation()
+                let initial = try await output.openContent(); try Task.checkCancellation()
                 return .opened(index,output,ProcessInfo.processInfo.systemUptime-started,initial)
             } catch { output.cancel(); throw error }
         }
         // Keep opening latency separate from finite bodies. Failed transports
         // wake the alternate immediately; healthy but busy peers avoid duplicates.
-        let opened = try await withThrowingTaskGroup(of: PeerStreamResult.self) { group -> (Int,RemotePTYPeerBodyStream,TimeInterval,Data) in
+        let opened = try await withThrowingTaskGroup(of: PeerStreamResult.self) { group -> (Int,RemotePTYPeerBodyStream,TimeInterval,RemotePeerStreamOpening) in
             group.addTask { try await open(0) }
             if endpoints.count > 1 { group.addTask { try await Task.sleep(for: .seconds(delay)); return .stagger } }
             var alternate = endpoints.count < 2, active = 1
@@ -1650,7 +1681,7 @@ struct RemoteTerminalUpdate: Encodable {
         }
         markPeerRead(peer)
         succeeded = true
-        return .eventStream(opened.1, nodeID: nodeID, initialData: opened.3)
+        return .eventStream(opened.1, nodeID: nodeID, initialData: opened.3.data,binary:opened.3.binary)
     }
     private func forwardedPath(_ request: RemoteHTTPRequest) -> String {
         let components = request.components

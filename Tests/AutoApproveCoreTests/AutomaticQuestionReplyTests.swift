@@ -213,6 +213,10 @@ extension ApprovalTests {
                 fixture.observe()
             default: break
             }
+            if name == "error" || name == "pending-read" {
+                try expectEqual(fixture.automation?.phase, .unavailable,
+                    "Losing the question source must cancel the scheduled reservation synchronously")
+            }
             fixtures[name] = fixture
         }
 #if DEBUG
@@ -406,6 +410,36 @@ extension ApprovalTests {
         var other = switched.question; other.threadID = "other-root"; other.id = "other-root-question"
         switched.engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: switched.session.id, questions: [other], threadID: other.threadID)])
         try expectEqual(switched.automation?.phase, .restored, "Each new root establishes its own history baseline")
+        // A newly discovered session may already carry queued questions. An
+        // earlier empty publication must not leave their protection stale.
+        let discovered = try ApprovalEngine(paths: AppPaths(directory: root.appendingPathComponent("discovery-ingress")),
+            questionTransport: transport)
+        defer { discovered.stop() }
+        discovered.refreshNotices()
+        var discoveryRow = AgentSession(id: "process:discovery:queue", agent: .codex, pid: 91, started: "discovery",
+            tty: "/dev/fixture-discovery", cwd: "/tmp/reply", terminal: .terminal)
+        discoveryRow.phase = .working; discoveryRow.channel = .terminalScreen
+        let discoveryQuestion = QueuedQuestion(id: "discovery-q", threadID: "discovery-thread",
+            title: "Proceed with discovery?", options: ["No", "Yes"])
+        var discoveryCopy = discoveryQuestion; discoveryCopy.id += ":copy"; discoveryCopy.title = "  " + discoveryCopy.title + "\n"
+        discoveryRow.queuedQuestions = [discoveryQuestion, discoveryCopy]
+        discovered.updateDiscovery([discoveryRow], records: [])
+        try expectEqual(discovered.snapshot.sessions[0].questions.count, 2)
+        try expect(discovered.snapshot.sessions[0].questions.allSatisfy { $0.automation?.phase == .duplicate },
+            "Fresh discovery queues must receive duplicate protection after an empty publication")
+        var reviewRow = AgentSession(id: "process:discovery:review", agent: .codex, pid: 92, started: "review",
+            tty: "/dev/fixture-review", cwd: "/tmp/reply", terminal: .terminal)
+        reviewRow.phase = .working; reviewRow.channel = .terminalScreen
+        var reviewQuestion = QueuedQuestion(id: "discovery-review", threadID: "review-thread",
+            title: "Choose an environment", options: ["Development", "Production"])
+        reviewQuestion.hasLaterUserMessage = true; reviewRow.queuedQuestions = [reviewQuestion]
+        discovered.updateDiscovery([discoveryRow, reviewRow], records: [])
+        try expectEqual(discovered.snapshot.sessions.first { $0.id == reviewRow.id }?.questions.first?.automation?.phase, .needsReview,
+            "A newly discovered ordinary question is projected even with an empty duplicate set")
+        discovered.refreshNotices()
+        try expectEqual(discovered.snapshot.sessions.first { $0.id == reviewRow.id }?.questions.first?.options, ["Development", "Production"])
+        discovered.updateDiscovery([], records: [])
+        try expect(discovered.snapshot.sessions.allSatisfy { $0.questions.isEmpty }, "Ended discovery queues must clear")
         try await Task.sleep(nanoseconds: 5_300_000_000)
         try expectEqual(await probe.count, 0)
         let decoded = try JSONDecoder().decode(EngineSnapshot.self, from: JSONEncoder().encode(duplicate.engine.snapshot))

@@ -9,6 +9,7 @@
 
 ## Version changes and GitHub releases
 
+- User instruction, 2026-10-26: finish each verified improvement through the matching build, source commit, GitHub release deployment and local installation with a running-version check. Do not stop after source-only changes or a local build.
 - User instruction, 2026-10-05: when a version is increased, finish the GitHub release deployment as part of the task. Do not finish after only a local build or installation.
 - Run the relevant checks, package the matching version, commit the release source, push its tag and publish the GitHub release with the install artifact and checksum.
 - Verify the published tag, assets and download. If deployment is blocked, report the precise blocker and which deployment step remains.

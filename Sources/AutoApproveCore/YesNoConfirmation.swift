@@ -9,11 +9,8 @@ public struct YesNoConfirmation {
     private static let denialWords = "아니오|아니요|거부|취소|no|deny|cancel|don't allow|do not allow"
 
     public static func detect(_ question: QueuedQuestion) -> YesNoConfirmation? {
-        detect(["questions": [[
-            "question": question.title,
-            "multiSelect": question.multiSelect ?? false,
-            "options": question.options.map { ["label": $0] }
-        ]]])
+        guard question.multiSelect != true else { return nil }
+        return detect(question: question.title, labels: question.options)
     }
 
     public static func detect(_ input: JSONObject) -> YesNoConfirmation? {
@@ -22,17 +19,25 @@ public struct YesNoConfirmation {
         }
         guard let questions = input["questions"] as? [JSONObject], questions.count == 1,
               let item = questions.first, let question = item["question"] as? String,
-              !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let options = item["options"] as? [JSONObject], options.count >= 2 else { return nil }
+              let options = item["options"] as? [JSONObject] else { return nil }
         if let multiSelect = item["multiSelect"] {
             guard let value = multiSelect as? Bool, !value else { return nil }
         }
         let labels = options.compactMap { $0["label"] as? String }
         guard labels.count == options.count else { return nil }
+        return detect(question: question, labels: labels,
+            descriptions: options.map { $0["description"] as? String ?? "" })
+    }
+
+    /// A queue already has typed labels. Hook objects validate their shape
+    /// before entering this shared confirmation policy.
+    static func detect(question: String, labels: [String], descriptions: [String] = []) -> YesNoConfirmation? {
+        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              labels.count >= 2 else { return nil }
         // Two options are not inherently a confirmation: "Yes, use staging" /
         // "No, use production" still chooses a task. Apply the same complete-label
         // permission rules to every menu, regardless of its option count.
-        guard let index = singleApprovalIndex(labels, descriptions: options.map { $0["description"] as? String ?? "" }) else { return nil }
+        guard let index = singleApprovalIndex(labels, descriptions: descriptions) else { return nil }
         // Hook answers identify an option by its label, not by its position.
         let answer = labels[index].precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard labels.filter({ $0.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == answer }).count == 1 else { return nil }
@@ -62,6 +67,27 @@ public struct YesNoConfirmation {
                 previousSpace = byte == 32
             }
             return true
+        } ?? false
+    }
+
+    /// Plain words outside every supported permission prefix cannot become a
+    /// confirmation. Hints, whitespace compaction, punctuation cleanup and
+    /// Unicode/foreign labels always keep the original parser.
+    private static func isPlainNonPermissionWord(_ value: String) -> Bool {
+        value.utf8.withContiguousStorageIfAvailable { bytes in
+            guard bytes.count <= 4096, let first = bytes.first, first < 128 else { return false }
+            switch first | 32 {
+            case 97: return false // Allow, approve, always, and
+            case 99 where bytes.count >= 3 && bytes[1] | 32 == 97 && bytes[2] | 32 == 110: return false
+            case 100 where bytes.count >= 2 && bytes[1] | 32 == 111: return false
+            case 100 where bytes.count >= 3 && bytes[1] | 32 == 101 && bytes[2] | 32 == 110: return false
+            case 110 where bytes.count >= 2 && bytes[1] | 32 == 111: return false
+            case 115 where bytes.count >= 2 && bytes[1] | 32 == 119: return false
+            case 117 where bytes.count >= 3 && bytes[1] | 32 == 115 && bytes[2] | 32 == 101: return false
+            case 121 where bytes.count >= 3 && bytes[1] | 32 == 101 && bytes[2] | 32 == 115: return false
+            default: break
+            }
+            return isUnchangedASCII(value) && !bytes.contains(32)
         } ?? false
     }
 
@@ -147,6 +173,7 @@ public struct YesNoConfirmation {
         guard labels.count >= 2 else { return nil }
         var current: [Int] = [], sessionOnly: [Int] = [], denials = 0
         for (index, label) in labels.enumerated() {
+            if isPlainNonPermissionWord(label) { return nil }
             let label = permissionLabel(label)
             // These predicates inspect the same normalized label. Keep
             // permissionLabel's separate first pass: cleaning is not idempotent

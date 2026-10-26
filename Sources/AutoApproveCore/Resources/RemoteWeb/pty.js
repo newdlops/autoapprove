@@ -1,9 +1,10 @@
 'use strict';
 // Raw PTY bytes are interpreted by xterm, never inserted as HTML or locally echoed.
 window.AutoApprovePTY = class {
-  constructor(container, descriptor, nodeID, api, uuid, report, fontSize = 14, streaming = true) {
+  constructor(container, descriptor, nodeID, api, uuid, report, fontSize = 14, streaming = true, binary = false) {
     this.container = container; this.descriptor = descriptor; this.nodeID = nodeID; this.api = api; this.uuid = uuid; this.report = report;
     this.streaming = streaming;
+    this.binary = binary;
     this.clientID = uuid(); this.sequence = 0; this.offset = null; this.queue = []; this.sending = false; this.disposed = false; this.ready = false; this.blocked = false;
     this.outputQueue = []; this.outputBytes = 0; this.writing = false; this.outputPaused = false; this.source = null;
     this.maxOutputBytes = 512000; this.maxSnapshotBytes = 2097152; this.maxOutputEvents = 64;
@@ -69,15 +70,16 @@ window.AutoApprovePTY = class {
       // Only a fully rendered offset is safe to resume. A new xterm starts from
       // the native current-screen snapshot, including the alternate buffer.
       if (this.offset !== null) query.set('offset', String(this.offset));
-      const source = new EventSource('/api/pty/stream?' + query); this.source = source;
+      const url = '/api/pty/stream?' + query;
+      const source = window.AutoApproveTerminalWire?.open(url,this.binary,true) || new EventSource(url); this.source = source;
       source.addEventListener('output', event => {
         if (this.disposed || this.source !== source) return;
-        try { this.receive(JSON.parse(event.data)); } catch (error) { this.fail(error); }
+        try { this.receive(Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data)); } catch (error) { this.fail(error); }
       });
       source.addEventListener('failure', event => {
         if (this.disposed || this.source !== source) return;
         let message;
-        try { message = JSON.parse(event.data).error; } catch (_) {}
+        try { message = (Object.hasOwn(event,'value') ? event.value : JSON.parse(event.data)).error; } catch (_) {}
         this.fail(new Error(message || 'PTY 출력 연결이 끊겼습니다. 화면을 다시 연결해주세요.'));
       });
       source.onerror = () => {
@@ -86,10 +88,10 @@ window.AutoApprovePTY = class {
     } catch (error) { this.fail(error); }
   }
   receive(update) {
-    if (update.streamID !== this.descriptor.streamID || update.ptyID !== this.descriptor.ptyID || !Number.isSafeInteger(update.offset) || update.offset < 0 || typeof update.data !== 'string') throw new Error('PTY 연결이 바뀌었습니다. 다시 연결해주세요.');
+    if (update.streamID !== this.descriptor.streamID || update.ptyID !== this.descriptor.ptyID || !Number.isSafeInteger(update.offset) || update.offset < 0 || typeof update.data !== 'string' && !(update.data instanceof Uint8Array)) throw new Error('PTY 연결이 바뀌었습니다. 다시 연결해주세요.');
     const singleLimit = update.reset ? this.maxSnapshotBytes : this.maxOutputBytes;
-    if (update.data.length > Math.ceil(singleLimit / 3) * 4) throw new Error('터미널 출력이 너무 큽니다. 화면을 다시 연결해주세요.');
-    const bytes = Uint8Array.from(atob(update.data), char => char.charCodeAt(0));
+    if (typeof update.data === 'string' && update.data.length > Math.ceil(singleLimit / 3) * 4) throw new Error('터미널 출력이 너무 큽니다. 화면을 다시 연결해주세요.');
+    const bytes = update.data instanceof Uint8Array ? update.data : Uint8Array.from(atob(update.data), char => char.charCodeAt(0));
     if (bytes.length > singleLimit) throw new Error('터미널 출력이 너무 큽니다. 화면을 다시 연결해주세요.');
     if (this.outputBytes + bytes.length > this.maxOutputBytes && (this.writing || this.outputQueue.length) || this.outputQueue.length >= this.maxOutputEvents) {
       // Stop receiving before xterm's own async write queue can grow. Drain the

@@ -1,5 +1,13 @@
 import Foundation
 
+private protocol AttentionCandidateSink {
+    var includeDetails: Bool { get }
+    var finished: Bool { get }
+    mutating func append(key: @autoclosure () -> String, summary: @autoclosure () -> String,
+                         sourceSessionID: @autoclosure () -> String, sourceKey: @autoclosure () -> String,
+                         kind: AttentionRequest.Kind, prefix: String)
+}
+
 public struct AttentionRequest: Equatable, Identifiable {
     public enum Kind: Equatable { case question, completion, interruption, systemChange }
     public let id: String
@@ -50,19 +58,44 @@ public struct AttentionRequest: Equatable, Identifiable {
         public var kind: Kind = .question
     }
 
-    private struct CandidateCollector {
+    private struct CandidateCollector: AttentionCandidateSink {
         let includeDetails: Bool
         var stopAfterFirst = false
         var count = 0
         var values: [Candidate] = []
         var finished: Bool { stopAfterFirst && count > 0 }
-        mutating func append(_ candidate: @autoclosure () -> Candidate, prefix: String) {
+        mutating func append(key: @autoclosure () -> String, summary: @autoclosure () -> String,
+                             sourceSessionID: @autoclosure () -> String, sourceKey: @autoclosure () -> String,
+                             kind: Kind, prefix: String) {
             count += 1
             guard includeDetails else { return }
-            var value = candidate()
+            var value = Candidate(key: key(), summary: summary(), sourceSessionID: sourceSessionID(), sourceKey: sourceKey(), kind: kind)
             if !prefix.isEmpty { value.key = prefix + value.key }
             values.append(value)
         }
+    }
+
+    private struct InboxCollector: AttentionCandidateSink {
+        let includeDetails = true
+        let finished = false
+        var update: SessionInbox.Update
+        var keyCache: SessionNotice.KeyCache?
+        mutating func append(key: @autoclosure () -> String, summary: @autoclosure () -> String,
+                             sourceSessionID: @autoclosure () -> String, sourceKey: @autoclosure () -> String,
+                             kind: Kind, prefix: String) {
+            let identifier = prefix.isEmpty ? key() : prefix + key()
+            if keyCache == nil { keyCache = SessionNotice.KeyCache() }
+            update.append(key: keyCache!.key(.question, identifier), kind: .question,
+                isInterruption: kind == .interruption, isSystemSafety: kind == .systemChange, summary: summary())
+        }
+    }
+
+    /// The same eligibility traversal feeds notices without materializing either
+    /// intermediate candidate array or summaries for already-posted requests.
+    static func collectInbox(_ session: AgentSession, paused: Bool, into update: inout SessionInbox.Update, keyCache: inout SessionNotice.KeyCache?) {
+        var collector = InboxCollector(update: update, keyCache: keyCache)
+        collectCandidates(session, paused: paused, prefix: "", into: &collector)
+        update = collector.update; keyCache = collector.keyCache
     }
 
     public static func candidates(_ session: AgentSession, paused: Bool) -> [Candidate] {
@@ -73,8 +106,8 @@ public struct AttentionRequest: Equatable, Identifiable {
 
     /// Eligibility stays in one traversal. Counts do not build question summaries,
     /// arrays or child-key prefixes; existence checks stop at the first request.
-    private static func collectCandidates(_ session: AgentSession, paused: Bool, prefix: String,
-                                          into collector: inout CandidateCollector) {
+    private static func collectCandidates<Sink: AttentionCandidateSink>(_ session: AgentSession, paused: Bool, prefix: String,
+                                                                      into collector: inout Sink) {
         guard session.agent != .shell else { return }
         if let safety = session.systemSafety {
             let key = "systemSafety:" + safety.id
@@ -84,30 +117,30 @@ public struct AttentionRequest: Equatable, Identifiable {
                 read = notices.first(where: { $0.sourceKey == noticeKey })?.isRead == true
             } else { read = false }
             if !read {
-                collector.append(Candidate(key: key, summary: safety.risk.title + " · " + safety.message,
-                    sourceSessionID: session.id, sourceKey: key, kind: .systemChange), prefix: prefix)
+                collector.append(key: key, summary: safety.risk.title + " · " + safety.message,
+                    sourceSessionID: session.id, sourceKey: key, kind: .systemChange, prefix: prefix)
                 if collector.finished { return }
             }
         }
         if let error = session.interruption, error.needsAttention, error.acknowledgedAt == nil {
-            collector.append(Candidate(key: "interruption:" + error.id, summary: error.kind.title + " · " + error.detail,
-                sourceSessionID: session.id, sourceKey: "interruption:" + error.id, kind: .interruption), prefix: prefix)
+            collector.append(key: "interruption:" + error.id, summary: error.kind.title + " · " + error.detail,
+                sourceSessionID: session.id, sourceKey: "interruption:" + error.id, kind: .interruption, prefix: prefix)
             if collector.finished { return }
         }
         guard session.phase != .ended else { return }
         let phase = session.ownPhase ?? session.phase
         let automatic = session.automatic && !paused
         for question in session.questions where question.needsAnswer && (!automatic || question.automation?.phase != .scheduled) {
-            collector.append(Candidate(key: question.id, summary: question.summary,
-                sourceSessionID: session.id, sourceKey: question.id), prefix: prefix)
+            collector.append(key: question.id, summary: question.summary,
+                sourceSessionID: session.id, sourceKey: question.id, kind: .question, prefix: prefix)
             if collector.finished { return }
         }
         if let approvals = session.claudeApprovals, !approvals.isEmpty {
             // A live five-second countdown needs no manual attention. Keep the request
             // visible in the detail view, but share this rule across banners and badges.
             for approval in approvals where approval.systemCommandRisk == nil && !approval.sending && (!automatic || approval.automaticAt == nil) {
-                collector.append(Candidate(key: "bridge:" + approval.id, summary: approval.summary,
-                    sourceSessionID: session.id, sourceKey: "bridge:" + approval.id), prefix: prefix)
+                collector.append(key: "bridge:" + approval.id, summary: approval.summary,
+                    sourceSessionID: session.id, sourceKey: "bridge:" + approval.id, kind: .question, prefix: prefix)
                 if collector.finished { return }
             }
         } else if session.systemCommandRisk == nil, let summary = session.pendingSummary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -124,7 +157,7 @@ public struct AttentionRequest: Equatable, Identifiable {
             }
             if !alreadyQueued {
                 let key = session.pendingRequestID ?? normalized
-                collector.append(Candidate(key: key, summary: summary, sourceSessionID: session.id, sourceKey: key), prefix: prefix)
+                collector.append(key: key, summary: summary, sourceSessionID: session.id, sourceKey: key, kind: .question, prefix: prefix)
                 if collector.finished { return }
             }
         }

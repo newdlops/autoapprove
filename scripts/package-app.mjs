@@ -6,11 +6,12 @@ import {stripReleaseSymbols} from './release-symbols.mjs';
 
 const configuration = process.argv[2] ?? 'debug';
 if (!['debug', 'release'].includes(configuration)) throw new Error('Expected debug or release');
+const build = path.resolve(process.argv.find(value=>value.startsWith('--build='))?.slice(8) || path.join('.build',configuration));
 const webVersion = JSON.parse(await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/web-version.json', 'utf8'));
-const builtVersion = JSON.parse(await readFile(path.resolve('.build', configuration, 'AutoApprove_AutoApproveCore.bundle/RemoteWeb/web-version.json'), 'utf8'));
+const builtVersion = JSON.parse(await readFile(path.join(build,'AutoApprove_AutoApproveCore.bundle/RemoteWeb/web-version.json'), 'utf8'));
 if (JSON.stringify(webVersion) !== JSON.stringify(builtVersion) || !/^\d+\.\d+\.\d+$/.test(webVersion.version) || !Number.isInteger(webVersion.build) || webVersion.build < 1) throw new Error('Build the current web resources before packaging');
 await import('./package-icon.mjs');
-const app = path.resolve(process.argv[3] ?? 'dist/AutoApprove.app');
+const app = path.resolve(process.argv.slice(3).find(value=>!value.startsWith('--')) ?? 'dist/AutoApprove.app');
 const macOS = path.join(app, 'Contents/MacOS');
 const resources = path.join(app, 'Contents/Resources');
 await mkdir(macOS, { recursive: true });
@@ -18,7 +19,7 @@ await mkdir(resources, { recursive: true });
 // Retire the original GUI name, which collided with the helper on case-insensitive APFS.
 try { await unlink(path.join(macOS, 'AutoApprove')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 for (const binary of ['AutoApproveApp', 'autoapprove', 'AutoApproveTTYService']) {
-  const source = path.resolve('.build', configuration, binary);
+  const source = path.join(build,binary);
   await access(source);
   await copyFile(source, path.join(macOS, binary));
   await chmod(path.join(macOS, binary), 0o755);
@@ -30,7 +31,7 @@ if (configuration === 'release') {
 }
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
 await copyFile('dist/AppIcon.icns', path.join(resources, 'AppIcon.icns'));
-await cp(path.resolve('.build', configuration, 'AutoApprove_AutoApproveCore.bundle'), path.join(resources, 'AutoApprove_AutoApproveCore.bundle'), { recursive: true });
+await cp(path.join(build,'AutoApprove_AutoApproveCore.bundle'), path.join(resources, 'AutoApprove_AutoApproveCore.bundle'), { recursive: true });
 const launchDaemons = path.join(app, 'Contents/Library/LaunchDaemons');
 await mkdir(launchDaemons, { recursive: true });
 await copyFile('scripts/resources/local.autoapprove.tty-input.plist', path.join(launchDaemons, 'local.autoapprove.tty-input.plist'));
@@ -55,5 +56,5 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>NSBonjourServices</key><array><string>_autoapprove._tcp</string></array>
 </dict></plist>
 `);
-await (await import('./sign-app.mjs')).signApp(app,{prepare:()=>prepareTerminalInputBundle(app,configuration,webVersion)});
+await (await import('./sign-app.mjs')).signApp(app,{prepare:()=>prepareTerminalInputBundle(app,configuration,webVersion,build)});
 console.log(app);

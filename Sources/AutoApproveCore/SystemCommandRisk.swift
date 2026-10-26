@@ -150,10 +150,45 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             }
         } ?? nil
         if let compactASCII { return compactASCII }
-        return text.filter {
-            if let ascii = $0.asciiValue { return ascii != 32 && (ascii < 9 || ascii > 13) }
-            return !$0.isWhitespace
+        func legacy() -> String {
+            text.filter {
+                if let ascii = $0.asciiValue { return ascii != 32 && (ascii < 9 || ascii > 13) }
+                return !$0.isWhitespace
+            }
         }
+        let native = text.isContiguousUTF8
+        if native {
+            // UTF8 uses at most3 bytes per UTF16 unit. Preserve the exact32-unit
+            // cutoff while counting UTF16 only in the bounded32...95-byte band.
+            let bytes = text.utf8.count
+            if bytes < 32 || (bytes < 96 && text.utf16.count < 32) { return legacy() }
+        } else {
+            let count = text.utf16.count
+            if count < 32 || count > 65_536 { return legacy() }
+        }
+        let source = native ? text : String(decoding: text.utf8, as: UTF8.self)
+        guard source.isContiguousUTF8 else { return legacy() }
+        let view = source.utf8
+        var result = "", offset = 0
+        var keptStart: Int?
+        func append(_ end: Int) {
+            guard let start = keptStart, start < end else { return }
+            let lower = view.index(view.startIndex, offsetBy: start)
+            let upper = view.index(view.startIndex, offsetBy: end)
+            result.append(contentsOf: source[lower..<upper])
+        }
+        // Use String's stateful Character iterator throughout. Substring's
+        // index-based iterator can repeatedly examine long regional-indicator runs.
+        for character in source {
+            let keep: Bool
+            if let ascii = character.asciiValue { keep = ascii != 32 && (ascii < 9 || ascii > 13) }
+            else { keep = !character.isWhitespace }
+            if keep { if keptStart == nil { keptStart = offset } }
+            else { append(offset); keptStart = nil }
+            offset += String(character).utf8.count
+        }
+        append(offset)
+        return result
     }
 
     private static let protectedStartupPattern = #"(?i)(?:(?:~|\$(?:HOME|\{HOME\}))[/\\]+Library[/\\]+(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])(?:/Users/[^/\r\n]+)?/Library/(?:LaunchAgents|LaunchDaemons|StartupItems|PrivilegedHelperTools)|(?:^|[\s\"'=])/etc/(?:cron|systemd)|(?:~|\$(?:HOME|\{HOME\}))[/\\]+\.config[/\\]+autostart)"#

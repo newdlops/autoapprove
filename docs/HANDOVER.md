@@ -1,5 +1,1043 @@
 # AutoApprove 작업 인계
 
+## 2026-10-26 · 머신 발견 복구 최종 0.2.179/206 · 서명·DMG 검증 완료
+
+- 사용자는 페이지 연결뿐 아니라 **다른 머신 발견도 저하**됐다고 확인했고, 이후 검증된 개선은 **빌드·커밋·GitHub 배포·설치까지 완료**하도록 지시했다. `AGENTS.md`에 이 절차를 기록했다. 이전의 서명/앱 교체 승인 대기는 이 작업의 미승인 조건이 아니다.
+- 두 발견 지연(무응답 16개 뒤의 후보, 첫 Mac을 이미 찾은 LAN의 두 번째 Mac)과 저장 IP의 새 소유자 누락을 실제 Core/HTTP로 재현·수정했다. 최종 세 사례 **4,105/4,076/2,456ms**, 원래 5.5초 예산을 유지했다. 총 8개/새 주소 6개/20시작·초의 검색 예산, 인터페이스 순환, 저장 주소 실패 뒤 재식별, 메타데이터 완료 기한 관찰을 적용했다. 이전 ID의 읽기/입력은 새 머신으로 바꾸지 않는다.
+- 최종 격리 Release의 **Core451/451**, 직접 발견 8그룹, 저장 머신/북마크/잘못된 ID/구형 연결 검사, 실제 Bonjour 상호 발견·단절/재시작 영수증, 코덱630/55,732분할을 통과했다. 기존 페이지 복구 Chromium/WebKit 각5상황과 세 화면 크기 검증도 포함한다. 세부 범위와 첫 실패 원인은 [검증 기록](../VALIDATION.md)에 있다.
+- 최종 앱은 `dist/network-release-179-final/AutoApprove.app`, 빌드는 `.build/network-stability/release`다. 기존 발행자 서명과 패키지 3종 검사, DMG 마운트 검증을 통과했다. DMG SHA-256은 **bac3b0b02594e7a0e25f10537d70650628f5611c89c03dd49ebdd558b6b143f7**. `dist/network-release-179/`는 앞선 후보이며 사용하지 말 것.
+- 기존 성능 사본·서명 키체인·IDE/인덱스 설정·사용자 데이터는 소스 커밋에 넣지 않는다. 현재 검증 소스 88개 경로의 비밀값 형식 검사를 통과했다. 게시와 설치 완료 기록은 다음 항목으로 추가한다.
+
+## 2026-10-26 · 사용자 우선 요청: 관리 페이지 전체 연결 복구
+
+- 사용자 확인 증상은 특정 터미널이 아니라 **페이지 전체가 연결 끊김·로딩에 머무는 것**이다. 현행 웹에서 코덱의 `defer`가 앱 시작을 막는 경우와 네트워크 복귀가 진행 중 GET을 교체하지 못하는 경우를 브라우저로 재현·수정했다. 코덱은 `async`, 목록은 복귀 이벤트 병합/취소·10초 제한·0.5~5초 오류 backoff·작은 초기 응답으로 복구한다. 정상 2.5초/304 및 기존 압축·증분·wire 구현과 입력 단일 전송은 유지한다.
+- 새 `scripts/network-recovery-browser-check.mjs`의 Chromium/WebKit **각 5/5**, 기존 Chromium 터미널 연결 **11개 그룹**, 새 격리 Release 빌드의 **Core451/451**와 실제 HTTP 네트워크 통합 검사가 통과했다. 통합 검사는 `--build=.build/network-stability/release --direct-only`로 실행했다. 기존 조기 EOF 503을 정확한 오류 문구 및 입력 전송 1건과 함께 검사하도록 바로잡았다. 상세 수치/범위는 [검증 기록](../VALIDATION.md)에 있다.
+- 세 크기 390×844/768×1024/1440×900와 단절 상태를 실제 브라우저로 확인했다. 새 보고서/화면은 `dist/qa/network-recovery/`다. 실물 폰/LAN/VPN의 장기 안정성이나 전체 앱 속도 개선을 입증한 것은 아니다.
+- **기존 성능 실험·canonical·서명 전 보관 패키지를 덮어쓰지 않았다.** 현재 웹 소스는 아래 fdbf452 기준과 달라졌으므로 기존 패키지/해시를 이번 수정이 포함된 것으로 사용하지 말 것. 이번 확인 빌드는 `.build/network-stability/release`다. 이전 성능 목표의 완료 상태나 후보 채택 판정도 바꾸지 않았다.
+- 실행 앱은 여전히 **0.2.168/195**다. 새 버전 증가·설치·서명·commit/tag/GitHub 게시는 하지 않았다. 배포 시 현재 웹 변경을 포함해 다시 포장하고 프로젝트의 릴리스 절차를 완료해야 한다.
+
+## 2026-10-26 · JSON 8바이트 탐색 CPU 통과 · 새 Core451·실제 응답45,727 통과 · 메모리 대기
+
+- 직전은 후보 정확성 검증 progress였고 이번은 성분 측정과 새 실제 Core 기능 검사 progress다. 목표는 active이며 아직 제품 반영이 아니다.
+- 최초 성분 측정의 `ri_user_time+ri_system_time`를 나노초로 잘못 표기했다. Apple XNU의 task/rusage 경로와 별도 자체 C 프로세스의 getrusage 교차 검사3회로 이 Mac의125/3 Mach timebase를 확인했다. 변환한 비율은0.999977~0.999997였다. 의도20ms가 원시20,000,000ticks,약833ms가 된 결함 때문에 **44개 완료 후 자체 driver만 SIGINT로 종료**했다. 마지막 worker는 이미 종료됐고 남은 자체 worker가 없음을 확인했다. 관찰 timeout이나 실패 기준 때문에 재시작한 것이 아니다. 원래 long-ASCII 힙 대조81,776바이트 초과·원시 결과·원래 기준을 보존했다.
+- 단위를 고친 새64프로세스·16경로는 모두 종료0이며,동일한 원래 CPU/힙 기준을 썼다. 인코딩 명령어 비율은 긴ASCII0.460003·Unicode0.452544·드문escape0.614746·조밀한escape0.999748이다. 실제 DTO 선언을 연결한 inventory/dashboard 성분은0.986389~0.988959였다. 모든CPU/목표와A/A±2%는 통과했다. 이는 **사본 인코더의 연산량**이며 실제Core CPU·전체 앱·실물 네트워크 속도 수치가 아니다. 시간은 처음부터진단용이었다.
+- **전체 성분 판정은 실패**다. 짧은ASCII/Unicode·혼합 경계와24세션 inventory 두 경로의 힙 A/A 또는 A/B가64KiB를 넘었다. 기존/후보를 구분할 수 없는 대조 실패도 그대로 남기며 실제 Core 메모리 검사로 별도 확인하기 전에는 채택하지 않는다.
+- Root452입력의 private 사본에서 helper와 문자열 루프만 바꿨음을 역변환 바이트 대조하고95Core·4바이너리를 새로 빌드했다. 이 private Core의 **451/451**과 실제 public response API **14,604프레임·45,727조건**이 통과했다. 후자는 기존 공개 fixture의 원래 Unicode/API oracle을 유지하고 양쪽 screen/capture/권한·power만 가짜 의존성으로 주입했다. 인코더 소스를 재컴파일해 대체하지 않았다.
+- 후보 코드 `d6ddb8a92eb8a46f308857069b50877f13474698069b6f24af24c1054f982b93`는 private에만 있다. Root/canonical/보관은 여전히452입력·95Core·4바이너리·웹14·638파일,`fdbf64c0e3fc882382e119952b07540263e8251693e493f9a47fc32be93c3478`다. 기존 Root451과 서명 전 앱 묶음을 유지한다. 새 버전·설치·서명·태그·GitHub 게시·원본 터미널/시스템/보안/VPN/전원 변경은 없다.
+- 다음은 `actual-core-profile-plan.json`의 실제Core CPU/힙이다. 같은 합성DTO와512호출·4구간·8개 suite worker로 baseline/candidate 양쪽 A/A와 교대 A/B를 비교한다. 출력은 native 구조체에 모으고 준비/응답의 autoreleasepool 및 C clock을 사용해 관측기 할당을 줄인다. **기존 실패와64KiB 기준은 유지**한다. 통과하면 공개 재현·채택/보관·서명 전 포장을 맞추고,미응답인 발행자 서명/앱 재시작 예외를 승인으로 간주하지 않는다.
+
+## 2026-10-26 · 날짜 재사용 보류 · JSON 이스케이프 8바이트 검사
+
+- 직전 질문 응답 턴은 기존 비트 최적화 확인이었으며 추가 제품 성능 진전은 없었다. 이번은 새 후보의 채택 여부를 판단하고 다음 알고리즘의 정확성 근거를 만든 progress다. 전체 경량화 목표는 active다.
+- 실제 fdbf Core DTO의 39개 합성 조사에서 날짜 변환 반복을 셌다. 초기 state 행은 inventory와 같았으므로 v3에서 실제 snapshot을 복원했다. 보정된 36개 JSON 응답과 3개 wire 조사이며,wire는 각각 날짜 하나라 재사용 후보에서 제외했다. natural 중복률은 해당 합성 생성 시계에 의존하며 실사용 빈도가 아니다.
+- 단일 encoding Arena에 finite Date의 정확한 Double 비트와 Foundation ISO 결과 하나만 보관하는 사본을 만들었다. 독립 Foundation 바이트/오류·codingPath,인접 날짜·반복/서로 다른 시각·호출 경계 등을 포함한 4,879조건이 통과했다. mutable strategy 조건은 기존 인코더와의 보존 비교다. 사용자 원본이나 완료된 파일/권한/세션 상태 캐시는 쓰지 않았다.
+- 12경로·48개 성분 측정 프로세스와 의미 검사1개가 모두 종료0이다. 날짜가 같은24세션 inventory/4Mac dashboard의 인코딩 명령어는 약5.7/6.0%,legacy state는 약8.0% 적었다. 그러나 **시간 A/A가 12경로 모두 실패**했고 힙 A/A도3경로에서64KiB를 넘었다. 일부 실제 구간은80ms 보정 목표보다 짧았다. 기준을 완화하거나 재실행 결과를 고르지 않았으며 **제품에 채택하지 않았다**. `scalar-date-census-179-20261026/decision.json`와 원시 결과를 유지한다.
+- 다음 사본은 `json-escape-swar-179-20261026/candidate.swift`다. 기존 JSON 출력 문자열 루프에서 깨끗한 UTF-8을 최대8바이트씩 건너뛴다. 동일 escaping/fallback/크기 제한을 지키며 새 캐시·타이머·서비스는 없다. 첫 특수문자 위치의655,374단어 조합과1,048,576비정렬 load 대조가 통과했다.
+- 사본 인코더를 Foundation과 대조한 문자열 2,651,047조건·호출자 키 저장소 213,762조건도 통과했다. 각각 Unicode scalar1,112,064개와UTF16 unit65,536개를 포함한다. 공개 fixture의 기존 순수 루틴을 사용하고 entry만 바꿔 engine/Core-model 루틴을 실행하지 않았다. 새 통합 Core 검사·451 전체 재실행·성능·실물 폰/네트워크·시각 검사는 아니다.
+- Root/canonical/보관 제품은452입력·95Core·4바이너리·웹14파일·638보관 파일,코드 `fdbf64c0e3fc882382e119952b07540263e8251693e493f9a47fc32be93c3478`다. 기존451/451과 서명 전 패키지를 유지한다. 두 private 후보는 제품/설치본에 반영하지 않았으며 버전·설치·서명·GitHub 배포를 바꾸지 않았다.
+- 다음은 SWAR 사본의 짧은/긴 ASCII·Unicode·조밀한 escape·foreign/fallback과 실제 DTO에 대한 CPU/할당 비용을 사전 계획으로 비교하는 것이다. 날짜 후보의 실패 기준은 그대로다. SWAR도 비용 근거가 없으면 채택하지 않는다. 기존 발행자 서명/앱 재시작 예외는 미응답이며 목표 재개가 승인은 아니다.
+
+## 2026-10-26 · 종료 후 힙 추적 · 로컬 주소 메타데이터 캐시 제외
+
+- 직전 goal 턴은 포장 입력 보정·서명 전 앱 묶음 준비로 progress였다. 이번에는 실제 fdbf 검증 Core의 합성 프로세스만 관찰했다. MallocStackLogging/heap/malloc_history는 해당 시험 프로세스에만 적용했고 설치 앱·원본 터미널·시스템/보안/VPN/전원 정책은 바꾸지 않았다.
+- 128회 연결 종료 뒤 증가한 힙은 계측 과정에서959,680/963,184바이트였다. 마지막 관찰 시점인 요청 뒤 약35.0/46.4초에는 각각1,432,352/1,435,648바이트로,워밍업 직후보다104,832/105,168바이트 낮았다. 증가한 주요 타입과 할당 호출은 Network.framework의 경로·연결 매개변수였다. **이 경로의 단기 증가분이 지연 회수됨을 확인한 것이며 앱 전체 누수 부재나 실물 장치 RAM 절감의 증명은 아니다.** 남은 dispatch continuation 캐시의 반복 부하 후 한계도 입증하지 않았다.
+- 현재 웹의 `/api/network` 전체/304 응답을 별도로 관찰했다. 전체 응답의 호출 스택에서 로컬 이름 상태를 확인하는 hosts 파일 open/close가 크게 보였다. 초기 legacy API 계측기의 마지막 부분 keepalive 정리 가정 실패와,요청 프레임을 잡지 못한 304 샘플도 보존했다. 후자를 0 CPU라고 해석하지 않는다.
+- `local-status-metadata-179-20261026`에 메타데이터가 같을 때 판정 하나를 재사용하는 후보3개를 만들었다. 첫 Swift stat 이름 충돌과 검사 생성자/비공개 심볼 링크 실패를 보존했다. 후보2의 전체451검사,후보3의 통합 빌드·정확한 소스를 namespace만 바꾼 공개 검사191조건·512회 동시 조회는 통과했다. 메타데이터를 못 읽을 때 정상 opener로 돌아가는 보완도 재현했다. 이 결과들은 아래 추가 반례를 포함하지 않았다.
+- 실제 Core의 4경로 교대 A/B에서 명령어 비율은0.809635~0.888308,동일 코드 명령어 대조는0.993574~1.005915였다. 그러나 **모든 HTTP 시간 대조가 기존±5% 기준을 벗어났고 전체 응답의 힙 대조도72,512바이트로64KiB를 넘었다.** 별도 소스 성분 측정과 빠른 구간을100ms 이상으로 늘린 측정도 시간 대조에 실패했다. 기준을 완화하거나 유리한 측정만 골라 채택하지 않았고,네트워크 지연 개선율을 주장하지 않는다.
+- 추가 합성 검사에서 경로의 inode·크기·mtime·ctime은 그대로 두고,허용된 opener의 실제 대상을 최초 일치 파일에서 다른 파일로 바꾸었다. 새로 읽은 판정은 conflict였지만 캐시는 ready를 반환했다. 이는 **후보 캐시의 최신성 반례**이며 실제 제품 사고나 SentinelOne/Zscaler 탓이라는 뜻은 아니다. 메타데이터만으로 opener의 현재 대상을 증명할 수 없어 후보를 제외했다. `decision.json`과 `opener-retarget-2/report.json`을 확인하고 이 후보를 자동 채택하지 말 것.
+- **현재 제품은 여전히452입력·95Core·4바이너리·웹14파일·보관638파일,코드 `fdbf64c0e3fc882382e119952b07540263e8251693e493f9a47fc32be93c3478`다.** 후보의454입력과 새 검사2파일은 private 실험에만 있으며 제품·canonical·선택 빌드에는 복사하지 않았다. 같은 fdbf 코드의 기존451/451과 서명 전 패키지를 유지한다. 새 버전 증가·설치·서명·GitHub 게시·UI 변경/시각 검사는 없다.
+- 자료는 `.runtime/performance/http-retained-heap-179-20261026/interpretation.json`과 `.runtime/performance/local-status-metadata-179-20261026`다. 목표는 active다. 다음은 실제로 관찰한 JSON/날짜 scalar 직렬화의 반복을 먼저 세고,요청/응답 내부에서만 가능한 연산 축소를 검토한다. 파일·권한·세션 상태의 완료 결과 캐시를 추가하지 않는다. 발행자 서명/설치 재시작의 기존 미응답 예외도 목표 이어가기로 승인된 것으로 해석하지 않는다.
+
+## 2026-10-26 · 비트 연산 적용 확인 · 서명 전 패키지와 링크 입력 정리
+
+- 제품 코드는 직전 공유 타이머 검증본과 같다. 고정 필드의 존재·중복 여부를 비트마스크로 처리한 인코더의 명령어 비율은0.863801이다. 약13.6% 감소는 해당 인코더의 합성 비교이며 전체 앱·네트워크 지연·추가 압축률이 아니다. 이 변경 전후의 전송 바이트는 같다. 브라우저 비트 순회 후보는 측정 이득이 없어 채택하지 않았다.
+- 현재 **452입력·95Core·4바이너리·웹14파일**과 코드 `fdbf64c0e3fc882382e119952b07540263e8251693e493f9a47fc32be93c3478`를 유지한다. 포장 시 다시 링크하는 TTY 보조 파일의 객체5개를 별도로 대조하니 canonical의 main 객체1개가 오래된 상태였다. 검증된 객체로 바로잡고 링크 목록도 보관본/canonical 각각에 고정했다. **보관 파일은636→638개**다. 포장 전 검사에 객체5개·링크 목록·보관 파일 전체의 해시 검사를 추가했으며 제품 소스와 검증 바이너리는 바꾸지 않았다.
+- 배포 helper의 이전 revision 참조와 존재하지 않는 검사 보고서 경로를 수정했다. 현재 packageDirectory·패키지/다운로드 검증기·preflight·공개 검사 경로를 공유 타이머 검증본으로 맞췄다. 공개 입력457개·허용73경로·HEAD 고정384개 검사를 통과했다. 이전 성공 결과만 보고 오래된 포장 입력을 사용하지 않도록 한다.
+- 고정 loopback 포트 오류49는 AutoApprove가 없는 순수 Network.framework와 C 소켓에서도 재현됐다. bind/listen/getsockname의 함수 제공자는 `libportmanager_hook.dylib`였고,자신이 연 소켓의 반환 포트와 커널 포트는3회 모두 같았다. 외부 실행 환경의 중간 계층이 관찰된 사실과 제품 결함의 증명은 구분한다. SentinelOne·Zscaler 원인으로 단정하지 않으며 후킹·보안 정책·인터페이스 제한·재사용 플래그를 바꾸지 않았다. 실물 네트워크 재연결 해결로 주장하지 않는다.
+- 실제 서명 전 앱 묶음은22파일·17,642,223바이트다. App/CLI의 로컬·디버그 심볼11,433,664바이트를 제거한 뒤 실행 section·주소·UUID·전역 심볼·로더 데이터와 웹14파일을 대조했다. 기존 설치본에서 추출한 **공개** 발행자 인증서46451DD581918D2EB45BDBAC62C13B9E066271BB와 현재 객체5개로 보조 파일의 정적 메타데이터도 준비했다. 서명·신뢰·키체인·서비스 등록·앱 실행은 하지 않았다. 이는 **설치/배포 파일이 아니다**. 정식 포장은 실제 서명한 CLI에서 인증서를 다시 추출하고 일치 서명 검사를 통과해야 한다.
+- 기본 sandbox의 iconutil 실패와 공개 인증서 미출력,허용된 읽기/포장 실행에서의 성공을 각각 보존했다. 아이콘 원본이나 인증서를 교체하지 않았다. 최신 설치본은 여전히 **0.2.168 · 빌드195**이며 교체/재시작하지 않았다. 0.2.179/206의 발행자 서명 예외·설치 재시작 요청은 여전히 미응답이다. 일치 서명,패키지3검사,DMG/체크섬,source commit/tag/push,GitHub 게시/다운로드 검증은 남아 있다. GitHub Actions workflow도0개여서 기존 CI 서명 경로가 없다.
+- 자료는 `.runtime/performance/release-readiness-179-20261026`와 `.runtime/performance/listener-reopen-179-20261026`다. 새451검사는 실행하지 않고 같은 코드의 직전451/451 결과를 유지했다. 새 UI/폰 검사는 없으며,CSS 없는 실험 사본 한 파일의 기존 Impeccable 오탐 예외를 유지했다. 전체 목표는 active다. 독립적으로 남은 조사 대상은 연결 종료 뒤 공통 힙 증가이며,설치/서명 예외를 목표 이어가기로 승인된 것으로 해석하지 않는다.
+
+## 2026-10-26 · HTTP 제한 시간 타이머 공유 반영 · 고정 포트 복원49 미해결
+
+- 제품 소스·canonical·보관본에 연결별 취소 지연 작업 대신 **리스너당 제한 시간 타이머1개**를 반영했다. 모든 연결이 같은 직렬 큐를 쓰므로 잠금 추가 없이 관리한다. 항목은 연결을 약하게 참조하고 종료 시 제거하며,스트림 전송마다 타이머를 할당/재설정하지 않는다. 요청/전송30초·유휴/종료5초·재사용32회·스트림12개 제한은 같다. heartbeat 타이머는 별개다.
+- 현재 기준은 **452입력·95Core·4바이너리·리소스14·보관636파일**이다. 모듈 `4bbaec04a554d486fbaf0910f23126fde415d4291ddd7f4f2ebb44e08dcd3d1a`, 코드 `fdbf64c0e3fc882382e119952b07540263e8251693e493f9a47fc32be93c3478`, 보관 `retained-shared-deadlines-build/source`, 워크플로 `revision-shared-deadlines-20261026`다. 아래 비트마스크 ea68 기록은 이전 상태이며 Root `.build/release`는 사용하지 않는다.
+- 실제 Core4경로·24프로세스·A/B와A/A 비교를 통과했다.512회 상태 조회 후 연결 재사용 경로의 남은 힙은594,624/596,160바이트 적었다. 연결을 매번 닫는 상태 조회는313,248~324,192바이트,128회 터미널 GET은70,368~72,160바이트,128회 wire/gzip 연결은168,880~169,280바이트 적었다. 연산량 비율은0.992086~1.013205로 기존±5% 기준 안이다. 전체 앱/물리 네트워크/RSS 개선율이나 공통 힙 증가 해결로 주장하지 않는다.
+- 새 **451/451**, 공개630프레임·55,732분할·raw265·정수38·손상10·SSE분할78과 실제 공개 watchdog19검사를 통과했다.30초 전송/오래된 기한·5초 종료·유휴 stream·12슬롯·재연결·정확한 gzip/SSE 바이트를 확인했다.12개 연결의 타이머1개·이른 이벤트 생존·실제 요청30초/유휴5초·32회 재사용·종료 후 연결/스케줄러/타이머 해제와 새 임시 포트 재시작도 확인했다.
+- **고정 loopback 포트 재시작은 기존/후보 모두NWError49(EADDRNOTAVAIL)로 실패했다.** 기존 공개 fallback API도 이 경우 복원하지 못했다. 새 임시 포트에서의 타이머 재생성 검사와 구분하고 미해결로 남긴다. 다음은 순수 Network.framework 재현으로 바인딩/복원 원인을 구분하는 일이다. 소켓 공유·시스템/VPN/보안 정책을 추측해서 바꾸지 않는다.
+- 검사 도구의 무제한 ready 대기와 ready 응답 분류 충돌을 보존했다. 확인된 자체 테스트 PID만 종료했으며 기존 성능 worker/자료는 수정하지 않았다. 재시작의 고정 포트 실패를 통과로 재분류하지 않았다. 자료 `.runtime/performance/shared-http-deadlines-179-20261026`.
+- UI 리소스14개의 내용은 같으며 새 시각/실물폰 검사는 없다. 버전은0.2.179/206 유지,설치·서명·commit/tag/GitHub 게시 미실행이다. 기존 서명 키체인과 앱 교체/재시작 요청은 미응답이고 전체 목표는 active다. 원본 터미널·시스템/전원·관리자/보안/VPN/TCC/키체인·상주 서비스 변경은 없다.
+
+## 2026-10-26 · 고정 필드 비트마스크 반영 · 452입력/95Core · 설치·배포 전
+
+- 고정 필드 중복 검사를 기존 존재 비트에 합쳤다. 문자열 집합·Optional 슬롯을 줄이고 켜진 비트를 순서대로 인코딩한다. wire2 형식·출력 바이트·입력 API는 같고 큰 sequence/offset은32비트로 자르지 않는다. 브라우저 후보는 실익과 WebKit 대조 기준을 충족하지 못해 미채택했다.
+- 현재 기준은 **452입력(이번 컴파일/전체 검사에도452)·95Core·4바이너리·리소스14·보관636파일**이다. 모듈 `389538d0887c628e3c2cdacebd5d8460dd238ccbd7ef2dda49e0255dc6901caa`, 코드 `ea683257d571303a58a1ea915d7a16b1633ba392764342653c9554905f14244b`다. 보관 `retained-wire-bitmask-build/source`와 `revision-wire-bitmask-20261026`가 새 기준이며 canonical도 일치한다. 아래da75/ca8 통합 기록은 이전 상태다. Root `.build/release`는 사용하지 않는다.
+- standalone 비교는18경로·54프로세스·648구간이다. 인코딩 명령어 기하평균 비율은 **0.863801(약13.6% 감소)**, A/A는 모두±2% 안이다.28개 필드 마스크와 중복 fallback4종도 바이트가 같았다. DTO 선언은 이름만 바꿔 재컴파일했다. 실제 Core/전체 앱/실물 네트워크 CPU 개선율이 아니다. 초기 외부 DTO enum 복사 재귀 실패2건과 raw 보고서 DTO 범위 정정을 보존했다.
+- standalone 힙 기준 실패는 계속 실패다. 별도 실제 Core 검사에서는 합성 iTerm·양쪽 native 어댑터/캡처 주입으로 Terminal 전용 커서 경로를 피했다. **294연결**에서 연결 수0·추적 IO/NW/stream/gzip/heartbeat 해제·색상/UTF-16 커서·gzip EOF 이전 수신을 확인했다. 절대/증분 추가 힙은 모두65,536바이트 상한 안이었다. 공통 연결 후 힙 증가의 해결이나 콜드/전체 RSS의 증거는 아니다.
+- 새 Core의 **451/451**을 다시 통과했고 공개630프레임·55,732분할·raw265·정수38·손상10·SSE분할78도 통과했다. 복사된 번들 폴더0700을 기존 요구0755로 맞춰 preflight를 통과했다. 리소스 바이트·private 상위 디렉터리·설치 앱은 유지했다. 새 시각/실물폰 검사는 아니다.
+- 자료는 `.runtime/performance/terminal-wire-bitmask-179-20261026`다. `native-interpretation.json`이 raw 메타데이터의 범위를 바로잡는다. 전체 목표는 active다. 별도 HTTP 타이머 후보는 미채택이며 공통 메모리 증가와 재연결 비용은 더 조사한다.
+- 버전은0.2.179/206 유지다. GitHub 최신v0.2.178과 main2bc1893을 다시 확인했다. 기존 서명 키체인 예외와 설치 앱 교체/재시작 요청은 미응답이다. 일치 서명 패키지·commit/tag/push·GitHub 게시/다운로드는 남았다. 원본 터미널·시스템/전원·관리자·보안/VPN/TCC/키체인·상주 서비스 변경은 없다.
+
+## 2026-10-26 · wire2·버퍼·브라우저 수신부 제품 통합 · 452입력/95Core · 설치·배포 전
+
+- 직전 브라우저 검증과 이번 제품 통합은 progress다. 전체 목표는 active다. 이제 시제품에만 있는 상태가 아니다. **제품 Root 소스·canonical·보관 빌드에 전체 협상형 이진 전송,버퍼 예약 최적화,측정된 두 JS와 공개 도구 5개를 함께 반영했다.** 버전은 0.2.179/206을 유지했다. 설치 앱은 교체/재시작하지 않았고 GitHub 게시도 하지 않았다.
+- 현재 권위 상태는 **452입력(실제 Core 컴파일/451검사 당시 450 + SPM 외 공개 검사 2)·95Core·4바이너리·리소스14개**다. Core 모듈은 `ca8c204ab056b7d642fa9ea0cee32d0482dbf39dc5722ab030fd15e21e5846b6`, 전체 코드 정체성은 `da75d37066c2c3db2d562888d9eb53a8ed064cdc9c211614b9244b952db3e5ab`이다. 검증된 95객체와4바이너리를 **바이트 그대로 재사용**했으며 JS 리소스는 별도 SHA로 고정했다. 변경 없는 전체451·writer180프로세스·공개 기존4도구를 반복하지 않았다.
+- `.runtime/releases/0.2.179/{provenance.json,retained-build.json,current-workflow.json}`이 기준이다. 보관본은 **`retained-terminal-wire-build/source`·636파일**, canonical은 `/private/tmp/autoapprove-discovery-worktree-20261020/.build/release`다. **Root `.build/release`는 여전히 오래된 빌드**이므로 현재 검증본으로 쓰지 않는다. 이전448/94와450/95 시제품 기록은 역사적 증거이며 현재 제품 상태를 대체하지 않는다. wire의 `selected-candidate.json`도 새 제품 provenance를 가리킨다.
+- 새 공개 재현은 `scripts/terminal-wire-check.mjs`와 `Tests/fixtures/terminal-wire-check.swift`다. 저장소 Root의 상대 import/기본 source-root로 실행해 **630프레임·55,732분할·raw265·정수38·손상10·SSE분할78·실제 PTY 큐/완료 offset**을 통과했다. 공개 corpus는 실행 때 합성하므로 private golden/runtime 데이터가 필요 없다. 제품 인코더 소스를 수정 없이 컴파일하고 DTO·patch/copy·gzip은 실제95Core에서 연결한다. 첫 직접 연결 시도는 release 내부 인코더 심볼이 외부 진입점으로 없어 실패했으며 stderr를 보존했다. 이를 실제Core 인코더 객체 직접 호출 검사로 주장하지 않는다.
+- **실제95Core가 보관 리소스를 직접 제공하는 검사도 통과했다.** proxy 없이 index/app/pty/wire/CSS를 대조하고 Chromium153.0.8010.12·WebKit26.6에서 gzip screen/alive의 EOF 이전 도착과 복귀 후 같은 stream을 확인했다. HTML은 `RemoteNetwork.webAsset`이 명시적으로 치환하는 **보안 nonce와179:206:1만** 적용한 정확한 바이트를 비교한다. 두 치환을 각각 빠뜨렸던 검사 실패와 수정 전 driver를 보존했다. 제품 버그나 임의 정상화로 세지 않는다. 기존18개 실제 시각 검증은 동일한 HTML/CSS/JS SHA로 재사용했으며 새 시각/실물폰 검사를 했다고 말하지 않는다.
+- 배포용 새 JS에0640 모드가 남은 것을 실제 stat으로 확인했다. Root/canonical 정적 웹 파일과 canonical/보관 번들의14개 정적 리소스는0644,번들 내부 디렉터리는0755로 정리했다. **내용 SHA와 Core 코드는 그대로**다. 새 preflight와 패키지 verifier가 리소스 읽기 모드도 확인한다. private 보관본의 상위 디렉터리는 유지했고 설치 앱·시스템/TCC 권한은 바꾸지 않았다. `resource-modes.json` 참조.
+- 공개 입력은 **457개·명시73경로**, 변경 대상 밖 **HEAD384개**의 바이트 일치를 확인했다. `.impeccable/config.json`의 기존 단일 파일/규칙 오탐 예외와 새 전송 명세 `docs/TERMINAL_WIRE.md`도 명시했다. IDE/인덱스·추가 진단 fixture와 실행 데이터는 포함하지 않는다. GitHub를 새로 읽었고 main/HEAD는 `2bc18930dfb7f1a30e32bbf8675cb6281442b172`, 최신 공개는 v0.2.178, v0.2.179 태그는 없었다. git stage/commit/tag/push는 아직 하지 않았다.
+- 현재 배포 도구도457입력/95Core로 전환했다. `current-workflow.json`의 sourcePreflight와 scriptHashes, 새 `release-206-terminal-wire-20261026`의 검증/다운로드 도구를 사용한다. 옛448/94·451공개입력·61경로 helper를 복원해 실행하지 않는다. 새 release notes와 README는 **준비 중** 상태를 표시하며 설치 파일이 있다고 주장하지 않는다. 실제 일치 서명 패키지는 없다. 기존 **private 서명 키체인을 검색 목록에 일시 포함하는 예외가 미응답**이라 같은 실패 서명을 반복하지 않았고, 키체인/인증서/ACL/trust/search-list를 변경하지 않았다.
+- 다음 배포 순서는 일치 서명 패키지 → 패키지/runtime/리소스 검사 → DMG/체크섬 →73경로 소스 capture/commit/tag/push →457입력 GitHub 자산/정상TLS 익명 다운로드 검증이다. 설치/재시작 예외도 별도로 미응답이다. 기존 unsigned179와 signed178을 새 통합본으로 배포하지 않는다. 원본 터미널·입력·화면/잠금·실제 전원·관리자/보안/VPN/TCC/상주 서비스는 바꾸지 않았다.
+- 종합과 다음 작업: `.runtime/performance/terminal-wire-integration-179-20261026/turn-final.json`, `next-action.json`. Root 공개 검사는 `root-public-run-1/report.json`, 실제 보관 리소스는 `retained-resource-check-3/report.json`이다. 서명 대기와 별개로 **SSE/wire 공통 lifecycle 힙 증가 및 남은 앱 비용**을 조사할 수 있다. 이전 절대 힙/최초 WebKit 대조 실패는 유지하며 추가 증가 기준 통과를 전체 앱 RAM 최소화로 해석하지 않는다. 모든 이번 관찰/컴파일/브라우저/합성 owner 작업은 종료됐다.
+
+## 2026-10-26 · 브라우저 수신 변환 축소 · 원본 25~51%, 대량 PTY 준비 94~98% 감소 · 제품 통합 전
+
+- 이번 단계도 progress이며 전체 경량화 목표는 active다. 제품 Root의 권위 상태는 여전히 **448입력·94Core·4바이너리 / dd9c374baa1949e86387b4c6d5504cc62df6ee83b2cf05a9270662c7f48e9a1f**다. 설치 앱·버전·서명·GitHub 배포는 바꾸지 않았다. 새 브라우저 오버레이는 `.runtime/performance/terminal-wire-browser-179-20261026/source/{terminal-wire.js,pty.js}`이며, 이전 wire의 `selected-candidate.json`에 두 파일의 SHA와 검증 보고서를 연결했다. **검증된 backend 450/95 후보와 함께 통합해야 하며 아직 제품 채택은 아니다.**
+- 최초 실브라우저 프로파일에서 `base64`가 가장 큰 self-sample 그룹이었다. 바이너리 PTY를 다시 Base64로 만들었다가 실제 `receive()`에서 바이트로 되돌리는 왕복을 없앴다. PTY 소스만 명시적으로 raw 출력을 요청하며, 그 경우에도 payload 길이만큼 **새 Uint8Array에 복사**하여 큰 TCP/전체 프레임 저장소를 큐가 붙들지 않는다. 기본 decoder는 원래 문자열 값을 유지하고 JSON fallback·SSE·구버전 EventSource는 기존 경로를 따른다. 입력 API·프로토콜 비트/태그·전송 바이트·허용 크기·대기 큐·렌더 완료 후 offset 확정 규칙은 그대로다.
+- 매 바이트 읽기에서 만들던 1바이트 typed-array view를 직접 경계 검사로 바꿨다. varuint는 JS의 안전한 정수 범위에서 Number로 누적하여 반복 BigInt 변환을 줄였고, 비트 연산은 제한된 byte/flag/nibble에 쓴다. 32비트 비트 연산으로 큰 sequence/offset을 누적하지 않는다. UUID/hex/RGB는 nibble 인덱스로 만들어 배열·callback·padStart 할당을 없앴다. 새 지속 캐시나 서비스는 없다.
+- 정상/경계 **630프레임**의 모든 값·일반 객체 prototype·missing/null/false·대소문자와 default/raw 경로를 대조했다. Node VM에서 **55,732분할**, 1바이트 수신, 7종 coalescing, 취소, 안전/비안전 정수 38개, 손상 프레임 8개, 잘린 접두어 1,656개와 prototype 관련 키를 확인했다. raw 265개는 정확한 자체 저장소를 가지며 원본 프레임을 변경해도 영향을 받지 않았다. 실제 PTY `receive()`/`renderOutput()`로 지연 완료·큐 제한·committed offset·재개를 확인했다. Chromium/WebKit에서도 각 630프레임의 default/raw 전체 값 대조를 통과했다.
+- 최초 512프레임 측정은 WebKit의 일부 JSON 시간이 0으로 나올 만큼 짧아 채택 기준으로 쓰지 않았다. 별도 페이지끼리 비교한 첫 결과도 WebKit A/A 6경로가 ±5%를 벗어났으므로 `paired-1/report.json`의 실패를 보존했다. 원인을 확정하지 않았다. 새 계획을 먼저 남긴 뒤 한 JS realm의 독립 codec, 대칭 4회 워밍업, 빠른 쪽도 30ms 이상인 구간으로 **새 WebKit A/B 2쌍·A/A 2쌍**을 검사했다. 13경로 모두 ≤1.05/±5%를 통과했고 A/A 비율은 0.977748~1.009615였다. Chromium은 첫 새 A/B 2쌍·A/A 1쌍의 13경로가 모두 통과했다.
+- 통과한 비교에서 원본 터미널 5경로의 수신 시간 비율은 **0.491563~0.749158(25.1~50.8% 감소)**다. 대량 PTY 2경로의 실제 `receive()` admission/바이트 준비 비율은 **0.020870~0.060035(94.0~97.9% 감소)**다. PTY 성능 관찰기의 렌더 sink는 동기로 비우므로 이 수치는 **xterm painting·전체 앱 CPU·네트워크 지연·실물 휴대폰 개선율이 아니다.** gzip payload 감소율과도 합산하지 않는다. 자료: `paired-1`, `same-realm-1`, `receiver-check-1`.
+- 실제 `Source`·`AutoApprovePTY`·xterm이 실행되는 전체 웹에서 두 브라우저 모두 binary/raw·ANSI 색/한글/이모지·백그라운드 복귀·느린 xterm 완료 후 마지막 committed offset 재개·SSE fallback·구버전 EventSource·binary 복귀를 통과했다. 별도 원본 화면 fixture의 14개 연결/복구·늦은 응답 제외·권한 상실·선택 변경·초안/초점 검사도 양쪽에서 통과했다. 입력·사용자 터미널 조작은 0이다. 옮긴 UI fixture의 최초 실행은 codec 상대 import가 틀려 실행 전에 실패했으며, 원본 파일과 정정 내역을 `ui-source-binding.json`에 보존했다. 제품 결함으로 세지 않는다.
+- 검증된 새 backend의 **95개 Core 객체**로 합성 owner만 새로 연결하고, 정확한 프런트 리소스를 임시 loopback proxy로 제공했다. 실제 Core gzip의 첫 screen/alive가 EOF 전에 도착하고 복귀 후 같은 stream을 유지함을 Chromium153.0.8010.12/WebKit26.6에서 확인했다. 두 fixture와 Core의 **18개 캡처**(390×844, 768×1024, 1440×900)를 모두 실제로 열어 보았다. 이전 WebKit 축소 직후의 커서 가림은 350ms 안정화 후 재현되지 않았고, Core의 6개 geometry 모두 커서가 출력 영역 안이었다. 레이아웃 코드는 수정하지 않았다. 물리 폰/핫스팟/VPN/SentinelOne 검사는 아니다.
+- 종합: `.runtime/performance/terminal-wire-browser-179-20261026/turn-final.json`, 시각 확인: `visual-review.json`. 변경 없는 **451 Core 회귀·180프로세스 writer 비교·공개 95Core CLI 4종을 반복하지 않고 SHA를 확인해 재사용**했다. CSS 없는 부분 복사본에 대한 `flat-type-hierarchy`의 기존 한 파일/한 규칙 오탐 예외를 유지했으며 광역 ignore나 타이포 변경은 없다.
+- 다음은 전체 wire/backend buffer와 이 두 JS, 검증된 공개 도구 5개를 함께 제품에 통합하고 공개 재현 fixture·새 소스/리소스 provenance·release whitelist를 준비하는 일이다. Root/설치본에 반영됐다고 말하지 않는다. 공통 lifecycle 힙 증가의 원인과 이전 절대 힙 실패는 별도로 남아 있다. 기존 서명 키체인의 임시 search-list 변경과 앱 교체/재시작 예외는 미응답이며 목표 재개를 승인으로 간주하지 않는다. 일치 서명 패키지·commit/tag/push·GitHub 게시/다운로드 검증도 남아 있다. 원본 터미널·시스템/전원·관리자/보안/VPN/TCC/키체인과 상주 서비스는 건드리지 않았다.
+
+## 2026-10-26 · 이진 프레임 버퍼 예약량 82.5% 감소 · 새 Core 451검사와 공개 도구 4종 통과
+
+- 직전 통신 시제품 작업은 progress였고 이번도 progress다. 전체 경량화 목표는 active다. Root 제품과 실제 설치본은 그대로이며, 제품의 검증 기준은 **448입력·94Core·4바이너리 / dd9c374baa1949e86387b4c6d5504cc62df6ee83b2cf05a9270662c7f48e9a1f**다. 새 우선 후보는 `.runtime/performance/terminal-wire-buffer-179-20261026`다. 이전 시제품의 `selected-candidate.json`도 이 후보를 가리킨다. 제품 채택·설치·배포를 뜻하지 않는다.
+- JSON 허용 크기를 보수적으로 계산한 상한을 이진 Output의 malloc 예약에도 쓰던 부분을 분리했다. JSON의 2MB 허용/전체 fallback 규칙은 유지하고, 이진 문자열 길이 헤더와 배열/객체 개수의 15·128·16384 경계, 기본 빈 노드의 1바이트를 따로 센다. 초기의 단순 5바이트 헤더 제안은 빈 값 배열에서 과예약할 수 있어 소스/계획을 보존한 뒤 다듬었다. 프로토콜 필드·비트·태그·payload·gzip·입력 API는 바꾸지 않았으며 새 지속 캐시나 서비스가 없다.
+- 같은 프로세스의 **동일 객체**를 직전/새 인코더에 넣고, 검사 복사본에만 똑같은 예약 계측을 삽입했다. 정상 576개와 큰/제어/Unicode/손상 UTF-16·빈 값 배열·헤더 경계·null/false·JSON fallback·깊이·PTY 54개, 총 **630프레임의 바이트가 완전히 같았다.** 실제 브라우저 디코더 대조도 통과했다. 모든 사례에서 예약량이 증가하지 않았고 재할당은 0회였다. 정상 576개 Output 요청 합계는 **4,144,960→726,686바이트(82.47% 감소)**, 정상 사례의 최대 예약은 30,983→5,247바이트다. 경계 사례 전체 최대값은 1,801,055→700,239바이트다. 이는 malloc 요청량이며 앱 전체 RAM·RSS 감소율이 아니다. `allocation-1/report.json` 참조.
+- 계측 코드를 넣지 않은 실제 인코더로 18경로(9종×인코딩/압축), 각 새 A/B 4쌍 및 A/A 2프로세스, 총 **180프로세스·각 16구간·구간당 2,048프레임**을 비교했다. 새 후보/직전 wire 명령어의 최대 비율은 **1.012312**이며 모든 경로가 사전 1.05 상한 안이다. 기존 SSE 대비 활동 4종 인코딩+gzip 비율은 0.645746~0.918197다. A/A 명령어도 모두 ±2% 안이었다. 여기서 쓰는 native 관찰기는 구간 사이 JSON을 출력하지 않는다. `profile/report.json` 참조.
+- **기존 메모리 실패는 지우지 않았다.** 새 후보도 구간 종료 후 절대 힙끼리의 차이를 비교하면 64KiB 기준을 넘었다. 동일 코드 A/A에서도 같은 상한을 넘는 경우가 있었다. 같은 호출 경로의 워밍업, 자체 malloc zone 관찰(DefaultMallocZone 1개), 합성 파일/JSON 관찰 루프의 autoreleasepool은 각각 따로 확인했으며 기존 실패를 해결했다고 주장하지 않는다. `aa-control`, `warm-path`, `zone-diagnostic`, `core-memory`, `core-memory-pool`의 결과는 진단 자료다.
+- 실제 Core 연결 검사에서 기존 SSE와 wire 모두 구간이 지날수록 공통 힙 증가가 있어, 서로 다른 시점의 `afterB-afterA`만으로 새 방식의 추가 비용을 판단할 수 없음을 확인했다. 이를 근거로 **`(afterB-beforeB)-(afterA-beforeA)`**와 A/A 대조, 동일 **65,536바이트** 상한을 새 실행 전에 명시했다. 새 4프로세스·8쌍·역순 교대·역할당 10회, **640연결+16워밍업**에서 모든 연결이 0개로 정리됐고 추가 증가분은 최대 **13,248바이트**, A/A는 **10,704바이트**였다. 새 비교 기준은 통과했지만 원래 절대값 비교는 여전히 실패로 남아 있다. `core-retention-confirmation/report.json` 참조. 이는 연결 정리 후 SSE 대비 추가 비용의 검사이며, 앱 전체 메모리·콜드스타트 RSS나 공통 증가가 최소라는 증거는 아니다.
+- 새 격리 빌드는 **450입력·95Core·4바이너리 / da75d37066c2c3db2d562888d9eb53a8ed064cdc9c211614b9244b952db3e5ab**다. `candidate-provenance.json`의 `sourceRoot`와 `build`를 사용한다. 새 **451/451** 회귀 검사도 끝났다. Root의 `.build/release`나 직전 시제품 빌드를 현재 후보로 쓰지 말 것.
+- 공개 검사 도구의 94개 고정을 빌드 `output-file-map.json`과 실제 객체 이름의 완전 대조로 바꾸는 5개 파일을 **`public-tool-source/scripts`에만** 준비했다. 기존 94와 새 95 객체를 모두 받아들이며 누락/오래된 추가 객체는 거부한다. helper와 출력 명세도 입력 SHA에 포함하고 실행한 driver 자체를 기록한다. 새 95개 Core에서 peer-stream-buffer, peer-stream-batch, peer-stream-batch-browser, stream-send-watchdog **4개 실제 CLI가 모두 종료 0**이었다. Root 공개 도구는 아직 바꾸지 않았다. `public-tool-preparation.json`, `public-tool-validation/report.json` 참조.
+- 다음은 브라우저의 실제 수신 CPU 비용을 측정해 필요하면 정수/객체 구성과 PTY base64 왕복을 개선하는 것이다. 이전 WebKit 데스크톱 축소 직후 캡처의 커서/하단 행은 안정화 후 geometry로 확인해야 한다. 공통 SSE/wire 연결 후 메모리 증가도 별도로 관찰해야 한다. 바뀌지 않은 451검사·180프로세스·공개 4도구를 다음 턴마다 반복하지 말 것. 제품 채택 전에는 검증한 5도구와 프로토콜 소스의 공개 경계/배포 자료도 함께 묶어야 한다.
+- GitHub를 새로 읽었으며 main은 2bc18930dfb7f1a30e32bbf8675cb6281442b172, 최신 공개 릴리스는 v0.2.178이었다. 0.2.179/206을 다시 올리지 않았고 서명/설치/배포도 하지 않았다. 기존 서명 키체인/search-list 및 설치 앱 재시작 허용은 미응답이다. 실제 원본 터미널·전원·잠금·시스템/관리자·보안/TCC/VPN·키체인·상주 서비스는 변경하지 않았다. 종합: `.runtime/performance/terminal-wire-buffer-179-20261026/turn-final.json`.
+
+## 2026-10-26 · 비트마스크 기반 터미널 이진 전송 시제품 · 기능 통과, 메모리 기준 미통과로 미채택
+
+- Stop 훅의 flat-type-hierarchy 경고는 CSS가 없는 `source/.../index.html` 부분 복사본에서 기본 16px로 판정한 오탐이다. 동일 HTML과 실제 CSS가 있는 `candidate-source-2`에서는 경고 0건임을 다시 확인했다. `impeccable hooks ignore-value`로 **그 부분 복사본의 해당 규칙만** 예외 등록했다. `.impeccable/config.json`에 이번 소유 변경이 하나 추가됐으므로, 다음 배포의 변경 목록/공개 경계에 이 경로도 명시하고 기존 61경로 목록을 그대로 재사용하지 말 것. 앱의 글자 크기나 디자인은 변경하지 않았다.
+- 경량화 목표는 active다. 제품에 채택된 기준은 기존 **448입력·94Core·4바이너리 / 코드 정체성 dd9c374baa1949e86387b4c6d5504cc62df6ee83b2cf05a9270662c7f48e9a1f** 그대로다. 이번 통신 시제품은 `.runtime/performance/terminal-wire-179-20261025/source`에만 있으며 Root 제품 소스·기존 검증 보관본·설치 앱은 변경하지 않았다. 버전은 0.2.179/206을 유지했다.
+- 서버는 Encodable 값을 직접 순회해 24개 필드의 존재 비트, 자료형 태그, 가변길이 정수, UUID/hex/RGB 및 PTY 원시 바이트를 인코딩한다. 미지원 표현은 같은 JSONEncoder의 전체 JSON으로 되돌아간다. 필드 부재/null/false, 대소문자, UTF-16 오프셋, 기존 gzip·delta/copy·원본 식별·입력 JSON 경로는 유지한다. 새 브라우저의 단일 fetch 수신기는 부분 헤더·부분 본문·합쳐진 프레임을 처리하고, 게이트웨이와 소유 Mac 모두 wire2를 광고할 때만 사용한다. 구버전은 기존 EventSource/SSE를 사용하며 fetch에서도 SSE 응답을 수용한다.
+- 격리 빌드는 **450입력·95Core·4바이너리 / 코드 정체성 040849ef179fb310162344891c2f1f19a1dca0e08d06f299646513c59fca2e63**다. 자료는 `candidate-provenance.json`, 빌드는 `candidate-build-2/release`, 소스는 `candidate-source-2`다. 이 수를 기존 제품의 448/94와 혼동하지 말 것. `full-validation.json`의 **451/451**은 새 격리 빌드의 실행 결과다. 새 프로토콜 검사는 아직 공개 검사 도구로 승격하지 않았다.
+- 최종 Swift 인코더와 실제 브라우저 디코더의 Node VM 대조에서 9종×64개 **576프레임**, 대표 프레임의 모든 **27,866분할**, 1바이트 조각·합침·취소·잘린 접두어가 통과했다. 실제 Core의 로컬/경유 gzip·이진/SSE·같은 리비전 재개·잘못된 소유자/형식·부분 EOF 후 완전한 오류 프레임도 통과했다. `encoder-final/encoder-functional-report.json`, `core-check-2/report.json` 참조. 이전 인코더 대조 결과는 덮어쓰지 않았다.
+- 실제 Core의 자산과 gzip 스트림을 Chromium **153.0.8010.12**, WebKit **26.6**에서 열어 최초 화면·compact alive의 EOF 이전 도착과 백그라운드/복귀 재연결을 확인했다. 합성 웹에서는 구버전 조합, 전송 중단/복구, 늦은 이전 세션 응답 배제, 초안·초점·빈 화면·Unicode·색·원본 커서도 확인했다. 390×844, 768×1024, 1440×900 캡처를 별도로 보았다. Impeccable optimize 지침·실제 CSS가 있는 소스의 detector(0건)와 웹 지침으로 변경 범위를 검토했다. 물리 휴대폰·핫스팟/VPN/SentinelOne 성능 또는 정식 두 에이전트 critique를 확인했다고 주장하지 않는다. `browser-chromium`과 `core-browser/report.json` 참조.
+- 현재 Swift 시제품의 실제 Core gzip(level1, 프레임마다 Z_SYNC_FLUSH)에서 원본 활동 4종의 압축 본문 기하평균 비율은 **0.737010(26.3% 감소)**다. 이는 1개 새 emitter의 합성 작업량 결과이며, 앞선 4 emitter의 JavaScript 코덱 실험 30.2%와 합산하지 않는다. 전체 앱 CPU·통신 지연 개선율도 아니다. 실제 Swift 인코딩+gzip 명령어 비율은 같은 4종에서 **0.642602~0.917909(8.2~35.7% 감소)**이며, 두 번의 18경로 비교에서 모든 명령어 제어는 ≤1.05였다. 압축이 어려운 PTY 난수 경로도 포함했다.
+- **메모리 기준은 실패 상태로 보존한다.** 두 비교의 유지 힙 차이가 사전 65,536바이트 한도를 넘었다. 두 번째 실행은 보고용 Foundation autorelease도 정리했지만 여전히 실패했다. 출력 없이 미리 할당한 native 관찰 기록으로 별도 3경로×A/B·B/A를 확인하니 반복 후 차이가 대부분 0이고 지속 증가를 확정할 수 없었다. 이 진단은 실패를 지우거나 채택 근거로 대체하지 않는다. `encoding-measure-report.json`, `observer-v2/encoding-measure-report.json`, `memory-probe/report.json` 참조. 브라우저 디코딩 CPU와 큰/분할 프레임의 피크 버퍼도 미검증이다.
+- 다음은 메모리 대조에 A/A 관찰 대조군을 넣고, `RemoteTerminalWireEncoder.Arena.estimate`의 보수적인 JSON 상한(문자당 최대 6바이트)을 Output 예약에도 사용하는 부분을 실제 wire 크기 상한과 분리해 검증하는 것이다. BigInt 정수 파싱과 PTY의 raw→base64→atob 왕복은 프로파일 후 판단한다. WebKit 데스크톱 캡처에서 뷰포트 축소 직후 마지막 행이 하단 도구 아래에 보인 점도 기록했다. resize/RAF 안정화 뒤 실제 좌표를 확인하기 전에는 제품 회귀라고 단정하거나 레이아웃을 바꾸지 않는다. 이미 통과한 변경 없는 전체/브라우저 검사를 무조건 반복하지 말 것.
+- 채택 전에 94개 객체를 고정한 공개 검사 도구와 확장된 소스/배포 경계도 95개 빌드에 맞춰 검증해야 한다. 현재 시제품은 **미채택·미배포**다. 기존 서명 키체인/search-list 변경 및 설치 앱 교체/재시작 예외는 여전히 미응답이며 다시 묻거나 허용으로 간주하지 않았다. 실제 원본 터미널·전원·잠금·시스템/관리자·보안/TCC/VPN·키체인·상주 서비스는 변경하지 않았다. 종합 결과: `.runtime/performance/terminal-wire-179-20261025/turn-final.json`.
+
+## 2026-10-25 · 모델 문구 ASCII 바이트 탐색 채택 · 자동 ON 68.6% 감소 · 48기준 통과
+
+- 직전 허용 접두어 최적화는 실제 소스·검증 빌드를 반영한 progress였고 이번도 progress다.전체 경량화 목표는 active이며 이 결과만으로 완료하지 않는다.직전66f3 Core의 새 자동ON 프로파일에서 mentionsModel의 ASCII literal contains가 여전히 Foundation 부분문자열 탐색으로 들어가는 포함 스택을 확인한 뒤 변경했다.
+- 짧은 native ASCII 제목은 기존6개 고정 모델 문구를 바이트로 비교한다.영문자만 대소문자를 접으며 gpt-의하이픈과 sonnet/opus/haiku의끝공백은 정확한byte로 확인한다.기존 단어 배열은 그대로이며4KiB초과·Unicode·foreign은 기존 Foundation fallback을 따른다.소문자 변환 문자열과6회의 Foundation 탐색을 줄였다.그 밖의 모델/허용/거절·유일답변·현재모델유지·일반선택지수동정책과 기존 prefixguard·캐시·저장/통신형식은 바꾸지 않았다.새상태·캐시·타이머·서비스는 없다.
+- 동일한188,790문자열에서 역사적Foundation·직전ASCII·새바이트 탐색의Boolean과입력UTF8/UTF16·저장상태를 대조했다.기존ASCII쌍131,072·대소문자648·제어문자삽입29,952·난수4,096·289scalar삽입22,542·길이경계192·손상UTF16 288건을 유지했다.세 함수구간과 단어표는 SHA로 고정했다.별도 source검사의foreign관측은6273개이며 실제Core검사라 주장하지 않는다.
+- 각 실제Core에는 같은188,790건을 공개 현재모델선택API로도 넣어 기대한정확한응답/kind/원문제목 또는nil을 확인했다.기존64,556허용메뉴·4,096typed/512JSON·4,096알림상태·2,048후보·32손상문자열·190캐시수명도 일치했다.후보451/451,정책1,204/quiet70/그룹4·전체payload·양쪽16smoke·공개명령의두Core연결·채택후Root기본fixture/상대import가 통과했다.공개검사에서는 원본reference-source-root와 직전baseline-source-root의검증대상을 구분해 역사적원본SHA고정과현재baseline검사를 함께 유지했다.변경없는baseline기능결과는과거Root4개를archive로정상화하고 현재448소스/94객체/4바이너리/worker SHA를 확인해 재사용했다.새baseline실행이라 주장하지 않는다.정렬원본1,201,995건의기존SHA도 유지했다.제품/성능/공개검사deadline은 바꾸지 않았다.
+- 새A/A48/48·A/B48/48,각16프로세스·8쌍·4epoch·16경로·1024구간·실제API161,792호출이다.자동ON 전체Engine갱신 명령어 비율은 **0.313552(68.6% 감소)**로 사전30%목표를 지켰다.나머지15개제어와메모리상한도통과했다.최대제어비율은readable32-empty=1.003453다.CPU·시간·cycles는진단용이며 앱전체·실물폰/LAN/VPN/SentinelOne개선율이아니고 이전39.9%와합산하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.999036 |
+| steady32-unique | 1.002996 |
+| steady96-unique | 0.996029 |
+| steady19-shared | 0.999577 |
+| steady32-shared | 1.003317 |
+| changed-cwd19 | 0.986048 |
+| empty | 1.002503 |
+| single | 0.997440 |
+| manual19-full | 1.001343 |
+| manual32-partial | 1.003254 |
+| readable32-empty | 1.003453 |
+| readable19-manual | 0.999445 |
+| unreadable19-manual | 0.998611 |
+| readable32-multi | 0.996735 |
+| readable19-fresh-storage | 0.998088 |
+| readable19-auto | 0.313552 |
+
+- 16경로×16합성엔진 worker의유지힙max차이는-7908~-7400바이트,RSSmax차이는94208~98304바이트다.실제앱/단일엔진절감량이아니다.raw App/CLI/checks/TTY차이는208/224/208/0바이트며 최종서명DMG크기는아직검사하지않았다.
+- 권위상태는448입력·94Core·4바이너리·모듈564f5877f70303a3e2b9ade8c2ea8a31c8d5125abdf6819200d2343b9580d6c5,전체코드정체성dd9c374baa1949e86387b4c6d5504cc62df6ee83b2cf05a9270662c7f48e9a1f,retained-native-model-word-bytes-build/source630파일이다.모듈SHA의직전과동일여부는true이며 모듈만으로판정하지않고94객체와4바이너리를함께고정했다.공개451입력·명시61파일·HEAD390입력preflight와Root/canonical/보관SHA감사가통과했고qualification lock은없다.채택후두경로의새프로파일링도끝났고모든worker/sampler는종료0이다.자료:.runtime/performance/post-native-model-word-bytes-publication-profile-179-20261025/profile.json.
+- 사용자의 비트 통신 제안도 조사했다. 화면 차이 비교는 이미64비트 단위이고 UTF8→UTF16 길이 계산에는8바이트 SWAR 마스크와 popcount를 쓴다. 다음 후보로 필드 존재 비트마스크·자료형 태그·가변길이 정수 및 정확한 대소문자를 지키는 UUID/hex/RGB 이진 표현의 검증용 코덱을 만들었다. 모든 전송 객체 필드를 복원하며 기존 JSON 데이터와 의미가 같음을 비교했다. 실제 제품 통신 형식은 바꾸지 않았다.
+- 최초 두 payload 실험의 SHA 리비전/고정 스트림 이름은 실제 엔진의 UUID 생성 규칙과 달랐다. 수치와 소스는 보존하고 scope-qualification.json에 한계를 남겼다. 실제 ApprovalEngine의 UUID 리비전/스트림 토큰, 커서·화면·속성 변경에 따른 리비전 교체와 nonzero sequence를 반영해4개의 새 emitter에서9종×64프레임,총2,304개를 다시 생성했다. RemoteTerminalUpdate는 현재 소스의 구조체 이름만 바꾼 대조본이며 패치/복사는 실제Core를 사용한다. 압축도 실제Core의 level1과 매프레임 Z_SYNC_FLUSH·사전 유지 조건으로 양쪽을 비교했다.
+- 수정한 payload 실험의 원본 터미널 활동4종 압축 본문 비율은 **0.697707(30.2% 감소)**였다. 커서 이동36.1%·추가 출력34.4%·스크롤10.6%·색상 갱신36.8% 감소하며9종 모두 사전≤1.05상한을 지켰다. 모든 필드/리비전 복원과297개 경계값,한 프레임의 잘린21개 접두어 검사가 통과했다. 실제 네트워크/브라우저/점진적TCP 파서/재연결 또는CPU 지연 검증은 아니다. 서버·브라우저 코덱 구현과 구버전SSE 협상·부분수신·재접속·복구 검증이 남았다.자료:.runtime/performance/bit-frame-uuid-study-179-20261025/report.json.
+- 0.2.179/206을다시올리지않았다.새일치서명패키지·3종패키지검사·DMG/체크섬·61파일소스commit/tag/push·GitHub451입력자산/다운로드검증이남았다.기존서명키체인/search-list임시변경허용과앱교체/재시작예외는미응답이다.오래된unsigned179를배포/설치하거나같은실패서명을반복하지않았다.설치앱·원본터미널/화면/입력/잠금·실제전원·관리자/시스템/보안/TCC/VPN·키체인/상주서비스는바꾸지않았고덮개문제도해결했다고주장하지않는다.기존IDE/인덱스/다른fixture를보존했다.이번완료검사를변경없이반복하지않는다.
+
+## 2026-10-25 · 단순 옵션의 불가능한 허용 접두어 조기 제외 · 자동 ON 39.9% 감소 · 48기준 통과
+
+- 직전 덮개 확인은 경량화의 새 진전이 아니었다.이번은 소스·검증 빌드를 실제 반영한 progress다.이전 후보의450/451실패는 그대로 보존했다.양쪽 실제Core에서 전송 콜백 진입과 엔진의 전송확인 처리를 의도적으로 분리해 테스트의 선행조건 차이를 확인했다.테스트는 같은3초 상한과 기대입력을 유지한 채 전송확인 완료를 기다리도록 강화했으며 새 전체451을 통과했다.전체 경량화 목표는 active이며 이 결과만으로 완료하지 않는다.직전 bede9f Core의 새 자동 ON 프로파일에서 YesNoConfirmation.singleApprovalIndex의 반복 허용·거절 정규식 비용을 확인한 뒤 새 알고리즘을 검증했다.
+- native ASCII4KiB이하 옵션 중 지원되는 허용/거절 표현으로 시작할 수 없는 단순 문자열만 원래의nil을 일찍 반환한다.조기 승인은 하지 않는다.기존 isUnchangedASCII와 공백 부재를 확인하므로 C a n c e l 같은 압축 alias·괄호/대괄호 hint·구두점 정리·Unicode/foreign·긴 label은 원본 전체 parser를 따른다.알려진/모호한 접두어는 전체 판정을 유지한다.기존 정규화·정규식·범위 선택 본문은 그대로이며 새 문자열 복사·캐시·지속 상태·타이머·서비스·저장/통신 필드는 없다.
+- 원본/후보 YesNoConfirmation 전체 소스를 SHA로 고정해64,556메뉴의 index와 전체 응답,모든 사례의 실제 연결 Core 결과를 대조했다.UTF8/UTF16과 입력 저장 상태도 유지했다.앞/뒤ASCII쌍32,768·ASCII삽입14,592·hint/대소문자/공백압축/description/순서2,560·289scalar삽입12,716·옵션이름1,600·길이경계128·손상UTF16 192건이다.별도 source oracle의 foreign 관측은3858개이며,Core빌드 전 source oracle와 실제 양쪽 Core에 연결한 공개 fixture에서 실행했다.반복 허용·현재 요청 우선·세션 한정·하나의 거절·중복 응답·description·한글·compact alias가 포함된다.
+- 기존188,790모델 문자열·4,096typed/512JSON판정·4,096알림 상태·2,048후보·32손상문자열·190수명도 일치했다.후보 Release451/451,정책1,204·quiet70·그룹4·전체payload 바이트·양쪽16smoke·공개 재현 및 채택 후 실제Root 기본fixture/상대import가 통과했다.변경 없는 baseline 기능 결과는 archive의 과거Root3개를 정상화하고 전체 기록·현재448소스/94객체/4바이너리/worker SHA로 확인해 재사용했다.새 baseline 실행이라 주장하지 않는다.코드가 같은 정렬1,201,995건의 이전SHA는 유지했다.공개 합성 corpus 실행기만 늘어난 입력을 위해120s에서240s로 바꿨고 제품/성능 제한은 바꾸지 않았다.
+- 새 A/A48/48·A/B48/48,각16프로세스·8쌍·4epoch·16경로·1024구간·실제API161,792호출이다.자동 ON 전체 Engine 갱신 명령어 비율은 **0.601473(39.9% 감소)**로 사전30%목표를 지켰다.다른15개 제어와 메모리 상한도 통과했고 최대 제어 비율은 single=1.005645다.CPU·시간·cycles는 진단용이며 앱 전체·실물폰/LAN/VPN/SentinelOne 개선율이 아니고 이전60.7%와 합산하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 1.004396 |
+| steady32-unique | 1.004260 |
+| steady96-unique | 1.003970 |
+| steady19-shared | 1.002728 |
+| steady32-shared | 1.003210 |
+| changed-cwd19 | 1.002058 |
+| empty | 1.002522 |
+| single | 1.005645 |
+| manual19-full | 0.999638 |
+| manual32-partial | 1.003964 |
+| readable32-empty | 1.003065 |
+| readable19-manual | 1.003290 |
+| unreadable19-manual | 1.004907 |
+| readable32-multi | 0.998038 |
+| readable19-fresh-storage | 1.003791 |
+| readable19-auto | 0.601473 |
+
+- 16경로×16합성 엔진 worker의 유지 힙 max 차이는 -608200~-595120바이트,RSS max 차이는 -544768~-528384바이트다.실제 앱/단일 엔진의 절감량이 아니다.raw App/CLI/checks/TTY 크기 차이는 224/224/240/0바이트며 최종 서명DMG 크기는 아직 검사하지 않았다.
+- 권위 상태는448입력·94Core·4바이너리·모듈 564f5877f70303a3e2b9ade8c2ea8a31c8d5125abdf6819200d2343b9580d6c5,전체94객체+4바이너리 정체성 66f3bfcb3c0baf9a4c504fd9bfa74961a7ac933ddc25b3c833dab94f8efcdf75,retained-plain-permission-confirmed-build/source630파일이다.직전과 모듈SHA가 같을 수 있으므로 모듈만으로 재사용/판정하지 않는다.공개451입력·명시61파일·HEAD390입력 preflight와 Root/canonical/보관 SHA 감사가 통과했다.qualification lock이 없고 IDE/인덱스/다른fixture는 보존했다.채택 뒤 두 경로의 새 프로파일링도 완료했고 모든 worker/sampler가 종료0이다.자료: .runtime/performance/post-plain-permission-confirmed-publication-profile-179-20261025/profile.json.
+- 새 자동ON 프로파일의 포함 스택 관측은 publish901·질문조정761·mentionsModel760이며,짧은 ASCII 분기 안의 StringProtocol.contains가 여전히 Foundation 부분문자열 탐색으로 들어간다.수동 경로에는 publish609·updateInboxes171 및 후보 Set 삽입/증가 비용이 보였다.서로 포함하는 스택이므로 합산하거나 CPU비율로 해석하지 않는다.다음은 자동ON에서 기존6개 modelWords(하이픈과 끝 공백 포함)를 보존하는 native ASCII 바이트 탐색을 조사한다.현재 문구 목록이나 Unicode/foreign/긴 문자열의 원본 fallback을 바꾸지 않는다.
+- 0.2.179/206은 다시 올리지 않았다.새 일치 서명 패키지·3종 패키지 검사·DMG/체크섬·61파일 소스commit/tag/push·GitHub451입력 자산/다운로드 검증이 남았다.기존 키체인/search-list 임시 변경 허용과 앱 교체/재시작 예외는 미응답이다.old unsigned179 bundle은 stale이며 배포/설치하거나 같은 실패 서명을 다시 시도하지 않았다.설치 앱·원본 터미널/화면/입력/잠금·전원·관리자/시스템/보안/TCC/VPN·키체인/상주 서비스는 바꾸지 않았고 덮개 문제도 해결했다고 주장하지 않는다.이번451·64,556메뉴/188,790문자열/4,608판정/4,096상태/2,048후보/190수명·1,204정책·공개 재현·48기준 A/A/A/B는 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 제한된 ASCII 모델 문구 검색 채택 · 자동 ON 60.7% 감소 · 48기준 통과
+
+- 직전 typed 질문 경로 채택은 실제 소스/검증 빌드를 바꾼 progress였으며 이번도 새 Core와 공개 검사 반영을 마친 progress다.전체 경량화 목표는 active로 유지한다.직전80d Core의 새 자동 ON 프로파일에서 mentionsModel 내부6개 Foundation case-insensitive 검색이 큰 inclusive stack으로 남는 것을 확인한 뒤 새 알고리즘을 검증했다.
+- native 연속 UTF8이고 전체 바이트가ASCII인4KiB이하 제목은 소문자 변환 한 번 뒤 literal 검색을 사용한다.외부 저장 문자열·비ASCII·긴 제목은 기존 Foundation 식을 그대로 실행한다.임시 folded 문자열만 최대4KiB이며 새 캐시·지속 상태·타이머·서비스·통신/저장 필드는 없다.단어 목록과 다른 모델/허용/거절/유일 답변 규칙,일반 질문 수동 처리,현재 모델 유지 정책은 바꾸지 않았다.
+- 원본/후보 함수 구간과 단어 목록을 SHA로 고정한188,790문자열의 Boolean·입력 UTF8/UTF16·저장 상태가 일치했다.ASCII쌍131,072·대소문자648·제어문자 삽입29,952·난수4,096·289scalar 삽입22,542·길이 경계192·손상 UTF16 288개다.foreign 입력 관측은별도 source oracle에서6,273개였다.처음 준비한 count 상수는 삽입 위치40개를 손으로 잘못 세어,어떤 검사/빌드/성능 실행 전 실제39개로 계산해 고쳤다.preparation-v1과 원인/해시를 보존했으며 루프·입력·제품 알고리즘·성능 기준은 바꾸지 않았다.
+- 먼저 별도 source oracle를 실제 실행했고,이후 두 실제 Core에 연결한 공개 fixture에서도 같은188,790건을 실행했다.기존4,096typed·512JSON판정·4,096알림 상태·2,048후보·32손상 문자열·190캐시 수명도 일치했다.후보 Release451/451,정책1,204·quiet70·그룹4·전체 payload바이트·양쪽16 smoke·공개 명령이 통과했다.변경 없는80d baseline 기능 결과는 archive의 과거Root4개를 정상화하고 원본 기록의 전체 입력 및 현재448소스/94객체/4바이너리/worker SHA를 확인해 재사용했다.새 baseline검사라고 주장하지 않는다.코드가 같은 정렬 oracle1,201,995건은 이전SHA를 유지했다.
+- 새 A/A48/48·A/B48/48,각16프로세스·8쌍·4epoch·16경로·1024구간·실제API161,792호출이다.자동 ON 전체 Engine 갱신의 명령어 비율은 **0.392959(60.7% 감소)**로 사전30%목표를 지켰다.15개 제어와 메모리 상한도 통과했고 가장 큰 제어 비율은 manual32-partial=1.010597다.CPU·시간·cycles는 진단용이며 앱 전체·실물폰/LAN/VPN/SentinelOne 개선율이 아니다.이전61.6%와 합산하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 1.001583 |
+| steady32-unique | 1.004245 |
+| steady96-unique | 0.999223 |
+| steady19-shared | 1.003321 |
+| steady32-shared | 1.004959 |
+| changed-cwd19 | 0.996629 |
+| empty | 0.993681 |
+| single | 0.994259 |
+| manual19-full | 1.006446 |
+| manual32-partial | 1.010597 |
+| readable32-empty | 1.003804 |
+| readable19-manual | 0.999211 |
+| unreadable19-manual | 0.999565 |
+| readable32-multi | 1.000343 |
+| readable19-fresh-storage | 0.995166 |
+| readable19-auto | 0.392959 |
+
+- 16경로×16합성 엔진 worker의 유지 힙 max 차이는 16372~21172바이트,RSS max 차이는 172032~188416바이트다.실제 앱/단일 엔진의 절감량이 아니다.raw App/CLI/checks/TTY의 크기 차이는 -32/-32/-32/0바이트며 최종 서명 DMG 크기는 아직 확인하지 않았다.
+- 권위 상태는448입력·94Core·4바이너리·모듈 80d939a4788c24f7125f4c2c5cabfc7d761dc5ad56186983253d69621404a9d5,retained-ascii-model-words-build/source630파일이다.이번 모듈SHA는 직전과 같으므로 단독 식별자로 쓰지 않는다.전체94객체+4바이너리 정체성은 bede9f06d7670f7566ca2d4ed06e834d15b11e63b26f04b5887869221866d1cc로 직전 447c9f5d501e4d61d8e1301a1c9e0e3fc22c7bf05f6eb1a641c87f19aa7386ee와 다르며 모든 개별 SHA도 확인한다.공개451입력·명시60파일·변하지 않은 HEAD391입력 preflight와 Root/canonical/보관 SHA 감사가 통과했다.qualification lock은 없고 무관한 IDE/인덱스/fixture는 보존했다.채택 후 새 Core의 자동 ON/수동 두 경로 프로파일링도 완료했으며 모든 worker/sampler가 종료0이다.자동 ON의 inclusive stack에는 YesNoConfirmation.singleApprovalIndex의 반복 허용/거절 정규식이 크게 남으며 이는 CPU%가 아니다.다음은 단순 ASCII 옵션의 지원 불가능한 접두어를 일찍 거르는 방법을 조사한다.공백이 삽입된 C a n c e l 등은 기존 permissionLabel의 압축으로 유효해지므로,공백·힌트·정규화가 없는 입력만 shortcut 대상으로 검증해야 한다.자료: .runtime/performance/post-ascii-model-words-publication-profile-179-20261025/profile.json.
+- 0.2.179/206은 다시 올리지 않았다.새 일치 서명 패키지·3종 패키지 검사·DMG/체크섬·60파일 소스 commit/tag/push·GitHub451입력 자산/다운로드 검증이 남았다.서명 키체인/search-list 임시 변경 허용과 설치 앱 교체/재시작 예외는 미응답이다.old unsigned179 bundle은 stale이며 배포/설치하거나 같은 실패 서명을 다시 시도하지 않았다.설치 앱·원본 터미널/화면/입력/잠금·전원·관리자/시스템/보안/TCC/VPN·키체인/상주 서비스는 바꾸지 않았고 덮개 문제도 해결했다고 주장하지 않는다.이번451·188,790문자열/4,608판정/4,096상태/2,048후보/190수명·1,204정책·공개 재현·48기준 A/A/A/B는 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 구조화 질문 직접 판정·중복 모델 문구 검사 제거 · 자동 ON 61.6% 감소 · 48기준 통과
+
+- 직전 덮개 응답은 읽기 전용 진단으로 경량화 목표의 진전은 없었다.이번은 실제 제품 소스2개와 기존 공개 검사2개 및 일치하는 검증 빌드를 채택한 progress다.전체 경량화 목표는 active이며 완료로 축소하지 않는다.
+- 직전 cardinality/own-flag 후보는 A/A48/48·A/B44/48이었다.일반 질문5.8~6.8%,자동 ON0.1% 감소로 네10%기준을 못 지켜 미채택으로 닫았다.이번에는 그 후보의 소스/수치/기준을 재사용하지 않았다.현재5521 Core와 새16경로 observer의 자동 ON 전체 refreshNotices를2초·1ms로 프로파일링해 세 경로에서 반복된 mentionsModel 비용을 확인했다.공통 선행 조건이 false일 때 같은 검사를 한 번만 하며,typed 질문을 JSONObject로 변환했다가 다시 읽는 경로도 제거한다.기존 모델·허용·거절·유일한 답변 판정 함수는 그대로 공유한다.
+- 새 캐시·저장 상태·타이머·상주 서비스·네트워크/저장 필드는 없다.일반 선택 질문은 계속 수동이며 명시된 현재 모델만 유지한다.훅의 기존 answers·질문 수·자료형·multiSelect 검증은 유지한다.부모 상속·실제 입력 권한·알림 packed 캐시·키·정렬은 바꾸지 않았다.
+- 원본 두 판정 파일 전체 소스를 SHA에 결합한 reference와 실제 양쪽 Core에서4,096typed·512JSON 입력의 종류·응답 UTF8/UTF16 및 caller 저장 공간이 일치했다.외부 문자열 관측은 빌드당3,584개다.한글 NFC/NFD·잘못된 UTF16·빈/단일 선택·중복 label·선택지/description 범위·기존 답변·오류 자료형·다중 선택·모델 변경/현재 모델을 포함한다.기존4,096알림 상태·2,048후보·32손상 문자열·190캐시 수명도 일치했다.검사기 실행 중 파일을 수정한 실수는 source SHA guard가 거부했고 oracle-run1-interrupted에13개 산출물/원인을 보존했다.고정된 최종 검사기로 다시 통과했으며 제품/fixture/성능 기준을 바꾸지 않았다.
+- 후보 Release451/451,정책1,204·quiet70·그룹4·전체 현재 payload 바이트 비교 및 양쪽16경로 smoke가 통과했다.변경 없는 baseline16경로 worker/정책 결과는1,118입력·모듈·94객체·4바이너리·worker SHA를 확인해 재사용했으며 새 실행이라고 주장하지 않는다.정렬1,201,995건도 코드가 같아 이전 SHA를 유지했다.확장 공개 명령은 private candidate와 채택 후 실제 Root 기본 fixture/상대 import에서 모두 실행했다.
+- 사전30% 감소 목표의 자동 ON 명령어 비율은 **0.383775(61.6% 감소)**다.새 A/A48/48·A/B48/48이며 각각16프로세스·8쌍·4epoch·16경로·1024구간·실제API161,792호출이다.다른15개 제어는5%상한을 지켰고 최대 비율은 empty=1.006863다.기존 메모리 상한도 모두 통과했다.CPU·경과·cycles는 진단용이며 앱 전체·폰/LAN/VPN/SentinelOne 개선율이 아니고 이전 개선율과 합산하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.999951 |
+| steady32-unique | 1.000182 |
+| steady96-unique | 0.998273 |
+| steady19-shared | 0.999784 |
+| steady32-shared | 1.001206 |
+| changed-cwd19 | 0.997838 |
+| empty | 1.006863 |
+| single | 1.003587 |
+| manual19-full | 1.006527 |
+| manual32-partial | 1.002848 |
+| readable32-empty | 1.000829 |
+| readable19-manual | 0.998643 |
+| unreadable19-manual | 0.999127 |
+| readable32-multi | 1.000114 |
+| readable19-fresh-storage | 0.999622 |
+| readable19-auto | 0.383775 |
+
+- 16경로×16합성 엔진을 가진 worker의 유지 힙 max 차이는 20920~25096바이트,RSS max 차이는 32768~61440바이트다.이는 실제 앱/단일 엔진의 절감량이 아니다.raw App/CLI/checks/TTY 크기 차이는 64/48/48/0바이트며 최종 서명 DMG는 아직 검사하지 않았다.
+- 권위 상태는448입력·94Core·4바이너리·모듈 80d939a4788c24f7125f4c2c5cabfc7d761dc5ad56186983253d69621404a9d5,retained-typed-question-decision-build/source630파일이다.공개451입력·명시60파일·변하지 않은 HEAD391입력 preflight와 Root/canonical/보관 SHA 감사가 통과했다.qualification lock이 없으며 IDE/인덱스/다른 fixture는 보존했다.채택 뒤 자동 ON/수동 두 경로의 새 프로파일링도 완료했고 모든 worker/sampler가 종료0이다.자동 ON에는 한 번으로 줄인 mentionsModel 안의6개 Foundation case-insensitive 검색과 YesNoConfirmation.singleApprovalIndex 정규식 비용이 남는다.수동 경로에는 inbox 수집·effectiveAutomatic·기존 순서 검사가 보인다.이는 inclusive stack 관측이며 CPU%가 아니다.다음은 ASCII 제목의 모델 문구 검색을 더 저렴하게 할 수 있는지 조사하되 비ASCII는 기존 case-fold 의미를 유지하고 원본 전체 바이트/정책 대조를 먼저 확장한다.자료: .runtime/performance/post-typed-question-decision-publication-profile-179-20261025/profile.json.
+- 0.2.179/206을 다시 올리지 않았다.일치하는 새 서명 패키지·3종 패키지 검사·DMG/체크섬·60파일 소스 commit/tag/push·GitHub451입력 자산/다운로드 검증이 남았다.기존 키체인/search-list 임시 변경 허용과 앱 교체·재시작 예외는 미응답이다.old unsigned179 bundle은 stale이며 배포/설치하거나 변경 없는 실패 서명을 재시도하지 않았다.설치 앱·원본 터미널/화면/입력/잠금·실제 전원·관리자/시스템/보안/TCC/VPN·키체인/상주 서비스는 바꾸지 않았고 덮개 문제도 해결했다고 주장하지 않는다.이번451·4,608결정/4,096상태/2,048후보/190수명·1,204정책·공개 재현·A/A/A/B는 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 알림 키 압축 보관 채택 · 12.2~21.5% 명령어 감소 · 45기준 통과
+
+- 직전 formatter 후보는 실제 측정으로 미채택을 결정해 다음 행동을 바꾼 progress였다. 이번은 제품 소스4개와 일치하는 검증 바이너리를 실제 채택한 progress다. 전체 경량화 목표active이며 결과를 현재 작업만으로 축소하거나 완료로 표시하지 않는다.
+- Engine의 짧은 native UTF8 알림 식별자를 최대96개 재사용한다. 고정 바이트 표본·길이·kind로128바이트 버킷을 조회하고,적중은 kind와 전체 원문 바이트를 다시 비교한다. 기존 `SessionNotice.key`·전역 `PromptDetector.fingerprint`의 Data(rawUTF8)+CryptoKit SHA256과 출력은 그대로다. 긴/외부 문자열·미적중·상한 도달은 기존 계산 경로를 사용한다. 원본 String은 보관하지 않고 최대24,576논리 바이트를 별도 소유 버퍼에 복사하며 항목에는 offset·length·고정 길이 SHA 키만 둔다.
+- 매 동기 갱신에서 사용하지 않은 항목과 원문 바이트를 안정 순서로 압축하고 과하게 남은 버퍼를 줄인다. 빈 상태·단일/전체 초기화·종료 시 캐시 공간을 해제한다. 캐시는 재사용할 계산 결과만 가지며 예약/승인/단일사용 receipt는 갖지 않는다. 일반 선택 질문·자동 승인·시스템 변경 경고·오류 재개·읽음·재발생·정렬·저장/네트워크 필드는 바꾸지 않고 새 타이머/서비스도 없다.
+- 이전48상한·전체 바이트 해시 후보는 원본 상태·정책·전체451을 통과했으나 A/A42/42·A/B40/42였다. 일반19질문 감소9.88%가10%목표에 못 미쳤고96질문은6.35%증가해 닫았다. 주소 힌트 후보는 동일 값이 새 저장 공간에 들어오는 소스 경로를 확인해 성능 실행 전에 닫았다. String을 직접 가진 표본 후보는451·정책·184단계 상태 검사는 통과했지만 원본의 큰 용량을 유지할 가능성을 없애기 위해 새 성능 측정 전에 닫고 소유 바이트 형태로 바꿨다. 실패한 formatter/48/전역 지문을 재채점하거나 기준을 완화하지 않았다. 준비기 들여쓰기 assertion 수정은 Root/canonical 변경 전에 끝났고 초기48 검사기의 존재 조건 실패와 진단도 보존했다.
+- 최종 실제 두 Core에서 소스에 결합한 **알림 상태4,096단계·후보2,048건·손상 문자열32건·Engine 수명190단계**가 일치했다. 기존 full private/public UTF8/UTF16·저장 바이트/codec oracle는 유지한다. 새 수명 검사는 게시 전 private inbox 키를 원본 reference와 비교하고99현재 질문·96상한·패킹 범위/빈 공간 제거·큰 원본 용량·0/7/8/255/256/257바이트·의도적 표본 충돌·동일ID 질문/완료·동일 값 새 저장 공간·대량 교체·읽음/복원·단일/전체 초기화·빈 상태/종료를 확인한다. 새 Engine cross-process trace에서 실제 wall clock 및 무관한 과거 게시 이력만 제외하며,기존4,096단계 전체 상태 oracle나 별도의 API 전체 필드 비교를 대신하지 않는다.
+- 후보 Release **451/451 · 258.075초**,정책1,204·quiet70·그룹4·전체 현재 출력 비교와 양측15경로 smoke가 통과했다. 변경 없는15경로 baseline worker/정책 결과는 전체 소스·모듈·94객체·4바이너리·worker/hash를 확인해 재사용했으며 재실행했다고 주장하지 않는다. 정렬 oracle1,201,995건도 정렬 코드가 같아 SHA를 보존했다. 공개 `scripts/inbox-candidates-check.mjs`를 후보 fixture로 실행하고 채택 후 실제 Root 기본 fixture/상대 import로도 실행했다.
+- 새 **A/A45/45·A/B45/45**. 각각16프로세스·8쌍·4epoch·15모드·960구간·실제API157,696호출이며 모드별16개의 독립 합성 엔진과 기본 해시 무작위화를 유지한다. 일반19질문12.2%,읽기실패19질문12.7%,32세션×3질문21.5% 명령어가 줄었다. 같은 식별자가 새 저장 공간에 오는 제어도7.6% 줄었고,그 반복은 updateCodexQuestions+refreshNotices 두 호출을 모두 센다. 나머지12경로와 RSS/유지 힙 상한도 통과했다. changed-cwd 제어는1.08%,빈 제어는0.32%늘었으며5%상한 안이다. 이전 최적화와 비율을 합산하거나 CPU/경과/cycles를 앱 전체·실물폰/LAN/VPN/SentinelOne 개선율로 해석하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 1.000028 |
+| steady32-unique | 0.998330 |
+| steady96-unique | 0.996976 |
+| steady19-shared | 1.000255 |
+| steady32-shared | 0.998247 |
+| changed-cwd19 | 1.010759 |
+| empty | 1.003208 |
+| single | 0.999782 |
+| manual19-full | 0.997571 |
+| manual32-partial | 1.001206 |
+| readable32-empty | 0.998183 |
+| readable19-manual | 0.877529 |
+| unreadable19-manual | 0.873386 |
+| readable32-multi | 0.784546 |
+| readable19-fresh-storage | 0.924262 |
+
+- 15모드×16엔진을 동시에 가진 worker의 유지 힙 max 차이는 **-111528~-98408바이트**,RSS max 차이는 **+36864~+49152바이트**다. 모든 메모리 상한을 지켰다. 힙 감소와 RSS 증가를 모두 보존하며 앱 전체나 한 Engine의 메모리 절감으로 주장하지 않는다. 패키징 전 raw App/CLI 실행 파일은25,424/41,952바이트,checks는25,472바이트 늘었고 TTYService는 같다. 최종 서명 DMG 크기는 아직 검증하지 않았다.
+- 권위 상태는 **448입력·94Core·4바이너리·모듈 552106096f033beddb05d5316a1feb804083fad8376658a7f4571090fa2da20d**, `retained-notice-key-packed-build/source` **630파일**이다. 공개451입력·명시58파일·변하지 않은 HEAD393입력 사전 검사와 현재 Root/canonical/보관본/전체 객체/바이너리 SHA 감사가 통과했다. 새 공개 파일은0개이며 기존 공개 fixture를 확장했다. qualification lock은 없고 무관한 IDE/인덱스/fixture 변경은 보존했다.
+- 채택한5521 Core의 다섯 경로를 각2초·1ms로 새 프로파일링했다. 실제API **84,992호출**,모든 sampler/worker 종료0이다. 일반19질문·32×3·readable32-empty·96반복·동일 값 새 저장 공간을 포함하며 이 마지막 경우 두 API를 센다. inclusive stack 관측은 CPU%나 새 채택 기준이 아니다. 일반/새 저장 공간 profile에 `updateInboxes`,`effectiveAutomatic`의 반복 딕셔너리 조회가 남고96반복에는 현재 순서 검증이 보인다. 소스 확인상 `effectiveAutomatic`에는 이미 부모가 없는 경로의 빠른 반환이 있어 이를 다시 만들지 않는다. 다음은 현재 session을 이미 가진 루프의 중복 재조회나 snapshot/order 비교를 조사하되 부모 상속/종료/순환 및 승인 정책을 원본과 대조하고 고정된 실제 전체 API 기준으로 판단한다. 자료는 `.runtime/performance/post-notice-key-packed-publication-profile-179-20261025/profile.json`에 있다.
+
+- 버전0.2.179/206은 다시 올리지 않았다. 채택 전 GitHub main=HEAD·179태그 없음·최신178을 확인했다. 현재 소스와 맞는 새 서명 패키지가 없고 기존 서명 키체인/search-list 임시 변경 허용 및 앱 설치·재시작 예외는 미응답이다. 일치 서명 패키지·3종 패키지 검사·DMG/체크섬·58파일 소스 commit/tag/push·451입력 GitHub 릴리스/자산/다운로드 검증이 남았다. old unsigned179 bundle은 stale이므로 배포/설치하거나 변경 없는 실패 서명을 재시도하지 않는다. 실제 설치 앱·원본 터미널/화면/입력/잠금·전원/관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스는 바꾸지 않았고 덮개 문제도 미해결이다. 이번451·190/4,096/2,048 oracle·1,204 API·공개 재현·45기준 A/A/A/B와 새 profile을 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 48개 알림 키 재사용 후보 미채택
+
+- 실제 Core의4,096알림 상태·2,048후보·32손상 문자열·174단계 Engine 수명·후보 정책1,204·quiet70·그룹4·14 smoke·전체451/451을 통과했다. 최초 검사기의 존재 조건 오류와 진단 기록은 보관했고,제품 Core/기준을 바꾸지 않고 검사기만 수정한 뒤 성능을 측정했다.
+
+- 새 A/A42/42·A/B40/42,각16프로세스·8쌍·4epoch·14모드·896구간·전체API153,600호출이다. 일반19질문 비율0.901242가10%감소 목표에 못 미쳤고,96질문 비율1.063470는6.35%증가했다. 읽기실패19질문은0.898310다.48상한에 걸린 미적중에도 바이트 해시/조회 비용을 내는 후보는 채택하지 않았다. 임계값/표본을 바꾸거나 같은 후보를 재채점하지 않았다.
+
+- 모든 RSS/힙 상한은 통과했다. 세 질문 workload를 동시에 가진16엔진 ensemble의 유지 힙 max 차이는-106,852~-118,016바이트다. 캐시 결과와 active/게시 알림이 키 저장 공간을 공유할 수 있으므로,새96상한·저렴한 조회 힌트 알고리즘을 같은 메모리 기준으로 시험할 근거가 생겼다. 이 수치를 앱 전체나 엔진 하나의 메모리 절감으로 주장하지 않는다.
+
+- Root/canonical/retained는448입력·94Core·4바이너리·630보관 파일·CCD 모듈의 기존 채택본을 유지한다. 새 제품/fixture·버전·GitHub·설치 앱·원본 터미널/화면/입력/잠금·실제 전원·시스템/보안/TCC/VPN·키체인·상주 서비스는 바꾸지 않았다. 서명/설치 예외 미응답과 덮개 미해결도 그대로다. 전체 경량화 목표active이며 다음은 pointer를 정확성 근거가 아닌 조회 힌트로만 쓰고 원문 바이트를 항상 재검사하는 새 후보를 고정 기준으로 검증한다. 기록은 `.runtime/performance/notice-key-reuse-179-20261025/decision.json`이다.
+
+## 2026-10-25 · 알림 키 문자열 할당 후보 미채택
+
+- 기존 Data(raw UTF8)+CryptoKit SHA256과 전역 지문 함수는 유지하고,접두사+hex를 최종 문자열 버퍼에 직접 쓰는 후보를 별도로 만들었다. 실제 두 Core에서 알림 키1,552건·상태4,096단계·후보2,048건·손상 문자열32건의 원문/상태/저장 결과가 일치했다. 후보의 정책1,204·quiet70·그룹4·14경로 smoke와451/451 전체 검사가 통과했다. 변경 없는 baseline 정책 결과는448입력·94객체·4바이너리 및 worker SHA를 검증해 재사용했으며 새로 실행했다고 주장하지 않는다.
+
+- 새 A/A42/42·A/B39/42다. 각각16프로세스·8쌍·4epoch·14경로·896구간·전체 API153,600호출을 유지했다. 질문 경로의 명령어 감소2.3~5.0%가 사전10% 목표3개에 못 미쳤다. 나머지11경로·RSS·유지 힙은 상한을 지켰다. 기준/표본을 바꾸거나 재채점하지 않고 후보를 닫았다. CPU·경과 시간·cycles는 진단용이며 전체 앱/폰/LAN 개선율이 아니다.
+
+| 전체 갱신 경로 | 후보/기존 명령어 비율 |
+| --- | ---: |
+| readable19-manual | 0.977349 |
+| unreadable19-manual | 0.976182 |
+| readable32-multi | 0.949947 |
+
+- Root 제품·canonical·retained 검증본은448입력·94Core·4바이너리·모듈 `ccd6152e24d798068727941bb274ba4d25a1814cbe99c9d59aede7ae087048ca`를 유지한다.630보관 파일의 SHA도 확인했고 qualification lock은 없다. 후보 helper·확장 fixture는 private 실험에만 있으며 새 공개 파일/패키지를 채택하지 않았다. 기존451입력 공개·58파일 whitelist·서명/설치 대기 상태도 그대로다. 기록은 `.runtime/performance/fused-notice-key-179-20261025/decision.json`이다.
+
+- 덮개 요청은 아직 해결하지 못했다. 이번에 설치본0.2.168이 실행 중임을 다시 확인했다. 배포된0.2.178에는 앱/guard의 명시적 sleepnow가 제거돼 있으나,이를 일반 앱 API만으로 덮개 강제 잠자기를 막는 해결책이라 주장하지 않는다. Apple QA1340은 idle과 forced sleep을 구분한다. 기존 시스템 변경 금지 및 업데이트 재시작 예외 미응답을 유지해 설치·전원·관리자·보안·키체인·원본 터미널/화면/입력/잠금은 바꾸지 않았다.
+
+- 전체 경량화 목표active다. 다음은 원문 바이트를 정확히 구분하며 메모리/수명을 제한한 알림 키 재사용 가능성을 조사한다. 캐시를 채택하기 전에 전체 상태·재발생·읽음·복원·세션 종료/초기화·손상 문자열과 고정 메모리/제어 상한을 검증해야 한다. 이번451·oracle·A/A/A/B 및 이미 닫은 전역 지문 후보는 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 알림 후보 직접 전달·요약문 지연 생성 · 추가16.2~23.9%·42기준 통과·채택
+
+- 직전 질문 인덱스 채택 턴은 progress였고 이번도 실제 제품 소스와 검증 빌드를 바꾼 progress다. 채택된446입력 Core의 새 일반 질문 profile에서 알림 후보의 지문·문자열 조합 비용을 확인했다. 이전169 전체 지문 교체 및179 native/단일 SHA 후보의 실패 기록을 읽고 같은 알고리즘을 재채점하지 않았다. 이번 지문 함수와 알림 키는 그대로다.
+- 기존 응답 필요 조건의 한 순회를 generic sink로 공유해 공개 후보/개수/존재 결과를 유지하면서 inbox로 바로 전달한다. `AttentionRequest.Candidate`와 `SessionInbox.Candidate`의 두 중간 배열을 만들지 않는다. 요약문은 알림을 실제 게시할 때만 계산하고,같은 active 이벤트는 같은 값으로 다시 쓰지 않는다. 임시 갱신기에는 inbox 저장 공간을 swap으로 넘겼다가 동기 함수가 끝나기 전에 돌려줘 불필요한 보유 복사 가능성도 줄였다. 새 지속 캐시·타이머·서비스·저장/네트워크 필드는 없다.
+- 첫 직접 전달 빌드는 원본 모델 비교를 통과했으나 성능 실행 전에 저장 공간 전달 형태로 보강해 보존했다. `.runtime/performance/fused-inbox-candidates-179-20261025/decision.json`은 미채택/성능 미실행이며,이전 지문 실패와 합치거나 비교 수치를 주장하지 않는다. 세 파일의 지정 구간을 역치환하면 직전 qualified 전체 원문과 정확히 같다.
+- 최종 실제 Core에서 원본 소스에 결합한 **알림 상태4,096단계·후보/개수/존재2,048사례**가 일치했다. private/public 전체 상태·UTF8/UTF16·유효한 저장 바이트 및 codec 결과를 확인하고 opaque UUID만 전체 trace 동안 지속적으로 대응시켰다. 중복 키/서로 다른 kind·지연 경계/역행 시계·읽음/복원·해결 후 새 발생·50기록·600문자·중첩 자식·시스템 경고를 포함한다. 비정상 원문32개를 명시적으로 게시해 기존 처리도 확인했다. 검사 초기화의 읽기 전용 속성/JSON scaffold·비정상 문자열 기록·assertion 오류와 잘못된 오류 빈도 기대를 수정한 이력을 v1~v7에 보존했다. 실패는 검사기 단계였고 제품 오류로 해석하지 않는다. 최종 v8은 모든 원문 사례를 유지했으며 입력·성능 기준을 낮추지 않았다. 변경 없는 기준 결과는 source/object/binary/fixture 동일성을 검증해 재사용했다.
+- 후보 실제 Release **451/451 · 208.906초**, 현재 Core 정책1,204·quiet70·그룹4·현재 전체 필드 바이트 비교와14개 smoke가 통과했다. 정렬은 바꾸지 않아 기존 소스 결합1,201,995건 oracle SHA를 유지했고 이를 새로 실행했다고 주장하지 않는다. 새 `scripts/inbox-candidates-check.mjs`/fixture는 원본 reference SHA를 직접 검증하며 두 실제 Core의4,096/2,048결과가 같다. 기존 공개 목록 도구의8경로도 확인했다. 채택 후 실제 Root의 새 기본 fixture 경로·상대 import로도 공개 도구를 실행했다.
+- **새 A/A42/42 뒤 A/B42/42**이 통과했다. 각각16프로세스·8쌍·4epoch·14모드·896구간·전체 API153,600호출이며 경로별16개의 독립 합성 엔진·기본 해시 무작위화를 유지했다. 일반 질문19개는16.2%,읽기 실패 질문19개는17.1%,32세션마다 질문3개인 조건은23.9% 명령어가 줄었다. 다른11조건과 RSS/유지 힙 상한도 통과했다. 빈/단일 제어의 명령어는 각각2.24%/0.98% 늘었고 사전5% 상한 안이다. 표본 제외·기준 완화·기존 시간 재사용은 없다. CPU/경과/cycles는 진단용이며 전체 앱·실물폰/LAN/VPN/SentinelOne 개선율을 뜻하지 않는다. 이전 최적화 비율과 합산하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.991089 |
+| steady32-unique | 0.996564 |
+| steady96-unique | 0.992312 |
+| steady19-shared | 0.989396 |
+| steady32-shared | 0.995582 |
+| changed-cwd19 | 0.988274 |
+| empty | 1.022358 |
+| single | 1.009799 |
+| manual19-full | 0.998560 |
+| manual32-partial | 1.000813 |
+| readable32-empty | 0.996597 |
+| readable19-manual | 0.838184 |
+| unreadable19-manual | 0.829453 |
+| readable32-multi | 0.761348 |
+
+- 패키징 전 App/CLI 실행 파일은 각각21,760/21,856바이트 늘었고 TTYService는 같다. 이는 처리 비용 절감과 작은 코드 증가의 교환이며 최종 DMG 크기나 힙 감소 측정이 아니다. 새2개 공개 파일은 SPM 밖이므로 컴파일/전체 검사446입력에서 최종448입력으로 추가됐다. 실제94Core·4바이너리는 검사한 후보와 같다.
+- 권위 상태는 **448입력·94Core·4바이너리·모듈 ccd6152e24d798068727941bb274ba4d25a1814cbe99c9d59aede7ae087048ca**, `retained-fused-inbox-moving-build/source` **630파일**이다. 공개451입력·명시58파일·변하지 않은 HEAD393입력 사전 검사가 통과했다. 세 수정 소스/현재 canonical/보관본/모든 객체와 바이너리 SHA를 대조했고 qualification lock은 없다. 공개 reference 검사2파일이 허용 목록에 포함되며 무관한 IDE/인덱스/fixture 변경은 유지했다.
+- 채택한 현재 Core를 일반19질문·32×3질문·readable32-empty·96반복4개 경로에서2초씩 표본 분석했다. 소유 합성 worker의 총92,160 API호출과 sampler/worker 종료0을 확인했다. 프로파일 준비의 Node 종료137 및 역사 입력 보관 경로 불일치는 실제 worker 시작 전에 해결했다. 새 표본에는 여전히 반복 알림 키 지문과 현재 행 순서 검증/비교가 보인다. 일반19질문에서 inbox 호출 위치685관측,32×3질문883관측이고 하위 지문 분기가 확인된다. readable32-empty는 순서 검증445·snapshot 비교385·inbox296관측이다. inclusive 관측을 CPU 백분율이나 채택 성능으로 쓰지 않는다. `.runtime/performance/post-fused-inbox-publication-profile-179-20261025/profile.json`과 원시 자료를 보존했다.
+
+- 전체 경량화 목표active를 유지한다. 버전179/206은 다시 올리지 않았다. 채택 전 GitHub main 일치·179태그 없음·최신178을 확인했다. 새 일치 서명 패키지·3패키지 검사·DMG/체크섬·58파일 source commit/tag/push·451입력 GitHub 게시/다운로드 검증은 남아 있다. 기존 서명/search-list 및 앱 설치·재시작 예외는 미응답이다. 설치본은 이번 읽기에서도168이며 교체하지 않았다. old unsigned179 bundle은 stale이므로 배포/설치하거나 같은 실패 서명을 재시도하지 않는다. 원본 터미널·화면/입력/잠금·실제 전원/관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스는 바꾸지 않았고 덮개 문제도 미해결이다. 다음은 새 현재-Core profile의 반복 알림 키 지문이나 행 순서/동등 비교 비용을 조사하되,이전 닫은 전역 지문 후보를 그대로 재채점하지 않는다. 이번451·4,096/2,048oracle·1,204API·공개 재현/default·42기준 A/A/A/B는 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 질문 상태 순회 경량화 · 추가14.6~15.8%·39기준 통과·채택
+
+- 직전 덮개 확인 턴은 경량화 자체에는 no progress였고 이번은 실제 소스·검증 빌드 채택을 마친 progress다. 현재446/7de4 Core의 새 profile에서 질문 후보/상태의 빈 순회 비용을 찾았다. 첫 guard-only 후보는 반복5조건 명령어가 약7~8% 줄었으나 사전≥10% 목표5개에 못 미쳐 A/A39/39·A/B34/39로 닫았다. 일반/읽기 실패 제어와 메모리 상한은 모두 지켰으며 표본·기준을 바꾸거나 같은 후보를 재채점하지 않았다. `.runtime/performance/empty-question-reconciliation-179-20261025/decision.json`에 보존했다.
+- 채택본은 기존 `duplicateQuestionIDsBySession`의 키를 사용해 실제 질문이 있는 행만 자동화 상태를 투영한다. 중복 집합이 비어 있는 일반 질문도 키에 포함한다. 읽을 수 있는 비어 있지 않은 질문이 없고 기존 예약도 없을 때만 후보 순회를 생략하며,기존 예약 취소와 활성 후보의 순회 순서는 유지한다. 새로운 지속 캐시·타이머·서비스는 추가하지 않았다.
+- 이 최적화에 앞서 새 세션이 질문을 가진 채 discovery로 들어오면 이전 빈 캐시가 갱신되지 않는 경로를 수정했다. 실제 공개 API 검사에서 기준 Core의 중복 보호 누락을 재현했고 후보에서는 중복2개를 표시·보호했다. 중복 집합이 빈 새 일반 질문의 needsReview/선택지/수동 상태와 종료 시 정리도 확인했다. 읽기 실패/보류 시 예약 취소가 타이머 전에 unavailable로 바뀌는 공개 회귀 assertion도 추가했다. 세 Core 구간과 두 테스트 추가를 역치환하면 두 파일 모두 직전 qualified 원문과 정확히 같다. 질문/승인 정책·inbox·기존 정렬·그룹 projection은 유지한다.
+- 후보 실제 Release **451/451 · 212.271초**, Core의 기존 정책1,204·quiet70·그룹4·현재 전체 출력 바이트 비교,private13경로 smoke,실제 수동 전체/부분 순위와 질문3상태 제어가 통과했다. 변경 없는 기준 기능 worker/결과는446입력·94객체·4바이너리·worker SHA가 동일함을 확인해 재사용했다. 후보와 성능 구간은 새로 실행했다. 정렬 코드는 바꾸지 않았으므로 이전 소스 결합1,201,995건 oracle의 SHA를 보존해 사용했으며 그 검사를 새로 실행했다고 주장하지 않는다.
+- **새 A/A39/39 뒤 A/B39/39**이 통과했다. 각각16프로세스·8쌍·4epoch·13모드·832구간·전체 API151,552호출이며 경로별16개의 독립 합성 엔진과 기본 해시 무작위화를 유지했다. 반복19/32/96세션·개별/공유 프로젝트5조건과 읽을 수 있는 빈 질문32조건의 명령어가 직전 검증본보다 **14.6~15.8%** 줄었다. 일반 선택 질문/읽기 실패/수동 순위/경로 변경/빈·단일 조건과 RSS/유지 힙 상한도 통과했다. CPU·경과 시간·cycles는 진단용이며 앱 전체·실물폰/LAN/VPN/SentinelOne 개선율을 뜻하지 않는다. 이전 최적화 비율과 합산하지 않는다.
+
+| 전체 API 경로 | 후보/직전 검증본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.854072 |
+| steady32-unique | 0.854310 |
+| steady96-unique | 0.854238 |
+| steady19-shared | 0.843465 |
+| steady32-shared | 0.842345 |
+| changed-cwd19 | 0.962395 |
+| empty | 0.754617 |
+| single | 0.786322 |
+| manual19-full | 0.833969 |
+| manual32-partial | 0.845851 |
+| readable32-empty | 0.851041 |
+| readable19-manual | 0.992096 |
+| unreadable19-manual | 0.961071 |
+
+- 기존 Root 공개 `scripts/presentation-order-check.mjs`와 fixture를 그대로 실제 두 Core에 연결해1,204정책·70quiet·4그룹·전체 출력·8경로 smoke도 확인했다. 공개8경로와private13경로를 구분하며 새 공개 파일은0개다. App·CLI·TTYService의 패키징 전 실행 파일 크기는 직전 빌드와 같고,회귀 assertion이 늘어난 검사 실행 파일만17,904바이트 늘었다. 이는 런타임 힙 감소나 최종 DMG 크기 측정이 아니다.
+- 권위 상태는 **446입력·94Core·4바이너리·모듈 7de4dfee3bdcdab383004c0e90d7b6f28adc7b986c1947915e469ca04ccd57c9**, `retained-question-index-reconciliation-build/source` **628파일**이다. 모듈 인터페이스 SHA가 직전과 같아도 실제 모든 객체와4바이너리를 검사한 후보 SHA로 결합했다. 컴파일/전체 검사/최종 입력은446개로 같으며 공개449입력·명시54파일·변하지 않은 HEAD395입력 사전 검사가 통과했다. 새로 수정한 공개 테스트 파일을 배포 허용 목록에 추가했다. canonical/보관본/현재 소스·검사 바이너리를 모두 대조했고 qualification lock은 없다. 이전 보관본과 실패 자료를 유지했다.
+- 채택한 현재 Core를 다시4개 실제 API 경로(32반복·readable32-empty·readable19-manual·96반복)에서2초씩 표본 분석했다. 자체 합성 worker만 사용했고 총122,880호출·worker/샘플러 모두 exit0이다. 일반 질문 경로에서는 inbox 후보 생성의 fingerprint와 summary 결합이 남은 비용으로 관측됐다. 예를 들어 readable19-manual에서 publish의 inbox 호출 위치는934개의 inclusive 관측,그 하위 fingerprint 및 후보 문자열 결합 분기가 나타났다. readable32-empty에서는 현재 순서 검증466·snapshot 비교386·inbox 호출271관측이다. 이는 CPU 백분율·채택 성능 비교가 아니라 다음 후보 선택 근거다. `.runtime/performance/post-question-index-publication-profile-179-20261025/profile.json`과 원시 표본을 보존했다.
+
+- 전체 경량화 목표active를 유지한다. 버전179/206을 다시 올리지 않았고 채택 전 GitHub main=HEAD `2bc18930dfb7f1a30e32bbf8675cb6281442b172`·179태그 없음·최신 정식178을 확인했다. 새 일치 서명 패키지·3종 패키지 검사·DMG/체크섬·54파일 source commit/tag/push·449입력 GitHub 게시/다운로드 검증은 남아 있다. 서명/search-list 및 앱 설치·재시작 예외는 미응답이다. 설치본은 이번 읽기에서도168이며 교체하지 않았다. old unsigned179 bundle은 stale이므로 배포/설치하거나 같은 실패 서명을 재시도하지 않는다. 원본 터미널·화면/입력/잠금·실제 전원/관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스를 바꾸지 않았고 덮개 문제도 미해결이다. 다음은 새 profile의 inbox fingerprint/문자열 결합 비용을 조사한다. 기존 fingerprint-preparation 등 후보 기록부터 확인해 같은 실패를 반복하지 않는다. 이번451·discovery probe·1,204API·공개 재현·39기준 A/A/A/B와 닫은 guard-only 후보는 변경 없이 반복하지 않는다.
+
+## 2026-10-25 · 현재 scalar 필드로 순서 검증 · 추가13~15%·30기준 통과·채택
+
+- 이미 표시 순서 재사용이 채택된446입력 Core의 새 실제 profile에서 큰 AgentSession의 current/result.last 읽기와 비교 인자 복사 비용을 확인했다. 인덱스만 바꾼 첫 후보는 추가8.9~10.3%가 줄었지만4개 주요 목표를 놓쳐 닫고 보존했다. 이번은 현재 ID·종료 여부·순위·프로젝트 이름으로 정책을 검증하고,앞 행의 현재 scalar 값만 호출 안에 보관한다. 프로젝트 이름은 phase/rank가 같을 때만 읽고 바로 앞의 현재 라벨을 재사용한다. 큰 행을 comparator 인자로 넘기지 않는다. 지속 캐시·타이머·서비스·허가/질문 work 생략은 추가하지 않았다.
+- ID/cwd/종료의 값싼 사전 검사·중복 ID coverage·locale/canonical 모호성의 raw-input 정렬 fallback·현재 row 반환을 유지했다. helper만 이전 body로 바꾸면 직전 qualified ApprovalEngine 원문과 바이트 단위로 같다. fallback comparator와 call-site·질문/승인/용량복구/inbox/그룹 projection은 그대로다. 빠른 경로는 원래 정렬 정책에 결합되므로 이후 정렬 규칙을 바꿀 때 scalar 검증과 원래 정책 reference도 함께 검토해야 한다.
+- 새 소스 결합 원본/후보 oracle **1,201,995건**, 실제 Core별 원래 정책 **1,204건·quiet70·그룹4**, 전체 필드 바이트·UTF8/UTF16·cwd/표시 설정/대기 질문/종료/새 ID가 통과했다. 각 프로세스의 현재 raw dictionary 입력으로 정확한 제품 순서를 확인했고,프로세스 사이 비교용 사본만 ID 정렬했다. 후보 실제 Release **451/451 · 211.373초**도 통과했다.
+- 수동 순위에서 프로젝트 읽기를 건너뛰는 비용을 보호하기 위해 새 측정 전에 manual19-full/manual32-partial을 추가했다. 모든16엔진에 실제 전체 순위19개 또는 부분 순위16/미지정16개가 있는지를 준비 단계에서 확인했다. 이 assertion 보강 전 worker/binding을 manual-controls-premeasurement-v1에 보존했으며 성능 실행 전 수정이다. 기존 공개 fixture에서 추가한 benchmark 제어를 제거하면 원문과 같고 기능·measure body는 유지한다.
+- **새 A/A30/30 뒤 A/B30/30**이 통과했다. 각각16프로세스·8쌍·4epoch·10모드·640구간·전체 API139,264호출이며 경로별16독립 엔진·기본 해시 무작위화를 사용했다. 직전 채택 Core 대비 반복5조건 명령어가 추가 약13~15%,수동 전체/부분 순위가 약15~16% 줄었다. 사전 고정한 반복≥10% 감소·변경/빈/단일/수동 제어≤5% 증가·RSS/유지 힙 상한을 모두 지켰다. CPU/경과/cycles는 진단용이며 앱 전체·실물폰/LAN/VPN/SentinelOne 개선율이나 제품 메모리 감소를 뜻하지 않는다. 이전34~74%와 이번 비율을 합산하지 않으며 표본 제외·기준 완화·재채점·과거 시간 재사용은 없다.
+
+| 전체 API 경로 | 후보/직전 채택 Core 명령어 |
+| --- | ---: |
+| steady19-unique | 0.866331 |
+| steady32-unique | 0.860764 |
+| steady96-unique | 0.852804 |
+| steady19-shared | 0.859101 |
+| steady32-shared | 0.852713 |
+| changed-cwd19 | 0.999298 |
+| empty | 0.992880 |
+| single | 0.997185 |
+| manual19-full | 0.848272 |
+| manual32-partial | 0.838936 |
+
+- 기존 Root의 `scripts/presentation-order-check.mjs`와 fixture를 그대로 실제 원본/후보 Core에 연결한 공개 재현도 전체 출력·1,204정책/70quiet/4그룹·8경로 smoke가 일치했다. private 성능 worker만 수동 제어2개를 추가한10모드이고 공개 smoke를 성능 증거로 대신하지 않았다. 새 공개 파일은0개다. Root의 상대 import/기본 fixture를 쓴 이 실행과 후보/현재 canonical의94객체·4바이너리 바이트 일치로 채택 상태를 확인해 같은 검사를 반복하지 않았다.
+- 권위 상태는 **446입력·94Core·4바이너리·모듈 7de4dfee3bdcdab383004c0e90d7b6f28adc7b986c1947915e469ca04ccd57c9**, `retained-presentation-scalar-order-build/source` **628파일**이다. 컴파일/전체 검사/최종 입력은446개로 같고 공개449입력·명시53파일·변하지 않은 HEAD396입력 사전 검사가 통과했다. canonical/보관본/소스와 실제 검사 후보의 전체 SHA를 확인했고 qualification lock은 없다. 이전 수정과 실패 보관본을 유지했다.
+
+- 이번은 실제 제품 소스/검증 빌드를 더 가볍게 바꾼 progress다. 전체 경량화 목표active를 유지한다. 현재 버전179/206을 다시 올리지 않았고 GitHub main 일치·179태그 없음·최신 정식178을 채택 전 확인했다. 기존 서명/search-list와 앱 설치/재시작 예외는 미응답이다. 새 일치 서명 패키지·3종 패키지 검사·DMG/체크섬·53파일 소스 커밋/태그/push·449입력 GitHub 게시/다운로드 검증은 남아 있다. old unsigned179 bundle은 stale이므로 배포/설치하거나 변경 없는 실패 서명을 재시도하지 않는다. 설치 앱·원본 터미널/화면/입력/잠금·전원·관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스는 바꾸지 않았고 덮개 문제도 미해결이다. 다음은 현재446/7de4 Core의 새 실제 profile로 남은 실질 비용을 고른다. 변경 없는 이번451·120만oracle·30기준640구간AA/AB·공개 출력 검사는 반복하지 않는다.
+
+## 2026-10-25 · 행 인덱스 비교 후보 · 추가8.9~10.3% 감소·주요 목표4개 미달로 미채택
+
+- 직전 순서 재사용 채택 턴은 실제 소스/빌드를 바꾼 progress였다. 현재446입력·94Core·4바이너리에 묶인 공개 worker를 새로 profile했다. 19/32/96개별·32공유 프로젝트4조건을 각각2초·1ms로 샘플링하고 합성 전체 API124,928호출을 수행했다. 모든 소유 worker/sampler 종료0과 source/object/binary 지문을 확인했다. sample의 candidate 이름은 실제 현재 채택 Core를 링크한 공개 회귀 executable의 파일 이름이다. inclusive stack 관찰은 CPU 비율이나 성능 채택 수치가 아니다.
+- 현재/이전 결과 행 전체를 로컬 값으로 꺼내는 비용을 줄이기 위해 scalar index만 보관하고 rows에서 직접 비교/필드 읽기를 하는 별도 helper를 시험했다. 새 소스 oracle1,201,995건·실제 Core별 정책1,204/quiet70/그룹4·전체 출력과 Release **451/451 · 210.371초**·8경로 smoke가 통과했다. 모듈 SHA는 기준/후보 모두33ea였지만 실제94객체·4바이너리로 각각 구분해 검증했다. assembly의 특정 이름 regex에 copy symbol이0개였다는 진단은 실제 복사가0개라는 증거로 쓰지 않았다.
+- 새 A/A24/24 뒤 A/B는 **20/24**였다. 각각16프로세스·8쌍·4epoch·512구간·전체 API131,072호출이다. 반복5조건의 명령어가 추가8.9~10.3% 줄었으나4조건이 사전 고정한10% 감소 목표를 놓쳤다. 변경/빈/단일 제어와 모든 RSS/유지 힙 기준은 통과했다. 기준을 낮추거나 좋은 조건만 골라 채택하지 않고 후보를 닫았다. 이전 순서 재사용의34~74%와 이번 후보의 비율을 합산하지 않는다. CPU/경과/cycles는 진단용이며 앱 전체·폰/LAN/VPN/보안 제품의 개선을 주장하지 않는다.
+
+| 전체 API 경로 | 후보/원본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.911426 |
+| steady32-unique | 0.903770 |
+| steady96-unique | 0.902062 |
+| steady19-shared | 0.905524 |
+| steady32-shared | 0.897247 |
+| changed-cwd19 | 1.003540 |
+| empty | 1.000575 |
+| single | 1.000185 |
+
+- Root 제품은 기존 qualified446입력·33ea 모듈·retained-presentation-order-preflight 보관본을 유지했다. 새 다음 후보는 비교에 필요한 현재 ID/종료 여부/순위/프로젝트 이름만 호출 내부에 보관하고,프로젝트 읽기를 phase/rank 동등 조건에서만 수행한다. 원래 fallback comparator와 모든 질문/승인/inbox/projection은 유지한다. 새 측정 전에 manual19-full/manual32-partial 두 제어를 추가해10모드·30기준·640구간·API139,264호출로 고정했다. 기존5개 주요 명령어0.90상한과 제어1.05·RSS/힙 상한은 유지한다. 후보는 `.runtime/performance/presentation-scalar-order-179-20261025`에 분리했고 아직 제품 채택 전이다.
+
+- 이번 새 profile·실제 Core/전체/AA/AB·미채택 후 다른 알고리즘과 제어를 고정한 작업은 다음 행동을 바꾼 progress다. 전체 목표active를 유지한다. 새 빌드는 qualification lock 아래 canonical만 일시 사용하고 끝나면 검증본으로 복구한다. 기존179 서명/search-list·앱 설치/재시작 예외는 미응답이며 덮개 문제도 미해결이다. 설치 앱·원본 터미널/화면/입력/잠금·전원·관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스·GitHub를 바꾸지 않았다. 이전 성공451/120만/24비교와 닫은 이 후보를 변경 없이 반복/재채점하지 않는다.
+
+## 2026-10-25 · 현재 행 사전 검사·표시 순서 재사용 · 전체 검증 통과·채택
+
+- 현재 projection의 ID·cwd·종료 상태를 먼저 모두 검사한 뒤 이전 스냅샷의 ID 순서대로 현재 row만 결과에 담는다. 기존 comparator의 엄격한 인접 순서와 UTF8/UTF16 canonical 모호성을 검사하며 조건이 바뀌거나 모호하면 기존 raw-input sorted로 돌아간다. 이전 내용은 반환하지 않고 기존 질문/승인/용량복구/inbox/그룹 projection은 항상 수행한다. 중간 Int 배열·map·지속 캐시·타이머·서비스는 추가하지 않았다. 정상 반복 갱신의 정렬·큰 값 이동을 줄이고,경로 변경 시 결과 할당·복사와 project 비교를 시작하기 전에 fallback한다.
+- 이전 두 후보는 각각 유지 힙8개 기준과 경로 변경 명령어 제어1개 기준 실패로 닫고 보존했다. 이번은 별도의 실제 Core 빌드·소스 결합 oracle **1,201,995건**·Core별 원래 정책1,204·quiet70·그룹4조건·전체 필드 바이트·Release **451/451 · 210.747초**를 새로 확인했다. 각 프로세스의 현재 dictionary 입력에 원래 정책을 적용해 실제 순서를 확인했다. 프로세스 사이 비교용 사본만 ID로 정렬하며,제품 순서나 payload를 변경해 비교하지 않았다. 실제 cwd 변경·표시 설정·대기 질문·종료·새 ID가 현재 값으로 유지된다.
+- **A/A24/24 뒤 A/B24/24**가 통과했다. 각 단계16프로세스·8쌍·4epoch·512구간·전체 API131,072호출이며 경로별16개의 독립 합성 엔진과 기본 해시 무작위화를 사용했다. 반복5조건 명령어는 약34~74% 줄었다. 경로 변경은1.009834배,빈 목록1.006636배,단일0.954414배다. 사전 고정한 반복 명령어≥10% 감소·제어≤5% 증가·RSS/유지 힙 상한을 모두 지켰다. CPU/경과/cycles는 진단용이고 앱 전체·실물폰/LAN/VPN/SentinelOne 개선율이나 제품 메모리 감소를 뜻하지 않는다. 모든 표본·실패를 보존하고 재채점·기준 완화·과거 시간 재사용은 없다.
+
+| 전체 API 경로 | 후보/원본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.535512 |
+| steady32-unique | 0.366627 |
+| steady96-unique | 0.256662 |
+| steady19-shared | 0.664559 |
+| steady32-shared | 0.483389 |
+| changed-cwd19 | 1.009834 |
+| empty | 1.006636 |
+| single | 0.954414 |
+
+- 공개 도구 `node scripts/presentation-order-check.mjs --build=/path/to/matching/.build/release`도 실제 Core로 원본/후보 전체 출력·1,204정책/70quiet/4그룹·8경로 smoke를 통과했다. Root로 복사한 뒤 기본 fixture/상대 import를 현재 Core에 연결한 실행도 별도로 통과했다. 기본 실행과 짧은 smoke만으로 성능·메모리 개선을 주장하지 않는다. 회귀 도구2파일은 SPM밖에 추가했으며 검사 당시444입력의 실제94Core·4바이너리 바이트가 최종446입력과 일치한다.
+- 권위 상태는 **446입력·94Core·4바이너리·모듈 33ea657e30737d59da6779b6106c4bac979122e23fa127901ba386ed31a8cf49**, `retained-presentation-order-preflight-build/source` **628파일**이다. canonical과 보관본의 전체 SHA를 검사했고 qualification lock은 없다. 공개449입력·명시53파일·변하지 않은 HEAD396입력의 배포 사전 검사를 통과했다. 새 helper/call-site를 제거하면 직전 qualified ApprovalEngine 원문과 바이트 단위로 같음을 실제 소스에서 다시 확인했다. 기존 압축 버퍼 등 이전 채택 변경과 실패 보관본을 유지했다.
+
+- 이번은 실제 제품 소스/검증 빌드 채택을 마친 progress다. 전체 경량화 목표는active이고 완료로 축소하지 않는다. 현재 버전179/206을 다시 올리지 않았고 GitHub main 일치·179태그 없음·최신 정식178을 채택 전 확인했다. 179의 새 서명 패키지는 아직 없으며 기존 unsigned179 bundle은 stale이므로 배포/설치하거나 같은 실패 서명을 재시도하지 않는다. 기존 서명/search-list 및 앱 설치/재시작 예외는 미응답이다. 3종 패키지 검사·DMG/체크섬·53파일 소스 커밋/태그/push·449입력 GitHub 게시/다운로드 검증은 남아 있다. 설치 앱·원본 터미널/화면/입력/크기/잠금·실제 전원/관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스는 변경하지 않았고 덮개 문제는 미해결이다. 다음 안전한 최적화는 현재446/33ea Core의 새 실제 profile로 남은 실질 비용을 고르는 것이다. 변경 없는 이번451·oracle1201995·A/A/A/B24·공개 출력 비교는 반복하지 않는다.
+
+## 2026-10-25 · 인덱스 배열 제거 후보 · 유지 힙 통과·경로 변경 제어 실패로 미채택
+
+- 이전 정렬 재사용 후보는8개 유지 힙 기준 실패로 닫았다. 별도16셀의 소유 합성 엔진 진단에서 snapshot 배열의 용량은 원본과 같았다(19행19,32행47,96행111). 생성/갱신/정리 뒤 힙도 기록했으며 추가 힙을 특정 원인 하나로 단정하거나 이전 후보를 재채점하지 않았다.
+- 새 후보는 중간 Int 인덱스 배열과 map을 제거하고 현재 row를 검증하면서 결과에 직접 append한다. 원본 comparator·fallback과 모든 projection/질문/승인/inbox 작업은 유지했다. 새120만 oracle **1,201,995건**, 실제 Core별 정책1,204·quiet70·그룹4·출력 전체 바이트, 새 Release **451/451 · 209.652초**와8경로 smoke가 통과했다.
+- 같은 고정 기준의 새 A/A24/24 뒤 A/B는 **23/24**였다. 각 단계16프로세스·8쌍·4epoch·512구간·전체 API131,072호출이다. 이번에는8조건의 RSS/유지 힙 기준을 모두 통과했다(프로세스 최대 유지 힙 차이 46,064~46,412바이트,상한+65,536). 그러나 **changed-cwd19 명령어1.071888배**가 사전1.05배 제어 상한을 넘어 **미채택으로 닫았다**. 반복5조건은 명령어31~73%가 줄었지만 제어 실패를 덮지 않는다. CPU/경과/cycles는 진단용이다. 앱 전체·실물폰/LAN/VPN/보안 제품의 개선을 주장하지 않는다.
+
+| 전체 API 경로 | 후보/원본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.552539 |
+| steady32-unique | 0.381389 |
+| steady96-unique | 0.268754 |
+| steady19-shared | 0.685583 |
+| steady32-shared | 0.501141 |
+| changed-cwd19 | 1.071888 |
+| empty | 1.006718 |
+| single | 0.954039 |
+
+- 코드상 늦은 cwd 불일치를 만나기 전까지 일부 결과 row를 복사하고 project 비교를 수행할 수 있다. 다음 별도 후보는 모든 ID/cwd/종료 사전 검사를 먼저 끝내, 이 불일치에서 결과 할당·복사·project 비교 전에 원래 정렬로 돌아가게 한다. 결과는 현재 row로만 만들고 중간 인덱스 배열은 넣지 않는다. 새 후보는 `.runtime/performance/reuse-presentation-order-preflight-179-20261025`에 분리했다. 같은 성능/메모리 기준과 전체 검증을 새로 적용하며 이전 실패 표본·결정·프로세스 종료0을 보존한다.
+
+- Root 제품과 보관된 권위 baseline은444입력·94Core·4바이너리·f8ee 모듈을 유지한다. 새 후보 빌드는 qualification lock 아래 canonical 임시 소스/빌드만 사용하고 완료 후 baseline으로 복구해야 한다. 제품/설치168·버전179/206·GitHub·원본 터미널/입력/화면/잠금·실제 전원/관리자/시스템/보안/TCC/VPN·키체인·자동실행/서비스를 바꾸지 않았다. 서명179/설치 예외와 덮개 문제는 여전히 미해결이다. 전체 경량화 목표active이며 이번은 새 실제 Core·전체·A/A/A/B·실패 후 알고리즘을 바꾼 progress다.
+
+## 2026-10-25 · 이전 표시 순서 재검증 후보 · 명령어 감소·유지 힙 상한 초과로 미채택
+
+- fresh 전체 publication profile의 정렬·localizedStandardCompare·큰 AgentSession 이동 비용을 근거로 새 알고리즘을 시험했다. 이전 스냅샷에서는 ID 순서만 읽고, 현재 projection의 ID 집합·cwd·종료 상태와 기존 comparator의 엄격한 인접 순서를 검사한 뒤 현재 row만 반환한다. 변경·모호한 locale/canonical 동등 비교는 기존 raw-input sorted로 돌아간다. 기존 comparator·질문/승인/용량복구/inbox/projection 작업은 유지하고 지속 캐시·타이머·서비스는 추가하지 않았다. 폐기한 작은 sort-key/SIMD 후보와 다른 알고리즘이다.
+- 소스에 묶인 원본/후보 oracle **1,201,995건**과 실제 Core별 원래 정책 **1,204건**, 조용한 반복70조건·그룹4조건이 통과했다. 각 프로세스의 현재 dictionary 입력에 원본 정렬을 적용해 실제 순서를 확인했다. 프로세스 사이 locale 동등 항목의 입력 순서는 다를 수 있어, 출력 비교용 사본만 ID로 정렬한 뒤 전체 필드 바이트도 일치했다. 실제 cwd 변경·표시 설정·대기 질문·종료/새 ID를 확인했다. 검증 fixture 첫 compile은 지역 변수 record가 함수 이름을 가린 오류로 실패했으며 원본과 로그를 api-precompile-v1에 보존하고 수정했다. 성능 측정 전의 fixture 수정이다.
+- 후보 actual Release **451/451 · 212.467초**와 실제8경로 smoke가 통과했다. 기본 해시 무작위화를 유지하고 각 경로16개의 독립 합성 엔진을 사용했다. A/A와 A/B 각각16프로세스·8쌍·4epoch·512구간·전체 API131,072호출을 새로 측정했다. CPU/경과/cycles는 진단용이며 이 결과를 앱 전체·폰/LAN/VPN/보안 도구의 속도 향상으로 주장하지 않는다.
+- 사전 고정 기준은 반복5조건의 전체 API 명령어≥10% 감소, 변경/빈/단일 제어 명령어≤5% 증가, RSS≤max(1.05×baseline,baseline+262,144), 유지 힙≤baseline+65,536이다. **A/A24/24**, **A/B16/24**였다. 모든 명령어/RSS 기준은 통과했지만8조건의 프로세스 유지 힙이 **90,576~91,044바이트** 늘어8개 힙 기준이 실패했다. 한 프로세스의128합성 엔진 측정이며 제품 전체 메모리 증가율은 주장하지 않는다.
+
+| 전체 갱신 경로 | 후보/원본 명령어 |
+| --- | ---: |
+| steady19-unique | 0.509310 |
+| steady32-unique | 0.368633 |
+| steady96-unique | 0.254353 |
+| steady19-shared | 0.644022 |
+| steady32-shared | 0.479278 |
+| changed-cwd19 | 1.007306 |
+| empty | 1.001801 |
+| single | 0.950798 |
+
+- 모든 표본과 실패를 보존하고 기준을 낮추거나 재채점하지 않았다. **후보는 닫고 제품에 채택하지 않았다.** 근거는 `.runtime/performance/reuse-presentation-order-179-20261025/decision.json`, 실제 raw NDJSON·각 worker 종료0·소스/94객체/4바이너리 지문에 보존했다. 새 다음 행동은 소유 합성 엔진의 snapshot/dictionary 용량과 생성·정리 후 유지 힙을 별도로 진단하는 것이다.
+
+- 권위 있는 제품은 여전히444입력·94Core·4바이너리·모듈f8eea1360475037bc8ceecba2665ec0f3e9326d651146948f67f365e034f07c8 및 retained-gzip-decoder-scoped 보관본이다. 새 정렬 helper는 private 후보에만 있으며 Root/정식 Core/버전179·206·릴리스 보조 도구는 바꾸지 않았다. 원본 터미널·앱 재시작/설치·전원·관리자/시스템/보안/TCC/VPN·자동실행/서비스·키체인 설정 변경은 없다. 기존 서명179/설치 예외는 미응답이며 덮개 문제는 미해결이다. 직전 덮개/설치 확인 턴은 경량화 목표에 no progress였고 이번 실제 Core/전체/새 A/A/A/B와 미채택 결정은 다음 행동을 바꾼 progress다. 전체 목표active를 유지한다.
+
+## 2026-10-25 · 프로젝트 ASCII 묶음 검사 미채택 · 전체 갱신 비용으로 우선순위 이동
+
+- 한 소스 SIMD 후보는 실제Core/451·66,864원시 출력·변경cwd/순서/조용한 게시/스택·A/A33을 통과했다. A/B는31/33으로 전체 게시19세션0.984243·32세션1.002100배가 각각<=0.98 목표를 놓쳐 **미채택**이다. 단독 getter0.785772/0.602445/0.210334/0.655880배는 전체 경로의 검증을 대신하지 않는다. 모든 표본·실패·v1/v2/v3관찰 코드를 보존했다.
+- v2는 실제 `directories` 경로 변경과 단언을 추가했고 v3는 성능 측정 전에 동일 호출 수를16독립 엔진/종류에 분산했다. 고정8쌍/4epoch/기본 해시/33기준을 유지했다. 각 단계16프로세스704구간35,598,336호출,모든 worker exit0이다. 공개 재현은 게이트 실패 뒤 실행하지 않았고 product/public 파일도 추가하지 않았다.
+- 현재 기준은 **444/f8ee/94Core/4바이너리/retained-gzip-decoder-scoped626파일**,공개447입력·명시51파일·불변HEAD396입력이다. 실제SHA와 잠금 없음·빈 index·git diff check를 확인했다. 이번 SIMD 구현과 그 실패한 전체 갱신 목표를 낮춰 재시도하지 않는다. 다음은 실제 전체 게시에서 더 큰 비용을 조사한다.
+- 직전 턴은 수신 버퍼를 실제 채택한progress이고,이번은 실제 새 Core/전체/원시 출력/A/A/A/B와 미채택 결정으로 다음 행동을 바꾼progress다. 전체 목표active,서명/설치 예외 미응답·179배포/설치와 덮개 문제 미해결 상태를 유지한다. 앱/원본 터미널/입력/화면/잠금·전원/관리자/시스템/보안/TCC/VPN·키체인·자동실행/새서비스를 변경하지 않았다.
+
+## 2026-10-25 · 압축 수신 임시 버퍼 수명 단축 채택 · 0.2.179 /206
+
+- 최신 채택은 `RemoteGzipDecoder`의32KiB scratch를 read 범위의 표준 임시 할당으로 옮기고 생성된 Data를 별도 소유하게 한 것이다. 디코더당 유지 힙49,168바이트와 여섯 조건 명령어0.51~2.61% 감소를 실제 Core에서 따로 측정했다. 입력 상태 전이/오류/complete는 유지하고 이전 readCount/input-view CPU 후보는 포함하지 않는다.
+- 새 실제 Core/451·같은 gzip2,108이벤트·조각176·정확한 오류/상태·반환 Data/포인터·제한 스택·메모리 A/A320와 A/B320·명령어 A/A18와 A/B18·독립 공개/Root 재현을 통과했다. 각 메모리 단계16프로세스160측정,명령어 단계16프로세스384구간이며 raw 표본과 이전 모든 보관본은 보존했다. 앞선 송신 버퍼 최적화도 포함하지만 송신 heartbeat4.961% 증가를 수신 감소율과 합산하지 않는다.
+- 권위 있는 기준은 **444입력·94Core·4바이너리·모듈`f8eea1360475037bc8ceecba2665ec0f3e9326d651146948f67f365e034f07c8`**,`retained-gzip-decoder-scoped-build/source`626파일이다. 공개447입력·명시51파일·불변HEAD396입력이며 qualification lock은 없다. 이전442/0db·440/7576 등 보관본을 유지한다. 최종 근거는 `gzip-decoder-scoped-scratch-179-20261025/final-audit.json`이다.
+- 채택 직전 실제 GitHub 조회에서 main은 로컬HEAD와 같고179태그는 없으며 최신은178이었다. 버전은179/206을 유지했다. 서명/설치 예외는 미응답이고 일치하는 새 서명 패키지3검사·DMG/체크섬·51파일 소스 커밋/태그/push·GitHub447입력 게시/익명 다운로드 대조가 남는다. 오래된 unsigned179 앱을 설치·배포하거나 같은 실패 서명을 재시도하지 않는다. release finisher는 현재 App/CLI의 source-build SHA가 맞아야 완료 문서를 만든다.
+- 직전 송신 버퍼 채택 턴과 이번 수신 버퍼 채택 턴은 각각 실제 구현/검증 빌드를 바꾼 **progress**다. 전체 목표active이며 다음은 현재 코드의 다른 실질 비용을 조사한다. 변경 없는 이번451·2,108/176·메모리320/명령어18 비교는 반복하지 않는다. 설치 앱·원본 터미널/입력/화면/잠금·전원·관리자/시스템/보안/TCC/VPN·키체인·자동실행/새서비스는 변경하지 않았다. 덮개 강제 잠자기 차단은 미해결이다.
+
+## 2026-10-25 · 압축 스트림 임시 버퍼 수명 단축 채택 · 0.2.179 /206
+
+- 최신 채택은 `RemoteGzipEncoder`의 연결별32KiB scratch 보관을 호출 범위의 표준 임시 할당으로 옮긴 것이다. 유지 힙은 인코더당49,168바이트 감소했고 압축 payload는 그대로다. heartbeat 명령어 4.961% 증가는 명시적인 교환이며 속도/앱 전체 RSS 개선으로 확대하지 않는다.
+- 첫 후보는 원래 deflate 오류 안내의 불필요한 변경 때문에 미채택으로 종료했고 `gzip-scoped-scratch-179-20261025/decision.json`에 남겼다. 원래 문구를 복원한 **v2**만 새 실제 Core/451·바이트2,108·제한 스택/포인터/가드·메모리 A/A320와 A/B320·명령어 A/A18와 A/B18·독립 공개 재현/Root 재현을 통과해 반영했다. raw 표본과 이전 보관본은 모두 보존한다.
+- 권위 있는 기준은 **442입력·94Core·4바이너리·모듈`0db748331548513cd4ec37875e987bf6c0fe0a87e6d47ab3c98fb2b9b31b2fd5`**,`retained-gzip-scoped-scratch-build/source`의624파일이다. 공개445입력·명시48파일·불변HEAD397입력이며 qualification lock은 없다. 기존 화면 상태 비교와 나머지 채택 최적화를 포함하고,폐기했던 세션 재사용·분석 reference·빈 parent 등록부·압축 memLevel 변경은 포함하지 않는다.
+- 실제 GitHub 사전 조회에서 main은 로컬HEAD `2bc18930dfb7f1a30e32bbf8675cb6281442b172`와 같고179태그는 없으며 최신은178이었다. 첫 샌드박스 API 조회 실패는 소스/빌드 변경 전에 끝났고 허용된 일반 사용자 네트워크 실행으로 채택을 완료했다. 새 버전 증가는 없고179/206을 유지한다. 서명/설치 예외는 여전히 미응답이며 현재 구현과 일치하는 서명 패키지3검사·DMG/체크섬·48파일 소스 커밋/태그/push·GitHub445입력 게시/다운로드 대조가 남았다. 오래된 unsigned179 앱을 설치·배포하거나 같은 실패 서명을 재시도하지 않는다.
+- 다음은 현재 실제 코드의 다른 실질 비용을 조사하는 것이다. 변경 없는 v2의451·2,108·메모리320/명령어18 비교는 반복하지 않는다. 이번은 실제 소스/검증 빌드 채택을 마친 **progress**다. 직전 덮개 상태 응답만으로는 경량화가 진전되지 않았으며 전체 목표는active다. 설치 앱/원본 터미널/입력/화면/잠금·전원·관리자/시스템/보안/TCC/VPN·키체인·자동실행/새서비스는 변경하지 않았다. 덮개 강제 잠자기 차단은 여전히 미해결이다.
+
+## 2026-10-25 · gzip 작업 공간·전송량 탐색 · 기본 압축 설정 유지
+
+- CPU 시간 편차 후보들을 닫은 뒤,현재 encoder의 deflateInit2(level1,window31,mem8,default strategy)와32KiB scratch를 조사했다. zlib 공식 manual의 메모리/속도/압축률 관계를 확인하고 mem8/7/6/5를 별도 native 도구로 비교했다. 앞서 보류한 gzip decoder input-view/direct-output 구현을 포함하지 않는다.
+- 합성16그룹·527이벤트를 설정별로 즉시 flush/최종 footer까지 복원해2108번 정확한 원본 byte 대조를 통과했다. native mem8의 각 flush 출력527개를 현재 qualified public Core RemoteGzipEncoder 출력과 Data 전체로 대조해 모두 일치했다. helper 내부 클래스 타이밍을 실제 후보Core 성능으로 대신하지 않았다. 같은 zlib1.2.12의 지원된 zalloc/zfree callback으로 요청 작업 공간과 전부 해제를 확인했으며 이 값은 전체 프로세스RSS가 아니다.
+- mem7의 요청 작업 공간은268096→202560바이트로65536바이트 감소했으나 escaped-strings wire는6187→6444바이트(+4.153871%),전체2583035→2584055바이트(+0.039488%)였다. mem6/5도 각각 전체0.114865%/0.219858%증가했다. 전송량을 늘리지 않는 설정을 찾지 못했으므로 압축 기본값8을 바꾸거나 실제 후보Core를 만들지 않았다. 변경 없는451검사도 다시 실행하지 않았다.
+- 별도 다음 가설은 같은 압축 파라미터·32768출력 공간·flush/오류/입력 상한을 유지하면서 인스턴스가 상시 소유한32KiB scratch만 encode 호출 수명으로 옮기는 것이다. native의 초기화하지 않은32KiB 출력 공간이 현재Core와 같은 byte를 낸527건은 이 방향의 근거지만 Swift 후보 구현·idle live-heap 감소·전체 byte/오류 검증은 아직 없다. 임시 공간 해제 전 next_in/next_out을 nil로 비우는 수명 규칙도 보존해야 한다.
+- 권위 있는440입력·94Core·4바이너리·7576모듈·retained-screen-session622파일을 확인했고 qualification lock은 없다. 제품 소스/설치168/버전179·206을 변경하지 않았다. 서명/설치 예외는 미응답이고 덮개 문제는 미해결이다. 실제 원본 터미널/화면/입력/전원·관리자/시스템/보안/TCC/VPN·키체인/서비스/자동실행 변경은 없다. 전체 목표active,이번 새 native 계측·실제Core527byte 대조·설정 유지 결정은progress다.
+
+## 2026-10-25 · 빈 자식 등록부 후보 · 동일 기준 편차58/60로 닫음
+
+- 직전 목표 턴들은 같은 live 핸들을 poll한 verified wait였다. 이번에는 같은 실행의16worker·768구간·324,352,000개 혼합 API iteration이 모두 exit0으로 종료된 것을 확인하고 판정했다. 두 라벨 모두 같은 기준 바이너리인 A/A는 **58/60**,실패는 single-native/cpu 1.078016 > 1.05；host-auto-cocoa19/cpu 1.075173 > 1.05이다. 이는 후보와의 비교 결과가 아니다. 표본 제외·기준 완화·해시 seed 변경·같은 프로토콜/구현 재시도는 하지 않는다.
+- 빈 사전이면 전체 세션 조회 전에 false를 반환하는 한 guard 후보는 실제Core451/451과 기준/후보12조건을 통과했다. persisted nonempty registry 대조군을 명시적으로 확인했고,비어 있지 않은 사전의 원래 본문·입력 권한/child hook/부모 종료/중복 응답 방지는 보존됐다. 그러나 A/A 실패로 A/B·공개 스크립트 재현·제품 채택을 진행하지 않았다. 구현·원복 대조·객체/바이너리·전체 원시 결과를 보존한다.
+- 서로 다른 세 후보의 동일 기준 시간 편차가 한도를 넘었다. 특정 SentinelOne/VPN/스케줄러를 원인으로 단정하지 않는다. 다음은 현재 스트림 codec의 정확한 전송 바이트와 중복 데이터처럼 결정적으로 확인할 수 있는 비용을 조사한다. 아직 새 payload 구현/검증을 했다는 뜻이 아니며 닫힌 후보를 다시 실행하지 않는다.
+- 권위 있는440입력·94Core·4바이너리·7576모듈·retained-screen-session622파일의 실제SHA를 확인했고 qualification lock은 없다. 제품은 기존 qualified179/206이며 새 빈 등록부·분석 reference·세션 재사용 후보를 포함하지 않는다. 설치168·서명/설치 예외 미응답·덮개 미해결 상태를 유지한다. 실제 화면/원본 입력/전원·관리자/시스템/보안/TCC/VPN·키체인·서비스/자동실행을 변경하지 않았다. 전체 목표active,이번 종료 판정·미채택 결정·권위 상태 검증은progress다.
+
+## 2026-10-25 · 빈 자식 등록부의 세션 조회 제거 후보 · 실제Core/451/12경로 통과
+
+- 공유 분석 후보는51/55 A/A로 닫았다. 현재440입력/7576 실제 profile의 hasBackgroundChildren 아래 세션 copy/destroy/hash 비용을 확인한 뒤,별도 후보에 빈 claudeParents면 false를 즉시 반환하는 guard만 추가했다. 기존 빈 사전의 contains는 모든 ID/상태에서 false이고,비어 있지 않은 사전에서는 원래 세션/종료 검사·인덱스/과거 fallback 본문이 byte-identical이다. 세션 조회 재사용·분석 reference 후보는 포함하지 않는다.
+- 실제 후보Core를 빌드하고 권위 있는440입력·94객체·4바이너리·7576모듈을 복원했다. 후보 전체451/451과 기준/후보12조건이 통과했다. Claude exact parent,child hook 상속,재시작/parent 종료,부모 화면의 중복 응답 차단,read/save 실패도 전체 검사에 포함된다.12조건은 직접 화면과 native/Cocoa host refresh에 더해 임시 저장소의 비어 있지 않은 관련 없는 등록부를 명시적으로 확인한 대조군을 포함한다. 실제 화면/입력/전원은 가짜 어댑터이고 앱/리스너/새서비스를 시작하지 않았다.
+- 성능은 아직 미확정이다. 새 조기 반환은 하나의 조회/전체 세션 복사를 생략하는 별도 구현으로,CPU3% material 목표·기존 동일 기준 CPU/명령어5%/wall10% A/A 한도·RSS/heap 한도를 측정 전에 고정했다. 기본 해시 무작위화8쌍/4epoch/60기준의 fresh A/A가 통과해야 A/B를 실행한다. 이전 후보의5%목표를 완화하거나 같은 후보를 재시도하는 것이 아니다.
+- 제품은 기존 qualified440/7576·retained-screen-session622파일이며 새 후보는 아직 미채택이다. 서명/설치 예외 미응답·설치168·버전179/206·덮개 미해결 상태를 유지한다. 실제 전원/관리자/시스템/보안/TCC/VPN·키체인/서비스/자동실행은 변경하지 않았다. 이 checkpoint는 측정 시작 전이고 실제 live 여부는 반환된 실행 핸들을 poll해서 확인한다. 전체 목표active,이번 새 구현·실제Core/451/12경로 검증은progress다.
+
+## 2026-10-25 · 공유 화면 분석 후보 · 동일 기준 편차51/55로 닫음
+
+- 직전 목표 턴은 같은 실제 실행 핸들을 확인한 verified wait였다. 이번에 같은 실행의16worker·704구간이 모두 exit0으로 종료된 것을 확인하고 최종 판정했다. 같은 기준 바이너리를 양쪽 라벨에 사용한 A/A는 **51/55**이며 실패는 cached-cocoa19/cpu 1.056217 > 1.05；single-native/cpu 1.073661 > 1.05；single-native/wall 1.111707 > 1.1；ended/cpu 1.060545 > 1.05이다. 표본·기준·기본 해시 무작위화를 보존했고,이 값은 실제 후보와 비교한 속도나 회귀가 아니다.
+- final Sendable 분석 공유와 정확한 객체 동일성에 따른 캐시 재삽입 생략의 두 소스 후보는 실제Core 전체451/451·기준/후보11화면/호스트 경로·공개fixture준비본5캐시 경계를 통과했다. 다만 A/A 편차 기준 미달로 A/B·별도 공개스크립트 재현·제품 채택은 진행하지 않았다. 초기화/필드/원본/권한/복구/캐시 한도를 보존한 근거와 실제 후보객체/바이너리를 남기며,같은 구현/프로토콜을 재시도하거나 한도를 완화하지 않는다.
+- 권위 있는440입력·94Core·4바이너리·7576모듈·retained-screen-session622파일을 실제SHA로 확인했고 qualification lock은 없다. 제품은 기존 unwrapped session 비교까지의 qualified179/206이며 새 공유 분석·세션 조회 후보는 포함하지 않는다. 설치168·서명/설치 예외 미응답·덮개 미해결 상태를 유지한다. 원본 터미널/입력/실제 전원·관리자/시스템/보안/TCC/VPN·서비스/자동실행·키체인을 변경하지 않았다.
+- 다음은 자식 등록부가 비어 있을 때도 전체 세션을 조회하는 별도 경로를 소스와 현재 profile로 검토하는 것이다. 아직 그 후보를 구현/측정했다는 뜻이 아니다. 전체 경량화 목표active,이번 완료된 측정 판정과 미채택 결정·권위 상태 검증은progress다.
+
+## 2026-10-25 · 화면 분석 공유·캐시 재삽입 제거 후보 · 실제Core/451/경계 통과,성능 검증 대기
+
+- 앞선 세션 조회 후보는 동일 빌드 A/A44/45로 닫았다. 별도 후보는 ScreenAnalysis의 전체 읽기 전용 필드를 final Sendable 객체로 공유하고,현재 캐시와 정확히 같은 객체일 때만 remove/reinsert를 생략한다. detector 초기화·필드·precomputed 우선순위·새 결과의512KiB/32개/8MiB 제한과 모든 승인/복구/시간 처리는 그대로다. 세션 조회 후보의 소스는 포함하지 않는다.
+- 실제 두 소스 후보Core를 빌드하고 원래440입력·94객체·4바이너리·7576모듈을 복원했다. 후보 전체451/451과 기준/후보11조건이 통과했다. 직접 화면9조건뿐 아니라 public connectScreenHost/refreshScreenHost의 사전 분석 경로를 native/Cocoa19자동 세션으로 검사했다. 화면·입력·전원은 가짜 어댑터이며 앱 시작/리스너/별도 서비스는 없다.
+- 추가로 기준/후보 실제Core에 연결한 공개 fixture 준비본에서 총8MiB가32개보다 먼저 제한되는40세션,정확512KiB와1바이트 초과,반복 membership/byte합,stop 후0개를 검사했다.5경계 확인과 전체11경로 setup이 모두 통과했다. 이 검사를 제품 클래스나 대체 분석 코드를 fixture에 복제해 실행하지 않았다.
+- 성능 개선은 아직 미확정이다. 새 후보의 기본 프로세스 해시 무작위화·8쌍/4epoch·55기준 A/A 뒤 A/B를 준비했다.6직접 재사용 및2실제host CPU5%목표와 변경/없는/종료 화면 제어,명령어/경과/RSS/heap 한도를 고정했다. A/A실패 시 후보 비교·채택 없이 닫는다. 전체 타이머/원본 검사를 건너뛰는 축소 경로는 쓰지 않는다.
+- 이 checkpoint는 성능 측정 시작 전이다. 실제 live 여부는 반환된 실행 핸들을 poll해서 확인해야 한다. 현재 제품은 기존 qualified440/7576·retained-screen-session622파일이며 새후보는 미채택이다. 서명/설치 예외 미응답·설치168·버전179/206·덮개 미해결 상태를 유지한다. 전체 목표active,이번 새 구현·실제Core/451/11경로/경계 검증은progress다.
+
+## 2026-10-25 · 화면 복구 세션 재사용 후보 · 동일 빌드 편차 기준 미달로 보류
+
+- 새440입력 실제 화면 프로파일을 근거로 receiveScreen이 이미 읽은 세션을 오류 복구에 전달하고,0.2.78 legacy Goal 기록이 실제 변환된 경우에만 최신 값을 다시 읽는 후보를 분리했다. 세 구간 원복 대조로 나머지 소스·전체 원본/receipt/footer/cancel 검사·history/persistence·스케줄러를 보존했다. 별도 후보 실제Core를 빌드한 뒤 원래 소스/빌드를 복원했다. sandbox의 Clang 캐시 쓰기 거부로 실패한 첫 빌드는 별도 보존하고 일반 사용자 빌드로 검증했다. 전원·관리자 작업은 없다.
+- 실제 후보 전체451/451과 기준/후보9조건 smoke가 통과했다. 자동 승인 on/off·native/Cocoa·32개·단일·변경 화면·없는/종료 세션의 반복 snapshot 게시0,캐시 count/byte와 합성 상태가 같았다. 공개 API를 사용하며 실제 입력/화면/전원은 가짜 어댑터로 격리했다.
+- fresh 동일 기준 A/A는 **44/45**였다.16worker·576구간·314,240,000호출을 보존했고,cached-native32 CPU 후보 라벨/기준 라벨 **1.055244**가 사전 한도1.05를 넘었다. 두 라벨 모두 같은 기준 바이너리이므로 후보가 느리다는 근거가 아니다. A/B·준비한 공개 재현·제품 채택으로 진행하지 않았다. 기준 완화·표본 제외·같은 구현/프로토콜 재시도는 하지 않는다.
+- 권위 있는440입력·94Core·4바이너리·7576 모듈·retained-screen-session622파일을 실제SHA로 확인했고 qualification lock은 없다. 소스179/206·설치168·GitHub 상태를 바꾸지 않았다. 기존 서명/설치 예외는 미응답이고 덮개 문제는 미해결이다. 다음은 동일 분석 캐시의 불필요한 remove/reinsert라는 별도 비용을 조사하는 것이다. 전체 목표active,이번 후보 구현·실제Core/451 검증·미채택 결정은progress다.
+
+## 2026-10-25 · 화면 상태 비교 경량화 채택 ·440입력/622보관 파일, 배포 서명 대기
+
+- 새 실제Core 후보는 전체451/451(237.514초)·기준/후보7조건 smoke·A/A35/35·A/B35/35·공개 overlay7조건을 통과했다. A/A와 A/B는 각각16worker·448구간·295,040,000 public receiveScreen 호출이며 모두 exit0이다. 표본 제외·한도 완화·동일 후보 재시도·과거 시간 재사용은 없다. 직전5조건 프로파일은 진단이고 이번 개선율은 별도 실제Core 비교에서 얻었다.
+- 반복 화면의 CPU 후보/기준은 cached-native19 **0.851964264**,Cocoa19 **0.866092175**,native32 **0.853448480**,single **0.853038682**배로13.4~14.8% 감소했다. changing-native19는0.969462253배,missing/ended는0.991251988/0.970393750배다. 명령어·wall·RSS/heap의 제어 기준도 통과했다. 합성 화면을 쓰는 실제 엔진 경로 비용이며 앱 전체·실물폰·VPN/보안 제품의 개선율이나 물리 메모리 절감률로 확대하지 않는다.
+- `ApprovalEngine.receiveScreen`의 defer에서 현재 세션을 unwrap한 뒤 기존 전체 AgentSession !=를 호출하도록 바꿨다. nil은 변경으로 보고,capacity projection의 두 번째 short circuit·모든 비교 필드·화면 freshness·캐시 예산·원본/권한·질문/입력/오류 복구·스케줄은 유지한다. 새 캐시·타이머·상주 서비스는 없다. 보류된 정렬/날짜/헤더/endpoint 후보를 섞지 않았다.
+- public `Tests/fixtures/screen-session-publication-check.swift`와 `scripts/screen-session-publication-check.mjs`를 추가했다. 실제 Core를 링크하며 제품 클래스/대체 비교를 복제하지 않는다. native/Cocoa·19/32캐시·단일·changing·missing·ended를 확인하고 반복 snapshot 게시0·캐시 budget·working/missing/ended 상태를 검사한다. 공개 파일을 Root에 복사한 뒤 실제 공개 명령을 실행한 exec10786도 exit0,7조건/94Core 통과였다. Root 경로·상대 helper import 검증을 위한 실행이며 전체451이나 성능 비교를 반복한 것이 아니다. 보고서는 `.runtime/screen-session-publication-check/run-9SSd74/report.json`이다.
+- adoption exec53833 exit0이 소스·canonical 및 새 `retained-screen-session-build/source`를 동기화했다. 현재 권위 있는 **440입력·94Core 객체·4바이너리·622보관 파일**이다. 모듈SHA는 기존과 같은7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8이지만94객체/바이너리는 실제 후보의 해시로 구분한다. 전체451 및 컴파일 당시438입력에 SPM대상 밖 공개2파일만 추가했다. 이전438/620 기준도 그대로 보존했고 모든 SHA를 대조했다. qualification lock은 없다.
+- GitHub 읽기 전용 사전 확인에서179태그 부재·최신v178·remote main==로컬HEAD를 확인했다. 공개 입력443개·명시적45파일 whitelist·변경 없는 HEAD398개로 release capture/publish/record/audit 및 preflight를 갱신했다. 바뀌지 않은 모듈SHA만으로 옛 앱을 통과시키지 않도록 package verifier가 실제 sourceBuildSHA256을 기록하고 새 finish-docs도 이를 필수로 확인한다. matching 서명/패키지3검사 전 완료 문서를 쓰지 않는 guard를 유지했다. 기존 unsigned179 앱은 여전히 stale이며 배포/설치하지 않는다.
+- 버전은179/206으로 유지했다. **GitHub 배포와 앱 설치는 아직 미완료**다. 앞서 읽기 전용으로 확인한 서명 키체인 잠금과 검색 목록/서명 예외 미응답이 남아 있으며 unlock·신뢰/ACL/검색 목록 변경·새 키체인/인증서·ad-hoc 공개 배포를 하지 않았다. 실제 설치/재시작 승인도 미응답이다. 서명→matching 패키지3검사→DMG/체크섬→소스45파일 commit/tag/push→GitHub443입력 게시/다운로드 대조가 남았다. 설치168·원본 터미널/화면/입력/잠금·전원/관리자/시스템/보안/TCC/VPN은 바꾸지 않았다. 무관한 IDE/인덱스/fixture를 보존했고 UI/브라우저/실물폰 QA는 새로 주장하지 않는다. 전체 목표는active/progress다.
+
+## 2026-10-25 · 화면 상태 비교의 값 복사 후보 · 실제Core451 통과, A/B 실행 중
+
+- 직전 목표 턴은 정렬 후보 종료·기준 파일 대조와 서명 상태의 새 근거를 얻은 progress다. 그 후보는 계속 미채택이며 같은 측정을 반복하지 않았다. 새 대상은 실제 public receiveScreen의 반복 처리다.
+- 새 `screen-update-profile-179-20261025`는 현재438입력/94Core/7576 실제Core를 링크한 합성 화면5조건이다. 각4.5초 반복 및2초/10ms 소유 프로세스 sample이 모두 exit0이었다. cached-native19/Cocoa19/native32/single/changing-native19는 각각473,561/499,794/461,255/654,639/43,352프레임이었다. 캐시19/19/32/1개 및 바이트 예산이 유지됐다. 엔진/리스너를 시작하거나 원본 터미널·전원을 조작하지 않았다. 바뀌지 않는19행 native의153 receiveScreen inclusive표본 아래 defer40,Cocoa는179 아래29에서 AgentSession 복사/소멸/전체 비교가 보였다. 누적 표본을 CPU점유율로 읽지 않는다.
+- private `screen-session-compare-179-20261025`는 defer의 `sessions[id] != sessionBeforeScreen`만 명시적 unwrap 후 같은 AgentSession != 비교로 바꾼다. nil은 여전히 변경이며 capacity projection의 두 번째 short circuit·모든 필드·원본 확인·캐시/스케줄/정책은 그대로다. 옵션 승격의 복사 감소는 가설이며 실제 효과는 A/B로 확인한다. Root ApprovalEngine.swift는 바꾸지 않았다.
+- 실제 후보Core 빌드 exec95172 exit0은229.009초(SPM223.43초)였고 원래 canonical 소스·객체/모듈·바이너리를 복원했다. **후보의 swiftmodule SHA는 기존과 같은7576이다.94 Core 객체는 모두 다른 SHA이며 해당 소스/전체 객체/4바이너리·링크된 observer SHA를 사용해 두 빌드를 구분한다. 모듈SHA만으로 동일 구현이라고 판단하지 않는다.**
+- 실제 후보Core 전체451/451은237.514초에 통과했다. qualification exec14526 exit0이며 실제 기준/후보 worker 컴파일과7종 smoke도 모두 exit0이다. 반복 화면의 snapshot 게시0·cache count/bytes·자동 승인/입력/PTY 없음과 양쪽 결과 checksum을 확인했다.7조건은 cached native19/Cocoa19/native32/single,changing-native19,missing,ended다. full451 및 smoke는 기존 정렬 후보의 미실행 준비물과 다르다.
+- 새로운 실제Core A/A exec54225 exit0은 **35/35**다.16worker/448구간/295,040,000호출이며 기본 프로세스 해시 무작위화를 양쪽에 유지했다. 그 뒤 새 A/B **exec49394가 현재 live**임을 poll했다. 확인 시246/448구간이며 아직 판정 전이다. 다음은 이 핸들을 재시작 없이 poll한 뒤 `node .runtime/performance/screen-session-compare-review-179.mjs bench`다.4cached CPU각7% 개선,나머지CPU/명령어5%·wall10%·RSS/heap의 기존 한도와 모든 표본을 고정했다. cycles는 진단만 한다. heavy compile/sample은 timed 구간과 겹치지 않는다.
+- 실제 A/B가35/35를 통과하고 공개 재현·최종 소스/객체 대조를 마치기 전까지 제품에 채택하지 않는다. 이번 후보 전체451을 다시 반복할 이유는 현재 없다. 버전179/206·Root438/7576 검증 기준·설치168을 유지하며 서명/게시·시스템/전원/보안/VPN/키체인·원본 터미널/입력/화면/잠금 변경은 없다. 서명·설치 예외도 미응답이다. 새 UI·브라우저/실물폰 QA나 앱 전체 속도 향상은 주장하지 않는다.
+
+## 2026-10-25 · 세션 정렬 키 후보 종료 · 동일 코드 A/A35/40, 제품 미채택
+
+- 직전 두 목표 턴은 실제 live53810 및 controller1485를 관찰한 verified wait였다. 이번에는 같은 작업의 종료·원본 판정·후보 보류·기준 파일 대조까지 끝냈으므로 progress다. 전체 경량화 목표는active이며 완료를 주장하지 않는다.
+- private 정렬 키 후보의 정합성26,580건은 통과했지만,서로 **같은 바이너리·같은 기존 정렬 함수**를 실행한 A/A는 **35/40**이었다.16worker/512구간/800,921,600반복/2984.250초이며 전 worker exit0,driver53810 exit0,controller1485도 terminal이다. reviewer가5실패를 판정하자 controller는 A/B를 시작하지 않고 정상 종료했다. 이제1485/53810을 다시 poll하거나 다른 controller를 시작하지 않는다.
+- 실패는19mixed CPU 대칭1.164598837배·명령어1.071302771배·wall1.194050518배와96mixed CPU1.062155532배·명령어1.073711998배다. CPU/명령어 한도1.05,wall1.10을 넘었다. **후보 속도는 측정하지 않았으므로 후보가 느리거나 빠르다는 결론이 아니다.** 특정 VPN/보안 제품·주파수·스케줄러·해시 seed를 원인으로 확정하지 않는다. 모든 원시 구간·체크섬·시작/종료 기록과 고정 기준을 보존했다. 같은 후보/프로토콜 재실행·표본 제외·한도 완화는 없다.
+- 사전 규칙에 따라 실제 후보Core 빌드,준비한720fixture/최소6000snapshot·관련30,실제 엔진 A/A/A/B,전체451·공개 재현·제품 채택으로 진행하지 않았다. 준비된 실제 엔진 검사·구문 검사는 보관만 한다. `.runtime/performance/publication-sort-keys-179-20261025/{decision,closure,final-audit,controller-terminal}.json`이 종료 근거다. 미채택 후보를 다음 빌드에 섞지 않는다.
+- closure exec44156 exit0은 현재438입력·94Core·4바이너리·모듈7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8와 canonical 및 retained-route-selection620파일을 실제SHA로 대조했다. qualification lock은 없다. Root ApprovalEngine.swift를 바꾸지 않았고,기존 검증 빌드·179/206을 유지한다. 설치본도 새 plist 읽기에서168/195였다. 기존 입력451검사를 이번 후보에 실행한 것처럼 재사용하지 않는다.
+- 배포 제한의 별도 읽기 전용 조사로 Apple 공개 API의 요청별 kSecMatchSearchList 및 인증서로 identity참조 생성 경로를 검토했다. private C probe는 컴파일/session25090 exit0,일반 사용자 실행 exit0이었다. **기존 서명 키체인은 잠겨 있었고 검색 목록은 전후 같았다.** 잠금 상태에서는 identity/인증서 조회를 아예 건너뛰어 해당 status는null이다.0건 카운터로 identity가 없거나 무효라고 판단하지 않는다. 자격 정보·개인키를 읽거나 export하지 않았고 unlock·서명·새 인증서/키체인·신뢰/ACL/검색 목록 변경을 하지 않았다. 결과는 `signing-scoped-reference-179-20261025/result.json`이다. 서명 우회가 해결된 것은 아니며 기존 예외 질문은 미응답이다.
+- 설치/재시작·원본 터미널/화면/입력/크기/잠금 해제·전원/관리자/시스템/보안/TCC/VPN·자동실행/새서비스·서명/게시 변경은 없다. 무관한 IDE/인덱스/fixture를 보존했다. 다음은 현재438/7576 실제Core의 다른 실질 비용을 새 근거로 조사하는 것이다. 이 후보와 이미 보류한 날짜/헤더/endpoint 후보의 같은 측정을 다시 실행하지 않는다. 서명·패키지3검사·DMG/체크섬·커밋/태그/push·GitHub 게시/다운로드 검증과 덮개 문제의 실제 적용은 여전히 남아 있다.
+
+## 2026-10-25 · 작은 세션 정렬 키 후보 · A/A 실행 중, 실제 엔진 검증 준비
+
+- 현재 실제Core의 공개 updateDiscovery 프로파일에서 세션 표시 정렬 비용을 확인해,1024바이트 AgentSession 대신 작은 일시 키를 정렬하고 마지막에 원래 값을 모으는 private 후보를 준비했다. 종료/수동 순서/프로젝트 localizedStandardCompare/ID·안정적 동률 순서는 유지한다. 지속 캐시·스케줄·자동 승인/권한 정책은 추가하거나 바꾸지 않는다. Root ApprovalEngine.swift에는 적용하지 않았다.
+- 앞서 완료한 소스 결합 oracle26,580건은 순열13,110·4행 상태 조합6,480·무작위6,000·native/NSString/CFString 원본UTF16/날짜비트/호출자 저장소를 포함하며 통과했다. 실제 후보Core의 검증 결과는 아니다. 이미 통과한 검사를 변경 없이 반복하지 않았다.
+- prototype A/A는 **exec53810이 현재 live**임을 같은 핸들 poll로 확인했다. 초기 확인235/512,이후 확인391/512구간이며 아직 종료·판정 전이다. 직전 덮개 요청 및 검증 준비 턴은 실제 live 핸들을 확인한 verified wait로 분류하며 경량화 제품 채택 진척으로 세지 않는다. 관찰 지연을 종료로 취급하거나 작업을 재시작하지 않았다. 정해진8쌍/4epoch/40기준과 모든 표본을 유지한다.
+- 이어서 **functions.exec controller cell1485**가53810의 관찰을 맡았다. 지금부터는 `functions.wait(cell_id:"1485")`로 관찰하며53810에 두 번째 write_stdin 소비자를 붙이지 않는다. controller는30초 이하 poll로 원래 작업 종료를 확인하고 원래 A/A reviewer를 실행한다.40/40일 때만 새 prototype A/B와 reviewer를 순서대로 실행하며 실패·관찰 오류 시 멈춘다. 실제Core 빌드·소스 채택·서명/설치/시스템 동작은 하지 않는다. `controller-handoff.json`은 핸들 안내이며 live 증거를 대신하지 않는다. 실행 중 별도 load()는undefined였으므로 store값의 부재로 작업 종료를 판단하지 않는다.
+- 기다리는 동안 `publication-sort-keys-179-20261025/engine-plan.json`을 실제Core 빌드·측정 전에 고정했다. 공개 discovery/표시 설정/수동 정책/전체·필터 이동/개별·전체 초기화/부분·전체 재발견/재시작720fixture와 느린 독립 소유 그래프 oracle의 최소6000snapshot·관련30검사다. Mirror는 결과 raw 상태를 읽기만 하며 제품 클래스를 fixture에 다시 컴파일하지 않는다. 동일 discovery의 불필요한 게시,원본 값/직렬화/입력 저장소도 확인할 예정이다.
+- 실제 전체 updateDiscovery의 별도 A/A/A/B도 각16worker/512구간·40기준으로 고정했다.5종19/96/256행 CPU10% 개선,제어 CPU/명령어5%·wall10%·기존RSS/heap 한도이며 cycles·첫 게시 비용은 진단만 한다. prototype의 시간/판정을 재사용하지 않는다. 실제Core/720fixture/관련30/실제 성능/전체451·공개 재현은 **아직 실행하지 않았다**. Swift2fixture 구문과 Node4driver 구문만 exit0이며 기능 통과를 의미하지 않는다.
+- 최초 준비의 관련 검사 수 예상28과 실제30 불일치는 `engine-preparation-attempt-1`에 원본 script와 실패를 보존했다. 추가 Claude registry2검사를 제외하지 않고30개 모두 고정했다. 측정 표본·성능 기준은 변경하지 않았다.7observer SHA가 고정 계획과 같았다. 버전179/206·제품 소스/설치168·서명/배포는 바꾸지 않았으며 전원/관리자/시스템/보안/VPN/키체인·원본 터미널/입력/화면/잠금은 조작하지 않았다. 기존438/7576 기준은 유지한다. 다음은1485를 관찰하고 원본 판정 뒤 조건부 A/B 결과에 따라 실제Core 검증 또는 후보 종료를 진행하는 것이다.
+- 새 읽기 전용 GitHub 조회3건과 태그 조회가 모두 exit0이었다. main은 로컬HEAD와 같은2bc18930dfb7f1a30e32bbf8675cb6281442b172,최신 공개 릴리스v0.2.178,열린 issue/PR 목록0건,179 일치 태그 목록은 비어 있다. release DMG/sha256 이름·크기만 확인했으며 이번 새 다운로드 검증을 주장하지 않는다. fetch/merge/push/게시 변경은 없다. 근거는 `github-state.json`이다.
+
+## 2026-10-25 · 덮개로 인한 중단 방지 요청 · 설치본과 공개 API 한계 확인
+
+- 이번 요청은 덮개 닫힘 때문에 Mac 작업·휴대폰 연결이 중단되는 것을 AutoApprove가 막아 달라는 것으로 해석했다. 읽기 전용 확인에서 설치본은 **0.2.168 (195)**, `SleepDisabled=Yes`, `AppleClamshellState=No`, `AppleClamshellCausesSleep=Yes`였다. 이미 잠자기 금지가 켜져 있으므로 꺼져 있다는 진단이나 추가 전원 변경을 하지 않았다. 이 한 번의 값으로 실제 덮개 위치·센서 고장·보안 제품 원인을 단정하지 않는다.
+- 설치된 실행 파일의 문자열에서 `/usr/bin/pmset sleepnow`와 guard의 `sleepnow`를 확인했다. 문자열 존재는 해당 명령이 이번 화면 꺼짐 때 실행됐다는 증거가 아니다. 현재 KeepAwake.swift/ApprovalEngine.swift에는 이 명시적 잠자기 호출이 없고, 기존 KeepAwakeTests는 guard·권한 규칙에 sleepnow가 없는 것과 덮개 신호 변동 중 방지 유지·단일 guard를 검사한다. 수정은169이상 소스에 있으나 설치168에는 미반영이다. 변경 없는 전체 검사를 다시 실행하지 않았다.
+- [Apple QA1340](https://developer.apple.com/library/archive/qa/qa1340/_index.html)과 설치 SDK의 IOPMLib.h를 확인했다. 공개 idle-sleep assertion은 덮개 닫힘으로 인한 강제 잠자기나 내장 화면 꺼짐의 차단을 보장하지 않는다. 전원 작업 지속과 내장 화면 유지·사용자 잠금 해제는 별개이며, 이미 잠근 화면은 해제하지 않는다.
+- 추가로 [Apple RootDomainUserClient.cpp](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/RootDomainUserClient.cpp)의 비공개 `kPMSetClamshellSleepState` 경로를 검토했다. 이 구현은 powerd용 전역 상태를 바꾸며 clientClose/stop에서 그 상태를 원복하는 코드가 보이지 않는다. 따라서 일반 앱의 프로세스 수명에 묶인 공개 assertion과 같은 종료 안전성을 보장할 수 없다고 판단해 호출·제품 적용·실제 전원 시험을 하지 않았다. 이 경로가 있다는 이유로 모든 방법이 불가능하다고 단정하지 않는다.
+- 후속으로 프로세스 소유 assertion의 덮개 예외도 확인했다. [Apple powerd의 권한 검사](https://github.com/apple-oss-distributions/PowerManagement/blob/main/pmconfigd/PMAssertions.c#L2326)에서는 `AppliesOnLidClose`에 별도 entitlement를 요구하고, 배터리에서도 적용하는 속성 역시 별도 권한을 검사한다. 설치 SDK의 `IOPMLib.h`는 `PreventSystemSleep`을 10.9부터 deprecated·지원되지 않는 형식으로 명시한다. 따라서 이를 일반 앱의 공개·무권한 덮개 차단 API로 채택하지 않았다. 특수 권한 추가·검사 우회·전원 변경·실제 assertion 생성은 하지 않았으며, 앞선 전원 진단과 변경 없는 테스트도 반복하지 않았다. 최신 요청은 여전히 덮개를 닫아도 작업과 휴대폰 연결을 유지하는 것이고, 내장 화면 켜기나 수동 잠금 해제와 구분한다.
+- 기존 설치/재시작 예외와179 서명 예외는 미응답이다. 앱 교체로 기존 앱 소유 잠자기 방지가 해제될 수 있어 앞선 시스템 변경 금지의 철회로 임의 해석하지 않았다. 원본 터미널·화면/입력·전원·관리자/시스템/보안/TCC/VPN·서비스/자동 실행·키체인을 바꾸지 않았고 버전·배포·설치도 바꾸지 않았다. **요구는 아직 미해결**이며 기존 수정본 적용과 실제 덮개 닫힘 시 동작 검증이 남는다.
+
+## 2026-10-25 · 날짜 초기 검증의 JSON 중복 제거 후보 · 반복 CPU 목표 미달로 미채택
+
+- 같은 목표 턴에서 앞선 공유 UTC 시제품의 첫 인코딩 CPU 기준 미달을 보존한 뒤,검증 날짜3개는 그대로 두고 bootstrap의 String 루트 JSONEncoder3회를 엄격한 JSON-safe ASCII 확인/직접 quote 버퍼로 바꾼 별도 구현을 검토했다. 기준 Date JSONEncoder3회는 유지하며 총 루트 직렬화6→3회다. 불안전한 표현은 빠른 경로를 거부한다. 첫 후보의 hot/cold/HTTP 한도를 그대로 사전 등록했다. 이전 시간 재사용·같은 후보 재실행이나 한도 완화가 아니다.
+- 새 구현의 독립 날짜3,702,428건과 병렬16,384건·전체 canonical JSON2,651,052건·Unicode/UTF16 key/storage213,762건·Core모델24건·호환성/오류/입력 저장소가 통과했다. 정확한 새 bootstrap quote 본문만 추출한 추가245,771건은 ASCII전체2문자·UTF16전체·native/NSString/CFString에서 Foundation(withoutEscapingSlashes)과 대조했고,26,237허용·219,534거부와 호출자 원본UTF16/저장소 보존을 확인했다. 이는 일반 값에 새 quote writer를 적용했다는 의미가 아니며 ISO bootstrap 전용이다. 날짜 corpus의 비정렬 prettyPrinted 대조군은 프로세스 간 JSON 키 순서가 달라질 수 있으므로 종합 checksum을 과거 실행과 동일하다는 증거로 쓰지 않았다.
+- fresh A/A18/18 뒤 A/B는 **14/18**이었다. 각각96worker·384창·835,584인코딩이며 전 worker exit0이다.19ASCII/19mixed/96ASCII/96mixed CPU 감소는5.515%/3.856%/5.935%/4.510%로 고정7%목표에 못 미쳤다. 원시 명령어/사이클/벽시계/RSS도 보존했으며 CPU 미달을 다른 지표로 대체하지 않았다. 특정 보안/VPN 제품·주파수·스케줄러나 bootstrap 변경을 편차 원인으로 단정하지 않는다.
+- 이 후보도 닫고 콜드 A/A·A/B·실제 후보Core·전체HTTP·451·공개 갱신·제품 채택으로 진행하지 않았다. 앞선 후보의 콜드 실패는 반복하지 않았다. 두 시제품과 별도 raw/계획/소스/바인딩을 보존하고 다른 실제 비용을 찾는다. 준비만 한 실제Core API 검사 스크립트는 실행하지 않았다.
+- 현재 권위 있는438입력·94Core·4바이너리·모듈7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8와 canonical 및 retained-route-selection620파일을 실제SHA로 확인했다. qualification lock은 없다. 버전179/206·설치168을 바꾸지 않았다. 기존 서명/설치 예외는 미응답이다. 원본 터미널/화면/입력/수동잠금·전원/관리자/시스템/보안/TCC/VPN·자동실행/상주서비스·키체인은 바꾸지 않았다. 덮개 문제는 미해결이고 새UI·브라우저·실물폰 QA를 주장하지 않는다. unrelated IDE/인덱스/fixture는 보존했다. 전체 경량화 목표는active이며 이번 새 근거·두 구현·검증·미채택 결정은progress다.
+
+## 2026-10-25 · 공유 UTC 날짜 직렬화 후보 · 첫 인코딩 기준 미달로 미채택
+
+- 직전 헤더 후보 턴은 실제Core 정합성과 파서 CPU 개선을 확인했지만 전체 요청 동일 빌드 편차로 미채택했다. 이번은 별도 날짜 비용의 새 근거 검토·새 시제품·정합성/반복 및 첫 인코딩 비교와 미채택 결정을 마친 progress다. 전체 목표는active다.
+- 실제438/7576 메타데이터 프로파일의 Date scalar→JSONEncoder→ISO8601 달력 설정/복제·JSON writer를 검토했다. Swift Foundation 공식 JSONEncoder의 Date.formatted(.iso8601),기본 ISO8601FormatStyle의 고정GMT 설정과 반복 사용 가능한 값 형식 구현도 확인했다. private 후보는48바이트 값 형식의 불변 UTC 설정을 공유하고,유한 Date·plain JSONEncoder·macOS15+·3개 런타임 날짜 probe가 일치할 때 기존 임시 문자열 atom으로 직렬화했다. 앱이 사용자 날짜/본문을 장기 저장하지 않으며48바이트는 전체 힙/RSS가 아니다.
+- 독립 JSONEncoder 날짜3,702,428건(1..9999년 UTC 모든3,652,059일·큰 유한값50,000·중첩 경계324·전략28·subclass8·호환 거부4·프로세스 내 시간대9)과 병렬16,384건이 일치했다. 입력 Date 원시 bits도 보존됐다. 같은 전체 후보 helper/호환 래퍼의 Unicode1,112,064scalar·UTF16전체·기본JSON2,651,052건과 key/storage213,762건·Core모델24건·오류/깊이/크기/foreign/명시적 fallback도 통과했다. 비유한 Date는 기존 scalar 호출 경로를 소스로 보존했으며 실제 포맷을 새로 실행했다고 주장하지 않는다.
+- 첫 canonical fixture 조립에서 호환 래퍼를 빠뜨리고 로컬 alias를 바꿔 컴파일이 실패했다. 제품 오류로 분류하지 않는다. 최초 소스·바인딩·컴파일 로그/exit1을 canonical-fixture-attempt-1에 보존하고 원본 oracle/전체 호환 섹션을 포함한 수정 fixture가 통과했다. 이미 통과한 날짜3,702,428검사는 반복하지 않았다.
+- 고정 순서·fresh 표본의 반복 인코딩 A/A18/18 뒤 A/B18/18이 통과했다. 각각96프로세스·384창·835,584인코딩이며 실제 기준Core 모델 값과 소스 결합된 helper를 사용했다.19ASCII/19mixed/96ASCII/96mixed CPU 후보/기준은0.913301/0.915176/0.886892/0.924026배다. 이는 실제 새 후보Core/전체HTTP/앱/휴대폰 속도 주장이 아니다.
+- 초기 helper warm-up 없이 처음 한 번을 측정한 별도64프로세스 A/A6/6 뒤 새64프로세스 A/B는5/6이었다.1세션 CPU 1093.600→1220.959µs(+11.646%)가 사전5%또는20µs 허용 한도를 넘었다. 처음 인코딩의 출력은 측정 뒤 독립 Foundation 전체 바이트로 대조했다. shared 설정 초기화가 포함되며 앱 전체 콜드 스타트나 특정 보안/VPN 제품의 원인을 측정한 것이 아니다.
+- 동일 후보 재실행·한도 완화·표본 제외·이전 시간 재사용 없이 이 후보를 닫았다. 새 실제Core 빌드·전체HTTP·451·public 갱신·제품 채택은 하지 않았다. 총320소유 worker는 전부exit0이며 원시 표본/계획/코드/실패를 보존했다. 다음에는 같은3개 날짜 검증을 유지하면서 String 루트 JSON 직렬화3회를 없애는 별도의 초기화 구현을 검토한다.
+- 현재 권위 있는438입력·94Core·4바이너리·모듈7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8와 canonical 및 retained-route-selection620파일이 실제SHA로 일치한다. qualification lock은 없다. 버전179/206을 올리지 않았고 기존 서명/설치 예외는 미응답이다. 설치 앱·원본 터미널/화면/입력/수동잠금·전원/관리자/시스템/보안/TCC/VPN·자동 실행/상주서비스·키체인은 바꾸지 않았다. 덮개 문제는 미해결이다. 새UI·브라우저·실물폰 QA를 주장하지 않는다. unrelated IDE/인덱스/fixture를 보존했다.
+
+## 2026-10-25 · ASCII HTTP 헤더 줄 분리 후보 · 전체 요청 A/A 기준 미달로 미채택
+
+- 직전 덮개 요청 턴은 설치168과 기존 API 한계를 재확인했으므로 경량화의 새 진척이 없었다. 이번은 새 실제Core 메타데이터 프로파일 검토·ASCII 헤더 분리 후보 구현·실제Core 정합성/성능·새 전체 요청 A/A와 미채택 결정을 끝낸 progress다. 전체 목표는active다.
+- 새6모드 프로파일의 바인딩552개가 현재438입력·94Core·모듈7576과 일치했다. query-conditional의 파서63 inclusive표본 중38은 헤더 분리 줄,35는 Foundation.components 하위였다. 누적 호출 표본이며 CPU비율·앱 전체 병목 점유율로 해석하지 않는다.
+- private 후보는 검증된 UTF8 헤더가 연속 ASCII일 때 CRLF를 한 번 순회하고 원문 Substring을 빌린다. 그 외 입력은 기존 Foundation 분리로 돌아간다. 시작줄/URL·헤더 대소문자/공백/중복·본문 길이/완성·Origin/허용 주소·reuse 검증은 그대로다. 장기 캐시·타이머·서비스·새 정책이 없다. Root 제품 소스는 바꾸지 않았다.
+- Foundation 줄 분리 oracle3,292,278건(모든128^3 ASCII3문자·Unicode scalar·UTF16 unit·native/foreign·제어문자/CRLF/공백/긴줄)의 원본 UTF16과 저장소가 같았다. 실제 컴파일된 기준/후보 Core의 공개 parse API81,550건도 원본 parser oracle과 메서드/대상/헤더/본문·오류/미완성·Origin·reuse가 같았다. candidate제품 파서를 observer에 복제하지 않았다.
+- 새 실제Core 파서 A/A42/42 뒤 A/B42/42가 통과했다. 각각16worker·224창·20,544,000파싱이다. 일반/쿼리/16헤더 CPU 후보/기준은0.631518/0.510090/0.511056배였다. Unicode는1.033060배로 정한5%대조군 한도 안에서 증가했다.16KiB헤더는0.043075배이며 실제 통상 트래픽 속도 주장이 아니다.
+- 그러나 실제Core parse+handle·fresh hosts읽기·19/96합성 세션·MainActor 제어 callback의 동일 기준 바이너리 A/A는144worker·288창·11,272,192요청 후 **44/45**였다. dense CPU 후보라벨/기준라벨 0.948656600배, 대칭 편차 1.054122219배가 사전1.05한도를 넘었다. 두 라벨 모두 같은 baseline실행파일임을 시작/종료 기록으로 대조했다. 전 worker exit0이다. 특정 VPN/보안 도구나 스케줄러를 원인으로 단정하지 않는다.
+- 사전 noAdditionalProtocolRetries에 따라 전체 요청 후보 A/B·전체451·공개 overlay·제품 채택을 진행하지 않았다. 같은 후보 재실행·한도 완화·표본 제외·과거 시간 재사용은 없다. `http-head-spans-179-20261025`에 후보·별도 모듈/94객체·원시 표본·계획/observer바인딩·실패·결정을 모두 보존했다. 공개 새2파일은 private overlay에만 있고 Root에는 없다.
+- 현재 권위 있는 **438입력·94Core·4실행파일·모듈7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8** 및 `retained-route-selection-build/source`620파일과 canonical 빌드를 실제 SHA로 검증했다. qualification lock은 없다. SPM의 첫 샌드박스 모듈캐시 접근 실패를 보존했고 일반 사용자 빌드는 성공한 뒤 기존 빌드를 복원했다.
+- 버전179/206을 올리지 않았다. 기존 서명 키체인 검색 목록 및 설치/재시작 예외는 미응답이며 새 서명·설치·커밋/태그/GitHub게시를 하지 않았다. 설치 앱·원본 터미널·화면/입력/크기/초기화/재시작/수동잠금 해제·실제 전원/관리자/시스템/보안/TCC/VPN·자동실행/상주서비스는 변경하지 않았다. 덮개 강제 잠자기/내장 화면 문제는 미해결이다. UI·브라우저·실물폰 검사는 새로 주장하지 않는다. 기존 IDE/인덱스와 unrelated fixture를 보존한다. 모든 소유 작업은 종료했다.
+
+## 2026-10-25 · 0.2.179/206 · 우선 주소 선택 후보 보류 · 검증된7576 유지
+
+- 직전 goal턴은 route 선택의 정렬 제거를 소스/보관 빌드에 채택한 progress다. 이번은 새 실제Core profile·별도 후보 빌드·정합성·새 A/A와 미채택 판정·기준 보존 검증을 끝낸 progress다. 전체 목표는active이며 제품 후보를 채택하지 않았다.
+- 현재438입력·94Core·4바이너리·retained-route-selection620파일·모듈7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8를 Root/canonical/보관본과 대조했다. 추가 version bump와 sourcecommit/태그/push/게시/설치는 없다. qualification lock은 없다.
+- 실제 기존 Core의 preferredEndpoint250,000회/16합성 주소 profile은 CPU14.204555초·경과14.490830초였다. 소유 프로세스만2초/5ms 샘플링해 반복 String(describing:host)/inet_ntop와URL/endpoint 해석 비용을 확인했다. 원본profile의 worker·driver·binary/hash는 보존했다. 실제 앱/휴대폰/LAN 지연의 비율로 확대하지 않는다.
+- 후보는 candidate 배열 대신 첫 유선 하나만 기억하고 첫 eligible Wi-Fi에서 반환한다. host.description은 후보당 한 번이며 빈 주소/인터페이스는 원래fallback을 바로 반환한다. matching port·허용 IP·자기주소/loopback 제외·route 선택·Wi-Fi 우선/첫 주소 동률을 유지하고 새 캐시/인스턴스 상태/타이머/서비스는 없다. 이 코드는 private 후보에만 있다.
+- 실제 컴파일된 원본/후보의 preferredEndpoint34,464건이 독립 legacy compactMap/min+Network/route oracle과 같았다. 전체7주소 순열·중복/역순·0/1/8765/65535포트·겹치는 서브넷·IPv6/mapped/DNS·Cocoa/Unicode·encoded/whitespace/malformed URL을 포함했다. 선택된23,947건의 바인딩 주소/물리 인터페이스도 같았고10,517건의 원본fallback과 호출자 rawUTF16/문자열 상태를 보존했다. 외부 소켓 연결은 요청하지 않았다. 기존631,266host·4,000origin·10,760route·354endpoint와83,120route/1,080consumer/30binding도 일치했다. 제품 selector를 실제 측정 관측기에 재컴파일하지 않았다.
+- private 후보 빌드는84.668초에 완료 후 기준을 복원했다. 원본/후보 모듈SHA는 같지만94Core객체가 전부 다르다. 모듈SHA만으로 구현 동일성을 간주하지 않았고, 원본/후보의 객체·실행 파일 지문을 모두 보존했다.
+- 새 동일 바이너리 A/A16프로세스·8쌍·2epoch·256창·648,640,000작업은45/48이었다. wifi-first16 CPU 후보/기준0.905180(대칭1.104753>1.05)·경과0.863731(대칭1.157767>1.10),wifi-last16 CPU1.066668>1.05가 실패했다. 명령어/사이클/RSS/힙과 나머지 항목은 통과했다. 두 label은 모두 같은baseline실행파일이었다. 원인을 특정 보안 제품·VPN·전원·온도·스케줄러로 단정하지 않는다.
+- 계획의 noAdditionalProtocolRetries를 지켰다. 한도 완화·표본 제외·기존 시간 재사용·같은 후보/프로토콜 재실행은 없으며 후보 A/B·새전체451·공개갱신·채택은 진행하지 않는다. 이는 후보의 속도 개선이나 악화를 입증한 결과가 아니다. 현재 제품451검증은 직전 route-selection의214.403초 기록을 그대로 보존하며 이번의 새검사로 주장하지 않는다.
+- 기존 서명 검색 목록 및 설치/재시작 예외는 여전히 미응답이다.179 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub게시/익명 다운로드가 남았다. 이번 새GitHub 조회/게시·설치 앱·원본 터미널/화면/입력/크기/재시작/잠금 해제·전원/관리자/시스템/보안/TCC/VPN·자동실행/상주서비스·서명 검색 목록 변경은 없다. UI/브라우저/실물폰 QA를 새로 주장하지 않는다. IDE/인덱스와 unrelated fixture를 보존했고 모든 소유 작업은 종료했다.
+
+private 근거: `.runtime/performance/preferred-endpoint-179-20261025/`의 `profile.json`, `source-binding.json`, `correctness.json`, `aa-review.json`, `decision.json`, `closure.json`.
+
+## 2026-10-25 · 0.2.179/206 · LAN 경로 선택 정렬 제거 채택
+
+- 직전 goal턴은 표준IPv4 경량화의 소스·검증 빌드 채택을 마친 progress다. 이번도 새 실제Core profile·원본/후보 정합성·A/A/A/B·전체 검사·공개 재현과 소스/보관 빌드 채택을 끝낸 progress다. 전체 목표는active다.
+- 새 실제Core route16 profile은 합성12,000,000조회에서 CPU10.773416초·경과11.721346초였다. 소유 프로세스만2초/5ms 샘플링하여 정렬·인터페이스 배열 복사/해제 비용을 확인했다. 이를 앱 전체나 실물LAN의 비용 비율로 해석하지 않는다.
+- RemoteLAN.route의 ordered/filter/두 번째 sort/first를 한 번 순회하는 선택으로 바꿨다. 지역 best/마스크만 보관하여 selector 자체의 보조 상태는 일정하고 중간 경로 배열을 만들지 않는다. 더는 쓰지 않는 fileprivate contains도 제거했다. 마스크 유효성·가장 구체적인 서브넷·동률의 Wi-Fi/이름/주소·완전 동률의 첫 입력을 유지한다. [Swift의 정렬 동률 보존 규칙](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0372-document-sorting-as-stable.md)을 확인했다. IPv4/허용 주소/Origin·실제 OS/VPN 경로 정책·캐시/타이머/상주서비스는 바꾸지 않았다.
+- 실제 컴파일된 Core의 새83,120route 사례에서1..32마스크·7개 인터페이스의 전체 순열·중복/역순·잘못된 입력·Cocoa/Unicode 정규화 동률을 독립 Network/두 정렬 oracle과 비교했다. 문자열 동등성 외에 선택된 rawUTF16과 caller문자열/contiguous상태도 같았다. 비연속 인터페이스139,704방문을 포함했다. 실제 발견 그룹/같은LAN API1,080건·바인딩 주소/종류30건 및 기존 주소631,266·출처4,000·route10,760·endpoint354도 일치했다. 제품 selector를 관측기에 다시 구현하지 않았다.
+- 새 동일 바이너리 A/A48/48 뒤 새 A/B48/48이 통과했다. 각각16프로세스·8쌍·2epoch·256창·632,000,000작업이다.1/2/16/64인터페이스·빈목록·경로없음·발견 그룹·fallback을 포함하고 기존5%제어군·10%경과·RSS/힙 한도를 유지했다. 모든 worker는exit0이며 표본 제외·시간 재사용·한도 완화·프로토콜 재시도는 없었다.
+- CPU 후보/기준은 route2/16/64 0.455096/0.445521/0.369489배, 발견 그룹 API 0.723001배다. 합성 입력을 쓰는 실제 Core 함수의 비용이며 앱 전체·휴대폰/LAN/VPN/SentinelOne 지연·물리 메모리·전송량의 개선율로 확대하지 않고 앞선 수치와 합산/곱하지 않는다.
+- HTTP4·압축5·연결 재사용12·경로 복구15·전체451/451(214.403초)과 공개 overlay 재현이 통과했다. 기존 numeric 주소 검증기에 같은83,120사례·소비자1,080·바인딩30을 추가했고 overlay의 차이는 helper import/fixture/provenance 절대 경로뿐임을 역변환으로 확인했다. Root의 기존 공개2파일은 최종 채택 때만 갱신했다. 이2파일은 SPM 밖이며 새 공개 파일은 없다.
+- 최종438입력·94Core·4바이너리·모듈7576b8ea7c1db897a053cbe1471d0887e71dcc4e1bbecacf8125e5d6e9d0e0d8를 Root/canonical/retained-route-selection과 대조했다. 새620파일과 직전 numeric 보관620파일을 검증했다. Core/전체검사 입력438개와 최종438개 중 늦게 바뀐 것은 공개 검증기2개뿐이다. 공개441입력·42경로·399고정HEAD입력과 빈 index를 확인했다. 이전 모든 보관본/검증은 유지한다.
+- 새 GitHub 사전 확인은 최신v178·v179태그 없음·main==로컬HEAD였다.179/206을 더 올리지 않았고 기존 서명 검색 목록과 설치/재시작 예외는 여전히 미응답이다. 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·게시/익명 다운로드가 남았다. 이전 unsigned179 앱은 현재7576 Core와 달라 배포하지 않는다. guarded finish-docs는 실행하지 않았다.
+- 설치 앱·원본 터미널/화면/입력/크기/초기화/재시작/수동잠금 해제·실제 전원/관리자/시스템/보안/TCC/VPN·자동실행/상주서비스·서명 검색 목록은 변경하지 않았다. 덮개 강제 잠자기/내장 화면 문제는 미해결이다. UI·브라우저·실물폰 QA를 새로 주장하지 않으며 기존 IDE/인덱스와 unrelated fixture를 보존한다. 모든 소유 작업은 종료했다.
+
+| 합성 API 조건 | CPU 후보/기준 | 경과 후보/기준 | 명령어 후보/기준 | 사이클 후보/기준 |
+| --- | ---: | ---: | ---: | ---: |
+| route-empty | 0.476353 | 0.473521 | 0.574934 | 0.473618 |
+| route-one | 0.403744 | 0.402512 | 0.390865 | 0.394795 |
+| route2 | 0.455096 | 0.445236 | 0.449204 | 0.453655 |
+| route16 | 0.445521 | 0.443525 | 0.435484 | 0.450377 |
+| route64 | 0.369489 | 0.368394 | 0.388268 | 0.369127 |
+| route-miss | 0.455618 | 0.454990 | 0.453615 | 0.459149 |
+| discovery-lane | 0.723001 | 0.719172 | 0.738577 | 0.728211 |
+| route-fallback | 0.945094 | 0.948259 | 0.955254 | 0.948256 |
+
+private 근거: `.runtime/performance/route-selection-179-20261024/`의 `correctness.json`, `aa-review.json`, `bench-review.json`, `qualification.json`, `public-check.json`, `decision.json`, `final-audit.json`, `closure.json`.
+
+## 2026-10-24 · 0.2.179/206 · 표준 IPv4 임시 객체 제거 채택
+
+- 직전 덮개 요청 턴은 설치168과 공개API 제한의 재확인이어서 경량화의 새 진척은 없었다. 이번은 새 실제Core 주소/시작 비용 검토·후보 정합성/성능·전체 검사·공개 재현·소스 및 보관 빌드 채택을 끝낸 progress다. 전체 목표는active다.
+- 표준 dotted-decimal IPv4만 빌린 연속UTF8로 파싱하여 Network 주소/Data·소문자/문자 집합/배열 변환을 생략한다. 앞자리0·공백·Unicode·NUL·괄호·IPv6·호스트 이름·비연속 저장소는 기존 경로다. 새 인스턴스 상태·캐시·타이머·서비스는 없고 허용 IP 범위·Origin·서브넷 우선순위·Wi-Fi/유선/VPN 정책은 그대로다.
+- 별도 source-bound parser631,266사례에서 표준575,736건은 Network 파서와 같았다. 실제 컴파일된 Core의 주소631,266·출처4,000·route10,760·endpoint354건은 기존 oracle과 일치했다. Cocoa 비연속11,156건과 원본 UTF16/저장소 보존을 확인했다. 실제 Core API 검증에서 제품 클래스를 다시 컴파일하지 않았다. 공개 검증기는 최적화 파서를 복사하지 않고 별도 Network 기반 oracle만 사용하며 예제 IP도 합성 주소로 바꿨다.
+- 처음의 짧은 동일 바이너리 A/A16프로세스·256창·20,480,000작업은47/48이었다. origin-dns 경과1.104091배가1.10을 넘었고 후보 비교는 하지 않았다. 약70~120ms 구간에서 CPU는 비슷하지만 경과가 늘어난 원시값을 보존하고, 최소CPU0.4초를 목표로 작업 수만 늘린 새 프로토콜을 먼저 고정했다. 기존5%제어군·10%경과·RSS/힙 한도를 유지한 새 A/A48/48 뒤 새 A/B48/48이 통과했다. 각각16프로세스·8쌍·2epoch·256창·72,000,000작업이며 모든 worker는exit0이다. 표본 제외·시간 재사용·한도 완화·동일 실패 비교 재실행은 없었다.
+- 개별 API CPU 후보/기준은 숫자주소0.023540·2/16인터페이스route0.042424/0.039565·숫자출처0.344039배다. 이름/IPv6/잘못된 표기 제어군도 고정 한도 안이다. 별도 실제Core accept/send38사례와 짧은 연결의 새 A/A5/5·A/B5/5(각16프로세스/32창/2,048stream)가 통과했다. 연결 시작 CPU0.999410·경과1.000525배로 거의 같으므로 앱/실물폰/LAN/VPN/SentinelOne 속도 개선으로 확대하지 않는다. 앞선 단계와 수치를 합산/곱하지 않는다.
+- HTTP4·압축5·재사용12·경로15·전체451/451(231.833초)과 공개 주소 검증이 통과했다. 최종438입력·94Core·4바이너리·모듈2ce36f30ef7c671c2e8c3c94728fd4648fcb9b4103ca795db1b4aaede6c822d3를 Root/canonical/retained-numeric-ipv4와 대조했다. 보관620파일과 직전618파일을 검증했다. Core/전체검사 시436입력 뒤 추가된 공개2파일은 SPM대상 밖이다. 공개441입력·42경로 whitelist·399고정HEAD입력을 대조했고 index는 비었다.
+- 이전 시작 profile의 sourceInputsAtCompilation436 표시는 Core컴파일434/최종검증436으로 새 계획에 정정했다. 원시 profile과 해당 driver/hash는 바꾸지 않았다. 첫 sandbox 빌드는 캐시 접근 실패 뒤 기준 복원을 확인하고 일반 사용자 환경에서138.167초에 빌드했다. 첫 관측기는 GET origin 조합 수가 정확히2000인데 >2000을 요구하여 비교 뒤 실패했다. POST/긴 Cocoa 입력을 추가한 뒤 성능 측정 전에 재컴파일했고 실패 소스/바이너리/로그는 보존했다. 첫 보관 명령 exit137와 뒤의 EEXIST 중단도 보존하며 원인을 특정 보안 제품으로 단정하지 않는다.
+- GitHub 사전 확인에서 최신v178·v179태그 부재·main==로컬HEAD를 확인했다. 버전179/206을 더 올리지 않았고 기존 서명 검색 목록 및 설치/재시작 예외는 여전히 미응답이다.179 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·게시/익명 다운로드가 남았다. 이전 unsigned179 앱은 현재2ce Core와 달라 배포하지 않는다. 새 guarded finish-docs는 패키지 완료 전 실행하지 않았다.
+- 설치 앱·원본 터미널/화면/입력/크기/초기화/재시작/수동잠금 해제·실제 전원/관리자/시스템/보안/TCC/VPN·자동실행/상주서비스·키체인 검색 목록을 변경하지 않았다. 덮개 강제 잠자기/내장 화면 문제는 미해결이다. UI·브라우저·실물폰 QA를 새로 주장하지 않는다. 기존 IDE/인덱스와 unrelated fixture를 보존한다. 모든 소유 작업은 종료했다.
+
+| 합성 API 조건 | CPU 후보/기준 | 경과 후보/기준 | 명령어 후보/기준 | 사이클 후보/기준 |
+| --- | ---: | ---: | ---: | ---: |
+| numeric-host | 0.023540 | 0.022732 | 0.031057 | 0.024489 |
+| route2 | 0.042424 | 0.039577 | 0.043282 | 0.042655 |
+| route16 | 0.039565 | 0.038539 | 0.033425 | 0.039269 |
+| origin-numeric | 0.344039 | 0.343179 | 0.420879 | 0.348498 |
+| dns-host | 0.993324 | 1.002381 | 1.003817 | 1.000074 |
+| ipv6-host | 0.958449 | 0.955150 | 0.947601 | 0.956717 |
+| origin-dns | 1.037285 | 1.051201 | 1.002514 | 1.021375 |
+| route-fallback | 0.370149 | 0.381750 | 0.362115 | 0.375954 |
+
+private 근거: `.runtime/performance/numeric-ipv4-windowed-179-20261024/`의 `correctness.json`, `aa-review.json`, `bench-review.json`, `startup/`, `qualification.json`, `public-check.json`, `decision.json`, `closure.json`.
+
+## 2026-10-24 · 0.2.179/206 · 준비된 SSE 기록 묶음 채택
+
+- 직전 goal턴은 큐 완료 호출 제거 후보의 미채택을 확정하고 정식434입력/watchdog 빌드를 유지한 progress였다. 이번은 별도 SSE 묶음 구현의 소스/실제Core/브라우저/성능/전체 검사와 정식 소스·기준 빌드 채택을 마친 progress다. 전체 경량화 목표는active다.
+- RemotePTYPeerBodyStream은 이미 수신한 완성 SSE 기록만 최대64KiB로 묶는다. 첫 기록이 더 크면 기존2,000,128byte 한도에서 하나만 보낸다. 추가 패킷·gzip 출력·타이머를 기다리거나 미리 읽지 않는다. 단일 LF 탐색 borrow 안에서 완성 경계만 고르고, 겹치는 LF를 재사용하지 않는다. Data의 시작 인덱스0과 기존 tail view/빈 해제/절반 이상 prefix 정리를 유지한다. 새 상태 필드·캐시·타이머·서비스는 없다.
+- 새 소스 기반1,764사례에서 old/new 논리 기록·바이트/오류·호출자와 보관 chunk가 같았다. native/NSData/0이 아닌 인덱스·단일byte분할/LF/이진/Unicode·64KiB와 개별크기 경계·손상/잘린gzip·장기 append/pop을 확인했다. 반환chunk 횟수는1,513,845→54,456이었다. 이는 source-bound 검사이며 실제Core 성능으로 대체해 주장하지 않는다. 생성된 두 class 본문도 이름 이외에는 원본과 같음을 대조했다.
+- 실제 컴파일Core의 공개 handle/next는 양쪽 각21사례를 통과했다. 정상 출력의 논리 기록/바이트 순서·보관chunk·prefix상한·크기/오류/역압력·취소를 확인했다. 취소와 손상gzip의 수신 prefix 수는 packet timing에 따라 달라도 각 prefix의 바이트는 source와 정확히 같아야 한다. callback의 chunk 경계가 같다고 요구하지 않는다. tail이 비는 묶음은 alias가 없어도 되며, 포인터 공유 횟수는 진단만 남겼다.
+- 실제 upstream/downstream Core는 정상바이트·gzip·오류전체필드·12슬롯·재연결38사례, 원본이 본문/다음기록을 보류해 즉시 전달을 증명하는16사례, 실제30초/최종5초·이전 기한·느린 수신자·유휴 생존10사례를 통과했다. 독립Source.body class를 재컴파일하지 않았다. HTTP4·압축5·재사용12·경로15·전체451/451(253.103초)가 통과했다.
+- 기존 Chrome의 native EventSource24사례에서 ordered/multiline/한글·이모지·ANSI 문자열·빈/생략/NUL id·LastEventID·재연결·부분오류·첫헤더/기록 게이트를 확인했다. 같은 origin의 Core JSON문서에서 실행했다. 별도 headless프로필과 정상 browser sandbox를 사용했으며 사용자 브라우저는 조작하지 않았다.390×844 mobile emulation이며 실물폰/WebKit/UI시각 QA는 아니다.
+- 새 동일 바이너리 A/A31/31, 별도 새 A/B32/32가 통과했다. 각96소유프로세스·8쌍·2epoch·192창·2,295,808합성 기록·377,487,360논리본문byte다.5묶음 조건의 CPU/명령어/사이클≤0.75·single제어≤1.05·경과≤1.10·RSS/추가힙 상한과 gzip-small 본문전송≤0.50 기준을 그대로 적용했다. 모든 worker는exit0이며 표본 제외·이전 시간 재사용·한도 완화·동일 비교 반복은 없다.
+- CPU는 small/medium/screen/gzip-small/gzip-screen에서 각각99.33%/95.05%/57.37%/99.33%/55.63% 감소했다. single은1.002769배다. gzip-small/screen의 열린 스트림 본문 전송량은 각각75.06/48.93% 감소했다. 합성 loopback의 실제 Core 비용이며 전체 앱·사용자 작업·실물폰/LAN/VPN/SentinelOne의 개선율은 아니다. 앞선 단계와 개선율을 합산/곱하지 않는다.
+- 공개 송신 검사19+인과8+실제기한5, native browser12, 갱신한 버퍼21사례가 통과했다. 새 공개2script는 Root에서, 기존2파일 갱신본은 별도 overlay에서 정확한 파일로 먼저 실행했다. 최종436입력·94Core·4실행파일·모듈6ce1dc17459aca40e2b2e9e30e37d697fe00fec975be26193f24c8969099ebf8다. SPM검사 시434입력 이후 추가2/갱신2 공개파일은 모두SPM대상 밖이다. retained-peer-batch의618파일과 직전616파일을 대조했다. 공개439입력·명시40파일·399고정HEAD입력이며 index는 비었다.
+- GitHub 사전확인은2026-10-24T12:58:11.794Z 기준 최신v0.2.178·v179태그없음·main==로컬HEAD였다. 버전179/206을 더 올리지 않았다. 기존 서명 키체인 검색 목록과 설치/재시작 예외는 여전히 미응답이다.179 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·게시/익명다운로드가 남았다. 옛 unsigned179 앱은 새6ce1…Core와 맞지 않아 배포하지 않는다. 새 finish-docs-peer-batch.mjs는 matching 서명/패키지3검사 뒤에만 실행하도록 준비했고 아직 실행하지 않았다.
+- 설치 앱·원본 터미널의 조회/입력/캡처/크기/초기화/재시작/수동잠금 해제·전원/관리자/시스템/보안/TCC/VPN·서명 검색 목록은 변경하지 않았다. 덮개 강제 잠자기/내장 화면 차단은 미해결이다. 기존 IDE/인덱스와 unrelated fixture는 보존한다. 실패한 완료 큐 후보는 보관하며 다시 실행하거나 목표를 낮추지 않는다.
+
+| 합성 송신 조건 | CPU 후보/기준 | 경과 후보/기준 | 명령어 후보/기준 | 사이클 후보/기준 | 스트림 본문 전송량 후보/기준 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small | 0.006660 | 0.006137 | 0.004836 | 0.006416 | 1.000000 |
+| medium | 0.049485 | 0.045609 | 0.035270 | 0.049044 | 1.000000 |
+| screen | 0.426327 | 0.425357 | 0.370809 | 0.425967 | 1.000000 |
+| single | 1.002769 | 0.983584 | 1.001705 | 1.001548 | 1.000000 |
+| gzip-small | 0.006729 | 0.007411 | 0.009746 | 0.006797 | 0.249432 |
+| gzip-screen | 0.443677 | 0.453271 | 0.499977 | 0.450301 | 0.510736 |
+
+## 2026-10-24 · 0.2.179/206 유지 · 송신 완료 큐 후보 미채택
+
+- 직전 goal턴은434입력·단일 송신 watchdog·451검사와 정식 소스/보관 빌드 채택을 끝낸 progress다. 이번도 새 실제Core profile·독립SDK 계약·원본/후보 검증과 새 A/A/A/B를 완료해 미채택을 확정한 progress다. 전체 목표는active다.
+- 현재434입력·94Core·4바이너리·retained-send-watchdog의616파일을 Root/canonical/보관본과 대조했다. 모듈은3800c5c208b72ff512cb990dbf3935992b8b311c17306fa689aa6d9cc883cca4다. 후보는 같은 모듈 hash지만94객체가 모두 다르다. 모듈 hash만으로 구현이 같다고 간주하지 않았고, 정식 객체/바이너리는 후보로 교체하지 않았다.
+- 새 소유 프로세스의 실제 upstream+downstream 송신524,288event/16,777,216byte를 정확히 확인하고2초/10ms 샘플에서 추가 큐 작업을 찾았다. [Apple start(queue:) 계약](https://developer.apple.com/documentation/network/nwconnection/start(queue:))과 로컬SDK connection.h도 확인했다. 독립SDK5사례/8,196완료에서 지정 큐·비동기·단일 송신을 확인했다. 첫 peer-close 검사에 수신이 없어서 EOF를 못 본 실패는 보존하고, 프로덕션처럼 동시 수신을 넣어 보완했다. 원본 터미널은 사용하지 않았다.
+- 후보는 contentProcessed 안의 추가 queue.async 한 개만 제거하며 새 필드/캐시/타이머/서비스는 없다. 실제Core 정상출력 바이트·압축·순서·분할·오류·12슬롯·재연결38사례와 실제30초/5초·이전 기한·느린 독자·유휴 생존10사례가 통과했다. 오류 JSON 키 순서만 다른 첫 비교 실패는 보존하고, 정상 SSE는 byte exact/오류 JSON은 모든 decoded field로 비교하도록 측정 전 관측기를 보완했다. 제품 직렬화는 바꾸지 않았다.
+- 새 동일 바이너리 A/A31/31은 통과했다. 별도 새 A/B는24/31로 미달했다. 각96프로세스·8쌍·2epoch·192창·2,295,808event이며 모든 worker는exit0이다. small/medium/gzip-small CPU의 고정0.95와 일부 명령어/사이클0.97 목표에 미달했다. 표본 제외·이전 시간 재사용·한도 완화·같은 후보 반복은 없다. 이 후보의 전체451/공개 재현/채택을 진행하지 않는다.
+- 다음 비용은 relay의 이미 받은 여러 SSE event를 각next/send로 보내는 경로다. 현재 제품은 한 완결 event마다 Data를 반환하고 그대로 NWsend한다. 소비자는 raw HTTP 중계와 브라우저 EventSource다. 대기/추가읽기 없이 이미 있는 완결 event만 상한 안에서 묶는 별도 구현을 검토하며, 논리 event/바이트 순서·개별 크기 한도·오류/불완전/EOF 경계·gzip·권한/노드·역압력/취소를 유지해야 한다. 과거coalesced profile은 업스트림 쓰기 묶음이며 제품 중계 batching의 채택/실패 기록은 찾지 못했다.
+- 버전179/206을 올리지 않았다. 기존 서명 키체인 검색 목록 예외와 설치/재시작 예외는 미응답이며, 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub게시/익명다운로드가 남았다. 이 턴의 새 GitHub 조회/게시·키체인/서명/설치·원본 터미널 조회/입력/캡처/초기화/크기/재시작/잠금 해제·전원/관리자/시스템/보안/TCC/VPN 변경은 없다. 덮개 문제는 미해결이며 UI/브라우저/실물폰 QA도 새로 주장하지 않는다. 기존 IDE/인덱스와 unrelated fixture를 보존한다.
+
+| 조건 | CPU 후보/기준 | 명령어 후보/기준 | 사이클 후보/기준 | 경과 후보/기준 |
+| --- | ---: | ---: | ---: | ---: |
+| small | 0.986809 | 0.965525 | 0.976098 | 0.969968 |
+| medium | 1.005673 | 0.971934 | 1.007268 | 1.002891 |
+| screen | 0.996750 | 0.978559 | 0.997871 | 0.993229 |
+| single | 0.967947 | 1.003417 | 0.975917 | 0.965358 |
+| gzip-small | 0.980703 | 0.972705 | 0.960933 | 0.972178 |
+| gzip-screen | 0.996470 | 0.981580 | 0.992969 | 0.992221 |
+
+private 근거: `.runtime/performance/send-completion-179-20261024/decision.json`, `aa-review.json`, `bench-review.json`, `core-correctness.json`, `deadline-correctness.json`, `queue-contract-report.json`, `profile/`.
+
+## 2026-10-24 · 0.2.179/206 · 송신 예약 누적 제거
+
+- 직전 덮개 응답은 기존 API 제한을 재확인한 상태 설명으로, 경량화의 새 진척으로 계산하지 않는다. 이번은 실제 송신의 새 비용 발견·후보 검증·정식 소스/기준 빌드 채택을 마친 progress다. 전체 목표는active다.
+- 실제 기존 Core의 downstream 송신으로32바이트 이벤트32,768개를 보낸 뒤 약20MiB의 live heap과 약23만 block이 추가됐고, 취소한30초 예약이 만료된 뒤 대부분 해제됐다. 원본 터미널은 사용하지 않았다. source-bound 모델을 실제Core 성능으로 대체해서 주장하지 않는다.
+- RemoteHTTPConnection은 송신마다 작업을 예약/취소하는 대신 연결마다 약한 참조의 예약 하나를 유지한다.8바이트의 현재 단조 기한을 갱신/해제하며, 오래된 예약은 새 기한을 확인해 다시 예약한다. 각 송신30초·최종 전송5초·헤더/Origin/노드/크기/압축/역압력/취소·입력 재전송 금지는 유지한다. 새 자동실행/상주 서비스는 없다.
+- 소스 기반 시간 모델4,096사례·1,048,576동작/10만 프레임과 실제 컴파일Core의 양쪽 각19사례/기한5사례가 통과했다. 공개 재현도19+5사례다. 실제 Core의 기존 accept callback을 소유 loopback listener에 연결하며 생산 class는 재컴파일하지 않는다. HTTP4·압축5·재사용12·경로15·전체451/451(451항목, 227.168초)가 통과했다.
+- 새 동일 바이너리 A/A31/31, 새 A/B32/32가 통과했다. 각각96소유프로세스·8쌍·2epoch·192창·2,295,808event·377,487,360논리본문byte다. 준비256event/프로세스는 측정에서 제외했다. 모든 worker가exit0이며 기존 시간 재사용·표본 제외·성능 한도 변경은 없다.
+- small 추가 live heap 중앙값은20,562,224→112,136byte다. CPU는 small/medium/screen/gzip-small/gzip-screen에서 각각28.34%/27.68%/19.08%/18.86%/14.44% 감소했다. single 제어군은1.003556배다. 이 범위는 실제 Core의 합성 upstream+downstream 송신이며 전체 앱·휴대폰/LAN/VPN/SentinelOne의 개선율/압축률이 아니다. 이전 단계와 개선율을 합산/곱하지 않는다.
+- A/A 집계기의 CPU 키 대소문자와1초 미만 비율 분모 오류는 원래 실패 보고와 코드로 보존하고 같은 원자료를 정확히 재집계했다. 측정을 재실행하지 않았다. 공개 생성의 두 구문 오류도 보존했다. 첫 공개 실시간 검사는 TCP가 늦게 ack해 새 송신이 시작된 것을 첫 대기 기한으로 계산해 실패했다. 실제 로그에서 기한 갱신을 확인한 뒤 마지막 기한 기준으로 관측기를 고쳤다. 후보 구현·30초/5초·성능 기준은 유지하고 공개 검사만 새로 실행했다.
+- 현재434입력·94Core·4실행파일/모듈3800c5c208b72ff512cb990dbf3935992b8b311c17306fa689aa6d9cc883cca4다. retained-send-watchdog-build/source의616파일과 직전614파일을 모두 대조했다. 공개437입력·명시38게시파일·399고정HEAD입력을 확인했고 index는 비었다. 버전은179/206 그대로다.
+- GitHub 사전 확인은 최신v178·v179태그 없음·remote main==로컬HEAD였다. 기존 서명 키체인 검색 목록 예외와 설치/재시작 예외는 여전히 미응답이다.179 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·게시/익명다운로드가 남았다. 옛 unsigned179 앱은 현재 Core와 맞지 않아 배포하지 않는다. finish-docs-send-watchdog.mjs는 일치하는 서명/패키지3검사 뒤에만 실행하도록 준비했으며 실행하지 않았다.
+- 설치 앱·원본 터미널의 조회/입력/캡처/크기/초기화/재시작/잠금 해제·전원/관리자/시스템/보안/TCC/VPN·서명 검색 목록을 변경하지 않았다. 새 UI·실물폰/브라우저 검사는 없다. 덮개 강제 잠자기/내장 화면 차단은 미해결이며, 이번 최적화가 이를 해결했다고 주장하지 않는다. 개인 IDE/인덱스와 기존 진단 fixture를 보존한다.
+
+| 송신 조건 | CPU 후보/기준 | 경과 후보/기준 | 명령어 후보/기준 | 사이클 후보/기준 |
+| --- | ---: | ---: | ---: | ---: |
+| small | 0.716585 | 0.748504 | 0.820685 | 0.705372 |
+| medium | 0.723177 | 0.764090 | 0.817146 | 0.732202 |
+| screen | 0.809174 | 0.857522 | 0.860503 | 0.815832 |
+| single | 1.003556 | 1.007320 | 0.988168 | 1.000691 |
+| gzip-small | 0.811441 | 0.830890 | 0.863578 | 0.811563 |
+| gzip-screen | 0.855580 | 0.879516 | 0.917133 | 0.855582 |
+
+다음은 현재 실제 송신 경로의 queue/할당 비용을 새로 골라 측정한다. 이미 끝난 동일 후보 A/A/A/B·451/공개 검사는 변경 없이 반복하지 않는다. 서명/설치 예외를 goal 이어가기로 승인됐다고 해석하지 않는다.
+
+## 2026-10-24 · 네이티브 SSE 검색·tail view 채택 · 432/431712 · 배포 대기
+
+- 직전 goal 턴은 tail 후보의 실제Core42사례와 MainActor A/A 실패를 끝낸 progress였다. 이번은 생산 queue 소비 형태에 맞춘 독립 관측기·동일 외부42결과 대조·A/A/A/B2후보·1200storage사례·실제Core/전체 검사·공개 재현과 소스/기준 빌드 채택을 마친 progress다. 전체 goal은active다.
+
+- 현재 권위 있는 기준은 **179/206·432입력·94Core·4실행파일·모듈4317124eb4ac12a28fe080e25ac36fa0302dcb7da67590c6b46d11c0e3da0c5a**다. `retained-peer-native-tail-build/source`614파일과 이전 `retained-peer-header`612파일을 검증했다. Root/canonical/retention은 검증 후보의 소스/객체/모듈/바이너리와 같다. 모든 이전 보관본과 실패를 보존하고 qualification lock을 봉인했다. 옛430/4da로 되돌리지 않는다.
+
+- 구분자검색은 memchr의 bounded borrowed bytes와 후속 LF 검사로 바꿨다. tail은 view를 쓰며 empty면해제,consumed-prefix≥65536 및 ≥remaining일 때만복사한다. 새 필드·권한/본문cache·timer/service가 없고 출력·헤더/auth·검색overlap·한도·압축·취소/timeout/backpressure 의미는 같다.
+
+- 새 소스/기존 소스1200사례(native/NSData/nonzero slice·모든 작은 분할·LF/이진/한글·gzip·한도·긴 append/pop)에서 caller 및 retained output bytes/indices가 같았다. 그 다음 실제 Core 양쪽 각21사례와 공개 재현21사례가 통과했다. relatedHTTP4·compression5·실제 연결 재사용12·경로 복구15·전체451/451(218.488초)도 통과했다.
+
+- 이전 MainActor A/A의23/29·6wall 실패는 그대로다. 새 queue 관측기는 같은42외부 결과/같은Core/모든7mode/round/29한도임을 독립대조했다. tail-only의 새A/A29/29 뒤 A/B28/29는 gzip-small instructions0.922391>0.90 때문에 미채택했다. 네이티브검색+tail은 새A/A29/29와 A/B29/29가 통과했다. 이전 시간을 재사용하거나 실패목표를 바꾸지 않았다.
+
+- 최종CPU는 small0.782054/medium0.754248/screen0.792890/single0.944825/large-tail0.730575/gzip-small0.859610/gzip-large-tail0.585914배다. RSS27156480→26886144byte다. 실제 Core의 공개 handle/stream.next와 직렬 queue 소비자로 합성 loopback 업스트림을 읽은 결과다. downstream NW send·전체 앱·실물 폰/LAN/VPN/SentinelOne 지연이나 페이로드 감소율은 측정하지 않았다. 이전 단계나 tail-only 비교와 비율을 합산/곱하지 않는다.
+
+- 각A/A/A/B는16worker/448창/3840stream/1281024event·실제4288요청이다. 두 구현의64worker/1792창·모든raw/시작/exit0·checksum/합계/판정을 closure에 남겼다. 1200source-bound실험은 production class를 이름만 바꿔 실제Core dependency에 붙였으며 실제Core stream클래스 호출로 주장하지 않는다. 이어 별도의 실제Core 공개경로/공개재현으로 확인했다.
+
+- 검사생성기의 escaping/private parameter 오류는 storage-attempt-1에 보존했다. adoption의 proof이름 오류도 제품 수정 전에 중단되어 고쳤다. 첫 새SDK cache 컴파일908.336초의 sample은 SDK header open/import 대기를 보였다. 같은cache의 두 번째6.774초,후속실제Core도구4.047/2.454초였다. 원본앱이나 특정보안도구의 원인/속도비교 증거로 쓰지 않는다.
+
+- release helper는 최신29기준·16프로세스/448창·native1200/actualCore42/공개21·432/435입력·35경로로 맞췄다. immutable HEAD400입력과GitHub상태를 adoption 직전에 확인했다. sourcecommit/tag/push/게시/설치는 없으며 package검증 전에 완료release문서를 만들지 않는다.
+
+- 기존 발행자 서명 키체인 검색 목록 예외와 설치/재시작 예외는 여전히 미응답이다. 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub 게시/익명 다운로드가 남았다. 옛 unsigned179 앱은 지금 Core와 달라 배포하지 않는다. 설치본·원본 터미널/화면/입력·전원·관리자/시스템/보안/TCC/VPN·자동실행/상주서비스·검색 목록/인증서/신뢰/ACL은 변경하지 않았다.
+
+- 다음은 새432/431712의 남은 실제 비용을 고른다. RemoteHTTPConnection.send는 stream의 매 비최종 send마다30초 DispatchWorkItem을 새로 만들고 완료에서취소한다. 할당/대기열 잔류/처리량 영향은 아직 검증하지 않았다. 실제Core의 loopback TCP 송신과bounded memory로 먼저프로파일한다. 이미 끝난native/storage/correctness/A/A/A/B·451·게시 준비를 변경 없이반복하지 않는다. UI·브라우저·실물폰 QA는이번에없고 개인 IDE/인덱스·기존fixture는보존했다.
+
+## 2026-10-24 · SSE tail 후보 보류 · 실제 Core A/A wall 불안정 · 430/4da 유지
+
+- 직전 goal 턴은 헤더 검색 후보의 실제Core 검증·소스/기준 빌드 채택을 끝낸 progress였다. 이번은 새 소스/실제Core 프로파일8개·경계/보관 데이터 검증·한 소스 후보Core·실제Core42기능사례·16worker A/A의 종료/판정/보관을 마친 progress다. 전체 goal은active다. 제품 후보는 채택하지 않았다.
+
+- 현재 권위 있는 Root/canonical/retained-peer-header는 **179/206·430입력·94Core·4바이너리·612파일·모듈4da00ac06c224f99ddff6a2b3f83cac26c592aace52463b4b55bf1d3687b405b**다. hash와 기준복원을 검증했고 qualification lock은 없다. `peer-tail-views-179-20261024/decision.json`·closure가 이번 판정의 권위 있는 기록이다. 모듈SHA가 후보와 같아도94객체가 전부 다르므로 구현 동일성을 뜻하지 않는다.
+
+- 처음 privatebuffer 접근은 Swift LLVM verifier가external/private global을 거부하며 compile1로 끝났다. 직접 Core 생성자는 최적화 후 외부 symbol이 없어 link1이었다. 원본 소스4프로파일을 따로 얻은 뒤 공개 RemoteNetworkService.handle로 실제 보관Core의 스트림을 얻어4프로파일을 추가했다. 클래스 재컴파일 없는 실제Core에서 tail subdata/할당/복사를 확인했다. fixture 소유 acceptor·NWPath monitor·발견Task는 첫 await 전에 취소했고 metadata/LAN 스캔 없이 loopback 업스트림만 요청했다.
+
+- 후보는 tail의 Data view와 조건부 compaction이다. empty 해제·64KiB 및 tail보다 큰 consumed-prefix에서만 복사하므로 새 필드/타이머/cache가 없다. 실제Core 각21기능사례,retained output digest·오류/경계·압축/정체/취소가 통과했다. 후보58,991뷰 연속성 확인,long32,768이벤트의 논리prefix≤65,534/compaction15를 기록했다. native/NSData/sliced 별도 source-bound corpus와 공개 재현은 아직 없으므로 완료로 주장하지 않는다.
+
+- 실제Core 동일baseline 바이너리로 두 label을 실행한 새 A/A16프로세스·448창·3,840stream·1,281,024event가 끝났다. 고정29기준 중23통과/6실패다. rawCPU·instructions·cycles·RSS는 통과했으나 wall 대칭 small1.108860/medium1.136994/screen1.170232/single1.380185/large-tail1.118328/gzip-large-tail1.257857이1.10 한도를 넘었다. candidate A/B·full451은 중단했다. 이는 후보의 속도나 특정 보안 제품의 문제를 증명하지 않는다. 전표본/프로세스exit0·TCP warm-up 포함4,288요청·observer source/94객체/4실행파일을 보존했다.
+
+- 다음에는 생산 소비자 경로와 관측기 차이를 검토한다. RemoteHTTPConnection.pumpStream은 queue callback을 쓰지만 현재 fixture는 이벤트마다 MainActor의 async continuation으로 돌아온다. 경과 편차의 원인으로 단정하지 않는다. 새 프로토콜을 만들려면 실제 queue 소비 형태에 맞춘 독립 변경과 가설을 먼저 고정하고 같은 rawCPU/wall/메모리 한도를 지켜 A/A부터 확인한다. 지금 프로토콜을 다시 실행하거나 실패wall을 제거·완화/정규화해서 후보 A/B를 시작하지 않는다.
+
+- 서명 검색 목록 예외와 설치/재시작 예외는 여전히 미응답이다. 179 서명·패키지3검사·DMG/체크섬·커밋/태그/push·GitHub 게시/익명 다운로드가 남았다. 공개433입력·32경로 whitelist와 기존 header release helper는 그대로다. 새 GitHub 상태 확인이나 새 버전 증가는 없으며 옛 unsigned179 앱을 배포하지 않는다.
+
+- 자기 소유 검사만 실행했다. 원본 터미널·화면/입력·설치 앱·전원·관리자/시스템/보안/TCC/VPN·자동실행/별도 상주 서비스는 변경하지 않았다. 전체 앱이나 폰/LAN/VPN/SentinelOne의 지연 원인·개선율,물리 메모리 감소 또는 페이로드 감소로 해석하지 않는다. 새 UI·브라우저/실물폰 QA는 없다. 개인 IDE/인덱스 및 기존 fixture 변경은 보존했다. 모든 소유 명령은 종료됐다.
+
+## 2026-10-24 · 헤더 반복 검색 제거 채택 · 430/4da 기준 · 게시 대기
+
+- 직전 목표 작업은 후보 동작/실패 검증을 마친 progress였고 최근 덮개 요청 턴에 진행 중이던 동일 바이너리 A/A가41/41로 종료된 사실을 확인했다. 이번은 새 후보 A/B·전송 회귀·공개 재현·전체 검사와 소스/기준 빌드 채택을 마친 progress다. 전체 목표는active다.
+
+- 현재 권위 있는 기준은 **179/206·430입력·94Core·4실행파일·모듈4da00ac06c224f99ddff6a2b3f83cac26c592aace52463b4b55bf1d3687b405b**다. `retained-peer-header-build/source`의612파일과 이전 `retained-typed-route`의610파일을 검증했다. 이전 모든 보관본을 보존했고 qualification lock은 봉인됐다. Root/canonical/retention의 소스·객체·모듈·바이너리는 같으며 옛 eb32로 되돌리지 않는다.
+
+- 매 receive의 전체 헤더 재검색 대신 새 구간+마지막3byte만 찾는다. 짧은 재검색은 raw byte 검사,32byte 이상은 Foundation의 범위 검색이다. 최초 Foundation 표현식과 인스턴스 필드/레이아웃은 그대로다. 기존 private status 정수는 headers가 nil인 동안 offset이며 헤더 검증 후 원래 code를 받는다. static separator4byte 외 새 장기 상태/캐시/타이머/서비스는 없다.
+
+- 실제 Core baseline/candidate의1,814사례와 검색 범위14사례에서 응답·매 append의 상태·오류·완료/이후 호출·caller 바이트/인덱스가 같았다. 헤더 분할·31/32바이트 검색 전환·16KiB 헤더·64,000수신·4,016,388전체·4MB본문/gzip 한도·UTF8/중복/노드/304/reuse를 포함한다. 공개 재현도 같은 실제94객체에 연결해 통과했다. 관련HTTP4·압축5·격리 재사용12·경로 복구15와 전체451/451(218.461초)이 통과했다.
+
+- 최종 측정은 별도 A/A와 A/B 각각16프로세스·8쌍·8epoch·1,280창·3,354,624작업이다. 개별 창을 두 소유 worker에 균형 교차하고, 원래 CPU/경과/RSS21기준을 모두 유지한 채 자기 프로세스의 public rusage 명령어/사이클20기준을 추가했다. A/A41/41 후 A/B41/41이 통과했다. 분할3조건 CPU≤0.5, 일반/AA대칭≤1.05, wall≤1.10, RSS≤1.05 또는+262,144byte를 완화하지 않았고 과거 시간은 재사용하지 않았다.
+
+- 첫 구현(추가cursor 필드/일괄helper)은 분할 개선에도 일반CPU/wall8기준이 실패해13/21로 미채택했다. 현재 구현의 원래 whole-process A/A는19/21, 개별창 교차 A/A는20/21로 실패했고 후보A/B를 시작하지 않았다. 자기 프로세스의 명령어/사이클을 더한 다른 프로토콜의 A/A가41/41을 통과한 뒤 새A/B를 실행했다. 이전 실패·원시값·모듈/객체를 보존했고 동일 재측정·표본 제외·한도 완화로 바꾸지 않았다.
+
+- 현재 A/B CPU는 split17 0.186911·split1 0.040891·pending1 0.043770·gzip 0.850914배다. 단일작은 수신1.009571·큰본문1.004757배 등 일반경로는 한도 안이다. RSS17,268,736→17,375,232byte다. 합성 finite HTTP decoder의 CPU·경과·RSS·작업량 결과다. 전체 앱 CPU/메모리·실물 폰/LAN/VPN/SentinelOne 지연이나 페이로드 압축률로 확대하지 않는다. 이전 경로 키/JSON/터미널 결과와 합산/곱하지 않는다. 새 UI·브라우저/실물폰 검사는 없다.
+
+- 전체 헤더 실험96개 worker·7,680창·20,127,744작업이 모두 끝났다. 각 closure.json에 raw/시작/종료/판정 해시와 합계 재검토를 남겼다. public 생성기의 per-case 출력 치환 검사와 adoption 생성기의 잘못된 템플릿 이름은 제품 채택 전에 중단되어 고쳤다. adoption의 sandbox GitHub 조회는 빈 응답으로 사전 단계에서 중단됐으며 허용된 일반 사용자 실행이 성공했다. 보조 disassembly 시도는137로 출력 없이 끝났고 원인을 특정하지 않는다.
+
+- 공개433입력·명시32경로 whitelist·HEAD와 같은401입력을 preflight했다. GitHub main은2bc18930dfb7f1a30e32bbf8675cb6281442b172, 최신 공개v178, v179태그 부재를 adoption 직전에 확인했다. release helper는 현재41기준/16프로세스/1280창·새 public fixture·압축5검사·430/433입력으로 맞췄으며 패키지 검증 전 완료 문서를 만들지 않는다.
+
+- 서명 키체인 검색 목록 예외와 설치/재시작 예외는 여전히 미응답이다. 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub 게시/익명 다운로드 대조는 남았다. 옛 unsigned179 앱은 현재 Core와 달라 배포/설치하지 않는다. 검색 목록/인증서/신뢰/ACL·설치본·원본 터미널/화면/입력·실제 전원·관리자/시스템/보안/TCC/VPN·자동실행/새서비스는 변경하지 않았다.
+
+- 다음은 새430/4da 기준에서 남은 비용을 새로 확인한다. RemotePTYStream의 이벤트 경계 검색은 이미 searchedBytes를 쓰지만 한 이벤트를 꺼낼 때 남은 buffer 전체를 subdata로 다시 만든다. 병합된 다수 이벤트에서 실제 비용과 기존 backpressure/timeout/압축/크기/취소 의미를 먼저 측정·검토한다. 아직 새 후보나 개선 증거는 없다. 이미 끝난 header A/A/A/B·1814/14·루프백·451은 코드 변경 없이 반복하지 않는다.
+
+## 2026-10-24 · 수신 버퍼 프로파일·gzip 후보2개 검증 완료 · 428/eb32 유지
+
+- 직전 goal 턴은 typed route의 실제Core 검증·소스/기준 빌드 채택을 마친 progress였다. 이번은 현재Core의 새6개 프로파일과 gzip 후보2개의 실제Core 정합성·동일 실행파일 대조·성능 판정을 마친 progress다. **Root/canonical/retained-typed-route는179/206·428입력·94Core·4실행파일·610보관파일·모듈eb32cadb0ac599d735539af926a8911104d056d0af15c2ad1903b576279ebb2b 그대로**다. 후보는 둘 다 미채택이고 모든 소유 작업이 종료됐으며 qualification lock은 없다.
+- `network-buffer-profile-179-20261024`는 실제 현재Core의 finite HTTP/gzip decoder만 호출하는6개 합성 worker를 각4.5초 실행하고3초/10ms sample을 수집했다. header-single720,724회·8KiB header/17byte조각4,764회·1byte조각366회·gzip-small910,751회·large16,910회·random37,532회였다. 반복 헤더의 CFDataFind 검색과 gzip 입력subdata/출력Data생성·append 복사가 보였다. 프레임/반복 수는 CPU퍼센트·A/B 개선율이 아니며 보안 도구/VPN의 인과 증거도 아니다. 최초 측정 fixture의 throwing-autoclosure 컴파일 오류를 보존하고 수정한 compile-2가 통과했다. 첫 실패 때 worker는 시작되지 않았다.
+- `gzip-input-views-179-20261024`는 finite complete의 최대64KiB 입력subdata를 읽기 전용 Data뷰로 바꾼 한 줄 후보다. `gzip-direct-output-179-20261024`는 여기에 기존 read 상태머신을 private readCount로 분리하고 finite 결과를 기존32KiB scratch에서 직접append해 출력 임시Data도 없앤 다른 구현이다. 공개stream read는 독립Data를 계속 반환하고 기존 guard/상태/오류 본문을 소스 정규화로 대조했다. 새 cache·서비스·타이머·trailer크기추측/전체선할당은 없다.
+- 두 후보의 모듈은 각각 **bdb6d91b65b20caa15a1ff68a2c35821c3d797deef431827b179a537c4b86ba3**, **e0ce1e2371323a406bf18be21495843b56e1f8ab678e73583ca0b378cd9a7075**다. 각94객체·4바이너리·428입력을 고정했고 실제 baseline/candidate의3,920사례에서 decoded바이트/오류/diagnostics·4MB/64KiB 경계·잘림/손상/후행/다중member·호출자 Data를 대조했다. heap뷰20항목은 실제 decoder의 보관 주소를 확인했다. 별도96사례에서 finite native/NSData 및 public stream의 nonzero-index 조각뷰·caller바이트/인덱스가 같았다. 지원이 불확실한 외부 finite slice 사전조건까지 확인했다고 주장하지 않는다.
+- 각 구현은 별도 fresh A/A16프로세스·8쌍·768구간/13기준을 먼저 통과했다. 같은 baseline binary/path를 두 이름에 쓰며 CPU대칭5%·wall10%·RSS5% 또는+262,144byte를 첫 측정 전에 고정했다. 이후 새 A/B도 각16프로세스·768구간/13기준을 끝냈다. 두 번 모두 **12통과/1목표미달**로, 512KiB16진수텍스트(mixed) CPU가0.935285/0.924446배여서 고정0.80에 못 미쳤다. random은0.301592/0.292044배였고 다른 CPU·wall·RSS 회귀 한도는 통과했다. 서로 다른 새baseline에 대한 비교라 두 후보 간 직접A/B나 개선율 합산으로 해석하지 않는다.
+- 정합성과 회귀가 통과해도 사전material목표를 낮추거나 동일 후보를 재측정해 통과시키지 않았다. 후보의 추가 loopback/전체451은 중단 규칙대로 실행하지 않았다. 기준eb32의 이전451결과는 유효하다. 두 후보의 code·raw표본·64개 종료worker/3072구간·Core/바이너리와 원본 profile을 보존했고 각각 closure/decision.json 및 profile의 next-action.json에 독립 합계·판정을 남겼다.
+- 다음은 같은 프로파일에서 확인한 finite HTTP 헤더 경계 검색이다. 현재는 매receive마다 separator를 만들고 앞에서부터 다시 검색한다. 상대 cursor/마지막3byte 겹침을 두고 짧은 구간은 raw 검사, 긴 구간은 Foundation 검색을 쓰는 방법을 검토한다. 원래16KiB헤더·64,000byte receive·전체크기·UTF8/중복/identity/encoding/304/reuse·오류/완료 의미를 그대로 유지해야 한다. **헤더 후보 코드는 아직 없다.** 기존 gzip 후보나 이전 시간 표본은 다시 사용하지 않는다.
+- 버전/공개431입력·29파일 whitelist·서명/설치 승인 상태는 바꾸지 않았다. 서명 검색 목록 및 설치/재시작 예외는 여전히 미응답이며 이번에도 재질문/서명 시도·검색 목록 변경·앱 교체·원본 터미널/화면/입력·전원/시스템/보안/TCC/VPN·자동실행/상주서비스 변경은 없다.179 게시·다운로드 검증은 남았고 전체 goal은 active다. 이번은 backend 검사로 UI/브라우저·실물폰 QA도 없다.
+
+## 2026-10-24 · 경로 키 문자열 제거 채택 · 179/206 유지
+
+- 이전 덮개 요청 턴은 설치168·기존 잠자기 방지 상태와 공개API 한계를 재확인했다. 이번은 새 경로 키 후보의 실제Core 정합성·성능·전송 회귀·전체 검사·공개 재현과 소스/기준 빌드 채택을 마친 progress다. 현재 권위 있는 기준은 **428입력·94Core·4실행파일·모듈eb32cadb0ac599d735539af926a8911104d056d0af15c2ad1903b576279ebb2b**다. `retained-typed-route-build/source`의610파일과 이전426/b596 등 모든 보관본을 보존한다.
+- `RemoteHTTPReadPool`의 매checkout route 문자열 map/sorted/joined를 전체필드 Hashable 인터페이스 배열로 바꿨다. 정렬된 기존 목록은 같은 배열 버퍼를 공유한다. 임의 순서·넷마스크 동률만 완전 정렬하며 중복 수를 유지한다. 매 요청 `interfaces()`와 `tcpParameters()` 호출 및 이후 읽기·재시도·취소 본문은 동일하다. endpoint/노드/주소/넷마스크/종류 구분과 최대4개 idle·4초 만료를 유지하고 새 캐시·타이머·서비스는 없다.
+- 실제 컴파일된 Core의10,779사례에서 순서 독립성·중복·각 필드 변경·구분자 충돌 분리·Unicode/호출자 저장소·정렬된 배열의 동일 버퍼를 확인했다. 같은 검사 본문을 공개 `Tests/fixtures/peer-route-key-check.swift`와 `scripts/peer-route-key-check.mjs`로 재현했다. 공개 두 파일은 SPM 대상 밖에 추가돼 최종입력428이며, 실제Core 컴파일·전체 검사 당시426입력과94객체/모듈/4실행파일이 바이트 단위로 같다.
+- 성능은 실제Core 경로 키 생성·해시·조회에만 한정한다. 같은 함수·같은 Dictionary를 양쪽 이름으로 실행한 A/A8프로세스/8epoch/1152구간/41,943,040연산이 사전19기준을 통과했다. 별도 A/B도 같은 크기/19기준을 통과했다. 인터페이스1/2/4/16개 CPU비율은0.088662/0.064646/0.064339/0.064755이며, A/B 최대RSS 중앙값은13,860,864→13,860,864바이트다. 전체 앱·실물폰/VPN 지연 개선율이 아니다. 앞선 HTTP A/A 실패나 미채택 JSON/ASCII 후보의 한도·판정은 바꾸지 않았다.
+- 새Core의 관련HTTP4·discovery1검사, 실제 루프백 재사용12·경로복구15항목과 **451/451 전체검사(227.203초)**가 통과했다. 잘못된 노드·권한 거부·손상 응답·만료·취소·동시 요청·POST 단일 전송·정지 시 socket 정리를 확인했다. 물리 인터페이스/VPN 전환이나 실제 휴대폰 시험은 아니다. 모든 소유 작업은 종료했고 qualification lock을 해제했다. 상세·원본은 private `typed-route-179-20261024`에 있다.
+- 179태그는404, GitHub 최신은178이며 remote main과 local HEAD가2bc18930dfb7f1a30e32bbf8675cb6281442b172로 같았다. 배포 helper·소스 whitelist를 **공개431입력·29대상파일·HEAD 고정402입력**으로 갱신했다. 새 notes helper는 최신19성능기준과 이전114기준의 범위를 구분하고 서명/패키지 검증 전에는 배포 완료 문서를 생성하지 않는다. index는 비워 두고 IDE/인덱스·activity-footer 등 별도 변경을 보존했다.
+- 기존 발행자의 서명 키체인 검색 목록 예외와 설치/재시작 예외는 여전히 미응답이다. 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub 게시/익명 다운로드 대조가 남았다. 옛 unsigned179 앱은 현재 모듈과 맞지 않아 배포하지 않는다. 새 서명 시도·검색 목록/인증서/신뢰/ACL 변경·설치 앱 교체·원본 터미널 조작·전원/시스템/보안/TCC/VPN 변경은 없다. 덮개 강제 잠자기 문제도 미해결이다.
+- 전체 경량화 goal은 active다. 이 단계의 동일 A/A·A/B·공개 재현·전체451을 변경 없이 반복하지 않는다. 다음은 남은 실제Core 전송/엔진 비용을 새 증거로 고르거나, 기존 서명 예외 답변이 도착하면 일치하는 앱을 패키징해179 배포를 마친다. 목표 이어가기는 예외 승인으로 해석하지 않는다.
+
+## 2026-10-24 · ASCII 읽기·요청 합류 후보 검증 · 성능 판정 정밀도 확인
+
+- 직전 턴은 문자열/정렬 후보3개의 판정을 마친 progress였다. 이번은 ASCII 파일 판독과 협력적 요청 합류 후보2개의 실제Core 정합성,원본HTTP 비교,동일 실행파일 대조2종을 마친 progress다. **Root/canonical/retained-direct-host-path는179/206·426입력·94Core·4바이너리/608보관파일·b596598527dc4c0c4b2aec2d261082415140d0784e5eaa55177ed8df5555602f 그대로**다. 새 후보는 모두 미채택이며 소유 프로세스는 전부 종료했다. 전체 goal은 active다.
+- `json-ascii-hosts-179-20261024`는 매 fresh hosts 읽기의 전체 버퍼가ASCII일 때 기존 asciiLineStatus로 판독해 임시 String을 생략한다. conflict 이후도 모든 바이트를 검사하고 non-ASCII/BOM/잘못된UTF8은 기존 decoder로 돌린다. IO·전후stat 검증 본문과 텍스트 parser는 동일하다. 기존 public BoundedLocalStatusTests에512 late-byte/150 size·Unicode 사례를 더했다. 독립1917파일 사례·동시읽기256·fd누수0,실제Core 공개API14,604응답/45,727단정·component2,651,052+213,762사례·관련45검사가 통과했다. 실제HTTP144프로세스/48기준은43통과/5미달로 미채택이다. CPU 목표3개는 통과했지만 single/query/inventory304의 일부wall/requestp95/actorp95가 미달했다. 이전 표본을 버리거나 같은 후보를 다시 측정하지 않았다.
+- `ascii-hosts-aa-179-20261024`는 실패한3조건에서 **같은 기준 실행파일·같은 경로**를 두 이름으로48프로세스/48구간 비교했다. 대칭15기준 중8미달,동일 single의wall 중앙값0.076056→0.314204초(4.131배),query CPU1.111배였다. single 관측 callback 수 중앙값도40→108로 달랐다. 이 자료는 코드 효과로 단정하기 어려운 측정 변동과 관측 작업량의 차이를 보여준다. SentinelOne/Zscaler 등 특정 도구를 원인으로 단정하지 않는다.
+- `json-ascii-coalesced-179-20261024`는 위 후보에 기본 dashboard 인코더 enqueue를 요청 우선순위의 Task에서 한 번 yield한 뒤 실행하도록 더한다. 이미 대기 중인 요청이 같은 fresh snapshot에 합류할 기회를 주며,고정 지연/새 결과 캐시는 없다. epoch/취소/관심 waiter 검증과stop/reset취소를 유지한다. 실제API/component·45검사는 통과했다. 부모와 Swiftmodule SHA는모두15f1f08c72f89cde8c6d7242eb9a1fe998993adf4c20a2995b1584824592f62f지만 **구현 동일성은 아니다**. RemoteNetwork.swift.o는3aacdefe00822589192679316630e9dc3bdacc011bcac274bd85cf95399d03e2→4be1b77b57bc71fa76c7a092bff0e03660fb0bc1832b3473a46f1974ba001f36이고94객체/4실행파일을 각각 대조했다.
+- 새 측정은 CPU 구간과 고정1callback/batch 구간을 나눠 각각의CPU/wall·두requestp95·actorp95·RSS까지75기준을 준비했다. 기존 총CPU요청량을8구간으로 나누고 같은 수의관측요청을 추가한다. 같은 파일을 쓰는16지속프로세스/1152구간/2304phase/557,056요청 A/A를 먼저 실행했다. 원본/독립 재계산을 확인했고72대칭 기준 중59통과,13개의CPU 기준이 사전2% 정밀도를 못 맞췄다(약2.0~5.2% 차이). wall·지연·RSS54기준은 전부 통과했다. **A/A실패시 중단 규칙대로 후보 A/B·SSE/엔진 비교·이 후보의 전체451은 실행하지 않았다.** gate 완화·계속 재측정으로 통과시키지 않는다. `.runtime/performance/json-ascii-coalesced-179-20261024/decision.json`과 부모decision이 종료·복원·보관 대조의 권위 있는 기록이다. 기준b596의 기존451/114결과는 유지한다.
+- 다음은 작은CPU차이의 반복 측정을 더 하지 말고,직접 확인 가능한 전송량/할당 비용을 고른다. `RemoteHTTPReadPool.read`는 매checkout에서 fresh interfaces/tcpParameters 검사 후 인터페이스 문자열들을map/sorted/joined해route키를 만든다. typed canonical route snapshot으로 임시 문자열을 줄일 여지가 있는지 먼저 살핀다. **fresh 경로/인터페이스 검증·전체필드 동등성·순서 독립/중복 의미·다른 경로 socket 격리는 유지**해야 한다. 이 변경 코드는 아직 없다. ASCII/합류 후보를 적용하려면 여전히 신뢰 가능한 전체 성능 증거가 필요하다.
+- 서명 키체인·설치/재시작 예외는 미응답이다.179의 서명·패키지3검사·DMG/체크섬·커밋/태그/push·GitHub게시/다운로드 대조는 남았다. 설치168·원본 터미널/입력/화면·수동 잠금·전원/시스템/보안/TCC/VPN·자동실행/새서비스·UI는 변경하지 않았다. 공개입력429/현재게시대상25파일 workflow도 바꾸지 않았다. 두 후보의3/4소스 override는 private 보관본에만 있다.
+
+## 2026-10-24 · b596 추가 프로파일·문자열/정렬 후보3개 판정 완료
+
+- 직전 턴은 실제179/206·426입력/b596 채택을 끝낸 progress였다. 이번은 그 기준의 새4개 HTTP 프로파일과 후보3개의 정합성/성능 판정을 마친 progress다. **제품·canonical·retained-direct-host-path는426입력·94Core·4바이너리·608보관파일·b596598527dc4c0c4b2aec2d261082415140d0784e5eaa55177ed8df5555602f 그대로**다. 모든 소유 명령은 종료했고 qualification lock은 없다. 전체 goal은 active다.
+- `direct-host-path-http-profile-179-20261024`의 새4.5초 worker/3초·10ms sample은 single15,869·inventory18,220·query96,152·dense36,104요청이었다. 각 요청의 새 parse·fresh hosts 읽기를 유지했고 sample/worker가 모두exit0이다. 문자열 escape 검사·키 정렬·스칼라 Foundation 처리·파일 open/read/변환 비용이 남는다. 프레임 수를 CPU 퍼센트나 이전 프로파일 대비 성능 향상으로 해석하지 않는다. 추가 요약용 node 명령은exit137·출력 파일 없음으로 끝났고 원인을 단정하거나 같은 명령을 반복하지 않았다. 원본 프로파일은 온전하다.
+- `json-word-string-179-20261024`는 안전한8바이트 블록 검사 후 escape 없는 문자열을 한 번 reserve/copy한다. `json-word-key-179-20261024`는 이에 연속 UTF8/memcmp 정렬을 더한다. 둘 다 전체scalar/UTF16·오류/저장소·추가140,145경계 사례를 통과했으나 각16프로세스/448구간/15기준에서 **10통과/5미달**이다. material CPU 비율은 각각0.955699~0.967554,0.984140~0.989215로 사전0.95 목표에 못 미쳤다. 정합성/회귀 한도는 통과했으며 실제Core 빌드는 하지 않았다. 부모 후보와 원본 표본/판정을 보관했다.
+- `json-word-order-179-20261024`는 첫 word 후보에 한 encode 안에서만 최대4개 ASCII 키 배열(각8..64키)의 정렬 인덱스 재사용을 더한다. Unicode 키·다른 형태는 기존 정렬이고 값/응답/권한/상태는 보관하지 않는다. 추가140,178경계/형태·중복·순서 변화·퇴거 사례와 전체 oracle가 통과했다. 새 prototype16/448/15기준 모두 통과, material CPU0.914269~0.936754배·최대RSS21,856,256→21,987,328(+131,072)바이트다. comparator 후보의 직접 비교는 포함하지 않았다.
+- 실제Core 모듈a4e75200edfd6e09897dcf904961e31f84653d2b5edb1665e08e0e8ae363297b로 공개API14,604응답/45,727단정·component2,651,052+213,762사례·관련36검사가 통과했다. 새HTTP144프로세스/48기준은 **47통과/1미달**이다. single CPU0.923414·inventory0.878702배지만 dense0.0243035→0.024421초(1.004835배)가 고정0.98 목표에 못 미쳐 미채택했다. 다른 회귀 한도는 모두 통과했다. SSE/엔진 추가 비교와 이 후보의 전체451은 실행하지 않았다. 기준b596의 기존451결과는 유지한다. `.runtime/performance/json-word-order-179-20261024/decision.json`이 종료·보관·복원 대조의 권위 있는 기록이다. 실패 표본 제외·동일 후보 재측정·기준 완화는 없다.
+- 다음은 매 HTTP 요청의 hosts Data→String 변환이다. 현재 파일은 내용 출력 없이 **760바이트·전체ASCII·크기 한도 안**임만 확인했다. 새 코드는 아직 없다. 전체 버퍼가 ASCII인 경우 기존 asciiLineStatus를 재사용해 임시 String을 생략하는 방법을 검토한다. 앞에서 ready/conflict를 봐도 뒤의 모든 바이트를 검증해야 하며, non-ASCII/BOM/잘못된UTF8은 기존 String(data:encoding:) 경로로 돌려야 한다. open/read/fstat/크기·변경 탐지/close와 hook을 생략하거나 상태 캐시로 바꾸지 않는다.
+- 서명 키체인·설치/재시작 예외는 미응답이며 반복 질문하지 않았다.179의 서명·패키지3검사·DMG/체크섬·커밋/태그/push·GitHub게시/다운로드 검증은 남아 있다. 설치168·전원/시스템/보안/TCC/VPN·수동 잠금·원본 터미널/입력/화면·자동실행/새서비스·UI는 변경하지 않았다.
+
+## 2026-10-24 · 현재179/206: 직접 hosts 경로·JSON 추가 경량화 채택
+
+- `json-direct-host-path-179-20261024`의 실제Core 검증을 끝내고 Root/canonical/retained에 채택했다. 현재는 **426입력·94Core·4바이너리·모듈b596598527dc4c0c4b2aec2d261082415140d0784e5eaa55177ed8df5555602f**, 검사 바이너리d03801a9fb86f5f577d85908b13d8f4fd0578335b9074a238dc6028f3085eaee다. 버전은179/206 그대로며 `retained-direct-host-path-build/source`의608파일과 앞선426/fdc 등 모든 보관본을 유지한다.
+- JSON의 원시값 슬롯 직접 쓰기·배열 인덱스 문자열 지연 생성에, `LocalDashboardAddress.status()`의 고정 경로 URL 변환 제거를 결합했다. live 경로만 같은 문자열로 `Darwin.open`하고 주입 URL 경로는 기존 변환을 유지한다. fd 이후의 판정 본문은 동일하며 매 호출 open/read/close·일반 symlink·O_NONBLOCK/O_CLOEXEC·fstat 전후 변경/1MiB/추가1byte/UTF8 검증을 유지한다. 새 캐시·상태 재사용·open hook 우회는 없다.
+- 독립 파일 읽기593사례·동시 성장256읽기·fd누수0, 실제Core 공개API14,604응답/45,727단정, component2,651,052+213,762사례와 관련45검사가 통과했다. 기존 공개 재현4파일의 지문을 대조했고 component runner 및 실제 response fixture를 실행했다. response CLI wrapper를 이번 단계에 별도로 실행했다고 주장하지 않는다.
+- 새 **176프로세스·2,192구간·114성능 기준**이 모두 통과했다. 직전 custom JSON426/fdc 대비 CPU 중앙값은 단일 network0.950338·inventory0.947817·96세션0.930779배로 약4.97%·5.22%·6.92% 감소했다. 일부 actor p95는 최대 약0.124ms 증가했지만 사전1.10배 또는+1ms 한도 안이다. 엔진 최대RSS30,654,464→30,638,080, 스트림23,085,056→23,199,744(+114,688)바이트로 한도 안이다. 이전 단계 개선율과 합산하거나 실물폰/앱전체/보안 제품 성능으로 확대하지 않는다.
+- 같은 후보 빌드의 전체 **451/451·209.493초**가 통과했다. 최종426입력·94Core·4바이너리/608보관파일과 이전426/fdc 보관본을 대조했다. 공개429입력·명시25파일·비대상HEAD404입력 사전 검사가 통과했다. `.runtime/performance/json-direct-host-path-179-20261024/closure.json`에 완료 증거가 있다. 완료한 성능 비교/전체 검사를 변경 없이 반복하지 않는다.
+- 사용자의 덮개 방지 요청은 아래 재진단에 기록했다. 실제 설치본168·전원 설정·수동 잠금은 그대로다. 서명 키체인 임시 검색 목록 등록과 설치/재시작 예외는 미응답이며 반복 질문하지 않는다. **179 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub게시/익명 다운로드 대조는 남아 있다.** 옛 `release-206-20261024/AutoApprove.app`은 현재 b596 빌드와 맞지 않아 배포/설치하지 않는다. 소유 작업은 모두 종료했고 전체 goal은 active/progress다.
+
+## 2026-10-24 · 현재426/fdc 재측정 · scalar/index 후보2개 보류
+
+- 직전 턴은 canonical JSON을426입력/fdc에 실제 채택한 progress였다. 이번은 그 빌드를 기준으로 새 프로파일과 변경된 인코더 후보2개의 실제Core 검증/판정을 끝낸 **progress**다. 제품·canonical·retained-canonical-json은 여전히 **179/206·426입력·94Core·모듈fdc8209b53d504d204e2e9e67d00853b4cb909fe9862db49f4a36eb7bd069ac5·4바이너리/608보관파일**다. qualification lock은 없고 모든 소유 실행은 종료했다. 이번 후보를 정식179로 오인하거나 이전422/f3로 되돌리지 않는다.
+- `canonical-json-http-profile-179-20261024`의 새4.5초 소유 HTTP worker에서 각3초/10ms 샘플을 얻었다. single5,184·inventory4,580·query31,032·dense10,800요청이며 모두 새 parse이고 worker/sampler가exit0이다. 값별 Cursor/경로 객체와 fresh 주소 상태 파일/URL 변환이 남은 비용으로 보인다. inclusive 노드를 더해 CPU 비율이나 A/B 개선으로 주장하지 않는다. 기본 hosts 읽기와 도구 런타임의 open hook은 포함되며 SentinelOne/Zscaler를 원인으로 단정하지 않는다.
+- `json-primitive-slots-179-20261024`는 scalar를 arena 슬롯에 먼저 써 자식 Encoder를 생략한다. 독립 Foundation oracle의2,651,052사례·추가 키/수치213,762사례·guard/오류/저장소와16프로세스/448구간/15기준이 통과했다. 실제Core330fc285…로 공개API14,604응답/45,727단정·같은 component 범위·관련36검사가 통과했다. 새144프로세스/48 HTTP기준은 **47통과/1미달**이다. single/inventory CPU0.910998/0.910628배지만 dense0.983588배가 사전0.98 목표에 못 미쳐 보류했다. 모든 회귀 한도는 통과했다. 후보/원본/판정은 private 보관이며 Root는 그대로다.
+- `json-lazy-index-179-20261024`는 앞 후보에 배열 인덱스 CodingKey 문자열 지연 생성을 더한 **다른 구현**이다. explicit 키 이름/intValue와 compound 경로를 유지한다. 같은 전체 oracle·15기준과 실제Core5635147b…의 공개API/component·36검사가 통과했다. 새144프로세스/48기준은 다시 **47통과/1미달**이다. single0.928395·query0.901628·dense0.901698배였지만 inventory0.996430배가 고정0.98 목표에 못 미쳤다. 본문·validator·Origin/권한·fresh 읽기·취소·동시 소비자·gzip은 유지됐다. 이 후보도 보류하고 보관했다. 같은 후보 재실행·표본 제외·한도 완화·과거 시간 재사용은 없다.
+- 두 후보 모두 scalar1,112,064·UTF16단위65,536, checksum7800523681052729380/9421890839001945081·실제API16170936545624258073이 같았다. prototype/실제 component의 대상 Core를 구분했다. HTTP 우선 판정에 따라 추가SSE/엔진 비교와 전체451을 실행하지 않았다. 기준426/fdc의 기존451결과는 유지한다. primitive 후보의 copied fixture hash 정정과 baseline C-link map 누락은 원본 보관 후 실제 양쪽 HTTP 바이너리를 새로 컴파일해 고쳤고 성공한 검사/측정은 반복하지 않았다. lazy 후보의 상대 import 오류는 검사가 시작되기 전에 수정했다.
+- 다음 가설은 **고정 live hosts 경로의 반복 URL 생성/파일시스템 표현 변환 제거**다. 현재 `status()`→`readStatus(file:URL)`가 매번 URL을 만들고, URL로 같은 고정 경로를 다시 변환한다. live 호출만 같은 `hostsPath` 문자열로 `Darwin.open`하고 기존 fd 판정 함수를 공유하는 방법을 검토한다. 매 호출 fresh open/read/close·O_NONBLOCK/O_CLOEXEC·일반 symlink 의미·전후fstat/변경 탐지·1MiB/추가1byte·UTF8 검증을 유지해야 한다. 이전 미채택 address-snapshot의 읽기 재사용/캐시와 다르며 open hook이나 보안 정책을 우회하지 않는다. 아직 이 가설의 코드를 작성/검증하지 않았다.
+- GitHub 열린 이슈는 읽기 전용 확인에서0개였다. 처음 sandbox 연결 실패 후 일반 사용자 네트워크에서 확인했다. 새 UI·실물폰/브라우저 QA·원본 터미널/입력/잠금·실제 전원·관리자/시스템/보안/TCC/VPN·자동실행/별도서비스·설치 앱 변경은 없다. 서명 키체인 예외·설치/재시작 허용은 여전히 미응답이고 같은 질문을 반복하지 않는다.179의 서명·패키지3검사·DMG/체크섬·소스커밋/태그/push/GitHub게시·익명다운로드 대조는 남았다. 전체 경량화 goal은 active다.
+
+## 2026-10-24 · 미게시179에 canonical JSON 경량화 채택 ·426입력
+
+- 직전 턴은 덮개 방지 재진단과 JSON 호환 시제품 review를 끝낸 progress였다. 이번에는 호환 후보를 실제Core에 빌드하고 정합성·HTTP/스트림/엔진 성능·공개 재현·전체 회귀를 마쳐 Root와 canonical 빌드에 채택했다. 버전은 **179/206** 그대로다. 현재 권위 있는 상태는 **426입력·94Core·4바이너리·모듈fdc8209b53d504d204e2e9e67d00853b4cb909fe9862db49f4a36eb7bd069ac5**, retention은 `retained-canonical-json-build/source`의608파일이다. 이전416/418/420/422 보관본과 실패 후보를 보존했고 qualification lock은 해제했다. 이전422/f3 기준으로 되돌리지 않는다.
+- `RemoteDashboardResponse.swift`의 canonical dashboard·inventory 두 인코딩에서만 일시 arena/컨테이너/출력 버퍼를 사용한다. 완성한 버퍼를 Data에 넘기며 새 장기 본문/권한/상태 캐시·타이머·서비스는 없다. Foundation의 실제 정렬/escape를 Bool로 검사하고 비호환·지원 밖 전략/키/크기/깊이/스칼라 오류는 기존 전체 인코딩으로 돌아간다. 관찰 시각·Origin/노드·fresh 상태/권한·취소·동시 소비자·압축/validator 수명은 유지한다.
+- 실제Core 공개API는 모든scalar1,112,064·UTF16단위65,536을 포함한 **14,604응답·45,727단정·foreign9,712**, checksum16170936545624258073이 일치했다. 관련36검사와 새 공개 재현4파일이 통과했다. 공개 component도2,651,052사례/checksum7800523681052729380 및 추가213,762사례/checksum9421890839001945081, 비호환 인코더의 fallback/오류 전달을 다시 확인했다. 구형 macOS 실물 검사는 아니다.
+- 새 실제Core 비교 **176프로세스·2,192구간·114기준**을 모두 통과했다. HTTP144프로세스/48기준에서 CPU는 단일network0.722091·inventory0.825341·96세션0.787373배였다. 일부 actor p95는 증가했으나 최대 증가 약0.110ms로 사전1.10배 또는+1ms 한도 안이다. 엔진16프로세스/512구간/17기준 및 스트림16/1536/49도 통과했다. 일반 변경 화면 CPU는0.989876~1.007557배, 최대RSS는엔진30,621,696→30,769,152(+147,456)·스트림양쪽24,379,392바이트다. 앱전체 메모리·실물폰/LAN/VPN/SentinelOne 향상이나 전송량 감소로 확대하지 않는다. 이전 개선율과 합산/곱하지 않는다.
+- 전체 **451/451·217.838초**, checks실행파일SHA1ac9ecfb5de7c13e8a2506bc2186ac46decb5448f89e84e24e1ae22f60cd332e다. 컴파일/전체 검사 당시422입력에서 실행 target 밖 공개 재현4파일을 더했으며 Core/4실행파일 byte identity를 대조해 전체 검사를 반복하지 않았다. 공개429입력·명시24파일·비대상HEAD405입력 사전 검사가 통과했다. README/릴리스 문서 생성은 서명·패키지 검증 후 실행하도록 준비했다.
+- 준비 실패는 private에 보존했다. 최초 API fixture의 중복 `z` 딕셔너리 리터럴이 SIGTRAP을 냈고 두 번째 키를 구분해 같은 전체 범위/기준을 통과했다. archive 준비 셸exit137은 어떤 보안 제품 때문인지 단정하지 않는다. 관련 검사 수34→36은 Peer stream compression 두 항목도 같은 필터에 포함된 메타데이터 정정이며 성공한 검사는 재실행하지 않았다. prototype/HTTP qualification 파일 이름 충돌은 단계별 새 이름과 원본 보관으로 고쳤다. 첫 sandbox GitHub preflight는 빈 응답으로 제품 변경 전에 종료됐고 일반 사용자 네트워크의 후속 확인에서179태그404·최신178을 확인했다. 통계 표본/한도 완화·실패 성능 표본 제외/재시도는 없다.
+- 기존 서명 키체인 예외·설치/재시작 허용은 여전히 미응답이다. **서명·패키지3검사·DMG/체크섬·소스커밋/태그/push·GitHub게시/익명 다운로드 대조는 남아 있다.** 기존 `release-206-20261024/AutoApprove.app`은 이번426/fdc 빌드와 맞지 않으므로 배포/설치하지 않는다. 실행 앱·원본 터미널·수동 잠금·실제 전원/관리자/시스템/보안/TCC/VPN·자동실행/별도서비스·UI는 변경하지 않았다. 모든 소유 실행은 종료했고 goal은 active/progress다. 다음은 새426/fdc 기준에서 남은 실제 비용을 관찰한다. 완료된114기준/공개 Unicode·API/451을 변경 없이 반복하거나 서명/설치 예외를 다시 묻지 않는다.
+
+## 2026-10-24 · 덮개 방지 재진단 · 설치본168 유지
+
+- 사용자가 AutoApprove에서 덮개로 인한 중단을 막아야 한다고 다시 요청했다. 09:52에는 `AppleClamshellState=Yes`였고, 새11:44:43 읽기 전용 확인은 설치 **0.2.168**, `SleepDisabled=Yes`, `AppleClamshellState=No`, `AppleClamshellCausesSleep=Yes`, AutoApprove의 유휴 시스템 잠자기 방지 및 마우스 tickle을 보였다. 방지가 꺼져 있다고 진단하지 않으며, 현재 실제 덮개 위치·센서 고장·특정 보안 제품이 원인이라고 단정하지 않는다.
+- 공개178과 Root의 KeepAwake.swift/KeepAwakeTests.swift는 동일하다. 이번 b596 실제Core의 전체451검사에서도 Keep-awake5항목이 통과했다. 앞선 단독 검사에서는 sandbox의 문자열 AppleScript 컴파일 실패 항목만 일반 사용자 환경에서1/1 통과한 기록을 보존한다. 관리자 실행문은 생성·컴파일만 하고 실제 설치/전원 명령은 실행하지 않는다. 덮개 신호 반복 중 방지 유지·단일 guard·실패 재시도·가짜 전원 도구의 종료/배터리/heartbeat와 권한 규칙 인용을 확인했으며 실제 덮개 닫힘 시험은 아니다.
+- Apple QA1340과 로컬 공식 IOPMLib.h를 다시 확인했다. 공개 유휴 assertion은 덮개에 따른 강제 잠자기·내장 화면 꺼짐을 확실히 막지 않는다. 이미 잠근 화면은 해제하지 않는다. 앱의 명시적 sleepnow 제거는169이상에 있지만 설치168에는 미적용이다. 준비된178 앱의 codesign 검증은 샌드박스에서 신뢰 오류였고 일반 사용자 읽기 전용 검증은exit0이었다. 인증서 신뢰/키체인·설치본은 바꾸지 않았다.
+- 설치·재시작 예외 질문은 여전히 미응답이다. 구버전 종료가 앱 소유 잠자기 설정을 해제할 수 있으므로 기존 시스템 변경 금지의 철회로 해석하지 않는다. 새 서비스/자동실행/관리자 상승·전원/보안/TCC/VPN 변경과 원본 터미널 조작은 없다. **덮개 강제 잠자기/화면 꺼짐 차단 요구는 미해결**이다.
+
+## 2026-10-24 · 일시 JSON 인코딩 호환 시제품 검증 · 아직 미채택
+
+- 현재Core HTTP 프로파일에서 확인한 Foundation wrapping/직렬화 비용을 대상으로, 자체 Encoder 컨테이너와 요청 안에서만 사는 bounded arena/output을 private 실험했다. 응답 캐시 수명·fresh 상태/권한·프로토콜·정렬/ETag는 바꾸지 않는다. 날짜/URL/Data/Decimal/부동소수와 지원 밖의 입력은 Foundation 경로다. Root 제품 소스에는 적용하지 않았다.
+- 첫 ASCII 키 시제품은1,342,368사례·16프로세스/320구간/11기준을 통과하고 private Core 빌드도exit0(485.790초)이었다. 이후 Foundation 버전별 키 정렬 차이를 확인해 이 빌드를 채택하지 않았고 검증된422입력/f3abdb889a4249bce0e96444ae228eaf376fe3e47244b6b4a6c42707ee08e777·94Core/4바이너리를 원복했다. 첫 준비의 의존 단계 조기 실행 오류도 private에 보존했다.
+- 호환 시제품 `transient-json-compatible-179-20261024`는 실제 Foundation 옵션·문자 escape·키 정렬을 작은 값으로 비교해 Bool만 보관하고, 호환되지 않으면 기존 전체 인코딩을 사용한다. native/foreign Unicode 키와 호출자 저장소를 보존하며 중복 정규화 키·크기/깊이 한도는 fallback이다. 전체 scalar1,112,064·UTF16단위65,536을 포함한 **2,651,052사례** checksum7800523681052729380, 추가 foreign 키/저장소/정수/실수 **213,762사례** checksum9421890839001945081이 통과했다. 비호환 인코더·예외 전달도 검사했지만 구형 macOS 실물 검사는 아니다.
+- 새16프로세스/448구간/15기준이54.381초에 모두 통과했다. 19/96세션·native/foreign 한글 키 및 short control의 CPU비율은0.708105~0.759524, 최대RSS21,331,968→21,315,584바이트다. reviewer(exec39231 exit0)가 원본 작업 종료·지문·통계를 확인했다. 이전 exec26536은 이미 정상 종료된 세션이며 다시 시작하지 않는다. **실제 제품Core의 호환 후보 빌드·공개 API/HTTP/SSE/엔진·전체 회귀는 아직 안 했고 채택도 아니다.** 준비된 integrate-compatible-json-179.mjs부터 의존 순서대로 진행한다. 제품179/206·서명/설치 대기·전체 경량화 목표active는 유지한다.
+
+## 2026-10-24 · 주소 상태 중복 읽기 후보 미채택 ·179 유지
+
+- 직전 쿼리 후보는 미채택 상태로 유지했다. 새 current-Core HTTP 프로파일은 query28,968·dense14,456·single1,321요청이며 각3초/10ms sampler와 소유 worker가 모두 exit0이다. 기본 live 주소 파일 읽기는 포함되며 시스템 파일을 수정하지 않았다. 일반 조회의 파일 I/O 외에 단일·밀집 조회에서 Foundation Encodable wrapping/JSON 직렬화 비용을 확인했다. inclusive 노드를 CPU 백분율·앱 전체·폰/VPN/보안 도구 향상으로 확대하지 않는다.
+- `address-snapshot-179-20261024`는 무조건200 응답에 요청 첫 주소 읽기를 재사용하되 다음 요청 fresh 읽기와 조건부 재검증을 유지하는 후보였다. 실제 공개 handle의161요청/46환경/476단정과 기존22고유 회귀가 통과했다. 새144프로세스/144구간/47기준에서는 **5실패로 미채택**이다. 단일 network/inventory CPU0.912676/0.924152배가 고정0.90 목표에 못 미쳤고, query304/network304 wall1.184434/1.226609배 및 network304 actor p95 1.390042→3.043479ms가 한도를 넘었다. 나머지 제어군·RSS는 통과했다.9조건 상세는 VALIDATION의 같은 날짜 절이다.
+- 독립 검토는 원본144stdout·종료 job·전체 입력/Core/모듈/실행 파일과47기준을 대조했다. 원본 review template의 query-prefix oracle 표시는 해당하지 않아 기록을 보존하고 performance-review의 실제 Core handle 표기로 정정했다. 통계/한도/표본은 바꾸지 않았다. HTTP 우선 판정에 따라 SSE/엔진 비교·전체451검사를 실행하지 않았다. 같은 후보 재실행·한도 완화·시간 재사용은 하지 않는다.
+- Root/canonical 임시 빌드/retained-native-patch는 검증된 **179/206·422입력·94Core·모듈f3abdb889a4249bce0e96444ae228eaf376fe3e47244b6b4a6c42707ee08e777·4바이너리**와 같다. 후보 소스/빌드·476단정·47기준/원본·review/decision은 private 보관이다. 이전416/418/420/422 보관본·451검사·19파일 배포 범위를 유지하고 새 공개 fixture·버전/서명/게시/설치는 없다. 모든 소유 작업은 종료했다. 기존 IDE/인덱스·진단 변경과 설치 앱·원본 세션·잠금·실제전원/관리자/시스템/보안/TCC/VPN·자동실행/새서비스·UI는 건드리지 않았다.
+- 179 서명 키체인 예외·설치/재시작 허용은 여전히 미응답이다. 서명·패키지3검사·DMG/체크섬·소스 커밋/태그·GitHub 게시/익명 다운로드 검증이 남아 있다. 이번은 progress이며 전체 경량화 목표는 active다. 다음은 새 단일/밀집 프로파일에서 JSON 생성의 일시 객체 비용을 더 좁힌다. 본문 캐시 보관 수명·fresh 입력/권한/상태 검증·정렬/ETag·프로토콜을 단순히 완화해 통과시키지 않는다.
+
+## 2026-10-24 · 덮개 닫힘 방지 요청 재확인
+
+- 사용자는 AutoApprove가 덮개 닫힘으로 인한 작업 중단을 막아야 한다고 요청했다. 읽기 전용 확인에서 현재 설치본은 **0.2.168**, `SleepDisabled=Yes`, `AppleClamshellState=No`였다. 잠자기 금지가 꺼져 있는 상황으로 진단하지 않는다.
+- 앱의 명시적인 `sleepnow` 요청 제거는 공개 **0.2.169 이상**에 포함되지만 현재 설치본에는 적용되지 않았다. 설치·재시작 예외 질문은 아직 미응답이다. 기존 설치본 종료가 전원 설정을 해제하므로 이번 요청만으로 앞선 시스템 변경 제한이 철회됐다고 해석하지 않는다.
+- 로컬 공식 SDK와 [Apple QA1340](https://developer.apple.com/library/archive/qa/qa1340/_index.html)을 다시 확인했다. 일반 유휴 잠자기 방지는 덮개에 의한 강제 잠자기나 내장 화면 꺼짐을 보장해서 차단하지 않는다. 새 assertion·마우스 신호 추가로 해결했다고 주장하지 않는다. 실제 덮개 닫힘 시험·전원 설정 변경·잠금 해제·앱 교체는 하지 않았다.
+
+## 2026-10-24 · 쿼리 디코딩 후보 미채택 · 검증된179 유지
+
+- `query-identity-179-20261024`는 요청 구조와 URL 파싱을 유지하고 짧은 printable ASCII query 조각의 두 Foundation 변환만 생략했다. 과거163의 URLComponents 보관 후보를 재적용하지 않았다. 전체 scalar1112064·UTF16단위65536·ASCII triple2097152·조각3419828(foreign139904)·메시지5824·parameter62104가 원본/실제Core에서 같았다. checksum6118518618205596672, 관련36고유 회귀가 통과했다.
+- 새112프로세스/112구간/37기준의 원본 stdout·종료 job·통계를 독립 검토했다. 쿼리304 CPU0.885213배지만 일반 쿼리0.973780배가 필수0.90 한도에 못 미쳐 **1기준 실패·미채택**이다. 나머지 제어군 CPU/wall·p95/actor·RSS는 사전 한도 안이다. HTTP 우선 판정에 따라 추가SSE/엔진 시간 비교·전체451검사는 생략했다. 끝난 비교를 반복하거나 쿼리 기준을 낮추지 않는다. 상세7조건은 VALIDATION의 같은 날짜 절에 있다.
+- private 후보 소스/빌드·정합성·HTTP protocol/원본·review/decision과 준비 실패를 보존했다. 캐시 접근 제한으로 실패한 첫 격리 빌드는 원복 후 일반 사용자 빌드로 확인했다. canonical 임시 빌드와 제품 소스는 **기존422입력·94Core·모듈f3abdb889a4249bce0e96444ae228eaf376fe3e47244b6b4a6c42707ee08e777·4바이너리**와 같다. 앞선416/418/420/422 보관본·최종451결과·19파일 배포 범위는 유지한다. 해당 후보를 정식179로 오인하거나 되돌려 채택하지 않는다.
+- 덮개 요청에 대해 이번 읽기 전용 확인도 설치168·SleepDisabled=Yes·AppleClamshellState=No·AutoApprove의 유휴 방지 assertion을 보였다. 일반 앱 API로 강제 덮개 잠자기를 보장해서 막았다고 주장하지 않는다. 169이상의 명시적 sleepnow 제거는 설치본에 미적용이며 설치/재시작 예외는 여전히 미응답이다. 실제 덮개 닫힘 시험·원본 터미널/화면/입력/잠금·전원·관리자/시스템/보안/TCC/VPN·자동실행/새서비스·UI·설치 앱은 변경하지 않았다.179 서명 키체인 예외도 미응답이며 서명/패키지/게시 단계가 남았다. 이번 goal턴은progress, 전체 경량화 목표는active다.
+
+<!-- pending-179-work:start -->
+## 2026-10-24 · 미게시179에 스트림 변경분 생성 경량화 채택
+
+- 실제Core의 연속UTF8 공통 앞·뒤 비교와 UTF16 길이 계산을8바이트 단위로 바꿨다. 원문·부분scalar/surrogate 경계·패치 필드/JSON·생성 여부를 유지하고 버퍼를 제공하지 않는 입력은 기존경로다. 새 캐시/타이머/서비스/UI·입력 정책 변경은 없다.
+- 전체1112064 scalar·65536UTF16단위·269414사례(foreign178010/패치258394/JSON21275)가 일치했다. checksum1404785650038312242다. 실제Core 공개API·공개178 재현·관련12검사·전체451/451(209.568초)이 통과했다.
+- 새32프로세스/2048구간/66기준을 통과했다. 실제 공개HTTP 처리기를 거치는 합성SSE 재연결 응답CPU는 영문0.525862037/혼합0.385660464배, gzip포함0.531491502/0.386664381배다. 직접변경분CPU는0.041429799/0.025927909배다. 일반16세션CPU는0.13~0.90% 증가로 기존1.05 한도 안이다. 최대RSS는SSE23199744→24281088(+1081344)·엔진30720000→30212096바이트로 한도 안이며 앱전체메모리감소로 주장하지 않는다.
+- 실제공개SSE.handle과gzip을 호출했으며 리스너를 시작하지 않았다. 원본Bridge화면은기존Core가전송용연속UTF8로보관한다. 직접Patch API는원래저장소별fallback도검사했다. 신선도sequence자릿수만전송량비교에서구분하고실제바이트/원본조회수도보존했다. 폰/LAN/VPN/SentinelOne 종합지연으로확대하거나 이전58/64/17단계비율과합산/곱하지 않는다.
+- 전송측정기 준비의 비공개함수/초기화symbol링크·Swift문법/CRLF·새원본문자확인 오류를 보존하고 공개handle/parse·정확한새원문/저장소확인으로 고쳤다. 채택시간표본은그뒤새프로세스에서만수집했고 기준완화·표본제외·성공검사중복실행은없다.
+- 179/206은미게시상태라버전을다시올리지않았다. 현재422입력·94Core/모듈f3abdb889a4249bce0e96444ae228eaf376fe3e47244b6b4a6c42707ee08e777·4실행파일이검사/측정후보와같다. 공개재현2파일은실행target밖이므로420입력으로검사한Core/바이너리byte identity를대조해451을중복실행하지않았다. 이전416/418/420 proof/retention은그대로보존했다. 공개425입력·명시19파일·비대상HEAD406입력 사전검사를통과했다.
+- GitHub179태그404·최신178을채택직전확인했다. 서명키체인임시검색목록예외·설치/재시작허용은미응답이다. 서명/패키지3검사/DMG·체크섬/소스커밋·태그/게시·익명다운로드검증은남아있다. 설치앱·원본터미널·잠금·실제전원/시스템/권한/보안/VPN·자동실행/별도서비스는변경하지않았다. 이번goal턴은progress이며전체목표는active다.
+
+## 2026-10-24 · 미게시179에 Cocoa snapshot 크기 검사 경량화 채택
+
+- 새 합성16세션 실제Core 비교16프로세스/512구간/17기준·전체451/451(208.692초)·관련12검사와 고정178 대상 공개 재현을 통과해 아직 미게시인179/206에 채택했다. 버전을 다시 올리지 않았고 앞선 행 경계/risk 결합 변경을 유지한다.
+- UTF16단위 수로 정확한UTF8길이의 상·하한이 확실한 Cocoa snapshot만 전체UTF8 변환을 생략한다. native는 기존O(1) 길이, 중간 구간은 기존 정확한UTF8 계산을 사용한다. 화면200000바이트 한도·원문/저장소·커서·입력/권한 정책은 같다. 새캐시/타이머/서비스/UI는 없다.
+- 이번 단계 CPU비율은 Cocoa 변경 영문0.918857054/혼합0.926911997, 동일 프레임0.389306446/0.479095250이다. native 변경0.994328315/0.999317471로 비슷하며 최대RSS는양쪽30703616바이트다. 이전58/64기준 단계와 비율을 합산/곱하지 않고 앱전체/폰/실제AX·VPN·SentinelOne 개선으로 확대하지 않는다.
+- 모든1112064 scalar·65536UTF16단위·16631화면·76617판정·527JSON이 일치했다. native/NSString/CF·손상surrogate·200000바이트 및66666/200000단위 경계를 포함한다. checksum1236825716355626643이며 공개 재현은50.407초에 통과했다.
+- 현재420입력·94Core/모듈1d5b869c0738056a027c90c90c0ce30cb8b76d01cc47a278e4c9cc751eb28818·4바이너리는 측정/검사 후보와 같다. standalone 공개fixture/script2개를추가하기 전418입력으로 전체451을 실행했으며 byte identity를 대조했으므로 중복 실행하지 않는다. 이전416/418 proof/retention과 실패 후보는 보존했다. 예상 공개423입력·명시16파일의 사전검사를 통과했고 비대상HEAD407입력을 batch로 검증했다.
+- 처음 채택 절차는 자기 소유 잠금을 해제 전에 없다고 검사해exit1이었다. 검증된 코드/바이너리/retention은 그대로 두고 소유 잠금을 확인하는 단계와 해제 후 검사를 나눠 모두 통과했다. 실패 기록을 보존했으며 검사/성능 기준은 바꾸지 않았다.
+- GitHub179태그404·최신178을 채택 직전 확인했다. 서명 키체인 임시 검색목록 예외와 설치/재시작 허용은 미응답이다. 서명·패키지3검사·DMG/체크섬·소스커밋/태그·게시/익명다운로드 검증은 남아 있다. 실행 앱·원본터미널·실제전원/시스템/권한/보안/VPN·자동실행/별도서비스는 변경하지 않았다. 이번goal턴은progress이며 전체목표는active다.
+
+## 2026-10-24 · 미게시179에 결합 최적화 채택·서명 대기
+
+- 앞선 후속 실험의 결합 후보가 전체64성능 기준·실제 Core451/451(208.684초)·관련78검사와 공개 재현2종을 통과했다. **아직 게시하지 않은179/206에 DetectionLines·SystemCommandRisk 변경을 함께 채택**했다. 버전은 다시 올리지 않았고 기존 TerminalAppearance 변경을 유지한다. 이전 후속 섹션의 ‘제품 소스 미변경/후속 보관’은 채택 전 checkpoint다.
+- native 변경 프레임 CPU는 UTF16-only179 기준 영문0.963636659·혼합0.968010434배다. Unicode risk native/foreign은0.908762555/0.912041223배다. 짧은 혼합 risk1.031583187배·Unicode 공백1.036508276배의 소폭 비용 증가도 기존1.05 한도 안이며 숨기지 않는다. RSS는 엔진30343168→30441472·risk20955136→21053440바이트로 감소를 주장하지 않는다. 두 단계의 성능 비율을 곱해 전체 앱/폰 개선율을 만들지 않는다.
+- 공개 native-row-boundary-check와 확장 risk-compaction-check를 새로 검증했다. per-row NFC·원문 byteStarts/예산·모든Unicode/손상UTF16·일반 질문/현재 모델/허가/거절 JSON·fresh installer 읽기 정책을 유지한다. 새 캐시·타이머·서비스·UI는 없다. 공개 추가 fixture/script는 product/test executable target 밖이므로 검사했던94Core/모듈·4실행파일이 byte-identical함을 확인해451검사를 중복 실행하지 않았다.
+- 현재 배포용 proof는418입력·94Core·모듈1d5b869c0738056a027c90c90c0ce30cb8b76d01cc47a278e4c9cc751eb28818다. private retained-combined-build/source와 revision-combined-20261024에 보존했다. 이전416입력 UTF16-only proof/451결과·기존 retained-build/source·실패 후보는 그대로 남겼다. 공개 입력 예상은421개이며 임시/IDE/인덱스·기존 untracked 진단은 배포에 포함하지 않는다.
+- GitHub179태그는404·최신 정식178을 채택 전 읽기 전용으로 확인했다. 기존 발행자의 서명에 필요한 임시 키체인 검색목록 추가 예외는 미응답이다. 서명·패키지3종·DMG/체크섬·소스 커밋/태그·게시/익명 다운로드 검증이 남았다. 설치/재시작 허용도 미응답이므로 실행 중인 앱은 바꾸지 않았다. 원본 터미널·실제 전원/시스템/권한/보안/VPN·자동실행/별도 서비스는 변경하지 않았다. 전체 경량화 목표는 active이며 이번 턴은 progress다.
+
+## 2026-10-24 · native 행 탐색·공백 제거 결합 후보의 실제 Core 검증
+
+- `combined-native-risk-179-20261024`는 앞선 native 행 경계 탐색과 Character-run 공백 제거의 두 소스 변경을 함께 적용한 새 후보다. 개별 개선율을 곱하거나 이전 시간을 재사용하지 않았다. 임시 canonical 빌드를 패키징 잠금으로 보호하고 두 파일·94Core/모듈·4바이너리를 원래179로 복원한 뒤 별도 보관 후보만 실행했다. 제품 소스와 버전은 바꾸지 않았다.
+- 결합된 실제 Core에서 parser/질문/허가·원문 byteStarts·fence·4MiB 예산과Unicode/손상UTF16·호출자 저장소 corpus가 일치했다. 추가Word56877/foreign26076·scalar1112064개/17376묶음 checksum3006880942655936958, native 질문 primitive7009730/화면30366/허가5336, complete-suffix와interactive preflight의 기존 checksum을 유지했다. 이름을 분리한 여섯 parser 소스와 risk helper 둘이 실제 빌드 소스와 정확히 같음을 확인했다.
+- 실제 Core 공개 risk API의6642정책·2040도구·56설치 소스 변화와 거절JSON/digest도 같았다. 정확한5480262공백 제거·모든 scalar·추가13032긴 grapheme묶음/960경계/54cap/180긴 조합이 통과했다. risk digest f2f98b6bfc54d1c650ab753b7176e20ce16a4de4e2f8f939dfefd709a8faf9ae다. 관련 안전·질문·모델·초기화·fresh risk 검사78개가 통과했다.
+- 새32프로세스/1984 ABBA·BAAB구간/64기준을 원본 stdout·종료 job·중첩 중앙값·소스/객체/모듈/실행 파일부터 검토했다. native 영문/혼합 변경 CPU는0.963636659/0.968010434배, Unicode native/foreign risk CPU는0.908762555/0.912041223배다. 영문·혼합 엔진 CPU≤0.97, risk23사례47기준과 기존 제어군·wall·RSS 한도를 유지했으며 0기준이 실패했다. 표본 제외/재시도/한도 완화는 없다.
+- 모든64기준과 전체 **451/451 checks passed · 208.684초**를 통과해 후속 채택 가능 상태로 보관했다. 기존179 배포 서명 대기를 먼저 해결하며 아직 제품 소스·태그·버전을 바꾸지 않았다. 합성 Core 수치를 전체 앱·실물 폰·VPN/보안 도구 개선율로 쓰지 않는다.
+- 최종179/206의416입력·canonical94Core/모듈·4바이너리를 다시 대조했다. 모든 소유 빌드/검사/비교 프로세스는 종료했고 원본 터미널·실제 전원/시스템/권한/보안/VPN·자동실행/별도 서비스·UI·설치 앱은 변경하지 않았다. 기존 IDE/인덱스·진단은 보존하며 서명 키체인 임시 등록과 설치/재시작 허용 대기는 그대로다. 이번 턴은 progress이며 전체 경량화 목표는 active다.
+
+## 2026-10-24 · native 행 경계 탐색 세 후보의 실제 Core 검증
+
+- 직전의 제한된 묶음 NFC 가설을 구현하기 전, `bulk-nfc-169-20261022/selection.json`의 실제 Unicode 불일치를 다시 확인했다. 해당 시제품을 재적용하거나 코드 포인트 예외를 만들지 않았다. 이번에는 **행별 NFC·원문 budget·Cocoa/손상 문자열 처리를 유지**하고 native CR/LF 경계 탐색 비용을 줄이는 별도 알고리즘을 비교했다.
+- 첫 `suffix-word-scan-179-20261024`는8바이트 단위로 행 경계와ASCII를 함께 검사했다. 둘째 `suffix-exact-mask-179-20261024`는 바이트별 carry가 섞이지 않는 정확한 delimiter mask와 leading-zero count로 줄바꿈 근처의 겹친 재검사를 없앴다. 셋째 `native-row-boundary-179-20261024`는 같은 경계 탐색을 질문 사전 검사와 원본 메뉴 범위 탐색의 나머지 두 native 경로에도 적용했다. 작은 끝부분은 기존 스칼라 탐색이며 포인터는 동기 borrowed scope 안에서만 읽는다.
+- 각 후보의 실제 Core 빌드와 원본 helper 소스 바인딩을 확인했다. 추가Word corpus **56877사례·foreign26076·scalar1112064개/17376묶음**의 행/원문 byteStarts·fence·호출자UTF8/UTF16/저장소가 같았다. checksum3006880942655936958이다. 기존 native 질문 primitive7009730·화면30366/foreign15183/허가5336/순서252, complete-suffix 및 interactive-preflight의 전체 corpus도 같은 checksum으로 통과했다. 실제 Core의 안전·질문·모델·초기화 관련 **77검사**가 후보마다 통과했다.
+- 후보1 native 영문/혼합 CPU0.981637065/0.990384642배 · 2기준 실패; 후보2 native 영문/혼합 CPU0.975801072/0.983575818배 · 2기준 실패; 후보3 native 영문/혼합 CPU0.966595586/0.978840816배 · 1기준 실패. 각 후보는 새16프로세스·512 ABBA/BAAB구간이며, native 변경 CPU≤0.97·나머지CPU≤1.05·wall≤1.10·RSS 한도를 바꾸지 않았다. 합계48프로세스/1536구간/51기준은 독립 실험 수이며 표본을 합쳐 개선율을 만들지 않았다. 원본 stdout/job·판정/읽기/게시 수·중첩 중앙값·객체/모듈/실행파일을 재검토했다.
+- 셋째 후보도 사전 성능 목표에 미달해 **미채택**했다. 세 후보 모두 채택 불가가 확정됐으므로 후보 전체451검사는 실행하지 않았다. 단독 루프나 일부 제어군의 개선으로 전체 통과를 대신하지 않았다.
+- 검증된179/206의416입력·canonical94Core/모듈·4바이너리를 복원/대조했고 모든 소유 빌드/검사/비교 프로세스는 종료했다. GitHub main2bc18930dfb7f1a30e32bbf8675cb6281442b172·최신 정식178/205와두자산을 새로 확인했다. 키체인 검색 목록은 여전히login만 포함하며 기존 임시 등록 예외와 설치/재시작 질문은 미응답이다. 사용자 시스템/보안/전원·원본 터미널·새서비스/자동실행·UI와 개인 IDE/인덱스·기존 진단은 변경하지 않았다. 이번 턴은 progress이며 전체 경량화 목표는 active다.
+
+## 2026-10-24 · 지문 복사 감소의 두 후보와 실제 Core 비교·미채택
+
+- 앞선169의 전체 지문/foreign 버퍼 교체를 재적용하지 않았다. 이번 `fingerprint-native-core-179-20261024`는 연속 UTF8이 있는1024바이트 이상 입력만 동기 수명 안에서 빌리고, 짧은/foreign의 기존 Data·hex 경로를 유지한 별도 후보였다. 새16프로세스/640구간/21기준에서 일반 터미널 크기 CPU0.930643823배라 사전0.90 목표에 못 미쳐 제외했다.
+- 별도 `fingerprint-native-oneshot-179-20261024`는 같은 eligibility·workload·한도로 공개 CommonCrypto의 단일 SHA256 호출과32바이트 임시 digest를 사용했다. 단일 호출 길이를 CC_LONG(exactly:)로 확인하고 표현 불가능/실패 시 기존 hash로 돌아간다. 새16프로세스/640구간/21기준은 모두 통과했다. 일반/큰 native 지문 CPU는0.886341511/0.939519785배였고 작은/foreign 제어군은 한도 안이었다.
+- 각 후보의 독립 정식179 소스 oracle846개(실제 foreign407개)와 추가13819경계 사례가 같았다. 모든 valid scalar1112064개를4344묶음으로, 전체UTF16단위·손상 surrogate·1024바이트/4MiB 경계·세 저장소를 확인했다. 원문 바이트/UTF16·호출자 저장소와64자리 지문을 유지했다. 기존 corpus digest c5eb762a7b5ad5b387896a4fcfc7c9d484ed93e63b66defe78284b97fae34191, 추가 digest03a888759775c7dba676992351b5b285ff338b2156543c85e5f52e64d4302297이다.
+- 단일 호출 후보의 실제 Core 공개 API에서도 같은14665사례가 일치했고 지문/시스템 안전/단일·전체 초기화30검사가 통과했다. 그러나 새16프로세스/512구간/17기준의 실제16세션 갱신 mixed-native CPU는1.001214779배로 사전0.99 목표를 넘었다. **전체 경로 이득을 확인하지 못해 미채택**했다. RSS30261248→30310400바이트는 한도 안이었다. 단독11%를 앱 전체·네트워크 개선으로 쓰지 않는다.
+- 세 비교는 합계48프로세스/1792구간/59기준이지만 독립된 실험이며 표본을 합쳐 성능 비율을 만들지 않았다. 원본 로그/종료 job·중첩 중앙값·모든 객체/소스/바이너리를 대조했다. SDK import로 실제94Core 객체와 모듈이 바뀌었으므로 한 파일 수정만으로 코드 동일성을 판단하지 않는다. 채택 불가가 확정돼 후보 전체451검사는 실행하지 않았다.
+- 검증된179/206의416입력·canonical94Core/모듈·4바이너리를 복원/대조했고 제품 소스는 바꾸지 않았다. 두 후보와 모든 소유 검증/비교 프로세스는 종료했다. 서명·GitHub 배포와 설치/재시작 예외 질문은 계속 대기 중이다. 원본 터미널·실제 전원/시스템/보안/권한/VPN·자동 실행/별도 서비스·UI와 개인 IDE/인덱스·기존 진단은 변경하지 않았다. 이번 턴은 progress이며 전체 경량화 목표는 active다.
+- 다음 근거는 기존 소유 실제 Core sample의 두 utility worker에서 보이는 suffix 행별 NFC 준비다. 제한된 native suffix를 한 번에 정규화하는 별도 가설을 검토한다. 아직 구현/측정/채택하지 않았으며, per-row NFC/원문 byteStarts·CR/LF/CRLF·코드 fence·원본 예산·질문/모델/오류/Goal·Cocoa/손상 fallback의 동등성이 선행돼야 한다.
+
+## 2026-10-24 · 후속 공백 제거 후보 실제 Core 검증·미채택
+
+- `risk-character-core-179-20261024`는 앞선 Character-run 프로토타입을 실제 Core에 연결한 독립 비교다. 제품 소스는 바꾸지 않고 임시 빌드에서 후보를 보관한 뒤 검증된179를 복원했다. 패키징 차단 잠금은 복원 후 제거됐으며 최종416입력·양쪽94Core/모듈·4바이너리·canonical 원본 소스/실행 파일을 다시 대조했다.
+- 실제 Core 공개 API의6642정책·2040도구·56설치 소스 변화와 거절JSON/digest가 기존 결과와 일치했다. 정확한5480262공백제거·Unicode scalar1112064개·추가13032긴 grapheme batch·손상UTF16/경계 corpus도 통과했다. 이름을 분리한 helper가 실제 빌드 소스에서 정확히 생성됐음을 별도로 확인했고 관련 안전/원격 처리15검사가 통과했다.
+- 새32프로세스/1984 ABBA·BAAB구간/64기준을 원본 로그부터 재계산했다. 안전 판정 단독 native/foreign CPU는 각각0.913875473/0.908381418배로47기준을 통과했지만, 실제16세션 터미널 변경의 mixed-native CPU는0.990164413배라 사전 목표0.97을 넘었다. 이1기준 실패로 **미채택**했다. 단독9% 이득을 전체 앱·터미널·네트워크 개선율로 쓰지 않는다.
+- 정책 비교 controller의 이전 파일명 참조가 첫 실행 준비 단계에서 실패했다. 당시 정책 fixture 프로세스는0개였다. 오류 소스/로그/job/빈 출력 폴더를 보존하고 해당 경로만 고친 뒤 미실시16프로세스만 실행했다. 완료한 엔진16프로세스의 시간은 다시 측정하지 않았고 workload·한도·이상치 제외·시간 재사용은 바꾸지 않았다.
+- 후보의 전체451검사는 실행하지 않았다. 채택 전 필수 검사지만 성능 기준 실패로 이미 채택할 수 없기 때문이다. 제품179/206·기존451/58기준 검증과 서명 예외/설치·재시작 승인 대기는 유지한다. 새 버전·설치 앱·원본 터미널·실제 전원·시스템/권한/보안/VPN·자동 실행/별도 서비스·UI 변경은 없다. 소유32프로세스와 검사·비교 작업은 모두 종료했다. 이번 턴은 progress이며 전체 경량화 목표는 active다.
+
+## 2026-10-24 · 0.2.179 / 206 검증 완료·배포 서명 대기 · 후속 문자열 조립 실험
+
+- 직전 UTF-16 후보의32프로세스/1792구간/58기준과 이번 실제 Core 재프로파일·후속 후보의 정합성/16프로세스/832구간/27기준 검토는 progress다. 전체 경량화 목표는 active다.
+- 현재 제품 버전은179/206이며 설치본 교체·새 소스 커밋·v179 태그·GitHub 릴리스는 아직 없다. 제품 변경은 TerminalAppearance.swift의 커서/희소 속성/AX 범위 임시 배열 감소와 버전 자원, 공개 UTF16 재현2파일이다. 최종416입력/94객체·451/451(225.007초)·공개Unicode/1320범위 검사와58기준이 통과했다. 변경 프레임 CPU36.3~67.1% 감소는 커서·색상 포함 합성16세션 Core 경로의 수치다.
+- TMP 재구성 때 빠진 assets/AppIcon.png와 docs/INSTALL.txt를 고정 v178 태그로, 변경 없는 VSIX를 이전 공개 패키지와 대조해 복구했다. 아이콘을 공개 패키징 입력에 포함해 예상 공개 소스는419개다. 첫 아이콘 누락 실패와 이후 서명 실패를 보존했다. 패키지3검사·DMG/체크섬·소스 커밋/주석 태그·원자적 push·게시/정상TLS 익명 다운로드 검증이 남았다.
+- 기존 발행자46451DD581918D2EB45BDBAC62C13B9E066271BB는 전용 키체인의 읽기 전용 검사에서 유효하다. codesign은 --keychain과 SHA/이름 명시로도 identity를 찾지 못했다. 사용자 검색 목록은 login만 포함한다. 배포 서명 동안만 기존 키체인을 검색 목록에 추가하고 즉시 원복하는 예외 질문은 미응답이다. 목표 이어가기를 그 승인이나 앱 설치/재시작 승인으로 해석하지 않는다. 새 키체인/인증서/신뢰/ACL/검색목록·시스템/전원 변경은 하지 않았다.
+- 비공개 .runtime/releases/0.2.179/retained-build.json에 검증된94Core·모듈·4바이너리·416빌드입력과3패키징입력의598파일을 보존했다. canonical TMP가 사라져도 이를 우선 사용한다. 모듈SHA는891f8edf18166bf4a3a61cef306d82a0e9393d31578f4b9d55ff31ffc2576a45다. 버전만 보고 과거 객체와 같다고 판단하지 않는다.
+- profile179-20261024는 소유 합성 실제 Core의 mixed-native/Cocoa를 각각3초/10ms로 새 샘플링했다.816/752갱신을 수행했고 두 프로세스/샘플 작업이 모두 종료했다. 안전 검사NFC/공백제거·행 판별 비용이 남아 있다. 중첩 inclusive node 합계는 CPU백분율이나 A/B 이득이 아니다.
+- risk-builder-179-20261024는 처음 보관 문자에서만 min(UTF16길이,4096) 용량을 예약하는 비공개 후보였다. 기존 ASCII경로·Character.isWhitespace·NFC/정책/설치 소스의 새 읽기를 유지했다. 정확한5480262공백제거·6642정책·2040도구·56소스변경과960추가 임계/손상UTF16 사례가 일치했고 정책digest는f2f98b6bfc54d1c650ab753b7176e20ce16a4de4e2f8f939dfefd709a8faf9ae다.
+- 프로토타입16프로세스/832구간의 원본로그·27기준을 따로 대조했다. unicode-negative CPU1.030504375/wall1.030510616, foreign-negative CPU1.026483325/wall1.026596492배로 목표0.94/0.97을 넘었다.4기준 실패로 미채택했으며 제품/Core에는 적용하지 않았다. planSHA dd891aa5ad527ac907fe2a58ecf512e067f2413a641ed23b7d076a612c860013다. 시간 재사용/제외/완화는 없다. 완료한 비교나179의451/58검사를 변경 없이 반복하지 않는다.
+- 후속 문자열 조립을6변형으로 구현·검증·새 쌍 비교했다. 각 변형은 서로 다른 소스/일부 확장 corpus의 독립 실험이며 시간을 합쳐 하나의 성능 결과로 쓰지 않는다. 입력/원본 로그·모든 작업 종료·중첩 중앙값·미채택 기준을 따로 검토했다. 총96프로세스/8192구간/262개 기준을 검토했고 기존 한도 완화나 이전 시간 재사용은 없다.
+  1. risk-ascii-spans-179-20261024：16프로세스/1152구간/37기준, 실패2개, 제품미적용. planSHA 24cb1674322a6e685d5b2df6a093f2da7b14e913e93eaebba3d42a52d689ba5a
+  2. risk-ascii-spans-length-179-20261024：16프로세스/1152구간/37기준, 실패1개, 제품미적용. planSHA fc97e7806ea928ff742fc2e21bdf0eaf1a7d7cedbf21199f56c1d49e06045e73
+  3. risk-ascii-spans-bounded-179-20261024：16프로세스/1472구간/47기준, 실패10개, 제품미적용. planSHA 8e3a13f08eb8060582528933945201aff41ab0079c3dfedc7d7425f10b2b2e9a
+  4. risk-character-runs-179-20261024：16프로세스/1472구간/47기준, 실패2개, 제품미적용. planSHA a7323f3e5d04dfc3f073ed7693277840c274e50a8e124714ab20c0b0e475ea44
+  5. risk-character-runs-sized-179-20261024：16프로세스/1472구간/47기준, 실패3개, 제품미적용. planSHA dd42852b4448eb0c3c0158a0b68ab4042246c7c327a5a3946500ba2771c1286f
+  6. risk-character-runs-bounds-179-20261024：16프로세스/1472구간/47기준, 실패0개, 제품미적용. planSHA a06b148a847be14a79a7e2218c897a96757bbee7b5b536154a1dc9857b445f26
+- 첫 UTF8구간 변형은 보통 혼합 로그7% 개선과 외부 희소결과2.34배 악화가 공존했다. 이미 읽은Character의UTF8길이로 경계 재계산을 줄인 두 번째는 보통27% 개선이지만 외부 희소결과CPU1.074993658배였다. 세 번째의 Substring 꼬리 반복은 국기문자에서19.64/20.20배 느렸다. SDK 인터페이스에서 Substring.Iterator=IndexingIterator<Substring>를 확인했다. 내부 단일 원인을 확정한 CPU분석으로 과장하지 않는다.
+- 네 번째는 String.Iterator를 그대로 쓰고 보관 구간만 이어 붙여 국기문자 악화를 없앴으나 short-mixed가CPU1.101035823/wall1.106639691배로 실패했다. 다섯 번째는32UTF16단위 미만을 원래filter로 처리해 short입력은 회복했지만 native UTF16길이의 추가 순회로target CPU0.951348506/0.945986068·Unicode공백1.058461260배가 되어 미채택했다. 여섯 번째는 같은32단위 기준을 UTF8길이의 상·하한으로 선택해 큰native입력의 UTF16순회를 없앤다. 현재 prototype47기준 통과이며 실제Core 채택/제품 적용은 아직 없다. 혼합로그 target CPU비율은 unicode-negative=0.919618980, foreign-negative=0.923736600다.
+- 마지막 두 후보는 기존5480262공백제거/6642정책/2040도구/56소스변경·ASCII조합2097152개와 강제혼합조합2097152개·960경계/손상UTF16·54복사상한·180긴 grapheme사례가 일치했다. 크기분기가 새Unicode경로의 오류를 숨기지 않도록1112064 scalar를13032 native/NSString/CF묶음(foreign8688)으로 추가 검증했다. 정책digest는f2f98b6bfc54d1c650ab753b7176e20ce16a4de4e2f8f939dfefd709a8faf9ae다.
+- 검증된179의416입력·94객체/모듈·4바이너리는 그대로다. 원본 터미널·설치 앱·실제 전원·서명 검색목록/신뢰/ACL·시스템/관리자/보안/TCC/VPN·자동실행/서비스·UI는 바꾸지 않았다. 서명/설치 예외 질문은 미응답이다. 완료한 이6개 비교·179의451/58검사를 변경 없이 다시 실행하지 않는다.
+- 모든 소유 작업은 종료했고 제품179의416입력·94객체/4바이너리를 다시 확인했다. 원본 터미널·설치 앱·실제 전원·관리자/시스템/보안/TCC/VPN·자동 실행/별도 서비스와 UI는 변경하지 않았다. IDE/인덱스·기존 activity-footer fixture·진단은 보존한다. 다음은 마지막String.Iterator 구간 후보의 실제Core 검증이다. 서명 승인이 도착하면 검증된179의배포를 먼저 끝내고 원본소스를 변경한다.
+
+<!-- pending-179-work:end -->
+
 ## 2026-10-23 · 0.2.178 / 205 배포 완료 · Codex 질문 경량화
 
 - 직전177 게시/다운로드 완료와 이번 후보 구현·정합성·32프로세스/768구간/26기준·최종451검사/패키지 검증은 progress다. 전체 경량화 목표는 active이며 설치/재시작 예외 질문은 미응답이다. goal 진행을 그 승인으로 해석하지 않는다.

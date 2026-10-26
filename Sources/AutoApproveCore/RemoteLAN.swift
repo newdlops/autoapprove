@@ -5,8 +5,8 @@ import Darwin
 
 /// Physical LAN addresses shared by publishing, discovery and peer connections.
 /// Tunnel addresses are never offered to a phone on the Mac's hotspot network.
-public struct RemoteLANInterface: Equatable, Sendable {
-    public enum Kind: Sendable { case wifi, ethernet }
+public struct RemoteLANInterface: Hashable, Sendable {
+    public enum Kind: Hashable, Sendable { case wifi, ethernet }
     public let name: String
     public let address: String
     public let netmask: String
@@ -18,10 +18,6 @@ public struct RemoteLANInterface: Equatable, Sendable {
         guard let value = RemoteLAN.ipv4(netmask), value != 0 else { return nil }
         let inverse = ~value
         return inverse & (inverse &+ 1) == 0 ? value : nil
-    }
-    fileprivate func contains(_ host: UInt32) -> Bool {
-        guard let own = RemoteLAN.ipv4(address), let mask else { return false }
-        return own & mask == host & mask
     }
 }
 
@@ -143,7 +139,19 @@ public enum RemoteLAN {
     }
     public static func route(to address: String, interfaces: [RemoteLANInterface]) -> RemoteLANInterface? {
         guard let host = ipv4(address) else { return nil }
-        return ordered(interfaces).filter { $0.contains(host) }.sorted { ($0.mask ?? 0) > ($1.mask ?? 0) }.first
+        var best: RemoteLANInterface?, bestMask: UInt32 = 0
+        for interface in interfaces {
+            guard let own = ipv4(interface.address), let mask = interface.mask,
+                  own & mask == host & mask else { continue }
+            if mask > bestMask {
+                best = interface; bestMask = mask
+            } else if mask == bestMask, let current = best,
+                      (interface.kind == .wifi ? 0 : 1, interface.name, interface.address)
+                        < (current.kind == .wifi ? 0 : 1, current.name, current.address) {
+                best = interface
+            }
+        }
+        return best
     }
     public static func tcpParameters() -> NWParameters {
         let tcp = NWProtocolTCP.Options()
@@ -192,7 +200,30 @@ public enum RemoteLAN {
         parameters.requiredInterfaceType = source.kind == .wifi ? .wifi : .wiredEthernet
         return parameters
     }
+    /// Recognize only canonical dotted decimal without constructing an address
+    /// object. All other representations keep the Network framework fallback.
+    static func canonicalIPv4(_ address: String) -> UInt32? {
+        address.utf8.withContiguousStorageIfAvailable { bytes -> UInt32? in
+            guard bytes.count >= 7, bytes.count <= 15 else { return nil }
+            var result: UInt32 = 0, octet: UInt32 = 0, parts = 0, digits = 0
+            for byte in bytes {
+                if byte >= 48, byte <= 57 {
+                    guard digits < 3, digits == 0 || octet != 0 else { return nil }
+                    octet = octet * 10 + UInt32(byte - 48)
+                    guard octet <= 255 else { return nil }
+                    digits += 1
+                } else if byte == 46 {
+                    guard digits > 0, parts < 3 else { return nil }
+                    result = (result << 8) | octet
+                    parts += 1; octet = 0; digits = 0
+                } else { return nil }
+            }
+            guard parts == 3, digits > 0 else { return nil }
+            return (result << 8) | octet
+        } ?? nil
+    }
     fileprivate static func ipv4(_ address: String) -> UInt32? {
-        IPv4Address(address)?.rawValue.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        if let number = canonicalIPv4(address) { return number }
+        return IPv4Address(address)?.rawValue.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
     }
 }
