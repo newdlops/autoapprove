@@ -19,6 +19,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     var relayController:CloudflareRelayController?
     var tunnelRestoreAttempted = false
     var tunnelSetupID: UUID?
+    var tunnelStartEpoch = UUID()
     @Published public internal(set) var cloudflareStatus=CloudflareSetupStatus()
     var cloudflareClient:CloudflareOnboarding?
     let cloudflareServices:CloudflareServices
@@ -507,6 +508,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        tunnelStartEpoch = UUID()
         tunnelPINSetupID=nil
         tunnelSetupID=nil
         cloudflareClient?.cancel()
@@ -753,6 +755,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
         synchronizePTYContainers(); publish()
         Task { [weak self] in await self?.refresh() }
         return terminal
+    }
+    func validateInputChannel(_ object:JSONObject) throws -> JSONObject {
+        guard !remoteInputStopped, let binding = try? RemoteInputBinding(JSONSerialization.data(withJSONObject:object)) else { throw RemoteInputPacket.invalid() }
+        if binding.mode == "pty" {
+            let terminal = try managedPTY.terminal(binding.values["ptyID"] as! String)
+            try terminal.validateInputBinding(streamID:binding.values["streamID"] as! String,client:binding.values["clientID"] as! String,sequence:binding.sequenceBase)
+        } else {
+            let id = binding.values["sessionID"] as! String, stream = binding.values["streamID"] as! String
+            guard let session = sessions[id],session.phase != .ended,let observed = remoteFrames[id],
+                  observed.frame.streamID == stream,remoteStreams[id]?.token == stream,remoteStreams[id]?.generation == observed.generation,
+                  Date().timeIntervalSince(observed.frame.observedAt) < 10,observed.frame.inputReason == nil,remoteInputReason(session) == nil else {
+                throw RemoteHTTPError(409,"원본 터미널의 실시간 연결을 먼저 확인해주세요.")
+            }
+        }
+        return ["accepted":true]
     }
     public func ptyInput(_ object: JSONObject) async throws -> JSONObject {
         guard !remoteInputStopped, let id = object["ptyID"] as? String, let stream = object["streamID"] as? String,

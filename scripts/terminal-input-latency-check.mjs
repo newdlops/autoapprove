@@ -1,4 +1,4 @@
-// Real browser keyboard -> production Swift HTTP -> authoritative editing
+// Legacy HTTP fallback: real browser keyboard -> production Swift HTTP -> authoritative editing
 // adapter or actual private PTY -> browser text/cursor render opportunity.
 import assert from 'node:assert/strict';
 import {execFileSync,spawn} from 'node:child_process';
@@ -29,6 +29,7 @@ try {
     fixture=spawn(binary,[directory],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
     const base=await new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>reject(Error('Latency fixture startup: '+stderr)),20000);fixture.stdout.on('data',data=>{text+=data;for(const line of text.split('\n'))try{const info=JSON.parse(line);if(info.url){clearTimeout(timer);resolve(info.url);}}catch{}});fixture.once('exit',code=>{clearTimeout(timer);reject(Error('Fixture exited '+code+': '+stderr));});});
     stage=variant.name+' original';page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});page.setDefaultTimeout(15000);
+    await page.route('**/input-channel.js',route=>route.fulfill({contentType:'text/javascript',body:'/* HTTP fallback regression; persistent input is verified by cloudflare-worker-check --socket. */'}));
     page.on('pageerror',error=>errors.push(error.message));
     for(const file of ['app.js','pty.js']){
       const body=variant.ref?execFileSync('git',['show',variant.ref+':Sources/AutoApproveCore/Resources/RemoteWeb/'+file],{encoding:'utf8'}):await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/'+file,'utf8');

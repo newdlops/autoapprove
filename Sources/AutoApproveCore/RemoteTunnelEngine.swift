@@ -67,6 +67,9 @@ extension ApprovalEngine {
     public var tunnelShareURL: URL? { relayController?.shareURL ?? tunnelController?.shareURL }
     public var tunnelAccessKey: String? { relayController?.accessKey ?? tunnelController?.accessKey }
     public var tunnelToolPath: String? { RemoteTunnelController.executable(directory:paths.directory) }
+    public func measureTunnelConnection() async {
+        if let relayController {await relayController.measureConnection()} else {await tunnelController?.measureConnection()}
+    }
     /// One explicit user action prepares prerequisites and starts the tunnel.
     public func connectTunnel(_ supplied:RemoteTunnelConfiguration,token:String = "") async throws {
         try Task.checkCancellation()
@@ -108,6 +111,7 @@ extension ApprovalEngine {
         objectWillChange.send()
     }
     public func startTunnel(_ supplied: RemoteTunnelConfiguration, token: String = "") async throws {
+        let startEpoch = UUID();tunnelStartEpoch = startEpoch
         tunnelRestoreAttempted=true
         var configuration=try supplied.validated(); configuration.enabled=true
         let pin=try readTunnelPIN();tunnelPINConfigured=pin != nil
@@ -127,6 +131,11 @@ extension ApprovalEngine {
         if configuration.provider == .https {
             guard let credential=try cloudflareServices.readSecret(paths.directory,"cloudflare-worker") else {throw AppError.message("Cloudflare Workers 승인을 마치고 도메인을 연결해주세요.")}
             _ = try JSONDecoder().decode(CloudflareRelayCredential.self,from:credential).validated(for:configuration.publicURL)
+            // Management API outages must not take an existing relay offline.
+            // The live greeting reports whether the upgraded input is available.
+            _ = try? await workers().refreshRelayIfNeeded(origin:configuration.publicURL)
+            try Task.checkCancellation()
+            guard tunnelStartEpoch == startEpoch,webService === service,webStatus.ready else {throw CancellationError()}
             try store.set("remoteTunnel",String(decoding:JSONEncoder().encode(configuration),as:UTF8.self))
             tunnelController?.stop();tunnelController=nil;relayController?.stop()
             let controller=CloudflareRelayController(handler:handler,services:relayServices,onStatus:{[weak self] status in self?.tunnelStatus=status})
@@ -142,6 +151,7 @@ extension ApprovalEngine {
         try await controller.start(configuration,token:secret,credentials:credential,pin:pin)
     }
     public func stopTunnel() throws {
+        tunnelStartEpoch = UUID()
         tunnelSetupID=nil
         var configuration=tunnelConfiguration; configuration.enabled=false
         tunnelRestoreAttempted=true

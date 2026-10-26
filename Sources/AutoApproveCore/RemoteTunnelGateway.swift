@@ -49,6 +49,7 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
     public var detail = "다른 네트워크에서 접속이 꺼져 있습니다."
     public var publicURL: String?
     public var localURL: String?
+    public var quality = RemoteTunnelQuality()
     public var ready: Bool { phase == "ready" }
     public var active: Bool { !["off","failed"].contains(phase) }
     public init() {}
@@ -58,7 +59,7 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
 /// listener's host/origin rules and unauthenticated discovery remain unchanged.
 @MainActor public final class RemoteTunnelGateway {
     private struct Session { let expires: TimeInterval }
-    private struct Client { let connection: RemoteHTTPConnection; var session: String?; var streaming=false }
+    private struct Client { let connection: RemoteHTTPConnection; var session: String?; var streaming=false;var inputSocket=false }
     private let queue = DispatchQueue(label:"autoapprove.tunnel.gateway")
     private var listener: NWListener?
     private var deadlines: RemoteHTTPDeadlines?
@@ -107,9 +108,14 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
                 guard let self, self.epoch == epoch, self.clients[id] != nil else { return .error(RemoteHTTPError(503,"터널 연결이 종료되었습니다.")) }
                 let session=self.session(request)
                 self.clients[id]?.session=session
-                if session != nil, request.method == "GET", request.path.hasSuffix("/stream") {
-                    guard self.clients.values.filter({$0.streaming}).count < 12 else { return .error(RemoteHTTPError(429,"실시간 연결이 많습니다. 다른 터미널 화면을 닫고 다시 시도해주세요.")) }
-                    self.clients[id]?.streaming=true
+                if session != nil, request.method == "GET" {
+                    if request.path.hasSuffix("/stream") {
+                        guard self.clients.values.filter({$0.streaming}).count < 12 else { return .error(RemoteHTTPError(429,"실시간 출력 연결이 많습니다. 다른 터미널 화면을 닫고 다시 시도해주세요.")) }
+                        self.clients[id]?.streaming=true
+                    } else if request.path == "/api/input/socket" {
+                        guard self.clients.values.filter({$0.inputSocket}).count < 12 else { return .error(RemoteHTTPError(429,"실시간 입력 연결이 많습니다. 다른 터미널 화면을 닫고 다시 시도해주세요.")) }
+                        self.clients[id]?.inputSocket=true
+                    }
                 }
                 return await self.respond(request,session:session,client:id)
             },onClose:{ [weak self] in Task { @MainActor in self?.clients.removeValue(forKey:id) } })

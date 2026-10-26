@@ -1,8 +1,60 @@
 # Terminal wire versions 2 and 3
 
 This is the output transport for existing terminal snapshots and managed PTYs.
-Input requests,source identity checks,permissions and committed PTY offsets use
-their existing APIs. The transport does not create a terminal session.
+Source identity checks,permissions and committed PTY offsets retain their existing
+semantics. Inputs can negotiate the persistent channel below; existing HTTP input
+remains the compatibility path. Neither transport creates a terminal session.
+
+## Persistent input channel
+
+Version 0.2.190 adds `GET /api/input/socket?node=…`, using WebSocket subprotocol
+`autoapprove-input.v1`. The same Host/Origin checks and public gateway cookie apply.
+No credential enters the URL. The handshake requires an Origin, version 13 and a
+16-byte WebSocket key. Client frames must be masked and have no extension bits;
+fragmentation and interleaved control frames are bounded and validated.
+
+Each binary message starts with `41 49 01`, one kind byte and a UInt32 big-endian
+sequence, followed by at most 16,001 payload bytes. WebSocket supplies the length.
+Kinds are bind(0), ready(1), PTY input(2), native input(3), cumulative ACK(4),
+failure(5), ping(6) and pong(7). A ready message with payload `[1]` is the
+authenticated bridge greeting; empty ready confirms the binding. Ping/pong use
+sequence zero and echo an eight-byte monotonic timestamp.
+
+Bind has sequence zero and a JSON identity: native mode uses sessionID, streamID
+and revision; PTY mode uses ptyID, streamID, clientID and sequenceBase. The owner
+validates the binding without writing input. Each subsequent input increments
+the channel sequence by exactly one. PTY input is at most 16,000 raw bytes and
+uses `sequenceBase + sequence` at the existing writer. Native input starts with
+the index in `[characters,enter,escape,interrupt,up,down,left,right,backspace,delete,
+home,end,tab]`, followed by UTF-8 text for characters only (at most 8,000 bytes).
+Every write still revalidates the source generation and permissions.
+
+The browser allows at most 16 outstanding messages and 64,000 payload bytes.
+It sends the first event immediately and coalesces subsequent bursts for up to
+4 ms. The receiver serializes input across asynchronous writes, reserves the
+sequence before delivery and acknowledges only success. A socket does not write
+the HTTP receipt archive per key. It never retries a failed or uncertain write.
+Only acknowledged idle channels reconnect automatically, retaining the PTY
+sequence. Unsent input remains separate from uncertain outstanding input.
+Unsupported upgrades may fall back to HTTP before any input is sent.
+
+The 443 relay negotiates features with `X-AutoApprove-Relay: 2`: legacy connectors
+still receive hello `[1]`; new peers receive `[1,3]` (input sockets and compression).
+Relay kinds 7/8/10 carry socket data/close/credit. Browser socket IDs and exact
+upload credit survive Durable Object hibernation in socket attachments. Kind 9
+carries a UInt32 big-endian original length and one complete gzip member, only
+when it saves bytes for an output chunk of at least 1,024 bytes. Its declared and
+decoded size must agree and stay at most 32 KiB. HTTP credit counts decoded bytes;
+queued decoding participates in backpressure and preserves DATA/END order.
+Interactive replies have priority over queued bulk output. While an input socket
+is active, bulk chunks are limited to 8 KiB. Old relay code stays compatible.
+
+Reproduction: `node scripts/input-channel-check.mjs` and
+`node scripts/cloudflare-relay-wire-check.mjs` cover protocol bounds/faults;
+`scripts/cloudflare-worker-check.mjs --socket --browser --pin --latency=100`
+exercises the real local Worker, native gateway and private terminals with an
+added 100 ms in each connector direction. Omit `--socket` for the HTTP comparison.
+These checks do not measure physical phones or the public Cloudflare path.
 
 ## Negotiation and compatibility
 

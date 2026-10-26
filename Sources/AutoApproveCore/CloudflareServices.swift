@@ -6,7 +6,8 @@ import LocalAuthentication
 public struct CloudflareHTTPReply:Sendable {
     public let data:Data
     public let status:Int
-    public init(data:Data,status:Int) {self.data=data;self.status=status}
+    public let headers:[String:String]
+    public init(data:Data,status:Int,headers:[String:String] = [:]) {self.data=data;self.status=status;self.headers=headers}
 }
 
 /// Dependency boundary for isolated account/HTTP tests; live URLs stay pinned.
@@ -31,7 +32,8 @@ public struct CloudflareServices:Sendable {
             guard data.count < 2_000_000 else {throw AppError.message("Cloudflare 응답이 너무 큽니다. 잠시 후 다시 시도해주세요.")}
             data.append(byte)
         }
-        return CloudflareHTTPReply(data:data,status:(response as? HTTPURLResponse)?.statusCode ?? 0)
+        let http = response as? HTTPURLResponse
+        return CloudflareHTTPReply(data:data,status:http?.statusCode ?? 0,headers:http?.value(forHTTPHeaderField:"CF-Ray").map {["cf-ray":$0]} ?? [:])
     },login:{executable,directory,onURL in
         try await CloudflareLogin.run(executable:executable,directory:directory,onURL:onURL)
     },readSecret:{directory,account in

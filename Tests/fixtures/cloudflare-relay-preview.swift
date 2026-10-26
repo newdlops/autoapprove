@@ -10,7 +10,12 @@ private final class RelayOriginal:@unchecked Sendable {
         lock.lock();defer{lock.unlock()};value+=input.bytes
         let path=root.appendingPathComponent("original-input.bin")
         if !FileManager.default.fileExists(atPath:path.path) {FileManager.default.createFile(atPath:path.path,contents:Data())}
-        let file=try FileHandle(forWritingTo:path);defer{try? file.close()};try file.seekToEnd();try file.write(contentsOf:Data(input.bytes.utf8));return .sent
+        let file=try FileHandle(forWritingTo:path);defer{try? file.close()};let offset = try file.seekToEnd();let bytes = Data(input.bytes.utf8);try file.write(contentsOf:bytes)
+        let timing = root.appendingPathComponent("original-times.jsonl")
+        if !FileManager.default.fileExists(atPath:timing.path) {FileManager.default.createFile(atPath:timing.path,contents:Data())}
+        let times = try FileHandle(forWritingTo:timing);defer {try? times.close()};_ = try times.seekToEnd()
+        var entry = try JSONSerialization.data(withJSONObject:["offset":Int(offset),"count":bytes.count,"at":Date().timeIntervalSince1970*1000]);entry.append(10);try times.write(contentsOf:entry)
+        return .sent
     }
 }
 @main struct RelayPreview {

@@ -1542,6 +1542,28 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")
                 case "/terminal-wire.js": return try asset("terminal-wire.js", type: "text/javascript; charset=utf-8")
                 case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
+                case "/input-channel.js": return try asset("input-channel.js", type: "text/javascript; charset=utf-8")
+                case "/api/input/socket":
+                    let handshake = try RemoteWebSocketParser.handshake(request)
+                    var response = RemoteHTTPResponse(status:101,body:Data())
+                    let epoch = generation
+                    response.inputSocket = (handshake,RemoteInputProtocol(target:request.parameter("node"),handler:{ [weak self] input in
+                        guard let self,!Task.isCancelled,self.generation == epoch else { return .error(RemoteHTTPError(503,"앱 연결이 종료됐습니다.")) }
+                        // A socket owns its sequence and never retries. Avoid
+                        // rewriting the HTTP receipt archive for every key.
+                        if input.parameter("node") == nil || input.parameter("node") == self.nodeID {
+                            do {
+                                guard let engine = self.engine else { throw RemoteHTTPError(503,"앱이 종료되었습니다.") }
+                                let object = try input.json()
+                                if input.path == "/api/input/bind" { return try .object(engine.validateInputChannel(object)) }
+                                if input.path == "/api/pty/input" { return try await .object(engine.ptyInput(object)) }
+                                if input.path == "/api/input" { return try await .object(engine.remoteInput(object)) }
+                                throw RemoteInputPacket.invalid()
+                            } catch { return .error(error) }
+                        }
+                        return await self.handle(input)
+                    }))
+                    return response
                 case "/vendor/xterm.js", "/vendor/xterm-fit.js": return try asset(String(request.path.dropFirst()), type: "text/javascript; charset=utf-8")
                 case "/vendor/xterm.css": return try asset("vendor/xterm.css", type: "text/css; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
@@ -1589,6 +1611,10 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/terminal/timings":
                     if let forwarded = try await forward(request) { return forwarded }
                     return try .json(RemoteTerminalPerformance.shared.snapshot())
+                case "/api/connection/quality":
+                    if let forwarded = try await forward(request) {return forwarded}
+                    guard let engine else {throw RemoteHTTPError(503,"앱이 종료되었습니다.")}
+                    return try .json(engine.tunnelStatus.quality)
                 case "/api/terminal":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }
@@ -1669,6 +1695,10 @@ struct RemoteTerminalUpdate: Encodable {
                     release: state.release?.isCompatible == true ? state.release : nil, webURLs: state.webURLs ?? [], webPort: state.webPort)
                 updateNamedAddresses(); emitStatus(); refreshWebPeers(force: true)
                 return try .object(["id": state.id, "name": state.name])
+            case "/api/input/bind":
+                if let forwarded = try await forward(request) { return forwarded }
+                guard let engine else { throw RemoteHTTPError(503,"앱이 종료되었습니다.") }
+                return try .object(engine.validateInputChannel(object))
             case "/api/action", "/api/input", "/api/terminal/connect", "/api/pty", "/api/pty/input", "/api/pty/resize", "/api/pty/close":
                 if let forwarded = try await forward(request) { return forwarded }
                 guard let engine, let requestID = object["requestID"] as? String, UUID(uuidString: requestID) != nil else { throw RemoteHTTPError(400, "고유한 요청 ID가 필요합니다.") }

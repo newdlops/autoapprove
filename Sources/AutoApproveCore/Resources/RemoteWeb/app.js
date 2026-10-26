@@ -60,6 +60,8 @@ const networkValidation = {etag:'', value:null, notModified:false, observedAt:nu
 let appliedNetworkETag = '', networkController = null;
 let networkFailures = 0, networkRefreshRequested = false;
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer = null, directTimerDue = Infinity, inputFailure = '';
+let directChannel = null, directCandidate = null, directChannelState = 'idle', directChannelStreamID = null, directFreshening = false;
+let directChannelRetries = 0, directChannelStableAt = 0, directChannelRetry = null;
 let composePreferred = false, composeMode = false;
 const keyboardMarker = '\u200b';
 let inputGeneration = 0, terminalFontSize = 14;
@@ -274,9 +276,20 @@ function stopPTY() {
   const key = ptyClient.sessionKey, draft = ptyClient.dispose();
   if (draft) ptyDrafts.set(key, (ptyDrafts.get(key) || '') + draft);
   ptyClient = null;
+  inputQuality(null);
+}
+function inputQuality(value) {
+  const target = $('terminal-latency'); if (!target) return;
+  const valid = value && value.samples > 0 && Number.isFinite(value.medianMS);
+  show(target,valid);
+  const number = amount => Math.round(amount).toLocaleString();
+  text(target,valid ? `${number(value.medianMS)}ms` : '');
+  target.title = valid ? `입력 왕복 중앙값 · 95% ${number(value.p95MS)}ms · ${number(value.samples)}회` : '';
+  target.setAttribute('aria-label',valid ? `입력 왕복 지연 중앙값 ${Math.round(value.medianMS)}밀리초` : '입력 왕복 지연 측정 전');
 }
 function ptyReport(state, message, client) {
   if (client !== ptyClient) return;
+  if (state === 'quality') { inputQuality(client.inputQuality); return; }
   if (selectedItem?.view.pty) selectedItem.view.pty.exitCode = client.descriptor.exitCode;
   if (state === 'ended') { retainEndedPTY(selectedItem); renderDetail(); renderList(); renderMachines(); }
   terminalState(['error', 'blocked'].includes(state) ? 'error' : ['ended','waiting','readonly'].includes(state) ? 'pending' : 'live', message);
@@ -496,6 +509,9 @@ function restoreDirectDraft(value, key = selectedKey) {
 }
 function stopDirect(preserve = true, failedText = '') {
   clearTimeout(directTimer); directTimer = null; directTimerDue = Infinity; inputGeneration++;
+  clearTimeout(directChannelRetry); directChannelRetry = null; directChannelRetries = 0;
+  if (directChannel || directCandidate) { directChannel?.close(); directCandidate?.close(); directSending = false; }
+  directChannel = directCandidate = null; directChannelState = 'idle'; directChannelStreamID = null; directFreshening = false; inputQuality(null);
   if (preserve && selectedKey) {
     const pending = failedText + directQueue.filter(item => item.key === selectedKey && item.kind === 'characters').map(item => item.value).join('') + keyboardText();
     restoreDirectDraft(pending);
@@ -507,6 +523,46 @@ function stopDirect(preserve = true, failedText = '') {
 function armDirect() {
   if (!directMode) directStreamID = latestFrame?.streamID || null;
   directMode = true;
+  void prepareDirectChannel();
+}
+async function prepareDirectChannel() {
+  if (directChannelState !== 'idle' || !window.AutoApproveInputChannel || !latestFrame?.streamID || !selectedItem || selectedItem.view.pty || composeMode || !terminalFrameFresh() || !inputKeys().includes('characters')) return;
+  directChannelState = 'opening'; const generation = inputGeneration, key = selectedKey, streamID = latestFrame.streamID; directChannelStreamID = streamID;
+  const candidate = new window.AutoApproveInputChannel(selectedItem.node.id,{mode:'native',sessionID:selectedItem.session.id,streamID,revision:latestFrame.revision},{
+    onChange:() => {
+      if (generation !== inputGeneration || directChannel !== candidate) return;
+      directSending = candidate.pendingCount > 0; updateControls();
+      if (directMode && directQueue.length) scheduleDirect(0);
+    },
+    onFailure:error => {
+      if (generation !== inputGeneration || directChannel !== candidate) return;
+      if (error.recoverable && !candidate.pendingCount) { recoverDirectChannel(); return; }
+      stopDirect(); inputFailure = error.message; terminalState('error','입력 연결 확인 필요'); feedback(error.message,true); updateControls();
+    },
+    onQuality:value => { if (generation === inputGeneration && selectedKey === key) inputQuality(value); }
+  });
+  directCandidate = candidate;
+  try {
+    const channel = await candidate.open();
+    if (generation !== inputGeneration || selectedKey !== key || latestFrame?.streamID !== streamID) { channel?.close(); return; }
+    directChannel = channel; directCandidate = null; directChannelState = channel ? 'ready':'fallback';
+    if (channel) directChannelStableAt = performance.now();
+    if (directMode && directQueue.length) scheduleDirect(0);
+  } catch (error) {
+    if (generation === inputGeneration && selectedKey === key) { stopDirect(); inputFailure = error.message; feedback(error.message,true); updateControls(); }
+  }
+}
+function recoverDirectChannel() {
+  if (performance.now()-directChannelStableAt > 30000) directChannelRetries = 0;
+  directChannelRetries++; directChannel = null; directChannelState = 'reconnecting'; directSending = false; inputQuality(null); updateControls();
+  if (directChannelRetries > 3) { directChannelState = 'fallback'; if (directMode && directQueue.length) scheduleDirect(0); return; }
+  const generation = inputGeneration, key = selectedKey;
+  directChannelRetry = setTimeout(async () => {
+    if (generation !== inputGeneration) return;
+    const fresh = await freshInputFrame(key); if (generation !== inputGeneration) return;
+    if (!fresh) { stopDirect(); updateControls(); return; }
+    directChannelState = 'idle'; void prepareDirectChannel();
+  },Math.min(2000,250*2**(directChannelRetries-1)));
 }
 function focusKeyboard() {
   if (composeMode) { if (!$('terminal-input').disabled) $('terminal-input').focus({ preventScroll: true }); return; }
@@ -1458,6 +1514,7 @@ function terminalUpdateIsOlder(update, previous) {
 function applyTerminalFrame(frame, receivedAt = performance.now()) {
   clearTerminalWarm();
   const previous = latestFrame;
+  if (!directMode && directChannelStreamID && frame.streamID !== directChannelStreamID) stopDirect();
   if (directMode && (frame.streamID || null) !== directStreamID) {
     stopDirect(); inputFailure = '터미널 연결이 바뀌어 직접 입력을 멈췄습니다. 보존한 입력과 새 화면을 확인해주세요.';
   }
@@ -1473,6 +1530,7 @@ function applyTerminalFrame(frame, receivedAt = performance.now()) {
   text($('terminal-time'), nowLabel(frame.observedAt)); show($('terminal-error'), false); show($('terminal-retry'), false);
   if (selectedItem) renderQuestions();
   updateControls();
+  if (!frame.inputReason) void prepareDirectChannel();
   if (directMode && directQueue.length && !directSending) void pumpDirect();
 }
 function stopTerminalStream(resetFailure = false) {
@@ -1802,11 +1860,11 @@ function queueDirect(kind, value = '') {
   const previous = directQueue[directQueue.length - 1];
   if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value,8000) <= 8000) previous.value += value;
   else directQueue.push({ key: selectedKey, kind, value, streamID: latestFrame?.streamID || null });
-  scheduleDirect(kind === 'characters' ? 8 : 0);
+  scheduleDirect(kind === 'characters' && directQueue.length > 1 ? 4 : 0);
   return true;
 }
 function scheduleDirect(delay) {
-  if (directSending || !directMode) return;
+  if (directSending && directChannel?.state !== 'ready' || !directMode) return;
   const due = performance.now() + delay;
   // Bound the first character's wait. Later keystrokes may accelerate a batch,
   // but must never postpone it until the user stops typing.
@@ -1815,7 +1873,9 @@ function scheduleDirect(delay) {
   directTimer = setTimeout(() => { directTimer = null; directTimerDue = Infinity; void pumpDirect(); }, delay);
 }
 async function pumpDirect() {
-  if (directSending || !directMode) return;
+  if (!directMode) return;
+  if (directChannel?.state === 'ready') { pumpDirectChannel(); return; }
+  if (['opening','reconnecting'].includes(directChannelState) || directSending) return;
   clearTimeout(directTimer); directTimer = null; directTimerDue = Infinity;
   directSending = true;
   const generation = inputGeneration;
@@ -1839,6 +1899,28 @@ async function pumpDirect() {
     directSending = false; updateControls();
     if (directMode && directQueue.length) scheduleDirect(250);
   }
+}
+function pumpDirectChannel() {
+  if (!directMode || directChannel?.state !== 'ready') return;
+  clearTimeout(directTimer); directTimer = null; directTimerDue = Infinity;
+  if (!terminalFrameFresh() || mutation) {
+    if (!directFreshening) {
+      directFreshening = true; const generation = inputGeneration, key = selectedKey;
+      void freshInputFrame(key).then(fresh => { if (generation !== inputGeneration) return;directFreshening = false;if (fresh) pumpDirectChannel();else {stopDirect();updateControls();} });
+    }
+    return;
+  }
+  while (directMode && directQueue.length && directChannel?.state === 'ready') {
+    const item = directQueue[0];
+    if (item.key !== selectedKey || item.streamID !== latestFrame?.streamID || latestFrame.inputReason || !inputKeys().includes(item.kind)) { stopDirect(); updateControls(); return; }
+    const index = window.AutoApproveInputChannel.keys.indexOf(item.kind);
+    if (index < 0) { stopDirect(); updateControls(); return; }
+    const text = new TextEncoder().encode(item.value), payload = new Uint8Array(1+text.length);payload[0] = index;payload.set(text,1);
+    if (!directChannel.canSend(payload.length)) break;
+    if (!directChannel.send(3,payload)) break;
+    directQueue.shift();
+  }
+  directSending = (directChannel?.pendingCount || 0) > 0; updateControls();
 }
 function captureDirectText() {
   if (composing || !directMode || !keyboardText()) return;

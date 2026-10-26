@@ -1,5 +1,17 @@
 # AutoApprove 검증 기록
 
+## 2026-10-27 · 지속 입력·연결 품질·출력 압축 · 0.2.190/217
+
+- 키 입력을 순서가 보장되는 지속 WebSocket으로 전송한다. 첫 키는 즉시 보내고 연속 입력은 최대 4ms만 모으며, 확인 창을 16개/64,000B로 제한한다. 원본 PID·시작 시각·TTY·stream/revision과 PTY 소유권·순서를 계속 검사한다. 정상 유휴 연결은 자동 복구하고, 전달 여부가 불확실한 입력은 재전송하지 않으며 미전송 텍스트를 보존한다. 기능 협상이 지원되지 않는 구형 경로는 기존 HTTP 입력을 사용한다.
+- 연결 설정의 **연결 품질**에 공개 경로 RTT 중앙값/p95·처리 지점·전송 방식·connector RTT/손실·재연결 횟수와 수동 측정을 추가했다. 표본은 64개로 제한하며 URL·접속 비밀·터미널 내용을 진단에 포함하지 않는다. 재연결 시 이전 connector 통계를 비우고 중지·재시작 세대가 지난 측정 응답을 무시한다. 웹 터미널에는 입력 왕복 지연을 표시한다.
+- HTTPS 443 Worker 중계는 입력 ACK/credit을 대량 출력보다 먼저 보내며 1,024B 이상이고 실제로 작아지는 출력만 gzip 압축한다. 복원 크기·credit은 원래 바이트 기준이고 연속 DATA/END 순서를 유지한다. 연결 시 소유권·코드 해시·hostname/binding을 확인한 Worker 코드만 갱신하며 DNS·도메인·연결 비밀을 보존한다. 구형 Worker 호환과 갱신 중 중지/실패 경로도 검사했다.
+- 최종 release 빌드 및 **483/483 핵심 검사**를 통과했다. 신규 검사는 RFC6455 handshake/mask/fragment/control/크기 경계, 실제 인증 gateway의 순서 입력·중복 거부·권한 폐기, 진단 표본/개인정보/재연결, 소유 Worker 갱신과 취소를 포함한다. 최초 전체 실행의 새 테스트 Unix socket 경로 길이 문제는 짧은 격리 경로로 수정했고 최종 동결 소스의 전체 검사를 다시 통과했다.
+- 실제 로컬 workerd/SQLite Durable Object → 제품 네이티브 WSS/gateway/Core → 격리 PTY를 Chromium/WebKit에서 검증했다. PIN 인증·한글/이모지/방향키·1MiB credit·압축, 유휴 입력 자동 복구, 입력 ACK 대기 중 출력만 복구, 16개 입력 ACK 보류 후 연결 손실에서 중복 전송 없음·미전송 보존, PIN 교체·로그아웃을 통과했다. 최종 두 브라우저 요청은 **67/66개**, 일반 pageerror 및 별도 종료 진단은 0개다. 강제로 끊은 스트림은 workerd 원시 로그에 의도한 연결 종료 예외를 남기므로 전체 런타임 로그가 무오류라고 주장하지 않는다.
+- 같은 최종 release 바이너리와 각 방향 100ms 지연 조건에서 20ms 간격 12키의 browser beforeinput → 합성 native adapter 도달을 비교했다. 기존 HTTP는 **중앙값 379.56ms/p95 513.56ms**, 지속 입력은 **112.02ms/119.11ms**였다. 추가 지연 없는 WebKit은 **4.14ms/5.14ms**였다. Chromium 압축 대상 출력은 복원 **2,347,764B** 대비 압축 데이터 **434,496B**다. 이는 제어된 시험 경로/압축 대상의 수치이며 실제 hm.newdlops.site·전체 트래픽·실물 휴대폰의 개선율로 환산하지 않는다.
+- 별도 입력/중계 프로토콜 검사에서 누적 ACK·64KB 창·모호한 입력 재전송 금지·구형 fallback, Durable Object 재구성 후 ID/credit·gzip DATA/END 비동기 순서·복원 제한을 통과했다. 기존 HTTP 입력의 IME·UTF-8 분할·불확실한 POST 회귀와 기존 Tunnel 인증/원본/PTY 회귀도 Chromium/WebKit에서 통과했다. 기존 WebKit Tunnel 검사에는 로그아웃 직후 폐기 문서의 정확한 `/api/network` 취소 진단 1개를 별도 기록했다.
+- 기존 디자인과 UI workflow를 유지했다. Chromium/WebKit의 **390×844·768×1024·1440×900** 로그인·실제 격리 PTY 렌더링에서 가로 넘침 없음을 확인하고 작은 화면의 실제 RTT 배지까지 검토했다. 격리 SwiftUI 앱에서 연결 품질 펼치기·다시 측정·light/dark·대기/실패/호환·긴 지점 목록/큰 카운터를 조작했다. 최종 AX에서 개별 행 label/value와 측정 버튼을 확인했다. 전체 VoiceOver·macOS 키보드 탐색 설정·실물 기기 검증으로 주장하지 않는다. Impeccable 기계 검사 결과는 빈 목록이며 변경된 웹 label/focus/overflow/tabular/dark를 Web Interface Guidelines로 점검했다.
+- 서명 패키지의 입력 보조 프로그램·발행자 요구식/다른 서명 거부, 이동 앱 리소스/누락 오류, 네트워크 포트 복구/ON·OFF/재시작/MCP/실제 PTY와 symbol strip 무결성 검사를 통과했다. DMG **8,759,955B**, SHA-256 **aa3293719baa7b61ae3348511e98b8700b5501735182953f4bb675b463906ed4**이며 읽기 전용 마운트의 서명·내장 앱·Applications 링크·설치 안내를 확인했다. 비공개 자료는 `.runtime/interactive-network-190/`에만 보관한다.
+
 ## 2026-10-27 · 0.2.189/216 공개 배포·설치 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.189)와 원격 태그 역참조는 **77b5f9ba72d32984423ce71c29683e8a67844934**다. DMG **8,612,357B**·체크섬 **102B**를 인증 없이 다시 내려받아 GitHub digest·로컬 파일·체크섬이 **d1b938c7a644c021cf5b862b43dbb623884e18dfd8cb5aedf3ce21ec71729fd5**와 일치함을 확인했다.

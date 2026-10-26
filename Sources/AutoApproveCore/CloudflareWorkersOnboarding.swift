@@ -20,12 +20,13 @@ private struct WorkerIntent:Codable {
     private let directory:URL,owner:String,http:CloudflareServices,tools:CloudflareWorkersServices
     private let onStatus:@MainActor(CloudflareSetupStatus)->Void
     private var epoch=UUID(),cancelOperation:(()->Void)?
+    private var quiet = false
     public private(set) var status=CloudflareSetupStatus()
     public private(set) var approvalURL:URL?
     public init(directory:URL,owner:String,http:CloudflareServices = .live,tools:CloudflareWorkersServices = .live,onStatus:@escaping @MainActor(CloudflareSetupStatus)->Void) {
         self.directory=directory;self.owner=owner;self.http=http;self.tools=tools;self.onStatus=onStatus
     }
-    private func publish(_ phase:String,_ detail:String) {status.phase=phase;status.detail=detail;onStatus(status)}
+    private func publish(_ phase:String,_ detail:String) {guard !quiet else {return};status.phase=phase;status.detail=detail;onStatus(status)}
     private func current(_ id:UUID) throws {try Task.checkCancellation();guard id==epoch else {throw CancellationError()}}
     public func cancel() {epoch=UUID();cancelOperation?();cancelOperation=nil;approvalURL=nil;publish(status.authorized ? "authorized":"idle",status.authorized ? "도메인을 선택하고 HTTPS로 연결하세요.":"Cloudflare Workers를 승인하면 443 포트로 연결할 수 있습니다.")}
     private func operation<T:Sendable>(_ body:@escaping @MainActor(UUID) async throws -> T) async throws -> T {
@@ -145,8 +146,51 @@ private struct WorkerIntent:Codable {
             try self.current(id)
             let credential=CloudflareRelayCredential(script:intent.script,origin:origin,key:intent.key)
             try self.http.saveSecret(self.directory,"cloudflare-worker",JSONEncoder().encode(credential))
+            try self.http.saveSecret(self.directory,"cloudflare-worker-source:"+intent.script,Data(SHA256.hash(data:source)))
             self.publish("authorized","HTTPS 접속 주소 설정을 마쳤습니다. 이 Mac을 연결하고 있습니다…")
             return origin
+        }
+    }
+    /// Update only the already-owned module. This never creates or changes DNS,
+    /// domains, connector secrets or Durable Object migrations. Failure leaves
+    /// the previous relay available through its negotiated compatibility mode.
+    @discardableResult public func refreshRelayIfNeeded(origin:String) async throws -> Bool {
+        guard let data = try http.readSecret(directory,"cloudflare-worker"),data.count <= 65536 else {throw invalid()}
+        let credential = try JSONDecoder().decode(CloudflareRelayCredential.self,from:data).validated(for:origin)
+        let source = try Self.relaySource(),digest = Data(SHA256.hash(data:source)),marker = "cloudflare-worker-source:"+credential.script
+        if try http.readSecret(directory,marker) == digest {return false}
+        guard cancelOperation == nil else {throw AppError.message("Cloudflare 작업이 끝난 뒤 중계를 업데이트합니다.")}
+        quiet = true;defer {quiet = false}
+        return try await operation {id in
+            let token = try await self.session(interactive:false,id:id)
+            try await self.load(token,id:id)
+            guard let host = URLComponents(string:origin)?.host,
+                  let domain = self.status.domains.sorted(by:{$0.name.count > $1.name.count}).first(where:{host.hasSuffix("."+$0.name)}),
+                  let saved = try self.http.readSecret(self.directory,"cloudflare-workers-intent:"+domain.accountID),saved.count <= 4096 else {throw self.invalid()}
+            let intent = try JSONDecoder().decode(WorkerIntent.self,from:saved)
+            guard intent.account == domain.accountID,intent.script == credential.script,intent.key == credential.key else {throw self.invalid()}
+            let path = "accounts/"+intent.account+"/workers/scripts/"+intent.script
+            let settings = try await self.request("GET",path+"/settings",token:token,id:id)
+            guard let bindings = (settings["result"] as? JSONObject)?["bindings"] as? [JSONObject],
+                  bindings.count == 4,Set(bindings.compactMap {$0["name"] as? String}) == Set(["TUNNEL","PUBLIC_HOST","CONNECTOR_HASH","AUTOAPPROVE_OWNER"]),
+                  bindings.contains(where:{$0["name"] as? String == "TUNNEL" && $0["class_name"] as? String == "TunnelRoom"}),
+                  bindings.contains(where:{$0["name"] as? String == "PUBLIC_HOST" && $0["text"] as? String == host}),
+                  bindings.contains(where:{$0["name"] as? String == "CONNECTOR_HASH" && $0["text"] as? String == intent.hash}),
+                  bindings.contains(where:{$0["name"] as? String == "AUTOAPPROVE_OWNER" && $0["text"] as? String == self.owner}) else {
+                throw AppError.message("이 Mac의 기존 중계 소유 정보가 달라 업데이트하지 않았습니다.")
+            }
+            let metadata:JSONObject = ["main_module":"relay.mjs","compatibility_date":"2026-10-01","bindings":[
+                ["type":"durable_object_namespace","name":"TUNNEL","class_name":"TunnelRoom"],
+                ["type":"plain_text","name":"PUBLIC_HOST","text":host],
+                ["type":"plain_text","name":"CONNECTOR_HASH","text":intent.hash],
+                ["type":"plain_text","name":"AUTOAPPROVE_OWNER","text":self.owner]
+            ],"logpush":false,"observability":["enabled":false]]
+            let boundary = "AutoApprove"+UUID().uuidString.replacingOccurrences(of:"-",with:"")
+            var body = Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n".utf8)
+            body.append(try JSONSerialization.data(withJSONObject:metadata));body.append(Data("\r\n--\(boundary)\r\nContent-Disposition: form-data; name=\"relay.mjs\"; filename=\"relay.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n".utf8));body.append(source);body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+            _ = try await self.request("PUT",path,token:token,id:id,raw:body,contentType:"multipart/form-data; boundary="+boundary)
+            try self.http.saveSecret(self.directory,marker,digest)
+            return true
         }
     }
     private func invalid()->AppError {.message("Cloudflare Workers 응답을 확인하지 못했습니다. 다시 연결하면 기존 생성 결과부터 확인합니다.")}

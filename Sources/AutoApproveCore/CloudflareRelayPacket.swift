@@ -1,7 +1,7 @@
 import Foundation
 
 public struct CloudflareRelayPacket:Sendable {
-    public enum Kind:UInt8,Sendable {case hello=0,request,headers,data,end,cancel,credit}
+    public enum Kind:UInt8,Sendable {case hello=0,request,headers,data,end,cancel,credit,socketData,socketClose,compressedData,socketCredit}
     public static let maximumSize=2_032_780
     public let kind:Kind,id:UInt32,payload:Data
     public init(kind:Kind,id:UInt32,payload:Data = Data()) {self.kind=kind;self.id=id;self.payload=payload}
@@ -19,6 +19,7 @@ public struct CloudflareRelayPacket:Sendable {
     }
     public struct Request:Sendable {
         public let method:String,path:String,headers:[String:String],body:Data
+        public let socket:Bool
     }
     public func request() throws -> Request {
         guard kind == .request,payload.count >= 4 else {throw Self.invalid()}
@@ -30,15 +31,20 @@ public struct CloudflareRelayPacket:Sendable {
               !path.utf8.contains(where:{$0 < 32 || $0 == 127}),!path.contains("\\"),!path.contains("#"),
               let headers=value["headers"] as? [String:String],headers.count <= 100,
               headers.allSatisfy({!$0.key.isEmpty && $0.key.utf8.allSatisfy {byte in byte > 32 && byte < 127 && ![UInt8(58),40,41,60,62,64,44,59,92,34,47,91,93,63,61,123,125].contains(byte)} && !$0.value.utf8.contains(where:{$0 == 0 || $0 == 10 || $0 == 13})}) else {throw Self.invalid()}
-        return Request(method:method,path:path,headers:headers,body:Data(payload.dropFirst(4+size)))
+        let socket = value["socket"] as? Bool == true
+        if socket {
+            guard method == "GET",payload.count == 4+size,URLComponents(string:"http://localhost"+path)?.path == "/api/input/socket" else {throw Self.invalid()}
+        }
+        return Request(method:method,path:path,headers:headers,body:Data(payload.dropFirst(4+size)),socket:socket)
     }
     public func credit() throws -> Int {
-        guard kind == .credit,payload.count == 4 else {throw Self.invalid()}
+        guard kind == .credit || kind == .socketCredit,payload.count == 4 else {throw Self.invalid()}
         let amount=Int(Self.read([UInt8](payload),at:0))
         guard (1...262144).contains(amount) else {throw Self.invalid()};return amount
     }
-    public static func requestPayload(method:String,path:String,headers:[String:String],body:Data = Data()) throws -> Data {
-        let metadata=try JSONSerialization.data(withJSONObject:["method":method,"path":path,"headers":headers])
+    public static func requestPayload(method:String,path:String,headers:[String:String],body:Data = Data(),socket:Bool = false) throws -> Data {
+        var object:JSONObject = ["method":method,"path":path,"headers":headers];if socket {object["socket"] = true}
+        let metadata=try JSONSerialization.data(withJSONObject:object)
         guard metadata.count <= 32768,body.count <= 2_000_000 else {throw invalid()}
         var data=Data();append(UInt32(metadata.count),to:&data);data.append(metadata);data.append(body);return data
     }

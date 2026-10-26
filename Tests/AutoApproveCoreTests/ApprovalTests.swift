@@ -504,6 +504,11 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Input socket: RFC handshake, fragmented masks and bounds",tests.testInputSocketRFCHandshakeFragmentationAndBounds),
+            ("Input socket: real gateway auth, ordered PTY and revocation",tests.testInputSocketRealGatewayAuthOrderingAndRevocation),
+            ("Tunnel quality: bounded RTT, metrics and privacy",tests.testTunnelQualityBoundsMetricsAndPrivacy),
+            ("Workers: owned source refresh preserves DNS and foreign settings",tests.testWorkersSourceRefreshPreservesDNSAndRejectsForeignBindings),
+            ("Workers: refresh cancellation cannot restart a stopped tunnel",tests.testWorkersRefreshCancellationCannotRestartStoppedTunnel),
             ("Tunnel PIN: salted verification, format and leading zeros",tests.testPINUsesSaltedVerificationAndKeepsLeadingZeros),
             ("Tunnel PIN: protected persistence, clear and cancellation",tests.testPINKeychainPersistenceClearAndCancellation),
             ("Tunnel PIN: concurrent limit, rotation and cookie revocation",tests.testPINRateLimitConcurrentAttemptsRotationAndSessionRevocation),

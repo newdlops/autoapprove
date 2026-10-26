@@ -1,0 +1,11 @@
+import {mkdir,writeFile} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
+import path from 'node:path';
+import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
+const option=name=>process.argv.find(value=>value.startsWith('--'+name+'='))?.slice(name.length+3);
+const build=path.resolve(option('build')||'.build/interactive-network/release'),out=path.resolve(option('output')||'.runtime/interactive-network-190/quality-native');
+const app=out+'/TunnelQualityPreview.app',mac=app+'/Contents/MacOS',cache=path.resolve('.build/cache/TunnelQualityPreview');
+await mkdir(mac,{recursive:true,mode:0o700});await mkdir(cache,{recursive:true});
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Sources/AutoApproveApp/TunnelConnectionQuality.swift','Tests/fixtures/tunnel-quality-ui.swift','-o',mac+'/TunnelQualityPreview'],{stdio:'inherit',timeout:300000});
+await writeFile(app+'/Contents/Info.plist','<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.autoapprove.tunnel-quality-qa</string><key>CFBundleName</key><string>TunnelQualityPreview</string><key>CFBundleExecutable</key><string>TunnelQualityPreview</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>');
+console.log(app);

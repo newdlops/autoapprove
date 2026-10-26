@@ -3,6 +3,48 @@ import Darwin
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testWorkersRefreshCancellationCannotRestartStoppedTunnel() async throws {
+        let root = URL(fileURLWithPath:"/private/tmp/aa-wrc-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:root)}
+        let fixture = WorkersFixture(),manager = fixture.manager();try await manager.authorize()
+        let origin = try await manager.provision(domainID:CloudflareFixture.zone,subdomain:"cp")
+        let marker = fixture.secrets.keys.first(where:{$0.hasPrefix("cloudflare-worker-source:")})!
+        fixture.secrets.removeValue(forKey:marker);fixture.delay = 200_000_000
+        let paths = AppPaths(directory:root);try paths.prepare();let store = try AuditStore(path:paths.database);try store.set("cloudflareOwner",CloudflareFixture.owner)
+        let connects = fixture.locked {fixture.authCalls}
+        let relay = CloudflareRelayServices(connect:{_ in
+            fixture.locked {fixture.conflict = true}
+            let session = URLSession(configuration:.ephemeral)
+            return CloudflareRelaySocket(session:session,task:session.webSocketTask(with:URL(string:"ws://127.0.0.1:9")!))
+        },probe:{_ in CloudflareHTTPReply(data:Data(),status:503)})
+        let engine = try ApprovalEngine(paths:paths,processReader:{[]},webLoopbackOnly:true,cloudflareServices:fixture.http,workersServices:fixture.tools,relayServices:relay)
+        defer {engine.stop()};try engine.start(poll:false);try engine.setWebEnabled(true)
+        for _ in 0..<200 where !engine.webStatus.ready {try await Task.sleep(for:.milliseconds(10))}
+        try expect(engine.webStatus.ready)
+        var config = RemoteTunnelConfiguration();config.provider = .https;config.publicURL = origin
+        let task = Task {try await engine.connectTunnel(config)}
+        for _ in 0..<100 where fixture.locked({fixture.authCalls}) == connects {try await Task.sleep(for:.milliseconds(5))}
+        try expect(fixture.locked {fixture.authCalls} > connects);try engine.stopTunnel()
+        do {try await task.value;throw CloudflareFixture.Failure()} catch is CancellationError {} catch {throw error}
+        try expectFalse(engine.tunnelStatus.active);try expectFalse(engine.tunnelConfiguration.enabled);try expectFalse(fixture.conflict)
+    }
+    func testWorkersSourceRefreshPreservesDNSAndRejectsForeignBindings() async throws {
+        let fixture = WorkersFixture(),manager = fixture.manager();try await manager.authorize()
+        let origin = try await manager.provision(domainID:CloudflareFixture.zone,subdomain:"cp")
+        let before = fixture.requests.count
+        try expectFalse(try await manager.refreshRelayIfNeeded(origin:origin));try expectEqual(fixture.requests.count,before)
+        let marker = fixture.secrets.keys.first(where:{$0.hasPrefix("cloudflare-worker-source:")})!
+        fixture.secrets.removeValue(forKey:marker)
+        let domains = fixture.domains,uploads = fixture.uploads,credentials = fixture.secrets["cloudflare-worker"]
+        try expect(try await manager.refreshRelayIfNeeded(origin:origin))
+        try expectEqual(fixture.domains,domains);try expectEqual(fixture.uploads,uploads+1)
+        try expectNil(fixture.metadata.last?["migrations"]);try expectEqual(fixture.secrets["cloudflare-worker"],credentials)
+        let writes = fixture.requests.dropFirst(before).filter {$0.httpMethod != "GET"}
+        try expectEqual(writes.count,1);try expectEqual(writes.first?.httpMethod,"PUT")
+        fixture.secrets.removeValue(forKey:marker);fixture.bindings?.append(["type":"plain_text","name":"FOREIGN_SETTING","text":"preserve"])
+        do {_ = try await manager.refreshRelayIfNeeded(origin:origin);throw CloudflareFixture.Failure()} catch is CloudflareFixture.Failure {throw CloudflareFixture.Failure()} catch {}
+        try expectEqual(fixture.uploads,uploads+1);try expectEqual(fixture.domains,domains)
+    }
     func testWorkersApprovalProvisionAndUncertainUpload() async throws {
         let fixture=WorkersFixture();var manager=fixture.manager()
         try await manager.restore();try expectFalse(manager.status.authorized);try expectEqual(fixture.authCalls,0)

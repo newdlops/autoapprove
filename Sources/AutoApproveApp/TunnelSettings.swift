@@ -111,6 +111,7 @@ import AutoApproveCore
             if status.phase != "off" {
                 Text(status.detail).font(.callout).foregroundStyle(status.phase == "failed" ? .red : .secondary)
                     .textSelection(.enabled).fixedSize(horizontal:false,vertical:true).accessibilityIdentifier("tunnel-status")
+                TunnelConnectionQuality(quality:status.quality,enabled:status.ready,measure:{await engine.measureTunnelConnection()})
             }
             if status.phase == "failed",configuration.provider.usesCloudflared {
                 Button("HTTPS (443)로 연결") {configuration.provider = .https;error=nil}

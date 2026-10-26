@@ -155,6 +155,7 @@ public struct RemoteHTTPResponse: Sendable {
     var contentEncoding: String?
     private var variesEncoding = false
     var stream: RemoteHTTPBodyStream?
+    var inputSocket: (handshake:Data, channel:RemoteInputProtocol)?
     public var nodeID: String?
     public init(status: Int = 200, body: Data, contentType: String = "application/json; charset=utf-8", location: String? = nil) {
         self.status = status; self.body = body; self.contentType = contentType; self.location = location
@@ -307,6 +308,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
     private var pendingResult: Result<Data?, Error>?
     private var sending = false
     private var terminalWriteStarted: TimeInterval?
+    private var inputSocket: RemoteInputWebSocket?
     init(_ connection: NWConnection, queue: DispatchQueue, deadlines: RemoteHTTPDeadlines, handler: @escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse, onClose: @escaping () -> Void) {
         self.connection = connection; self.queue = queue; self.deadlines = deadlines; self.handler = handler; self.onClose = onClose
     }
@@ -329,6 +331,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
             guard let self, !self.closed else { return }; self.receiving = false
             if ended || error != nil { self.closeNow(); return }
             if let data, !data.isEmpty {
+                if let socket = self.inputSocket { socket.receive(data); self.receive(); return }
                 // Read disconnects while the handler/source is pending. Only a
                 // reusable response already being sent may receive the next
                 // message early; it is never dispatched before send completion.
@@ -385,7 +388,10 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                         var response = handled
                         self.handlerTask = nil
                         guard !self.closed else { response.stream?.cancel(); return }
-                        if let stream = response.stream {
+                        if let upgrade = response.inputSocket {
+                            self.inputSocket = RemoteInputWebSocket(connection:self.connection,queue:self.queue,channel:upgrade.channel,onClose:{ [weak self] in self?.closeNow() })
+                            self.send(upgrade.handshake)
+                        } else if let stream = response.stream {
                             if compressStream {
                                 do {
                                     let encoder = try RemoteGzipEncoder()
@@ -462,6 +468,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
                     self.armDeadline(self.buffer.isEmpty ? 5 : 30)
                     self.readRequest(); self.receive()
                 }
+                else if let socket = self.inputSocket { self.cancelDeadline(); socket.start() }
                 else if !final { self.pumpStream() }
             }
         })
@@ -505,6 +512,7 @@ final class RemoteHTTPConnection: @unchecked Sendable {
         cancelDeadline(); heartbeat?.setEventHandler {}; heartbeat?.cancel(); heartbeat = nil
         handlerTask?.cancel(); handlerTask = nil
         stream?.cancel(); stream = nil; pendingResult = nil
+        inputSocket?.cancel(); inputSocket = nil
         gzip = nil
         buffer = Data()
         connection.stateUpdateHandler = nil; connection.cancel(); onClose()

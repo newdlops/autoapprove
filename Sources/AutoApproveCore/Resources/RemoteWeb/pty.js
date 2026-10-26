@@ -7,6 +7,8 @@ window.AutoApprovePTY = class {
     this.polling = polling && streaming;
     this.binary = binary;
     this.clientID = uuid(); this.sequence = 0; this.offset = null; this.queue = []; this.sending = false; this.disposed = false; this.ready = false; this.blocked = false;
+    this.inputChannel = null; this.inputNegotiating = false; this.inputAttempted = false;
+    this.inputRetries = 0; this.inputEpoch = 0;
     this.outputQueue = []; this.outputBytes = 0; this.writing = false; this.outputPaused = false; this.source = null;
     this.sourceEpoch = 0; this.retries = 0; this.reconnecting = false;
     this.maxOutputBytes = 512000; this.maxSnapshotBytes = 2097152; this.maxOutputEvents = 64;
@@ -90,7 +92,7 @@ window.AutoApprovePTY = class {
     if (this.disposed || this.blocked || this.ending) return;
     // A pending write may already have reached the Mac. Never replay it or
     // silently resume input while its result is uncertain.
-    if (this.sending || this.queue.length || error.failureKind === 'identity' || [400,401,403,404,409,410].includes(error.status)) { this.fail(error); return; }
+    if ((this.sending || this.queue.length) && this.inputChannel?.state !== 'ready' || error.failureKind === 'identity' || [400,401,403,404,409,410].includes(error.status)) { this.fail(error); return; }
     const source = this.source;
     if (source?.version && !source.received && (error.wireFormat || error.wireTimeout || [406,415].includes(error.status))) this.binary = source.version === 3 ? 2 : 0;
     this.closeStream(); this.ready = false; this.term.options.disableStdin = true; this.reconnecting = true;
@@ -195,6 +197,7 @@ window.AutoApprovePTY = class {
         this.ready = this.streaming && epoch === this.sourceEpoch && !this.reconnecting && !this.blocked && !this.ending && update.exitCode == null && update.canInput !== false; this.term.options.disableStdin = !this.ready;
         this.report(update.exitCode != null ? 'ended' : this.blocked ? 'blocked' : !this.streaming ? 'readonly' : !this.ready ? 'waiting' : 'live', update.exitCode != null ? 'PTY 종료 · 코드 ' + update.exitCode : this.blocked ? this.error : !this.streaming ? '화면 보기 · Mac 업데이트 필요' : this.ending ? 'PTY 마지막 출력 반영 중…' : this.reconnecting ? 'PTY 다시 연결 중…' : this.outputPaused ? '터미널 출력 반영 중…' : this.ready ? 'PTY 실시간 연결됨' : '출력 연결됨 · 다른 브라우저 입력 대기', this);
         if (this.ready && this.resizePending) { this.resizePending = false; void this.resize(); }
+        if (this.ready && !this.inputAttempted) void this.openInputChannel();
         if (this.ready && this.queue.length) void this.flush();
         if (update.exitCode != null) { this.term.options.cursorBlink = false; return; }
       }
@@ -205,27 +208,82 @@ window.AutoApprovePTY = class {
     }
   }
   enqueue(data) { this.enqueueBytes(new TextEncoder().encode(data)); }
+  async openInputChannel() {
+    this.inputAttempted = true;
+    if (!window.AutoApproveInputChannel || !this.streaming) return;
+    this.inputNegotiating = true;
+    const candidate = new window.AutoApproveInputChannel(this.nodeID,{mode:'pty',ptyID:this.descriptor.ptyID,streamID:this.descriptor.streamID,clientID:this.clientID,sequenceBase:this.sequence},{
+      onChange:() => { if (!this.disposed && this.inputChannel === candidate) { this.sending = candidate.pendingCount > 0; if (this.ready && this.queue.length) void this.flush(); } },
+      onFailure:error => {
+        if (this.disposed || this.inputChannel !== candidate) return;
+        if (error.recoverable && !candidate.pendingCount) this.recoverInputChannel(); else this.fail(error);
+      },
+      onQuality:value => { if (!this.disposed) { this.inputQuality = value; this.report('quality','',this); } }
+    });
+    this.inputCandidate = candidate;
+    try {
+      const channel = await candidate.open();
+      if (this.disposed || this.blocked) { channel?.close(); return; }
+      this.inputChannel = channel;
+      if (channel) this.inputStableAt = performance.now();
+      if (this.ready) this.report('live','PTY 실시간 연결됨',this);
+    } catch (error) { if (!this.disposed) this.fail(error); }
+    finally { this.inputCandidate = null; this.inputNegotiating = false; if (!this.disposed && this.ready && this.queue.length) void this.flush(); }
+  }
+  recoverInputChannel() {
+    if (performance.now()-(this.inputStableAt || 0) > 30000) this.inputRetries = 0;
+    this.inputRetries++; this.inputChannel = null; this.sending = false; this.inputQuality = null; this.report('quality','',this);
+    if (this.inputRetries > 3) { this.inputNegotiating = false; if (this.ready && this.queue.length) void this.flush(); return; }
+    this.inputNegotiating = true; const epoch = ++this.inputEpoch;
+    this.report('waiting','입력 연결 복구 중…',this);
+    this.inputRetryTimer = setTimeout(() => {
+      if (this.disposed || this.blocked || epoch !== this.inputEpoch) return;
+      this.inputNegotiating = false; this.inputAttempted = false;
+      if (this.ready) void this.openInputChannel();
+    },Math.min(2000,250*2**(this.inputRetries-1)));
+  }
+  takeQueued(length) {
+    const next = new Uint8Array(length);
+    for (let at = 0; at < length;) {
+      const item = this.queue[0], count = Math.min(item.length,length-at);
+      next.set(item.subarray(0,count),at); at += count;
+      if (count === item.length) this.queue.shift(); else this.queue[0] = item.slice(count);
+    }
+    return next;
+  }
+  flushChannel() {
+    clearTimeout(this.inputTimer); this.inputTimer = null;
+    while (!this.disposed && this.ready && this.queue.length && this.inputChannel?.state === 'ready') {
+      const length = Math.min(16000,this.queue.reduce((sum,item) => sum+item.length,0));
+      if (!this.inputChannel.canSend(length)) break;
+      const next = this.takeQueued(length);
+      if (this.inputChannel.send(2,next)) this.sequence++;
+      else { this.queue.unshift(next); break; }
+    }
+    this.sending = (this.inputChannel?.pendingCount || 0) > 0;
+  }
   enqueueBytes(bytes) {
     if (!this.ready || this.disposed || !bytes.length) return;
     if (this.queue.reduce((sum, item) => sum + item.length, 0) + bytes.length > 128000) { this.fail(new Error('미전달 입력이 너무 많아 입력을 멈췄습니다. 화면을 확인해주세요.')); return; }
     for (let at = 0; at < bytes.length; at += 16000) this.queue.push(bytes.slice(at, at + 16000));
     // A fixed short window coalesces one event-loop burst without starving
     // continuous typing. The active writer drains everything arriving in flight.
-    if (!this.sending && this.inputTimer == null) this.inputTimer = setTimeout(() => { this.inputTimer = null; void this.flush(); }, 4);
+    if (this.inputChannel?.state === 'ready') {
+      // The first event leaves immediately; only subsequent bursts coalesce.
+      if (!this.sending) void this.flush();
+      else if (this.inputTimer == null) this.inputTimer = setTimeout(() => { this.inputTimer = null; void this.flush(); },4);
+    } else if (!this.sending && this.inputTimer == null) this.inputTimer = setTimeout(() => { this.inputTimer = null; void this.flush(); },0);
   }
   async flush() {
+    if (this.inputNegotiating) return;
+    if (this.inputChannel?.state === 'ready') { this.flushChannel(); return; }
     if (this.sending || this.disposed || !this.ready || !this.queue.length) return;
     clearTimeout(this.inputTimer); this.inputTimer = null;
     this.sending = true;
     // Merge only unsent bytes, within the server's existing per-request limit.
     // Keep one acknowledged request in flight; an uncertain write is never replayed.
     const length = Math.min(16000, this.queue.reduce((sum, item) => sum + item.length, 0));
-    const next = new Uint8Array(length);
-    for (let at = 0; at < length;) {
-      const item = this.queue[0], count = Math.min(item.length, length - at);
-      next.set(item.subarray(0, count), at); at += count;
-      if (count === item.length) this.queue.shift(); else this.queue[0] = item.slice(count);
-    }
+    const next = this.takeQueued(length);
     try {
       const data = btoa(Array.from(next, byte => String.fromCharCode(byte)).join(''));
       const sequence = ++this.sequence;
@@ -235,6 +293,9 @@ window.AutoApprovePTY = class {
     finally { this.sending = false; if (this.ready && !this.disposed && this.queue.length) void this.flush(); }
   }
   fail(error) {
+    clearTimeout(this.inputRetryTimer); this.inputEpoch++;
+    this.inputChannel?.close(); this.inputCandidate?.close(); this.inputChannel = null;
+    this.inputQuality = null; this.sending = false; this.report('quality','',this);
     clearTimeout(this.inputTimer); this.inputTimer = null;
     clearTimeout(this.retryTimer); this.retryTimer = null;
     this.closeStream(); this.outputQueue = []; this.outputBytes = 0;
@@ -252,6 +313,8 @@ window.AutoApprovePTY = class {
   focus() { if (this.ready) this.term.focus(); }
   font(value) { this.term.options.fontSize = value; this.fit(); }
   dispose() {
+    clearTimeout(this.inputRetryTimer); this.inputEpoch++;
+    this.inputChannel?.close(); this.inputCandidate?.close(); this.inputChannel = null;
     this.disposed = true; this.closeStream(); this.outputQueue = []; this.outputBytes = 0; clearTimeout(this.retryTimer); clearTimeout(this.inputTimer); clearTimeout(this.resizeTimer); this.observer.disconnect();
     this.container.removeEventListener('pointerup', this.focusListener);
     this.container.removeEventListener('pointerdown', this.pointerListener);

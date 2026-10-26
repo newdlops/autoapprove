@@ -17,6 +17,7 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
   <script src="/terminal-wire.js" async></script>
+  <script src="/input-channel.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -84,7 +85,7 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
             </div>
             <div id="native-connection" class="native-connection" hidden><p id="native-status" role="status"></p><button id="native-connect" type="button" aria-describedby="native-status">원본 터미널 연결</button></div>
             <div class="terminal" data-colored="true">
-              <div class="terminal-bar"><span id="terminal-host"></span><div class="terminal-connection"><span id="terminal-live" class="terminal-live" role="status" data-state="pending">연결 중…</span><span id="terminal-time">—</span></div></div>
+              <div class="terminal-bar"><span id="terminal-host"></span><div class="terminal-connection"><span id="terminal-live" class="terminal-live" role="status" data-state="pending">연결 중…</span><span id="terminal-latency" hidden></span><span id="terminal-time">—</span></div></div>
               <div id="native-screen" class="native-screen" tabindex="0" aria-label="Mac 원본 터미널 창 화면. 누르거나 Enter로 직접 입력" aria-describedby="native-status" hidden><div id="native-image-stage" class="native-image-stage" hidden><img id="native-image" alt="현재 Mac 원본 터미널 창 화면" width="1" height="1" draggable="false"></div><p id="native-empty" class="native-empty">원본 터미널을 연결하면 실제 창 화면이 여기에 표시됩니다.</p></div>
               <pre id="terminal-screen" tabindex="0" aria-label="현재 터미널 출력. 누르거나 Enter로 직접 입력" translate="no">화면을 불러오는 중…</pre>
               <div id="native-tools" class="native-tools" role="group" aria-label="원본 화면 확대와 맞춤" hidden><button id="native-fit" type="button" class="secondary">화면 맞춤</button><button id="native-zoom-out" type="button" class="secondary" aria-label="원본 화면 축소">−</button><output id="native-scale" aria-live="polite">100%</output><button id="native-zoom-in" type="button" class="secondary" aria-label="원본 화면 확대">+</button><span>확대 후 화면을 밀어 이동</span></div>

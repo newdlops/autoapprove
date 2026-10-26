@@ -15,17 +15,21 @@ const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name
 const build=path.resolve(option('build')||'.build/cloudflare-https/release'),out=path.resolve(option('output')||'.runtime/cf-workers-188/transport');
 const dependencies=path.resolve(option('dependencies')||'.runtime/cf-workers-188/dependencies');
 const require=createRequire(dependencies+'/package.json'),{Miniflare,Log,LogLevel,convertV4MiniflareOptions}=require('miniflare'),{WebSocketServer}=require('ws');
+const socketMode=process.argv.includes('--socket'),legDelay=Number(option('latency')||0);
 const root=await mkdtemp('/private/tmp/aa-relay-');await mkdir(out,{recursive:true,mode:0o700});
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,time=30000){const deadline=Date.now()+time;while(!await test()){if(Date.now()>deadline)throw Error(label);await wait(30);}}
 const origin='https://relay.tunnel-qa.invalid',host=new URL(origin).hostname,key=Buffer.alloc(32,91).toString('base64url');
-const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,connections=0;const sockets=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];let stage='startup';
+const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,dropSocketACK,connections=0;const sockets=new Set(),streamResponses=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];
+const wire={compressedFrames:0,compressedBytes:0,expandedBytes:0,socketFrames:0};let stage='startup';
+let typingLatency=null;
 try{
  mf=new Miniflare(convertV4MiniflareOptions({workers:[{name:'relay',modules:true,scriptPath:path.resolve('Sources/AutoApproveCore/Resources/CloudflareRelay/relay.mjs'),compatibilityDate:'2026-10-01',
   durableObjects:{TUNNEL:{className:'TunnelRoom',useSQLite:true}},bindings:{PUBLIC_HOST:host,CONNECTOR_HASH:hash}}],log:new Log(LogLevel.ERROR)}));
  await mf.ready;
  const handle=async(req,res)=>{
   const abort=new AbortController();res.on('close',()=>abort.abort());
+  if(req.url.startsWith('/api/pty/stream')){streamResponses.add(res);res.on('close',()=>streamResponses.delete(res));}
   try{
    let body;for await(const chunk of req)body=body?Buffer.concat([body,chunk]):Buffer.from(chunk);
    const actualHost=req.headers.host?.startsWith('127.0.0.1:')?host:req.headers.host;
@@ -39,21 +43,28 @@ try{
   }catch{if(!res.headersSent)res.writeHead(502);res.end();}
  };server=createServer(handle);
  const wsServer=new WebSocketServer({noServer:true});
- server.on('upgrade',async(req,socket,head)=>{
+ const upgrade=async(req,socket,head)=>{
   try{
    const response=await mf.dispatchFetch(origin+req.url,{headers:{...req.headers,host}});
    if(response.status!==101||!response.webSocket){socket.end('HTTP/1.1 '+response.status+' Rejected\r\nContent-Length: 0\r\n\r\n');return;}
    const upstream=response.webSocket;
    wsServer.handleUpgrade(req,socket,head,client=>{
     connections++;
-    sockets.add(client);client.on('message',(data,binary)=>upstream.send(binary?data:new TextDecoder().decode(data)));
-    upstream.addEventListener('message',event=>{if(client.readyState===1)client.send(event.data);});
+    const connector=req.url==='/_autoapprove/connector';
+    client.autoapprovePath=req.url;
+    sockets.add(client);client.on('message',(data,binary)=>{
+     if(connector&&binary){const bytes=new Uint8Array(data);if(bytes[3]===9){wire.compressedFrames++;wire.compressedBytes+=bytes.length;wire.expandedBytes+=new DataView(bytes.buffer,bytes.byteOffset+8,4).getUint32(0);}if(bytes[3]===7){wire.socketFrames++;if(dropSocketACK&&bytes[11]===4){dropSocketACK.accepted++;dropSocketACK.frames?.push({upstream,data});return;}}}
+     const forward=()=>{try{upstream.send(binary?data:new TextDecoder().decode(data));}catch{}};
+     if(connector&&legDelay)setTimeout(forward,legDelay);else forward();
+    });
+    upstream.addEventListener('message',event=>{const forward=()=>{if(client.readyState===1)client.send(event.data);};if(connector&&legDelay)setTimeout(forward,legDelay);else forward();});
     client.on('error',()=>{});client.on('close',()=>{sockets.delete(client);try{upstream.close(1001,'closed');}catch{}});
     upstream.addEventListener('close',()=>{try{client.close(1001);}catch{}});
     upstream.accept();
    });
   }catch{socket.destroy();}
- });
+ };
+ server.on('upgrade',upgrade);
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  const port=server.address().port,url='http://127.0.0.1:'+port;
  if(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS!==undefined)process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS+=(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS?',':'')+port;
@@ -79,6 +90,7 @@ try{
  const echo=await fetch(url+'/api/echo',{method:'POST',headers:{Host:host,Origin:origin,...auth,'Content-Type':'text/plain'},body});
  assert.equal(echo.status,200);assert.equal((await echo.json()).echo,body);assert.equal(await readFile(root+'/writes','utf8'),'1');
  const large=await get('/api/large',auth);assert.equal(large.status,200);const data=new Uint8Array(await large.arrayBuffer());assert.equal(data.length,1048576);assert.ok(data.every(v=>v===97));
+ assert.ok(wire.compressedFrames>0&&wire.compressedBytes<wire.expandedBytes/2,'Negotiated gzip frames must reduce actual connector bytes');
  stage='reconnect without input replay';for(const socket of sockets)socket.terminate();
  await until(async()=>{try{status=JSON.parse(await readFile(root+'/status.json','utf8'));return status.phase==='reconnecting';}catch{return false;}},'reconnecting');
  await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','reconnected');
@@ -96,7 +108,7 @@ try{
   await writeFile(root+'/.zshrc',"PROMPT='QA> '\n");
   await writeFile(root+'/openssl.cnf','[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=relay.tunnel-qa.invalid\n[v3]\nsubjectAltName=DNS:relay.tunnel-qa.invalid\n');
   execFileSync('/usr/bin/openssl',['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-config',root+'/openssl.cnf','-keyout',root+'/key.pem','-out',root+'/cert.pem'],{stdio:'ignore'});
-  tls=createTLS({key:await readFile(root+'/key.pem'),cert:await readFile(root+'/cert.pem')},handle);await new Promise(resolve=>tls.listen(0,'127.0.0.1',resolve));
+  tls=createTLS({key:await readFile(root+'/key.pem'),cert:await readFile(root+'/cert.pem')},handle);tls.on('upgrade',upgrade);await new Promise(resolve=>tls.listen(0,'127.0.0.1',resolve));
   proxy=createServer();proxy.on('connect',(req,client,head)=>{
    if(req.url!==host+':443'){client.destroy();return;}
    const remote=connect(tls.address().port,'127.0.0.1',()=>{client.write('HTTP/1.1 200 Connection Established\r\n\r\n');if(head.length)remote.write(head);client.pipe(remote);remote.pipe(client);});
@@ -110,6 +122,7 @@ try{
    if(engine==='webkit'&&['webkit PIN rotation','webkit logout'].includes(stage)&&revoked.includes(error.message))shutdownDiagnostics.push({phase:stage,message:error.message});
    else errors.push(error.message);
   });page.setDefaultTimeout(20000);
+  if(!socketMode)await page.route('**/input-channel.js',route=>route.fulfill({contentType:'text/javascript',body:'/* Legacy HTTP fallback verification. */'}));
   await page.goto(origin);await page.locator('#tunnel-key').waitFor();
   if(pinMode){assert.equal(await page.locator('#tunnel-key-label').textContent(),'접속 PIN');assert.equal(await page.locator('#tunnel-key').getAttribute('inputmode'),'numeric');}
   await page.locator('#tunnel-key').fill(pinMode?'000000':'wrong');await page.locator('#tunnel-login-submit').click();await page.locator('#tunnel-login-error').waitFor({state:'visible'});
@@ -121,34 +134,78 @@ try{
   assert.ok(!page.url().includes('access='));assert.ok((await context.cookies()).some(v=>v.httpOnly&&v.secure&&v.name==='__Host-autoapprove_tunnel'));
   assert.equal(await page.evaluate(key=>Object.values(localStorage).some(v=>v.includes(key)),info.key),false);
   stage=engine+' original';await page.locator('.session-row').filter({hasText:'Codex'}).first().click();await page.waitForFunction(()=>latestFrame?.streamID&&!$('terminal-keyboard').disabled);
+  if(socketMode)await page.waitForFunction(()=>directChannel?.state==='ready');
   const identity=await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]);
   await page.locator('#terminal-screen').click();const text='WORKER-'+engine+'-한글😀';await page.keyboard.insertText(text);
   await page.waitForFunction(value=>$('terminal-screen').textContent.includes(value)&&!directSending&&!directQueue.length,text);
   assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
   assert.equal((await readFile(root+'/original-input.bin','utf8')).split(text).length-1,1);
+  stage=engine+' continuous typing latency';
+  const offset=(await readFile(root+'/original-input.bin')).length,burst='abcdefghijkl';
+  await page.evaluate(()=>{window.typingSamples=[];window.recordTyping=event=>{if(event.target.id==='terminal-keyboard'&&event.data?.length===1)typingSamples.push({at:Date.now(),character:event.data});};document.addEventListener('beforeinput',recordTyping,true);});
+  await page.keyboard.type(burst,{delay:20});
+  await page.waitForFunction(value=>$('terminal-screen').textContent.includes(value)&&!directSending&&!directQueue.length,burst);
+  const samples=await page.evaluate(()=>{document.removeEventListener('beforeinput',recordTyping,true);return typingSamples;});assert.equal(samples.map(v=>v.character).join(''),burst);
+  const delivered=(await readFile(root+'/original-times.jsonl','utf8')).trim().split('\n').map(JSON.parse);
+  const delays=samples.map((sample,index)=>{const entry=delivered.find(row=>row.offset<=offset+index&&row.offset+row.count>offset+index);assert.ok(entry,'Every typed byte must have a native receipt');return entry.at-sample.at;}).sort((a,b)=>a-b);
+  typingLatency={samples:delays.length,medianMS:delays[Math.ceil(delays.length*.5)-1],p95MS:delays[Math.ceil(delays.length*.95)-1],maximumMS:delays.at(-1),scope:'Real browser beforeinput to synthetic native adapter receipt, production Worker/WSS/gateway. Original user terminals are untouched.'};
+  assert.ok(delays.every(value=>value>=-2&&value<5000));
+  assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
+  if(socketMode){
+   await page.evaluate(()=>{window.beforeDirectChannel=directChannel;});
+   for(const socket of sockets)if(socket.autoapprovePath.startsWith('/api/input/socket'))socket.terminate();
+   await page.waitForFunction(()=>directChannel?.state==='ready'&&directChannel!==window.beforeDirectChannel&&directMode);
+   assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
+   assert.equal((await readFile(root+'/original-input.bin','utf8')).split(text).length-1,1);
+   browserChecks.push(engine+': idle original input reconnects transparently without replay or source changes');
+  }
   stage=engine+' PTY';await page.locator('#terminal-back').click();await page.locator('#new-pty').click();await page.locator('#pty-directory').fill(root);await page.locator('#pty-program').selectOption('shell');await page.locator('#pty-automatic').uncheck();await page.locator('#start-pty').click();
-  await page.waitForFunction(()=>ptyClient?.ready);await page.locator('#terminal-keyboard-toggle').click();
+  await page.waitForFunction(()=>ptyClient?.ready);if(socketMode)await page.waitForFunction(()=>ptyClient.inputChannel?.state==='ready');await page.locator('#terminal-keyboard-toggle').click();
   await page.keyboard.insertText("printf 'WORKER-PTY=한글😀\\n'");await page.keyboard.press('Enter');
   const terminalText=()=>page.evaluate(()=>{const buffer=ptyClient.term.buffer.active;return Array.from({length:buffer.length},(_,i)=>buffer.getLine(i)?.translateToString(true)||'').join('\n');});
   await until(async()=>/\nWORKER-PTY=한글😀[ \t]*(\n|$)/.test(await terminalText()),'Worker native PTY echo');
   await page.keyboard.insertText("printf 'AB\\n'");for(let i=0;i<4;i++)await page.keyboard.press('ArrowLeft');await page.keyboard.insertText('X');await page.keyboard.press('Enter');
   await until(async()=>/\nAXB[ \t]*(\n|$)/.test(await terminalText()),'Worker cursor editing');assert.equal(await page.evaluate(()=>ptyClient.polling),false);
   assert.ok(requests.some(v=>v.path.startsWith('/api/pty/stream')),'Real SSE must cross Worker and native WSS');
+  if(socketMode){
+   await page.waitForFunction(()=>!ptyClient.sending&&!ptyClient.queue.length);
+   await page.evaluate(()=>{window.beforePTYChannel=ptyClient.inputChannel;});
+   for(const socket of sockets)if(socket.autoapprovePath.startsWith('/api/input/socket'))socket.terminate();
+   await page.waitForFunction(()=>ptyClient.inputChannel?.state==='ready'&&ptyClient.inputChannel!==window.beforePTYChannel&&!ptyClient.blocked);
+   browserChecks.push(engine+': idle PTY input reconnects with its acknowledged sequence and retains output');
+   stage=engine+' independent output recovery';
+   const binding=await page.evaluate(()=>({channel:ptyClient.inputChannel.sequence,ptySequence:ptyClient.sequence,epoch:ptyClient.sourceEpoch}));
+   dropSocketACK={accepted:0,frames:[]};await page.evaluate(()=>ptyClient.enqueue('#OUTPUT-RECOVERY'));
+   await until(()=>dropSocketACK.accepted===1,'Write accepted before output loss');
+   assert.ok(streamResponses.size>0);for(const response of [...streamResponses])response.destroy();
+   await page.waitForFunction(epoch=>ptyClient.ready&&!ptyClient.blocked&&ptyClient.sourceEpoch>epoch,binding.epoch);
+   assert.equal(await page.evaluate(()=>ptyClient.inputChannel.pendingCount),1);
+   const heldFrames=dropSocketACK.frames;dropSocketACK=null;for(const item of heldFrames)item.upstream.send(item.data);
+   await page.waitForFunction(()=>!ptyClient.sending);await page.evaluate(()=>ptyClient.enqueue('\x15'));await page.waitForFunction(()=>!ptyClient.sending&&!ptyClient.queue.length);
+   assert.equal(await page.evaluate(()=>ptyClient.sequence),binding.ptySequence+2);
+   browserChecks.push(engine+': output reconnects during an outstanding input ACK without replaying input');
+  }
+  if(socketMode)await page.waitForFunction(()=>ptyClient.inputQuality?.samples>0);
   for(const[name,width,height]of[['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]) {await page.setViewportSize({width,height});await wait(150);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.screenshot({path:out+'/'+engine+'-pty-'+name+'.png'});}
   stage=engine+' uncertain input';const descriptor=await page.evaluate(()=>ptyClient.descriptor),marker=root+'/once';
   await page.waitForFunction(()=>!ptyClient.sending&&!ptyClient.queue.length);
-  const nativeBefore=(await readFile(root+'/native-inputs','utf8')).trim().split('\n').length;
-  const held={accepted:false,release:null};drop=held;const before=requests.filter(v=>v.path.startsWith('/api/pty/input')).length;
-  await page.evaluate(command=>ptyClient.enqueue(command),"printf 'ONCE\\n' >> '"+marker+"'\r");await until(()=>held.accepted,'Worker accepted input');assert.equal(await readFile(marker,'utf8'),'ONCE\n');
-  await page.locator('#terminal-keyboard-toggle').click();await page.keyboard.insertText('PRESERVE');await page.waitForFunction(()=>ptyClient.queue.reduce((sum,item)=>sum+item.length,0)===8);
-  for(const socket of sockets)socket.terminate();held.release();await page.waitForFunction(()=>ptyClient.blocked);await wait(300);
+  const nativeBefore=socketMode?0:(await readFile(root+'/native-inputs','utf8')).trim().split('\n').length;
+  const held={accepted:false,release:null};if(socketMode)dropSocketACK={accepted:0};else drop=held;const before=requests.filter(v=>v.path.startsWith('/api/pty/input')).length;
+  await page.evaluate(command=>ptyClient.enqueue(command),"printf 'ONCE\\n' >> '"+marker+"'\r");await until(()=>socketMode?dropSocketACK.accepted>0:held.accepted,'Worker accepted input');assert.equal(await readFile(marker,'utf8'),'ONCE\n');
+  if(socketMode){
+   await page.evaluate(()=>{for(let i=0;i<15;i++){ptyClient.enqueue('x');ptyClient.flushChannel();}});
+   await page.waitForFunction(()=>ptyClient.inputChannel.pendingCount===16);await until(()=>dropSocketACK.accepted===16,'All reserved input must reach the real PTY');
+   await page.evaluate(()=>ptyClient.enqueue('PRESERVE'));
+  }else{await page.locator('#terminal-keyboard-toggle').click();await page.keyboard.insertText('PRESERVE');}
+  await page.waitForFunction(()=>ptyClient.queue.reduce((sum,item)=>sum+item.length,0)===8);
+  for(const socket of sockets)socket.terminate();if(socketMode)dropSocketACK=null;else held.release();await page.waitForFunction(()=>ptyClient.blocked);await wait(300);
   assert.equal(await page.evaluate(()=>ptyClient.unsent),'PRESERVE');
   const attempts=requests.filter(v=>v.path.startsWith('/api/pty/input')).slice(before);
   // Chromium can retry a POST at the HTTP transport boundary when the TLS
   // proxy loses its response. It must retain the same request identity, and
   // neither the connector nor the native terminal may replay the write.
-  assert.equal(new Set(attempts.map(v=>v.requestID)).size,1);assert.ok(attempts.length>=1&&attempts.length<=2);
-  assert.equal((await readFile(root+'/native-inputs','utf8')).trim().split('\n').length-nativeBefore,1);
+  if(socketMode){assert.equal(attempts.length,0);assert.ok(wire.socketFrames>0);}
+  else{assert.equal(new Set(attempts.map(v=>v.requestID)).size,1);assert.ok(attempts.length>=1&&attempts.length<=2);assert.equal((await readFile(root+'/native-inputs','utf8')).trim().split('\n').length-nativeBefore,1);}
   await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','Worker restore after uncertain input');
   assert.equal(await readFile(marker,'utf8'),'ONCE\n');
   await fetch(info.owner+'/api/pty/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestID:randomUUID(),ptyID:descriptor.ptyID,streamID:descriptor.streamID})});
@@ -167,7 +224,7 @@ try{
  stage='logout';assert.equal((await fetch(url+'/auth/logout',{method:'POST',headers:{Host:host,Origin:origin,...auth,'Content-Type':'application/json'},body:'{}'})).status,200);
  assert.equal((await get('/api/state',auth)).status,401);
  await writeFile(root+'/stop','stop');await new Promise(resolve=>fixture.once('exit',resolve));assert.equal(fixture.exitCode,0);
- const report={passed:true,pinMode,silentRecovery:process.argv.includes('--soak'),connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
+ const report={passed:true,pinMode,socketMode,legDelay,typingLatency,wire,silentRecovery:process.argv.includes('--soak'),connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control and measured compression','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
 }catch(error){await page?.screenshot({path:out+'/failure.png'}).catch(()=>{});await writeFile(out+'/failure.json',JSON.stringify({stage,error:error.message,diagnostics:await readFile(root+'/diagnostics','utf8').catch(()=>''),requests},null,2));throw error;}
 finally{

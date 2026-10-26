@@ -247,6 +247,11 @@ public final class ManagedPTY: @unchecked Sendable {
         writerExpiry?.schedule(deadline: .now() + 3)
         notifyOutputObservers()
     }
+    func validateInputBinding(streamID:String,client:String,sequence:Int) throws {
+        lock.lock();defer {lock.unlock()}
+        guard UUID(uuidString:client) != nil, streamID == info.streamID, master >= 0, !closing, info.exitCode == nil,
+              writer == client || Date() >= writerUntil, sequence == (sequences[client] ?? 0) else { throw RemoteHTTPError(409,"PTY 입력 연결이 바뀌었습니다. 현재 화면을 확인해주세요.") }
+    }
     public func input(_ data: Data, streamID: String, client: String, sequence: Int) throws {
         lock.lock(); defer { lock.unlock() }
         guard streamID == info.streamID else { throw RemoteHTTPError(409, "다른 PTY 연결에는 입력을 보낼 수 없습니다.") }

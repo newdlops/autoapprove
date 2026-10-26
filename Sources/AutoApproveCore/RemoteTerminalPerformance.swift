@@ -8,7 +8,7 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
         case mainQueue, automation, automationQuery, identity, textRead, presentationRead
         case terminalContents, terminalMetadata
         case firstFrame, liveFrame, responseEncoding, transferPreparation, initialWrite
-        case relayHTTP, relayStreamOpen
+        case relayHTTP, relayStreamOpen, inputDispatch
     }
     public enum Counter: String, CaseIterable, Codable, Sendable {
         case initialReads, sharedInitialReads, abandonedInitialReads
