@@ -28,9 +28,12 @@ Cloudflare의 임시 터널은 가동 시간 보장과 SSE 지원이 없으므�
 
 1. **Cloudflare에서 승인**을 누른다. 필요한 공식 연결 도구를 준비하고 브라우저의
    Cloudflare 로그인·도메인 승인 화면을 연다. 사용자가 직접 로그인하고 허용한다.
-2. 앱의 **등록된 도메인**에서 사용할 도메인을 선택한다. 승인된 계정의 활성 도메인을
+2. 앱의 **등록된 도메인**에서 사용할 도메인을 선택하고 **서브도메인**을 입력한다.
+   `a`를 입력하면 `https://a.선택한도메인`으로 연결한다. 새 설정의 제안 값은 `aa`이며
+   영문·숫자·하이픈 1~63자를 사용할 수 있다. 처음과 끝에는 하이픈을 쓸 수 없다.
+   승인된 계정의 활성 도메인을
    표시한다. Cloudflare 승인이 선택한 도메인만 조회하도록 제한된 경우 그 도메인을 표시한다.
-3. **연결**을 누른다. 앱이 이 Mac의 터널과 `autoapprove-<Mac 식별자>.도메인` 주소를
+3. **연결**을 누른다. 앱이 이 Mac의 터널과 직접 지정한 주소를
    만들고 DNS·내부 포트·웹 접속을 자동 설정한다. 공개 주소가 이 Mac의 인증 게이트웨이에
    연결되는지 확인한 뒤 접속 링크·QR을 제공한다.
 
@@ -41,10 +44,14 @@ Cloudflare에 이미 등록되어 활성화된 도메인이 필요하다. 승인
 [공식 로컬 관리 터널 설정](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/create-local-tunnel/),
 [승인 인증서와 실행 인증 정보의 권한](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/tunnel-permissions/).
 
-기존 DNS 기록은 변경하거나 삭제하지 않는다. 주소가 이미 사용 중이면 `-2`부터 다른
-주소를 찾는다. 생성 응답을 받지 못해 다시 연결할 때는 저장한 생성 의도와 실행 정보를
+기존 DNS 기록은 변경하거나 삭제하지 않는다. 지정한 주소가 이미 사용 중이면 오류를
+표시하므로 다른 이름을 입력한다. 임의의 접미사를 붙이지 않는다. 생성 응답을 받지 못해
+다시 연결할 때는 저장한 생성 의도와 실행 정보를
 이용해 이전 결과부터 확인한다. 준비 중 **취소**하면 이 앱의 승인·연결 작업을 중지한다.
 DNS 반영이 늦으면 연결 도구를 유지하며 **공개 주소 확인**으로 재검사할 수 있다.
+
+기존에 저장한 주소는 업데이트 후에도 유지한다. 주소를 바꾸려면 **연결 종료** 후
+서브도메인을 수정하고 다시 연결한다. 이후에는 새 접속 링크·QR을 사용한다.
 
 ## Cloudflare 토큰 직접 입력 · 기존 수동 설정
 
@@ -108,20 +115,24 @@ Origin과 인증을 확인한 후 기존 엔진으로 전달한다. 쿠키·프�
 [공식 다운로드](https://developers.cloudflare.com/tunnel/downloads/),
 [해당 배포](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.3).
 
-Cloudflare 연결 도구는 외부 **TCP 7844** 연결이 필요하다. 해당 경로가 막힌 네트워크에서는
-연결 시간 초과와 원인을 표시하며 접속 링크를 준비된 상태로 표시하지 않는다.
+0.2.187부터 연결 도구의 QUIC/HTTP2와 IPv4/IPv6 선택을 자동으로 맡긴다. TCP가 막혀도
+UDP가 허용되면 QUIC을 사용할 수 있고, UDP가 막히면 HTTP2를 사용할 수 있다.
+Cloudflare Tunnel은 **UDP 또는 TCP 7844**가 필요하며 443으로 포트만 바꾸는 기능은 없다.
+443 전용 연결은 별도 Workers 중계 기능이 필요하며 0.2.187의 자동 전환과 구분한다.
+사용 가능한 경로가 없으면 실패를 표시하고 접속 링크를 준비된 상태로 표시하지 않는다.
 현재 검증 환경에서도 공식 도구의 DNS 검사는 통과했지만 양쪽 edge의 TCP 연결은
 시간 초과되어 실제 인터넷을 통한 Quick Tunnel 검사는 완료하지 못했다.
 [Cloudflare 방화벽 요구사항](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/).
+[자동 프로토콜과 연결 진단](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/troubleshoot-tunnels/connectivity-prechecks/).
 
 ```sh
-swift build -c release --scratch-path .build/cloudflare-approval
-.build/cloudflare-approval/release/autoapprove-checks
-node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-approval/release
-node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-approval/release --webkit
-node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-approval/release --public
-node scripts/tunnel-settings-preview.mjs --build=.build/cloudflare-approval/release
-node scripts/tunnel-setup-ui-preview.mjs --build=.build/cloudflare-approval/release --output=.runtime/cf-approval-186
+swift build -c release --scratch-path .build/cloudflare-address
+.build/cloudflare-address/release/autoapprove-checks
+node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-address/release
+node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-address/release --webkit
+node scripts/tunnel-browser-check.mjs --build=.build/cloudflare-address/release --public
+node scripts/tunnel-settings-preview.mjs --build=.build/cloudflare-address/release
+node scripts/tunnel-setup-ui-preview.mjs --build=.build/cloudflare-address/release --output=.runtime/cf-address-187
 ```
 
 브라우저 검사는 합성 HTTPS 호스트·실제 인증 게이트웨이·격리 PTY를 사용한다.

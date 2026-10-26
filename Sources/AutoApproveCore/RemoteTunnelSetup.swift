@@ -8,6 +8,18 @@ public enum RemoteTunnelSetup {
         let value=supplied.trimmingCharacters(in:.whitespacesAndNewlines)
         return try RemoteTunnelConfiguration.origin(value.contains("://") ? value : "https://"+value)
     }
+    public static func subdomain(_ supplied:String) throws -> String {
+        let value=supplied.trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
+        guard value.range(of:#"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"#,options:.regularExpression) != nil else {
+            throw AppError.message("서브도메인은 영문·숫자·하이픈 1~63자로 입력하세요. 예: a, aa, term. 처음과 끝에는 하이픈을 쓸 수 없습니다.")
+        }
+        return value
+    }
+    public static func subdomain(from origin:String,domain:String)->String? {
+        guard let canonical=try? Self.origin(origin),let host=URLComponents(string:canonical)?.host,
+              host.hasSuffix("."+domain.lowercased()) else {return nil}
+        return try? subdomain(String(host.dropLast(domain.count+1)))
+    }
     public static func token(_ supplied:String) throws -> String {
         let value=supplied.trimmingCharacters(in:.whitespacesAndNewlines)
         guard value.utf8.count <= 32768, !value.contains("\0") else {throw invalidToken()}

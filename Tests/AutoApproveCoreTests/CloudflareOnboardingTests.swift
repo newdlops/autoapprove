@@ -14,7 +14,7 @@ extension ApprovalTests {
         try await manager.authorize(executable:"synthetic")
         try expect(manager.status.authorized);try expectEqual(manager.status.phase,"authorized")
         try expectEqual(manager.status.domains.map(\.name),["a.example.com","z.example.com"])
-        try expectEqual(manager.proposedURL(for:CloudflareFixture.zone),"https://autoapprove-12345678.z.example.com")
+        try expectEqual(manager.proposedURL(for:CloudflareFixture.zone),"https://aa.z.example.com")
         try expectNil(manager.approvalURL);try expectFalse(manager.status.detail.contains(CloudflareFixture.token))
         let saved=String(decoding:fixture.secrets["cloudflare-account"]!,as:UTF8.self)
         try expectFalse(saved.contains("PRIVATE KEY"));try expectFalse(saved.contains("ARGO TUNNEL TOKEN"))
@@ -45,13 +45,15 @@ extension ApprovalTests {
     }
     func testCloudflareProvisionPreservesDNSAndReusesOwnedResources() async throws {
         let fixture=CloudflareFixture(),manager=cloudflareManager(fixture)
-        let host="autoapprove-12345678.example.com",existing:JSONObject=["name":"autoapprove-12345678.example.com","type":"A","content":"192.0.2.1"]
+        let host="aa.example.com",existing:JSONObject=["name":"aa.example.com","type":"A","content":"192.0.2.1"]
         fixture.records[host]=[existing]
         try await manager.authorize(executable:"synthetic")
-        let connection=try await manager.provision(domainID:CloudflareFixture.zone)
-        try expectEqual(connection.publicURL,"https://autoapprove-12345678-2.example.com")
+        do {_ = try await manager.provision(domainID:CloudflareFixture.zone);throw CloudflareFixture.Failure()} catch is CloudflareFixture.Failure {throw CloudflareFixture.Failure()} catch {}
+        try expectEqual(fixture.tunnels.count,0);try expectEqual(fixture.requests.filter {$0.httpMethod == "POST"}.count,0)
+        let connection=try await manager.provision(domainID:CloudflareFixture.zone,subdomain:" a ")
+        try expectEqual(connection.publicURL,"https://a.example.com")
         try expectEqual(connection.tunnelID,CloudflareFixture.tunnel)
-        let again=try await manager.provision(domainID:CloudflareFixture.zone)
+        let again=try await manager.provision(domainID:CloudflareFixture.zone,subdomain:"A")
         try expectEqual(again.publicURL,connection.publicURL)
         try expectEqual(fixture.tunnels.count,1);try expectEqual(fixture.requests.filter {$0.httpMethod == "POST"}.count,2)
         try expectEqual(fixture.records[host]?.first?["content"] as? String,"192.0.2.1")
@@ -68,7 +70,7 @@ extension ApprovalTests {
             // A fresh manager simulates app restart after an ambiguous POST.
             manager=cloudflareManager(fixture);try await manager.restore()
             let result=try await manager.provision(domainID:CloudflareFixture.zone)
-            try expectEqual(result.publicURL,"https://autoapprove-12345678.example.com")
+            try expectEqual(result.publicURL,"https://aa.example.com")
             try expectEqual(fixture.tunnels.count,1);try expectEqual(fixture.records.count,1)
             try expectEqual(fixture.requests.filter {$0.httpMethod == "POST"}.count,2)
         }
@@ -84,6 +86,37 @@ extension ApprovalTests {
         fixture.loginDelay=0;try await manager.authorize(executable:"synthetic")
         do {_ = try await manager.provision(domainID:"unregistered");throw CloudflareFixture.Failure()} catch is CloudflareFixture.Failure {throw CloudflareFixture.Failure()} catch {}
         try expectEqual(fixture.requests.filter {$0.httpMethod == "POST"}.count,0)
+    }
+    func testCloudflareSubdomainValidationAndLegacyAddressRecovery() throws {
+        for value in ["a","AA"," term ","mac-2",String(repeating:"a",count:63)] {
+            try expectEqual(try RemoteTunnelSetup.subdomain(value),value.trimmingCharacters(in:.whitespacesAndNewlines).lowercased())
+        }
+        for value in [""," ","-a","a-","a.b","a/b","a_b","a@b","https://a.example.com","한글","a\0b",String(repeating:"a",count:64)] {try expectThrows(try RemoteTunnelSetup.subdomain(value))}
+        try expectEqual(RemoteTunnelSetup.subdomain(from:"https://autoapprove-12345678.example.com",domain:"example.com"),"autoapprove-12345678")
+        try expectEqual(RemoteTunnelSetup.subdomain(from:"https://a.sub.example.com",domain:"sub.example.com"),"a")
+        try expectNil(RemoteTunnelSetup.subdomain(from:"https://a.sub.example.com",domain:"example.com"))
+        try expectNil(RemoteTunnelSetup.subdomain(from:"https://notexample.com",domain:"example.com"))
+    }
+    func testCloudflareInvalidSubdomainCannotCreateRemoteResources() async throws {
+        let fixture=CloudflareFixture(),manager=cloudflareManager(fixture)
+        try await manager.authorize(executable:"synthetic")
+        let reads=fixture.requests.count
+        for value in ["","wrong.example.com","-bad",String(repeating:"x",count:64)] {
+            do {_ = try await manager.provision(domainID:CloudflareFixture.zone,subdomain:value);throw CloudflareFixture.Failure()} catch is CloudflareFixture.Failure {throw CloudflareFixture.Failure()} catch {}
+            try expectNil(manager.proposedURL(for:CloudflareFixture.zone,subdomain:value))
+        }
+        try expectEqual(fixture.requests.count,reads);try expectEqual(fixture.tunnels.count,0)
+    }
+    func testCloudflareAddressChangeKeepsPriorDNSAndTunnelIdentity() async throws {
+        let fixture=CloudflareFixture(),manager=cloudflareManager(fixture)
+        try await manager.authorize(executable:"synthetic")
+        let before=try await manager.provision(domainID:CloudflareFixture.zone,subdomain:"autoapprove-12345678")
+        let after=try await manager.provision(domainID:CloudflareFixture.zone,subdomain:"term")
+        try expectEqual(after.publicURL,"https://term.example.com");try expectEqual(before.tunnelID,after.tunnelID)
+        try expectEqual(fixture.tunnels.count,1);try expectEqual(fixture.records.count,2)
+        try expectEqual(fixture.requests.filter {$0.httpMethod == "POST"}.count,3)
+        try expectEqual(fixture.records["autoapprove-12345678.example.com"]?.first?["content"] as? String,CloudflareFixture.tunnel+".cfargotunnel.com")
+        try expectEqual(manager.proposedURL(for:CloudflareFixture.zone,subdomain:"TERM"),after.publicURL)
     }
     func testCloudflareLiveLoginUsesPrivateHomeAndCleansOwnedChild() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-cf-login-"+UUID().uuidString)

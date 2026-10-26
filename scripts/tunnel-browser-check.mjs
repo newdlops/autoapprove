@@ -10,8 +10,8 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {coreLinkArguments} from './swift-core-link.mjs';
 const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3);
-const build=path.resolve(option('build')||'.build/cloudflare-approval/release'),engine=process.argv.includes('--webkit')?'webkit':'chromium';
-const out=path.resolve(option('output')||'.runtime/cf-approval-186/'+engine);await mkdir(out,{recursive:true,mode:0o700});
+const build=path.resolve(option('build')||'.build/cloudflare-address/release'),engine=process.argv.includes('--webkit')?'webkit':'chromium';
+const out=path.resolve(option('output')||'.runtime/cf-address-187/'+engine);await mkdir(out,{recursive:true,mode:0o700});
 const root=await mkdtemp('/private/tmp/aa-tunnel-'),wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,timeout=15000){const end=performance.now()+timeout;while(!await test()){assert.ok(performance.now()<end,label);await wait(20);}}
 const checks=[],errors=[],shutdownDiagnostics=[],traffic=[],sockets=new Set();let browser,fixture,tls,proxy,info,page,stage='startup',drop=null;
@@ -75,6 +75,7 @@ try{
  const managedSecret=Buffer.alloc(32,91).toString('base64'),managed=await control('managed',{executable:fake,secret:managedSecret});
  let managedRun;await until(async()=>{for(const entry of await readdir(root+'/tunnel-runs')){const directory=root+'/tunnel-runs/'+entry;try{await stat(directory+'/credentials.json');await stat(directory+'/pid');managedRun=directory;return true;}catch{}}return false;},'Managed connector files');
  const managedArgs=(await readFile(managedRun+'/arguments.bin')).toString().split('\0').filter(Boolean);
+ assert.equal(managedArgs[managedArgs.indexOf('--protocol')+1],'auto');assert.equal(managedArgs[managedArgs.indexOf('--edge-ip-version')+1],'auto');
  assert.ok(managedArgs.includes('--config')&&managedArgs.includes('--credentials-file'));assert.ok(!managedArgs.some(v=>v.includes(managedSecret)));
  const configText=await readFile(managedRun+'/config.json','utf8');assert.ok(!configText.includes('\\/'),'cloudflared YAML parser must not receive JSON slash escapes');
  const managedConfig=JSON.parse(configText),managedCredential=JSON.parse(await readFile(managedRun+'/credentials.json','utf8'));

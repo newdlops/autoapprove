@@ -11,7 +11,7 @@ extension ApprovalEngine {
         cloudflareClient=client;return client
     }
     public var cloudflareApprovalURL:URL? {cloudflareClient?.approvalURL}
-    public func cloudflareAddress(domainID:String)->String? {cloudflareClient?.proposedURL(for:domainID)}
+    public func cloudflareAddress(domainID:String,subdomain:String = "aa")->String? {cloudflareClient?.proposedURL(for:domainID,subdomain:subdomain)}
     public func loadCloudflareDomains() async throws {try await cloudflare().restore()}
     public func authorizeCloudflare(executable:String = "") async throws {
         guard !tunnelStatus.active else {throw AppError.message("진행 중인 터널 연결을 종료한 뒤 승인해주세요.")}
@@ -32,9 +32,9 @@ extension ApprovalEngine {
     public func cancelCloudflareSetup() {
         if let cloudflareClient {cloudflareClient.cancel()} else {cloudflareStatus=CloudflareSetupStatus()}
     }
-    public func connectCloudflare(domainID:String,executable:String = "") async throws {
+    public func connectCloudflare(domainID:String,subdomain:String = "aa",executable:String = "") async throws {
         guard !tunnelStatus.active else {throw AppError.message("진행 중인 터널 연결을 종료한 뒤 도메인을 선택해주세요.")}
-        let connection=try await cloudflare().provision(domainID:domainID)
+        let connection=try await cloudflare().provision(domainID:domainID,subdomain:subdomain)
         try Task.checkCancellation()
         var configuration=RemoteTunnelConfiguration();configuration.provider = .managed
         configuration.tunnelID=connection.tunnelID;configuration.publicURL=connection.publicURL;configuration.executable=executable

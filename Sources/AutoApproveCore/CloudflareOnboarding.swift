@@ -130,15 +130,18 @@ private struct CloudflareCreationIntent:Codable {
               (try? RemoteTunnelSetup.origin(name)) == "https://"+name else {return nil}
         return CloudflareDomain(id:id,name:name,accountID:account.accountID)
     }
-    public func proposedURL(for domainID:String)->String? {
+    public func proposedURL(for domainID:String,subdomain:String = "aa")->String? {
         guard let domain=status.domains.first(where:{$0.id == domainID}) else {return nil}
-        return "https://autoapprove-"+owner.replacingOccurrences(of:"-",with:"").prefix(8).lowercased()+"."+domain.name
+        guard let label=try? RemoteTunnelSetup.subdomain(subdomain) else {return nil}
+        return try? RemoteTunnelSetup.origin(label+"."+domain.name)
     }
-    public func provision(domainID:String) async throws -> CloudflareManagedConnection {
+    public func provision(domainID:String,subdomain:String = "aa") async throws -> CloudflareManagedConnection {
         try await operation {id in
             guard let account=try self.account(),let domain=self.status.domains.first(where:{$0.id == domainID}),domain.accountID == account.accountID else {
                 throw AppError.message("Cloudflare 승인을 마치고 등록된 도메인을 선택해주세요.")
             }
+            let label=try RemoteTunnelSetup.subdomain(subdomain)
+            let origin=try RemoteTunnelSetup.origin(label+"."+domain.name),host=label+"."+domain.name
             self.publish("provisioning","이 Mac의 터널과 접속 주소를 자동으로 설정하고 있습니다…")
             var intent:CloudflareCreationIntent
             if let data=try self.services.readSecret(self.directory,"cloudflare-create-intent"),let saved=try? JSONDecoder().decode(CloudflareCreationIntent.self,from:data),saved.accountID == account.accountID {
@@ -150,6 +153,19 @@ private struct CloudflareCreationIntent:Codable {
                 guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes) == errSecSuccess else {throw self.invalidResponse()}
                 intent=CloudflareCreationIntent(accountID:account.accountID,name:"AutoApprove-"+UUID().uuidString.lowercased(),secret:Data(bytes).base64EncodedString(),tunnelID:nil)
                 try self.save(intent)
+            }
+            let dns="zones/"+domain.id+"/dns_records",marker="AutoApprove "+self.owner
+            let found=try await self.request("GET",dns,account:account,id:id,query:["name":host,"per_page":"100"])
+            guard let rows=found["result"] as? [JSONObject] else {throw self.invalidResponse()}
+            let matches:(JSONObject,String)->Bool={row,tunnelID in
+                (row["name"] as? String)?.lowercased() == host && row["type"] as? String == "CNAME" &&
+                (row["content"] as? String)?.lowercased().trimmingCharacters(in:CharacterSet(charactersIn:".")) == tunnelID.lowercased()+".cfargotunnel.com" &&
+                row["proxied"] as? Bool == true && row["comment"] as? String == marker
+            }
+            if !rows.isEmpty {
+                guard rows.count == 1,let known=intent.tunnelID,matches(rows[0],known) else {
+                    throw AppError.message("선택한 서브도메인이 이미 사용 중입니다. 기존 DNS는 유지했습니다. 다른 이름을 입력해주세요.")
+                }
             }
             let path="accounts/"+account.accountID+"/cfd_tunnel"
             if intent.tunnelID == nil {
@@ -167,29 +183,15 @@ private struct CloudflareCreationIntent:Codable {
                 intent.tunnelID=tunnelID.lowercased();try self.save(intent)
             }
             try self.current(id)
-            let tunnelID=intent.tunnelID!,target=tunnelID+".cfargotunnel.com",marker="AutoApprove "+self.owner
+            let tunnelID=intent.tunnelID!,target=tunnelID+".cfargotunnel.com"
             let credential:JSONObject=["AccountTag":account.accountID,"TunnelID":tunnelID,"TunnelSecret":intent.secret]
             try self.services.saveSecret(self.directory,"cloudflare-tunnel:"+tunnelID,JSONSerialization.data(withJSONObject:credential))
-            let base="autoapprove-"+self.owner.replacingOccurrences(of:"-",with:"").prefix(8).lowercased()
-            let dns="zones/"+domain.id+"/dns_records"
-            for suffix in 0..<5 {
-                let host=base+(suffix == 0 ? "" : "-\(suffix+1)")+"."+domain.name
-                _ = try RemoteTunnelSetup.origin(host)
-                let found=try await self.request("GET",dns,account:account,id:id,query:["name":host,"per_page":"100"])
-                guard let rows=found["result"] as? [JSONObject] else {throw self.invalidResponse()}
-                let matches:(JSONObject)->Bool={row in
-                    (row["name"] as? String)?.lowercased() == host && row["type"] as? String == "CNAME" &&
-                    (row["content"] as? String)?.lowercased().trimmingCharacters(in:CharacterSet(charactersIn:".")) == target &&
-                    row["proxied"] as? Bool == true && row["comment"] as? String == marker
-                }
-                if rows.count == 1,let first=rows.first,matches(first) {self.publish("authorized","접속 주소 설정을 마쳤습니다. 이 Mac과 연결하고 있습니다…");return CloudflareManagedConnection(tunnelID:tunnelID,publicURL:"https://"+host)}
-                guard rows.isEmpty else {continue}
+            if rows.isEmpty {
                 let created=try await self.request("POST",dns,account:account,id:id,body:["type":"CNAME","name":host,"content":target,"proxied":true,"ttl":1,"comment":marker])
-                guard let record=created["result"] as? JSONObject,matches(record) else {throw self.invalidResponse()}
-                self.publish("authorized","접속 주소 설정을 마쳤습니다. 이 Mac과 연결하고 있습니다…")
-                return CloudflareManagedConnection(tunnelID:tunnelID,publicURL:"https://"+host)
+                guard let record=created["result"] as? JSONObject,matches(record,tunnelID) else {throw self.invalidResponse()}
             }
-            throw AppError.message("접속 주소가 이미 사용 중입니다. 기존 DNS는 유지했습니다. 다른 도메인을 선택해주세요.")
+            self.publish("authorized","접속 주소 설정을 마쳤습니다. 이 Mac과 연결하고 있습니다…")
+            return CloudflareManagedConnection(tunnelID:tunnelID,publicURL:origin)
         }
     }
     private func save(_ intent:CloudflareCreationIntent) throws {try services.saveSecret(directory,"cloudflare-create-intent",JSONEncoder().encode(intent))}

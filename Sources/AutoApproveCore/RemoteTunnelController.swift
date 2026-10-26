@@ -113,7 +113,7 @@ enum RemoteTunnelCredentials {
         }
         let root=directory.appendingPathComponent("tunnel-runs/"+UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]); runDirectory=root
-        var arguments=["tunnel","--no-autoupdate","--protocol","http2","--edge-ip-version","4","--metrics","127.0.0.1:0"]
+        var arguments=["tunnel","--no-autoupdate","--protocol","auto","--edge-ip-version","auto","--metrics","127.0.0.1:0"]
         if configuration.provider == .managed {
             guard let id=configuration.tunnelID,let data=managedCredentials,data.count <= 65536,
                   let value=try? JSONSerialization.jsonObject(with:data) as? JSONObject,
@@ -164,7 +164,7 @@ enum RemoteTunnelCredentials {
         task?.cancel(); task=Task { [weak self] in
             do { try await Task.sleep(for:.seconds(60)) } catch { return }
             guard let self, self.generation == epoch, !self.status.ready else { return }
-            let detail=self.edgeConnectionFailed ? "Cloudflare 서버에 연결하지 못했습니다. 현재 네트워크의 외부 TCP 7844 연결과 방화벽 설정을 확인한 뒤 다시 시도해주세요." : "Cloudflare 연결 시간이 초과됐습니다. 인터넷 연결과 터널 설정을 확인하고 다시 시도해주세요."
+            let detail=self.edgeConnectionFailed ? "Cloudflare 자동 연결에 실패했습니다. Tunnel은 UDP 또는 TCP 7844가 필요합니다. 443만 허용된 네트워크에서는 HTTPS 중계 연결이 필요합니다." : "Cloudflare 연결 시간이 초과됐습니다. 인터넷 연결과 터널 설정을 확인하고 다시 시도해주세요."
             self.stop(); self.publish("failed",detail)
         }
     }
@@ -176,6 +176,7 @@ enum RemoteTunnelCredentials {
             let line=String(logBuffer[..<newline]); logBuffer.removeSubrange(...newline)
             // Classify a known network failure without exposing diagnostic text.
             if line.contains("HTTP/2 connection is blocked or unreachable") || (line.contains("dial tcp ") && line.contains(":7844:") && line.contains("timeout")) { edgeConnectionFailed=true }
+            if line.contains("failed to dial to edge with quic") && line.contains("timeout") {edgeConnectionFailed=true}
             if configuration.provider == .quick, let range=line.range(of:"https://[a-z0-9-]+\\.trycloudflare\\.com",options:.regularExpression) {
                 let url=String(line[range]); status.publicURL=url
                 do { try gateway?.setOrigin(url) } catch { stop(); publish("failed","Cloudflare 접속 주소를 확인하지 못했습니다.") }

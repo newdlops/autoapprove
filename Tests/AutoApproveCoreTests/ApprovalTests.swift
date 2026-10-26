@@ -505,6 +505,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
             ("Cloudflare: approved domain pagination and account isolation",tests.testCloudflareApprovalFiltersAndPaginatesRegisteredDomains),
+            ("Cloudflare: subdomain validation and legacy address recovery",tests.testCloudflareSubdomainValidationAndLegacyAddressRecovery),
+            ("Cloudflare: invalid subdomain never creates remote resources",tests.testCloudflareInvalidSubdomainCannotCreateRemoteResources),
+            ("Cloudflare: user address changes preserve prior DNS and tunnel",tests.testCloudflareAddressChangeKeepsPriorDNSAndTunnelIdentity),
             ("Cloudflare: selected zone permission fallback",tests.testCloudflareApprovalSelectedZoneFallbackAndPermissions),
             ("Cloudflare: malformed approval and oversized response rejection",tests.testCloudflareApprovalRejectsMalformedAndOversizedAccountData),
             ("Cloudflare: preserve DNS and reuse owned tunnel",tests.testCloudflareProvisionPreservesDNSAndReusesOwnedResources),
