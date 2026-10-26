@@ -6,4 +6,5 @@ int aa_open_dashboard_hosts(int writable);
 int aa_spawn_owned_tool(const char *path, char *const argv[], char *const envp[], const char *cwd, int output_fd, int error_fd, int *pid);
 int aa_poll_owned_tool(int pid, int *exit_code);
 void aa_stop_owned_tool(int pid);
+int aa_derive_tunnel_pin(const void *pin, unsigned long length, const void *salt, void *digest);
 #endif

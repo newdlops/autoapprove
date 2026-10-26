@@ -47,7 +47,7 @@ enum RemoteTunnelCredentials {
     public var accessKey: String? { gateway?.accessKey }
     public var shareURL: URL? {
         guard status.ready, let origin=status.publicURL, let key=accessKey else { return nil }
-        return URL(string:origin+"/#access="+key)
+        return URL(string:origin+(gateway?.pinEnabled == true ? "/":"/#access="+key))
     }
     public init(directory: URL,handler:@escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse,onStatus:@escaping @MainActor (RemoteTunnelStatus)->Void) {
         self.directory=directory; self.handler=handler; self.onStatus=onStatus
@@ -58,12 +58,13 @@ enum RemoteTunnelCredentials {
     private func publish(_ phase: String,_ detail: String) {
         status.phase=phase; status.detail=detail; onStatus(status)
     }
-    public func start(_ supplied: RemoteTunnelConfiguration, token: String = "",credentials:Data? = nil) async throws {
+    public func setPIN(_ pin:RemoteTunnelPIN?,accessKey:String) {gateway?.setPIN(pin,accessKey:accessKey)}
+    public func start(_ supplied: RemoteTunnelConfiguration, token: String = "",credentials:Data? = nil,pin:RemoteTunnelPIN? = nil) async throws {
         stop(); configuration=try supplied.validated(); self.token=token;managedCredentials=credentials;retries=0
         let epoch=UUID(); generation=epoch; status.provider=configuration.provider
         publish("starting","인증 접속을 준비하고 있습니다…")
         do {
-            let gateway=try RemoteTunnelGateway(polling:configuration.provider == .quick,handler:handler)
+            let gateway=try RemoteTunnelGateway(polling:configuration.provider == .quick,pin:pin,handler:handler)
             self.gateway=gateway
             try await gateway.start(port:[.quick,.managed].contains(configuration.provider) ? 0 : configuration.port)
             guard generation == epoch else { gateway.stop(); throw CancellationError() }

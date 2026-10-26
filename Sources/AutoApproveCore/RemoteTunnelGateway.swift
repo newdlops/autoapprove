@@ -72,15 +72,19 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
     private var failedAt: TimeInterval = 0, failedAttempts = 0
     private let sessionDuration: TimeInterval
     public private(set) var port: UInt16?
-    public let accessKey: String
+    public private(set) var accessKey: String
+    private var pin:RemoteTunnelPIN?,pinEpoch=UUID(),pinAttempts:[TimeInterval]=[]
+    private let clock:@Sendable()->TimeInterval
+    public var pinEnabled:Bool {pin != nil}
     public let probe: String
     public var sessionCount: Int { sessions.count }
-    public init(polling: Bool = false, sessionDuration: TimeInterval = 28800,
+    public init(polling: Bool = false, sessionDuration: TimeInterval = 28800,pin:RemoteTunnelPIN? = nil,clock:@escaping @Sendable()->TimeInterval = {ProcessInfo.processInfo.systemUptime},
                 handler: @escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse) throws {
+        self.pin=pin;self.clock=clock
         self.polling=polling; self.handler=handler; self.sessionDuration=max(1,min(28800,sessionDuration))
         accessKey=try Self.random(); probe=try Self.random()
     }
-    private static func random() throws -> String {
+    static func random() throws -> String {
         var bytes=[UInt8](repeating:0,count:32)
         guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes) == errSecSuccess else { throw AppError.message("접속 키를 만들지 못했습니다. 다시 연결해주세요.") }
         return Data(bytes).base64EncodedString().replacingOccurrences(of:"+",with:"-").replacingOccurrences(of:"/",with:"_").replacingOccurrences(of:"=",with:"")
@@ -140,12 +144,16 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
         }
     }
     public func stop() {
+        pinEpoch=UUID();pinAttempts=[]
         epoch=UUID(); listener?.cancel(); listener=nil; port=nil
         expiryTask?.cancel(); expiryTask=nil; sessions.removeAll()
         for value in clients.values { value.connection.close() }; clients.removeAll(); deadlines=nil
     }
     public func disconnectClients() {
         for value in clients.values { value.connection.close() }; clients.removeAll()
+    }
+    public func setPIN(_ pin:RemoteTunnelPIN?,accessKey:String) {
+        self.pin=pin;self.accessKey=accessKey;pinEpoch=UUID();pinAttempts=[];sessions.removeAll();disconnectClients()
     }
     private func expire() {
         let now=ProcessInfo.processInfo.systemUptime
@@ -177,10 +185,20 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
             guard ["GET","POST"].contains(request.method) else { throw RemoteHTTPError(405,"지원하지 않는 요청입니다.") }
             if request.path == "/auth/probe", request.method == "GET" { return try .object(["probe":probe]) }
             if request.path == "/auth/login", request.method == "POST" {
-                guard request.body.count <= 1024, let key=try request.json()["key"] as? String, key.utf8.count <= 256 else { throw RemoteHTTPError(400,"접속 키를 입력해주세요.") }
+                guard request.body.count <= 1024, let key=try request.json()["key"] as? String, key.utf8.count <= 256 else { throw RemoteHTTPError(400,pinEnabled ? "접속 PIN을 입력해주세요.":"접속 키를 입력해주세요.") }
                 let expected=Array(SHA256.hash(data:Data(accessKey.utf8))), actual=Array(SHA256.hash(data:Data(key.utf8)))
                 let equal=zip(expected,actual).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
-                guard equal else {
+                var authenticated=equal
+                if !authenticated,let pin {
+                    let now=clock();pinAttempts.removeAll {now-$0>=60}
+                    guard pinAttempts.count<5 else {throw RemoteHTTPError(429,"PIN 입력 횟수를 초과했습니다. 60초 후 다시 시도해주세요.")}
+                    pinAttempts.append(now);let epoch=pinEpoch
+                    authenticated=await Task.detached(priority:.userInitiated) {pin.matches(key)}.value
+                    guard epoch==pinEpoch,clients[client] != nil else {throw RemoteHTTPError(401,"접속 PIN이 변경됐습니다. 새 PIN으로 연결해주세요.")}
+                    guard authenticated else {throw RemoteHTTPError(401,"PIN이 맞지 않습니다. Mac에서 지정한 PIN을 확인해주세요.")}
+                    pinAttempts=[]
+                }
+                guard authenticated else {
                     let now=ProcessInfo.processInfo.systemUptime
                     if now-failedAt > 60 { failedAt=now; failedAttempts=0 }
                     failedAttempts += 1
@@ -200,8 +218,12 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
             }
             if request.method == "GET", ["/tunnel-login.js","/tunnel-login.css","/app.css","/favicon.svg"].contains(request.path) { return try Self.asset(String(request.path.dropFirst())) }
             if session == nil || request.path == "/auth" {
-                if request.method == "GET", ["/","/auth","/index.html"].contains(request.path) { return try Self.asset("tunnel-login.html") }
-                throw RemoteHTTPError(401,"접속 시간이 끝났습니다. Mac의 접속 키로 다시 연결해주세요.")
+                if request.method == "GET", ["/","/auth","/index.html"].contains(request.path) {
+                    var response=try Self.asset("tunnel-login.html")
+                    if pinEnabled,let html=String(data:response.body,encoding:.utf8) {response.body=Data(html.replacingOccurrences(of:"<html lang=\"ko\">",with:"<html lang=\"ko\" data-pin=\"true\">").utf8)}
+                    return response
+                }
+                throw RemoteHTTPError(401,"접속 시간이 끝났습니다. PIN 또는 접속 키로 다시 연결해주세요.")
             }
             // Quick Tunnels do not support SSE. Never expose a stalled stream
             // as an input-capable terminal; the page uses sequential JSON reads.

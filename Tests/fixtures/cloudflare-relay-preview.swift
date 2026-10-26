@@ -17,6 +17,7 @@ private final class RelayOriginal:@unchecked Sendable {
     @MainActor static func main() async throws {
         let root=URL(fileURLWithPath:CommandLine.arguments[1]),proxy=URL(string:CommandLine.arguments[2])!,key=CommandLine.arguments[3]
         let origin="https://relay.tunnel-qa.invalid"
+        let pin=CommandLine.arguments.contains("--pin") ? try RemoteTunnelPIN.create("001234"):nil
         let original=RelayOriginal(root)
         let records=ProcessDiscovery.parse("2000000000 1 ?? 2000000000 0 Tue Oct 27 09:00:00 2026 /Applications/iTerm.app/Contents/MacOS/iTerm2/iTermServer\n2000000001 2000000000 ttys093 2000000001 2000000001 Tue Oct 27 09:00:01 2026 /fixture/codex")
         let adapter=ScreenHostAdapter(screens:{targets in TerminalSnapshot(screens:targets.map {original.screen($0.tty)})},approve:{_,_,_ in .missingTarget},reveal:{_ in nil},input:{_,_,_,input in try original.input(input)})
@@ -62,9 +63,14 @@ private final class RelayOriginal:@unchecked Sendable {
         defer {controller.stop();session.invalidateAndCancel()}
         var configuration=RemoteTunnelConfiguration();configuration.provider = .https;configuration.publicURL=origin
         let credential=CloudflareRelayCredential(script:"autoapprove-relay-"+String(repeating:"a",count:32),origin:origin,key:key)
-        try await controller.start(configuration,credential:JSONEncoder().encode(credential))
+        try await controller.start(configuration,credential:JSONEncoder().encode(credential),pin:pin)
         print(String(decoding:try JSONSerialization.data(withJSONObject:["key":controller.accessKey!,"owner":"http://127.0.0.1:\(webPort)"]),as:UTF8.self));fflush(stdout)
         while true {
+            if (try? String(contentsOf:root.appendingPathComponent("pin-control"),encoding:.utf8))=="rotate" {
+                let next=try await Task.detached {try RemoteTunnelPIN.create("009876")}.value
+                controller.setPIN(next,accessKey:String(repeating:"m",count:43));try FileManager.default.removeItem(at:root.appendingPathComponent("pin-control"))
+            }
+            if let share=controller.shareURL {try Data(String(share.fragment != nil).utf8).write(to:root.appendingPathComponent("share-has-fragment"))}
             if (try? String(contentsOf:root.appendingPathComponent("stop"),encoding:.utf8)) == "stop" {controller.stop();return}
             try await Task.sleep(for:.milliseconds(20))
         }

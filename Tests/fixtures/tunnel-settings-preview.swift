@@ -13,7 +13,7 @@ import AutoApproveCore
         let output=URL(fileURLWithPath:CommandLine.arguments[1]),root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-tunnel-ui-"+UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         defer {try? FileManager.default.removeItem(at:root)}
-        let scenarios=RemoteTunnelProvider.allCases.map {($0.rawValue,$0)}+[("managed-authorized",.managed),("managed-empty",.managed),("managed-error",.managed),("https-authorized",.https),("https-empty",.https),("https-error",.https)]
+        let scenarios=RemoteTunnelProvider.allCases.map {($0.rawValue,$0)}+[("managed-authorized",.managed),("managed-empty",.managed),("managed-error",.managed),("https-authorized",.https),("https-empty",.https),("https-error",.https),("https-pin",.https)]
         for (scenario,provider) in scenarios {
             let paths=AppPaths(directory:root.appendingPathComponent(scenario));try paths.prepare()
             var configuration=RemoteTunnelConfiguration();configuration.provider=provider
@@ -29,6 +29,7 @@ import AutoApproveCore
             if scenario == "managed-error" {fixture.indexStatus=401;try? await engine.loadCloudflareDomains()}
             if scenario.hasPrefix("https-") {try await engine.authorizeCloudflare(provider:.https)}
             if scenario == "https-error" {workers.indexStatus=403;try? await engine.loadCloudflareDomains(provider:.https)}
+            if scenario == "https-pin" {try await engine.setTunnelPIN("001234")}
             for (name,scheme) in [("light",ColorScheme.light),("dark",ColorScheme.dark)] {
                 let view=TunnelSnapshotRoot(engine:engine).padding(24).frame(width:600,height:660,alignment:.topLeading)
                     .background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,scheme)

@@ -110,6 +110,7 @@ extension ApprovalEngine {
     public func startTunnel(_ supplied: RemoteTunnelConfiguration, token: String = "") async throws {
         tunnelRestoreAttempted=true
         var configuration=try supplied.validated(); configuration.enabled=true
+        let pin=try readTunnelPIN();tunnelPINConfigured=pin != nil
         guard webStatus.ready, let service=webService else { throw AppError.message("먼저 같은 네트워크에서 웹 접속을 켜주세요.") }
         let secret:String
         if configuration.provider == .named {
@@ -129,7 +130,7 @@ extension ApprovalEngine {
             try store.set("remoteTunnel",String(decoding:JSONEncoder().encode(configuration),as:UTF8.self))
             tunnelController?.stop();tunnelController=nil;relayController?.stop()
             let controller=CloudflareRelayController(handler:handler,services:relayServices,onStatus:{[weak self] status in self?.tunnelStatus=status})
-            relayController=controller;try await controller.start(configuration,credential:credential);return
+            relayController=controller;try await controller.start(configuration,credential:credential,pin:pin);return
         }
         try store.set("remoteTunnel",String(decoding:JSONEncoder().encode(configuration),as:UTF8.self))
         relayController?.stop();relayController=nil;tunnelController?.stop()
@@ -138,7 +139,7 @@ extension ApprovalEngine {
         let credential:Data?
         if configuration.provider == .managed,let id=configuration.tunnelID {credential=try cloudflareServices.readSecret(paths.directory,"cloudflare-tunnel:"+id.lowercased())}
         else {credential=nil}
-        try await controller.start(configuration,token:secret,credentials:credential)
+        try await controller.start(configuration,token:secret,credentials:credential,pin:pin)
     }
     public func stopTunnel() throws {
         tunnelSetupID=nil

@@ -22,7 +22,8 @@ public struct CloudflareRelayCredential:Codable,Sendable {
     private var generation=UUID(),connection=UUID()
     public private(set) var status=RemoteTunnelStatus()
     public var accessKey:String? {gateway?.accessKey}
-    public var shareURL:URL? {guard status.ready,let origin=status.publicURL,let key=accessKey else {return nil};return URL(string:origin+"/#access="+key)}
+    public var shareURL:URL? {guard status.ready,let origin=status.publicURL,let gateway else {return nil};return URL(string:origin+(gateway.pinEnabled ? "/":"/#access="+gateway.accessKey))}
+    public func setPIN(_ pin:RemoteTunnelPIN?,accessKey:String) {gateway?.setPIN(pin,accessKey:accessKey)}
     public init(handler:@escaping @MainActor(RemoteHTTPRequest) async -> RemoteHTTPResponse,services:CloudflareRelayServices = .live,onStatus:@escaping @MainActor(RemoteTunnelStatus)->Void) {
         self.handler=handler;self.services=services;self.onStatus=onStatus
     }
@@ -33,14 +34,14 @@ public struct CloudflareRelayCredential:Codable,Sendable {
         task=nil;probe=nil;watchdog=nil;ping=nil;socket?.cancel();agent?.cancel();socket=nil;agent=nil
         gateway?.stop();gateway=nil;status=RemoteTunnelStatus();onStatus(status)
     }
-    public func start(_ supplied:RemoteTunnelConfiguration,credential:Data) async throws {
+    public func start(_ supplied:RemoteTunnelConfiguration,credential:Data,pin:RemoteTunnelPIN? = nil) async throws {
         stop();let config=try supplied.validated()
         guard config.provider == .https,credential.count<=65536 else {throw AppError.message("HTTPS 중계 설정을 확인해주세요.")}
         let secret=try JSONDecoder().decode(CloudflareRelayCredential.self,from:credential).validated(for:config.publicURL)
         let epoch=UUID();generation=epoch;status.provider = .https;status.publicURL=config.publicURL
         publish("starting","HTTPS 443 인증 접속을 준비하고 있습니다…")
         do {
-            let gateway=try RemoteTunnelGateway(handler:handler);self.gateway=gateway
+            let gateway=try RemoteTunnelGateway(pin:pin,handler:handler);self.gateway=gateway
             try await gateway.start(port:0);try Task.checkCancellation()
             guard generation==epoch,let port=gateway.port else {gateway.stop();throw CancellationError()}
             try gateway.setOrigin(config.publicURL)

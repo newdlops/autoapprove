@@ -90,6 +90,7 @@ import AutoApproveCore
                     VStack(alignment:.leading,spacing:6) {Text(serviceURL).font(.system(.callout,design:.monospaced)).textSelection(.enabled);copyServiceButton}
                 }.accessibilityElement(children:.contain)
             }
+            TunnelPINSettings(configured:engine.tunnelPINConfigured,save:{try await engine.setTunnelPIN($0)},clear:{try engine.clearTunnelPIN()})
             HStack {
                 if !status.active {
                     Button(busy ? "준비 중…" : status.phase == "failed" ? "다시 연결" : configuration.provider.managedAddress ? "연결" : configuration.provider == .quick ? "임시 주소 만들기" : configuration.provider == .named ? "고정 도메인 연결" : "터널 연결 확인") {connect()}
@@ -120,12 +121,12 @@ import AutoApproveCore
                     HStack(alignment:.top,spacing:16) {qr(link);share(link,address:address)}
                     VStack(alignment:.leading,spacing:10) {qr(link);share(link,address:address)}
                 }
-                DisclosureGroup("접속 키 직접 입력") {
+                if !engine.tunnelPINConfigured {DisclosureGroup("접속 키 직접 입력") {
                     if let key=engine.tunnelAccessKey {
                         Text(key).font(.system(.caption,design:.monospaced)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
                         Button(copied == "key" ? "복사됨" : "접속 키 복사") {copy(key,kind:"key")}
                     }
-                }.font(.caption)
+                }.font(.caption)}
             }
             if let error {Label(error,systemImage:"exclamationmark.circle").font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)}
             DisclosureGroup("연결 세부 설정") {
@@ -151,6 +152,7 @@ import AutoApproveCore
         }.frame(maxWidth:.infinity,alignment:.leading)
             .windowUpdates(updates,sources:[engine.objectWillChange])
             .onAppear {
+                do{try engine.loadTunnelPIN()}catch{self.error=error.localizedDescription}
                 configuration=engine.tunnelConfiguration
                 if !engine.hasTunnelConfiguration {configuration.provider = .https}
                 if configuration.provider.managedAddress,let host=URLComponents(string:configuration.publicURL)?.host,
@@ -176,7 +178,7 @@ import AutoApproveCore
     private func qr(_ link:URL)->some View {
         Group {if let image=qrCodes.image(for:link.absoluteString) {
             Image(nsImage:image).interpolation(.none).resizable().frame(width:116,height:116).padding(8).background(.white)
-                .clipShape(RoundedRectangle(cornerRadius:8)).accessibilityLabel("인증 키가 포함된 외부 접속 QR 코드")
+                .clipShape(RoundedRectangle(cornerRadius:8)).accessibilityLabel(engine.tunnelPINConfigured ? "PIN으로 로그인하는 접속 주소 QR 코드":"인증 키가 포함된 외부 접속 QR 코드")
         }}
     }
     private func share(_ link:URL,address:String)->some View {
@@ -184,7 +186,7 @@ import AutoApproveCore
             Text(address).font(.system(.callout,design:.monospaced)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
             ShareLink(item:link) {Label("접속 링크 공유",systemImage:"square.and.arrow.up")}
             HStack {Button(copied == "link" ? "복사됨" : "접속 링크 복사") {copy(link.absoluteString,kind:"link")};Link("웹에서 열기",destination:link)}
-            Text("QR과 링크에 접속 키가 포함됩니다. 브라우저 접속은 최대 8시간 유지됩니다.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            Text(engine.tunnelPINConfigured ? "이 주소를 열고 지정한 PIN을 입력하세요. 브라우저 접속은 최대 8시간 유지됩니다.":"QR과 링크에 접속 키가 포함됩니다. 브라우저 접속은 최대 8시간 유지됩니다.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
         }
     }
     private func connect() {

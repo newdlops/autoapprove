@@ -25,6 +25,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     let workersServices:CloudflareWorkersServices,relayServices:CloudflareRelayServices
     var workersClient:CloudflareWorkersOnboarding?
     var cloudflareSetupProvider:RemoteTunnelProvider = .managed
+    @Published public internal(set) var tunnelPINConfigured=false
+    var tunnelPINSetupID:UUID?
     @Published public private(set) var lanUpdate = LANUpdateStatus() {
         didSet { remoteDashboardRevision &+= 1; remoteInventoryChanges.notify() }
     }
@@ -505,6 +507,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        tunnelPINSetupID=nil
         tunnelSetupID=nil
         cloudflareClient?.cancel()
         workersClient?.cancel()
@@ -591,7 +594,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
     var lanUpdateWaitReason: String? {
-        if cloudflareStatus.busy {return "Cloudflare 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
+        if cloudflareStatus.busy || tunnelPINSetupID != nil {return "외부 접속 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
         if tunnelStatus.active { return "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||

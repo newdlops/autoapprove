@@ -504,6 +504,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Tunnel PIN: salted verification, format and leading zeros",tests.testPINUsesSaltedVerificationAndKeepsLeadingZeros),
+            ("Tunnel PIN: protected persistence, clear and cancellation",tests.testPINKeychainPersistenceClearAndCancellation),
+            ("Tunnel PIN: concurrent limit, rotation and cookie revocation",tests.testPINRateLimitConcurrentAttemptsRotationAndSessionRevocation),
             ("Workers: OAuth, SQLite migration and uncertain upload recovery",tests.testWorkersApprovalProvisionAndUncertainUpload),
             ("Workers: protect foreign DNS, script and invalid names",tests.testWorkersForeignResourcesAndInvalidNamesArePreserved),
             ("Workers: cancellation and sanitized permission errors",tests.testWorkersCancelledAuthorizationAndSanitizedPermissionError),

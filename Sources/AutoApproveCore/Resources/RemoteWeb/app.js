@@ -529,7 +529,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
     if(response.status === 401 && tunnelAccess){
       tunnelAuthExpired=true;
       stopDirect();
-      if(ptyClient && !ptyClient.blocked)ptyClient.fail(new Error('접속 시간이 끝났습니다. 접속 키로 다시 연결해주세요.'));
+      if(ptyClient && !ptyClient.blocked)ptyClient.fail(new Error('접속 시간이 끝났습니다. PIN 또는 접속 키로 다시 연결해주세요.'));
       text($('tunnel-access-state'),'접속 시간이 끝났습니다. 미전달 입력을 확인하고 다시 연결해주세요.');show($('tunnel-relogin'),true);
     }
     if (validation) validation.waitApplied = response.headers.get('Preference-Applied') === 'wait';
@@ -543,7 +543,10 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
       validation.observedAt = response.headers.get('X-AutoApprove-Observed-At') || new Date().toISOString();
       return validation.value;
     }
-    const result = await response.json();
+    const result = await response.json().catch(error=>{
+      if(!response.ok)return {error:response.status>=500?'Mac과 연결하지 못했습니다. 연결 상태를 확인한 뒤 다시 시도해주세요.':'요청을 처리하지 못했습니다. 다시 로그인하거나 연결 상태를 확인해주세요.'};
+      throw error;
+    });
     if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, unsent:result.diagnostics?.delivery === 'not_started', delivery:result.diagnostics?.delivery});
     if (validation) {
       const tag = response.headers.get('ETag') || '';

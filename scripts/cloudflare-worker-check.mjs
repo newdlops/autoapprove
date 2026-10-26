@@ -19,7 +19,7 @@ const root=await mkdtemp('/private/tmp/aa-relay-');await mkdir(out,{recursive:tr
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,time=30000){const deadline=Date.now()+time;while(!await test()){if(Date.now()>deadline)throw Error(label);await wait(30);}}
 const origin='https://relay.tunnel-qa.invalid',host=new URL(origin).hostname,key=Buffer.alloc(32,91).toString('base64url');
-const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,connections=0;const sockets=new Set(),requests=[],proxySockets=new Set(),errors=[];let stage='startup';
+const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,connections=0;const sockets=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];let stage='startup';
 try{
  mf=new Miniflare(convertV4MiniflareOptions({workers:[{name:'relay',modules:true,scriptPath:path.resolve('Sources/AutoApproveCore/Resources/CloudflareRelay/relay.mjs'),compatibilityDate:'2026-10-01',
   durableObjects:{TUNNEL:{className:'TunnelRoom',useSQLite:true}},bindings:{PUBLIC_HOST:host,CONNECTOR_HASH:hash}}],log:new Log(LogLevel.ERROR)}));
@@ -59,10 +59,12 @@ try{
  if(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS!==undefined)process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS+=(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS?',':'')+port;
  const cache=path.resolve('.build/cache/WorkerPreview');await mkdir(cache,{recursive:true});
  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/cloudflare-relay-preview.swift','-o',root+'/RelayPreview'],{stdio:'inherit',timeout:300000});
- fixture=spawn(root+'/RelayPreview',[root,url,key],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
+ const pinMode=process.argv.includes('--pin');
+ fixture=spawn(root+'/RelayPreview',[root,url,key,...(pinMode?['--pin']:[])],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
  const info=await new Promise((resolve,reject)=>{let output='';const timer=setTimeout(()=>reject(Error('native startup '+stderr)),15000);fixture.stdout.on('data',data=>{output+=data;try{const value=JSON.parse(output.trim());clearTimeout(timer);resolve(value);}catch{}});fixture.on('exit',code=>{clearTimeout(timer);reject(Error('native exit '+code+' '+stderr));});});
  let status;
  stage='public nonce';await until(async()=>{try{status=JSON.parse(await readFile(root+'/status.json','utf8'));return status.phase==='ready';}catch{return false;}},'Native public nonce proof: '+JSON.stringify(status),45000);
+ await until(async()=>{try{return await readFile(root+'/share-has-fragment','utf8')===String(!pinMode);}catch{return false;}},'Shared URL must omit its access key when PIN is configured');
  const get=(route,headers={})=>fetch(url+route,{headers:{Host:host,...headers}});
  assert.equal((await get('/api/state')).status,401);
  assert.equal((await mf.dispatchFetch('https://foreign.invalid/api/state')).status,403);
@@ -103,11 +105,19 @@ try{
   const playwright=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');
   browser=await playwright[engine].launch({headless:true,...(engine==='chromium'?{executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH||undefined}:{})});
   const context=await browser.newContext({proxy:{server:'http://127.0.0.1:'+proxy.address().port},ignoreHTTPSErrors:true,viewport:{width:390,height:844},isMobile:true,hasTouch:true});
-  page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));page.setDefaultTimeout(20000);
+  page=await context.newPage();page.on('pageerror',error=>{
+   const revoked=[origin+'/api/network due to access control checks.','/'+host+'/api/network due to access control checks.'];
+   if(engine==='webkit'&&['webkit PIN rotation','webkit logout'].includes(stage)&&revoked.includes(error.message))shutdownDiagnostics.push({phase:stage,message:error.message});
+   else errors.push(error.message);
+  });page.setDefaultTimeout(20000);
   await page.goto(origin);await page.locator('#tunnel-key').waitFor();
-  await page.locator('#tunnel-key').fill('wrong');await page.locator('#tunnel-login-submit').click();await page.locator('#tunnel-login-error').waitFor({state:'visible'});
+  if(pinMode){assert.equal(await page.locator('#tunnel-key-label').textContent(),'접속 PIN');assert.equal(await page.locator('#tunnel-key').getAttribute('inputmode'),'numeric');}
+  await page.locator('#tunnel-key').fill(pinMode?'000000':'wrong');await page.locator('#tunnel-login-submit').click();await page.locator('#tunnel-login-error').waitFor({state:'visible'});
   for(const[name,width,height]of[['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]) {await page.setViewportSize({width,height});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.screenshot({path:out+'/'+engine+'-login-'+name+'.png'});}
-  await page.setViewportSize({width:390,height:844});await page.goto(origin+'/#access='+info.key);await page.waitForFunction(()=>typeof connected!=='undefined'&&connected);
+  await page.setViewportSize({width:390,height:844});
+  if(pinMode){await page.locator('#tunnel-key').fill('001234');await page.locator('#tunnel-login-submit').click();}
+  else {await page.goto(origin+'/#access='+info.key);}
+  await page.waitForFunction(()=>typeof connected!=='undefined'&&connected);
   assert.ok(!page.url().includes('access='));assert.ok((await context.cookies()).some(v=>v.httpOnly&&v.secure&&v.name==='__Host-autoapprove_tunnel'));
   assert.equal(await page.evaluate(key=>Object.values(localStorage).some(v=>v.includes(key)),info.key),false);
   stage=engine+' original';await page.locator('.session-row').filter({hasText:'Codex'}).first().click();await page.waitForFunction(()=>latestFrame?.streamID&&!$('terminal-keyboard').disabled);
@@ -142,6 +152,14 @@ try{
   await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','Worker restore after uncertain input');
   assert.equal(await readFile(marker,'utf8'),'ONCE\n');
   await fetch(info.owner+'/api/pty/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestID:randomUUID(),ptyID:descriptor.ptyID,streamID:descriptor.streamID})});
+  if(pinMode){
+   stage=engine+' PIN rotation';await writeFile(root+'/pin-control','rotate');
+   await page.locator('#tunnel-terminal-relogin').waitFor({state:'visible'});assert.equal(await page.evaluate(()=>ptyClient.unsent),'PRESERVE');
+   await page.locator('#tunnel-terminal-relogin').click();await page.locator('#tunnel-key').waitFor();
+   await page.locator('#tunnel-key').fill('001234');await page.locator('#tunnel-login-submit').click();await page.locator('#tunnel-login-error').waitFor({state:'visible'});
+   await page.locator('#tunnel-key').fill('009876');await page.locator('#tunnel-login-submit').click();await page.waitForFunction(()=>typeof connected!=='undefined'&&connected);
+   browserChecks.push(engine+': PIN rotation revokes current cookie, preserves unsent text until explicit relogin, rejects old PIN and accepts new PIN');
+  }
   stage=engine+' logout';if(await page.locator('#terminal-back').isVisible())await page.locator('#terminal-back').click();await page.locator('#tunnel-logout').click();await page.locator('#tunnel-key').waitFor();assert.equal((await page.request.get(origin+'/api/state')).status(),401);
   assert.equal(requests.some(v=>v.path.includes(info.key)),false);assert.deepEqual(errors,[]);
   browserChecks.push(engine+': responsive auth, original identity/Unicode, real PTY cursor + SSE, connection loss after accepted input, preserved unsent text, no replay, logout');await context.close();
@@ -149,7 +167,7 @@ try{
  stage='logout';assert.equal((await fetch(url+'/auth/logout',{method:'POST',headers:{Host:host,Origin:origin,...auth,'Content-Type':'application/json'},body:'{}'})).status,200);
  assert.equal((await get('/api/state',auth)).status,401);
  await writeFile(root+'/stop','stop');await new Promise(resolve=>fixture.once('exit',resolve));assert.equal(fixture.exitCode,0);
- const report={passed:true,silentRecovery:process.argv.includes('--soak'),connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,requests:requests.length};
+ const report={passed:true,pinMode,silentRecovery:process.argv.includes('--soak'),connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
 }catch(error){await page?.screenshot({path:out+'/failure.png'}).catch(()=>{});await writeFile(out+'/failure.json',JSON.stringify({stage,error:error.message,diagnostics:await readFile(root+'/diagnostics','utf8').catch(()=>''),requests},null,2));throw error;}
 finally{
