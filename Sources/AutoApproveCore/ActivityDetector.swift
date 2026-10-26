@@ -42,6 +42,13 @@ public enum ActivityDetector {
         if permissionPrompt() {
             return ActivityObservation(phase: .approval, detail: "실행 권한에 대한 응답을 기다리고 있습니다.")
         }
+        if agent == .codex, bottom.contains("Giving this request a little extra thought"), !bottom.contains("```") {
+            let dialog=bottom.components(separatedBy:.whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator:" ")
+            let message="1. Dismiss and keep waiting 2. Learn more No action is required. Codex will keep waiting, and this menu will close when the response is ready."
+            if ["›","»"].contains(where: { dialog.hasSuffix("Giving this request a little extra thought \($0) "+message) }) {
+                return ActivityObservation(phase:.working,detail:"Codex가 서버 응답을 기다리고 있습니다. 응답이 준비되면 작업을 계속합니다.")
+            }
+        }
         let background = matches(bottom, #"(?i)\b[1-9][0-9]* (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b|running in (?:the )?background"#)
         let unresolved = background ? ActivityObservation(phase: .working, detail: "백그라운드 작업이 보이지만 다음 지시를 받을 준비가 됐는지 아직 확인하지 못했습니다.") : unknown
         let glyphs = agent == .claude ? "❯" : "›»"
@@ -54,7 +61,7 @@ public enum ActivityDetector {
         }
         guard !footer.isEmpty, footer.count <= 6, !bottom.contains("```"),
               footer.contains(where: isHint),
-              (footer.allSatisfy({ isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } })
+              (footer.allSatisfy({ isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } || isStatusFooter($0,agent:agent) })
                 || (agent == .codex && CodexResumeCheck.goalStalled(tail))) else { return unresolved }
         // Option menus and questions also use prompt glyphs; they are never idle composers.
         if matches(prompt, #"^[0-9]+\."#) { return unknown }
@@ -71,6 +78,19 @@ public enum ActivityDetector {
 
     private static func isBackgroundHint(_ line: String) -> Bool {
         matches(line, #"(?i)^[•·⏵▶↳\s]*[0-9]+ (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b"#)
+    }
+
+    /// A user status line can sit between the composer and the CLI's own hint.
+    /// These supplemental rows never establish a ready composer on their own.
+    private static func isStatusFooter(_ line: String, agent: AgentKind) -> Bool {
+        switch agent {
+        case .claude:
+            guard line.contains("|"), line.contains("ctx"), line.contains("7d") else { return false }
+            return matches(line, #"^[^|\r\n]{1,200}\|[^|\r\n]{1,200}\|\s*(?:Opus|Sonnet|Haiku) [0-9]+(?:\.[0-9]+){0,2}\s*\|\s*ctx (?:100|[0-9]{1,2})%\s*\|\s*7d (?:100|[0-9]{1,2})%$"#)
+        case .codex:
+            return line.hasPrefix("⚠") && matches(line, #"^⚠\s*[1-9][0-9]{0,2} warnings? · f2 to view$"#)
+        case .shell: return false
+        }
     }
 
     /// Only the last 18 nonempty rows participate. Walk backwards to avoid splitting
