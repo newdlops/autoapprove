@@ -17,8 +17,9 @@ private final class ScreenApprovalCounter:@unchecked Sendable {
     var target=RemoteScreenControlTarget(identity:"display-generation-1",bounds:CGRect(x:-1920,y:-200,width:1920,height:1080))
     var events:[CGEvent]=[]
     var failOnceAt:Int?
+    var targetReads=0
     func services()->RemoteScreenControlServices {
-        RemoteScreenControlServices(permission:{_ in self.allowed},target:{_ in self.target},post:{event in
+        RemoteScreenControlServices(permission:{_ in self.allowed},target:{_ in self.targetReads+=1;return self.target},post:{event in
             if self.failOnceAt==self.events.count {self.failOnceAt=nil;throw AppError.message("synthetic native sink failure")}
             self.events.append(event)
         },frontmostBundle:{self.bundle},clock:{self.clock})
@@ -51,6 +52,17 @@ private final class ScreenApprovalCounter:@unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testScreenControlUsesOneFreshTargetWithoutCachingAcrossInputs() async throws {
+        let f=try await ScreenControlFixture.make();defer {f.control.revoke()};let grant=try f.begin(),before=f.probe.targetReads
+        try f.send(.move(x:0,y:0,modifiers:0),1,grant:grant)
+        try expectEqual(f.probe.targetReads-before,1)
+        f.probe.target.bounds=CGRect(x:100,y:200,width:800,height:600)
+        try f.send(.move(x:0,y:0,modifiers:0),2,grant:grant)
+        try expectEqual(f.probe.events.last?.location,CGPoint(x:100,y:200));try expectEqual(f.probe.targetReads-before,2)
+        f.probe.target.focused=false
+        try expectThrows(try f.send(.text("must not reach the changed focus"),3,grant:grant))
+        try expectEqual(f.probe.events.count,2);try expectFalse(f.control.isControlling(f.share.id))
+    }
     func testScreenControlBinaryCoordinatesAndValidation() throws {
         let values:[RemoteScreenInput]=[.move(x:0,y:65535,modifiers:15),.button(down:true,button:0,x:123,y:456,modifiers:0),
             .button(down:false,button:2,x:65535,y:0,modifiers:8),.scroll(x:1000,y:2000,deltaX:-2000,deltaY:2000,modifiers:4),

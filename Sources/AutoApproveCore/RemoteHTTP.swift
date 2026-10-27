@@ -19,6 +19,16 @@ enum RemoteReadRecovery {
     }
 }
 
+/// Validators are allowed only on the two finite, explicitly conditional read
+/// routes. Every request still verifies its node, permission and share lifetime.
+enum RemoteConditionalRead {
+    static func accepts(path:String,tag:String?) ->Bool {
+        guard let tag else {return true}
+        guard tag.count<=128,!tag.contains("\r"),!tag.contains("\n") else {return false}
+        return path=="/api/inventory" || URLComponents(string:"http://localhost"+path)?.path=="/api/test-screen"
+    }
+}
+
 /// One bounded HTTP message. No cookies, CORS or socket-bridge passthrough.
 public struct RemoteHTTPRequest {
     public let method: String
@@ -537,7 +547,7 @@ final class RemoteHTTPExchange: @unchecked Sendable {
     private let queue = DispatchQueue(label: "autoapprove.web.peer")
     convenience init(endpoint: NWEndpoint, path: String, method: String, body: Data, expectedNodeID: String? = nil, timeout: TimeInterval? = nil, entityTag: String? = nil, retryReads: Bool = true, wait: Int = 0) throws {
         let identity = expectedNodeID.map { "X-AutoApprove-Node: \($0)\r\n" } ?? ""
-        guard entityTag == nil || method == "GET" && body.isEmpty && path == "/api/inventory" && entityTag!.count <= 128 && !entityTag!.contains("\r") && !entityTag!.contains("\n") else { throw RemoteHTTPError(400,"목록 조회의 조건부 요청이 올바르지 않습니다.") }
+        guard entityTag == nil || method == "GET" && body.isEmpty && RemoteConditionalRead.accepts(path:path,tag:entityTag) else { throw RemoteHTTPError(400,"조회의 조건부 요청이 올바르지 않습니다.") }
         let validator = entityTag.map { "If-None-Match: \($0)\r\n" } ?? ""
         let acceptsGzip = method == "GET" && body.isEmpty
         let encoding = acceptsGzip ? "Accept-Encoding: gzip\r\n" : ""

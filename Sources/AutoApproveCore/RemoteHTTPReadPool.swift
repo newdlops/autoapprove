@@ -19,7 +19,7 @@ final class RemoteHTTPReadPool: @unchecked Sendable {
               entityTag: String? = nil, retryReads: Bool = true, wait: Int = 0) async throws -> RemoteHTTPResponse {
         try Task.checkCancellation()
         guard UUID(uuidString:expectedNodeID) != nil, path.hasPrefix("/"), !path.contains("\r"), !path.contains("\n"),
-              entityTag == nil || path == "/api/inventory" && entityTag!.count <= 128 && !entityTag!.contains("\r") && !entityTag!.contains("\n") else {
+              RemoteConditionalRead.accepts(path:path,tag:entityTag) else {
             throw RemoteHTTPError(400,"Mac 읽기 요청이 올바르지 않습니다.")
         }
         let interfaces = RemoteLAN.interfaces()

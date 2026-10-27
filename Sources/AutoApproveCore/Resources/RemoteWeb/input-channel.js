@@ -64,6 +64,7 @@ window.AutoApproveInputChannel = class {
       if (kind === 7 && sequence === 0 && payload.length === 8) {
         const sent = new DataView(payload.buffer,payload.byteOffset,8).getFloat64(0);
         if (sent !== this.lastPing) throw new Error('연결 지연 측정 응답을 확인하지 못했습니다.');
+        clearTimeout(this.pongTimer);this.pongTimer=null;
         this.observe(performance.now()-sent); this.lastPing = null; return;
       }
       if (kind !== 4 || payload.length || sequence <= this.acknowledged || sequence > this.sequence || !this.pending.has(sequence)) throw new Error('입력 확인 순서가 바뀌었습니다. 화면을 확인해주세요.');
@@ -93,6 +94,11 @@ window.AutoApproveInputChannel = class {
   ping() {
     if (this.state !== 'ready' || this.lastPing != null) return;
     this.lastPing = performance.now(); const bytes = new Uint8Array(8); new DataView(bytes.buffer).setFloat64(0,this.lastPing);
+    this.pongTimer=setTimeout(()=>{
+      if(this.state!=='ready'||this.lastPing==null)return;
+      const error=new Error(this.pendingCount?'입력 전달 결과를 확인하지 못했습니다. 같은 입력을 다시 보내지 말고 원본 화면을 확인해주세요.':'입력 연결의 응답이 없어 연결을 다시 확인합니다.');
+      error.recoverable=this.pendingCount===0;this.fail(error);
+    },this.binding.mode==='screen'?3000:7500);
     try { this.socket.send(window.AutoApproveInputChannel.packet(6,0,bytes)); } catch (_) { this.disconnected(); }
   }
   observe(ms,notify = true) {
@@ -111,7 +117,7 @@ window.AutoApproveInputChannel = class {
   }
   close() {
     if (this.state === 'closed') return; this.state = 'closed';
-    clearTimeout(this.openTimer); clearTimeout(this.ackTimer); clearInterval(this.pingTimer);
+    clearTimeout(this.openTimer); clearTimeout(this.ackTimer); clearInterval(this.pingTimer);clearTimeout(this.pongTimer);this.pongTimer=null;this.lastPing=null;
     if (this.socket) { this.socket.onopen = this.socket.onmessage = this.socket.onerror = this.socket.onclose = null; this.socket.close(); }
     // Keep only numeric pending metadata for the owner to classify uncertainty.
     const resolve = this.resolve; this.resolve = null; this.reject = null; resolve?.(null);

@@ -24,7 +24,8 @@ const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,time=30000){const deadline=Date.now()+time;while(!await test()){if(Date.now()>deadline)throw Error(label);await wait(30);}}
 const origin='https://relay.tunnel-qa.invalid',host=new URL(origin).hostname,key=Buffer.alloc(32,91).toString('base64url');
 const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,dropSocketACK,holdInputResponse,connections=0,connectorAttempts=0,publicProbes=0;const sockets=new Set(),streamResponses=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];
-const wire={compressedFrames:0,compressedBytes:0,expandedBytes:0,socketFrames:0};let stage='startup';
+const wire={compressedFrames:0,compressedBytes:0,expandedBytes:0,socketFrames:0,screenNotModified:0,silentInputPongsDropped:0};let stage='startup';
+let dropOneInputPong=false;
 let typingLatency=null,silentRecoveryMS=null;
 async function run() {
 try{
@@ -41,6 +42,7 @@ try{
    requests.push({method:req.method,path:req.url,...(requestID?{requestID}:{})});
    if(req.url==='/auth/probe'&&++publicProbes<=probeFaults){res.writeHead(503,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end('{}');return;}
    const response=await mf.dispatchFetch('https://'+actualHost+req.url,{method:req.method,headers:{...req.headers,host:actualHost},...(body?.length?{body}:{}),signal:abort.signal});
+   if(req.url.startsWith('/api/test-screen')&&response.status===304)wire.screenNotModified++;
    if(holdInputResponse&&new URL(req.url,origin).pathname===holdInputResponse.path){
     const held=holdInputResponse;holdInputResponse=null;const bytes=Buffer.from(await response.arrayBuffer());held.accepted=true;
     held.release=()=>{res.writeHead(response.status,Object.fromEntries(response.headers));res.end(bytes);};return;
@@ -66,7 +68,7 @@ try{
     const connector=req.url==='/_autoapprove/connector';
     client.autoapprovePath=req.url;
     sockets.add(client);client.on('message',(data,binary)=>{
-     if(connector&&binary){const bytes=new Uint8Array(data);if(bytes[3]===9){wire.compressedFrames++;wire.compressedBytes+=bytes.length;wire.expandedBytes+=new DataView(bytes.buffer,bytes.byteOffset+8,4).getUint32(0);}if(bytes[3]===7){wire.socketFrames++;if(dropSocketACK&&bytes[11]===4){dropSocketACK.accepted++;dropSocketACK.frames?.push({upstream,data});return;}}}
+     if(connector&&binary){const bytes=new Uint8Array(data);if(bytes[3]===9){wire.compressedFrames++;wire.compressedBytes+=bytes.length;wire.expandedBytes+=new DataView(bytes.buffer,bytes.byteOffset+8,4).getUint32(0);}if(bytes[3]===7){wire.socketFrames++;if(dropOneInputPong&&bytes[11]===7){dropOneInputPong=false;wire.silentInputPongsDropped++;return;}if(dropSocketACK&&bytes[11]===4){dropSocketACK.accepted++;dropSocketACK.frames?.push({upstream,data});return;}}}
      const forward=()=>{try{upstream.send(binary?data:new TextDecoder().decode(data));}catch{}};
      if(connector&&legDelay)setTimeout(forward,legDelay);else forward();
     });
@@ -201,6 +203,13 @@ try{
    assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
    assert.equal((await readFile(root+'/original-input.bin','utf8')).split(text).length-1,1);
    browserChecks.push(engine+': idle original input reconnects transparently without replay or source changes');
+   await page.waitForFunction(()=>directChannel?.pendingCount===0&&directChannel.lastPing==null);
+   await page.evaluate(()=>{window.beforeSilentChannel=directChannel;});dropOneInputPong=true;const silenceBegan=Date.now();
+   await page.evaluate(()=>directChannel.ping());await page.waitForFunction(()=>directChannel?.state==='ready'&&directChannel!==window.beforeSilentChannel);
+   assert.equal(wire.silentInputPongsDropped,1);assert.ok(Date.now()-silenceBegan<14000);
+   assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
+   assert.equal((await readFile(root+'/original-input.bin','utf8')).split(text).length-1,1);
+   browserChecks.push(engine+': a silently lost input pong triggers automatic idle recovery through Worker without replaying input or replacing the original terminal');
   }
   stage=engine+' screen control';await page.locator('#terminal-screens').click();
   await page.waitForFunction(()=>$('test-screen-image').naturalWidth===960);
@@ -210,6 +219,7 @@ try{
   await until(async()=>{try{return (await readFile(root+'/screen-events.ndjson','utf8')).trim().split('\n').map(JSON.parse).some(event=>event.type===1);}catch{return false;}},'Screen click through Worker');
   const screenText='SCREEN-'+engine+'-한글🙂';await page.locator('#screen-control-keyboard').fill(screenText);
   await until(async()=>{try{return (await readFile(root+'/typed.txt','utf8')).endsWith(screenText);}catch{return false;}},'Screen Unicode through Worker');
+  await until(()=>wire.screenNotModified>0,'Conditional screen image crosses Worker and gateway');
   await page.locator('#close-test-screen').click();await page.waitForFunction(()=>!screenControl?.active);
   browserChecks.push(engine+': screen pointer and exact Korean/emoji traverse production Worker/WSS/PIN gateway to synthetic Quartz sink; closing the viewer revokes control');
   stage=engine+' PTY';await page.locator('#terminal-back').click();

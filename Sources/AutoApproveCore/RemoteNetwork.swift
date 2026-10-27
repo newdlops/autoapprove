@@ -1659,7 +1659,7 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/test-screen":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("share"), let engine else { throw RemoteHTTPError(400, "화면 공유를 지정해주세요.") }
-                    return try await .json(engine.testScreens.frame(id))
+                    return try await engine.testScreens.response(id,entityTag:request.headers["if-none-match"])
                 case "/api/codex/queue":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "Codex 세션을 지정해주세요.") }
@@ -1842,13 +1842,14 @@ struct RemoteTerminalUpdate: Encodable {
         let start = RemoteTerminalPerformance.now; var succeeded = false
         defer { if measured { RemoteTerminalPerformance.shared.observe(.relayHTTP,elapsed:RemoteTerminalPerformance.now-start,succeeded:succeeded) } }
         let read = request.method == "GET" && request.body.isEmpty
-        let response = try await exchange(peer,path:forwardedPath(request),method:request.method,body:request.body,allowUnavailableRead:read)
+        let response = try await exchange(peer,path:forwardedPath(request),method:request.method,body:request.body,
+            entityTag:read && request.path=="/api/test-screen" ? request.headers["if-none-match"]:nil,allowUnavailableRead:read)
         // Only an exact fresh identity can restore a saved/offline read route.
         // Legacy peers without the header still use metadata discovery first.
         if !peer.available, response.nodeID != peer.id {
             throw RemoteHTTPError(502,"저장한 주소의 Mac을 확인하지 못했습니다. 목록을 새로고침해주세요.",diagnostics:["failureKind":"identity"])
         }
-        if read, response.status == 200, response.nodeID == peer.id { markPeerRead(peer) }
+        if read, [200,304].contains(response.status), response.nodeID == peer.id { markPeerRead(peer) }
         succeeded = response.status < 400
         return response
     }

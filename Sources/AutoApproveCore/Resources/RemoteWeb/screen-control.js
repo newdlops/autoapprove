@@ -47,15 +47,16 @@ window.AutoApproveScreenControl = class {
   enqueue(payload,text){
     if(!this.active)return false;
     if(performance.now()-(this.frameAt||0)>3000){this.stop(Error('최신 공유 화면을 받은 뒤 다시 조작해주세요.'));return false;}
-    if(this.queue.length>=64||this.queueBytes+payload.length>64000){this.stop(Error('아직 보내지 못한 입력이 쌓여 조작을 멈췄습니다. 남은 텍스트를 확인해주세요.'));return false;}
     const last=this.queue.at(-1);
     if(payload[0]===0&&last?.payload[0]===0){this.queueBytes-=last.payload.length;this.queue.pop();}
+    if(this.queue.length>=64||this.queueBytes+payload.length>64000){this.stop(Error('아직 보내지 못한 입력이 쌓여 조작을 멈췄습니다. 남은 텍스트를 확인해주세요.'));return false;}
     this.queue.push({payload,text});this.queueBytes+=payload.length;
     if(payload[0]===0){if(!this.moveTimer)this.moveTimer=setTimeout(()=>{this.moveTimer=null;this.drain();},16);}else{clearTimeout(this.moveTimer);this.moveTimer=null;this.drain();}
     return true;
   }
   async drain(){
     if(!this.active||this.sending)return;
+    if(this.moveTimer&&this.queue[0]?.payload[0]===0)return;
     if(this.channel){
       while(this.active&&this.queue.length&&this.channel.canSend(this.queue[0].payload.length)){
         const item=this.queue.shift();this.queueBytes-=item.payload.length;

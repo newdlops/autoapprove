@@ -69,6 +69,10 @@ public final class RemotePeerResponseDecoder {
         let body = status != 304 && fields["content-encoding"]?.lowercased() == "gzip" ? try RemoteGzipDecoder.complete(buffer) : buffer
         var response = RemoteHTTPResponse(status:status,body:body,contentType:fields["content-type"] ?? "application/json; charset=utf-8")
         response.entityTag = fields["etag"]; response.nodeID = fields["x-autoapprove-node"]
+        if let value=fields["x-autoapprove-observed-at"] {
+            guard value.utf8.count<=40,let observed=try? Date.ISO8601FormatStyle().parse(value) else {throw invalid("Mac 화면의 관찰 시각을 확인하지 못했습니다.")}
+            response.observedAt=observed
+        }
         response.waitApplied = fields["preference-applied"] == "wait"
         complete = true; buffer = Data(); return response
     }

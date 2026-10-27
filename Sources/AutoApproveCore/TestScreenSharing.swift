@@ -3,6 +3,7 @@ import ScreenCaptureKit
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import CryptoKit
 
 public struct TestScreenSource: Codable, Equatable, Sendable {
     public var id: UInt32
@@ -34,11 +35,16 @@ public struct TestScreenFrame: Codable, Sendable {
 
 /// Only explicit MCP/web start calls authorize a source. No captures occur in discovery or ordinary terminal mode.
 @MainActor public final class TestScreenSharing {
+    private struct Capture {
+        let id=UUID()
+        let task:Task<TestScreenFrame,Error>
+    }
     private struct Entry {
         var owner: String
         var share: TestScreenShare
         var frame: TestScreenFrame?
-        var task: Task<TerminalNativeImage, Error>?
+        var imageTag:String?
+        var task:Capture?
         var expiry: Task<Void, Never>?
     }
     private var entries: [String: Entry] = [:]
@@ -103,33 +109,59 @@ public struct TestScreenFrame: Codable, Sendable {
     public func stop(_ id: String, owner: String? = nil) throws {
         guard let entry = entries[id], owner == nil || owner == entry.owner else { throw RemoteHTTPError(404, "공유가 종료되었거나 이 MCP 연결의 공유가 아닙니다.") }
         remoteControl.revoke(shareID:id)
-        let removed = entries.removeValue(forKey: id); removed?.task?.cancel(); removed?.expiry?.cancel()
+        let removed = entries.removeValue(forKey: id); removed?.task?.task.cancel(); removed?.expiry?.cancel()
     }
     public func stopAll(owner: String? = nil) {
         if owner == nil { generation &+= 1 }
         for id in Array(entries.keys) where owner == nil || entries[id]?.owner == owner { try? stop(id, owner: owner) }
     }
     public func frame(_ id: String) async throws -> TestScreenFrame {
+        try Task.checkCancellation()
         expire()
         guard let entry = entries[id] else { throw RemoteHTTPError(410, "화면 공유가 종료되었습니다.") }
         guard permission(false) else {remoteControl.revoke(shareID:id);throw RemoteHTTPError(403, "Mac의 화면 녹음 권한이 필요합니다.") }
         let interactive=remoteControl.isControlling(id)
         if let frame = entry.frame, Date().timeIntervalSince(frame.observedAt) < (interactive ? 0.12:0.5) { return frame }
-        let task: Task<TerminalNativeImage, Error>
-        if let existing = entry.task { task = existing }
+        let work:Capture
+        if let existing = entry.task { work = existing }
         else {
             let capture = interactive ? self.interactiveCapture:self.capture, source = entry.share.source
-            task = Task { try await capture(source) }; entries[id]?.task = task
+            work=Capture(task:Task {
+                let image=try await capture(source);try Task.checkCancellation();try image.validate()
+                return TestScreenFrame(shareID:id,observedAt:Date(),image:image)
+            });entries[id]?.task=work
         }
         do {
-            let image = try await task.value; try image.validate()
-            guard !Task.isCancelled, let current = entries[id], current.share == entry.share, current.share.expiresAt > Date() else {
+            let frame=try await work.task.value;try Task.checkCancellation()
+            guard let current = entries[id], current.share == entry.share, current.share.expiresAt > Date() else {
                 throw RemoteHTTPError(410, "화면 공유가 종료되었습니다.")
             }
-            let frame = TestScreenFrame(shareID: id, observedAt: Date(), image: image)
-            entries[id]?.frame = frame; entries[id]?.task = nil
+            if current.task?.id==work.id {entries[id]?.task=nil}
+            if let newer=current.frame,newer.observedAt>=frame.observedAt {return newer}
+            let image=frame.image
+            if current.frame?.image != image || current.imageTag==nil {
+                var digest=SHA256();digest.update(data:Data("\(id):\(image.width)x\(image.height):1:".utf8));digest.update(data:Data(image.data.utf8))
+                entries[id]?.imageTag="W/\"screen-"+digest.finalize().map {String(format:"%02x",$0)}.joined()+"\""
+            }
+            entries[id]?.frame = frame
             return frame
-        } catch {remoteControl.revoke(shareID:id);entries[id]?.task = nil;throw error }
+        } catch {
+            // A cancelled read-only viewer does not own another viewer's input
+            // lease, nor a newer capture that has already replaced this work.
+            if !(error is CancellationError) || !Task.isCancelled {remoteControl.revoke(shareID:id)}
+            if entries[id]?.task?.id==work.id {entries[id]?.task=nil}
+            throw error
+        }
+    }
+    /// Revalidate capture/permission first. A weak tag describes the displayed
+    /// image; the current observation time travels independently on every reply.
+    public func response(_ id:String,entityTag:String?) async throws ->RemoteHTTPResponse {
+        let frame=try await frame(id)
+        guard let tag=entries[id]?.imageTag else {throw RemoteHTTPError(410,"화면 공유가 종료되었습니다.")}
+        var response:RemoteHTTPResponse
+        if entityTag==tag {response=RemoteHTTPResponse(status:304,body:Data())} else {response=try .json(frame)}
+        response.entityTag=tag;response.observedAt=frame.observedAt
+        return response
     }
     public func beginControl(_ object:JSONObject) throws ->RemoteScreenControlGrant {
         let entry=try controlEntry(object);return try remoteControl.begin(share:entry.share,frame:entry.frame)

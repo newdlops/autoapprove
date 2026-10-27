@@ -2610,13 +2610,17 @@ function updateScreenSessionControls(){
 async function readTestScreen(){
   if(!sharedScreen||document.hidden||!$('test-screen-dialog').open)return;
   clearTimeout(sharedScreenTimer);if(sharedScreenController)return;
-  const current=sharedScreen,controller=new AbortController();sharedScreenController=controller;
-  try{const result=await api(endpoint('/api/test-screen',current.node.id)+`&share=${encodeURIComponent(current.share.id)}`,undefined,controller.signal);
+  const current=sharedScreen,controller=new AbortController(),began=performance.now();sharedScreenController=controller;
+  const validation=current.validation||={};
+  try{const result=await api(endpoint('/api/test-screen',current.node.id)+`&share=${encodeURIComponent(current.share.id)}`,undefined,controller.signal,5000,validation);
     if(sharedScreen!==current||controller.signal.aborted)return;
     const image=result.image;if(result.shareID!==current.share.id||typeof image?.data!=='string'||image.data.length>1000000||!Number.isInteger(image.width)||!Number.isInteger(image.height)||image.width<1||image.height<1||image.width>2048||image.height>2048)throw new Error('공유 화면의 형식이나 크기를 확인하지 못했습니다.');
-    sharedScreenFailures=0;current.observedAt=result.observedAt;current.frame=result;
-    $('test-screen-image').width=image.width;$('test-screen-image').height=image.height;$('test-screen-image').src='data:image/jpeg;base64,'+image.data;text($('test-screen-status'),`${current.share.title} · ${nowLabel(result.observedAt)} 갱신 · ${screenControl?.active?'클릭·드래그로 조작':'누르면 확대'}`);show($('test-screen-error'),false);show($('retry-test-screen'),false);
-    sharedScreenTimer=setTimeout(readTestScreen,screenControl?.active?150:750);
+    sharedScreenFailures=0;current.observedAt=validation.notModified?validation.observedAt:result.observedAt;current.frame=result;
+    const element=$('test-screen-image'),reuse=validation.notModified&&current.renderedTag===validation.etag&&element.hasAttribute('src')&&element.complete&&element.naturalWidth>0;
+    if(reuse){current.imageAt=performance.now();screenControl?.frame(result);renderScreenControl();}
+    else{current.pendingImageTag=validation.etag;element.width=image.width;element.height=image.height;element.src='data:image/jpeg;base64,'+image.data;}
+    text($('test-screen-status'),`${current.share.title} · ${nowLabel(current.observedAt)} 갱신 · ${screenControl?.active?'클릭·드래그로 조작':'누르면 확대'}`);show($('test-screen-error'),false);show($('retry-test-screen'),false);
+    sharedScreenTimer=setTimeout(readTestScreen,screenControl?.active?Math.max(0,150-(performance.now()-began)):750);
   }catch(error){
     if(controller.signal.aborted||sharedScreen!==current||document.hidden||!$('test-screen-dialog').open||error.name==='AbortError')return;
     stopScreenControl();
@@ -2653,7 +2657,7 @@ $('cancel-clear-queue').addEventListener('click',()=>{show($('queue-confirm'),fa
 $('confirm-clear-queue').addEventListener('click',()=>void clearCodexQueue());
 $('close-test-screen').addEventListener('click',()=>$('test-screen-dialog').close());$('test-screen-dialog').addEventListener('close',()=>{stopTestScreenRead();$('test-screen-image').removeAttribute('src');});
 $('retry-test-screen').addEventListener('click',()=>void readTestScreen());
-$('test-screen-image').addEventListener('load',()=>{$('test-screen-zoom').disabled=false;if(sharedScreen?.frame){sharedScreen.imageAt=performance.now();screenControl?.frame(sharedScreen.frame);}renderScreenControl();});
+$('test-screen-image').addEventListener('load',()=>{$('test-screen-zoom').disabled=false;if(sharedScreen?.frame){sharedScreen.imageAt=performance.now();sharedScreen.renderedTag=sharedScreen.pendingImageTag;screenControl?.frame(sharedScreen.frame);}renderScreenControl();});
 $('test-screen-image').addEventListener('error',()=>{if(!$('test-screen-image').hasAttribute('src'))return;stopTestScreenRead();$('test-screen-zoom').disabled=true;text($('test-screen-error'),'공유 이미지를 표시하지 못했습니다. 화면을 다시 연결해주세요.');show($('test-screen-error'),true);show($('retry-test-screen'),true);});
 $('test-screen-zoom').addEventListener('click',()=>{if(screenControl?.active)return;const zoom=$('test-screen-image').dataset.zoom!=='true';$('test-screen-image').dataset.zoom=String(zoom);$('test-screen-zoom').setAttribute('aria-pressed',String(zoom));$('test-screen-zoom').setAttribute('aria-label',zoom?'공유 화면 맞춤':'공유 화면 확대');});
 $('toggle-screen-control')?.addEventListener('click',()=>void toggleScreenControl());

@@ -11,7 +11,7 @@ import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const option=n=>process.argv.find(v=>v.startsWith('--'+n+'='))?.slice(n.length+3);
 const build=path.resolve(option('build')||'.build/network-stability/release'),engine=process.argv.includes('--webkit')?'webkit':'chromium';
 const out=path.resolve(option('output')||'.runtime/screen-control-193/browser-'+engine);await mkdir(out,{recursive:true,mode:0o700});
-const root=await mkdtemp('/private/tmp/aa-screen-control-'),sockets=new Set(),errors=[],checks=[],packetKinds=[],captures=[];
+const root=await mkdtemp('/private/tmp/aa-screen-control-'),sockets=new Set(),inputReplies=new Set(),errors=[],checks=[],packetKinds=[],captures=[];
 let child,browser,proxy,origin,page;
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,ms=12000){const end=Date.now()+ms;let last;while(Date.now()<end){try{const value=await test();if(value)return value;}catch(error){last=error;}await delay(40);}throw Error(label+': '+(last?.message||'timed out'));}
@@ -34,6 +34,7 @@ try{
  proxy.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
  proxy.on('upgrade',(req,socket,head)=>{
   const upstream=net.connect(Number(upstreamURL.port),upstreamURL.hostname);sockets.add(upstream);upstream.once('close',()=>sockets.delete(upstream));
+  inputReplies.add(upstream);upstream.once('close',()=>inputReplies.delete(upstream));
   upstream.once('connect',()=>{const headers=headersFor(req.headers);upstream.write(`${req.method} ${req.url} HTTP/1.1\r\n`+Object.entries(headers).map(([k,v])=>`${k}: ${v}`).join('\r\n')+'\r\n\r\n');if(head.length)upstream.write(head);socket.pipe(upstream);upstream.pipe(socket);});
   upstream.on('error',()=>socket.destroy());socket.on('error',()=>upstream.destroy());socket.on('close',()=>upstream.destroy());
  });
@@ -96,10 +97,28 @@ try{
  await until(async()=>(await events()).slice(beforeClose).some(e=>e.type===2),'Disconnect releases held mouse',8000);await page.mouse.up();
  await page.waitForFunction(()=>!screenControl?.active);const afterClose=(await events()).length;await delay(500);assert.equal((await events()).length,afterClose);
  checks.push('Escape exits control without trapping the dialog, permission errors stay view-only, and WebSocket loss releases held input without replay');
+ await openControl();p=await point();await page.mouse.move(p.x,p.y);await page.mouse.down();
+ await page.waitForFunction(()=>screenControl.channel.pendingCount===0&&screenControl.pressed.size===1);
+ const silentBefore=(await events()).length,silentStart=Date.now();for(const socket of inputReplies)socket.pause();
+ await page.waitForFunction(()=>!screenControl?.active);await page.mouse.up();
+ await until(async()=>(await events()).slice(silentBefore).some(event=>event.type===2),'A silent input socket releases the held pointer',7000);
+ assert.ok(Date.now()-silentStart<6500);assert.match(await page.locator('#screen-control-error').textContent(),/입력 연결|전달 결과/);
+ checks.push('A silent actual WebSocket is detected by its pong deadline while HTTP frames remain fresh and releases a held native button without replay');
  await openControl();const sourceEvents=(await events()).length;await flag('source-changed',true);p=await point(.6,.4);await page.mouse.move(p.x,p.y);
  await page.waitForFunction(()=>!screenControl?.active);assert.equal((await events()).slice(sourceEvents).filter(e=>e.type===5).length,0);await flag('source-changed',false);
  checks.push('A changed native target identity rejects the next input before dispatch');
  await openControl();await page.locator('#close-test-screen').click();await until(async()=>{const reply=await context.request.post(origin+'/api/screen/control',{headers:{Origin:origin},data:{action:'begin',shareID:ready.display}});if(reply.status()!==200)return false;const grant=await reply.json();await context.request.post(origin+'/api/screen/control',{headers:{Origin:origin},data:{...grant,action:'end'}});return true;},'Closed viewer revokes its control lease');
+ await page.locator('#global-screens').click();await page.waitForFunction(()=>document.getElementById('test-screen-image').complete&&document.getElementById('test-screen-image').naturalWidth===960);
+ await openControl();await flag('capture-denied',true);await page.locator('#test-screen-error').waitFor({state:'visible'});
+ await page.waitForFunction(()=>!screenControl?.active&&!document.getElementById('test-screen-image').hasAttribute('src'));
+ await flag('capture-denied',false);await page.locator('#retry-test-screen').click();await page.waitForFunction(()=>document.getElementById('test-screen-image').naturalWidth===960);
+ await openControl();await page.locator('#close-test-screen').click();
+ checks.push('A valid frame validator cannot bypass revoked capture permission; explicit retry restores the image and permits a fresh control lease');
+ await page.route('**/api/test-screen**',async route=>{const headers={...route.request().headers()};delete headers['if-none-match'];const response=await route.fetch({headers}),replyHeaders={...response.headers()};delete replyHeaders.etag;delete replyHeaders['content-encoding'];delete replyHeaders['content-length'];await route.fulfill({response,headers:replyHeaders,body:await response.body()});});
+ await page.locator('#global-screens').click();await page.waitForFunction(()=>document.getElementById('test-screen-image').naturalWidth===960&&sharedScreen.validation?.etag==='');
+ await openControl();await page.locator('#screen-control-keyboard').fill('이전 호스트 호환');await until(async()=>(await text()).endsWith('이전 호스트 호환'),'Host without conditional frame support');
+ await page.locator('#close-test-screen').click();await page.unroute('**/api/test-screen**');
+ checks.push('A host without frame validators keeps the sequential full-image and exact keyboard input behavior');
  await page.locator('#global-screens').click();await page.waitForFunction(()=>document.getElementById('test-screen-image').complete&&document.getElementById('test-screen-image').naturalWidth===960);
  await page.route('**/api/input/socket**',route=>route.abort());await page.evaluate(()=>{window.AutoApproveInputChannel=undefined;});
  const httpStart=(await events()).length;await openControl();assert.equal(await page.evaluate(()=>screenControl.channel==null),true);

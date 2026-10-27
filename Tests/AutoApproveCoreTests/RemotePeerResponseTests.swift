@@ -25,13 +25,14 @@ extension ApprovalTests {
         let body = Data((String(repeating:"원본🙂 e\u{301} /fixture/file.swift\r\n",count:4000)+"\u{0}").utf8)
         for compressed in [false,true] {
             let payload = compressed ? try RemoteGzipEncoder(level:6).encode(body,final:true) : body
-            let wire = Data("HTTP/1.1 200 OK\r\nContent-Length: \(payload.count)\r\nContent-Type: application/octet-stream\r\nX-AutoApprove-Node: owner\r\nETag: \"current\"\r\n\(compressed ? "Content-Encoding: gzip\r\n" : "")\r\n".utf8)+payload
+            let wire = Data("HTTP/1.1 200 OK\r\nContent-Length: \(payload.count)\r\nContent-Type: application/octet-stream\r\nX-AutoApprove-Node: owner\r\nX-AutoApprove-Observed-At: 2026-10-27T06:00:00Z\r\nETag: \"current\"\r\n\(compressed ? "Content-Encoding: gzip\r\n" : "")\r\n".utf8)+payload
             for chunk in [1,17,64_000] {
                 let decoder = RemotePeerResponseDecoder(expectedNodeID:"owner",acceptsGzip:true)
                 var response: RemoteHTTPResponse?
                 for offset in stride(from:0,to:wire.count,by:chunk) { response = try decoder.append(wire.subdata(in:offset..<min(wire.count,offset+chunk))) ?? response }
                 try decoder.finish(); try expectEqual(response?.body,body); try expectEqual(response?.nodeID,"owner")
                 try expectEqual(response?.entityTag,"\"current\""); try expectEqual(response?.contentType,"application/octet-stream")
+                try expectEqual(response?.observedAt?.ISO8601Format(),"2026-10-27T06:00:00Z")
                 try expectEqual(decoder.expectedBytes,payload.count); try expectEqual(decoder.receivedBytes,wire.count)
                 try expectThrows(try decoder.append(Data()))
             }
@@ -39,6 +40,7 @@ extension ApprovalTests {
         let legacy = RemotePeerResponseDecoder(expectedNodeID:"owner")
         let response = try legacy.append(Data("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}".utf8))
         try expectEqual(response?.body,Data("{}".utf8)); try legacy.finish()
+        try expectNil(response?.observedAt)
         let conditional = RemotePeerResponseDecoder(expectedNodeID:"owner",acceptsGzip:true)
         let unchanged = try conditional.append(Data("HTTP/1.1 304 Not Modified\r\nX-AutoApprove-Node: owner\r\nETag: \"current\"\r\n\r\n".utf8))
         try expectEqual(unchanged?.status,304); try expectEqual(unchanged?.body,Data()); try conditional.finish()
@@ -51,6 +53,7 @@ extension ApprovalTests {
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncontent-length: 0", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked",
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Encoding: br", "HTTP/1.1 304 Not Modified\r\nContent-Length: 1",
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: a\r\nETag: b",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-AutoApprove-Observed-At: yesterday",
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: text/plain\ninjected: value",
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nBad Header: value"
         ]

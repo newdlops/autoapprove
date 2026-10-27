@@ -79,6 +79,7 @@ public struct RemoteScreenControlGrant:Encodable {
     private struct Lease {
         var share:TestScreenShare
         var grant:RemoteScreenControlGrant
+        var tokenDigest:SHA256.Digest
         var identity:String
         var seen:TimeInterval
         var sequence:UInt32=0
@@ -109,7 +110,7 @@ public struct RemoteScreenControlGrant:Encodable {
         let target=try services.target(share.source)
         _ = try target.point(x:32768,y:32768)
         let grant=RemoteScreenControlGrant(shareID:share.id,controlID:UUID().uuidString,token:try Self.random())
-        lease=Lease(share:share,grant:grant,identity:target.identity,seen:services.clock())
+        lease=Lease(share:share,grant:grant,tokenDigest:SHA256.hash(data:Data(grant.token.utf8)),identity:target.identity,seen:services.clock())
         // Retain the releaser until its short lease ends, even if a viewer or
         // owner is destroyed without its normal shutdown callback.
         watchdog=Task { [self] in
@@ -121,15 +122,20 @@ public struct RemoteScreenControlGrant:Encodable {
         return grant
     }
     public func validate(_ object:JSONObject,frame:TestScreenFrame?) throws {
+        _ = try validatedTarget(object,frame:frame)
+    }
+    private func validatedTarget(_ object:JSONObject,frame:TestScreenFrame?) throws ->RemoteScreenControlTarget {
         expire();try authenticate(object)
         guard let current=lease else {throw ended()}
-        do {try checkFrame(frame,share:current.share);try checkPermission();guard try services.target(current.share.source).identity==current.identity else {throw ended()}}
+        let target:RemoteScreenControlTarget
+        do {try checkFrame(frame,share:current.share);try checkPermission();target=try services.target(current.share.source);guard target.identity==current.identity else {throw ended()}}
         catch {revoke();throw error}
         lease?.seen=services.clock()
+        return target
     }
     public func heartbeat(_ object:JSONObject,frame:TestScreenFrame?) throws {try validate(object,frame:frame)}
     public func input(_ object:JSONObject,frame:TestScreenFrame?) throws ->JSONObject {
-        try validate(object,frame:frame)
+        let target=try validatedTarget(object,frame:frame)
         guard let raw=object["sequence"] as? NSNumber,CFGetTypeID(raw) != CFBooleanGetTypeID(),raw.doubleValue.rounded()==raw.doubleValue,raw.doubleValue>=1,raw.doubleValue<=Double(UInt32.max),
               let sequence=UInt32(exactly:raw.uint64Value),let current=lease,current.sequence<UInt32.max,sequence==current.sequence+1,
               let text=object["payload"] as? String,text.utf8.count<=11000,let data=Data(base64Encoded:text) else {throw RemoteScreenInput.invalid()}
@@ -137,7 +143,7 @@ public struct RemoteScreenControlGrant:Encodable {
         lease?.rate.removeAll {now-$0>=1}
         guard (lease?.rate.count ?? 0)<240 else {revoke();throw RemoteHTTPError(429,"화면 입력이 너무 빠르게 쌓여 조작을 멈췄습니다. 다시 연결해주세요.")}
         lease?.sequence=sequence;lease?.rate.append(now)
-        do {try deliver(input);return ["accepted":true,"sequence":Int(sequence)]}
+        do {try deliver(input,target:target);return ["accepted":true,"sequence":Int(sequence)]}
         catch {revoke();throw error}
     }
     public func end(_ object:JSONObject) throws {expire();guard lease != nil else {return};try authenticate(object);revoke()}
@@ -159,12 +165,12 @@ public struct RemoteScreenControlGrant:Encodable {
     private func authenticate(_ object:JSONObject) throws {
         guard let current=lease,object["shareID"] as? String==current.share.id,object["controlID"] as? String==current.grant.controlID,
               let token=object["token"] as? String,token.utf8.count<=128 else {throw ended()}
-        let expected=SHA256.hash(data:Data(current.grant.token.utf8)),actual=SHA256.hash(data:Data(token.utf8))
+        let expected=current.tokenDigest,actual=SHA256.hash(data:Data(token.utf8))
         guard zip(expected,actual).reduce(UInt8(0),{$0 | ($1.0 ^ $1.1)})==0 else {throw ended()}
     }
-    private func deliver(_ input:RemoteScreenInput) throws {
+    private func deliver(_ input:RemoteScreenInput,target:RemoteScreenControlTarget) throws {
         guard let current=lease else {throw ended()}
-        let target=try services.target(current.share.source)
+        // No await or callback separates this fresh snapshot from dispatch.
         guard target.identity==current.identity else {throw ended()}
         func point(_ x:UInt16,_ y:UInt16) throws ->CGPoint {try target.point(x:x,y:y)}
         switch input {
