@@ -17,20 +17,23 @@ public struct CloudflareRelayCredential:Codable,Sendable {
     private let handler:@MainActor(RemoteHTTPRequest) async -> RemoteHTTPResponse
     private let onStatus:@MainActor(RemoteTunnelStatus)->Void
     private let services:CloudflareRelayServices
+    private let recovery:RemoteNetworkRecovery
     private var gateway:RemoteTunnelGateway?,socket:CloudflareRelaySocket?,agent:CloudflareRelayAgent?
     private var task:Task<Void,Never>?,probe:Task<Void,Never>?,watchdog:Task<Void,Never>?,ping:Task<Void,Never>?,pingDeadline:Task<Void,Never>?
     private var generation=UUID(),connection=UUID()
     private var qualityTracker = RemoteTunnelQualityTracker()
     private var monitor:RemoteTunnelMonitor?
+    private var connectedAt:TimeInterval?,heartbeat = UUID()
     public private(set) var status=RemoteTunnelStatus()
     public var accessKey:String? {gateway?.accessKey}
     public var shareURL:URL? {guard status.ready,let origin=status.publicURL,let gateway else {return nil};return URL(string:origin+(gateway.pinEnabled ? "/":"/#access="+gateway.accessKey))}
     public func setPIN(_ pin:RemoteTunnelPIN?,accessKey:String) {gateway?.setPIN(pin,accessKey:accessKey)}
-    public init(handler:@escaping @MainActor(RemoteHTTPRequest) async -> RemoteHTTPResponse,services:CloudflareRelayServices = .live,onStatus:@escaping @MainActor(RemoteTunnelStatus)->Void) {
-        self.handler=handler;self.services=services;self.onStatus=onStatus
+    public init(handler:@escaping @MainActor(RemoteHTTPRequest) async -> RemoteHTTPResponse,services:CloudflareRelayServices = .live,recovery:RemoteNetworkRecovery? = nil,onStatus:@escaping @MainActor(RemoteTunnelStatus)->Void) {
+        self.handler=handler;self.services=services;self.recovery = recovery ?? RemoteNetworkRecovery();self.onStatus=onStatus
     }
     private func publish(_ phase:String,_ detail:String) {status.phase=phase;status.detail=detail;onStatus(status)}
     public func stop() {
+        recovery.stop();connectedAt = nil;heartbeat = UUID()
         monitor?.stop();monitor = nil
         generation=UUID();connection=UUID();task?.cancel();probe?.cancel();watchdog?.cancel();ping?.cancel()
         pingDeadline?.cancel();pingDeadline=nil
@@ -51,62 +54,79 @@ public struct CloudflareRelayCredential:Codable,Sendable {
             let local=URL(string:"http://127.0.0.1:\(port)")!;status.localURL=local.absoluteString
             var endpoint=URLComponents(string:config.publicURL)!;endpoint.scheme="wss";endpoint.path="/_autoapprove/connector"
             var request=URLRequest(url:endpoint.url!);request.setValue("Bearer "+secret.key,forHTTPHeaderField:"Authorization");request.setValue("2",forHTTPHeaderField:"X-AutoApprove-Relay");request.timeoutInterval=20
+            recovery.start { [weak self] in self?.networkAvailable() }
             task=Task { [weak self] in
-                var attempt=0
-                while attempt<6 {
+                var backoff = RemoteReconnectBackoff()
+                while !Task.isCancelled {
                     guard let self,self.generation==epoch,!Task.isCancelled else {return}
-                    let id=UUID();self.connection=id
+                    let id=UUID();self.connection=id;self.connectedAt = nil
                     let socket=self.services.connect(request);self.socket=socket
-                    let opened=ProcessInfo.processInfo.systemUptime
                     let agent=CloudflareRelayAgent(socket:socket,localURL:local,host:endpoint.host!,diagnostic:self.services.diagnostic);self.agent=agent
-                    self.publish(attempt==0 ? "connecting" : "reconnecting",attempt==0 ? "Cloudflare에 HTTPS 443으로 연결하고 있습니다…" : "HTTPS 연결을 복구하고 있습니다… (\(attempt)/5)")
+                    self.publish(backoff.failures==0 ? "connecting" : "reconnecting",backoff.failures==0 ? "Cloudflare에 HTTPS 443으로 연결하고 있습니다…" : "HTTPS 연결을 자동으로 복구하고 있습니다…")
                     self.watchdog=Task {try? await Task.sleep(for:.seconds(25));guard !Task.isCancelled,self.generation==epoch,self.connection==id else {return};socket.cancel()}
                     do {try await agent.run { [weak self] features in await self?.connected(epoch:epoch,id:id,features:features) }} catch {self.services.diagnostic("connector_error_"+String((error as? URLError)?.code.rawValue ?? 0))}
-                    agent.cancel();self.watchdog?.cancel();self.ping?.cancel();self.pingDeadline?.cancel();self.probe?.cancel()
-                    self.monitor?.stop()
+                    agent.cancel()
+                    guard self.generation==epoch,self.connection==id,!Task.isCancelled else {return}
+                    let response = socket.task.response as? HTTPURLResponse
+                    let healthyFor = self.connectedAt.map {ProcessInfo.processInfo.systemUptime-$0} ?? 0
+                    self.watchdog?.cancel();self.ping?.cancel();self.pingDeadline?.cancel();self.probe?.cancel()
+                    self.monitor?.stop();self.socket = nil;self.agent = nil;self.connectedAt = nil
                     guard self.generation==epoch,!Task.isCancelled else {return}
-                    if ProcessInfo.processInfo.systemUptime-opened>=30 {attempt=0}
-                    if attempt==5 {self.stop();self.status.provider = .https;self.publish("failed","Cloudflare HTTPS 443에 연결하지 못했습니다. 도메인 연결과 네트워크의 HTTPS·WebSocket 허용 여부를 확인하고 다시 연결해주세요.");return}
+                    if let status = response?.statusCode,[401,403].contains(status) {
+                        self.stop();self.status.provider = .https;self.publish("failed","Cloudflare HTTPS 중계 인증을 확인하지 못했습니다. Cloudflare 승인과 도메인 연결을 확인한 뒤 다시 연결해주세요.");return
+                    }
                     self.qualityTracker.reconnected();self.status.quality = self.qualityTracker.snapshot()
-                    self.publish("reconnecting","HTTPS 연결을 복구하고 있습니다… (\(attempt+1)/5)")
-                    do {try await Task.sleep(for:.seconds(Double(1<<attempt)))} catch {return}
-                    attempt+=1
+                    if self.status.ready {backoff = RemoteReconnectBackoff()}
+                    let delay = backoff.nextDelay(healthyFor:healthyFor)
+                    let retryAfter = response?.value(forHTTPHeaderField:"Retry-After").flatMap(Double.init).flatMap {$0.isFinite ? min(300,max(0,$0)):nil} ?? 0
+                    self.publish("reconnecting","HTTPS 연결을 기다리고 있습니다. 네트워크가 돌아오면 자동으로 다시 연결합니다.")
+                    do {try await self.recovery.wait(seconds:max(delay,retryAfter),interruptible:retryAfter <= 0)} catch {return}
                 }
             }
         } catch {if generation==epoch {stop();status.provider = .https;publish("failed","HTTPS 접속을 준비하지 못했습니다. 다시 연결해주세요.")};throw error}
     }
     private func connected(epoch:UUID,id:UUID,features:UInt8) {
         guard generation==epoch,connection==id,let socket else {return}
+        connectedAt = ProcessInfo.processInfo.systemUptime
         qualityTracker.relayFeatures(features);status.quality = qualityTracker.snapshot()
         watchdog?.cancel();ping?.cancel()
         ping=Task { [weak self] in
             while !Task.isCancelled {
                 do {try await Task.sleep(for:.seconds(20))} catch {return}
                 guard let self,self.generation==epoch,self.connection==id else {return}
-                let deadline=Task { [weak self] in
-                    do {try await Task.sleep(for:.seconds(10))} catch {return}
-                    guard let self,self.generation==epoch,self.connection==id else {return};socket.cancel()
-                }
-                self.pingDeadline?.cancel();self.pingDeadline=deadline
-                let began = ProcessInfo.processInfo.systemUptime
-                socket.task.sendPing { [weak self] error in
-                    deadline.cancel();if error != nil {socket.cancel();return}
-                    Task { @MainActor [weak self] in
-                        guard let self,self.generation == epoch,self.connection == id else {return}
-                        self.qualityTracker.connectorPing(milliseconds:(ProcessInfo.processInfo.systemUptime-began)*1000)
-                        self.status.quality = self.qualityTracker.snapshot();self.onStatus(self.status)
-                    }
-                }
+                self.checkSocket(socket,epoch:epoch,id:id,timeout:10)
             }
         }
         verify(epoch:epoch,id:id)
     }
-    private func verify(epoch:UUID,id:UUID) {
+    private func networkAvailable() {
+        guard let socket else {return}
+        if connectedAt == nil {socket.cancel()}
+        else {checkSocket(socket,epoch:generation,id:connection,timeout:3)}
+    }
+    private func checkSocket(_ socket:CloudflareRelaySocket,epoch:UUID,id:UUID,timeout:TimeInterval) {
+        let token = UUID();heartbeat = token;pingDeadline?.cancel()
+        let deadline = Task { [weak self] in
+            do {try await Task.sleep(for:.seconds(timeout))} catch {return}
+            guard let self,self.generation == epoch,self.connection == id,self.heartbeat == token else {return};socket.cancel()
+        }
+        pingDeadline = deadline;let began = ProcessInfo.processInfo.systemUptime
+        socket.task.sendPing { [weak self] error in
+            deadline.cancel()
+            Task { @MainActor [weak self] in
+                guard let self,self.generation == epoch,self.connection == id,self.heartbeat == token else {return}
+                if error != nil {socket.cancel();return}
+                self.qualityTracker.connectorPing(milliseconds:(ProcessInfo.processInfo.systemUptime-began)*1000)
+                self.status.quality = self.qualityTracker.snapshot();self.onStatus(self.status)
+            }
+        }
+    }
+    private func verify(epoch:UUID,id:UUID,background:Bool = false) {
         guard let origin=status.publicURL,let gateway else {return}
-        probe?.cancel();publish("checking","공개 HTTPS 주소가 이 Mac으로 연결되는지 확인 중…")
+        probe?.cancel();if !background {publish("checking","공개 HTTPS 주소가 이 Mac으로 연결되는지 확인 중…")}
         probe=Task { [weak self] in
             guard let self else {return}
-            for _ in 0..<15 {
+            for _ in 0..<(background ? 1:15) {
                 guard !Task.isCancelled,self.generation==epoch,self.connection==id else {return}
                 do {
                     var request=URLRequest(url:URL(string:origin+"/auth/probe")!);request.timeoutInterval=3
@@ -124,7 +144,10 @@ public struct CloudflareRelayCredential:Codable,Sendable {
                 do {try await Task.sleep(for:.seconds(1))} catch {return}
             }
             guard !Task.isCancelled,self.generation==epoch,self.connection==id else {return}
-            self.publish("routeRequired","HTTPS 중계가 연결됐습니다. 도메인 반영을 기다린 뒤 ‘공개 주소 확인’을 눌러주세요.")
+            self.publish("routeRequired","HTTPS 중계가 연결됐습니다. 도메인 반영을 기다리며 공개 주소를 자동으로 다시 확인합니다. ‘공개 주소 확인’으로 바로 확인할 수도 있습니다.")
+            do {try await self.recovery.wait(seconds:30)} catch {return}
+            guard !Task.isCancelled,self.generation == epoch,self.connection == id,self.status.phase == "routeRequired" else {return}
+            self.verify(epoch:epoch,id:id,background:true)
         }
     }
     public func checkPublicURL() {if status.phase=="routeRequired" {verify(epoch:generation,id:connection)}}

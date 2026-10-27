@@ -209,8 +209,8 @@ window.AutoApprovePTY = class {
   }
   enqueue(data) { this.enqueueBytes(new TextEncoder().encode(data)); }
   async openInputChannel() {
+    if (this.inputAttempted || this.inputNegotiating || this.sending || this.disposed || this.blocked || !this.ready || !window.AutoApproveInputChannel || !this.streaming) return;
     this.inputAttempted = true;
-    if (!window.AutoApproveInputChannel || !this.streaming) return;
     this.inputNegotiating = true;
     const candidate = new window.AutoApproveInputChannel(this.nodeID,{mode:'pty',ptyID:this.descriptor.ptyID,streamID:this.descriptor.streamID,clientID:this.clientID,sequenceBase:this.sequence},{
       onChange:() => { if (!this.disposed && this.inputChannel === candidate) { this.sending = candidate.pendingCount > 0; if (this.ready && this.queue.length) void this.flush(); } },
@@ -278,6 +278,7 @@ window.AutoApprovePTY = class {
     if (this.inputNegotiating) return;
     if (this.inputChannel?.state === 'ready') { this.flushChannel(); return; }
     if (this.sending || this.disposed || !this.ready || !this.queue.length) return;
+    if (!this.inputAttempted && window.AutoApproveInputChannel) { void this.openInputChannel(); return; }
     clearTimeout(this.inputTimer); this.inputTimer = null;
     this.sending = true;
     // Merge only unsent bytes, within the server's existing per-request limit.

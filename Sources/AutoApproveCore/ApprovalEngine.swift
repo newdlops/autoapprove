@@ -20,6 +20,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     var tunnelRestoreAttempted = false
     var tunnelSetupID: UUID?
     var tunnelStartEpoch = UUID()
+    var tunnelRefreshTask:Task<Bool,Error>?
     @Published public internal(set) var cloudflareStatus=CloudflareSetupStatus()
     var cloudflareClient:CloudflareOnboarding?
     let cloudflareServices:CloudflareServices
@@ -36,6 +37,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public var finishLANUpdate: @MainActor () -> Void = {}
     public private(set) var webService: RemoteNetworkService?
     private let webLoopbackOnly: Bool
+    private let nativeKeyboardActivity:NativeKeyboardActivity
     public let managedPTY: ManagedPTYManager
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
@@ -343,8 +345,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
-                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live) throws {
+                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil) throws {
         self.paths = paths
+        // Synthetic/injected process inventories have no implicit association
+        // with the user's desktop. Tests can supply explicit keyboard activity.
+        self.nativeKeyboardActivity = nativeKeyboardActivity ?? (processReader == nil ? .live:.inactive)
         self.cloudflareServices=cloudflareServices
         self.workersServices=workersServices;self.relayServices=relayServices
         self.webLoopbackOnly = webLoopbackOnly
@@ -509,6 +514,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func stop() {
         tunnelStartEpoch = UUID()
+        tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
         tunnelPINSetupID=nil
         tunnelSetupID=nil
         cloudflareClient?.cancel()
@@ -938,7 +944,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         let pending: RemoteScreenRead
-        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
+        let cacheAge: TimeInterval = remoteUserInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
         let sourceRevision = host == .tmux ? tmuxRelay.sourceRevision(target) : remoteTerminalChanges[session.id]?.revision
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
            existing.observedAt.map({ existing.sourceRevision == sourceRevision && Date().timeIntervalSince($0) < cacheAge }) ?? true {
@@ -985,7 +991,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let target = ScreenTarget(tty: session.tty, handle: handle)
         let targetGeneration = remoteGeneration(session, host: .orca), generation = targetGeneration + ":ansi"
-        let cacheAge: TimeInterval = userInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
+        let cacheAge: TimeInterval = remoteUserInputHasPriority(session.id) ? 0.12 : realtime ? 0.18 : Self.remoteReadCacheLifetime
         let pending: RemoteScreenRead
         if let existing = remoteScreenReads[session.id], existing.target == target, existing.generation == generation,
            existing.observedAt.map({ Date().timeIntervalSince($0) < cacheAge }) ?? true {
@@ -1597,8 +1603,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 409, error.localizedDescription, diagnostics: diagnostics)
         }
     }
-    private func userInputHasPriority(_ id: String) -> Bool {
+    private func remoteUserInputHasPriority(_ id: String) -> Bool {
         remoteInputSessions.contains(id) || remoteInputUntil[id].map { Date() < $0 } == true
+    }
+    private func nativeUserInputHasPriority(_ id:String) -> Bool {
+        sessions[id].map {nativeKeyboardActivity.hasPriority(terminal:$0.terminal)} ?? false
+    }
+    private func userInputHasPriority(_ id:String) -> Bool {
+        remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
@@ -1618,7 +1630,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // New screen contents arrive through the host's change signal. Force
         // short confirmation reads only while a user or approval input is in
         // flight, not merely because the CLI is doing work in the background.
-        userInputHasPriority(id) || automaticInputBusy(id)
+        remoteUserInputHasPriority(id) || automaticInputBusy(id)
     }
 
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
@@ -2737,6 +2749,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func automaticQuestionAnswer(sessionID: String, question: QueuedQuestion,
                                          confirmations: inout QuestionConfirmationCache) -> String? {
+        guard !nativeUserInputHasPriority(sessionID) else {return nil}
         // The reservation already owns the exact parsed answer for this request.
         // Unrelated publications must not repeat its label/permission analysis.
         if let pending = automaticQuestionReplies[question.id], pending.sessionID == sessionID,
@@ -2848,7 +2861,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             if let token = automaticToken {
                 guard !snapshot.paused, current.automatic, automaticQuestionReplies[question.id]?.token == token,
-                      questionAutomationOverrides[question.id] == nil else { throw CancellationError() }
+                      !nativeUserInputHasPriority(session.id),questionAutomationOverrides[question.id] == nil else { throw CancellationError() }
             }
             do { return try await questionTransport.prepare(session, question) }
             catch {
@@ -2889,6 +2902,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             if let automaticToken {
                 guard !Task.isCancelled, !snapshot.paused, current.automatic, current.canApprove,
+                      !nativeUserInputHasPriority(sessionID),
                       automaticQuestionReplies[questionID]?.token == automaticToken else {
                     throw AppError.message("자동 응답이 취소되었습니다. 필요하면 직접 답변을 보내주세요.")
                 }
@@ -2918,6 +2932,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     }
                     if let automaticToken {
                         guard !Task.isCancelled, !self.snapshot.paused, self.sessions[sessionID]?.automatic == true,
+                              !self.nativeUserInputHasPriority(sessionID),
                               self.automaticQuestionReplies[questionID]?.token == automaticToken,
                               verified.automaticReplyUnavailableReason == nil else {
                             throw RemoteHTTPError(409, "자동 응답이 취소되었습니다. 필요하면 직접 답변해주세요.")
@@ -2936,7 +2951,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let audit { log(audit, session: session) }
         } catch {
             if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" { launched = false }
-            let cancelled = automaticToken.map { !launched && (Task.isCancelled || automaticQuestionReplies[questionID]?.token != $0) } ?? false
+            let cancelled = automaticToken.map { !launched && (Task.isCancelled || nativeUserInputHasPriority(sessionID) || automaticQuestionReplies[questionID]?.token != $0) } ?? false
             let reply = QuestionReply(phase: cancelled ? .cancelled : (launched ? .uncertain : .failed), answer: answer,
                 message: cancelled ? "전송 전에 자동 응답을 멈췄습니다." : error.localizedDescription)
             do { try setReply(reply, sessionID: sessionID, question: question, persist: true) }
@@ -4378,10 +4393,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessions[sessionID]?.systemCommandRisk = nil
             let request = analysis.request
             let observation = analysis.activity
+            let dispatched = screens[sessionID].map {$0.generation == generation && $0.attempted} == true
             // An incomplete repaint is not evidence that a dispatched request finished.
             // Keep its reservation, but never dispatch from this unverified frame.
-            if screens[sessionID]?.generation == generation, request?.phase != .input,
-               observation.phase == .unknown || request?.phase == .approval {
+            if dispatched && observation.phase != .working ||
+                screens[sessionID]?.generation == generation && request?.phase != .input &&
+                (observation.phase == .unknown || request?.phase == .approval) {
                 screens[sessionID]?.isCurrent = false
                 screens[sessionID]?.scheduledID = nil
             } else {
@@ -4403,6 +4420,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let activity = activityTrackers[sessionID, default: ActivityTracker()].observe(observation, fingerprint: analysis.fingerprint, agent: session.agent, generation: generation, at: now)
             presentPhase(sessionID, activity, at: now)
+            // A draft, blank repaint or selection is not proof that an already
+            // answered permission is a new request. Only real work or a stable
+            // empty composer can retire its single-use dispatch reservation.
+            if dispatched,activity.phase == .idle,!userInputHasPriority(sessionID) {screens.removeValue(forKey:sessionID)}
             return
         }
         activityTrackers.removeValue(forKey: sessionID)

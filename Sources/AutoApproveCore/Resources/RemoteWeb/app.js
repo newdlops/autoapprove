@@ -99,6 +99,7 @@ const sessionHistories = new Map();
 // History is auxiliary: one cancelable read, and a bounded page-memory cache.
 let historyRequest = null, historyInView = !('IntersectionObserver' in window);
 let terminalLibraries = null;
+let terminalLibraryAttempt = 0;
 const structuredDrafts = new Map(), messageDrafts = new Map();
 const questionDeliveries = new Map(), questionEditing = new Map();
 let queueSnapshot = null, queueLoading = false, queueGeneration = 0, queueSessionKey = '';
@@ -303,13 +304,31 @@ function ptyReport(state, message, client) {
 }
 async function loadTerminalLibraries() {
   if (!terminalLibraries) terminalLibraries = (async () => {
-    const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/vendor/xterm.css'; document.head.append(style);
-    for (const src of ['/vendor/xterm.js','/vendor/xterm-fit.js','/pty.js']) await new Promise((resolve,reject) => {
-      const script = document.createElement('script'); script.src = src;
-      script.onload = resolve; script.onerror = () => { script.remove(); reject(new Error('터미널 구성 요소를 받지 못했습니다. 화면 다시 연결을 눌러주세요.')); };
-      document.head.append(script);
-    });
-  })().catch(error => { terminalLibraries = null; throw error; });
+    const pending = new Set();
+    const assets = [
+      ['/vendor/xterm.css',() => !!document.querySelector('link[data-terminal-style]')?.sheet,true],
+      ['/vendor/xterm.js',() => typeof window.Terminal === 'function'],
+      ['/vendor/xterm-fit.js',() => typeof window.FitAddon?.FitAddon === 'function'],
+      ['/pty.js',() => typeof window.AutoApprovePTY === 'function']
+    ];
+    try {
+      // These files only define independent classes. Start their requests
+      // together, then instantiate a terminal after every dependency is ready.
+      await Promise.all(assets.filter(([,ready]) => !ready()).map(([src,,style]) => new Promise((resolve,reject) => {
+        const element = document.createElement(style ? 'link':'script');
+        // A removed script can retain a stalled browser fetch. A retry needs a
+        // fresh request instead of joining that same unfinished cache entry.
+        const address = terminalLibraryAttempt ? src+'?reconnect='+terminalLibraryAttempt:src;
+        if (style) { element.rel = 'stylesheet'; element.href = address; element.dataset.terminalStyle = 'true'; }
+        else { element.src = address; element.async = true; }
+        const cleanup = remove => { clearTimeout(timer); element.onload = element.onerror = null; pending.delete(cleanup); if (remove) element.remove(); };
+        const fail = () => { cleanup(true); reject(new Error('터미널 구성 요소를 받지 못했습니다. 화면 다시 연결을 눌러주세요.')); };
+        const timer = setTimeout(fail,8000); pending.add(cleanup);
+        element.onload = () => { cleanup(false); resolve(); }; element.onerror = fail; document.head.append(element);
+      })));
+      if (assets.some(([,ready]) => !ready())) throw new Error('터미널 구성 요소를 확인하지 못했습니다. 화면 다시 연결을 눌러주세요.');
+    } catch (error) { for (const cleanup of [...pending]) cleanup(true); throw error; }
+  })().catch(error => { terminalLibraries = null; terminalLibraryAttempt = Math.min(1000000,terminalLibraryAttempt+1); throw error; });
   return terminalLibraries;
 }
 async function ensurePTY() {
@@ -318,7 +337,7 @@ async function ensurePTY() {
   if (ptyClient?.sessionKey === item.key && ptyClient.streaming === streaming) return;
   try { await loadTerminalLibraries(); }
   catch (error) {
-    if (selectedKey === item.key) { terminalState('error','터미널 로드 실패'); text($('terminal-error'),error.message); show($('terminal-error'),true); show($('terminal-retry'),true); }
+    if (selectedKey === item.key) { terminalState('error','터미널 로드 실패'); text($('terminal-error'),error.message); show($('terminal-error'),true); show($('terminal-retry'),true); updateTerminalRecovery(); }
     return;
   }
   if (selectedKey !== item.key || document.hidden || ptyClient?.sessionKey === item.key) return;
@@ -526,7 +545,7 @@ function armDirect() {
   void prepareDirectChannel();
 }
 async function prepareDirectChannel() {
-  if (directChannelState !== 'idle' || !window.AutoApproveInputChannel || !latestFrame?.streamID || !selectedItem || selectedItem.view.pty || composeMode || !terminalFrameFresh() || !inputKeys().includes('characters')) return;
+  if (directChannelState !== 'idle' || directSending || mutation || inputFailure || !window.AutoApproveInputChannel || !latestFrame?.streamID || !selectedItem || selectedItem.view.pty || composeMode || !terminalFrameFresh() || !inputKeys().includes('characters')) return;
   directChannelState = 'opening'; const generation = inputGeneration, key = selectedKey, streamID = latestFrame.streamID; directChannelStreamID = streamID;
   const candidate = new window.AutoApproveInputChannel(selectedItem.node.id,{mode:'native',sessionID:selectedItem.session.id,streamID,revision:latestFrame.revision},{
     onChange:() => {
@@ -1874,6 +1893,7 @@ function scheduleDirect(delay) {
 }
 async function pumpDirect() {
   if (!directMode) return;
+  if (directChannelState === 'idle' && !directSending && window.AutoApproveInputChannel) void prepareDirectChannel();
   if (directChannel?.state === 'ready') { pumpDirectChannel(); return; }
   if (['opening','reconnecting'].includes(directChannelState) || directSending) return;
   clearTimeout(directTimer); directTimer = null; directTimerDue = Infinity;
@@ -1897,6 +1917,9 @@ async function pumpDirect() {
     }
   } finally {
     directSending = false; updateControls();
+    // An optional input script can arrive after HTTP input has begun. Bind only
+    // after its acknowledgement, so there is still exactly one ordered writer.
+    if (directMode && directChannelState === 'idle') void prepareDirectChannel();
     if (directMode && directQueue.length) scheduleDirect(250);
   }
 }

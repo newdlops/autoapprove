@@ -38,6 +38,10 @@ import AutoApproveCore
                 },probe:{_ in CloudflareHTTPReply(data:Data(),status:503)})
                 let engine=try ApprovalEngine(paths:AppPaths(directory:root),claudeRegistryReader:{_ in []},processReader:{[]},webLoopbackOnly:true,cloudflareServices:workers.http,workersServices:workers.tools,relayServices:relay)
                 delegate.engine=engine;try engine.start(poll:false)
+                if FileManager.default.fileExists(atPath:output.appendingPathComponent("reconnect-fixture").path) {
+                    var config = RemoteTunnelConfiguration();config.executable = "/usr/bin/true"
+                    try await engine.connectTunnel(config)
+                }
                 let view=SetupRoot(engine:engine)
                 let window=NSWindow(contentRect:NSRect(x:0,y:0,width:680,height:760),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
                 window.isReleasedWhenClosed=false

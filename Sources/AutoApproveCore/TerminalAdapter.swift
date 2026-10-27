@@ -510,6 +510,7 @@ public enum TerminalAdapter {
         """
     }
     @discardableResult public static func approve(tty: String, expectedScreen: String, agent: AgentKind) throws -> TerminalDelivery {
+        if NativeKeyboardActivity.live.hasPriority(terminal:.terminal) {return .screenChanged}
         let result = try javascript(approvalScript(tty: tty, expectedScreen: expectedScreen, agent: agent))
         guard let delivery = TerminalDelivery(rawValue: result) else { throw AppError.message("승인 입력의 전달 결과를 확인하지 못했습니다.") }
         return delivery

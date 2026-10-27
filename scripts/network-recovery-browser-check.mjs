@@ -15,12 +15,13 @@ const playwright = await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE || 'pl
 const browser = await playwright[engine].launch({headless:true,...(engine==='chromium' && process.env.AUTOAPPROVE_CHROMIUM_PATH ? {executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH} : {})});
 const checks = [], metrics = [], errors = [];
 const view = {session:{id:'synthetic-original',agent:'codex',pid:7100,started:'fixture',tty:'/dev/fixture',cwd:'/fixture/project',terminal:'iterm',phase:'idle',automatic:false,queuedQuestions:[]},title:'연결 복구 검증',phaseTitle:'입력 대기',canRead:false,canReveal:false,canApprove:false,keys:[]};
-const inventory = () => ({gatewayID:'fixture-mac',updatedAt:new Date().toISOString(),nodes:[{id:'fixture-mac',name:'연결 검증 Mac',local:true,online:true,state:{snapshot:{paused:false,events:[]},sessions:[view],release:{version:'0.2.179',build:206,api:1}}}]});
+const descriptor={ptyID:'fixture-pty',streamID:'fixture-stream',program:'shell',pid:7101,tty:'/dev/fixture-pty',cwd:'/fixture/project',columns:80,rows:24};
+const inventory = (pty=false) => ({gatewayID:'fixture-mac',updatedAt:new Date().toISOString(),nodes:[{id:'fixture-mac',name:'연결 검증 Mac',local:true,online:true,state:{snapshot:{paused:false,events:[]},sessions:[pty?{...view,session:{...view.session,id:'pty:fixture-pty',terminal:'pty',agent:'shell'},canRead:true,ptyID:descriptor.ptyID,pty:descriptor}:view],release:pty?{version:'0.2.40',build:46,api:1}:{version:'0.2.179',build:206,api:1}}}]});
 
 async function scenario(name,run) {
   if (only && name!==only) return;
-  const sockets = new Set(), held = new Set(), reads = [];
-  let mode = name==='optional-codec' ? 'codec-held' : ['online-recovery','deadline-recovery'].includes(name) ? 'held' : 'healthy';
+  const sockets = new Set(), held = new Set(), reads = [],assetStarts=[],assetWaiters=[];
+  let mode = name==='optional-codec' ? 'codec-held' : name==='optional-input' ? 'input-held' : name==='pty-assets' ? 'xterm-held' : name==='pty-style' ? 'style-held' : ['online-recovery','deadline-recovery'].includes(name) ? 'held' : 'healthy';
   let failures = 0, writes = 0, active = 0, maxActive = 0;
   const server = createServer(async(req,res) => {
     const url = new URL(req.url,'http://fixture');
@@ -33,12 +34,16 @@ async function scenario(name,run) {
       if (failures>0) { failures--;res.writeHead(503,{'Content-Type':'application/json'});res.end('{"error":"Synthetic temporary outage"}');return; }
       const tag='W/"synthetic-inventory"',unchanged=req.headers['if-none-match']===tag;
       res.writeHead(unchanged?304:200,{'Content-Type':'application/json','Cache-Control':'no-store',ETag:tag,'X-AutoApprove-Observed-At':new Date().toISOString()});
-      res.end(unchanged?undefined:JSON.stringify(inventory()));return;
+      res.end(unchanged?undefined:JSON.stringify(inventory(name.startsWith('pty-'))));return;
     }
-    if (url.pathname==='/terminal-wire.js' && mode==='codec-held') { held.add(res);res.once('close',()=>held.delete(res));return; }
+    if ((url.pathname==='/terminal-wire.js' && mode==='codec-held') || (url.pathname==='/input-channel.js' && mode==='input-held') || (url.pathname==='/vendor/xterm.js' && mode==='xterm-held') || (url.pathname==='/vendor/xterm.css' && mode==='style-held')) { held.add(res);res.once('close',()=>held.delete(res));return; }
+    if(url.pathname==='/api/pty/output'){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({ptyID:descriptor.ptyID,streamID:descriptor.streamID,offset:0,data:btoa('QA fixture'),reset:true,canInput:false}));return;}
     if (url.pathname.startsWith('/api/')) { res.writeHead(200,{'Content-Type':'application/json'});res.end('{}');return; }
     const file = url.pathname==='/' ? 'index.html' : url.pathname.slice(1);
-    if (!['index.html','app.js','terminal-wire.js','app.css','favicon.svg'].includes(file)) { res.writeHead(404);res.end();return; }
+    if (!['index.html','app.js','terminal-wire.js','input-channel.js','app.css','favicon.svg','pty.js','vendor/xterm.js','vendor/xterm-fit.js','vendor/xterm.css'].includes(file)) { res.writeHead(404);res.end();return; }
+    if(name==='pty-parallel'&&['pty.js','vendor/xterm.js','vendor/xterm-fit.js','vendor/xterm.css'].includes(file)){
+      assetStarts.push({file,at:performance.now()});await new Promise(resolve=>{assetWaiters.push(resolve);if(assetWaiters.length===4)for(const done of assetWaiters)done();});
+    }
     try {
       const body=await readFile(path.join(webRoot,file));
       res.writeHead(200,{'Content-Type':file.endsWith('.html')?'text/html':file.endsWith('.css')?'text/css':file.endsWith('.svg')?'image/svg+xml':'text/javascript','Cache-Control':'no-store'});res.end(body);
@@ -47,12 +52,39 @@ async function scenario(name,run) {
   server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const page=await browser.newPage({viewport:{width:390,height:844}});page.setDefaultTimeout(5000);page.on('pageerror',error=>errors.push(error.message));
-  const fixture={page,reads,held,url:'http://127.0.0.1:'+server.address().port,setMode:value=>mode=value,setFailures:value=>failures=value};
+  const fixture={page,reads,held,assetStarts,url:'http://127.0.0.1:'+server.address().port,setMode:value=>mode=value,setFailures:value=>failures=value};
   try { await run(fixture);assert.equal(writes,0);checks.push({name,passed:true,reads:reads.length,maxActive}); }
+  catch(error){await page.screenshot({path:path.join(output,name+'-failure.png')}).catch(()=>{});const state=await page.evaluate(()=>({selection:typeof selectedKey==='undefined'?null:selectedKey,terminal:typeof Terminal,fit:typeof FitAddon,pty:typeof AutoApprovePTY,error:document.getElementById('terminal-error')?.textContent,screen:document.getElementById('pty-screen')?.outerHTML.slice(0,1000)})).catch(()=>({}));await writeFile(path.join(output,name+'-failure.json'),JSON.stringify({message:error.message,state,errors,reads,writes},null,2));throw error;}
   finally { await page.close();for(const res of held)res.destroy();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve)); }
 }
 
 try {
+  await scenario('pty-parallel',async({page,url,assetStarts})=>{
+    await page.goto(url);const start=performance.now();await page.locator('.session-row').click();
+    await page.locator('.xterm-screen').waitFor({timeout:5000});await page.waitForFunction(()=>ptyClient&&!ptyClient.blocked);
+    assert.equal(assetStarts.length,4,'Independent terminal assets must start without waiting for another asset response');
+    metrics.push({case:'All four terminal assets load concurrently',ms:Math.round(performance.now()-start)});
+  });
+  for(const name of ['pty-assets','pty-style'])await scenario(name,async({page,url,setMode})=>{
+    await page.goto(url);await page.locator('.session-row').click();const start=performance.now();
+    await page.locator('#terminal-error').waitFor({state:'visible',timeout:9500});
+    assert.match(await page.locator('#terminal-error').textContent(),/구성 요소/);
+    metrics.push({case:name+' bounded failure',ms:Math.round(performance.now()-start)});
+    for(const[label,width,height]of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
+      await page.setViewportSize({width,height});await page.screenshot({path:path.join(output,name+'-'+label+'.png')});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    }
+    setMode('healthy');await page.locator('#terminal-retry').click();
+    await page.locator('.xterm-screen').waitFor({timeout:2500});await page.waitForFunction(()=>ptyClient&&!ptyClient.blocked);
+    assert.equal(await page.evaluate(()=>ptyClient.streaming),false,'The fixture remains read-only');
+    checks.push({name:name+' retry',passed:true});
+  });
+  await scenario('optional-input',async({page,url,reads})=>{
+    const start=performance.now();await page.goto(url,{waitUntil:'commit'});
+    await page.locator('.session-row').waitFor({timeout:2500});
+    assert.ok(reads.length>0);assert.match(await page.locator('#connection').textContent(),/1대 연결/);
+    await page.getByRole('button',{name:'Mac 추가',exact:true}).click();await page.locator('#add-dialog').waitFor({state:'visible'});await page.keyboard.press('Escape');
+    metrics.push({case:'Inventory usable while optional input script never responds',ms:Math.round(performance.now()-start)});
+  });
   await scenario('optional-codec',async({page,url,reads})=>{
     // A deferred optional script must not gate the main application or its API.
     const start=performance.now();await page.goto(url,{waitUntil:'commit'});

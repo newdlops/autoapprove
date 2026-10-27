@@ -113,8 +113,8 @@ import AutoApproveCore
                     .textSelection(.enabled).fixedSize(horizontal:false,vertical:true).accessibilityIdentifier("tunnel-status")
                 TunnelConnectionQuality(quality:status.quality,enabled:status.ready,measure:{await engine.measureTunnelConnection()})
             }
-            if status.phase == "failed",configuration.provider.usesCloudflared {
-                Button("HTTPS (443)로 연결") {configuration.provider = .https;error=nil}
+            if ["failed","reconnecting"].contains(status.phase),configuration.provider.usesCloudflared {
+                Button("HTTPS (443)로 연결") {cancel();configuration.provider = .https;error=nil}
                     .disabled(busy || engine.cloudflareStatus.busy).accessibilityIdentifier("tunnel-use-https")
             }
             if let link=engine.tunnelShareURL,let address=status.publicURL {

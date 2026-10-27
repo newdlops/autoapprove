@@ -24,8 +24,102 @@ private final class ApprovalRecoveryProbe: @unchecked Sendable {
     var inputs: [(ScreenTarget, String)] { lock.lock(); defer { lock.unlock() }; return calls }
 }
 
+private final class NativeTypingActivity:@unchecked Sendable {
+    private let lock = NSLock()
+    private var idle:TimeInterval = 0,bundle:String? = ScreenHost.iterm.bundleID
+    func set(idle:TimeInterval,bundle:String?) {lock.lock();self.idle = idle;self.bundle = bundle;lock.unlock()}
+    var activity:NativeKeyboardActivity {NativeKeyboardActivity(idleSeconds:{self.lock.lock();defer {self.lock.unlock()};return self.idle},frontmostBundle:{self.lock.lock();defer {self.lock.unlock()};return self.bundle})}
+}
+
+private final class NativeTypingValidationGate:@unchecked Sendable {
+    private let lock = NSLock(),gate = DispatchSemaphore(value:0)
+    private var entered = false
+    func wait() {lock.lock();let first = !entered;entered = true;lock.unlock();if first {_ = gate.wait(timeout:.now()+3)}}
+    var started:Bool {lock.lock();defer {lock.unlock()};return entered}
+    func release() {gate.signal()}
+}
+
 extension ApprovalTests {
-    private func recoveryEngine(_ probe: ApprovalRecoveryProbe, agents: [AgentKind] = [.codex]) throws -> (ApprovalEngine, [AgentSession], URL) {
+    func testNativeTypingActivitySeparatesHostsAndPhysicalIdle() throws {
+        let state = NativeTypingActivity(),activity = state.activity
+        for (bundle,terminal) in [("com.apple.Terminal",TerminalKind.terminal),("com.googlecode.iterm2",.iterm),("com.stablyai.orca",.orca),("com.microsoft.VSCode",.vscode),("com.microsoft.VSCodeInsiders",.vscode),("com.todesktop.230313mzl4w4u92",.vscode),("com.exafunction.windsurf",.vscode),("com.vscodium",.vscode)] {
+            state.set(idle:0.1,bundle:bundle);try expect(activity.hasPriority(terminal:terminal));try expect(activity.hasPriority(terminal:.tmux))
+            try expectFalse(activity.hasPriority(terminal:.pty));try expectFalse(activity.hasPriority(terminal:.unknown))
+            state.set(idle:0.1,bundle:"fixture.other-app");try expectFalse(activity.hasPriority(terminal:terminal),"Typing in another app cannot stall background approvals")
+            for idle in [1.2,2,.infinity,.nan,-1] {state.set(idle:idle,bundle:bundle);try expectFalse(activity.hasPriority(terminal:terminal))}
+        }
+    }
+    func testNativeTypingYieldsApprovalWithoutDisablingAutomation() async throws {
+        let probe = ApprovalRecoveryProbe(),activity = NativeTypingActivity()
+        let (engine,sessions,directory) = try recoveryEngine(probe,nativeKeyboardActivity:activity.activity)
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id = sessions[0].id,prompt = recoveryPrompt("echo native-input")
+        for _ in 0..<12 {engine.receiveScreen(sessionID:id,raw:prompt,generation:"native-input");try await Task.sleep(for:.milliseconds(10))}
+        try expectEqual(probe.inputs.count,0,"No automatic Return may overlap physical typing in the target host")
+        try expect(engine.snapshot.sessions.first?.automatic == true)
+        activity.set(idle:2,bundle:ScreenHost.iterm.bundleID)
+        engine.receiveScreen(sessionID:id,raw:prompt,generation:"native-input")
+        try await waitForRecovery({probe.inputs.count == 1},"The pending permission resumes when local typing ends")
+        activity.set(idle:0,bundle:"fixture.other-app")
+        engine.receiveScreen(sessionID:id,raw:recoveryPrompt("echo background-input"),generation:"native-input")
+        try await waitForRecovery({probe.inputs.count == 2},"Typing elsewhere preserves background approval speed")
+    }
+    func testNativeTypingCancelsApprovalDuringProcessValidation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-native-typing-"+UUID().uuidString)
+        let probe = ApprovalRecoveryProbe(),activity = NativeTypingActivity(),gate = NativeTypingValidationGate()
+        activity.set(idle:2,bundle:ScreenHost.iterm.bundleID)
+        let records = ProcessDiscovery.parse("82001 1 ttys891 82001 82001 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")
+        var session = ProcessDiscovery.sessions(records)[0];session.terminal = .iterm;session.channel = .itermScreen
+        let adapter = ScreenHostAdapter(screens:{_ in TerminalSnapshot()},approve:{target,raw,_ in try probe.approve(target,raw)},reveal:{_ in nil})
+        let engine = try ApprovalEngine(paths:AppPaths(directory:root),processReader:{gate.wait();return records},screenAdapters:[.iterm:adapter],nativeKeyboardActivity:activity.activity)
+        defer {gate.release();engine.stop();try? FileManager.default.removeItem(at:root)}
+        engine.updateDiscovery([session],records:records);try engine.setAutomatic(session.id,enabled:true)
+        let prompt = recoveryPrompt("echo queued-input")
+        engine.receiveScreen(sessionID:session.id,raw:prompt,generation:"queued-input")
+        try await waitForRecovery({gate.started},"The approval must be waiting for process identity validation")
+        activity.set(idle:0,bundle:ScreenHost.iterm.bundleID);gate.release()
+        try await Task.sleep(for:.milliseconds(60));try expectEqual(probe.inputs.count,0,"Physical typing that starts during async validation cancels dispatch")
+        activity.set(idle:2,bundle:ScreenHost.iterm.bundleID)
+        engine.receiveScreen(sessionID:session.id,raw:prompt,generation:"queued-input")
+        try await waitForRecovery({probe.inputs.count == 1},"The same pending permission remains usable afterward")
+    }
+    func testAnsweredPermissionRetiresOnlyAfterRealResolution() async throws {
+        let probe = ApprovalRecoveryProbe()
+        let (engine,sessions,directory) = try recoveryEngine(probe)
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id = sessions[0].id,prompt = recoveryPrompt("echo repeated-legitimate-command"),generation = "resolved-input"
+        engine.receiveScreen(sessionID:id,raw:prompt,generation:generation)
+        try await waitForRecovery({probe.inputs.count == 1},"The first permission is delivered")
+        engine.receiveScreen(sessionID:id,raw:"Working\nesc to interrupt",generation:generation)
+        engine.receiveScreen(sessionID:id,raw:prompt,generation:generation)
+        try await waitForRecovery({probe.inputs.count == 2},"Observed real work lets the same command request permission again")
+        let idle = "Done\n›\nGPT-6.1-Sol max · ~/fixture · Ready · Context 35% left\n⚠ 1 warning · f2 to view",now = Date()
+        engine.receiveScreen(sessionID:id,raw:idle,generation:generation,at:now)
+        engine.receiveScreen(sessionID:id,raw:idle,generation:generation,at:now.addingTimeInterval(2.1))
+        engine.receiveScreen(sessionID:id,raw:prompt,generation:generation,at:now.addingTimeInterval(2.2))
+        try await waitForRecovery({probe.inputs.count == 3},"A stable empty composer also retires the preceding reservation")
+    }
+    func testAnsweredPermissionSurvivesManualComposerRepaints() async throws {
+      for agent in [AgentKind.codex,.claude] {
+        let probe = ApprovalRecoveryProbe()
+        let (engine,sessions,directory) = try recoveryEngine(probe,agents:[agent])
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id = sessions[0].id,prompt = recoveryPrompt("echo one-permission",agent:agent)
+        let draft = agent == .codex ? "Done\n› Draft 한글\nGPT-6.1-Sol max · ~/fixture · Ready · Context 35% left\n⚠ 1 warning · f2 to view" : "Done\n────────\n❯ Draft 한글\n────────\nfixture | main | Opus 5.5 | ctx 42% | 7d 94%\n⏵⏵ auto mode on (shift+tab to cycle)"
+        try expectEqual(ActivityDetector.detect(draft,agent:agent).phase,.input)
+        engine.receiveScreen(sessionID:id,raw:prompt,generation:"typing-process")
+        try await waitForRecovery({probe.inputs.count == 1},"The first permission is delivered")
+        for _ in 0..<8 {
+            engine.receiveScreen(sessionID:id,raw:draft,generation:"typing-process")
+            engine.receiveScreen(sessionID:id,raw:prompt,generation:"typing-process")
+            try await Task.sleep(for:.milliseconds(30))
+        }
+        try expectEqual(probe.inputs.count,1,"Manual composer repaints cannot drop a dispatched reservation and inject Return repeatedly")
+        engine.receiveScreen(sessionID:id,raw:recoveryPrompt("echo next-permission",agent:agent),generation:"typing-process")
+        try await waitForRecovery({probe.inputs.count == 2},"A genuinely different permission still proceeds")
+      }
+    }
+    private func recoveryEngine(_ probe: ApprovalRecoveryProbe, agents: [AgentKind] = [.codex],nativeKeyboardActivity:NativeKeyboardActivity? = nil) throws -> (ApprovalEngine, [AgentSession], URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-approval-recovery-" + UUID().uuidString)
         let records = ProcessDiscovery.parse(agents.enumerated().map { index, agent in
             "\(82001 + index) 1 ttys\(891 + index) \(82001 + index) \(82001 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/\(agent.rawValue)"
@@ -36,7 +130,7 @@ extension ApprovalTests {
             session.channel = .itermScreen; return session
         }
         let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { target, raw, _ in try probe.approve(target, raw) }, reveal: { _ in nil })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter])
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter],nativeKeyboardActivity:nativeKeyboardActivity)
         engine.updateDiscovery(sessions, records: records)
         for session in sessions { try engine.setAutomatic(session.id, enabled: true) }
         return (engine, sessions, directory)
@@ -238,6 +332,7 @@ extension ApprovalTests {
         let id = sessions[0].id, original = recoveryPrompt("echo uncertain")
         engine.receiveScreen(sessionID: id, raw: original, generation: "uncertain-process")
         try await waitForRecovery({ engine.snapshot.events.first?.outcome.hasPrefix("입력 확인 필요") == true }, "An uncertain write must request review")
+        engine.receiveScreen(sessionID:id,raw:"Done\n› Draft 한글\nGPT-6.1-Sol max · ~/fixture · Ready · Context 35% left\n⚠ 1 warning · f2 to view",generation:"uncertain-process")
         engine.receiveScreen(sessionID: id, raw: original.replacingOccurrences(of: "following command?", with: "following\ncommand?"), generation: "uncertain-process")
         try engine.setPaused(true); try engine.setPaused(false)
         try await Task.sleep(nanoseconds: 350_000_000)

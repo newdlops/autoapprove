@@ -3,6 +3,35 @@ import Darwin
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testWorkersSlowManagementCannotHoldExistingRelayConnection() async throws {
+        let root = URL(fileURLWithPath:"/private/tmp/aa-wmb-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:root)}
+        let fixture = WorkersFixture(),manager = fixture.manager();try await manager.authorize()
+        let origin = try await manager.provision(domainID:CloudflareFixture.zone,subdomain:"cp")
+        fixture.secrets.removeValue(forKey:fixture.secrets.keys.first(where:{$0.hasPrefix("cloudflare-worker-source:")})!)
+        let originalHTTP = fixture.http
+        let slowHTTP = CloudflareServices(exchange:{request in
+            try await Task.sleep(for:.seconds(10));return try await originalHTTP.exchange(request)
+        },login:originalHTTP.login,readSecret:originalHTTP.readSecret,saveSecret:originalHTTP.saveSecret)
+        let uploads = fixture.uploads,domains = fixture.domains,credential = fixture.secrets["cloudflare-worker"]
+        let paths = AppPaths(directory:root);try paths.prepare();let store = try AuditStore(path:paths.database);try store.set("cloudflareOwner",CloudflareFixture.owner)
+        let relay = CloudflareRelayServices(connect:{_ in
+            fixture.locked {fixture.conflict = true};let session = URLSession(configuration:.ephemeral)
+            return CloudflareRelaySocket(session:session,task:session.webSocketTask(with:URL(string:"ws://127.0.0.1:9")!))
+        },probe:{_ in CloudflareHTTPReply(data:Data(),status:503)})
+        let engine = try ApprovalEngine(paths:paths,processReader:{[]},webLoopbackOnly:true,cloudflareServices:slowHTTP,workersServices:fixture.tools,relayServices:relay)
+        defer {engine.stop()};try engine.start(poll:false);try engine.setWebEnabled(true)
+        for _ in 0..<200 where !engine.webStatus.ready {try await Task.sleep(for:.milliseconds(10))}
+        var config = RemoteTunnelConfiguration();config.provider = .https;config.publicURL = origin
+        let start = ProcessInfo.processInfo.systemUptime;try await engine.connectTunnel(config)
+        for _ in 0..<100 where !fixture.locked({fixture.conflict}) {try await Task.sleep(for:.milliseconds(5))}
+        try expect(fixture.locked {fixture.conflict},"The existing data connection starts even while the management API stalls")
+        try expect(ProcessInfo.processInfo.systemUptime-start < 4.5,"Management refresh has a three-second startup budget")
+        try expect(engine.tunnelStatus.active);try expectNotNil(engine.tunnelAccessKey)
+        try engine.stopTunnel();try await Task.sleep(for:.milliseconds(20))
+        try expectFalse(engine.tunnelStatus.active);try expectFalse(engine.tunnelConfiguration.enabled)
+        try expectEqual(fixture.uploads,uploads);try expectEqual(fixture.domains,domains);try expectEqual(fixture.secrets["cloudflare-worker"],credential)
+    }
     func testWorkersRefreshCancellationCannotRestartStoppedTunnel() async throws {
         let root = URL(fileURLWithPath:"/private/tmp/aa-wrc-"+UUID().uuidString)
         defer {try? FileManager.default.removeItem(at:root)}

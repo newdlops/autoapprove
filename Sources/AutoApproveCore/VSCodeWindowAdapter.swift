@@ -10,6 +10,7 @@ public enum VSCodeWindowAdapter {
         "com.microsoft.VSCode", "com.microsoft.VSCodeInsiders", "com.todesktop.230313mzl4w4u92",
         "com.exafunction.windsurf", "com.vscodium"
     ]
+    static func supportsBundle(_ bundle:String) -> Bool {bundles.contains(bundle)}
     public static func ownerBundleID(ownerPID: Int32) -> String? {
         guard ownerPID > 0, let value = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier,
               bundles.contains(value) else { return nil }

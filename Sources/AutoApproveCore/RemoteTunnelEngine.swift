@@ -112,6 +112,7 @@ extension ApprovalEngine {
     }
     public func startTunnel(_ supplied: RemoteTunnelConfiguration, token: String = "") async throws {
         let startEpoch = UUID();tunnelStartEpoch = startEpoch
+        tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
         tunnelRestoreAttempted=true
         var configuration=try supplied.validated(); configuration.enabled=true
         let pin=try readTunnelPIN();tunnelPINConfigured=pin != nil
@@ -131,9 +132,18 @@ extension ApprovalEngine {
         if configuration.provider == .https {
             guard let credential=try cloudflareServices.readSecret(paths.directory,"cloudflare-worker") else {throw AppError.message("Cloudflare Workers 승인을 마치고 도메인을 연결해주세요.")}
             _ = try JSONDecoder().decode(CloudflareRelayCredential.self,from:credential).validated(for:configuration.publicURL)
-            // Management API outages must not take an existing relay offline.
-            // The live greeting reports whether the upgraded input is available.
-            _ = try? await workers().refreshRelayIfNeeded(origin:configuration.publicURL)
+            // A management API outage must not hold the data connection for its
+            // thirty-second request timeout. Finish a quick owned-code refresh
+            // before publishing access, or cancel it and use compatibility mode.
+            if let manager = try? workers() {
+                let origin = configuration.publicURL
+                let refresh = Task {try await manager.refreshRelayIfNeeded(origin:origin)}
+                tunnelRefreshTask = refresh
+                let timeout = Task {do {try await Task.sleep(for:.seconds(3))} catch {return};refresh.cancel()}
+                _ = try? await withTaskCancellationHandler(operation:{try await refresh.value},onCancel:{refresh.cancel()})
+                timeout.cancel()
+                if tunnelStartEpoch == startEpoch {tunnelRefreshTask = nil}
+            }
             try Task.checkCancellation()
             guard tunnelStartEpoch == startEpoch,webService === service,webStatus.ready else {throw CancellationError()}
             try store.set("remoteTunnel",String(decoding:JSONEncoder().encode(configuration),as:UTF8.self))
@@ -152,6 +162,7 @@ extension ApprovalEngine {
     }
     public func stopTunnel() throws {
         tunnelStartEpoch = UUID()
+        tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
         tunnelSetupID=nil
         var configuration=tunnelConfiguration; configuration.enabled=false
         tunnelRestoreAttempted=true

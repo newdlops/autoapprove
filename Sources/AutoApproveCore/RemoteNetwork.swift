@@ -160,6 +160,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var browser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
     private var interfaceMonitors: [NWPathMonitor] = []
+    private var pathChanges = RemoteNetworkPathChanges()
     private var discoveryTask: Task<Void, Never>?
     private var webPeerTask: Task<Void, Never>?
     private var webPeerToken = UUID()
@@ -567,11 +568,13 @@ struct RemoteTerminalUpdate: Encodable {
         }
         startDirectDiscovery(epoch: epoch)
         let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .cellular]); pathMonitor = monitor
-        let changed: @Sendable (NWPath) -> Void = { [weak self] _ in
+        let changed: @Sendable (NWPath,String) -> Void = { [weak self] path,source in
+            let available = path.status == .satisfied,fingerprint = RemoteNetworkPathChanges.fingerprint(path)
             Task { @MainActor in
                 guard let self, self.running, self.generation == epoch, self.status.ready, let port = self.port else { return }
+                let restored = self.pathChanges.update(source:source,available:available,fingerprint:fingerprint)
                 let interfaces = RemoteLAN.interfaces(refresh: true)
-                if interfaces != self.lanInterfaces {
+                if interfaces != self.lanInterfaces || restored {
                     self.lanInterfaces = interfaces
                     self.readTimingEpoch = UUID()
                     for id in self.peers.keys {
@@ -587,18 +590,20 @@ struct RemoteTerminalUpdate: Encodable {
                     self.directProbedAt.removeAll(); self.pendingHints.removeAll(); self.cachedDirectAddresses = nil
                     self.startDirectDiscovery(epoch: epoch)
                     self.publishService(port: port)
+                    if restored,self.bonjourEnabled {self.startBrowser(parameters:RemoteLAN.tcpParameters(),epoch:epoch)}
                 }
                 self.status.port = port; self.updateNamedAddresses(); self.emitStatus()
             }
         }
-        monitor.pathUpdateHandler = changed
+        monitor.pathUpdateHandler = {changed($0,"default")}
         monitor.start(queue: queue)
         for kind in [NWInterface.InterfaceType.wifi,.wiredEthernet] {
             let scoped = NWPathMonitor(requiredInterfaceType:kind)
-            scoped.pathUpdateHandler = changed; scoped.start(queue:queue); interfaceMonitors.append(scoped)
+            scoped.pathUpdateHandler = {changed($0,String(describing:kind))}; scoped.start(queue:queue); interfaceMonitors.append(scoped)
         }
     }
     private func startBrowser(parameters: NWParameters, epoch: UUID) {
+            browserRetry?.cancel();browserRetry = nil
             browser?.cancel()
             let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Self.serviceType, domain: "local."), using: parameters)
             self.browser = browser
@@ -666,6 +671,7 @@ struct RemoteTerminalUpdate: Encodable {
         stopInventoryWatches(); inventoryChanges.notify()
         updateReceiver.stop()
         running = false; generation = UUID()
+        pathChanges = RemoteNetworkPathChanges()
         cachedDashboardValidator = nil
         cancelDashboardEncoding()
         discoveryTask?.cancel(); discoveryTask = nil

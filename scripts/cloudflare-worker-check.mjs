@@ -16,13 +16,17 @@ const build=path.resolve(option('build')||'.build/cloudflare-https/release'),out
 const dependencies=path.resolve(option('dependencies')||'.runtime/cf-workers-188/dependencies');
 const require=createRequire(dependencies+'/package.json'),{Miniflare,Log,LogLevel,convertV4MiniflareOptions}=require('miniflare'),{WebSocketServer}=require('ws');
 const socketMode=process.argv.includes('--socket'),legDelay=Number(option('latency')||0);
+const lateInput=process.argv.includes('--late-input'),connectorFaults=process.argv.includes('--connector-faults')?6:0;
+const connectorDenied=Number(option('connector-denied')||0);assert.ok([0,401,403].includes(connectorDenied));
+const probeFaults=Number(option('probe-faults')||0);assert.ok(Number.isInteger(probeFaults)&&probeFaults>=0&&probeFaults<=30);
 const root=await mkdtemp('/private/tmp/aa-relay-');await mkdir(out,{recursive:true,mode:0o700});
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,time=30000){const deadline=Date.now()+time;while(!await test()){if(Date.now()>deadline)throw Error(label);await wait(30);}}
 const origin='https://relay.tunnel-qa.invalid',host=new URL(origin).hostname,key=Buffer.alloc(32,91).toString('base64url');
-const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,dropSocketACK,connections=0;const sockets=new Set(),streamResponses=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];
+const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,dropSocketACK,holdInputResponse,connections=0,connectorAttempts=0,publicProbes=0;const sockets=new Set(),streamResponses=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];
 const wire={compressedFrames:0,compressedBytes:0,expandedBytes:0,socketFrames:0};let stage='startup';
-let typingLatency=null;
+let typingLatency=null,silentRecoveryMS=null;
+async function run() {
 try{
  mf=new Miniflare(convertV4MiniflareOptions({workers:[{name:'relay',modules:true,scriptPath:path.resolve('Sources/AutoApproveCore/Resources/CloudflareRelay/relay.mjs'),compatibilityDate:'2026-10-01',
   durableObjects:{TUNNEL:{className:'TunnelRoom',useSQLite:true}},bindings:{PUBLIC_HOST:host,CONNECTOR_HASH:hash}}],log:new Log(LogLevel.ERROR)}));
@@ -35,7 +39,12 @@ try{
    const actualHost=req.headers.host?.startsWith('127.0.0.1:')?host:req.headers.host;
    let requestID;try{requestID=JSON.parse(body||'{}').requestID;}catch{}
    requests.push({method:req.method,path:req.url,...(requestID?{requestID}:{})});
+   if(req.url==='/auth/probe'&&++publicProbes<=probeFaults){res.writeHead(503,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end('{}');return;}
    const response=await mf.dispatchFetch('https://'+actualHost+req.url,{method:req.method,headers:{...req.headers,host:actualHost},...(body?.length?{body}:{}),signal:abort.signal});
+   if(holdInputResponse&&new URL(req.url,origin).pathname===holdInputResponse.path){
+    const held=holdInputResponse;holdInputResponse=null;const bytes=Buffer.from(await response.arrayBuffer());held.accepted=true;
+    held.release=()=>{res.writeHead(response.status,Object.fromEntries(response.headers));res.end(bytes);};return;
+   }
    if(drop&&req.url.startsWith('/api/pty/input')) {
     const held=drop;drop=null;await response.arrayBuffer();held.accepted=true;held.release=()=>res.destroy();return;
    }
@@ -45,6 +54,10 @@ try{
  const wsServer=new WebSocketServer({noServer:true});
  const upgrade=async(req,socket,head)=>{
   try{
+   if(req.url==='/_autoapprove/connector'){
+    connectorAttempts++;const status=connectorDenied||(connectorAttempts<=connectorFaults?503:0);
+    if(status){socket.end('HTTP/1.1 '+status+' Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');return;}
+   }
    const response=await mf.dispatchFetch(origin+req.url,{headers:{...req.headers,host}});
    if(response.status!==101||!response.webSocket){socket.end('HTTP/1.1 '+response.status+' Rejected\r\nContent-Length: 0\r\n\r\n');return;}
    const upstream=response.webSocket;
@@ -73,8 +86,19 @@ try{
  const pinMode=process.argv.includes('--pin');
  fixture=spawn(root+'/RelayPreview',[root,url,key,...(pinMode?['--pin']:[])],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
  const info=await new Promise((resolve,reject)=>{let output='';const timer=setTimeout(()=>reject(Error('native startup '+stderr)),15000);fixture.stdout.on('data',data=>{output+=data;try{const value=JSON.parse(output.trim());clearTimeout(timer);resolve(value);}catch{}});fixture.on('exit',code=>{clearTimeout(timer);reject(Error('native exit '+code+' '+stderr));});});
+ if(connectorDenied){
+  await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='failed','Permanent connector authorization rejection is actionable',5000);
+  await wait(1500);assert.equal(connectorAttempts,1,'401/403 must not be retried as a transient network outage');
+  await writeFile(root+'/stop','stop');await new Promise(resolve=>fixture.once('exit',resolve));assert.equal(fixture.exitCode,0);
+  const report={passed:true,connectorDenied,connectorAttempts,checks:['Actual native WebSocket HTTP authorization rejection stops recovery without a retry storm','Owned fixture stops cleanly'],scope:'Local synthetic connector authorization response; no account or user terminals'};
+  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));return;
+ }
  let status;
- stage='public nonce';await until(async()=>{try{status=JSON.parse(await readFile(root+'/status.json','utf8'));return status.phase==='ready';}catch{return false;}},'Native public nonce proof: '+JSON.stringify(status),45000);
+ const readyStarted=performance.now();
+ stage='public nonce';await until(async()=>{try{status=JSON.parse(await readFile(root+'/status.json','utf8'));return status.phase==='ready';}catch{return false;}},'Native public nonce proof: '+JSON.stringify(status),connectorFaults||probeFaults?150000:45000);
+ const readyMS=Math.round(performance.now()-readyStarted);
+ if(connectorFaults)assert.ok(connectorAttempts>connectorFaults,'The connector must recover after the old six-attempt limit');
+ if(probeFaults)assert.ok(publicProbes>probeFaults,'Public proof must recover without a manual button after its initial attempts fail');
  await until(async()=>{try{return await readFile(root+'/share-has-fragment','utf8')===String(!pinMode);}catch{return false;}},'Shared URL must omit its access key when PIN is configured');
  const get=(route,headers={})=>fetch(url+route,{headers:{Host:host,...headers}});
  assert.equal((await get('/api/state')).status,401);
@@ -96,10 +120,11 @@ try{
  await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','reconnected');
  assert.equal((await get('/api/state',auth)).status,200);assert.equal(await readFile(root+'/writes','utf8'),'1');
  if(process.argv.includes('--soak')) {
-  stage='silent transport recovery';const before=connections;
+  stage='silent transport recovery';const before=connections,began=performance.now();
   for(const socket of sockets)socket._socket.pause();
   await until(()=>connections>before,'Pong deadline must reconnect a silent socket',45000);
   await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','Public proof after silent recovery');
+  silentRecoveryMS=Math.round(performance.now()-began);
   assert.equal((await get('/api/state',auth)).status,200);assert.equal(await readFile(root+'/writes','utf8'),'1');
  }
  const browserChecks=[];
@@ -122,18 +147,31 @@ try{
    if(engine==='webkit'&&['webkit PIN rotation','webkit logout'].includes(stage)&&revoked.includes(error.message))shutdownDiagnostics.push({phase:stage,message:error.message});
    else errors.push(error.message);
   });page.setDefaultTimeout(20000);
-  if(!socketMode)await page.route('**/input-channel.js',route=>route.fulfill({contentType:'text/javascript',body:'/* Legacy HTTP fallback verification. */'}));
+  let releaseInput;
+  if(lateInput){assert.ok(socketMode);const gate=new Promise(resolve=>releaseInput=resolve);await page.route('**/input-channel.js',async route=>{await gate;await route.continue();});}
+  else if(!socketMode)await page.route('**/input-channel.js',route=>route.fulfill({contentType:'text/javascript',body:'/* Legacy HTTP fallback verification. */'}));
   await page.goto(origin);await page.locator('#tunnel-key').waitFor();
   if(pinMode){assert.equal(await page.locator('#tunnel-key-label').textContent(),'접속 PIN');assert.equal(await page.locator('#tunnel-key').getAttribute('inputmode'),'numeric');}
   await page.locator('#tunnel-key').fill(pinMode?'000000':'wrong');await page.locator('#tunnel-login-submit').click();await page.locator('#tunnel-login-error').waitFor({state:'visible'});
   for(const[name,width,height]of[['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]) {await page.setViewportSize({width,height});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.screenshot({path:out+'/'+engine+'-login-'+name+'.png'});}
   await page.setViewportSize({width:390,height:844});
   if(pinMode){await page.locator('#tunnel-key').fill('001234');await page.locator('#tunnel-login-submit').click();}
-  else {await page.goto(origin+'/#access='+info.key);}
+  else {await page.goto(origin+'/#access='+info.key,{waitUntil:lateInput?'domcontentloaded':'load'});}
   await page.waitForFunction(()=>typeof connected!=='undefined'&&connected);
   assert.ok(!page.url().includes('access='));assert.ok((await context.cookies()).some(v=>v.httpOnly&&v.secure&&v.name==='__Host-autoapprove_tunnel'));
   assert.equal(await page.evaluate(key=>Object.values(localStorage).some(v=>v.includes(key)),info.key),false);
   stage=engine+' original';await page.locator('.session-row').filter({hasText:'Codex'}).first().click();await page.waitForFunction(()=>latestFrame?.streamID&&!$('terminal-keyboard').disabled);
+  if(lateInput){
+   assert.equal(await page.evaluate(()=>typeof AutoApproveInputChannel),'undefined');
+   const held=holdInputResponse={path:'/api/input',accepted:false};await page.locator('#terminal-screen').click();await page.keyboard.insertText('LATE-HTTP-');
+   await until(()=>held.accepted,'Original HTTP input is accepted before its ACK and script');releaseInput();
+   await page.waitForFunction(()=>typeof AutoApproveInputChannel==='function');
+   assert.equal(await page.evaluate(()=>directCandidate===null&&directChannel===null&&directSending),true,'Late script cannot bind over an unacknowledged HTTP input');
+   await page.keyboard.insertText('AFTER-WS-');held.release();
+   await page.waitForFunction(()=>directChannel?.state==='ready'&&!directSending&&!directQueue.length);
+   const bytes=await readFile(root+'/original-input.bin','utf8');assert.equal(bytes,'LATE-HTTP-AFTER-WS-');
+   browserChecks.push(engine+': delayed optional script keeps inventory usable and switches original input after its HTTP ACK without overlap or replay');
+  }
   if(socketMode)await page.waitForFunction(()=>directChannel?.state==='ready');
   const identity=await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]);
   await page.locator('#terminal-screen').click();const text='WORKER-'+engine+'-한글😀';await page.keyboard.insertText(text);
@@ -159,8 +197,21 @@ try{
    assert.equal((await readFile(root+'/original-input.bin','utf8')).split(text).length-1,1);
    browserChecks.push(engine+': idle original input reconnects transparently without replay or source changes');
   }
-  stage=engine+' PTY';await page.locator('#terminal-back').click();await page.locator('#new-pty').click();await page.locator('#pty-directory').fill(root);await page.locator('#pty-program').selectOption('shell');await page.locator('#pty-automatic').uncheck();await page.locator('#start-pty').click();
-  await page.waitForFunction(()=>ptyClient?.ready);if(socketMode)await page.waitForFunction(()=>ptyClient.inputChannel?.state==='ready');await page.locator('#terminal-keyboard-toggle').click();
+  stage=engine+' PTY';await page.locator('#terminal-back').click();
+  if(lateInput)await page.evaluate(()=>{window.availableInputClass=window.AutoApproveInputChannel;window.AutoApproveInputChannel=null;});
+  await page.locator('#new-pty').click();await page.locator('#pty-directory').fill(root);await page.locator('#pty-program').selectOption('shell');await page.locator('#pty-automatic').uncheck();await page.locator('#start-pty').click();
+  await page.waitForFunction(()=>ptyClient?.ready);
+  if(lateInput){
+   const held=holdInputResponse={path:'/api/pty/input',accepted:false};await page.evaluate(()=>ptyClient.enqueue('#LATE-HTTP-'));
+   await until(()=>held.accepted,'PTY HTTP input is accepted before its ACK');
+   await page.evaluate(()=>{window.AutoApproveInputChannel=window.availableInputClass;ptyClient.enqueue('AFTER-WS-');});
+   assert.equal(await page.evaluate(()=>ptyClient.inputChannel===null&&ptyClient.sending),true);
+   held.release();await page.waitForFunction(()=>ptyClient.inputChannel?.state==='ready'&&!ptyClient.sending&&!ptyClient.queue.length);
+   assert.equal(await page.evaluate(()=>ptyClient.sequence),2,'A late PTY channel binds after the acknowledged HTTP sequence');
+   await page.evaluate(()=>ptyClient.enqueue('\x15'));await page.waitForFunction(()=>!ptyClient.sending&&!ptyClient.queue.length);
+   browserChecks.push(engine+': delayed PTY input module upgrades after HTTP acknowledgement and preserves its exact sequence');
+  }
+  if(socketMode)await page.waitForFunction(()=>ptyClient.inputChannel?.state==='ready');await page.locator('#terminal-keyboard-toggle').click();
   await page.keyboard.insertText("printf 'WORKER-PTY=한글😀\\n'");await page.keyboard.press('Enter');
   const terminalText=()=>page.evaluate(()=>{const buffer=ptyClient.term.buffer.active;return Array.from({length:buffer.length},(_,i)=>buffer.getLine(i)?.translateToString(true)||'').join('\n');});
   await until(async()=>/\nWORKER-PTY=한글😀[ \t]*(\n|$)/.test(await terminalText()),'Worker native PTY echo');
@@ -224,7 +275,7 @@ try{
  stage='logout';assert.equal((await fetch(url+'/auth/logout',{method:'POST',headers:{Host:host,Origin:origin,...auth,'Content-Type':'application/json'},body:'{}'})).status,200);
  assert.equal((await get('/api/state',auth)).status,401);
  await writeFile(root+'/stop','stop');await new Promise(resolve=>fixture.once('exit',resolve));assert.equal(fixture.exitCode,0);
- const report={passed:true,pinMode,socketMode,legDelay,typingLatency,wire,silentRecovery:process.argv.includes('--soak'),connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control and measured compression','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
+ const report={passed:true,pinMode,socketMode,lateInput,connectorFaults,connectorAttempts,probeFaults,publicProbes,readyMS,legDelay,typingLatency,wire,silentRecovery:process.argv.includes('--soak'),silentRecoveryMS,connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control and measured compression','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
 }catch(error){await page?.screenshot({path:out+'/failure.png'}).catch(()=>{});await writeFile(out+'/failure.json',JSON.stringify({stage,error:error.message,diagnostics:await readFile(root+'/diagnostics','utf8').catch(()=>''),requests},null,2));throw error;}
 finally{
@@ -232,3 +283,5 @@ finally{
  if(fixture&&fixture.exitCode===null){await writeFile(root+'/stop','stop').catch(()=>{});await wait(150);fixture.kill();}
  for(const socket of sockets)socket.terminate();server?.closeAllConnections();await new Promise(resolve=>server?server.close(resolve):resolve());await mf?.dispose();await rm(root,{recursive:true,force:true});
 }
+}
+await run();

@@ -109,6 +109,7 @@ public enum ITermAdapter {
         """
     }
     @discardableResult public static func approve(target: ScreenTarget, expectedScreen: String, agent: AgentKind) throws -> TerminalDelivery {
+        if NativeKeyboardActivity.live.hasPriority(terminal:.iterm) {return .screenChanged}
         let result = try javascript(approvalScript(target: target, expectedScreen: expectedScreen, agent: agent))
         guard let delivery = TerminalDelivery(rawValue: result) else { throw AppError.message("승인 입력의 전달 결과를 확인하지 못했습니다.") }
         return delivery
@@ -316,6 +317,7 @@ public enum OrcaAdapter {
     }
     /// Orca has no atomic compare-and-write, so the frame is re-read immediately before the write.
     public static func approve(target: ScreenTarget, expectedScreen: String, agent: AgentKind) throws -> TerminalDelivery {
+        if NativeKeyboardActivity.live.hasPriority(terminal:.orca) {return .screenChanged}
         guard let handle = target.handle else { return .missingTarget }
         let data = try AutomationScript.dialogData(tty: target.tty, expectedScreen: expectedScreen, agent: agent)
         let dialog = data["dialog"] as? String ?? ""

@@ -32,14 +32,15 @@ enum RemoteTunnelCredentials {
     private let directory: URL
     private let handler: @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse
     private let onStatus: @MainActor (RemoteTunnelStatus) -> Void
+    private let recovery:RemoteNetworkRecovery
     private var gateway: RemoteTunnelGateway?
     private var process: Process?
     private var output: Pipe?
     private var runDirectory: URL?
     private var task: Task<Void,Never>?
-    private var generation=UUID(), retries=0
+    private var generation=UUID(),backoff = RemoteReconnectBackoff()
     private var configuration=RemoteTunnelConfiguration(), token="", logBuffer=""
-    private var startedAt:TimeInterval=0
+    private var readyAt:TimeInterval?
     private var checkingURL: String?
     private var edgeConnectionFailed=false
     private var managedCredentials:Data?
@@ -52,8 +53,8 @@ enum RemoteTunnelCredentials {
         guard status.ready, let origin=status.publicURL, let key=accessKey else { return nil }
         return URL(string:origin+(gateway?.pinEnabled == true ? "/":"/#access="+key))
     }
-    public init(directory: URL,handler:@escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse,onStatus:@escaping @MainActor (RemoteTunnelStatus)->Void) {
-        self.directory=directory; self.handler=handler; self.onStatus=onStatus
+    public init(directory: URL,handler:@escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse,recovery:RemoteNetworkRecovery? = nil,onStatus:@escaping @MainActor (RemoteTunnelStatus)->Void) {
+        self.directory=directory; self.handler=handler; self.recovery = recovery ?? RemoteNetworkRecovery();self.onStatus=onStatus
     }
     public static func executable(directory: URL) -> String? {
         [directory.appendingPathComponent("tunnel-tools/cloudflared").path,"/opt/homebrew/bin/cloudflared","/usr/local/bin/cloudflared"].first { FileManager.default.isExecutableFile(atPath:$0) }
@@ -63,7 +64,7 @@ enum RemoteTunnelCredentials {
     }
     public func setPIN(_ pin:RemoteTunnelPIN?,accessKey:String) {gateway?.setPIN(pin,accessKey:accessKey)}
     public func start(_ supplied: RemoteTunnelConfiguration, token: String = "",credentials:Data? = nil,pin:RemoteTunnelPIN? = nil) async throws {
-        stop(); qualityTracker = RemoteTunnelQualityTracker(); configuration=try supplied.validated(); self.token=token;managedCredentials=credentials;retries=0
+        stop(); qualityTracker = RemoteTunnelQualityTracker(); configuration=try supplied.validated(); self.token=token;managedCredentials=credentials;backoff = RemoteReconnectBackoff()
         let epoch=UUID(); generation=epoch; status.provider=configuration.provider
         publish("starting","인증 접속을 준비하고 있습니다…")
         do {
@@ -73,6 +74,11 @@ enum RemoteTunnelCredentials {
             guard generation == epoch else { gateway.stop(); throw CancellationError() }
             guard let port=gateway.port else { throw AppError.message("터널 연결 포트를 열지 못했습니다.") }
             status.localURL="http://127.0.0.1:\(port)"
+            recovery.start { [weak self] in
+                guard let self,let url=self.status.publicURL else {return}
+                if self.status.phase == "routeRequired" {self.checkingURL = nil;self.verify(url,epoch:self.generation)}
+                else if self.status.ready {Task { [weak self] in await self?.monitor?.sample() }}
+            }
             if configuration.provider == .external {
                 status.publicURL=configuration.publicURL; try gateway.setOrigin(configuration.publicURL)
                 verify(configuration.publicURL,epoch:epoch)
@@ -83,6 +89,7 @@ enum RemoteTunnelCredentials {
         }
     }
     public func stop(waitForExit:Bool = false) {
+        recovery.stop();readyAt = nil
         monitor?.stop();monitor = nil;metricsPort = nil
         generation=UUID(); task?.cancel(); task=nil; checkingURL=nil
         let child=process, pipe=output, scratch=runDirectory
@@ -144,7 +151,7 @@ enum RemoteTunnelCredentials {
             arguments += ["run","--token-file",file.path]
             status.publicURL=configuration.publicURL; try gateway?.setOrigin(configuration.publicURL)
         }
-        let child=Process(), pipe=Pipe(); output=pipe; process=child; logBuffer=""; edgeConnectionFailed=false; startedAt=ProcessInfo.processInfo.systemUptime
+        let child=Process(), pipe=Pipe(); output=pipe; process=child; logBuffer=""; edgeConnectionFailed=false;readyAt = nil
         child.executableURL=URL(fileURLWithPath:executable); child.arguments=arguments
         var environment=["HOME":root.path,"PATH":"/usr/bin:/bin:/usr/sbin:/sbin"]
         for key in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","SSL_CERT_FILE","SSL_CERT_DIR"] {
@@ -169,9 +176,17 @@ enum RemoteTunnelCredentials {
         catch { pipe.fileHandleForReading.readabilityHandler=nil; throw AppError.message("Cloudflare 연결 도구를 실행하지 못했습니다. 파일과 실행 권한을 확인해주세요.") }
         task?.cancel(); task=Task { [weak self] in
             do { try await Task.sleep(for:.seconds(60)) } catch { return }
-            guard let self, self.generation == epoch, !self.status.ready else { return }
-            let detail=self.edgeConnectionFailed ? "Cloudflare 자동 연결에 실패했습니다. Tunnel은 UDP 또는 TCP 7844가 필요합니다. 443만 허용된 네트워크에서는 HTTPS 중계 연결이 필요합니다." : "Cloudflare 연결 시간이 초과됐습니다. 인터넷 연결과 터널 설정을 확인하고 다시 시도해주세요."
-            self.stop(); self.publish("failed",detail)
+            guard let self,self.generation == epoch,self.process === child,!self.status.ready else {return}
+            let detail=self.edgeConnectionFailed ? "Tunnel 연결을 기다리고 있습니다. UDP 또는 TCP 7844가 막힌 네트워크는 HTTPS (443) 연결을 이용해주세요." : "인터넷 연결을 기다리고 있습니다. 네트워크가 돌아오면 자동으로 다시 연결합니다."
+            self.publish("reconnecting",detail)
+            // Keep the gateway, browser cookies and PIN alive. Only replace the
+            // stalled owned connector; its exit schedules one bounded retry.
+            if child.isRunning {
+                child.terminate()
+                do {try await Task.sleep(for:.seconds(2))} catch {return}
+                guard self.generation == epoch,self.process === child,child.isRunning else {return}
+                kill(child.processIdentifier,SIGKILL)
+            }
         }
     }
     private func readLog(_ data: Data,epoch:UUID) {
@@ -180,6 +195,10 @@ enum RemoteTunnelCredentials {
         if logBuffer.utf8.count > 16384 { logBuffer=String(logBuffer.suffix(4096)) }
         while let newline=logBuffer.firstIndex(of:"\n") {
             let line=String(logBuffer[..<newline]); logBuffer.removeSubrange(...newline)
+            if line.contains("Provided Tunnel token is not valid") || line.contains("Unauthorized: Invalid tunnel secret") {
+                let provider = configuration.provider;stop();status.provider = provider
+                publish("failed","Cloudflare 터널 인증을 확인하지 못했습니다. 토큰 또는 도메인 승인을 갱신한 뒤 다시 연결해주세요.");return
+            }
             if let range = line.range(of:#"Starting metrics server on 127\.0\.0\.1:[0-9]{1,5}(?:/metrics)?"#,options:.regularExpression),
                let port = UInt16(line[range].split(separator:":").last!.split(separator:"/").first!),port > 0 {
                 metricsPort = port;monitor?.setMetricsPort(port)
@@ -196,15 +215,15 @@ enum RemoteTunnelCredentials {
             }
         }
     }
-    private func verify(_ url:String,epoch:UUID) {
+    private func verify(_ url:String,epoch:UUID,background:Bool = false) {
         guard checkingURL != url else { return }; checkingURL=url
-        publish("checking","공개 HTTPS 주소가 이 Mac으로 연결되는지 확인 중…")
+        if !background {publish("checking","공개 HTTPS 주소가 이 Mac으로 연결되는지 확인 중…")}
         task?.cancel(); task=Task { [weak self] in
             guard let self else { return }
             let session=URLSession(configuration:.ephemeral,delegate:TunnelRedirectPolicy(),delegateQueue:nil)
             defer { session.invalidateAndCancel() }
             var failure="응답 없음"
-            for _ in 0..<(self.configuration.provider == .quick ? 20 : 5) {
+            for _ in 0..<(background ? 1:self.configuration.provider == .quick ? 20:5) {
                 guard !Task.isCancelled, self.generation == epoch, let gateway=self.gateway else { return }
                 do {
                     var request=URLRequest(url:URL(string:url+"/auth/probe")!); request.timeoutInterval=3
@@ -214,23 +233,27 @@ enum RemoteTunnelCredentials {
                     if (response as? HTTPURLResponse)?.statusCode == 200, data.count < 1024,
                        let value=try JSONSerialization.jsonObject(with:data) as? [String:String], value["probe"] == gateway.probe {
                         self.publish("ready",self.configuration.provider == .quick ? "임시 주소로 연결됨 · 화면 순차 조회" : "외부 접속 연결됨 · 실시간 터미널")
+                        self.readyAt = ProcessInfo.processInfo.systemUptime
                         self.startMonitor(url,epoch:epoch);return
                     }
                 } catch {failure="네트워크 오류 \((error as NSError).code)"}
                 do { try await Task.sleep(for:.seconds(1)) } catch { return }
             }
             guard self.generation == epoch else { return }
+            self.checkingURL=nil
             if self.configuration.provider == .quick {
-                self.stop();self.publish("failed","공개 주소에서 이 Mac을 확인하지 못했습니다 (\(failure)). 인터넷 연결을 확인한 뒤 다시 시도해주세요.")
+                self.publish("routeRequired","임시 주소의 연결을 기다리고 있습니다. 네트워크가 돌아오면 자동으로 확인합니다 (\(failure)).")
             } else {
-                self.checkingURL=nil
                 if self.configuration.provider == .managed {
-                    self.publish("routeRequired","터널과 DNS 설정을 마쳤습니다. DNS 반영을 잠시 기다린 뒤 ‘공개 주소 확인’을 눌러주세요 (\(failure)).")
+                    self.publish("routeRequired","터널과 DNS 설정을 마쳤습니다. DNS 반영을 기다리며 공개 주소를 자동으로 다시 확인합니다 (\(failure)).")
                 } else {
                     let provider=self.configuration.provider == .named ? "Cloudflare의 게시된 애플리케이션 경로" : "사용 중인 터널"
-                    self.publish("routeRequired","연결 도구가 준비됐습니다. \(provider)에 서비스 URL을 지정한 뒤 ‘공개 주소 확인’을 눌러주세요 (\(failure)).")
+                    self.publish("routeRequired","연결 도구가 준비됐습니다. \(provider)에 서비스 URL을 지정해주세요. 공개 주소를 자동으로 다시 확인합니다 (\(failure)).")
                 }
             }
+            do {try await self.recovery.wait(seconds:30)} catch {return}
+            guard self.generation == epoch,!Task.isCancelled,self.status.phase == "routeRequired" else {return}
+            self.verify(url,epoch:epoch,background:true)
         }
     }
     public func checkPublicURL() {
@@ -253,13 +276,13 @@ enum RemoteTunnelCredentials {
         if let runDirectory { try? FileManager.default.removeItem(at:runDirectory) }; runDirectory=nil
         task?.cancel(); checkingURL=nil; gateway?.disconnectClients()
         monitor?.stop();qualityTracker.reconnected();status.quality = qualityTracker.snapshot()
-        if ProcessInfo.processInfo.systemUptime-startedAt > 60 { retries=0 }
-        guard retries < 5 else { stop(); publish("failed","Cloudflare 연결이 반복 종료됐습니다. 도구·토큰·네트워크를 확인하고 다시 연결해주세요."); return }
-        let delay=Double(1 << retries); retries += 1
-        publish("reconnecting","터널 연결을 다시 시도합니다… (\(retries)/5)")
+        if status.ready {backoff = RemoteReconnectBackoff()}
+        let delay = backoff.nextDelay(healthyFor:readyAt.map {ProcessInfo.processInfo.systemUptime-$0} ?? 0);readyAt = nil
+        publish("reconnecting","터널 연결을 기다리고 있습니다. 네트워크가 돌아오면 자동으로 다시 연결합니다.")
         task=Task { [weak self] in
-            do { try await Task.sleep(for:.seconds(delay)) } catch { return }
-            guard let self, self.generation == epoch else { return }
+            guard let self else {return}
+            do {try await self.recovery.wait(seconds:delay)} catch {return}
+            guard self.generation == epoch else { return }
             do { try self.launch(epoch:epoch) } catch { self.stop(); self.publish("failed",error.localizedDescription) }
         }
     }

@@ -13,23 +13,25 @@ import AutoApproveCore
         let output=URL(fileURLWithPath:CommandLine.arguments[1]),root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-tunnel-ui-"+UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         defer {try? FileManager.default.removeItem(at:root)}
-        let scenarios=RemoteTunnelProvider.allCases.map {($0.rawValue,$0)}+[("managed-authorized",.managed),("managed-empty",.managed),("managed-error",.managed),("https-authorized",.https),("https-empty",.https),("https-error",.https),("https-pin",.https)]
+        let scenarios=RemoteTunnelProvider.allCases.map {($0.rawValue,$0)}+[("managed-authorized",.managed),("managed-empty",.managed),("managed-error",.managed),("https-authorized",.https),("https-empty",.https),("https-error",.https),("https-pin",.https),("quick-reconnecting",.quick)]
         for (scenario,provider) in scenarios {
             let paths=AppPaths(directory:root.appendingPathComponent(scenario));try paths.prepare()
             var configuration=RemoteTunnelConfiguration();configuration.provider=provider
             configuration.publicURL="https://terminal-with-a-long-name.for-existing-settings-layout.example.com"
+            if scenario == "quick-reconnecting" {configuration.executable = "/usr/bin/true"}
             let store=try AuditStore(path:paths.database)
             try store.set("remoteTunnel",String(decoding:JSONEncoder().encode(configuration),as:UTF8.self))
             let fixture=CloudflareFixture()
             let workers=WorkersFixture()
             if scenario == "managed-empty" {fixture.pages=[[]]}
             if scenario == "https-empty" {workers.empty=true}
-            let engine=try ApprovalEngine(paths:paths,processReader:{[]},cloudflareServices:provider == .https ? workers.http:fixture.services,workersServices:workers.tools)
+            let engine=try ApprovalEngine(paths:paths,processReader:{[]},webLoopbackOnly:true,cloudflareServices:provider == .https ? workers.http:fixture.services,workersServices:workers.tools)
             if scenario.hasPrefix("managed-") {try await engine.authorizeCloudflare(executable:"/usr/bin/true")}
             if scenario == "managed-error" {fixture.indexStatus=401;try? await engine.loadCloudflareDomains()}
             if scenario.hasPrefix("https-") {try await engine.authorizeCloudflare(provider:.https)}
             if scenario == "https-error" {workers.indexStatus=403;try? await engine.loadCloudflareDomains(provider:.https)}
             if scenario == "https-pin" {try await engine.setTunnelPIN("001234")}
+            if scenario == "quick-reconnecting" {try await engine.connectTunnel(configuration)}
             for (name,scheme) in [("light",ColorScheme.light),("dark",ColorScheme.dark)] {
                 let view=TunnelSnapshotRoot(engine:engine).padding(24).frame(width:600,height:660,alignment:.topLeading)
                     .background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,scheme)
@@ -39,6 +41,7 @@ import AutoApproveCore
                 // Allow onAppear and the view's ordinary state update to finish.
                 try await Task.sleep(for:.milliseconds(250))
                 for _ in 0..<100 where engine.cloudflareStatus.busy {try await Task.sleep(for:.milliseconds(10))}
+                if scenario == "quick-reconnecting" {for _ in 0..<200 where engine.tunnelStatus.phase != "reconnecting" {try await Task.sleep(for:.milliseconds(5))}}
                 host.layoutSubtreeIfNeeded();host.displayIfNeeded()
                 guard let bitmap=host.bitmapImageRepForCachingDisplay(in:host.bounds) else {throw AppError.message("Native tunnel preview unavailable")}
                 host.cacheDisplay(in:host.bounds,to:bitmap)
@@ -47,6 +50,6 @@ import AutoApproveCore
             }
             engine.stop()
         }
-        print("PASS: five native connection modes and both approval methods' authorized/empty/error states in light/dark at 600×660; synthetic profiles, no public connection, keychain or permission changes")
+        print("PASS: five native connection modes, both approval methods' authorized/empty/error states and reconnecting HTTPS fallback in light/dark at 600×660; synthetic loopback profiles, no public connection, keychain or permission changes")
     }
 }
