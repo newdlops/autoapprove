@@ -38,6 +38,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public private(set) var webService: RemoteNetworkService?
     private let webLoopbackOnly: Bool
     private let nativeKeyboardActivity:NativeKeyboardActivity
+    let publishedUpdateServices:PublishedUpdateServices
     public let managedPTY: ManagedPTYManager
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
@@ -345,8 +346,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
-                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil) throws {
+                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live) throws {
         self.paths = paths
+        self.publishedUpdateServices=publishedUpdateServices
         // Synthetic/injected process inventories have no implicit association
         // with the user's desktop. Tests can supply explicit keyboard activity.
         self.nativeKeyboardActivity = nativeKeyboardActivity ?? (processReader == nil ? .live:.inactive)
@@ -602,8 +604,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
     var lanUpdateWaitReason: String? {
+        updateWaitReason(allowTunnelRestart:false)
+    }
+    func updateWaitReason(allowTunnelRestart:Bool) -> String? {
         if cloudflareStatus.busy || tunnelPINSetupID != nil {return "외부 접속 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
-        if tunnelStatus.active { return "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
+        if tunnelStatus.active && (!allowTunnelRestart || tunnelStatus.provider == .quick) { return tunnelStatus.provider == .quick && allowTunnelRestart ? "임시 주소는 앱 재시작 시 바뀝니다. Mac에서 임시 연결을 종료하면 업데이트합니다." : "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||
             !sendingMessages.isEmpty || !replyingQuestions.isEmpty || !clearingCodexQueues.isEmpty ||

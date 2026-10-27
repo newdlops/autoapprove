@@ -225,7 +225,7 @@ import AutoApproveCore
         engine.receiveScreen(sessionID: shell.id, raw: codex, generation: "forged")
         try expect(engine.snapshot.sessions.isEmpty)
         try expectNil(PromptDetector.detect(codex, agent: .shell))
-        try expectThrows(try TerminalAdapter.approve(tty: shell.tty, expectedScreen: codex, agent: .shell))
+        try expectThrows(try TerminalAdapter.approvalScript(tty: shell.tty, expectedScreen: codex, agent: .shell))
         let running = ProcessDiscovery.parse(base + "\n12 11 ttys001 12 12 Mon Sep 21 09:00:03 2026 codex")
         engine.updateDiscovery(ProcessDiscovery.sessions(running), records: running)
         try expectEqual(engine.snapshot.sessions.filter { $0.phase != .ended }.map(\.agent), [.codex])
@@ -582,6 +582,12 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Codex terminal input permission: inactive, incomplete and changed requests", tests.testCodexTerminalInputPermissionBoundsAndIdentity),
             ("Codex terminal input permission: concurrent isolation and single use", tests.testCodexTerminalInputApprovalIsolatedAndSingleUse),
             ("Codex selected conversation: explicit message, stale target rejection and original preservation", tests.testExplicitCodexConversationMessagePreservesOriginalAndRejectsStaleTarget),
+            ("Published updates: exact stable release, architecture, digest and origin",tests.testPublishedUpdateOnlyAcceptsExactStablePublisherAsset),
+            ("Published updates: exact loopback gateway and web ports after reuse",tests.testExplicitLoopbackPortsSurviveListenerReuse),
+            ("Published updates: Port Manager namespace, ephemeral and reserved addresses",tests.testPortManagerLoopbackCoordinatesStayInsideDeclaredNamespace),
+            ("Published updates: coalesced checks, cache, cancellation and sanitized errors",tests.testPublishedUpdateChecksCoalesceCacheAndCancel),
+            ("Published updates: exact ranges and interrupted download resume",tests.testPublishedUpdateRangesResumeAndRejectWrongBoundaries),
+            ("Published updates: metadata, origin, exact host and disabled preference",tests.testPublishedVersionControlChecksMetadataWithoutInstalling),
             ("LAN updates: reject wrong peer, downgrade, architecture and oversize", tests.testLANUpdateRejectsWrongPeerDowngradeArchitectureAndOversize),
             ("LAN updates: reject unsafe ZIP paths, links, duplicates and bombs", tests.testLANUpdateArchiveRejectsTraversalLinksDuplicatesAndBombs),
             ("LAN updates: preference persists across engine restart", tests.testLANUpdatePreferenceSurvivesEngineRestart),

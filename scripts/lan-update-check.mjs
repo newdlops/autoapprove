@@ -11,12 +11,13 @@ import {coreLinkArguments} from './swift-core-link.mjs';
 import {signApp} from './sign-app.mjs';
 
 const artifact=path.resolve(process.argv[2]||'dist/AutoApprove.app');
-const root=path.resolve('.runtime/qa/lan-update'),build=path.resolve('.build/release');
+const root=path.resolve('.runtime/qa/lan-update'),build=path.resolve(process.argv.find(v=>v.startsWith('--build='))?.slice(8)||'.build/release');
 await mkdir(root,{recursive:true});
 const objects=(await readdir(path.join(build,'AutoApproveCore.build'))).filter(n=>n.endsWith('.swift.o')).map(n=>path.join(build,'AutoApproveCore.build',n));
 const fixture=path.join(root,'manager'),cache=path.resolve('.build/cache/LANUpdate');await mkdir(cache,{recursive:true});
 execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',path.join(build,'Modules'),'-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,'Tests/fixtures/lan-update-manager.swift','-o',fixture],{stdio:'inherit'});
 const children=[],pids=new Set(),servers=[];
+const proxyOrigins=new Map();
 const ports=[];
 while(ports.length<8){
   const reservation=net.createServer();await new Promise(resolve=>reservation.listen(0,'127.0.0.1',resolve));
@@ -25,11 +26,12 @@ while(ports.length<8){
 }
 const release=JSON.parse(await readFile(path.join(artifact,'Contents/Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb/web-version.json')));
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-async function state(port){return (await fetch('http://127.0.0.1:'+port+'/api/state',{signal:AbortSignal.timeout(2500)})).json();}
+async function state(origin){return (await fetch(origin+'/api/state',{signal:AbortSignal.timeout(2500)})).json();}
 async function appState(app){
   const web=JSON.parse(await readFile(path.join(app.directory,'fixture-web.json'),'utf8'));
   if(web.ready&&web.port)app.port=web.port;
-  return state(app.port);
+  app.origin=web.loopbackURL||'http://127.0.0.1:'+app.port;
+  return state(app.origin);
 }
 async function waitFor(check,seconds=90){const deadline=Date.now()+seconds*1000;let last;while(Date.now()<deadline){try{const result=await check();if(result)return result;}catch(e){last=e;}await delay(250);}throw new Error('LAN update check timed out'+(last?': '+last.message:''));}
 async function application(name,{port,peer='',low=false,enabled=true,lidClosed=false,foreign=false}){
@@ -59,7 +61,7 @@ async function proxy(port,manifest,archive,options={}){
   const server=http.createServer((request,response)=>{
     let body,type='application/json',status=200;
     const url=new URL(request.url,'http://localhost');
-    if(url.pathname==='/api/discovery')body=Buffer.from(JSON.stringify({service:'autoapprove',version:1,id:manifest.nodeID,name:'isolated source',release:manifest.release,port,urls:options.urls||['http://127.0.0.1:'+port]}));
+    if(url.pathname==='/api/discovery')body=Buffer.from(JSON.stringify({service:'autoapprove',version:1,id:manifest.nodeID,name:'isolated source',release:manifest.release,port,urls:(options.urls||[proxyOrigins.get(port)]).map(v=>typeof v==='number'?proxyOrigins.get(v):v)}));
     else if(url.pathname==='/api/update/manifest'){
       stats.manifests++;
       if(options.failManifest){request.socket.destroy();return;}
@@ -74,12 +76,13 @@ async function proxy(port,manifest,archive,options={}){
     response.writeHead(status,{'Content-Type':type,'Content-Length':body.length});response.end(body);
   });
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});servers.push(server);
+  proxyOrigins.set(port,'http://'+server.address().address+':'+port);
   return stats;
 }
 const checks=[];
 try{
   const high=await application('source',{port:0});await start(high);
-  const low=await application('recipient',{port:0,peer:'http://127.0.0.1:'+high.port,low:true,lidClosed:true});const old=await start(low);
+  const low=await application('recipient',{port:0,peer:high.origin,low:true,lidClosed:true});const old=await start(low);
   const pending=await waitFor(async()=>{const s=await appState(low);if(s.update?.phase==='failed')throw new Error(s.update.detail);return s.update?.phase==='waiting'?s:null;});
   assert.equal(pending.release.version,'0.2.52');assert.match(pending.update.detail,/덮개/);assert.equal(old.exitCode,null);
   checks.push('closed lid defers a fully verified update without restarting the manager');
@@ -89,11 +92,11 @@ try{
   assert.equal(old.exitCode,0);const restarted=Number(await readFile(path.join(low.directory,'fixture-pid'),'utf8'));assert.notEqual(restarted,old.pid);pids.add(restarted);
   pids.delete(old.pid);
   checks.push('two signed applications discover the newest LAN version, pull chunks, verify, replace, restart and confirm web health');
-  const manifest=await (await fetch('http://127.0.0.1:'+high.port+'/api/update/manifest')).json();
+  const manifest=await (await fetch(high.origin+'/api/update/manifest')).json();
   const archive=await readFile(path.join(high.directory,'runtime/updates/offer/offer.zip'));
   assert.equal(createHash('sha256').update(archive).digest('hex'),manifest.sha256);
   const corrupt=Buffer.from(archive);corrupt[Math.floor(corrupt.length/2)]^=1;await proxy(ports[2],manifest,corrupt);
-  const tampered=await application('tampered',{port:0,peer:'http://127.0.0.1:'+ports[2],low:true});const tamperedProcess=await start(tampered);
+  const tampered=await application('tampered',{port:0,peer:proxyOrigins.get(ports[2]),low:true});const tamperedProcess=await start(tampered);
   const failure=await waitFor(async()=>{const s=await appState(tampered);return s.update?.phase==='failed'?s:null;});
   assert.match(failure.update.detail,/체크섬/);assert.equal(failure.release.version,'0.2.52');assert.equal(tamperedProcess.exitCode,null);
   checks.push('a modified transfer is rejected before application replacement');
@@ -101,22 +104,22 @@ try{
   const foreignZip=path.join(root,'foreign.zip');execFileSync('/usr/bin/ditto',['-c','-k','--norsrc','--keepParent',foreign.app,foreignZip]);
   const foreignBytes=await readFile(foreignZip),foreignManifest={...manifest,size:foreignBytes.length,sha256:createHash('sha256').update(foreignBytes).digest('hex')};
   await proxy(ports[5],foreignManifest,foreignBytes);
-  const untrusted=await application('untrusted',{port:0,peer:'http://127.0.0.1:'+ports[5],low:true});const untrustedProcess=await start(untrusted);
+  const untrusted=await application('untrusted',{port:0,peer:proxyOrigins.get(ports[5]),low:true});const untrustedProcess=await start(untrusted);
   const untrustedState=await waitFor(async()=>{const s=await appState(untrusted);return s.update?.phase==='failed'?s:null;});
   assert.match(untrustedState.update.detail,/게시자 서명/);assert.equal(untrustedProcess.exitCode,null);
   checks.push('a different signature is rejected even when the advertised checksum matches');
-  const disabled=await application('disabled',{port:0,peer:'http://127.0.0.1:'+high.port,low:true,enabled:false});const disabledProcess=await start(disabled);
+  const disabled=await application('disabled',{port:0,peer:high.origin,low:true,enabled:false});const disabledProcess=await start(disabled);
   await delay(3500);const off=await appState(disabled);assert.equal(off.update.phase,'off');assert.equal(off.release.version,'0.2.52');assert.equal(disabledProcess.exitCode,null);
   checks.push('the saved disabled preference prevents automatic installation');
   const interrupted=await proxy(ports[6],manifest,archive,{dropOffset:256*1024});
-  const resumed=await application('resumed',{port:0,peer:'http://127.0.0.1:'+ports[6],low:true,lidClosed:true});await start(resumed);
+  const resumed=await application('resumed',{port:0,peer:proxyOrigins.get(ports[6]),low:true,lidClosed:true});await start(resumed);
   await waitFor(async()=>{const s=await appState(resumed);return s.update?.phase==='waiting'?s:null;});
   assert.equal(interrupted.dropped,true);assert.equal(interrupted.offsets.filter(offset=>offset===0).length,1);
   assert.equal(interrupted.offsets.filter(offset=>offset===256*1024).length,2);
   checks.push('a disconnected chunk retries within seconds and resumes without downloading the completed prefix again');
   const backup=await proxy(ports[7],manifest,archive);
-  const failedRoute=await proxy(ports[1],manifest,archive,{failManifest:true,urls:['http://127.0.0.1:'+ports[1],'http://127.0.0.1:'+ports[7]]});
-  const alternate=await application('alternate',{port:0,peer:'http://127.0.0.1:'+ports[1],low:true,lidClosed:true});await start(alternate);
+  const failedRoute=await proxy(ports[1],manifest,archive,{failManifest:true,urls:[ports[1],ports[7]]});
+  const alternate=await application('alternate',{port:0,peer:proxyOrigins.get(ports[1]),low:true,lidClosed:true});await start(alternate);
   await waitFor(async()=>{const s=await appState(alternate);return s.update?.phase==='waiting'?s:null;});
   assert.ok(failedRoute.manifests>0);assert.ok(backup.manifests>0);assert.ok(backup.offsets.length>0);
   checks.push('healthy discovery with a failed update route recovers the manifest and chunks over the same verified node on another address');

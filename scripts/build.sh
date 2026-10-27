@@ -7,3 +7,6 @@ mkdir -p dist
 npm --prefix extensions/vscode ci
 npm --prefix extensions/vscode run package
 node scripts/package-app.mjs "$AUTOAPPROVE_BUILD"
+if [[ "$AUTOAPPROVE_BUILD" == "release" ]]; then
+  node scripts/package-update.mjs
+fi

@@ -73,6 +73,8 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
     private var failedAt: TimeInterval = 0, failedAttempts = 0
     private let sessionDuration: TimeInterval
     public private(set) var port: UInt16?
+    private var loopbackHost="127.0.0.1"
+    public var localURL:String? {port.map {"http://\(loopbackHost):\($0)"}}
     public private(set) var accessKey: String
     private var pin:RemoteTunnelPIN?,pinEpoch=UUID(),pinAttempts:[TimeInterval]=[]
     private let clock:@Sendable()->TimeInterval
@@ -98,7 +100,8 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
     public func start(port: UInt16) async throws {
         stop(); let epoch=UUID(); self.epoch=epoch
         let parameters=RemoteLAN.tcpParameters()
-        parameters.requiredLocalEndpoint = .hostPort(host:"127.0.0.1",port:.any)
+        loopbackHost=RemoteLoopback.host(requestedPort:port)
+        parameters.requiredLocalEndpoint = .hostPort(host:NWEndpoint.Host(loopbackHost),port:.any)
         let listener=try NWListener(using:parameters,on:NWEndpoint.Port(rawValue:port)!); self.listener=listener
         let deadlines=RemoteHTTPDeadlines(queue:queue); self.deadlines=deadlines
         listener.newConnectionHandler={ [weak self] connection in Task { @MainActor in
@@ -175,7 +178,7 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
     }
     private func checkOrigin(_ request: RemoteHTTPRequest) throws {
         guard let origin, let port, let host=request.headers["host"]?.lowercased(),
-              host == URLComponents(string:origin)?.host || host == (URLComponents(string:origin)?.host ?? "")+":443" || host == "127.0.0.1:\(port)" || host == "127.0.0.1" || host == "localhost" || host == "localhost:\(port)" else { throw RemoteHTTPError(403,"접속한 터널 주소를 확인해주세요.") }
+              host == URLComponents(string:origin)?.host || host == (URLComponents(string:origin)?.host ?? "")+":443" || host == "\(loopbackHost):\(port)" || host == "127.0.0.1:\(port)" || host == "127.0.0.1" || host == "localhost" || host == "localhost:\(port)" else { throw RemoteHTTPError(403,"접속한 터널 주소를 확인해주세요.") }
         if let supplied=request.headers["origin"], supplied != origin { throw RemoteHTTPError(403,"다른 웹사이트의 요청은 처리하지 않습니다.") }
         if request.method == "POST", request.headers["origin"] != origin { throw RemoteHTTPError(403,"접속 페이지에서 직접 요청해주세요.") }
         if let site=request.headers["sec-fetch-site"], !["same-origin","none"].contains(site) {

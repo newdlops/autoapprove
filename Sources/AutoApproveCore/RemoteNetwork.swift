@@ -7,6 +7,7 @@ public struct RemoteNetworkStatus: Codable, Equatable {
     public var ready = false
     public var urls: [String] = []
     public var port: UInt16?
+    public var loopbackURL:String?
     public var peerCount = 0
     public var detail = "같은 네트워크에서 웹 접속이 꺼져 있습니다."
     /// Hotspot hosts may use their cellular resolver and cannot resolve .local.
@@ -156,6 +157,9 @@ struct RemoteTerminalUpdate: Encodable {
     private weak var engine: ApprovalEngine?
     private let updateArchive: LANUpdateArchive
     private let updateReceiver: LANUpdateReceiver
+    private let publishedUpdates:PublishedUpdates
+    private var pendingPublishedOffer:PublishedReleaseOffer?
+    private var publishedUpdateMaintenance:Task<Void,Never>?
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
@@ -181,6 +185,7 @@ struct RemoteTerminalUpdate: Encodable {
     private var lanInterfaces: [RemoteLANInterface] = []
     private let bonjourEnabled: Bool
     private let loopbackOnly: Bool
+    private var listenerLoopbackHost="127.0.0.1"
     private let advertisement: RemoteServiceAdvertising
     private let discoveryAddresses: () -> [String]
     private let cacheDiscoveryAddresses: Bool
@@ -348,6 +353,7 @@ struct RemoteTerminalUpdate: Encodable {
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
         updateReceiver = LANUpdateReceiver(engine: engine)
+        publishedUpdates=PublishedUpdates(services:engine.publishedUpdateServices)
         self.loopbackOnly = loopbackOnly
         self.bonjourEnabled = bonjourEnabled && !loopbackOnly
         self.advertisement = advertisement ?? RemoteServiceAdvertisement()
@@ -452,12 +458,12 @@ struct RemoteTerminalUpdate: Encodable {
         cancelDashboardEncoding()
         nextWebPeerRefresh = .distantPast
         let port = preferredPort
-        let parameters = listenerParameters()
+        let parameters = listenerParameters(port:port)
         lanInterfaces = loopbackOnly ? [] : RemoteLAN.interfaces(refresh: true)
         cachedDirectAddresses = nil
         // Constrain the address here; NWListener remains the single source of
         // the selected port, including persisted ports and busy-port recovery.
-        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        let listener = try NWListener(using: parameters, on:NWEndpoint.Port(rawValue:port)!)
         let epoch = UUID(); generation = epoch; running = true; self.listener = listener
         listenerPort = port; allowListenerPortFallback = allowPortFallback; listenerRetryDelay = 1
         publishedPortal = false
@@ -467,9 +473,10 @@ struct RemoteTerminalUpdate: Encodable {
         startDiscovery(parameters: parameters, epoch: epoch)
     }
 
-    private func listenerParameters() -> NWParameters {
+    private func listenerParameters(port:UInt16) -> NWParameters {
         let parameters = RemoteLAN.tcpParameters()
-        if loopbackOnly { parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any) }
+        listenerLoopbackHost=RemoteLoopback.host(requestedPort:port)
+        if loopbackOnly {parameters.requiredLocalEndpoint = .hostPort(host:NWEndpoint.Host(listenerLoopbackHost),port:.any)}
         return parameters
     }
 
@@ -508,8 +515,9 @@ struct RemoteTerminalUpdate: Encodable {
                 switch state {
                 case .ready:
                     self.status.ready = true
-                    self.status.detail = self.loopbackOnly ? "이 Mac의 127.0.0.1에서만 접속할 수 있습니다." : "같은 네트워크의 휴대폰과 Mac에서 접속할 수 있습니다."
+                    self.status.detail = self.loopbackOnly ? "이 Mac의 \(self.listenerLoopbackHost)에서만 접속할 수 있습니다." : "같은 네트워크의 휴대폰과 Mac에서 접속할 수 있습니다."
                     self.status.port = listener.port?.rawValue ?? port
+                    self.status.loopbackURL=self.status.port.map {"http://\(self.listenerLoopbackHost):\($0)"}
                     self.listenerPort = self.status.port ?? port
                     self.listenerRetry?.cancel(); self.listenerRetry = nil; self.listenerRetryDelay = 1
                     self.publishService(port: self.listenerPort)
@@ -540,7 +548,7 @@ struct RemoteTerminalUpdate: Encodable {
             // Accepted requests and durable receipts remain alive while the acceptor recovers.
             self.listener?.cancel(); self.listener = nil
             do {
-                let listener = try NWListener(using: self.listenerParameters(), on: NWEndpoint.Port(rawValue: self.listenerPort)!)
+                let listener = try NWListener(using:self.listenerParameters(port:self.listenerPort),on:NWEndpoint.Port(rawValue:self.listenerPort)!)
                 self.listener = listener
                 self.configureListener(listener, port: self.listenerPort, epoch: epoch)
                 listener.start(queue: self.queue)
@@ -669,7 +677,7 @@ struct RemoteTerminalUpdate: Encodable {
     }
     public func stop() {
         stopInventoryWatches(); inventoryChanges.notify()
-        updateReceiver.stop()
+        cancelLANUpdate()
         running = false; generation = UUID()
         pathChanges = RemoteNetworkPathChanges()
         cachedDashboardValidator = nil
@@ -698,9 +706,50 @@ struct RemoteTerminalUpdate: Encodable {
         for id in Array(peers.keys) { peers[id]?.portal = false; peers[id]?.webVerifiedAt = nil }
         status = RemoteNetworkStatus(); emitStatus()
     }
-    public func cancelLANUpdate() { updateReceiver.stop() }
+    public func cancelLANUpdate() {
+        updateReceiver.stop();pendingPublishedOffer=nil;publishedUpdates.stop()
+        publishedUpdateMaintenance?.cancel();publishedUpdateMaintenance=nil
+    }
+    private func beginPublishedUpdate(_ offer:PublishedReleaseOffer) {
+        pendingPublishedOffer=offer;checkLANUpdate()
+        publishedUpdateMaintenance?.cancel()
+        let epoch=generation
+        // Explicit web updates must resume and recheck install guards even
+        // when LAN discovery is disabled or waiting on another address.
+        publishedUpdateMaintenance=Task { [weak self] in
+            while !Task.isCancelled {
+                do {try await Task.sleep(for:.seconds(5))} catch {return}
+                guard let self,!Task.isCancelled,self.running,self.generation==epoch,self.pendingPublishedOffer != nil else {return}
+                self.checkLANUpdate()
+            }
+        }
+    }
+    private func publishedVersionStatus()->PublishedUpdateStatus {
+        var value=publishedUpdates.status
+        value.host=webVersion;value.update=engine?.lanUpdate
+        if let current=webVersion,let offer=publishedUpdates.record?.offer {
+            value.canSync=offer.manifest.release>current && engine?.lanUpdate.enabled==true && (try? LANUpdateInstallation.currentApp()) != nil
+            if offer.manifest.release<=current,value.phase=="ready" {value.detail=offer.manifest.release==current ? "호스트가 정식 최신 버전입니다." : "호스트가 정식 릴리스보다 높은 버전입니다. 현재 버전을 유지합니다."}
+        } else if let latest=value.latestVersion,let current=webVersion,value.phase=="ready" {
+            let order=latest.compare(current.version,options:.numeric)
+            value.detail=order == .orderedDescending ? "새 버전의 자동 업데이트 파일을 준비 중입니다. 잠시 후 다시 확인해주세요." : order == .orderedAscending ? "호스트가 정식 릴리스보다 높은 버전입니다. 현재 버전을 유지합니다." : "호스트가 정식 최신 버전입니다."
+        }
+        return value
+    }
     private func checkLANUpdate() {
         guard running, let webVersion else { return }
+        if let offer=pendingPublishedOffer {
+            if offer.manifest.release>webVersion {
+                let epoch=generation
+                updateReceiver.check(nodeID:offer.manifest.nodeID,release:offer.manifest.release,routeKey:offer.url.absoluteString,allowTunnelRestart:true) { [weak self] path in
+                    guard let self,self.running,self.generation==epoch,self.pendingPublishedOffer==offer else {throw CancellationError()}
+                    if path=="/api/update/manifest" {return try .json(offer.manifest)}
+                    return try await self.publishedUpdates.read(path,offer:offer)
+                }
+                return
+            }
+            pendingPublishedOffer=nil
+        }
         var selected: Peer?
         for peer in peers.values where verified(peer) {
             guard let release = peer.release, release.isCompatible, release > webVersion else { continue }
@@ -1073,7 +1122,7 @@ struct RemoteTerminalUpdate: Encodable {
     }
     private func updateNamedAddresses() {
         guard running, status.ready, let port = status.port, !updatingNamedAccess else { return }
-        if loopbackOnly { status.urls = ["http://127.0.0.1:\(port)"]; return }
+        if loopbackOnly {status.urls = ["http://\(listenerLoopbackHost):\(port)"];return}
         guard bonjourEnabled else { status.urls = Self.addresses(port: port, interfaces: lanInterfaces); return }
         updatingNamedAccess = true
         defer { updatingNamedAccess = false }
@@ -1539,6 +1588,9 @@ struct RemoteTerminalUpdate: Encodable {
             guard ["GET", "POST"].contains(request.method) else { throw RemoteHTTPError(405, "이 요청 방식은 지원하지 않습니다.") }
             if request.method == "GET" {
                 switch request.path {
+                case "/api/version":
+                    guard request.parameter("node")==nil || request.parameter("node")==nodeID else {throw RemoteHTTPError(400,"접속 중인 호스트에서 확인해주세요.")}
+                    return try .json(publishedVersionStatus())
                 case "/", "/index.html":
                     if let expected = request.parameter("webNode"), expected != nodeID { throw RemoteHTTPError(409, "이 주소의 Mac이 바뀌었습니다. 원래 즐겨찾기나 Mac의 접속 링크로 다시 열어주세요.") }
                     // Every client owns its entry document. A newer/offline Mac
@@ -1687,6 +1739,22 @@ struct RemoteTerminalUpdate: Encodable {
             }
             let object = try request.json()
             switch request.path {
+            case "/api/version/check", "/api/version/sync":
+                guard request.parameter("node")==nil || request.parameter("node")==nodeID else {throw RemoteHTTPError(400,"외부 접속을 제공하는 호스트에서 확인해주세요.")}
+                let epoch=generation
+                await publishedUpdates.check()
+                guard generation==epoch else {throw CancellationError()}
+                if request.path=="/api/version/sync" {
+                    guard let engine,engine.lanUpdate.enabled else {throw RemoteHTTPError(409,"Mac의 연결 설정에서 자동 업데이트를 켜주세요.")}
+                    guard (try? LANUpdateInstallation.currentApp()) != nil else {throw RemoteHTTPError(409,"설치된 AutoApprove 앱에서 지원합니다. 먼저 설치 파일을 적용해주세요.")}
+                    guard let raw=object["client"],let client=try? JSONDecoder().decode(RemoteWebVersion.self,from:JSONSerialization.data(withJSONObject:raw)),client.isCompatible,
+                          let current=webVersion else {throw RemoteHTTPError(400,"웹 클라이언트 버전을 확인하지 못했습니다.")}
+                    guard let offer=publishedUpdates.record?.offer,offer.manifest.release>=client else {
+                        throw RemoteHTTPError(409,"웹 버전에 맞는 정식 업데이트 파일이 아직 없습니다. 잠시 후 다시 확인해주세요.")
+                    }
+                    if offer.manifest.release>current {beginPublishedUpdate(offer)}
+                }
+                return try .json(publishedVersionStatus())
             case "/api/peers":
                 guard !loopbackOnly else { throw RemoteHTTPError(403, "로컬 전용 실행에서는 다른 Mac을 연결하지 않습니다.") }
                 guard let address = object["address"] as? String else { throw RemoteHTTPError(400, "Mac 주소가 필요합니다.") }

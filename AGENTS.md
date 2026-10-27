@@ -12,5 +12,6 @@
 - User instruction, 2026-10-26: finish each verified improvement through the matching build, source commit, GitHub release deployment and local installation with a running-version check. Do not stop after source-only changes or a local build.
 - User instruction, 2026-10-05: when a version is increased, finish the GitHub release deployment as part of the task. Do not finish after only a local build or installation.
 - Run the relevant checks, package the matching version, commit the release source, push its tag and publish the GitHub release with the install artifact and checksum.
+- Cloudflare web version matching also requires the signed `AutoApprove-<version>-build<build>-macOS-<architecture>.zip` and its SHA-256 file on each GitHub release. Generate them with `scripts/package-update.mjs`; publish them alongside the DMG and its checksum.
 - Verify the published tag, assets and download. If deployment is blocked, report the precise blocker and which deployment step remains.
 - Preserve unrelated workspace changes. Never publish local runtime data, signing secrets, keychains, user terminal content or private test artifacts.

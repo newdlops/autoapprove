@@ -147,7 +147,7 @@ actor CloudflareRelayAgent {
     private func forward(_ request:CloudflareRelayPacket.Request,id:UInt32,call:Call) async {
         defer {if calls[id] === call {call.timer?.cancel();call.flush?.cancel();call.waiter?.resume(throwing:CancellationError());call.waiter=nil;bodyBytes-=call.bodyBytes;calls.removeValue(forKey:id)}}
         do {
-            guard let url=URL(string:localURL.absoluteString+request.path),url.scheme=="http",url.host=="127.0.0.1",url.port==localURL.port,url.user==nil,url.password==nil else {throw invalid()}
+            guard RemoteLoopback.isAddress(localURL.host ?? ""),let url=URL(string:localURL.absoluteString+request.path),url.scheme=="http",url.host==localURL.host,url.port==localURL.port,url.user==nil,url.password==nil else {throw invalid()}
             var input=URLRequest(url:url);input.httpMethod=request.method;input.httpShouldHandleCookies=false;input.cachePolicy = .reloadIgnoringLocalCacheData
             let hop=Set(["connection","upgrade","keep-alive","transfer-encoding","te","trailer","content-length","proxy-authorization","proxy-authenticate","host","accept-encoding"])
             for (name,value) in request.headers where !hop.contains(name.lowercased()) {input.setValue(value,forHTTPHeaderField:name)}
@@ -180,7 +180,7 @@ actor CloudflareRelayAgent {
             if calls[id] === call {call.waiter?.resume(throwing:CancellationError());call.waiter = nil;bodyBytes -= call.bodyBytes;calls.removeValue(forKey:id)}
         }
         do {
-            guard var components = URLComponents(string:localURL.absoluteString+request.path),components.host == "127.0.0.1",components.port == localURL.port else {throw invalid()}
+            guard RemoteLoopback.isAddress(localURL.host ?? ""),var components = URLComponents(string:localURL.absoluteString+request.path),components.scheme == "http",components.host == localURL.host,components.port == localURL.port,components.user==nil,components.password==nil else {throw invalid()}
             components.scheme = "ws"
             var input = URLRequest(url:components.url!);input.timeoutInterval = 10;input.httpShouldHandleCookies = false
             let hop = Set(["connection","upgrade","keep-alive","transfer-encoding","content-length","host","accept-encoding","sec-websocket-key","sec-websocket-version","sec-websocket-extensions","sec-websocket-accept","sec-websocket-protocol"])

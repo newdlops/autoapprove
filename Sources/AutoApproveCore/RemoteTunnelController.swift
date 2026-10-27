@@ -72,8 +72,8 @@ enum RemoteTunnelCredentials {
             self.gateway=gateway
             try await gateway.start(port:[.quick,.managed].contains(configuration.provider) ? 0 : configuration.port)
             guard generation == epoch else { gateway.stop(); throw CancellationError() }
-            guard let port=gateway.port else { throw AppError.message("터널 연결 포트를 열지 못했습니다.") }
-            status.localURL="http://127.0.0.1:\(port)"
+            guard let local=gateway.localURL else { throw AppError.message("터널 연결 포트를 열지 못했습니다.") }
+            status.localURL=local
             recovery.start { [weak self] in
                 guard let self,let url=self.status.publicURL else {return}
                 if self.status.phase == "routeRequired" {self.checkingURL = nil;self.verify(url,epoch:self.generation)}

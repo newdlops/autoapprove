@@ -34,7 +34,7 @@ private actor AutomaticReplyProbe {
     var paths: AppPaths
     init(root: URL, name: String, transport: CodexReplyTransport, enabled: Bool = true, restored: Bool = false) throws {
         paths = AppPaths(directory: root.appendingPathComponent(name))
-        engine = try ApprovalEngine(paths: paths, questionTransport: transport)
+        engine = try ApprovalEngine(paths: paths, questionTransport: transport,nativeKeyboardActivity:.inactive)
         engine.automaticConfirmationDelay = 5
         session = AgentSession(id: "process:\(name):first", agent: .codex, pid: 42, started: name,
             tty: "/dev/fixture-\(name)", cwd: "/tmp/reply", terminal: .terminal)
@@ -176,7 +176,7 @@ extension ApprovalTests {
         try expectEqual(fixture.engine.snapshot.sessions[0].phase, .working)
         try expect(fixture.engine.snapshot.sessions[0].unansweredQuestions.isEmpty)
         fixture.engine.updateCodexQuestions([update])
-        let reopened = try ApprovalEngine(paths: fixture.paths, questionTransport: transport)
+        let reopened = try ApprovalEngine(paths: fixture.paths, questionTransport: transport,nativeKeyboardActivity:.inactive)
         defer { reopened.stop() }
         reopened.updateDiscovery([fixture.session], records: []); reopened.updateCodexQuestions([update])
         try await Task.sleep(nanoseconds: 5_100_000_000)
@@ -322,7 +322,7 @@ extension ApprovalTests {
         defer { reopened.forEach { $0.stop() } }
         for fixture in fixtures {
             fixture.observe()
-            let engine = try ApprovalEngine(paths: fixture.paths, questionTransport: transport)
+            let engine = try ApprovalEngine(paths: fixture.paths, questionTransport: transport,nativeKeyboardActivity:.inactive)
             engine.updateDiscovery([fixture.session], records: [])
             engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: fixture.session.id, questions: [fixture.question])])
             reopened.append(engine)
@@ -360,7 +360,7 @@ extension ApprovalTests {
             if ["draft", "cancel"].contains(name) {
                 try fixture.engine.setPaused(true); try fixture.engine.setPaused(false)
                 fixture.observe()
-                let engine = try ApprovalEngine(paths: fixture.paths, questionTransport: transport)
+                let engine = try ApprovalEngine(paths: fixture.paths, questionTransport: transport,nativeKeyboardActivity:.inactive)
                 engine.updateDiscovery([fixture.session], records: [])
                 engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: fixture.session.id, questions: [fixture.question])])
                 try expectEqual(engine.snapshot.sessions[0].questions[0].automation?.phase, fixture.automation?.phase)

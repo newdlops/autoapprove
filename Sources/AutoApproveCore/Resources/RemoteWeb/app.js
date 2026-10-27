@@ -371,7 +371,7 @@ const newerVersion = (left, right) => {
   return false;
 };
 function updateWebVersion(result) {
-  if(tunnelAccess){show($('web-update'),false);return;}
+  if(tunnelAccess){show($('web-update'),false);updateTunnelVersion(result);return;}
   const loaded = versionNumbers(loadedWebVersion) ? loadedWebVersion : result.gatewayRelease;
   let gateway = result.preferredGateway;
   if (!gateway && newerVersion(result.gatewayRelease, loaded)) gateway = { id: result.gatewayID, name: '이 Mac', url: location.origin + '/', release: result.gatewayRelease };
@@ -389,6 +389,68 @@ function updateWebVersion(result) {
   $('open-latest-web').href = url.href; show($('web-update'), true);
 }
 $('open-latest-web').addEventListener('click', () => { const url = new URL($('open-latest-web').href); url.hash = location.hash; $('open-latest-web').href = url.href; });
+
+let versionSyncState = null, versionSyncHost = null, versionSyncBusy = false, versionSyncRead = false, versionSyncCompared = '', versionSyncEpoch = 0;
+function renderVersionSync() {
+  if (!tunnelAccess || !$('version-sync') || !versionNumbers(versionSyncHost)) return;
+  const state = versionSyncState || {}, host = versionSyncHost, client = loadedWebVersion;
+  const parts = [`웹 v${client?.version || '미확인'} · 호스트 v${host.version}`];
+  if (state.latestVersion) parts.push(`정식 v${state.latestVersion}`);
+  const update = state.update, active = ['checking','downloading','waiting','applying'].includes(update?.phase);
+  if (active) parts.push(update.detail + (update.progress == null ? '' : ` ${update.progress}%`));
+  else if (update?.phase === 'failed') parts.push(update.detail);
+  else if (versionSyncBusy) parts.push('정식 최신 버전을 확인하고 있습니다…');
+  else if (state.phase === 'failed' || state.error) parts.push(state.error || state.detail);
+  else if (newerVersion(host,client)) parts.push('호스트가 더 최신입니다. 새 탭에서 열면 이 페이지의 초안을 유지합니다.');
+  else if (newerVersion(client,host)) parts.push('웹이 더 최신입니다. 정식 호스트 업데이트를 확인하세요.');
+  else if (state.phase === 'ready') parts.push(state.detail);
+  const canSync = state.canSync && !!versionNumbers(client) && newerVersion(state.latest,host) && !newerVersion(client,state.latest);
+  if (state.phase === 'ready' && newerVersion(state.latest,host) && !state.canSync) parts.push(state.update?.enabled === false ? 'Mac의 연결 설정에서 자동 업데이트를 켜주세요.' : 'Mac 설치본의 자동 업데이트 지원을 확인해주세요.');
+  if (state.phase === 'ready' && newerVersion(client,host) && !canSync) parts.push('웹 버전에 맞는 정식 호스트 파일이 아직 준비되지 않았습니다.');
+  if (canSync && !active) parts.push('적용할 때 잠시 재연결하며 PIN으로 다시 로그인할 수 있습니다.');
+  text($('version-sync-message'),parts.join(' · ')); show($('version-sync'),true);
+  $('check-version').disabled = !connected || tunnelAuthExpired || versionSyncBusy || update?.phase === 'applying';
+  text($('check-version'),versionSyncBusy ? '확인 중…' : '최신 버전 확인');
+  show($('sync-version'),!!canSync); $('sync-version').disabled = !connected || tunnelAuthExpired || versionSyncBusy || active;
+  const latestWeb = newerVersion(host,client); show($('sync-web'),latestWeb);
+  if (latestWeb) {
+    const url = new URL(location.href);url.searchParams.set('version',`${host.version}-${host.build}`);
+    $('sync-web').href = url.href;
+  }
+}
+function updateTunnelVersion(result) {
+  if (!$('version-sync')) return;
+  versionSyncHost = result.gatewayRelease;
+  const gateway = result.nodes.find(n=>n.id===result.gatewayID);
+  if (versionSyncState && gateway?.state?.update) versionSyncState.update = gateway.state.update;
+  renderVersionSync();
+  if (!versionSyncRead) {versionSyncRead=true;void readVersionSync();}
+  const key = `${loadedWebVersion?.version}:${loadedWebVersion?.build}/${versionSyncHost?.version}:${versionSyncHost?.build}`;
+  if (newerVersion(loadedWebVersion,versionSyncHost) && key !== versionSyncCompared) {
+    versionSyncCompared=key;void checkVersionSync();
+  }
+}
+async function readVersionSync() {
+  const epoch=versionSyncEpoch;
+  try {
+    const state = await api('/api/version',undefined,undefined,10000);
+    if (versionSyncBusy || versionSyncEpoch!==epoch) return;
+    versionSyncState=state;if(versionNumbers(state.host))versionSyncHost=state.host;renderVersionSync();
+  } catch (_) { /* Older hosts remain usable; an explicit check explains support. */ }
+}
+async function checkVersionSync(sync=false) {
+  if(versionSyncBusy || !tunnelAccess || !connected || tunnelAuthExpired)return;
+  versionSyncEpoch++;
+  versionSyncBusy=true;renderVersionSync();
+  try {
+    const state=await api(sync?'/api/version/sync':'/api/version/check',{client:loadedWebVersion},undefined,25000);
+    versionSyncState=state;if(versionNumbers(state.host))versionSyncHost=state.host;
+  } catch(error) {
+    versionSyncState={...(versionSyncState||{}),error:error.status===404?'이 호스트는 웹 버전 맞추기를 지원하지 않습니다. Mac에 최신 버전을 한 번 설치해주세요.':error.message};
+  } finally {versionSyncBusy=false;renderVersionSync();}
+}
+$('check-version')?.addEventListener('click',()=>void checkVersionSync());
+$('sync-version')?.addEventListener('click',()=>void checkVersionSync(true));
 
 function updateViewport() {
   const viewport = window.visualViewport;
@@ -603,6 +665,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: tunnelAccess ? 'same-origin' : 'omit' });
     if(response.status === 401 && tunnelAccess){
       tunnelAuthExpired=true;
+      renderVersionSync();
       stopDirect();
       if(ptyClient && !ptyClient.blocked)ptyClient.fail(new Error('접속 시간이 끝났습니다. PIN 또는 접속 키로 다시 연결해주세요.'));
       text($('tunnel-access-state'),'접속 시간이 끝났습니다. 미전달 입력을 확인하고 다시 연결해주세요.');show($('tunnel-relogin'),true);
@@ -1030,6 +1093,7 @@ async function refreshNetwork(initial = false, restart = false) {
     networkFailures = Math.min(5,networkFailures+1);
     partialNetwork = false; partialNetworkRefreshes = 0;
     connected = false; text($('connection'), lastNetworkUpdate ? `연결 끊김 · 마지막 갱신 ${nowLabel(lastNetworkUpdate)}` : '연결 끊김 · 다시 연결 중');
+    renderVersionSync();
     show($('web-update'), false);
     text($('network-error'), error.message); show($('network-error'), true);
     if (!nodes.length) text($('list-empty'), 'Mac에 연결하면 감지된 세션이 여기에 표시됩니다.');

@@ -23,7 +23,7 @@ import AutoApproveCore
         guard configuration.provider != .quick,attempted || !configuration.publicURL.isEmpty else {return nil}
         return (try? RemoteTunnelSetup.origin(configuration.publicURL)) == nil ? "공개 도메인을 입력하세요. 예: terminal.example.com" : nil
     }
-    private var serviceURL:String {"http://127.0.0.1:"+port}
+    private var serviceURL:String {engine.tunnelStatus.localURL ?? "http://"+RemoteLoopback.host(requestedPort:UInt16(port) ?? configuration.port)+":"+port}
     private var subdomainError:String? {
         guard configuration.provider.managedAddress else {return nil}
         do {_ = try RemoteTunnelSetup.subdomain(cloudflareSubdomain);return nil} catch {return error.localizedDescription}

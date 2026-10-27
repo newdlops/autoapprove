@@ -49,9 +49,9 @@ public struct CloudflareRelayCredential:Codable,Sendable {
         do {
             let gateway=try RemoteTunnelGateway(pin:pin,handler:handler);self.gateway=gateway
             try await gateway.start(port:0);try Task.checkCancellation()
-            guard generation==epoch,let port=gateway.port else {gateway.stop();throw CancellationError()}
+            guard generation==epoch,let address=gateway.localURL,let local=URL(string:address) else {gateway.stop();throw CancellationError()}
             try gateway.setOrigin(config.publicURL)
-            let local=URL(string:"http://127.0.0.1:\(port)")!;status.localURL=local.absoluteString
+            status.localURL=local.absoluteString
             var endpoint=URLComponents(string:config.publicURL)!;endpoint.scheme="wss";endpoint.path="/_autoapprove/connector"
             var request=URLRequest(url:endpoint.url!);request.setValue("Bearer "+secret.key,forHTTPHeaderField:"Authorization");request.setValue("2",forHTTPHeaderField:"X-AutoApprove-Relay");request.timeoutInterval=20
             recovery.start { [weak self] in self?.networkAvailable() }

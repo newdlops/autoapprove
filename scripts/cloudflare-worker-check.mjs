@@ -160,6 +160,11 @@ try{
   await page.waitForFunction(()=>typeof connected!=='undefined'&&connected);
   assert.ok(!page.url().includes('access='));assert.ok((await context.cookies()).some(v=>v.httpOnly&&v.secure&&v.name==='__Host-autoapprove_tunnel'));
   assert.equal(await page.evaluate(key=>Object.values(localStorage).some(v=>v.includes(key)),info.key),false);
+  if(await page.locator('#check-version').count()){
+   stage=engine+' version check';await page.locator('#check-version').click();
+   await page.waitForFunction(()=>versionSyncState?.phase==='ready'&&versionSyncState.latestVersion===loadedWebVersion.version);
+   browserChecks.push(engine+': authenticated version check reaches the native host through the actual Worker/WSS gateway');
+  }
   stage=engine+' original';await page.locator('.session-row').filter({hasText:'Codex'}).first().click();await page.waitForFunction(()=>latestFrame?.streamID&&!$('terminal-keyboard').disabled);
   if(lateInput){
    assert.equal(await page.evaluate(()=>typeof AutoApproveInputChannel),'undefined');

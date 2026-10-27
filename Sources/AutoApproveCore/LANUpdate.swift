@@ -85,6 +85,12 @@ actor LANUpdateArchive {
 }
 
 public enum LANUpdateInstallation {
+    fileprivate static func matchesExecutable(_ path:String,app:URL)->Bool {
+        guard path.hasPrefix("/") else {return false}
+        let actual=URL(fileURLWithPath:path).standardizedFileURL.resolvingSymlinksInPath()
+        let expected=app.appendingPathComponent("Contents/MacOS/AutoApproveApp").standardizedFileURL.resolvingSymlinksInPath()
+        return actual==expected
+    }
     public static func currentApp() throws -> URL {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.resolvingSymlinksInPath()
         let app = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -223,7 +229,7 @@ public enum LANUpdateInstallation {
         try verifyPublisher(app); try verifyPublisher(candidate)
         guard try release(candidate) == job.release, try release(app) < job.release,
               let manager = try ProcessDiscovery.read(pid: job.managerPID).first(where: { $0.started == job.managerStarted }),
-              manager.executable == app.appendingPathComponent("Contents/MacOS/AutoApproveApp").path else { throw AppError.message("업데이트할 AutoApprove 실행이 바뀌었습니다.") }
+              matchesExecutable(manager.executable,app:app) else { throw AppError.message("업데이트할 AutoApprove 실행이 바뀌었습니다.") }
         try Data("ready".utf8).write(to: directory.appendingPathComponent("helper-ready"), options: .atomic)
         let deadline = Date().addingTimeInterval(40)
         while try ProcessDiscovery.read(pid: job.managerPID).contains(where: { $0.started == job.managerStarted }) {
@@ -232,7 +238,7 @@ public enum LANUpdateInstallation {
         }
         let reading = PowerControl.live.read()
         if reading.lidClosed {
-            _ = try? CommandRunner.run("/usr/bin/open", [app.path])
+            try? launch(app,home:job.home)
             throw AppError.message("덮개가 닫혀 업데이트 적용을 멈추고 기존 AutoApprove를 다시 열었습니다.")
         }
         let parent = app.deletingLastPathComponent(), identifier = UUID().uuidString
@@ -243,8 +249,7 @@ public enum LANUpdateInstallation {
         try FileManager.default.moveItem(at: app, to: backup)
         do {
             try FileManager.default.moveItem(at: staged, to: app)
-            let opened = try CommandRunner.run("/usr/bin/open", ["-n", app.path])
-            guard opened.status == 0 else { throw AppError.message("업데이트한 앱을 열지 못했습니다.") }
+            try launch(app,home:job.home)
             let healthyUntil = Date().addingTimeInterval(40)
             while Date() < healthyUntil {
                 // The normal busy-port fallback may choose a new port on restart.
@@ -252,7 +257,8 @@ public enum LANUpdateInstallation {
                 // the exact node and release at its actual current HTTP listener.
                 let web = try? SocketClient.request(path: AppPaths(directory: URL(fileURLWithPath: job.home)).socket, message: ["method": "web"])
                 let port = (web?["port"] as? Int).flatMap(UInt16.init(exactly:)) ?? job.port
-                if let response = try? await RemoteHTTPExchange(endpoint: RemoteNetworkAddress.endpoint("http://127.0.0.1:\(port)"),
+                for origin in RemoteLoopback.healthOrigins(preferred:web?["loopbackURL"] as? String,port:port) {
+                if let response = try? await RemoteHTTPExchange(endpoint: RemoteNetworkAddress.endpoint(origin),
                     path: "/api/discovery", method: "GET", body: Data(), expectedNodeID: job.nodeID, timeout: 2).run(),
                    response.status == 200, let object = try? JSONSerialization.jsonObject(with: response.body) as? JSONObject,
                    object["id"] as? String == job.nodeID, let releaseObject = object["release"],
@@ -260,6 +266,7 @@ public enum LANUpdateInstallation {
                     try? FileManager.default.removeItem(at: backup)
                     try? FileManager.default.removeItem(at: directory)
                     return
+                }
                 }
                 try await Task.sleep(for: .milliseconds(500))
             }
@@ -270,9 +277,22 @@ public enum LANUpdateInstallation {
             if !live {
                 try? FileManager.default.removeItem(at: app)
                 try FileManager.default.moveItem(at: backup, to: app)
-                _ = try? CommandRunner.run("/usr/bin/open", [app.path])
+                try? launch(app,home:job.home)
             }
             throw error
+        }
+    }
+    private static func launch(_ app:URL,home:String) throws {
+        if RemoteLoopback.portManagerHost() != nil || ProcessInfo.processInfo.environment["AUTOAPPROVE_HOME"] != nil {
+            // Keep the existing namespace/preload in memory; never serialize
+            // environment credentials or alter Port Manager configuration.
+            let child=Process();child.executableURL=app.appendingPathComponent("Contents/MacOS/AutoApproveApp")
+            var environment=ProcessInfo.processInfo.environment;environment["AUTOAPPROVE_HOME"]=home;child.environment=environment
+            child.standardInput=FileHandle.nullDevice;child.standardOutput=FileHandle.nullDevice;child.standardError=FileHandle.nullDevice
+            try child.run()
+        } else {
+            let opened=try CommandRunner.run("/usr/bin/open",["-n",app.path])
+            guard opened.status==0 else {throw AppError.message("업데이트한 앱을 열지 못했습니다.")}
         }
     }
 }
@@ -291,6 +311,7 @@ public enum LANUpdateInstallation {
     deinit { if !applying, let staged { try? FileManager.default.removeItem(at: staged.1) } }
     func stop() { task?.cancel(); retryAfter = .distantPast; failures = 0; rejected = nil }
     func check(nodeID: String, release: RemoteWebVersion, routeKey: String,
+               allowTunnelRestart:Bool = false,
                read: @escaping @MainActor @Sendable (String) async throws -> RemoteHTTPResponse) {
         if context?.node != nodeID || context?.release != release { retryAfter = .distantPast; failures = 0; rejected = nil }
         else if context?.route != routeKey { retryAfter = .distantPast }
@@ -334,11 +355,11 @@ public enum LANUpdateInstallation {
                 }
                 stage = "install"
                 guard let staged = self.staged, engine.lanUpdate.enabled else { return }
-                if let reason = engine.lanUpdateWaitReason {
+                if let reason = engine.updateWaitReason(allowTunnelRestart:allowTunnelRestart) {
                     self.status("waiting", reason, version: release.version); return
                 }
                 let manager = try ProcessDiscovery.read(pid: getpid()).first
-                guard let manager, manager.executable == app.appendingPathComponent("Contents/MacOS/AutoApproveApp").path,
+                guard let manager,LANUpdateInstallation.matchesExecutable(manager.executable,app:app),
                       let port = engine.webStatus.port, FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path),
                       FileManager.default.isWritableFile(atPath: app.path) else { throw AppError.message("설치 위치에 쓸 수 없습니다. 설치 파일을 Applications에 적용해주세요.") }
                 let job = LANUpdateInstallation.Job(app: app.path, candidate: staged.2.path, managerPID: getpid(), managerStarted: manager.started,
@@ -361,8 +382,8 @@ public enum LANUpdateInstallation {
                     try await Task.sleep(for: .milliseconds(100))
                 }
                 try Task.checkCancellation()
-                guard engine.lanUpdate.enabled, engine.lanUpdateWaitReason == nil else {
-                    helper.terminate(); self.status("waiting", engine.lanUpdateWaitReason ?? "자동 업데이트가 꺼져 있습니다.", version: release.version); return
+                guard engine.lanUpdate.enabled, engine.updateWaitReason(allowTunnelRestart:allowTunnelRestart) == nil else {
+                    helper.terminate(); self.status("waiting", engine.updateWaitReason(allowTunnelRestart:allowTunnelRestart) ?? "자동 업데이트가 꺼져 있습니다.", version: release.version); return
                 }
                 self.status("applying", "AutoApprove를 업데이트하고 다시 엽니다. 원본 CLI는 계속 실행됩니다.", version: release.version)
                 self.applying = true
