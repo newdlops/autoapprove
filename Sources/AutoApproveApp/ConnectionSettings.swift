@@ -15,6 +15,7 @@ import AutoApproveCore
     @State private var keepAwakeError: String?
     @State private var mouseActivityError: String?
     @State private var terminalWindowSharingAllowed = false
+    @State private var screenControlAllowed=false
     @State private var terminalInputStatus = TerminalInputStatus.notInstalled
     @State private var terminalInputBusy = false
     @State private var terminalInputError: String?
@@ -38,10 +39,10 @@ import AutoApproveCore
                             disconnect: { engine.disconnectScreenHost(.tmux) })
                     }
                     Divider()
-                    section("원본 터미널 화면·입력", icon: "display", status: "기본은 터미널 중계 · Mac 창 보기는 선택 사항입니다.") {
+                    section("터미널 중계·화면 공유", icon: "display", status: "기본은 터미널 중계 · 화면 보기와 조작은 선택 사항입니다.") {
                         TerminalSharingSettings(screenAllowed: terminalWindowSharingAllowed, inputStatus: terminalInputStatus,
-                            inputBusy: terminalInputBusy, inputError: terminalInputError,
-                            screenAction: requestTerminalScreenSharing, inputAction: requestTerminalInput)
+                            inputBusy: terminalInputBusy, inputError: terminalInputError,controlAllowed:screenControlAllowed,
+                            screenAction: requestTerminalScreenSharing, inputAction: requestTerminalInput,controlAction:requestScreenControl)
                     }
                     Divider()
                     section("질문 · 작업 완료 알림", icon: "bell", status: notifications.status) {
@@ -205,6 +206,7 @@ import AutoApproveCore
     private func refreshTerminalPermissions() {
         terminalWindowSharingAllowed = TerminalWindowCapture.screenPermissionGranted
         terminalInputStatus = TerminalInputClient.shared.state
+        screenControlAllowed=RemoteScreenControl.permissionGranted
     }
     private func openPrivacySettings(_ pane: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") { NSWorkspace.shared.open(url) }
@@ -215,6 +217,11 @@ import AutoApproveCore
             _ = TerminalWindowCapture.requestScreenPermission(); refreshTerminalPermissions()
             notice = "macOS 설정에서 AutoApprove의 화면 공유를 허용해주세요. macOS가 재시작을 요청하면 앱을 다시 연 뒤 휴대폰에서 원본 터미널을 연결하세요."
         }
+    }
+    private func requestScreenControl() {
+        if !screenControlAllowed {_ = RemoteScreenControl.requestPermission();refreshTerminalPermissions()}
+        openPrivacySettings("Privacy_Accessibility")
+        if !screenControlAllowed {notice="손쉬운 사용에서 AutoApprove를 허용한 뒤 웹의 공유 화면에서 조작하기를 눌러주세요."}
     }
     private func requestTerminalInput() {
         terminalInputError = nil

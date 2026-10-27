@@ -6,8 +6,10 @@ struct TerminalSharingSettings: View {
     var inputStatus: TerminalInputStatus
     var inputBusy: Bool
     var inputError: String?
+    var controlAllowed:Bool
     var screenAction: () -> Void
     var inputAction: () -> Void
+    var controlAction:()->Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -18,6 +20,13 @@ struct TerminalSharingSettings: View {
                 Button(screenAllowed ? "화면 공유 설정" : "화면 공유 허용", action: screenAction)
                     .help("선택한 원본 터미널 창을 공유하는 macOS 권한을 확인합니다.")
             }
+            HStack {
+                permissionLabel(controlAllowed,allowed:"공유 화면 키보드·마우스 허용됨",needed:"화면 조작 · 손쉬운 사용 필요",optional:true)
+                Spacer()
+                Button(controlAllowed ? "화면 조작 설정":"화면 조작 허용",action:controlAction)
+                    .help("웹의 공유 화면에서 키보드·마우스를 사용할 수 있도록 macOS 손쉬운 사용 권한을 확인합니다.")
+            }
+            Text("화면을 공유한 뒤 웹에서 ‘조작하기’를 켜면 클릭·드래그·스크롤과 키보드를 사용할 수 있습니다. 손쉬운 사용 권한은 이 Mac에서 한 번 허용합니다.").font(.caption)
             HStack {
                 permissionLabel(inputStatus.available, allowed: "원본에 직접 입력 연결됨", needed: inputStatus == .requiresApproval ? "Terminal 직접 입력 · 승인 대기" : "Terminal 직접 입력 연결 필요")
                 Spacer()

@@ -1601,6 +1601,7 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/terminal-wire.js": return try asset("terminal-wire.js", type: "text/javascript; charset=utf-8")
                 case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
                 case "/input-channel.js": return try asset("input-channel.js", type: "text/javascript; charset=utf-8")
+                case "/screen-control.js": return try asset("screen-control.js",type:"text/javascript; charset=utf-8")
                 case "/api/input/socket":
                     let handshake = try RemoteWebSocketParser.handshake(request)
                     var response = RemoteHTTPResponse(status:101,body:Data())
@@ -1613,7 +1614,15 @@ struct RemoteTerminalUpdate: Encodable {
                             do {
                                 guard let engine = self.engine else { throw RemoteHTTPError(503,"앱이 종료되었습니다.") }
                                 let object = try input.json()
-                                if input.path == "/api/input/bind" { return try .object(engine.validateInputChannel(object)) }
+                                if input.path == "/api/input/bind" { return try .object(object["mode"] as? String=="screen" ? engine.testScreens.bindControl(object):engine.validateInputChannel(object)) }
+                                if input.path == "/api/screen/input" {return try .object(engine.testScreens.screenInput(object))}
+                                if input.path == "/api/screen/control" {
+                                    switch object["action"] as? String {
+                                    case "heartbeat":return try .object(engine.testScreens.heartbeatControl(object))
+                                    case "end":return try .object(engine.testScreens.endControl(object))
+                                    default:throw RemoteInputPacket.invalid()
+                                    }
+                                }
                                 if input.path == "/api/pty/input" { return try await .object(engine.ptyInput(object)) }
                                 if input.path == "/api/input" { return try await .object(engine.remoteInput(object)) }
                                 throw RemoteInputPacket.invalid()
@@ -1739,6 +1748,19 @@ struct RemoteTerminalUpdate: Encodable {
             }
             let object = try request.json()
             switch request.path {
+            case "/api/screen/control":
+                if let forwarded=try await forward(request) {return forwarded}
+                guard let engine else {throw RemoteHTTPError(503,"앱이 종료되었습니다.")}
+                switch object["action"] as? String {
+                case "begin":return try .json(engine.testScreens.beginControl(object))
+                case "heartbeat":return try .object(engine.testScreens.heartbeatControl(object))
+                case "end":return try .object(engine.testScreens.endControl(object))
+                default:throw RemoteScreenInput.invalid()
+                }
+            case "/api/screen/input":
+                if let forwarded=try await forward(request) {return forwarded}
+                guard let engine else {throw RemoteHTTPError(503,"앱이 종료되었습니다.")}
+                return try .object(engine.testScreens.screenInput(object))
             case "/api/version/check", "/api/version/sync":
                 guard request.parameter("node")==nil || request.parameter("node")==nodeID else {throw RemoteHTTPError(400,"외부 접속을 제공하는 호스트에서 확인해주세요.")}
                 let epoch=generation
@@ -1772,7 +1794,7 @@ struct RemoteTerminalUpdate: Encodable {
             case "/api/input/bind":
                 if let forwarded = try await forward(request) { return forwarded }
                 guard let engine else { throw RemoteHTTPError(503,"앱이 종료되었습니다.") }
-                return try .object(engine.validateInputChannel(object))
+                return try .object(object["mode"] as? String=="screen" ? engine.testScreens.bindControl(object):engine.validateInputChannel(object))
             case "/api/action", "/api/input", "/api/terminal/connect", "/api/pty", "/api/pty/input", "/api/pty/resize", "/api/pty/close":
                 if let forwarded = try await forward(request) { return forwarded }
                 guard let engine, let requestID = object["requestID"] as? String, UUID(uuidString: requestID) != nil else { throw RemoteHTTPError(400, "고유한 요청 ID가 필요합니다.") }

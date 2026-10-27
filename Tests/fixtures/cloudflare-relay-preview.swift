@@ -27,13 +27,18 @@ private final class RelayOriginal:@unchecked Sendable {
         let records=ProcessDiscovery.parse("2000000000 1 ?? 2000000000 0 Tue Oct 27 09:00:00 2026 /Applications/iTerm.app/Contents/MacOS/iTerm2/iTermServer\n2000000001 2000000000 ttys093 2000000001 2000000001 Tue Oct 27 09:00:01 2026 /fixture/codex")
         let adapter=ScreenHostAdapter(screens:{targets in TerminalSnapshot(screens:targets.map {original.screen($0.tty)})},approve:{_,_,_ in .missingTarget},reveal:{_ in nil},input:{_,_,_,input in try original.input(input)})
         let environment=["HOME":root.path,"ZDOTDIR":root.path,"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","PS1":"QA> "]
+        let screenProbe=ScreenControlPreviewProbe(root)
+        let screenControl=RemoteScreenControl(services:screenProbe.services())
+        let screenSources=[TestScreenSource(id:1,scope:"display",title:"합성 Worker 화면",width:1920,height:1080)]
+        let screens=TestScreenSharing(permission:{_ in true},sources:{screenSources},capture:{try await screenProbe.image($0)},remoteControl:screenControl)
         guard let release=RemoteWebVersion.current else {throw AppError.message("Missing fixture release")}
         let published=PublishedUpdateServices {request,_ in
             guard request.url?.absoluteString=="https://api.github.com/repos/newdlops/autoapprove/releases/latest" else {throw AppError.message("Unexpected release request")}
             return PublishedUpdateReply(status:200,body:try JSONSerialization.data(withJSONObject:["tag_name":"v"+release.version,"draft":false,"prerelease":false,"assets":[]]))
         }
-        let engine=try ApprovalEngine(paths:AppPaths(directory:root.appendingPathComponent("profile")),claudeRegistryReader:{_ in []},processReader:{records},screenAdapters:[.iterm:adapter],managedPTY:ManagedPTYManager(environment:environment),publishedUpdateServices:published)
+        let engine=try ApprovalEngine(paths:AppPaths(directory:root.appendingPathComponent("profile")),claudeRegistryReader:{_ in []},processReader:{records},screenAdapters:[.iterm:adapter],managedPTY:ManagedPTYManager(environment:environment),testScreenSharing:screens,publishedUpdateServices:published)
         defer{engine.stop()};try engine.start(poll:false)
+        _=try await screens.start(["scope":"display","sourceID":1,"durationSeconds":900],owner:"synthetic-worker-preview")
         var originals=ProcessDiscovery.sessions(records);for i in originals.indices {originals[i].terminal = .iterm;originals[i].cwd=root.path}
         engine.updateDiscovery(originals,records:records);await engine.connectScreenHost(.iterm)
         var webStatus=RemoteNetworkStatus()

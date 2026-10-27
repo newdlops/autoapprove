@@ -271,6 +271,19 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .test-screen-image img[data-zoom=true] { width: auto; max-width: none; max-height: none; cursor: zoom-out; }
 #test-screen-image { cursor: zoom-in; }
 #test-screen-status { overflow-wrap: anywhere; }
+.screen-control-toolbar { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; }
+.screen-control-toolbar > p { flex: 1 1 220px; margin: 6px 0; }
+#screen-control-status, #screen-control-error, #screen-control-help { overflow-wrap: anywhere; }
+.screen-control-text { display: flex; align-items: flex-end; gap: 8px; margin-top: 4px; }
+#screen-control-keyboard { flex: 1; min-width: 0; min-height: 44px; max-height: 160px; resize: vertical; }
+.screen-control-keys { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.screen-control-keys > button { min-width: 44px; }
+#screen-control-panel { margin-top: 12px; }
+#screen-control-quality { font-variant-numeric: tabular-nums; }
+#toggle-screen-control[aria-pressed=true], #screen-touch-secondary[aria-pressed=true] { color: var(--blue); border-color: var(--blue); background: var(--selected); }
+.screen-zoom-button[data-controlling=true] { touch-action: none; user-select: none; -webkit-user-select: none; }
+#test-screen-image[data-controlling=true] { cursor: crosshair; touch-action: none; }
+.test-screen-dialog[data-controlling=true] .test-screen-image, .test-screen-dialog[data-controlling=true] .test-screen-image img:not([data-zoom=true]) { max-height: 44dvh; }
 .question-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .question-label { display: block; font-size: 13px; margin: 10px 0 6px; }
 .history-item { border-bottom: 1px solid var(--line); padding: 10px 0; font-size: 13px; }

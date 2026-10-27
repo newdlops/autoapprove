@@ -1612,7 +1612,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         remoteInputSessions.contains(id) || remoteInputUntil[id].map { Date() < $0 } == true
     }
     private func nativeUserInputHasPriority(_ id:String) -> Bool {
-        sessions[id].map {nativeKeyboardActivity.hasPriority(terminal:$0.terminal)} ?? false
+        sessions[id].map {nativeKeyboardActivity.hasPriority(terminal:$0.terminal) || testScreens.remoteControl.hasInputPriority(terminal:$0.terminal)} ?? false
     }
     private func userInputHasPriority(_ id:String) -> Bool {
         remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)

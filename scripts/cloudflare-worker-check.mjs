@@ -82,7 +82,7 @@ try{
  const port=server.address().port,url='http://127.0.0.1:'+port;
  if(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS!==undefined)process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS+=(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS?',':'')+port;
  const cache=path.resolve('.build/cache/WorkerPreview');await mkdir(cache,{recursive:true});
- execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/cloudflare-relay-preview.swift','-o',root+'/RelayPreview'],{stdio:'inherit',timeout:300000});
+ execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/ScreenControlFixture.swift','Tests/fixtures/cloudflare-relay-preview.swift','-o',root+'/RelayPreview'],{stdio:'inherit',timeout:300000});
  const pinMode=process.argv.includes('--pin');
  fixture=spawn(root+'/RelayPreview',[root,url,key,...(pinMode?['--pin']:[])],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
  const info=await new Promise((resolve,reject)=>{let output='';const timer=setTimeout(()=>reject(Error('native startup '+stderr)),15000);fixture.stdout.on('data',data=>{output+=data;try{const value=JSON.parse(output.trim());clearTimeout(timer);resolve(value);}catch{}});fixture.on('exit',code=>{clearTimeout(timer);reject(Error('native exit '+code+' '+stderr));});});
@@ -202,6 +202,16 @@ try{
    assert.equal((await readFile(root+'/original-input.bin','utf8')).split(text).length-1,1);
    browserChecks.push(engine+': idle original input reconnects transparently without replay or source changes');
   }
+  stage=engine+' screen control';await page.locator('#terminal-screens').click();
+  await page.waitForFunction(()=>$('test-screen-image').naturalWidth===960);
+  await page.locator('#toggle-screen-control').click();await page.waitForFunction(()=>screenControl?.active&&!screenControlBusy);
+  if(socketMode)await page.waitForFunction(()=>screenControl.channel?.state==='ready');
+  const pointer=await page.locator('#test-screen-image').boundingBox();await page.mouse.click(pointer.x+pointer.width/2,pointer.y+pointer.height/2);
+  await until(async()=>{try{return (await readFile(root+'/screen-events.ndjson','utf8')).trim().split('\n').map(JSON.parse).some(event=>event.type===1);}catch{return false;}},'Screen click through Worker');
+  const screenText='SCREEN-'+engine+'-한글🙂';await page.locator('#screen-control-keyboard').fill(screenText);
+  await until(async()=>{try{return (await readFile(root+'/typed.txt','utf8')).endsWith(screenText);}catch{return false;}},'Screen Unicode through Worker');
+  await page.locator('#close-test-screen').click();await page.waitForFunction(()=>!screenControl?.active);
+  browserChecks.push(engine+': screen pointer and exact Korean/emoji traverse production Worker/WSS/PIN gateway to synthetic Quartz sink; closing the viewer revokes control');
   stage=engine+' PTY';await page.locator('#terminal-back').click();
   if(lateInput)await page.evaluate(()=>{window.availableInputClass=window.AutoApproveInputChannel;window.AutoApproveInputChannel=null;});
   await page.locator('#new-pty').click();await page.locator('#pty-directory').fill(root);await page.locator('#pty-program').selectOption('shell');await page.locator('#pty-automatic').uncheck();await page.locator('#start-pty').click();

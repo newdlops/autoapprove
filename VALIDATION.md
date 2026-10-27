@@ -1,5 +1,17 @@
 # AutoApprove 검증 기록
 
+## 2026-10-27 · 공유 화면 키보드·마우스 조작 · 0.2.193/220
+
+- 기존 보기 전용 화면에 명시적인 **조작하기**를 추가했다. 같은 Mac의 한 조작 연결에 공유 ID·비공개 토큰·정확한 순서·5초 만료를 묶는다. 현재 창의 PID/시작 시각·노출·포커스, 화면 기록/손쉬운 사용 권한과 최신 프레임을 검사한다. 종료·연결 손실·대상 변경 시 눌린 마우스 버튼을 정리하며 전송 여부가 불확실한 입력을 재전송하지 않는다. 입력은 디스크 영수증·브라우저 저장소에 남기지 않는다. 미전송 텍스트만 현재 페이지 메모리에 보존한다.
+- 기존 입력 프로토콜의 번호를 유지하고 화면 kind 8을 추가했다. 이동 6B·버튼 7B·휠 10B·키 4B의 payload와 8B 프레임을 사용하며 이동은 16ms로 병합한다. 조작 중 캡처는 최대 1280px/JPEG 0.55·최소 캐시 120ms, 브라우저 요청 간격은 완료 후 150ms다. 네이티브 60fps나 실제 공개 Cloudflare 지연을 측정한 수치로 해석하지 않는다. 기존 보기 캡처는 유지한다.
+- 최종 release App·CLI·Core 빌드와 **509/509 핵심 검사**를 통과했다. 신규 7그룹은 정확한 바이너리·잘못된 입력·음수 원점/Retina/가림, 최신 명시적 권한·단일 조작자·토큰·순서, Quartz 이동/드래그/우클릭/더블 클릭/휠/해제, 정확한 한글/이모지 UTF-16과 modifier, 만료·소유자 교체, 포커스·부분 실패·입력 제한, 같은 터미널의 자동 승인 양보를 검사했다. 테스트 sink에서 실제 CGEvent 객체를 읽으며 OS에는 게시하지 않았다.
+- Chromium·WebKit의 실제 PIN gateway/HTTP/WebSocket 검사 **각 9그룹**을 통과했다. 보기 모드 입력 0건, 다른 origin/권한 없는 입력 거부, 단일 조작자, 좌표·한글/이모지·단축키, 두 IME 이벤트 순서의 1회 전달, 드래그/우클릭/휠/더블 클릭, Esc·권한 거부·socket 손실/버튼 해제·대상 변경·HTTP 선선택·공유 종료를 확인했다. 터치 지원 모바일 context의 실제 touchscreen 탭/보조 탭과 합성 다중 PointerEvent의 드래그/두 손가락 스크롤을 구분해 검사했다. 최종 바이너리 패킷 **30/28개**, 합성 native 이벤트 **50/48개**, pageerror·사용자 데스크톱 입력 0건이다.
+- 실제 로컬 workerd/SQLite Durable Object → 제품 네이티브 WSS/gateway/Core 경로를 두 브라우저에서 PIN·지속 입력·늦은 입력 모듈과 함께 통과했다. 새 화면 클릭과 정확한 한글/이모지가 합성 Quartz sink에 도달했고 viewer 닫기가 조작을 해제했다. 기존 버전 확인·원본 식별·유휴 입력 재연결·실제 격리 PTY/방향키/SSE·출력만 복구·16개 ACK 손실·미전송 보존·PIN 교체·로그아웃도 통과했다. 요청 **78/76개**, pageerror·별도 종료 진단 0개다. 강제 종료 스트림의 workerd 원시 예외는 의도한 연결 종료 진단이다. 실제 Cloudflare 계정·DNS·사용자 터미널은 사용하지 않았다.
+- 기존 질문/메시지/화면 보기 브라우저 회귀 **17그룹**을 통과했다. 종료 직후 늦은 목록 응답으로 종료된 공유가 재선택되던 문제를 고쳐 공유 종료·권한 거부·명시적 재시작을 확인했다. 과거 답변을 현재 질문에서 찾던 오래된 검사는 현재 ‘지난 답변’에서 정확한 질문·접수 문구를 요구하도록 수정했다. 전송·입력 권한을 완화하지 않았다.
+- UI workflow와 기존 디자인을 유지했다. 웹 **390×844·768×1024·1440×900**, 밝음/어두움·권한 오류·터치 화면을 캡처하고 모바일 어두움·태블릿·데스크톱을 시각 확인했다. 가로 넘침 0건이며 label/name/자동완성 끄기·44px 조작부·포커스·Esc 이탈·선택 상태·모달 스크롤 격리를 Web Interface Guidelines로 점검했다. 네이티브 실제 TerminalSharingSettings의 권한 필요/허용/진행/긴 오류 × light/dark × 480/600pt **16장**을 렌더링하고 작은 권한/긴 오류와 어두운 허용 상태를 시각 확인했다. 콜백은 무동작이며 시스템 권한을 변경하지 않았다. 실물 휴대폰·전체 VoiceOver·실제 사용자 데스크톱 이벤트 전달 검증으로 주장하지 않는다.
+- 최종 서명 앱의 입력 보조 프로그램·상호 게시자 요구식/다른 서명 거부, 이동 앱의 네트워크/포트/ON·OFF/MCP/실제 격리 PTY 검사를 통과했다. Worker 리소스/누락 처리와 심볼 분리 검사도 통과했다. 최종 DMG는 읽기 전용 마운트의 앱·서명·Applications 링크·설치 안내를 검증했으며 SHA-256은 **456fb5a57a7ee71d82f73acc14e4989e7173a1dd0e9753346ca6af03a0da0d44**다. 업데이트 ZIP **9,366,063B**, SHA-256 **7bc3519280e31361313e3f5381d6fdb48b9fd1446e9bcb546e940a7faf5baba3**와 각 체크섬을 함께 배포한다.
+- 재현: release 빌드와 `autoapprove-checks`, `node scripts/web-screen-control-check.mjs [--webkit]`, `node scripts/cloudflare-worker-check.mjs --build=.build/network-stability/release --pin --socket --late-input --browser [--webkit]`, `node scripts/web-interaction-browser-check.mjs --release --core-build=.build/network-stability/release`, `node scripts/screen-control-settings-preview.mjs`. Playwright/Miniflare는 각 스크립트의 모듈·dependencies 옵션을 사용한다. 비공개 실행 자료·원본 식별·백업은 `.runtime/screen-control-193/`에 보관하며 공개 소스에 포함하지 않는다.
+
 ## 2026-10-27 · 0.2.192/219 공개 배포·설치 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.192)와 원격 태그 역참조는 **ddef6ac0d9b4942026fcf725b93c619701972fcb**다. DMG·업데이트 ZIP·각 체크섬 **4개**를 인증 없이 다시 내려받아 GitHub digest·로컬 파일·체크섬이 모두 일치함을 확인했다. DMG **9,068,442B**·체크섬 **102B**, ZIP **9,268,957B**·체크섬 **111B**이며 SHA-256은 아래 기능 검증 기록과 같다.

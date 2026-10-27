@@ -106,6 +106,9 @@ let queueSnapshot = null, queueLoading = false, queueGeneration = 0, queueSessio
 const queueConversations = new Map();
 let screenStarting = false, screenStartNode = null;
 let webFormSignature = '', screenListSignature = '', sharedScreen = null, sharedScreenTimer, sharedScreenController, sharedScreenFailures = 0;
+const stoppedScreenShares = new Set();
+let screenControl=null,screenControlBusy=false,screenControlEpoch=0,screenControlModuleTask=null;
+const screenControlDrafts=new Map();
 const messageDeliveries = new Map(), messageReceiptReads = new Set();
 let messageUncertain = new Set(), interactionLinkOpened = false, messageReceiptTimer;
 const messageStorage = 'autoapprove-message-drafts-v1';
@@ -667,6 +670,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
       tunnelAuthExpired=true;
       renderVersionSync();
       stopDirect();
+      stopScreenControl();
       if(ptyClient && !ptyClient.blocked)ptyClient.fail(new Error('접속 시간이 끝났습니다. PIN 또는 접속 키로 다시 연결해주세요.'));
       text($('tunnel-access-state'),'접속 시간이 끝났습니다. 미전달 입력을 확인하고 다시 연결해주세요.');show($('tunnel-relogin'),true);
     }
@@ -2248,7 +2252,7 @@ function renderInteractions() {
   const link = new URLSearchParams(location.hash.slice(1));
   if (!interactionLinkOpened && link.has('request') && forms.some(({request})=>request.id===link.get('request'))) { interactionLinkOpened=true; openInteraction(); }
   if (!interactionLinkOpened && link.has('share')) {
-    const found = nodes.flatMap(node=>(node.state?.screenShares || []).map(share=>({node,share}))).find(item=>item.share.id===link.get('share'));
+    const found = currentScreenShares().find(item=>item.share.id===link.get('share'));
     if (found) { interactionLinkOpened=true; void openTestScreens(false,found); }
   }
 }
@@ -2420,8 +2424,10 @@ async function checkPendingMessages() {
   await Promise.all([...messageDeliveries].filter(([,value])=>value.phase==='uncertain' && !value.receiptSettled && (value.receiptChecks || 0)<15).map(([key,value])=>checkMessageReceipt(key,value)));
   scheduleMessageReceipts();
 }
+function currentScreenShares(){return nodes.flatMap(node=>(node.state?.screenShares || []).filter(share=>!stoppedScreenShares.has(share.id)).map(share=>({node,share})));}
+function forgetTestScreen(id){stoppedScreenShares.add(id);if(stoppedScreenShares.size>64)stoppedScreenShares.delete(stoppedScreenShares.values().next().value);renderTestScreenList();}
 function renderTestScreenList() {
-  const shares=nodes.flatMap(node=>(node.state?.screenShares || []).map(share=>({node,share})));
+  const shares=currentScreenShares();
   text($('screen-count'),shares.length || ''); text($('global-screens'),`화면 공유 ${shares.length}`); show($('global-screens'),shares.length>0); show($('screen-share-picker'),shares.length>1);
   const signature=JSON.stringify(shares.map(({node,share})=>[node.id,node.online,share])); if(signature===screenListSignature)return;
   screenListSignature=signature; $('test-screen-list').replaceChildren();
@@ -2434,7 +2440,7 @@ async function openTestScreens(start = false, requested = null) {
   renderTestScreenList(); if (!$('test-screen-dialog').open) $('test-screen-dialog').showModal();
   screenStartNode = requested?.node || currentNode() || nodes.find(node => node.local && node.online) || nodes.find(node => node.online);
   text($('test-screen-source'), screenStartNode ? `${screenStartNode.name} · Mac 전체 화면 · 보기 전용` : '화면을 공유할 Mac에 연결해주세요.');
-  const shares = nodes.flatMap(node => (node.state?.screenShares || []).map(share => ({node,share}))).filter(item => item.node.online);
+  const shares = currentScreenShares().filter(item => item.node.online);
   const existing = requested || shares.find(item => item.node.id === screenStartNode?.id) || (!start ? shares[0] : null);
   show($('screen-start-error'),false); text($('screen-start-status'),'');
   show($('start-test-screen'),!existing); $('start-test-screen').disabled = screenStarting || !screenStartNode?.online || !supportsRelease(screenStartNode,[0,2,50,61]);
@@ -2527,8 +2533,74 @@ async function clearCodexQueue() {
     }
   }
 }
-function stopTestScreenRead(){clearTimeout(sharedScreenTimer);sharedScreenController?.abort();sharedScreenController=null;sharedScreenFailures=0;}
-function selectTestScreen(node,share){stopTestScreenRead();sharedScreen={node,share,sessionKey:selectedItem?.node.id===node.id&&['codex','claude'].includes(selectedItem.session.agent)?selectedKey:''};text($('test-screen-source'),`${node.name} · ${share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · 보기 전용`);$('test-screen-image').removeAttribute('src');$('test-screen-image').dataset.zoom='false';$('test-screen-zoom').setAttribute('aria-pressed','false');$('test-screen-zoom').setAttribute('aria-label','공유 화면 확대');$('test-screen-zoom').disabled=true;$('stop-test-screen').disabled=false;show($('test-screen-viewer'),true);show($('test-screen-error'),false);updateScreenSessionControls();void readTestScreen();}
+function screenDraftKey(value=sharedScreen){return value?value.node.id+'/'+value.share.id:'';}
+function saveScreenDraft(value=sharedScreen){
+  const key=screenDraftKey(value),field=$('screen-control-keyboard');if(!key||!field)return;
+  if(field.value)screenControlDrafts.set(key,{text:field.value,expires:value.share.expiresAt});else screenControlDrafts.delete(key);
+  for(const [id,draft]of screenControlDrafts)if(Date.parse(draft.expires)<=Date.now()||screenControlDrafts.size>8)screenControlDrafts.delete(id);
+}
+function renderScreenControl(){
+  const button=$('toggle-screen-control');if(!button)return;
+  const active=!!screenControl?.active,frame=sharedScreen?.frame,capable=frame?.controlVersion===1;
+  const fresh=sharedScreen?.imageAt&&performance.now()-sharedScreen.imageAt<3000&&$('test-screen-image').naturalWidth>0;
+  show(button,capable);button.disabled=screenControlBusy||(!active&&(!fresh||tunnelAuthExpired||document.hidden));
+  text(button,screenControlBusy?'조작 연결 중…':active?'조작 종료':'조작하기');button.setAttribute('aria-pressed',String(active));
+  $('test-screen-dialog').dataset.controlling=String(active);
+  show($('screen-control-panel'),active||!!$('screen-control-keyboard').value);$('screen-control-keyboard').readOnly=!active;
+  $('screen-send-text').disabled=!active||!$('screen-control-keyboard').value;
+  for(const key of document.querySelectorAll('[data-screen-key],#screen-touch-secondary'))key.disabled=!active;
+  if(!active){show($('screen-control-quality'),false);$('screen-touch-secondary').setAttribute('aria-pressed','false');}
+  text($('screen-control-status'),screenControlBusy?'입력 연결을 확인하고 있습니다…':active?'키보드·마우스 조작 중 · Esc 키로 조작 종료':!sharedScreen&&$('screen-control-keyboard').value?'화면 공유가 종료되었습니다. 아직 보내지 않은 텍스트를 확인하세요.':frame&&!capable?'이 호스트는 보기 전용입니다. Mac을 최신 버전으로 업데이트하면 화면을 조작할 수 있습니다.':$('screen-control-keyboard').value?'아직 보내지 않은 텍스트가 남아 있습니다. 조작을 연결한 뒤 문자 전송을 누르세요.':capable?'보기 전용 · 조작하기를 켜면 키보드·마우스를 사용할 수 있습니다.':'');
+  show($('screen-control-status'),!!$('screen-control-status').textContent);
+  if(sharedScreen)text($('test-screen-source'),`${sharedScreen.node.name} · ${sharedScreen.share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · ${active?'조작 중':'보기 전용'}`);
+  $('test-screen-image').alt=`공유 중인 Mac 화면. ${active?'키보드·마우스 조작 중':'보기 전용'}`;
+  $('test-screen-zoom').setAttribute('aria-label',active?'공유 화면 조작 · Esc로 조작 종료':$('test-screen-image').dataset.zoom==='true'?'공유 화면 맞춤':'공유 화면 확대');
+}
+function stopScreenControl(){
+  screenControlEpoch++;screenControlBusy=false;const previous=screenControl;screenControl=null;
+  previous?.stop();saveScreenDraft();renderScreenControl();
+}
+function loadScreenControl(){
+  if(window.AutoApproveScreenControl)return Promise.resolve();if(screenControlModuleTask)return screenControlModuleTask;
+  const work=new Promise((resolve,reject)=>{
+    const script=document.createElement('script'),timer=setTimeout(()=>finish(Error('화면 조작 도구를 받지 못했습니다. 조작하기를 눌러 다시 시도해주세요.')),8000);
+    const finish=error=>{clearTimeout(timer);script.onload=script.onerror=null;if(error){script.remove();reject(error);}else resolve();};
+    script.src='/screen-control.js?version='+encodeURIComponent(loadedWebVersion?.version||'')+'&attempt='+uuid();script.async=true;
+    script.onload=()=>finish(window.AutoApproveScreenControl?null:Error('화면 조작 도구의 응답을 확인하지 못했습니다. 다시 시도해주세요.'));
+    script.onerror=()=>finish(Error('화면 조작 도구를 받지 못했습니다. 연결을 확인하고 다시 시도해주세요.'));document.head.append(script);
+  });
+  screenControlModuleTask=work;work.finally(()=>{if(screenControlModuleTask===work)screenControlModuleTask=null;}).catch(()=>{});return work;
+}
+async function toggleScreenControl(){
+  if(screenControl?.active){stopScreenControl();$('toggle-screen-control').focus();return;}
+  if(screenControlBusy||!sharedScreen||$('toggle-screen-control').disabled)return;
+  stopScreenControl();const owner=sharedScreen,epoch=++screenControlEpoch;screenControlBusy=true;show($('screen-control-error'),false);renderScreenControl();
+  try{
+    await loadScreenControl();if(epoch!==screenControlEpoch||sharedScreen!==owner||!$('test-screen-dialog').open)return;
+    const post=async(path,body,options={})=>{
+      const url=endpoint(path,owner.node.id);
+      if(!options.keepalive)return api(url,body,undefined,5000);
+      const reply=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),keepalive:true,cache:'no-store',credentials:tunnelAccess?'same-origin':'omit'});
+      if(!reply.ok)throw Error('화면 조작 연결이 종료되었습니다.');return reply.json();
+    };
+    const candidate=new window.AutoApproveScreenControl({node:owner.node,share:owner.share,image:$('test-screen-image'),surface:$('test-screen-zoom'),keyboard:$('screen-control-keyboard'),post,
+      onState:()=>{if(screenControl===candidate)renderScreenControl();},
+      onDraft:value=>{
+        const key=screenDraftKey(owner),field=$('screen-control-keyboard');
+        if(sharedScreen===owner){field.value=value+field.value;saveScreenDraft(owner);}else screenControlDrafts.set(key,{text:value,expires:owner.share.expiresAt});
+      },
+      onError:error=>{if(sharedScreen===owner){text($('screen-control-error'),error.message);show($('screen-control-error'),true);renderScreenControl();}},
+      onQuality:value=>{if(screenControl===candidate&&candidate.active&&Number.isFinite(value.medianMS)){text($('screen-control-quality'),`${Math.round(value.medianMS)} ms`);$('screen-control-quality').title=`${value.transport} 입력 연결 왕복 · ${value.samples}개 표본`;show($('screen-control-quality'),true);}},
+      onExit:()=>{$('toggle-screen-control').focus({preventScroll:true});},
+      onDraftChanged:()=>{if(sharedScreen===owner){saveScreenDraft(owner);renderScreenControl();}}
+    });
+    screenControl=candidate;candidate.frame(owner.frame);await candidate.open();
+    if(epoch===screenControlEpoch&&sharedScreen===owner&&candidate.active){clearTimeout(sharedScreenTimer);sharedScreenTimer=setTimeout(readTestScreen,0);}
+  }catch(error){if(epoch===screenControlEpoch&&sharedScreen===owner){text($('screen-control-error'),error.message);show($('screen-control-error'),true);}}
+  finally{if(epoch===screenControlEpoch){screenControlBusy=false;renderScreenControl();}}
+}
+function stopTestScreenRead(){stopScreenControl();clearTimeout(sharedScreenTimer);sharedScreenController?.abort();sharedScreenController=null;sharedScreenFailures=0;}
+function selectTestScreen(node,share){stopTestScreenRead();sharedScreen={node,share,sessionKey:selectedItem?.node.id===node.id&&['codex','claude'].includes(selectedItem.session.agent)?selectedKey:''};if($('screen-control-keyboard')){$('screen-control-keyboard').value=screenControlDrafts.get(screenDraftKey())?.text||'';show($('screen-control-error'),false);}text($('test-screen-source'),`${node.name} · ${share.source.scope==='display'?'Mac 전체 화면':'Mac 창'} · 보기 전용`);$('test-screen-image').removeAttribute('src');$('test-screen-image').dataset.zoom='false';$('test-screen-zoom').setAttribute('aria-pressed','false');$('test-screen-zoom').setAttribute('aria-label','공유 화면 확대');$('test-screen-zoom').disabled=true;$('stop-test-screen').disabled=false;show($('test-screen-viewer'),true);show($('test-screen-error'),false);updateScreenSessionControls();renderScreenControl();void readTestScreen();}
 function updateScreenSessionControls(){
   const key=sharedScreen?.sessionKey,item=key&&allSessions.find(item=>item.key===key);
   const same=item&&selectedKey===key&&item.node.id===sharedScreen.node.id&&item.session.phase!=='ended';
@@ -2542,18 +2614,19 @@ async function readTestScreen(){
   try{const result=await api(endpoint('/api/test-screen',current.node.id)+`&share=${encodeURIComponent(current.share.id)}`,undefined,controller.signal);
     if(sharedScreen!==current||controller.signal.aborted)return;
     const image=result.image;if(result.shareID!==current.share.id||typeof image?.data!=='string'||image.data.length>1000000||!Number.isInteger(image.width)||!Number.isInteger(image.height)||image.width<1||image.height<1||image.width>2048||image.height>2048)throw new Error('공유 화면의 형식이나 크기를 확인하지 못했습니다.');
-    sharedScreenFailures=0;current.observedAt=result.observedAt;
-    $('test-screen-image').width=image.width;$('test-screen-image').height=image.height;$('test-screen-image').src='data:image/jpeg;base64,'+image.data;text($('test-screen-status'),`${current.share.title} · ${nowLabel(result.observedAt)} 갱신 · 누르면 확대`);show($('test-screen-error'),false);show($('retry-test-screen'),false);
-    sharedScreenTimer=setTimeout(readTestScreen,750);
+    sharedScreenFailures=0;current.observedAt=result.observedAt;current.frame=result;
+    $('test-screen-image').width=image.width;$('test-screen-image').height=image.height;$('test-screen-image').src='data:image/jpeg;base64,'+image.data;text($('test-screen-status'),`${current.share.title} · ${nowLabel(result.observedAt)} 갱신 · ${screenControl?.active?'클릭·드래그로 조작':'누르면 확대'}`);show($('test-screen-error'),false);show($('retry-test-screen'),false);
+    sharedScreenTimer=setTimeout(readTestScreen,screenControl?.active?150:750);
   }catch(error){
     if(controller.signal.aborted||sharedScreen!==current||document.hidden||!$('test-screen-dialog').open||error.name==='AbortError')return;
+    stopScreenControl();
     const retry=error.retryable||[408,429,500,502,503,504].includes(error.status);
     text($('test-screen-error'),retry?'Mac 화면 연결이 잠시 끊겼습니다. 자동으로 다시 연결하고 있습니다.':error.message);show($('test-screen-error'),true);show($('retry-test-screen'),error.status!==410);
     if(retry){
       text($('test-screen-status'),current.observedAt?`${current.share.title} · ${nowLabel(current.observedAt)} 마지막 화면 · 다시 연결 중…`:'Mac 화면에 다시 연결하고 있습니다…');
       sharedScreenTimer=setTimeout(readTestScreen,Math.min(3000,500*2**Math.min(sharedScreenFailures++,3)));
     }
-    if([403,410].includes(error.status)){$('test-screen-image').removeAttribute('src');$('test-screen-zoom').disabled=true;if(error.status===410)$('stop-test-screen').disabled=true;}
+    if([403,410].includes(error.status)){$('test-screen-image').removeAttribute('src');$('test-screen-zoom').disabled=true;current.frame=null;current.imageAt=0;if(error.status===410){forgetTestScreen(current.share.id);sharedScreen=null;$('stop-test-screen').disabled=true;updateScreenSessionControls();}renderScreenControl();}
   }
   finally{if(sharedScreenController===controller)sharedScreenController=null;}
 }
@@ -2580,10 +2653,15 @@ $('cancel-clear-queue').addEventListener('click',()=>{show($('queue-confirm'),fa
 $('confirm-clear-queue').addEventListener('click',()=>void clearCodexQueue());
 $('close-test-screen').addEventListener('click',()=>$('test-screen-dialog').close());$('test-screen-dialog').addEventListener('close',()=>{stopTestScreenRead();$('test-screen-image').removeAttribute('src');});
 $('retry-test-screen').addEventListener('click',()=>void readTestScreen());
-$('test-screen-image').addEventListener('load',()=>{$('test-screen-zoom').disabled=false;});
+$('test-screen-image').addEventListener('load',()=>{$('test-screen-zoom').disabled=false;if(sharedScreen?.frame){sharedScreen.imageAt=performance.now();screenControl?.frame(sharedScreen.frame);}renderScreenControl();});
 $('test-screen-image').addEventListener('error',()=>{if(!$('test-screen-image').hasAttribute('src'))return;stopTestScreenRead();$('test-screen-zoom').disabled=true;text($('test-screen-error'),'공유 이미지를 표시하지 못했습니다. 화면을 다시 연결해주세요.');show($('test-screen-error'),true);show($('retry-test-screen'),true);});
-$('test-screen-zoom').addEventListener('click',()=>{const zoom=$('test-screen-image').dataset.zoom!=='true';$('test-screen-image').dataset.zoom=String(zoom);$('test-screen-zoom').setAttribute('aria-pressed',String(zoom));$('test-screen-zoom').setAttribute('aria-label',zoom?'공유 화면 맞춤':'공유 화면 확대');});
-$('stop-test-screen').addEventListener('click',async()=>{if(!sharedScreen||mutation)return;const current=sharedScreen;stopTestScreenRead();if(await action(current.node.id,{action:'stopScreenShare',shareID:current.share.id},'화면 공유를 종료했습니다.')){$('test-screen-image').removeAttribute('src');sharedScreen=null;text($('test-screen-status'),'화면 공유가 종료되었습니다.');$('stop-test-screen').disabled=true;}});
+$('test-screen-zoom').addEventListener('click',()=>{if(screenControl?.active)return;const zoom=$('test-screen-image').dataset.zoom!=='true';$('test-screen-image').dataset.zoom=String(zoom);$('test-screen-zoom').setAttribute('aria-pressed',String(zoom));$('test-screen-zoom').setAttribute('aria-label',zoom?'공유 화면 맞춤':'공유 화면 확대');});
+$('toggle-screen-control')?.addEventListener('click',()=>void toggleScreenControl());
+$('screen-control-keyboard')?.addEventListener('input',()=>queueMicrotask(()=>{saveScreenDraft();renderScreenControl();}));
+$('screen-send-text')?.addEventListener('click',()=>{screenControl?.commit();saveScreenDraft();renderScreenControl();});
+for(const button of document.querySelectorAll('[data-screen-key]'))button.addEventListener('click',()=>{screenControl?.key(button.dataset.screenKey,Number(button.dataset.screenModifiers||0));if(screenControl?.active&&!matchMedia('(pointer:coarse)').matches)screenControl.focusKeyboard();});
+$('screen-touch-secondary')?.addEventListener('click',()=>{if(!screenControl?.active)return;screenControl.rightClick=!screenControl.rightClick;$('screen-touch-secondary').setAttribute('aria-pressed',String(screenControl.rightClick));});
+$('stop-test-screen').addEventListener('click',async()=>{if(!sharedScreen||mutation)return;const current=sharedScreen;stopTestScreenRead();if(await action(current.node.id,{action:'stopScreenShare',shareID:current.share.id},'화면 공유를 종료했습니다.')){forgetTestScreen(current.share.id);$('test-screen-image').removeAttribute('src');$('test-screen-zoom').disabled=true;sharedScreen=null;text($('test-screen-status'),'화면 공유가 종료되었습니다.');$('stop-test-screen').disabled=true;updateScreenSessionControls();renderScreenControl();}});
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopTestScreenRead();$('test-screen-image').removeAttribute('src');}else if(sharedScreen&&$('test-screen-dialog').open)void readTestScreen();});
 function renderHistory() {
   if (!historyVisible()) { stopSessionHistory(); return; }

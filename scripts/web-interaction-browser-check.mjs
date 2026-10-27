@@ -79,7 +79,7 @@ try {
   assert.equal(beginStarted,true,'Question editing should be acknowledged independently');assert.equal(beginFinished,false);
   assert.equal(await codexForm.getByRole('button',{name:'답변 보내기'}).isEnabled(),true,'Holding automation must not swallow a Send tap');
   await codexForm.getByRole('button',{name:'답변 보내기'}).click({timeout:800});
-  await page.waitForFunction(()=>$('questions').textContent.includes('대기열에 등록'));
+  await page.waitForFunction(()=>$('past-question-list').textContent.includes('합성 모바일 테스트를 진행할까요?')&&$('past-question-list').textContent.includes('대기열에 등록'));
   assert.equal(replyAfterBegin,true);assert.equal((await optionalFile('messages.txt')).split('> 합성 모바일 테스트를 진행할까요?').length-1,1);
   await page.unroute('**/api/action**');checks.push('Immediate Send during a delayed editing acknowledgement delivers the selected Codex answer exactly once');
   const nodeID=await page.evaluate(()=>selectedItem.node.id);
@@ -213,6 +213,7 @@ try {
   await writeFile(path.join(output,'report.json'),JSON.stringify({result:'PASS',scope:'Real browser, production Swift HTTP/MCP/hooks with synthetic sessions/providers/images; no physical phone or user desktop',checks,screenshots,errors},null,2));console.log(JSON.stringify({result:'PASS',checks,screenshots,errors},null,2));
 }catch(error){
   const client=page ? await page.evaluate(()=>({deliveries:[...questionDeliveries.entries()],questions:interactionSources().flatMap(source=>source.queuedQuestions||[]),buttons:[...document.querySelectorAll('#questions button')].map(button=>({text:button.textContent,disabled:button.disabled})),network:{connected,mutation,original:originalStreamSelected()}})).catch(()=>null) : null;
-  await writeFile(path.join(output,'failure.json'),JSON.stringify({error:error.message,errors,checks,client},null,2));throw error;
+  await page?.screenshot({path:path.join(output,'failure.png')}).catch(()=>{});
+  await writeFile(path.join(output,'failure.json'),JSON.stringify({error:error.message,stack:error.stack,errors,checks,client},null,2));throw error;
 }
 finally{if(browser)await browser.close();if(mcp){mcp.stdin.end();await new Promise(resolve=>setTimeout(resolve,200));if(mcp.exitCode===null)mcp.kill('SIGTERM');}if(fixture&&fixture.exitCode===null)fixture.kill('SIGTERM');await rm(directory,{recursive:true,force:true});}

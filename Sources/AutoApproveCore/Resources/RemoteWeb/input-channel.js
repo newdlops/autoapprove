@@ -53,7 +53,7 @@ window.AutoApproveInputChannel = class {
         if (payload.length || this.state !== 'opening') throw new Error('입력 연결 확인 순서가 바뀌었습니다.');
         clearTimeout(this.openTimer); this.openTimer = null; this.state = 'ready';
         const resolve = this.resolve; this.resolve = null; this.reject = null; resolve?.(this);
-        this.ping(); this.pingTimer = setInterval(() => this.ping(),15000); this.changed(); return;
+        this.ping(); this.pingTimer = setInterval(() => this.ping(),this.binding.mode==='screen'?1000:15000); this.changed(); return;
       }
       if (kind === 5) {
         const failure = JSON.parse(this.decoder.decode(payload));

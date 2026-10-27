@@ -3,7 +3,7 @@ import Foundation
 /// Eight bytes of framing; identity is bound once, never repeated per key.
 /// Acknowledgements are cumulative. Neither endpoint replays uncertain input.
 public struct RemoteInputPacket: Sendable {
-    public enum Kind: UInt8, Sendable { case bind = 0, ready, pty, native, ack, failure, ping, pong }
+    public enum Kind: UInt8, Sendable { case bind = 0, ready, pty, native, ack, failure, ping, pong, screen }
     public static let maximumPayload = 16_001
     public static let windowMessages = 16
     public static let windowBytes = 64_000
@@ -36,7 +36,7 @@ struct RemoteInputBinding {
     let sequenceBase: Int
     init(_ data: Data) throws {
         guard data.count <= 4096, let object = try JSONSerialization.jsonObject(with:data) as? JSONObject,
-              let mode = object["mode"] as? String, ["pty","native"].contains(mode),
+              let mode = object["mode"] as? String, ["pty","native","screen"].contains(mode),
               let stream = object["streamID"] as? String, !stream.isEmpty, stream.utf8.count <= 512 else { throw RemoteInputPacket.invalid() }
         self.mode = mode
         if mode == "pty" {
@@ -44,10 +44,15 @@ struct RemoteInputBinding {
                   let client = object["clientID"] as? String, UUID(uuidString:client) != nil,
                   let base = object["sequenceBase"] as? Int, (0...1_000_000_000).contains(base) else { throw RemoteInputPacket.invalid() }
             sequenceBase = base; values = ["mode":mode,"ptyID":id,"streamID":stream,"clientID":client,"sequenceBase":base]
-        } else {
+        } else if mode=="native" {
             guard let id = object["sessionID"] as? String, !id.isEmpty, id.utf8.count <= 512,
                   let revision = object["revision"] as? String, !revision.isEmpty, revision.utf8.count <= 512 else { throw RemoteInputPacket.invalid() }
             sequenceBase = 0; values = ["mode":mode,"sessionID":id,"streamID":stream,"revision":revision,"relay":true]
+        } else {
+            guard let share=object["shareID"] as? String,UUID(uuidString:share) != nil,
+                  let control=object["controlID"] as? String,UUID(uuidString:control) != nil,stream==control,
+                  let token=object["token"] as? String,token.utf8.count==44,Data(base64Encoded:token)?.count==32 else {throw RemoteInputPacket.invalid()}
+            sequenceBase=0;values=["mode":mode,"shareID":share,"controlID":control,"streamID":stream,"token":token]
         }
     }
     func input(_ packet: RemoteInputPacket) throws -> (path:String, body:Data) {
@@ -58,14 +63,22 @@ struct RemoteInputBinding {
             guard packet.kind == .pty, !packet.payload.isEmpty, packet.payload.count <= 16_000 else { throw RemoteInputPacket.invalid() }
             object["sequence"] = sequenceBase + Int(packet.sequence)
             object["data"] = packet.payload.base64EncodedString()
-        } else {
+        } else if mode=="native" {
             guard packet.kind == .native, let key = packet.payload.first, Int(key) < RemoteInputPacket.nativeKeys.count,
                   let text = String(data:packet.payload.dropFirst(),encoding:.utf8) else { throw RemoteInputPacket.invalid() }
             let kind = RemoteInputPacket.nativeKeys[Int(key)]
             guard kind == "characters" ? !text.isEmpty && text.utf8.count <= 8000 : text.isEmpty else { throw RemoteInputPacket.invalid() }
             object["kind"] = kind; object["text"] = text
+        } else {
+            guard packet.kind == .screen else {throw RemoteInputPacket.invalid()}
+            _ = try RemoteScreenInput.decode(packet.payload)
+            object["sequence"]=Int(packet.sequence);object["payload"]=packet.payload.base64EncodedString()
         }
-        return (mode == "pty" ? "/api/pty/input":"/api/input",try JSONSerialization.data(withJSONObject:object,options:[.withoutEscapingSlashes]))
+        return (mode == "pty" ? "/api/pty/input":mode == "screen" ? "/api/screen/input":"/api/input",try JSONSerialization.data(withJSONObject:object,options:[.withoutEscapingSlashes]))
+    }
+    func controlAction(_ action:String) throws ->Data {
+        var object=values;object["action"]=action
+        return try JSONSerialization.data(withJSONObject:object,options:[.withoutEscapingSlashes])
     }
 }
 
@@ -78,12 +91,21 @@ struct RemoteInputBinding {
     private var sequence: UInt32 = 0
     private var cancelled = false
     init(target:String?,handler:@escaping @MainActor (RemoteHTTPRequest) async -> RemoteHTTPResponse) { self.target = target; self.handler = handler }
-    func cancel() { cancelled = true }
+    func cancel() {
+        guard !cancelled else {return};cancelled=true
+        if let binding,binding.mode=="screen",let body=try? binding.controlAction("end") {
+            Task { @MainActor in _ = await self.dispatch("/api/screen/control",body:body) }
+        }
+    }
     func receive(_ data:Data) async throws -> Data {
         guard !cancelled, !Task.isCancelled else { throw CancellationError() }
         let packet = try RemoteInputPacket.decode(data)
         if packet.kind == .ping {
             guard packet.sequence == 0, packet.payload.count == 8 else { throw RemoteInputPacket.invalid() }
+            if let binding,binding.mode=="screen" {
+                try check(await dispatch("/api/screen/control",body:try binding.controlAction("heartbeat")))
+                guard !cancelled,!Task.isCancelled else {throw CancellationError()}
+            }
             return try RemoteInputPacket(kind:.pong,payload:packet.payload).encoded()
         }
         if packet.kind == .bind {
