@@ -81,7 +81,14 @@ private final class ContinuityOriginal: @unchecked Sendable {
         for _ in 0..<100 where !status.ready { try await Task.sleep(for:.milliseconds(20)) }
         guard let port = status.port, status.ready else { throw AppError.message("Synthetic listener unavailable") }
         let control = root.appendingPathComponent("control.json"), stats = root.appendingPathComponent("observations.json")
-        let info: JSONObject = ["id":web.nodeID,"url":"http://127.0.0.1:\(port)","control":control.path,"observations":stats.path]
+        var info: JSONObject = ["id":web.nodeID,"url":"http://127.0.0.1:\(port)","control":control.path,"observations":stats.path]
+        var capacityGateway: RemoteTunnelGateway?
+        if CommandLine.arguments.contains("--capacity-gateway") {
+            let gateway = try RemoteTunnelGateway(pin:RemoteTunnelPIN.create("001234"),handler:{await web.handle($0)})
+            try await gateway.start(port:0); try gateway.setOrigin("https://capacity.tunnel-qa.invalid")
+            capacityGateway = gateway; info["gateway"] = gateway.localURL!
+        }
+        defer {capacityGateway?.stop()}
         print(String(decoding:try JSONSerialization.data(withJSONObject:info),as:UTF8.self)); fflush(stdout)
         var generation = -1, previous = Data(), noise = 0, storm = false
         while !Task.isCancelled {

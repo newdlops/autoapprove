@@ -201,6 +201,7 @@ struct RemoteTerminalUpdate: Encodable {
     private let queue = DispatchQueue(label: "autoapprove.web.listener")
     private var httpDeadlines: RemoteHTTPDeadlines?
     private var connections: [UUID: RemoteHTTPConnection] = [:]
+    private var pendingIdleAdmissions = 0
     private var streamConnections: Set<UUID> = []
     private let terminalFeeds = RemoteTerminalFeeds()
     private var running = false
@@ -486,9 +487,20 @@ struct RemoteTerminalUpdate: Encodable {
         // slots, leaving room for input, state, assets and normal API requests.
         listener.newConnectionHandler = { [weak self, weak listener] connection in
             Task { @MainActor in
-                guard let self, let listener, self.listener === listener, self.running, self.generation == epoch, self.connections.count < 32,
+                guard let self, let listener, self.listener === listener, self.running, self.generation == epoch,
                       case .hostPort(let host, _) = connection.endpoint,
                       RemoteNetworkAddress.isLocalHost(String(describing: host)) else { connection.cancel(); return }
+                if self.connections.count >= 32 {
+                    guard self.pendingIdleAdmissions < 4 else { connection.cancel(); return }
+                    self.pendingIdleAdmissions += 1
+                    defer { self.pendingIdleAdmissions -= 1 }
+                    for (id, candidate) in Array(self.connections) {
+                        if self.connections.count < 32 { break }
+                        if await candidate.retireIfIdle() { self.connections.removeValue(forKey:id); self.streamConnections.remove(id) }
+                        guard self.listener === listener, self.running, self.generation == epoch else { connection.cancel(); return }
+                    }
+                }
+                guard self.listener === listener, self.running, self.generation == epoch, self.connections.count < 32 else { connection.cancel(); return }
                 let id = UUID()
                 let deadlines: RemoteHTTPDeadlines
                 if let existing = self.httpDeadlines { deadlines = existing }

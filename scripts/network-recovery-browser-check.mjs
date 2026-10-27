@@ -123,10 +123,14 @@ try {
     // Reach steady conditional polling before injecting one failed read.
     await page.getByRole('button',{name:'상태 새로고침'}).click();await page.waitForFunction(()=>!loadingNetwork);
     assert.ok(reads.at(-1).tag);setFailures(1);const start=performance.now();
-    await page.getByRole('button',{name:'상태 새로고침'}).click();await page.locator('#network-error').waitFor({state:'visible'});
+    const before=reads.length;
+    await page.getByRole('button',{name:'상태 새로고침'}).click();await page.waitForFunction(()=>!loadingNetwork);
+    assert.equal(reads.length,before+2,'One failed read receives exactly one fresh confirmation');
+    assert.equal(reads.at(-1).tag,undefined);assert.equal(reads.at(-1).initial,false);
+    assert.equal(await page.locator('#network-error').isVisible(),false);
     assert.equal(await page.locator('.session-row').count(),1);
     await page.locator('#network-error').waitFor({state:'hidden',timeout:2500});
-    metrics.push({case:'One failed read recovers automatically',ms:Math.round(performance.now()-start)});
+    metrics.push({case:'One failed read confirms connectivity without a false offline state',ms:Math.round(performance.now()-start)});
     await page.waitForFunction(()=>!loadingNetwork);
     const count=reads.length;await page.waitForTimeout(1100);assert.equal(reads.length,count,'Healthy inventories retain their 2.5-second cadence');
     setMode('held');await page.getByRole('button',{name:'상태 새로고침'}).click();await page.waitForFunction(()=>loadingNetwork);

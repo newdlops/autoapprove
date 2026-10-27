@@ -64,6 +64,7 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
     private var listener: NWListener?
     private var deadlines: RemoteHTTPDeadlines?
     private var clients: [UUID:Client] = [:]
+    private var pendingIdleAdmissions = 0
     private var sessions: [String:Session] = [:]
     private var expiryTask: Task<Void,Never>?
     private var epoch = UUID()
@@ -105,7 +106,18 @@ public struct RemoteTunnelStatus: Equatable, Sendable {
         let listener=try NWListener(using:parameters,on:NWEndpoint.Port(rawValue:port)!); self.listener=listener
         let deadlines=RemoteHTTPDeadlines(queue:queue); self.deadlines=deadlines
         listener.newConnectionHandler={ [weak self] connection in Task { @MainActor in
-            guard let self, self.epoch == epoch, self.listener != nil, self.clients.count < 32 else { connection.cancel(); return }
+            guard let self, self.epoch == epoch, self.listener != nil else { connection.cancel(); return }
+            if self.clients.count >= 32 {
+                guard self.pendingIdleAdmissions < 4 else { connection.cancel(); return }
+                self.pendingIdleAdmissions += 1
+                defer { self.pendingIdleAdmissions -= 1 }
+                for (id, candidate) in Array(self.clients) {
+                    if self.clients.count < 32 { break }
+                    if await candidate.connection.retireIfIdle() { self.clients.removeValue(forKey:id) }
+                    guard self.epoch == epoch, self.listener != nil else { connection.cancel(); return }
+                }
+            }
+            guard self.epoch == epoch, self.listener != nil, self.clients.count < 32 else { connection.cancel(); return }
             let id=UUID()
             let client=RemoteHTTPConnection(connection,queue:self.queue,deadlines:deadlines,handler:{ [weak self] request in
                 guard let self, self.epoch == epoch, self.clients[id] != nil else { return .error(RemoteHTTPError(503,"터널 연결이 종료되었습니다.")) }

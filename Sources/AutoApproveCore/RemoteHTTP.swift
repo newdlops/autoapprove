@@ -517,6 +517,22 @@ final class RemoteHTTPConnection: @unchecked Sendable {
         catch { closeNow() } // Never splice uncompressed bytes into a gzip stream.
     }
     func close() { queue.async { self.closeNow() } }
+    // Only completed, empty keep-alives may yield a listener slot. Inspect and
+    // retire on the connection queue so a parsed request/stream/upgrade cannot
+    // be mistaken for idle work by an accepting listener on the main actor.
+    func retireIfIdle() async -> Bool {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                guard !self.closed, !self.complete, self.completedRequests > 0,
+                      self.buffer.isEmpty, self.handlerTask == nil,
+                      self.stream == nil, self.inputSocket == nil,
+                      !self.sending, !self.reuseAfterSend else {
+                    continuation.resume(returning:false); return
+                }
+                self.closeNow(); continuation.resume(returning:true)
+            }
+        }
+    }
     private func closeNow() {
         guard !closed else { return }; closed = true
         cancelDeadline(); heartbeat?.setEventHandler {}; heartbeat?.cancel(); heartbeat = nil

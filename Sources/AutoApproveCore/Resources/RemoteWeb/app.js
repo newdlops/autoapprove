@@ -59,6 +59,7 @@ let lastNetworkStartedAt = -Infinity;
 const networkValidation = {etag:'', value:null, notModified:false, observedAt:null};
 let appliedNetworkETag = '', networkController = null;
 let networkFailures = 0, networkRefreshRequested = false;
+let networkGatewayID = '';
 let directMode = false, composing = false, directSending = false, inputInFlight = false, directTimer = null, directTimerDue = Infinity, inputFailure = '';
 let directChannel = null, directCandidate = null, directChannelState = 'idle', directChannelStreamID = null, directFreshening = false;
 let directChannelRetries = 0, directChannelStableAt = 0, directChannelRetry = null;
@@ -759,6 +760,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
   const timeout = setTimeout(() => controller.abort(), timeoutMS);
   try {
     const headers = body ? {'Content-Type':'application/json'} : validation?.etag ? {'If-None-Match':validation.etag,...(validation.wait ? {Prefer:'wait=15'} : {})} : {};
+    if (validation?.expectedNodeID) headers['X-AutoApprove-Node'] = validation.expectedNodeID;
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: tunnelAccess ? 'same-origin' : 'omit' });
     if(response.status === 401 && tunnelAccess){
       tunnelAuthExpired=true;
@@ -783,7 +785,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
       if(!response.ok)return {error:response.status>=500?'Mac과 연결하지 못했습니다. 연결 상태를 확인한 뒤 다시 시도해주세요.':'요청을 처리하지 못했습니다. 다시 로그인하거나 연결 상태를 확인해주세요.'};
       throw error;
     });
-    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, unsent:result.diagnostics?.delivery === 'not_started', delivery:result.diagnostics?.delivery});
+    if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, failureKind:result.diagnostics?.failureKind, unsent:result.diagnostics?.delivery === 'not_started', delivery:result.diagnostics?.delivery});
     if (validation) {
       const tag = response.headers.get('ETag') || '';
       validation.etag = /^(?:W\/)?"[^"\r\n]{1,128}"$/.test(tag) ? tag : '';
@@ -1077,6 +1079,35 @@ async function sendQuestionAnswer(key, nodeID, payload, message) {
   } finally { state.busy = false; updateInteractionControls(); }
 }
 
+async function readNetworkInventory(path, initial, waiting, signal) {
+  const established = !initial && connected && !!networkGatewayID;
+  const budget = waiting ? 20000 : 10000, deadline = performance.now() + budget;
+  const read = async (wait, fresh, timeout) => {
+    // A failed/misdirected response cannot replace the last verified validator.
+    const validation = {...(fresh ? {etag:'',value:null} : networkValidation),wait,expectedNodeID:networkGatewayID};
+    const result = await api(path,undefined,signal,timeout,validation);
+    if (signal.aborted) throw new DOMException('Aborted','AbortError');
+    if (typeof result?.gatewayID !== 'string' || !result.gatewayID || result.gatewayID.length > 256 || /[\u0000-\u0020\u007f]/.test(result.gatewayID) || !Array.isArray(result.nodes)) {
+      throw Object.assign(new Error('Mac의 목록 응답을 확인하지 못했습니다. 상태를 새로고침해주세요.'),{failureKind:'protocol'});
+    }
+    if (networkGatewayID && result.gatewayID !== networkGatewayID) {
+      throw Object.assign(new Error('접속 주소의 Mac이 변경되었습니다. 주소를 확인한 뒤 페이지를 다시 열어주세요.'),{status:409,failureKind:'identity'});
+    }
+    networkGatewayID = result.gatewayID;
+    if (!initial) Object.assign(networkValidation,validation);
+    return result;
+  };
+  try { return await read(waiting,initial,established ? budget-2000 : budget); }
+  catch (error) {
+    const remaining = Math.min(2000,deadline-performance.now());
+    if (!established || signal.aborted || remaining <= 0 || ['identity','protocol'].includes(error.failureKind)
+      || !(error.retryable === true || [502,503,504].includes(error.status))) throw error;
+    // One fresh GET confirms connectivity before changing the whole dashboard
+    // to offline. No input replay, stale-success fallback or extra healthy poll.
+    return await read(false,true,remaining);
+  }
+}
+
 async function refreshNetwork(initial = false, restart = false) {
   clearTimeout(networkTimer);
   if (document.hidden) return;
@@ -1089,13 +1120,12 @@ async function refreshNetwork(initial = false, restart = false) {
   // Recover with the small local inventory before waiting for other Macs.
   initial ||= !connected;
   const waiting = !initial && !restart && !partialNetwork && gatewayNetworkWaitVersion === 1 && !!networkValidation.etag;
-  networkValidation.wait = waiting;
   loadingNetwork = true; $('refresh').disabled = !waiting; $('refresh').setAttribute('aria-busy', String(!waiting));
   const controller = new AbortController(); networkController = controller;
   const startedAt = performance.now();
   try {
     const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
-    const result = await api(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', undefined, controller.signal, waiting ? 20000 : 10000, initial ? undefined : networkValidation);
+    const result = await readNetworkInventory(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', initial, waiting, controller.signal);
     if (controller.signal.aborted || document.hidden) return;
     if (!initial && networkValidation.notModified && connected && appliedNetworkETag === networkValidation.etag) {
       // Still observe liveness/history and recover streams, without replacing

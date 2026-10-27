@@ -26,8 +26,8 @@ export async function fixtureSuite(out,build=path.resolve('.build/release')){
   'Tests/fixtures/terminal-continuity.swift','-o',binary],{stdio:'inherit',timeout:300000});
  const root=await mkdtemp('/private/tmp/aa-continuity-'),children=[],streams=[];
  return {
-  async start(label){
-   const child=spawn(binary,[path.join(root,label)],{stdio:['ignore','pipe','pipe']});children.push(child);
+  async start(label,args=[]){
+   const child=spawn(binary,[path.join(root,label),...args],{stdio:['ignore','pipe','pipe']});children.push(child);
    let text='',stderr='',info;child.stdout.on('data',chunk=>{text+=chunk;for(const line of text.split('\n'))if(line.startsWith('{'))try{const v=JSON.parse(line);if(v.url)info=v;}catch{}});child.stderr.on('data',chunk=>stderr+=chunk);
    await until(()=>info||child.exitCode!==null||child.signalCode!==null,'Fixture startup '+label,20000);assert.ok(info,stderr);
    info.generation=0;return info;
