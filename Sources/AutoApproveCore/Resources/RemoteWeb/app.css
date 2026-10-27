@@ -259,7 +259,7 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .message-history li p { white-space: pre-wrap; }
 .message-history > button { margin-bottom: 8px; }
 .message-history li > button { margin-top: 6px; }
-.message-cleanup-result { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.message-cleanup-result, .question-cleanup-result { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; overflow-wrap: anywhere; }
 .past-questions { margin: 8px 0 16px; }
 .past-questions > summary { min-height: 44px; padding: 10px 0; cursor: pointer; }
 .past-questions ul { max-height: 180px; overflow: auto; overscroll-behavior: contain; padding-left: 20px; margin: 8px 0 0; }

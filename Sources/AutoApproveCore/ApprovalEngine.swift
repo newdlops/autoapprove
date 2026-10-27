@@ -1767,6 +1767,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let question = object["questionID"] as? String, let answer = object["answer"] as? String else { throw RemoteHTTPError(400, "질문과 답변을 지정해주세요.") }
             try await replyToQuestion(sessionID: id, questionID: question, answer: answer)
             return ["ok": true, "message": sessions[id]?.questions.first(where: { $0.id == question })?.reply?.message ?? "답변을 전달했습니다."]
+        case "cleanPastQuestions", "restorePastQuestions":
+            return try cleanPastQuestions(sessionID:id,object:object,restore:action == "restorePastQuestions")
         case "replyTerminalQuestion": return try await replyTerminalQuestion(session, object: object)
         case "replyClaudeQuestions":
             guard let request = object["requestIDForApproval"] as? String else { throw RemoteHTTPError(400, "질문 요청을 지정해주세요.") }
@@ -2626,6 +2628,45 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[sessionID]?.queuedQuestions?.removeAll { $0.id == questionID }
         invalidateDuplicateQuestionIDs()
         publish()
+    }
+
+    /// Only explicit metadata cleanup. No daemon, terminal, answer or queue writes.
+    private func cleanPastQuestions(sessionID:String,object:JSONObject,restore:Bool) throws -> JSONObject {
+        guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended,
+              let supplied=object["questions"] as? [JSONObject],!supplied.isEmpty,supplied.count<=512 else {
+            throw RemoteHTTPError(400,"정리할 지난 질문 목록을 다시 확인해주세요.")
+        }
+        var ids=Set<String>(),values:[String:String]=[:]
+        for item in supplied {
+            guard let id=item["id"] as? String,!id.isEmpty,id.utf8.count<=1024,ids.insert(id).inserted,
+                  let token=item["token"] as? String,token.range(of:#"^[a-f0-9]{64}$"#,options:.regularExpression) != nil,
+                  !replyingQuestions.contains(id),automaticQuestionReplies[id]?.sending != true else {
+                throw RemoteHTTPError(409,"질문을 전달 중이거나 목록이 바뀌었습니다. 현재 질문을 다시 확인해주세요.")
+            }
+            let marker=PromptDetector.fingerprint(sessionID+"\u{0}"+token)
+            if restore {
+                guard store.value("cleanedQuestion:\(id)")==marker else {throw RemoteHTTPError(409,"이 Mac에서 정리한 질문만 되돌릴 수 있습니다.")}
+            } else {
+                guard let question=session.questions.first(where:{$0.id==id}),question.isPastForCleanup,
+                      question.cleanupIdentity(sessionID:sessionID)==token else {
+                    throw RemoteHTTPError(409,"새 질문이거나 내용·전송 상태가 바뀌었습니다. 목록을 갱신한 뒤 다시 정리해주세요.")
+                }
+                values["cleanedQuestion:\(id)"]=marker
+            }
+            values["dismissedQuestion:\(id)"]=restore ? "false":"true"
+            values["questionAutomation:\(id)"]=QuestionAutomation.Phase.editing.rawValue
+        }
+        // Persist the entire observed batch before publishing any removal.
+        try store.setValues(values)
+        for id in ids {
+            cancelAutomaticQuestionReply(id)
+            persistedQuestionSettings.removeValue(forKey:id)
+            questionAutomationOverrides[id] = .editing
+            restoredQuestionIDs.insert(id)
+        }
+        if !restore {sessions[sessionID]?.queuedQuestions?.removeAll {ids.contains($0.id)}}
+        invalidateDuplicateQuestionIDs();publish()
+        return ["ok":true,"count":ids.count,"message":restore ? "지난 질문을 다시 표시합니다. 다음 질문 조회에 반영됩니다.":"지난 질문을 정리했습니다. 원본 대화와 대기 입력은 유지됩니다."]
     }
 
     private func replyTerminalQuestion(_ session: AgentSession, object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)? = nil) async throws -> JSONObject {

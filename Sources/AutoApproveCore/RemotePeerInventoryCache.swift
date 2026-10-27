@@ -9,6 +9,11 @@ extension AgentSession {
         let warnings = notices?.filter { $0.isSystemSafety == true && !$0.isRead } ?? []
         value.notices = warnings.isEmpty ? nil : warnings
         value.backgroundSessions = backgroundSessions?.map(\.webInventory)
+        value.queuedQuestions = queuedQuestions?.map { question in
+            var question = question
+            question.cleanupToken = question.isPastForCleanup ? question.cleanupIdentity(sessionID:id) : nil
+            return question
+        }
         return value
     }
 }

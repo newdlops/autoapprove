@@ -77,7 +77,7 @@ try{
   } else {
   for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.setViewportSize({width,height});await capture(name+'-list-warnings');}
   await page.setViewportSize({width:390,height:844});
-  removedGhost=true;await refresh();assert.equal(await page.locator('#machines .machine').count(),3);assert.equal(await page.evaluate(()=>machineRows.has('ghost')),false);
+  removedGhost=true;await refresh();assert.equal(await page.locator('#machines .machine').count(),2);assert.equal(await page.locator('#offline-machine-list .machine').count(),1);assert.equal(await page.evaluate(()=>machineRows.has('ghost')),false);
   checks.push('A node removed by the server releases its existing DOM row and map entry');
   const read=page.locator('#interruption-list .interruption-read');assert.equal(await read.textContent(),'표시 정리');
   await page.evaluate(()=>{window.syntheticCleanupSet=Storage.prototype.setItem;Storage.prototype.setItem=function(key,...args){if(key==='autoapprove-web-cleanup-v1')throw new DOMException('synthetic quota','QuotaExceededError');return window.syntheticCleanupSet.call(this,key,...args);};});

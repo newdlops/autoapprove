@@ -115,6 +115,8 @@ const messageStorage = 'autoapprove-message-drafts-v1';
 const cleanupStorage = 'autoapprove-web-cleanup-v1';
 let cleanup = {macs:new Set(),warnings:new Set(),questions:new Set()};
 let messageCleanupUndo = null, messageCleanupTimer, messageCleanupError = null;
+let questionCleanupBusy=false, questionCleanupUndo=null, questionCleanupTimer, questionCleanupStatus='', questionCleanupError='';
+const questionReviewKeys=new Set();
 try {
   const saved = JSON.parse(localStorage.getItem(cleanupStorage) || '{}');
   for (const [kind,limit] of [['macs',128],['warnings',1024],['questions',2048]]) {
@@ -148,6 +150,86 @@ function saveCleanup(changes) {
 const warningKey = (item,source,kind) => JSON.stringify([kind,item.node.id,source.id,kind==='safety' ? source.systemSafety?.id : source.interruption?.id]);
 const warningHidden = (item,source,kind) => cleanup.warnings.has(warningKey(item,source,kind));
 const pastQuestionKey = (node,source,question) => JSON.stringify([node.id,source.id,question.id,question.reply?.queueID || '']);
+const questionKeyFor = (node,source,question) => `${node.id}/${source.id}/${question.id}`;
+const questionReviewKey = (node,source,question) => questionKeyFor(node,source,question)+'/'+(question.cleanupToken || question.title);
+function pastQuestionEligible(node,source,question) {
+  if (!(question.hasLaterUserMessage || question.reply?.phase==='queued') || ['sending','uncertain'].includes(question.reply?.phase)) return false;
+  const key=questionKeyFor(node,source,question),draft=questionDrafts.get(key),delivery=questionDeliveries.get(key);
+  const composed=[...(draft?.choices || []),draft?.answer?.trim() || ''].filter(Boolean).join('\n');
+  const unsubmitted=composed && !(question.reply?.phase==='queued' && composed===question.reply.answer);
+  return !unsubmitted && !delivery?.busy && !delivery?.uncertain && (question.reply?.phase==='queued' || !questionReviewKeys.has(questionReviewKey(node,source,question)));
+}
+function pastQuestionRecords() {
+  const result=new Map();
+  for(const item of allSessions)for(const source of [item.session,...(item.session.backgroundSessions || [])])for(const question of source.queuedQuestions || []) {
+    if(pastQuestionEligible(item.node,source,question)) {
+      const key=pastQuestionKey(item.node,source,question);
+      if(!question.cleanupToken && cleanup.questions.has(key))continue;
+      result.set(key,{key,node:item.node,source,question});
+    }
+  }
+  return [...result.values()];
+}
+function updateQuestionCleanupControls() {
+  const records=pastQuestionRecords(),count=records.filter(v=>v.node.online || !v.question.cleanupToken).length;
+  text($('clean-all-past-questions'),questionCleanupBusy ? '질문 정리 중…' : `지난 질문${count ? ' '+count+'개' : ''} 정리`);
+  $('clean-all-past-questions').disabled=questionCleanupBusy || !count;
+  for(const prefix of ['global-question-cleanup','question-cleanup']) {
+    show($(prefix+'-result'),!!questionCleanupStatus || !!questionCleanupError);
+    text($(prefix+'-status'),[questionCleanupStatus,questionCleanupError].filter(Boolean).join(' '));
+    $(prefix+'-status').className=questionCleanupError ? 'error-text small' : 'muted small';
+    show($(prefix+'-undo'),!!questionCleanupUndo);$(prefix+'-undo').disabled=questionCleanupBusy;
+  }
+  $('clear-past-questions').disabled=questionCleanupBusy || records.some(r=>r.node.id===selectedItem?.node.id && r.source.id===selectedItem?.session.id && r.question.cleanupToken && !r.node.online);
+}
+async function cleanQuestionRecords(records) {
+  if(questionCleanupBusy || !records.length)return;
+  questionCleanupBusy=true;questionCleanupStatus='지난 질문을 정리하고 있습니다…';questionCleanupError='';updateQuestionCleanupControls();
+  const grouped=new Map(),legacy=[],completed=[];let count=0;const errors=[];
+  for(const record of records) {
+    if(!record.question.cleanupToken){legacy.push(record.key);continue;}
+    const key=JSON.stringify([record.node.id,record.source.id]);
+    if(!grouped.has(key))grouped.set(key,{nodeID:record.node.id,sessionID:record.source.id,questions:[]});
+    grouped.get(key).questions.push({id:record.question.id,token:record.question.cleanupToken});
+  }
+  try {
+    for(const group of grouped.values())for(let i=0;i<group.questions.length;i+=512) {
+      const batch={...group,questions:group.questions.slice(i,i+512)};
+      try {
+        const result=await api(endpoint('/api/action',batch.nodeID),{action:'cleanPastQuestions',sessionID:batch.sessionID,questions:batch.questions,requestID:uuid()});
+        if(result.count!==batch.questions.length)throw new Error('정리 결과를 확인하지 못했습니다.');
+        count+=result.count;completed.push(batch);
+      } catch(error){errors.push(error.message);}
+    }
+    if(legacy.length && saveCleanup({questions:new Set([...cleanup.questions,...legacy])}))count+=legacy.length;
+    else if(legacy.length)errors.push('이 브라우저의 표시 정리를 저장하지 못했습니다.');
+    if(completed.length) {
+      questionCleanupUndo={groups:completed,count};clearTimeout(questionCleanupTimer);
+      questionCleanupTimer=setTimeout(()=>{questionCleanupUndo=null;updateQuestionCleanupControls();},60000);
+    }
+    questionCleanupStatus=count ? `지난 질문 ${count}개를 정리했습니다.${completed.length ? ' 1분 동안 되돌릴 수 있습니다.' : ' 이 브라우저에만 적용됩니다.'}` : '';
+    questionCleanupError=errors.length ? `일부 질문은 정리하지 못했습니다. ${errors[0]} 목록을 확인한 뒤 다시 시도해주세요.` : '';
+    questionSignature='';if(selectedItem)renderQuestions();await refreshNetwork(false,true);if(selectedItem)renderQuestions();
+  } finally {
+    questionCleanupBusy=false;updateQuestionCleanupControls();
+    const focus=$('interaction-dialog').open ? (questionCleanupUndo ? $('question-cleanup-undo') : $('message-input')) : $('clean-all-past-questions');
+    focus.focus({preventScroll:true});
+  }
+}
+async function undoQuestionCleanup() {
+  const undo=questionCleanupUndo;if(!undo || questionCleanupBusy)return;
+  questionCleanupBusy=true;questionCleanupError='';updateQuestionCleanupControls();const failed=[];let restored=0;
+  try {
+    for(const group of undo.groups) {
+      try {const result=await api(endpoint('/api/action',group.nodeID),{action:'restorePastQuestions',sessionID:group.sessionID,questions:group.questions,requestID:uuid()});restored+=result.count;}
+      catch(error){failed.push(group);questionCleanupError=error.message;}
+    }
+    questionCleanupUndo=failed.length ? {...undo,groups:failed} : null;
+    if(!questionCleanupUndo)clearTimeout(questionCleanupTimer);
+    questionCleanupStatus=`지난 질문 ${restored}개의 표시를 복원했습니다. 다음 질문 조회에 반영됩니다.`;
+    questionSignature='';await refreshNetwork();if(selectedItem)renderQuestions();
+  } finally {questionCleanupBusy=false;updateQuestionCleanupControls();}
+}
 function offlineMacs() {
   return nodes.filter(node=>!node.local && displayedOfflineMac(node) && !(selectedItem?.node.id===node.id && (originalReadSelected() || originalStreamSelected())));
 }
@@ -165,6 +247,7 @@ function updateCleanupControls() {
   $('clean-offline-macs').disabled = !connected || !count;
   $('clean-warnings').disabled = displayedWarnings().length===0;
   $('restore-cleanup').disabled = !Object.values(cleanup).some(values=>values.size);
+  updateQuestionCleanupControls();
 }
 function cleanOfflineMacs(ids = offlineMacs().map(node=>node.id)) {
   const eligible = new Set(offlineMacs().map(node=>node.id)), chosen = ids.filter(id=>eligible.has(id));
@@ -207,8 +290,19 @@ try {
   }
 } catch (_) {}
 function saveMessageDrafts() {
-  try { sessionStorage.setItem(messageStorage,JSON.stringify({drafts:Object.fromEntries(messageDrafts),deliveries:Object.fromEntries(messageDeliveries)})); } catch (_) {}
+  const next=new Map(messageDeliveries),counts=new Map();
+  // Only confirmed archived messages are bounded. Uncertain/busy/failed and
+  // the current delivery are retained, as are every unsubmitted draft.
+  for(const [key,record] of [...next].reverse())if(key.includes('#') && record.phase==='accepted') {
+    const scope=key.slice(0,key.lastIndexOf('#')),count=(counts.get(scope)||0)+1;counts.set(scope,count);
+    if(count>20)next.delete(key);
+  }
+  try {
+    sessionStorage.setItem(messageStorage,JSON.stringify({drafts:Object.fromEntries(messageDrafts),deliveries:Object.fromEntries(next)}));
+    for(const key of messageDeliveries.keys())if(!next.has(key)){messageDeliveries.delete(key);messageUncertain.delete(key);}
+  } catch (_) {}
 }
+saveMessageDrafts();
 const messageBusy = key => messageDeliveries.get(key)?.phase === 'busy';
 const keyFor = (node, session, view) => `${node.id}/${view?.ptyID ? 'pty:' + view.ptyID : session.id}`;
 let ptyClient = null;
@@ -2091,9 +2185,9 @@ function renderQuestions() {
       section.append(actions); $('questions').append(section);
     }
     for (const question of source.queuedQuestions || []) {
-      if (question.reply?.phase === 'queued') {
+      if (pastQuestionEligible(node,source,question)) {
         const key = pastQuestionKey(node,source,question);
-        if (!cleanup.questions.has(key)) past.push({key,question});
+        if (!cleanup.questions.has(key)) past.push({key,question,source});
         continue;
       }
       count++; const questionKey = `${node.id}/${source.id}/${question.id}`, draft = questionDrafts.get(questionKey) || { answer: '', choices: [] };
@@ -2147,19 +2241,25 @@ function renderQuestions() {
     }
   }
   show($('past-questions'),past.length>0);
-  text($('past-question-count'),`지난 답변 ${past.length}개`);
+  text($('past-question-count'),`지난 질문·답변 ${past.length}개`);
   $('past-question-list').replaceChildren();
-  for (const {key,question} of past.slice(0,10)) {
-    const row=make('li'), clean=make('button','secondary','표시 정리'); clean.type='button';
-    row.append(make('p','',question.title),make('p','muted small',question.reply.message || '답변 접수됨'));
-    if(question.reply.answer) row.append(make('p','past-answer',question.reply.answer));
-    clean.setAttribute('aria-label',`${question.title} 지난 답변 표시 정리`);
-    clean.addEventListener('click',()=>cleanPastQuestions([key])); row.append(clean); $('past-question-list').append(row);
+  for (const {key,question,source} of past.slice(-10).reverse()) {
+    const row=make('li'), clean=make('button','secondary','질문 정리'); clean.type='button';
+    row.append(make('p','',question.title),make('p','muted small',question.reply?.message || '이 질문 이후에 대화가 이어졌습니다. 아직 유효하다면 다시 답변할 수 있습니다.'));
+    if(question.reply?.answer) row.append(make('p','past-answer',question.reply.answer));
+    if(question.reply?.phase!=='queued') {
+      const review=make('button','secondary','답변하기');review.type='button';review.disabled=questionCleanupBusy;
+      review.addEventListener('click',()=>{questionReviewKeys.add(questionReviewKey(node,source,question));questionSignature='';renderQuestions();renderInteractions();const form=[...$('questions').querySelectorAll('form')].find(f=>f.dataset.questionKey===questionKeyFor(node,source,question));form?.querySelector('textarea')?.focus();});
+      row.append(review);
+    }
+    clean.setAttribute('aria-label',`${question.title.slice(0,80)} 지난 질문 정리`);
+    clean.disabled=questionCleanupBusy || !!question.cleanupToken && !node.online;clean.addEventListener('click',()=>void cleanPastQuestions([key])); row.append(clean); $('past-question-list').append(row);
   }
   $('clear-past-questions').onclick=()=>cleanPastQuestions(past.map(value=>value.key));
   show($('questions-section'), count > 0);
   text($('question-count'), count || '');
   updateInteractionControls();
+  updateQuestionCleanupControls();
   if (activeQuestion && wasText) {
     const form = Array.from($('questions').querySelectorAll('form')).find(form => form.dataset.questionKey === activeQuestion);
     const answer = form?.querySelectorAll('textarea')[fieldIndex]; if (answer && !answer.disabled) { answer.focus({ preventScroll: true }); answer.setSelectionRange(selectionStart, selectionEnd); }
@@ -2169,17 +2269,8 @@ function renderQuestions() {
     if (choice && !choice.disabled) choice.focus({preventScroll:true});
   }
 }
-function cleanPastQuestions(keys) {
-  if (!keys.length || !saveCleanup({questions:new Set([...cleanup.questions,...keys])})) return;
-  const chosen=new Set(keys);
-  for(const source of interactionSources())for(const question of source.queuedQuestions || []) {
-    if(question.reply?.phase!=='queued' || !chosen.has(pastQuestionKey(selectedItem.node,source,question)))continue;
-    const key=`${selectedItem.node.id}/${source.id}/${question.id}`;questionDrafts.delete(key);
-    if(!questionDeliveries.get(key)?.busy){questionDeliveries.delete(key);questionEditing.delete(key);}
-  }
-  questionSignature=''; if(selectedItem)renderQuestions();
-  if(document.activeElement===document.body)$('message-input').focus({preventScroll:true});
-  feedback('지난 답변의 표시를 정리했습니다. 목록 정리에서 다시 볼 수 있습니다.');
+async function cleanPastQuestions(keys) {
+  const chosen=new Set(keys);await cleanQuestionRecords(pastQuestionRecords().filter(record=>chosen.has(record.key)));
 }
 function structuredQuestionForm(key, fields, config) {
   const form = make('form', 'question'); form.dataset.questionKey = key; form.dataset.structured = 'true'; form.dataset.nodeID = config.nodeID;
@@ -2229,7 +2320,7 @@ function appendQuestionDelivery(form) {
 function interactionSources() { return selectedItem ? [selectedItem.session, ...(selectedItem.session.backgroundSessions || [])] : []; }
 function renderInteractions() {
   const pending = interactionSources().reduce((count, source) => count + (source.claudeApprovals || []).filter(item => !item.sending).length
-    + (source.queuedQuestions || []).filter(item => !['sending','queued'].includes(item.reply?.phase)).length
+    + (source.queuedQuestions || []).filter(item => !['sending','queued'].includes(item.reply?.phase) && !pastQuestionEligible(selectedItem.node,source,item)).length
     + (source.pendingSummary && !(source.claudeApprovals || []).length && !(source.queuedQuestions || []).length ? 1 : 0), 0);
   const forms = nodes.flatMap(node => (node.state?.questionForms || []).map(request => ({node, request})));
   const signature = JSON.stringify(forms.map(({node,request})=>[node.id,node.online,request]));
@@ -2297,6 +2388,7 @@ function updateInteractionControls() {
   const archives=allArchives.slice(-10);
   show($('message-history'),archives.length>0);
   text($('message-history-summary'),`이전 메시지 · 전송 상태 ${allArchives.length}개`);
+  updateQuestionCleanupControls();
   $('clear-message-history').disabled = !allArchives.some(([,record])=>record.phase!=='busy');
   const undo=messageCleanupUndo?.sessionKey===selectedKey ? messageCleanupUndo : null;
   show($('message-cleanup-result'),!!undo);
@@ -2742,6 +2834,8 @@ if ('IntersectionObserver' in window) {
 $('search').addEventListener('input', renderList); $('node-filter').addEventListener('change', renderList);
 $('clean-offline-macs').addEventListener('click',()=>cleanOfflineMacs());
 $('clean-warnings').addEventListener('click',()=>cleanWarnings());
+$('clean-all-past-questions').addEventListener('click',()=>void cleanQuestionRecords(pastQuestionRecords()));
+for(const id of ['global-question-cleanup-undo','question-cleanup-undo'])$(id).addEventListener('click',()=>void undoQuestionCleanup());
 $('restore-cleanup').addEventListener('click',()=>{
   if(!saveCleanup({macs:new Set(),warnings:new Set(),questions:new Set()}))return;
   questionSignature='';renderMachines();renderList();if(selectedItem){renderSessionSafety();renderQuestions();}

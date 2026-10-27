@@ -23,6 +23,15 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
     /// A later unquoted message may already answer this question; keep it visible,
     /// but require a person to resolve it instead of guessing another answer.
     public var hasLaterUserMessage: Bool?
+    /// Supplied only by the web inventory; cleanup must still recheck live state.
+    public var cleanupToken: String? = nil
+    public var isPastForCleanup: Bool {
+        (hasLaterUserMessage == true || reply?.phase == .queued) && reply?.phase != .sending && reply?.phase != .uncertain
+    }
+    public func cleanupIdentity(sessionID: String) -> String {
+        let fields = [sessionID,id,threadID,title,(multiSelect ?? false) ? "1":"0"] + options
+        return PromptDetector.fingerprint(fields.map {String($0.utf8.count)+":"+$0}.joined())
+    }
     public var needsAnswer: Bool { reply?.phase != .queued && reply?.phase != .sending }
     public var summary: String {
         ([title] + options.enumerated().map { "\($0.offset + 1). \($0.element)" }).joined(separator: "\n")
