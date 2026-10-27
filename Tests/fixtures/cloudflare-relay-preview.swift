@@ -36,7 +36,10 @@ private final class RelayOriginal:@unchecked Sendable {
             guard request.url?.absoluteString=="https://api.github.com/repos/newdlops/autoapprove/releases/latest" else {throw AppError.message("Unexpected release request")}
             return PublishedUpdateReply(status:200,body:try JSONSerialization.data(withJSONObject:["tag_name":"v"+release.version,"draft":false,"prerelease":false,"assets":[]]))
         }
-        let engine=try ApprovalEngine(paths:AppPaths(directory:root.appendingPathComponent("profile")),claudeRegistryReader:{_ in []},processReader:{records},screenAdapters:[.iterm:adapter],managedPTY:ManagedPTYManager(environment:environment),testScreenSharing:screens,publishedUpdateServices:published)
+        let secrets=RelayAccountSecrets();var accountSecrets=CloudflareServices.live
+        accountSecrets.readSecret={_,key in secrets.values[key]};accountSecrets.saveSecret={_,key,value in secrets.values[key]=value}
+        let engine=try ApprovalEngine(paths:AppPaths(directory:root.appendingPathComponent("profile")),claudeRegistryReader:{_ in []},processReader:{records},screenAdapters:[.iterm:adapter],managedPTY:ManagedPTYManager(environment:environment),testScreenSharing:screens,cloudflareServices:accountSecrets,publishedUpdateServices:published)
+        if CommandLine.arguments.contains("--accounts") {engine.agentAccounts=AgentAccounts(services:try AgentAccountFixture.services(root.appendingPathComponent("account-login")));try await engine.setTunnelPIN("001234")}
         defer{engine.stop()};try engine.start(poll:false)
         _=try await screens.start(["scope":"display","sourceID":1,"durationSeconds":900],owner:"synthetic-worker-preview")
         var originals=ProcessDiscovery.sessions(records);for i in originals.indices {originals[i].terminal = .iterm;originals[i].cwd=root.path}
@@ -91,3 +94,4 @@ private final class RelayOriginal:@unchecked Sendable {
         }
     }
 }
+private final class RelayAccountSecrets:@unchecked Sendable {var values:[String:Data]=[:]}

@@ -84,9 +84,9 @@ try{
  const port=server.address().port,url='http://127.0.0.1:'+port;
  if(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS!==undefined)process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS+=(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS?',':'')+port;
  const cache=path.resolve('.build/cache/WorkerPreview');await mkdir(cache,{recursive:true});
- execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/ScreenControlFixture.swift','Tests/fixtures/cloudflare-relay-preview.swift','-o',root+'/RelayPreview'],{stdio:'inherit',timeout:300000});
+ execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/ScreenControlFixture.swift','Tests/fixtures/AgentAccountFixture.swift','Tests/fixtures/cloudflare-relay-preview.swift','-o',root+'/RelayPreview'],{stdio:'inherit',timeout:300000});
  const pinMode=process.argv.includes('--pin');
- fixture=spawn(root+'/RelayPreview',[root,url,key,...(pinMode?['--pin']:[])],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
+ fixture=spawn(root+'/RelayPreview',[root,url,key,...(pinMode?['--pin']:[]),...(process.argv.includes('--accounts')?['--accounts']:[])],{stdio:['ignore','pipe','pipe']});let stderr='';fixture.stderr.on('data',data=>stderr+=data);
  const info=await new Promise((resolve,reject)=>{let output='';const timer=setTimeout(()=>reject(Error('native startup '+stderr)),15000);fixture.stdout.on('data',data=>{output+=data;try{const value=JSON.parse(output.trim());clearTimeout(timer);resolve(value);}catch{}});fixture.on('exit',code=>{clearTimeout(timer);reject(Error('native exit '+code+' '+stderr));});});
  if(connectorDenied){
   await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='failed','Permanent connector authorization rejection is actionable',5000);
@@ -162,6 +162,18 @@ try{
   await page.waitForFunction(()=>typeof connected!=='undefined'&&connected);
   assert.ok(!page.url().includes('access='));assert.ok((await context.cookies()).some(v=>v.httpOnly&&v.secure&&v.name==='__Host-autoapprove_tunnel'));
   assert.equal(await page.evaluate(key=>Object.values(localStorage).some(v=>v.includes(key)),info.key),false);
+  if(process.argv.includes('--accounts')){
+   stage=engine+' AI account login';await page.getByRole('button',{name:/AI 계정 로그인/}).first().click();
+   await page.locator('#account-pin').fill('001234');await page.locator('#account-unlock-button').click();await page.locator('#account-codex-login').waitFor({state:'visible'});
+   await page.locator('#account-codex-login').click();await page.locator('#account-device-code').waitFor({state:'visible'});assert.equal(await page.locator('#account-device-code').textContent(),'ABCD-12345');
+   await writeFile(root+'/account-login/signed-codex','synthetic provider approved');await page.locator('#account-codex-launch').waitFor({state:'visible'});
+   await page.locator('#account-claude-login').click();await page.locator('#account-code').waitFor({state:'visible'});
+   await page.locator('#account-code').fill('SYNTHETIC-CODE#state');await page.locator('#account-code-button').click();await page.locator('#account-claude-launch').waitFor({state:'visible'});
+   assert.equal(await readFile(root+'/account-login/submitted-codes','utf8'),'SYNTHETIC-CODE#state\n');
+   assert.ok(requests.some(request=>request.path.startsWith('/api/agent-account')));
+   await page.locator('#account-close').click();
+   browserChecks.push(engine+': encrypted PIN, Codex device challenge and Claude one-time code traverse actual workerd/DO/native WSS/gateway; private PTYs confirm both synthetic logins once');
+  }
   if(await page.locator('#check-version').count()){
    stage=engine+' version check';await page.locator('#check-version').click();
    await page.waitForFunction(()=>versionSyncState?.phase==='ready'&&versionSyncState.latestVersion===loadedWebVersion.version);

@@ -1136,8 +1136,9 @@ function renderMachines() {
       row = make('article', 'machine'); const info = make('div', 'machine-info');
       const resetResult=make('p','error-text small machine-reset-result');resetResult.setAttribute('role','status');resetResult.hidden=true;
       info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status'),resetResult);
-      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), reset=make('button','secondary machine-reset','모든 세션 초기화'), clean = make('button','secondary machine-clean','목록에서 정리');
-      toggle.type = reset.type = clean.type = 'button'; actions.append(toggle,reset,clean); row.append(info,actions);
+      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), reset=make('button','secondary machine-reset','모든 세션 초기화'), clean = make('button','secondary machine-clean','목록에서 정리'), accounts=make('button','secondary machine-accounts','AI 계정');
+      toggle.type = reset.type = clean.type = accounts.type = 'button'; actions.append(accounts,toggle,reset,clean); row.append(info,actions);
+      accounts.addEventListener('click',()=>void openAgentAccounts(node.id));
       reset.addEventListener('click',()=>void resetAllAutomations(node.id));
       clean.addEventListener('click',()=>cleanOfflineMacs([node.id]));
       toggle.addEventListener('click', () => {
@@ -1156,6 +1157,7 @@ function renderMachines() {
     status.title = node.error || '';
     const button = row.querySelector('.machine-toggle'); text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
+    const accounts=row.querySelector('.machine-accounts');accounts.disabled=!connected||!node.online;accounts.setAttribute('aria-label',`${node.name} AI 계정 로그인`);show(accounts,node.online);
     button.setAttribute('aria-label', `${node.name} 자동 승인 ${node.online && node.state.snapshot.paused ? '재개' : '일시정지'}`);
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
     const reset = row.querySelector('.machine-reset'), resetBusy=automationResetNodes.has(node.id), resetSupported=supportsRelease(node,[0,2,161,188]);
@@ -2978,6 +2980,23 @@ window.addEventListener('online', () => {
   void refreshNetwork(false,true); void refreshFrame();
 });
 window.addEventListener('hashchange', restoreSelection);
+let accountModuleLoading,accountUI;
+async function openAgentAccounts(id){
+  const node=nodes.find(item=>item.id===id);if(!node?.online)return;
+  try{
+    if(!window.AutoApproveAgentAccounts){
+      if(!accountModuleLoading)accountModuleLoading=new Promise((resolve,reject)=>{
+        const script=document.createElement('script');script.src='/agent-accounts.js';
+        const timer=setTimeout(()=>{script.remove();accountModuleLoading=null;reject(Error('AI 계정 화면을 받지 못했습니다. 다시 눌러주세요.'));},8000);
+        script.onload=()=>{clearTimeout(timer);resolve();};script.onerror=()=>{clearTimeout(timer);script.remove();accountModuleLoading=null;reject(Error('AI 계정 화면을 불러오지 못했습니다. 다시 눌러주세요.'));};document.head.append(script);
+      });await accountModuleLoading;
+    }
+    if(!accountUI)accountUI=new window.AutoApproveAgentAccounts({api,endpoint,uuid,launch:async(nodeID,agent,home)=>{
+      const result=await api(endpoint('/api/pty',nodeID),{cwd:home,program:agent,automatic:false,columns:80,rows:24,requestID:uuid()});selectPTYDescriptor(nodeID,result,false,true);
+    }});
+    await accountUI.open(node);
+  }catch(error){feedback(error.message,true);}
+}
 function openPTYDialog() {
   $('pty-node').replaceChildren(...nodes.filter(node => node.online).map(node => { const option = make('option', '', node.name); option.value = node.id; return option; }));
   if (selectedItem) $('pty-node').value = selectedItem.node.id;

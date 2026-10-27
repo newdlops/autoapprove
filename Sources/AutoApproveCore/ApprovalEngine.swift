@@ -40,6 +40,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let nativeKeyboardActivity:NativeKeyboardActivity
     let publishedUpdateServices:PublishedUpdateServices
     public let managedPTY: ManagedPTYManager
+    public var agentAccounts=AgentAccounts()
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
     private let tmuxRelay = TmuxRelay()
@@ -515,6 +516,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        agentAccounts.stop()
         tunnelStartEpoch = UUID()
         tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
         tunnelPINSetupID=nil
@@ -609,6 +611,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     func updateWaitReason(allowTunnelRestart:Bool) -> String? {
         if cloudflareStatus.busy || tunnelPINSetupID != nil {return "외부 접속 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
         if tunnelStatus.active && (!allowTunnelRestart || tunnelStatus.provider == .quick) { return tunnelStatus.provider == .quick && allowTunnelRestart ? "임시 주소는 앱 재시작 시 바뀝니다. Mac에서 임시 연결을 종료하면 업데이트합니다." : "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
+        if agentAccounts.busy {return "AI 계정 로그인이 진행 중입니다. 인증을 마치거나 취소한 뒤 업데이트합니다."}
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||
             !sendingMessages.isEmpty || !replyingQuestions.isEmpty || !clearingCodexQueues.isEmpty ||
@@ -2968,6 +2971,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil) {
+        let privateTTYs=agentAccounts.privateTTYs
+        let found=found.filter{!privateTTYs.contains($0.tty)}
         pruneExpiredRemoteFrames()
         let previousPolling = pollingIdentities()
         let previousCodex = Set(sessions.values.lazy.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id))

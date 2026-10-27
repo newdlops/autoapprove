@@ -504,6 +504,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("AI account login: encrypted PIN, node scope, replay, stale requests and revocation",tests.testAccountCryptoPINReplayAndScope),
+            ("AI account login: bounded PIN attempts",tests.testAccountPINAttemptsAreBounded),
+            ("AI account login: official challenge URL allowlist",tests.testAccountChallengeOnlyAcceptsOfficialProviderURLs),
+            ("AI account login: private PTY ownership, exact code, cancel and hidden inventory",tests.testAccountPrivateLoginOwnershipCancelAndInventory),
             ("Native typing: answered permission survives composer repaint",tests.testAnsweredPermissionSurvivesManualComposerRepaints),
             ("Native typing: host isolation and physical idle",tests.testNativeTypingActivitySeparatesHostsAndPhysicalIdle),
             ("Native typing: local input yields without disabling automation",tests.testNativeTypingYieldsApprovalWithoutDisablingAutomation),

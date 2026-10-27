@@ -23,7 +23,7 @@ import AutoApproveCore
             }
             if let error {Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)}
             else if !pin.isEmpty && !valid {Text("숫자 6~12자리를 입력하세요. 앞의 0도 유지됩니다.").font(.caption).foregroundStyle(.red)}
-            else {Text(saved ? "PIN을 저장했습니다. 기존 로그인은 해제됐습니다.":configured ? "웹에서 지정한 PIN만 입력하세요. 링크와 QR에 긴 키를 붙이지 않습니다.":"한 번 설정하면 짧은 주소와 PIN으로 접속합니다. PIN은 키체인에 보호해 저장합니다.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
+            else {Text(saved ? "PIN을 저장했습니다. 기존 로그인은 해제됐습니다.":configured ? "LAN의 AI 계정 로그인과 외부 접속에 사용합니다. Cloudflare 연결 없이 PIN만 사용할 수 있습니다.":"LAN의 AI 계정 로그인에도 사용합니다. Cloudflare 연결 없이 설정할 수 있고 PIN은 키체인에 보호해 저장합니다.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
         }.padding(.top,6).onChange(of:pin) {if !pin.isEmpty {saved=false;error=nil}}.onDisappear {task?.cancel()}
     }
     private func store() {

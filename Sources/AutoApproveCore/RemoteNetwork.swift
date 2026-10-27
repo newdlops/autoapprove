@@ -1598,6 +1598,12 @@ struct RemoteTerminalUpdate: Encodable {
                     return try asset("index.html", type: "text/html; charset=utf-8")
                 case "/app.css": return try asset("app.css", type: "text/css; charset=utf-8")
                 case "/app.js": return try asset("app.js", type: "text/javascript; charset=utf-8")
+                case "/agent-accounts.js": return try asset("agent-accounts.js",type:"text/javascript; charset=utf-8")
+                case "/vendor/account-crypto.js": return try asset("vendor/account-crypto.js",type:"text/javascript; charset=utf-8")
+                case "/api/agent-account/key":
+                    if let forwarded=try await forward(request) {return forwarded}
+                    guard let engine else {throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
+                    return try .object(engine.agentAccounts.hello(node:nodeID,pin:try engine.readTunnelPIN()))
                 case "/terminal-wire.js": return try asset("terminal-wire.js", type: "text/javascript; charset=utf-8")
                 case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
                 case "/input-channel.js": return try asset("input-channel.js", type: "text/javascript; charset=utf-8")
@@ -1748,6 +1754,10 @@ struct RemoteTerminalUpdate: Encodable {
             }
             let object = try request.json()
             switch request.path {
+            case "/api/agent-account":
+                if let forwarded=try await forward(request) {return forwarded}
+                guard let engine else {throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
+                return try await .object(engine.agentAccounts.encrypted(object,node:nodeID,pin:try engine.readTunnelPIN()))
             case "/api/screen/control":
                 if let forwarded=try await forward(request) {return forwarded}
                 guard let engine else {throw RemoteHTTPError(503,"앱이 종료되었습니다.")}

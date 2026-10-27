@@ -1,0 +1,24 @@
+{
+  "sources": [
+    {
+      "package": "@noble/curves",
+      "version": "2.4.0",
+      "integrity": "sha512-P4/62zrgfH33CneE3Dn4WhJVA22YUU0eR51wKIan4NVRvwsA0YnPTwWGpNbpuacSujmSFLvyzpyuR30+fbq2Ew==",
+      "source": "https://github.com/paulmillr/noble-curves"
+    },
+    {
+      "package": "@noble/ciphers",
+      "version": "2.4.0",
+      "integrity": "sha512-AnjFn0Jv92laAkvMrghlFZq4qQCIN/4DxFV/eooqtC2YTjB7kBeLMS2T9KJX4Dn+ZVXLOwK0lSgqDtx9gvxtiw==",
+      "source": "https://github.com/paulmillr/noble-ciphers"
+    },
+    {
+      "package": "@noble/hashes",
+      "version": "2.4.0",
+      "integrity": "sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==",
+      "source": "https://github.com/paulmillr/noble-hashes"
+    }
+  ],
+  "bytes": 44445,
+  "sha256": "51eba53dfa5287fce8533269ba244cb70e935f2d0dbdf35c82f0c0ac20ffe274"
+}

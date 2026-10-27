@@ -81,6 +81,11 @@ try {
   const css = await fetch(url + '/app.css'); assert.equal(css.status, 200);
   assert.ok((await css.text()).includes(marker), 'Relocated helper must use its packaged resources');
   const first = await (await fetch(url + '/api/state')).json();
+  for(const filename of ['agent-accounts.js','vendor/account-crypto.js']) {
+    const response=await fetch(url+'/'+filename);assert.equal(response.status,200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()),await readFile(path.join(app,'Contents/Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb',filename)),'Relocated login resources must come from the signed bundle');
+  }
+  const accountKey=await(await fetch(url+'/api/agent-account/key')).json();assert.equal(accountKey.node,first.id);assert.equal(accountKey.pinConfigured,false);assert.equal(Buffer.from(accountKey.publicKey,'base64').length,32);
   assert.deepEqual(first.release, versionMarker, 'Relocated helper must read its bundled version, not the build machine resources');
   assert.deepEqual((await (await fetch(url + '/api/discovery')).json()).release, versionMarker);
   assert.deepEqual(on.urls, [url], 'The disposable package must publish only its loopback address');
