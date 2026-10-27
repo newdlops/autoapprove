@@ -43,6 +43,23 @@ try{
  await page.goto(origin);await page.locator('#global-screens').click();await page.waitForFunction(()=>document.getElementById('test-screen-image').naturalWidth===960);
  await page.waitForFunction(()=>!!window.AutoApproveInputChannel);await page.locator('#toggle-screen-control').click();await page.waitForFunction(()=>screenControl?.active&&!screenControlBusy);
  await delay(Math.max(750,latency*3+300)); // Let the control toolbar settle before measuring a static image.
+ if(process.argv.includes('--wheel-burst')){
+  const baseline=process.argv.includes('--baseline');
+  const native=async()=>{try{return (await readFile(root+'/screen-events.ndjson','utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);}catch{return [];}};
+  const scroll=async delta=>page.locator('#test-screen-image').evaluate(async(image,delta)=>{
+   const r=image.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2;
+   for(let index=0;index<1000;){for(let count=0;count<16&&index<1000;count++,index++)image.dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,clientX:x,clientY:y,deltaX:0,deltaY:delta}));await new Promise(requestAnimationFrame);}
+  },delta);
+  await scroll(0.2);await page.waitForFunction(()=>!screenControl?.active||!screenControl.queue.length&&!screenControl.channel?.pendingCount&&!screenControl.moveTimer);
+  const fractional=(await native()).filter(event=>event.type===22),fractionalPixels=0-fractional.reduce((sum,event)=>sum+event.deltaY,0);
+  const before=(await native()).length;await scroll(1);await page.waitForFunction(()=>!screenControl?.active||!screenControl.queue.length&&!screenControl.channel?.pendingCount&&!screenControl.moveTimer);
+  const integer=(await native()).slice(before).filter(event=>event.type===22),integerPixels=0-integer.reduce((sum,event)=>sum+event.deltaY,0),active=await page.evaluate(()=>screenControl?.active===true),error=await page.locator('#screen-control-error').textContent();
+  if(baseline){assert.equal(fractionalPixels,0);assert.equal(active,false);assert.match(error,/너무 빠르게/);}
+  else{assert.equal(fractionalPixels,200);assert.equal(integerPixels,1000);assert.equal(active,true);assert.ok(fractional.length<160&&integer.length<160);}
+  assert.deepEqual(errors,[]);
+  const report={passed:true,engine,mode:baseline?'baseline-regression-reproduction':'candidate',eventsPerPhase:1000,fractionalPixels,fractionalPackets:fractional.length,integerPixels,integerPackets:integer.length,controlActive:active,error:baseline?error:null,userDesktopPosts:0,scope:'Real browser DOM WheelEvents, actual HTTP/WebSocket/Core and synthetic Quartz sink; no physical trackpad, desktop input or public-route claim'};
+  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));await page.locator('#close-test-screen').click();
+ }else{
  await page.evaluate(()=>{window.frameChanges=0;window.frameObserver=new MutationObserver(records=>window.frameChanges+=records.length);frameObserver.observe(document.getElementById('test-screen-image'),{attributes:true,attributeFilter:['src']});});
  phase='static';await delay(seconds*1000);phase=null;
  assert.equal(await page.evaluate(()=>screenControl?.active),true,'Static conditional frames must keep the native control lease fresh');
@@ -55,6 +72,7 @@ try{
  const report={passed:true,engine,simulatedFrameRTTMS:latency,seconds,metrics,errors,scope:'Real local browser/Core, static synthetic JPEG and screen control, controlled response delay; wire body bytes include actual HTTP gzip. No public-route performance or OS event delivery claim.'};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
  await page.locator('#close-test-screen').click();
+ }
 }finally{
  await browser?.close();for(const socket of sockets)socket.destroy();if(server)await new Promise(resolve=>server.close(resolve));
  await writeFile(root+'/stop','stop').catch(()=>{});if(fixture){await Promise.race([new Promise(resolve=>fixture.once('exit',resolve)),delay(1000)]);if(fixture.exitCode===null)fixture.kill('SIGTERM');}

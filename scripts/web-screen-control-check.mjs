@@ -73,6 +73,15 @@ try{
   await until(async()=>(await text())===before+value,'IME composition commits once');
   await page.waitForFunction(()=>!screenControlDrafts.has(screenDraftKey()));
  }
+ await page.waitForFunction(()=>screenControl.channel.pendingCount===0&&!screenControl.queue.length);
+ const beforeBuffer=await text(),bufferText='버퍼복구🙂';
+ await page.evaluate(()=>Object.defineProperty(screenControl.channel.socket,'bufferedAmount',{configurable:true,get:()=>64000}));
+ await page.locator('#screen-control-keyboard').fill(bufferText);await page.waitForFunction(()=>screenControl.queue.length>0);
+ await delay(80);assert.equal(await text(),beforeBuffer);
+ await page.evaluate(()=>{delete screenControl.channel.socket.bufferedAmount;});
+ await until(async()=>(await text())===beforeBuffer+bufferText,'Buffered screen input resumes without another input or ACK');
+ await page.waitForFunction(()=>screenControl.active&&!screenControl.queue.length&&screenControl.channel.pendingCount===0);
+ checks.push('Injected browser bufferedAmount pressure retains exact Unicode and resumes once over the actual screen socket after drain, without another input or ACK');
  await page.getByRole('button',{name:'Mac에서 전체 선택',exact:true}).click();await until(async()=>(await events()).some(e=>e.type===10&&e.keyCode===0&&(e.flags&0x100000)!==0),'Command shortcut');
  assert.ok(packetKinds.includes(8),'Screen input must traverse the actual binary WebSocket path');
  await page.locator('#screen-control-quality').waitFor({state:'visible'});
@@ -147,6 +156,9 @@ try{
  await touch('pointermove',102,t1.x,t1.y-25);await touch('pointermove',103,t2.x,t2.y-25);
  await touch('pointerup',102,t1.x,t1.y-25);await touch('pointerup',103,t2.x,t2.y-25);
  await until(async()=>(await events()).slice(start).some(event=>event.type===22&&event.deltaY!==0),'Synthetic two-finger scroll');
+ const touchWheel=(await events()).slice(start).filter(event=>event.type===22);
+ assert.equal(touchWheel.reduce((sum,event)=>sum+event.deltaY,0),-25);
+ assert.ok(touchWheel.every(event=>Math.abs(event.x-touchWheel[0].x)<1&&Math.abs(event.y-touchWheel[0].y)<1),'Two-finger scroll keeps its initial target while its centroid moves');
  await capture('touch-mobile');
  checks.push('Touch-capable mobile contexts accept actual touchscreen tap/right-tap without opening the keyboard; synthetic multi-pointer events verify drag and two-finger scroll');
  await page.locator('#stop-test-screen').tap();await page.waitForFunction(()=>sharedScreen===null);

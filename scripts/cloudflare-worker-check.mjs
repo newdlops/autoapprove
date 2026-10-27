@@ -197,6 +197,16 @@ try{
   assert.ok(delays.every(value=>value>=-2&&value<5000));
   assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
   if(socketMode){
+   stage=engine+' original buffer drain';await page.waitForFunction(()=>directChannel.pendingCount===0&&!directQueue.length);
+   const beforeBuffer=await readFile(root+'/original-input.bin','utf8'),bufferText='BUFFER-'+engine+'-한글🙂';
+   await page.evaluate(()=>Object.defineProperty(directChannel.socket,'bufferedAmount',{configurable:true,get:()=>64000}));
+   await page.locator('#terminal-screen').click();await page.keyboard.insertText(bufferText);await page.waitForFunction(()=>directQueue.length>0);
+   await wait(80);assert.equal(await readFile(root+'/original-input.bin','utf8'),beforeBuffer);
+   await page.evaluate(()=>{delete directChannel.socket.bufferedAmount;});
+   await page.waitForFunction(()=>!directQueue.length&&directChannel.pendingCount===0);
+   assert.equal(await readFile(root+'/original-input.bin','utf8'),beforeBuffer+bufferText);
+   assert.deepEqual(await page.evaluate(()=>[selectedItem.session.pid,selectedItem.session.started,selectedItem.session.tty,latestFrame.streamID]),identity);
+   browserChecks.push(engine+': injected browser socket pressure resumes original Unicode exactly once over actual Worker/WSS after drain without another input or ACK');
    await page.evaluate(()=>{window.beforeDirectChannel=directChannel;});
    for(const socket of sockets)if(socket.autoapprovePath.startsWith('/api/input/socket'))socket.terminate();
    await page.waitForFunction(()=>directChannel?.state==='ready'&&directChannel!==window.beforeDirectChannel&&directMode);
@@ -245,6 +255,14 @@ try{
   assert.ok(requests.some(v=>v.path.startsWith('/api/pty/stream')),'Real SSE must cross Worker and native WSS');
   if(socketMode){
    await page.waitForFunction(()=>!ptyClient.sending&&!ptyClient.queue.length);
+   stage=engine+' PTY buffer drain';await page.waitForFunction(()=>ptyClient.inputChannel.pendingCount===0);
+   await page.evaluate(()=>{Object.defineProperty(ptyClient.inputChannel.socket,'bufferedAmount',{configurable:true,get:()=>64000});ptyClient.enqueue("printf 'DRAIN-한글🙂\\n'\r");});
+   await page.waitForFunction(()=>ptyClient.queue.length>0);await wait(80);assert.doesNotMatch(await terminalText(),/\nDRAIN-한글🙂[ \t]*(\n|$)/);
+   await page.evaluate(()=>{delete ptyClient.inputChannel.socket.bufferedAmount;});
+   await until(async()=>/\nDRAIN-한글🙂[ \t]*(\n|$)/.test(await terminalText()),'Buffered PTY command resumes without another key or ACK');
+   await page.waitForFunction(()=>!ptyClient.queue.length&&ptyClient.inputChannel.pendingCount===0);
+   assert.equal((await terminalText()).split('\n').filter(line=>/^DRAIN-한글🙂[ \t]*$/.test(line)).length,1);
+   browserChecks.push(engine+': injected browser socket pressure resumes a real private PTY command once over Worker/WSS without another key or ACK');
    await page.evaluate(()=>{window.beforePTYChannel=ptyClient.inputChannel;});
    for(const socket of sockets)if(socket.autoapprovePath.startsWith('/api/input/socket'))socket.terminate();
    await page.waitForFunction(()=>ptyClient.inputChannel?.state==='ready'&&ptyClient.inputChannel!==window.beforePTYChannel&&!ptyClient.blocked);

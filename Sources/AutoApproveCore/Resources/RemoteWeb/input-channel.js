@@ -74,7 +74,27 @@ window.AutoApproveInputChannel = class {
     } catch (error) { this.fail(error); }
   }
   canSend(length) {
-    return this.state === 'ready' && this.socket.readyState === WebSocket.OPEN && this.pendingCount < 16 && this.pendingBytes + length <= 64000 && this.socket.bufferedAmount < 64000;
+    if(this.state!=='ready'||this.socket.readyState!==WebSocket.OPEN||this.pendingCount>=16||this.pendingBytes+length>64000)return false;
+    if(this.socket.bufferedAmount>=64000){this.watchBuffer();return false;}
+    this.clearBufferWait();return true;
+  }
+  watchBuffer() {
+    if(this.state!=='ready'||this.bufferTimer!=null)return;
+    if(this.bufferStarted==null){this.bufferStarted=performance.now();this.bufferDelay=8;}
+    this.bufferTimer=setTimeout(()=>{
+      this.bufferTimer=null;if(this.state!=='ready')return;
+      if(this.socket.readyState!==WebSocket.OPEN){this.disconnected();return;}
+      if(this.socket.bufferedAmount<64000){this.clearBufferWait();this.changed();return;}
+      if(performance.now()-this.bufferStarted>=20000){
+        const error=new Error(this.pendingCount?'입력 전달 결과를 확인하지 못했습니다. 같은 입력을 다시 보내지 말고 원본 화면을 확인해주세요.':'입력 연결의 전송 대기가 길어 연결을 다시 확인합니다.');
+        error.recoverable=this.pendingCount===0;this.fail(error);return;
+      }
+      this.bufferDelay=Math.min(100,this.bufferDelay*2);this.watchBuffer();
+    },Math.max(1,Math.min(this.bufferDelay,20000-(performance.now()-this.bufferStarted))));
+  }
+  clearBufferWait() {
+    if(this.bufferStarted==null)return;
+    clearTimeout(this.bufferTimer);this.bufferTimer=null;this.bufferStarted=null;this.bufferDelay=0;
   }
   send(kind,payload) {
     if (!this.canSend(payload.length)) return false;
@@ -87,9 +107,14 @@ window.AutoApproveInputChannel = class {
     return true;
   }
   armDeadline() {
+    const first=this.pending.entries().next().value;
+    if(first&&this.ackTimer!=null&&this.ackSequence===first[0])return;
     clearTimeout(this.ackTimer); this.ackTimer = null;
-    const first = this.pending.values().next().value;
-    if (first) this.ackTimer = setTimeout(() => this.fail(new Error('입력 확인 응답이 늦어 직접 입력을 멈췄습니다. 원본 화면을 확인해주세요.')),Math.max(1,20000-(performance.now()-first.sent)));
+    this.ackSequence=first?.[0]??null;
+    if(first){const[sequence,item]=first;this.ackTimer=setTimeout(()=>{
+      this.ackTimer=null;
+      if(this.state==='ready'&&this.pending.keys().next().value===sequence)this.fail(new Error('입력 확인 응답이 늦어 직접 입력을 멈췄습니다. 원본 화면을 확인해주세요.'));
+    },Math.max(1,20000-(performance.now()-item.sent)));}
   }
   ping() {
     if (this.state !== 'ready' || this.lastPing != null) return;
@@ -109,7 +134,10 @@ window.AutoApproveInputChannel = class {
     const values = [...this.samples].sort((a,b) => a-b);
     this.callbacks.onQuality?.({transport:'WebSocket',samples:values.length,medianMS:values.length ? values[Math.ceil(values.length*.5)-1] : null,p95MS:values.length ? values[Math.ceil(values.length*.95)-1] : null,pending:this.pendingCount});
   }
-  changed() { queueMicrotask(() => { if (this.state === 'ready') this.callbacks.onChange?.(); }); }
+  changed() {
+    if(this.state!=='ready'||this.changeScheduled)return;this.changeScheduled=true;
+    queueMicrotask(()=>{this.changeScheduled=false;if(this.state==='ready')this.callbacks.onChange?.();});
+  }
   fail(error) {
     if (this.state === 'closed') return;
     const reject = this.reject, opening = this.state === 'opening'; this.resolve = null; this.reject = null;
@@ -118,6 +146,7 @@ window.AutoApproveInputChannel = class {
   close() {
     if (this.state === 'closed') return; this.state = 'closed';
     clearTimeout(this.openTimer); clearTimeout(this.ackTimer); clearInterval(this.pingTimer);clearTimeout(this.pongTimer);this.pongTimer=null;this.lastPing=null;
+    this.ackTimer=null;this.ackSequence=null;this.clearBufferWait();
     if (this.socket) { this.socket.onopen = this.socket.onmessage = this.socket.onerror = this.socket.onclose = null; this.socket.close(); }
     // Keep only numeric pending metadata for the owner to classify uncertainty.
     const resolve = this.resolve; this.resolve = null; this.reject = null; resolve?.(null);

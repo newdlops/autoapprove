@@ -41,6 +41,7 @@ window.AutoApproveScreenControl = class {
     for(const [target,type,listener,options] of this.listeners)target.removeEventListener(type,listener,options);this.listeners=[];
     for(const id of this.captures)try{if(this.surface.hasPointerCapture(id))this.surface.releasePointerCapture(id);}catch(_){}this.captures.clear();
     this.surface.removeAttribute('data-controlling');this.image.removeAttribute('data-controlling');this.pressed.clear();this.touches.clear();
+    this.wheelCarry=null;this.touchWheelPoint=null;
     if(draft)this.onDraft?.(draft);this.onState?.();if(error)this.onError?.(error);
   }
   listen(target,type,listener,options){target.addEventListener(type,listener,options);this.listeners.push([target,type,listener,options]);}
@@ -48,17 +49,26 @@ window.AutoApproveScreenControl = class {
     if(!this.active)return false;
     if(performance.now()-(this.frameAt||0)>3000){this.stop(Error('최신 공유 화면을 받은 뒤 다시 조작해주세요.'));return false;}
     const last=this.queue.at(-1);
+    let merged=false;
+    if(payload[0]!==3)this.wheelCarry=null;
     if(payload[0]===0&&last?.payload[0]===0){this.queueBytes-=last.payload.length;this.queue.pop();}
-    if(this.queue.length>=64||this.queueBytes+payload.length>64000){this.stop(Error('아직 보내지 못한 입력이 쌓여 조작을 멈췄습니다. 남은 텍스트를 확인해주세요.'));return false;}
-    this.queue.push({payload,text});this.queueBytes+=payload.length;
-    if(payload[0]===0){if(!this.moveTimer)this.moveTimer=setTimeout(()=>{this.moveTimer=null;this.drain();},16);}else{clearTimeout(this.moveTimer);this.moveTimer=null;this.drain();}
+    if(payload[0]===3&&last?.payload[0]===3&&payload[9]===last.payload[9]&&[1,2,3,4].every(at=>payload[at]===last.payload[at])){
+      const a=new DataView(last.payload.buffer),b=new DataView(payload.buffer),x=a.getInt16(5),y=a.getInt16(7),dx=b.getInt16(5),dy=b.getInt16(7),sx=x+dx,sy=y+dy;
+      if((!x||!dx||(x>0)===(dx>0))&&(!y||!dy||(y>0)===(dy>0))&&Math.abs(sx)<=2000&&Math.abs(sy)<=2000){a.setInt16(5,sx);a.setInt16(7,sy);merged=true;}
+    }
+    if(!merged){
+      if(this.queue.length>=64||this.queueBytes+payload.length>64000){this.stop(Error('아직 보내지 못한 입력이 쌓여 조작을 멈췄습니다. 남은 텍스트를 확인해주세요.'));return false;}
+      this.queue.push({payload,text});this.queueBytes+=payload.length;
+    }
+    if(payload[0]===0||payload[0]===3){if(!this.moveTimer)this.moveTimer=setTimeout(()=>{this.moveTimer=null;this.drain();},16);}else{clearTimeout(this.moveTimer);this.moveTimer=null;this.drain();}
     return true;
   }
   async drain(){
     if(!this.active||this.sending)return;
-    if(this.moveTimer&&this.queue[0]?.payload[0]===0)return;
+    if(this.moveTimer&&[0,3].includes(this.queue[0]?.payload[0]))return;
     if(this.channel){
       while(this.active&&this.queue.length&&this.channel.canSend(this.queue[0].payload.length)){
+        if(this.moveTimer&&[0,3].includes(this.queue[0].payload[0]))break;
         const item=this.queue.shift();this.queueBytes-=item.payload.length;
         if(!this.channel.send(8,item.payload)){if(item.text)this.onDraft?.(item.text);break;}
       }
@@ -90,7 +100,11 @@ window.AutoApproveScreenControl = class {
     const accepted=this.enqueue(bytes);if(accepted){if(down)this.pressed.add(button);else this.pressed.delete(button);}return accepted;
   }
   wheel(point,dx,dy,flags=0){
-    dx=Math.round(Math.max(-2000,Math.min(2000,dx)));dy=Math.round(Math.max(-2000,Math.min(2000,dy)));if(!dx&&!dy)return true;
+    if(!point||!Number.isFinite(dx)||!Number.isFinite(dy))return false;
+    const now=performance.now();let carry=this.wheelCarry;
+    if(!carry||carry.x!==point.x||carry.y!==point.y||carry.flags!==flags||now-carry.at>250)carry=this.wheelCarry={...point,flags,dx:0,dy:0,at:now};
+    const x=Math.max(-2000,Math.min(2000,dx))+carry.dx,y=Math.max(-2000,Math.min(2000,dy))+carry.dy;
+    dx=Math.max(-2000,Math.min(2000,Math.round(x)));dy=Math.max(-2000,Math.min(2000,Math.round(y)));carry.dx=x-dx;carry.dy=y-dy;carry.at=now;if(!dx&&!dy)return true;
     const bytes=new Uint8Array(10),view=new DataView(bytes.buffer);bytes[0]=3;this.constructor.word(bytes,1,point.x);this.constructor.word(bytes,3,point.y);view.setInt16(5,dx);view.setInt16(7,dy);bytes[9]=flags;return this.enqueue(bytes);
   }
   text(value){
@@ -101,6 +115,7 @@ window.AutoApproveScreenControl = class {
     if(this.queue.length+chunks.length>64||this.queueBytes+bytes>64000){this.stop(Error('보낼 텍스트가 너무 길어 조작을 멈췄습니다. 나눠서 입력해주세요.'));return false;}
     if(!this.active)return false;
     if(performance.now()-(this.frameAt||0)>3000){this.stop(Error('최신 공유 화면을 받은 뒤 다시 조작해주세요.'));return false;}
+    this.wheelCarry=null;
     for(const text of chunks){const value=this.encoder.encode(text),payload=new Uint8Array(value.length+1);payload[0]=4;payload.set(value,1);this.queue.push({payload,text});this.queueBytes+=payload.length;}
     clearTimeout(this.moveTimer);this.moveTimer=null;this.drain();
     return true;
@@ -111,12 +126,12 @@ window.AutoApproveScreenControl = class {
     const bytes=new Uint8Array(4);bytes[0]=5;bytes[1]=flags;this.constructor.word(bytes,2,code);return this.enqueue(bytes);
   }
   focusKeyboard(){if(this.active)this.keyboard.focus({preventScroll:true});}
-  release(){clearTimeout(this.touchTimer);this.touchTimer=null;this.touchDragging=false;if(this.pressed.size)this.enqueue(new Uint8Array([6]));this.pressed.clear();}
+  release(){clearTimeout(this.touchTimer);this.touchTimer=null;this.touchDragging=false;this.wheelCarry=null;if(this.pressed.size)this.enqueue(new Uint8Array([6]));this.pressed.clear();}
   pointerDown(event){
     if(!this.active||event.button>2)return;const point=this.point(event);if(!point)return;event.preventDefault();try{this.surface.setPointerCapture(event.pointerId);this.captures.add(event.pointerId);}catch(_){}
     if(event.pointerType==='touch'){
       this.touches.set(event.pointerId,{x:event.clientX,y:event.clientY,point});
-      if(this.touches.size>1){clearTimeout(this.touchTimer);this.release();this.touchMulti=true;this.touchCenter=this.center();return;}
+      if(this.touches.size>1){clearTimeout(this.touchTimer);this.release();this.touchMulti=true;this.touchCenter=this.center();this.touchWheelPoint=this.point({clientX:this.touchCenter.x,clientY:this.touchCenter.y},true);return;}
       this.touchOrigin={x:event.clientX,y:event.clientY,point};this.touchTimer=setTimeout(()=>{this.touchTimer=null;if(this.active&&this.touches.size===1&&!this.touchMulti){this.button(true,0,point);this.touchDragging=true;}},350);return;
     }
     this.button(true,event.button,point,this.constructor.modifiers(event));
@@ -126,7 +141,7 @@ window.AutoApproveScreenControl = class {
     if(!this.active)return;
     if(event.pointerType==='touch'){
       if(!this.touches.has(event.pointerId))return;event.preventDefault();this.touches.set(event.pointerId,{x:event.clientX,y:event.clientY,point:this.point(event,true)});
-      if(this.touchMulti){const center=this.center();if(center&&this.touchCenter&&this.touches.size>1)this.wheel(this.point({clientX:center.x,clientY:center.y},true),this.touchCenter.x-center.x,this.touchCenter.y-center.y);this.touchCenter=center;return;}
+      if(this.touchMulti){const center=this.center();if(center&&this.touchCenter&&this.touches.size>1)this.wheel(this.touchWheelPoint,this.touchCenter.x-center.x,this.touchCenter.y-center.y);this.touchCenter=center;return;}
       const origin=this.touchOrigin;if(!origin)return;
       if(!this.touchDragging&&Math.hypot(event.clientX-origin.x,event.clientY-origin.y)>6){clearTimeout(this.touchTimer);this.touchTimer=null;this.button(true,0,origin.point);this.touchDragging=true;}
       if(this.touchDragging)this.move(this.point(event,true));return;
@@ -140,7 +155,7 @@ window.AutoApproveScreenControl = class {
       if(!this.touches.has(event.pointerId))return;event.preventDefault();clearTimeout(this.touchTimer);this.touchTimer=null;
       const point=this.point(event,true),multi=this.touchMulti;this.touches.delete(event.pointerId);
       if(!multi){if(this.touchDragging){this.button(false,0,point);this.touchDragging=false;}else{const button=this.rightClick?2:0;this.move(point);this.button(true,button,point);this.button(false,button,point);}}
-      if(!this.touches.size){this.touchOrigin=null;this.touchCenter=null;this.touchMulti=false;}return;
+      if(!this.touches.size){this.touchOrigin=null;this.touchCenter=null;this.touchWheelPoint=null;this.touchMulti=false;this.wheelCarry=null;}return;
     }
     if(this.pressed.has(event.button)){event.preventDefault();this.button(false,event.button,this.point(event,true),this.constructor.modifiers(event));}
   }
@@ -157,7 +172,7 @@ window.AutoApproveScreenControl = class {
   install(){
     this.surface.dataset.controlling='true';this.image.dataset.controlling='true';
     this.listen(this.surface,'pointerdown',event=>this.pointerDown(event));this.listen(this.surface,'pointermove',event=>this.pointerMove(event));this.listen(this.surface,'pointerup',event=>this.pointerUp(event));
-    this.listen(this.surface,'pointercancel',()=>{this.release();this.touches.clear();this.touchOrigin=null;this.touchMulti=false;});
+    this.listen(this.surface,'pointercancel',()=>{this.release();this.touches.clear();this.touchOrigin=null;this.touchWheelPoint=null;this.touchMulti=false;});
     this.listen(this.surface,'lostpointercapture',event=>{if(this.pressed.size&&!this.touches.has(event.pointerId))this.release();});
     this.listen(window,'pointerup',event=>{if(!this.surface.contains(event.target))this.pointerUp(event);});
     this.listen(this.surface,'contextmenu',event=>event.preventDefault());

@@ -1,5 +1,16 @@
 # AutoApprove 검증 기록
 
+## 2026-10-27 · 스크롤·입력 대기 안정화 · 0.2.195/222
+
+- 기존 0.2.194 리소스와 실제 Chromium/Core·합성 Quartz sink로 연속 DOM WheelEvent를 재현했다. 소수 픽셀 이벤트 1,000×0.2는 **0픽셀/0패킷**, 정수 이벤트 1,000×1은 **240픽셀/240패킷** 뒤 ‘입력이 너무 빠르게 쌓임’으로 조작이 종료됐다. 수정 후 Chromium은 **200픽셀/34패킷·1,000픽셀/35패킷**, WebKit은 **200픽셀/31패킷·1,000픽셀/32패킷**이며 두 경우 모두 조작을 유지했다. 이벤트는 RAF마다 최대 16개씩 보냈다. 실제 HTTP/WebSocket/Core·실제 CGEvent 구성/검사지만 물리 트랙패드·사용자 데스크톱 이벤트·공개 경로 RTT/FPS 측정은 아니다.
+- 제품 JavaScript의 결정적 시계/버퍼/ACK 주입 검사에서 16개 연속 전송의 상태 callback·ACK 타이머 생성은 각각 **16→1회**, 같은 1초의 정수 휠은 **1,000→63패킷**이며 총 1,000픽셀을 보존한다. 기존의 버퍼 해제 후 영구 대기는 수정 후 **24ms**에 한 번 재개된다. 유휴 버퍼의 20초 초과는 복구 가능 종료, 미확인 입력이 있는 경우는 불확실 상태를 유지하며 재전송하지 않는다. 가장 오래된 ACK의 원래 기한·닫기 후 타이머/전송 없음·방향/좌표/보조키/텍스트 장벽·2,000픽셀 한도와 HTTP 휠 합계도 통과했다. 이 시간은 주입한 시계의 결과이며 실제 네트워크 지연으로 환산하지 않는다.
+- release App·CLI·Core 빌드 및 **514/514 핵심 검사**, 기존 입력 프로토콜·pong deadline·1,000포인터/최종 좌표/꽉 찬 대기열/키 장벽 검사를 통과했다. 제품 Swift 코드는 바꾸지 않고 입력 writer 리소스를 갱신했다.
+- Chromium·WebKit의 실제 PIN gateway/HTTP/WebSocket·합성 Quartz sink **각 13그룹**을 통과했다. 화면의 브라우저 `bufferedAmount`를 일시 주입한 뒤 한글/이모지가 추가 입력·ACK 없이 정확히 한 번 전달됐고 두 손가락의 이동 합계 **25픽셀**·고정된 초기 대상도 확인했다. 기존 원본/좌표/IME/단축키/드래그/권한/공유 수명/무응답/HTTP 호환 검사를 유지한다. 기존 질문·메시지·보기·확대 회귀 **17그룹**도 통과했다.
+- 실제 로컬 workerd/SQLite Durable Object → 제품 WSS/gateway/Core를 두 브라우저에서 PIN·지속 입력·늦은 입력 모듈과 함께 확인했다. 각 **19검증 항목**, 요청 **78/76개**, pageerror·별도 종료 진단 0개다. 주입한 브라우저 송신 압력을 해제하면 원본 Unicode와 격리한 실제 PTY 명령이 추가 키/ACK 없이 한 번 전달된다. 유휴 복구·pong 손실·출력만 복구·16 ACK 손실/미전송 보존·PIN 변경·로그아웃을 포함한다. 실제 Cloudflare 계정·DNS·hm 공개 경로 지연 검증과 구분하며 사용자 터미널에는 입력하지 않았다.
+- UI workflow에 따라 기존 구성·글꼴·의미 색상·조작부를 유지했다. 두 브라우저의 **390×844·768×1024·1440×900** 기능·가로 넘침·light/dark·권한 오류·터치 상태를 검사하고 데스크톱·어두운 모바일·태블릿·모바일 권한 오류를 시각 확인했다. 기존 접근 가능한 이름·focus·Esc 이탈·선택/disabled·모달 스크롤을 유지한다. 실물 휴대폰·전체 VoiceOver 검증은 포함하지 않는다.
+- 최종 서명 패키지의 입력 보조 도구·상호 게시자 요구식/다른 서명 거부, 이동 앱의 네트워크/포트/ON·OFF/MCP/격리 PTY, Worker 리소스/누락 처리, 심볼 분리를 통과했다. DMG의 읽기 전용 마운트에서 서명·동일 앱·Applications 링크·안내를 확인하고 서명 업데이트 ZIP과 두 체크섬을 생성했다.
+- 재현: `swift build --package-path . --scratch-path .build/network-stability -c release`, 해당 `autoapprove-checks`, `scripts/input-flow-check.mjs`, `input-channel-check.mjs`, `input-deadline-check.mjs`, `screen-input-queue-check.mjs`, `screen-transport-check.mjs --wheel-burst [--webkit]`, `web-screen-control-check.mjs [--webkit]`, `cloudflare-worker-check.mjs --build=.build/network-stability/release --pin --socket --late-input --browser [--webkit]`, `web-interaction-browser-check.mjs --release --core-build=.build/network-stability/release`를 사용한다. 전후 재현·실행 자료·개인 백업은 `.runtime/input-flow-195/`에만 보관한다.
+
 ## 2026-10-27 · 0.2.194/221 공개 배포·설치 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.194)와 원격 태그 역참조는 **eb8dc23bae0811eadadff21a8bb19c1dcbf796ae**다. DMG **9,038,614B**·체크섬 **102B**, 업데이트 ZIP **9,378,323B**·체크섬 **111B**의 4자산을 인증 없이 다시 내려받아 로컬 파일·GitHub digest·체크섬 일치를 확인했다. 제품의 네이티브 공식 최신 API·전체 ZIP 정확한 범위 다운로드·SHA-256·ZIP 제한·같은 게시자/아키텍처/버전의 설치 준비 검사도 통과했다.
