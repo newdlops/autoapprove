@@ -1,5 +1,7 @@
 # AutoApprove
 
+**LAN 연결 안정화 · 0.2.197 빌드 224:** 상태 대기 연결이 실패하면 일반 LAN 조회로 새 상태를 재확인합니다. 인증용 키체인 조회가 목록·터미널 통신을 막지 않도록 분리했습니다. [변경 사항](docs/releases/v0.2.197.md).
+
 **다른 Mac의 AI 계정 로그인 · 0.2.196 빌드 223:** Mac별 **AI 계정**에서 PIN을 확인하고 현재 기기·휴대폰의 공식 인증 페이지로 Codex·Claude를 로그인합니다. LAN 직접 연결과 기존 Cloudflare 경로를 지원하며 완료 후 대상 Mac에서 CLI를 시작할 수 있습니다. [사용 안내](docs/AGENT_ACCOUNTS.md), [변경 사항](docs/releases/v0.2.196.md).
 
 **스크롤·입력 대기 안정화 · 0.2.195 빌드 222:** 고해상도 스크롤의 작은 이동량을 보존하고 연속 전송을 줄입니다. 송신 버퍼가 비워진 뒤 추가 키 입력 없이 전송을 재개하고, 입력 상태 갱신과 확인 타이머의 중복 작업을 줄입니다. 기존 화면 조건부 전송·연결 복구도 포함합니다. [변경 사항](docs/releases/v0.2.195.md), [화면 조작 안내](docs/SCREEN_CONTROL.md).
@@ -601,6 +603,8 @@ node scripts/screen-integration-check.mjs .build/release/autoapprove --race
 `node scripts/terminal-continuity-check.mjs`는 실제 Core 직접/중계 HTTP·gzip SSE에서 재접속 변경분, 권한 철회, 공유 감시·취소·기준 만료를 검사합니다. `node scripts/terminal-continuity-browser-check.mjs`와 `--webkit`은 합성 원본의 짧은 앱 전환, 조용히 멈춘 연결, 초안과 미확인 입력 보호를 실제 브라우저로 검사합니다. 설치된 Playwright와 Chromium은 기존 `AUTOAPPROVE_PLAYWRIGHT_MODULE`·`AUTOAPPROVE_CHROMIUM_PATH`로 지정할 수 있습니다. 검사 입력은 합성 원본에만 전달합니다.
 
 `node scripts/network-recovery-browser-check.mjs`와 `--webkit`은 보조 전송 스크립트의 무응답, 멈춘 목록 요청, 네트워크 복귀, 응답 제한 시간, 일시·지속 단절과 화면 복귀를 검사합니다. 정상 상태의 조건부 조회·갱신 주기와 모바일·태블릿·데스크톱 화면도 확인합니다. `--case=optional-codec`, `--case=online-recovery`, `--case=deadline-recovery`, `--case=sustained-outage`, `--case=transient-recovery`로 각각 실행할 수 있습니다. 실제 Mac 간 HTTP 검사는 `node scripts/network-integration-check.mjs --release --direct-only`로 실행하며, `--build=경로`로 별도 빌드를 지정할 수 있습니다. 두 검사는 사용자 터미널을 조작하지 않습니다.
+
+`node scripts/peer-inventory-recovery-check.mjs --build=.build/release`는 실제 Core에서 상태 대기 연결의 끊김·무응답·503 뒤 새 조회 복구와 node/권한/응답 검증을 확인합니다. `node scripts/account-connection-check.mjs --build=.build/release`는 느린 합성 키체인 아래 동시 인증 요청·네트워크 응답성·제한 시간·취소·PIN 변경을 확인합니다. 모두 격리 프로필을 사용하며 설치 앱·실제 계정·사용자 터미널을 변경하지 않습니다.
 
 `node scripts/discovery-latency-check.mjs --build=.build/release`는 응답 없는 주소 16개 뒤의 머신, 이미 한 대를 찾은 LAN의 두 번째 머신, 저장된 IP를 새로 받은 머신을 같은 5.5초 예산으로 확인합니다. `node scripts/discovery-integration-check.mjs --release --build=.build/release`는 저장된 머신 복구, 검색 동시성·시작 간격, 여러 인터페이스의 검색 공정성과 단일 입력 전송을 검사합니다. 격리된 loopback 서버만 사용하므로 실물 네트워크의 지연 측정과 구분합니다.
 

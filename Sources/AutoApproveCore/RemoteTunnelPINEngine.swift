@@ -1,6 +1,9 @@
 import Foundation
 
 extension ApprovalEngine {
+    func readAccountPIN() async throws -> RemoteTunnelPIN? {
+        try await accountPINReader.read(directory:paths.directory,services:cloudflareServices)
+    }
     func readTunnelPIN() throws -> RemoteTunnelPIN? {
         do {
             guard let data=try cloudflareServices.readSecret(paths.directory,"remote-tunnel-pin"),!data.isEmpty else {return nil}
@@ -19,6 +22,7 @@ extension ApprovalEngine {
         catch {throw AppError.message("접속 PIN을 키체인에 저장하지 못했습니다. 키체인을 잠금 해제한 뒤 다시 시도해주세요.")}
         tunnelController?.setPIN(credential,accessKey:nextKey);relayController?.setPIN(credential,accessKey:nextKey)
         tunnelPINConfigured=true
+        accountPINReader.invalidate()
         agentAccounts.stop()
     }
     public func clearTunnelPIN() throws {
@@ -26,6 +30,7 @@ extension ApprovalEngine {
         do {try cloudflareServices.saveSecret(paths.directory,"remote-tunnel-pin",Data())}
         catch {throw AppError.message("키체인의 접속 PIN을 해제하지 못했습니다. 다시 시도해주세요.")}
         tunnelPINSetupID=nil;tunnelController?.setPIN(nil,accessKey:nextKey);relayController?.setPIN(nil,accessKey:nextKey);tunnelPINConfigured=false
+        accountPINReader.invalidate()
         agentAccounts.stop()
     }
 }

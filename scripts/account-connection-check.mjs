@@ -1,0 +1,10 @@
+import {execFileSync} from 'node:child_process';
+import {mkdir,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
+const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3);
+const build=path.resolve(option('build')||'.build/network-stability/release'),out=path.resolve(option('output')||'.runtime/lan-stability-197/account-connection'),cache=path.resolve('.build/cache/AccountConnection');
+await mkdir(out,{recursive:true});await mkdir(cache,{recursive:true});
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/account-connection-check.swift','-o',out+'/Check'],{stdio:'inherit',timeout:180000});
+const report=execFileSync(out+'/Check',process.argv.includes('--baseline')?['--baseline']:[],{encoding:'utf8',timeout:30000});
+await writeFile(out+'/report.json',report);console.log(report.trim());

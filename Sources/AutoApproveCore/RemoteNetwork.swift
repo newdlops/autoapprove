@@ -1409,8 +1409,25 @@ struct RemoteTerminalUpdate: Encodable {
                 if wait > 0, let tag {
                     // One bounded watch per peer; keep ordinary GET traffic slots
                     // available. A healthy held response must not trigger hedges.
-                    response = try await self.readConnections.read(endpoint:endpoint,path:"/api/inventory",expectedNodeID:peer.id,timeout:7,entityTag:tag,retryReads:false,wait:wait)
-                    self.inventoryWatchDelay[peer.id] = response.waitApplied ? 0.08 : 2.5
+                    do {
+                        let watched = try await self.readConnections.read(endpoint:endpoint,path:"/api/inventory",expectedNodeID:peer.id,timeout:7,entityTag:tag,retryReads:false,wait:wait)
+                        if [502,503,504].contains(watched.status) { throw RemoteHTTPError(watched.status,"Mac의 상태 대기 연결을 다시 확인합니다.") }
+                        response = watched
+                        self.inventoryWatchDelay[peer.id] = watched.waitApplied ? 0.08 : 2.5
+                    } catch {
+                        // A closed/stalled long poll does not prove the Mac is
+                        // offline. Confirm with one ordinary identity-pinned GET,
+                        // including its existing LAN alternate, before publishing
+                        // failure. Never retain a stale success or retry a denied,
+                        // malformed, wrong-node or cancelled response.
+                        guard RemoteReadRecovery.isTransient(error) else { throw error }
+                        try Task.checkCancellation()
+                        guard self.running,self.generation == epoch,self.stateReads.isCurrent(id:peer.id,token:token) else { throw CancellationError() }
+                        self.inventoryWatchDelay[peer.id] = 2.5
+                        response = try await RemoteDashboardTraffic.shared.read(foreground:foreground) { @MainActor in
+                            try await self.exchange(peer,path:"/api/inventory",timeout:4,entityTag:tag,allowUnavailableRead:true)
+                        }
+                    }
                 } else {
                     response = try await RemoteDashboardTraffic.shared.read(foreground:foreground) { @MainActor in
                         try await self.exchange(peer,path:compact ? "/api/inventory" : "/api/state",timeout:4,entityTag:tag,allowUnavailableRead:foreground)
@@ -1603,7 +1620,7 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/api/agent-account/key":
                     if let forwarded=try await forward(request) {return forwarded}
                     guard let engine else {throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
-                    return try .object(engine.agentAccounts.hello(node:nodeID,pin:try engine.readTunnelPIN()))
+                    return try await .object(engine.agentAccounts.hello(node:nodeID,pin:engine.readAccountPIN()))
                 case "/terminal-wire.js": return try asset("terminal-wire.js", type: "text/javascript; charset=utf-8")
                 case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
                 case "/input-channel.js": return try asset("input-channel.js", type: "text/javascript; charset=utf-8")
@@ -1757,7 +1774,7 @@ struct RemoteTerminalUpdate: Encodable {
             case "/api/agent-account":
                 if let forwarded=try await forward(request) {return forwarded}
                 guard let engine else {throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
-                return try await .object(engine.agentAccounts.encrypted(object,node:nodeID,pin:try engine.readTunnelPIN()))
+                return try await .object(engine.agentAccounts.encrypted(object,node:nodeID,pin:engine.readAccountPIN()))
             case "/api/screen/control":
                 if let forwarded=try await forward(request) {return forwarded}
                 guard let engine else {throw RemoteHTTPError(503,"앱이 종료되었습니다.")}

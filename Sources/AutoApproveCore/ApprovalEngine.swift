@@ -41,6 +41,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     let publishedUpdateServices:PublishedUpdateServices
     public let managedPTY: ManagedPTYManager
     public var agentAccounts=AgentAccounts()
+    let accountPINReader=RemoteAccountPINReader()
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
     private let tmuxRelay = TmuxRelay()
@@ -516,6 +517,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        accountPINReader.invalidate()
         agentAccounts.stop()
         tunnelStartEpoch = UUID()
         tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
