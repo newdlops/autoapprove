@@ -320,7 +320,10 @@ public enum PromptDetector {
                             continue
                         }
                         // `Allow ` is a word prefix, not `Allowing` or another question.
-                        if marker == "Allow ", !first.hasPrefix("Allow "), first != "Allow" { break }
+                        if marker == "Allow " {
+                            guard first.hasPrefix("Allow") else { break }
+                            if let boundary = first.dropFirst(5).first, !boundary.isWhitespace { break }
+                        }
                         return (index, row, marker)
                     }
                     if !expected.hasPrefix(candidate) { break }

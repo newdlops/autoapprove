@@ -246,6 +246,28 @@ extension ApprovalTests {
         try expectEqual(probe.inputs.filter { $0.0.tty == sessions[1].tty }.map { $0.1 }, [second])
     }
 
+    func testCodexOneTimeAllowAutomationPreservesPolicyAndSingleUse() async throws {
+        let probe = ApprovalRecoveryProbe()
+        let (engine,sessions,directory) = try recoveryEngine(probe)
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id = sessions[0].id
+        let first = codexMCPToolPermissionFixture.replacingOccurrences(of:"Allow   Run the tool and continue",with:"Allow once   Run the tool and continue")
+        try engine.setAutomatic(id,enabled:false)
+        engine.receiveScreen(sessionID:id,raw:first,generation:"one-time-allow")
+        try await Task.sleep(for:.milliseconds(100));try expectEqual(probe.inputs.count,0,"OFF remains manual")
+        try expectEqual(engine.snapshot.sessions.first?.phase,.approval)
+        try engine.setAutomatic(id,enabled:true)
+        try await waitForRecovery({probe.inputs.count == 1},"A supported one-time Allow must dispatch when enabled")
+        engine.receiveScreen(sessionID:id,raw:"Earlier output\n"+first,generation:"one-time-allow")
+        try await Task.sleep(for:.milliseconds(100));try expectEqual(probe.inputs.count,1,"An unchanged Allow remains single use")
+        let next = first.replacingOccurrences(of:"fixture_tool",with:"another_tool").replacingOccurrences(of:"Allow the fixture",with:"Allow\u{00a0}the fixture")
+        try engine.setPaused(true);engine.receiveScreen(sessionID:id,raw:next,generation:"one-time-allow")
+        try await Task.sleep(for:.milliseconds(100));try expectEqual(probe.inputs.count,1,"Pause keeps the next permission pending")
+        try engine.setPaused(false)
+        try await waitForRecovery({probe.inputs.count == 2},"Unpause resumes only the next exact permission")
+        try expectEqual(probe.inputs.map{$0.1},[first,next])
+    }
+
     func testPermissionDetectionAcrossTerminalGridSizes() throws {
         func wrapWords(_ text: String, width: Int) -> String {
             var rows = [String](), row = ""

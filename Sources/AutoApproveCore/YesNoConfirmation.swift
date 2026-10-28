@@ -111,6 +111,9 @@ public struct YesNoConfirmation {
     private static let permissionPhrases: [(compact: String, label: String)] = {
         let descriptions = [
             ("Allow", "Run the tool and continue."),
+            ("Allow once", "Run the tool and continue."),
+            ("Allow this time", "Run the tool and continue."),
+            ("Allow this request only", "Run the tool and continue."),
             ("Allow for this session", "Run the tool and remember this choice for this session."),
             ("Always allow", "Run the tool and remember this choice for future tool calls."),
             ("Allow and don't ask me again", "Run the tool and remember this choice for future tool calls."),
@@ -137,7 +140,8 @@ public struct YesNoConfirmation {
 
     static func isToolPermissionMenu(_ labels: [String]) -> Bool {
         let labels = labels.map { permissionLabel($0).lowercased() }
-        let known: Set<String> = ["allow", "allow for this session", "always allow", "allow and don't ask me again",
+        let known: Set<String> = ["allow", "allow once", "allow this time", "allow this request only",
+                                  "allow for this session", "always allow", "allow and don't ask me again",
                                   "cancel", "deny", "don't allow", "do not allow"]
         // Tool capabilities determine which permission scopes are offered. Two,
         // three and four rows are valid; an unrelated task is never a scope.

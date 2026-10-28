@@ -28,7 +28,8 @@ function preserveFixturePort(port) {
 }
 preserveFixturePort(8765);
 let child, mcp, stderr = '';
-const preferredPortBlocker = createServer();
+// A busy-port fixture must not retain an incidental health probe at shutdown.
+const preferredPortBlocker = createServer(socket => socket.destroy());
 async function reserveDefaultPort() {
   await new Promise((resolve, reject) => {
     preferredPortBlocker.once('error', error => error.code === 'EADDRINUSE' ? resolve() : reject(error));

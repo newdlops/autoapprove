@@ -345,6 +345,17 @@ try {
   await bridge.request('screen', { terminalID: fixtures[0].id, screen: toolPermission, generation: 'tool-permission' });
   await sleep(150); assert.equal(actions.length, 15, 'Repeated tool permission observation cannot resend Allow');
 
+  for (const [index,label] of ['Allow once','Allow this time','Allow this request only'].entries()) {
+    const before=actions.length;
+    const frame=toolPermission.replaceAll('HighlightPreview','OneTimeFixture'+index)
+      .replace('Allow Computer','Allow\u00a0Computer').replace('Allow                   Run',label+'   Run');
+    await bridge.request('screen',{terminalID:fixtures[0].id,screen:frame,generation:'tool-permission'});
+    await until(()=>actions.length===before+1,'explicit one-time Allow '+label);
+    assert.equal(actions.at(-1).answer,'1');assert.equal(actions.at(-1).dialog,frame);assert.equal(actions.at(-1).terminalID,fixtures[0].id);
+    await bridge.request('screen',{terminalID:fixtures[0].id,screen:'New history\n'+frame,generation:'tool-permission'});
+    await sleep(100);assert.equal(actions.length,before+1,'History/repaint cannot replay one-time Allow');
+  }
+
   await bridge.request('register', { terminals: fixtures.map(fixture => ({ ...fixture, streamAttached: false })) });
   status = await bridge.request('status');
   const disconnected = status.sessions.find(session => session.id === sessions[0].id);
@@ -358,7 +369,7 @@ try {
   for (const session of sessions) {
     assert.equal(english.find(value => value.pid === session.pid)?.id, korean.find(value => value.pid === session.pid)?.id, 'Process identity must be locale independent');
   }
-  console.log('PASS real PTY discovery, periodic Git branch refresh, exact target, wrapped three-choice approval, single-use screen, pause/resume, idle/background monitoring/work transitions, hook takeover, manual questions, confirmed-unsent retry with backoff, missing acknowledgement timeout, unchanged delivered dialog attention, late result isolation, disconnected off, locale-independent identity');
+  console.log('PASS real PTY discovery, periodic Git branch refresh, exact target, wrapped three-choice approval, single-use screen, pause/resume, idle/background monitoring/work transitions, hook takeover, manual questions, confirmed-unsent retry with backoff, missing acknowledgement timeout, unchanged delivered dialog attention, late result isolation, four-choice and explicit one-time Allow with Unicode heading whitespace, disconnected off, locale-independent identity');
   }
 } catch (error) {
   const processes = await exec('/bin/ps', ['-axo', 'pid=,ppid=,tty=,lstart=,comm=']);

@@ -98,6 +98,61 @@ private let claudeCreatePermissionFixture = """
 """
 
 extension ApprovalTests {
+    func testCodexToolPermissionOneTimeAllowVariants() throws {
+        let original = codexMCPToolPermissionFixture
+        for heading in ["Allow the fixture MCP server to run tool \"fixture_tool\"?", "Approve app tool call?"] {
+            for label in ["Allow once", "Allow this time", "Allow this request only"] {
+                for description in ["", "   Run the tool and continue"] {
+                    let frame = original.replacingOccurrences(of:"Allow the fixture MCP server to run tool \"fixture_tool\"?",with:heading)
+                        .replacingOccurrences(of:"Allow   Run the tool and continue",with:label+description)
+                    let prompt = PromptDetector.detect(frame,agent:.codex)
+                    try expectEqual(prompt?.answer,"1","A tool's explicit one-time permission must stay a one-time choice")
+                    try expectEqual(prompt?.dialog,frame)
+                    for iterm in [false,true] {
+                        let context = JSContext()!; context.setObject(frame,forKeyedSubscript:"current" as NSString)
+                        context.evaluateScript("""
+                        var writes=[];
+                        const session={tty:()=>'/dev/fixture',contents:()=>current,processes:()=>['codex'],variable:()=>42,rows:()=>100,write:v=>writes.push(v.text)};
+                        const tab={...session,sessions:()=>[session]};
+                        function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:v=>writes.push(v)};}
+                        """)
+                        let target = ScreenTarget(tty:"/dev/fixture",jobPIDs:[42])
+                        let script = iterm ? try ITermAdapter.approvalScript(target:target,expectedScreen:frame,agent:.codex)
+                            : try TerminalAdapter.approvalScript(tty:target.tty,expectedScreen:frame,agent:.codex)
+                        try expectEqual(context.evaluateScript(script)?.toString(),"sent")
+                        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(),"[\"1\"]")
+                        context.setObject(frame.replacingOccurrences(of:#"\u{4}"#,with:"changed argument"),forKeyedSubscript:"current" as NSString)
+                        try expectEqual(context.evaluateScript(script)?.toString(),"screenChanged")
+                        try expectEqual(context.evaluateScript("writes.length")?.toInt32(),1)
+                        try expectNil(context.exception)
+                    }
+                }
+            }
+        }
+        for label in ["Always allow", "Allow another tool", "Allow once and deploy", "Allow once Run another tool instead"] {
+            try expectNil(PromptDetector.detect(original.replacingOccurrences(of:"Allow   Run the tool and continue",with:label),agent:.codex))
+        }
+        let ambiguous = original.replacingOccurrences(of:"    2. Cancel",with:"    2. Allow once\n    3. Cancel")
+        try expectNil(PromptDetector.detect(ambiguous,agent:.codex))
+        let cancel = original.replacingOccurrences(of:"Allow   Run the tool and continue",with:"Allow once")
+            .replacingOccurrences(of:"› 1.",with:"  1.").replacingOccurrences(of:"    2.",with:"  › 2.")
+        try expectNil(PromptDetector.detect(cancel,agent:.codex))
+    }
+
+    func testCodexToolPermissionHeadingWhitespace() throws {
+        let original = codexMCPToolPermissionFixture
+        for separator in ["\t","\u{00a0}","\u{202f}","\u{2003}"] {
+            let frame = original.replacingOccurrences(of:"Allow the fixture",with:"Allow"+separator+"the fixture")
+            try expectEqual(PromptDetector.detect(frame,agent:.codex)?.answer,"1","The Allow word boundary is Unicode whitespace")
+            let cocoa = NSString(string:frame).copy() as! NSString
+            try expectEqual(PromptDetector.detect(cocoa as String,agent:.codex)?.answer,"1")
+        }
+        for prefix in ["Allowing", "Allowance", "Allow_another", "Allowlisted"] {
+            try expectNil(PromptDetector.detect(original.replacingOccurrences(of:"Allow the fixture",with:prefix+" the fixture"),agent:.codex))
+        }
+        try expectNil(PromptDetector.detect("```\n"+original+"\n```",agent:.codex))
+    }
+
     func testCodexMCPToolPermissionWithTwoChoices() throws {
         let original = codexMCPToolPermissionFixture
         let variants = [original,
