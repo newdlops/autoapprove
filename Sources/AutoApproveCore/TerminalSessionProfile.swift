@@ -20,7 +20,7 @@ public struct TerminalProfileTabLayout: Codable, Equatable, Sendable {
     public var label:String {"창 \(windowOrder+1) · 탭 \(tabOrder+1)"+(selected ? " · 선택 탭":"")}
 }
 
-/// A resumable conversation, never a saved shell command, transcript or credential.
+/// A workspace CLI or a specific conversation, never a saved shell command.
 public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     public enum Host: String, Codable, Sendable, CaseIterable { case terminal, iterm }
     public var id: UUID
@@ -36,18 +36,23 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         self.id=id; self.title=title; self.agent=agent; self.cwd=cwd; self.conversationID=conversationID
         self.providerHome=providerHome; self.host=host;self.terminalTab=terminalTab
     }
-    public var key: String { agent+"\n"+(providerHome ?? "")+"\n"+conversationID.lowercased() }
+    public var resumesConversation:Bool {!conversationID.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
+    public var key: String {
+        let conversation=conversationID.trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
+        return agent+"\n"+(providerHome ?? "")+"\n"+(conversation.isEmpty ? "new\n"+cwd+"\n"+id.uuidString.lowercased():conversation)
+    }
     public var terminalTabSummary:String {
         guard host == .terminal else {return ""}
         return (terminalTab?.label ?? "한 창의 탭으로 복원")+(terminalTab?.settingsName.map {" · 설정: "+$0} ?? "")
     }
     public func validated() throws -> Self {
-        guard ["codex","claude"].contains(agent), UUID(uuidString:conversationID) != nil,
-              Self.path(cwd), providerHome.map(Self.path) ?? true,
-              title.count <= 256, !title.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains) else {
-            throw AppError.message("프로필의 CLI 종류·폴더·대화 ID를 확인해주세요.")
-        }
-        var copy=self; copy.conversationID=UUID(uuidString:conversationID)!.uuidString.lowercased();copy.terminalTab=try terminalTab?.validated();return copy
+        let conversation=conversationID.trimmingCharacters(in:.whitespacesAndNewlines)
+        guard ["codex","claude"].contains(agent) else {throw AppError.message("CLI 종류는 Codex 또는 Claude Code를 선택해주세요.")}
+        guard Self.path(cwd) else {throw AppError.message("작업 폴더의 전체 경로를 입력해주세요.")}
+        guard providerHome.map(Self.path) ?? true else {throw AppError.message("CLI 설정 폴더의 전체 경로를 확인해주세요.")}
+        guard conversation.isEmpty || UUID(uuidString:conversation) != nil else {throw AppError.message("대화 ID를 입력할 때는 UUID 형식을 사용해주세요. 비워 두면 새 CLI를 엽니다.")}
+        guard title.count<=256,!title.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains) else {throw AppError.message("프로필 항목 이름은 줄바꿈 없이 256자까지 입력해주세요.")}
+        var copy=self;copy.conversationID=UUID(uuidString:conversation)?.uuidString.lowercased() ?? "";copy.terminalTab=try terminalTab?.validated();return copy
     }
     private static func path(_ value: String) -> Bool {
         value.hasPrefix("/") && value.utf8.count <= 4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
@@ -57,7 +62,8 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         let entry=try validated()
         var arguments=["env"]
         if let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
-        arguments += [agent,agent == "codex" ? "resume":"--resume",entry.conversationID]
+        arguments.append(agent)
+        if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
         return "cd -- "+HookInstaller.quote(entry.cwd)+" && exec "+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
 }
@@ -256,12 +262,12 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             let key=group(entry)
             let result:TerminalProfileRestoreResult
             if !active.contains(where:{$0.key == entry.key}),let receipt=dispatched[entry.key],receipt.tty == nil {
-                result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 대화를 다시 열기 전에 터미널을 확인해주세요.")
+                result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 항목을 다시 열기 전에 터미널을 확인해주세요.")
             } else if active.contains(where:{$0.key == entry.key}) || dispatched[entry.key] != nil {
                 result = .init(id:entry.id,phase:.alreadyOpen,detail:"이미 열려 있거나 복원 명령을 전달한 세션입니다.")
             } else if key.map({blocked.contains($0)}) == true {
                 result = .init(id:entry.id,phase:.needsReview,detail:"같은 창의 앞선 탭 복원을 확인하지 못했습니다. 창이 나뉘지 않도록 후속 탭을 열지 않았습니다. 터미널을 확인한 뒤 다시 시도해주세요.")
-            } else if active.contains(where:{$0.agent == entry.agent && $0.cwd == entry.cwd && $0.providerHome == entry.providerHome && UUID(uuidString:$0.conversationID)==nil}) {
+            } else if entry.resumesConversation && active.contains(where:{$0.agent == entry.agent && $0.cwd == entry.cwd && $0.providerHome == entry.providerHome && UUID(uuidString:$0.conversationID)==nil}) {
                 result = .init(id:entry.id,phase:.needsReview,detail:"같은 폴더의 CLI가 실행 중입니다. 원래 대화를 확인한 뒤 복원해주세요.")
             } else if !directoryExists(entry.cwd) {
                 result = .init(id:entry.id,phase:.failed,detail:"작업 폴더가 없습니다. 프로필의 폴더 경로를 확인해주세요.")
@@ -272,7 +278,8 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 do {
                     let tty=try await launch(entry,key.flatMap {anchors[$0]});dispatched[entry.key]=Receipt(tty:tty);knownTTYs[entry.key]=tty
                     if let key {anchors[key]=tty;openedGroups.insert(key)}
-                    result = .init(id:entry.id,phase:.opened,detail:entry.host == .terminal ? "저장한 창의 탭으로 대화 이어하기 명령을 전달했습니다.":"새 터미널에 저장한 대화의 이어하기 명령을 전달했습니다.")
+                    let detail=entry.resumesConversation ? (entry.host == .terminal ? "저장한 창의 탭으로 대화 이어하기 명령을 전달했습니다.":"새 터미널에 저장한 대화의 이어하기 명령을 전달했습니다."):"저장한 폴더에서 새 CLI 실행 명령을 전달했습니다."
+                    result = .init(id:entry.id,phase:.opened,detail:detail)
                 }
                 catch {
                     let notStarted=(error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started"

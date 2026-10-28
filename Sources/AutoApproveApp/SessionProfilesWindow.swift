@@ -23,7 +23,7 @@ struct SessionProfilesWindow: View {
                         Spacer(minLength:4)
                         if controller.loading {ProgressView().controlSize(.small).accessibilityLabel("프로필 불러오는 중")}
                     }.padding(.horizontal,16).padding(.top,20)
-                    Text("창마다 이어갈 대화를 파일로 저장합니다.").font(.callout).foregroundStyle(.secondary).padding(.horizontal,16)
+                    Text("작업 폴더와 CLI, 이어갈 대화를 파일로 저장합니다.").font(.callout).foregroundStyle(.secondary).padding(.horizontal,16)
                     if controller.profiles.isEmpty {
                         VStack(alignment:.leading,spacing:8) {
                             Text(controller.loading ? "프로필을 불러오고 있습니다…":"저장한 프로필이 없습니다").font(.headline)
@@ -48,7 +48,7 @@ struct SessionProfilesWindow: View {
                         ContentUnavailableView {
                             Label("창별 대화를 다시 여세요",systemImage:"terminal")
                         } description: {
-                            Text("현재 세션을 프로필로 저장하면 재부팅 뒤에도 선택한 대화에서 이어갈 수 있습니다. 여러 프로필을 만들 수 있습니다.")
+                            Text("현재 세션을 프로필로 저장하면 재부팅 뒤 같은 폴더에서 CLI를 열 수 있습니다. 대화 ID를 저장하면 해당 대화를 이어갑니다.")
                         } actions: {
                             Button("현재 세션으로 새 프로필") {Task {await controller.captureCurrent()}}.disabled(controller.busy)
                         }
@@ -105,7 +105,7 @@ struct SessionProfilesWindow: View {
                     .accessibilityLabel("프로필 관리").help("이름·대화 편집, 현재 창으로 갱신, 파일 내보내기 또는 휴지통 이동")
                     .disabled(controller.busy)
             }
-            Text("복원할 세션을 선택하세요. 저장한 대화를 새 터미널 창에서 엽니다.")
+            Text("복원할 세션을 선택하세요. 대화 ID가 있으면 이어가고, 없으면 저장한 폴더에서 새 CLI를 엽니다.")
                 .font(.callout).foregroundStyle(.secondary)
             if profile.entries.contains(where:{$0.host == .terminal && $0.terminalTab == nil}) {
                 Text("창 정보가 없는 Terminal 세션은 한 창의 탭으로 모아 엽니다. ‘현재 창으로 갱신’하면 원래 구성을 저장합니다.")
@@ -124,7 +124,9 @@ struct SessionProfilesWindow: View {
                     if let home=entry.providerHome {
                         Text("CLI 설정 폴더: "+home).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(home)
                     }
-                    Text(entry.conversationID).font(.system(.caption,design:.monospaced)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    if entry.resumesConversation {
+                        Text(entry.conversationID).font(.system(.caption,design:.monospaced)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    } else {Text("새 CLI 실행").font(.caption).foregroundStyle(.secondary)}
                     if let result=controller.results[entry.id] {
                         Label(result.detail,systemImage:result.phase == .opened ? "checkmark.circle":result.phase == .alreadyOpen ? "arrow.uturn.forward.circle":"exclamationmark.triangle")
                             .font(.callout).foregroundStyle(result.phase == .failed ? Color.red:Color.primary)
@@ -175,7 +177,7 @@ struct SessionProfileEditor:View {
     var body:some View {
         VStack(alignment:.leading,spacing:16) {
             Text("세션 프로필 저장").font(.title2.weight(.semibold))
-            Text("각 창에서 이어갈 대화를 확인하세요. 대화 ID를 확인하지 못한 세션은 목록에서 선택하거나 직접 입력하세요.")
+            Text("대화 ID는 선택 사항입니다. 비워 두면 저장한 폴더에서 새 CLI를 열고, 입력하면 해당 대화를 이어갑니다.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             HStack {
                 Text("프로필 이름")
@@ -206,12 +208,13 @@ struct SessionProfileEditor:View {
                                 if let home=row.entry.providerHome {Text("CLI 설정 폴더: "+home).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)}
                                 if !row.choices.isEmpty {
                                     Picker("복원할 대화",selection:$row.entry.conversationID) {
-                                        Text("대화 선택…").tag("")
+                                        Text("새 CLI 실행").tag("")
                                         ForEach(row.choices) {choice in Text(choice.title).tag(choice.id)}
                                     }.frame(maxWidth:.infinity,alignment:.leading)
                                 }
-                                TextField("대화 ID (UUID)",text:$row.entry.conversationID).textFieldStyle(.roundedBorder)
-                                    .font(.system(.callout,design:.monospaced)).accessibilityLabel("\(row.entry.title) 대화 ID")
+                                TextField("대화 ID (선택 사항)",text:$row.entry.conversationID).textFieldStyle(.roundedBorder)
+                                    .font(.system(.callout,design:.monospaced)).accessibilityLabel("\(row.entry.title) 대화 ID · 선택 사항")
+                                    .help("비워 두면 새 CLI를 실행합니다. 대화를 이어가려면 해당 UUID를 입력하세요.")
                                 if let detail=row.detail {Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
                             }.padding(.leading,20).disabled(!row.included)
                             Divider()

@@ -37,13 +37,18 @@ private actor FixtureLaunches {
                     try entry(100,"결제 API · Codex","codex","old-api"),try entry(101,"웹 관리자 · Claude Code","claude","old-web")]))
                 _ = try store.save(.init(id:UUID(uuidString:id(2))!,name:"긴 이름의 프로필 · 여러 프로젝트와 재부팅 뒤 이어갈 작업",entries:try (0..<18).map {try entry(200+$0,"긴 작업 이름 \($0+1) · 한국어와 English 프로젝트의 작업 상태","codex","dense/project-\($0)/long-project-directory")}))
             }
-            var ambiguous=try entry(400,"대화 선택이 필요한 창","codex","current-choice");ambiguous.conversationID=""
+            var ambiguous=try entry(400,"대화 ID 없이 새 Codex","codex","current-choice");ambiguous.conversationID=""
+            var freshClaude=try entry(402,"대화 ID 없이 새 Claude","claude","current-claude");freshClaude.conversationID=""
             let candidates=[TerminalProfileCandidate(id:"fixture-current-a",entry:try entry(300,"현재 API 창","codex","current-api")),
                             TerminalProfileCandidate(id:"fixture-current-b",entry:try entry(301,"현재 Claude 창","claude","current-web")),
-                            TerminalProfileCandidate(id:"fixture-current-choice",entry:ambiguous,conversations:[.init(id:id(400),title:"도구 승인 안정화 작업"),.init(id:id(401),title:"프로필 복원 구현 작업")],detail:"공유 서버의 복원할 대화를 선택해주세요. 현재 창의 대화를 자동으로 추측하지 않습니다.")]
+                            TerminalProfileCandidate(id:"fixture-current-choice",entry:ambiguous,conversations:[.init(id:id(400),title:"도구 승인 안정화 작업"),.init(id:id(401),title:"프로필 복원 구현 작업")],detail:"대화 ID는 선택 사항입니다. 비워 두면 새 Codex를 엽니다."),
+                            TerminalProfileCandidate(id:"fixture-current-claude",entry:freshClaude)]
             controller=SessionProfilesController(store:store,capture:{
                 try await Task.sleep(for:.milliseconds(250))
-                return candidates + (await launches.entries).enumerated().map {index,value in
+                let sources=candidates.enumerated().map {index,value in
+                    var candidate=value;candidate.entry.id=UUID();candidate.tty="/dev/ttys\(800+index)";return candidate
+                }
+                return sources + (await launches.entries).enumerated().map {index,value in
                     var entry=value;entry.terminalTab?.windowOrder=2
                     return .init(id:entry.id.uuidString,entry:entry,tty:"/dev/ttys\(900+index)")
                 }

@@ -511,6 +511,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: multiple private files, explicit update, import and restart",tests.testTerminalProfilesMultiplePrivateFilesAndRestart),
             ("Session profiles: malformed, future, duplicate and unsafe files",tests.testTerminalProfilesRejectMalformedUnsafeAndDuplicateFiles),
             ("Session profiles: fixed resume grammar and native host contracts",tests.testTerminalProfileFixedCommandsAndNativeHostContracts),
+            ("Session profiles: optional conversation starts CLI and saves separate entries",tests.testTerminalProfileFreshCLICommandsAndPrivateFiles),
+            ("Session profiles: fresh CLI tabs and bounded duplicate launch receipts",tests.testTerminalProfileFreshCLIRestoreKeepsTabsAndReceipts),
             ("Session profiles: duplicate prevention, missing folder and uncertain delivery",tests.testTerminalProfileRestoreDeduplicationAndPartialFailure),
             ("Session profiles: exact identity, explicit daemon picker and stale process",tests.testTerminalProfileCaptureBindsExactConversationsAndRejectsStalePID),
             ("Terminal profile tabs: versioned layout and legacy files",tests.testTerminalTabProfileSchemaAndLegacyFiles),

@@ -714,8 +714,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         let target=try await questionTransport.queueHome(session)
                         entry.providerHome=target.home
                         choices=try await codexQueue.conversations(target,session.cwd).map {CodexProfileConversation(id:$0.id,title:$0.title)}
-                        detail="공유 서버의 복원할 대화를 선택해주세요. 현재 창의 대화를 자동으로 추측하지 않습니다."
-                    } catch {detail="대화 ID를 자동으로 확인하지 못했습니다. Codex의 /status에서 Session ID를 확인해 입력해주세요."}
+                        detail="대화를 이어가려면 선택하거나 ID를 입력하세요. 비워 두면 이 폴더에서 새 Codex를 엽니다."
+                    } catch {detail="대화 ID는 선택 사항입니다. 비워 두면 이 폴더에서 새 Codex를 엽니다."}
                 }
             } else {
                 let home=entry.providerHome
@@ -725,7 +725,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let identities=Set(rows.filter {$0.processID == session.id}.compactMap { $0.activity?.providerID })
                 if identities.count == 1,let id=identities.first,UUID(uuidString:id) != nil {entry.conversationID=id}
                 else if let id=session.providerID,UUID(uuidString:id) != nil {entry.conversationID=id}
-                else {detail="대화 ID를 자동으로 확인하지 못했습니다. Claude Code의 /status에서 세션 ID를 확인해 입력해주세요."}
+                else {detail="대화 ID는 선택 사항입니다. 비워 두면 이 폴더에서 새 Claude Code를 엽니다."}
             }
             if ![TerminalKind.terminal,.iterm].contains(session.terminal) {
                 detail=(detail.map {$0+" "} ?? "")+"이 세션은 새 Terminal 창에서 복원합니다."

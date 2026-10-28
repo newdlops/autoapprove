@@ -11,6 +11,14 @@ private actor ProfileLaunchRecorder {
     var keys:[String]=[]
     func add(_ key:String) {keys.append(key)}
 }
+private actor FreshProfileLaunchRecorder {
+    var anchors:[String?]=[]
+    var commands:[String]=[]
+    func launch(_ entry:TerminalProfileEntry,_ anchor:String?) throws -> String {
+        commands.append(try entry.resumeCommand());anchors.append(anchor)
+        return "/dev/ttys\(980+commands.count-1)"
+    }
+}
 private final class ProfileReadFixture: @unchecked Sendable {
     let records:[ProcessRecord]
     private let lock=NSLock()
@@ -99,6 +107,57 @@ extension ApprovalTests {
         try expect(try entry.resumeCommand().contains("'CLAUDE_CONFIG_DIR="))
     }
 
+    func testTerminalProfileFreshCLICommandsAndPrivateFiles() throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-fresh-profile-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:root)}
+        var codex=profileEntry(cwd:"/tmp/fresh-workspace");codex.conversationID=" \n "
+        let normalized=try codex.validated()
+        try expectEqual(normalized.conversationID,"");try expect(!normalized.resumesConversation)
+        try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && exec 'env' 'codex'")
+        var claude=normalized;claude.id=UUID();claude.agent="claude";claude.providerHome="/tmp/provider with space"
+        try expectEqual(try claude.resumeCommand(),"cd -- '/tmp/fresh-workspace' && exec 'env' 'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'claude'")
+        var another=normalized;another.id=UUID()
+        try expect(normalized.key != another.key,"Separate tabs in one folder have distinct launch receipts")
+        var moved=normalized;moved.cwd="/tmp/other-workspace";try expect(moved.key != normalized.key)
+        let store=TerminalProfileStore(directory:root),saved=try store.save(.init(name:"폴더와 CLI",entries:[normalized,another,claude]))
+        try expectEqual(try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(saved.id))).entries,saved.entries)
+        for value in [normalized,claude] {for host in TerminalProfileEntry.Host.allCases {
+            var entry=value;entry.host=host
+            let context=JSContext()!
+            context.evaluateScript("""
+            var commands=[];const tab={tty:()=>'/dev/ttys099'};
+            function Application(){return {activate:()=>{},doScript:command=>{commands.push(command);return tab;},createWindowWithDefaultProfile:options=>{commands.push(options.command);return {currentSession:()=>tab};}};}
+            """)
+            let result=context.evaluateScript(try TerminalProfileLauncher.script(entry))?.toString()
+            try expectNil(context.exception);try expectEqual(result,#"{"tty":"/dev/ttys099"}"#)
+            try expectEqual(context.evaluateScript("commands.length")?.toInt32(),1)
+            try expectEqual(context.evaluateScript("commands[0]")?.toString(),try entry.resumeCommand())
+        }}
+        var specific=normalized;specific.conversationID=" 00000000-0000-4000-8000-000000000001 "
+        try expectEqual(try specific.validated().conversationID,"00000000-0000-4000-8000-000000000001")
+        try expect(try specific.resumeCommand().contains("'codex' 'resume'"))
+    }
+
+    func testTerminalProfileFreshCLIRestoreKeepsTabsAndReceipts() async throws {
+        let group=UUID(),log=FreshProfileLaunchRecorder(),restorer=TerminalProfileRestorer()
+        var a=profileEntry();a.conversationID="";a.terminalTab = .init(window:group,windowOrder:0,tabOrder:0)
+        var b=a;b.id=UUID();b.terminalTab?.tabOrder=1;b.terminalTab?.selected=true
+        var unrelated=a;unrelated.id=UUID()
+        let profile=TerminalSessionProfile(name:"같은 폴더의 두 CLI",entries:[a,b]),selected=Set([a.id,b.id])
+        let first=try await restorer.restore(profile,selected:selected,active:[unrelated],directoryExists:{_ in true},launch:{try await log.launch($0,$1)})
+        try expectEqual(first.map(\.phase),[.opened,.opened]);try expectEqual(await log.anchors.count,2)
+        let anchors=await log.anchors;try expectNil(anchors[0]);try expectEqual(anchors[1],"/dev/ttys980")
+        let commands=await log.commands;try expect(commands.allSatisfy {!$0.contains("'resume'") && !$0.contains("'--resume'")})
+        let again=try await restorer.restore(profile,selected:selected,active:[unrelated],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await log.launch($0,$1)})
+        try expectEqual(again.map(\.phase),[.alreadyOpen,.alreadyOpen]);try expectEqual(await log.commands.count,2)
+        let closed=try await restorer.restore(profile,selected:[a.id],active:[],directoryExists:{_ in true},terminalIsOpen:{$0 != "/dev/ttys980"},launch:{try await log.launch($0,$1)})
+        try expectEqual(closed.first?.phase,.opened);try expectEqual(await log.anchors.last!,"/dev/ttys981")
+        let uncertain=TerminalProfileRestorer()
+        _ = try await uncertain.restore(profile,selected:[a.id],active:[],directoryExists:{_ in true},launch:{_,_ in throw AppError.message("uncertain launch")})
+        let retry=try await uncertain.restore(profile,selected:[a.id],active:[],directoryExists:{_ in true},launch:{try await log.launch($0,$1)})
+        try expectEqual(retry.first?.phase,.needsReview);try expectEqual(await log.commands.count,3)
+    }
+
     func testTerminalProfileRestoreDeduplicationAndPartialFailure() async throws {
         let opened=ProfileLaunchRecorder(),first=profileEntry(),missing=profileEntry(cwd:"/missing"),ambiguous=profileEntry(cwd:"/ambiguous"),next=profileEntry("claude")
         let profile=TerminalSessionProfile(name:"복원",entries:[first,missing,ambiguous,next]),restorer=TerminalProfileRestorer()
@@ -140,7 +199,8 @@ extension ApprovalTests {
         let codex=try unwrap(candidates.first {$0.entry.agent == "codex"}),claude=try unwrap(candidates.first {$0.entry.agent == "claude"})
         try expectEqual(codex.entry.conversationID,"");try expectEqual(codex.conversations.map(\.id),[first,second])
         try expectEqual(claude.entry.conversationID,claudeID)
-        try expectThrows(try TerminalSessionProfile(name:"미선택",entries:[codex.entry]).validated())
+        try expectEqual(try TerminalSessionProfile(name:"새 CLI",entries:[codex.entry]).validated().entries.first?.conversationID,"")
+        try expect(!(try codex.entry.resumeCommand()).contains("'resume'"))
         var chosen=codex.entry;chosen.conversationID=second
         try expectEqual(try TerminalSessionProfile(name:"선택",entries:[chosen]).validated().entries[0].conversationID,second)
         let reader=ProfileReadFixture(records)

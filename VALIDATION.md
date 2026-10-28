@@ -1,5 +1,14 @@
 # AutoApprove 검증 기록
 
+## 2026-10-28 · 대화 ID 선택 입력·폴더에서 새 CLI 실행 · 0.2.206/233
+
+- 사용자는 대화 ID를 지정하지 않으면 해당 폴더에서 CLI만 열고, 빈 ID에 대한 일반 저장 경고를 없애도록 요청했다. 빈/공백 ID는 정상 값으로 정규화하며 `cd -- <quoted cwd> && exec env [설정 HOME] codex/claude`를 생성한다. 입력된 UUID가 있으면 기존의 정확한 `codex resume UUID`/`claude --resume UUID`를 유지한다. CLI·폴더·설정 폴더·실제로 입력된 잘못된 UUID는 해당 필드의 안내로 검증한다.
+- 새 CLI 항목의 실행 식별은 저장 항목 UUID·CLI·설정 폴더·작업 폴더를 사용한다. 빈 ID의 여러 항목이 같은 대화로 충돌하지 않으며 같은 폴더의 여러 탭을 독립적으로 저장한다. 이미 열린 다른 CLI를 빈 ID 항목의 정확한 대화로 추측하지 않고 새 CLI를 연다. 앱 실행 중 해당 저장 항목의 확인된 실행 영수증은 반복 복원을 막고, 닫힌 TTY는 다시 열 수 있으며 불확실 전달은 자동 재실행하지 않는다.
+- 관련 검사는 **세션 프로필 7/7·Terminal 창/탭 8/8**이 통과했다. 새 두 검사는 빈/공백 ID·선택 UUID 정규화, 두 CLI의 정확한 기본 명령과 Terminal/iTerm2 합성 전달, 같은 폴더의 독립 항목 파일 저장/재열기, 새 CLI의 탭 anchor·반복/닫힌 탭·불확실 전달 제어를 포함한다. 기존 정확한 대화 이어하기·null 선택 탭·다중 파일·안전한 인용·누락/오래된 원본 검증도 통과했다. 이번에는 전체 회귀 검사를 재실행하지 않았으며 최근 전체 결과는 v0.2.204의 547/548이다.
+- 프로덕션 SwiftUI 편집기에서 이름 입력 후 빈 ID 두 개가 포함된 **4개 항목의 저장 버튼 활성·저장 완료·‘새 CLI 실행’ 목록 표시**를 격리 QA 앱으로 조작했다. 첫 복원은 새 Codex/Claude **2개 전달·기존 2개 유지·확인 필요 0개**, 반복 복원은 **추가 전달 0개·기존 4개**다. 가짜 실행기의 두 명령은 각각 `env claude`/`env codex`, anchor는 **기존 같은 창의 TTY·새 창 nil**이었다. 실제 사용자 Terminal 실행과 시험 입력은 **0건**이다.
+- 실제 프로덕션 뷰를 **700×480·860×640·1100×800 light/dark**, 빈 목록·긴 오류·이전 프로필·빈 ID/잘못된 UUID 편집 상태로 렌더링했다. 빈 ID 편집 light/dark·최소 목록 light·잘못된 UUID light·실제 격리 저장/복원 화면을 눈으로 확인했다. 저장/복원 버튼이 가려지지 않았고 긴 내용은 스크롤되며, 빈 ID에는 경고가 없고 잘못 입력한 UUID에만 필드 안내와 저장 비활성이 나타났다. 기존 네이티브 언어·서체·컨트롤을 유지했으며 UI workflow/Impeccable craft floor와 변경 파일 detector에서 추가 지적은 없었다. 웹 UI와 모바일 화면을 새로 디자인한 작업은 아니다.
+- 최종 App·CLI·Core release 빌드와 정식 패키지의 입력·동일 게시자 서명·격리 네트워크·Worker 리소스·release 심볼 **5검사**가 통과했다. 기존 SMJobBless 경고만 남는다. 재현은 release `autoapprove-checks --filter 'Session profiles'`, `--filter 'Terminal profile tabs'`, `scripts/session-profiles-render.mjs`, `scripts/session-profiles-preview.mjs`다. 실제 Terminal 직접 접근 제한은 앞선 기록과 같으며 우회하지 않았다. 사용자 프로필 대신 격리 파일만 저장했고, 사적인 QA·원본 식별·배포 파일은 `.runtime/optional-cli-206/`에만 둔다.
+
 ## 2026-10-28 · 0.2.205/232 공개 배포·로컬 설치 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.205)의 공개 태그 역참조 **fda03a6814504740b8865ad75b80e824566cce54**, DMG **9,587,129B**·체크섬 **102B**, 업데이트 ZIP **9,984,247B**·체크섬 **111B**를 확인했다. 네 자산의 공개 다운로드·로컬/GitHub digest·SHA-256이 일치했다. DMG SHA-256은 **a28159ce28b0784cd95d2079340d619f73b6c43177a724047ffce94e91ec1fda**, ZIP은 **17dfa768c587d5c09531e78c84515f5f31d1312f6d6c8d5ff9aa36ec63cc44dd**다. 실제 Core 공식 최신 조회·ZIP 전체 범위 다운로드·해시·동일 게시자/버전/아키텍처 설치 준비도 통과했다.
