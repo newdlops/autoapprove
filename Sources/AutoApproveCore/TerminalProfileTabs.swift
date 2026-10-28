@@ -23,9 +23,13 @@ public enum TerminalProfileTopology {
           const app=Application('com.apple.Terminal'),wanted=new Set(\(targets)),result=[];
           if(!app.running())throw Error('Terminal이 실행 중이 아닙니다.');
           app.windows().forEach((window,windowOrder)=>{
-            const windowID=Number(window.id()),tabs=window.tabs(),selected=window.selectedTab().tty();
-            tabs.forEach((tab,tabOrder)=>{
-              const tty=tab.tty();if(!wanted.has(tty))return;
+            const matches=[];
+            window.tabs().forEach((tab,tabOrder)=>{
+              const tty=tab.tty();if(wanted.has(tty))matches.push({tab,tty,tabOrder});
+            });
+            if(!matches.length)return;
+            const windowID=Number(window.id()),selectedTab=window.selectedTab(),selected=selectedTab ? selectedTab.tty():null;
+            matches.forEach(({tab,tty,tabOrder})=>{
               const settingsName=String(tab.currentSettings().name()),customTitle=String(tab.customTitle());
               result.push({tty,windowID,windowOrder,tabOrder,selected:tty===selected,settingsName,customTitle:customTitle||null});
             });

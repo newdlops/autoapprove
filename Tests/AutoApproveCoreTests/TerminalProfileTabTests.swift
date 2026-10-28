@@ -76,6 +76,53 @@ extension ApprovalTests {
         try expectThrows(try TerminalProfileTopology.apply(rows+[rows[0]],to:candidates))
     }
 
+    func testTerminalTabTopologySkipsUnrelatedWindowsWithoutSelection() throws {
+        let context=JSContext()!
+        context.evaluateScript("""
+        const tab={tty:()=>'/dev/ttys701',currentSettings:()=>({name:()=> 'Pro'}),customTitle:()=> 'API'};
+        const empty={id:()=>100,tabs:()=>[],selectedTab:()=>null};
+        const unrelated={tabs:()=>[{tty:()=>'/dev/ttys799'}],id:()=>{throw Error('unrelated ID read');},selectedTab:()=>{throw Error('unrelated selection read');}};
+        const target={id:()=>101,tabs:()=>[tab],selectedTab:()=>tab};
+        function Application(){return {running:()=>true,windows:()=>[empty,unrelated,target]};}
+        """)
+        let text=context.evaluateScript(try TerminalProfileTopology.script(ttys:["/dev/ttys701"]))?.toString() ?? ""
+        try expectNil(context.exception)
+        let rows=try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8))
+        try expectEqual(rows.count,1);try expectEqual(rows.first?.tty,"/dev/ttys701")
+        try expectEqual(rows.first?.windowID,101);try expectEqual(rows.first?.windowOrder,2);try expectEqual(rows.first?.selected,true)
+    }
+
+    func testTerminalTabTopologyUnknownSelectionStillSavesExactGroupedTabs() throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-null-tabs-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:root)}
+        let store=TerminalProfileStore(directory:root)
+        for selection in ["null","undefined"] {
+            let context=JSContext()!
+            context.evaluateScript("""
+            function tab(tty,name,title){return {tty:()=>tty,currentSettings:()=>({name:()=>name}),customTitle:()=>title};}
+            const a=tab('/dev/ttys701','Pro','API'),b=tab('/dev/ttys702','Basic','Web');
+            const target={id:()=>101,tabs:()=>[a,b],selectedTab:()=>\(selection)};
+            function Application(){return {running:()=>true,windows:()=>[target]};}
+            """)
+            let script=try TerminalProfileTopology.script(ttys:["/dev/ttys701","/dev/ttys702"])
+            let text=context.evaluateScript(script)?.toString() ?? ""
+            try expectNil(context.exception)
+            let rows=try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8)),group=UUID()
+            let candidates=[0,1].map {TerminalProfileCandidate(id:"\($0)",entry:tabEntry($0,window:group),tty:"/dev/ttys\(701+$0)")}
+            let captured=try TerminalProfileTopology.apply(rows,to:candidates)
+            try expectEqual(captured.count,2);try expect(captured.allSatisfy {$0.entry.terminalTab?.selected==false})
+            try expectEqual(captured[0].entry.terminalTab?.window,captured[1].entry.terminalTab?.window)
+            try expectEqual(captured.map {$0.entry.terminalTab?.tabOrder},[0,1]);try expectEqual(captured.map {$0.entry.terminalTab?.settingsName},["Pro","Basic"])
+            let saved=try store.save(.init(name:selection,entries:captured.map(\.entry)))
+            try expectEqual(try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(saved.id))).entries,saved.entries)
+            try expectThrows(try TerminalProfileTopology.apply(Array(rows.dropLast()),to:candidates))
+            context.evaluateScript("target.selectedTab=()=>{throw Error('automation denied');};")
+            _ = context.evaluateScript(script)
+            try expect(context.exception?.toString()?.contains("automation denied")==true,"Read failures must not be hidden as missing selection")
+        }
+        try expectEqual(try store.list().profiles.count,2)
+    }
+
     func testTerminalTabRestoreKeepsWindowsOrderAndSelection() async throws {
         let first=UUID(),second=UUID(),a=tabEntry(0,window:first),b=tabEntry(1,window:first,selected:true),c=tabEntry(2,window:second,order:1)
         let log=TabLaunchLog(),restorer=TerminalProfileRestorer(),profile=TerminalSessionProfile(name:"배치",entries:[c,b,a])

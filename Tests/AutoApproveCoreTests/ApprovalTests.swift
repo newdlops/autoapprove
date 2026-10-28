@@ -515,6 +515,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: exact identity, explicit daemon picker and stale process",tests.testTerminalProfileCaptureBindsExactConversationsAndRejectsStalePID),
             ("Terminal profile tabs: versioned layout and legacy files",tests.testTerminalTabProfileSchemaAndLegacyFiles),
             ("Terminal profile tabs: relative window groups and tab order capture",tests.testTerminalTabTopologyCapturesRelativeGroupsAndOrder),
+            ("Terminal profile tabs: empty and unrelated windows need no selection",tests.testTerminalTabTopologySkipsUnrelatedWindowsWithoutSelection),
+            ("Terminal profile tabs: unknown selection preserves exact grouped profile save",tests.testTerminalTabTopologyUnknownSelectionStillSavesExactGroupedTabs),
             ("Terminal profile tabs: grouped restore, ordering, selection and existing anchor",tests.testTerminalTabRestoreKeepsWindowsOrderAndSelection),
             ("Terminal profile tabs: uncertain group never spills into separate windows",tests.testTerminalTabGroupFailureNeverSpillsIntoSeparateWindows),
             ("Terminal profile tabs: exact owner/window keyboard and uncertain result",tests.testTerminalTabKeyboardPinsOwnerWindowAndUncertainResult),
