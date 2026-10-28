@@ -2,6 +2,18 @@ import Foundation
 import IOKit
 import IOKit.ps
 
+/// A process-owned idle/display hold; it never sends input or unlocks a session.
+public struct KeepAwakeActivityControl: Sendable {
+    public var begin: @MainActor @Sendable () -> NSObjectProtocol
+    public var end: @MainActor @Sendable (NSObjectProtocol) -> Void
+    public init(begin: @escaping @MainActor @Sendable () -> NSObjectProtocol,
+                end: @escaping @MainActor @Sendable (NSObjectProtocol) -> Void) { self.begin=begin; self.end=end }
+    public static let inactive = Self(begin:{NSObject()},end:{_ in})
+    public static let live = Self(begin:{
+        ProcessInfo.processInfo.beginActivity(options:KeepAwake.activityOptions,reason:"AutoApprove가 켜진 동안 작업과 유휴 화면을 유지합니다.")
+    },end:{ProcessInfo.processInfo.endActivity($0)})
+}
+
 /// Sleep, lid and power state that macOS reports to any process, read without privileges.
 public struct PowerReading: Equatable, Sendable {
     /// `pmset disablesleep`. While it is on, macOS sleeps for nothing: not a closed lid, the Apple menu or a low battery.
@@ -12,10 +24,12 @@ public struct PowerReading: Equatable, Sendable {
     public var onBattery: Bool
     public var batteryPercent: Int?
     public var thermal: ProcessInfo.ThermalState
+    public var screenLocked: Bool?
     public init(sleepDisabled: Bool = false, lidClosed: Bool = false, lidCausesSleep: Bool = true, onBattery: Bool = false,
-                batteryPercent: Int? = nil, thermal: ProcessInfo.ThermalState = .nominal) {
+                batteryPercent: Int? = nil, thermal: ProcessInfo.ThermalState = .nominal, screenLocked: Bool? = nil) {
         self.sleepDisabled = sleepDisabled; self.lidClosed = lidClosed; self.lidCausesSleep = lidCausesSleep
         self.onBattery = onBattery; self.batteryPercent = batteryPercent; self.thermal = thermal
+        self.screenLocked = screenLocked
     }
 }
 
@@ -41,12 +55,15 @@ public struct PowerControl: Sendable {
     public var setSleepDisabled: @Sendable (Bool) throws -> Void
     /// Watches a hold from outside AutoApprove: `marker`, then the battery floor.
     public var startGuard: @Sendable (String, Int) throws -> KeepAwakeGuard
+    public var activity: KeepAwakeActivityControl
     public init(read: @escaping @Sendable () -> PowerReading, ruleInstalled: @escaping @Sendable () -> Bool, ruleFile: @escaping @Sendable () -> Bool,
                 installRule: @escaping @Sendable () throws -> Void, removeRule: @escaping @Sendable () throws -> Void,
                 setSleepDisabled: @escaping @Sendable (Bool) throws -> Void,
-                startGuard: @escaping @Sendable (String, Int) throws -> KeepAwakeGuard) {
+                startGuard: @escaping @Sendable (String, Int) throws -> KeepAwakeGuard,
+                activity: KeepAwakeActivityControl = .inactive) {
         self.read = read; self.ruleInstalled = ruleInstalled; self.ruleFile = ruleFile; self.installRule = installRule
         self.removeRule = removeRule; self.setSleepDisabled = setSleepDisabled; self.startGuard = startGuard
+        self.activity = activity
     }
 
     public static let live = PowerControl(
@@ -56,7 +73,7 @@ public struct PowerControl: Sendable {
         installRule: { try KeepAwake.runAsAdministrator(KeepAwake.installScript(user: NSUserName()), prompt: KeepAwake.installPrompt) },
         removeRule: { try KeepAwake.runAsAdministrator(KeepAwake.removeScript, prompt: KeepAwake.removePrompt) },
         setSleepDisabled: { try KeepAwake.pmsetAsRoot(["-a", "disablesleep", $0 ? "1" : "0"]) },
-        startGuard: { try KeepAwake.launchGuard(script: KeepAwake.guardScript(), marker: $0, floor: $1) })
+        startGuard: { try KeepAwake.launchGuard(script: KeepAwake.guardScript(), marker: $0, floor: $1) },activity:.live)
 }
 
 public struct KeepAwakeStatus: Codable, Equatable {
@@ -69,13 +86,20 @@ public struct KeepAwakeStatus: Codable, Equatable {
     public var working = 0
     /// After the last work ends, the hold lasts until this time.
     public var releaseAt: Date?
-    public init(phase: Phase, detail: String, enabled: Bool, ruleFile: Bool, working: Int = 0, releaseAt: Date? = nil) {
+    public var lidClosed: Bool?
+    public var screenLocked: Bool?
+    public var idleDisplaySleepPrevented: Bool?
+    public init(phase: Phase, detail: String, enabled: Bool, ruleFile: Bool, working: Int = 0, releaseAt: Date? = nil,
+                lidClosed: Bool? = nil, screenLocked: Bool? = nil, idleDisplaySleepPrevented: Bool? = nil) {
         self.phase = phase; self.detail = detail; self.enabled = enabled; self.ruleFile = ruleFile
         self.working = working; self.releaseAt = releaseAt
+        self.lidClosed=lidClosed;self.screenLocked=screenLocked;self.idleDisplaySleepPrevented=idleDisplaySleepPrevented
     }
 }
 
 public enum KeepAwake {
+    /// Preventing system idle alone does not prevent display idle and its lock policy.
+    public static let activityOptions: ProcessInfo.ActivityOptions = [.userInitiated,.idleDisplaySleepDisabled]
     /// The idle check only guards a stale marker. While disabled with no owned
     /// hold, a one-minute safety check replaces the otherwise needless 5 s wake.
     public static func evaluationInterval(enabled: Bool, ownsSleepHold: Bool) -> TimeInterval {
@@ -217,6 +241,11 @@ public enum KeepAwake {
 
     static func liveReading() -> PowerReading {
         var reading = PowerReading(thermal: ProcessInfo.processInfo.thermalState)
+        switch MouseActivityControl.currentSession() {
+        case .active: reading.screenLocked=false
+        case .locked: reading.screenLocked=true
+        case .unavailable: reading.screenLocked=nil
+        }
         let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
         if root != IO_OBJECT_NULL {
             defer { IOObjectRelease(root) }

@@ -1,5 +1,14 @@
 # AutoApprove 검증 기록
 
+## 2026-10-28 · 앱 실행 중 잠자기·유휴 화면 유지 · 0.2.201/228
+
+- 사용자는 덮개를 닫은 직후가 아니라 시간이 지난 뒤 잠긴다고 답했다. 기존 코드는 자동 승인 중인 것으로 감지한 작업이 없어진 뒤 2분이면 유지 활동을 해제했고, `.userInitiated`만 요청해 유휴 화면 꺼짐은 억제하지 않았다. 실제 두 Mac에서 기존 유지 설정과 권한 규칙이 이미 켜진 상태임을 읽기 전용으로 확인했다. 이 두 코드 경로를 수정했으며 물리 덮개를 닫아 사용자가 본 현상 전체를 재현한 것은 아니다.
+- 새 실제 Core 검사에서 세션 0개·검색 전·자동 승인 OFF·질문/유휴·전체 일시정지·2분을 넘는 가상 시간·덮개 닫힘·설정 복원에도 앱 실행 중 유지를 확인했다. 배터리 20% 이하·과열/5분 냉각·권한 취소/실패/재시도·외부 소유 설정·감시/정상 종료 보호 회귀도 통과했다. 잠금 상태는 표시만 하고 새 입력이나 잠금 해제를 시도하지 않는다. 새 필드의 구버전 decode 호환도 확인했다. 관련 **7/7**, 최종 전체 **526/526** 핵심 검사를 통과했다.
+- `scripts/keep-awake-activity-check.mjs`는 최종 Core의 실제 `.live` 구현을 실행한다. 공개 IOPM API로 시험 프로세스 소유의 **PreventUserIdleDisplaySleep 1개·PreventUserIdleSystemSleep 1개**를 확인하고 명시적 해제 및 시험 프로세스 종료 후 회수를 검증했다. 최초 보조 검사의 assertion level이 상수 255 대신 1을 비교하던 오류는 SDK의 `kIOPMAssertionLevelOn`을 쓰도록 고쳤다. 해당 검사에서 sudo·pmset·사용자 입력·암호/잠금 정책은 변경하지 않았다.
+- 실제 프로덕션 `KeepAwakeSettings`를 NSHostingView로 **600×660**, 켜짐·유휴·잠김·꺼짐·적용 중·저전력·고온·긴 오류 **8상태×light/dark**로 렌더링했다. 밝은/어두운 기본 상태와 잠김/긴 오류를 눈으로 확인하고, 밝은 화면 잠금 안내의 대비를 개선한 뒤 잠김 light·꺼짐 dark를 재확인했다. 기존 시스템 글꼴·스위치·간격·ScrollView를 유지했으며 Impeccable detector 출력은 없었다. 이 렌더 검사는 실제 토글/권한 설치를 실행하지 않는다.
+- 최종 App·CLI·Core release 빌드와 패키지 입력·동일 게시자 서명·격리 네트워크·Worker 리소스·release 심볼 **5검사**를 통과했다. 빌드에는 기존 SMJobBless 경고만 남는다. macOS 잠금 화면 설정을 여는 버튼은 인증 설정을 자동 변경하지 않는다. 이미 잠긴 화면·수동 잠금·덮개/조직 정책에 따른 모든 잠금을 막는다고 보장하지 않는다. [Apple 유휴 화면 꺼짐 방지 API](https://developer.apple.com/documentation/iokit/kiopmassertiontypepreventuseridledisplaysleep).
+- 재현: `node scripts/keep-awake-activity-check.mjs --build=.build/network-stability/release`, `node scripts/keep-awake-settings-preview.mjs --build=.build/network-stability/release`. 시험 진단·스크린샷·기존 앱/세션 식별은 `.runtime/lid-session-201/`의 비공개 파일에만 보관한다.
+
 ## 2026-10-28 · 0.2.200/227 공개 배포·로컬 설치·다른 Mac 적용 대기
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.200)의 태그 역참조는 **4a16d1b05d366e2d32a83591cea551e4b4d89760**다. DMG **9,172,464B**·체크섬 **102B**, 서명된 업데이트 ZIP **9,569,581B**·체크섬 **111B**의 네 자산을 인증 없이 내려받아 로컬 파일·GitHub digest·체크섬 일치를 확인했다. DMG SHA-256은 **1afad0a037441137bd624107175755d03750b2e68341122afc380ccf93e04584**, ZIP은 **768855c257e6a93474d93175b4639821e31b08402089ae98fffd94bad48d00c6**다. 제품의 공식 최신 조회·전체 ZIP 범위 다운로드·SHA-256·ZIP 제한·동일 게시자/아키텍처/버전 설치 준비 경로도 통과했다.

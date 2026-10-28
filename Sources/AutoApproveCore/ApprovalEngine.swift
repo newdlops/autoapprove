@@ -299,7 +299,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var exitRecoveries: [String: SessionExitRecovery] = [:]
     private var exitRecoveryTasks: [String: UUID] = [:]
     private var conversationReads = Set<String>()
-    /// Work must be gone this long before the hold ends. It bridges a turn's end and the next approval or continue.
+    /// Retained for source compatibility. Enabled keep-awake now lasts for the app lifetime.
     public var keepAwakeGrace: TimeInterval = 120
     /// On battery at or below this percent the hold ends; macOS's own low-battery sleep is off while it holds.
     public var keepAwakeBatteryFloor = 20
@@ -316,7 +316,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var keepAwakeEnabled = false
     /// nil: not checked since the last failure, which needs `sudo -n -l`.
     private var keepAwakeRule: Bool?
-    private var keepAwakeWorkSeen: Date?
     private var keepAwakeRetryAfter = Date.distantPast
     private var keepAwakeFailure: String?
     private var keepAwakeEvaluating = false
@@ -5538,13 +5537,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !keepAwakeStopped else { return }
         guard keepAwakeEnabled || keepAwakeSwitch.owned else {
             // Off with nothing held: macOS sleep is neither read nor changed.
-            keepAwakeWorkSeen = nil; setKeepAwakeActivity(false)
+            setKeepAwakeActivity(false)
             setKeepAwakeStatus(KeepAwakeStatus(phase: .off, detail: Self.keepAwakeOff, enabled: false, ruleFile: powerControl.ruleFile()))
             return
         }
-        // After a restart, sessions are unknown until the first discovery and screen read; a hold from the
-        // earlier run is neither kept nor ended before then.
-        if pollTask != nil && !initialDiscoveryComplete { return }
+        // The app's hold is independent of session discovery and approval state.
         // `sudo -n -l` runs only after turning it on or after a failed change, never on every pass.
         if keepAwakeRule == nil, now >= keepAwakeRetryAfter {
             let control = powerControl
@@ -5553,10 +5550,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         var reading = powerControl.read()
         let working = KeepAwake.working(snapshot.sessions, paused: snapshot.paused).count
-        if snapshot.paused { keepAwakeWorkSeen = nil } else if working > 0 { keepAwakeWorkSeen = now }
         let blocked = keepAwakeBlock(reading, at: now)
-        let releaseAt = keepAwakeWorkSeen.map { $0.addingTimeInterval(keepAwakeGrace) }
-        let wanted = keepAwakeEnabled && keepAwakeRule == true && blocked == nil && releaseAt.map { now < $0 } == true
+        let wanted = keepAwakeEnabled && keepAwakeRule == true && blocked == nil
         let owned = keepAwakeSwitch.owned
         if owned && reading.sleepDisabled { keepAwakeSwitch.heartbeat() }
         if keepAwakeRule != nil, now >= keepAwakeRetryAfter {
@@ -5570,9 +5565,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             reading = powerControl.read()
         }
+        guard !keepAwakeStopped else {setKeepAwakeActivity(false);return}
         let holding = keepAwakeSwitch.owned && reading.sleepDisabled
-        setKeepAwakeActivity(holding)
-        setKeepAwakeStatus(keepAwakeStatus(reading, holding: holding, working: working, releaseAt: releaseAt, blocked: blocked))
+        setKeepAwakeActivity(keepAwakeEnabled && blocked == nil && reading.sleepDisabled)
+        setKeepAwakeStatus(keepAwakeStatus(reading, holding: holding, working: working, blocked: blocked))
     }
 
     private func changeKeepAwake<T: Sendable>(at now: Date, _ change: @escaping @Sendable (KeepAwakeSwitch) async throws -> T) async -> T? {
@@ -5599,10 +5595,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return nil
     }
 
-    private func keepAwakeStatus(_ reading: PowerReading, holding: Bool, working: Int, releaseAt: Date?, blocked: KeepAwakeStatus.Phase?) -> KeepAwakeStatus {
+    private func keepAwakeStatus(_ reading: PowerReading, holding: Bool, working: Int, blocked: KeepAwakeStatus.Phase?) -> KeepAwakeStatus {
         let ruleFile = powerControl.ruleFile()
-        func status(_ phase: KeepAwakeStatus.Phase, _ detail: String, releaseAt: Date? = nil) -> KeepAwakeStatus {
-            KeepAwakeStatus(phase: phase, detail: detail, enabled: keepAwakeEnabled, ruleFile: ruleFile, working: working, releaseAt: releaseAt)
+        func status(_ phase: KeepAwakeStatus.Phase, _ detail: String) -> KeepAwakeStatus {
+            KeepAwakeStatus(phase: phase, detail: detail, enabled: keepAwakeEnabled, ruleFile: ruleFile, working: working,
+                lidClosed:reading.lidClosed,screenLocked:reading.screenLocked,idleDisplaySleepPrevented:keepAwakeActivity != nil)
         }
         if !keepAwakeEnabled { return holding ? status(.holding, "끄는 중입니다. 잠자기 금지를 해제하고 있습니다.") : status(.off, Self.keepAwakeOff) }
         if let failure = keepAwakeFailure { return status(.failed, "잠자기 설정을 바꾸지 못했습니다. 잠시 후 다시 시도합니다. \(failure)") }
@@ -5612,10 +5609,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if blocked == .lowBattery { return status(.lowBattery, "배터리가 \(keepAwakeBatteryFloor)% 이하라 평소처럼 잠듭니다. 전원을 연결하면 다시 켭니다.") }
         if blocked == .hot { return status(.hot, "Mac이 뜨거워 평소처럼 잠듭니다. 식은 뒤 5분이 지나면 다시 켭니다.") }
         if holding {
-            return working > 0 ? status(.holding, "작업 중인 세션 \(working)개 · 덮개를 닫아도 잠들지 않습니다.")
-                : status(.holding, "작업이 모두 끝났습니다. 잠시 뒤 평소처럼 잠듭니다.", releaseAt: releaseAt)
+            return status(.holding, reading.screenLocked == true ? "앱이 켜진 동안 계속 작업 중 · 화면은 잠겨 있습니다." : "앱이 켜진 동안 잠자기·자동 화면 꺼짐을 방지하고 있습니다.")
         }
-        return status(.ready, "자동 승인을 켠 세션이 작업하는 동안 덮개를 닫아도 잠들지 않습니다.")
+        return status(.ready, "앱이 켜진 동안 계속 작업할 수 있도록 잠자기 유지를 준비합니다.")
     }
 
     private func setKeepAwakeStatus(_ status: KeepAwakeStatus) {
@@ -5625,9 +5621,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// While it holds, App Nap must not slow the checks that answer approvals behind a closed lid.
     private func setKeepAwakeActivity(_ on: Bool) {
         if on, keepAwakeActivity == nil {
-            keepAwakeActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "덮개를 닫아도 자동 승인과 이어하기를 계속합니다.")
+            keepAwakeActivity = powerControl.activity.begin()
         } else if !on, let activity = keepAwakeActivity {
-            ProcessInfo.processInfo.endActivity(activity); keepAwakeActivity = nil
+            powerControl.activity.end(activity); keepAwakeActivity = nil
         }
     }
 

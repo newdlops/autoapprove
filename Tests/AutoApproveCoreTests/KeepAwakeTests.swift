@@ -10,6 +10,7 @@ private final class FakePower: @unchecked Sendable {
     private var file = true
     private var installFailure: String?
     private var failing = false
+    private var activityBegins = 0, activityEnds = 0
     private var log: (changes: [Bool], attempts: Int, reads: Int, installs: Int, removals: Int, floors: [Int], running: Bool) =
         ([], 0, 0, 0, 0, [], false)
     private func locked<T>(_ body: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body() }
@@ -25,6 +26,7 @@ private final class FakePower: @unchecked Sendable {
     var removals: Int { locked { log.removals } }
     var guardFloors: [Int] { locked { log.floors } }
     var guardRunning: Bool { locked { log.running } }
+    var activities: (Int,Int) {locked {(activityBegins,activityEnds)}}
     var control: PowerControl {
         PowerControl(
             read: { self.locked { self.log.reads += 1; return self.state } },
@@ -48,7 +50,9 @@ private final class FakePower: @unchecked Sendable {
             startGuard: { _, floor in
                 self.locked { self.log.floors.append(floor); self.log.running = true }
                 return KeepAwakeGuard(isRunning: { self.locked { self.log.running } }, stop: { self.locked { self.log.running = false } })
-            })
+            },activity:KeepAwakeActivityControl(begin:{
+                self.locked {self.activityBegins += 1};return NSObject()
+            },end:{_ in self.locked {self.activityEnds += 1}}))
     }
 }
 
@@ -67,6 +71,47 @@ private let idleScreen = codexScreen([1: "  >_ OpenAI Codex (v0.158.0)", 7: "›
 }
 
 extension ApprovalTests {
+    func testKeepAwakeAppLifetimeWithoutSessions() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-awake-lifetime-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let power=FakePower(),clock=ManualClock(),paths=AppPaths(directory:directory)
+        var engine=try ApprovalEngine(paths:paths,powerControl:power.control)
+        engine.keepAwakeClock={clock.now}
+        try await engine.setKeepAwake(true)
+        try expectEqual(engine.snapshot.keepAwake?.phase,.holding,"An enabled app keeps working before any CLI/session exists")
+        try expectEqual(power.changes,[true]);try expectEqual(power.guardFloors,[20])
+        try expectEqual(power.activities.0,1)
+        try engine.setPaused(true);clock.now += 3600;await engine.evaluateKeepAwake()
+        try expectEqual(power.changes,[true],"Approval pause and long idle cannot end the app's hold")
+        try expectNil(engine.snapshot.keepAwake?.releaseAt)
+        power.reading.lidClosed=true;clock.now += 3600;await engine.evaluateKeepAwake()
+        try expectEqual(power.changes,[true],"A closed lid with no work remains held")
+        power.reading.screenLocked=true;await engine.evaluateKeepAwake()
+        try expectEqual(engine.snapshot.keepAwake?.screenLocked,true)
+        try expectEqual(engine.snapshot.keepAwake?.idleDisplaySleepPrevented,true)
+        try expectEqual(power.activities.0,1,"No repeated idle activity or unlock attempt")
+        engine.stop();try expectEqual(power.changes,[true,false])
+        try expectEqual(power.activities.1,1)
+        engine=try ApprovalEngine(paths:paths,powerControl:power.control);engine.keepAwakeClock={clock.now}
+        await engine.evaluateKeepAwake()
+        try expectEqual(engine.snapshot.keepAwake?.phase,.holding,"The saved setting restores independently of discovery and pause")
+        try expectEqual(power.changes,[true,false,true])
+        try await engine.setKeepAwake(false);try expectEqual(power.changes,[true,false,true,false]);engine.stop()
+        try expectEqual(power.activities.0,2);try expectEqual(power.activities.1,2)
+    }
+
+    func testKeepAwakeStatusLegacyCompatibilityAndDisplayOptions() throws {
+        let legacy:JSONObject=["phase":"holding","detail":"legacy","enabled":true,"ruleFile":true,"working":0]
+        let decoded=try JSONDecoder().decode(KeepAwakeStatus.self,from:JSONSerialization.data(withJSONObject:legacy))
+        try expectNil(decoded.lidClosed);try expectNil(decoded.screenLocked);try expectNil(decoded.idleDisplaySleepPrevented)
+        struct LegacyStatus:Decodable {var phase:String;var detail:String;var enabled:Bool}
+        let current=KeepAwakeStatus(phase:.holding,detail:"current",enabled:true,ruleFile:true,lidClosed:true,screenLocked:true,idleDisplaySleepPrevented:true)
+        let old=try JSONDecoder().decode(LegacyStatus.self,from:JSONEncoder().encode(current))
+        try expectEqual(old.phase,"holding");try expect(old.enabled)
+        try expect(KeepAwake.activityOptions.contains(.idleDisplaySleepDisabled))
+        try expect(KeepAwake.activityOptions.contains(.idleSystemSleepDisabled))
+    }
+
     @MainActor func testMouseActivityIndependentAndRestored() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-mouse-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -150,9 +195,9 @@ extension ApprovalTests {
         await pass()
         try expectEqual(power.reads, 0); try expectEqual(power.attempts, 0); try expectEqual(phase(), .off)
 
-        // On with the rule in place: no password, and a manual session keeps nothing awake.
+        // On with the rule in place: app lifetime, even before enabling automation.
         try await engine.setKeepAwake(true)
-        try expectEqual(power.installs, 0); try expectEqual(power.changes, []); try expectEqual(phase(), .ready)
+        try expectEqual(power.installs, 0); try expectEqual(power.changes, [true]); try expectEqual(phase(), .holding)
 
         // Auto-approval on: the working session holds, with the marker and one guard at the battery floor.
         try engine.setAutomatic(id, enabled: true)
@@ -174,25 +219,25 @@ extension ApprovalTests {
         }
         power.reading.lidClosed = false
 
-        // The turn ends: the hold lasts through the grace period, then ends.
+        // Work ending and the old grace period no longer end the app's hold.
         finish()
         await pass(1)
         try expectEqual(power.changes, [true]); try expectEqual(phase(), .holding)
-        try expectNotNil(engine.snapshot.keepAwake?.releaseAt, "A finished hold shows when it ends")
+        try expectNil(engine.snapshot.keepAwake?.releaseAt)
         await pass(engine.keepAwakeGrace)
-        try expectEqual(power.changes, [true, false])
-        try expectFalse(held()); try expectFalse(power.guardRunning); try expectEqual(phase(), .ready)
+        try expectEqual(power.changes, [true])
+        try expect(held()); try expect(power.guardRunning); try expectEqual(phase(), .holding)
 
-        // Even a reported closed lid only releases the hold; the app has no explicit sleep operation.
+        // A closed lid and an external display cannot turn idle into a release.
         show(workingScreen); await pass(1)
         power.reading.lidClosed = true
         finish(); await pass(engine.keepAwakeGrace + 1)
-        try expectEqual(power.changes, [true, false, true, false]); try expectFalse(held())
+        try expectEqual(power.changes, [true]); try expect(held())
         // An external display does not change the release operation.
         power.reading.lidCausesSleep = false
         show(workingScreen); await pass(1)
         finish(); await pass(engine.keepAwakeGrace + 1)
-        try expectEqual(Array(power.changes.suffix(2)), [true, false]); try expectFalse(held())
+        try expectEqual(power.changes, [true]); try expect(held())
         power.reading.lidClosed = false; power.reading.lidCausesSleep = true
 
         // Battery floor: at 20% on battery the hold ends regardless of the lid reading.
@@ -223,9 +268,9 @@ extension ApprovalTests {
         await pass(20)
         try expectEqual(power.changes.last, true)
 
-        // Pausing every session ends the hold without the grace period.
+        // Approval pause is independent of the app's power setting.
         try engine.setPaused(true); await pass(1)
-        try expectEqual(power.changes.last, false); try expectFalse(held())
+        try expectEqual(power.changes.last, true); try expect(held())
         try engine.setPaused(false); await pass(1)
         try expectEqual(power.changes.last, true)
 
@@ -259,7 +304,7 @@ extension ApprovalTests {
         engine.stop()
         try expectEqual(power.changes.last, false); try expectFalse(held())
 
-        // A hold left by a crashed run is adopted while work remains, then released.
+        // A hold left by a crashed run is adopted for the enabled app lifetime.
         power = FakePower()
         power.reading.sleepDisabled = true
         try expect(FileManager.default.createFile(atPath: marker, contents: nil))
@@ -269,8 +314,9 @@ extension ApprovalTests {
         show(workingScreen); await pass(1)
         try expectEqual(power.changes, [], "The earlier hold is kept, not set again"); try expectEqual(power.guardFloors, [20])
         finish(); await pass(engine.keepAwakeGrace + 1)
-        try expectEqual(power.changes, [false]); try expectFalse(held())
+        try expectEqual(power.changes, []); try expect(held())
         engine.stop()
+        try expectEqual(power.changes,[false]);try expectFalse(held())
 
         // Without the rule, turning it on asks for the password; a cancel keeps it off.
         power = FakePower()
@@ -281,7 +327,7 @@ extension ApprovalTests {
         try expect(cancelled); try expectEqual(power.installs, 1); try expectEqual(engine.snapshot.keepAwake?.enabled, false)
         power.installError = nil
         try await engine.setKeepAwake(true)
-        try expectEqual(power.installs, 2); try expectEqual(engine.snapshot.keepAwake?.enabled, true); try expectEqual(phase(), .ready)
+        try expectEqual(power.installs, 2); try expectEqual(engine.snapshot.keepAwake?.enabled, true); try expectEqual(phase(), .holding)
         try expectEqual(engine.snapshot.keepAwake?.ruleFile, true)
         // Removing the rule turns the setting off first.
         try await engine.removeKeepAwakeRule()

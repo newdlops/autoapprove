@@ -71,7 +71,7 @@ public struct MouseActivityControl: Sendable {
         return CGRequestPostEventAccess()
     }, diagnostics: { MouseActivityPermissions(accessibilityGranted:AXIsProcessTrusted(),eventPostingGranted:CGPreflightPostEventAccess()) })
 
-    private static func currentSession() -> MouseActivitySession {
+    static func currentSession() -> MouseActivitySession {
         guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return .unavailable }
         // macOS reports this flag while the screen is locked. Never send an event to a locked session.
         if session["CGSSessionScreenIsLocked"] as? Bool == true { return .locked }

@@ -155,26 +155,10 @@ import AutoApproveCore
     }
     @ViewBuilder private var keepAwakeSection: some View {
         let status = engine.snapshot.keepAwake
-        section("덮개를 닫아도 계속 작업", icon: "laptopcomputer",
+        section("앱이 켜진 동안 계속 작업", icon: "laptopcomputer",
                 status: keepAwakeBusy ? "적용하고 있습니다. 관리자 암호 창이 열리면 입력해주세요." : status?.detail ?? "꺼져 있습니다.") {
-            Text("자동 승인을 켠 세션이 작업 중이면 덮개를 닫아도 Mac이 잠들지 않습니다. 작업이 모두 끝나고 2분이 지나면 원래대로 돌리고, 그때 덮개가 닫혀 있으면 바로 잠재웁니다. 배터리가 20% 이하이거나 Mac이 뜨거우면 작업 중이어도 원래대로 돌립니다.")
-            Toggle("덮개를 닫아도 계속 작업", isOn: Binding(get: { status?.enabled ?? false }, set: { setKeepAwake($0) }))
-                .toggleStyle(.switch).disabled(keepAwakeBusy)
-                .help(status?.enabled == true ? "끄면 잠자기 금지를 바로 해제하고 macOS의 평소 잠자기로 돌아갑니다."
-                    : "켜면 자동 승인 세션이 작업하는 동안 덮개를 닫아도 잠들지 않습니다. 처음에는 관리자 암호를 묻습니다.")
-            if status?.phase == .holding, let releaseAt = status?.releaseAt {
-                TimelineView(.periodic(from: .now, by: 5)) { context in
-                    Text("\(max(0, Int(releaseAt.timeIntervalSince(context.date).rounded(.up))))초 뒤 평소처럼 잠듭니다.")
-                        .font(.caption).monospacedDigit()
-                }
-            }
-            if let keepAwakeError { Label(keepAwakeError, systemImage: "exclamationmark.circle").foregroundStyle(.red) }
-            Text("처음 켤 때 관리자 암호를 받아, 잠자기 금지(pmset disablesleep)를 켜고 끄는 일과 잠자기만 암호 없이 실행하는 규칙을 설치합니다. 켜 둔 동안에는 Apple 메뉴의 잠자기와 macOS의 배터리 부족 잠자기도 동작하지 않고, AutoApprove의 배터리 하한만 적용됩니다.").font(.caption)
-            Text("‘상태 미확인’ 세션은 작업 중으로 보지 않습니다. 덮개를 닫은 채 가방에 넣지 마세요. 앱이 종료되거나 멈추면 별도 감시 프로세스가 원래대로 돌립니다.").font(.caption)
-            if status?.ruleFile == true && status?.enabled != true {
-                Button("권한 규칙 제거") { removeKeepAwakeRule() }.disabled(keepAwakeBusy)
-                    .help("AutoApprove가 설치한 잠자기 금지 권한 규칙을 지웁니다. 관리자 암호가 필요합니다.")
-            }
+            KeepAwakeSettings(status:status,busy:keepAwakeBusy,error:keepAwakeError,setEnabled:setKeepAwake,removeRule:removeKeepAwakeRule,
+                openLockSettings:{if let url=URL(string:"x-apple.systempreferences:com.apple.Lock-Screen-Settings.extension") {NSWorkspace.shared.open(url)}})
         }
     }
     private func setKeepAwake(_ enabled: Bool) {

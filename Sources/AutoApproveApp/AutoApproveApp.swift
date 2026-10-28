@@ -108,7 +108,7 @@ private struct StatusMenu: View {
         }
         Text("응답 필요 \(engine.snapshot.attentionCount)건")
         if engine.snapshot.paused { Text("자동 승인 일시정지됨") }
-        if engine.snapshot.keepAwake?.phase == .holding { Text("덮개를 닫아도 계속 작업 중") }
+        if engine.snapshot.keepAwake?.phase == .holding { Text("앱 실행 중 잠자기·자동 화면 꺼짐 방지") }
         Divider()
         Button("관리 창 열기") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
             .keyboardShortcut("o")
