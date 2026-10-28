@@ -3,6 +3,7 @@
 import Foundation
 import Darwin
 import AutoApproveCore
+import TerminalInputSupport
 
 private final class PreviewScreens: @unchecked Sendable {
     private let lock = NSLock()
@@ -10,6 +11,9 @@ private final class PreviewScreens: @unchecked Sendable {
     private var nextScrollLine = 1000
     var historyReport:URL?
     private var historyReads=0
+    var progressReport:URL?
+    private var progressInputs:[JSONObject]=[]
+    static let progressWorking="• Working (12s • esc to interrupt)\n\n› Ask Codex to do anything\n\n? for shortcuts"
     func history() -> String {
         lock.lock();historyReads+=1;let count=historyReads;lock.unlock()
         if let file=historyReport,let data=try? JSONSerialization.data(withJSONObject:["captures":count,"realTerminalReads":0]) {try? data.write(to:file,options:.atomic)}
@@ -29,6 +33,13 @@ private final class PreviewScreens: @unchecked Sendable {
     func input(_ target: ScreenTarget, _ expected: String, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         guard screens[target.tty] == expected else { return .screenChanged }
+        if CommandLine.arguments.contains("--codex-progress") {
+            progressInputs.append(["kind":input.kind.rawValue,"text":input.text,"tty":target.tty])
+            if let file=progressReport,let data=try? JSONSerialization.data(withJSONObject:["inputs":progressInputs,"realTerminalInputs":0]) {try? data.write(to:file,options:.atomic)}
+            if input.kind == .escape,!CommandLine.arguments.contains("--progress-hang") {screens[target.tty]="Conversation interrupted\n\n› Ask Codex to do anything\n\n? for shortcuts"}
+            if input.kind == .submit {screens[target.tty]="Synthetic progress request accepted\n"+Self.progressWorking}
+            return .sent
+        }
         if CommandLine.arguments.contains("--scroll-payload"), input.bytes.hasPrefix("SCROLL-") {
             let lines = expected.split(separator:"\n",omittingEmptySubsequences:false).dropLast()
             let added = (nextScrollLine..<(nextScrollLine+3)).map(Self.scrollLine).joined(); nextScrollLine += 3
@@ -68,12 +79,17 @@ private final class PreviewScreens: @unchecked Sendable {
         let label = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "A"
         let directOnly = CommandLine.arguments.contains("--direct-only")
         let connectionPerformance = CommandLine.arguments.contains("--connection-performance")
+        let progressMode=CommandLine.arguments.contains("--codex-progress")
         let releaseOption = CommandLine.arguments.first(where: { $0.hasPrefix("--web-version=") })?.dropFirst("--web-version=".count)
         let releaseParts = releaseOption?.split(separator: ":")
         let webVersion = releaseOption == "legacy" ? nil : releaseParts.flatMap { parts in
             parts.count == 2 ? Int(parts[1]).map { RemoteWebVersion(version: String(parts[0]), build: $0) } : nil
         } ?? RemoteWebVersion.current
         let state = PreviewScreens()
+        if progressMode {
+            try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
+            state.progressReport=directory.appendingPathComponent("progress-inputs.json")
+        }
         if CommandLine.arguments.contains("--terminal-history") {
             try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
             state.historyReport=directory.appendingPathComponent("history-captures.json")
@@ -94,9 +110,21 @@ private final class PreviewScreens: @unchecked Sendable {
         if CommandLine.arguments.contains("--terminal-history") {adapter.history={_ in state.history()}}
         let capture = connectionPerformance ? TerminalWindowCapture(permissions:{TerminalWindowPermissions(screen:false,keyboard:false,automation:true)},
             automationQuery:{Thread.sleep(forTimeInterval:0.12);return true}) : nil
+        let progressIdentity:(@Sendable (Int32)->TTYInputIdentity?)?
+        if progressMode {
+            progressIdentity={pid in
+                guard let record=records.first(where:{$0.pid==pid}) else {return nil}
+                let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.timeZone = .current;formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
+                guard let date=formatter.date(from:record.started) else {return nil}
+                return TTYInputIdentity(pid:pid,processGroup:record.processGroup,uid:getuid(),effectiveUID:geteuid(),device:42,startSeconds:UInt64(date.timeIntervalSince1970),startMicroseconds:70)
+            }
+        } else {progressIdentity=nil}
+        let inputAvailable:(@Sendable ()->Bool)?
+        if progressMode {inputAvailable={true}} else if connectionPerformance {inputAvailable={false}} else {inputAvailable=nil}
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
             claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
-            terminalInputAvailable:connectionPerformance ? { @Sendable in false } : nil)
+            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity)
+        if let raw=CommandLine.arguments.first(where:{$0.hasPrefix("--progress-delay=")}),let seconds=Double(raw.dropFirst("--progress-delay=".count)) {engine.codexProgressTimeout=seconds}
         try engine.start(poll: false)
         var sessions = ProcessDiscovery.sessions(records)
         sessions[0].id += "+한글 검증"
@@ -112,12 +140,14 @@ private final class PreviewScreens: @unchecked Sendable {
                 state.screens[sessions[index].tty,default:""] += output
             }
             if CommandLine.arguments.contains("--scroll-payload") { state.screens[sessions[index].tty] = (0..<600).map(PreviewScreens.scrollLine).joined() }
+            if progressMode {state.screens[sessions[index].tty]=PreviewScreens.progressWorking}
         }
         engine.updateDiscovery(sessions, records: records); await engine.connectTerminal()
         for index in sessions.indices {
             try engine.setCustomization(sessions[index].id, value: SessionCustomization(title: index == 2 ? "긴 표시 이름과 여러 단어가 있는 터미널 · 좁은 휴대폰 화면에서도 전체 이름을 확인합니다" : "검증용 \(label) · " + ["웹 관리 구현", "질문 응답 대기", "긴 텍스트 검증", "API 회귀 검사", "문서 정리", "배포 준비"][index]))
         }
         try engine.setAutomatic(sessions[3].id, enabled: true)
+        if progressMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
         engine.updateGitBranches(sessions.map { GitBranchUpdate(sessionID: $0.id, cwd: $0.cwd, state: .init(kind: .branch, name: "feature/network-sessions")) })
         let question = QueuedQuestion(id: "fixture-question-" + label, threadID: UUID().uuidString, title: "어떤 환경에서 네트워크 연결을 확인할까요? 검증용 질문이며 실제 작업에는 영향을 주지 않습니다.", options: ["개인 핫스팟에서 확인", "같은 Wi-Fi에서 확인", "긴 선택지의 줄바꿈과 선택 영역이 작은 휴대폰 화면에서도 유지되는지 확인"])
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: sessions[1].id, questions: [question], threadID: question.threadID)])
@@ -145,6 +175,7 @@ private final class PreviewScreens: @unchecked Sendable {
                                 "namedURL": status.urls.first(where: { URL(string: $0)?.host?.hasPrefix("autoapprove-") == true }) ?? ""]
         print(String(decoding: try JSONSerialization.data(withJSONObject: info), as: UTF8.self)); fflush(stdout)
         while !Task.isCancelled {
+            if progressMode {engine.receiveScreen(sessionID:sessions[0].id,raw:state.read(sessions[0].tty),generation:"terminal:"+sessions[0].id,source:.terminalScreen)}
             if CommandLine.arguments.contains("--trace-routes"), let value = Mirror(reflecting: web).children.first(where: { $0.label == "peers" })?.value {
                 try? String(describing: value).write(to: directory.appendingPathComponent("route-trace.txt"), atomically: true, encoding: .utf8)
             }

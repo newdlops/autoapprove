@@ -144,6 +144,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var capacityResume: CapacityResume?
     /// An observed CLI failure, independent of Mac/web connectivity.
     public var interruption: SessionInterruption?
+    public var codexProgressRecovery:CodexProgressRecovery?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
@@ -155,6 +156,14 @@ public struct AgentSession: Identifiable, Codable, Equatable {
             case .sending, .awaiting: return "중단 · 이어가는 중"
             case .paused: return "중단 · 자동 이어가기 일시정지"
             default: return "오류로 중단됨"
+            }
+        }
+        if phase != .ended,let recovery=codexProgressRecovery {
+            switch recovery.phase {
+            case .interrupting,.waiting,.asking:return "진척 확인 중"
+            case .review:if phase == .working || phase == .unknown {return "진척 확인 필요"}
+            case .requested:if phase == .working {return "진행 확인 요청됨"}
+            case .watching:break
             }
         }
         return isMonitoring ? "대기 중 · 모니터링" : phase.title
@@ -306,6 +315,7 @@ public struct EngineSnapshot: Codable {
     public var keepAwake: KeepAwakeStatus?
     /// Optional for compatibility with clients predating the independent mouse signal setting.
     public var mouseActivity: MouseActivityStatus?
+    public var codexProgressRecoveryEnabled:Bool?
     public var questionNotificationDelay: Int {
         guard let value = questionNotificationDelaySeconds, Self.questionNotificationDelayRange.contains(value) else { return 10 }
         return value

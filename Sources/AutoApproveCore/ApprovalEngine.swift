@@ -240,6 +240,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var bridges: [String: [JSONObject]] = [:]
     private var screens: [String: ScreenState] = [:]
     private var activityTrackers: [String: ActivityTracker] = [:]
+    private var codexProgressTrackers:[String:CodexProgressTracker]=[:]
+    private var codexProgressHistory:[String:(token:String,at:Date)]=[:]
+    private var codexProgressJobs:[String:UUID]=[:]
+    public var codexProgressTimeout:TimeInterval=CodexProgressRecovery.timeout
+    public var codexProgressWaitSeconds:TimeInterval=20
     /// Only immutable parsing results are reused. Policies, reservations and delivery checks stay live.
     private var screenAnalyses: [String: ScreenAnalysis] = [:]
     private var screenAnalysisCacheBytes = 0
@@ -425,6 +430,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         lanUpdate.enabled = store.value("lanUpdateEnabled") != "false"
         if !lanUpdate.enabled { lanUpdate.phase = "off"; lanUpdate.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다." }
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
+        snapshot.codexProgressRecoveryEnabled=store.value("codexProgressRecoveryEnabled") != "false"
         keepAwakeEnabled = store.value("keepAwake") == "true"
         mouseActivity.setEnabled(store.value("mouseActivity") == "true")
         snapshot.mouseActivity = mouseActivity.status
@@ -536,6 +542,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         relayController?.stop();relayController=nil
         noticeKeyCache = nil
         remoteInputStopped = true
+        for id in Array(codexProgressJobs.keys) {cancelCodexProgressCheck(id)}
+        codexProgressTrackers.removeAll();codexProgressHistory.removeAll()
         if let history=terminalHistoryStore {Task {await history.stop()};terminalHistoryStore=nil}
         automationRuntime.stop()
         observationEpoch &+= 1
@@ -1461,6 +1469,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     public func remoteInput(_ object: JSONObject) async throws -> JSONObject {
+        if let id=object["sessionID"] as? String {cancelCodexProgressCheck(id)}
         if let id = object["sessionID"] as? String, let pending = modelRetentionTasks[id] {
             manuallyChangedModelQuestions[id] = pending.generation + ":" + pending.questionID
             cancelModelRetention(id)
@@ -1800,6 +1809,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let seconds = object["seconds"] as? Int else { throw RemoteHTTPError(400, "대기 시간을 지정해주세요.") }
             try setQuestionNotificationDelay(seconds); return ["seconds": snapshot.questionNotificationDelay]
         }
+        if action == "codexProgressRecovery" {
+            guard let enabled=object["enabled"] as? Bool else {throw RemoteHTTPError(400,"진척 확인 설정을 지정해주세요.")}
+            try setCodexProgressRecoveryEnabled(enabled);return ["ok":true,"enabled":enabled]
+        }
         if action == "mouseActivity" {
             guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "마우스 신호 설정을 지정해주세요.") }
             try setMouseActivity(enabled)
@@ -1852,6 +1865,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case "automatic":
             guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "자동 승인 값을 지정해주세요.") }
             try setAutomatic(id, enabled: enabled)
+        case "checkCodexProgress": try requestCodexProgressCheck(id)
+        case "cancelCodexProgress": cancelCodexProgressCheck(id)
         case "reveal": _ = try await reveal(session)
         case "read": try markNotificationsRead(id, interruptionID: object["interruptionID"] as? String)
         case "claudeApprove", "claudeRelease":
@@ -2637,6 +2652,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var needsPublish = false
         for update in updates {
             guard var session = sessions[update.sessionID], session.agent == .codex, session.phase != .ended else { continue }
+            if let token=update.progressToken,update.error==nil {codexProgressHistory[session.id]=(token,date)}
+            else {codexProgressHistory.removeValue(forKey:session.id)}
             let wasReadable = readableQuestionSessions.contains(session.id)
             let previousQuestions = session.queuedQuestions, previousError = session.codexQuestionsError
             let previousCompletion = session.completion, previousCompletionError = session.completionError
@@ -3343,6 +3360,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for member in groupIDs(target) { screens[member]?.scheduledID = nil }
         if !enabled {
             for member in groupIDs(target) {
+                cancelCodexProgressCheck(member);codexProgressTrackers.removeValue(forKey:member)
+                if sessions[member]?.codexProgressRecovery?.phase != .review {sessions[member]?.codexProgressRecovery=nil}
                 cancelModelRetention(member)
                 cancelCapacityResume(member)
                 capacityStates.removeValue(forKey: member)
@@ -3366,6 +3385,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func setPaused(_ paused: Bool) throws {
         snapshot.paused = paused; revision &+= 1
+        if paused {
+            for id in Array(codexProgressJobs.keys) {cancelCodexProgressCheck(id)}
+            codexProgressTrackers.removeAll()
+            for id in sessions.keys where sessions[id]?.codexProgressRecovery?.phase != .review {sessions[id]?.codexProgressRecovery=nil}
+        }
         if paused { for id in Array(modelRetentionTasks.keys) { cancelModelRetention(id) } }
         for id in screens.keys { screens[id]?.scheduledID = nil }
         for id in Array(capacityStates.keys) { capacityStates[id]?.scheduledID = nil }
@@ -4495,6 +4519,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         observeCapacity(sessionID,analysis:analysis,raw:raw,at:now)
         defer {
             scheduleSystemSafety(sessionID)
+            observeCodexProgress(sessionID,raw:raw,generation:generation,at:now)
             // Native screen polling can deliver the same frame every 1–2 s.
             // Keep freshness and detector state current, but don't rebuild all
             // question, inbox and session projections unless this observation
@@ -5115,6 +5140,161 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         capacityStates[id] = state
         if state.phase == .waiting { scheduleCapacityResume(id) }
+    }
+
+    public func setCodexProgressRecoveryEnabled(_ enabled:Bool) throws {
+        try store.set("codexProgressRecoveryEnabled",enabled ? "true":"false")
+        snapshot.codexProgressRecoveryEnabled=enabled
+        for id in Array(codexProgressJobs.keys) {cancelCodexProgressCheck(id)}
+        codexProgressTrackers.removeAll()
+        for id in sessions.keys {sessions[id]?.codexProgressRecovery=nil}
+        publish()
+    }
+    private func codexProgressToken(_ id:String,at date:Date)->String? {
+        guard let value=codexProgressHistory[id],date.timeIntervalSince(value.at)>=(-5),date.timeIntervalSince(value.at)<20 else {return nil}
+        let turn=codexTurns[id]?.state
+        return value.token+":"+(turn?.turnID ?? "")+":"+(turn?.status ?? "")
+    }
+    private func codexProgressFinishedTurn(_ id:String)->String? {
+        guard let turn=codexTurns[id],abs(Date().timeIntervalSince(turn.observedAt))<20,
+              let status=turn.state.status,["completed","failed","interrupted"].contains(status) else {return nil}
+        return status
+    }
+    private func codexProgressEligible(_ session:AgentSession,allowInterrupted:Bool=false)->Bool {
+        !remoteInputStopped && snapshot.codexProgressRecoveryEnabled != false && !snapshot.paused && session.automatic &&
+            session.agent == .codex && session.terminal == .terminal && session.channel == .terminalScreen && session.phase != .ended &&
+            (codexProgressFinishedTurn(session.id)==nil || allowInterrupted && codexProgressFinishedTurn(session.id)=="interrupted")
+    }
+    private func observeCodexProgress(_ id:String,raw:String,generation:String,at now:Date) {
+        guard let session=sessions[id] else {codexProgressTrackers.removeValue(forKey:id);return}
+        if codexProgressJobs[id] != nil {return}
+        if session.agent == .codex,session.terminal == .terminal,session.phase == .working,let finished=codexProgressFinishedTurn(id) {
+            codexProgressTrackers.removeValue(forKey:id)
+            let label=finished=="completed" ? "완료":finished=="failed" ? "실패":"중단"
+            sessions[id]?.codexProgressRecovery = .init(phase:.review,lastProgressAt:session.codexProgressRecovery?.lastProgressAt ?? codexTurns[id]!.observedAt,detail:"대화 기록에서는 현재 차례가 \(label) 상태입니다. 화면의 Working 표시만으로 자동 중단하거나 다시 실행하지 않습니다.",historyAvailable:true)
+            return
+        }
+        guard codexProgressEligible(session),session.phase == .working,
+              !session.pendingInTerminal,session.unansweredQuestions.allSatisfy({$0.hasLaterUserMessage == true}),
+              let fingerprint=CodexProgressScreen.workingFingerprint(raw) else {
+            codexProgressTrackers.removeValue(forKey:id)
+            if session.codexProgressRecovery?.phase != .review {sessions[id]?.codexProgressRecovery=nil}
+            return
+        }
+        let token=codexProgressToken(id,at:now)
+        var tracker:CodexProgressTracker
+        if let current=codexProgressTrackers[id] {tracker=current;tracker.observe(fingerprint:fingerprint,generation:generation,at:now,historyToken:token)}
+        else {
+            let previous=store.value("codexProgressRecovery:"+id).flatMap {try? JSONDecoder().decode(CodexProgressRecovery.self,from:Data($0.utf8))}
+            tracker = .init(fingerprint:fingerprint,generation:generation,at:now,historyToken:token,previous:previous)
+        }
+        if tracker.status.checks>=3,now.timeIntervalSince(tracker.status.lastProgressAt)>=codexProgressTimeout {
+            tracker.set(.review,detail:"자동 진행 확인을 3회 시도했습니다. 원래 Codex의 진행 상황을 직접 확인해주세요.")
+        }
+        codexProgressTrackers[id]=tracker;sessions[id]?.codexProgressRecovery=tracker.status
+        if tracker.isDue(at:now,timeout:codexProgressTimeout),!userInputHasPriority(id) {try? requestCodexProgressCheck(id)}
+    }
+    private func saveCodexProgress(_ id:String) throws {
+        guard let value=codexProgressTrackers[id]?.status else {return}
+        try store.set("codexProgressRecovery:"+id,String(decoding:JSONEncoder().encode(value),as:UTF8.self))
+    }
+    public func cancelCodexProgressCheck(_ id:String) {
+        guard codexProgressJobs.removeValue(forKey:id) != nil else {return}
+        codexProgressTrackers[id]?.set(.review,detail:"진행 확인을 취소했습니다. 이미 전달된 입력은 원래 Terminal에서 확인해주세요.")
+        sessions[id]?.codexProgressRecovery=codexProgressTrackers[id]?.status
+        try? saveCodexProgress(id);publish()
+    }
+    public func requestCodexProgressCheck(_ id:String) throws {
+        guard let session=sessions[id],codexProgressEligible(session),session.phase == .working,
+              !session.pendingInTerminal,!userInputHasPriority(id),!automaticInputBusy(id),codexProgressJobs[id]==nil,
+              session.unansweredQuestions.allSatisfy({$0.hasLaterUserMessage == true}),
+              let observed=remoteObservedScreens[id],abs(Date().timeIntervalSince(observed.observedAt))<6,
+              let fingerprint=CodexProgressScreen.workingFingerprint(observed.raw),let adapter=screenAdapters[.terminal] else {
+            throw RemoteHTTPError(409,"자동 승인이 켜진 원래 Terminal의 Codex 작업 화면과 빈 입력창을 먼저 확인해주세요.")
+        }
+        if codexProgressTrackers[id]==nil {codexProgressTrackers[id] = .init(fingerprint:fingerprint,generation:observed.generation,at:Date(),historyToken:codexProgressToken(id,at:Date()))}
+        guard codexProgressTrackers[id]?.status.phase != .review else {throw RemoteHTTPError(409,"이전 확인의 전달 결과를 원래 Terminal에서 확인해주세요. 새 진척 신호를 감지하면 감시를 재개합니다.")}
+        if let checked=codexProgressTrackers[id]?.status.checkedAt,Date().timeIntervalSince(checked)<30 {throw RemoteHTTPError(409,"최근 진행 확인 요청을 이미 처리했습니다. 원래 Codex의 반영 결과를 확인해주세요.")}
+        let job=UUID(),history=codexProgressToken(id,at:Date()),generation=observed.generation
+        codexProgressJobs[id]=job
+        automationRuntime.launch(id) {[weak self] epoch in
+            guard let self else {return}
+            await self.performCodexProgressCheck(session,adapter:adapter,job:job,epoch:epoch,generation:generation,fingerprint:fingerprint,history:history)
+        }
+    }
+    private func performCodexProgressCheck(_ original:AgentSession,adapter:ScreenHostAdapter,job:UUID,epoch:UInt64,generation:String,fingerprint:String,history:String?) async {
+        let id=original.id
+        var interruptWasSent=false
+        func authorized()->Bool {
+            guard !Task.isCancelled,codexProgressJobs[id]==job,automationRuntime.epoch(id)==epoch,
+                  let current=sessions[id],codexProgressEligible(current,allowInterrupted:interruptWasSent),!userInputHasPriority(id),
+                  current.pid==original.pid,current.started==original.started,current.tty==original.tty,
+                  !current.pendingInTerminal,current.phase != .approval,current.phase != .input,
+                  current.unansweredQuestions.allSatisfy({$0.hasLaterUserMessage == true}),
+                  remoteObservedScreens[id]?.generation==generation else {return false}
+            return true
+        }
+        guard authorized(),!automaticInputBusy(id) else {codexProgressJobs.removeValue(forKey:id);return}
+        automaticInputSessions.insert(id)
+        defer {automaticInputSessions.remove(id);if codexProgressJobs[id]==job {codexProgressJobs.removeValue(forKey:id)};scheduleScreenApproval(id);publish()}
+        func stage(_ phase:CodexProgressRecovery.Phase,_ detail:String,attempt:Bool=false) throws {
+            guard authorized() else {throw CancellationError()}
+            codexProgressTrackers[id]?.set(phase,detail:detail,at:attempt ? Date():nil)
+            sessions[id]?.codexProgressRecovery=codexProgressTrackers[id]?.status
+            try saveCodexProgress(id);publish()
+        }
+        let reader=processReader,identityReader=terminalInputIdentity
+        var event=AuditEvent(sessionID:id,summary:"Codex 진행 확인·이어가기",outcome:"진행 확인 준비",source:"Codex 진척 확인",context:AuditContext(session:original),request:"진척 신호가 없는 원래 Codex 확인",answer:CodexProgressRecovery.prompt)
+        do {
+            let live=try await Task.detached(priority:.utility) {try reader()}.value
+            guard authorized(),let process=live.first(where:{$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent == .codex}),process.isForeground else {throw AppError.message("원래 CLI의 실행 정보가 바뀌었습니다.")}
+            guard let identity=identityReader(original.pid),identity.processStart==original.started,identity.foregroundGroup==identity.processGroup else {throw AppError.message("원래 Codex의 직접 입력 연결을 확인해주세요.")}
+            let target=ScreenTarget(tty:original.tty,jobPIDs:live.filter {$0.tty==process.tty && $0.processGroup==process.processGroup}.map(\.pid),sourcePID:original.pid,sourceStarted:original.started,sourceIdentity:identity)
+            func read() async throws -> String {
+                guard authorized() else {throw CancellationError()}
+                let snapshot=try await Task.detached(priority:.utility) {try adapter.readForValidation([target])}.value
+                guard authorized(),snapshot.failures.isEmpty,snapshot.screens.filter({$0.tty==target.tty}).count==1,let raw=snapshot.screens.first(where:{$0.tty==target.tty})?.contents else {throw AppError.message("원래 Codex 화면을 새로 확인하지 못했습니다.")}
+                return raw
+            }
+            func send(_ input:RemoteTerminalInput,expected:String) async throws {
+                let single=singleProcessReader
+                let verified=try await Task.detached(priority:.utility) {try single(original.pid).contains {$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent == .codex && $0.isForeground}}.value
+                guard authorized(),verified else {throw CancellationError()}
+                let result=try await Task.detached(priority:.utility) {try adapter.input(target,expected,.codex,input)}.value
+                guard result == .sent else {throw AppError.message("입력 전달을 확인하지 못했습니다. 원래 Codex 화면을 확인해주세요.")}
+            }
+            let before=try await read()
+            guard CodexProgressScreen.workingFingerprint(before)==fingerprint,codexProgressToken(id,at:Date())==history else {throw AppError.message("새 진척 신호나 입력을 감지해 중단하지 않았습니다.")}
+            guard log(event) else {throw AppError.message("진행 확인 기록을 저장하지 못했습니다.")}
+            try stage(.interrupting,"진행 여부를 확인하기 위해 원래 Codex에 Esc를 한 번 보냅니다.",attempt:true)
+            try await send(.init(kind:.escape),expected:before)
+            interruptWasSent=true
+            event.outcome="Esc 전달 · 입력 대기 확인 중";_ = log(event)
+            try stage(.waiting,"중단 후 빈 입력창을 확인하고 있습니다. 추가 Esc는 보내지 않습니다.")
+            let deadline=Date().addingTimeInterval(codexProgressWaitSeconds)
+            var ready:String?,previous:String?
+            while Date()<deadline {
+                try await Task.sleep(for:.milliseconds(300))
+                let raw=try await read()
+                if CodexProgressScreen.ready(raw) {
+                    if previous==raw {ready=raw;break};previous=raw
+                } else {
+                    previous=nil
+                    guard CodexProgressScreen.workingFingerprint(raw) != nil else {throw AppError.message("입력창·승인 요청이 바뀌어 진행 확인 메시지를 보내지 않았습니다.")}
+                }
+            }
+            guard let ready else {throw AppError.message("Codex가 입력 대기로 돌아왔는지 확인하지 못했습니다. 자동 재입력 없이 원래 창 확인을 기다립니다.")}
+            try stage(.asking,"진행 상황 보고 후 기존 작업을 이어가도록 요청합니다.")
+            try await send(.init(kind:.submit,text:CodexProgressRecovery.prompt),expected:ready)
+            event.outcome="진행 보고·이어가기 요청 전달";_ = log(event)
+            try stage(.requested,"진행 보고·이어가기 요청을 전달했습니다. 새 출력과 기록 갱신을 계속 확인합니다.")
+        } catch {
+            event.outcome="진행 확인 중단·원본 확인 필요: "+String(error.localizedDescription.prefix(600));_ = log(event)
+            if codexProgressJobs[id]==job {
+                codexProgressTrackers[id]?.set(.review,detail:Task.isCancelled ? "자동 진행 확인이 취소됐습니다. 원래 Terminal의 입력 상태를 확인해주세요.":String(error.localizedDescription.prefix(1000)))
+                sessions[id]?.codexProgressRecovery=codexProgressTrackers[id]?.status;try? saveCodexProgress(id)
+            }
+        }
     }
 
     private func scheduleCapacityResume(_ id: String) {

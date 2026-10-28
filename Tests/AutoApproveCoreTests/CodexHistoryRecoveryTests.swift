@@ -34,6 +34,19 @@ private final class HistoryFixture {
 }
 
 extension ApprovalTests {
+    func testCodexProgressHistoryTokenIsBoundToExactThread() throws {
+        let fixture=try HistoryFixture(),reader=CodexSessionHistoryReader()
+        let first=reader.read(sessionID:"one",location:fixture.location)
+        try expectEqual(first.progressToken,"root:2")
+        try fixture.sql("INSERT INTO thread_history_projection_state VALUES('unrelated',400);")
+        let unrelated=reader.read(sessionID:"one",location:fixture.location)
+        try expectEqual(unrelated.progressToken,first.progressToken)
+        try fixture.sql("UPDATE thread_history_projection_state SET next_rollout_ordinal=3 WHERE thread_id='root';")
+        let changed=reader.read(sessionID:"one",location:fixture.location)
+        try expectEqual(changed.progressToken,"root:3")
+        try fixture.sql("DELETE FROM thread_history_projection_state WHERE thread_id='root';")
+        try expectNil(reader.read(sessionID:"one",location:fixture.location).progressToken)
+    }
     func testCodexHistoryContentionAndRecovery() throws {
         let fixture = try HistoryFixture(), reader = CodexSessionHistoryReader()
         let engine = try ApprovalEngine(paths: AppPaths(directory: fixture.directory.appendingPathComponent("app")))

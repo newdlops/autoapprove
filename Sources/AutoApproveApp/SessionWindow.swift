@@ -307,7 +307,8 @@ import AutoApproveCore
                           cancelCapacityResume: { engine.cancelCapacityResume(id) },
                           approveClaude: { sourceID, requestID, automatic in try engine.answerClaudeApproval(sessionID: sourceID, requestID: requestID, enableAutomatic: automatic) },
                           releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) },
-                          questionDrafts: questionDrafts)
+                          questionDrafts: questionDrafts,
+                          checkCodexProgress:{try engine.requestCodexProgressCheck(id)},cancelCodexProgress:{engine.cancelCodexProgressCheck(id)})
                 .id(session.id)
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
@@ -518,6 +519,8 @@ private struct SessionDetail: View {
     let approveClaude: (String, String, Bool) throws -> Void
     let releaseClaude: (String, String) throws -> Void
     var questionDrafts: QuestionReplyDrafts? = nil
+    var checkCodexProgress:(() throws -> Void)?=nil
+    var cancelCodexProgress:(() -> Void)?=nil
     @State private var automationResetMessage: String?
     @State private var automationResetFailed = false
     var body: some View {
@@ -577,6 +580,9 @@ private struct SessionDetail: View {
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     if let resume = session.capacityResume {
                         CapacityResumeStatus(resume: resume, cancel: cancelCapacityResume)
+                    }
+                    if let progress=session.codexProgressRecovery {
+                        CodexProgressStatusView(progress:progress,paused:paused,automatic:session.automatic,working:session.phase == .working,check:checkCodexProgress,cancel:cancelCodexProgress).padding(.top,8)
                     }
                     if let error = session.completionError {
                         Label(error, systemImage: "bell.slash").font(.caption).foregroundStyle(.orange)

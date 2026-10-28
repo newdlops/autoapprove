@@ -14,6 +14,7 @@ import AutoApproveCore
     @State private var keepAwakeBusy = false
     @State private var keepAwakeError: String?
     @State private var mouseActivityError: String?
+    @State private var codexProgressError:String?
     @State private var terminalWindowSharingAllowed = false
     @State private var screenControlAllowed=false
     @State private var terminalInputStatus = TerminalInputStatus.notInstalled
@@ -86,6 +87,14 @@ import AutoApproveCore
                     }
                     Divider()
                     keepAwakeSection
+                    Divider()
+                    section("Codex 진척 확인",icon:"clock.arrow.circlepath",status:"진척 신호가 없으면 30분 뒤 확인합니다.") {
+                        Toggle("이 Mac의 Codex 자동 진행 확인",isOn:Binding(get:{engine.snapshot.codexProgressRecoveryEnabled != false},set:{enabled in
+                            do {try engine.setCodexProgressRecoveryEnabled(enabled);codexProgressError=nil} catch {codexProgressError=error.localizedDescription}
+                        }))
+                        Text("자동 승인이 켜진 기본 Terminal의 Codex가 대상입니다. Esc를 한 번 보내고 빈 입력창을 확인한 뒤 진행 상황 보고와 이어가기를 요청합니다. 사용자 입력·승인 대기·연결 끊김 상태에서는 진행하지 않습니다.").font(.caption).fixedSize(horizontal:false,vertical:true)
+                        if let codexProgressError {Text(codexProgressError).foregroundStyle(.red).font(.caption)}
+                    }
                     Divider()
                     section("마우스 활동 유지", icon: "computermouse", status: "켜 두면 1분마다 신호를 보냅니다.") {
                         MouseActivitySettings(status: engine.snapshot.mouseActivity ?? MouseActivityStatus(enabled: false, phase: .off, detail: "마우스 신호가 꺼져 있습니다."),

@@ -66,6 +66,13 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
           <p id="session-status" class="muted small"></p><p id="session-ended" class="notice error" hidden>이 세션이 종료되었거나 Mac 연결이 끊겼습니다. 목록에서 다른 세션을 선택해주세요.</p>
           </div>
           <section id="session-safety" class="notice error safety-panel" aria-label="시스템 변경 보호 상태" hidden></section>
+          <section id="codex-progress" class="question" aria-labelledby="codex-progress-heading" hidden>
+            <h3 id="codex-progress-heading">Codex 진척 확인</h3>
+            <label class="switch-label"><input id="codex-progress-enabled" name="codexProgressRecoveryEnabled" autocomplete="off" type="checkbox" role="switch" aria-describedby="codex-progress-help"><span>이 Mac의 Codex 자동 확인</span></label>
+            <p id="codex-progress-status" role="status" aria-live="polite"></p><p id="codex-progress-time" class="muted small"></p>
+            <p id="codex-progress-help" class="muted small">자동 승인 중인 Codex에서 30분간 진척 신호가 없으면 중단 후 진행 보고·이어가기를 요청합니다. 모델 중지를 확정하는 표시는 아닙니다.</p>
+            <div class="question-actions"><button id="codex-progress-check" type="button" class="secondary">진행 확인·이어가기</button><button id="codex-progress-cancel" type="button" class="secondary" hidden>진행 확인 취소</button></div>
+          </section>
           <section class="terminal-section" aria-labelledby="terminal-heading">
             <div class="section-heading terminal-heading">
               <button id="terminal-back" type="button" class="icon-button focus-only" aria-label="세션 목록으로 돌아가기"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>

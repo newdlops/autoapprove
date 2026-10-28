@@ -49,6 +49,7 @@ public struct QueuedQuestion: Identifiable, Codable, Equatable {
 }
 
 public struct CodexQuestionUpdate {
+    public var progressToken:String?=nil
     public var sessionID: String
     public var threadID: String?
     /// nil means the read did not succeed; [] is a successfully observed empty queue.
@@ -284,6 +285,7 @@ public final class CodexHistoryReader {
         ORDER BY rollout_ordinal
         """
     private var cursor: Int64 = 0
+    var progressOrdinal:Int64 {cursor}
     // User-message projections are applied incrementally or during a rare
     // replay; only async question rows need to remain in this cache.
     private var items: [String: CachedItem] = [:]

@@ -275,6 +275,7 @@ public final class CodexSessionHistoryReader {
         var update = CodexQuestionUpdate(sessionID: sessionID, questions: nil, threadID: location.threadID)
         do {
             update.questions = try questions.read(location, database: db)
+            update.progressToken=location.threadID+":"+String(questions.progressOrdinal)
             questionRecovery.succeeded()
         } catch { update.error = questionRecovery.failed(error) }
         do {

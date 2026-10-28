@@ -1558,6 +1558,7 @@ function renderDetail() {
   }
   $('automatic').checked = session.automatic; text($('session-status'), node.state.snapshot.paused ? '이 Mac의 자동 승인이 일시정지되어 있습니다.' : session.activityDetail || session.detail);
   renderSessionSafety();
+  renderCodexProgress(selectedItem);
   const terminalHost = `${node.name} · ${session.hostName || hosts[session.terminal]}`;
   text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
   if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
@@ -3179,6 +3180,21 @@ $('close-pty').addEventListener('click', async () => {
     }
   } catch (error) { client.fail(error); }
 });
+function renderCodexProgress(item){
+  const session=item?.session,node=item?.node,supported=session?.agent==='codex'&&session.terminal==='terminal'&&supportsRelease(node,[0,2,207,234]);
+  show($('codex-progress'),supported);if(!supported)return;
+  const state=session.codexProgressRecovery,enabled=node.state.snapshot.codexProgressRecoveryEnabled!==false,busy=['interrupting','waiting','asking'].includes(state?.phase),online=node.online&&connected&&!sessionEnded(item);
+  $('codex-progress-enabled').checked=enabled;$('codex-progress-enabled').disabled=!online;
+  text($('codex-progress-status'),state?.detail||(enabled?'자동 승인이 켜진 작업에서 진척 신호를 확인합니다.':'이 Mac의 자동 진행 확인이 꺼져 있습니다.'));
+  text($('codex-progress-time'),state?`${state.historyAvailable?'출력·대화 기록':'화면 출력'} · 감시 기준 ${new Date(state.lastProgressAt).toLocaleTimeString('ko-KR')} · 확인 ${state.checks}회`:'');
+  $('codex-progress-check').disabled=!online||!enabled||!session.automatic||node.state.snapshot.paused||session.phase!=='working'||busy||['review','requested'].includes(state?.phase);
+  const focused=document.activeElement;
+  show($('codex-progress-cancel'),busy);$('codex-progress-cancel').disabled=!online;
+  if(focused===$('codex-progress-check')&&busy)$('codex-progress-cancel').focus({preventScroll:true});
+  else if(focused===$('codex-progress-cancel')&&!busy)$('codex-progress-enabled').focus({preventScroll:true});
+}
+$('codex-progress-enabled').addEventListener('change',()=>{if(selectedItem)void action(selectedItem.node.id,{action:'codexProgressRecovery',enabled:$('codex-progress-enabled').checked},'이 Mac의 Codex 진척 확인 설정을 적용했습니다.');});
+for(const [id,name]of [['codex-progress-check','checkCodexProgress'],['codex-progress-cancel','cancelCodexProgress']])$(id).addEventListener('click',()=>{if(selectedItem)void action(selectedItem.node.id,{action:name,sessionID:selectedItem.session.id},name==='checkCodexProgress'?'원래 Codex의 진행 확인을 시작합니다.':'진행 확인을 취소했습니다.');});
 $('terminal-history-open').addEventListener('click',()=>void openTerminalHistory());
 resetKeyboard();
 void refreshNetwork(true);
