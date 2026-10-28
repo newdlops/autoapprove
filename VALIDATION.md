@@ -1,5 +1,17 @@
 # AutoApprove 검증 기록
 
+## 2026-10-28 · 관리 페이지 Terminal 전체 기록 · 0.2.204/231
+
+- 기존 실시간 화면은 원본 Terminal의 `contents`와 16만 자 범위를 사용했다. 새 **전체 기록**은 기본 Terminal의 `history`를 명시적으로 열 때만 읽는다. 정확한 TTY를 앞뒤로 확인하고 원래 CLI의 PID·시작 시각·TTY·agent·채널과 현재 읽기 권한을 검증한다. 기록은 승인 감지·화면 리비전·입력 토큰에 전달하지 않는다. 원본에서 이미 삭제한 출력이나 iTerm2·VS Code·앱 관리 PTY의 전체 기록 지원으로 표시하지 않는다.
+- 새 **6/6** Core 검사는 16만 자 초과 기록의 처음/끝과 모든 구간의 원문 일치, 한글·이모지·결합 문자·NUL·긴 줄·빈 기록, 원본 조회 공유·별도 원본의 바쁜 응답, 새로고침·만료·잘못된 토큰/원본/구간·최대 네 파일·용량 초과·0600·정리, 합성 AppleEvent의 정확한 TTY/읽기 전용 `hist` 속성, 과거 승인 문구와 실제 입력 리비전의 격리를 확인했다. 주입된 가짜 프로세스/화면 읽기는 기본 네이티브 기록 경로를 사용하지 않는다.
+- 실제 Core HTTP 두 노드의 직접·LAN 중계와 격리 Chrome에서 **1,188,972B·20,002줄**의 합성 기록을 확인했다. 원본 조회는 **1회**였으며, 기록 창을 열기 전 기록 API·화면 모듈 요청은 **0건**이다. 첫/끝 이동·반복 구간 이동 뒤에도 DOM은 최대 **3개 구간·49,152 UTF-16 단위**, 구간당 최대 **16,384 단위·512개 줄바꿈**을 유지했다. 원본 조회 중 실시간 응답·동일 리비전·잘못된 쿼리 400·다른 Origin 403, HTML 문자열의 비실행, 기록에서 Enter 후 입력 요청 0건, 미전송 초안 보존을 확인했다.
+- 같은 브라우저 검사는 대기·빈 기록·새로고침 오류 때 기존 기록 유지/재시도·닫은 뒤 늦은 응답 무시를 포함한다. 창을 닫은 후 합성 입력 반영은 **70ms**, JS 오류와 실제 Terminal 읽기는 **0건**이었다. 이 수치는 격리 합성 환경이며 사용자 Mac 원본 캡처나 공개 Cloudflare의 지연 측정값은 아니다. 공개 외부 경로를 켜거나 사용자 CLI에 시험 입력을 보내지 않았다.
+- **390×844·768×1024·1440×900** 실제 렌더링, 닫기/이동 조작부 표시, 가로 넘침 없음·Escape를 확인했고 세 크기와 오류·빈 상태 스크린샷을 눈으로 확인했다. UI workflow·Impeccable craft floor·Web Interface Guidelines에 따라 기존 색상/서체/dialog·44px 조작부·키보드 포커스·읽기 전용 출력·상태/오류 알림·한정 DOM을 점검했다. 변경 UI 파일의 detector는 지적을 출력하지 않았다. 실물 휴대폰·VoiceOver 전수 검사는 수행하지 않았다.
+- 새 기록 작업은 UI/실시간 생산자와 분리한 utility 작업 한 개로 제한하며 원본 캡처 후 작은 조각을 사용자 전용 파일에 쓴다. 완료한 스냅샷은 최대 네 개·합계 512MiB, 접근 기준 10분 경과 후 다음 조회 때 정리한다. 종료 시 정리하며 비정상 종료 잔여 파일도 다음 기록 초기화 때 제거한다. 단일 원본이 512MiB를 넘으면 413을 반환하고 조용히 자르지 않는다. 원본 Terminal에서 전체 `history`를 한 번 읽는 최초 비용은 남는다.
+- 최종 App·CLI·Core release 빌드와 패키지 입력·동일 게시자 서명·격리 네트워크/새 리소스·Worker 리소스·release 심볼 **5검사**가 통과했다. 기존 SMJobBless 경고만 남는다. 정식 DMG와 서명 업데이트 ZIP·각 SHA-256 파일을 생성했다. 재현은 `autoapprove-checks --filter 'Terminal history'`, `scripts/terminal-history-check.mjs --build=.build/network-stability/release`와 기존 패키지 검사 도구다.
+- 빌드·패키지 작업을 모두 마친 뒤 분리해 실행한 전체 회귀 검사는 **547/548**이다. 실패는 기존 `Published updates: exact loopback gateway and web ports after reuse`의 **NWError 49: Can't assign requested address** 한 건이다. 해당 loopback/gateway/검사 세 파일은 v0.2.203과 동일하며, PortManager 지정 **127.1.0.1**이 실제 lo0의 **127.0.0.1·127.103.218.122**에 없는 상태도 같다. 네트워크 namespace·주소 별칭·환경 플래그·방화벽·검사 조건을 변경하거나 실패를 제외하지 않았다.
+- 앞선 작업에서 컴퓨터 조작 도구가 기본 Terminal 직접 접근을 **“not allowed … for safety reasons”**로 거부한 제한을 다른 경로로 우회하지 않았다. 따라서 실제 사용자 Terminal의 `history` 캡처·초대형 원본의 실기 지연은 검증하지 않았다. 네이티브 속성/TTY 계약은 주입된 descriptor sender, HTTP/브라우저는 합성 원본으로 검증했다. 비공개 원본 식별·가짜 기록·스크린샷·배포 보조 파일은 `.runtime/terminal-history-204/`에만 보관한다.
+
 ## 2026-10-28 · 0.2.203/230 공개 배포·로컬 설치 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.203)의 태그 역참조 **1b4093f118eec542b274a238d2bc0b9f2a368aea**, DMG **9,518,583B**·체크섬 **102B**, 서명된 업데이트 ZIP **9,912,295B**·체크섬 **111B**를 확인했다. 네 파일의 인증 없는 다운로드·로컬/GitHub digest·SHA-256 일치가 통과했다. DMG SHA-256은 **9ec516994eb869198eae61755ac94acfef96676c81af6c2c7b8b43c744981c91**, ZIP은 **3de3285819cde60356568d08a099aefe1dcc13b486b2df7e3c1142aa599f9ec6**다. 실제 Core의 공식 최신 조회·전체 ZIP 범위 다운로드·ZIP 제한·동일 게시자/버전/아키텍처 설치 준비도 통과했다.

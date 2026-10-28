@@ -8,6 +8,14 @@ private final class PreviewScreens: @unchecked Sendable {
     private let lock = NSLock()
     var screens: [String: String] = [:]
     private var nextScrollLine = 1000
+    var historyReport:URL?
+    private var historyReads=0
+    func history() -> String {
+        lock.lock();historyReads+=1;let count=historyReads;lock.unlock()
+        if let file=historyReport,let data=try? JSONSerialization.data(withJSONObject:["captures":count,"realTerminalReads":0]) {try? data.write(to:file,options:.atomic)}
+        Thread.sleep(forTimeInterval:0.3)
+        return "EARLIEST HISTORY · 가장 오래된 기록\n"+(0..<20_000).map {"기록 \($0) · 한글🙂 e\u{301} <img src=x onerror=alert(1)>\n"}.joined()+"LATEST HISTORY · 가장 최근 기록"
+    }
     static func scrollLine(_ index: Int) -> String {
         var bits = UInt64(index) &+ 0x9e3779b97f4a7c15, words = ""
         for _ in 0..<4 { bits = bits &* 2862933555777941757 &+ 3037000493; words += String(format:"%016llx",bits) }
@@ -66,6 +74,10 @@ private final class PreviewScreens: @unchecked Sendable {
             parts.count == 2 ? Int(parts[1]).map { RemoteWebVersion(version: String(parts[0]), build: $0) } : nil
         } ?? RemoteWebVersion.current
         let state = PreviewScreens()
+        if CommandLine.arguments.contains("--terminal-history") {
+            try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
+            state.historyReport=directory.appendingPathComponent("history-captures.json")
+        }
         let records = ProcessDiscovery.parse((0..<6).map { index in
             "\(82000 + index) 1 ttys0\(80 + index) \(82000 + index) \(82000 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/codex"
         }.joined(separator: "\n"))
@@ -79,6 +91,7 @@ private final class PreviewScreens: @unchecked Sendable {
                 TerminalScreen(tty:$0.tty,contents:state.read($0.tty),cursor:TerminalCursor(offset:0))
             }) }
         }
+        if CommandLine.arguments.contains("--terminal-history") {adapter.history={_ in state.history()}}
         let capture = connectionPerformance ? TerminalWindowCapture(permissions:{TerminalWindowPermissions(screen:false,keyboard:false,automation:true)},
             automationQuery:{Thread.sleep(forTimeInterval:0.12);return true}) : nil
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,

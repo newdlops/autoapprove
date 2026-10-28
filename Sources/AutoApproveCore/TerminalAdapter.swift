@@ -66,6 +66,8 @@ public struct ScreenHostAdapter: Sendable {
     public var presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
+    /// Explicit read-only scrollback; never used by monitoring or approval detection.
+    public var history: (@Sendable (ScreenTarget) throws -> String)?
     public var approve: @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery
     /// nil means the host revealed the tab but reports no window frame to highlight.
     public var reveal: @Sendable (ScreenTarget) throws -> TerminalWindowBounds?
@@ -84,11 +86,13 @@ public struct ScreenHostAdapter: Sendable {
                 input: @escaping @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery = { _, _, _, _ in .missingTarget },
                 presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
                 initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
-                validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) {
+                validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
+                history:(@Sendable (ScreenTarget) throws -> String)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
         self.initialScreens = initialScreens
         self.validationScreens = validationScreens
+        self.history=history
     }
     /// Validation consumes only fresh text. A channel failure must propagate;
     /// retrying through presentation could compare a different original frame.
@@ -107,10 +111,12 @@ public struct ScreenHostAdapter: Sendable {
                 input: { try RemoteTerminalAdapter.input(host: .terminal, target: $0, expected: $1, agent: $2, input: $3) },
                 presentationScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty)) },
                 initialScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty), includeCursor: false) },
-                validationScreens: { try TerminalAdapter.screens(ttys:$0.map(\.tty),includeCursor:false,includeTitles:false,purpose:.validation) })
+                validationScreens: { try TerminalAdapter.screens(ttys:$0.map(\.tty),includeCursor:false,includeTitles:false,purpose:.validation) },
+                history:{try TerminalAppleEvents.history(tty:$0.tty)})
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
                 adapter.validationScreens = nil
+                adapter.history=nil
             }
             return adapter
         case .iterm:

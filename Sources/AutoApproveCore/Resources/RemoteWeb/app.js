@@ -1,4 +1,25 @@
 'use strict';
+let terminalHistoryViewer=null,terminalHistoryLoading=null;
+async function openTerminalHistory() {
+  const item=selectedItem,key=selectedKey;
+  if(!item||$('terminal-history-open').disabled)return;
+  $('terminal-settings').open=false;$('terminal-history-open').disabled=true;
+  try {
+    if(!window.AutoApproveTerminalHistory){
+      if(!terminalHistoryLoading)terminalHistoryLoading=new Promise((resolve,reject)=>{
+        const script=document.createElement('script');script.src='/terminal-history.js';
+        const timer=setTimeout(()=>{script.remove();terminalHistoryLoading=null;reject(Error('전체 기록 화면을 받지 못했습니다. 다시 열어주세요.'));},8000);
+        script.onload=()=>{clearTimeout(timer);resolve();};script.onerror=()=>{clearTimeout(timer);script.remove();terminalHistoryLoading=null;reject(Error('전체 기록 화면을 불러오지 못했습니다. 다시 열어주세요.'));};
+        document.head.append(script);
+      });
+      await terminalHistoryLoading;
+    }
+    if(selectedKey!==key)return;
+    if(!terminalHistoryViewer)terminalHistoryViewer=new window.AutoApproveTerminalHistory({api,endpoint});
+    await terminalHistoryViewer.open(item);
+  }catch(error){feedback(error.message,true);}
+  finally{updateControls();}
+}
 const tunnelAccess=document.querySelector('meta[name="autoapprove-tunnel"]')?.content || '';
 let tunnelAuthExpired=false;
 if(tunnelAccess){
@@ -1473,6 +1494,7 @@ function renderList() {
 function selectSession(key, focus = false) {
   const item = allSessions.find(item => item.key === key) || ptyRetained.get(key); if (!item) return;
   if (selectedKey !== item.key) {
+    terminalHistoryViewer?.close();
     clearTerminalWarm();
     stopSessionHistory();
     stopPTY(); stopTerminalStream(true);
@@ -1585,6 +1607,9 @@ function updateControls() {
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
   const resetBusy = automationResets.has(selectedKey) || automationResetNodes.has(selectedItem.node.id);
   const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation && !resetBusy;
+  const historySupported=!selectedItem.view.pty&&selectedItem.session.terminal==='terminal'&&supportsRelease(selectedItem.node,[0,2,204,231]);
+  show($('terminal-history-open'),historySupported);
+  $('terminal-history-open').disabled=!enabled||sessionEnded(selectedItem);
   const temporaryPTY = ptyTemporary.has(selectedKey);
   const resetSupported = supportsRelease(selectedItem.node,[0,2,159,186]);
   $('reset-automation').disabled = !connected || !current?.online || !sessionPresent || sessionEnded(selectedItem) || temporaryPTY || !resetSupported || resetBusy;
@@ -3154,5 +3179,6 @@ $('close-pty').addEventListener('click', async () => {
     }
   } catch (error) { client.fail(error); }
 });
+$('terminal-history-open').addEventListener('click',()=>void openTerminalHistory());
 resetKeyboard();
 void refreshNetwork(true);

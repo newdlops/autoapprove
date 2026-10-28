@@ -1634,6 +1634,7 @@ struct RemoteTerminalUpdate: Encodable {
                     guard let engine else {throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
                     return try await .object(engine.agentAccounts.hello(node:nodeID,pin:engine.readAccountPIN()))
                 case "/terminal-wire.js": return try asset("terminal-wire.js", type: "text/javascript; charset=utf-8")
+                case "/terminal-history.js": return try asset("terminal-history.js", type:"text/javascript; charset=utf-8")
                 case "/pty.js": return try asset("pty.js", type: "text/javascript; charset=utf-8")
                 case "/input-channel.js": return try asset("input-channel.js", type: "text/javascript; charset=utf-8")
                 case "/screen-control.js": return try asset("screen-control.js",type:"text/javascript; charset=utf-8")
@@ -1726,6 +1727,13 @@ struct RemoteTerminalUpdate: Encodable {
                     return try RemoteTerminalPerformance.shared.measure(.responseEncoding) {
                         try .terminalJSON(RemoteTerminalUpdate(frame, knownRevision:request.parameter("revision")))
                     }
+                case "/api/terminal/history":
+                    if let forwarded=try await forward(request) {return forwarded}
+                    guard let id=request.parameter("session"),let engine else {throw RemoteHTTPError(400,"세션을 지정해주세요.")}
+                    let rawPage=request.parameter("page"),page=rawPage.flatMap(Int.init)
+                    guard rawPage==nil || page.map({$0>=0})==true,
+                          request.parameter("snapshot").map({UUID(uuidString:$0) != nil}) ?? true else {throw RemoteHTTPError(400,"기록 조회 구간을 확인해주세요.")}
+                    return try await .json(engine.remoteTerminalHistory(sessionID:id,snapshot:request.parameter("snapshot"),page:page,refresh:request.parameter("refresh")=="1"))
                 case "/api/terminal/stream":
                     if let forwarded = try await forwardStream(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "세션을 지정해주세요.") }

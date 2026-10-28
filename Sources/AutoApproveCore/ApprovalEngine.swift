@@ -259,6 +259,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
+    private var terminalHistoryStore:TerminalHistoryStore?
     private let terminalProfileLayoutReader:@Sendable ([String]) throws -> [TerminalProfileTabSnapshot]
     /// A brief cancellation window for supported yes/no confirmations. Ordinary
     /// permission screens are handled immediately; unsafe system changes deny.
@@ -370,6 +371,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var adapters = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, ScreenHostAdapter.live($0, terminalReader:terminalReader)) })
         adapters[.pty] = managedPTY.adapter
         adapters[.tmux] = tmuxRelay.adapter
+        if processReader != nil,screenAdapters[.terminal]==nil {adapters[.terminal]?.history=nil}
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
         self.questionTransport = questionTransport
         self.codexQueue = codexQueue
@@ -534,6 +536,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         relayController?.stop();relayController=nil
         noticeKeyCache = nil
         remoteInputStopped = true
+        if let history=terminalHistoryStore {Task {await history.stop()};terminalHistoryStore=nil}
         automationRuntime.stop()
         observationEpoch &+= 1
         for pending in claudeHookWaitTasks.values { pending.task.cancel() }; claudeHookWaitTasks.removeAll()
@@ -1431,6 +1434,30 @@ private struct ScreenAnalysisStorageKey: Hashable {
         remoteFrames[sessionID] = (frame, raw, generation, usesRawPresentation, orcaBinding, nativeOnly ? nativeBinding : nil, current.agent)
         frameSucceeded = true
         return frame
+    }
+
+    /// Scrollback never enters screen analysis, approval receipts or input revisions.
+    public func remoteTerminalHistory(sessionID:String,snapshot:String?=nil,page:Int?=nil,refresh:Bool=false) async throws -> TerminalHistoryPage {
+        guard !remoteInputStopped,let session=sessions[sessionID],session.phase != .ended,session.terminal == .terminal,
+              remoteCanRead(session),let history=screenAdapters[.terminal]?.history else {
+            throw RemoteHTTPError(409,"이 세션의 전체 기록을 읽을 수 없습니다. Mac 기본 Terminal 연결을 확인해주세요.")
+        }
+        if let capture=nativeWindowCapture(for:session),try await !capture.checkAutomationPermission() {throw TerminalAdapterError.permissionDenied}
+        let reader=singleProcessReader,pid=session.pid,started=session.started,tty=session.tty,agent=session.agent
+        let verify:@Sendable () throws -> Bool = {try reader(pid).contains {$0.pid==pid && $0.started==started && "/dev/"+$0.tty==tty && $0.agent==agent}}
+        guard try await Task.detached(operation:verify).value else {throw RemoteHTTPError(409,"원래 CLI의 실행 정보가 바뀌었습니다. 목록을 새로고침해주세요.")}
+        let target=ScreenTarget(tty:tty,sourcePID:pid,sourceStarted:started)
+        let source=sessionID+"\n"+String(pid)+"\n"+started+"\n"+tty+"\n"+session.channel.rawValue
+        if terminalHistoryStore==nil {terminalHistoryStore=TerminalHistoryStore(directory:paths.directory.appendingPathComponent("terminal-history-cache",isDirectory:true))}
+        let result=try await terminalHistoryStore!.page(sessionID:sessionID,source:source,snapshot:snapshot,page:page,refresh:refresh,capture:{
+            guard try verify() else {throw RemoteHTTPError(409,"원래 CLI가 바뀌어 기록을 읽지 않았습니다.")}
+            let text=try history(target)
+            guard try verify() else {throw RemoteHTTPError(409,"기록을 읽는 동안 원래 CLI가 바뀌었습니다.")}
+            return text
+        })
+        guard !remoteInputStopped,let current=sessions[sessionID],current.phase != .ended,current.pid==pid,current.started==started,
+              current.tty==tty,current.channel==session.channel,remoteCanRead(current) else {throw RemoteHTTPError(409,"기록을 읽는 동안 세션 연결이 바뀌었습니다.")}
+        return result
     }
 
     public func remoteInput(_ object: JSONObject) async throws -> JSONObject {

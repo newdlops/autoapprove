@@ -70,6 +70,8 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
             <div class="section-heading terminal-heading">
               <button id="terminal-back" type="button" class="icon-button focus-only" aria-label="세션 목록으로 돌아가기"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
               <h3 id="terminal-heading" tabindex="-1">터미널 화면</h3>
+              <div class="terminal-heading-actions">
+              <button id="terminal-history-open" type="button" class="secondary" hidden>전체 기록</button>
               <button id="terminal-focus" type="button" class="secondary" aria-pressed="false">크게 보기</button>
               <details class="terminal-settings" id="terminal-settings"><summary>터미널 설정</summary><div class="terminal-options">
                 <button id="reset-automation" type="button" class="secondary" aria-describedby="reset-automation-help">자동화 초기화·재실행</button>
@@ -84,6 +86,7 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
                 <p id="terminal-color-status" class="muted small terminal-color-status"></p>
                 <button id="close-pty" type="button" class="secondary" hidden>PTY 종료</button>
               </div></details>
+              </div>
             </div>
             <div id="native-connection" class="native-connection" hidden><p id="native-status" role="status"></p><button id="native-connect" type="button" aria-describedby="native-status">원본 터미널 연결</button></div>
             <div class="terminal" data-colored="true">
@@ -108,6 +111,14 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
       </section>
     </div>
   </main>
+  <dialog id="terminal-history-dialog" class="terminal-history-dialog" aria-labelledby="terminal-history-title" aria-describedby="terminal-history-help">
+    <div class="dialog-heading"><div><h2 id="terminal-history-title">터미널 전체 기록</h2><p id="terminal-history-source" class="muted small"></p></div><button id="terminal-history-close" type="button" class="icon-button" aria-label="전체 기록 닫기">×</button></div>
+    <p id="terminal-history-help" class="muted small">Mac의 Terminal이 보관한 출력을 읽기 전용으로 봅니다. 위아래로 스크롤하면 앞뒤 기록을 불러옵니다. 원본에서 삭제된 기록은 포함되지 않습니다.</p>
+    <div class="terminal-history-status"><p id="terminal-history-status" class="muted small" role="status" aria-live="polite"></p><button id="terminal-history-refresh" type="button" class="secondary">새로고침</button></div>
+    <p id="terminal-history-error" class="notice error" role="alert" hidden></p>
+    <pre id="terminal-history-output" tabindex="0" aria-label="읽기 전용 전체 터미널 기록" translate="no"></pre>
+    <div class="terminal-history-navigation" role="group" aria-label="터미널 기록 이동"><button id="terminal-history-first" type="button" class="secondary">맨 처음</button><button id="terminal-history-previous" type="button" class="secondary">이전</button><output id="terminal-history-range" aria-live="polite"></output><button id="terminal-history-next" type="button" class="secondary">다음</button><button id="terminal-history-last" type="button" class="secondary">최신 기록</button></div>
+  </dialog>
   <dialog id="interaction-dialog" class="interaction-dialog" aria-labelledby="interaction-title">
     <div class="dialog-heading"><div><h2 id="interaction-title">질문·메시지</h2><p id="interaction-session" class="muted small"></p></div><button id="close-interaction" type="button" class="icon-button" aria-label="질문·메시지 닫기">×</button></div>
     <div class="interaction-body">

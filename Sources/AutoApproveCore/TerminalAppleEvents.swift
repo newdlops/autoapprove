@@ -111,6 +111,24 @@ public struct TerminalAppleEventReader {
         return [UInt32(value.int32Value)]
     }
 
+    public func history(tty:String) throws -> String {
+        try autoreleasepool {
+            let all=NSAppleEventDescriptor(descriptorType:aeCode("abso"),data:NSAppleEventDescriptor(enumCode:aeCode("all ")).data)!
+            let windows=try object("cwin",form:"indx",selector:all)
+            let tabs=try matching("ttab",property:["ttty"],tty:tty,container:windows)
+            let deadline=clock()+timeout
+            func get(_ name:String) throws -> [String] {
+                try Task.checkCancellation()
+                let remaining=deadline-clock()
+                guard remaining>0 else {throw TerminalReadEventError.timedOut}
+                return try strings(send(property(name,of:tabs),remaining))
+            }
+            let before=try get("ttty"),history=try get("hist"),after=try get("ttty")
+            guard before==[tty],after==before,history.count==1 else {throw TerminalReadEventError.ambiguous}
+            return history[0]
+        }
+    }
+
     /// First frames need only contents. Live frames may obtain the selected
     /// window's ID in one exact-TTY event, without a JXA process or a
     /// scan of unrelated titles. The callback independently verifies visibility.
@@ -461,6 +479,23 @@ enum TerminalAppleEvents {
         if access == errAEEventNotPermitted || access == errAEEventWouldRequireUserConsent { return false }
         guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
         return true
+    }
+    static func history(tty:String) throws -> String {
+        guard let app=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Terminal").first else {throw AppError.message("Terminal 앱을 먼저 실행해주세요.")}
+        let pid=app.processIdentifier
+        guard readAccess(pid:pid)==noErr else {throw TerminalAdapterError.permissionDenied}
+        let reader=TerminalAppleEventReader {subject,timeout in
+            let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode("getd"),targetDescriptor:.init(processIdentifier:pid),returnID:-1,transactionID:0)
+            event.setParam(subject,forKeyword:aeCode("----"))
+            let noConsent=NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
+            let reply=try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:timeout)
+            let status=reply.paramDescriptor(forKeyword:aeCode("errn"))?.int32Value ?? 0
+            if [-1743,-1744].contains(status) {throw TerminalAdapterError.permissionDenied}
+            guard status==0 else {throw NSError(domain:NSOSStatusErrorDomain,code:Int(status))}
+            guard let value=reply.paramDescriptor(forKeyword:aeCode("----")) else {throw TerminalReadEventError.incompatible}
+            return value
+        }
+        return try reader.history(tty:tty)
     }
     private static func readAccess(pid: pid_t) -> OSStatus {
         let target = NSAppleEventDescriptor(processIdentifier: pid)

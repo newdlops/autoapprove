@@ -82,7 +82,7 @@ try {
   const css = await fetch(url + '/app.css'); assert.equal(css.status, 200);
   assert.ok((await css.text()).includes(marker), 'Relocated helper must use its packaged resources');
   const first = await (await fetch(url + '/api/state')).json();
-  for(const filename of ['agent-accounts.js','vendor/account-crypto.js']) {
+  for(const filename of ['agent-accounts.js','vendor/account-crypto.js','terminal-history.js']) {
     const response=await fetch(url+'/'+filename);assert.equal(response.status,200);
     assert.deepEqual(Buffer.from(await response.arrayBuffer()),await readFile(path.join(app,'Contents/Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb',filename)),'Relocated login resources must come from the signed bundle');
   }
