@@ -1,5 +1,11 @@
 # AutoApprove 검증 기록
 
+## 2026-10-28 · 0.2.205/232 공개 배포·로컬 설치 확인
+
+- [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.205)의 공개 태그 역참조 **fda03a6814504740b8865ad75b80e824566cce54**, DMG **9,587,129B**·체크섬 **102B**, 업데이트 ZIP **9,984,247B**·체크섬 **111B**를 확인했다. 네 자산의 공개 다운로드·로컬/GitHub digest·SHA-256이 일치했다. DMG SHA-256은 **a28159ce28b0784cd95d2079340d619f73b6c43177a724047ffce94e91ec1fda**, ZIP은 **17dfa768c587d5c09531e78c84515f5f31d1312f6d6c8d5ff9aa36ec63cc44dd**다. 실제 Core 공식 최신 조회·ZIP 전체 범위 다운로드·해시·동일 게시자/버전/아키텍처 설치 준비도 통과했다.
+- 비공개 백업과 새 앱 소유 PTY/화면 공유 **0개** 확인, Cmd-Q 정상 종료 후 **/Applications/AutoApprove.app 0.2.205/232**를 설치하고 서명·실행 PID **37748**·API 버전을 확인했다. 기존 CLI **18/18개**의 PID·시작 시각·TTY, 같은 node ID·wire 3·network wait 1·Terminal connected=true를 유지했다. 다른 Mac도 마지막 읽기 전용 조회에서 온라인 **0.2.205/232·inventory 8개·자동 업데이트 idle**였다.
+- 설치본의 JS **8개** 소스 일치·세 화면 크기의 가로 넘침 없음·Mac 추가 창/Escape 검사는 통과했으나, 기존 AI 계정 대화창 검사는 **‘Mac의 접속 PIN 확인이 지연되고 있습니다. 잠시 후 다시 시도해주세요.’**를 표시하고 PIN 입력 상태 대기에서 30초 후 실패했다. 이 설치본 브라우저 검사를 전체 통과로 표시하지 않는다. PIN 입력·인증 조건 변경·계정 로그인이나 사용자 Terminal 직접 조작은 하지 않았다. 세션 저장 수정의 관련 13개 검사는 위/아래 별도 항목에 구분했다.
+
 ## 2026-10-28 · 선택 탭이 없는 Terminal의 프로필 저장 · 0.2.205/232
 
 - 사용자가 보고한 `window.selectedTab().tty`의 null 참조를 기존 v0.2.204 Core가 생성한 실제 수집 스크립트와 JavaScriptCore의 합성 Terminal 객체로 재현했다. **빈 창과 대상 창이 함께 있는 경우·대상 탭은 있지만 선택 탭이 null인 경우 모두 같은 TypeError**로 실패했다. 수정 후 동일한 두 재현이 JSON 결과를 반환한다. 대상 탭이 없는 창은 선택/창 메타데이터를 읽지 않으며, 대상 창의 선택 탭이 null/undefined이면 선택 표시만 false로 남긴다.
