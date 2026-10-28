@@ -1,5 +1,17 @@
 # AutoApprove 검증 기록
 
+## 2026-10-28 · 여러 세션 프로필·Computer Use 승인 · 0.2.202/229
+
+- 사용자가 제공한 실제 `Allow Computer Use to use …?` 화면은 기존 감지기에서 승인으로 인식되었고 기존 설치본의 전달 기록도 있었지만, 선택 필드에 숫자와 Return을 함께 보내는 경로였다. 새 격리 JavaScriptCore 검사는 기존 방식 **0/1 → 단독 Return 수정 후 1/1**이다. 전체 대화·선택된 1번 Allow·TTY·실행 중 CLI를 재확인한 뒤 해당 형식만 빈 Terminal `doScript`로 제출한다. 일반 명령/다른 호스트의 전송 방식은 유지한다. 이 단계의 검사는 합성 Terminal 객체이며 실제 사용자 CLI에 시험 입력을 보내지 않았다.
+- 동일한 허용창 사이의 짧은 작업을 일반 폴링이 놓치는 재현은 **변경 전 1/2 → 수정 후 통과**다. 확실한 전달 직후 같은 PID·시작 시각·TTY의 원래 Terminal을 최대 4회, 시작 예산 1.25초 이내로 읽고 실제 작업 상태만 기존 승인 완료 경로에 반영한다. 그대로인 메뉴·빈 화면·입력 초안·늦은 OFF/일시정지 결과는 새 승인이나 재전송의 근거로 사용하지 않는다. Computer Use 새 **4검사**가 통과했다.
+- 좁은 원본 터미널에서 확인 안내가 단어 중간에 줄바꿈되는 2~16열 재현은 기존 **2/15**였다. 완전한 알려진 안내 문법에만 공백 무시를 적용했고 새 검사에서 String/NSString 경로·원문 요청 동일성·뒤따르는 일반 출력 거부를 확인했다. 첫 전체 검사에서 나중의 Esc 안내가 앞의 일반 출력을 가릴 수 있는 회귀를 찾아 수정했고 기존 관련 검사까지 다시 통과했다.
+- 프로필 새 **5검사**는 여러 파일의 저장·편집·가져오기·재시작 보존, 0700/0600 권한, JSON 크기/개수/스키마·중복·심볼릭 링크 거부, 고정된 인용 `codex resume ID`/`claude --resume ID`, 합성 Terminal/iTerm JXA 계약, 중복 복원 방지·폴더 없음·확정 미전달 재시도·불명 전달 보류·닫힌 TTY 재복원, 정확한 Claude/Codex ID·공유 서버 명시 선택·오래된 PID 거부를 포함한다. 프로필에 대화 본문·인증 정보·임의 명령을 저장하지 않는다. 현재 공유 서버 방식 Codex 창은 정확한 대화 연결을 확인할 수 없으므로 사용자가 저장 전에 대화를 선택하며 최근 대화를 추측하지 않는다.
+- 최종 App·CLI·Core release 빌드, 패키지 입력·동일 게시자 서명·격리 네트워크·Worker 리소스·release 심볼 **5검사**가 통과했다. 빌드에는 기존 SMJobBless 경고만 남는다. 프로필 관련 두 SwiftUI 파일의 Impeccable detector 출력은 없었다.
+- 다른 빌드/패키지 작업과 분리한 최종 전체 검사는 **535/536**이다. 이번에 추가한 **10/10**과 기존 AI 로그인 검사를 포함해 통과했으며, 아래의 변경하지 않은 PortManager 루프백 환경 검사 1개가 실패했다. 실패를 제외하거나 전체 통과로 표시하지 않았다.
+- 기존 loopback listener 재사용 검사는 현재 셸의 PortManager가 지정한 **127.1.0.1**이 실제 lo0 주소에 없어 `NWError 49: Can't assign requested address`로 단독 실행에서도 실패했다. 해당 제품/검사 세 파일은 v0.2.201과 동일하다. 이는 수정하지 않은 소스의 환경 의존 실패이며, 이전 릴리스를 현재 환경에서 다시 빌드해 비교한 결과는 아니다. 네트워크 namespace·별칭·방화벽이나 테스트 조건을 바꾸지 않았다. 빌드/패키지와 겹친 실행에서 기존 AI 로그인 PTY 타이밍 검사도 한 번 실패했지만, 이후 작업을 분리한 원래 검사에서는 통과했다. 해당 제품 코드나 검사를 바꾸지 않았다.
+- 실제 프로덕션 SwiftUI를 NSHostingView로 **700×480·860×640·1100×800의 light/dark**, 빈 목록·긴 오류·미확정 대화 편집 상태로 렌더링했다. 최소 light·기본 dark·편집 light·긴 오류 light를 눈으로 확인하고 providerHome 표시 후 최소 light·편집 dark를 재확인했다. 버튼과 스크롤 영역의 잘림/가로 넘침을 발견하지 않았다. 별도의 네이티브 QA 앱은 가짜 캡처/실행기만 주입해 복원 2개 전달 후 재시도 0개·기존 항목 2개를 확인했다. 실제 CLI 재실행·재부팅 복원 및 전체 VoiceOver 검사는 미실시다.
+- 재현: `autoapprove-checks --filter 'Session profiles'`, `autoapprove-checks --filter 'Computer Use'`, `autoapprove-checks --filter 'Permission footer'`, `node scripts/session-profiles-render.mjs --build=.build/network-stability/release`, `node scripts/session-profiles-preview.mjs --build=.build/network-stability/release`. 개인 프로필·진단·스크린샷·이전 앱은 `.runtime/session-profiles-202/`에만 보관한다.
+
 ## 2026-10-28 · 0.2.201/228 공개 배포·재부팅 후 실행 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.201)의 태그 역참조 **ea94f5eba3742aaaa591265933fe874571cd1a63**, DMG **9,181,633B**·체크섬 **102B**, 서명된 업데이트 ZIP **9,576,611B**·체크섬 **111B**를 확인했다. 네 파일의 인증 없는 다운로드·로컬/GitHub digest·SHA-256 일치와 제품의 공식 최신 조회·정확한 전체 ZIP 범위 다운로드·동일 게시자/버전/아키텍처 설치 준비가 통과했다. DMG SHA-256은 **ab43a302cf26d325cd65899aac1e2f37f1ba845a18b44d8f736adbf116e0b9e4**, ZIP은 **b798cfbc80b581191f261f8bdd8694e08ab5deb4bda676592fc5d67c7d2c0647**다.

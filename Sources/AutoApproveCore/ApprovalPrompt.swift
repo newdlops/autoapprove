@@ -372,10 +372,21 @@ public enum PromptDetector {
         // `or o to open thread` when a sub-agent's request is shown in the parent session.
         let action = #"(?:(?:press\s+)?enter\s+to\s+(?:confirm|select|submit)|esc\s+to\s+cancel|tab\s+to\s+amend|ctrl-g\s+to\s+edit|tab/arrow\s+keys\s+to\s+navigate|o\s+to\s+open\s+thread)"#
         let pattern = "(?i)^" + action + #"(?:(?:\s*(?:[,·•|/]|or|and)\s*|\s+)"# + action + #")*[.!]?$"#
-        guard let start = ((lastOption + 1)..<lines.count).first(where: {
-            lines[$0].range(of: #"(?i)^(?:press|enter|esc|ctrl-g|tab/arrow)(?:\s|$)"#, options: .regularExpression) != nil
-        }) else { return nil }
-        let hint = lines[start...].filter { !$0.isEmpty && !$0.allSatisfy { "─━╌- ".contains($0) } }.joined(separator: " ")
-        return hint.range(of: pattern, options: .regularExpression) != nil ? start : nil
+        let prefixes=["press","enter","esc","ctrl-g","tab/arrow"]
+        for start in (lastOption+1)..<lines.count {
+            let first=lines[start].filter {!$0.isWhitespace}.lowercased()
+            guard !first.isEmpty,prefixes.contains(where:{$0.hasPrefix(first)||first.hasPrefix($0)}) else {continue}
+            let hint=lines[start...].filter {!$0.isEmpty && !$0.allSatisfy {"─━╌- ".contains($0)}}.joined(separator:" ")
+            if hint.range(of:pattern,options:.regularExpression) != nil {return start}
+            // Terminal cells can hard-wrap inside `Press`, `enter` or `confirm`.
+            // Only the fixed, complete hint grammar is whitespace-insensitive;
+            // the original dialog and all later text still take part in validation.
+            let compact=hint.filter {!$0.isWhitespace}
+            let compactPattern=pattern.replacingOccurrences(of:#"\s+"#,with:"").replacingOccurrences(of:#"\s*"#,with:"")
+            if compact.range(of:compactPattern,options:.regularExpression) != nil {return start}
+            // Later hints cannot hide unrelated output after the first hint.
+            return nil
+        }
+        return nil
     }
 }

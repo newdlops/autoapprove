@@ -504,6 +504,16 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         if WorkingDirectoryFixture.runIfRequested() { return }
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Computer Use: identical permissions after brief real work",tests.testComputerUseSamePermissionAfterFastConfirmedTransition),
+            ("Computer Use: selected Allow submits with standalone Return",tests.testComputerUseFieldSubmissionUsesReturnWithoutTextPaste),
+            ("Computer Use: no replay from unchanged, blank or draft frames",tests.testComputerUseFollowupNeverReplaysWithoutResolution),
+            ("Computer Use: late confirmation respects pause and OFF",tests.testComputerUseFollowupDiscardsPausedOrDisabledRead),
+            ("Session profiles: multiple private files, explicit update, import and restart",tests.testTerminalProfilesMultiplePrivateFilesAndRestart),
+            ("Session profiles: malformed, future, duplicate and unsafe files",tests.testTerminalProfilesRejectMalformedUnsafeAndDuplicateFiles),
+            ("Session profiles: fixed resume grammar and native host contracts",tests.testTerminalProfileFixedCommandsAndNativeHostContracts),
+            ("Session profiles: duplicate prevention, missing folder and uncertain delivery",tests.testTerminalProfileRestoreDeduplicationAndPartialFailure),
+            ("Session profiles: exact identity, explicit daemon picker and stale process",tests.testTerminalProfileCaptureBindsExactConversationsAndRejectsStalePID),
+            ("Permission footer: hard wrap, complete dialog and trailing output rejection",tests.testHardWrappedPermissionFooterRetainsWholeDialogAndRejections),
             ("AI account login: encrypted PIN, node scope, replay, stale requests and revocation",tests.testAccountCryptoPINReplayAndScope),
             ("AI account login: bounded PIN attempts",tests.testAccountPINAttemptsAreBounded),
             ("AI account login: official challenge URL allowlist",tests.testAccountChallengeOnlyAcceptsOfficialProviderURLs),

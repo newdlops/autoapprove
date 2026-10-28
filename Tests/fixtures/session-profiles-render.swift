@@ -1,0 +1,48 @@
+import SwiftUI
+import AppKit
+import AutoApproveCore
+
+@main struct SessionProfilesRender {
+    @MainActor static func main() async throws {
+        _ = NSApplication.shared
+        let root=URL(fileURLWithPath:CommandLine.arguments[1])
+        let store=TerminalProfileStore(directory:root.appendingPathComponent("render-data"))
+        var entries:[TerminalProfileEntry]=[]
+        for i in 0..<24 {
+            let agent=i%2==0 ? "codex":"claude"
+            let conversation=String(format:"00000000-0000-4000-8000-%012d",i+1)
+            var entry=TerminalProfileEntry(title:"긴 프로젝트 작업 \(i+1) · Codex와 Claude 대화 복원",agent:agent,cwd:"/fixture/여러 프로젝트/긴 작업 폴더 이름/프로젝트-\(i)",conversationID:conversation)
+            if i==0 {entry.providerHome="/fixture/CLI 설정을 따로 보관하는 긴 폴더 이름/.codex"}
+            entries.append(entry)
+        }
+        let profile=try store.save(.init(name:"여러 창 작업 프로필 · 재부팅 뒤 이어가기",entries:entries))
+        let controller=SessionProfilesController(store:store,capture:{[]},launch:{_ in "/dev/fixture-render"})
+        await controller.reload();controller.selectedID=profile.id
+        for (name,width,height) in [("minimum",700,480),("default",860,640),("wide",1100,800)] {
+            for (theme,scheme) in [("light",ColorScheme.light),("dark",ColorScheme.dark)] {
+                try await render(SessionProfilesWindow(controller:controller),name:name+"-"+theme,width:width,height:height,scheme:scheme,root:root)
+            }
+        }
+        controller.error="프로필 파일을 읽지 못했습니다. 파일 형식을 확인한 뒤 다시 불러와주세요. "+String(repeating:"긴 오류 안내. ",count:16)
+        try await render(SessionProfilesWindow(controller:controller),name:"error-light",width:700,height:480,scheme:.light,root:root)
+        let empty=SessionProfilesController(store:.init(directory:root.appendingPathComponent("empty-data")),capture:{[]},launch:{_ in "/dev/fixture-render"})
+        await empty.reload()
+        try await render(SessionProfilesWindow(controller:empty),name:"empty-light",width:700,height:480,scheme:.light,root:root)
+        var missing=entries[1];missing.conversationID=""
+        let draft=SessionProfileDraft(profileID:UUID(),name:"대화 확인이 필요한 프로필",candidates:[.init(id:"known",entry:entries[0]),.init(id:"choose",entry:missing,conversations:[.init(id:entries[1].conversationID,title:"선택할 기존 대화")],detail:"현재 창의 복원할 대화를 선택해주세요.")])
+        for scheme in [ColorScheme.light,.dark] {
+            try await render(SessionProfileEditor(draft:draft,save:{_ in},cancel:{}),name:scheme == .dark ? "editor-dark":"editor-light",width:700,height:620,scheme:scheme,root:root)
+        }
+        print("PASS native profile views: 700×480 / 860×640 / 1100×800 light/dark, empty, long error and unresolved conversation editor; synthetic data only")
+    }
+    @MainActor static func render<V:View>(_ view:V,name:String,width:Int,height:Int,scheme:ColorScheme,root:URL) async throws {
+        let host=NSHostingView(rootView:view.frame(width:CGFloat(width),height:CGFloat(height)).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,scheme))
+        host.frame=NSRect(x:0,y:0,width:width,height:height);host.appearance=NSAppearance(named:scheme == .dark ? .darkAqua:.aqua)
+        let window=NSWindow(contentRect:host.frame,styleMask:[.borderless],backing:.buffered,defer:false);window.isReleasedWhenClosed=false;window.contentView=host
+        try await Task.sleep(for:.milliseconds(120));host.layoutSubtreeIfNeeded();host.displayIfNeeded()
+        guard let bitmap=host.bitmapImageRepForCachingDisplay(in:host.bounds) else {throw AppError.message("Native profile render missing")}
+        host.cacheDisplay(in:host.bounds,to:bitmap)
+        guard let png=bitmap.representation(using:.png,properties:[:]) else {throw AppError.message("Native profile PNG missing")}
+        try png.write(to:root.appendingPathComponent(name+".png"));window.close()
+    }
+}

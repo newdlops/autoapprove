@@ -39,7 +39,96 @@ private final class NativeTypingValidationGate:@unchecked Sendable {
     func release() {gate.signal()}
 }
 
+private let computerUsePermission="""
+Field 1/1
+Allow Computer Use to use "AutoApprove Profiles QA"?
+
+App: AutoApprove Profiles QA
+
+› 1. Allow                  Run the tool and continue
+  2. Allow for this session Run the tool and remember this choice for this session
+  3. Always allow           Run the tool and remember this choice for future tool calls
+  4. Cancel                 Cancel this tool call
+enter to submit | esc to cancel
+"""
+private final class DeliveredFrameProbe:@unchecked Sendable {
+    let frame:String
+    private let lock=NSLock()
+    private var reads:[ScreenTarget]=[]
+    init(_ frame:String) {self.frame=frame}
+    func read(_ targets:[ScreenTarget]) -> TerminalSnapshot {
+        lock.lock();reads += targets;lock.unlock()
+        return .init(screens:targets.map {.init(tty:$0.tty,contents:frame)})
+    }
+    var targets:[ScreenTarget] {lock.lock();defer {lock.unlock()};return reads}
+}
+
 extension ApprovalTests {
+    func testComputerUseFieldSubmissionUsesReturnWithoutTextPaste() throws {
+        let context=JSContext()!
+        context.setObject(computerUsePermission,forKeyedSubscript:"frame" as NSString)
+        context.evaluateScript("""
+        var writes=[],submitted=0,pasted=0;
+        const fixtureTab={tty:()=>'/dev/fixture',contents:()=>frame,processes:()=>['codex']};
+        function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[fixtureTab]}],doScript:(text,options)=>{
+          if(options.in!==fixtureTab)throw Error('wrong tab');writes.push(text);
+          // Text plus Return is a paste to Codex's single-choice field. A
+          // standalone Return submits the already selected Allow option.
+          if(text.length)pasted++;else submitted++;
+        }};}
+        """)
+        let script=try TerminalAdapter.approvalScript(tty:"/dev/fixture",expectedScreen:computerUsePermission,agent:.codex)
+        try expectEqual(context.evaluateScript(script)?.toString(),"sent");try expectNil(context.exception)
+        try expectEqual(context.evaluateScript("submitted")?.toInt32(),1,"Computer Use fields need standalone Return, not pasted numeric text")
+        try expectEqual(context.evaluateScript("pasted")?.toInt32(),0)
+        try expectEqual(context.evaluateScript("writes.length")?.toInt32(),1)
+        context.setObject(computerUsePermission.replacingOccurrences(of:"› 1.",with:"  1.").replacingOccurrences(of:"  4.",with:"› 4."),forKeyedSubscript:"frame" as NSString)
+        try expectEqual(context.evaluateScript(script)?.toString(),"screenChanged")
+        try expectEqual(context.evaluateScript("submitted")?.toInt32(),1,"A changed selection never receives Return")
+    }
+    func testComputerUseSamePermissionAfterFastConfirmedTransition() async throws {
+        try expectEqual(PromptDetector.detect(computerUsePermission,agent:.codex)?.answer,"1")
+        let probe=ApprovalRecoveryProbe(),frames=DeliveredFrameProbe("Working\nesc to interrupt")
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{frames.read($0)})
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id=sessions[0].id,generation="same-computer-use"
+        engine.receiveScreen(sessionID:id,raw:computerUsePermission,generation:generation)
+        try await waitForRecovery({probe.inputs.count == 1},"The exact Computer Use Allow menu dispatches once")
+        try await waitForRecovery({engine.snapshot.sessions.first?.phase == .working},"Read the brief real work after delivery, before the normal slow poll")
+        engine.receiveScreen(sessionID:id,raw:computerUsePermission,generation:generation)
+        try await waitForRecovery({probe.inputs.count == 2},"A newly requested identical Computer Use permission must not inherit the preceding reservation")
+        try expect(frames.targets.allSatisfy {$0.tty == sessions[0].tty},"Follow-up observation stays on the exact original tab")
+    }
+    func testComputerUseFollowupNeverReplaysWithoutResolution() async throws {
+        for raw in [computerUsePermission,"", "Done\n› Draft text\nGPT-6.1-Sol max · ~/fixture · Ready · Context 35% left\n⚠ 1 warning · f2 to view"] {
+            let probe=ApprovalRecoveryProbe(),frames=DeliveredFrameProbe(raw)
+            let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{frames.read($0)})
+            defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+            engine.receiveScreen(sessionID:sessions[0].id,raw:computerUsePermission,generation:"unresolved-computer-use")
+            try await waitForRecovery({probe.inputs.count == 1},"Deliver one permission")
+            try await Task.sleep(for:.milliseconds(1100))
+            engine.receiveScreen(sessionID:sessions[0].id,raw:computerUsePermission,generation:"unresolved-computer-use")
+            try await Task.sleep(for:.milliseconds(50))
+            try expectEqual(probe.inputs.count,1,"The same dialog, a blank repaint or a draft is never proof to repeat Return")
+            try expect(frames.targets.count<=4,"Post-delivery reads have a strict per-request bound")
+        }
+    }
+    func testComputerUseFollowupDiscardsPausedOrDisabledRead() async throws {
+        for pause in [true,false] {
+            let gate=NativeTypingValidationGate(),probe=ApprovalRecoveryProbe()
+            let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{targets in gate.wait();return .init(screens:targets.map {.init(tty:$0.tty,contents:"Working\nesc to interrupt")})})
+            defer {gate.release();engine.stop();try? FileManager.default.removeItem(at:directory)}
+            let id=sessions[0].id
+            engine.receiveScreen(sessionID:id,raw:computerUsePermission,generation:"held-transition")
+            try await waitForRecovery({gate.started},"The post-delivery read starts on the original tab")
+            if pause {try engine.setPaused(true)} else {try engine.setAutomatic(id,enabled:false)}
+            gate.release();try await Task.sleep(for:.milliseconds(80))
+            try expectEqual(engine.snapshot.sessions.first?.phase,.approval,"A late read cannot retire a receipt after pause/OFF")
+            if pause {try engine.setPaused(false)} else {try engine.setAutomatic(id,enabled:true)}
+            engine.receiveScreen(sessionID:id,raw:computerUsePermission,generation:"held-transition")
+            try await Task.sleep(for:.milliseconds(80));try expectEqual(probe.inputs.count,1)
+        }
+    }
     func testNativeTypingActivitySeparatesHostsAndPhysicalIdle() throws {
         let state = NativeTypingActivity(),activity = state.activity
         for (bundle,terminal) in [("com.apple.Terminal",TerminalKind.terminal),("com.googlecode.iterm2",.iterm),("com.stablyai.orca",.orca),("com.microsoft.VSCode",.vscode),("com.microsoft.VSCodeInsiders",.vscode),("com.todesktop.230313mzl4w4u92",.vscode),("com.exafunction.windsurf",.vscode),("com.vscodium",.vscode)] {
@@ -119,18 +208,19 @@ extension ApprovalTests {
         try await waitForRecovery({probe.inputs.count == 2},"A genuinely different permission still proceeds")
       }
     }
-    private func recoveryEngine(_ probe: ApprovalRecoveryProbe, agents: [AgentKind] = [.codex],nativeKeyboardActivity:NativeKeyboardActivity? = nil) throws -> (ApprovalEngine, [AgentSession], URL) {
+    private func recoveryEngine(_ probe: ApprovalRecoveryProbe, agents: [AgentKind] = [.codex],nativeKeyboardActivity:NativeKeyboardActivity? = nil,
+                                host:ScreenHost = .iterm,validation:(@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) throws -> (ApprovalEngine, [AgentSession], URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-approval-recovery-" + UUID().uuidString)
         let records = ProcessDiscovery.parse(agents.enumerated().map { index, agent in
             "\(82001 + index) 1 ttys\(891 + index) \(82001 + index) \(82001 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/\(agent.rawValue)"
         }.joined(separator: "\n"))
         let sessions = records.map { record -> AgentSession in
             var session = AgentSession(id: record.key, agent: record.agent!, pid: record.pid, started: record.started,
-                tty: "/dev/" + record.tty, cwd: "/tmp/approval-fixture", terminal: .iterm)
-            session.channel = .itermScreen; return session
+                tty: "/dev/" + record.tty, cwd: "/tmp/approval-fixture", terminal: host.kind)
+            session.channel = host.channel; return session
         }
-        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { target, raw, _ in try probe.approve(target, raw) }, reveal: { _ in nil })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter],nativeKeyboardActivity:nativeKeyboardActivity)
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { target, raw, _ in try probe.approve(target, raw) }, reveal: { _ in nil },validationScreens:validation)
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [host: adapter],nativeKeyboardActivity:nativeKeyboardActivity)
         engine.updateDiscovery(sessions, records: records)
         for session in sessions { try engine.setAutomatic(session.id, enabled: true) }
         return (engine, sessions, directory)

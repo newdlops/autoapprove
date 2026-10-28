@@ -674,6 +674,64 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let keep = Set(inventory.map { "pty:" + $0.ptyID })
         for id in Array(sessions.keys) where id.hasPrefix("pty:") && !keep.contains(id) { sessions.removeValue(forKey: id) }
     }
+    /// Capture exact current identities where available. A daemon-backed TUI
+    /// without a per-window thread binding returns an explicit conversation picker.
+    public func terminalProfileCandidates() async throws -> [TerminalProfileCandidate] {
+        guard !remoteInputStopped else {throw AppError.message("앱이 종료 중입니다.")}
+        let targets=snapshot.sessions.filter {$0.agent != .shell && $0.phase != .ended && $0.pid>0}
+        guard targets.count<=128 else {throw AppError.message("프로필에는 최대 128개 세션을 저장합니다.")}
+        let reader=processReader,registry=claudeRegistryReader
+        let live=try await Task.detached(priority:.utility) {try reader()}.value
+        var result:[TerminalProfileCandidate]=[]
+        for session in targets {
+            try Task.checkCancellation()
+            guard let record=live.first(where:{$0.key == session.id && $0.agent == session.agent && "/dev/"+$0.tty == session.tty}) else {
+                throw AppError.message("세션 목록이 바뀌었습니다. 현재 창을 다시 불러와주세요.")
+            }
+            let environment=await Task.detached(priority:.utility) {ProcessEnvironment.read(record) ?? [:]}.value
+            let title=String(session.displayedTerminalTitle.components(separatedBy:.newlines).joined(separator:" ").unicodeScalars.filter {!CharacterSet.controlCharacters.contains($0)}.map(String.init).joined().prefix(256))
+            var entry=TerminalProfileEntry(title:title,agent:session.agent.rawValue,cwd:session.cwd,conversationID:"",
+                providerHome:environment[session.agent == .codex ? "CODEX_HOME":"CLAUDE_CONFIG_DIR"],host:session.terminal == .iterm ? .iterm:.terminal)
+            var choices:[CodexProfileConversation]=[],detail:String?
+            if session.agent == .codex {
+                let location=try? await Task.detached(priority:.utility) {
+                    try CodexThreadLocation.locate(paths:ProcessOpenFiles.codexRolloutPaths(pid:record.pid,expectedStart:record.started))
+                }.value
+                if let location {
+                    entry.conversationID=location.threadID
+                    entry.providerHome=URL(fileURLWithPath:location.database).deletingLastPathComponent().path
+                } else {
+                    do {
+                        let target=try await questionTransport.queueHome(session)
+                        entry.providerHome=target.home
+                        choices=try await codexQueue.conversations(target,session.cwd).map {CodexProfileConversation(id:$0.id,title:$0.title)}
+                        detail="공유 서버의 복원할 대화를 선택해주세요. 현재 창의 대화를 자동으로 추측하지 않습니다."
+                    } catch {detail="대화 ID를 자동으로 확인하지 못했습니다. Codex의 /status에서 Session ID를 확인해 입력해주세요."}
+                }
+            } else {
+                let home=entry.providerHome
+                let rows=await Task.detached(priority:.utility) {
+                    home.map {ClaudeSessionRegistry.read(records:[record],directory:URL(fileURLWithPath:$0))} ?? registry([record])
+                }.value
+                let identities=Set(rows.filter {$0.processID == session.id}.compactMap { $0.activity?.providerID })
+                if identities.count == 1,let id=identities.first,UUID(uuidString:id) != nil {entry.conversationID=id}
+                else if let id=session.providerID,UUID(uuidString:id) != nil {entry.conversationID=id}
+                else {detail="대화 ID를 자동으로 확인하지 못했습니다. Claude Code의 /status에서 세션 ID를 확인해 입력해주세요."}
+            }
+            if ![TerminalKind.terminal,.iterm].contains(session.terminal) {
+                detail=(detail.map {$0+" "} ?? "")+"이 세션은 새 Terminal 창에서 복원합니다."
+            }
+            result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail))
+        }
+        let fresh=try await Task.detached(priority:.utility) {try reader()}.value
+        guard !remoteInputStopped,result.allSatisfy({candidate in
+            guard let original=targets.first(where:{$0.id == candidate.id}),let current=sessions[candidate.id] else {return false}
+            return current.pid == original.pid && current.started == original.started && current.cwd == original.cwd &&
+                fresh.contains(where:{$0.key == original.id && $0.agent == original.agent && "/dev/"+$0.tty == original.tty})
+        }) else {throw AppError.message("대화를 확인하는 동안 창이 바뀌었습니다. 현재 세션을 다시 불러와주세요.")}
+        return result
+    }
+
     public func createPTY(_ object: JSONObject) async throws -> ManagedPTYDescriptor {
         guard !remoteInputStopped else { throw RemoteHTTPError(503, "앱이 종료 중입니다.") }
         guard let id = object["sessionID"] as? String, object["reuse"] as? Bool == true else {
@@ -5699,8 +5757,50 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func watchDeliveredApproval(_ id: String, dispatchID: UUID, generation: String, requestIdentity: String) {
         let deliveredAt = Date()
-        automationRuntime.launch(id) { [weak self] _ in
-            do { try await Task.sleep(nanoseconds: 8_000_000_000) } catch { return }
+        let original=sessions[id],validation=original.flatMap {session in
+            session.terminal == .terminal ? screenAdapters[.terminal]?.validationScreens:nil
+        },reader=processReader
+        automationRuntime.launch(id) { [weak self] epoch in
+            // A repeated Computer Use permission can have exactly the same text
+            // after a brief real turn. Normal 1–2 s polling can miss that turn.
+            // Observe only after a definite write, on the same original tab,
+            // with a strict four-read/1.25 s start budget. No input is replayed.
+            if let original,let validation {
+                let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,sourcePID:original.pid,sourceStarted:original.started)
+                for delay:UInt64 in [0,60_000_000,140_000_000,300_000_000] {
+                    do {if delay>0 {try await Task.sleep(nanoseconds:delay)}} catch {return}
+                    guard let self,!Task.isCancelled,self.automationRuntime.epoch(id)==epoch,
+                          !self.remoteInputStopped,!self.snapshot.paused,self.sessions[id]?.automatic == true,
+                          self.screens[id]?.dispatchID==dispatchID,self.screens[id]?.generation==generation,
+                          self.screens[id]?.prompt.requestIdentity==requestIdentity else {return}
+                    guard Date().timeIntervalSince(deliveredAt)<1.25 else {break}
+                    let readStartedAt=Date()
+                    let observed:(String,ScreenAnalysis)?
+                    do {
+                        observed=try await Task.detached(priority:.userInitiated) {() throws -> (String,ScreenAnalysis)? in
+                            let live=try reader()
+                            guard live.contains(where:{$0.pid==original.pid && $0.started==original.started && $0.agent==original.agent && "/dev/"+$0.tty==original.tty}) else {return nil}
+                            let snapshot=try validation([target]),frames=snapshot.screens.filter {$0.tty==target.tty}
+                            guard frames.count==1 else {return nil}
+                            let raw=frames[0].contents
+                            return (raw,ScreenAnalysis(raw:raw,agent:original.agent))
+                        }.value
+                    } catch {break}
+                    guard !Task.isCancelled,self.automationRuntime.epoch(id)==epoch,!self.remoteInputStopped,
+                          !self.snapshot.paused,self.sessions[id]?.automatic == true,
+                          self.sessions[id]?.pid==original.pid,self.sessions[id]?.started==original.started,
+                          self.sessions[id]?.tty==original.tty,self.sessions[id]?.channel==original.channel,
+                          self.screens[id]?.dispatchID==dispatchID,self.screens[id]?.generation==generation else {return}
+                    if let observed,observed.1.prompt==nil,observed.1.activity.phase == .working,
+                       (self.remoteObservedScreens[id]?.observedAt ?? .distantPast)<=readStartedAt {
+                        self.receiveScreen(sessionID:id,raw:observed.0,generation:generation,source:original.channel,at:readStartedAt,
+                            precomputed:observed.1,screenContentsUnchanged:false)
+                        break
+                    }
+                }
+            }
+            let remaining=max(0,8-Date().timeIntervalSince(deliveredAt))
+            do {try await Task.sleep(nanoseconds:UInt64(remaining*1_000_000_000))} catch {return}
             guard let self, self.screens[id]?.prompt.requestIdentity == requestIdentity,
                   let observed = self.screenObservedAt[id], observed > deliveredAt,
                   Date().timeIntervalSince(observed) < 6 else { return }

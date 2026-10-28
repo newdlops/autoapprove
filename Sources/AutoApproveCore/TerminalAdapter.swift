@@ -518,7 +518,10 @@ public enum TerminalAdapter {
 
     public static func approvalScript(tty: String, expectedScreen: String, agent: AgentKind) throws -> String {
         // Compare the complete active dialog, preserving command whitespace. Unrelated history can change.
-        let data = try literal(AutomationScript.dialogData(tty: tty, expectedScreen: expectedScreen, agent: agent))
+        var target=try AutomationScript.dialogData(tty:tty,expectedScreen:expectedScreen,agent:agent)
+        let compact=(target["dialog"] as? String ?? "").filter {!$0.isWhitespace}.lowercased()
+        target["submitSelected"]=agent == .codex && compact.hasPrefix("allowcomputerusetouse")
+        let data = try literal(target)
         return """
         (() => {
         const app = Application('com.apple.Terminal'); const target = \(data);
@@ -544,7 +547,10 @@ public enum TerminalAdapter {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;
           if (activeDialog(tab.contents()) !== normalize(target.dialog)) return 'screenChanged';
           if (!tab.processes().some(p => p.toLowerCase().includes(target.agent))) return 'agentMissing';
-          app.doScript('1', {in:tab});
+          // Codex's Computer Use field treats text plus Return as a paste.
+          // The detector and final dialog check already prove Allow is selected;
+          // an empty script sends the standalone Return that submits that field.
+          app.doScript(target.submitSelected ? '' : '1', {in:tab});
           return 'sent';
         }
         return 'missingTarget';

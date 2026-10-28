@@ -6,6 +6,7 @@ import AutoApproveCore
 @MainActor final class AppContainer: ObservableObject {
     let engine: ApprovalEngine?
     let notifications: QuestionNotifications?
+    let sessionProfiles: SessionProfilesController?
     let error: String?
     init() {
         do {
@@ -15,11 +16,12 @@ import AutoApproveCore
             try engine.start(webByDefault: true)
             self.engine = engine; self.error = nil
             self.notifications = QuestionNotifications(engine: engine)
+            self.sessionProfiles = SessionProfilesController(engine: engine)
             // Logout, restart and the Dock's Quit end here too; the Mac gets its normal sleep back.
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated { engine.stop() }
             }
-        } catch { self.engine = nil; self.notifications = nil; self.error = error.localizedDescription }
+        } catch { self.engine = nil; self.notifications = nil; self.sessionProfiles=nil; self.error = error.localizedDescription }
     }
 }
 
@@ -45,6 +47,10 @@ import AutoApproveCore
         Window("승인 내역", id: "history") {
             if let engine = container.engine { AuditHistoryWindow(engine: engine) }
         }.defaultSize(width: 1040, height: 700).windowResizability(.contentMinSize).commandsRemoved()
+
+        Window("세션 프로필", id: "profiles") {
+            if let controller=container.sessionProfiles {SessionProfilesWindow(controller:controller)}
+        }.defaultSize(width:860,height:640).windowResizability(.contentMinSize).commandsRemoved()
 
         Window("연결 설정", id: "settings") {
             if let engine = container.engine, let notifications = container.notifications {
@@ -118,6 +124,8 @@ private struct StatusMenu: View {
             .help(AppHelp.history)
         Button("연결 설정…") { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
             .help(AppHelp.connections)
+        Button("세션 프로필…") {openWindow(id:"profiles");NSApp.activate(ignoringOtherApps:true)}
+            .help("창별 Codex·Claude Code 대화를 여러 프로필 파일로 저장하고 다시 엽니다.")
         Button(engine.snapshot.paused ? "자동 승인 재개" : "자동 승인 일시정지") { try? engine.setPaused(!engine.snapshot.paused) }
             .help(AppHelp.pause(engine.snapshot.paused))
         Divider()

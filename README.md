@@ -1,5 +1,7 @@
 # AutoApprove
 
+**여러 세션 프로필·Computer Use 승인 · 0.2.202 빌드 229:** **세션 프로필(⌘⇧P) → 새 프로필**에서 창별 Codex·Claude 대화를 이름 있는 여러 JSON 파일로 저장하고, 재부팅 후 선택해 다시 엽니다. Computer Use Allow의 단독 Enter 제출과 좁은 창의 확인 안내 인식도 보완했습니다. [사용법과 변경 사항](docs/releases/v0.2.202.md).
+
 **앱 실행 중 잠자기·화면 유지 · 0.2.201 빌드 228:** 연결 설정에서 한 번 켜면 작업·질문·대기·전체 일시정지 중에도 잠자기와 유휴 화면 꺼짐을 방지합니다. 배터리·과열 보호와 종료 시 복원을 유지합니다. [변경 사항과 macOS 잠금 제한](docs/releases/v0.2.201.md).
 
 **1회 Allow 감지 보완 · 0.2.200 빌드 227:** Codex 도구 승인창의 `Allow once`·`Allow this time`·`Allow this request only`와 제목의 특수 공백을 인식합니다. 명시적인 1회 허용과 기존 입력 검증·중복 방지를 유지합니다. [변경 사항](docs/releases/v0.2.200.md).

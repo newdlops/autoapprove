@@ -80,7 +80,7 @@ public struct TerminalHost: Equatable {
 /// Reads only allowlisted launch variables of an agent process. Terminals export secrets such as
 /// `ORCA_AGENT_HOOK_TOKEN` beside these names; no other value is retained or logged.
 public enum ProcessEnvironment {
-    public static let names: Set<String> = ["TERM_PROGRAM", "__CFBundleIdentifier", "ITERM_SESSION_ID", "ORCA_TERMINAL_HANDLE", "TMUX", "TMUX_PANE", "STY", "ZELLIJ", "CODEX_HOME"]
+    public static let names: Set<String> = ["TERM_PROGRAM", "__CFBundleIdentifier", "ITERM_SESSION_ID", "ORCA_TERMINAL_HANDLE", "TMUX", "TMUX_PANE", "STY", "ZELLIJ", "CODEX_HOME", "CLAUDE_CONFIG_DIR"]
 
     /// KERN_PROCARGS2 layout: argc, executable path, NUL padding, argv, then environment until an empty string.
     public static func parse(_ bytes: [UInt8]) -> [String: String] {
