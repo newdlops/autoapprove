@@ -4,14 +4,16 @@ import AutoApproveCore
 
 private actor FixtureLaunches {
     var entries:[TerminalProfileEntry]=[]
+    var anchors:[String?]=[]
     let file:URL
     init(file:URL) {self.file=file}
-    func launch(_ entry:TerminalProfileEntry) throws -> String {
+    func launch(_ entry:TerminalProfileEntry,_ anchor:String?) throws -> String {
         _ = try entry.resumeCommand()
         entries.append(entry)
-        let report:[String:Any]=["launched":entries.map(\.conversationID),"commands":try entries.map {try $0.resumeCommand()},"realTerminalLaunches":0]
+        anchors.append(anchor)
+        let report:[String:Any]=["launched":entries.map(\.conversationID),"commands":try entries.map {try $0.resumeCommand()},"anchors":anchors.map {$0 as Any? ?? NSNull()},"realTerminalLaunches":0]
         try JSONSerialization.data(withJSONObject:report,options:.prettyPrinted).write(to:file,options:.atomic)
-        return "/dev/fixture-profiles-qa"
+        return "/dev/ttys\(900+entries.count-1)"
     }
 }
 
@@ -25,7 +27,9 @@ private actor FixtureLaunches {
         func entry(_ number:Int,_ title:String,_ agent:String,_ leaf:String) throws -> TerminalProfileEntry {
             let cwd=root.appendingPathComponent(leaf)
             try FileManager.default.createDirectory(at:cwd,withIntermediateDirectories:true)
-            return .init(title:title,agent:agent,cwd:cwd.path,conversationID:id(number))
+            let current=number>=300,group=current ? (number==400 ? 21:20):10
+            let order=number==400 ? 0:number%100
+            return .init(title:title,agent:agent,cwd:cwd.path,conversationID:id(number),terminalTab:.init(window:UUID(uuidString:id(group))!,windowOrder:group==21 ? 1:0,tabOrder:order,selected:order==0,settingsName:"Pro"))
         }
         do {
             if try store.list().profiles.isEmpty {
@@ -39,8 +43,11 @@ private actor FixtureLaunches {
                             TerminalProfileCandidate(id:"fixture-current-choice",entry:ambiguous,conversations:[.init(id:id(400),title:"도구 승인 안정화 작업"),.init(id:id(401),title:"프로필 복원 구현 작업")],detail:"공유 서버의 복원할 대화를 선택해주세요. 현재 창의 대화를 자동으로 추측하지 않습니다.")]
             controller=SessionProfilesController(store:store,capture:{
                 try await Task.sleep(for:.milliseconds(250))
-                return candidates + (await launches.entries).map {.init(id:$0.id.uuidString,entry:$0)}
-            },launch:{try await launches.launch($0)})
+                return candidates + (await launches.entries).enumerated().map {index,value in
+                    var entry=value;entry.terminalTab?.windowOrder=2
+                    return .init(id:entry.id.uuidString,entry:entry,tty:"/dev/ttys\(900+index)")
+                }
+            },launch:{entry,anchor in try await launches.launch(entry,anchor)})
         } catch {fatalError("Fixture setup failed: "+error.localizedDescription)}
     }
 }

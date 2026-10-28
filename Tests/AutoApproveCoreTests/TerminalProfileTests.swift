@@ -51,7 +51,7 @@ extension ApprovalTests {
         let store=TerminalProfileStore(directory:directory),entry=profileEntry(),valid=try store.save(.init(name:"기존",entries:[entry]))
         let original=try TerminalProfileStore.read(store.file(valid.id))
         for bad in ["",String(repeating:"가",count:81),"잘못된\n이름"] {var value=valid;value.name=bad;try expectThrows(try store.save(value))}
-        var future=valid;future.schema=2;try expectThrows(try store.save(future))
+        var future=valid;future.schema=3;try expectThrows(try store.save(future))
         var duplicate=valid;duplicate.entries += [entry];try expectThrows(try store.save(duplicate))
         var unknown=entry;unknown.agent="shell";try expectThrows(try unknown.resumeCommand())
         unknown=entry;unknown.conversationID="--last";try expectThrows(try unknown.resumeCommand())
@@ -103,21 +103,21 @@ extension ApprovalTests {
         let opened=ProfileLaunchRecorder(),first=profileEntry(),missing=profileEntry(cwd:"/missing"),ambiguous=profileEntry(cwd:"/ambiguous"),next=profileEntry("claude")
         let profile=TerminalSessionProfile(name:"복원",entries:[first,missing,ambiguous,next]),restorer=TerminalProfileRestorer()
         var unknown=ambiguous;unknown.conversationID=""
-        let result=try await restorer.restore(profile,selected:Set(profile.entries.map(\.id)),active:[first,unknown],directoryExists:{$0 != "/missing"},launch:{entry in await opened.add(entry.key);return "/dev/fixture-profile"})
+        let result=try await restorer.restore(profile,selected:Set(profile.entries.map(\.id)),active:[first,unknown],activeTerminalTTYs:[first.key:"/dev/ttys099"],directoryExists:{$0 != "/missing"},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
         try expectEqual(result.map(\.phase),[.alreadyOpen,.failed,.needsReview,.opened]);try expectEqual(await opened.keys.count,1)
-        let again=try await restorer.restore(profile,selected:[next.id],active:[],terminalIsOpen:{_ in true},launch:{entry in await opened.add(entry.key);return "/dev/fixture-profile"})
+        let again=try await restorer.restore(profile,selected:[next.id],active:[],terminalIsOpen:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
         try expectEqual(again.first?.phase,.alreadyOpen);try expectEqual(await opened.keys.count,1)
         let uncertain=profileEntry(),uncertainProfile=TerminalSessionProfile(name:"확인",entries:[uncertain])
-        let failed=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{_ in throw AppError.message("lost acknowledgement")})
+        let failed=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{_,_ in throw AppError.message("lost acknowledgement")})
         try expectEqual(failed.first?.phase,.needsReview)
-        let retry=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{entry in await opened.add(entry.key);return "/dev/fixture-profile"})
+        let retry=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
         try expectEqual(retry.first?.phase,.needsReview);try expectEqual(await opened.keys.count,1)
-        let closed=try await restorer.restore(profile,selected:[next.id],active:[],directoryExists:{_ in true},terminalIsOpen:{_ in false},launch:{entry in await opened.add(entry.key);return "/dev/fixture-profile-new"})
+        let closed=try await restorer.restore(profile,selected:[next.id],active:[],directoryExists:{_ in true},terminalIsOpen:{_ in false},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile-new"})
         try expectEqual(closed.first?.phase,.opened);try expectEqual(await opened.keys.count,2)
         let beforeStart=profileEntry(),beforeProfile=TerminalSessionProfile(name:"권한",entries:[beforeStart])
-        let denied=try await restorer.restore(beforeProfile,selected:[beforeStart.id],active:[],directoryExists:{_ in true},launch:{_ in throw RemoteHTTPError(403,"permission",diagnostics:["delivery":"not_started"])})
+        let denied=try await restorer.restore(beforeProfile,selected:[beforeStart.id],active:[],directoryExists:{_ in true},launch:{_,_ in throw RemoteHTTPError(403,"permission",diagnostics:["delivery":"not_started"])})
         try expectEqual(denied.first?.phase,.failed)
-        let allowed=try await restorer.restore(beforeProfile,selected:[beforeStart.id],active:[],directoryExists:{_ in true},launch:{entry in await opened.add(entry.key);return "/dev/fixture-profile-allowed"})
+        let allowed=try await restorer.restore(beforeProfile,selected:[beforeStart.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile-allowed"})
         try expectEqual(allowed.first?.phase,.opened);try expectEqual(await opened.keys.count,3)
     }
 
@@ -133,7 +133,8 @@ extension ApprovalTests {
         let transport=CodexReplyTransport(prepare:{_,_ in throw AppError.message("unused")},send:{_,_ in throw AppError.message("never send")},queueHome:{_ in .init(executable:"",home:"/tmp/profile-codex-home",threadID:"")})
         let queue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in [.init(id:first,title:"첫 대화"),.init(id:second,title:"다른 대화")]})
         let registry:@Sendable ([ProcessRecord])->[ClaudeSessionRegistration] = {_ in [.init(processID:records[1].key,kind:"interactive",activity:.init(providerID:claudeID,status:"idle",changedAt:Date()))]}
-        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,claudeRegistryReader:registry,processReader:{records},codexQueue:queue)
+        let layout:@Sendable ([String]) throws -> [TerminalProfileTabSnapshot] = {ttys in ttys.enumerated().map {.init(tty:$0.element,windowID:7,windowOrder:0,tabOrder:$0.offset,selected:$0.offset==1,settingsName:"Pro")}}
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,claudeRegistryReader:registry,processReader:{records},codexQueue:queue,terminalProfileLayoutReader:layout)
         defer {engine.stop()};engine.updateDiscovery(sessions,records:records)
         let candidates=try await engine.terminalProfileCandidates()
         let codex=try unwrap(candidates.first {$0.entry.agent == "codex"}),claude=try unwrap(candidates.first {$0.entry.agent == "claude"})
@@ -143,7 +144,7 @@ extension ApprovalTests {
         var chosen=codex.entry;chosen.conversationID=second
         try expectEqual(try TerminalSessionProfile(name:"선택",entries:[chosen]).validated().entries[0].conversationID,second)
         let reader=ProfileReadFixture(records)
-        let stale=try ApprovalEngine(paths:AppPaths(directory:directory.appendingPathComponent("stale")),questionTransport:transport,claudeRegistryReader:registry,processReader:{reader.read()},codexQueue:queue)
+        let stale=try ApprovalEngine(paths:AppPaths(directory:directory.appendingPathComponent("stale")),questionTransport:transport,claudeRegistryReader:registry,processReader:{reader.read()},codexQueue:queue,terminalProfileLayoutReader:layout)
         defer {stale.stop()};stale.updateDiscovery(sessions,records:records)
         var rejected=false;do {_ = try await stale.terminalProfileCandidates()} catch {rejected=true}
         try expect(rejected,"A vanished or reused source cannot be captured after its async identity read")

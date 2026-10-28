@@ -259,6 +259,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
+    private let terminalProfileLayoutReader:@Sendable ([String]) throws -> [TerminalProfileTabSnapshot]
     /// A brief cancellation window for supported yes/no confirmations. Ordinary
     /// permission screens are handled immediately; unsafe system changes deny.
     public var automaticConfirmationDelay: TimeInterval = 0.5
@@ -347,9 +348,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
-                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live) throws {
+                workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
+                terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil) throws {
         self.paths = paths
         self.publishedUpdateServices=publishedUpdateServices
+        // Injected inventories never inspect the user's real Terminal implicitly.
+        if let terminalProfileLayoutReader {self.terminalProfileLayoutReader=terminalProfileLayoutReader}
+        else if processReader == nil {self.terminalProfileLayoutReader={try TerminalProfileTopology.read(ttys:$0)}}
+        else {self.terminalProfileLayoutReader={_ in []}}
         // Synthetic/injected process inventories have no implicit association
         // with the user's desktop. Tests can supply explicit keyboard activity.
         self.nativeKeyboardActivity = nativeKeyboardActivity ?? (processReader == nil ? .live:.inactive)
@@ -721,7 +727,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if ![TerminalKind.terminal,.iterm].contains(session.terminal) {
                 detail=(detail.map {$0+" "} ?? "")+"이 세션은 새 Terminal 창에서 복원합니다."
             }
-            result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail))
+            result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail,tty:session.terminal == .terminal ? session.tty:nil))
+        }
+        let terminalTTYs=result.filter {$0.entry.host == .terminal}.compactMap(\.tty),layoutReader=terminalProfileLayoutReader
+        if !terminalTTYs.isEmpty {
+            let layout=try await Task.detached(priority:.utility) {try layoutReader(terminalTTYs)}.value
+            result=try TerminalProfileTopology.apply(layout,to:result)
         }
         let fresh=try await Task.detached(priority:.utility) {try reader()}.value
         guard !remoteInputStopped,result.allSatisfy({candidate in

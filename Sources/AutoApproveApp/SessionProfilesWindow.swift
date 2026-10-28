@@ -91,6 +91,7 @@ struct SessionProfilesWindow: View {
                     Text(profile.name).font(.title2.weight(.semibold)).lineLimit(3).textSelection(.enabled)
                     Text("세션 \(profile.entries.count)개 · \(profile.savedAt.formatted(date:.abbreviated,time:.shortened)) 저장")
                         .font(.callout).foregroundStyle(.secondary)
+                    if !profile.terminalLayoutSummary.isEmpty {Text(profile.terminalLayoutSummary).font(.callout).foregroundStyle(.secondary)}
                 }
                 Spacer(minLength:8)
                 Menu {
@@ -106,6 +107,10 @@ struct SessionProfilesWindow: View {
             }
             Text("복원할 세션을 선택하세요. 저장한 대화를 새 터미널 창에서 엽니다.")
                 .font(.callout).foregroundStyle(.secondary)
+            if profile.entries.contains(where:{$0.host == .terminal && $0.terminalTab == nil}) {
+                Text("창 정보가 없는 Terminal 세션은 한 창의 탭으로 모아 엽니다. ‘현재 창으로 갱신’하면 원래 구성을 저장합니다.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            }
             Divider()
             List(profile.entries) {entry in
                 VStack(alignment:.leading,spacing:6) {
@@ -114,6 +119,7 @@ struct SessionProfilesWindow: View {
                     }.toggleStyle(.checkbox).disabled(controller.busy)
                     Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal"))
                         .font(.caption).foregroundStyle(.secondary)
+                    if !entry.terminalTabSummary.isEmpty {Text(entry.terminalTabSummary).font(.caption).foregroundStyle(.secondary).lineLimit(2).help(entry.terminalTabSummary)}
                     Text(entry.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(entry.cwd)
                     if let home=entry.providerHome {
                         Text("CLI 설정 폴더: "+home).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(home)
@@ -191,6 +197,9 @@ struct SessionProfileEditor:View {
                                         Text("Terminal").tag(TerminalProfileEntry.Host.terminal)
                                         Text("iTerm2").tag(TerminalProfileEntry.Host.iterm)
                                     }.frame(width:180)
+                                }
+                                if !row.entry.terminalTabSummary.isEmpty {
+                                    Text(row.entry.terminalTabSummary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                                 }
                                 TextField("작업 폴더",text:$row.entry.cwd).textFieldStyle(.roundedBorder)
                                     .accessibilityLabel("\(row.entry.title) 작업 폴더").help("이 대화를 다시 열 작업 폴더의 전체 경로")

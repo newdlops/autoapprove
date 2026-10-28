@@ -21,11 +21,18 @@ struct SessionProfileDraft: Identifiable {
     @Published private(set) var message:String?
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
     private let capture:@MainActor () async throws -> [TerminalProfileCandidate]
-    private let launch:@Sendable (TerminalProfileEntry) async throws -> String
+    private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
+    private let selectTab:@Sendable (String) async throws -> Void
     private let restorer=TerminalProfileRestorer()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
-         launch:@escaping @Sendable (TerminalProfileEntry) async throws -> String = {try await TerminalProfileLauncher.launch($0)}) {
-        self.store=store;self.capture=capture;self.launch=launch
+         launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
+         selectTab:(@Sendable (String) async throws -> Void)? = nil) {
+        self.store=store;self.capture=capture
+        self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
+        // A synthetic launcher cannot acquire an implicit path to real native UI.
+        if let selectTab {self.selectTab=selectTab}
+        else if launch == nil {self.selectTab={try await TerminalProfileLauncher.selectTab($0)}}
+        else {self.selectTab={_ in}}
     }
     convenience init(engine:ApprovalEngine) {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),capture:{try await engine.terminalProfileCandidates()})
@@ -63,8 +70,9 @@ struct SessionProfileDraft: Identifiable {
         guard !busy else {return};busy=true;error=nil;message="실행 중인 세션을 확인하고 있습니다…";results=[:]
         defer {busy=false}
         do {
-            let active=try await capture().map(\.entry)
-            let values=try await restorer.restore(profile,selected:selected,active:active,launch:launch) { [weak self] result in
+            let candidates=try await capture(),active=candidates.map(\.entry)
+            let anchors=Dictionary(candidates.compactMap {candidate in candidate.entry.host == .terminal ? candidate.tty.map {(candidate.entry.key,$0)}:nil},uniquingKeysWith:{first,_ in first})
+            let values=try await restorer.restore(profile,selected:selected,active:active,activeTerminalTTYs:anchors,launch:launch,selectTab:selectTab) { [weak self] result in
                 self?.results[result.id]=result
                 self?.message="\(self?.results.count ?? 0)/\(selected.count)개 처리"
             }
