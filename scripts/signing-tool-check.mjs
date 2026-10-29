@@ -11,8 +11,9 @@ const original=childProcess.execFileSync,previous=process.cwd();
 const directory=await mkdtemp(path.join(tmpdir(),'autoapprove-signing-tools-'));
 const identity='A'.repeat(40),calls=[];
 const signedPaths=[];
-const signingVariables=['AUTOAPPROVE_SIGNING_IDENTITY','AUTOAPPROVE_SIGNING_KEYCHAIN'];
+const signingVariables=['AUTOAPPROVE_SIGNING_IDENTITY','AUTOAPPROVE_SIGNING_KEYCHAIN','AUTOAPPROVE_SIGNING_READ_ONLY'];
 const savedVariables=signingVariables.map(name=>process.env[name]);
+let opensslCalls=0;
 let denyUnlock=false;
 let failSigning=false,concurrentAddition=false;
 let canonicalSearch=false;
@@ -43,6 +44,7 @@ childProcess.execFileSync=(binary,args,options)=>{
     return Buffer.alloc(0);
   }
   if(binary==='/usr/bin/openssl') {
+    opensslCalls++;
     if(args[0]==='req') {
       writeFileSync(args[args.indexOf('-keyout')+1],'disposable private key');
       writeFileSync(args[args.indexOf('-out')+1],'disposable public certificate');
@@ -119,6 +121,32 @@ try {
   await assert.rejects(()=>signApp(path.join(directory,'RelativeAlias.app')),/absolute path/);
   assert.equal(calls.length,beforeRelative,'Ambiguous relative keychains must be rejected before OS calls');
   canonicalSearch=false;signingVariables.forEach(name=>delete process.env[name]);
+  // Restricted packaging must fail if the existing identity is unavailable,
+  // without trying to unlock it or adding it to the user's search list.
+  process.env.AUTOAPPROVE_SIGNING_READ_ONLY='1';denyUnlock=true;
+  const beforeReadOnly=calls.length,beforeReadOnlyOpenSSL=opensslCalls;
+  const originalMetadata=await readFile(metadata,'utf8');
+  let readOnlyPrepared=false;
+  await assert.rejects(()=>signApp(path.join(directory,'ReadOnlyUnavailable.app'),{prepare:()=>{readOnlyPrepared=true;}}),/No identity found/);
+  assert.equal(readOnlyPrepared,false,'Unavailable identity must stop before preparing a bundle');
+  assert.equal(calls.length,beforeReadOnly,'Restricted failure must not invoke security');
+  assert.equal(opensslCalls,beforeReadOnlyOpenSSL,'Restricted failure must not create a replacement publisher');
+  assert.deepEqual(searchList,originalSearch,'Restricted failure must preserve the search list');
+  assert.equal(await readFile(metadata,'utf8'),originalMetadata,'Restricted failure must preserve publisher metadata');
+  // An identity already available in the disposable search list can sign
+  // without any keychain command. This changes fixture memory only.
+  const readablePublisher=canonicalKeychain(publisher);
+  searchList=[...originalSearch,readablePublisher];
+  await signApp(path.join(directory,'ReadOnlyAvailable.app'));
+  assert.equal(calls.length,beforeReadOnly,'Restricted success must not invoke security');
+  assert.equal(opensslCalls,beforeReadOnlyOpenSSL,'Restricted success must not create a publisher');
+  assert.deepEqual(searchList,[...originalSearch,readablePublisher],'Restricted success must preserve the search list');
+  assert.equal(await readFile(metadata,'utf8'),originalMetadata);
+  process.env.AUTOAPPROVE_SIGNING_IDENTITY=identity;process.env.AUTOAPPROVE_SIGNING_KEYCHAIN=publisher;
+  await signApp(path.join(directory,'ReadOnlyExplicit.app'));
+  assert.equal(calls.length,beforeReadOnly,'Explicit restricted identity must not invoke security');
+  assert.deepEqual(searchList,[...originalSearch,readablePublisher]);
+  signingVariables.forEach(name=>delete process.env[name]);searchList=[...originalSearch];
   denyUnlock=true;
   await assert.rejects(()=>signApp(path.join(directory,'Failure.app')),error=>
     error.message.includes('private arguments omitted')&&!error.message.includes(saved.password));
@@ -133,7 +161,11 @@ try {
   const beforeReuseOnly=calls.length;
   await assert.rejects(()=>signApp(path.join(directory,'NoPublisher.app'),{allowProvisioning:false}),/matching publisher identity/);
   assert.equal(calls.length,beforeReuseOnly,'Compatibility QA must not provision a publisher keychain');
-  console.log('PASS: signing setup/update secrets absent from argv; stdin only; errors redact credentials; search list restored after success/failure, concurrent entries preserved; reuse-only never provisions; OS untouched');
+  process.env.AUTOAPPROVE_SIGNING_READ_ONLY='1';
+  await assert.rejects(()=>signApp(path.join(directory,'ReadOnlyMissingPublisher.app')),/matching publisher identity/);
+  assert.equal(calls.length,beforeReuseOnly,'Restricted packaging must not provision a missing publisher');
+  assert.equal(opensslCalls,beforeReadOnlyOpenSSL,'Restricted packaging must never create a replacement publisher');
+  console.log('PASS: signing setup/update secrets absent from argv; stdin only; errors redact credentials; search list restored after success/failure, concurrent entries preserved; reuse-only never provisions; restricted success/failure never invokes security or creates a publisher; OS untouched');
 } finally {
   process.chdir(previous);childProcess.execFileSync=original;syncBuiltinESMExports();
   signingVariables.forEach((name,index)=>savedVariables[index]===undefined?delete process.env[name]:process.env[name]=savedVariables[index]);
