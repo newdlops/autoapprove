@@ -1700,6 +1700,10 @@ struct RemoteTerminalUpdate: Encodable {
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("session"), let engine else { throw RemoteHTTPError(400, "Codex 세션을 지정해주세요.") }
                     return try await .json(engine.remoteCodexQueue(sessionID: id, threadID: request.parameter("thread")))
+                case "/api/codex/goal":
+                    if let forwarded = try await forward(request) { return forwarded }
+                    guard let id=request.parameter("session"),let engine else {throw RemoteHTTPError(400,"Codex 세션을 지정해주세요.")}
+                    return try await .json(engine.remoteCodexGoal(sessionID:id,threadID:request.parameter("thread")))
                 case "/api/receipt":
                     if let forwarded = try await forward(request) { return forwarded }
                     guard let id = request.parameter("request"), UUID(uuidString: id) != nil else { throw RemoteHTTPError(400, "전송 요청을 지정해주세요.") }

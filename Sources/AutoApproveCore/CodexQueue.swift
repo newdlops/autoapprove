@@ -133,7 +133,7 @@ public struct CodexQueueTransport: Sendable {
             }
         }.value
     })
-    private static func isLoadedRoot(_ row: JSONObject, cwd: String) -> Bool {
+    static func isLoadedRoot(_ row: JSONObject, cwd: String) -> Bool {
         guard let path = row["cwd"] as? String, URL(fileURLWithPath: path).resolvingSymlinksInPath().path == URL(fileURLWithPath: cwd).resolvingSymlinksInPath().path,
               let status = (row["status"] as? JSONObject)?["type"] as? String, ["active", "idle", "systemError"].contains(status), row["source"] is String,
               row["parentThreadId"] == nil || row["parentThreadId"] is NSNull else { return false }
@@ -143,7 +143,7 @@ public struct CodexQueueTransport: Sendable {
 
 /// Codex's user-owned Unix control socket carries RFC 6455 WebSocket JSON-RPC.
 /// All blocking I/O runs off the main actor and is bounded by one deadline.
-private final class CodexQueueConnection {
+final class CodexQueueConnection {
     private var fd: Int32 = -1
     private let deadline = Date().addingTimeInterval(8)
     private var sequence = 0
@@ -223,10 +223,10 @@ private final class CodexQueueConnection {
             }
             guard object["id"] as? Int == id else { continue }
             if let error = object["error"] as? JSONObject {
-                if error["code"] as? Int == -32601 { throw AppError.message("이 Codex 버전은 대기열 제어를 지원하지 않습니다. Codex를 업데이트해주세요.") }
-                throw AppError.message("Codex 대기열 요청에 실패했습니다. 목록을 다시 확인해주세요. (\(error["code"] as? Int ?? 0))")
+                if error["code"] as? Int == -32601 { throw RemoteHTTPError(409,"이 Codex 버전은 요청한 제어 기능을 지원하지 않습니다. Codex를 업데이트해주세요.",diagnostics:["delivery":"not_started"]) }
+                throw RemoteHTTPError(409,"Codex 제어 요청이 거절되었습니다. 현재 대화 상태를 다시 확인해주세요. (\(error["code"] as? Int ?? 0))",diagnostics:["delivery":"not_started"])
             }
-            guard let result = object["result"] as? JSONObject else { throw AppError.message("Codex 대기열 응답을 확인하지 못했습니다.") }
+            guard let result = object["result"] as? JSONObject else { throw AppError.message("Codex 제어 응답을 확인하지 못했습니다.") }
             return result
         }
     }

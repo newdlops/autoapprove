@@ -783,6 +783,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
     const headers = body ? {'Content-Type':'application/json'} : validation?.etag ? {'If-None-Match':validation.etag,...(validation.wait ? {Prefer:'wait=15'} : {})} : {};
     if (validation?.expectedNodeID) headers['X-AutoApprove-Node'] = validation.expectedNodeID;
     const response = await fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal, cache: 'no-store', credentials: tunnelAccess ? 'same-origin' : 'omit' });
+    if(controller.signal.aborted)throw new DOMException('Aborted','AbortError');
     if(response.status === 401 && tunnelAccess){
       tunnelAuthExpired=true;
       renderVersionSync();
@@ -806,6 +807,7 @@ async function api(path, body, signal, timeoutMS = 20000, validation) {
       if(!response.ok)return {error:response.status>=500?'Mac과 연결하지 못했습니다. 연결 상태를 확인한 뒤 다시 시도해주세요.':'요청을 처리하지 못했습니다. 다시 로그인하거나 연결 상태를 확인해주세요.'};
       throw error;
     });
+    if(controller.signal.aborted)throw new DOMException('Aborted','AbortError');
     if (!response.ok) throw Object.assign(new Error(result.error || '요청을 처리하지 못했습니다. 상태를 새로고침해주세요.'), {status: response.status, failureKind:result.diagnostics?.failureKind, unsent:result.diagnostics?.delivery === 'not_started', delivery:result.diagnostics?.delivery});
     if (validation) {
       const tag = response.headers.get('ETag') || '';
@@ -1008,8 +1010,8 @@ async function action(nodeID, payload, message) {
   try {
     await api(endpoint('/api/action', nodeID), { ...payload, requestID: uuid() });
     if (message) feedback(message);
-    await refreshNetwork(); return true;
-  } catch (error) { feedback(error.message, true); }
+    await refreshNetwork(false,true); return true;
+  } catch (error) { feedback(error.message, true); await refreshNetwork(false,true); }
   finally { mutation = false; if (selectedItem) $('automatic').checked = selectedItem.session.automatic; updateControls(); renderMachines(); }
 }
 async function resetSelectedAutomation() {
@@ -1129,7 +1131,24 @@ async function readNetworkInventory(path, initial, waiting, signal) {
   }
 }
 
-async function refreshNetwork(initial = false, restart = false) {
+let networkRefreshTask=null,networkRestartTask=null;
+function refreshNetwork(initial = false, restart = false) {
+  if(document.hidden)return Promise.resolve();
+  if(networkRefreshTask){
+    if(!restart)return networkRefreshTask;
+    // Coalesce foreground/write refreshes. Callers await the fresh response,
+    // never the older long poll; a late aborted response cannot overwrite it.
+    networkRefreshRequested=true;networkController?.abort();
+    if(!networkRestartTask)networkRestartTask=networkRefreshTask.then(()=>{
+      networkRestartTask=null;return refreshNetwork(initial,true);
+    });
+    return networkRestartTask;
+  }
+  const task=performNetworkRefresh(initial,restart);
+  networkRefreshTask=task.finally(()=>{networkRefreshTask=null;});
+  return networkRefreshTask;
+}
+async function performNetworkRefresh(initial = false, restart = false) {
   clearTimeout(networkTimer);
   if (document.hidden) return;
   if (loadingNetwork) {
@@ -1560,6 +1579,7 @@ function renderDetail() {
   renderSessionSafety();
   renderCodexProgress(selectedItem);
   renderOSPermissions(selectedItem);
+  renderCodexGoal();
   const terminalHost = `${node.name} · ${session.hostName || hosts[session.terminal]}`;
   text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
   if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
@@ -1604,6 +1624,7 @@ function updateControls() {
   updateInteractionControls();
   updateTerminalRecovery();
   if (!selectedItem) return;
+  renderOSPermissions(selectedItem);
   renderNativeDisplay();
   const current = currentNode(), sessionPresent = allSessions.some(item => item.key === selectedKey);
   const streamLive = !!selectedItem.view.pty && !!ptyClient?.ready;
@@ -3197,24 +3218,48 @@ function renderCodexProgress(item){
 }
 const osPermissionKinds=[['automation','다른 앱 제어'],['accessibility','손쉬운 사용·기기 제어'],['screenRecording','화면 기록'],['camera','카메라'],['microphone','마이크'],['files','파일·폴더 접근'],['localNetwork','로컬 네트워크'],['fullDiskAccess','전체 디스크 접근'],['appManagement','앱 관리'],['other','기타 OS 접근 권한']];
 let osPermissionSignature='';
+const permissionOperations=new Map();
 for(const [kind,title]of osPermissionKinds){
   const label=make('label'),input=document.createElement('input');input.type='checkbox';input.name='osPermissionKind';input.value=kind;input.autocomplete='off';input.id='os-permission-'+kind;
   label.append(input,document.createTextNode(title));$('os-permission-kinds').querySelector('.permission-options').append(label);
   input.addEventListener('change',async()=>{if(!selectedItem)return;const item=selectedItem,restoreFocus=document.activeElement===input,allowed=osPermissionKinds.filter(([key])=>$('os-permission-'+key).checked).map(([key])=>key);
-    const pending=action(item.node.id,{action:'osPermissionPolicy',sessionID:item.session.id,allowed},'이 세션의 OS 권한 정책을 저장했습니다.');renderOSPermissions(item);await pending;if(selectedItem)renderOSPermissions(selectedItem);
+    await permissionAction(item,{action:'osPermissionPolicy',allowed},'이 세션의 OS 권한 정책을 저장했습니다.');
     if(restoreFocus&&selectedItem?.node.id===item.node.id&&selectedItem?.session.id===item.session.id&&document.activeElement===document.body&&!input.disabled)input.focus({preventScroll:true});
   });
 }
-function permissionAction(item,payload,message){void action(item.node.id,{...payload,sessionID:item.session.id},message).finally(()=>{if(selectedItem)renderOSPermissions(selectedItem);});renderOSPermissions(item);}
+async function permissionAction(item,payload,message){
+  if(mutation||!connected||!item.node.online||sessionEnded(item))return;
+  const key=item.key,operation={phase:'saving',allowed:payload.allowed};
+  permissionOperations.set(key,operation);mutation=true;updateControls();renderMachines();
+  try{
+    const result=await api(endpoint('/api/action',item.node.id),{...payload,sessionID:item.session.id,policyRevision:item.session.osPermissionPolicy?.revision||'initial',requestID:uuid()});
+    if(result.sessionID===item.session.id&&result.osPermissionPolicy){
+      for(const current of allSessions.filter(v=>v.node.id===item.node.id&&v.session.id===item.session.id))current.session.osPermissionPolicy=result.osPermissionPolicy;
+      const node=nodes.find(v=>v.id===item.node.id);if(node?.state&&result.osPermissions)node.state.snapshot.osPermissions=result.osPermissions;
+    }
+    operation.phase='confirming';operation.message=message;
+    await refreshNetwork(false,true);
+    operation.phase='saved';feedback(message);
+  }catch(error){
+    operation.phase='error';operation.message=error.message;
+    if(error.delivery==='unknown'||!error.status||error.status>=500)operation.message+=' 자동으로 다시 보내지 않습니다. 최신 정책과 요청 상태를 확인해주세요.';
+    feedback(operation.message,true);await refreshNetwork(false,true);
+  }finally{mutation=false;updateControls();renderMachines();}
+}
 function renderOSPermissions(item){
   const supported=item&&item.session.agent!=='shell'&&supportsRelease(item.node,[0,2,208,235]);show($('os-permissions'),supported);if(!supported)return;
-  const {session,node}=item,policy=session.osPermissionPolicy||{allowed:[],targets:[]},status=node.state.snapshot.osPermissions,online=node.online&&connected&&!sessionEnded(item),disabled=!online||mutation;
+  const {session,node}=item,policy=session.osPermissionPolicy||{allowed:[],targets:[]},status=node.state.snapshot.osPermissions,online=node.online&&connected&&!sessionEnded(item),disabled=!online||mutation,operation=permissionOperations.get(item.key),saving=['saving','confirming'].includes(operation?.phase);
   text($('os-permission-summary'),policy.allowed.length?`이 세션에서 ${policy.allowed.length}종류 허용 · 등록 앱 ${policy.targets.length}개`:'직접 확인 · 이 세션의 OS 권한 자동 승인이 꺼져 있습니다.');
-  text($('os-permission-status'),!online?'Mac 연결이 끊겼습니다. 다시 연결되면 설정을 변경할 수 있습니다.':node.state.snapshot.paused?'전체 일시정지 중에는 OS 권한을 조작하지 않습니다.':status?.detail||'OS 권한 연결을 확인하고 있습니다.');
-  for(const [kind]of osPermissionKinds){const input=$('os-permission-'+kind);if(!mutation)input.checked=policy.allowed.includes(kind);input.disabled=disabled;}
+  text($('os-permission-status'),!online?'Mac 연결이 끊겼습니다. 표시된 정책은 마지막 확인 값입니다.':saving?'정책을 저장하고 최신 상태를 확인하고 있습니다…':operation?.phase==='error'?operation.message:node.state.snapshot.paused?'전체 일시정지 중에는 OS 권한을 조작하지 않습니다.':status?.detail||'OS 권한 연결을 확인하고 있습니다.');
+  $('os-permission-status').className=operation?.phase==='error'?'error-text small':'muted small';
+  for(const [kind]of osPermissionKinds){const input=$('os-permission-'+kind);input.checked=(saving&&operation.allowed||policy.allowed).includes(kind);input.disabled=disabled;}
   const requests=(status?.requests||[]).filter(r=>(!r.sessionID||r.sessionID===session.id)&&r.phase!=='resolved');
-  const signature=JSON.stringify([node.id,session.id,policy.allowed,policy.targets,requests,disabled]);if(signature===osPermissionSignature)return;osPermissionSignature=signature;
+  // Busy/offline changes only update controls. Preserve open disclosures and
+  // focus without rebuilding every permission row on each connection tick.
+  for(const button of $('os-permissions').querySelectorAll('button'))button.disabled=disabled;
+  const signature=JSON.stringify([node.id,session.id,policy.revision,policy.allowed,policy.targets,requests]);if(signature===osPermissionSignature)return;osPermissionSignature=signature;
   const focused=document.activeElement?.dataset.permissionFocus;
+  const expanded=new Set([...$('os-permission-requests').querySelectorAll('article')].filter(row=>row.querySelector('details')?.open).map(row=>row.dataset.permissionId));
   const targets=$('os-permission-targets');targets.replaceChildren();
   if(!policy.targets.length)targets.append(make('p','muted small','등록한 앱이 없습니다. OS 요청이 나타나면 앱과 내용을 확인해 이 세션에 등록하세요.'));
   for(const target of policy.targets){const row=make('div','permission-target');row.append(make('strong','',target.name),make('p','path',target.path));
@@ -3224,7 +3269,7 @@ function renderOSPermissions(item){
   for(const request of requests){const row=make('article','permission-request');row.dataset.permissionId=request.id;
     row.append(make('h4','',`${request.requester?.name||'요청 앱 미확인'} · ${request.kind==='authentication'?'Mac 사용자 인증':osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind}`),make('p','',request.detail));
     if(request.requester)row.append(make('p','path',request.requester.path));
-    const details=document.createElement('details'),summary=make('summary','','OS 요청 내용');details.append(summary,make('pre','terminal-text',request.content));row.append(details);
+    const details=document.createElement('details'),summary=make('summary','','OS 요청 내용');details.open=expanded.has(request.id);summary.dataset.permissionFocus='details-'+request.id;details.append(summary,make('pre','terminal-text',request.content));row.append(details);
     const controls=make('div','question-actions'),token=request.id+'\u0000'+(request.requester?`${request.requester.pid}:${request.requester.started}:${request.requester.id}`:'?');
     const addButton=(title,key,payload,message)=>{const button=make('button','secondary',title);button.type='button';button.disabled=disabled;button.dataset.permissionFocus=key;button.addEventListener('click',()=>permissionAction(item,{...payload,permissionID:request.id,permissionToken:token},message));controls.append(button);};
     if(!request.managementApp&&request.phase==='waiting'&&request.action!=='manual'&&!policy.allowed.includes(request.kind))addButton(`이 세션에서 ${osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind} 허용`,'allow-kind-'+request.id,{action:'osPermissionPolicy',allowed:[...policy.allowed,request.kind]},'이 세션의 해당 OS 권한을 허용했습니다.');
@@ -3238,6 +3283,86 @@ function renderOSPermissions(item){
   if(focused){const next=[...$('os-permissions').querySelectorAll('[data-permission-focus]')].find(e=>e.dataset.permissionFocus===focused);(next||$('os-permission-options').querySelector('summary')).focus({preventScroll:true});}
 }
 $('codex-progress-enabled').addEventListener('change',()=>{if(selectedItem)void action(selectedItem.node.id,{action:'codexProgressRecovery',enabled:$('codex-progress-enabled').checked},'이 Mac의 Codex 진척 확인 설정을 적용했습니다.');});
+const goalStates=new Map(),goalStatusNames={active:'진행 중',paused:'일시정지',blocked:'진행 막힘',usageLimited:'사용량 제한',budgetLimited:'예산 제한',complete:'완료'};
+let goalSelection='',goalTimer;
+function goalState(item=selectedItem){
+  if(!item)return null;
+  if(!goalStates.has(item.key))goalStates.set(item.key,{snapshot:null,checked:0,loading:false,changing:false,error:'',thread:null,generation:0});
+  // Keep only a bounded page-local cache; never persist goals or objectives.
+  if(goalStates.size>64)for(const [key,state]of goalStates)if(key!==item.key&&!state.loading&&!state.changing){goalStates.delete(key);break;}
+  return goalStates.get(item.key);
+}
+function renderCodexGoal(){
+  clearTimeout(goalTimer);
+  const item=selectedItem,supported=item?.session.agent==='codex'&&supportsRelease(item.node,[0,2,209,236]);
+  show($('codex-goal'),supported);if(!supported)return;
+  const state=goalState(item),snapshot=state.snapshot,goal=snapshot?.goal,online=connected&&currentNode()?.online&&!sessionEnded(item),busy=state.loading||state.changing;
+  if(goalSelection!==item.key){goalSelection=item.key;show($('goal-cancel-confirm'),false);show($('goal-thread-picker'),false);$('goal-objective-details').open=false;}
+  text($('goal-status'),!online?'연결 끊김 · 마지막 확인 상태':state.changing?'Goal 변경 결과를 확인하고 있습니다…':state.loading&&!snapshot?'Goal을 확인하고 있습니다…':snapshot?(goal?goalStatusNames[goal.status]||'상태 미확인':'현재 대화에 Goal이 없습니다.'):'현재 대화의 Goal을 확인합니다.');
+  text($('goal-usage'),goal?`${state.thread?.title?state.thread.title+' · ':''}${Number(goal.tokensUsed).toLocaleString('ko-KR')} 토큰${goal.tokenBudget!=null?' / '+Number(goal.tokenBudget).toLocaleString('ko-KR'):''} · ${Math.floor(goal.timeUsedSeconds/60).toLocaleString('ko-KR')}분`:'');
+  text($('goal-objective'),goal?.objective||'');show($('goal-objective-details'),!!goal);
+  text($('goal-help'),goal?.status==='budgetLimited'?'Goal 예산을 모두 사용했습니다. 원래 Codex에서 예산을 조정한 뒤 재개해주세요.':snapshot?.detail||'원래 대화를 확인한 뒤 Goal 재개·취소를 선택할 수 있습니다.');
+  text($('goal-error'),state.error);show($('goal-error'),!!state.error);
+  $('refresh-goal').disabled=!online||busy;setBusy($('refresh-goal'),state.loading);
+  const locked=!online||busy||mutation||!snapshot||!state.checked||!!state.error;
+  $('resume-goal').disabled=locked||!snapshot?.canResume;$('cancel-goal').disabled=locked||!snapshot?.canCancel;
+  $('confirm-cancel-goal').disabled=$('cancel-goal').disabled;$('keep-goal').disabled=state.changing;
+  show($('choose-goal-thread'),!!state.error||!!state.thread);$('choose-goal-thread').disabled=!online||busy;
+  $('use-goal-thread').disabled=!online||busy||!$('goal-thread').value;$('goal-thread').disabled=busy||!online;
+  if(online&&!busy&&!document.hidden){
+    const delay=state.checked?Math.max(1000,10000-(performance.now()-state.checked)):0;
+    goalTimer=setTimeout(()=>void refreshCodexGoal(false),delay);
+  }
+}
+async function refreshCodexGoal(explicit=true){
+  const item=selectedItem;if(!item||item.session.agent!=='codex'||!supportsRelease(item.node,[0,2,209,236])||!connected||!currentNode()?.online||document.hidden)return;
+  const state=goalState(item);if(state.loading||state.changing)return;
+  const generation=++state.generation;state.loading=true;if(explicit)state.error='';renderCodexGoal();
+  try{
+    const result=await api(endpoint('/api/codex/goal',item.node.id,item.session.id)+(state.thread?'&thread='+encodeURIComponent(state.thread.id):''));
+    if(generation!==state.generation)return;
+    if(result.sessionID!==item.session.id||typeof result.threadID!=='string'||state.thread&&result.threadID!==state.thread.id||!['control','terminal'].includes(result.transport)||result.goal&&(!goalStatusNames[result.goal.status]||result.goal.threadId!==result.threadID||typeof result.revision!=='string'||typeof result.goal.objective!=='string'))throw new Error('원래 대화의 Goal 응답을 확인하지 못했습니다.');
+    state.snapshot=result;if(explicit)state.error='';
+  }catch(error){if(generation===state.generation)state.error=error.message;}
+  finally{if(generation===state.generation){state.loading=false;state.checked=performance.now();}if(selectedKey===item.key)renderCodexGoal();}
+}
+async function chooseGoalThread(){
+  const item=selectedItem;if(!item||$('choose-goal-thread').disabled)return;
+  const state=goalState(item),generation=++state.generation;state.loading=true;renderCodexGoal();
+  try{
+    const result=await api(endpoint('/api/codex/conversations',item.node.id,item.session.id));
+    if(selectedKey!==item.key||generation!==state.generation)return;
+    if(result.sessionID!==item.session.id||!Array.isArray(result.items))throw new Error('이 세션의 대화 목록을 확인하지 못했습니다.');
+    if(result.available===false)throw new Error(result.unavailableReason||'원래 Codex의 대화를 확인해주세요.');
+    $('goal-thread').replaceChildren(new Option('원래 Codex의 대화를 선택해주세요.',''));
+    for(const entry of result.items){const option=new Option(`${entry.title} · ${entry.id.slice(0,8)}`,entry.id);option.dataset.title=entry.title;$('goal-thread').append(option);}
+    show($('goal-thread-picker'),true);state.error=result.items.length?'':'이 폴더에서 실행 중인 대화를 찾지 못했습니다.';
+    $('goal-thread').focus({preventScroll:true});
+  }catch(error){state.error=error.message;}
+  finally{state.loading=false;state.checked=performance.now();if(selectedKey===item.key)renderCodexGoal();}
+}
+async function changeGoal(action){
+  const item=selectedItem,button=action==='resumeGoal'?$('resume-goal'):$('confirm-cancel-goal');if(!item||button.disabled)return;
+  const state=goalState(item),snapshot=state.snapshot;state.changing=true;state.error='';show($('goal-cancel-confirm'),false);renderCodexGoal();
+  try{
+    const result=await api(endpoint('/api/action',item.node.id),{action,sessionID:item.session.id,threadID:snapshot.threadID,goalRevision:snapshot.revision,requestID:uuid()});
+    feedback(result.message||'Goal을 변경했습니다.');
+  }catch(error){state.error=error.message+(error.delivery==='unknown'||!error.status||error.status>=500?' 같은 명령을 다시 보내지 않습니다. Goal 갱신으로 결과를 확인해주세요.':'');}
+  finally{
+    state.changing=false;state.checked=0;state.snapshot=null;
+    if(selectedKey===item.key){await refreshCodexGoal(false);$('refresh-goal').focus({preventScroll:true});}
+    await refreshNetwork(false,true);
+  }
+}
+$('refresh-goal').addEventListener('click',()=>void refreshCodexGoal());
+$('resume-goal').addEventListener('click',()=>void changeGoal('resumeGoal'));
+$('cancel-goal').addEventListener('click',()=>{show($('goal-cancel-confirm'),true);$('keep-goal').focus({preventScroll:true});});
+$('confirm-cancel-goal').addEventListener('click',()=>void changeGoal('cancelGoal'));
+$('keep-goal').addEventListener('click',()=>{show($('goal-cancel-confirm'),false);$('cancel-goal').focus({preventScroll:true});});
+$('choose-goal-thread').addEventListener('click',()=>void chooseGoalThread());
+$('goal-thread').addEventListener('change',renderCodexGoal);
+$('use-goal-thread').addEventListener('click',()=>{if($('use-goal-thread').disabled)return;const state=goalState(),option=$('goal-thread').selectedOptions[0];state.thread={id:option.value,title:option.dataset.title};state.snapshot=null;state.checked=0;show($('goal-thread-picker'),false);void refreshCodexGoal();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(goalTimer);else renderCodexGoal();});
 for(const [id,name]of [['codex-progress-check','checkCodexProgress'],['codex-progress-cancel','cancelCodexProgress']])$(id).addEventListener('click',()=>{if(selectedItem)void action(selectedItem.node.id,{action:name,sessionID:selectedItem.session.id},name==='checkCodexProgress'?'원래 Codex의 진행 확인을 시작합니다.':'진행 확인을 취소했습니다.');});
 $('terminal-history-open').addEventListener('click',()=>void openTerminalHistory());
 resetKeyboard();

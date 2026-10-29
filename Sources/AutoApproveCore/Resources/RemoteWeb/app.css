@@ -30,7 +30,12 @@ button:disabled { cursor: default; opacity: .5; }
 #os-permission-kinds legend { font-weight: 600; padding: 8px 0; }
 .permission-request, .permission-target { padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .permission-request:last-child, .permission-target:last-child { border-bottom: 0; }
-#os-permissions summary { cursor: pointer; min-height: 44px; padding: 10px 0; }
+#os-permissions summary, #codex-goal summary { cursor: pointer; min-height: 44px; padding: 10px 0; }
+.goal-objective { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 18rem; overflow: auto; }
+#codex-goal p { overflow-wrap: anywhere; }
+#goal-thread-picker label { display: block; margin: 12px 0 8px; }
+#goal-thread-picker select { width: 100%; margin-bottom: 8px; }
+#goal-cancel-confirm { margin-top: 12px; }
 input[type=search], input[type=text], input[type=number], textarea, select { min-height: 44px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: 16px; min-width: 0; }
 textarea { resize: vertical; width: 100%; line-height: 1.5; }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }

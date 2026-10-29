@@ -166,6 +166,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private let codexQueue: CodexQueueTransport
+    private let codexGoals:CodexGoalTransport
+    private var changingGoals=Set<String>()
+    private var changingGoalThreads=Set<String>()
+    private var manualGoalHoldCache:[String:String]=[:]
     private var clearingCodexQueues = Set<String>()
     private var replyingQuestions = Set<String>()
     private var sendingMessages = Set<String>()
@@ -370,7 +374,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
-                osPermissionServices:OSPermissionServices? = nil) throws {
+                osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live) throws {
         self.paths = paths
         self.osPermissionServices=osPermissionServices ?? (processReader == nil ? OSPermissionAutomation.live:.inactive)
         self.osPermissionMonitoringEnabled=processReader==nil || osPermissionServices != nil
@@ -397,6 +401,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.screenAdapters = adapters.merging(screenAdapters) { _, explicit in explicit }
         self.questionTransport = questionTransport
         self.codexQueue = codexQueue
+        self.codexGoals = codexGoals
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
         // Native window checks need one original process, not a system-wide
@@ -1750,7 +1755,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[id].map {nativeKeyboardActivity.hasPriority(terminal:$0.terminal) || testScreens.remoteControl.hasInputPriority(terminal:$0.terminal)} ?? false
     }
     private func userInputHasPriority(_ id:String) -> Bool {
-        remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
+        changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
@@ -1847,7 +1852,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard let id = object["sessionID"] as? String, let session = sessions[id],
               session.phase != .ended || ["cancelCapacity","read"].contains(action) else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
+        if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission"].contains(action) {
+            guard object["policyRevision"] as? String == (session.osPermissionPolicy?.revision ?? "initial"),
+                  try remoteProcessVerifier(session) else {
+                throw RemoteHTTPError(409,"OS 권한 정책이나 원래 실행이 바뀌었습니다. 최신 상태를 확인한 뒤 다시 선택해주세요.",diagnostics:["delivery":"not_started"])
+            }
+        }
         switch action {
+        case "resumeGoal","cancelGoal": return try await changeCodexGoal(session,object:object,action:action=="resumeGoal" ? .resume:.cancel)
         case "resetAutomation":
             let result = try resetAutomation(id)
             return ["ok": true, "sessionCount": result.sessionCount, "cancelledTasks": result.cancelledTasks,
@@ -1973,6 +1985,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case "cancelCapacity": cancelCapacityResume(id)
         default: throw RemoteHTTPError(400, "지원하지 않는 동작입니다.")
         }
+        if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission"].contains(action) {
+            let encoder=JSONEncoder();encoder.dateEncodingStrategy = .iso8601
+            return ["ok":true,"sessionID":id,"osPermissionPolicy":try JSONSerialization.jsonObject(with:encoder.encode(sessions[id]?.osPermissionPolicy ?? OSPermissionPolicy())),
+                    "osPermissions":try JSONSerialization.jsonObject(with:encoder.encode(snapshot.osPermissions ?? OSPermissionMonitorStatus()))]
+        }
         return ["ok": true]
     }
 
@@ -1984,6 +2001,106 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let items = try await codexQueue.conversations(target, session.cwd)
         try validateCodexQueueSession(session, threadID: nil)
         return RemoteCodexConversations(sessionID: sessionID, items: items)
+    }
+
+    private func codexGoalTarget(_ session:AgentSession,threadID:String?) async throws -> CodexReplyTarget {
+        let target:CodexReplyTarget
+        if let threadID {target=try await questionTransport.prepareQueue(session,threadID)}
+        else {target=try await questionTransport.prepareMessage(session)}
+        guard UUID(uuidString:target.threadID) != nil,threadID==nil || threadID==target.threadID else {throw RemoteHTTPError(409,"원래 Codex 대화를 다시 선택해주세요.")}
+        // Without a control server, only the thread opened by this exact CLI
+        // can receive a slash command. A same-folder thread is not sufficient.
+        if !target.queueAvailable,threadID != nil {
+            let original=try await questionTransport.prepareMessage(session)
+            guard original.threadID==target.threadID,original.home==target.home else {throw RemoteHTTPError(409,"선택한 대화가 원래 터미널의 대화와 다릅니다.")}
+        }
+        try validateCodexQueueSession(session,threadID:target.threadID)
+        return target
+    }
+    private func manualGoalHold(_ id:String)->String {
+        if let value=manualGoalHoldCache[id] {return value}
+        let value=store.value("manualGoalHold:"+id) ?? "";manualGoalHoldCache[id]=value
+        if manualGoalHoldCache.count>512 {manualGoalHoldCache=manualGoalHoldCache.filter {sessions[$0.key] != nil || $0.key==id}}
+        return value
+    }
+    private func hasManualGoalHold(_ id:String)->Bool {!manualGoalHold(id).isEmpty}
+    private func setManualGoalHold(_ id:String,_ value:String) throws {
+        try store.set("manualGoalHold:"+id,value);manualGoalHoldCache[id]=value
+    }
+    public func remoteCodexGoal(sessionID:String,threadID:String?=nil) async throws -> RemoteCodexGoal {
+        guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {throw RemoteHTTPError(404,"실행 중인 Codex 세션을 선택해주세요.")}
+        let target=try await codexGoalTarget(session,threadID:threadID)
+        let goal=try await codexGoals.read(target,session.cwd)
+        try validateCodexQueueSession(session,threadID:target.threadID)
+        if let goal,let hold=try? JSONDecoder().decode(ManualGoalHold.self,from:Data(manualGoalHold(sessionID).utf8)),
+           !hold.belongs(to:goal) || hold.action=="resume" && goal.status == .active {
+            try setManualGoalHold(sessionID,"")
+        }
+        var ready=target.queueAvailable,detail="Goal 취소는 목표를 해제합니다. 대화는 보존되며 실행 중인 작업은 계속될 수 있습니다."
+        if !ready,goal != nil {
+            let frame=try await remoteTerminal(sessionID:sessionID,realtime:true)
+            ready=frame.inputReason==nil && frame.keys.contains("submit") && CodexGoalScreen.ready(frame.screen)
+            detail=ready ? "원래 터미널에 Goal 명령을 전달합니다. 목표를 취소해도 대화는 보존됩니다.":"원래 터미널이 빈 입력 대기 상태가 되면 Goal을 변경할 수 있습니다. 작성 중인 입력과 실행 중인 작업을 먼저 확인해주세요."
+        }
+        try validateCodexQueueSession(session,threadID:target.threadID)
+        return RemoteCodexGoal(sessionID:sessionID,threadID:target.threadID,goal:goal,revision:goal?.revision,transport:target.queueAvailable ? "control":"terminal",canResume:ready && goal?.canResume==true,canCancel:ready && goal != nil,detail:detail)
+    }
+    private func changeCodexGoal(_ session:AgentSession,object:JSONObject,action:CodexGoalAction) async throws -> JSONObject {
+        let id=session.id
+        guard session.agent == .codex,let thread=object["threadID"] as? String,let revision=object["goalRevision"] as? String,
+              !changingGoals.contains(id),!automaticInputBusy(id),!remoteInputSessions.contains(id) else {throw RemoteHTTPError(409,"현재 Goal과 진행 중인 입력을 다시 확인해주세요.",diagnostics:["delivery":"not_started"])}
+        changingGoals.insert(id);defer {changingGoals.remove(id)}
+        let target=try await codexGoalTarget(session,threadID:thread),threadKey=target.home+"\u{0}"+thread
+        guard changingGoalThreads.insert(threadKey).inserted else {throw RemoteHTTPError(409,"이 대화의 Goal을 변경 중입니다. 결과를 기다려주세요.",diagnostics:["delivery":"not_started"])}
+        defer {changingGoalThreads.remove(threadKey)}
+        guard let expected=try await codexGoals.read(target,session.cwd),expected.revision==revision,
+              action == .cancel || expected.canResume else {throw RemoteHTTPError(409,"Goal이나 재개 조건이 바뀌었습니다. 최신 목표를 확인해주세요.",diagnostics:["delivery":"not_started"])}
+        try validateCodexQueueSession(session,threadID:thread)
+        guard !automaticInputBusy(id) else {throw RemoteHTTPError(409,"이미 진행 중인 승인 입력의 결과를 기다려주세요.",diagnostics:["delivery":"not_started"])}
+        // Persist the hold before any write. A lost acknowledgement or restart
+        // must not let a stale blocked footer revive this user's cancelled Goal.
+        try setManualGoalHold(id,String(decoding:JSONEncoder().encode(ManualGoalHold(goal:expected,action:action.rawValue)),as:UTF8.self))
+        cancelCapacityResume(id);cancelCodexProgressCheck(id)
+        var event=AuditEvent(sessionID:id,summary:action == .resume ? "Goal 재개":"Goal 취소",outcome:"Goal 명령 전달 확인 중",source:"웹 Goal 관리",context:AuditContext(session:session),answer:action.command)
+        guard log(event) else {throw RemoteHTTPError(503,"Goal 변경 기록을 저장하지 못했습니다.",diagnostics:["delivery":"not_started"])}
+        var started=false
+        do {
+            if target.queueAvailable {
+                try validateCodexQueueSession(session,threadID:thread)
+                started=true
+                _ = try await codexGoals.change(target,session.cwd,expected,action)
+            } else {
+                let frame=try await remoteTerminal(sessionID:id,realtime:true)
+                guard frame.inputReason==nil,frame.keys.contains("submit"),CodexGoalScreen.ready(frame.screen) else {throw RemoteHTTPError(409,"원래 Codex의 빈 입력창을 확인해주세요. 초안이나 작업을 변경하지 않았습니다.",diagnostics:["delivery":"not_started"])}
+                let freshTarget=try await questionTransport.prepareMessage(session)
+                guard freshTarget.threadID==thread,freshTarget.home==target.home,
+                      try await codexGoals.read(freshTarget,session.cwd)?.revision==revision else {throw RemoteHTTPError(409,"원래 대화나 Goal이 바뀌었습니다.",diagnostics:["delivery":"not_started"])}
+                // The input path rechecks process, TTY, exact screen and source
+                // immediately before writing, and never retries this command.
+                started=true
+                _ = try await remoteInput(["sessionID":id,"revision":frame.revision,"kind":"submit","text":action.command],automaticAuthorization:{
+                    try self.validateCodexQueueSession(session,threadID:thread)
+                    guard self.changingGoals.contains(id) else {throw CancellationError()}
+                })
+                // Read-only confirmation; never type the command again.
+                var confirmed=false
+                for _ in 0..<8 {
+                    try await Task.sleep(for:.milliseconds(150))
+                    let value=try await codexGoals.read(freshTarget,session.cwd)
+                    try validateCodexQueueSession(session,threadID:thread)
+                    if action == .cancel ? value==nil:value?.status == .active && value?.createdAt==expected.createdAt && value?.objective==expected.objective {confirmed=true;break}
+                }
+                guard confirmed else {throw AppError.message("Goal 명령의 반영을 아직 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 상태를 갱신해주세요.")}
+            }
+            if action == .resume {try setManualGoalHold(id,"")}
+            event.outcome=action == .resume ? "Goal 재개 확인":"Goal 취소 확인";_ = log(event)
+            return ["ok":true,"message":action == .resume ? "Goal을 재개했습니다.":"Goal을 취소했습니다. 대화는 보존됩니다. 현재 실행 중인 작업은 계속될 수 있습니다."]
+        } catch {
+            event.outcome=started ? "Goal 결과 확인 필요":"Goal 미전달";_ = log(event)
+            var diagnostics=(error as? RemoteHTTPError)?.diagnostics ?? [:]
+            if diagnostics["delivery"]==nil {diagnostics["delivery"]=started ? "unknown":"not_started"}
+            throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 503,error.localizedDescription,diagnostics:diagnostics)
+        }
     }
 
     public func remoteCodexQueue(sessionID: String, threadID: String? = nil) async throws -> RemoteCodexQueue {
@@ -5157,6 +5274,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func startCapacityRun(_ id: String, stop: CodexCapacityStop, channel: ApprovalChannel, attempt: Int, at now: Date) {
+        if hasManualGoalHold(id) {return}
         let delays = recoveryDelays(for: stop.kind)
         var state = CapacityState(phase: .waiting, stop: stop, channel: channel, attempt: attempt,
             deadline: now, observedAt: now)
@@ -5189,6 +5307,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func osPermissionSource(_ session:AgentSession)->String {"\(session.agent.rawValue):\(session.pid):\(session.started):\(session.tty)"}
     private func saveOSPermissionPolicy(_ session:AgentSession,_ policy:OSPermissionPolicy) throws {
+        var policy=policy;policy.revision=UUID().uuidString
         let value=OSPermissionPolicyEnvelope(source:osPermissionSource(session),policy:policy)
         try store.set("osPermissionPolicy:"+session.id,String(decoding:JSONEncoder().encode(value),as:UTF8.self))
         sessions[session.id]?.osPermissionPolicy=policy
@@ -5379,7 +5498,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return status
     }
     private func codexProgressEligible(_ session:AgentSession,allowInterrupted:Bool=false)->Bool {
-        !hasOSPermissionWait(session.id) && !remoteInputStopped && snapshot.codexProgressRecoveryEnabled != false && !snapshot.paused && session.automatic &&
+        !hasManualGoalHold(session.id) && !hasOSPermissionWait(session.id) && !remoteInputStopped && snapshot.codexProgressRecoveryEnabled != false && !snapshot.paused && session.automatic &&
             session.agent == .codex && session.terminal == .terminal && session.channel == .terminalScreen && session.phase != .ended &&
             (codexProgressFinishedTurn(session.id)==nil || allowInterrupted && codexProgressFinishedTurn(session.id)=="interrupted")
     }

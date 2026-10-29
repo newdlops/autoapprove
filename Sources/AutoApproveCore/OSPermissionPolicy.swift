@@ -58,6 +58,9 @@ public struct OSPermissionTarget:Codable,Equatable,Identifiable,Sendable {
 }
 
 public struct OSPermissionPolicy:Codable,Equatable,Sendable {
+    /// Changes on every saved policy, including a return to the default. Old
+    /// browser snapshots cannot restore permissions revoked in another client.
+    public var revision:String?
     public var allowed:[OSPermissionKind] = []
     public var targets:[OSPermissionTarget] = []
     public init(allowed:[OSPermissionKind]=[],targets:[OSPermissionTarget]=[]) {self.allowed=Array(Set(allowed)).sorted {$0.rawValue<$1.rawValue};self.targets=targets}

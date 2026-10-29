@@ -31,8 +31,11 @@ function keychainSearchList() {
   });
 }
 
-function withSigningKeychain(keychain,sign) {
+function withSigningKeychain(keychain,sign,{readOnly=false}={}) {
   if(!keychain)return sign();
+  // A restricted release uses the explicitly supplied, already available key.
+  // It must fail normally if signing needs an unlock or a search-list change.
+  if(readOnly)return sign();
   const before=keychainSearchList();
   if(before.includes(keychain))return sign();
   const during=[...before,keychain];
@@ -47,6 +50,8 @@ function withSigningKeychain(keychain,sign) {
 }
 
 export async function signApp(app,{allowProvisioning=true,prepare}={}) {
+  const readOnly=process.env.AUTOAPPROVE_SIGNING_READ_ONLY==='1';
+  if(readOnly)allowProvisioning=false;
   let identity=process.env.AUTOAPPROVE_SIGNING_IDENTITY;
   let keychain=process.env.AUTOAPPROVE_SIGNING_KEYCHAIN;
   if(keychain&&!path.isAbsolute(keychain))throw new Error('AUTOAPPROVE_SIGNING_KEYCHAIN must be an absolute path');
@@ -85,7 +90,7 @@ export async function signApp(app,{allowProvisioning=true,prepare}={}) {
     }
     assert.match(saved.identity,/^[A-Fa-f0-9]{40}$/);
     if(!/^[A-Fa-f0-9]{64}$/.test(saved.password))throw new Error('Invalid private signing metadata; restore the signing backup');
-    keychainCommand(['unlock-keychain','-p',saved.password,keychain]);
+    if(!readOnly)keychainCommand(['unlock-keychain','-p',saved.password,keychain]);
     identity=saved.identity;
   }
   assert.ok(identity!=='-','Ad-hoc identity invalidates privacy permission on every update');
@@ -106,6 +111,6 @@ export async function signApp(app,{allowProvisioning=true,prepare}={}) {
     execFileSync('/usr/bin/codesign',['--verify','--deep','--strict',app],{stdio:'inherit'});
     const requirement=execFileSync('/usr/bin/codesign',['-d','-r-',app],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
     assert.ok(requirement.includes('identifier "local.autoapprove.mac"')&&/certificate|anchor/.test(requirement)&&!requirement.includes('cdhash'),'Publisher identity must survive binary changes and remain signer-bound');
-  });
+  },{readOnly});
   console.log('Signed with stable publisher identity; private keychain stays outside release assets.');
 }

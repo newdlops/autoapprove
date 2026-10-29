@@ -76,6 +76,16 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
               <div id="os-permission-targets"></div>
             </details>
           </section>
+          <section id="codex-goal" class="question" aria-labelledby="codex-goal-heading" hidden>
+            <h3 id="codex-goal-heading">Codex Goal</h3>
+            <p id="goal-status" role="status" aria-live="polite"></p>
+            <p id="goal-usage" class="muted small"></p>
+            <details id="goal-objective-details" hidden><summary>목표 내용</summary><p id="goal-objective" class="goal-objective" tabindex="0"></p></details>
+            <p id="goal-help" class="muted small"></p><p id="goal-error" class="error-text small" role="status" hidden></p>
+            <div class="question-actions"><button id="refresh-goal" type="button" class="secondary">Goal 갱신</button><button id="resume-goal" type="button">Goal 재개</button><button id="cancel-goal" type="button" class="secondary">Goal 취소</button><button id="choose-goal-thread" type="button" class="secondary" hidden>대화 선택</button></div>
+            <div id="goal-thread-picker" hidden><label for="goal-thread">같은 폴더에서 실행 중인 대화</label><select id="goal-thread" name="goalThread" autocomplete="off"></select><button id="use-goal-thread" type="button" class="secondary">이 대화의 Goal 보기</button></div>
+            <div id="goal-cancel-confirm" class="notice" hidden><p>이 목표를 해제할까요? 대화는 보존됩니다. 실행 중인 작업을 멈추려면 터미널에서 별도로 중단해주세요.</p><div class="question-actions"><button id="confirm-cancel-goal" type="button" class="danger">Goal 취소 확인</button><button id="keep-goal" type="button" class="secondary">유지</button></div></div>
+          </section>
           <section id="codex-progress" class="question" aria-labelledby="codex-progress-heading" hidden>
             <h3 id="codex-progress-heading">Codex 진척 확인</h3>
             <label class="switch-label"><input id="codex-progress-enabled" name="codexProgressRecoveryEnabled" autocomplete="off" type="checkbox" role="switch" aria-describedby="codex-progress-help"><span>이 Mac의 Codex 자동 확인</span></label>

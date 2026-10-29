@@ -5,6 +5,36 @@ import Darwin
 import AutoApproveCore
 import TerminalInputSupport
 
+private func previewGoalThread(_ pid:Int32)->String {"00000000-0000-4000-8000-"+String(format:"%012d",pid)}
+private final class PreviewGoals:@unchecked Sendable {
+    let directory:URL
+    private let lock=NSLock()
+    private var goals:[String:CodexGoal]=[:],removed=Set<String>(),control=Data(),actions:[JSONObject]=[]
+    private var reads=0
+    init(_ directory:URL) {self.directory=directory}
+    func read(_ thread:String)->CodexGoal? {
+        lock.lock();defer{lock.unlock()};reads+=1
+        let latest=(try? Data(contentsOf:directory.appendingPathComponent("goal-control.json"))) ?? Data()
+        if latest != control {
+            control=latest
+            if let row=(try? JSONSerialization.jsonObject(with:latest)) as? JSONObject,let id=row["threadID"] as? String {
+                if row["empty"] as? Bool==true {removed.insert(id);goals.removeValue(forKey:id)}
+                else {removed.remove(id);goals[id]=CodexGoal(threadId:id,objective:row["objective"] as? String ?? "격리된 새 목표",status:(row["status"] as? String).flatMap(CodexGoal.Status.init(rawValue:)) ?? .blocked,createdAt:(row["createdAt"] as? Int64) ?? 200,updatedAt:210)}
+            }
+        }
+        if goals[thread]==nil,!removed.contains(thread) {goals[thread]=CodexGoal(threadId:thread,objective:"연결을 안정적으로 복구하고 현재 작업을 이어갑니다.\n"+String(repeating:"긴 목표 한글🙂 <img src=x onerror=alert(1)> /fixture/long-path ",count:24),status:.blocked,createdAt:100,updatedAt:110,tokensUsed:12345,timeUsedSeconds:240)}
+        report();return goals[thread]
+    }
+    func change(_ target:CodexReplyTarget,_ expected:CodexGoal,_ action:CodexGoalAction) throws -> CodexGoal? {
+        lock.lock();defer{lock.unlock()}
+        guard goals[target.threadID]?.revision==expected.revision else {throw RemoteHTTPError(409,"합성 Goal이 바뀌었습니다.")}
+        actions.append(["thread":target.threadID,"action":action.rawValue])
+        if action == .resume {goals[target.threadID]?.status = .active} else {removed.insert(target.threadID);goals.removeValue(forKey:target.threadID)}
+        report();return goals[target.threadID]
+    }
+    private func report(){if let data=try? JSONSerialization.data(withJSONObject:["reads":reads,"actions":actions,"realTerminalInputs":0]) {try? data.write(to:directory.appendingPathComponent("goal-report.json"),options:.atomic)}}
+}
+
 private final class PreviewOSPermissions:@unchecked Sendable {
     let directory:URL
     private let lock=NSLock()
@@ -123,7 +153,13 @@ private final class PreviewScreens: @unchecked Sendable {
         let records = ProcessDiscovery.parse((0..<6).map { index in
             "\(82000 + index) 1 ttys0\(80 + index) \(82000 + index) \(82000 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/codex"
         }.joined(separator: "\n"))
-        let transport = CodexReplyTransport(prepare: { _, question in CodexReplyTarget(executable: "/fixture/codex", home: directory.path, threadID: question.threadID) }, send: { _, _ in UUID().uuidString })
+        let goalMode=CommandLine.arguments.contains("--codex-goals"),goalState=PreviewGoals(directory)
+        let transport = CodexReplyTransport(prepare: { _, question in CodexReplyTarget(executable: "/fixture/codex", home: directory.path, threadID: question.threadID) }, send: { _, _ in UUID().uuidString },prepareMessage:{session in
+            guard goalMode else {return try await CodexReplyTransport.messageTarget(session)}
+            return CodexReplyTarget(executable:"/fixture/codex",home:directory.path,threadID:previewGoalThread(session.pid))
+        })
+        let goals=CodexGoalTransport(read:{target,_ in goalState.read(target.threadID)},change:{target,_,expected,action in try goalState.change(target,expected,action)})
+        let goalQueue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{target,_ in [.init(id:target.threadID,title:"원래 실행 중인 Codex 대화 · 검증용")]})
         var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map {
             TerminalScreen(tty: $0.tty, contents: state.read($0.tty), title: "검증용 \(label) · " + $0.tty,
                 appearance: Self.fixtureAppearance(state.read($0.tty)))
@@ -152,11 +188,11 @@ private final class PreviewScreens: @unchecked Sendable {
         if osMode {osServices=OSPermissionServices(scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")})} else {osServices=nil}
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
             claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
-            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,osPermissionServices:osServices)
+            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,codexQueue:goalMode ? goalQueue:.live,osPermissionServices:osServices,codexGoals:goals)
         if let raw=CommandLine.arguments.first(where:{$0.hasPrefix("--progress-delay=")}),let seconds=Double(raw.dropFirst("--progress-delay=".count)) {engine.codexProgressTimeout=seconds}
         try engine.start(poll: false)
         var sessions = ProcessDiscovery.sessions(records)
-        sessions[0].id += "+한글 검증"
+        if !goalMode {sessions[0].id += "+한글 검증"}
         for index in sessions.indices {
             sessions[index].terminal = .terminal
             sessions[index].cwd = "/Users/qa/projects/" + ["autoapprove", "결제-서비스", "아주-긴-프로젝트-이름-네트워크-협력-터미널-화면-검증", "api-server", "문서-정리", "배포-작업"][index]
@@ -179,7 +215,7 @@ private final class PreviewScreens: @unchecked Sendable {
         if progressMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
         if osMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
         engine.updateGitBranches(sessions.map { GitBranchUpdate(sessionID: $0.id, cwd: $0.cwd, state: .init(kind: .branch, name: "feature/network-sessions")) })
-        let question = QueuedQuestion(id: "fixture-question-" + label, threadID: UUID().uuidString, title: "어떤 환경에서 네트워크 연결을 확인할까요? 검증용 질문이며 실제 작업에는 영향을 주지 않습니다.", options: ["개인 핫스팟에서 확인", "같은 Wi-Fi에서 확인", "긴 선택지의 줄바꿈과 선택 영역이 작은 휴대폰 화면에서도 유지되는지 확인"])
+        let question = QueuedQuestion(id: "fixture-question-" + label, threadID:goalMode ? previewGoalThread(sessions[1].pid):UUID().uuidString, title: "어떤 환경에서 네트워크 연결을 확인할까요? 검증용 질문이며 실제 작업에는 영향을 주지 않습니다.", options: ["개인 핫스팟에서 확인", "같은 Wi-Fi에서 확인", "긴 선택지의 줄바꿈과 선택 영역이 작은 휴대폰 화면에서도 유지되는지 확인"])
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: sessions[1].id, questions: [question], threadID: question.threadID)])
         let nodeIDFile = directory.appendingPathComponent("preview-node-id")
         let nodeID = (try? String(contentsOf: nodeIDFile, encoding: .utf8)) ?? UUID().uuidString

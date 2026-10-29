@@ -1,5 +1,14 @@
 # AutoApprove 검증 기록
 
+## 2026-10-30 · 0.2.209/236 웹 연결·OS 정책·Goal 관리 후보
+
+- 릴리스 컴파일 및 JavaScript 구문 검사 통과. 전체 회귀 **574/575**이며 남은 1건은 이전 릴리스에도 있던 `Published updates: exact loopback gateway and web ports after reuse`다. 실행 환경의 PortManager 선언 주소 `127.1.0.1`이 실제 loopback 인터페이스에 없어 `EADDRNOTAVAIL`이 발생한다. 주소 별칭·PortManager 환경·방화벽·VPN을 변경하거나 다른 주소로 우회하지 않았다. Goal 보류 캐시 보완 뒤 관련 검사 **Goal 3/3 · OS permissions 11/11**을 다시 통과했다. 마지막으로 목표 UUID를 일시적으로 읽지 못해도 취소 보류를 유지하도록 보완했고, 최종 release 빌드 **95.01초**와 해당 회귀를 포함한 **Goal 3/3**이 통과했다.
+- 새 Goal 검사는 정확한 대화/실행/목표 상태, 재개·취소, 오래된 상태와 교체된 목표 거절, 취소 후 오래된 footer 자동 복구 차단, 원래 터미널 초안 보존, 전달 결과 미확인 시 재전송 금지, 읽기 전용 SQLite와 사용량 변경 중 안정적인 revision을 다룬다. 실제 WebSocket JSON-RPC 소켓 fixture에서 `origin:user`, `thread/goal/get/set/clear`와 교체 후 쓰기 **0회**를 확인했다. 실행 중인 실제 Codex에서도 기존 제어 소켓의 Goal 읽기·로컬 목표 ID 대조가 통과했고 실제 목표 변경은 **0회**다.
+- 격리 Core HTTP 노드 **3개**와 Chromium에서 long poll 도중 저장, 늦은 이전 응답, 다른 화면의 정책 철회/ABA 충돌, 저장 중 세션 전환, Goal 대화 선택·다른 Mac 중계·취소 확인·목표 교체, 적용 후 응답 유실, 오프라인/온라인 복구를 검사했다. 마지막 브라우저 실행은 저장 후 확인 **44ms**, 연결 복구 **13ms**, Goal 중복 전달 **0회**, JS 오류 **0건**이었다. 이는 로컬 합성 환경 측정이며 실제 Wi-Fi·Cloudflare 지연 보장이 아니다. 사용자 Terminal·실제 OS 권한 입력은 **0회**다.
+- 동일한 권한 패널을 **250회** 렌더링할 때 요청 DOM 행 변경 **0회**, 측정 **1.1ms**였다. Goal 복구 보류는 메모리 캐시를 사용하며 화면마다 SQLite를 다시 읽지 않는다. 390×844·768×1024·1440×900의 밝음/어두움 렌더링, 긴 목표·OS 요청, 44px 조작부, 줄바꿈/가로 넘침과 키보드 확인/취소 포커스를 확인했다. Impeccable 기계적 detector 결과는 **0건**이며 Web Interface Guidelines의 관련 접근성 항목을 점검했다. 정식 별도 다중 평가나 실제 휴대폰·다른 물리 Mac 검증을 수행했다고 표시하지 않는다.
+- **배포 차단:** `AUTOAPPROVE_SIGNING_READ_ONLY=1`로 키체인 생성·잠금 해제·검색 경로 변경 없이 패키징을 시도했으나 `codesign: no identity found`로 실패했다. 읽기 전용 검사에서 기존 게시자 identity는 유효하지만 해당 키체인은 **locked/readable**, 기본 검색 대상에는 사용 가능한 identity가 **0개**였다. 이 실패를 서명 우회나 새 키 생성으로 해결하지 않았다. 현재 후보 디렉터리는 설치 가능한 서명 앱이 아니며 DMG/서명 업데이트 ZIP·체크섬, 공개 릴리스/태그, 프로젝트 내부 설치·실행 버전 검증이 남아 있다. 같은 게시자 키가 이미 사용 가능한 환경에서 제한 모드로 패키징하는 것이 허용 범위 내 대안이다.
+- 기존 시스템 앱과 사용자 CLI를 종료·교체하지 않았다. 최종 읽기 전용 확인에서 실행 앱은 **/Applications/AutoApprove.app 0.2.207/234**이며 작업 전과 같은 PID였다. 기존 CLI **19/19개**의 PID·시작 시각·TTY와 앱 Info.plist/GUI/CLI 해시를 보존했고 **Terminal connected=true · OS 정책 활성 0개 · 소유 PTY 0개**였다. 관리자 권한, LaunchAgent/LaunchDaemon/cron 등록, 새 상주 서비스, OS 권한 부여/회수, 보안 도구·VPN 정책 변경은 실행하지 않았다. 개인 런타임·실제 대화·키체인·검증 스크린샷은 공개 소스에 포함하지 않는다. 격리 검사 프로세스는 검사 종료 시 정리한다.
+
 ## 2026-10-29 · 0.2.208/235 공개 배포·프로젝트 내부 설치 확인
 
 - [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.208)의 공개 태그 역참조는 **5935ac61c3ea36f5a6c91df130f7502d4bd7db02**다. DMG **9,952,564B**·체크섬 **102B**, 서명 업데이트 ZIP **10,355,329B**·체크섬 **111B**를 인증 없이 내려받아 로컬 파일·GitHub digest·SHA-256 일치를 확인했다. DMG SHA-256은 **84aac39b7e2e83505471500518e2b7d85395c843a4f9226506db8eecaf9c3610**, ZIP은 **5a806d7aeffc958861042a74ba6f68376d1f26618d2844a8b43cca050b9a0c14**다. 실제 Core의 공식 최신 조회·ZIP 전체 범위 다운로드·해시·ZIP 제한·동일 게시자/버전/아키텍처 설치 준비도 통과했다. 이 업데이트 검사는 임시 복사본의 준비 단계까지이며 시스템 앱에 설치하지 않았다.

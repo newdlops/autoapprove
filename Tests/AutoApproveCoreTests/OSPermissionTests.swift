@@ -51,6 +51,20 @@ private final class OSFixture:@unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testOSPermissionWebRevisionRejectsStalePolicyAndABARestore() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-web-revision-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
+        let (engine,ids)=try await osEngine(fixture,root:root);defer{engine.stop()};let id=ids[0]
+        _ = try await engine.remoteAction(["action":"osPermissionPolicy","sessionID":id,"allowed":["camera"],"policyRevision":"initial"])
+        let revision=engine.snapshot.sessions.first(where:{$0.id==id})!.osPermissionPolicy!.revision!
+        try engine.setOSPermissionPolicy(id,allowed:[])
+        do {_ = try await engine.remoteAction(["action":"osPermissionPolicy","sessionID":id,"allowed":["camera","microphone"],"policyRevision":revision]);throw AppError.message("Stale policy restored a revoked grant")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        try engine.setOSPermissionPolicy(id,allowed:[.camera])
+        do {_ = try await engine.remoteAction(["action":"osPermissionPolicy","sessionID":id,"allowed":["camera","microphone"],"policyRevision":revision]);throw AppError.message("ABA policy accepted")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        try expectEqual(engine.snapshot.sessions.first(where:{$0.id==id})?.osPermissionPolicy?.allowed,[.camera]);try expectEqual(fixture.presses,[])
+        fixture.exited()
+        let latest=engine.snapshot.sessions.first(where:{$0.id==id})!.osPermissionPolicy!.revision!
+        do {_ = try await engine.remoteAction(["action":"osPermissionPolicy","sessionID":id,"allowed":["microphone"],"policyRevision":latest]);throw AppError.message("Exited source accepted")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+    }
     func testOSPermissionPolicyIdentityAndPromptAttribution() throws {
         let fixture=OSFixture(),request=fixture.request(),policy=OSPermissionPolicy(allowed:[.camera],targets:[fixture.target])
         try expect(!OSPermissionPolicy().permits(request));try expect(policy.permits(request))
