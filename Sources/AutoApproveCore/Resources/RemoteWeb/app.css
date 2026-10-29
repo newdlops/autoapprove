@@ -24,6 +24,13 @@ button:active:not(:disabled) { filter: brightness(.86); }
 button.secondary { background: var(--surface); color: var(--fg); border-color: var(--line); }
 button:disabled { cursor: default; opacity: .5; }
 :focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
+.permission-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); gap: 8px 16px; }
+.permission-options label { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; }
+#os-permission-kinds { border: 0; padding: 8px 0; margin: 0; min-width: 0; }
+#os-permission-kinds legend { font-weight: 600; padding: 8px 0; }
+.permission-request, .permission-target { padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.permission-request:last-child, .permission-target:last-child { border-bottom: 0; }
+#os-permissions summary { cursor: pointer; min-height: 44px; padding: 10px 0; }
 input[type=search], input[type=text], input[type=number], textarea, select { min-height: 44px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: 16px; min-width: 0; }
 textarea { resize: vertical; width: 100%; line-height: 1.5; }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }

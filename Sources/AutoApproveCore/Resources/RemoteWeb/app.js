@@ -1559,6 +1559,7 @@ function renderDetail() {
   $('automatic').checked = session.automatic; text($('session-status'), node.state.snapshot.paused ? '이 Mac의 자동 승인이 일시정지되어 있습니다.' : session.activityDetail || session.detail);
   renderSessionSafety();
   renderCodexProgress(selectedItem);
+  renderOSPermissions(selectedItem);
   const terminalHost = `${node.name} · ${session.hostName || hosts[session.terminal]}`;
   text($('terminal-host'), terminalHost); $('terminal-host').title = terminalHost;
   if (document.body.classList.contains('terminal-focus')) text($('terminal-heading'), view.title);
@@ -3187,11 +3188,54 @@ function renderCodexProgress(item){
   $('codex-progress-enabled').checked=enabled;$('codex-progress-enabled').disabled=!online;
   text($('codex-progress-status'),state?.detail||(enabled?'자동 승인이 켜진 작업에서 진척 신호를 확인합니다.':'이 Mac의 자동 진행 확인이 꺼져 있습니다.'));
   text($('codex-progress-time'),state?`${state.historyAvailable?'출력·대화 기록':'화면 출력'} · 감시 기준 ${new Date(state.lastProgressAt).toLocaleTimeString('ko-KR')} · 확인 ${state.checks}회`:'');
-  $('codex-progress-check').disabled=!online||!enabled||!session.automatic||node.state.snapshot.paused||session.phase!=='working'||busy||['review','requested'].includes(state?.phase);
+  const permissionWait=(node.state.snapshot.osPermissions?.requests||[]).some(r=>r.phase!=='resolved'&&(!r.sessionID||r.sessionID===session.id));
+  $('codex-progress-check').disabled=!online||!enabled||!session.automatic||permissionWait||node.state.snapshot.paused||session.phase!=='working'||busy||['review','requested'].includes(state?.phase);
   const focused=document.activeElement;
   show($('codex-progress-cancel'),busy);$('codex-progress-cancel').disabled=!online;
   if(focused===$('codex-progress-check')&&busy)$('codex-progress-cancel').focus({preventScroll:true});
   else if(focused===$('codex-progress-cancel')&&!busy)$('codex-progress-enabled').focus({preventScroll:true});
+}
+const osPermissionKinds=[['automation','다른 앱 제어'],['accessibility','손쉬운 사용·기기 제어'],['screenRecording','화면 기록'],['camera','카메라'],['microphone','마이크'],['files','파일·폴더 접근'],['localNetwork','로컬 네트워크'],['fullDiskAccess','전체 디스크 접근'],['appManagement','앱 관리'],['other','기타 OS 접근 권한']];
+let osPermissionSignature='';
+for(const [kind,title]of osPermissionKinds){
+  const label=make('label'),input=document.createElement('input');input.type='checkbox';input.name='osPermissionKind';input.value=kind;input.autocomplete='off';input.id='os-permission-'+kind;
+  label.append(input,document.createTextNode(title));$('os-permission-kinds').querySelector('.permission-options').append(label);
+  input.addEventListener('change',async()=>{if(!selectedItem)return;const item=selectedItem,restoreFocus=document.activeElement===input,allowed=osPermissionKinds.filter(([key])=>$('os-permission-'+key).checked).map(([key])=>key);
+    const pending=action(item.node.id,{action:'osPermissionPolicy',sessionID:item.session.id,allowed},'이 세션의 OS 권한 정책을 저장했습니다.');renderOSPermissions(item);await pending;if(selectedItem)renderOSPermissions(selectedItem);
+    if(restoreFocus&&selectedItem?.node.id===item.node.id&&selectedItem?.session.id===item.session.id&&document.activeElement===document.body&&!input.disabled)input.focus({preventScroll:true});
+  });
+}
+function permissionAction(item,payload,message){void action(item.node.id,{...payload,sessionID:item.session.id},message).finally(()=>{if(selectedItem)renderOSPermissions(selectedItem);});renderOSPermissions(item);}
+function renderOSPermissions(item){
+  const supported=item&&item.session.agent!=='shell'&&supportsRelease(item.node,[0,2,208,235]);show($('os-permissions'),supported);if(!supported)return;
+  const {session,node}=item,policy=session.osPermissionPolicy||{allowed:[],targets:[]},status=node.state.snapshot.osPermissions,online=node.online&&connected&&!sessionEnded(item),disabled=!online||mutation;
+  text($('os-permission-summary'),policy.allowed.length?`이 세션에서 ${policy.allowed.length}종류 허용 · 등록 앱 ${policy.targets.length}개`:'직접 확인 · 이 세션의 OS 권한 자동 승인이 꺼져 있습니다.');
+  text($('os-permission-status'),!online?'Mac 연결이 끊겼습니다. 다시 연결되면 설정을 변경할 수 있습니다.':node.state.snapshot.paused?'전체 일시정지 중에는 OS 권한을 조작하지 않습니다.':status?.detail||'OS 권한 연결을 확인하고 있습니다.');
+  for(const [kind]of osPermissionKinds){const input=$('os-permission-'+kind);if(!mutation)input.checked=policy.allowed.includes(kind);input.disabled=disabled;}
+  const requests=(status?.requests||[]).filter(r=>(!r.sessionID||r.sessionID===session.id)&&r.phase!=='resolved');
+  const signature=JSON.stringify([node.id,session.id,policy.allowed,policy.targets,requests,disabled]);if(signature===osPermissionSignature)return;osPermissionSignature=signature;
+  const focused=document.activeElement?.dataset.permissionFocus;
+  const targets=$('os-permission-targets');targets.replaceChildren();
+  if(!policy.targets.length)targets.append(make('p','muted small','등록한 앱이 없습니다. OS 요청이 나타나면 앱과 내용을 확인해 이 세션에 등록하세요.'));
+  for(const target of policy.targets){const row=make('div','permission-target');row.append(make('strong','',target.name),make('p','path',target.path));
+    const button=make('button','secondary','등록 해제');button.type='button';button.disabled=disabled;button.dataset.permissionFocus='remove-'+target.id;button.addEventListener('click',()=>permissionAction(item,{action:'removeOSPermissionTarget',targetID:target.id},'이 세션의 등록 앱을 해제했습니다.'));row.append(button);targets.append(row);
+  }
+  const rows=$('os-permission-requests');rows.replaceChildren();
+  for(const request of requests){const row=make('article','permission-request');row.dataset.permissionId=request.id;
+    row.append(make('h4','',`${request.requester?.name||'요청 앱 미확인'} · ${request.kind==='authentication'?'Mac 사용자 인증':osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind}`),make('p','',request.detail));
+    if(request.requester)row.append(make('p','path',request.requester.path));
+    const details=document.createElement('details'),summary=make('summary','','OS 요청 내용');details.append(summary,make('pre','terminal-text',request.content));row.append(details);
+    const controls=make('div','question-actions'),token=request.id+'\u0000'+(request.requester?`${request.requester.pid}:${request.requester.started}:${request.requester.id}`:'?');
+    const addButton=(title,key,payload,message)=>{const button=make('button','secondary',title);button.type='button';button.disabled=disabled;button.dataset.permissionFocus=key;button.addEventListener('click',()=>permissionAction(item,{...payload,permissionID:request.id,permissionToken:token},message));controls.append(button);};
+    if(request.phase==='waiting'&&request.action!=='manual'&&!policy.allowed.includes(request.kind))addButton(`이 세션에서 ${osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind} 허용`,'allow-kind-'+request.id,{action:'osPermissionPolicy',allowed:[...policy.allowed,request.kind]},'이 세션의 해당 OS 권한을 허용했습니다.');
+    if(request.phase==='waiting'&&!request.sessionID&&request.requester){addButton('이 요청만 이 세션에 연결','once-'+request.id,{action:'assignOSPermission',remember:false},'현재 요청을 이 세션의 정책에 연결했습니다.');
+      const id=request.requester.bundleID,shared=['com.apple.Terminal','com.googlecode.iterm2','com.microsoft.VSCode','com.openai.chat','com.openai.codex','local.autoapprove.mac','com.anthropic.claudefordesktop','com.anthropic.claude','com.google.Chrome','com.google.Chrome.canary','org.mozilla.firefox','com.microsoft.edgemac','com.apple.Safari','com.brave.Browser'].includes(id)||/computer-?use/i.test(id);
+      if(!shared)addButton('이 앱을 이 세션에 등록','remember-'+request.id,{action:'assignOSPermission',remember:true},'이 테스트 앱을 현재 세션에 등록했습니다.');
+    }
+    if(request.sessionID===session.id&&request.phase!=='approving')addButton('Mac에서 처리 완료로 표시','ack-'+request.id,{action:'acknowledgeOSPermission'},'직접 확인한 OS 요청을 처리 완료로 표시했습니다.');
+    row.append(controls);rows.append(row);
+  }
+  if(focused){const next=[...$('os-permissions').querySelectorAll('[data-permission-focus]')].find(e=>e.dataset.permissionFocus===focused);(next||$('os-permission-options').querySelector('summary')).focus({preventScroll:true});}
 }
 $('codex-progress-enabled').addEventListener('change',()=>{if(selectedItem)void action(selectedItem.node.id,{action:'codexProgressRecovery',enabled:$('codex-progress-enabled').checked},'이 Mac의 Codex 진척 확인 설정을 적용했습니다.');});
 for(const [id,name]of [['codex-progress-check','checkCodexProgress'],['codex-progress-cancel','cancelCodexProgress']])$(id).addEventListener('click',()=>{if(selectedItem)void action(selectedItem.node.id,{action:name,sessionID:selectedItem.session.id},name==='checkCodexProgress'?'원래 Codex의 진행 확인을 시작합니다.':'진행 확인을 취소했습니다.');});

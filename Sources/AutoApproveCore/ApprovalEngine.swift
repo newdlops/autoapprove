@@ -98,6 +98,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var resetApprovalReceipts: [String: ResetApprovalReceipt] = [:]
     private var systemSafetyStates: [String: SystemSafetyState] = [:]
     private var systemSafetyTasks: [String: UUID] = [:]
+    private let osPermissionServices:OSPermissionServices
+    private let osPermissionMonitoringEnabled:Bool
+    private var osPermissionTask:Task<Void,Never>?
+    private var osPermissionScanning=false
+    private var osPermissionRequests:[String:OSPermissionRequest]=[:]
+    private var osPermissionClaims:[String:(sessionID:String,token:String,source:String)]=[:]
+    private var osPermissionPolicySources:[String:String]=[:]
+    private var osPermissionReceipts:Set<String>=[]
+    private var osPermissionSeen:[String:Date]=[:]
+    private var osPermissionBlocked=Set<String>()
+    private var osPermissionActing:String?
+    private var osPermissionEpoch=UUID()
+    private struct OSPermissionTransition {var target:OSPermissionTarget;var kind:OSPermissionKind;var sessionID:String;var source:String;var until:Date}
+    private var osPermissionTransitions:[String:OSPermissionTransition]=[:]
     private var remoteInputUntil: [String: Date] = [:]
     private var remoteStreams: [String: (generation: String, token: String, identity: TTYInputIdentity?)] = [:]
     private var remoteFrameSequence = 0
@@ -355,8 +369,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
-                terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil) throws {
+                terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
+                osPermissionServices:OSPermissionServices? = nil) throws {
         self.paths = paths
+        self.osPermissionServices=osPermissionServices ?? (processReader == nil ? OSPermissionAutomation.live:.inactive)
+        self.osPermissionMonitoringEnabled=processReader==nil || osPermissionServices != nil
         self.publishedUpdateServices=publishedUpdateServices
         // Injected inventories never inspect the user's real Terminal implicitly.
         if let terminalProfileLayoutReader {self.terminalProfileLayoutReader=terminalProfileLayoutReader}
@@ -507,6 +524,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         if poll {
+            if osPermissionMonitoringEnabled {osPermissionTask=Task { [weak self] in
+                while !Task.isCancelled {
+                    await self?.refreshOSPermissions()
+                    do {try await Task.sleep(for:.seconds(1))} catch {break}
+                }
+            }}
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refreshDiscovery()
@@ -530,6 +553,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        osPermissionEpoch=UUID()
+        osPermissionTransitions.removeAll()
+        osPermissionTask?.cancel();osPermissionTask=nil
         accountPINReader.invalidate()
         agentAccounts.stop()
         tunnelStartEpoch = UUID()
@@ -1649,7 +1675,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func automaticInputBusy(_ id: String) -> Bool {
-        automaticInputSessions.contains(id) || systemSafetyTasks[id] != nil || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
+        automaticInputSessions.contains(id) || osPermissionActing != nil || systemSafetyTasks[id] != nil || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
     }
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
@@ -1866,6 +1892,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let enabled = object["enabled"] as? Bool else { throw RemoteHTTPError(400, "자동 승인 값을 지정해주세요.") }
             try setAutomatic(id, enabled: enabled)
         case "checkCodexProgress": try requestCodexProgressCheck(id)
+        case "osPermissionPolicy":
+            guard let values=object["allowed"] as? [String],values.count<=OSPermissionKind.allCases.count else {throw RemoteHTTPError(400,"허용할 OS 권한 종류를 지정해주세요.")}
+            let allowed=values.compactMap(OSPermissionKind.init(rawValue:))
+            guard allowed.count==values.count,!allowed.contains(.authentication) else {throw RemoteHTTPError(400,"지원하지 않는 OS 권한 종류입니다. Mac 사용자 인증은 직접 처리해주세요.")}
+            try setOSPermissionPolicy(id,allowed:allowed)
+        case "assignOSPermission":
+            guard let request=object["permissionID"] as? String,let token=object["permissionToken"] as? String,let remember=object["remember"] as? Bool else {throw RemoteHTTPError(400,"원래 OS 요청과 등록 범위를 확인해주세요.")}
+            try assignOSPermission(id,requestID:request,token:token,remember:remember)
+        case "removeOSPermissionTarget":
+            guard let target=object["targetID"] as? String else {throw RemoteHTTPError(400,"등록 앱을 지정해주세요.")}
+            try removeOSPermissionTarget(id,targetID:target)
+        case "acknowledgeOSPermission":
+            guard let request=object["permissionID"] as? String,let token=object["permissionToken"] as? String else {throw RemoteHTTPError(400,"원래 OS 요청을 확인해주세요.")}
+            try acknowledgeOSPermission(id,requestID:request,token:token)
         case "cancelCodexProgress": cancelCodexProgressCheck(id)
         case "reveal": _ = try await reveal(session)
         case "read": try markNotificationsRead(id, interruptionID: object["interruptionID"] as? String)
@@ -2343,6 +2383,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func restorePreferences(_ session: inout AgentSession) {
         session.automatic = store.value("automatic:\(session.id)") == "true"
+        if let text=store.value("osPermissionPolicy:"+session.id),let data=text.data(using:.utf8),
+           let saved=try? JSONDecoder().decode(OSPermissionPolicyEnvelope.self,from:data),saved.source==osPermissionSource(session) {
+            session.osPermissionPolicy=saved.policy
+            osPermissionPolicySources[session.id]=saved.source
+        }
         session.customization = nil
         if let saved = store.value("customization:\(session.id)"),
            let decoded = try? JSONDecoder().decode(SessionCustomization.self, from: Data(saved.utf8)),
@@ -4663,7 +4708,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let receipt = "terminalChoice:\(id):\(choice.id)"
         guard !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id),
-              !automationNeedsFreshScreen.contains(id),
+              !hasOSPermissionWait(id),!automationNeedsFreshScreen.contains(id),
               retainedModelMenus[id] != menuIdentity,
               manuallyChangedModelQuestions[id] != identity,
               !userInputHasPriority(id), !automaticInputBusy(id),
@@ -4679,7 +4724,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             do {
                 try await Task.sleep(for: .seconds(delay))
                 @MainActor func authorize() throws {
-                    guard !Task.isCancelled, !self.remoteInputStopped, !self.snapshot.paused,
+                    guard !Task.isCancelled, !self.hasOSPermissionWait(id),!self.remoteInputStopped, !self.snapshot.paused,
                           self.revision == scheduledRevision, self.effectiveAutomatic(id),
                           self.modelRetentionTasks[id]?.token == token,
                           self.remoteObservedScreens[id]?.generation == generation,
@@ -4746,7 +4791,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleSystemSafety(_ id: String) {
-        guard let state = systemSafetyStates[id], state.generation != nil,
+        guard !hasOSPermissionWait(id),let state = systemSafetyStates[id], state.generation != nil,
               state.notice.phase != .guided, state.notice.phase != .uncertain,
               state.retryAfter.map({ $0 > Date() }) != true,
               !remoteInputStopped, !snapshot.paused, effectiveAutomatic(id), !automationNeedsFreshScreen.contains(id),
@@ -4768,7 +4813,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func safetyInputAllowed(_ original: AgentSession, noticeID: String, automationEpoch: UInt64) -> Bool {
-        guard !Task.isCancelled, automationRuntime.epoch(original.id) == automationEpoch,
+        guard !hasOSPermissionWait(original.id),!Task.isCancelled, automationRuntime.epoch(original.id) == automationEpoch,
               !automationNeedsFreshScreen.contains(original.id),
               !remoteInputStopped, !snapshot.paused, effectiveAutomatic(original.id), !userInputHasPriority(original.id),
               let current = sessions[original.id], current.phase != .ended, current.pid == original.pid,
@@ -5142,6 +5187,174 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if state.phase == .waiting { scheduleCapacityResume(id) }
     }
 
+    private func osPermissionSource(_ session:AgentSession)->String {"\(session.agent.rawValue):\(session.pid):\(session.started):\(session.tty)"}
+    private func saveOSPermissionPolicy(_ session:AgentSession,_ policy:OSPermissionPolicy) throws {
+        let value=OSPermissionPolicyEnvelope(source:osPermissionSource(session),policy:policy)
+        try store.set("osPermissionPolicy:"+session.id,String(decoding:JSONEncoder().encode(value),as:UTF8.self))
+        sessions[session.id]?.osPermissionPolicy=policy
+        osPermissionPolicySources[session.id]=osPermissionSource(session)
+    }
+    public func setOSPermissionPolicy(_ id:String,allowed:[OSPermissionKind]) throws {
+        guard !allowed.contains(.authentication) else {throw RemoteHTTPError(400,"Mac 사용자 인증은 자동 승인 정책으로 허용할 수 없습니다.")}
+        guard let session=sessions[id],session.agent != .shell,session.pid>0,session.phase != .ended else {throw RemoteHTTPError(404,"실행 중인 Codex·Claude 세션을 선택해주세요.")}
+        var policy=osPermissionPolicySources[id]==osPermissionSource(session) ? session.osPermissionPolicy ?? .init():.init();policy.allowed=Array(Set(allowed)).sorted {$0.rawValue<$1.rawValue}
+        let event=AuditEvent(sessionID:id,summary:"OS 권한 정책 변경",outcome:allowed.isEmpty ? "직접 확인":"허용: "+policy.allowed.map(\.title).joined(separator:", "),source:"세션 OS 권한 정책",context:AuditContext(session:session))
+        guard log(event) else {throw RemoteHTTPError(503,"정책 변경 기록을 저장하지 못했습니다.")}
+        try saveOSPermissionPolicy(session,policy)
+        osPermissionTransitions=osPermissionTransitions.filter {$0.value.sessionID != id || allowed.contains($0.value.kind)}
+        for (key,claim) in osPermissionClaims where claim.sessionID==id && osPermissionRequests[key].map({!allowed.contains($0.kind)})==true {osPermissionClaims.removeValue(forKey:key)}
+        // Every already-queued terminal action must use a fresh policy observation.
+        cancelCodexProgressCheck(id);codexProgressTrackers.removeValue(forKey:id)
+        publish()
+    }
+    public func assignOSPermission(_ id:String,requestID:String,token:String,remember:Bool) throws {
+        guard let session=sessions[id],session.agent != .shell,session.phase != .ended,
+              let request=osPermissionRequests[requestID],request.isPending,request.phase == .waiting,
+              request.immutableToken==token,let target=request.requester,let seen=osPermissionSeen[requestID],Date().timeIntervalSince(seen)<6 else {throw RemoteHTTPError(409,"현재 OS 요청과 앱 신원을 다시 확인해주세요.")}
+        guard request.sessionID==nil || request.sessionID==id else {throw RemoteHTTPError(409,"다른 세션에 연결된 요청입니다.")}
+        if remember {
+            guard !target.isSharedController else {throw RemoteHTTPError(409,"여러 세션이 공유하는 제어 앱은 현재 요청만 연결할 수 있습니다.")}
+            guard !sessions.values.contains(where:{$0.id != id && $0.phase != .ended && $0.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true}) else {throw RemoteHTTPError(409,"이 앱은 다른 실행 세션에 등록되어 있습니다. 그 세션에서 먼저 해제해주세요.")}
+        }
+        guard log(AuditEvent(sessionID:id,summary:"OS 권한 요청 연결 · "+target.name,outcome:remember ? "이 세션의 테스트 앱 등록":"현재 요청만 연결",source:"세션 OS 권한 정책",context:AuditContext(session:session),request:request.content)) else {throw RemoteHTTPError(503,"요청 연결 기록을 저장하지 못했습니다.")}
+        if remember {
+            var policy=osPermissionPolicySources[id]==osPermissionSource(session) ? session.osPermissionPolicy ?? .init():.init();policy.targets.removeAll {$0.id==target.id};policy.targets.append(target)
+            guard policy.targets.count<=32 else {throw RemoteHTTPError(400,"세션당 등록 앱은 32개까지입니다.")}
+            try saveOSPermissionPolicy(session,policy)
+        }
+        osPermissionClaims[requestID]=(id,token,osPermissionSource(session));osPermissionRequests[requestID]?.sessionID=id
+        publishOSPermissions();publish()
+    }
+    public func removeOSPermissionTarget(_ id:String,targetID:String) throws {
+        guard let session=sessions[id] else {throw RemoteHTTPError(404,"세션을 찾지 못했습니다.")}
+        var policy=session.osPermissionPolicy ?? .init();policy.targets.removeAll {$0.id==targetID}
+        guard log(AuditEvent(sessionID:id,summary:"OS 권한 등록 앱 해제",outcome:"후속 자동 승인 중지",source:"세션 OS 권한 정책",context:AuditContext(session:session))) else {throw RemoteHTTPError(503,"정책 변경 기록을 저장하지 못했습니다.")}
+        try saveOSPermissionPolicy(session,policy)
+        osPermissionTransitions=osPermissionTransitions.filter {!($0.value.sessionID==id && $0.value.target.id==targetID)}
+        for (key,claim) in osPermissionClaims where claim.sessionID==id && osPermissionRequests[key]?.requester?.id==targetID {osPermissionClaims.removeValue(forKey:key)}
+        publish()
+    }
+    public func acknowledgeOSPermission(_ id:String,requestID:String,token:String) throws {
+        guard var request=osPermissionRequests[requestID],request.sessionID==id,request.immutableToken==token,let session=sessions[id] else {throw RemoteHTTPError(409,"이 세션에 연결된 원래 요청을 확인해주세요.")}
+        guard log(AuditEvent(sessionID:id,summary:"OS 권한 결과 직접 확인",outcome:"사용자가 확인 완료로 표시",source:"세션 OS 권한 정책",context:AuditContext(session:session),request:request.content)) else {throw RemoteHTTPError(503,"확인 기록을 저장하지 못했습니다.")}
+        request.phase = .resolved;request.detail="사용자가 Mac에서 처리 완료로 표시했습니다. OS 권한 부여 여부는 원래 앱에서 확인해주세요."
+        try store.set("osPermissionReceipt:"+requestID,String(decoding:JSONEncoder().encode(request),as:UTF8.self))
+        osPermissionReceipts.insert(requestID);osPermissionRequests[requestID]=request;publishOSPermissions();publish()
+    }
+    private func hasOSPermissionWait(_ id:String)->Bool {
+        osPermissionRequests.values.contains {$0.isPending && ($0.sessionID==nil || $0.sessionID==id)}
+    }
+    private func publishOSPermissions() {
+        var status=snapshot.osPermissions ?? .init()
+        status.requests=osPermissionRequests.values.sorted {a,b in a.observedAt==b.observedAt ? a.id<b.id:a.observedAt>b.observedAt}
+        if snapshot.osPermissions != status {snapshot.osPermissions=status}
+        for id in sessions.keys {
+            let waiting=hasOSPermissionWait(id)
+            if waiting {cancelCodexProgressCheck(id);codexProgressTrackers.removeValue(forKey:id);if sessions[id]?.codexProgressRecovery?.phase != .review {sessions[id]?.codexProgressRecovery=nil}}
+            if osPermissionBlocked.contains(id) && !waiting {
+                automationNeedsFreshScreen.insert(id);invalidateRemoteRead(id)
+                if let host=sessions[id].flatMap({ScreenHost(kind:$0.terminal)}) {screenPollSignals[host]?.notify()}
+            }
+            if waiting {osPermissionBlocked.insert(id)} else {osPermissionBlocked.remove(id)}
+            sessions[id]?.osPermissionWaiting=osPermissionRequests.values.contains {$0.isPending && $0.sessionID==id}
+        }
+    }
+    public func refreshOSPermissions() async {
+        guard !osPermissionScanning,!remoteInputStopped,sessions.values.contains(where:{$0.agent != .shell && $0.phase != .ended}) else {return}
+        osPermissionScanning=true;defer {osPermissionScanning=false}
+        osPermissionTransitions=osPermissionTransitions.filter {entry in guard let session=sessions[entry.value.sessionID] else {return false};return entry.value.until>Date() && session.phase != .ended && entry.value.source==osPermissionSource(session)}
+        let epoch=osPermissionEpoch,service=osPermissionServices,targets=sessions.values.flatMap {$0.osPermissionPolicy?.targets ?? []}+osPermissionTransitions.values.map(\.target)
+        do {
+            let scanned=try await Task.detached(priority:.utility) {try service.scan(targets)}.value
+            guard !Task.isCancelled,epoch==osPermissionEpoch,!remoteInputStopped else {return}
+            let before=snapshot.osPermissions,now=Date(),seen=Set(scanned.requests.map(\.id))
+            for fresh in scanned.requests {
+                var request=fresh
+                osPermissionSeen[request.id]=now
+                if let previous=osPermissionRequests[request.id],previous.immutableToken==request.immutableToken {
+                    request.phase=previous.phase;request.detail=previous.detail;request.observedAt=previous.observedAt
+                    if previous.phase == .resolved {request.phase = .uncertain;request.detail="OS 권한창이 아직 열려 있습니다. 이전 조작을 반복하지 않고 Mac에서 직접 확인을 기다립니다."}
+                } else if let saved=store.value("osPermissionReceipt:"+request.id),let decoded=try? JSONDecoder().decode(OSPermissionRequest.self,from:Data(saved.utf8)) {
+                    osPermissionReceipts.insert(request.id);request.phase = decoded.phase == .resolved ? .resolved:.uncertain
+                    request.detail="이 요청에는 이전 조작 기록이 있습니다. 자동으로 다시 누르지 않습니다. 원래 Mac에서 확인해주세요."
+                    request.sessionID=decoded.sessionID
+                }
+                if let claim=osPermissionClaims[request.id],claim.token==request.immutableToken,let session=sessions[claim.sessionID],session.phase != .ended,claim.source==osPermissionSource(session) {request.sessionID=claim.sessionID}
+                else if request.action == .enableSetting,let target=request.requester {
+                    let transitions=osPermissionTransitions.values.filter {$0.target==target && $0.kind==request.kind && $0.until>now}
+                    if transitions.count==1 {request.sessionID=transitions[0].sessionID;osPermissionClaims[request.id]=(transitions[0].sessionID,request.immutableToken,transitions[0].source)}
+                }
+                else if let target=request.requester {
+                    let owners=sessions.values.filter {$0.phase != .ended && osPermissionPolicySources[$0.id]==osPermissionSource($0) && $0.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true}
+                    if owners.count==1 {request.sessionID=owners[0].id}
+                }
+                if request.phase == .waiting {
+                    if request.action == .manual {request.detail="Mac 사용자 인증이나 보호된 OS 조작이 필요합니다. 이 창은 Mac에서 직접 처리해주세요."}
+                    else if request.requester==nil {request.detail="OS 요청 앱의 서명과 실행 신원을 확인하지 못해 자동 승인하지 않습니다."}
+                    else if let id=request.sessionID,let session=sessions[id] {
+                        request.detail=snapshot.paused ? "전체 일시정지 중입니다.":!session.automatic ? "이 세션의 자동 승인을 켜면 정책을 적용합니다.":session.osPermissionPolicy?.allowed.contains(request.kind)==true ? "이 세션의 허용 정책을 확인하고 있습니다.":"이 세션에서 \(request.kind.title) 권한을 허용하지 않았습니다."
+                    } else {request.detail="요청 앱과 내용을 확인한 뒤 처리할 세션에 연결해주세요."}
+                }
+                osPermissionRequests[request.id]=request
+            }
+            for id in Array(osPermissionRequests.keys) where scanned.available && !seen.contains(id) {
+                guard var old=osPermissionRequests[id] else {continue}
+                if old.phase == .settings,!scanned.requests.contains(where:{$0.requester?.id==old.requester?.id && $0.kind==old.kind && $0.action == .enableSetting}) {
+                    if osPermissionTransitions.values.contains(where:{$0.sessionID==old.sessionID && $0.target.id==old.requester?.id && $0.until>now}) {continue}
+                    old.phase = .uncertain;old.detail="OS 설정의 원래 앱 스위치를 확인하지 못했습니다. Mac에서 권한과 앱 동작을 확인해주세요.";osPermissionRequests[id]=old;continue
+                }
+                if old.phase == .uncertain,old.action == .openSettings {continue}
+                if old.phase != .resolved {
+                    old.phase = .resolved;old.detail="원래 OS 권한창이 닫혔습니다. 원래 앱에서 접근 결과를 확인해주세요.";osPermissionRequests[id]=old
+                }
+                if now.timeIntervalSince(old.observedAt)>300 {osPermissionRequests.removeValue(forKey:id);osPermissionClaims.removeValue(forKey:id)}
+            }
+            var status=scanned;status.requests=[]
+            if snapshot.osPermissions?.available != status.available || snapshot.osPermissions?.detail != status.detail {snapshot.osPermissions=status}
+            publishOSPermissions()
+            if before != snapshot.osPermissions {publish()}
+            guard osPermissionActing==nil,!snapshot.paused,!scanned.requests.contains(where:{$0.action == .manual && $0.isPending}) else {return}
+            for request in osPermissionRequests.values.sorted(by:{$0.observedAt<$1.observedAt}) where request.phase == .waiting && seen.contains(request.id) {
+                guard request.action != .manual,let id=request.sessionID,let original=sessions[id],original.automatic,original.phase != .ended,
+                      osPermissionPolicySources[id]==osPermissionSource(original),original.osPermissionPolicy?.allowed.contains(request.kind)==true,request.requester != nil,
+                      !userInputHasPriority(id),!automaticInputBusy(id),!osPermissionReceipts.contains(request.id) else {continue}
+                let reader=singleProcessReader,pid=original.pid,automationEpoch=automationRuntime.epoch(id)
+                let records=try await Task.detached(priority:.utility) {try reader(pid)}.value
+                guard epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,!remoteInputStopped,!snapshot.paused,
+                      records.contains(where:{$0.pid==pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {continue}
+                osPermissionActing=request.id;defer {osPermissionActing=nil}
+                var event=AuditEvent(sessionID:id,summary:"OS 권한 정책 승인 · "+request.kind.title,outcome:"허용 입력 전 확인",source:"세션 OS 권한 정책",context:AuditContext(session:original),request:request.content)
+                guard log(event) else {continue}
+                var receipt=request;receipt.phase = .uncertain;receipt.detail="조작 시작 기록이 있습니다. 결과 미확인 시 자동 반복하지 않습니다."
+                try store.set("osPermissionReceipt:"+request.id,String(decoding:JSONEncoder().encode(receipt),as:UTF8.self));osPermissionReceipts.insert(request.id)
+                osPermissionRequests[request.id]?.phase = .approving
+                let delivery=service.approve(request) { [self] in
+                    guard epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,!remoteInputStopped,!snapshot.paused,!userInputHasPriority(id),
+                          let current=sessions[id],osPermissionSource(current)==osPermissionSource(original),current.automatic,current.phase != .ended,
+                          osPermissionPolicySources[id]==osPermissionSource(current),current.osPermissionPolicy?.allowed.contains(request.kind)==true,osPermissionRequests[request.id]?.immutableToken==request.immutableToken else {return false}
+                    guard let live=try? singleProcessReader(original.pid),live.contains(where:{$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {return false}
+                    return current.osPermissionPolicy?.permits(request)==true || osPermissionClaims[request.id].map {$0.sessionID==id && $0.token==request.immutableToken && $0.source==osPermissionSource(current)}==true
+                }
+                switch delivery {
+                case .sent:
+                    receipt.phase=request.action == .openSettings ? .settings:.submitted
+                    if request.action == .openSettings,let target=request.requester {osPermissionTransitions[request.id] = .init(target:target,kind:request.kind,sessionID:id,source:osPermissionSource(original),until:Date().addingTimeInterval(30))}
+                    if request.action == .enableSetting {osPermissionTransitions=osPermissionTransitions.filter {!($0.value.target==request.requester && $0.value.kind==request.kind && $0.value.sessionID==id)}}
+                    receipt.detail=request.action == .openSettings ? "OS 설정을 열었습니다. 같은 앱의 허용 스위치를 확인합니다. 인증이 필요하면 Mac에서 직접 처리해주세요.":"OS 권한 허용 입력을 한 번 전달했습니다. 권한창과 원래 앱의 결과를 확인합니다."
+                    event.outcome=request.action == .openSettings ? "OS 설정 열기 전달":"OS 허용 입력 전달"
+                case .unavailable(let message):receipt.phase = .uncertain;receipt.detail=message;event.outcome="OS 입력 미전달 · 확인 필요"
+                case .uncertain(let message):receipt.phase = .uncertain;receipt.detail=message;event.outcome="OS 입력 결과 미확인"
+                }
+                osPermissionRequests[request.id]=receipt
+                try store.set("osPermissionReceipt:"+request.id,String(decoding:JSONEncoder().encode(receipt),as:UTF8.self));_ = log(event)
+                publishOSPermissions();publish();break
+            }
+        } catch {
+            var status=snapshot.osPermissions ?? .init();status.available=false;status.detail="OS 권한 연결 확인 실패: "+String(error.localizedDescription.prefix(500))
+            if snapshot.osPermissions != status {snapshot.osPermissions=status;publish()}
+        }
+    }
+
     public func setCodexProgressRecoveryEnabled(_ enabled:Bool) throws {
         try store.set("codexProgressRecoveryEnabled",enabled ? "true":"false")
         snapshot.codexProgressRecoveryEnabled=enabled
@@ -5161,7 +5374,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return status
     }
     private func codexProgressEligible(_ session:AgentSession,allowInterrupted:Bool=false)->Bool {
-        !remoteInputStopped && snapshot.codexProgressRecoveryEnabled != false && !snapshot.paused && session.automatic &&
+        !hasOSPermissionWait(session.id) && !remoteInputStopped && snapshot.codexProgressRecoveryEnabled != false && !snapshot.paused && session.automatic &&
             session.agent == .codex && session.terminal == .terminal && session.channel == .terminalScreen && session.phase != .ended &&
             (codexProgressFinishedTurn(session.id)==nil || allowInterrupted && codexProgressFinishedTurn(session.id)=="interrupted")
     }
@@ -5298,7 +5511,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleCapacityResume(_ id: String) {
-        guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), systemSafetyStates[id]?.notice.isPending != true,
+        guard !hasOSPermissionWait(id),!remoteInputStopped, !automationNeedsFreshScreen.contains(id), systemSafetyStates[id]?.notice.isPending != true,
               let state = capacityStates[id], state.phase == .waiting, state.scheduledID == nil, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id) else { return }
         let scheduledID = UUID(), scheduledRevision = revision
         capacityStates[id]?.scheduledID = scheduledID
@@ -5312,7 +5525,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64, automationEpoch: UInt64) async {
         func current() -> (CapacityState, AgentSession, ScreenHostAdapter?)? {
-            guard !Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !automationNeedsFreshScreen.contains(id),
+            guard !hasOSPermissionWait(id),!Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !automationNeedsFreshScreen.contains(id),
                   let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
                   // Preserve async questions in history, but do not let questions
@@ -5366,7 +5579,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if superseded { scheduleCapacityResume(id) }
         }
         func ownsDelivery() -> Bool {
-            !Task.isCancelled && automationRuntime.epoch(id) == automationEpoch &&
+            !hasOSPermissionWait(id) && !Task.isCancelled && automationRuntime.epoch(id) == automationEpoch &&
                 capacityStates[id]?.phase == .sending && capacityStates[id]?.dispatchID == scheduledID
                 && sessions[id]?.phase != .ended
         }
@@ -6043,6 +6256,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleScreenApproval(_ id: String) {
+        guard !hasOSPermissionWait(id) else {return}
         if systemSafetyStates[id]?.notice.isPending == true { scheduleSystemSafety(id); return }
         guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
@@ -6062,7 +6276,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let live = try? await Task.detached { try reader() }.value
             guard let self else { return }
             guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
-                  self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
+                  !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,

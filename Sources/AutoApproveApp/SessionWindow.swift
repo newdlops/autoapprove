@@ -308,7 +308,12 @@ import AutoApproveCore
                           approveClaude: { sourceID, requestID, automatic in try engine.answerClaudeApproval(sessionID: sourceID, requestID: requestID, enableAutomatic: automatic) },
                           releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) },
                           questionDrafts: questionDrafts,
-                          checkCodexProgress:{try engine.requestCodexProgressCheck(id)},cancelCodexProgress:{engine.cancelCodexProgressCheck(id)})
+                          checkCodexProgress:{try engine.requestCodexProgressCheck(id)},cancelCodexProgress:{engine.cancelCodexProgressCheck(id)},
+                          osPermissionStatus:engine.snapshot.osPermissions,
+                          setOSPermissionAllowed:{try engine.setOSPermissionPolicy(id,allowed:$0)},
+                          assignOSPermission:{try engine.assignOSPermission(id,requestID:$0,token:$1,remember:$2)},
+                          removeOSPermissionTarget:{try engine.removeOSPermissionTarget(id,targetID:$0)},
+                          acknowledgeOSPermission:{try engine.acknowledgeOSPermission(id,requestID:$0,token:$1)})
                 .id(session.id)
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
@@ -521,6 +526,11 @@ private struct SessionDetail: View {
     var questionDrafts: QuestionReplyDrafts? = nil
     var checkCodexProgress:(() throws -> Void)?=nil
     var cancelCodexProgress:(() -> Void)?=nil
+    var osPermissionStatus:OSPermissionMonitorStatus?=nil
+    var setOSPermissionAllowed:(([OSPermissionKind]) throws -> Void)?=nil
+    var assignOSPermission:((String,String,Bool) throws -> Void)?=nil
+    var removeOSPermissionTarget:((String) throws -> Void)?=nil
+    var acknowledgeOSPermission:((String,String) throws -> Void)?=nil
     @State private var automationResetMessage: String?
     @State private var automationResetFailed = false
     var body: some View {
@@ -591,6 +601,10 @@ private struct SessionDetail: View {
                     }
                 }
                 Divider()
+                if session.agent != .shell {
+                    OSPermissionPolicyView(session:session,status:osPermissionStatus,paused:paused,setAllowed:setOSPermissionAllowed,assign:assignOSPermission,remove:removeOSPermissionTarget,acknowledge:acknowledgeOSPermission)
+                    Divider()
+                }
                 ForEach(([session] + session.backgroundChildren).filter { $0.systemSafety != nil }) { source in
                     if let notice = source.systemSafety {
                         VStack(alignment: .leading, spacing: 8) {

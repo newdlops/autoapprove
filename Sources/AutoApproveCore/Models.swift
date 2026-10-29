@@ -145,10 +145,13 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     /// An observed CLI failure, independent of Mac/web connectivity.
     public var interruption: SessionInterruption?
     public var codexProgressRecovery:CodexProgressRecovery?
+    public var osPermissionPolicy:OSPermissionPolicy?
+    public var osPermissionWaiting:Bool?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
     public var phaseTitle: String {
+        if phase != .ended,osPermissionWaiting == true {return "OS 권한 대기"}
         if interruption?.needsAttention == true {
             if phase == .ended { return "오류로 종료됨" }
             switch capacityResume?.phase {
@@ -168,7 +171,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
         }
         return isMonitoring ? "대기 중 · 모니터링" : phase.title
     }
-    public var needsReview: Bool { (interruption?.needsAttention == true && interruption?.acknowledgedAt == nil) || (phase != .ended && (phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending })) }
+    public var needsReview: Bool { (interruption?.needsAttention == true && interruption?.acknowledgedAt == nil) || (phase != .ended && (osPermissionWaiting==true || phase == .approval || phase == .input || questions.contains { $0.needsAnswer || $0.reply?.phase == .sending })) }
     public var canApprove: Bool { agent != .shell && phase != .ended && (channel != .none || backgroundChildren.contains(where: \.canApprove)) }
     public var automaticWaitingForConnection: Bool { automatic && !canApprove && phase != .ended }
     public var canReveal: Bool {
@@ -316,6 +319,7 @@ public struct EngineSnapshot: Codable {
     /// Optional for compatibility with clients predating the independent mouse signal setting.
     public var mouseActivity: MouseActivityStatus?
     public var codexProgressRecoveryEnabled:Bool?
+    public var osPermissions:OSPermissionMonitorStatus?
     public var questionNotificationDelay: Int {
         guard let value = questionNotificationDelaySeconds, Self.questionNotificationDelayRange.contains(value) else { return 10 }
         return value

@@ -5,6 +5,29 @@ import Darwin
 import AutoApproveCore
 import TerminalInputSupport
 
+private final class PreviewOSPermissions:@unchecked Sendable {
+    let directory:URL
+    private let lock=NSLock()
+    private var inputs:[JSONObject]=[]
+    let target=OSPermissionTarget(name:"컴퓨터 유즈 테스트 앱 · 긴 이름 한글🙂",bundleID:"local.preview.permission",path:"/fixture/긴 프로젝트 이름/컴퓨터 유즈 테스트 앱.app",requirement:"identifier local.preview.permission and stable publisher",pid:89990,started:"Synthetic original app start")
+    init(_ directory:URL) {self.directory=directory}
+    func scan()->OSPermissionMonitorStatus {
+        let url=directory.appendingPathComponent("os-control.json")
+        let data=(try? Data(contentsOf:url)) ?? Data("{}".utf8)
+        let object=(try? JSONSerialization.jsonObject(with:data)) as? JSONObject ?? [:]
+        if object["closed"] as? Bool==true {return .init(available:true,detail:"격리된 OS 권한 연결 · 실제 OS 입력 없음")}
+        let kind=(object["kind"] as? String).flatMap(OSPermissionKind.init(rawValue:)) ?? .camera
+        let suffix=object["suffix"] as? String ?? "first"
+        let request=OSPermissionRequest(kind:kind,requester:target,ownerPID:77,ownerStarted:"Synthetic OS owner",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"컴퓨터 유즈 테스트 앱 · 긴 이름 한글🙂\" would like to access the camera.\n<img src=x onerror=alert(1)>\n실제 OS 요청이 아닌 격리된 테스트 데이터입니다.",action:.allow,actionToken:"allow-"+suffix)
+        return .init(available:true,detail:"격리된 OS 권한 연결 · 실제 OS 입력 없음",requests:[request])
+    }
+    func input(_ request:OSPermissionRequest)->OSPermissionDelivery {
+        lock.lock();defer{lock.unlock()};inputs.append(["id":request.id,"kind":request.kind.rawValue,"action":request.action.rawValue])
+        if let data=try? JSONSerialization.data(withJSONObject:["inputs":inputs,"realOSInputs":0,"realTerminalInputs":0]) {try? data.write(to:directory.appendingPathComponent("os-inputs.json"),options:.atomic)}
+        return .sent
+    }
+}
+
 private final class PreviewScreens: @unchecked Sendable {
     private let lock = NSLock()
     var screens: [String: String] = [:]
@@ -80,6 +103,7 @@ private final class PreviewScreens: @unchecked Sendable {
         let directOnly = CommandLine.arguments.contains("--direct-only")
         let connectionPerformance = CommandLine.arguments.contains("--connection-performance")
         let progressMode=CommandLine.arguments.contains("--codex-progress")
+        let osMode=CommandLine.arguments.contains("--os-permissions")
         let releaseOption = CommandLine.arguments.first(where: { $0.hasPrefix("--web-version=") })?.dropFirst("--web-version=".count)
         let releaseParts = releaseOption?.split(separator: ":")
         let webVersion = releaseOption == "legacy" ? nil : releaseParts.flatMap { parts in
@@ -121,9 +145,12 @@ private final class PreviewScreens: @unchecked Sendable {
         } else {progressIdentity=nil}
         let inputAvailable:(@Sendable ()->Bool)?
         if progressMode {inputAvailable={true}} else if connectionPerformance {inputAvailable={false}} else {inputAvailable=nil}
+        let osState=PreviewOSPermissions(directory)
+        let osServices:OSPermissionServices?
+        if osMode {osServices=OSPermissionServices(scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")})} else {osServices=nil}
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
             claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
-            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity)
+            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,osPermissionServices:osServices)
         if let raw=CommandLine.arguments.first(where:{$0.hasPrefix("--progress-delay=")}),let seconds=Double(raw.dropFirst("--progress-delay=".count)) {engine.codexProgressTimeout=seconds}
         try engine.start(poll: false)
         var sessions = ProcessDiscovery.sessions(records)
@@ -148,6 +175,7 @@ private final class PreviewScreens: @unchecked Sendable {
         }
         try engine.setAutomatic(sessions[3].id, enabled: true)
         if progressMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
+        if osMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
         engine.updateGitBranches(sessions.map { GitBranchUpdate(sessionID: $0.id, cwd: $0.cwd, state: .init(kind: .branch, name: "feature/network-sessions")) })
         let question = QueuedQuestion(id: "fixture-question-" + label, threadID: UUID().uuidString, title: "어떤 환경에서 네트워크 연결을 확인할까요? 검증용 질문이며 실제 작업에는 영향을 주지 않습니다.", options: ["개인 핫스팟에서 확인", "같은 Wi-Fi에서 확인", "긴 선택지의 줄바꿈과 선택 영역이 작은 휴대폰 화면에서도 유지되는지 확인"])
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: sessions[1].id, questions: [question], threadID: question.threadID)])
@@ -175,6 +203,7 @@ private final class PreviewScreens: @unchecked Sendable {
                                 "namedURL": status.urls.first(where: { URL(string: $0)?.host?.hasPrefix("autoapprove-") == true }) ?? ""]
         print(String(decoding: try JSONSerialization.data(withJSONObject: info), as: UTF8.self)); fflush(stdout)
         while !Task.isCancelled {
+            if osMode {await engine.refreshOSPermissions()}
             if progressMode {engine.receiveScreen(sessionID:sessions[0].id,raw:state.read(sessions[0].tty),generation:"terminal:"+sessions[0].id,source:.terminalScreen)}
             if CommandLine.arguments.contains("--trace-routes"), let value = Mirror(reflecting: web).children.first(where: { $0.label == "peers" })?.value {
                 try? String(describing: value).write(to: directory.appendingPathComponent("route-trace.txt"), atomically: true, encoding: .utf8)
