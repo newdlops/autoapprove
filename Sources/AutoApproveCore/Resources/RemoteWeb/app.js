@@ -1165,7 +1165,11 @@ async function performNetworkRefresh(initial = false, restart = false) {
   const startedAt = performance.now();
   try {
     const selectedNode = new URLSearchParams(location.hash.slice(1)).get('node');
-    const result = await readNetworkInventory(initial ? '/api/network?'+new URLSearchParams({initial:'1',...(selectedNode ? {node:selectedNode} : {})}) : '/api/network', initial, waiting, controller.signal);
+    // Every refresh keeps the selected Mac's bounded foreground priority. A
+    // write invalidates its inventory; another peer's warm cache must not turn
+    // the selected controls into a pending/offline view before that read ends.
+    const parameters=new URLSearchParams({...(initial?{initial:'1'}:{}),...(selectedNode?{node:selectedNode}:{})}).toString();
+    const result = await readNetworkInventory('/api/network'+(parameters?'?'+parameters:''), initial, waiting, controller.signal);
     if (controller.signal.aborted || document.hidden) return;
     if (!initial && networkValidation.notModified && connected && appliedNetworkETag === networkValidation.etag) {
       // Still observe liveness/history and recover streams, without replacing

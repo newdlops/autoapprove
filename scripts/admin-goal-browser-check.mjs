@@ -7,9 +7,12 @@ import {mkdir,mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const opt=n=>process.argv.find(v=>v.startsWith('--'+n+'='))?.slice(n.length+3),build=path.resolve(opt('build')||'.build/network-stability/release'),out=path.resolve(opt('output')||'.runtime/admin-goal-browser');
+const soakCycles=Number(opt('soak-cycles')||0);
+assert.ok(Number.isSafeInteger(soakCycles)&&soakCycles>=0&&soakCycles<=200,'--soak-cycles must be an integer from 0 to 200');
+const engine=process.argv.includes('--webkit')?'webkit':'chromium';
 await mkdir(out,{recursive:true});const binary=out+'/AdminPreview';
 execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/AdminPreview'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/network-preview.swift','-o',binary],{stdio:'inherit',timeout:180000});
-const root=await mkdtemp('/private/tmp/aa-admin-http-'),children=[],wait=ms=>new Promise(r=>setTimeout(r,ms));let browser,page;
+const root=await mkdtemp('/private/tmp/aa-admin-http-'),children=[],wait=ms=>new Promise(r=>setTimeout(r,ms));let browser,page,phase='startup';
 async function until(test,label,timeout=20000){const end=Date.now()+timeout;while(!await test()){if(Date.now()>end)throw Error(label);await wait(60);}}
 async function start(label,version='0.2.209:236'){const home=root+'/'+label,child=spawn(binary,[home,label,'--direct-only','--os-permissions','--codex-goals','--web-version='+version],{stdio:['ignore','pipe','pipe']});children.push(child);let info,stdout='',stderr='';child.stdout.on('data',b=>{stdout+=b;for(const line of stdout.split('\n'))if(line.startsWith('{'))try{const x=JSON.parse(line);if(x.url)info=x;}catch{}});child.stderr.on('data',b=>stderr+=b);await until(()=>info||child.exitCode!==null,'Fixture startup '+stderr);assert.ok(info,stderr);return {...info,home};}
 async function json(url,body,status=200){const response=await fetch(url,{method:body?'POST':'GET',headers:body?{'content-type':'application/json'}:{},body:body?JSON.stringify({requestID:randomUUID(),...body}):undefined,signal:AbortSignal.timeout(15000)});assert.equal(response.status,status,await response.clone().text());return response.json();}
@@ -20,8 +23,8 @@ async function settled(){await page.waitForFunction(()=>!mutation);}
 try{
  const a=await start('Admin A'),b=await start('Admin B'),old=await start('Admin Old','0.2.207:234');
  await json(a.url+'/api/peers',{address:b.url});await json(a.url+'/api/peers',{address:old.url});
- const module=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');browser=await module.chromium.launch({headless:true,channel:'chrome'});
- const context=await browser.newContext({viewport:{width:1440,height:900}});page=await context.newPage();const errors=[],mutations=[];page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.method()==='POST'&&r.url().includes('/api/action'))mutations.push(r.postDataJSON());});
+ const module=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');browser=await module[engine].launch({headless:true,...(engine==='chromium'?{channel:'chrome'}:{})});
+ const context=await browser.newContext({viewport:{width:1440,height:900}});page=await context.newPage();const errors=[],mutations=[];let networkReads=0;page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(new URL(r.url()).pathname==='/api/network')networkReads++;if(r.method()==='POST'&&r.url().includes('/api/action'))mutations.push(r.postDataJSON());});
  await page.goto(a.url);await select('Admin A');await page.waitForFunction(()=>document.querySelector('#resume-goal')?.disabled===false);
  let missingThread=true;await page.route('**/api/codex/goal**',route=>{if(missingThread){missingThread=false;return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'원래 대화를 선택해주세요.'})});}return route.continue();});
  await page.locator('#refresh-goal').click();await page.locator('#choose-goal-thread').waitFor({state:'visible'});await page.locator('#choose-goal-thread').click();await page.locator('#goal-thread').selectOption({index:1});await page.locator('#use-goal-thread').click();await page.waitForFunction(()=>!document.querySelector('#resume-goal').disabled);await page.unroute('**/api/codex/goal**');
@@ -62,13 +65,49 @@ try{
  await context.setOffline(true);await page.evaluate(()=>{void refreshNetwork(false,true);});await page.waitForFunction(()=>!connected);assert.ok(await page.locator('#os-permission-camera').isDisabled());assert.ok(await page.locator('#cancel-goal').isDisabled());
  const recoveredAt=Date.now();await context.setOffline(false);await page.evaluate(()=>window.dispatchEvent(new Event('online')));await page.waitForFunction(()=>connected&&currentNode()?.online);const reconnectMS=Date.now()-recoveredAt;
  await page.locator('#refresh-goal').click();await page.waitForFunction(()=>document.querySelector('#goal-status').textContent==='진행 중'&&!document.querySelector('#cancel-goal').disabled);assert.equal((await report(b)).actions.length,2);
+ let soak=null;
+ if(soakCycles){
+  const started=performance.now(),policyTimes=[],recoveryTimes=[],burstReads=[];
+  for(let index=0;index<soakCycles;index++){
+   const host=index%2===0?{node:a,label:'Admin A',session:sa}:{node:b,label:'Admin B',session:sb};
+   phase=`soak ${index+1}/${soakCycles}: select`;
+   await select(host.label);await page.waitForFunction(id=>selectedItem?.session.id===id,host.session.id);
+   await page.locator('#refresh-goal').click();await page.waitForFunction(()=>goalState()?.snapshot?.sessionID===selectedItem.session.id&&!goalState().loading&&goalState().snapshot.goal?.status==='active');
+   const key=await page.evaluate(()=>selectedKey),camera=page.locator('#os-permission-camera'),enabled=!await camera.isChecked();
+   await page.locator('#os-permission-options').evaluate(e=>e.open=true);await page.locator('#os-permission-requests details').first().evaluate(e=>e.open=true);
+   phase=`soak ${index+1}/${soakCycles}: delayed inventory and policy save`;
+   await holdInventory();await camera.focus();const policyStart=performance.now();await camera.press('Space');await settled();
+   await page.waitForFunction(()=>currentNode()?.online&&!mutation);policyTimes.push(performance.now()-policyStart);
+   assert.equal(await camera.isChecked(),enabled);await page.waitForFunction(()=>document.activeElement.id==='os-permission-camera',{},{timeout:2000});
+   await releaseInventory();assert.equal(await page.evaluate(()=>selectedKey),key);assert.equal(await camera.isChecked(),enabled,'Late response rolled back the selected policy');
+   assert.ok(await page.locator('#os-permission-requests details').first().evaluate(e=>e.open),'Policy refresh collapsed the request');
+   const current=(await state(host.node)).sessions.find(v=>v.session.id===host.session.id);assert.equal(current.session.osPermissionPolicy.allowed.includes('camera'),enabled);
+   phase=`soak ${index+1}/${soakCycles}: disconnect`;
+   await context.setOffline(true);await page.evaluate(()=>{void refreshNetwork(false,true);});await page.waitForFunction(()=>!connected);
+   assert.ok(await camera.isDisabled());assert.ok(await page.locator('#cancel-goal').isDisabled());assert.equal(await page.evaluate(()=>selectedKey),key);
+   phase=`soak ${index+1}/${soakCycles}: online event burst`;
+   const beforeBurst=networkReads,recoveryStart=performance.now();await context.setOffline(false);
+   await page.evaluate(()=>{for(let i=0;i<8;i++)window.dispatchEvent(new Event('online'));});
+   await page.waitForFunction(key=>connected&&currentNode()?.online&&selectedKey===key,key);recoveryTimes.push(performance.now()-recoveryStart);
+   burstReads.push(networkReads-beforeBurst);assert.ok(burstReads.at(-1)<=5,'Online notifications caused excessive inventory reads');
+   await page.locator('#refresh-goal').click();await page.waitForFunction(()=>!goalState().loading&&!goalState().error&&goalState().snapshot?.sessionID===selectedItem.session.id&&!document.querySelector('#cancel-goal').disabled);
+   assert.equal(await camera.isChecked(),enabled);assert.deepEqual(errors,[]);
+   if((index+1)%10===0||index+1===soakCycles)console.log(JSON.stringify({soakProgress:index+1,total:soakCycles,elapsedMS:Math.round(performance.now()-started)}));
+  }
+  assert.equal((await report(a)).actions.length,1);assert.equal((await report(b)).actions.length,2);
+  for(const node of[a,b]){let inputs;try{inputs=JSON.parse(await readFile(node.home+'/os-inputs.json','utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}assert.equal(inputs?.inputs?.length||0,0,'Policy changes must not grant a permission to an unregistered app');}
+  const summary=values=>{const sorted=[...values].sort((a,b)=>a-b);return {p50MS:Math.round(sorted[Math.floor(sorted.length*.5)]),p95MS:Math.round(sorted[Math.min(sorted.length-1,Math.ceil(sorted.length*.95)-1)]),maxMS:Math.round(sorted.at(-1))};};
+  soak={cycles:soakCycles,elapsedMS:Math.round(performance.now()-started),policy:summary(policyTimes),reconnect:summary(recoveryTimes),maxInventoryReadsPerOnlineBurst:Math.max(...burstReads),notificationsPerBurst:8,lateResponsesChecked:soakCycles,sessionSelectionsPreserved:soakCycles,additionalGoalWrites:0,syntheticOSInputs:0};
+  await select('Admin B');await page.locator('#refresh-goal').click();await page.waitForFunction(()=>!goalState().loading&&goalState().snapshot?.goal?.status==='active');
+ }
+ phase='stable render and visual checks';
  const stable=await page.evaluate(async()=>{let childChanges=0;const observer=new MutationObserver(rows=>childChanges+=rows.filter(r=>r.type==='childList').length);observer.observe(document.querySelector('#os-permission-requests'),{childList:true,subtree:true});const before=performance.now();for(let i=0;i<250;i++)renderOSPermissions(selectedItem);await Promise.resolve();observer.disconnect();return {renders:250,childChanges,elapsedMS:performance.now()-before};});assert.equal(stable.childChanges,0);
  await writeFile(b.home+'/goal-control.json',JSON.stringify({threadID:thread,status:'active',objective:'긴 목표와 원래 대화의 내용 · <img src=x onerror=alert(1)>\n'+'한글🙂 길이가 긴 목표를 확인하면서 현재 작업과 연결을 유지합니다. '.repeat(60),createdAt:400}));await page.locator('#refresh-goal').click();await page.waitForFunction(()=>document.querySelector('#goal-objective').textContent.length>1000);
  await page.locator('#goal-objective-details').evaluate(e=>e.open=true);assert.equal(await page.locator('#codex-goal img').count(),0);await page.locator('#feedback').waitFor({state:'hidden',timeout:15000});
- const viewports=[];for(const theme of ['light','dark'])for(const [name,width,height]of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.emulateMedia({colorScheme:theme});await page.setViewportSize({width,height});await page.locator('#codex-goal').evaluate(e=>e.scrollIntoView({block:'start'}));await page.screenshot({path:out+'/'+name+'-'+theme+'.png'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);const buttons=await page.locator('#codex-goal button:visible').evaluateAll(es=>es.map(e=>({height:e.getBoundingClientRect().height,label:e.textContent})));assert.ok(buttons.every(b=>b.height>=44));viewports.push({width,height,theme});}
+ const viewports=[];for(const theme of ['light','dark'])for(const [name,width,height]of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){await page.emulateMedia({colorScheme:theme});await page.setViewportSize({width,height});await page.locator('#codex-goal').evaluate(e=>e.scrollIntoView({block:'start'}));await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));await page.screenshot({path:out+'/'+name+'-'+theme+'.png'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);const buttons=await page.locator('#codex-goal button:visible').evaluateAll(es=>es.map(e=>({height:e.getBoundingClientRect().height,label:e.textContent})));assert.ok(buttons.every(b=>b.height>=44));viewports.push({width,height,theme});}
  await page.setViewportSize({width:390,height:844});await page.locator('#os-permission-options').evaluate(e=>e.open=true);await page.locator('#os-permissions').evaluate(e=>e.scrollIntoView({block:'start'}));await page.screenshot({path:out+'/permissions-mobile-dark.png'});
  await page.locator('#cancel-goal').focus();assert.equal(await page.evaluate(()=>document.activeElement.id),'cancel-goal');await page.keyboard.press('Enter');assert.equal(await page.evaluate(()=>document.activeElement.id),'keep-goal');await page.keyboard.press('Enter');assert.equal(await page.evaluate(()=>document.activeElement.id),'cancel-goal');
  await page.setViewportSize({width:1440,height:900});await page.getByRole('button',{name:/검증용 Admin Old · 웹 관리 구현/}).click();assert.ok(await page.locator('#codex-goal').isHidden());assert.ok(await page.locator('#os-permissions').isHidden());assert.deepEqual(errors,[]);
- const result={passed:true,nodes:3,writeRefreshMS,reconnectMS,lateResponsePreserved:true,policyConflictRejected:true,sessionSwitchPreserved:true,goalForwarded:true,goalReplacementRejected:true,lostReplyReplays:0,stable,viewports,errors,realTerminalInputs:0,realOSInputs:0};await writeFile(out+'/report.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));
-}catch(error){if(page)await page.screenshot({path:out+'/failure.png'}).catch(()=>{});throw error;}
+ const result={passed:true,engine,nodes:3,writeRefreshMS,reconnectMS,lateResponsePreserved:true,policyConflictRejected:true,sessionSwitchPreserved:true,goalForwarded:true,goalReplacementRejected:true,lostReplyReplays:0,soak,stable,viewports,errors,realTerminalInputs:0,realOSInputs:0};await writeFile(out+'/report.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));
+}catch(error){if(page){await page.screenshot({path:out+'/failure.png'}).catch(()=>{});const state=await page.evaluate(()=>({connected,loadingNetwork,mutation,selection:selectedKey,nodes:nodes.map(n=>({id:n.id,online:n.online,loading:n.loading,error:n.error})),focus:document.activeElement.id,goal:document.querySelector('#goal-status')?.textContent,goalError:document.querySelector('#goal-error')?.textContent,permission:document.querySelector('#os-permission-status')?.textContent})).catch(()=>null);await writeFile(out+'/failure.json',JSON.stringify({phase,message:error.message,state},null,2));}throw error;}
 finally{await browser?.close();for(const child of children)if(child.exitCode===null&&child.signalCode===null)child.kill();await Promise.all(children.map(child=>child.exitCode!==null||child.signalCode!==null?null:new Promise(r=>child.once('exit',r))));await rm(root,{recursive:true,force:true});}
