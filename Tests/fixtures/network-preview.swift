@@ -18,7 +18,9 @@ private final class PreviewOSPermissions:@unchecked Sendable {
         if object["closed"] as? Bool==true {return .init(available:true,detail:"격리된 OS 권한 연결 · 실제 OS 입력 없음")}
         let kind=(object["kind"] as? String).flatMap(OSPermissionKind.init(rawValue:)) ?? .camera
         let suffix=object["suffix"] as? String ?? "first"
-        let request=OSPermissionRequest(kind:kind,requester:target,ownerPID:77,ownerStarted:"Synthetic OS owner",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"컴퓨터 유즈 테스트 앱 · 긴 이름 한글🙂\" would like to access the camera.\n<img src=x onerror=alert(1)>\n실제 OS 요청이 아닌 격리된 테스트 데이터입니다.",action:.allow,actionToken:"allow-"+suffix)
+        var requester=target
+        if object["managementApp"] as? Bool==true {requester.pid=ProcessInfo.processInfo.processIdentifier;requester.name="AutoApprove";requester.bundleID="local.autoapprove.mac"}
+        let request=OSPermissionRequest(kind:kind,requester:requester,ownerPID:77,ownerStarted:"Synthetic OS owner",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"컴퓨터 유즈 테스트 앱 · 긴 이름 한글🙂\" would like to access the camera.\n<img src=x onerror=alert(1)>\n실제 OS 요청이 아닌 격리된 테스트 데이터입니다.",action:.allow,actionToken:"allow-"+suffix)
         return .init(available:true,detail:"격리된 OS 권한 연결 · 실제 OS 입력 없음",requests:[request])
     }
     func input(_ request:OSPermissionRequest)->OSPermissionDelivery {

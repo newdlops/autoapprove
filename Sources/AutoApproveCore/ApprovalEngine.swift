@@ -5211,6 +5211,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let session=sessions[id],session.agent != .shell,session.phase != .ended,
               let request=osPermissionRequests[requestID],request.isPending,request.phase == .waiting,
               request.immutableToken==token,let target=request.requester,let seen=osPermissionSeen[requestID],Date().timeIntervalSince(seen)<6 else {throw RemoteHTTPError(409,"현재 OS 요청과 앱 신원을 다시 확인해주세요.")}
+        guard !request.isManagementApp else {throw RemoteHTTPError(409,"AutoApprove 자체의 권한은 CLI 세션 정책에 연결할 수 없습니다. Mac에서 직접 설정해주세요.")}
         guard request.sessionID==nil || request.sessionID==id else {throw RemoteHTTPError(409,"다른 세션에 연결된 요청입니다.")}
         if remember {
             guard !target.isSharedController else {throw RemoteHTTPError(409,"여러 세션이 공유하는 제어 앱은 현재 요청만 연결할 수 있습니다.")}
@@ -5242,7 +5243,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         osPermissionReceipts.insert(requestID);osPermissionRequests[requestID]=request;publishOSPermissions();publish()
     }
     private func hasOSPermissionWait(_ id:String)->Bool {
-        osPermissionRequests.values.contains {$0.isPending && ($0.sessionID==nil || $0.sessionID==id)}
+        osPermissionRequests.values.contains {!$0.isManagementApp && $0.isPending && ($0.sessionID==nil || $0.sessionID==id)}
     }
     private func publishOSPermissions() {
         var status=snapshot.osPermissions ?? .init()
@@ -5256,7 +5257,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if let host=sessions[id].flatMap({ScreenHost(kind:$0.terminal)}) {screenPollSignals[host]?.notify()}
             }
             if waiting {osPermissionBlocked.insert(id)} else {osPermissionBlocked.remove(id)}
-            sessions[id]?.osPermissionWaiting=osPermissionRequests.values.contains {$0.isPending && $0.sessionID==id}
+            sessions[id]?.osPermissionWaiting=osPermissionRequests.values.contains {!$0.isManagementApp && $0.isPending && $0.sessionID==id}
         }
     }
     public func refreshOSPermissions() async {
@@ -5270,6 +5271,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let before=snapshot.osPermissions,now=Date(),seen=Set(scanned.requests.map(\.id))
             for fresh in scanned.requests {
                 var request=fresh
+                request.managementApp=request.isManagementApp ? true:nil
                 osPermissionSeen[request.id]=now
                 if let previous=osPermissionRequests[request.id],previous.immutableToken==request.immutableToken {
                     request.phase=previous.phase;request.detail=previous.detail;request.observedAt=previous.observedAt
@@ -5288,7 +5290,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let owners=sessions.values.filter {$0.phase != .ended && osPermissionPolicySources[$0.id]==osPermissionSource($0) && $0.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true}
                     if owners.count==1 {request.sessionID=owners[0].id}
                 }
-                if request.phase == .waiting {
+                if request.isManagementApp {
+                    request.sessionID=nil;osPermissionClaims.removeValue(forKey:request.id)
+                    request.detail="AutoApprove 자체의 권한은 Mac에서 직접 설정해주세요. 이 대기는 다른 CLI의 승인 감지와 진행 확인을 막지 않습니다."
+                } else if request.phase == .waiting {
                     if request.action == .manual {request.detail="Mac 사용자 인증이나 보호된 OS 조작이 필요합니다. 이 창은 Mac에서 직접 처리해주세요."}
                     else if request.requester==nil {request.detail="OS 요청 앱의 서명과 실행 신원을 확인하지 못해 자동 승인하지 않습니다."}
                     else if let id=request.sessionID,let session=sessions[id] {
@@ -5313,9 +5318,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if snapshot.osPermissions?.available != status.available || snapshot.osPermissions?.detail != status.detail {snapshot.osPermissions=status}
             publishOSPermissions()
             if before != snapshot.osPermissions {publish()}
-            guard osPermissionActing==nil,!snapshot.paused,!scanned.requests.contains(where:{$0.action == .manual && $0.isPending}) else {return}
+            guard osPermissionActing==nil,!snapshot.paused,!scanned.requests.contains(where:{!$0.isManagementApp && $0.action == .manual && $0.isPending}) else {return}
             for request in osPermissionRequests.values.sorted(by:{$0.observedAt<$1.observedAt}) where request.phase == .waiting && seen.contains(request.id) {
-                guard request.action != .manual,let id=request.sessionID,let original=sessions[id],original.automatic,original.phase != .ended,
+                guard !request.isManagementApp,request.action != .manual,let id=request.sessionID,let original=sessions[id],original.automatic,original.phase != .ended,
                       osPermissionPolicySources[id]==osPermissionSource(original),original.osPermissionPolicy?.allowed.contains(request.kind)==true,request.requester != nil,
                       !userInputHasPriority(id),!automaticInputBusy(id),!osPermissionReceipts.contains(request.id) else {continue}
                 let reader=singleProcessReader,pid=original.pid,automationEpoch=automationRuntime.epoch(id)

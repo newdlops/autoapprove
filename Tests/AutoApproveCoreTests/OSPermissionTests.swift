@@ -92,6 +92,28 @@ extension ApprovalTests {
         try engine.assignOSPermission(ids[0],requestID:request.id,token:request.immutableToken,remember:false);await engine.refreshOSPermissions();try expectEqual(fixture.presses,[request.id])
         fixture.set([fixture.request("different-tab")]);await engine.refreshOSPermissions();try expectEqual(fixture.presses,[request.id])
     }
+    func testOSPermissionManagerSetupIsManualAndIndependent() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-host-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
+        let (engine,ids)=try await osEngine(fixture,root:root);defer{engine.stop()};let id=ids[0]
+        let host=OSPermissionTarget(name:"AutoApprove",bundleID:"local.autoapprove.mac",path:"/fixture/AutoApprove.app",requirement:"Synthetic host identity",pid:ProcessInfo.processInfo.processIdentifier,started:"same host")
+        let request=fixture.request("host-setup",kind:.localNetwork,target:host)
+        fixture.set([request]);await engine.refreshOSPermissions();try engine.setOSPermissionPolicy(id,allowed:[.localNetwork,.camera])
+        for remember in [false,true] {
+            do {try engine.assignOSPermission(id,requestID:request.id,token:request.immutableToken,remember:remember);throw AppError.message("Manager setup was attached to a CLI")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        }
+        try expect(!OSPermissionPolicy(allowed:[.localNetwork],targets:[host]).permits(request))
+        try expectEqual(OSPermissionAutomation().approve(request,authorized:{true}),.unavailable("AutoApprove 자체의 권한은 Mac에서 직접 설정해주세요."))
+        let observed=engine.snapshot.osPermissions?.requests.first
+        try expectEqual(observed?.managementApp,true);try expectNil(observed?.sessionID);try expectEqual(fixture.presses,[])
+        let raw="• Working (12s • esc to interrupt)\n› Ask Codex to do anything"
+        engine.receiveScreen(sessionID:id,raw:raw,generation:"host-setup")
+        try expect(engine.snapshot.sessions.first(where:{$0.id==id})?.codexProgressRecovery != nil,"Manager setup must not suppress the CLI progress clock")
+        // A manual host request must not suppress another session's explicitly scoped permission.
+        var manual=request;manual.action = .manual
+        let app=fixture.request("separate-app");fixture.set([manual,app]);await engine.refreshOSPermissions()
+        try engine.assignOSPermission(id,requestID:app.id,token:app.immutableToken,remember:true)
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[app.id])
+    }
     func testOSPermissionPauseOffRevocationAndProcessChange() async throws {
         for mode in ["pause","automatic-off","policy-off","remove-app","process-exit","stop","typing"] {
             let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-race-"+UUID().uuidString),fixture=OSFixture();defer{fixture.release();try? FileManager.default.removeItem(at:root)}

@@ -63,7 +63,7 @@ public struct OSPermissionPolicy:Codable,Equatable,Sendable {
     public init(allowed:[OSPermissionKind]=[],targets:[OSPermissionTarget]=[]) {self.allowed=Array(Set(allowed)).sorted {$0.rawValue<$1.rawValue};self.targets=targets}
     public var isEnabled:Bool {!allowed.isEmpty}
     public func permits(_ request:OSPermissionRequest)->Bool {
-        guard let target=request.requester else {return false}
+        guard !request.isManagementApp,let target=request.requester else {return false}
         return allowed.contains(request.kind) && targets.contains { $0.matches(target) }
     }
 }
@@ -84,14 +84,18 @@ public struct OSPermissionRequest:Codable,Equatable,Identifiable,Sendable {
     public var action:Action
     public var actionToken:String
     public var sessionID:String?
+    /// Host setup is manual and never belongs to a managed CLI session.
+    public var managementApp:Bool?
     public var phase:Phase = .waiting
     public var detail:String = "이 요청을 처리할 세션과 권한 정책을 확인해주세요."
     public var observedAt:Date = Date()
     public init(kind:OSPermissionKind,requester:OSPermissionTarget?,ownerPID:Int32,ownerStarted:String,ownerBundleID:String,windowToken:String,content:String,action:Action,actionToken:String) {
         self.kind=kind;self.requester=requester;self.ownerPID=ownerPID;self.ownerStarted=ownerStarted;self.ownerBundleID=ownerBundleID;self.windowToken=windowToken;self.content=content;self.action=action;self.actionToken=actionToken
+        managementApp=requester?.pid==ProcessInfo.processInfo.processIdentifier ? true:nil
         id=PromptDetector.fingerprint("\(ownerPID)\u{0}\(ownerStarted)\u{0}\(windowToken)\u{0}\(kind.rawValue)\u{0}\(requester?.id ?? "?")\u{0}\(content)\u{0}\(actionToken)")
     }
     public var isPending:Bool {phase != .resolved}
+    public var isManagementApp:Bool {requester?.pid==ProcessInfo.processInfo.processIdentifier}
     public var immutableToken:String {id+"\u{0}"+(requester.map {"\($0.pid):\($0.started):\($0.id)"} ?? "?")}
 }
 

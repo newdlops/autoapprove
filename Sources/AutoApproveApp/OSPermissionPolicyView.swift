@@ -28,17 +28,17 @@ struct OSPermissionPolicyView:View {
                     Text(request.detail).font(.callout).fixedSize(horizontal:false,vertical:true)
                     if let target=request.requester {Text(target.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
                     DisclosureGroup("OS 요청 내용") {Text(request.content).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
-                    if request.phase == .waiting,request.action != .manual,!policy.allowed.contains(request.kind) {
+                    if request.managementApp != true,request.phase == .waiting,request.action != .manual,!policy.allowed.contains(request.kind) {
                         Button("이 세션에서 \(request.kind.title) 허용") {perform {try setAllowed?(policy.allowed+[request.kind])}}
                             .disabled(setAllowed==nil || session.phase == .ended)
                     }
-                    if request.phase == .waiting,request.sessionID==nil,let target=request.requester {
+                    if request.managementApp != true,request.phase == .waiting,request.sessionID==nil,let target=request.requester {
                         ViewThatFits(in:.horizontal) {
                             HStack {assignmentButtons(request,target:target)}
                             VStack(alignment:.leading,spacing:8) {assignmentButtons(request,target:target)}
                         }
                     }
-                    if request.sessionID==session.id,request.phase != .approving {
+                    if request.managementApp != true,request.sessionID==session.id,request.phase != .approving {
                         Button("Mac에서 처리 완료로 표시") {perform {try acknowledge?(request.id,request.immutableToken)}}.disabled(acknowledge==nil)
                             .help("OS 설정이나 원래 앱에서 결과를 직접 확인한 뒤 이 대기 표시를 닫습니다. 권한을 부여하는 버튼은 아닙니다.")
                     }

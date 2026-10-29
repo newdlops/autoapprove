@@ -151,6 +151,7 @@ public final class OSPermissionAutomation:@unchecked Sendable {
         return .init(available:true,detail:"OS 권한은 등록한 앱과 이 세션에서 허용한 종류에만 적용합니다.",requests:try handles(targets:targets).map(\.request))
     }
     @MainActor public func approve(_ request:OSPermissionRequest,authorized:@MainActor ()->Bool)->OSPermissionDelivery {
+        guard !request.isManagementApp else {return .unavailable("AutoApprove 자체의 권한은 Mac에서 직접 설정해주세요.")}
         guard request.action != .manual,authorized(),let target=request.requester else {return .unavailable("이 요청은 Mac에서 직접 인증하거나 요청 앱을 확인해야 합니다.")}
         do {
             let fresh=try handles(targets:[target]).filter {$0.request.immutableToken==request.immutableToken}

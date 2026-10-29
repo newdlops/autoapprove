@@ -3188,7 +3188,7 @@ function renderCodexProgress(item){
   $('codex-progress-enabled').checked=enabled;$('codex-progress-enabled').disabled=!online;
   text($('codex-progress-status'),state?.detail||(enabled?'자동 승인이 켜진 작업에서 진척 신호를 확인합니다.':'이 Mac의 자동 진행 확인이 꺼져 있습니다.'));
   text($('codex-progress-time'),state?`${state.historyAvailable?'출력·대화 기록':'화면 출력'} · 감시 기준 ${new Date(state.lastProgressAt).toLocaleTimeString('ko-KR')} · 확인 ${state.checks}회`:'');
-  const permissionWait=(node.state.snapshot.osPermissions?.requests||[]).some(r=>r.phase!=='resolved'&&(!r.sessionID||r.sessionID===session.id));
+  const permissionWait=(node.state.snapshot.osPermissions?.requests||[]).some(r=>!r.managementApp&&r.phase!=='resolved'&&(!r.sessionID||r.sessionID===session.id));
   $('codex-progress-check').disabled=!online||!enabled||!session.automatic||permissionWait||node.state.snapshot.paused||session.phase!=='working'||busy||['review','requested'].includes(state?.phase);
   const focused=document.activeElement;
   show($('codex-progress-cancel'),busy);$('codex-progress-cancel').disabled=!online;
@@ -3227,12 +3227,12 @@ function renderOSPermissions(item){
     const details=document.createElement('details'),summary=make('summary','','OS 요청 내용');details.append(summary,make('pre','terminal-text',request.content));row.append(details);
     const controls=make('div','question-actions'),token=request.id+'\u0000'+(request.requester?`${request.requester.pid}:${request.requester.started}:${request.requester.id}`:'?');
     const addButton=(title,key,payload,message)=>{const button=make('button','secondary',title);button.type='button';button.disabled=disabled;button.dataset.permissionFocus=key;button.addEventListener('click',()=>permissionAction(item,{...payload,permissionID:request.id,permissionToken:token},message));controls.append(button);};
-    if(request.phase==='waiting'&&request.action!=='manual'&&!policy.allowed.includes(request.kind))addButton(`이 세션에서 ${osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind} 허용`,'allow-kind-'+request.id,{action:'osPermissionPolicy',allowed:[...policy.allowed,request.kind]},'이 세션의 해당 OS 권한을 허용했습니다.');
-    if(request.phase==='waiting'&&!request.sessionID&&request.requester){addButton('이 요청만 이 세션에 연결','once-'+request.id,{action:'assignOSPermission',remember:false},'현재 요청을 이 세션의 정책에 연결했습니다.');
+    if(!request.managementApp&&request.phase==='waiting'&&request.action!=='manual'&&!policy.allowed.includes(request.kind))addButton(`이 세션에서 ${osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind} 허용`,'allow-kind-'+request.id,{action:'osPermissionPolicy',allowed:[...policy.allowed,request.kind]},'이 세션의 해당 OS 권한을 허용했습니다.');
+    if(!request.managementApp&&request.phase==='waiting'&&!request.sessionID&&request.requester){addButton('이 요청만 이 세션에 연결','once-'+request.id,{action:'assignOSPermission',remember:false},'현재 요청을 이 세션의 정책에 연결했습니다.');
       const id=request.requester.bundleID,shared=['com.apple.Terminal','com.googlecode.iterm2','com.microsoft.VSCode','com.openai.chat','com.openai.codex','local.autoapprove.mac','com.anthropic.claudefordesktop','com.anthropic.claude','com.google.Chrome','com.google.Chrome.canary','org.mozilla.firefox','com.microsoft.edgemac','com.apple.Safari','com.brave.Browser'].includes(id)||/computer-?use/i.test(id);
       if(!shared)addButton('이 앱을 이 세션에 등록','remember-'+request.id,{action:'assignOSPermission',remember:true},'이 테스트 앱을 현재 세션에 등록했습니다.');
     }
-    if(request.sessionID===session.id&&request.phase!=='approving')addButton('Mac에서 처리 완료로 표시','ack-'+request.id,{action:'acknowledgeOSPermission'},'직접 확인한 OS 요청을 처리 완료로 표시했습니다.');
+    if(!request.managementApp&&request.sessionID===session.id&&request.phase!=='approving')addButton('Mac에서 처리 완료로 표시','ack-'+request.id,{action:'acknowledgeOSPermission'},'직접 확인한 OS 요청을 처리 완료로 표시했습니다.');
     row.append(controls);rows.append(row);
   }
   if(focused){const next=[...$('os-permissions').querySelectorAll('[data-permission-focus]')].find(e=>e.dataset.permissionFocus===focused);(next||$('os-permission-options').querySelector('summary')).focus({preventScroll:true});}

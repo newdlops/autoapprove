@@ -536,6 +536,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("OS permissions: signed identity and unambiguous requester headlines",tests.testOSPermissionPolicyIdentityAndPromptAttribution),
             ("OS permissions: explicit kinds, app enrollment and session isolation",tests.testOSPermissionDefaultsAndSessionIsolation),
             ("OS permissions: shared controllers are current-request only",tests.testOSPermissionSharedControllersAreOneRequestOnly),
+            ("OS permissions: manager setup stays manual without blocking CLI work",tests.testOSPermissionManagerSetupIsManualAndIndependent),
             ("OS permissions: pause, OFF, revocation, typing and original process races",tests.testOSPermissionPauseOffRevocationAndProcessChange),
             ("OS permissions: durable receipts prevent replay after restart",tests.testOSPermissionReceiptsSurviveRestartAndUncertainInput),
             ("OS permissions: settings transition and direct user authentication",tests.testOSPermissionSettingsTransitionAndManualAuthentication),
