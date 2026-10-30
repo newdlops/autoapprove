@@ -400,8 +400,9 @@ enum TerminalAppleEvents {
     // or expired TTYs alone enter the title query set.
     private static let titleCacheLifetime: TimeInterval = 300
 
-    static func profileWindowMetadata(tty:String) throws -> TerminalWindowMetadata? {
-        let owner=try TerminalProcessLookup.running()
+    static func profileWindowMetadata(tty:String,owner suppliedOwner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
+        let owner=try suppliedOwner ?? TerminalProcessLookup.running()
+        guard TerminalProcessLookup.identity(pid:owner.pid)==owner else {return nil}
         let reader=TerminalAppleEventReader(timeout:3) {subject,timeout in
             let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode("getd"),targetDescriptor:.init(processIdentifier:owner.pid),returnID:-1,transactionID:0)
             event.setParam(subject,forKeyword:aeCode("----"))

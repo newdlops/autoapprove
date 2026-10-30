@@ -48,6 +48,42 @@ extension ApprovalTests {
         try expectThrows(try TerminalProfileTopology.focusScript(tty:"/dev/foreign"))
     }
 
+    func testTerminalProfileKnownWindowFocusBoundsQueriesAndRejectsChanges() throws {
+        for count in [2,20,128,1024] {
+            let context=JSContext()!
+            context.evaluateScript("""
+            var allTabs=0,lookups=0,exactQueries=0,activations=0,front=true,missing=false,moved=false;
+            function makeWindow(index){
+              const tty='/dev/ttys'+(700+index),tab={tty:()=>tty,selected:()=>true},window={id:()=>77+index,exists:()=>!missing};
+              const tabs=()=>{allTabs++;return [tab];};tabs.whose=predicate=>()=>{exactQueries++;return moved?[]:predicate.tty===tty?[tab]:[];};window.tabs=tabs;
+              Object.defineProperty(window,'selectedTab',{get:()=>()=>tab,set:value=>{if(value!==tab)throw Error('foreign tab');}});
+              Object.defineProperty(window,'miniaturized',{get:()=>()=>false,set:()=>{}});return window;
+            }
+            const windows=Array.from({length:\(count)},(_,index)=>makeWindow(index)),list=()=>windows;
+            list.byId=id=>{lookups++;return windows.find(w=>w.id()===id)||{exists:()=>false};};
+            const app={windows:list,frontmost:()=>front,activate:()=>{activations++;}};function Application(){return app;}
+            function reset(){allTabs=lookups=exactQueries=activations=0;}
+            """)
+            let previous=TerminalWindowMetadata(tty:"/dev/ttys700",windowID:77,ownerPID:1009001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)
+            let tty="/dev/ttys\(699+count)",windowID=UInt32(76+count)
+            let baseline=context.evaluateScript(try TerminalProfileTopology.focusScript(tty:tty,previous:previous))?.toString()
+            try expectNil(context.exception);try expectEqual(context.evaluateScript("allTabs")?.toInt32(),Int32(count))
+            context.evaluateScript("reset();")
+            let fastScript=try TerminalProfileTopology.focusScript(tty:tty,windowID:windowID,previous:previous)
+            let fast=context.evaluateScript(fastScript)?.toString()
+            try expectNil(context.exception);try expectEqual(fast,baseline)
+            try expectEqual(context.evaluateScript("allTabs")?.toInt32(),0)
+            try expectEqual(context.evaluateScript("lookups")?.toInt32(),2)
+            try expectEqual(context.evaluateScript("exactQueries")?.toInt32(),2)
+            for mutation in ["front=false","missing=true","moved=true"] {
+                context.evaluateScript("reset();front=true;missing=moved=false;"+mutation+";")
+                _ = context.evaluateScript(fastScript)
+                try expect(context.exception != nil,"A changed window, TTY or preceding focus cannot select another tab")
+                context.exception=nil;try expectEqual(context.evaluateScript("activations")?.toInt32(),0)
+            }
+        }
+    }
+
     func testTerminalProfileShellReadinessAllowsSlowStartupWithoutRepeatingActions() throws {
         let context=JSContext()!
         context.evaluateScript("""

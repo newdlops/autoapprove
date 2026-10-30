@@ -50,6 +50,29 @@ private final class ProfileAXFixture {
 }
 
 extension ApprovalTests {
+    func testTerminalProfileNativeSelectionIsSingleAndRejectsStaleFocusedGroups() throws {
+        let fixture=ProfileAXFixture(),reader=fixture.reader(),original=try reader.groups()[0]
+        var target=original;target.selected=original.tabs[1]
+        fixture.delayedSelectionReads=3
+        try reader.select(target,expected:original)
+        try expectEqual(fixture.selected,1);try expectEqual(fixture.actions,[kAXPressAction])
+        for mode in 0..<4 {
+            let blocked=ProfileAXFixture(),other=blocked.reader(),before=try other.groups()[0]
+            var desired=before;desired.selected=before.tabs[1]
+            if mode==0 {blocked.selected=1}
+            if mode==1 {blocked.foreground=false}
+            if mode==2 {blocked.owns=false}
+            if mode==3 {desired.tabs.reverse()}
+            try expectThrows(try other.select(desired,expected:before))
+            try expect(blocked.actions.isEmpty)
+        }
+        let denied=ProfileAXFixture(),other=denied.reader(),before=try other.groups()[0]
+        var desired=before;desired.selected=before.tabs[1];denied.actionStatus = .apiDisabled
+        do {try other.select(desired,expected:before);try expect(false)}
+        catch {try expectEqual(error as? TerminalProfileAccessError,.accessibilityDenied)}
+        try expectEqual(denied.actions,[kAXPressAction],"An unconfirmed selection cannot replay or activate another application")
+    }
+
     func testTerminalProfileAccessUsesAuthoritativeReadAndActionReplies() throws {
         let fixture=ProfileAXFixture(),reader=fixture.reader()
         let original=try reader.groups()

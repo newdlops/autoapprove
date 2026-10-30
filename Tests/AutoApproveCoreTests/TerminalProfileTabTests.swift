@@ -270,6 +270,83 @@ extension ApprovalTests {
         }
     }
 
+    func testTerminalNativeFastOpenerHalvesScriptsForEverySupportedAddition() throws {
+        for count in 1..<128 {
+            for replacement in 0..<4 {
+                for fast in [false,true] {
+                    let fixture=TabKeyFixture();fixture.nativeWindows=true
+                    let anchorIndex=count/2,oldTabs=Array(1000..<(1000+count))
+                    let before=TerminalNativeTabGroup(id:5,tabs:oldTabs,selected:oldTabs[anchorIndex])
+                    var tabs=replacement>=2 ? Array(2000..<(2000+count)):oldTabs
+                    tabs.insert(3000,at:anchorIndex+1)
+                    let added=TerminalNativeTabGroup(id:replacement%2==1 ? 10:5,tabs:tabs,selected:3000)
+                    var current=added,selections:[Int]=[]
+                    let selector:((TerminalNativeTabGroup,TerminalNativeTabGroup) throws -> Void)?=fast ? {state,expected in
+                        try expectEqual(current,expected);current=state;selections.append(state.selected)
+                    }:nil
+                    let tty=try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",settingsName:"Pro",environment:fixture.environment,nativeGroupReader:{
+                        if fixture.runs==1 {return before}
+                        if fast {return current}
+                        var value=added;if fixture.runs==3 {value.selected=tabs[anchorIndex]};return value
+                    },nativeTabSelector:selector)
+                    try expectEqual(tty,"/dev/ttys701");try expectEqual(fixture.posts,1)
+                    try expectEqual(fixture.runs,fast ? 2:4)
+                    try expectEqual(selections,fast ? [tabs[anchorIndex],3000]:[])
+                }
+            }
+        }
+    }
+
+    func testTerminalNativeFastSelectionFailureNeverStartsScriptFallback() throws {
+        let fixture=TabKeyFixture();fixture.nativeWindows=true
+        let before=TerminalNativeTabGroup(id:5,tabs:[11,12],selected:12)
+        let added=TerminalNativeTabGroup(id:10,tabs:[21,22,30],selected:30)
+        var calls=0
+        do {
+            _ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{fixture.runs==1 ? before:added},nativeTabSelector:{_,_ in
+                calls+=1;throw TerminalProfileAccessError.accessibilityDenied
+            })
+            try expect(false)
+        } catch let error as RemoteHTTPError {
+            try expect(error.diagnostics?["delivery"] != "not_started")
+            try expect(error.localizedDescription.contains("macOS가"))
+        }
+        try expectEqual(calls,1);try expectEqual(fixture.runs,2);try expectEqual(fixture.posts,1)
+    }
+
+    func testTerminalTabSettingsAreCheckedInPreparationBeforeAnySelection() throws {
+        let context=JSContext()!
+        context.evaluateScript("""
+        var scanned=0,settingsReads=0,available=false;
+        function Application(){return {settingsSets:{byName:name=>({exists:()=>{settingsReads++;return available;}})},windows:()=>{scanned++;throw Error('selection boundary');}};}
+        """)
+        let script=try TerminalProfileTabOpener.prepareScript(anchorTTY:"/dev/ttys700",settingsName:"프로필 ' \\")
+        _ = context.evaluateScript(script)
+        try expect(context.exception?.toString()?.contains("저장한 Terminal 설정 프로필이 없습니다")==true)
+        try expectEqual(context.evaluateScript("settingsReads")?.toInt32(),1);try expectEqual(context.evaluateScript("scanned")?.toInt32(),0)
+        context.exception=nil;context.evaluateScript("available=true;")
+        _ = context.evaluateScript(script)
+        try expect(context.exception?.toString()?.contains("selection boundary")==true)
+        try expectEqual(context.evaluateScript("scanned")?.toInt32(),1)
+        let fixture=TabKeyFixture()
+        var environment=fixture.environment
+        environment.run={body in
+            let test=JSContext()!
+            test.evaluateScript("function Application(){return {settingsSets:{byName:()=>({exists:()=>false})},windows:()=>{throw Error('unexpected scan');}};}")
+            let output=test.evaluateScript(body)?.toString() ?? ""
+            if let error=test.exception {throw AppError.message(error.toString())}
+            return output
+        }
+        do {
+            _ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",settingsName:"missing",environment:environment,nativeGroupReader:{nil})
+            try expect(false)
+        } catch let error as RemoteHTTPError {
+            try expectEqual(error.diagnostics?["delivery"],"not_started")
+            try expect(error.localizedDescription.contains("저장한 Terminal 설정 프로필이 없습니다"))
+        }
+        try expectEqual(fixture.posts,0)
+    }
+
     func testTerminalNativeTabRebindingRejectsWrongCountPositionAndRetainedOrder() throws {
         for mode in 0..<6 {
             let fixture=TabKeyFixture();fixture.nativeWindows=true

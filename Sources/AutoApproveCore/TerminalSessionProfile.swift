@@ -377,13 +377,8 @@ public enum TerminalProfileLauncher {
         let entry=try entry.validated()
         return try await Task.detached(priority:.userInitiated) {
             var targetTTY:String?
-            if entry.host == .terminal,anchorTTY != nil,let settings=entry.terminalTab?.settingsName {
-                let name=try AutomationScript.literal(settings)
-                do {_ = try AutomationScript.run("const app=Application('com.apple.Terminal'); if(!app.settingsSets.byName(\(name)).exists())throw Error('저장한 Terminal 설정 프로필이 없습니다.'); 'ready';",app:"Terminal",denied:.permissionDenied)}
-                catch {throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])}
-            }
             if entry.host == .terminal,let anchorTTY {
-                targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY)
+                targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY,settingsName:entry.terminalTab?.settingsName)
             }
             let body=try script(entry,targetTTY:targetTTY)
             let text:String

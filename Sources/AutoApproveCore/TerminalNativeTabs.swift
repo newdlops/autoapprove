@@ -84,8 +84,8 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         // Injected adapters cannot acquire a path to real focus-changing UI.
         originalApplication=services == nil ? NSWorkspace.shared.frontmostApplication:nil
     }
-    public static func terminal() throws -> TerminalNativeTabReader {
-        let owner=try TerminalProcessLookup.running()
+    public static func terminal(owner suppliedOwner:TerminalProcessIdentity? = nil) throws -> TerminalNativeTabReader {
+        let owner=try suppliedOwner ?? TerminalProcessLookup.running()
         let reader=TerminalNativeTabReader(ownerPID:owner.pid,bundleID:TerminalProcessLookup.bundleID)
         guard reader.terminalIdentity==owner else {throw AppError.message("탭 구성을 읽기 전에 Terminal 프로세스가 바뀌었습니다. 다시 불러와주세요.")}
         return reader
@@ -157,35 +157,48 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         guard let window=try attribute(application,kAXFocusedWindowAttribute,deadline:deadline),CFGetTypeID(window)==AXUIElementGetTypeID() else {throw AppError.message("선택한 Terminal 창을 확인하지 못했습니다.")}
         return try group(window as! AXUIElement,deadline:deadline)
     }
-    public func restore(_ original:[TerminalNativeTabGroup]) throws {
+    /// Select an already identified tab in the current operation. When supplied,
+    /// expected must still be the focused group before the single AX action.
+    public func select(_ state:TerminalNativeTabGroup,expected:TerminalNativeTabGroup? = nil) throws {
         try check()
-        // Re-read the exact native group before acting. Every AX read/action
-        // is permission-checked by macOS; do not gate on cached AX trust here.
         guard services.foreground(ownerPID) else {throw AppError.message("확인 중 앱 초점이 바뀌었습니다. Terminal의 선택 탭을 확인한 뒤 다시 불러와주세요.")}
-        for state in original {
-            guard state.isValid,state.selected<=elements.count,state.id<=elements.count else {throw AppError.message("원래 선택 탭을 확인하지 못했습니다.")}
-            let bar=elements[state.id-1],deadline=ProcessInfo.processInfo.systemUptime+1
+        guard state.isValid,state.selected<=elements.count,state.id<=elements.count else {throw AppError.message("원래 선택 탭을 확인하지 못했습니다.")}
+        let bar=elements[state.id-1],deadline=ProcessInfo.processInfo.systemUptime+1
+        let fresh:TerminalNativeTabGroup
+        if let expected {
+            guard expected.isValid,expected.id==state.id,expected.tabs==state.tabs,let focused=try focusedGroup(),focused==expected else {
+                throw AppError.message("선택한 Terminal 탭이 바뀌어 탭 선택을 중단했습니다.")
+            }
+            fresh=focused
+        } else {
             let window=try attribute(bar,kAXWindowAttribute,deadline:deadline)
-            guard let window,CFGetTypeID(window)==AXUIElementGetTypeID(),let fresh=try group(window as! AXUIElement,deadline:deadline),fresh.id==state.id,fresh.tabs==state.tabs else {
+            guard let window,CFGetTypeID(window)==AXUIElementGetTypeID(),let current=try group(window as! AXUIElement,deadline:deadline),current.id==state.id,current.tabs==state.tabs else {
                 throw AppError.message("탭 구성이 바뀌어 원래 선택 탭을 복원하지 않았습니다.")
             }
-            if fresh.selected != state.selected {
-                let target=elements[state.selected-1];AXUIElementSetMessagingTimeout(target,0.5)
-                let result=services.action(target,kAXPressAction)
-                if result == .apiDisabled {throw TerminalProfileAccessError.accessibilityDenied}
-                guard result == .success else {throw AppError.message("원래 선택 탭으로 돌아가지 못했습니다.")}
-            }
-            try TerminalProfileReadiness.wait(message:"원래 선택 탭 복원을 확인하지 못했습니다.") {
-                try self.check()
-                guard self.services.foreground(self.ownerPID) else {throw AppError.message("선택 탭 복원 중 앱 초점이 바뀌었습니다.")}
-                let limit=ProcessInfo.processInfo.systemUptime+1
-                guard let window=try self.attribute(bar,kAXWindowAttribute,deadline:limit),CFGetTypeID(window)==AXUIElementGetTypeID(),
-                      let restored=try self.group(window as! AXUIElement,deadline:limit),restored.id==state.id,restored.tabs==state.tabs else {
-                    throw AppError.message("탭 구성이 바뀌어 원래 선택 탭 복원을 확인하지 못했습니다.")
-                }
-                return restored==state ? true:nil
-            }
+            fresh=current
         }
+        if fresh.selected != state.selected {
+            let target=elements[state.selected-1];AXUIElementSetMessagingTimeout(target,0.5)
+            let result=services.action(target,kAXPressAction)
+            if result == .apiDisabled {throw TerminalProfileAccessError.accessibilityDenied}
+            guard result == .success else {throw AppError.message("원래 선택 탭으로 돌아가지 못했습니다.")}
+        }
+        try TerminalProfileReadiness.wait(message:"원래 선택 탭 복원을 확인하지 못했습니다.") {
+            try self.check()
+            guard self.services.foreground(self.ownerPID) else {throw AppError.message("선택 탭 복원 중 앱 초점이 바뀌었습니다.")}
+            let limit=ProcessInfo.processInfo.systemUptime+1
+            guard let window=try self.attribute(bar,kAXWindowAttribute,deadline:limit),CFGetTypeID(window)==AXUIElementGetTypeID(),
+                  let restored=try self.group(window as! AXUIElement,deadline:limit),restored.id==state.id,restored.tabs==state.tabs else {
+                throw AppError.message("탭 구성이 바뀌어 원래 선택 탭 복원을 확인하지 못했습니다.")
+            }
+            return restored==state ? true:nil
+        }
+    }
+    public func restore(_ original:[TerminalNativeTabGroup]) throws {
+        // Every AX read/action remains subject to macOS authorization.
+        try check()
+        guard services.foreground(ownerPID) else {throw AppError.message("확인 중 앱 초점이 바뀌었습니다. Terminal의 선택 탭을 확인한 뒤 다시 불러와주세요.")}
+        for state in original {try select(state)}
         if let originalWindow {_ = services.action(originalWindow,kAXRaiseAction)}
         if let originalApplication,!originalApplication.isTerminated,originalApplication.processIdentifier != ownerPID {originalApplication.activate()}
     }
