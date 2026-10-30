@@ -251,6 +251,77 @@ extension ApprovalTests {
         try expect(rejected,"Restoration still rejects a source that changed during identity reads")
     }
 
+    func testCodexProfileNameBindingRequiresUniqueFullNamedConversation() throws {
+        let id="00000000-0000-4000-8000-000000000001",name="대화 이름 · cafe\u{301}"
+        let named=CodexQueueConversation(id:id,title:"abbreviated label",name:name)
+        for prefix in ["","⠏ ","⠦ ","[ . ] Action Required | "] {
+            let title=prefix+name+" | cafe\u{301}"
+            try expectEqual(CodexProfileConversationBinding.match(title:title,cwd:"/tmp/cafe\u{301}",conversations:[named])?.id,id)
+        }
+        for title in [nil,"","⠦ 다른 대화 | café",name,"⠦ "+name+" | other",name+"\n | café"] as [String?] {
+            try expectNil(CodexProfileConversationBinding.match(title:title,cwd:"/tmp/café",conversations:[named]))
+        }
+        let title="⠏ "+name+" | café"
+        try expect(CodexProfileConversationBinding.match(title:title,cwd:"/tmp/café",conversations:[.init(id:id,title:name)])==nil,"A preview or sole folder candidate cannot become the current conversation")
+        try expect(CodexProfileConversationBinding.match(title:title,cwd:"/tmp/café",conversations:[named,.init(id:UUID().uuidString,title:name,name:name)])==nil,"Duplicate full names remain an explicit choice")
+        try expectNil(CodexProfileConversationBinding.match(title:title,cwd:"/tmp/café",conversations:[.init(id:"not-a-thread",title:name,name:name)]))
+        let long=String(repeating:"긴 대화",count:60)
+        try expectEqual(CodexProfileConversationBinding.match(title:long+" | project",cwd:"/tmp/project",conversations:[.init(id:id,title:String(long.prefix(180)),name:long)])?.id,id,"Use the complete server name, not the abbreviated picker label")
+        let original=try JSONDecoder().decode(CodexQueueConversation.self,from:Data("{\"id\":\"\(id)\",\"title\":\"old\"}".utf8))
+        try expect(original.name==nil,"Older queue payloads remain readable")
+    }
+
+    func testTerminalProfileAutomaticallySavesNamedDaemonConversationsAndResumesThem() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-profile-named-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let records=ProcessDiscovery.parse("""
+        100521 1 named1 100521 100521 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100522 1 named2 100522 100522 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100523 1 named3 100523 100523 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let titles=["⠏ 첫 대화 | profile-project","[ . ] Action Required | 둘째 대화 | profile-project","제목 미확인"]
+        let sessions=records.enumerated().map {index,record in
+            var session=AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/"+record.tty,cwd:"/tmp/profile-project",terminal:.terminal)
+            session.terminalTitle=titles[index];session.customization = .init(title:"사용자 표시 이름 \(index)");return session
+        }
+        let first="00000000-0000-4000-8000-000000000001",second="00000000-0000-4000-8000-000000000002"
+        let choices=[CodexQueueConversation(id:first,title:"첫 대화",name:"첫 대화"),.init(id:second,title:"둘째 대화",name:"둘째 대화")]
+        let transport=CodexReplyTransport(prepare:{_,_ in throw AppError.message("unused")},send:{_,_ in throw AppError.message("never send")},queueHome:{_ in .init(executable:"",home:"/tmp/profile-home",threadID:"")})
+        let queue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in choices})
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,processReader:{records},codexQueue:queue,terminalProfileLayoutReader:{ttys in
+            ttys.enumerated().map {index,tty in .init(tty:tty,windowID:77,windowOrder:0,tabOrder:index,customTitle:titles[records.firstIndex {$0.tty==String(tty.dropFirst(5))}!])}
+        })
+        defer {engine.stop()};engine.updateDiscovery(sessions,records:records)
+        let captured=try await engine.terminalProfileCandidates()
+        try expectEqual(captured.first {$0.id==records[0].key}?.entry.conversationID,first)
+        try expectEqual(captured.first {$0.id==records[1].key}?.entry.conversationID,second)
+        try expectEqual(captured.first {$0.id==records[2].key}?.entry.conversationID,"")
+        try expect(captured.filter {!$0.entry.conversationID.isEmpty}.allSatisfy {$0.detail==nil})
+        let store=TerminalProfileStore(directory:directory.appendingPathComponent("saved")),profile=try store.save(.init(name:"대화까지 저장",entries:captured.map(\.entry)))
+        let restored=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(profile.id))),log=FreshProfileLaunchRecorder()
+        let results=try await TerminalProfileRestorer().restore(restored,selected:Set(restored.entries.map(\.id)),active:[],directoryExists:{_ in true},launch:{try await log.launch($0,$1)})
+        try expect(results.allSatisfy {$0.phase == .opened})
+        let commands=await log.commands
+        try expectEqual(commands.filter {$0.contains("'codex' 'resume'")}.count,2)
+        for id in [first,second] {try expect(commands.contains {$0.contains("'resume' '"+id+"'")})}
+        try expectEqual(commands.filter {!$0.contains("'resume'")}.count,1,"Unresolved/explicit fresh CLI entries retain their behavior")
+    }
+
+    func testTerminalProfileNamedConversationRejectsChangedNativeTitle() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-profile-title-race-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let record=ProcessDiscovery.parse("100524 1 title1 100524 100524 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+        var session=AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/title1",cwd:"/tmp/project",terminal:.terminal)
+        session.terminalTitle="⠏ 원래 대화 | project"
+        let tty=session.tty
+        let transport=CodexReplyTransport(prepare:{_,_ in throw AppError.message("unused")},send:{_,_ in throw AppError.message("never send")},queueHome:{_ in .init(executable:"",home:"/tmp/profile-home",threadID:"")})
+        let queue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in [.init(id:"00000000-0000-4000-8000-000000000001",title:"원래 대화",name:"원래 대화")]})
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,processReader:{[record]},codexQueue:queue,terminalProfileLayoutReader:{_ in [.init(tty:tty,windowID:77,windowOrder:0,tabOrder:0,customTitle:"⠦ 바뀐 대화 | project")]})
+        defer {engine.stop()};engine.updateDiscovery([session],records:[record])
+        do {_ = try await engine.terminalProfileCandidates();throw AppError.message("A changed native title cannot save the previous conversation")}
+        catch {try expect(error.localizedDescription.contains("창이 바뀌었습니다"))}
+    }
+
     func testHardWrappedPermissionFooterRetainsWholeDialogAndRejections() throws {
         let heading="Approve app tool call?\n› 1. Allow once\n  2. Cancel\n",hint="Press enter to confirm or esc to cancel"
         let ordinary=try unwrap(PromptDetector.detect(heading+hint,agent:.codex))

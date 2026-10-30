@@ -9,7 +9,7 @@ import path from 'node:path';
 import {coreLinkArguments} from './swift-core-link.mjs';
 const require=createRequire(import.meta.url),ws=require(path.join(path.dirname(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright')),'../playwright-core/lib/utilsBundle.js'));
 const directory=await mkdtemp('/private/tmp/aa-codex-rpc-'),build=path.resolve('.build',process.argv.includes('--release')?'release':'debug');
-const thread='00000000-0000-4000-8000-000000000001',idleThread='00000000-0000-4000-8000-000000000002',methods=[],connections=new Set();let approvalRefusals=0,addMode='ack',adds=0;
+const thread='00000000-0000-4000-8000-000000000001',idleThread='00000000-0000-4000-8000-000000000002',methods=[],connections=new Set();let approvalRefusals=0,addMode='ack',adds=0,conversationMode='valid';
 const server=http.createServer(),websocket=new ws.wsServer({noServer:true});
 let child;
 try {
@@ -31,7 +31,16 @@ try {
       }
       if(message.method==='thread/list'){
         assert.equal(message.params.cwd,'/fixture');assert.equal(message.params.useStateDbOnly,true);
-        socket.send(JSON.stringify({id:message.id,result:{data:[{id:thread,name:'실행 중 원본',cwd:'/fixture',source:'vscode',status:{type:'active'}},{id:idleThread,cwd:'/fixture',source:'cli',status:{type:'idle'}},{id:crypto.randomUUID(),cwd:'/other',source:'cli',status:{type:'active'}},{id:crypto.randomUUID(),cwd:'/fixture',source:'cli',status:{type:'notLoaded'}}]}}));return;
+        if(conversationMode==='repeat'||conversationMode==='malformed'){
+          socket.send(JSON.stringify({id:message.id,result:{data:[],nextCursor:conversationMode==='repeat'?'same':42}}));return;
+        }
+        if(conversationMode==='overflow'){
+          const page=Number(message.params.cursor||0),data=Array.from({length:100},()=>({id:crypto.randomUUID(),name:'bounded fixture',cwd:'/fixture',source:'cli',status:{type:'idle'}}));
+          socket.send(JSON.stringify({id:message.id,result:{data,nextCursor:String(page+1)}}));return;
+        }
+        const result=message.params.cursor?{data:[{id:idleThread,cwd:'/fixture',source:'cli',status:{type:'idle'}},{id:crypto.randomUUID(),cwd:'/other',source:'cli',status:{type:'active'}},{id:crypto.randomUUID(),cwd:'/fixture',source:'cli',status:{type:'notLoaded'}},{id:crypto.randomUUID(),name:'child',cwd:'/fixture',source:'cli',parentThreadId:thread,status:{type:'active'}}],nextCursor:null}:{data:[{id:thread,name:'실행 중 원본'.repeat(30),cwd:'/fixture',source:'vscode',status:{type:'active'}}],nextCursor:'threads-next'};
+        if(message.params.cursor)assert.equal(message.params.cursor,'threads-next');
+        socket.send(JSON.stringify({id:message.id,result}));return;
       }
       assert.equal(message.params.threadId,thread);
       if(message.method==='thread/queue/add'){
@@ -65,8 +74,10 @@ try {
   assert.equal((await runFixture('--home-socket-proof')).kernelPeerBound,true);assert.equal(methods.length,0);
   const result=await runFixture();assert.deepEqual(result.ids,['first','second','third']);assert.equal(result.text,'한글🧪 · 첫 번째');assert.equal(result.attachments,1);assert.deepEqual(result.removed,['first']);assert.equal(result.partialError,true);
   assert.deepEqual(result.conversations,[thread,idleThread]);assert.equal(result.changedFolderRefused,true);
+  assert.equal(result.fullNamePreserved,true);assert.equal(result.namedConversationBound,true);
+  for(const mode of ['repeat','malformed','overflow']){conversationMode=mode;const before=methods.filter(v=>v==='thread/list').length;assert.equal((await runFixture('--expect-conversations-error')).invalidConversationsRefused,true);assert.equal(methods.filter(v=>v==='thread/list').length-before,{repeat:2,malformed:1,overflow:11}[mode]);}conversationMode='valid';
   const queued=await runFixture('--enqueue');assert.match(queued.queueID,/^[a-fA-F0-9-]{36}$/);assert.equal(queued.bytes,60000);
   for(const mode of ['mismatch','disconnect']){addMode=mode;const before=adds;assert.equal((await runFixture('--expect-unconfirmed')).unconfirmedRefused,true);assert.equal(adds-before,1,'An ambiguous write must not be retried');}
   assert.ok(approvalRefusals>=2);assert.ok(methods.every(method=>['initialize','initialized','thread/list','thread/read','thread/queue/list','thread/queue/delete','thread/queue/add'].includes(method)));
-  console.log(JSON.stringify({result:'PASS',checks:['user-owned Unix WebSocket handshake, masked client frames and initialize','user-owned control symlink resolves to a socket; a non-socket link is refused before connection','paginated Unicode queue with fragmented responses and ping/pong','only queue operations and state-only thread lookup; server approval requests refused','partial delete acknowledgement is retained without retry','explicit active root selection uses state-only lookup and rejects changed folder','native queue/add works with a missing executable and a 60000-byte Unicode message','mismatched receipt and disconnect are refused without duplicate writes'],methods},null,2));
+  console.log(JSON.stringify({result:'PASS',checks:['user-owned Unix WebSocket handshake, masked client frames and initialize','user-owned control symlink resolves to a socket; a non-socket link is refused before connection','paginated Unicode queue with fragmented responses and ping/pong','only queue operations and state-only thread lookup; server approval requests refused','partial delete acknowledgement is retained without retry','explicit active root selection uses state-only lookup and rejects changed folder','full server names survive abbreviated labels and bind named Codex profiles across pages','repeating/malformed conversation cursors and the 1000-row bound fail closed','native queue/add works with a missing executable and a 60000-byte Unicode message','mismatched receipt and disconnect are refused without duplicate writes'],methods},null,2));
 }finally{if(child&&child.exitCode===null)child.kill('SIGTERM');for(const socket of connections)socket.terminate();server.close();websocket.close();await rm(directory,{recursive:true,force:true});}

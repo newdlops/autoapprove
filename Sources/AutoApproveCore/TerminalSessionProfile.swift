@@ -203,6 +203,33 @@ public struct CodexProfileConversation: Identifiable, Sendable {
     public init(id:String,title:String) {self.id=id;self.title=title}
 }
 
+/// The daemon can own many threads while the TUI owns no rollout descriptor.
+/// Bind only a unique full server name rendered by this terminal in this folder.
+/// A single folder candidate, preview or newest conversation is insufficient.
+public enum CodexProfileConversationBinding {
+    public static func terminalName(_ title:String?,cwd:String)->String? {
+        guard var title=title?.precomposedStringWithCanonicalMapping.trimmingCharacters(in:.whitespacesAndNewlines),
+              !title.isEmpty,title.utf8.count<=16_384 else {return nil}
+        if let first=title.unicodeScalars.first,(0x2800...0x28ff).contains(first.value),title.dropFirst().first==" " {
+            title=String(title.dropFirst(2))
+        }
+        let attention="[ . ] Action Required | "
+        if title.hasPrefix(attention) {title=String(title.dropFirst(attention.count))}
+        let suffix=" | "+URL(fileURLWithPath:cwd).lastPathComponent.precomposedStringWithCanonicalMapping
+        guard title.hasSuffix(suffix) else {return nil}
+        let name=String(title.dropLast(suffix.count))
+        guard !name.isEmpty,!name.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains) else {return nil}
+        return name
+    }
+    public static func match(title:String?,cwd:String,conversations:[CodexQueueConversation])->CodexQueueConversation? {
+        guard let name=terminalName(title,cwd:cwd) else {return nil}
+        let matches=conversations.filter {
+            UUID(uuidString:$0.id) != nil && $0.name?.precomposedStringWithCanonicalMapping==name
+        }
+        return matches.count==1 ? matches[0]:nil
+    }
+}
+
 public struct TerminalProfileRestoreResult: Identifiable, Sendable {
     public enum Phase: String, Sendable {case opened,alreadyOpen,needsReview,failed}
     public var id: UUID

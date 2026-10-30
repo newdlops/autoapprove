@@ -722,8 +722,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let keep = Set(inventory.map { "pty:" + $0.ptyID })
         for id in Array(sessions.keys) where id.hasPrefix("pty:") && !keep.contains(id) { sessions.removeValue(forKey: id) }
     }
-    /// Capture exact current identities where available. A daemon-backed TUI
-    /// without a per-window thread binding returns an explicit conversation picker.
+    /// Prefer the exact live rollout. A daemon-backed TUI can also bind a unique
+    /// full server name to its current terminal title; unresolved rows keep a picker.
     public func terminalProfileCandidates(includeLayout:Bool = true) async throws -> [TerminalProfileCandidate] {
         guard !remoteInputStopped else {throw AppError.message("앱이 종료 중입니다.")}
         let targets=snapshot.sessions.filter {$0.agent != .shell && $0.phase != .ended && $0.pid>0}
@@ -733,7 +733,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var result:[TerminalProfileCandidate]=[]
         // A picker is useful only when saving. Share its read within this
         // operation; separate CLIs still resolve their own provider home.
-        var conversationLists:[String:[String:[CodexProfileConversation]]]=[:]
+        var conversationLists:[String:[String:[CodexQueueConversation]]]=[:]
+        var namedCodexBindings:[String:String]=[:]
         for session in targets {
             try Task.checkCancellation()
             guard let record=live.first(where:{$0.key == session.id && $0.agent == session.agent && "/dev/"+$0.tty == session.tty}) else {
@@ -756,13 +757,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         let target=try await questionTransport.queueHome(session)
                         entry.providerHome=target.home
                         if includeLayout {
-                            if let cached=conversationLists[target.home]?[session.cwd] {choices=cached}
+                            let conversations:[CodexQueueConversation]
+                            if let cached=conversationLists[target.home]?[session.cwd] {conversations=cached}
                             else {
-                                choices=try await codexQueue.conversations(target,session.cwd).map {CodexProfileConversation(id:$0.id,title:$0.title)}
-                                conversationLists[target.home,default:[:]][session.cwd]=choices
+                                conversations=try await codexQueue.conversations(target,session.cwd)
+                                conversationLists[target.home,default:[:]][session.cwd]=conversations
+                            }
+                            choices=conversations.map {CodexProfileConversation(id:$0.id,title:$0.title)}
+                            if let bound=CodexProfileConversationBinding.match(title:session.terminalTitle,cwd:session.cwd,conversations:conversations),let name=bound.name {
+                                entry.conversationID=bound.id
+                                namedCodexBindings[session.id]=name.precomposedStringWithCanonicalMapping
                             }
                         }
-                        detail="대화를 이어가려면 선택하거나 ID를 입력하세요. 비워 두면 이 폴더에서 새 Codex를 엽니다."
+                        if entry.conversationID.isEmpty {detail="대화를 이어가려면 선택하거나 ID를 입력하세요. 비워 두면 이 폴더에서 새 Codex를 엽니다."}
                     } catch {detail="대화 ID는 선택 사항입니다. 비워 두면 이 폴더에서 새 Codex를 엽니다."}
                 }
             } else {
@@ -788,6 +795,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let fresh=try await Task.detached(priority:.utility) {try reader()}.value
         guard !remoteInputStopped,result.allSatisfy({candidate in
             guard let original=targets.first(where:{$0.id == candidate.id}),let current=sessions[candidate.id] else {return false}
+            if let name=namedCodexBindings[candidate.id] {
+                guard CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd)==name else {return false}
+                if let title=candidate.entry.terminalTab?.customTitle,!title.isEmpty,
+                   CodexProfileConversationBinding.terminalName(title,cwd:current.cwd) != name {return false}
+            }
             return current.pid == original.pid && current.started == original.started && current.cwd == original.cwd &&
                 fresh.contains(where:{$0.key == original.id && $0.agent == original.agent && "/dev/"+$0.tty == original.tty})
         }) else {throw AppError.message("대화를 확인하는 동안 창이 바뀌었습니다. 현재 세션을 다시 불러와주세요.")}

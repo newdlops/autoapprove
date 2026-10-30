@@ -39,6 +39,11 @@ import Darwin
             }
             throw AppError.message("A non-socket control link was accepted")
         }
+        if CommandLine.arguments.contains("--expect-conversations-error") {
+            do {_ = try await CodexQueueTransport.live.conversations(target,"/fixture")}
+            catch {print("{\"invalidConversationsRefused\":true}");return}
+            throw AppError.message("An incomplete or repeating conversation list was accepted")
+        }
         let list = try await CodexQueueTransport.live.list(target)
         if CommandLine.arguments.contains("--read-only") {
             print("{\"listCount\":\(list.count)}"); return
@@ -51,7 +56,9 @@ import Darwin
         let deleted = try await CodexQueueTransport.live.delete(target, ["first", "second"])
         let value: JSONObject = ["ids":list.map(\.id), "text":list.first?.text ?? "", "attachments":list.last?.attachments ?? 0,
                                  "removed":deleted.removed, "partialError":deleted.error != nil,
-                                 "conversations":conversations.map(\.id), "changedFolderRefused":refusedChangedFolder]
+                                 "conversations":conversations.map(\.id), "changedFolderRefused":refusedChangedFolder,
+                                 "fullNamePreserved":conversations.first?.name==String(repeating:"실행 중 원본",count:30),
+                                 "namedConversationBound":CodexProfileConversationBinding.match(title:"⠏ "+String(repeating:"실행 중 원본",count:30)+" | fixture",cwd:"/fixture",conversations:conversations)?.id==target.threadID]
         print(String(decoding:try JSONSerialization.data(withJSONObject:value,options:.sortedKeys),as:UTF8.self))
     }
 }

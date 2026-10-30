@@ -21,7 +21,9 @@ public struct RemoteCodexQueue: Codable, Sendable {
 public struct CodexQueueConversation: Codable, Sendable {
     public var id: String
     public var title: String
-    public init(id: String, title: String) { self.id = id; self.title = title }
+    /// Full server name, distinct from the abbreviated picker label/preview.
+    public var name: String?
+    public init(id: String, title: String, name:String? = nil) { self.id = id; self.title = title;self.name=name }
 }
 public struct RemoteCodexConversations: Codable, Sendable {
     public var sessionID: String
@@ -117,13 +119,26 @@ public struct CodexQueueTransport: Sendable {
         }.value
     }, conversations: { target, cwd in
         try await Task.detached(priority: .utility) {
-            let result = try CodexQueueConnection(home: target.home).request("thread/list", ["cwd": cwd, "limit": 100, "useStateDbOnly": true])
-            guard let rows = result["data"] as? [JSONObject], rows.count <= 100 else { throw AppError.message("Codex 대화 목록을 읽지 못했습니다.") }
-            return rows.compactMap { row in
-                guard let id = row["id"] as? String, UUID(uuidString: id) != nil, isLoadedRoot(row, cwd: cwd) else { return nil }
-                let title = (row["name"] as? String ?? row["preview"] as? String ?? "Codex 대화").components(separatedBy: .newlines).first ?? "Codex 대화"
-                return CodexQueueConversation(id: id, title: String(title.prefix(180)))
-            }
+            let connection=try CodexQueueConnection(home:target.home)
+            var cursor:String?,seen=Set<String>(),conversations:[CodexQueueConversation]=[],count=0
+            repeat {
+                try Task.checkCancellation()
+                var params:JSONObject=["cwd":cwd,"limit":100,"useStateDbOnly":true]
+                if let cursor {params["cursor"]=cursor}
+                let result=try connection.request("thread/list",params)
+                guard let rows=result["data"] as? [JSONObject],rows.count<=100 else {throw AppError.message("Codex 대화 목록을 읽지 못했습니다.")}
+                count+=rows.count
+                conversations += rows.compactMap {row in
+                    guard let id=row["id"] as? String,UUID(uuidString:id) != nil,isLoadedRoot(row,cwd:cwd) else {return nil}
+                    let name=row["name"] as? String
+                    let title=(name ?? row["preview"] as? String ?? "Codex 대화").components(separatedBy:.newlines).first ?? "Codex 대화"
+                    return CodexQueueConversation(id:id,title:String(title.prefix(180)),name:name)
+                }
+                guard result["nextCursor"]==nil || result["nextCursor"] is NSNull || result["nextCursor"] is String else {throw AppError.message("Codex 대화 목록의 다음 위치를 확인하지 못했습니다.")}
+                cursor=result["nextCursor"] as? String
+                guard count<=1000,cursor==nil || seen.insert(cursor!).inserted else {throw AppError.message("Codex 대화 목록이 너무 많거나 조회가 반복됐습니다. 대화를 직접 선택해주세요.")}
+            } while cursor != nil
+            return conversations
         }.value
     }, validate: { target, cwd in
         try await Task.detached(priority: .utility) {
