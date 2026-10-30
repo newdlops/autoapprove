@@ -13,12 +13,12 @@ private actor TabLaunchLog {
     func select(_ tty:String) {selections.append(tty)}
 }
 private final class TabKeyFixture:@unchecked Sendable {
-    var trusted=true,focused=true,changeWindow=false,throwAfterPost=false,failConfirmation=false,nativeWindows=false
+    var trusted=true,postingAllowed=true,focused=true,changeWindow=false,throwAfterPost=false,failConfirmation=false,nativeWindows=false
     var reads=0,runs=0,posts=0
     var flags:CGEventFlags=[],code:Int64=0,pid:Int32=0
     let records=ProcessDiscovery.parse("1009001 1 ?? 1009001 0 Wed Oct 28 14:00:00 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
     var environment:TerminalKeyboard.Environment {
-        .init(trusted:{self.trusted},postingAllowed:{true},run:{_ in
+        .init(trusted:{self.trusted},postingAllowed:{self.postingAllowed},run:{_ in
             self.runs+=1
             if self.runs==1 {return #"{"tty":"/dev/ttys700","windowID":77,"ttys":["/dev/ttys700"]}"#}
             if self.failConfirmation {throw AppError.message("no new tab")}
@@ -166,7 +166,7 @@ extension ApprovalTests {
         try expectEqual(fixture.posts,1);try expectEqual(fixture.pid,1009001);try expectEqual(fixture.code,17);try expect(fixture.flags.contains(.maskCommand))
         for mode in [0,1,2] {
             let blocked=TabKeyFixture()
-            if mode==0 {blocked.trusted=false};if mode==1 {blocked.focused=false};if mode==2 {blocked.changeWindow=true}
+            if mode==0 {blocked.postingAllowed=false};if mode==1 {blocked.focused=false};if mode==2 {blocked.changeWindow=true}
             do {_ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:blocked.environment,nativeGroupReader:{nil});try expect(false)}
             catch let error as RemoteHTTPError {try expectEqual(error.diagnostics?["delivery"],"not_started")}
             try expectEqual(blocked.posts,0)
@@ -177,6 +177,21 @@ extension ApprovalTests {
             catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
             try expectEqual(uncertain.posts,1)
         }
+    }
+
+    func testTerminalNativeTabDoesNotTreatStaleTrustAsPermissionDenial() throws {
+        let fixture=TabKeyFixture();fixture.trusted=false
+        let tty=try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{nil})
+        try expectEqual(tty,"/dev/ttys701");try expectEqual(fixture.posts,1,"Current posting permission plus verified AX focus permits the exact target even if the advisory trust value is false")
+        let denied=TabKeyFixture();denied.trusted=false
+        do {
+            _ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:denied.environment,nativeGroupReader:{throw TerminalProfileAccessError.accessibilityDenied})
+            try expect(false)
+        } catch let error as RemoteHTTPError {
+            try expectEqual(error.diagnostics?["delivery"],"not_started")
+            try expect(error.localizedDescription.contains("macOS가"))
+        }
+        try expectEqual(denied.posts,0,"An actual AX denial still prevents the key, without replay")
     }
 
     func testTerminalNativeTabOpenerVerifiesAnchorAndNewWindowShareAGroup() throws {

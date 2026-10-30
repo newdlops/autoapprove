@@ -2,6 +2,16 @@ import Foundation
 import AppKit
 import ApplicationServices
 
+public enum TerminalProfileAccessError:LocalizedError,Equatable {
+    case terminalNotRunning,accessibilityDenied
+    public var errorDescription:String? {
+        switch self {
+        case .terminalNotRunning:return "Terminal이 실행 중이 아닙니다. Terminal을 연 뒤 현재 창을 다시 불러와주세요."
+        case .accessibilityDenied:return "macOS가 실행 중인 AutoApprove의 손쉬운 사용 접근을 거부했습니다. 설정에서 이미 허용했다면 AutoApprove를 완전히 종료한 뒤 다시 열어주세요."
+        }
+    }
+}
+
 /// Operation-local accessibility identities. Never written to a saved profile.
 public struct TerminalNativeTabGroup:Equatable,Sendable {
     public var id:Int
@@ -17,33 +27,56 @@ public struct TerminalNativeTabGroup:Equatable,Sendable {
 /// AppKit moves the same native tab bar between its individual NSWindows.
 /// Compare AX elements, never tab titles, window bounds or scripting IDs.
 public final class TerminalNativeTabReader:@unchecked Sendable {
+    /// Actual AX replies are authoritative. A cached trust preflight must not
+    /// prevent an already permitted process from even trying a read.
+    public struct Services {
+        public var ownsProcess:(Int32,String)->Bool
+        public var read:(AXUIElement,String)->(AXError,CFTypeRef?)
+        public var action:(AXUIElement,String)->AXError
+        public var foreground:(Int32)->Bool
+        public init(ownsProcess:@escaping (Int32,String)->Bool,read:@escaping (AXUIElement,String)->(AXError,CFTypeRef?),
+                    action:@escaping (AXUIElement,String)->AXError,foreground:@escaping (Int32)->Bool) {
+            self.ownsProcess=ownsProcess;self.read=read;self.action=action;self.foreground=foreground
+        }
+        public static var live:Self {
+            .init(ownsProcess:{pid,bundle in
+                guard let app=NSRunningApplication(processIdentifier:pid) else {return false}
+                return !app.isTerminated && app.bundleIdentifier==bundle
+            },read:{element,name in
+                var value:CFTypeRef?;let result=AXUIElementCopyAttributeValue(element,name as CFString,&value);return (result,value)
+            },action:{AXUIElementPerformAction($0,$1 as CFString)},foreground:{NSWorkspace.shared.frontmostApplication?.processIdentifier==$0})
+        }
+    }
     private let application:AXUIElement
     private let ownerPID:Int32
     private let bundleID:String
     private var elements:[AXUIElement]=[]
     private var originalWindow:AXUIElement?
     private let originalApplication:NSRunningApplication?
-    public init(ownerPID:Int32,bundleID:String) {
+    private let services:Services
+    public init(ownerPID:Int32,bundleID:String,services:Services?=nil) {
         self.ownerPID=ownerPID;self.bundleID=bundleID
         application=AXUIElementCreateApplication(ownerPID)
-        originalApplication=NSWorkspace.shared.frontmostApplication
+        self.services=services ?? .live
+        // Injected adapters cannot acquire a path to real focus-changing UI.
+        originalApplication=services == nil ? NSWorkspace.shared.frontmostApplication:nil
     }
     public static func terminal() throws -> TerminalNativeTabReader {
-        guard AXIsProcessTrusted(),let app=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Terminal").first,!app.isTerminated else {
-            throw AppError.message("Terminal 탭 묶음을 확인하려면 손쉬운 사용에서 AutoApprove를 허용하고 Terminal을 열어주세요.")
+        guard let app=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Terminal").first,!app.isTerminated else {
+            throw TerminalProfileAccessError.terminalNotRunning
         }
         return .init(ownerPID:app.processIdentifier,bundleID:"com.apple.Terminal")
     }
     private func check() throws {
-        guard (ownerPID==getpid() || AXIsProcessTrusted()),let app=NSRunningApplication(processIdentifier:ownerPID),!app.isTerminated,app.bundleIdentifier==bundleID else {
-            throw AppError.message("탭 구성을 읽는 동안 원래 앱이나 접근 권한이 바뀌었습니다.")
+        guard services.ownsProcess(ownerPID,bundleID) else {
+            throw AppError.message("탭 구성을 읽는 동안 원래 Terminal 프로세스가 바뀌었습니다.")
         }
     }
     private func attribute(_ element:AXUIElement,_ name:String,deadline:TimeInterval) throws -> CFTypeRef? {
         guard ProcessInfo.processInfo.systemUptime<deadline else {throw AppError.message("Terminal 탭 구성 확인 시간이 초과됐습니다. 다시 불러와주세요.")}
         AXUIElementSetMessagingTimeout(element,0.15)
-        var value:CFTypeRef?
-        let error=AXUIElementCopyAttributeValue(element,name as CFString,&value)
+        let (error,value)=services.read(element,name)
+        if error == .apiDisabled {throw TerminalProfileAccessError.accessibilityDenied}
         if error == .attributeUnsupported || error == .noValue {return nil}
         guard error == .success else {throw AppError.message("Terminal 탭 구성을 읽지 못했습니다. 창을 확인한 뒤 다시 불러와주세요.")}
         return value
@@ -85,7 +118,7 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
     public func groups() throws -> [TerminalNativeTabGroup] {
         try check();let deadline=ProcessInfo.processInfo.systemUptime+3
         if let window=try attribute(application,kAXFocusedWindowAttribute,deadline:deadline),CFGetTypeID(window)==AXUIElementGetTypeID() {originalWindow=(window as! AXUIElement)}
-        let windows=try attribute(application,kAXWindowsAttribute,deadline:deadline) as? [AXUIElement] ?? []
+        guard let windows=try attribute(application,kAXWindowsAttribute,deadline:deadline) as? [AXUIElement] else {throw AppError.message("Terminal의 접근성 창 목록을 확인하지 못했습니다. 현재 창을 다시 불러와주세요.")}
         guard windows.count<=512 else {throw AppError.message("확인할 Terminal 창이 너무 많습니다.")}
         var result:[TerminalNativeTabGroup]=[]
         for window in windows {
@@ -100,9 +133,9 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
     }
     public func restore(_ original:[TerminalNativeTabGroup]) throws {
         try check()
-        // Reading this process's own windows needs no AX grant. Performing
-        // native actions always requires trust and the exact foreground owner.
-        guard AXIsProcessTrusted(),NSWorkspace.shared.frontmostApplication?.processIdentifier==ownerPID else {throw AppError.message("확인 중 앱 초점이나 손쉬운 사용 권한이 바뀌었습니다. Terminal의 선택 탭을 확인한 뒤 다시 불러와주세요.")}
+        // Re-read the exact native group before acting. Every AX read/action
+        // is permission-checked by macOS; do not gate on cached AX trust here.
+        guard services.foreground(ownerPID) else {throw AppError.message("확인 중 앱 초점이 바뀌었습니다. Terminal의 선택 탭을 확인한 뒤 다시 불러와주세요.")}
         for state in original {
             guard state.isValid,state.selected<=elements.count,state.id<=elements.count else {throw AppError.message("원래 선택 탭을 확인하지 못했습니다.")}
             let bar=elements[state.id-1],deadline=ProcessInfo.processInfo.systemUptime+1
@@ -111,12 +144,15 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
                 throw AppError.message("탭 구성이 바뀌어 원래 선택 탭을 복원하지 않았습니다.")
             }
             if fresh.selected != state.selected {
-                guard AXUIElementPerformAction(elements[state.selected-1],kAXPressAction as CFString) == .success else {throw AppError.message("원래 선택 탭으로 돌아가지 못했습니다.")}
+                let target=elements[state.selected-1];AXUIElementSetMessagingTimeout(target,0.5)
+                let result=services.action(target,kAXPressAction)
+                if result == .apiDisabled {throw TerminalProfileAccessError.accessibilityDenied}
+                guard result == .success else {throw AppError.message("원래 선택 탭으로 돌아가지 못했습니다.")}
             }
             guard let selectedWindow=try attribute(bar,kAXWindowAttribute,deadline:deadline),CFGetTypeID(selectedWindow)==AXUIElementGetTypeID(),
                   let restored=try group(selectedWindow as! AXUIElement,deadline:deadline),restored==state else {throw AppError.message("원래 선택 탭 복원을 확인하지 못했습니다.")}
         }
-        if let originalWindow {_ = AXUIElementPerformAction(originalWindow,kAXRaiseAction as CFString)}
+        if let originalWindow {_ = services.action(originalWindow,kAXRaiseAction)}
         if let originalApplication,!originalApplication.isTerminated,originalApplication.processIdentifier != ownerPID {originalApplication.activate()}
     }
 }

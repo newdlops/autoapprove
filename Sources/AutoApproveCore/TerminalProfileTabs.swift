@@ -151,7 +151,9 @@ public enum TerminalProfileTabOpener {
         let deadline=environment.clock()+3
         func check() throws {
             guard !environment.cancelled(),environment.clock()<deadline else {throw AppError.message("탭 복원 준비가 중단되었습니다.")}
-            guard environment.trusted(),environment.postingAllowed() else {throw AppError.message("같은 창에 탭을 열려면 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 AutoApprove를 허용해주세요.")}
+            // Posting has its own current authorization check. Native AX
+            // reads below prove access and focus before any key is submitted.
+            guard environment.postingAllowed() else {throw AppError.message("macOS가 AutoApprove의 새 탭 키 전달을 허용하지 않았습니다. 손쉬운 사용에서 이미 허용했다면 앱을 완전히 종료한 뒤 다시 열어주세요.")}
         }
         do {
             try check()

@@ -30,6 +30,12 @@ import AutoApproveCore
         controller.selectedID=profile.id
         controller.error="프로필 파일을 읽지 못했습니다. 파일 형식을 확인한 뒤 다시 불러와주세요. "+String(repeating:"긴 오류 안내. ",count:16)
         try await render(SessionProfilesWindow(controller:controller),name:"error-light",width:700,height:480,scheme:.light,root:root)
+        for (name,error) in [("access-denied",TerminalProfileAccessError.accessibilityDenied),("terminal-closed",.terminalNotRunning)] {
+            controller.error=error.localizedDescription
+            for scheme in [ColorScheme.light,.dark] {
+                try await render(SessionProfilesWindow(controller:controller),name:name+(scheme == .dark ? "-dark":"-light"),width:700,height:480,scheme:scheme,root:root)
+            }
+        }
         let empty=SessionProfilesController(store:.init(directory:root.appendingPathComponent("empty-data")),capture:{[]},launch:{_,_ in "/dev/fixture-render"})
         await empty.reload()
         try await render(SessionProfilesWindow(controller:empty),name:"empty-light",width:700,height:480,scheme:.light,root:root)
@@ -40,7 +46,7 @@ import AutoApproveCore
         }
         var invalid=draft;invalid.candidates[0].entry.conversationID="bad-id"
         try await render(SessionProfileEditor(draft:invalid,save:{_ in},cancel:{}),name:"editor-invalid-light",width:700,height:620,scheme:.light,root:root)
-        print("PASS native profile views: 700×480 / 860×640 / 1100×800 light/dark, empty, long error and optional/invalid conversation editor; synthetic data only")
+        print("PASS native profile views: 700×480 / 860×640 / 1100×800 light/dark, access denied, Terminal closed, empty, long error and optional/invalid conversation editor; synthetic data only")
     }
     @MainActor static func render<V:View>(_ view:V,name:String,width:Int,height:Int,scheme:ColorScheme,root:URL) async throws {
         let host=NSHostingView(rootView:view.frame(width:CGFloat(width),height:CGFloat(height)).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,scheme))
