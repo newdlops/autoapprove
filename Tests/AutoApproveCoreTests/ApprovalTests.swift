@@ -530,6 +530,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Terminal profile tabs: native new-window identity and selected window activation",tests.testTerminalNativeScriptsFindNewTabInDifferentScriptingWindowAndSelectIt),
             ("Terminal profile tabs: native new tab belongs to the exact original group",tests.testTerminalNativeTabOpenerVerifiesAnchorAndNewWindowShareAGroup),
             ("Terminal profile tabs: delayed AX settles without repeated keys or selections",tests.testTerminalNativeTabOpenerWaitsForDelayedAXWithoutRepeatingKey),
+            ("Terminal profile tabs: first pair rebinds AX bar through exact TTY selection",tests.testTerminalNativeTabOpenerAcceptsNewBarForFirstPairOnlyAfterTTYRoundTrip),
             ("Terminal profile tabs: bounded observation waiting and immediate read errors",tests.testTerminalProfileReadinessWaitsOnlyForObservations),
             ("Terminal profile tabs: capture combines previous verification and next selection",tests.testTerminalProfileCaptureFocusVerifiesPreviousAndReturnsSelectionInOneScript),
             ("Terminal profile tabs: native exact TTY selection avoids scripting processes",tests.testTerminalProfileNativeSelectionUsesExactTTYAndStableWindow),

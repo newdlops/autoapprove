@@ -243,6 +243,41 @@ extension ApprovalTests {
         try expectEqual(reads[2],3);try expectEqual(reads[3],3);try expectEqual(reads[4],3)
     }
 
+    func testTerminalNativeTabOpenerAcceptsNewBarForFirstPairOnlyAfterTTYRoundTrip() throws {
+        // Showing the first native tab bar can replace the singleton's AX
+        // objects. The two exact TTYs must still select the same new bar.
+        for replacedTab in [false,true] {
+            let fixture=TabKeyFixture();fixture.nativeWindows=true
+            let before=TerminalNativeTabGroup(id:5,tabs:[replacedTab ? 6:11],selected:replacedTab ? 6:11)
+            let added=TerminalNativeTabGroup(id:10,tabs:[11,12],selected:12)
+            var reads=0
+            let tty=try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+                defer {reads+=1}
+                if reads==0 {return before}
+                var value=added;if reads==2 {value.selected=11};return value
+            })
+            try expectEqual(tty,"/dev/ttys701");try expectEqual(fixture.posts,1);try expectEqual(fixture.runs,4)
+            try expectEqual(reads,4)
+        }
+        for mode in 0..<3 {
+            let fixture=TabKeyFixture();fixture.nativeWindows=true
+            var reads=0
+            do {
+                _ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+                    defer {reads+=1}
+                    if reads==0 {return .init(id:5,tabs:[6],selected:6)}
+                    var value=TerminalNativeTabGroup(id:10,tabs:[11,12],selected:reads==2 ? 11:12)
+                    if mode==0 && reads>=2 {value.id=20}
+                    if mode==1 && reads>=2 {value.selected=12}
+                    if mode==2 && reads>=3 {value.selected=11}
+                    return value
+                })
+                try expect(false,"A replaced bar still needs exact anchor/new-TTY selection confirmation")
+            } catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
+            try expectEqual(fixture.posts,1,"An uncertain new tab cannot repeat Cmd-T")
+        }
+    }
+
     func testTerminalTabScriptsOnlyWriteConfirmedIdleNewTab() throws {
         let context=JSContext()!,group=UUID(),entry=tabEntry(0,window:group)
         context.evaluateScript("""

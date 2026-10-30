@@ -2,6 +2,13 @@ import AppKit
 import ApplicationServices
 import AutoApproveCore
 
+private final class NativeOpenerState:@unchecked Sendable {
+    var windows:[String:NSWindow]=[:]
+    var phase=0,posts=0
+    var anchor="/dev/ttys900",target="/dev/ttys901"
+    var selected="/dev/ttys900"
+}
+
 @MainActor private final class NativeTabsFixture:NSObject,NSApplicationDelegate {
     var windows:[NSWindow]=[]
     var labels:[NSTextField]=[]
@@ -107,6 +114,56 @@ import AutoApproveCore
                 guard let anchor=try reader.focusedGroup(),anchor.id==added.id,anchor.tabs==added.tabs,anchor.selected != added.selected else {return nil}
                 return anchor
             }
+            // Exercise the production opener from a singleton through three
+            // additions. Only our AppKit windows implement the action boundary;
+            // native AX groups are real, while Terminal and key posting are not.
+            let state=NativeOpenerState()
+            DispatchQueue.main.sync {
+                let window=self.makeWindow(6);window.tabbingIdentifier="first-pair";window.makeKeyAndOrderFront(nil)
+                state.windows[state.anchor]=window;self.windows.append(window)
+            }
+            let openerReader=TerminalNativeTabReader(ownerPID:getpid(),bundleID:Bundle.main.bundleIdentifier!)
+            let singleton=try openerReader.focusedGroup()
+            let records=ProcessDiscovery.parse("1009001 1 ?? 1009001 0 Wed Oct 28 14:00:00 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
+            let environment=TerminalKeyboard.Environment(trusted:{true},postingAllowed:{true},run:{_ in
+                state.phase+=1
+                if state.phase==1 {
+                    return try DispatchQueue.main.sync {
+                        state.windows[state.anchor]!.makeKeyAndOrderFront(nil)
+                        state.selected=state.anchor
+                        return String(decoding:try JSONSerialization.data(withJSONObject:["tty":state.anchor,"windowID":state.windows[state.anchor]!.windowNumber,"ttys":Array(state.windows.keys)]),as:UTF8.self)
+                    }
+                }
+                let tty=state.phase==3 ? state.anchor:state.target
+                return try DispatchQueue.main.sync {
+                    state.windows[tty]!.makeKeyAndOrderFront(nil)
+                    state.selected=tty
+                    return String(decoding:try JSONSerialization.data(withJSONObject:["tty":tty,"windowID":state.windows[tty]!.windowNumber]),as:UTF8.self)
+                }
+            },metadata:{tty in
+                DispatchQueue.main.sync {
+                    guard let window=state.windows[tty] else {return nil}
+                    return TerminalWindowMetadata(tty:tty,windowID:UInt32(window.windowNumber),ownerPID:1009001,ownerBundleID:"com.apple.Terminal",selected:state.selected==tty,minimized:false)
+                }
+            },ownerBundle:{_ in "com.apple.Terminal"},focused:{metadata in
+                DispatchQueue.main.sync {state.windows[state.selected]?.windowNumber==Int(metadata.windowID)}
+            },processes:{records},postPair:{_,_,_ in
+                DispatchQueue.main.sync {
+                    state.posts+=1
+                    let window=self.makeWindow(6+state.posts);window.tabbingIdentifier="first-pair"
+                    state.windows[state.anchor]!.addTabbedWindow(window,ordered:.above);window.makeKeyAndOrderFront(nil)
+                    state.windows[state.target]=window;self.windows.append(window)
+                    state.selected=state.target
+                }
+            })
+            for index in 1...3 {
+                state.phase=0;state.target="/dev/ttys\(900+index)"
+                let tty=try TerminalProfileTabOpener.open(anchorTTY:state.anchor,environment:environment,nativeGroupReader:{try openerReader.focusedGroup()})
+                guard tty==state.target,try openerReader.focusedGroup()?.tabs.count==index+1 else {throw AppError.message("Singleton/multiple native opener failed")}
+                state.anchor=tty
+            }
+            report["singletonInitialAXTabs"]=singleton?.tabs.count ?? 0
+            report["productionOpenerTabCount"]=state.windows.count;report["openerActions"]=state.posts;report["terminalKeyEvents"]=0
             report.merge(["passed":true,"nativeGroups":baseline.count,"scriptingWindowCount":rows.count,"capturedWindowGroups":Set(captured.map(\.windowID)).count,"originalSelectionRestored":true,"newTabVerifiedAcrossWindowIDs":true,"duplicateTitles":true]) {_,new in new}
         } catch {report["passed"]=false;report["error"]=error.localizedDescription}
         let root=URL(fileURLWithPath:Bundle.main.object(forInfoDictionaryKey:"NativeTabsQAOutput") as! String)
