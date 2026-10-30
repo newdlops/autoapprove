@@ -203,6 +203,13 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .terminal-history-dialog[open] { display: flex; flex-direction: column; gap: 12px; }
 .terminal-history-dialog .dialog-heading, .terminal-history-dialog > p, .terminal-history-status, .terminal-history-navigation { flex-shrink: 0; margin: 0; }
 .terminal-history-dialog .dialog-heading { align-items: flex-start; min-width: 0; }
+.terminal-history-dialog .dialog-heading > div { min-width: 0; }
+.terminal-history-dialog .dialog-heading .icon-button { flex-shrink: 0; }
+.history-tools { flex-shrink: 0; }
+.terminal-history-dialog[data-conversation=true] .history-tools { display: flex; align-items: flex-end; gap: 12px; }
+.conversation-location { flex: 1; min-width: 0; }
+.conversation-location label { margin: 0 0 4px; font-size: 12px; color: var(--muted); }
+.conversation-location select { display: block; width: 100%; max-width: 100%; height: 44px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--fg); text-overflow: ellipsis; font-size: 14px; }
 #terminal-history-source { overflow-wrap: anywhere; margin: 6px 0 0; }
 .terminal-history-status, .terminal-history-navigation { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .terminal-history-status p { flex: 1; min-width: 120px; margin: 0; }
@@ -211,12 +218,22 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 #terminal-history-output:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
 #terminal-history-output::selection, #terminal-history-output *::selection { background: #315782; color: #fff; }
 #terminal-history-output .terminal-history-page { white-space: inherit; }
-#terminal-history-output.conversation-output { background: var(--subtle); color: var(--fg); font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; white-space: normal; }
-.conversation-message { max-width: 75ch; margin-inline: auto; padding: 16px 4px; border-bottom: 1px solid var(--line); }
-.conversation-message:first-child { padding-top: 4px; }
-.conversation-message strong { display: block; position: sticky; top: 0; padding-block: 4px; margin-bottom: 8px; font-size: 13px; color: var(--muted); background: var(--subtle); }
+#terminal-history-output.conversation-output { background: var(--surface); color: var(--fg); padding: 16px 24px; font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; white-space: normal; scrollbar-color: var(--muted) var(--surface); }
+.conversation-message { max-width: 70ch; margin-inline: auto; padding: 24px 0; border-bottom: 1px solid var(--line); }
+.conversation-message:first-child { padding-top: 0; }
+.conversation-message strong { display: block; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
 .conversation-message[data-role="user"] strong { color: var(--blue); }
 .conversation-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-text p { margin: 0 0 1em; font: inherit; white-space: pre-wrap; }
+.conversation-text > :last-child { margin-bottom: 0; }
+.conversation-text pre { overflow: auto; max-width: 100%; padding: 16px; border-radius: var(--radius); background: var(--subtle); color: var(--fg); white-space: pre; font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 4; }
+.conversation-message[data-role=user] .conversation-text { background: var(--subtle); border-radius: var(--radius); padding: 12px 16px; }
+.conversation-wayfinding { flex-shrink: 0; min-width: 0; border-top: 1px solid var(--line); padding-top: 8px; }
+.conversation-position, .conversation-boundaries { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); }
+.conversation-position label { margin: 0; font-size: inherit; font-weight: 400; }
+.conversation-position output { font-variant-numeric: tabular-nums; }
+.conversation-boundaries span:last-child { text-align: right; }
+.conversation-wayfinding input[type=range] { display: block; width: 100%; min-height: 44px; margin: 0; padding: 0; border: 0; accent-color: var(--blue); cursor: pointer; touch-action: pan-y; }
 #terminal-history-picker label { display: block; margin-bottom: 6px; }
 #terminal-history-picker select { flex: 1; width: 100%; }
 #terminal-history-close { color: var(--fg); }
@@ -227,6 +244,9 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
   .terminal-history-navigation { gap: 6px; }
   .terminal-history-navigation button { padding-inline: 10px; }
   #terminal-history-range { order: -1; flex-basis: 100%; }
+  #terminal-history-output.conversation-output { padding: 12px 8px; }
+  .conversation-message { padding-block: 20px; }
+  .conversation-position, .conversation-boundaries { gap: 8px; }
 }
 .terminal-heading > button, .terminal-settings { flex-shrink: 0; }
 .terminal-settings { position: relative; }

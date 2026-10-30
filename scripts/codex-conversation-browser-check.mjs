@@ -52,24 +52,55 @@ try{
  assert.equal((await page.locator('#terminal-history-output').textContent()).includes('pnpm test'),false);
  await page.locator('#terminal-history-output').focus();await page.keyboard.press('Enter');assert.equal(posts.length,0);
  checks.push('Cold on-demand conversation, author separation, literal Unicode/code/XSS text, no terminal copy or keyboard writes');
- for(let i=0;i<8;i++){await page.locator('#terminal-history-older').click();await page.waitForFunction(()=>document.getElementById('terminal-history-output').getAttribute('aria-busy')==='false');}
+ const output=page.locator('#terminal-history-output');
+ assert.equal(await page.locator('#terminal-history-navigation').isVisible(),false);assert.equal(await page.locator('#terminal-history-older').isVisible(),false);
+ assert.match(await page.locator('#terminal-history-position').textContent(),/1 \/ 2개/);
+ assert.equal(await output.locator('pre code').textContent(),'let answer = 42');
+ const initialTop=await page.locator('[data-message-id="user-0"]').evaluate(e=>e.getBoundingClientRect().top);
+ await output.hover();await page.mouse.wheel(0,-150);await page.waitForFunction(()=>terminalHistoryViewer.pages[0]?.index===1&&!terminalHistoryViewer.busy);
+ assert.ok(Math.abs(await page.locator('[data-message-id="user-0"]').evaluate(e=>e.getBoundingClientRect().top)-initialTop)<2,'Prepending preserves the visible message');
+ for(let i=2;i<=8;i++){await output.hover();await page.mouse.wheel(0,-10000);await page.waitForFunction(index=>terminalHistoryViewer.pages[0]?.index===index&&!terminalHistoryViewer.busy,i);}
  assert.equal(await page.locator('.conversation-page').count(),3);assert.equal(await page.locator('.conversation-message').count(),6);assert.equal(await page.locator('#terminal-history-older').isDisabled(),true);
+ await output.hover();await page.mouse.wheel(0,-10000);await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('1 /'));
+ assert.equal(await page.locator('#terminal-history-start').textContent(),'대화의 처음');assert.equal(await page.locator('#terminal-history-end').textContent(),'아래로 스크롤 · 이후 대화');
+ await page.locator('#terminal-history-jump').selectOption('2');await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('3 /'));
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+ assert.equal(await page.locator('#terminal-history-jump').inputValue(),'2');assert.match(await page.locator('#terminal-history-jump option:checked').textContent(),/사용자 대화 7/);
+ await page.screenshot({path:out+'/'+engine+'-reading-position.png'});
+ await page.locator('#terminal-history-seek').focus();await page.keyboard.press('Home');await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('1 /'));
+ await output.hover();await page.mouse.wheel(0,350);await page.waitForFunction(()=>Number(document.getElementById('terminal-history-seek').value)>0);
+ assert.equal(await page.locator('#terminal-history-jump').inputValue(),String(Number((await page.locator('#terminal-history-position').textContent()).split(' /')[0])-1));
+ for(let i=5;i>=0;i--){await output.hover();await page.mouse.wheel(0,10000);await page.waitForFunction(index=>terminalHistoryViewer.pages.at(-1)?.index===index&&!terminalHistoryViewer.busy,i);}
+ assert.equal(await page.locator('#terminal-history-end').textContent(),'최신 기록');assert.equal(await page.locator('.conversation-page').count(),3);
  await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>document.querySelectorAll('.conversation-message').length===2&&document.getElementById('terminal-history-output').textContent.includes('Codex 답변 0'));
- checks.push('Eight older pages retain at most three DOM pages; latest refresh resets the range');
+ await page.locator('#terminal-history-jump').focus();await output.hover();await page.mouse.wheel(0,350);await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('2 /'));assert.equal(await page.locator('#terminal-history-jump').inputValue(),'1');
+ await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&document.getElementById('terminal-history-position').textContent.startsWith('1 /'));
+ checks.push('Gesture-driven older/newer round trip, viewport anchor, current-message selector and keyboard position seek; three DOM pages retained');
  const screenshots=[];
  for(const theme of ['light','dark'])for(const [name,width,height]of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
   await page.emulateMedia({colorScheme:theme});await page.setViewportSize({width,height});
   await page.waitForFunction(()=>!terminalHistoryViewer.busy);await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   await page.screenshot({path:out+'/'+engine+'-'+theme+'-'+name+'.png',animations:'disabled',caret:'hide'});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-  for(const selector of ['#terminal-history-close','#terminal-history-older','#terminal-history-refresh']){
-   const box=await page.locator(selector).boundingBox();assert.ok(box&&box.width>=44&&box.height>=44);assert.ok(box.y>=0&&box.y+box.height<=height);
+  for(const selector of ['#terminal-history-close','#terminal-history-jump','#terminal-history-seek','#terminal-history-refresh']){
+   const box=await page.locator(selector).boundingBox();assert.ok(box&&box.width>=44&&box.height>=44,`${selector}: ${JSON.stringify(box)}`);assert.ok(box.y>=0&&box.y+box.height<=height);
   }screenshots.push({theme,width,height});
  }
  const route='**/api/codex/history?**',retained=await page.locator('#terminal-history-output').textContent();
+ const paragraph=await page.locator('[data-message-id="user-0"] .conversation-text p').first().boundingBox();
+ await page.mouse.move(paragraph.x+10,paragraph.y+12);await page.mouse.down();await page.mouse.move(paragraph.x+150,paragraph.y+12,{steps:8});await page.mouse.up();
+ assert.equal(await page.evaluate(()=>!!terminalHistoryViewer.selectedText()),true);const selectedCount=requests.length;await page.mouse.wheel(0,-1000);await page.waitForTimeout(120);assert.equal(requests.length,selectedCount,'Selecting text must not fetch or replace the reading window');await page.mouse.click(paragraph.x+10,paragraph.y+12);
+ await page.route(route,route=>route.fulfill({status:503,json:{error:'합성 오류: 이전 대화를 다시 불러와주세요.'}}));await output.hover();await page.mouse.wheel(0,-10000);await page.locator('#terminal-history-error').waitFor();
+ assert.equal(await page.locator('#terminal-history-older').isVisible(),true);const failedCount=requests.length;await page.mouse.wheel(0,-1000);await page.waitForTimeout(150);assert.equal(requests.length,failedCount,'A failed gesture read never spins retries');await page.unroute(route);
+ await page.locator('#terminal-history-older').click();await page.waitForFunction(()=>terminalHistoryViewer.pages[0]?.index===1&&!terminalHistoryViewer.busy);await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>terminalHistoryViewer.pages.length===1&&!terminalHistoryViewer.busy);
  await page.route(route,route=>route.fulfill({status:503,json:{error:'합성 오류: 대화 기록을 다시 불러와주세요.'}}));await page.locator('#terminal-history-refresh').click();await page.locator('#terminal-history-error').waitFor();
  assert.equal(await page.locator('#terminal-history-output').textContent(),retained);assert.equal(await page.locator('#terminal-history-refresh').isEnabled(),true);await page.screenshot({path:out+'/'+engine+'-error.png'});await page.unroute(route);
  await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>document.getElementById('terminal-history-error').hidden);checks.push('Failed refresh retains readable messages; retry recovers');
+ const shortIdentity=await page.evaluate(()=>({sessionID:selectedItem.session.id,threadID:terminalHistoryViewer.threadID}));
+ await page.route(route,route=>{const older=new URL(route.request().url()).searchParams.has('cursor');return route.fulfill({json:{...shortIdentity,messages:[{id:older?'short-old':'short-new',role:'user',text:older?'이전의 짧은 질문':'짧은 질문',truncated:false}],nextCursor:older?null:'short-cursor'}});});
+ await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.messages[0]?.dataset.messageId==='short-new');assert.equal(await page.locator('#terminal-history-older').isVisible(),true);
+ await page.waitForTimeout(150);assert.equal(await page.locator('#terminal-history-older').isVisible(),true);await page.locator('#terminal-history-older').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.pages.length===2);assert.equal(await page.locator('#terminal-history-older').isVisible(),false);
+ await page.unroute(route);await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.pages.length===1);checks.push('Text selection suppresses paging; short content retains a stable keyboard-accessible previous-page action');
  await page.keyboard.press('Escape');assert.equal(await page.locator('#terminal-history-dialog').isVisible(),false);assert.equal(await page.locator('#terminal-input').inputValue(),'PRESERVE UNSENT DRAFT');
  await page.route(route,route=>route.fulfill({status:409,json:{error:'대화를 확정하지 못했습니다. 확인할 대화를 선택해주세요.'}}));await page.locator('#codex-conversation-open').click();await page.locator('#terminal-history-picker').waitFor();
  assert.equal(await page.locator('#terminal-history-use').isDisabled(),true);await page.unroute(route);
@@ -85,6 +116,16 @@ try{
  await page.screenshot({path:out+'/'+engine+'-loading.png'});await page.keyboard.press('Escape');release();await page.unroute(route);
  await page.locator('.session-row').nth(1).click();await page.locator('#codex-conversation-open').click();await page.locator('.conversation-message').last().waitFor();
  assert.ok((await page.locator('#terminal-history-output').textContent()).includes('Codex 답변'));checks.push('Empty/loading/close and abandoned request isolation; original composer draft preserved');
+ if(engine==='chromium'){
+  const touch=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});touch.on('pageerror',error=>errors.push(error.message));touch.on('request',request=>{if(request.method()==='POST')posts.push(request.url());});
+  await touch.goto(second.url);await touch.getByRole('button',{name:/웹 관리 구현/}).first().click();await touch.locator('#codex-conversation-open').click();await touch.waitForFunction(()=>terminalHistoryViewer?.pages.length===1&&!terminalHistoryViewer.busy);
+  const area=await touch.locator('#terminal-history-output').boundingBox(),cdp=await touch.context().newCDPSession(touch),x=area.x+area.width/2,y=area.y+80;
+  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x,y}]});
+  for(let step=1;step<=5;step++)await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x,y:y+step*25}]});
+  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForFunction(()=>terminalHistoryViewer.pages[0]?.index===1&&!terminalHistoryViewer.busy);
+  const seek=await touch.locator('#terminal-history-seek').boundingBox();await touch.touchscreen.tap(seek.x+seek.width*.7,seek.y+seek.height/2);assert.ok(await touch.locator('#terminal-history-seek').evaluate(e=>Number(e.value)/Number(e.max)>.5));await touch.close();
+  checks.push('Chromium mobile emulation: synthesized touch scroll loads older history and native range tap moves the reading position');
+ }
  assert.deepEqual(errors,[]);assert.equal(posts.length,0);
  const report={engine,verified:true,checks,screenshots,historyRequests:requests.length,posts:posts.length,errors,scope:'Production Core and dashboard, synthetic originals; no actual Terminal or user dialogue rendered'};
  await writeFile(out+'/'+engine+'.json',JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
