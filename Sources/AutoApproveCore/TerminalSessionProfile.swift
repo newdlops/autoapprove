@@ -362,9 +362,13 @@ public enum TerminalProfileLauncher {
     }
     public static func selectTab(_ tty:String) async throws {
         guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
-        let target=try AutomationScript.literal(tty)
         _ = try await Task.detached(priority:.utility) {
-            try AutomationScript.run("const app=Application('com.apple.Terminal'); let found=false; for(const window of app.windows())for(const tab of window.tabs())if(tab.tty()===\(target)){window.selectedTab=tab;found=true;} if(!found)throw Error('선택할 탭이 닫혔습니다.'); 'selected';",app:"Terminal",denied:.permissionDenied)
+            try AutomationScript.run(selectionScript(tty),app:"Terminal",denied:.permissionDenied)
         }.value
+    }
+    public static func selectionScript(_ tty:String) throws -> String {
+        guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
+        let target=try AutomationScript.literal(tty)
+        return "const app=Application('com.apple.Terminal'),matches=[]; for(const window of app.windows())for(const tab of window.tabs())if(tab.tty()===\(target))matches.push({window,tab}); if(matches.length!==1)throw Error('선택할 탭이 닫혔거나 바뀌었습니다.'); const {window,tab}=matches[0]; window.selectedTab=tab;window.miniaturized=false;window.index=1;app.activate(); 'selected';"
     }
 }

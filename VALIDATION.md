@@ -1,5 +1,14 @@
 # AutoApprove 검증 기록
 
+## 2026-10-30 · macOS 기본 탭 그룹 복원 · 0.2.210/237 후보
+
+- Terminal의 스크립트 창 ID를 저장 그룹으로 쓰던 경로를 수정했다. macOS 기본 탭은 개별 NSWindow로 보고될 수 있으므로 실제 AX 탭 막대/탭 객체로 그룹·순서·원래 선택을 대조한다. 현재 창 수집 때 정확한 TTY를 잠시 선택하며, 사용자 초점/창/순서 변경이나 선택 복원 실패는 저장을 중단한다. 새 탭은 별도 창 ID를 허용하되 원래 TTY와 동일한 실제 탭 막대를 공유하는지 확인한 뒤에만 CLI 명령을 전달한다. 선택 탭 복원은 해당 네이티브 창도 앞으로 가져온다. 이전에 개별 창으로 잘못 기록한 파일은 **현재 창으로 갱신**이 필요하며 자동 덮어쓰지 않는다.
+- 최종 release App·CLI·Core 빌드 **93.07초**, 탭 회귀 **13/13**·기존 세션 프로필 **7/7**, JavaScript 구문과 `git diff --check`가 통과했다. 새 5개 회귀는 개별 스크립트 창의 실제 그룹 매핑, 중복 제목, 저장하지 않는 셸 탭의 선택, 여러 그룹/순서/초점·원상 복원 실패, 별도 창 ID의 새 탭과 정확한 anchor/선택 확인을 다룬다. 생성한 CGEvent는 합성 전달기로만 받으며 실제 키 입력은 보내지 않는다. 샌드박스에서 이벤트 객체 생성이 막혀 해당 검사는 승인된 샌드박스 외부 실행으로 확인했다.
+- 선택 복원의 마지막 보호 보완 전 전체 회귀는 **579/580**이다. 실패 1건은 기존 `Published updates: exact loopback gateway and web ports after reuse`의 **NWError 49: Can't assign requested address**다. 이전 기록과 같은 루프백 주소 환경 문제이며 네트워크 설정/검사 조건을 변경하지 않았다. 마지막 보완 뒤에는 위 관련 20개와 아래 네이티브 검사를 다시 실행했으며 전체 회귀를 다시 수행했다고 표시하지 않는다.
+- 격리된 실제 AppKit 앱에서 동일 제목의 **5개 NSWindow → 2개 그룹**, 순서 **[0,1,2,0,1]**, 선택 **[false,true,false,false,true]**, 원래 선택으로 돌아온 뒤의 AX 객체 일치를 확인했다. 새 여섯 번째 창을 기존 그룹의 탭으로 추가한 뒤 같은 막대/기존 탭 순서 보존/새 탭 선택과 anchor 재선택을 확인했다. 일반 버튼 조작으로 실행했으며 실제 네이티브 탭 막대·선택 표시·통과 문구를 화면으로 확인했다. AX 트리가 창 생성보다 늦게 갱신될 수 있어 QA는 조건을 최대 1초 조회하며 창 생성이나 입력을 반복하지 않는다.
+- **검증 경계:** 컴퓨터 조작 도구가 실제 `com.apple.Terminal` 접근을 안전 정책으로 거부했다. 다른 경로로 우회하거나 실제 사용자 Terminal에 시험 입력을 하지 않았다. QA 앱은 접근성 권한을 요청하지 않아 실제 AX 읽기와 자체 AppKit 창의 선택 복원을 함께 검증하고, 외부 Terminal의 라이브 AX 선택 복원/실제 Cmd-T/resume 전달은 미검증으로 남긴다. 제품 경로는 접근성 권한·정확한 전면 PID·창·TTY를 요구한다. 재현은 `autoapprove-checks --filter 'Terminal profile tabs'`, `--filter 'Session profiles'`, `node scripts/terminal-native-tabs-check.mjs --output=<비공개 QA 폴더>` 후 출력된 앱의 **탭 복원 검사 시작** 버튼이다.
+- **배포 차단:** 최종 빌드를 `AUTOAPPROVE_SIGNING_READ_ONLY=1 node scripts/package-app.mjs release .runtime/native-tabs-210/release/AutoApprove.app --build=.build/network-stability/release`로 패키징했으나 기존 게시자 identity의 **`codesign: no identity found`**로 중단됐다. 키체인 생성·잠금 해제·검색 목록·ACL/신뢰 변경과 대체 키 생성은 하지 않았다. 소스와 일치하는 비공개 패키징 후보는 서명 완료 앱이 아니며 설치하지 않는다. 서명 DMG/업데이트 ZIP·체크섬, 태그/GitHub 릴리스·공개 다운로드 검증, 로컬 설치·실행 버전 확인이 남는다. 이전 0.2.209 기록의 기존 프로젝트 키체인 임시 등록 예외가 필요하다. 개인 런타임·키체인·QA 자료와 무관한 설정 변경은 공개 소스에 포함하지 않는다.
+
 ## 2026-10-30 · 0.2.209/236 웹 연결·OS 정책·Goal 관리 후보
 
 - 릴리스 컴파일 및 JavaScript 구문 검사 통과. 전체 회귀 **574/575**이며 남은 1건은 이전 릴리스에도 있던 `Published updates: exact loopback gateway and web ports after reuse`다. 실행 환경의 PortManager 선언 주소 `127.1.0.1`이 실제 loopback 인터페이스에 없어 `EADDRNOTAVAIL`이 발생한다. 주소 별칭·PortManager 환경·방화벽·VPN을 변경하거나 다른 주소로 우회하지 않았다. Goal 보류 캐시 보완 뒤 관련 검사 **Goal 3/3 · OS permissions 11/11**을 다시 통과했다. 마지막으로 목표 UUID를 일시적으로 읽지 못해도 취소 보류를 유지하도록 보완했고, 최종 release 빌드 **95.01초**와 해당 회귀를 포함한 **Goal 3/3**이 통과했다.

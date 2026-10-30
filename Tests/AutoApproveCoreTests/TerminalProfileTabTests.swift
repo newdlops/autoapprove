@@ -13,7 +13,7 @@ private actor TabLaunchLog {
     func select(_ tty:String) {selections.append(tty)}
 }
 private final class TabKeyFixture:@unchecked Sendable {
-    var trusted=true,focused=true,changeWindow=false,throwAfterPost=false,failConfirmation=false
+    var trusted=true,focused=true,changeWindow=false,throwAfterPost=false,failConfirmation=false,nativeWindows=false
     var reads=0,runs=0,posts=0
     var flags:CGEventFlags=[],code:Int64=0,pid:Int32=0
     let records=ProcessDiscovery.parse("1009001 1 ?? 1009001 0 Wed Oct 28 14:00:00 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
@@ -22,8 +22,8 @@ private final class TabKeyFixture:@unchecked Sendable {
             self.runs+=1
             if self.runs==1 {return #"{"tty":"/dev/ttys700","windowID":77,"ttys":["/dev/ttys700"]}"#}
             if self.failConfirmation {throw AppError.message("no new tab")}
-            return #"{"tty":"/dev/ttys701"}"#
-        },metadata:{tty in self.reads+=1;return .init(tty:tty,windowID:self.changeWindow && self.reads>1 ? 78:77,ownerPID:1009001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)},ownerBundle:{_ in "com.apple.Terminal"},focused:{_ in self.focused},processes:{self.records},postPair:{pid,down,up in
+            return "{\"tty\":\"/dev/ttys701\",\"windowID\":\(self.nativeWindows ? 78:77)}"
+        },metadata:{tty in self.reads+=1;return .init(tty:tty,windowID:(self.changeWindow && self.reads>1) || (self.nativeWindows && tty=="/dev/ttys701") ? 78:77,ownerPID:1009001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)},ownerBundle:{_ in "com.apple.Terminal"},focused:{_ in self.focused},processes:{self.records},postPair:{pid,down,up in
             self.posts+=1;self.pid=pid;self.flags=down.flags;self.code=down.getIntegerValueField(.keyboardEventKeycode)
             if self.throwAfterPost {throw AppError.message("lost key acknowledgement")}
         })
@@ -162,20 +162,51 @@ extension ApprovalTests {
 
     func testTerminalTabKeyboardPinsOwnerWindowAndUncertainResult() throws {
         let fixture=TabKeyFixture()
-        try expectEqual(try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment),"/dev/ttys701")
+        try expectEqual(try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{nil}),"/dev/ttys701")
         try expectEqual(fixture.posts,1);try expectEqual(fixture.pid,1009001);try expectEqual(fixture.code,17);try expect(fixture.flags.contains(.maskCommand))
         for mode in [0,1,2] {
             let blocked=TabKeyFixture()
             if mode==0 {blocked.trusted=false};if mode==1 {blocked.focused=false};if mode==2 {blocked.changeWindow=true}
-            do {_ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:blocked.environment);try expect(false)}
+            do {_ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:blocked.environment,nativeGroupReader:{nil});try expect(false)}
             catch let error as RemoteHTTPError {try expectEqual(error.diagnostics?["delivery"],"not_started")}
             try expectEqual(blocked.posts,0)
         }
         for afterPost in [true,false] {
             let uncertain=TabKeyFixture();uncertain.throwAfterPost=afterPost;uncertain.failConfirmation = !afterPost
-            do {_ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:uncertain.environment);try expect(false)}
+            do {_ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:uncertain.environment,nativeGroupReader:{nil});try expect(false)}
             catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
             try expectEqual(uncertain.posts,1)
+        }
+    }
+
+    func testTerminalNativeTabOpenerVerifiesAnchorAndNewWindowShareAGroup() throws {
+        for alreadyGrouped in [false,true] {
+            let fixture=TabKeyFixture();fixture.nativeWindows=true
+            var reads=0
+            let before=TerminalNativeTabGroup(id:10,tabs:alreadyGrouped ? [11,13]:[11],selected:11)
+            let added=TerminalNativeTabGroup(id:10,tabs:alreadyGrouped ? [11,12,13]:[11,12],selected:12)
+            let tty=try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+                defer {reads+=1}
+                if reads==0 {return alreadyGrouped ? before:nil}
+                var value=added;if reads==2 {value.selected=11};return value
+            })
+            try expectEqual(tty,"/dev/ttys701");try expectEqual(fixture.posts,1);try expectEqual(reads,4)
+        }
+        for mode in 0..<4 {
+            let fixture=TabKeyFixture();fixture.nativeWindows=true
+            var reads=0
+            do {
+                _ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+                    defer {reads+=1}
+                    if reads==0 {return .init(id:10,tabs:[11,13],selected:11)}
+                    var value=TerminalNativeTabGroup(id:10,tabs:[11,12,13],selected:reads==2 ? 11:12)
+                    if mode==0 {value.id=99};if mode==1 {value.tabs=[13,12,11]}
+                    if mode==2 && reads==2 {value.id=99};if mode==3 && reads==3 {value.selected=11}
+                    return value
+                })
+                try expect(false,"A separate native window, reordered group or changed selection cannot receive a command")
+            } catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
+            try expectEqual(fixture.posts,1)
         }
     }
 
@@ -195,17 +226,17 @@ extension ApprovalTests {
         let prepared=context.evaluateScript(try TerminalProfileTabOpener.prepareScript(anchorTTY:"/dev/ttys700"))?.toString() ?? ""
         try expectNil(context.exception);try expect(prepared.contains("77"))
         context.evaluateScript("targetTabs.push(newTab);")
-        let confirmed=context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700"]))?.toString()
-        try expectNil(context.exception);try expectEqual(confirmed,#"{"tty":"/dev/ttys701"}"#)
+        let confirmed=context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700","/dev/ttys799"]))?.toString()
+        try expectNil(context.exception);try expectEqual(confirmed,#"{"tty":"/dev/ttys701","windowID":77}"#)
         let delivered=context.evaluateScript(try TerminalProfileLauncher.script(entry,targetTTY:"/dev/ttys701"))?.toString()
-        try expectNil(context.exception);try expectEqual(delivered,confirmed)
+        try expectNil(context.exception);try expectEqual(delivered,#"{"tty":"/dev/ttys701"}"#)
         try expectEqual(context.evaluateScript("commands.length")?.toInt32(),1);try expectEqual(context.evaluateScript("created")?.toInt32(),0)
         try expectEqual(context.evaluateScript("commands[0].tty")?.toString(),"/dev/ttys701")
         context.evaluateScript("newTab.busy=()=>true;")
         _ = context.evaluateScript(try TerminalProfileLauncher.script(entry,targetTTY:"/dev/ttys701"));try expect(context.exception != nil);context.exception=nil
         try expectEqual(context.evaluateScript("commands.length")?.toInt32(),1)
         context.evaluateScript("targetTabs=[oldTab];")
-        _ = context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700"]));try expect(context.exception != nil);context.exception=nil
+        _ = context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700","/dev/ttys799"]));try expect(context.exception != nil);context.exception=nil
         try expectEqual(context.evaluateScript("created")?.toInt32(),0,"A failed tab never falls back to a separate window")
     }
 }
