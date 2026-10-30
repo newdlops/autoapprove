@@ -39,7 +39,7 @@ public enum TerminalKeyboard {
             Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
                 run: { try AutomationScript.run($0, app: "Terminal", denied: .permissionDenied, timeout: 3) },
                 metadata: { try TerminalAdapter.windowMetadata(tty: $0) },
-                ownerBundle: { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier }, focused: { TerminalKeyboard.isFocused($0) },
+                ownerBundle: { TerminalProcessLookup.ownerBundle(pid:$0) }, focused: { TerminalKeyboard.isFocused($0) },
                 processes: { try ProcessDiscovery.read() }, postPair: { pid, down, up in
                     down.postToPid(pid); up.postToPid(pid)
                 })
@@ -51,8 +51,7 @@ public enum TerminalKeyboard {
         ![.text, .submit, .enter].contains(input.kind) || input.kind == .enter && input.isRelay
     }
     private static func isFocused(_ metadata: TerminalWindowMetadata) -> Bool {
-        guard NSRunningApplication(processIdentifier: metadata.ownerPID)?.isActive == true,
-              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
               let first = windows.first(where: {
                   ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == metadata.ownerPID
                     && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
@@ -66,7 +65,8 @@ public enum TerminalKeyboard {
             var value: CFTypeRef?
             return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
         }
-        guard let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
+        guard (attribute(app,kAXFrontmostAttribute) as? NSNumber)?.boolValue==true,
+              let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
               attribute(focused as! AXUIElement, kAXRoleAttribute) as? String == kAXTextAreaRole,
               let inputWindow = attribute(focused as! AXUIElement, kAXWindowAttribute), CFGetTypeID(inputWindow) == AXUIElementGetTypeID(),
               let focusedWindow = attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(focusedWindow) == AXUIElementGetTypeID(), CFEqual(inputWindow, focusedWindow) else { return false }

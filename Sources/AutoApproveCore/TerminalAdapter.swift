@@ -292,7 +292,7 @@ public enum TerminalAdapter {
               let window = TerminalCursorReader.windowInfo(windowID: selection.windowID).first(where: {
                   ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == selection.windowID }),
               let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-              let owner = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier, owner == host.bundleID else { return nil }
+              let owner = TerminalProcessLookup.ownerBundle(pid:ownerPID), owner == host.bundleID else { return nil }
         let bounds = TerminalCursorReader.windowBounds(window).map {
             TerminalWindowBounds(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height)
         }

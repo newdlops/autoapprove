@@ -54,6 +54,15 @@ import AutoApproveCore
             }
         }
         do {
+            let live=TerminalNativeTabReader.Services.live
+            report["liveForegroundConfirmed"]=live.foreground(getpid())
+            report["liveOwnerConfirmed"]=live.ownsProcess(getpid(),Bundle.main.bundleIdentifier!)
+            let active=DispatchQueue.main.sync {NSApp.isActive}
+            report["ownAppActive"]=active
+            var frontmost:CFTypeRef?
+            report["AXFrontmostStatus"]=AXUIElementCopyAttributeValue(app,kAXFrontmostAttribute as CFString,&frontmost).rawValue
+            report["AXFrontmostValue"]=(frontmost as? NSNumber)?.boolValue ?? false
+            guard live.ownsProcess(getpid(),Bundle.main.bundleIdentifier!),live.foreground(getpid())==active else {throw AppError.message("Own live AX foreground/owner validation failed")}
             let reader=TerminalNativeTabReader(ownerPID:getpid(),bundleID:Bundle.main.bundleIdentifier!)
             var baseline:[TerminalNativeTabGroup]=[]
             let captured=try TerminalProfileNativeCapture.capture(rows,environment:.init(groups:{baseline=try reader.groups();return baseline},focus:{tty in

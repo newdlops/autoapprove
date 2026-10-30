@@ -40,11 +40,14 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         }
         public static var live:Self {
             .init(ownsProcess:{pid,bundle in
-                guard let app=NSRunningApplication(processIdentifier:pid) else {return false}
-                return !app.isTerminated && app.bundleIdentifier==bundle
+                TerminalProcessLookup.ownerBundle(pid:pid)==bundle
             },read:{element,name in
                 var value:CFTypeRef?;let result=AXUIElementCopyAttributeValue(element,name as CFString,&value);return (result,value)
-            },action:{AXUIElementPerformAction($0,$1 as CFString)},foreground:{NSWorkspace.shared.frontmostApplication?.processIdentifier==$0})
+            },action:{AXUIElementPerformAction($0,$1 as CFString)},foreground:{pid in
+                let app=AXUIElementCreateApplication(pid);AXUIElementSetMessagingTimeout(app,0.15)
+                var value:CFTypeRef?
+                return AXUIElementCopyAttributeValue(app,kAXFrontmostAttribute as CFString,&value) == .success && (value as? NSNumber)?.boolValue==true
+            })
         }
     }
     private let application:AXUIElement
@@ -54,20 +57,25 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
     private var originalWindow:AXUIElement?
     private let originalApplication:NSRunningApplication?
     private let services:Services
+    private let terminalIdentity:TerminalProcessIdentity?
     public init(ownerPID:Int32,bundleID:String,services:Services?=nil) {
         self.ownerPID=ownerPID;self.bundleID=bundleID
         application=AXUIElementCreateApplication(ownerPID)
         self.services=services ?? .live
+        terminalIdentity=services==nil && bundleID==TerminalProcessLookup.bundleID ? TerminalProcessLookup.identity(pid:ownerPID):nil
         // Injected adapters cannot acquire a path to real focus-changing UI.
         originalApplication=services == nil ? NSWorkspace.shared.frontmostApplication:nil
     }
     public static func terminal() throws -> TerminalNativeTabReader {
-        guard let app=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Terminal").first,!app.isTerminated else {
-            throw TerminalProfileAccessError.terminalNotRunning
-        }
-        return .init(ownerPID:app.processIdentifier,bundleID:"com.apple.Terminal")
+        let owner=try TerminalProcessLookup.running()
+        let reader=TerminalNativeTabReader(ownerPID:owner.pid,bundleID:TerminalProcessLookup.bundleID)
+        guard reader.terminalIdentity==owner else {throw AppError.message("탭 구성을 읽기 전에 Terminal 프로세스가 바뀌었습니다. 다시 불러와주세요.")}
+        return reader
     }
     private func check() throws {
+        if let terminalIdentity,TerminalProcessLookup.identity(pid:ownerPID) != terminalIdentity {
+            throw AppError.message("탭 구성을 읽는 동안 원래 Terminal 프로세스가 바뀌었습니다.")
+        }
         guard services.ownsProcess(ownerPID,bundleID) else {
             throw AppError.message("탭 구성을 읽는 동안 원래 Terminal 프로세스가 바뀌었습니다.")
         }
