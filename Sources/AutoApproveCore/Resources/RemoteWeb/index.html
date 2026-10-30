@@ -161,6 +161,14 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
     </div>
     <form id="message-form" class="message-form"><label for="message-input">새 메시지</label><textarea id="message-input" name="message" rows="2" maxlength="8000" placeholder="질문이나 다음 작업을 입력하세요…" aria-describedby="message-help message-error" autocomplete="off"></textarea><p id="message-help" class="muted small"></p><p id="message-error" class="error-text" role="alert" hidden></p><div class="message-actions"><span id="message-status" class="muted small" role="status"></span><button id="use-original-message" type="button" class="secondary" hidden>원본 터미널로 보내기</button><button id="check-message" type="button" class="secondary" hidden>전송 결과 확인</button><button id="new-message" type="button" class="secondary" hidden>새 메시지 작성</button><button id="clear-message-status" type="button" class="secondary" hidden>전송 상태 정리</button><button id="send-message" type="submit">메시지 보내기</button></div><div id="message-cleanup-result" class="message-cleanup-result" hidden><span id="message-cleanup-status" class="muted small" role="status"></span><button id="undo-message-cleanup" type="button" class="secondary">정리 되돌리기</button></div></form>
   </dialog>
+  <dialog id="os-request-dialog" class="os-request-dialog" aria-labelledby="os-request-title" aria-describedby="os-request-help">
+    <div class="dialog-heading"><div><h2 id="os-request-title">macOS 요청</h2><p id="os-request-session" class="muted small"></p></div><button id="close-os-request" type="button" class="icon-button" aria-label="macOS 요청 닫기" autofocus>×</button></div>
+    <p id="os-request-app" class="small"></p><p id="os-request-path" class="path"></p>
+    <p id="os-request-help" class="muted small">Mac에 열린 요청의 내용과 버튼입니다. 버튼을 선택하면 원래 창에 한 번 전달합니다. 자동 승인 정책은 변경하지 않습니다.</p>
+    <pre id="os-request-content" class="os-request-content" tabindex="0" aria-label="macOS 원래 요청 내용" translate="no"></pre>
+    <p id="os-request-status" class="muted small" role="status" aria-live="polite" tabindex="-1"></p><p id="os-request-error" class="error-text" role="alert" hidden></p>
+    <div id="os-request-buttons" class="question-actions" role="group" aria-label="원래 macOS 요청의 버튼"></div>
+  </dialog>
   <dialog id="test-screen-dialog" class="test-screen-dialog" aria-labelledby="test-screen-title" aria-describedby="screen-view-help">
     <div class="dialog-heading"><div><h2 id="test-screen-title">화면 공유</h2><p id="test-screen-source" class="muted small">Mac 화면 · 보기 전용</p></div><button id="close-test-screen" type="button" class="icon-button" aria-label="화면 공유 닫기">×</button></div>
     <p id="screen-view-help" class="muted small">공유한 Mac 화면을 확인합니다. 조작하기를 켜면 클릭·스크롤과 키보드를 사용할 수 있습니다.</p>

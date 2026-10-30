@@ -7,7 +7,7 @@ import Security
 public final class OSPermissionAutomation:@unchecked Sendable {
     public static let system = OSPermissionAutomation()
     public static var live:OSPermissionServices {
-        .init(scan:{try system.scan(targets:$0)},approve:{request,authorized in system.approve(request,authorized:authorized)})
+        .init(scan:{try system.scan(targets:$0)},approve:{request,authorized in system.approve(request,authorized:authorized)},respond:{request,button,authorized in system.respond(request,button:button,authorized:authorized)})
     }
     private let lock=NSLock()
     private let ownerVerifier:@Sendable (NSRunningApplication)->Bool
@@ -70,6 +70,20 @@ public final class OSPermissionAutomation:@unchecked Sendable {
     }
     private static let allows:Set<String>=["Allow","OK","Allow While Using the App","허용","확인","앱을 사용하는 동안 허용"]
     private static let openSettings:Set<String>=["Open System Settings","Open Settings","시스템 설정 열기","설정 열기","시스템 설정"]
+    private static let denies:Set<String>=["Don't Allow","Don’t Allow","Do Not Allow","Deny","Cancel","Not Now","허용 안 함","허용하지 않음","거부","취소","나중에"]
+    private static func responseButton(_ node:Node)->OSPermissionButton? {
+        guard node.role==kAXButtonRole,node.enabled else {return nil}
+        let choices=node.texts.compactMap {title -> OSPermissionButton? in
+            let kind:OSPermissionButton.Kind
+            if allows.contains(title) {kind = .allow}
+            else if denies.contains(title) {kind = .deny}
+            else if openSettings.contains(title) {kind = .openSettings}
+            else {return nil}
+            return .init(id:PromptDetector.fingerprint("\(CFHash(node.element))\u{0}\(kind.rawValue)\u{0}\(title)"),title:title,kind:kind)
+        }
+        let unique=Dictionary(grouping:choices,by:\.id)
+        return unique.count==1 ? choices.first:nil
+    }
     private static func requestNode(_ window:Node)->Node? {
         // Do not treat an ordinary app page or notification as an OS permission dialog.
         let alert=window.all.filter {$0.role==kAXSheetRole || $0.role=="AXDialog" || $0.role=="AXAlert"}
@@ -140,7 +154,7 @@ public final class OSPermissionAutomation:@unchecked Sendable {
                 else if allow.count==1 {action = .allow;button=allow[0]}
                 else if allow.isEmpty,settings.count==1 {action = .openSettings;button=settings[0]}
                 else {continue}
-                let request=OSPermissionRequest(kind:kind,requester:Self.requester(content,apps:apps),ownerPID:owner.pid,ownerStarted:owner.started,ownerBundleID:app.bundleIdentifier!,windowToken:String(CFHash(dialog.element)),content:content,action:action,actionToken:String(CFHash(button.element)))
+                let request=OSPermissionRequest(kind:kind,requester:Self.requester(content,apps:apps),ownerPID:owner.pid,ownerStarted:owner.started,ownerBundleID:app.bundleIdentifier!,windowToken:String(CFHash(dialog.element)),content:content,action:action,actionToken:String(CFHash(button.element)),buttons:protected ? nil:buttons.compactMap(Self.responseButton))
                 result.append(.init(request:request,window:window,button:button.element))
             }
         }
@@ -173,12 +187,36 @@ public final class OSPermissionAutomation:@unchecked Sendable {
                       button.role==kAXButtonRole,button.texts.contains(where:request.action == .allow ? Self.allows.contains:Self.openSettings.contains) else {return .unavailable("OS 요청 내용이나 허용 버튼이 바뀌어 누르지 않았습니다.")}
             }
             AXUIElementSetMessagingTimeout(handle.button,0.5)
+            guard authorized() else {return .unavailable("OS 입력 직전에 정책이 바뀌어 누르지 않았습니다.")}
             let error=AXUIElementPerformAction(handle.button,kAXPressAction as CFString)
             if request.action == .enableSetting {lock.lock();settings.removeValue(forKey:target.id);lock.unlock()}
             guard error == .success else {return .uncertain("OS 권한 입력 결과를 확인하지 못했습니다 (AX \(error.rawValue)). 원래 Mac에서 확인해주세요.")}
             if request.action == .openSettings {
                 lock.lock();settings[target.id]=(target,request.kind);lock.unlock()
             }
+            return .sent
+        } catch {return .unavailable(String(error.localizedDescription.prefix(1000)))}
+    }
+    @MainActor public func respond(_ request:OSPermissionRequest,button choice:OSPermissionButton,authorized:@MainActor ()->Bool)->OSPermissionDelivery {
+        guard !request.isManagementApp,request.action != .manual,request.action != .enableSetting,
+              request.buttons?.contains(choice)==true,let target=request.requester,authorized() else {return .unavailable("원래 요청의 버튼을 확인하거나 Mac에서 직접 처리해주세요.")}
+        do {
+            let fresh=try handles(targets:[target]).filter {$0.request.immutableToken==request.immutableToken}
+            guard fresh.count==1,let handle=fresh.first,handle.request.buttons?.contains(choice)==true,
+                  let requester=NSRunningApplication(processIdentifier:target.pid),Self.target(requester)==target,
+                  let owner=NSRunningApplication(processIdentifier:request.ownerPID),ownerVerifier(owner),
+                  (try? ProcessDiscovery.read(pid:request.ownerPID).first?.started)==request.ownerStarted,authorized() else {return .unavailable("원래 OS 요청 창이나 앱이 바뀌어 누르지 않았습니다.")}
+            var budget=500
+            guard let tree=Self.node(handle.window,budget:&budget),budget>0,let dialog=Self.requestNode(tree),
+                  !dialog.all.contains(where:{$0.role==kAXTextFieldRole || $0.role=="AXSecureTextField"}),
+                  dialog.all.filter({![kAXButtonRole,kAXCheckBoxRole].contains($0.role)}).flatMap(\.texts).joined(separator:"\n")==request.content else {return .unavailable("OS 요청 내용이 바뀌어 누르지 않았습니다.")}
+            let matches=dialog.all.filter {Self.responseButton($0)==choice}
+            guard matches.count==1,let button=matches.first,authorized() else {return .unavailable("선택한 OS 버튼이나 세션이 바뀌어 누르지 않았습니다.")}
+            AXUIElementSetMessagingTimeout(button.element,0.5)
+            guard authorized() else {return .unavailable("OS 입력 직전에 세션이 바뀌어 누르지 않았습니다.")}
+            let error=AXUIElementPerformAction(button.element,kAXPressAction as CFString)
+            guard error == .success else {return .uncertain("OS 버튼 응답 결과를 확인하지 못했습니다 (AX \(error.rawValue)). Mac에서 확인해주세요.")}
+            if choice.kind == .openSettings {lock.lock();settings[target.id]=(target,request.kind);lock.unlock()}
             return .sent
         } catch {return .unavailable(String(error.localizedDescription.prefix(1000)))}
     }

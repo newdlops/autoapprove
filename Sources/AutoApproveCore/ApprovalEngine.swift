@@ -1875,7 +1875,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard let id = object["sessionID"] as? String, let session = sessions[id],
               session.phase != .ended || ["cancelCapacity","read"].contains(action) else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
-        if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission"].contains(action) {
+        if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission","respondOSPermission"].contains(action) {
             guard object["policyRevision"] as? String == (session.osPermissionPolicy?.revision ?? "initial"),
                   try remoteProcessVerifier(session) else {
                 throw RemoteHTTPError(409,"OS 권한 정책이나 원래 실행이 바뀌었습니다. 최신 상태를 확인한 뒤 다시 선택해주세요.",diagnostics:["delivery":"not_started"])
@@ -1941,6 +1941,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case "acknowledgeOSPermission":
             guard let request=object["permissionID"] as? String,let token=object["permissionToken"] as? String else {throw RemoteHTTPError(400,"원래 OS 요청을 확인해주세요.")}
             try acknowledgeOSPermission(id,requestID:request,token:token)
+        case "respondOSPermission":
+            guard let request=object["permissionID"] as? String,let token=object["permissionToken"] as? String,let button=object["buttonID"] as? String else {throw RemoteHTTPError(400,"원래 OS 요청과 선택한 버튼을 확인해주세요.")}
+            try respondOSPermission(id,requestID:request,token:token,buttonID:button)
         case "cancelCodexProgress": cancelCodexProgressCheck(id)
         case "reveal": _ = try await reveal(session)
         case "read": try markNotificationsRead(id, interruptionID: object["interruptionID"] as? String)
@@ -2008,7 +2011,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case "cancelCapacity": cancelCapacityResume(id)
         default: throw RemoteHTTPError(400, "지원하지 않는 동작입니다.")
         }
-        if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission"].contains(action) {
+        if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission","respondOSPermission"].contains(action) {
             let encoder=JSONEncoder();encoder.dateEncodingStrategy = .iso8601
             return ["ok":true,"sessionID":id,"osPermissionPolicy":try JSONSerialization.jsonObject(with:encoder.encode(sessions[id]?.osPermissionPolicy ?? OSPermissionPolicy())),
                     "osPermissions":try JSONSerialization.jsonObject(with:encoder.encode(snapshot.osPermissions ?? OSPermissionMonitorStatus()))]
@@ -5416,6 +5419,50 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try store.set("osPermissionReceipt:"+requestID,String(decoding:JSONEncoder().encode(request),as:UTF8.self))
         osPermissionReceipts.insert(requestID);osPermissionRequests[requestID]=request;publishOSPermissions();publish()
     }
+    /// Explicit per-request response. Automatic policy and session AUTO are not changed.
+    public func respondOSPermission(_ id:String,requestID:String,token:String,buttonID:String) throws {
+        guard !remoteInputStopped,!snapshot.paused,osPermissionActing==nil,
+              let original=sessions[id],original.agent != .shell,original.phase != .ended,
+              let request=osPermissionRequests[requestID],request.sessionID==id,request.phase == .waiting,
+              request.immutableToken==token,!request.isManagementApp,request.requester != nil,
+              request.action != .manual,request.action != .enableSetting,
+              let choice=request.buttons?.first(where:{$0.id==buttonID}),
+              let seen=osPermissionSeen[requestID],Date().timeIntervalSince(seen)<6,
+              !osPermissionReceipts.contains(requestID),!automaticInputBusy(id) else {throw RemoteHTTPError(409,"이 세션에 연결된 현재 OS 요청과 버튼을 다시 확인해주세요. 전체 일시정지 중에는 응답할 수 없습니다.",diagnostics:["delivery":"not_started"])}
+        let source=osPermissionSource(original),epoch=osPermissionEpoch
+        func authorized()->Bool {
+            guard epoch==osPermissionEpoch,!remoteInputStopped,!snapshot.paused,
+                  let current=sessions[id],current.phase != .ended,osPermissionSource(current)==source,
+                  let currentRequest=osPermissionRequests[requestID],currentRequest.immutableToken==token,currentRequest.sessionID==id,currentRequest.buttons?.contains(choice)==true,
+                  let records=try? singleProcessReader(original.pid) else {return false}
+            return records.contains {$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}
+        }
+        guard authorized() else {throw RemoteHTTPError(409,"원래 세션 프로세스가 바뀌어 OS 버튼을 누르지 않았습니다.",diagnostics:["delivery":"not_started"])}
+        osPermissionActing=requestID;defer {osPermissionActing=nil}
+        var event=AuditEvent(sessionID:id,summary:"OS 요청 직접 응답 · "+choice.title,outcome:"버튼 전달 전 확인",source:"세션 OS 요청 응답",context:AuditContext(session:original),request:request.content)
+        guard log(event) else {throw RemoteHTTPError(503,"OS 응답 기록을 저장하지 못했습니다.",diagnostics:["delivery":"not_started"])}
+        var receipt=request;receipt.phase = .uncertain;receipt.detail="OS 버튼 전달 시작 기록이 있습니다. 결과 미확인 시 다시 누르지 않습니다."
+        try store.set("osPermissionReceipt:"+requestID,String(decoding:JSONEncoder().encode(receipt),as:UTF8.self))
+        osPermissionReceipts.insert(requestID);osPermissionRequests[requestID]?.phase = .approving
+        let delivery=osPermissionServices.respond(request,choice,authorized)
+        switch delivery {
+        case .sent:
+            receipt.phase=choice.kind == .openSettings ? .settings:.submitted
+            receipt.detail="‘\(choice.title)’ 버튼을 원래 Mac 창에 한 번 전달했습니다. 원래 앱에서 결과를 확인해주세요."
+            if choice.kind == .openSettings,let target=request.requester {osPermissionTransitions[requestID] = .init(target:target,kind:request.kind,sessionID:id,source:source,until:Date().addingTimeInterval(30))}
+            event.outcome="선택한 OS 버튼 전달 · "+choice.title
+        case .unavailable(let message):receipt.detail=message;event.outcome="OS 버튼 미전달 · 확인 필요"
+        case .uncertain(let message):receipt.detail=message;event.outcome="OS 버튼 결과 미확인"
+        }
+        osPermissionRequests[requestID]=receipt
+        try store.set("osPermissionReceipt:"+requestID,String(decoding:JSONEncoder().encode(receipt),as:UTF8.self));_ = log(event)
+        publishOSPermissions();publish()
+        switch delivery {
+        case .sent:break
+        case .unavailable(let message):throw RemoteHTTPError(409,message,diagnostics:["delivery":"not_started"])
+        case .uncertain(let message):throw RemoteHTTPError(409,message,diagnostics:["delivery":"unknown"])
+        }
+    }
     private func hasOSPermissionWait(_ id:String)->Bool {
         osPermissionRequests.values.contains {!$0.isManagementApp && $0.isPending && ($0.sessionID==nil || $0.sessionID==id)}
     }
@@ -5500,6 +5547,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let reader=singleProcessReader,pid=original.pid,automationEpoch=automationRuntime.epoch(id)
                 let records=try await Task.detached(priority:.utility) {try reader(pid)}.value
                 guard epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,!remoteInputStopped,!snapshot.paused,
+                      osPermissionActing==nil,osPermissionRequests[request.id]?.phase == .waiting,!osPermissionReceipts.contains(request.id),
                       records.contains(where:{$0.pid==pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {continue}
                 osPermissionActing=request.id;defer {osPermissionActing=nil}
                 var event=AuditEvent(sessionID:id,summary:"OS 권한 정책 승인 · "+request.kind.title,outcome:"허용 입력 전 확인",source:"세션 OS 권한 정책",context:AuditContext(session:original),request:request.content)

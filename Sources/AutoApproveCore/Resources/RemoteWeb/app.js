@@ -3226,6 +3226,37 @@ function renderCodexProgress(item){
 }
 const osPermissionKinds=[['automation','다른 앱 제어'],['accessibility','손쉬운 사용·기기 제어'],['screenRecording','화면 기록'],['camera','카메라'],['microphone','마이크'],['files','파일·폴더 접근'],['localNetwork','로컬 네트워크'],['fullDiskAccess','전체 디스크 접근'],['appManagement','앱 관리'],['other','기타 OS 접근 권한']];
 let osPermissionSignature='';
+let osRequestDialogState=null;
+function osRequestToken(request){return request.id+'\u0000'+(request.requester?`${request.requester.pid}:${request.requester.started}:${request.requester.id}`:'?');}
+function openOSRequest(item,request){
+  osRequestDialogState={key:item.key,id:request.id,token:osRequestToken(request),request,signature:''};
+  renderOSRequestDialog(item);$('os-request-dialog').showModal();
+}
+function renderOSRequestDialog(item){
+  const state=osRequestDialogState;if(!state)return;
+  const dialog=$('os-request-dialog');
+  if(!item||item.key!==state.key){dialog.close();osRequestDialogState=null;return;}
+  const snapshot=item.node.state.snapshot,request=snapshot.osPermissions?.requests?.find(r=>r.id===state.id),original=state.request;
+  const same=request&&osRequestToken(request)===state.token,online=connected&&item.node.online&&!sessionEnded(item),operation=permissionOperations.get(item.key),busy=mutation||['saving','confirming'].includes(operation?.phase);
+  const pending=same&&request.phase==='waiting',bound=same&&request.sessionID===item.session.id,protectedRequest=original.action==='manual'||original.managementApp;
+  const available=online&&snapshot.osPermissions?.available===true&&!snapshot.paused&&!busy;
+  text($('os-request-session'),`${item.node.name||'Mac'} · ${item.session.title||item.session.cwd||item.session.id}`);
+  text($('os-request-app'),original.requester?.name||'요청 앱 미확인');text($('os-request-path'),original.requester?.path||'');text($('os-request-content'),original.content);
+  let message=!online?'Mac 연결을 확인해야 응답할 수 있습니다.':busy?'요청을 전달하고 최신 상태를 확인하고 있습니다…':!same?'원래 요청 창이 닫혔거나 바뀌었습니다. 현재 세션의 새 요청을 확인해주세요.':snapshot.paused?'전체 일시정지 중입니다. 해제한 뒤 응답할 수 있습니다.':snapshot.osPermissions?.available!==true?'OS 요청 연결을 확인하지 못했습니다. Mac에서 확인해주세요.':protectedRequest?'암호·Touch ID 또는 보호된 요청입니다. Mac에서 직접 처리해주세요.':!pending?request.detail:!bound?'이 요청을 현재 세션에 연결한 뒤 응답할 수 있습니다.':!request.buttons?.length?'이 요청은 원래 버튼 응답을 지원하지 않습니다. Mac에서 직접 처리해주세요.':'원래 macOS 창의 버튼을 선택하세요. 자동 승인 OFF에서도 이번 요청에 한 번 응답합니다.';
+  text($('os-request-status'),message);
+  const error=operation?.phase==='error'&&operation.permissionID===state.id?operation.message:'';text($('os-request-error'),error);show($('os-request-error'),!!error);
+  const choices=same&&!protectedRequest&&request.buttons||[],canBind=pending&&!bound&&!request.sessionID&&request.requester&&!protectedRequest;
+  const signature=JSON.stringify([state.id,canBind,bound,choices]);
+  if(signature!==state.signature){
+    state.signature=signature;const buttons=$('os-request-buttons');buttons.replaceChildren();
+    if(canBind){const button=make('button','secondary','이 요청만 이 세션에 연결');button.type='button';button.addEventListener('click',()=>{state.focusResponse=true;void permissionAction(item,{action:'assignOSPermission',permissionID:state.id,permissionToken:state.token,remember:false},'현재 요청을 이 세션에 연결했습니다.');});buttons.append(button);}
+    for(const choice of choices){const button=make('button','secondary',choice.title);button.type='button';button.dataset.osButton=choice.id;button.addEventListener('click',()=>permissionAction(item,{action:'respondOSPermission',permissionID:state.id,permissionToken:state.token,buttonID:choice.id},`‘${choice.title}’ 버튼을 원래 Mac 창에 한 번 전달했습니다.`));buttons.append(button);}
+  }
+  for(const button of $('os-request-buttons').querySelectorAll('button'))button.disabled=!available||!pending||(!bound&&!!button.dataset.osButton);
+  if(state.focusResponse&&bound&&available){state.focusResponse=false;$('os-request-status').focus({preventScroll:true});}
+}
+$('close-os-request').addEventListener('click',()=>$('os-request-dialog').close());
+$('os-request-dialog').addEventListener('close',()=>{osRequestDialogState=null;});
 const permissionOperations=new Map();
 for(const [kind,title]of osPermissionKinds){
   const label=make('label'),input=document.createElement('input');input.type='checkbox';input.name='osPermissionKind';input.value=kind;input.autocomplete='off';input.id='os-permission-'+kind;
@@ -3237,7 +3268,7 @@ for(const [kind,title]of osPermissionKinds){
 }
 async function permissionAction(item,payload,message){
   if(mutation||!connected||!item.node.online||sessionEnded(item))return;
-  const key=item.key,operation={phase:'saving',allowed:payload.allowed};
+  const key=item.key,operation={phase:'saving',allowed:payload.allowed,permissionID:payload.permissionID};
   permissionOperations.set(key,operation);mutation=true;updateControls();renderMachines();
   try{
     const result=await api(endpoint('/api/action',item.node.id),{...payload,sessionID:item.session.id,policyRevision:item.session.osPermissionPolicy?.revision||'initial',requestID:uuid()});
@@ -3255,6 +3286,7 @@ async function permissionAction(item,payload,message){
   }finally{mutation=false;updateControls();renderMachines();}
 }
 function renderOSPermissions(item){
+  renderOSRequestDialog(item);
   const supported=item&&item.session.agent!=='shell'&&supportsRelease(item.node,[0,2,208,235]);show($('os-permissions'),supported);if(!supported)return;
   const {session,node}=item,policy=session.osPermissionPolicy||{allowed:[],targets:[]},status=node.state.snapshot.osPermissions,online=node.online&&connected&&!sessionEnded(item),disabled=!online||mutation,operation=permissionOperations.get(item.key),saving=['saving','confirming'].includes(operation?.phase);
   text($('os-permission-summary'),policy.allowed.length?`이 세션에서 ${policy.allowed.length}종류 허용 · 등록 앱 ${policy.targets.length}개`:'직접 확인 · 이 세션의 OS 권한 자동 승인이 꺼져 있습니다.');
@@ -3280,6 +3312,7 @@ function renderOSPermissions(item){
     const details=document.createElement('details'),summary=make('summary','','OS 요청 내용');details.open=expanded.has(request.id);summary.dataset.permissionFocus='details-'+request.id;details.append(summary,make('pre','terminal-text',request.content));row.append(details);
     const controls=make('div','question-actions'),token=request.id+'\u0000'+(request.requester?`${request.requester.pid}:${request.requester.started}:${request.requester.id}`:'?');
     const addButton=(title,key,payload,message)=>{const button=make('button','secondary',title);button.type='button';button.disabled=disabled;button.dataset.permissionFocus=key;button.addEventListener('click',()=>permissionAction(item,{...payload,permissionID:request.id,permissionToken:token},message));controls.append(button);};
+    if(!request.managementApp&&supportsRelease(node,[0,2,220,247])){const button=make('button','secondary','요청 창 보기·응답');button.type='button';button.dataset.permissionFocus='view-'+request.id;button.addEventListener('click',()=>openOSRequest(item,request));controls.append(button);}
     if(!request.managementApp&&request.phase==='waiting'&&request.action!=='manual'&&!policy.allowed.includes(request.kind))addButton(`이 세션에서 ${osPermissionKinds.find(([key])=>key===request.kind)?.[1]||request.kind} 허용`,'allow-kind-'+request.id,{action:'osPermissionPolicy',allowed:[...policy.allowed,request.kind]},'이 세션의 해당 OS 권한을 허용했습니다.');
     if(!request.managementApp&&request.phase==='waiting'&&!request.sessionID&&request.requester){addButton('이 요청만 이 세션에 연결','once-'+request.id,{action:'assignOSPermission',remember:false},'현재 요청을 이 세션의 정책에 연결했습니다.');
       const id=request.requester.bundleID,shared=['com.apple.Terminal','com.googlecode.iterm2','com.microsoft.VSCode','com.openai.chat','com.openai.codex','local.autoapprove.mac','com.anthropic.claudefordesktop','com.anthropic.claude','com.google.Chrome','com.google.Chrome.canary','org.mozilla.firefox','com.microsoft.edgemac','com.apple.Safari','com.brave.Browser'].includes(id)||/computer-?use/i.test(id);

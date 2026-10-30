@@ -73,6 +73,15 @@ public struct OSPermissionPolicy:Codable,Equatable,Sendable {
 
 struct OSPermissionPolicyEnvelope:Codable {var source:String;var policy:OSPermissionPolicy}
 
+/// Only observed, supported buttons from the original OS dialog are exposed.
+public struct OSPermissionButton:Codable,Equatable,Identifiable,Sendable {
+    public enum Kind:String,Codable,Sendable {case allow,deny,openSettings}
+    public var id:String
+    public var title:String
+    public var kind:Kind
+    public init(id:String,title:String,kind:Kind) {self.id=id;self.title=title;self.kind=kind}
+}
+
 public struct OSPermissionRequest:Codable,Equatable,Identifiable,Sendable {
     public enum Action:String,Codable,Sendable {case allow,openSettings,enableSetting,manual}
     public enum Phase:String,Codable,Sendable {case waiting,approving,submitted,settings,resolved,uncertain}
@@ -86,15 +95,18 @@ public struct OSPermissionRequest:Codable,Equatable,Identifiable,Sendable {
     public var content:String
     public var action:Action
     public var actionToken:String
+    /// Optional for compatibility with stored receipts and older hosts.
+    public var buttons:[OSPermissionButton]?
     public var sessionID:String?
     /// Host setup is manual and never belongs to a managed CLI session.
     public var managementApp:Bool?
     public var phase:Phase = .waiting
     public var detail:String = "이 요청을 처리할 세션과 권한 정책을 확인해주세요."
     public var observedAt:Date = Date()
-    public init(kind:OSPermissionKind,requester:OSPermissionTarget?,ownerPID:Int32,ownerStarted:String,ownerBundleID:String,windowToken:String,content:String,action:Action,actionToken:String) {
+    public init(kind:OSPermissionKind,requester:OSPermissionTarget?,ownerPID:Int32,ownerStarted:String,ownerBundleID:String,windowToken:String,content:String,action:Action,actionToken:String,buttons:[OSPermissionButton]?=nil) {
         self.kind=kind;self.requester=requester;self.ownerPID=ownerPID;self.ownerStarted=ownerStarted;self.ownerBundleID=ownerBundleID;self.windowToken=windowToken;self.content=content;self.action=action;self.actionToken=actionToken
         managementApp=requester?.pid==ProcessInfo.processInfo.processIdentifier ? true:nil
+        self.buttons=buttons
         id=PromptDetector.fingerprint("\(ownerPID)\u{0}\(ownerStarted)\u{0}\(windowToken)\u{0}\(kind.rawValue)\u{0}\(requester?.id ?? "?")\u{0}\(content)\u{0}\(actionToken)")
     }
     public var isPending:Bool {phase != .resolved}
@@ -127,6 +139,7 @@ public enum OSPermissionPrompt {
 public struct OSPermissionServices:Sendable {
     public var scan:@Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus
     public var approve:@MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery
-    public init(scan:@escaping @Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus,approve:@escaping @MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery) {self.scan=scan;self.approve=approve}
+    public var respond:@MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery
+    public init(scan:@escaping @Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus,approve:@escaping @MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery,respond:@escaping @MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery={_,_,_ in .unavailable("OS 요청 버튼 응답을 지원하지 않는 연결입니다.")}) {self.scan=scan;self.approve=approve;self.respond=respond}
     public static let inactive=Self(scan:{_ in .init(available:false,detail:"격리된 실행 환경입니다.")},approve:{_,_ in .unavailable("OS 입력 연결이 없습니다.")})
 }

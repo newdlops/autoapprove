@@ -370,6 +370,16 @@ input[type=radio] { width: 18px; height: 18px; margin: 0; accent-color: var(--bl
 .feedback[data-error=true] { background: var(--error-bg); color: var(--red); border: 1px solid var(--red); }
 dialog { padding: 24px; width: min(460px, calc(100% - 32px)); border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--fg); overscroll-behavior: contain; }
 dialog::backdrop { background: #0006; }
+.os-request-dialog { width: min(640px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; }
+.os-request-dialog[open] { display: flex; flex-direction: column; gap: 12px; }
+.os-request-dialog > *, .os-request-dialog .dialog-heading p { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.os-request-dialog > :not(.os-request-content) { flex-shrink: 0; }
+.os-request-dialog .dialog-heading { align-items: flex-start; }
+.os-request-dialog .dialog-heading > div { min-width: 0; }
+.os-request-dialog .icon-button { flex-shrink: 0; }
+.os-request-content { min-height: 72px; overflow: auto; overscroll-behavior: contain; white-space: pre-wrap; font: inherit; line-height: 1.55; background: var(--subtle); border-radius: var(--radius); padding: 16px; }
+.os-request-dialog .question-actions button { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 480px) { .os-request-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); padding: 16px; } .os-request-dialog .question-actions { display: grid; } }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 12px; }
 dialog p { font-size: 14px; }
 dialog label { display: block; font-size: 14px; font-weight: 600; margin: 20px 0 8px; }

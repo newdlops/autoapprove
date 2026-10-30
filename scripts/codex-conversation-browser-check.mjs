@@ -23,7 +23,7 @@ try{
   const served=await(await fetch(second.url+'/'+file)).text();let expected=await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/'+file,'utf8');
   if(file==='index.html'){
    const version=served.match(/name="autoapprove-web-version" content="([^"]+)"/)?.[1],nonce=served.match(/name="autoapprove-style-nonce" content="([^"]+)"/)?.[1];
-   assert.equal(version,'0.2.219:246:1');assert.match(nonce,/^[0-9a-f-]{36}$/i);
+   const release=JSON.parse(await readFile('Sources/AutoApproveCore/Resources/RemoteWeb/web-version.json','utf8'));assert.equal(version,`${release.version}:${release.build}:${release.api}`);assert.match(nonce,/^[0-9a-f-]{36}$/i);
    expected=expected.replaceAll('__AUTOAPPROVE_WEB_VERSION__',version).replaceAll('__AUTOAPPROVE_STYLE_NONCE__',nonce);
   }
   assert.equal(served,expected,'Served resources must match the current source: '+file);

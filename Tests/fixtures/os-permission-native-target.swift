@@ -4,12 +4,13 @@ import AppKit
 import CoreServices
 @MainActor final class PermissionTargetDelegate:NSObject,NSApplicationDelegate {
     var window:NSWindow!,alert:NSAlert?,timer:Timer?,toggle:NSButton?
-    var phase="",camera=0,opened=0,enabled=0
+    var phase="",camera=0,opened=0,enabled=0,denied=0
     var authorization:Int32?
     var targetName:String?
     let root=URL(fileURLWithPath:CommandLine.arguments[1])
     func report(settings:Bool=false) {
         var value:[String:Any]=["camera":camera,"openedSettings":opened,"enabledSetting":enabled,"settingsVisible":settings,"toggleOn":toggle?.state == .on,"realOSPermissionsChanged":authorization==0 ? 1:0]
+        value["denied"]=denied
         if let authorization {value["automationAuthorizationStatus"]=authorization};if let targetName {value["eventTargetName"]=targetName}
         if let data=try? JSONSerialization.data(withJSONObject:value) {try? data.write(to:root.appendingPathComponent("native-target.json"),options:.atomic)}
     }
@@ -48,7 +49,7 @@ import CoreServices
             if response == .alertFirstButtonReturn {
                 if next=="camera" {self.camera+=1;self.report()}
                 else {self.opened+=1;self.showSettings()}
-            }
+            } else {self.denied+=1;self.report()}
         }
     }
     func showSettings() {

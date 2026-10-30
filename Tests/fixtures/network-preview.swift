@@ -50,13 +50,14 @@ private final class PreviewOSPermissions:@unchecked Sendable {
         let suffix=object["suffix"] as? String ?? "first"
         var requester=target
         if object["managementApp"] as? Bool==true {requester.pid=ProcessInfo.processInfo.processIdentifier;requester.name="AutoApprove";requester.bundleID="local.autoapprove.mac"}
-        let request=OSPermissionRequest(kind:kind,requester:requester,ownerPID:77,ownerStarted:"Synthetic OS owner",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"컴퓨터 유즈 테스트 앱 · 긴 이름 한글🙂\" would like to access the camera.\n<img src=x onerror=alert(1)>\n실제 OS 요청이 아닌 격리된 테스트 데이터입니다.",action:.allow,actionToken:"allow-"+suffix)
+        let request=OSPermissionRequest(kind:kind,requester:requester,ownerPID:77,ownerStarted:"Synthetic OS owner",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"컴퓨터 유즈 테스트 앱 · 긴 이름 한글🙂\" would like to access the camera.\n<img src=x onerror=alert(1)>\n실제 OS 요청이 아닌 격리된 테스트 데이터입니다."+String(repeating:"\n긴 OS 요청 내용과 한글 설명🙂",count:object["long"] as? Bool==true ? 60:0),action:kind == .authentication ? .manual:.allow,actionToken:"allow-"+suffix,buttons:kind == .authentication ? nil:[.init(id:"deny-"+suffix,title:"Don't Allow",kind:.deny),.init(id:"allow-"+suffix,title:"Allow",kind:.allow)])
         return .init(available:true,detail:"격리된 OS 권한 연결 · 실제 OS 입력 없음",requests:[request])
     }
-    func input(_ request:OSPermissionRequest)->OSPermissionDelivery {
-        lock.lock();defer{lock.unlock()};inputs.append(["id":request.id,"kind":request.kind.rawValue,"action":request.action.rawValue])
+    func input(_ request:OSPermissionRequest,button:OSPermissionButton?=nil)->OSPermissionDelivery {
+        lock.lock();defer{lock.unlock()};inputs.append(["id":request.id,"kind":request.kind.rawValue,"action":button?.kind.rawValue ?? request.action.rawValue,"buttonID":button?.id ?? ""])
         if let data=try? JSONSerialization.data(withJSONObject:["inputs":inputs,"realOSInputs":0,"realTerminalInputs":0]) {try? data.write(to:directory.appendingPathComponent("os-inputs.json"),options:.atomic)}
-        return .sent
+        let object=(try? JSONSerialization.jsonObject(with:Data(contentsOf:directory.appendingPathComponent("os-control.json")))) as? JSONObject
+        return object?["uncertain"] as? Bool==true ? .uncertain("격리된 응답 결과 미확인 · 다시 보내지 않습니다."):.sent
     }
 }
 
@@ -194,7 +195,7 @@ private final class PreviewScreens: @unchecked Sendable {
         if progressMode {inputAvailable={true}} else if connectionPerformance {inputAvailable={false}} else {inputAvailable=nil}
         let osState=PreviewOSPermissions(directory)
         let osServices:OSPermissionServices?
-        if osMode {osServices=OSPermissionServices(scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")})} else {osServices=nil}
+        if osMode {osServices=OSPermissionServices(scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")},respond:{request,button,authorized in authorized() ? osState.input(request,button:button):.unavailable("Synthetic source changed")})} else {osServices=nil}
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
             claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
             terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,codexQueue:goalMode || conversationMode ? goalQueue:.live,osPermissionServices:osServices,codexGoals:goals,codexConversation:conversationMode ? conversation:.live)

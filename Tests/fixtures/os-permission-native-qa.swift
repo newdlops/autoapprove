@@ -6,7 +6,7 @@ import AutoApproveCore
     var window:NSWindow!,engine:ApprovalEngine?,child:Process?,task:Task<Void,Never>?
     var requester:NSRunningApplication?,eventTarget:Process?
     let root=URL(fileURLWithPath:CommandLine.arguments[1]),childURL=URL(fileURLWithPath:CommandLine.arguments[2])
-    var sessionID="",nativeActions=0,productionIgnoredFixture=false
+    var sessionID="",nativeActions=0,productionIgnoredFixture=false,staleButtonRejected=false,revocationRejected=false
     var realTCC:Bool {CommandLine.arguments.contains("--real-tcc")}
     func applicationDidFinishLaunching(_ notification:Notification) {Task {await prepare()}}
     func prepare() async {
@@ -26,6 +26,11 @@ import AutoApproveCore
             let actual=OSPermissionAutomation.system,useReal=realTCC
             let services=OSPermissionServices(scan:{try (useReal ? actual:native).scan(targets:$0)},approve:{[weak self] request,authorized in
                 let result=(useReal ? actual:native).approve(request,authorized:authorized);if result == .sent {self?.nativeActions+=1};return result
+            },respond:{[weak self] request,button,authorized in
+                var changed=button;changed.id="stale-"+button.id
+                if case .unavailable=(useReal ? actual:native).respond(request,button:changed,authorized:{true}) {self?.staleButtonRejected=true}
+                if case .unavailable=(useReal ? actual:native).respond(request,button:button,authorized:{false}) {self?.revocationRejected=true}
+                let result=(useReal ? actual:native).respond(request,button:button,authorized:authorized);if result == .sent {self?.nativeActions+=1};return result
             })
             let records=ProcessDiscovery.parse("101950 1 ttys950 101950 101950 Wed Oct 28 22:00:00 2026 /fixture/codex")
             let adapter=ScreenHostAdapter(screens:{targets in .init(screens:targets.map {.init(tty:$0.tty,contents:"Working\n› Ask Codex to do anything")})},approve:{_,_,_ in .missingTarget},reveal:{_ in nil})
@@ -45,11 +50,17 @@ import AutoApproveCore
             print("READY: isolated native permission policy QA");fflush(stdout)
         } catch {print("FAIL: \(error)");NSApplication.shared.terminate(nil)}
     }
-    func control(_ value:String) {if let data=try? JSONSerialization.data(withJSONObject:["phase":value]) {try? data.write(to:root.appendingPathComponent("native-control.json"),options:.atomic)}}
+    func control(_ value:String) {
+        if value=="manual-deny",!realTCC,let engine,let request=engine.snapshot.osPermissions?.requests.first(where:{$0.phase == .waiting}),let button=request.buttons?.first(where:{$0.kind == .deny}) {
+            do {try engine.setAutomatic(sessionID,enabled:false);try engine.assignOSPermission(sessionID,requestID:request.id,token:request.immutableToken,remember:false);try engine.respondOSPermission(sessionID,requestID:request.id,token:request.immutableToken,buttonID:button.id)} catch {print("Manual fixture response failed: \(error.localizedDescription)")};report();return
+        }
+        if let data=try? JSONSerialization.data(withJSONObject:["phase":value]) {try? data.write(to:root.appendingPathComponent("native-control.json"),options:.atomic)}
+    }
     func report() {
         let status=engine?.snapshot.osPermissions
         let value:[String:Any]=["available":status?.available==true,"detail":status?.detail ?? "","nativeActions":nativeActions,"requests":status?.requests.count ?? 0,"states":status?.requests.map {["phase":$0.phase.rawValue,"detail":$0.detail,"action":$0.action.rawValue]} ?? [],"productionIgnoredFixture":productionIgnoredFixture,"realTCC":realTCC,"originalTerminalInputs":0]
-        if let data=try? JSONSerialization.data(withJSONObject:value) {try? data.write(to:root.appendingPathComponent("native-driver.json"),options:.atomic)}
+        var report=value;report["staleButtonRejected"]=staleButtonRejected;report["revocationRejected"]=revocationRejected
+        if let data=try? JSONSerialization.data(withJSONObject:report) {try? data.write(to:root.appendingPathComponent("native-driver.json"),options:.atomic)}
     }
     func applicationWillTerminate(_ notification:Notification) {task?.cancel();engine?.stop();if child?.isRunning==true {child?.terminate()};requester?.terminate();if eventTarget?.isRunning==true {eventTarget?.terminate()}}
 }
@@ -67,6 +78,7 @@ struct NativePermissionRoot:View {
                 else {
                     HStack {Button("카메라 요청 만들기") {control("camera")};Button("손쉬운 사용 요청 만들기") {control("accessibility")}}
                     Button("테스트 권한 다시 끄기") {control("revoke")}
+                    Button("현재 요청 거부로 응답") {control("manual-deny")}
                 }
                 if let session=engine.snapshot.sessions.first(where:{$0.id==id}) {
                     OSPermissionPolicyView(session:session,status:engine.snapshot.osPermissions,paused:engine.snapshot.paused,setAllowed:{try engine.setOSPermissionPolicy(id,allowed:$0)},assign:{try engine.assignOSPermission(id,requestID:$0,token:$1,remember:$2)},remove:{try engine.removeOSPermissionTarget(id,targetID:$0)},acknowledge:{try engine.acknowledgeOSPermission(id,requestID:$0,token:$1)},initiallyExpanded:true)

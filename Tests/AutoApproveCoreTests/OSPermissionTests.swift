@@ -26,13 +26,16 @@ private final class OSFixture:@unchecked Sendable {
     var presses:[String] {condition.lock();defer{condition.unlock()};return values}
     func pressed(_ id:String) {condition.lock();values.append(id);condition.unlock()}
     func request(_ suffix:String="one",kind:OSPermissionKind = .camera,action:OSPermissionRequest.Action = .allow,target:OSPermissionTarget?=nil)->OSPermissionRequest {
-        .init(kind:kind,requester:target ?? self.target,ownerPID:77,ownerStarted:"OS same start",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"Permission QA\" would like to access the camera. "+suffix,action:action,actionToken:"allow-"+suffix)
+        .init(kind:kind,requester:target ?? self.target,ownerPID:77,ownerStarted:"OS same start",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"Permission QA\" would like to access the camera. "+suffix,action:action,actionToken:"allow-"+suffix,buttons:[.init(id:"allow-"+suffix,title:"Allow",kind:.allow),.init(id:"deny-"+suffix,title:"Don't Allow",kind:.deny)])
     }
 }
 @MainActor private func osEngine(_ fixture:OSFixture,root:URL) async throws -> (ApprovalEngine,[String]) {
     let service=OSPermissionServices(scan:{_ in fixture.scan()},approve:{request,authorized in
         fixture.beforeApproval?()
         guard authorized() else {return .unavailable("Synthetic authorization was revoked")};fixture.pressed(request.id);return fixture.result
+    },respond:{request,button,authorized in
+        fixture.beforeApproval?()
+        guard authorized() else {return .unavailable("Synthetic authorization was revoked")};fixture.pressed(request.id+":"+button.id);return fixture.result
     })
     let adapter=ScreenHostAdapter(screens:{targets in .init(screens:targets.map {.init(tty:$0.tty,contents:"• Working (12s • esc to interrupt)\n› Ask Codex to do anything")})},approve:{_,_,_ in fixture.pressed("TERMINAL_APPROVAL");return .sent},reveal:{_ in nil},input:{_,_,_,_ in fixture.pressed("TERMINAL_INPUT");return .sent})
     let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{fixture.processes()},screenAdapters:[.terminal:adapter],nativeKeyboardActivity:.init(idleSeconds:{fixture.idle()},frontmostBundle:{"com.apple.Terminal"}),osPermissionServices:service)
@@ -51,6 +54,48 @@ private final class OSFixture:@unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testOSPermissionManualResponseWithoutAutomaticPolicyAndDurableReplayGuard() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-manual-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
+        let (engine,ids)=try await osEngine(fixture,root:root);let id=ids[0],request=fixture.request();fixture.set([request]);try engine.setAutomatic(id,enabled:false)
+        await engine.refreshOSPermissions()
+        func payload(_ session:String)->JSONObject {["action":"respondOSPermission","sessionID":session,"permissionID":request.id,"permissionToken":request.immutableToken,"buttonID":"deny-one","policyRevision":"initial"]}
+        do {_ = try await engine.remoteAction(payload(id));throw AppError.message("Unbound request accepted")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        try engine.assignOSPermission(id,requestID:request.id,token:request.immutableToken,remember:false)
+        do {_ = try await engine.remoteAction(payload(ids[1]));throw AppError.message("Another session responded")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        _ = try await engine.remoteAction(payload(id))
+        try expectEqual(fixture.presses,[request.id+":deny-one"]);try expectEqual(engine.snapshot.osPermissions?.requests.first?.phase,.submitted)
+        try expectEqual(engine.snapshot.sessions.first(where:{$0.id==id})?.automatic,false);try expectNil(engine.snapshot.sessions.first(where:{$0.id==id})?.osPermissionPolicy)
+        do {_ = try await engine.remoteAction(payload(id));throw AppError.message("Duplicate response accepted")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        engine.stop();let (reopened,_)=try await osEngine(fixture,root:root);defer{reopened.stop()};await reopened.refreshOSPermissions()
+        do {_ = try await reopened.remoteAction(payload(id));throw AppError.message("Restart replay accepted")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        try expectEqual(fixture.presses,[request.id+":deny-one"])
+        // Old receipts must decode with no button field and preserve the exact replay key.
+        var object=try JSONSerialization.jsonObject(with:JSONEncoder().encode(request)) as! JSONObject;object.removeValue(forKey:"buttons")
+        let old=try JSONDecoder().decode(OSPermissionRequest.self,from:JSONSerialization.data(withJSONObject:object))
+        try expectNil(old.buttons);try expectEqual(old.immutableToken,request.immutableToken)
+    }
+    func testOSPermissionManualResponseRejectsStaleProtectedPausedAndChangedSource() async throws {
+        for mode in ["token","button","protected","setting","pause","process","last-moment","changed-button"] {
+            let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-manual-race-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
+            let (engine,ids)=try await osEngine(fixture,root:root);defer{engine.stop()};let id=ids[0]
+            let request=fixture.request(action:mode=="protected" ? .manual:mode=="setting" ? .enableSetting:.allow);fixture.set([request]);await engine.refreshOSPermissions()
+            try engine.assignOSPermission(id,requestID:request.id,token:request.immutableToken,remember:false)
+            if mode=="pause" {try engine.setPaused(true)}
+            if mode=="process" {fixture.exited()}
+            if mode=="last-moment" {fixture.beforeApproval={fixture.exited()}}
+            if mode=="changed-button" {var changed=request;changed.buttons=[.init(id:"new",title:"Cancel",kind:.deny)];fixture.set([changed]);await engine.refreshOSPermissions()}
+            do {try engine.respondOSPermission(id,requestID:request.id,token:mode=="token" ? "stale":request.immutableToken,buttonID:mode=="button" ? "unknown":"deny-one");throw AppError.message(mode+" accepted")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+            try expectEqual(fixture.presses,[],mode)
+        }
+    }
+    func testOSPermissionManualUncertainResponseCannotBeRetriedOrAutoAllowed() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-manual-uncertain-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
+        fixture.result = .uncertain("Synthetic lost reply");let (engine,ids)=try await osEngine(fixture,root:root);defer{engine.stop()};let id=ids[0],request=fixture.request();fixture.set([request]);await engine.refreshOSPermissions()
+        try engine.assignOSPermission(id,requestID:request.id,token:request.immutableToken,remember:true)
+        do {try engine.respondOSPermission(id,requestID:request.id,token:request.immutableToken,buttonID:"deny-one");throw AppError.message("Unknown delivery reported success")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        try engine.setOSPermissionPolicy(id,allowed:[.camera]);await engine.refreshOSPermissions();await engine.refreshOSPermissions()
+        try expectEqual(engine.snapshot.osPermissions?.requests.first?.phase,.uncertain);try expectEqual(fixture.presses,[request.id+":deny-one"])
+    }
     func testOSPermissionWebRevisionRejectsStalePolicyAndABARestore() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-web-revision-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
         let (engine,ids)=try await osEngine(fixture,root:root);defer{engine.stop()};let id=ids[0]
