@@ -86,11 +86,12 @@ extension ApprovalTests {
 
     func testTerminalProfileShellReadinessAllowsSlowStartupWithoutRepeatingActions() throws {
         let context=JSContext()!
+        context.evaluateScript(terminalProfileBulkQueryFixture)
         context.evaluateScript("""
         var checks=0,sleeps=0;
         const old={tty:()=>'/dev/ttys700'},tab={tty:()=>'/dev/ttys701',busy:()=>{checks++;return checks<60;},processes:()=>['-zsh']};
         const window={id:()=>77,tabs:()=>[old,tab]};
-        function Application(){return {windows:()=>[window]};}
+        const app=enableProfileQueries({windows:()=>[window]});function Application(){return app;}
         const ObjC={import:()=>{}};const $={NSThread:{sleepForTimeInterval:()=>{sleeps++;}}};
         """)
         let result=context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700"]))?.toString()
@@ -170,11 +171,12 @@ extension ApprovalTests {
 
     func testTerminalNativeScriptsFindNewTabInDifferentScriptingWindowAndSelectIt() throws {
         let context=JSContext()!
+        context.evaluateScript(terminalProfileBulkQueryFixture)
         context.evaluateScript("""
         var activated=0;
         const old={tty:()=>'/dev/ttys700'},newTab={tty:()=>'/dev/ttys701',busy:()=>false,processes:()=>['-zsh']};
         const oldWindow={id:()=>77,tabs:()=>[old]},newWindow={id:()=>78,tabs:()=>[newTab]};
-        function Application(){return {windows:()=>[newWindow,oldWindow],activate:()=>{activated++}};}
+        const app=enableProfileQueries({windows:()=>[newWindow,oldWindow],activate:()=>{activated++}});function Application(){return app;}
         const ObjC={import:()=>{}};const $={NSThread:{sleepForTimeInterval:()=>{}}};
         """)
         let result=context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700"]))?.toString()

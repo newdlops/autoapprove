@@ -354,13 +354,12 @@ public enum TerminalProfileLauncher {
           const app=Application('com.apple.Terminal'),target=\(target),settings=\(settings),title=\(title);
           const profile=settings===null ? null:app.settingsSets.byName(settings);
           if(profile!==null && !profile.exists())throw Error('저장한 Terminal 설정 프로필이 없습니다: '+settings);
+          \(TerminalProfileScriptQueries.matchingTab)
           let tab;
           if(target!==null){
-            const matches=[];
-            for(const window of app.windows())for(const item of window.tabs())if(item.tty()===target)matches.push(item);
-            if(matches.length!==1)throw Error('새 Terminal 탭을 확인하지 못했습니다.');
-            tab=matches[0];
-            if(tab.busy() || !tab.processes().length || !tab.processes().every(p=>/^(?:-?(?:zsh|bash|sh|fish|tcsh|csh|dash|ksh)|login)$/.test(String(p).trim().split(/\\s+/)[0].split('/').pop())))throw Error('새 탭에서 다른 작업이 실행 중이어서 대화 명령을 보내지 않았습니다.');
+            tab=matchingTab(target);
+            const processes=tab.processes();
+            if(tab.busy() || !processes.length || !processes.every(p=>/^(?:-?(?:zsh|bash|sh|fish|tcsh|csh|dash|ksh)|login)$/.test(String(p).trim().split(/\\s+/)[0].split('/').pop())))throw Error('새 탭에서 다른 작업이 실행 중이어서 대화 명령을 보내지 않았습니다.');
             if(profile!==null)tab.currentSettings=profile;
             if(title!==null)tab.customTitle=title;
             app.doScript(\(command),{in:tab});
@@ -400,6 +399,14 @@ public enum TerminalProfileLauncher {
     public static func selectionScript(_ tty:String) throws -> String {
         guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
         let target=try AutomationScript.literal(tty)
-        return "const app=Application('com.apple.Terminal'),matches=[]; for(const window of app.windows())for(const tab of window.tabs())if(tab.tty()===\(target))matches.push({window,tab}); if(matches.length!==1)throw Error('선택할 탭이 닫혔거나 바뀌었습니다.'); const {window,tab}=matches[0]; window.selectedTab=tab;window.miniaturized=false;window.index=1;app.activate(); 'selected';"
+        return """
+        (()=>{
+          const app=Application('com.apple.Terminal');
+          \(TerminalProfileScriptQueries.inventory)
+          const row=inventory().find(row=>row.tty===\(target));
+          if(!row)throw Error('선택할 탭이 닫혔거나 바뀌었습니다.');
+          const {window,tab}=exactTab(row);window.selectedTab=tab;window.miniaturized=false;window.index=1;app.activate();return 'selected';
+        })();
+        """
     }
 }

@@ -1,6 +1,43 @@
 import Foundation
 import CoreGraphics
 
+/// Read the current scripting topology in a fixed number of Apple events.
+/// Window IDs bracket the bulk TTY reply; exact predicates bind any later action.
+enum TerminalProfileScriptQueries {
+    static let inventory = """
+    function inventory(){
+      const ids=app.windows.id(),groups=app.windows.tabs.tty(),after=app.windows.id();
+      if(!Array.isArray(ids)||!Array.isArray(groups)||!Array.isArray(after)||ids.length>512||
+         ids.length!==groups.length||JSON.stringify(ids)!==JSON.stringify(after)||
+         new Set(ids).size!==ids.length||ids.some(id=>!Number.isInteger(id)||id<=0)||groups.some(tabs=>!Array.isArray(tabs)))
+        throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
+      const rows=[],seen=new Set();
+      groups.forEach((tabs,index)=>tabs.forEach(tty=>{
+        if(typeof tty!=='string'||!/^\\/dev\\/ttys[0-9]+$/.test(tty)||seen.has(tty)||rows.length>=4095)
+          throw Error('Terminal 탭을 구분하지 못했습니다.');
+        seen.add(tty);rows.push({tty,windowID:ids[index]});
+      }));return rows;
+    }
+    function exactTab(row){
+      const window=app.windows.byId(row.windowID);
+      if(!window.exists()||Number(window.id())!==row.windowID)throw Error('선택할 Terminal 창이 닫혔거나 바뀌었습니다.');
+      const tabs=window.tabs.whose({tty:row.tty})();
+      if(tabs.length!==1||tabs[0].tty()!==row.tty)throw Error('선택할 Terminal 탭이 닫혔거나 이동했습니다.');
+      return {window,tab:tabs[0]};
+    }
+    """
+    static let matchingTab = """
+    function matchingTab(tty){
+      const groups=app.windows.tabs.whose({tty})();
+      if(!Array.isArray(groups)||groups.length>512||groups.some(tabs=>!Array.isArray(tabs)))
+        throw Error('새 Terminal 탭을 확인하지 못했습니다.');
+      const matches=groups.flat();
+      if(matches.length!==1||matches[0].tty()!==tty)throw Error('새 Terminal 탭을 확인하지 못했습니다.');
+      return matches[0];
+    }
+    """
+}
+
 /// Native IDs are used only during capture. Saved files contain relative groups.
 public struct TerminalProfileTabSnapshot:Codable,Equatable,Sendable {
     public var tty:String
@@ -155,13 +192,12 @@ public enum TerminalProfileTabOpener {
         let settings=try AutomationScript.literal(settingsName as Any? ?? NSNull())
         return """
         (()=>{
-          const app=Application('com.apple.Terminal'),wanted=\(wanted),settings=\(settings),matches=[],ttys=[];
+          const app=Application('com.apple.Terminal'),wanted=\(wanted),settings=\(settings);
           if(settings!==null&&!app.settingsSets.byName(settings).exists())throw Error('저장한 Terminal 설정 프로필이 없습니다.');
-          for(const window of app.windows())for(const tab of window.tabs()){
-            const tty=tab.tty();ttys.push(tty);if(tty===wanted)matches.push({window,tab});
-          }
-          if(matches.length!==1)throw Error('원래 Terminal 탭이 닫혔거나 이동했습니다.');
-          const {window,tab}=matches[0];
+          \(TerminalProfileScriptQueries.inventory)
+          const rows=inventory(),anchor=rows.find(row=>row.tty===wanted),ttys=rows.map(row=>row.tty);
+          if(!anchor)throw Error('원래 Terminal 탭이 닫혔거나 이동했습니다.');
+          const {window,tab}=exactTab(anchor);
           window.miniaturized=false;window.selectedTab=tab;window.index=1;app.activate();
           return JSON.stringify({tty:wanted,windowID:Number(window.id()),ttys});
         })();
@@ -173,15 +209,15 @@ public enum TerminalProfileTabOpener {
         (()=>{
           ObjC.import('Foundation');
           const app=Application('com.apple.Terminal'),target=\(target),previous=new Set(target.previous),deadline=Date.now()+5000;
+          \(TerminalProfileScriptQueries.inventory)
           for(let attempt=0;attempt<200&&Date.now()<deadline;attempt++){
-            const all=[];
-            for(const window of app.windows())for(const tab of window.tabs())all.push({window,tab,tty:tab.tty()});
+            const all=inventory();
             const anchor=all.filter(item=>item.tty===target.anchor),ttys=all.map(item=>item.tty);
-            if(anchor.length!==1||Number(anchor[0].window.id())!==target.windowID||!target.previous.every(tty=>ttys.includes(tty)))throw Error('원래 탭 구성이 바뀌었습니다.');
+            if(anchor.length!==1||anchor[0].windowID!==target.windowID||!target.previous.every(tty=>ttys.includes(tty)))throw Error('원래 탭 구성이 바뀌었습니다.');
             const added=all.filter(item=>!previous.has(item.tty));
             if(added.length>1)throw Error('새 탭이 여러 개여서 입력 대상을 확인하지 못했습니다.');
             if(added.length===1){
-              const {window,tab}=added[0],processes=tab.processes();
+              const {window,tab}=exactTab(added[0]),processes=tab.processes();
               if(!tab.busy()&&processes.length&&processes.every(p=>/^(?:-?(?:zsh|bash|sh|fish|tcsh|csh|dash|ksh)|login)$/.test(String(p).trim().split(/\\s+/)[0].split('/').pop()))){
                 window.selectedTab=tab;return JSON.stringify({tty:tab.tty(),windowID:Number(window.id())});
               }

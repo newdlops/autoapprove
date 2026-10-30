@@ -3,6 +3,25 @@ import CoreGraphics
 import JavaScriptCore
 import AutoApproveCore
 
+// Scripting collection properties are separate requests from enumeration.
+// Keep both surfaces so the same fixture also runs the previous release scripts.
+let terminalProfileBulkQueryFixture = """
+function enableProfileQueries(app){
+  app.windows.id=()=>app.windows().map(window=>window.id());
+  app.windows.tabs={
+    tty:()=>app.windows().map(window=>window.tabs().map(tab=>tab.tty())),
+    whose:predicate=>()=>app.windows().map(window=>window.tabs().filter(tab=>tab.tty()===predicate.tty))
+  };
+  app.windows.byId=id=>{
+    const window=app.windows().find(window=>window.id()===id);
+    if(!window)return {exists:()=>false};
+    window.exists=()=>true;
+    window.tabs.whose=predicate=>()=>window.tabs().filter(tab=>tab.tty()===predicate.tty);
+    return window;
+  };return app;
+}
+"""
+
 private func tabEntry(_ index:Int,window:UUID,order:Int=0,selected:Bool=false)->TerminalProfileEntry {
     .init(title:"작업 \(index)",agent:"codex",cwd:"/tmp/tab-profile",conversationID:String(format:"00000000-0000-4000-8000-%012d",index+1),terminalTab:.init(window:window,windowOrder:order,tabOrder:index,selected:selected,settingsName:"Pro",customTitle:"작업 \(index)"))
 }
@@ -318,7 +337,7 @@ extension ApprovalTests {
         let context=JSContext()!
         context.evaluateScript("""
         var scanned=0,settingsReads=0,available=false;
-        function Application(){return {settingsSets:{byName:name=>({exists:()=>{settingsReads++;return available;}})},windows:()=>{scanned++;throw Error('selection boundary');}};}
+        function Application(){return {settingsSets:{byName:name=>({exists:()=>{settingsReads++;return available;}})},windows:{id:()=>{scanned++;throw Error('selection boundary');}}};}
         """)
         let script=try TerminalProfileTabOpener.prepareScript(anchorTTY:"/dev/ttys700",settingsName:"프로필 ' \\")
         _ = context.evaluateScript(script)
@@ -427,15 +446,16 @@ extension ApprovalTests {
 
     func testTerminalTabScriptsOnlyWriteConfirmedIdleNewTab() throws {
         let context=JSContext()!,group=UUID(),entry=tabEntry(0,window:group)
+        context.evaluateScript(terminalProfileBulkQueryFixture)
         context.evaluateScript("""
         var commands=[],created=0;
         function makeTab(tty){return {tty:()=>tty,busy:()=>false,processes:()=>['-zsh'],currentSettings:null,customTitle:''};}
         const oldTab=makeTab('/dev/ttys700'),newTab=makeTab('/dev/ttys701'),foreignTab=makeTab('/dev/ttys799');
         var targetTabs=[oldTab];const targetWindow={id:()=>77,tabs:()=>targetTabs};
         const profile={exists:()=>true},foreignWindow={id:()=>88,tabs:()=>[foreignTab]};
-        function Application(){return {activate:()=>{},windows:()=>[foreignWindow,targetWindow],settingsSets:{byName:()=>profile},doScript:(command,options)=>{
+        const app=enableProfileQueries({activate:()=>{},windows:()=>[foreignWindow,targetWindow],settingsSets:{byName:()=>profile},doScript:(command,options)=>{
           if(!options){created++;return makeTab('/dev/ttys702');}commands.push({command,tty:options.in.tty()});return options.in;
-        }};}
+        }});function Application(){return app;}
         const ObjC={import:()=>{}};const $={NSThread:{sleepForTimeInterval:()=>{}}};
         """)
         let prepared=context.evaluateScript(try TerminalProfileTabOpener.prepareScript(anchorTTY:"/dev/ttys700"))?.toString() ?? ""
@@ -453,5 +473,84 @@ extension ApprovalTests {
         context.evaluateScript("targetTabs=[oldTab];")
         _ = context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700","/dev/ttys799"]));try expect(context.exception != nil);context.exception=nil
         try expectEqual(context.evaluateScript("created")?.toInt32(),0,"A failed tab never falls back to a separate window")
+    }
+
+    func testTerminalProfileBulkInventoryRejectsChangedAndAmbiguousRepliesBeforeSelection() throws {
+        for mutation in [
+            "app.windows.id=()=>++reads===1?[77]:[78];",
+            "app.windows.tabs.tty=()=>[['/dev/ttys700','/dev/ttys700']];",
+            "app.windows.tabs.tty=()=>[['/dev/foreign']];",
+            "app.windows.tabs.tty=()=>['/dev/ttys700'];",
+            "app.windows.tabs.tty=()=>[];",
+            "app.windows.id=()=>[77,77];app.windows.tabs.tty=()=>[['/dev/ttys700'],['/dev/ttys701']];",
+            "app.windows.byId=()=>({exists:()=>false});",
+            "app.windows.byId=()=>({exists:()=>true,id:()=>77,tabs:{whose:()=>()=>[]}});",
+            "app.windows.tabs.tty=()=>{throw Error('automation denied (-1743)');};"
+        ] {
+            let context=JSContext()!
+            context.evaluateScript(terminalProfileBulkQueryFixture)
+            context.evaluateScript("""
+            var reads=0,selections=0;
+            const tab={tty:()=>'/dev/ttys700'},window={id:()=>77,tabs:()=>[tab]};
+            Object.defineProperty(window,'selectedTab',{set:()=>{selections++;}});
+            const app=enableProfileQueries({windows:()=>[window],activate:()=>{selections++;}});
+            function Application(){return app;}
+            \(mutation)
+            """)
+            _ = context.evaluateScript(try TerminalProfileTabOpener.prepareScript(anchorTTY:"/dev/ttys700"))
+            try expectNotNil(context.exception,mutation)
+            try expectEqual(context.evaluateScript("selections")?.toInt32(),0)
+        }
+    }
+
+    func testTerminalProfileBulkConfirmationRetainsFreshInventoryOnEveryShellPoll() throws {
+        for mutation in [
+            "windows=[newWindow];",
+            "oldWindow.id=()=>99;",
+            "windows.push({id:()=>79,tabs:()=>[{tty:()=>'/dev/ttys702'}]});",
+            "app.windows.tabs.tty=()=>[['/dev/ttys700'],['/dev/ttys701','/dev/ttys701']];",
+            "app.windows.tabs.tty=()=>{throw Error('automation denied (-1743)');};"
+        ] {
+            let context=JSContext()!
+            context.evaluateScript(terminalProfileBulkQueryFixture)
+            context.evaluateScript("""
+            var sleeps=0,selections=0,ready=false;
+            const oldWindow={id:()=>77,tabs:()=>[{tty:()=>'/dev/ttys700'}]};
+            const newWindow={id:()=>78,tabs:()=>[{tty:()=>'/dev/ttys701',busy:()=>!ready,processes:()=>['-zsh']}]};
+            Object.defineProperty(newWindow,'selectedTab',{set:()=>{selections++;}});
+            var windows=[oldWindow,newWindow];const app=enableProfileQueries({windows:()=>windows});
+            function Application(){return app;}
+            const ObjC={import:()=>{}},$={NSThread:{sleepForTimeInterval:()=>{sleeps++;ready=true;\(mutation)}}};
+            """)
+            _ = context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700"]))
+            try expectNotNil(context.exception,mutation)
+            try expectEqual(context.evaluateScript("sleeps")?.toInt32(),1)
+            try expectEqual(context.evaluateScript("selections")?.toInt32(),0,"A changed inventory must not reuse the first observed new tab")
+        }
+    }
+
+    func testTerminalProfileExactCommandLookupRejectsDuplicateAndChangedTargets() throws {
+        let entry=tabEntry(0,window:UUID())
+        for mutation in [
+            "app.windows.tabs.whose=()=>()=>[[],[]];",
+            "app.windows.tabs.whose=()=>()=>[[tab],[tab]];",
+            "app.windows.tabs.whose=()=>()=>[[{tty:()=>'/dev/ttys799'}]];",
+            "tab.processes=()=>[];",
+            "tab.processes=()=>['-zsh','codex'];",
+            "app.windows.tabs.whose=()=>()=>{throw Error('automation denied (-1743)');};"
+        ] {
+            let context=JSContext()!
+            context.evaluateScript(terminalProfileBulkQueryFixture)
+            context.evaluateScript("""
+            var commands=0;
+            const tab={tty:()=>'/dev/ttys701',busy:()=>false,processes:()=>['-zsh']};
+            const app=enableProfileQueries({windows:()=>[{id:()=>78,tabs:()=>[tab]}],settingsSets:{byName:()=>({exists:()=>true})},doScript:()=>{commands++;},activate:()=>{}});
+            function Application(){return app;}
+            \(mutation)
+            """)
+            _ = context.evaluateScript(try TerminalProfileLauncher.script(entry,targetTTY:"/dev/ttys701"))
+            try expectNotNil(context.exception,mutation)
+            try expectEqual(context.evaluateScript("commands")?.toInt32(),0)
+        }
     }
 }
