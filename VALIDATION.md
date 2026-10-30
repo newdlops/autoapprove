@@ -1,5 +1,11 @@
 # AutoApprove 검증 기록
 
+## 2026-10-30 · 0.2.217/244 공개 배포·정식 설치
+
+- [정식 릴리스](https://github.com/newdlops/autoapprove/releases/tag/v0.2.217)의 공개 태그 역참조 **2286c1503b2667f0618f6c43d1f953c2053276e2**, DMG·업데이트 ZIP·각 SHA-256 파일 **4개**의 공개 다운로드·GitHub digest·체크섬·추출 앱 서명과 버전 일치를 확인했다.
+- 설치 전 등록 세션 **21개**, 앱 소유 PTY·화면 공유 **0개**에서 기존 앱을 비공개 백업했다. 첫 교체 시도는 준비 시간 만료로 파일 변경 전에 중단됐고, 기존 앱을 다시 열어 상태와 준비를 갱신했다. 앱 메뉴로 정상 종료한 후 **`/Applications/AutoApprove.app`**을 교체·실행했다. 설치 결과와 실행 앱의 버전 응답은 **0.2.217/244**다.
+- 요청대로 추가 UI·기능 검증과 실제 Terminal 저장·복원은 실행하지 않았다. 프로필 저장·갱신·복원 버튼도 누르지 않았다. 이전 앱·설치 자료·개별 실행 정보와 합성 횟수 비교 자료는 비공개 런타임 폴더에만 보관한다.
+
 ## 2026-10-30 · 0.2.217/244 전체 회귀·서명·설치 파일
 
 - 최종 전체 release 회귀는 **604/605**다. 남은 실패는 이전 버전과 같은 `Published updates: exact loopback gateway and web ports after reuse`의 **NWError 49: Can't assign requested address**다. 네트워크·PortManager·검사 조건을 변경하거나 항목을 제외하지 않았다.
