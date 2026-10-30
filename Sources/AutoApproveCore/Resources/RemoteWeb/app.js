@@ -1,9 +1,10 @@
 'use strict';
 let terminalHistoryViewer=null,terminalHistoryLoading=null;
-async function openTerminalHistory() {
+async function openTerminalHistory(conversation=false) {
   const item=selectedItem,key=selectedKey;
-  if(!item||$('terminal-history-open').disabled)return;
-  $('terminal-settings').open=false;$('terminal-history-open').disabled=true;
+  const opener=$(conversation?'codex-conversation-open':'terminal-history-open');
+  if(!item||opener.disabled)return;
+  $('terminal-settings').open=false;opener.disabled=true;
   try {
     if(!window.AutoApproveTerminalHistory){
       if(!terminalHistoryLoading)terminalHistoryLoading=new Promise((resolve,reject)=>{
@@ -16,7 +17,7 @@ async function openTerminalHistory() {
     }
     if(selectedKey!==key)return;
     if(!terminalHistoryViewer)terminalHistoryViewer=new window.AutoApproveTerminalHistory({api,endpoint});
-    await terminalHistoryViewer.open(item);
+    await terminalHistoryViewer.open(item,{conversation});
   }catch(error){feedback(error.message,true);}
   finally{updateControls();}
 }
@@ -1636,7 +1637,10 @@ function updateControls() {
   const enabled = (connected && current?.online || streamLive) && sessionPresent && !mutation && !resetBusy;
   const historySupported=!selectedItem.view.pty&&selectedItem.session.terminal==='terminal'&&supportsRelease(selectedItem.node,[0,2,204,231]);
   show($('terminal-history-open'),historySupported);
+  show($('codex-conversation-open'),!selectedItem.view.pty&&selectedItem.session.agent==='codex'&&supportsRelease(selectedItem.node,[0,2,219,246]));
+  text($('terminal-history-open'),selectedItem.session.agent==='codex'?'터미널 기록':'전체 기록');
   $('terminal-history-open').disabled=!enabled||sessionEnded(selectedItem);
+  $('codex-conversation-open').disabled=mutation||!selectedItem.node.online||sessionEnded(selectedItem);
   const temporaryPTY = ptyTemporary.has(selectedKey);
   const resetSupported = supportsRelease(selectedItem.node,[0,2,159,186]);
   $('reset-automation').disabled = !connected || !current?.online || !sessionPresent || sessionEnded(selectedItem) || temporaryPTY || !resetSupported || resetBusy;
@@ -3369,5 +3373,6 @@ $('use-goal-thread').addEventListener('click',()=>{if($('use-goal-thread').disab
 document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(goalTimer);else renderCodexGoal();});
 for(const [id,name]of [['codex-progress-check','checkCodexProgress'],['codex-progress-cancel','cancelCodexProgress']])$(id).addEventListener('click',()=>{if(selectedItem)void action(selectedItem.node.id,{action:name,sessionID:selectedItem.session.id},name==='checkCodexProgress'?'원래 Codex의 진행 확인을 시작합니다.':'진행 확인을 취소했습니다.');});
 $('terminal-history-open').addEventListener('click',()=>void openTerminalHistory());
+$('codex-conversation-open').addEventListener('click',()=>void openTerminalHistory(true));
 resetKeyboard();
 void refreshNetwork(true);

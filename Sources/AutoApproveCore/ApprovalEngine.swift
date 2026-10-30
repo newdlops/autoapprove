@@ -166,6 +166,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var claudeWorkIDs: [String: String] = [:]
     private let questionTransport: CodexReplyTransport
     private let codexQueue: CodexQueueTransport
+    private let codexConversation:CodexConversationTransport
     private let codexGoals:CodexGoalTransport
     private var changingGoals=Set<String>()
     private var changingGoalThreads=Set<String>()
@@ -374,7 +375,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
-                osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live) throws {
+                osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live) throws {
+        self.codexConversation=codexConversation
         self.paths = paths
         self.osPermissionServices=osPermissionServices ?? (processReader == nil ? OSPermissionAutomation.live:.inactive)
         self.osPermissionMonitoringEnabled=processReader==nil || osPermissionServices != nil
@@ -2022,6 +2024,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let items = try await codexQueue.conversations(target, session.cwd)
         try validateCodexQueueSession(session, threadID: nil)
         return RemoteCodexConversations(sessionID: sessionID, items: items)
+    }
+
+    public func remoteCodexHistory(sessionID:String,threadID:String?=nil,cursor:String?=nil) async throws -> CodexConversationPage {
+        guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {throw RemoteHTTPError(404,"실행 중인 Codex 세션을 선택해주세요.")}
+        guard threadID.map({UUID(uuidString:$0) != nil}) ?? true,
+              cursor.map({!$0.isEmpty && $0.utf8.count<=8192}) ?? true,cursor==nil || threadID != nil else {throw RemoteHTTPError(400,"대화와 기록 위치를 다시 확인해주세요.")}
+        try validateCodexQueueSession(session,threadID:nil)
+        let target:CodexReplyTarget
+        var matchedName:String?
+        if let threadID {target=try await questionTransport.prepareQueue(session,threadID)}
+        else {
+            do {target=try await questionTransport.prepareMessage(session)}
+            catch {
+                let home=try await questionTransport.queueHome(session)
+                try validateCodexQueueSession(session,threadID:nil)
+                let conversations=try await codexQueue.conversations(home,session.cwd)
+                try validateCodexQueueSession(session,threadID:nil)
+                guard let current=sessions[sessionID],let match=CodexProfileConversationBinding.match(title:current.terminalTitle,cwd:session.cwd,conversations:conversations),let name=match.name else {
+                    throw RemoteHTTPError(409,"이 세션의 Codex 대화를 확정하지 못했습니다. 확인할 대화를 선택해주세요.")
+                }
+                matchedName=name.precomposedStringWithCanonicalMapping
+                target=try await questionTransport.prepareQueue(session,match.id)
+                guard target.home==home.home,target.threadID==match.id else {throw RemoteHTTPError(409,"Codex 대화 연결이 바뀌었습니다.")}
+            }
+        }
+        guard UUID(uuidString:target.threadID) != nil,threadID==nil || target.threadID==threadID else {throw RemoteHTTPError(409,"원래 Codex 대화를 다시 선택해주세요.")}
+        try validateCodexQueueSession(session,threadID:target.threadID)
+        var result=try await codexConversation.read(target,session.cwd,cursor)
+        try validateCodexQueueSession(session,threadID:target.threadID)
+        guard result.threadID==target.threadID,matchedName==nil || CodexProfileConversationBinding.terminalName(sessions[sessionID]?.terminalTitle,cwd:session.cwd)==matchedName else {throw RemoteHTTPError(409,"기록을 읽는 동안 Codex 대화가 바뀌었습니다.")}
+        result.sessionID=sessionID
+        return result
     }
 
     private func codexGoalTarget(_ session:AgentSession,threadID:String?) async throws -> CodexReplyTarget {

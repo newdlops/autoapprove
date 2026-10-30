@@ -153,13 +153,22 @@ private final class PreviewScreens: @unchecked Sendable {
         let records = ProcessDiscovery.parse((0..<6).map { index in
             "\(82000 + index) 1 ttys0\(80 + index) \(82000 + index) \(82000 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/codex"
         }.joined(separator: "\n"))
+        let conversationMode=CommandLine.arguments.contains("--codex-conversation")
         let goalMode=CommandLine.arguments.contains("--codex-goals"),goalState=PreviewGoals(directory)
         let transport = CodexReplyTransport(prepare: { _, question in CodexReplyTarget(executable: "/fixture/codex", home: directory.path, threadID: question.threadID) }, send: { _, _ in UUID().uuidString },prepareMessage:{session in
-            guard goalMode else {return try await CodexReplyTransport.messageTarget(session)}
+            guard goalMode || conversationMode else {return try await CodexReplyTransport.messageTarget(session)}
             return CodexReplyTarget(executable:"/fixture/codex",home:directory.path,threadID:previewGoalThread(session.pid))
         })
         let goals=CodexGoalTransport(read:{target,_ in goalState.read(target.threadID)},change:{target,_,expected,action in try goalState.change(target,expected,action)})
         let goalQueue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{target,_ in [.init(id:target.threadID,title:"원래 실행 중인 Codex 대화 · 검증용")]})
+        let conversation=CodexConversationTransport {target,_,cursor in
+            let page=cursor.flatMap(Int.init) ?? 0
+            guard (0..<9).contains(page) else {throw RemoteHTTPError(400,"합성 기록 구간을 확인해주세요.")}
+            return .init(threadID:target.threadID,messages:[
+                .init(id:"user-\(page)",role:"user",text:"사용자 대화 \(page) · 원본 스크롤과 무관한 요청\n한글🙂 e\u{301}"),
+                .init(id:"answer-\(page)",role:"assistant",text:"Codex 답변 \(page)\n"+String(repeating:"긴 대화 내용 · 실제 본문 표시와 줄바꿈 검증. ",count:80)+"\n```swift\nlet answer = 42\n```\n<img src=x onerror=alert(1)>",phase:"final_answer")
+            ],nextCursor:page<8 ? String(page+1):nil)
+        }
         var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map {
             TerminalScreen(tty: $0.tty, contents: state.read($0.tty), title: "검증용 \(label) · " + $0.tty,
                 appearance: Self.fixtureAppearance(state.read($0.tty)))
@@ -188,11 +197,11 @@ private final class PreviewScreens: @unchecked Sendable {
         if osMode {osServices=OSPermissionServices(scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")})} else {osServices=nil}
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
             claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
-            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,codexQueue:goalMode ? goalQueue:.live,osPermissionServices:osServices,codexGoals:goals)
+            terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,codexQueue:goalMode || conversationMode ? goalQueue:.live,osPermissionServices:osServices,codexGoals:goals,codexConversation:conversationMode ? conversation:.live)
         if let raw=CommandLine.arguments.first(where:{$0.hasPrefix("--progress-delay=")}),let seconds=Double(raw.dropFirst("--progress-delay=".count)) {engine.codexProgressTimeout=seconds}
         try engine.start(poll: false)
         var sessions = ProcessDiscovery.sessions(records)
-        if !goalMode {sessions[0].id += "+한글 검증"}
+        if !goalMode && !conversationMode {sessions[0].id += "+한글 검증"}
         for index in sessions.indices {
             sessions[index].terminal = .terminal
             sessions[index].cwd = "/Users/qa/projects/" + ["autoapprove", "결제-서비스", "아주-긴-프로젝트-이름-네트워크-협력-터미널-화면-검증", "api-server", "문서-정리", "배포-작업"][index]
@@ -215,7 +224,7 @@ private final class PreviewScreens: @unchecked Sendable {
         if progressMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
         if osMode {try engine.setAutomatic(sessions[0].id,enabled:true)}
         engine.updateGitBranches(sessions.map { GitBranchUpdate(sessionID: $0.id, cwd: $0.cwd, state: .init(kind: .branch, name: "feature/network-sessions")) })
-        let question = QueuedQuestion(id: "fixture-question-" + label, threadID:goalMode ? previewGoalThread(sessions[1].pid):UUID().uuidString, title: "어떤 환경에서 네트워크 연결을 확인할까요? 검증용 질문이며 실제 작업에는 영향을 주지 않습니다.", options: ["개인 핫스팟에서 확인", "같은 Wi-Fi에서 확인", "긴 선택지의 줄바꿈과 선택 영역이 작은 휴대폰 화면에서도 유지되는지 확인"])
+        let question = QueuedQuestion(id: "fixture-question-" + label, threadID:goalMode || conversationMode ? previewGoalThread(sessions[1].pid):UUID().uuidString, title: "어떤 환경에서 네트워크 연결을 확인할까요? 검증용 질문이며 실제 작업에는 영향을 주지 않습니다.", options: ["개인 핫스팟에서 확인", "같은 Wi-Fi에서 확인", "긴 선택지의 줄바꿈과 선택 영역이 작은 휴대폰 화면에서도 유지되는지 확인"])
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: sessions[1].id, questions: [question], threadID: question.threadID)])
         let nodeIDFile = directory.appendingPathComponent("preview-node-id")
         let nodeID = (try? String(contentsOf: nodeIDFile, encoding: .utf8)) ?? UUID().uuidString

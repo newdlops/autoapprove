@@ -42,7 +42,7 @@ try{
  assert.equal(historyRequests.length,0);assert.equal(await page.locator('script[src="/terminal-history.js"]').count(),0);
  await page.locator('#terminal-settings summary').click();await page.locator('#compose-input').check();await page.locator('#terminal-settings summary').click();
  await page.locator('#terminal-input').fill('PRESERVE UNSENT DRAFT');
- await page.getByRole('button',{name:'전체 기록',exact:true}).click();await page.waitForFunction(()=>document.getElementById('terminal-history-output').textContent.includes('LATEST HISTORY'));
+ await page.locator('#terminal-history-open').click();await page.waitForFunction(()=>document.getElementById('terminal-history-output').textContent.includes('LATEST HISTORY'));
  assert.equal(await page.locator('#terminal-history-output img').count(),0);
  await page.locator('#terminal-history-output').focus();await page.keyboard.press('Enter');assert.equal(inputs.length,0,'Reading history never enters the original terminal');
  await page.getByRole('button',{name:'맨 처음',exact:true}).click();await page.waitForFunction(()=>document.getElementById('terminal-history-output').textContent.startsWith('EARLIEST HISTORY'));
@@ -67,7 +67,7 @@ try{
  await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.getElementById('terminal-history-dialog').open);
  let delayed;
  await page.route(historyRoute,route=>delayed=(async()=>{await wait(500);try{await route.fulfill({json:sample});}catch{}})());
- await page.getByRole('button',{name:'전체 기록',exact:true}).click();await page.waitForFunction(()=>document.getElementById('terminal-history-output').getAttribute('aria-busy')==='true');
+ await page.locator('#terminal-history-open').click();await page.waitForFunction(()=>document.getElementById('terminal-history-output').getAttribute('aria-busy')==='true');
  await page.keyboard.press('Escape');await delayed;await page.unroute(historyRoute);
  assert.equal(await page.locator('#terminal-history-dialog').evaluate(dialog=>dialog.open),false);assert.equal(await page.locator('.terminal-history-page').count(),0,'A closed dialog ignores its delayed response');
  assert.equal(await page.locator('#terminal-input').inputValue(),'PRESERVE UNSENT DRAFT');assert.equal(inputs.length,0);
