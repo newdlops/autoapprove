@@ -114,7 +114,7 @@ private final class NativeOpenerState:@unchecked Sendable {
                 guard let anchor=try reader.focusedGroup(),anchor.id==added.id,anchor.tabs==added.tabs,anchor.selected != added.selected else {return nil}
                 return anchor
             }
-            // Exercise the production opener from a singleton through three
+            // Exercise the production opener from a singleton through nineteen
             // additions. Only our AppKit windows implement the action boundary;
             // native AX groups are real, while Terminal and key posting are not.
             let state=NativeOpenerState()
@@ -154,16 +154,33 @@ private final class NativeOpenerState:@unchecked Sendable {
                     state.windows[state.anchor]!.addTabbedWindow(window,ordered:.above);window.makeKeyAndOrderFront(nil)
                     state.windows[state.target]=window;self.windows.append(window)
                     state.selected=state.target
+                    if state.posts.isMultiple(of:2),let group=window.tabGroup {
+                        // Recreate our own native bar on repeated additions,
+                        // retaining the actual NSWindow order and selection.
+                        let ordered=group.windows
+                        for member in ordered {group.removeWindow(member)}
+                        var previous=ordered[0]
+                        for member in ordered.dropFirst() {previous.addTabbedWindow(member,ordered:.above);previous=member}
+                        window.makeKeyAndOrderFront(nil)
+                    }
                 }
             })
-            for index in 1...3 {
+            var changedBars=0,changedTabObjects=0
+            for index in 1..<20 {
                 state.phase=0;state.target="/dev/ttys\(900+index)"
+                let previous=try openerReader.focusedGroup()
                 let tty=try TerminalProfileTabOpener.open(anchorTTY:state.anchor,environment:environment,nativeGroupReader:{try openerReader.focusedGroup()})
-                guard tty==state.target,try openerReader.focusedGroup()?.tabs.count==index+1 else {throw AppError.message("Singleton/multiple native opener failed")}
+                let next=try openerReader.focusedGroup()
+                guard tty==state.target,next?.tabs.count==index+1 else {throw AppError.message("Native opener failed at tab \(index+1)")}
+                if let previous,let next {
+                    if previous.id != next.id {changedBars+=1}
+                    if !previous.tabs.allSatisfy(next.tabs.contains) {changedTabObjects+=1}
+                }
                 state.anchor=tty
             }
             report["singletonInitialAXTabs"]=singleton?.tabs.count ?? 0
             report["productionOpenerTabCount"]=state.windows.count;report["openerActions"]=state.posts;report["terminalKeyEvents"]=0
+            report["rebuiltBarsObserved"]=changedBars;report["rebuiltTabObjectsObserved"]=changedTabObjects
             report.merge(["passed":true,"nativeGroups":baseline.count,"scriptingWindowCount":rows.count,"capturedWindowGroups":Set(captured.map(\.windowID)).count,"originalSelectionRestored":true,"newTabVerifiedAcrossWindowIDs":true,"duplicateTitles":true]) {_,new in new}
         } catch {report["passed"]=false;report["error"]=error.localizedDescription}
         let root=URL(fileURLWithPath:Bundle.main.object(forInfoDictionaryKey:"NativeTabsQAOutput") as! String)

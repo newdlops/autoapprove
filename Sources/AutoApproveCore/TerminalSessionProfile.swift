@@ -258,7 +258,20 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
         for entry in entries where activeKeys.contains(entry.key) {
             if let key=group(entry),anchors[key]==nil {blocked.insert(key)}
         }
-        for entry in entries where selected.contains(entry.id) {
+        func finishGroup(_ key:String) async {
+            guard openedGroups.contains(key),!Task.isCancelled else {return}
+            let candidates=entries.filter {group($0)==key && knownTTYs[$0.key] != nil}
+            guard let target=candidates.first(where:{$0.terminalTab?.selected == true}) ?? candidates.first,
+                  let tty=knownTTYs[target.key] else {return}
+            do {try await selectTab(tty)}
+            catch {
+                if let index=results.firstIndex(where: {result in result.phase == .opened && entries.contains(where:{$0.id==result.id && group($0)==key})}) {
+                    results[index].detail += " 선택 탭 복원은 확인하지 못했습니다: "+error.localizedDescription;progress(results[index])
+                }
+            }
+        }
+        let selectedEntries=entries.filter {selected.contains($0.id)}
+        for (position,entry) in selectedEntries.enumerated() {
             let key=group(entry)
             let result:TerminalProfileRestoreResult
             if !active.contains(where:{$0.key == entry.key}),let receipt=dispatched[entry.key],receipt.tty == nil {
@@ -290,16 +303,11 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 }
             }
             results.append(result);progress(result)
-        }
-        for key in openedGroups where !Task.isCancelled {
-            let candidates=entries.filter {group($0)==key && knownTTYs[$0.key] != nil}
-            guard let target=candidates.first(where:{$0.terminalTab?.selected == true}) ?? candidates.first,
-                  let tty=knownTTYs[target.key] else {continue}
-            do {try await selectTab(tty)}
-            catch {
-                if let index=results.firstIndex(where: {result in result.phase == .opened && entries.contains(where:{$0.id==result.id && group($0)==key})}) {
-                    results[index].detail += " 선택 탭 복원은 확인하지 못했습니다: "+error.localizedDescription;progress(results[index])
-                }
+            // Complete the current window, including its saved selection,
+            // before opening the next. A final Set traversal revisited earlier
+            // windows in an arbitrary order after all launches had finished.
+            if let key,position+1==selectedEntries.count || group(selectedEntries[position+1]) != key {
+                await finishGroup(key)
             }
         }
         return results

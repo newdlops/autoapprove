@@ -9,8 +9,9 @@ private func tabEntry(_ index:Int,window:UUID,order:Int=0,selected:Bool=false)->
 private actor TabLaunchLog {
     var entries:[(UUID,String?)]=[]
     var selections:[String]=[]
-    func launch(_ entry:TerminalProfileEntry,_ anchor:String?)->String {entries.append((entry.id,anchor));return "/dev/ttys\(700+entries.count)"}
-    func select(_ tty:String) {selections.append(tty)}
+    var timeline:[String]=[]
+    func launch(_ entry:TerminalProfileEntry,_ anchor:String?)->String {entries.append((entry.id,anchor));timeline.append("open:"+entry.id.uuidString);return "/dev/ttys\(700+entries.count)"}
+    func select(_ tty:String) {selections.append(tty);timeline.append("select:"+tty)}
 }
 private final class TabKeyFixture:@unchecked Sendable {
     var trusted=true,postingAllowed=true,focused=true,changeWindow=false,throwAfterPost=false,failConfirmation=false,nativeWindows=false
@@ -131,6 +132,7 @@ extension ApprovalTests {
         try expectEqual(result.map(\.phase),[.opened,.opened,.opened]);try expectEqual(events.map(\.0),[a.id,b.id,c.id])
         try expectNil(events[0].1);try expectEqual(events[1].1,"/dev/ttys701");try expectNil(events[2].1)
         try expectEqual(Set(selections),Set(["/dev/ttys702","/dev/ttys703"]))
+        try expectEqual(await log.timeline,["open:"+a.id.uuidString,"open:"+b.id.uuidString,"select:/dev/ttys702","open:"+c.id.uuidString,"select:/dev/ttys703"],"Finish a window's selection before opening the next window")
         _ = try await restorer.restore(profile,selected:[a.id,b.id,c.id],active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{await log.launch($0,$1)})
         try expectEqual(await log.entries.count,3)
         let partial=TerminalProfileRestorer()
@@ -140,6 +142,26 @@ extension ApprovalTests {
         let legacy=TabLaunchLog()
         _ = try await TerminalProfileRestorer().restore(old,selected:Set(old.entries.map(\.id)),active:[],directoryExists:{_ in true},launch:{await legacy.launch($0,$1)})
         try expectEqual(await legacy.entries.filter {$0.1==nil}.count,1,"Legacy Terminal sessions share one new window")
+    }
+
+    func testTerminalTabRestoreFinishesEachOfThreeWindowsBeforeMovingOn() async throws {
+        let sizes=[7,4,9],log=TabLaunchLog()
+        var entries:[TerminalProfileEntry]=[],expected:[String]=[],count=0
+        for (order,size) in sizes.enumerated() {
+            let window=UUID(),selected=size/2
+            for index in 0..<size {
+                var entry=tabEntry(count,window:window,order:order,selected:index==selected)
+                entry.terminalTab?.tabOrder=index
+                entries.append(entry);expected.append("open:"+entry.id.uuidString);count+=1
+            }
+            expected.append("select:/dev/ttys\(700+count-size+selected+1)")
+        }
+        let profile=TerminalSessionProfile(name:"세 창 · 스무 탭",entries:entries.reversed())
+        let results=try await TerminalProfileRestorer().restore(profile,selected:Set(entries.map(\.id)),active:[],directoryExists:{_ in true},launch:{await log.launch($0,$1)},selectTab:{await log.select($0)})
+        try expectEqual(results.map(\.phase),Array(repeating:.opened,count:20))
+        try expectEqual(await log.timeline,expected)
+        let opened=await log.entries
+        try expectEqual(opened.enumerated().filter {$0.element.1==nil}.map(\.offset),[0,7,11])
     }
 
     func testTerminalTabGroupFailureNeverSpillsIntoSeparateWindows() async throws {
@@ -215,11 +237,59 @@ extension ApprovalTests {
                     defer {reads+=1}
                     if reads==0 {return .init(id:10,tabs:[11,13],selected:11)}
                     var value=TerminalNativeTabGroup(id:10,tabs:[11,12,13],selected:reads==2 ? 11:12)
-                    if mode==0 {value.id=99};if mode==1 {value.tabs=[13,12,11]}
+                    if mode==0 && reads != 2 {value.id=99};if mode==1 {value.tabs=[13,12,11]}
                     if mode==2 && reads==2 {value.id=99};if mode==3 && reads>=3 {value.selected=11}
                     return value
                 })
                 try expect(false,"A separate native window, reordered group or changed selection cannot receive a command")
+            } catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
+            try expectEqual(fixture.posts,1)
+        }
+    }
+
+    func testTerminalNativeTabOpenerRebindsEveryAdditionThroughProfileLimit() throws {
+        // Every supported N, including insertion after a non-final anchor.
+        // AX bars and tab objects may be rebuilt on any addition.
+        for count in 1..<128 {
+            for replacement in 0..<4 {
+                let fixture=TabKeyFixture();fixture.nativeWindows=true
+                let anchorIndex=count/2,oldTabs=Array(1000..<(1000+count))
+                let before=TerminalNativeTabGroup(id:5,tabs:oldTabs,selected:oldTabs[anchorIndex])
+                var newTabs=replacement>=2 ? Array(2000..<(2000+count)):oldTabs
+                newTabs.insert(3000,at:anchorIndex+1)
+                let added=TerminalNativeTabGroup(id:replacement%2==1 ? 10:5,tabs:newTabs,selected:3000)
+                let tty=try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+                    if fixture.runs==1 {return before}
+                    var value=added
+                    if fixture.runs==3 {value.selected=newTabs[anchorIndex]}
+                    return value
+                })
+                try expectEqual(tty,"/dev/ttys701","Tab \(count+1), AX replacement \(replacement)")
+                try expectEqual(fixture.posts,1);try expectEqual(fixture.runs,4)
+            }
+        }
+    }
+
+    func testTerminalNativeTabRebindingRejectsWrongCountPositionAndRetainedOrder() throws {
+        for mode in 0..<6 {
+            let fixture=TabKeyFixture();fixture.nativeWindows=true
+            let before=TerminalNativeTabGroup(id:5,tabs:[11,12,13,14],selected:12)
+            var added=TerminalNativeTabGroup(id:10,tabs:[21,22,30,23,24],selected:30)
+            if mode==0 {added.tabs.append(25)}
+            if mode==1 {added.tabs=[21,22,23,30,24]}
+            if mode==2 {added.tabs=[14,12,30,13,11]}
+            do {
+                _ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+                    if fixture.runs==1 {return before}
+                    var value=added
+                    if fixture.runs==3 {
+                        value.selected=value.tabs[mode==3 ? 0:1]
+                        if mode==4 {value.id=99}
+                    }
+                    if fixture.runs==4 && mode==5 {value.selected=value.tabs[1]}
+                    return value
+                })
+                try expect(false,"Wrong count, insertion, retained order, anchor or final group cannot authorize a command")
             } catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
             try expectEqual(fixture.posts,1)
         }

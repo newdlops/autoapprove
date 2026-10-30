@@ -221,12 +221,20 @@ public enum TerminalProfileTabOpener {
                 throw AppError.message("새 탭을 선택한 원래 Terminal 프로세스에서 확인하지 못했습니다.")
             }
             try TerminalProfileReadiness.wait(message:"새 Terminal 탭의 화면 반영을 확인하지 못했습니다.") {environment.focused(newMetadata) ? true:nil}
-            // The first visible tab bar can replace a singleton's AX bar and
-            // tab objects. Bind that new pair by selecting both exact TTYs
-            // below; an existing multi-tab bar must retain its full order.
-            let firstPair=before == nil || before?.tabs.count==1
+            // Adding ANY tab can rebuild the AX bar and its tab objects.
+            // Compare insertion positions and any surviving identities, then
+            // bind the current bar through both exact TTYs below. Old AX
+            // identities are never a prerequisite for the Nth addition.
+            let anchorIndex=before.flatMap {$0.tabs.firstIndex(of:$0.selected)} ?? 0
             func matchesAddition(_ value:TerminalNativeTabGroup)->Bool {
-                value.isValid && (firstPair ? value.tabs.count==2:before.map {value.addingOneTab(to:$0)} == true)
+                guard value.isValid,value.tabs.count==(before?.tabs.count ?? 1)+1,
+                      value.tabs.firstIndex(of:value.selected)==anchorIndex+1 else {return false}
+                guard let before else {return true}
+                guard !before.tabs.contains(value.selected) else {return false}
+                let remaining=value.tabs.filter {$0 != value.selected}
+                return before.tabs.enumerated().allSatisfy {index,tab in
+                    !remaining.contains(tab) || remaining[index]==tab
+                }
             }
             let added:TerminalNativeTabGroup?=try TerminalProfileReadiness.wait(message:"새 탭의 묶음과 순서를 확인하지 못했습니다.") {() throws -> TerminalNativeTabGroup?? in
                 let value=try nativeGroup()
@@ -243,7 +251,7 @@ public enum TerminalProfileTabOpener {
                       anchor.tty==anchorTTY,anchor.ownerBundleID=="com.apple.Terminal",anchor.selected,!anchor.minimized else {throw AppError.message("새 탭이 원래 탭과 같은 창에 속하는지 확인하지 못했습니다.")}
                 try TerminalProfileReadiness.wait(message:"새 탭이 원래 탭과 같은 창에 속하는지 확인하지 못했습니다.") {
                     guard environment.focused(anchor),let same=try nativeGroup(),same.id==added.id,same.tabs==added.tabs,
-                          same.selected != added.selected,firstPair || before?.selected==same.selected else {return nil as Bool?}
+                          same.tabs.firstIndex(of:same.selected)==anchorIndex else {return nil as Bool?}
                     return true
                 }
                 _ = try environment.run(TerminalProfileLauncher.selectionScript(tty))
