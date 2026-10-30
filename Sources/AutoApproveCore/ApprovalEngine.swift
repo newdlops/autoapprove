@@ -724,13 +724,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     /// Capture exact current identities where available. A daemon-backed TUI
     /// without a per-window thread binding returns an explicit conversation picker.
-    public func terminalProfileCandidates() async throws -> [TerminalProfileCandidate] {
+    public func terminalProfileCandidates(includeLayout:Bool = true) async throws -> [TerminalProfileCandidate] {
         guard !remoteInputStopped else {throw AppError.message("앱이 종료 중입니다.")}
         let targets=snapshot.sessions.filter {$0.agent != .shell && $0.phase != .ended && $0.pid>0}
         guard targets.count<=128 else {throw AppError.message("프로필에는 최대 128개 세션을 저장합니다.")}
         let reader=processReader,registry=claudeRegistryReader
         let live=try await Task.detached(priority:.utility) {try reader()}.value
         var result:[TerminalProfileCandidate]=[]
+        // A picker is useful only when saving. Share its read within this
+        // operation; separate CLIs still resolve their own provider home.
+        var conversationLists:[String:[String:[CodexProfileConversation]]]=[:]
         for session in targets {
             try Task.checkCancellation()
             guard let record=live.first(where:{$0.key == session.id && $0.agent == session.agent && "/dev/"+$0.tty == session.tty}) else {
@@ -752,7 +755,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     do {
                         let target=try await questionTransport.queueHome(session)
                         entry.providerHome=target.home
-                        choices=try await codexQueue.conversations(target,session.cwd).map {CodexProfileConversation(id:$0.id,title:$0.title)}
+                        if includeLayout {
+                            if let cached=conversationLists[target.home]?[session.cwd] {choices=cached}
+                            else {
+                                choices=try await codexQueue.conversations(target,session.cwd).map {CodexProfileConversation(id:$0.id,title:$0.title)}
+                                conversationLists[target.home,default:[:]][session.cwd]=choices
+                            }
+                        }
                         detail="대화를 이어가려면 선택하거나 ID를 입력하세요. 비워 두면 이 폴더에서 새 Codex를 엽니다."
                     } catch {detail="대화 ID는 선택 사항입니다. 비워 두면 이 폴더에서 새 Codex를 엽니다."}
                 }
@@ -772,7 +781,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail,tty:session.terminal == .terminal ? session.tty:nil))
         }
         let terminalTTYs=result.filter {$0.entry.host == .terminal}.compactMap(\.tty),layoutReader=terminalProfileLayoutReader
-        if !terminalTTYs.isEmpty {
+        if includeLayout && !terminalTTYs.isEmpty {
             let layout=try await Task.detached(priority:.utility) {try layoutReader(terminalTTYs)}.value
             result=try TerminalProfileTopology.apply(layout,to:result)
         }

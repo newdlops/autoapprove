@@ -3,6 +3,11 @@ import Darwin
 import JavaScriptCore
 import AutoApproveCore
 
+private actor ProfileConversationReads {
+    var lists=0
+    func read() -> [CodexQueueConversation] {lists+=1;return [.init(id:"00000000-0000-4000-8000-000000000001",title:"직접 선택할 대화")]}
+}
+
 private func profileEntry(_ agent:String="codex",cwd:String="/tmp/profile-project",host:TerminalProfileEntry.Host = .terminal) -> TerminalProfileEntry {
     .init(title:"프로필 창 · "+agent,agent:agent,cwd:cwd,conversationID:UUID().uuidString.lowercased(),host:host)
 }
@@ -170,7 +175,7 @@ extension ApprovalTests {
         let failed=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{_,_ in throw AppError.message("lost acknowledgement")})
         try expectEqual(failed.first?.phase,.needsReview)
         let retry=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
-        try expectEqual(retry.first?.phase,.needsReview);try expectEqual(await opened.keys.count,1)
+        try expectEqual(retry.first?.phase,.needsReview);try expect(retry.first?.detail.contains("lost acknowledgement") == true,"Keep the original failure visible after retrying");try expectEqual(await opened.keys.count,1)
         let closed=try await restorer.restore(profile,selected:[next.id],active:[],directoryExists:{_ in true},terminalIsOpen:{_ in false},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile-new"})
         try expectEqual(closed.first?.phase,.opened);try expectEqual(await opened.keys.count,2)
         let beforeStart=profileEntry(),beforeProfile=TerminalSessionProfile(name:"권한",entries:[beforeStart])
@@ -208,6 +213,42 @@ extension ApprovalTests {
         defer {stale.stop()};stale.updateDiscovery(sessions,records:records)
         var rejected=false;do {_ = try await stale.terminalProfileCandidates()} catch {rejected=true}
         try expect(rejected,"A vanished or reused source cannot be captured after its async identity read")
+    }
+
+    func testTerminalProfileRestorationSkipsLayoutAndPickersAndSaveSharesLists() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-profile-fast-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let records=ProcessDiscovery.parse("""
+        100511 1 fast1 100511 100511 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100512 1 fast2 100512 100512 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100513 1 fast3 100513 100513 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100514 1 fast4 100514 100514 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let sessions=records.map {record in AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/"+record.tty,cwd:record.pid==100513 ? "/tmp/other":"/tmp/shared",terminal:.terminal)}
+        let reads=ProfileConversationReads()
+        let transport=CodexReplyTransport(prepare:{_,_ in throw AppError.message("unused")},send:{_,_ in throw AppError.message("never send")},queueHome:{session in .init(executable:"",home:session.pid==100514 ? "/tmp/other-home":"/tmp/profile-home",threadID:"")})
+        let queue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in await reads.read()})
+        let deniedLayout:@Sendable ([String]) throws -> [TerminalProfileTabSnapshot] = {_ in throw TerminalProfileAccessError.accessibilityDenied}
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,processReader:{records},codexQueue:queue,terminalProfileLayoutReader:deniedLayout)
+        defer {engine.stop()};engine.updateDiscovery(sessions,records:records)
+        let active=try await engine.terminalProfileCandidates(includeLayout:false)
+        try expectEqual(active.count,4);try expectEqual(await reads.lists,0,"Restoration does not request a conversation picker")
+        try expect(active.allSatisfy {$0.entry.terminalTab==nil && $0.conversations.isEmpty && $0.tty != nil})
+        try expectEqual(active.filter {$0.entry.providerHome=="/tmp/profile-home"}.count,3)
+        try expectEqual(active.filter {$0.entry.providerHome=="/tmp/other-home"}.count,1,"Each live CLI must still resolve its own provider home")
+        let save=try ApprovalEngine(paths:AppPaths(directory:directory.appendingPathComponent("save")),questionTransport:transport,processReader:{records},codexQueue:queue,terminalProfileLayoutReader:{ttys in ttys.enumerated().map {.init(tty:$0.element,windowID:1,windowOrder:0,tabOrder:$0.offset)}})
+        defer {save.stop()};save.updateDiscovery(sessions,records:records)
+        for expected in [3,6] {
+            let candidates=try await save.terminalProfileCandidates()
+            try expectEqual(await reads.lists,expected,"One list per provider home/folder, fresh for each capture")
+            try expect(candidates.allSatisfy {$0.conversations.count==1 && $0.entry.conversationID.isEmpty && $0.entry.terminalTab != nil},"Shared picker results must never pick a conversation automatically")
+        }
+        let reader=ProfileReadFixture(records)
+        let stale=try ApprovalEngine(paths:AppPaths(directory:directory.appendingPathComponent("stale-fast")),questionTransport:transport,processReader:{reader.read()},codexQueue:queue,terminalProfileLayoutReader:deniedLayout)
+        defer {stale.stop()};stale.updateDiscovery(sessions,records:records)
+        var rejected=false
+        do {_ = try await stale.terminalProfileCandidates(includeLayout:false)} catch {rejected=true}
+        try expect(rejected,"Restoration still rejects a source that changed during identity reads")
     }
 
     func testHardWrappedPermissionFooterRetainsWholeDialogAndRejections() throws {

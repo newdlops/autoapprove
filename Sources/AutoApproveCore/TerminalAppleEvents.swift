@@ -111,6 +111,42 @@ public struct TerminalAppleEventReader {
         return [UInt32(value.int32Value)]
     }
 
+    private func booleans(_ value:NSAppleEventDescriptor,depth:Int = 0) throws -> [Bool] {
+        guard depth<8,value.numberOfItems<=4096 else {throw TerminalReadEventError.incompatible}
+        if value.descriptorType==aeCode("list") {
+            guard value.numberOfItems>0 else {return []}
+            return try (1...value.numberOfItems).flatMap {index in
+                guard let item=value.atIndex(index) else {throw TerminalReadEventError.incompatible}
+                return try booleans(item,depth:depth+1)
+            }
+        }
+        guard ["bool","true","fals"].contains(where:{value.descriptorType==aeCode($0)}) else {throw TerminalReadEventError.incompatible}
+        return [value.booleanValue]
+    }
+
+    /// Exact selected-TTY predicates keep profile checks independent of the
+    /// number of unrelated tabs. No osascript process or title/content scan.
+    public func selectedWindow(tty:String) throws -> UInt32? {
+        try autoreleasepool {
+            let windows=try matching("cwin",property:["tcnt","ttty"],tty:tty)
+            let deadline=clock()+timeout
+            func get(_ subject:NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
+                try Task.checkCancellation()
+                let remaining=deadline-clock()
+                guard remaining>0 else {throw TerminalReadEventError.timedOut}
+                return try send(subject,remaining)
+            }
+            let identity=try property("ID  ",of:windows)
+            let before=try windowIDs(get(identity))
+            guard before.count==1 else {return nil}
+            let selected=try booleans(get(property("tbsl",of:property("tcnt",of:windows))))
+            let minimized=try booleans(get(property("pmnd",of:windows)))
+            let after=try windowIDs(get(identity))
+            guard before==after,selected==[true],minimized==[false] else {return nil}
+            return before[0]
+        }
+    }
+
     public func history(tty:String) throws -> String {
         try autoreleasepool {
             let all=NSAppleEventDescriptor(descriptorType:aeCode("abso"),data:NSAppleEventDescriptor(enumCode:aeCode("all ")).data)!
@@ -363,6 +399,30 @@ enum TerminalAppleEvents {
     // frequent monitor cadence, which can stall on busy Terminal. Newly seen
     // or expired TTYs alone enter the title query set.
     private static let titleCacheLifetime: TimeInterval = 300
+
+    static func profileWindowMetadata(tty:String) throws -> TerminalWindowMetadata? {
+        let owner=try TerminalProcessLookup.running()
+        let reader=TerminalAppleEventReader(timeout:3) {subject,timeout in
+            let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode("getd"),targetDescriptor:.init(processIdentifier:owner.pid),returnID:-1,transactionID:0)
+            event.setParam(subject,forKeyword:aeCode("----"))
+            let noConsent=NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
+            let reply:NSAppleEventDescriptor
+            do {reply=try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:timeout)}
+            catch {
+                if [-1743,-1744].contains((error as NSError).code) {throw TerminalAdapterError.permissionDenied}
+                throw error
+            }
+            let status=reply.paramDescriptor(forKeyword:aeCode("errn"))?.int32Value ?? 0
+            if [-1743,-1744].contains(status) {throw TerminalAdapterError.permissionDenied}
+            guard status==0 else {throw NSError(domain:NSOSStatusErrorDomain,code:Int(status))}
+            guard let value=reply.paramDescriptor(forKeyword:aeCode("----")) else {throw TerminalReadEventError.incompatible}
+            return value
+        }
+        guard let windowID=try reader.selectedWindow(tty:tty),TerminalProcessLookup.identity(pid:owner.pid)==owner else {return nil}
+        let output=try AutomationScript.literal(["tty":tty,"windowID":windowID,"selected":true,"minimized":false] as JSONObject)
+        guard let metadata=try TerminalAdapter.windowMetadata(output:output,tty:tty),metadata.ownerPID==owner.pid else {return nil}
+        return metadata
+    }
 
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.

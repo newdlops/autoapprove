@@ -12,6 +12,24 @@ public enum TerminalProfileAccessError:LocalizedError,Equatable {
     }
 }
 
+/// Wait for the result of an action that was submitted once. Reads can settle
+/// on a later AppKit/AX turn; actions and resume commands are never retried.
+public enum TerminalProfileReadiness {
+    @discardableResult public static func wait<Value>(timeout:TimeInterval = 1.5,message:String,
+        clock:() -> TimeInterval = {ProcessInfo.processInfo.systemUptime},
+        pause:(TimeInterval) -> Void = {Thread.sleep(forTimeInterval:$0)},
+        read:() throws -> Value?) throws -> Value {
+        let deadline=clock()+timeout
+        while true {
+            try Task.checkCancellation()
+            if let value=try read() {return value}
+            let remaining=deadline-clock()
+            guard remaining>0 else {throw AppError.message(message)}
+            pause(min(0.02,remaining))
+        }
+    }
+}
+
 /// Operation-local accessibility identities. Never written to a saved profile.
 public struct TerminalNativeTabGroup:Equatable,Sendable {
     public var id:Int
@@ -157,8 +175,16 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
                 if result == .apiDisabled {throw TerminalProfileAccessError.accessibilityDenied}
                 guard result == .success else {throw AppError.message("원래 선택 탭으로 돌아가지 못했습니다.")}
             }
-            guard let selectedWindow=try attribute(bar,kAXWindowAttribute,deadline:deadline),CFGetTypeID(selectedWindow)==AXUIElementGetTypeID(),
-                  let restored=try group(selectedWindow as! AXUIElement,deadline:deadline),restored==state else {throw AppError.message("원래 선택 탭 복원을 확인하지 못했습니다.")}
+            try TerminalProfileReadiness.wait(message:"원래 선택 탭 복원을 확인하지 못했습니다.") {
+                try self.check()
+                guard self.services.foreground(self.ownerPID) else {throw AppError.message("선택 탭 복원 중 앱 초점이 바뀌었습니다.")}
+                let limit=ProcessInfo.processInfo.systemUptime+1
+                guard let window=try self.attribute(bar,kAXWindowAttribute,deadline:limit),CFGetTypeID(window)==AXUIElementGetTypeID(),
+                      let restored=try self.group(window as! AXUIElement,deadline:limit),restored.id==state.id,restored.tabs==state.tabs else {
+                    throw AppError.message("탭 구성이 바뀌어 원래 선택 탭 복원을 확인하지 못했습니다.")
+                }
+                return restored==state ? true:nil
+            }
         }
         if let originalWindow {_ = services.action(originalWindow,kAXRaiseAction)}
         if let originalApplication,!originalApplication.isTerminated,originalApplication.processIdentifier != ownerPID {originalApplication.activate()}

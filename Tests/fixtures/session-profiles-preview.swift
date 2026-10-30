@@ -5,8 +5,13 @@ import AutoApproveCore
 private actor FixtureLaunches {
     var entries:[TerminalProfileEntry]=[]
     var anchors:[String?]=[]
+    var captures:[String:Int]=[:]
     let file:URL
     init(file:URL) {self.file=file}
+    func capture(_ purpose:String) throws {
+        captures[purpose,default:0]+=1
+        try JSONSerialization.data(withJSONObject:captures,options:.prettyPrinted).write(to:file.deletingLastPathComponent().appendingPathComponent("capture-events.json"),options:.atomic)
+    }
     func launch(_ entry:TerminalProfileEntry,_ anchor:String?) throws -> String {
         _ = try entry.resumeCommand()
         entries.append(entry)
@@ -43,7 +48,7 @@ private actor FixtureLaunches {
                             TerminalProfileCandidate(id:"fixture-current-b",entry:try entry(301,"현재 Claude 창","claude","current-web")),
                             TerminalProfileCandidate(id:"fixture-current-choice",entry:ambiguous,conversations:[.init(id:id(400),title:"도구 승인 안정화 작업"),.init(id:id(401),title:"프로필 복원 구현 작업")],detail:"대화 ID는 선택 사항입니다. 비워 두면 새 Codex를 엽니다."),
                             TerminalProfileCandidate(id:"fixture-current-claude",entry:freshClaude)]
-            controller=SessionProfilesController(store:store,capture:{
+            let current:@MainActor () async throws -> [TerminalProfileCandidate] = {
                 try await Task.sleep(for:.milliseconds(250))
                 let sources=candidates.enumerated().map {index,value in
                     var candidate=value;candidate.entry.id=UUID();candidate.tty="/dev/ttys\(800+index)";return candidate
@@ -52,7 +57,9 @@ private actor FixtureLaunches {
                     var entry=value;entry.terminalTab?.windowOrder=2
                     return .init(id:entry.id.uuidString,entry:entry,tty:"/dev/ttys\(900+index)")
                 }
-            },launch:{entry,anchor in try await launches.launch(entry,anchor)})
+            }
+            controller=SessionProfilesController(store:store,capture:{try await launches.capture("save");return try await current()},
+                activeSessions:{try await launches.capture("restore");return try await current()},launch:{entry,anchor in try await launches.launch(entry,anchor)})
         } catch {fatalError("Fixture setup failed: "+error.localizedDescription)}
     }
 }

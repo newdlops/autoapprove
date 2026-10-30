@@ -8,6 +8,7 @@ private final class ProfileAXFixture {
     let bar=AXUIElementCreateApplication(1009003),a=AXUIElementCreateApplication(1009004),b=AXUIElementCreateApplication(1009005)
     var readStatus:AXError = .success,actionStatus:AXError = .success
     var owns=true,foreground=true,selected=0,reads=0
+    var delayedSelectionReads=0,pendingSelection:Int?
     var actions:[String]=[]
     var services:TerminalNativeTabReader.Services {
         .init(ownsProcess:{pid,bundle in self.owns && pid==self.pid && bundle=="com.apple.Terminal"},read:{element,name in
@@ -21,7 +22,13 @@ private final class ProfileAXFixture {
             if CFEqual(element,self.bar) {
                 if name==kAXRoleAttribute {return (.success,kAXTabGroupRole as CFString)}
                 if name==kAXTabsAttribute {return (.success,[self.a,self.b] as CFArray)}
-                if name==kAXValueAttribute {return (.success,self.selected==0 ? self.a:self.b)}
+                if name==kAXValueAttribute {
+                    if let pending=self.pendingSelection {
+                        if self.delayedSelectionReads==0 {self.selected=pending;self.pendingSelection=nil}
+                        else {self.delayedSelectionReads-=1}
+                    }
+                    return (.success,self.selected==0 ? self.a:self.b)
+                }
                 if name==kAXWindowAttribute {return (.success,self.window)}
             }
             return (.attributeUnsupported,nil)
@@ -29,9 +36,12 @@ private final class ProfileAXFixture {
             self.actions.append(name)
             guard self.actionStatus == .success else {return self.actionStatus}
             if name==kAXPressAction {
-                if CFEqual(element,self.a) {self.selected=0}
-                else if CFEqual(element,self.b) {self.selected=1}
+                let target:Int
+                if CFEqual(element,self.a) {target=0}
+                else if CFEqual(element,self.b) {target=1}
                 else {return .invalidUIElement}
+                if self.delayedSelectionReads>0 {self.pendingSelection=target}
+                else {self.selected=target}
             }
             return .success
         },foreground:{self.foreground && $0==self.pid})
@@ -49,6 +59,10 @@ extension ApprovalTests {
         try expectEqual(fixture.selected,0)
         try expectEqual(fixture.actions.filter {$0==kAXPressAction}.count,1)
         try expect(fixture.reads>0)
+        let delayed=ProfileAXFixture(),other=delayed.reader(),baseline=try other.groups()
+        delayed.selected=1;delayed.delayedSelectionReads=3
+        try other.restore(baseline)
+        try expectEqual(delayed.selected,0);try expectEqual(delayed.actions.filter {$0==kAXPressAction}.count,1,"Wait for AX selection reflection without pressing a second time")
     }
 
     func testTerminalProfileAccessDistinguishesDeniedUnreadableAndMissingTree() throws {

@@ -285,6 +285,11 @@ public enum TerminalAdapter {
         guard [.terminal, .iterm].contains(host) else { return nil }
         let output = try AutomationScript.run(windowMetadataScript(tty: tty, host: host), app: host.title,
             denied: host == .terminal ? .permissionDenied : .automationDenied(host.title), timeout: 3)
+        return try windowMetadata(output:output,tty:tty,host:host)
+    }
+    /// Verify scripting selection against the current WindowServer owner.
+    /// Profile focus can return the same selection in its existing event.
+    static func windowMetadata(output:String,tty:String,host:ScreenHost = .terminal) throws -> TerminalWindowMetadata? {
         if output == "null" { return nil }
         struct Selection: Decodable { var tty: String; var windowID: UInt32; var selected: Bool; var minimized: Bool }
         let selection = try JSONDecoder().decode(Selection.self, from: Data(output.utf8))

@@ -24,6 +24,38 @@ private func terminalBatchTargets(_ query: NSAppleEventDescriptor) -> [String]? 
 }
 
 extension ApprovalTests {
+    func testTerminalProfileNativeSelectionUsesExactTTYAndStableWindow() throws {
+        for mode in ["ready","missing","ambiguous","unselected","minimized","changed","denied"] {
+            var queries=0,identityReads=0
+            let reader=TerminalAppleEventReader {query,budget in
+                queries+=1;try expect(budget>0 && budget<=8)
+                var window=query.forKeyword(terminalCode("from"))!
+                if window.forKeyword(terminalCode("want"))?.typeCodeValue==terminalCode("prop") {window=window.forKeyword(terminalCode("from"))!}
+                try expectEqual(window.forKeyword(terminalCode("want"))?.typeCodeValue,terminalCode("cwin"))
+                let predicate=window.forKeyword(terminalCode("seld"))!
+                try expectEqual(predicate.forKeyword(terminalCode("obj2"))?.stringValue,"/dev/ttys700")
+                let tty=predicate.forKeyword(terminalCode("obj1"))!
+                try expectEqual(terminalProperty(tty),terminalCode("ttty"))
+                try expectEqual(terminalProperty(tty.forKeyword(terminalCode("from"))!),terminalCode("tcnt"))
+                if mode=="denied" {throw TerminalAdapterError.permissionDenied}
+                switch terminalProperty(query) {
+                case terminalCode("ID  "):
+                    identityReads+=1
+                    let ids:[Int32]=mode=="missing" ? []:mode=="ambiguous" ? [77,78]:[mode=="changed" && identityReads==2 ? 78:77]
+                    return terminalList(ids.map {.init(int32:$0)})
+                case terminalCode("tbsl"):return terminalList([.init(boolean:mode != "unselected")])
+                case terminalCode("pmnd"):return terminalList([.init(boolean:mode=="minimized")])
+                default:throw AppError.message("Unexpected profile query")
+                }
+            }
+            if mode=="denied" {try expectThrows(try reader.selectedWindow(tty:"/dev/ttys700"));try expectEqual(queries,1)}
+            else {
+                try expectEqual(try reader.selectedWindow(tty:"/dev/ttys700"),mode=="ready" ? 77:nil)
+                try expectEqual(queries,["missing","ambiguous"].contains(mode) ? 1:4,"Four exact native property reads regardless of unrelated terminal count")
+            }
+        }
+    }
+
     func testNativeTerminalDiagnosticsTagExactSendWithoutRetainingSourceText() throws {
         let timing = RemoteTerminalPerformance()
         let reader = TerminalAppleEventReader(diagnostics:timing,purpose:.validation) { _,_ in

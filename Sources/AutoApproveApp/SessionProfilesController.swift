@@ -21,13 +21,15 @@ struct SessionProfileDraft: Identifiable {
     @Published private(set) var message:String?
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
     private let capture:@MainActor () async throws -> [TerminalProfileCandidate]
+    private let activeSessions:@MainActor () async throws -> [TerminalProfileCandidate]
     private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
     private let selectTab:@Sendable (String) async throws -> Void
     private let restorer=TerminalProfileRestorer()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
+         activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
          selectTab:(@Sendable (String) async throws -> Void)? = nil) {
-        self.store=store;self.capture=capture
+        self.store=store;self.capture=capture;self.activeSessions=activeSessions ?? capture
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
         // A synthetic launcher cannot acquire an implicit path to real native UI.
         if let selectTab {self.selectTab=selectTab}
@@ -35,7 +37,9 @@ struct SessionProfileDraft: Identifiable {
         else {self.selectTab={_ in}}
     }
     convenience init(engine:ApprovalEngine) {
-        self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),capture:{try await engine.terminalProfileCandidates()})
+        self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
+                  capture:{try await engine.terminalProfileCandidates()},
+                  activeSessions:{try await engine.terminalProfileCandidates(includeLayout:false)})
     }
     var selected:TerminalSessionProfile? {profiles.first {$0.id == selectedID}}
     func reload() async {
@@ -70,7 +74,7 @@ struct SessionProfileDraft: Identifiable {
         guard !busy else {return};busy=true;error=nil;message="실행 중인 세션을 확인하고 있습니다…";results=[:]
         defer {busy=false}
         do {
-            let candidates=try await capture(),active=candidates.map(\.entry)
+            let candidates=try await activeSessions(),active=candidates.map(\.entry)
             let anchors=Dictionary(candidates.compactMap {candidate in candidate.entry.host == .terminal ? candidate.tty.map {(candidate.entry.key,$0)}:nil},uniquingKeysWith:{first,_ in first})
             let values=try await restorer.restore(profile,selected:selected,active:active,activeTerminalTTYs:anchors,launch:launch,selectTab:selectTab) { [weak self] result in
                 self?.results[result.id]=result

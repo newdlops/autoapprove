@@ -216,13 +216,31 @@ extension ApprovalTests {
                     if reads==0 {return .init(id:10,tabs:[11,13],selected:11)}
                     var value=TerminalNativeTabGroup(id:10,tabs:[11,12,13],selected:reads==2 ? 11:12)
                     if mode==0 {value.id=99};if mode==1 {value.tabs=[13,12,11]}
-                    if mode==2 && reads==2 {value.id=99};if mode==3 && reads==3 {value.selected=11}
+                    if mode==2 && reads==2 {value.id=99};if mode==3 && reads>=3 {value.selected=11}
                     return value
                 })
                 try expect(false,"A separate native window, reordered group or changed selection cannot receive a command")
             } catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
             try expectEqual(fixture.posts,1)
         }
+    }
+
+    func testTerminalNativeTabOpenerWaitsForDelayedAXWithoutRepeatingKey() throws {
+        let fixture=TabKeyFixture();fixture.nativeWindows=true
+        let before=TerminalNativeTabGroup(id:10,tabs:[11,13],selected:11)
+        let added=TerminalNativeTabGroup(id:10,tabs:[11,12,13],selected:12)
+        var reads:[Int:Int]=[:]
+        let tty=try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:fixture.environment,nativeGroupReader:{
+            let phase=fixture.runs;reads[phase,default:0]+=1
+            if phase==1 {return before}
+            if phase==2 {return reads[phase]!<3 ? before:added}
+            var anchor=added;anchor.selected=11
+            if phase==3 {return reads[phase]!<3 ? added:anchor}
+            return reads[phase]!<3 ? anchor:added
+        })
+        try expectEqual(tty,"/dev/ttys701");try expectEqual(fixture.posts,1)
+        try expectEqual(fixture.runs,4,"Only observation repeats; selection and Cmd-T each run once")
+        try expectEqual(reads[2],3);try expectEqual(reads[3],3);try expectEqual(reads[4],3)
     }
 
     func testTerminalTabScriptsOnlyWriteConfirmedIdleNewTab() throws {

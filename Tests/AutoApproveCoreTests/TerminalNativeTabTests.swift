@@ -3,6 +3,65 @@ import JavaScriptCore
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testTerminalProfileReadinessWaitsOnlyForObservations() throws {
+        var now:TimeInterval=0,reads=0,pauses=0
+        let result:Int=try TerminalProfileReadiness.wait(timeout:1,message:"late",clock:{now},pause:{now+=$0;pauses+=1}) {
+            reads+=1;return reads==4 ? 42:nil
+        }
+        try expectEqual(result,42);try expectEqual(reads,4);try expectEqual(pauses,3);try expect(now<0.1)
+        now=0;reads=0
+        try expectThrows(try TerminalProfileReadiness.wait(timeout:0.05,message:"bounded",clock:{now},pause:{now+=$0},read:{() -> Bool? in reads+=1;return nil}))
+        try expectEqual(now,0.05);try expect(reads<=4)
+        reads=0
+        try expectThrows(try TerminalProfileReadiness.wait(message:"denied",read:{() throws -> Bool? in reads+=1;throw TerminalProfileAccessError.accessibilityDenied}))
+        try expectEqual(reads,1,"Permission and source errors cannot become retry loops")
+    }
+
+    func testTerminalProfileCaptureFocusVerifiesPreviousAndReturnsSelectionInOneScript() throws {
+        let context=JSContext()!
+        context.evaluateScript("""
+        var front=true,activations=0;
+        function makeWindow(id,tty){
+          let minimized=false;
+          const tab={tty:()=>tty,selected:()=>true},window={id:()=>id,tabs:()=>[tab]};
+          Object.defineProperty(window,'selectedTab',{get:()=>()=>tab,set:value=>{if(value!==tab)throw Error('foreign tab');}});
+          Object.defineProperty(window,'miniaturized',{get:()=>()=>minimized,set:value=>{minimized=value;}});
+          return window;
+        }
+        const a=makeWindow(77,'/dev/ttys700'),b=makeWindow(78,'/dev/ttys701');
+        const app={windows:()=>[a,b],frontmost:()=>front,activate:()=>{activations++;front=true;}};
+        function Application(){return app;}
+        """)
+        let previous=TerminalWindowMetadata(tty:"/dev/ttys700",windowID:77,ownerPID:1009001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)
+        let text=context.evaluateScript(try TerminalProfileTopology.focusScript(tty:"/dev/ttys701",previous:previous))?.toString()
+        try expectNil(context.exception);try expectEqual(text,#"{"tty":"/dev/ttys701","windowID":78,"selected":true,"minimized":false}"#)
+        try expectEqual(context.evaluateScript("activations")?.toInt32(),1)
+        context.evaluateScript("front=false;")
+        _ = context.evaluateScript(try TerminalProfileTopology.focusScript(tty:"/dev/ttys701",previous:previous))
+        try expect(context.exception != nil);context.exception=nil
+        try expectEqual(context.evaluateScript("activations")?.toInt32(),1,"A changed previous focus cannot select another tab")
+        context.evaluateScript("front=true;")
+        var stale=previous;stale.windowID=99
+        _ = context.evaluateScript(try TerminalProfileTopology.focusScript(tty:"/dev/ttys701",previous:stale))
+        try expect(context.exception != nil);context.exception=nil
+        try expectEqual(context.evaluateScript("activations")?.toInt32(),1)
+        try expectThrows(try TerminalProfileTopology.focusScript(tty:"/dev/foreign"))
+    }
+
+    func testTerminalProfileShellReadinessAllowsSlowStartupWithoutRepeatingActions() throws {
+        let context=JSContext()!
+        context.evaluateScript("""
+        var checks=0,sleeps=0;
+        const old={tty:()=>'/dev/ttys700'},tab={tty:()=>'/dev/ttys701',busy:()=>{checks++;return checks<60;},processes:()=>['-zsh']};
+        const window={id:()=>77,tabs:()=>[old,tab]};
+        function Application(){return {windows:()=>[window]};}
+        const ObjC={import:()=>{}};const $={NSThread:{sleepForTimeInterval:()=>{sleeps++;}}};
+        """)
+        let result=context.evaluateScript(try TerminalProfileTabOpener.confirmationScript(anchorTTY:"/dev/ttys700",windowID:77,previousTTYs:["/dev/ttys700"]))?.toString()
+        try expectNil(context.exception);try expectEqual(result,#"{"tty":"/dev/ttys701","windowID":77}"#)
+        try expectEqual(context.evaluateScript("checks")?.toInt32(),60);try expectEqual(context.evaluateScript("sleeps")?.toInt32(),59)
+    }
+
     func testTerminalNativeCaptureUsesRealGroupInsteadOfScriptingWindows() throws {
         let rows=[TerminalProfileTabSnapshot(tty:"/dev/ttys702",windowID:102,windowOrder:0,tabOrder:0,selected:true,customTitle:"동일 제목"),
                   .init(tty:"/dev/ttys703",windowID:103,windowOrder:1,tabOrder:0,selected:true,customTitle:"동일 제목"),

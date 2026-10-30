@@ -96,21 +96,17 @@ import AutoApproveCore
             }
             // AppKit can publish its AX tree a run-loop turn after window
             // creation. Wait for the observed condition without repeating it.
-            let additionDeadline=ProcessInfo.processInfo.systemUptime+1
-            var newGroup=try reader.focusedGroup()
-            while newGroup?.addingOneTab(to:before) != true,ProcessInfo.processInfo.systemUptime<additionDeadline {
-                Thread.sleep(forTimeInterval:0.01);newGroup=try reader.focusedGroup()
+            let added:TerminalNativeTabGroup=try TerminalProfileReadiness.wait(message:"New native tab was not recognized") {
+                guard let group=try reader.focusedGroup(),group.addingOneTab(to:before) else {return nil}
+                return group
             }
             report["beforeAddition"]=["id":before.id,"tabs":before.tabs,"selected":before.selected]
-            if let newGroup {report["afterAddition"]=["id":newGroup.id,"tabs":newGroup.tabs,"selected":newGroup.selected]}
-            guard let added=newGroup,added.addingOneTab(to:before) else {throw AppError.message("New native tab was not recognized")}
+            report["afterAddition"]=["id":added.id,"tabs":added.tabs,"selected":added.selected]
             DispatchQueue.main.sync {self.windows[1].makeKeyAndOrderFront(nil)}
-            let anchorDeadline=ProcessInfo.processInfo.systemUptime+1
-            var anchor=try reader.focusedGroup()
-            while anchor?.selected==added.selected,ProcessInfo.processInfo.systemUptime<anchorDeadline {
-                Thread.sleep(forTimeInterval:0.01);anchor=try reader.focusedGroup()
+            let _:TerminalNativeTabGroup=try TerminalProfileReadiness.wait(message:"Anchor and new window do not share the exact bar") {
+                guard let anchor=try reader.focusedGroup(),anchor.id==added.id,anchor.tabs==added.tabs,anchor.selected != added.selected else {return nil}
+                return anchor
             }
-            guard let anchor,anchor.id==added.id,anchor.tabs==added.tabs,anchor.selected != added.selected else {throw AppError.message("Anchor and new window do not share the exact bar")}
             report.merge(["passed":true,"nativeGroups":baseline.count,"scriptingWindowCount":rows.count,"capturedWindowGroups":Set(captured.map(\.windowID)).count,"originalSelectionRestored":true,"newTabVerifiedAcrossWindowIDs":true,"duplicateTitles":true]) {_,new in new}
         } catch {report["passed"]=false;report["error"]=error.localizedDescription}
         let root=URL(fileURLWithPath:Bundle.main.object(forInfoDictionaryKey:"NativeTabsQAOutput") as! String)

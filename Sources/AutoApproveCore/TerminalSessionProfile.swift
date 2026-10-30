@@ -213,7 +213,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
 @MainActor public final class TerminalProfileRestorer {
     public private(set) var busy=false
     // nil TTY means an ambiguous write: it cannot be replayed automatically.
-    private struct Receipt {var tty:String?}
+    private struct Receipt {var tty:String?;var failure:String? = nil}
     private var dispatched:[String:Receipt]=[:]
     public init() {}
     public func restore(_ profile: TerminalSessionProfile,selected: Set<UUID>,active: [TerminalProfileEntry],
@@ -262,7 +262,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             let key=group(entry)
             let result:TerminalProfileRestoreResult
             if !active.contains(where:{$0.key == entry.key}),let receipt=dispatched[entry.key],receipt.tty == nil {
-                result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 항목을 다시 열기 전에 터미널을 확인해주세요.")
+                result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 항목을 다시 열기 전에 터미널을 확인해주세요."+(receipt.failure.map {" 원인: "+$0} ?? ""))
             } else if active.contains(where:{$0.key == entry.key}) || dispatched[entry.key] != nil {
                 result = .init(id:entry.id,phase:.alreadyOpen,detail:"이미 열려 있거나 복원 명령을 전달한 세션입니다.")
             } else if key.map({blocked.contains($0)}) == true {
@@ -284,6 +284,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 catch {
                     let notStarted=(error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started"
                     if notStarted {dispatched.removeValue(forKey:entry.key)}
+                    else {dispatched[entry.key]?.failure=error.localizedDescription}
                     if let key {blocked.insert(key)}
                     result = .init(id:entry.id,phase:notStarted ? .failed:.needsReview,detail:notStarted ? error.localizedDescription:"복원 결과를 확인하지 못했습니다. 중복 실행 전에 터미널을 확인해주세요. "+error.localizedDescription)
                 }
@@ -341,7 +342,7 @@ public enum TerminalProfileLauncher {
         let entry=try entry.validated()
         return try await Task.detached(priority:.userInitiated) {
             var targetTTY:String?
-            if entry.host == .terminal,let settings=entry.terminalTab?.settingsName {
+            if entry.host == .terminal,anchorTTY != nil,let settings=entry.terminalTab?.settingsName {
                 let name=try AutomationScript.literal(settings)
                 do {_ = try AutomationScript.run("const app=Application('com.apple.Terminal'); if(!app.settingsSets.byName(\(name)).exists())throw Error('저장한 Terminal 설정 프로필이 없습니다.'); 'ready';",app:"Terminal",denied:.permissionDenied)}
                 catch {throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])}
