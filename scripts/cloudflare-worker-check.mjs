@@ -24,7 +24,7 @@ const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(test,label,time=30000){const deadline=Date.now()+time;while(!await test()){if(Date.now()>deadline)throw Error(label);await wait(30);}}
 const origin='https://relay.tunnel-qa.invalid',host=new URL(origin).hostname,key=Buffer.alloc(32,91).toString('base64url');
 const hash=createHash('sha256').update(key).digest('hex');let mf,server,fixture,tls,proxy,browser,page,drop,dropSocketACK,holdInputResponse,connections=0,connectorAttempts=0,publicProbes=0;const sockets=new Set(),streamResponses=new Set(),requests=[],proxySockets=new Set(),errors=[],shutdownDiagnostics=[];
-const wire={compressedFrames:0,compressedBytes:0,expandedBytes:0,socketFrames:0,screenNotModified:0,silentInputPongsDropped:0};let stage='startup';
+const wire={compressedFrames:0,compressedBytes:0,expandedBytes:0,socketFrames:0,screenNotModified:0,silentInputPongsDropped:0,connectorPings:0};let stage='startup';
 let dropOneInputPong=false;
 let typingLatency=null,silentRecoveryMS=null;
 async function run() {
@@ -66,6 +66,7 @@ try{
    wsServer.handleUpgrade(req,socket,head,client=>{
     connections++;
     const connector=req.url==='/_autoapprove/connector';
+    client.on('ping',()=>{if(connector)wire.connectorPings++;});
     client.autoapprovePath=req.url;
     sockets.add(client);client.on('message',(data,binary)=>{
      if(connector&&binary){const bytes=new Uint8Array(data);if(bytes[3]===9){wire.compressedFrames++;wire.compressedBytes+=bytes.length;wire.expandedBytes+=new DataView(bytes.buffer,bytes.byteOffset+8,4).getUint32(0);}if(bytes[3]===7){wire.socketFrames++;if(dropOneInputPong&&bytes[11]===7){dropOneInputPong=false;wire.silentInputPongsDropped++;return;}if(dropSocketACK&&bytes[11]===4){dropSocketACK.accepted++;dropSocketACK.frames?.push({upstream,data});return;}}}
@@ -121,10 +122,19 @@ try{
  await until(async()=>{try{status=JSON.parse(await readFile(root+'/status.json','utf8'));return status.phase==='reconnecting';}catch{return false;}},'reconnecting');
  await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','reconnected');
  assert.equal((await get('/api/state',auth)).status,200);assert.equal(await readFile(root+'/writes','utf8'),'1');
+ if(process.argv.includes('--healthy-probes')){
+  stage='consecutive healthy probes';const before=wire.connectorPings,open=connections;
+  await until(()=>wire.connectorPings>=before+2,'Successful pong must release the pending probe for later periodic checks',45000);
+  assert.equal(connections,open,'Healthy probes must not reconnect the connector');
+  assert.equal((await get('/api/state',auth)).status,200);
+ }
  if(process.argv.includes('--soak')) {
   stage='silent transport recovery';const before=connections,began=performance.now();
   for(const socket of sockets)socket._socket.pause();
-  await until(()=>connections>before,'Pong deadline must reconnect a silent socket',45000);
+  const storm=process.argv.includes('--recovery-storm');
+  if(storm)await writeFile(root+'/recovery-storm','signal');
+  await until(()=>connections>before,'Pong deadline must reconnect a silent socket despite repeated network return notifications',storm?8000:45000);
+  if(storm)await rm(root+'/recovery-storm');
   await until(async()=>JSON.parse(await readFile(root+'/status.json','utf8')).phase==='ready','Public proof after silent recovery');
   silentRecoveryMS=Math.round(performance.now()-began);
   assert.equal((await get('/api/state',auth)).status,200);assert.equal(await readFile(root+'/writes','utf8'),'1');
@@ -330,7 +340,7 @@ try{
  stage='logout';assert.equal((await fetch(url+'/auth/logout',{method:'POST',headers:{Host:host,Origin:origin,...auth,'Content-Type':'application/json'},body:'{}'})).status,200);
  assert.equal((await get('/api/state',auth)).status,401);
  await writeFile(root+'/stop','stop');await new Promise(resolve=>fixture.once('exit',resolve));assert.equal(fixture.exitCode,0);
- const report={passed:true,pinMode,socketMode,lateInput,connectorFaults,connectorAttempts,probeFaults,publicProbes,readyMS,legDelay,typingLatency,wire,silentRecovery:process.argv.includes('--soak'),silentRecoveryMS,connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control and measured compression','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
+ const report={passed:true,pinMode,socketMode,lateInput,connectorFaults,connectorAttempts,probeFaults,publicProbes,readyMS,legDelay,typingLatency,wire,silentRecovery:process.argv.includes('--soak'),repeatedRecoverySignals:process.argv.includes('--recovery-storm'),silentRecoveryMS,connections,scope:'Local actual workerd Durable Object, production native WSS agent/gateway and private PTYs; no Cloudflare account, DNS or user terminals',checks:['public nonce','mandatory browser auth and secure cookie','connector secret distinct from browser key','binary unicode/escape input','1MiB response with credit flow control and measured compression','reconnect retains cookie and never replays POST',...browserChecks,'logout and native stop'],errors,shutdownDiagnostics,requests:requests.length};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
 }catch(error){await page?.screenshot({path:out+'/failure.png'}).catch(()=>{});await writeFile(out+'/failure.json',JSON.stringify({stage,error:error.message,diagnostics:await readFile(root+'/diagnostics','utf8').catch(()=>''),requests},null,2));throw error;}
 finally{

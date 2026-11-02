@@ -63,6 +63,7 @@ private final class RelayOriginal:@unchecked Sendable {
             if let file=try? FileHandle(forWritingTo:path) {defer{try? file.close()};try? file.seekToEnd();try? file.write(contentsOf:Data((value+"\n").utf8))}
         })
         var writes=0
+        let recovery=RemoteNetworkRecovery(observesSystem:false)
         let controller=CloudflareRelayController(handler:{request in
             if request.path=="/api/large" {return RemoteHTTPResponse(body:Data(repeating:97,count:1_048_576),contentType:"application/octet-stream")}
             if request.path=="/api/echo" {
@@ -74,7 +75,7 @@ private final class RelayOriginal:@unchecked Sendable {
                 if let file=try? FileHandle(forWritingTo:path) {defer{try? file.close()};_ = try? file.seekToEnd();try? file.write(contentsOf:Data((id+"\n").utf8))}
             }
             return await web.handle(request)
-        },services:services,onStatus:{status in
+        },services:services,recovery:recovery,onStatus:{status in
             let value:[String:String]=["phase":status.phase,"detail":status.detail,"local":status.localURL ?? ""]
             try? JSONSerialization.data(withJSONObject:value).write(to:root.appendingPathComponent("status.json"),options:.atomic)
         })
@@ -83,7 +84,10 @@ private final class RelayOriginal:@unchecked Sendable {
         let credential=CloudflareRelayCredential(script:"autoapprove-relay-"+String(repeating:"a",count:32),origin:origin,key:key)
         try await controller.start(configuration,credential:JSONEncoder().encode(credential),pin:pin)
         print(String(decoding:try JSONSerialization.data(withJSONObject:["key":controller.accessKey!,"owner":"http://127.0.0.1:\(webPort)"]),as:UTF8.self));fflush(stdout)
+        var lastRecoverySignal = -Double.infinity
         while true {
+            let now=ProcessInfo.processInfo.systemUptime
+            if FileManager.default.fileExists(atPath:root.appendingPathComponent("recovery-storm").path),now-lastRecoverySignal>=0.3 {lastRecoverySignal=now;recovery.notifyAvailable()}
             if (try? String(contentsOf:root.appendingPathComponent("pin-control"),encoding:.utf8))=="rotate" {
                 let next=try await Task.detached {try RemoteTunnelPIN.create("009876")}.value
                 controller.setPIN(next,accessKey:String(repeating:"m",count:43));try FileManager.default.removeItem(at:root.appendingPathComponent("pin-control"))

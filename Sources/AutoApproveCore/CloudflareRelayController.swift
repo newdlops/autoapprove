@@ -70,6 +70,7 @@ public struct CloudflareRelayCredential:Codable,Sendable {
                     let response = socket.task.response as? HTTPURLResponse
                     let healthyFor = self.connectedAt.map {ProcessInfo.processInfo.systemUptime-$0} ?? 0
                     self.watchdog?.cancel();self.ping?.cancel();self.pingDeadline?.cancel();self.probe?.cancel()
+                    self.pingDeadline=nil
                     self.monitor?.stop();self.socket = nil;self.agent = nil;self.connectedAt = nil
                     guard self.generation==epoch,!Task.isCancelled else {return}
                     if let status = response?.statusCode,[401,403].contains(status) {
@@ -105,16 +106,21 @@ public struct CloudflareRelayCredential:Codable,Sendable {
         else {checkSocket(socket,epoch:generation,id:connection,timeout:3)}
     }
     private func checkSocket(_ socket:CloudflareRelaySocket,epoch:UUID,id:UUID,timeout:TimeInterval) {
-        let token = UUID();heartbeat = token;pingDeadline?.cancel()
+        // Link/wake notifications may repeat while a socket is silent. Keep
+        // the first probe's deadline: restarting it could postpone recovery
+        // indefinitely, and also queues redundant WebSocket pings.
+        guard pingDeadline == nil else {return}
+        let token = UUID();heartbeat = token
         let deadline = Task { [weak self] in
             do {try await Task.sleep(for:.seconds(timeout))} catch {return}
-            guard let self,self.generation == epoch,self.connection == id,self.heartbeat == token else {return};socket.cancel()
+            guard let self,self.generation == epoch,self.connection == id,self.heartbeat == token else {return};self.pingDeadline=nil;socket.cancel()
         }
         pingDeadline = deadline;let began = ProcessInfo.processInfo.systemUptime
         socket.task.sendPing { [weak self] error in
             deadline.cancel()
             Task { @MainActor [weak self] in
                 guard let self,self.generation == epoch,self.connection == id,self.heartbeat == token else {return}
+                self.pingDeadline=nil
                 if error != nil {socket.cancel();return}
                 self.qualityTracker.connectorPing(milliseconds:(ProcessInfo.processInfo.systemUptime-began)*1000)
                 self.status.quality = self.qualityTracker.snapshot();self.onStatus(self.status)
