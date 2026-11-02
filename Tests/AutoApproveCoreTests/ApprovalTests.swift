@@ -590,8 +590,15 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("AI account login: encrypted PIN, node scope, replay, stale requests and revocation",tests.testAccountCryptoPINReplayAndScope),
             ("AI account login: bounded PIN attempts",tests.testAccountPINAttemptsAreBounded),
             ("AI account login: native scoped home, shared exclusion and remote isolation",tests.testNativeCodexLoginSharedOwnershipAndScopedHome),
-            ("Account transition: missing conversation proof blocks before every side effect",tests.testAccountTransitionMissingConversationProofStopsBeforeAnyEffect),
+            ("Account transition: all original conversations and processes prove empty TUI reconnection",tests.testAccountTransitionMissingConversationProofStopsBeforeAnyEffect),
+            ("Account transition: fresh reconnect barrier rejects account and membership races",tests.testAccountTransitionReconnectionFreshBarrierRejectsAccountAndMembershipRaces),
+            ("Account transition: persisted offscreen conversations need not stay loaded",tests.testAccountTransitionOffscreenConversationsDoNotNeedToStayLoaded),
+            ("Account transition: idle Goals and owned background jobs stop once before restart",tests.testAccountTransitionQuiescesIdleGoalAndBackgroundWorkOnce),
+            ("Account transition: engine stop cancels manual check remaining mutations",tests.testAccountTransitionManualCheckStopsRemainingMutationsOnEngineStop),
+            ("Account transition: worker waiting retains the queued-message barrier",tests.testAccountTransitionQuiescesWorkersThenPreservesQueueBarrier),
+            ("Account transition: native login starts all sessions without a settings view",tests.testNativeCodexLoginStartsAllSessionTransitionWithoutAnySettingsView),
             ("AI account login: literal executable and Codex home with shell punctuation",tests.testNativeCodexLoginLiteralExecutableAndHome),
+            ("AI account login: native browser OAuth URL scope and remote device isolation",tests.testNativeCodexBrowserURLScopeAndRemoteDeviceIsolation),
             ("AI account login: official challenge URL allowlist",tests.testAccountChallengeOnlyAcceptsOfficialProviderURLs),
             ("AI account login: private PTY ownership, exact code, cancel and hidden inventory",tests.testAccountPrivateLoginOwnershipCancelAndInventory),
             ("Native typing: answered permission survives composer repaint",tests.testAnsweredPermissionSurvivesManualComposerRepaints),
@@ -1139,6 +1146,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         ]
 #if DEBUG
         cases.insert(contentsOf: [
+            ("Account transition: queued completion is invalid after manager replacement", tests.testNativeCodexLoginReplacementInvalidatesAlreadyQueuedCompletion),
+            ("Account transition: native login wakes parked polling immediately", tests.testNativeCodexLoginWakesPollingWithoutWaitingThirtySeconds),
             ("Idle poller observations park until source change or cancellation", tests.testIdleObservationWaitsForChangeOrCancellation),
             ("Terminal stream: reused JSON encoder preserves equivalent screen and heartbeat data", tests.testTerminalStreamEncoderReusePreservesWireBytes),
             ("Managed Mac load: stale NFS descriptor paths do not abort open-file discovery", tests.testDescriptorPathReaderSkipsOnlyTransientFDPathErrors),

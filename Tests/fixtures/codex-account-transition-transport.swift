@@ -4,8 +4,32 @@ import AutoApproveCore
 @main struct AccountTransitionTransportCheck {
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
-        let target = CodexAccountTransitionTarget(home: args[1], executable: args[2])
+        var target = CodexAccountTransitionTarget(home: args[1], executable: args[2])
         let mode = args[3], service = CodexAccountTransitionServices.live
+        if mode == "official-lifecycle" {
+            guard target.home.hasPrefix("/private/tmp/aa-account-real-cli-"), args.count == 6,
+                  let first=Int32(args[4]),let second=Int32(args[5]),first != second else {throw AppError.message("Owned temporary official fixture required")}
+            let pids:Set<Int32>=[first,second]
+            let records=try ProcessDiscovery.read().filter{pids.contains($0.pid)}
+            let discovered=try await CodexAccountTransitionTarget.discover(records)
+            let canonical=URL(fileURLWithPath:target.home).standardizedFileURL.resolvingSymlinksInPath().path
+            guard discovered.count==1,discovered[0].home==canonical,discovered[0].witnesses.count==2 else {throw AppError.message("Owned TUI identity or common server missing")}
+            target=discovered[0]
+            let before=try await service.observe(target)
+            guard before.threads.count==2,before.threads.allSatisfy({!$0.active && $0.blocker==nil}),target.witnesses.allSatisfy({$0.threadID==nil}) else {throw AppError.message("Expected two empty owned conversations without rollout witnesses")}
+            let journal=URL(fileURLWithPath:target.home).appendingPathComponent("autoapprove-transition-fixture.json")
+            let coordinator=CodexAccountTransitionCoordinator(target:target,services:service,save:{state in try JSONEncoder().encode(state).write(to:journal,options:.atomic)})
+            for _ in 0..<100 {
+                await coordinator.check()
+                if coordinator.state.phase == .complete {
+                    guard coordinator.state.verified==2 else {throw AppError.message("Not every owned TUI reconnected")}
+                    print("{\"verified\":true,\"officialLifecycle\":true,\"originalProcesses\":2,\"originalConversations\":2,\"withoutRolloutWitnesses\":true}");return
+                }
+                if [.review,.unsupported].contains(coordinator.state.phase) {throw AppError.message(coordinator.state.detail)}
+                try await Task.sleep(for:.milliseconds(250))
+            }
+            throw AppError.message("Owned official lifecycle did not finish")
+        }
         if mode == "reject" {
             do { _ = try await service.observe(target) }
             catch { print("{\"rejected\":true}"); return }
@@ -30,6 +54,11 @@ import AutoApproveCore
             do { try await task.value }
             catch is CancellationError { print("{\"cancelled\":true}"); return }
             throw AppError.message("Cancelled inspection still sent an interrupt")
+        } else if mode == "quiesce" || mode == "queued-worker" {
+            let thread=observed.threads.first(where:{$0.active || $0.blocker != nil})!
+            if mode == "queued-worker" {guard ["활성 Goal","백그라운드 작업"].contains(thread.blocker ?? "") else {throw AppError.message("Queue masked a worker that must stop")}}
+            try await service.interrupt(target,observed.serverID,thread.id,thread.turnID!)
+            if mode == "queued-worker" {let after=try await service.observe(target);guard after.threads.first(where:{$0.id==thread.id})?.blocker=="대기 입력" else {throw AppError.message("Queued message was lost during work cleanup")}}
         } else if mode == "interrupt" {
             let thread = observed.threads.first(where: \.active)!
             try await service.interrupt(target, observed.serverID, thread.id, thread.turnID!)

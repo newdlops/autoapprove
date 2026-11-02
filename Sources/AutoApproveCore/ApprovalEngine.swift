@@ -40,7 +40,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let nativeKeyboardActivity:NativeKeyboardActivity
     let publishedUpdateServices:PublishedUpdateServices
     public let managedPTY: ManagedPTYManager
-    public var agentAccounts=AgentAccounts()
+    public var agentAccounts=AgentAccounts() {didSet {configureNativeCodexLogin()}}
     let accountPINReader=RemoteAccountPINReader()
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
@@ -364,6 +364,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
     private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
     private var codexAccountTransitionTask: Task<Void, Never>?
+    private var codexAccountCheckTask:Task<Void,Never>?
+    private var codexAccountNativeWakePending=false
+    private let codexAccountTransitionSignal=RemoteTerminalChangeSignal()
     private var codexAccountTransitionEpoch = UUID()
     private static let codexAccountJournalKey = "codexAccountTransitions.v1"
     private func codexAccountInputHeld(_ id: String) -> Bool { sessions[id]?.agent == .codex && codexAccountTransitionHeld }
@@ -516,6 +519,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sessions[value.id] = value
             }
         }
+        configureNativeCodexLogin()
+    }
+    private func configureNativeCodexLogin() {
+        let accounts=agentAccounts
+        accounts.nativeCodexLoginCompleted={ [weak self,weak accounts] _ in
+            guard let self,let accounts,self.agentAccounts === accounts,!self.remoteInputStopped else{return}
+            let epoch=self.codexAccountTransitionEpoch
+            Task { [weak self,weak accounts] in
+                guard let self,let accounts,self.agentAccounts === accounts,!self.remoteInputStopped,self.codexAccountTransitionEpoch==epoch else{return}
+                do {
+                    self.codexAccountNativeWakePending=true
+                    if !self.codexAccountTransitionEnabled {try self.setCodexAccountTransitionEnabled(true)}
+                    await self.checkCodexAccountTransitions()
+                    self.codexAccountTransitionSignal.notify()
+                } catch {self.codexAccountNativeWakePending=false;self.codexAccountTransitionNotice="로그인은 완료됐지만 자동 전환 설정을 저장하지 못했습니다. 현재 로그인 확인으로 다시 확인해주세요."}
+            }
+        }
     }
     static func connectionGuide(_ session: AgentSession) -> String {
         if let host = ScreenHost(kind: session.terminal) { return "연결 설정에서 \(host.title) 연결 또는 Claude 훅을 설정하세요." }
@@ -591,6 +611,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func stop() {
         codexAccountTransitionEpoch = UUID()
         codexAccountTransitionTask?.cancel(); codexAccountTransitionTask = nil
+        codexAccountCheckTask?.cancel();codexAccountCheckTask=nil
+        codexAccountTransitionBusy=false;codexAccountNativeWakePending=false
         osPermissionEpoch=UUID()
         osPermissionTransitions.removeAll()
         osPermissionTask?.cancel();osPermissionTask=nil
@@ -5658,9 +5680,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return try await codexAccountTargetReader(records)
     }
     public func checkCodexAccountTransitions() async {
+        guard codexAccountCheckTask==nil else{return}
+        let epoch=codexAccountTransitionEpoch
+        let task=Task { [weak self] in
+            guard let self else{return}
+            await self.performCodexAccountTransitionCheck(epoch:epoch)
+        }
+        codexAccountCheckTask=task
+        await withTaskCancellationHandler(operation:{await task.value},onCancel:{task.cancel()})
+        if epoch==codexAccountTransitionEpoch {
+            codexAccountCheckTask=nil
+            if codexAccountNativeWakePending {codexAccountNativeWakePending=false;codexAccountTransitionSignal.notify()}
+        }
+    }
+    private func performCodexAccountTransitionCheck(epoch:UUID) async {
+        guard epoch==codexAccountTransitionEpoch else{return}
         guard !remoteInputStopped, !codexAccountTransitionBusy, codexAccountTransitionEnabled || codexAccountTransitionHeld else { return }
-        codexAccountTransitionBusy = true; defer { codexAccountTransitionBusy = false }
-        let epoch = codexAccountTransitionEpoch
+        codexAccountTransitionBusy = true; defer {if epoch==codexAccountTransitionEpoch {codexAccountTransitionBusy = false}}
         do {
             let reader = processReader
             let records = try await Task.detached(priority: .utility) { try reader() }.value
@@ -5738,11 +5774,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private func startCodexAccountTransitionPolling() {
         guard codexAccountTransitionTask == nil else { return }
+        let observation=codexAccountTransitionSignal.observe()
         codexAccountTransitionTask = Task { [weak self] in
+            await observation.waitForChange(timeout:0)
             while !Task.isCancelled, let self {
                 await self.checkCodexAccountTransitions()
                 let delay: Double = self.codexAccountTransitionHeld && !self.codexAccountTransitionStates.values.allSatisfy({ !$0.held || $0.phase == .review }) ? 2 : 30
-                do { try await Task.sleep(for: .seconds(delay)) } catch { break }
+                await observation.waitForChange(timeout:delay)
             }
         }
     }

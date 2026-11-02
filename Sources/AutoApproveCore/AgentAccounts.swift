@@ -15,6 +15,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     private final class Job {
         let id:String,owner:String,agent:String,expires:Date,tty:String
         let services:AgentAccountServices
+        var browser=false
         var codexHome:String?
         var terminal:ManagedPTY?,task:Task<Void,Never>?,sequence=0
         let writer=UUID().uuidString
@@ -37,6 +38,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     private let codexServices:@Sendable(CodexAccountTransitionTarget) throws -> AgentAccountServices
     private let nativeOwner=UUID().uuidString
     private var nativeJob:String?
+    var nativeCodexLoginCompleted:((String)->Void)?
     private var crypto=AgentAccountCrypto(),generation=UUID()
     private var grants:[String:Date]=[:],jobs:[String:Job]=[:],seen:[String:Date]=[:]
     private var failures:[Date]=[],unlocking=false,pinStamp=""
@@ -49,7 +51,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     }
     public func beginNativeCodexLogin(_ target:CodexAccountTransitionTarget) throws {
         let job=try begin(agent:"codex",id:UUID().uuidString,owner:nativeOwner,services:codexServices(target))
-        job.codexHome=target.home;nativeJob=job.id
+        job.browser=true;job.codexHome=target.home;nativeJob=job.id
     }
     public func cancelNativeCodexLogin() {
         guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner,job.active else {return}
@@ -160,12 +162,15 @@ public struct NativeCodexLoginState: Equatable, Sendable {
             do {
                 let output=try terminal.read(after:offset);offset=output.offset
                 if let data=Data(base64Encoded:output.data) {buffer+=String(decoding:data,as:UTF8.self);if buffer.utf8.count>24000 {buffer=String(buffer.suffix(16000))}}
-                let challenge=AgentAccountOutput.challenge(buffer,agent:job.agent)
+                let challenge=AgentAccountOutput.challenge(buffer,agent:job.browser ? "codex-browser":job.agent)
                 if let url=challenge.url {job.url=url;if let code=challenge.code {job.code=code};if job.phase=="starting" {job.phase="waiting"}}
                 if let exit=output.exitCode {
                     job.phase="verifying";let state=try await job.services.check(job.agent)
                     guard !Task.isCancelled,epoch==generation,job.active else {return}
-                    if exit==0,state.phase=="authenticated" {job.finish("succeeded","이 Mac에서 로그인했습니다.")}
+                    if exit==0,state.phase=="authenticated" {
+                        job.finish("succeeded","이 Mac에서 로그인했습니다.")
+                        if job.owner==nativeOwner,let home=job.codexHome {nativeCodexLoginCompleted?(home)}
+                    }
                     else if buffer.lowercased().contains("expired") {job.finish("expired","인증 코드가 만료됐습니다. 다시 로그인해주세요.")}
                     else {job.finish("failed","로그인을 완료하지 못했습니다. CLI 버전·인터넷 연결·계정의 인증 허용 설정을 확인한 뒤 다시 시도해주세요.")}
                     cachedAt = .distantPast;return

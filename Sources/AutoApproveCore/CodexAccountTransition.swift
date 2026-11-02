@@ -22,6 +22,8 @@ public struct CodexAccountTransitionThread: Codable, Equatable, Sendable {
     public var turnID: String?
     public var active: Bool
     public var blocker: String?
+    var needsQuiescence:Bool {active || blocker == "활성 Goal" || blocker == "백그라운드 작업"}
+    var stopToken:String {turnID ?? "__autoapprove_idle__"}
     public init(id: String, turnID: String? = nil, active: Bool = false, blocker: String? = nil) {
         self.id = id; self.turnID = turnID; self.active = active; self.blocker = blocker
     }
@@ -39,11 +41,11 @@ public struct CodexAccountTransitionObservation: Sendable {
     public var observe: (CodexAccountTransitionTarget) async throws -> CodexAccountTransitionObservation
     public var interrupt: (CodexAccountTransitionTarget, String, String, String) async throws -> Void
     public var restart: (CodexAccountTransitionTarget, CodexAccountTransitionObservation) async throws -> Void
-    public var verify: (CodexAccountTransitionTarget, [CodexAccountTransitionWitness]) async throws -> Int
+    public var verify: (CodexAccountTransitionTarget, [CodexAccountTransitionWitness], [CodexAccountTransitionThread]) async throws -> Int
     public init(observe: @escaping (CodexAccountTransitionTarget) async throws -> CodexAccountTransitionObservation,
                 interrupt: @escaping (CodexAccountTransitionTarget, String, String, String) async throws -> Void,
                 restart: @escaping (CodexAccountTransitionTarget, CodexAccountTransitionObservation) async throws -> Void,
-                verify: @escaping (CodexAccountTransitionTarget, [CodexAccountTransitionWitness]) async throws -> Int) {
+                verify: @escaping (CodexAccountTransitionTarget, [CodexAccountTransitionWitness], [CodexAccountTransitionThread]) async throws -> Int) {
         self.observe = observe; self.interrupt = interrupt; self.restart = restart; self.verify = verify
     }
 }
@@ -93,10 +95,16 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 guard observed.savedAccount == state.account else {
                     throw AppError.message("전환 중 로그인이 다시 바뀌었습니다. 현재 계정과 연결을 확인해주세요.")
                 }
-                if observed.serverID != state.serverID, observed.serverAccount == state.account {
-                    let verified = try await services.verify(target, state.witnesses)
+                if observed.serverID != state.serverID, observed.serverAccount == state.account, reconnectedThreads(observed) {
+                    let verified = try await services.verify(target, state.witnesses, state.threads)
                     state.verified = verified
                     if verified == state.witnesses.count {
+                        let fresh = try await services.observe(target)
+                        try Task.checkCancellation()
+                        guard fresh.serverID == observed.serverID, fresh.serverAccount == state.account,
+                              fresh.savedAccount == state.account, reconnectedThreads(fresh) else {
+                            throw AppError.message("재연결 확인 중 계정·서버·원래 대화 상태가 바뀌었습니다. 전환 명령은 반복하지 않았습니다.")
+                        }
                         state.phase = .complete
                         state.detail = "새 로그인으로 서버 전환 · 기존 창 \(verified)개 재연결을 확인했습니다. 중단한 작업은 대기 상태입니다."
                         try persist(); return
@@ -120,12 +128,6 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                     }
                     return
                 }
-                let missing = target.witnesses.filter { $0.threadID == nil }.count
-                guard missing == 0 else {
-                    state.phase = .unsupported
-                    state.detail = "대화 ID를 확인할 수 없는 Codex 창 \(missing)개가 있습니다. 빈 대화 창을 닫거나 대화 기록의 연결을 확인한 뒤 ‘현재 로그인 확인’을 눌러주세요. 작업·서버는 변경하지 않았습니다."
-                    changed(state); return
-                }
                 var next = CodexAccountTransitionState()
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
                 next.originalAccount = observed.serverAccount
@@ -144,7 +146,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 guard now.timeIntervalSince(state.since) < 120 else {
                     throw AppError.message("작업의 정상 중단을 확인하지 못했습니다. 다음 작업과 서버 전환은 보류했습니다.")
                 }
-                if thread.active {
+                if thread.needsQuiescence {
                     state.detail = "현재 작업의 정상 종료를 기다립니다. 다음 대화는 아직 중단하지 않았습니다."
                     changed(state); return
                 }
@@ -152,13 +154,14 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 state.detail = "작업 대기 확인 · 다음 대화 확인 중"
                 try persist(); return
             }
-            if let thread = observed.threads.sorted(by: { $0.id < $1.id }).first(where: \.active) {
-                guard let turn = thread.turnID, !turn.isEmpty, state.reservations[thread.id] == nil else {
+            if let thread = observed.threads.sorted(by: { $0.id < $1.id }).first(where: \.needsQuiescence) {
+                let turn=thread.stopToken
+                guard !turn.isEmpty, state.reservations[thread.id] == nil else {
                     throw AppError.message("중단 뒤 새 작업이 시작됐거나 실행 차례를 확인하지 못했습니다. 자동 전환을 멈췄습니다.")
                 }
                 state.waitingThread = thread.id; state.reservations[thread.id] = turn
                 state.phase = .waiting; state.since = now
-                state.detail = "작업 \(state.reservations.count)/\(state.threads.filter(\.active).count)개 순차 중단 · 정상 종료 확인 중"
+                state.detail = "작업 \(state.reservations.count)/\(state.threads.filter(\.needsQuiescence).count)개 순차 대기 전환 · 정상 종료 확인 중"
                 try persist()
                 try await services.interrupt(target, state.serverID, thread.id, turn)
                 return
@@ -210,6 +213,15 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         try persist()
     }
     private func persist() throws { try save(state); changed(state) }
+    private func reconnectedThreads(_ observed: CodexAccountTransitionObservation) -> Bool {
+        // Official TUIs resume their own in-memory thread IDs. The shared
+        // server owns rollout files, so a per-TUI rollout FD is not required.
+        // Require every original conversation and every original process,
+        // then repeat the full account/server/membership barrier before done.
+        (state.threads.isEmpty || !observed.threads.isEmpty) &&
+            Set(observed.threads.map(\.id)).isSubset(of:Set(state.threads.map(\.id))) &&
+            observed.threads.allSatisfy { !$0.active && $0.blocker == nil }
+    }
     private func validate(_ observed: CodexAccountTransitionObservation) throws {
         guard observed.savedAccount == state.account, observed.serverID == state.serverID, observed.serverAccount == state.originalAccount,
               Set(observed.threads.map(\.id)) == Set(state.threads.map(\.id)),

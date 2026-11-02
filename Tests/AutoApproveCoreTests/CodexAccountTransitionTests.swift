@@ -1,5 +1,9 @@
 import Foundation
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 
 @MainActor private final class AccountTransitionRig {
     var target = CodexAccountTransitionTarget(home: "/fixture/home", executable: "/fixture/codex",
@@ -11,6 +15,7 @@ import AutoApproveCore
     var checkReservations = true
     var observeFails = false
     var observeCount = 0
+    var persistedThreads:Set<String>=["a","b"]
     var mutateOnObserve: ((Int) -> Void)?
     lazy var services = CodexAccountTransitionServices(observe: { [unowned self] _ in
         observeCount += 1; mutateOnObserve?(observeCount)
@@ -27,8 +32,10 @@ import AutoApproveCore
         if checkReservations { try expect(saved.last?.restartReserved == true, "Restart must be durably reserved before submission") }
         effects.append("restart")
         if restartFails { throw AppError.message("unknown restart") }
-    }, verify: { [unowned self] _, witnesses in
-        try expectEqual(witnesses, target.witnesses); return verified
+    }, verify: { [unowned self] _, witnesses,threads in
+        try expectEqual(witnesses, target.witnesses)
+        guard Set(threads.map(\.id)).isSubset(of:persistedThreads) else{return 0}
+        return verified
     })
     func coordinator(restored: CodexAccountTransitionState? = nil) -> CodexAccountTransitionCoordinator {
         CodexAccountTransitionCoordinator(target: target, state: restored, services: services, save: { [unowned self] in
@@ -64,20 +71,138 @@ private final class AccountTargetList: @unchecked Sendable {
 }
 
 extension ApprovalTests {
-    func testAccountTransitionMissingConversationProofStopsBeforeAnyEffect() async throws {
-        for idle in [false,true] {
-            let r=AccountTransitionRig()
-            r.target.witnesses.append(.init(pid:43,started:"empty-window",tty:"/dev/fixture-empty",threadID:nil))
-            if idle {r.idle(0);r.idle(1)}
-            let c=r.coordinator()
-            await c.check();await c.check();await c.check(now:Date().addingTimeInterval(121))
-            try expectEqual(c.state.phase,.unsupported)
-            try expectFalse(c.state.held)
-            try expect(r.effects.isEmpty,"Missing conversation identity must block before interrupt or restart")
-            try expect(c.state.detail.contains("대화 ID"))
-            try expect(c.state.detail.contains("현재 로그인 확인"))
-            try expect(c.state.reservations.isEmpty);try expectFalse(c.state.restartReserved)
+    func testAccountTransitionManualCheckStopsRemainingMutationsOnEngineStop() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-stop-check-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig(),target=r.target
+        var events:[String]=[],stop:(()->Void)?
+        var services=r.services
+        services.interrupt={_,_,_,_ in
+            events.append("goal-paused");stop?()
+            try Task.checkCancellation()
+            events.append("background-terminated");events.append("turn-interrupted")
         }
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:services,codexAccountTargets:{_ in [target]})
+        stop={ [weak engine] in engine?.stop() };defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions();await engine.checkCodexAccountTransitions()
+        try expectEqual(events,["goal-paused"],"Engine stop must cancel remaining writes from a manual check")
+        let restored=try ApprovalEngine(paths:.init(directory:root),processReader:{[]});defer{restored.stop()}
+        try expectEqual(restored.codexAccountTransitionStates[target.home]?.phase,.review)
+        try expectNotNil(restored.codexAccountTransitionStates[target.home]?.reservations["a"])
+    }
+    func testAccountTransitionQuiescesWorkersThenPreservesQueueBarrier() async throws {
+        let r=AccountTransitionRig();r.idle(0);r.idle(1)
+        r.observation.threads[0].blocker="활성 Goal"
+        let c=r.coordinator();await c.check();await c.check()
+        r.observation.threads[0].blocker="백그라운드 작업";await c.check()
+        try expectEqual(c.state.waitingThread,"a")
+        r.observation.threads[0].blocker="대기 입력";await c.check();await c.check()
+        try expectEqual(c.state.phase,.waiting);try expectFalse(c.state.restartReserved)
+        try expectEqual(r.effects.count,1);try expect(c.state.detail.contains("대기 입력"))
+    }
+    func testAccountTransitionOffscreenConversationsDoNotNeedToStayLoaded() async throws {
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);let c=r.coordinator()
+        await c.check();await c.check()
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        r.observation.threads.removeLast()
+        await c.check()
+        try expectEqual(c.state.phase,.complete,"Persisted offscreen conversations need not be reattached by a TUI before account application completes")
+    }
+    #if DEBUG
+    func testNativeCodexLoginReplacementInvalidatesAlreadyQueuedCompletion() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-native-replace-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig(),target=r.target
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        let old=engine.agentAccounts
+        old.nativeCodexLoginCompleted?(target.home)
+        engine.agentAccounts=AgentAccounts()
+        for _ in 0..<10 {await Task.yield()}
+        try expectFalse(engine.codexAccountTransitionEnabled,"An old manager's queued completion must not enable the replacement manager")
+        try expectEqual(r.observeCount,0)
+    }
+    func testNativeCodexLoginWakesPollingWithoutWaitingThirtySeconds() async throws {
+        let root=URL(fileURLWithPath:"/private/tmp/aa-wake-"+UUID().uuidString.prefix(8))
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig(),target=r.target
+        r.checkReservations=false
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        try engine.start()
+        try await Task.sleep(for:.milliseconds(100))
+        engine.agentAccounts.nativeCodexLoginCompleted?(target.home)
+        for _ in 0..<100 {if !r.effects.isEmpty {break};try await Task.sleep(for:.milliseconds(20))}
+        try expectFalse(r.effects.isEmpty,"Native login must wake the parked poller without a thirty-second hold")
+    }
+    #endif
+    func testAccountTransitionQuiescesIdleGoalAndBackgroundWorkOnce() async throws {
+        for reason in ["활성 Goal","백그라운드 작업"] {
+            let r=AccountTransitionRig();r.idle(0);r.idle(1)
+            r.observation.threads[0].turnID=nil;r.observation.threads[0].blocker=reason
+            let c=r.coordinator();await c.check();await c.check();await c.check()
+            try expectEqual(r.effects.count,1,"Idle owned work must receive one normal quiesce request")
+            try expectNotNil(c.state.reservations["a"])
+            try expectFalse(c.state.restartReserved)
+            r.observation.threads[0].blocker=nil
+            await c.check();await c.check()
+            try expectEqual(r.effects.filter{$0=="restart"}.count,1)
+        }
+    }
+    func testAccountTransitionMissingConversationProofStopsBeforeAnyEffect() async throws {
+        let r=AccountTransitionRig();r.idle(0);r.idle(1)
+        r.target.witnesses=[.init(pid:42,started:"first",tty:"/dev/fixture",threadID:nil),.init(pid:43,started:"second",tty:"/dev/fixture-empty",threadID:nil)]
+        r.verified=2;let c=r.coordinator()
+        await c.check();await c.check()
+        try expectEqual(c.state.phase,.reconnecting)
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        r.observation.threads.removeLast();r.persistedThreads.remove("b");await c.check()
+        try expectEqual(c.state.phase,.reconnecting,"All original conversations must remain readable, even when every process reconnects")
+        r.observation.threads.append(.init(id:"b",turnID:"turn-b"))
+        r.persistedThreads.insert("b")
+        await c.check();try expectEqual(c.state.phase,.complete)
+        try expectEqual(c.state.verified,2);try expectEqual(r.effects,["restart"])
+    }
+    func testAccountTransitionReconnectionFreshBarrierRejectsAccountAndMembershipRaces() async throws {
+        for mutation in ["account","server","thread","active","queue"] {
+            let r=AccountTransitionRig();r.idle(0);r.idle(1);let c=r.coordinator()
+            await c.check();await c.check()
+            r.observation.serverID="server-2";r.observation.serverAccount="new"
+            let next=r.observeCount+2
+            r.mutateOnObserve={ n in
+                guard n==next else{return}
+                switch mutation {
+                case "account":r.observation.serverAccount="other"
+                case "server":r.observation.serverID="server-3"
+                case "thread":r.observation.threads[0].id="foreign"
+                case "active":r.observation.threads[0].active=true
+                default:r.observation.threads[0].blocker="queued input"
+                }
+            }
+            await c.check();try expectEqual(c.state.phase,.review)
+            try expectEqual(r.effects,["restart"],"A fresh reconnect race must never replay the restart")
+        }
+    }
+    func testNativeCodexLoginStartsAllSessionTransitionWithoutAnySettingsView() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-login-apply-"+UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.checkReservations=false
+        r.target.witnesses=[.init(pid:42,started:"first",tty:"/dev/fixture",threadID:nil),.init(pid:43,started:"second",tty:"/dev/fixture-empty",threadID:nil)];r.verified=2
+        let target=r.target
+        let engine=try ApprovalEngine(paths:.init(directory:root.appendingPathComponent("profile")),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        let services=AgentAccountServices(home:root.path,check:{agent in .init(agent:agent,phase:"authenticated")},launch:{_ in
+            try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","exit 0"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
+        })
+        engine.agentAccounts=AgentAccounts(services:services,codexServices:{_ in services})
+        try expectFalse(engine.codexAccountTransitionEnabled)
+        try engine.agentAccounts.beginNativeCodexLogin(target)
+        for _ in 0..<100 {if engine.codexAccountTransitionStates[target.home]?.phase == .stopping {break};try await Task.sleep(for:.milliseconds(20))}
+        try expect(engine.codexAccountTransitionEnabled,"Successful native login must start application without a settings view")
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.stopping)
+        await engine.checkCodexAccountTransitions()
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.verified,2)
     }
     func testAccountTransitionCancelledReservationSurvivesSignedOutAndUnknownReads() async throws {
         let r = AccountTransitionRig(), c = r.coordinator()
@@ -256,8 +381,9 @@ extension ApprovalTests {
         for reason in ["대기 입력", "백그라운드 작업", "활성 Goal"] {
             let r = AccountTransitionRig(); r.idle(0); r.idle(1); r.observation.threads[0].blocker = reason
             let c = r.coordinator(); for _ in 0..<4 { await c.check() }
-            try expect(r.effects.isEmpty); try expectEqual(c.state.phase, .waiting)
-            try expect(c.state.detail.contains(reason))
+            try expectEqual(r.effects.count,reason == "대기 입력" ? 0:1)
+            try expectEqual(c.state.phase, .waiting)
+            if reason == "대기 입력" {try expect(c.state.detail.contains(reason))}
         }
     }
     func testAccountTransitionAmbiguousEffectsAndPersistenceAreNotRetried() async throws {

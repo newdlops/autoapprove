@@ -41,7 +41,7 @@ struct CodexAccountTransitionSettings: View {
                         }
                         Text(state.detail).foregroundStyle(.primary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                         if !state.threads.isEmpty {
-                            Text("대화 \(state.threads.count)개 · 중단 요청 \(state.reservations.count)개" + (state.restartReserved ? " · 연결 확인 \(state.verified)/\(state.witnesses.count)개" : ""))
+                            Text("대화 \(state.threads.count)개 · 대기 전환 \(state.reservations.count)개" + (state.restartReserved ? " · 연결 확인 \(state.verified)/\(state.witnesses.count)개" : ""))
                                 .font(.caption).monospacedDigit()
                         }
                         DisclosureGroup("서버 위치") {
@@ -62,7 +62,7 @@ struct CodexAccountTransitionSettings: View {
                     .help(enabled ? "현재 저장된 로그인과 연결된 서버를 다시 비교합니다. 확인 필요 상태의 명령은 반복하지 않습니다." : "자동 전환을 켜면 현재 로그인을 확인할 수 있습니다.")
                 if busy { ProgressView().controlSize(.small); Text("확인 중…").font(.caption) }
             }
-            Text("대기 입력·백그라운드 작업·활성 Goal이 남으면 서버 전환을 기다립니다. 새 메시지를 자동 제출하지 않으며 중단한 작업은 직접 이어갈 수 있습니다.")
+            Text("Goal을 일시정지하고 Codex 백그라운드 작업을 종료합니다. 사용자의 대기 메시지는 삭제하지 않으며 남아 있으면 전환을 기다립니다. AutoApprove는 새 메시지를 만들지 않습니다.")
                 .font(.caption).fixedSize(horizontal: false, vertical: true)
             Text("공식 관리형 Codex 0.166.0 이상이 대상입니다. 대화 연결을 확인할 증거가 부족하면 ‘확인 필요’로 표시합니다.")
                 .font(.caption).fixedSize(horizontal: false, vertical: true)

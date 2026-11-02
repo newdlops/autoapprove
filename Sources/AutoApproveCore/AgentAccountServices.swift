@@ -14,9 +14,9 @@ public struct AgentAccountServices:Sendable {
     public static func codex(_ target:CodexAccountTransitionTarget) throws -> Self {
         guard target.home.hasPrefix("/"), !target.home.contains("\0"),
               target.executable == "codex" || target.executable.hasPrefix("/") && !target.executable.contains("\0") else {throw AppError.message("로그인할 Codex 위치를 확인해주세요.")}
-        return live(codexHome:target.home,executable:target.executable)
+        return live(codexHome:target.home,executable:target.executable,browser:true)
     }
-    private static func live(codexHome:String?,executable:String?) -> Self {
+    private static func live(codexHome:String?,executable:String?,browser:Bool=false) -> Self {
         let home=NSHomeDirectory()
         var environment=ProcessInfo.processInfo.environment
         environment["HOME"]=home;environment["BROWSER"]="true";environment["NO_COLOR"]="1"
@@ -42,7 +42,12 @@ public struct AgentAccountServices:Sendable {
                 return AgentAccountState(agent:agent,phase:"unknown")
             }.value
         },launch:{agent in
-            try ManagedPTY(cwd:home,program:"shell",command:["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]+(agent=="codex" ? (codexHome.map{["CODEX_HOME="+$0]} ?? [])+[executable ?? "codex","login","--device-auth"]:["claude","auth","login","--claudeai"]),columns:240,rows:40,environment:env)
+            // A native Mac login uses the CLI's standard browser + loopback
+            // flow. Clear overrides after the login shell has run as well.
+            let nativeBrowser=browser && agent=="codex"
+            let prefix=nativeBrowser ? ["/usr/bin/env","-u","SSH_CONNECTION","-u","SSH_TTY","-u","SSH_CLIENT","-u","BROWSER","NO_COLOR=1"] : ["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]
+            let command=agent=="codex" ? (codexHome.map{["CODEX_HOME="+$0]} ?? [])+[executable ?? "codex","login"]+(nativeBrowser ? []:["--device-auth"]) : ["claude","auth","login","--claudeai"]
+            return try ManagedPTY(cwd:home,program:"shell",command:prefix+command,columns:240,rows:40,environment:env)
         })
     }
 }
@@ -63,6 +68,20 @@ public enum AgentAccountOutput {
     }
     public static func validURL(_ text:String,agent:String)->Bool {
         guard text.utf8.count<=8192,let url=URLComponents(string:text),url.scheme=="https",url.user==nil,url.password==nil,url.port==nil,let host=url.host?.lowercased() else {return false}
-        return agent=="codex" ? host=="auth.openai.com" && url.path=="/codex/device" : host=="claude.com" && url.path=="/cai/oauth/authorize" || ["claude.ai","console.anthropic.com","platform.claude.com","console.claude.ai"].contains(host) && url.path=="/oauth/authorize"
+        if agent=="codex-browser" {
+            guard host=="auth.openai.com",url.percentEncodedPath=="/oauth/authorize",url.fragment==nil,
+                  let items=url.queryItems,items.count<=32,Set(items.map(\.name)).count==items.count else {return false}
+            let params=Dictionary(uniqueKeysWithValues:items.map{($0.name,$0.value ?? "")})
+            guard params["client_id"]=="app_EMoamEEZ73f0CkXaXp7hrann",params["response_type"]=="code",params["code_challenge_method"]=="S256",
+                  let challenge=params["code_challenge"],challenge.range(of:#"^[A-Za-z0-9_-]{43}$"#,options:.regularExpression) != nil,
+                  let state=params["state"],(16...1024).contains(state.utf8.count),
+                  let redirect=params["redirect_uri"],let callback=URLComponents(string:redirect),callback.scheme=="http",
+                  ["127.0.0.1","localhost"].contains(callback.host ?? ""),let port=callback.port,(1...65535).contains(port),
+                  callback.user==nil,callback.password==nil,callback.percentEncodedPath=="/auth/callback",callback.query==nil,callback.fragment==nil else {return false}
+            return true
+        }
+        if agent=="codex" {return host=="auth.openai.com" && url.path=="/codex/device"}
+        guard agent=="claude" else {return false}
+        return host=="claude.com" && url.path=="/cai/oauth/authorize" || ["claude.ai","console.anthropic.com","platform.claude.com","console.claude.ai"].contains(host) && url.path=="/oauth/authorize"
     }
 }

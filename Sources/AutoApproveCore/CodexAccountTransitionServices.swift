@@ -13,8 +13,7 @@ extension CodexAccountTransitionTarget {
                       FileManager.default.isExecutableFile(atPath: record.executable) else { continue }
                 let hints = [ProcessEnvironment.read(record)?["CODEX_HOME"], NSHomeDirectory() + "/.codex"].compactMap { $0 }
                 guard let home = CodexServerLocation.connectedHome(pid: record.pid, hints: hints) else { continue }
-                let location = try? CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: record.pid, expectedStart: record.started))
-                let witness = CodexAccountTransitionWitness(pid: record.pid, started: record.started, tty: session.tty, threadID: location?.threadID)
+                let witness = CodexAccountTransitionWitness(pid: record.pid, started: record.started, tty: session.tty, threadID: nil)
                 if grouped[home] == nil { grouped[home] = Self(home: home, executable: record.executable) }
                 grouped[home]?.witnesses.append(witness)
             }
@@ -34,11 +33,7 @@ extension CodexAccountTransitionServices {
                 guard try CodexAccountTransitionLocal.identity(target) == server else { throw AppError.message("중단 직전 Codex 서버가 바뀌었습니다.") }
                 try Task.checkCancellation()
                 let connection = try CodexQueueConnection(home: target.home)
-                let current = try CodexAccountTransitionLocal.thread(connection, id: thread)
-                guard current.active, current.turnID == turn,
-                      try CodexAccountTransitionLocal.identity(target) == server else { throw AppError.message("중단할 실행 차례나 서버가 바뀌었습니다.") }
-                try Task.checkCancellation()
-                _ = try connection.request("turn/interrupt", ["threadId": thread, "turnId": turn])
+                try CodexAccountTransitionLocal.quiesce(connection,target:target,server:server,id:thread,token:turn)
             }
         }, restart: { target, expected in
             try await CodexAccountBackground.run {
@@ -60,21 +55,26 @@ extension CodexAccountTransitionServices {
                     environment: CodexAccountTransitionLocal.environment(target), inheritEnvironment: false, outputLimit: 32_768, errorLimit: 32_768)
                 guard result.status == 0 else { throw AppError.message("공통 서버 전환 결과를 확인하지 못했습니다. 같은 요청을 반복하지 말고 Mac에서 연결을 확인해주세요.") }
             }
-        }, verify: { target, witnesses in
+        }, verify: { target, witnesses, threads in
             try await CodexAccountBackground.run {
+                let before = try CodexAccountTransitionLocal.identity(target)
+                let connection=try CodexQueueConnection(home:target.home)
+                let serverPID=try connection.peerProcessID()
+                // Background conversations are reattached by the official
+                // TUI on selection. Verify retained history without resuming
+                // it or requiring every offscreen thread to become loaded.
+                for thread in threads {
+                    guard let response=try? connection.request("thread/read",["threadId":thread.id,"includeTurns":false]),
+                          let row=response["thread"] as? JSONObject,row["id"] as? String==thread.id,
+                          let status=(row["status"] as? JSONObject)?["type"] as? String,["idle","notLoaded"].contains(status) else{return 0}
+                }
                 var verified = 0
                 for witness in witnesses {
                     guard CodexAccountTransitionLocal.sameProcess(witness),
-                          CodexServerLocation.connectedHome(pid: witness.pid, hints: [target.home]) == target.home,
-                          let threadID = witness.threadID,
-                          let location = try? CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: witness.pid, expectedStart: witness.started)),
-                          location.threadID == threadID,
-                          URL(fileURLWithPath: location.database).deletingLastPathComponent().resolvingSymlinksInPath().path == target.home else { continue }
-                    let response = try CodexQueueConnection(home: target.home).request("thread/read", ["threadId": threadID, "includeTurns": false])
-                    guard let row = response["thread"] as? JSONObject, row["id"] as? String == threadID,
-                          (row["status"] as? JSONObject)?["type"] as? String == "idle" else { continue }
+                          CodexServerLocation.connectedHome(pid: witness.pid, hints: [target.home],peerPID:serverPID) == target.home else { continue }
                     verified += 1
                 }
+                guard try CodexAccountTransitionLocal.identity(target) == before else {throw AppError.message("창 재연결 확인 중 Codex 서버가 바뀌었습니다.")}
                 return verified
             }
         })
@@ -179,6 +179,50 @@ private enum CodexAccountTransitionLocal {
         guard let cursor = value as? String, !cursor.isEmpty, cursor.utf8.count <= 8192 else { throw AppError.message("목록의 다음 위치를 확인하지 못했습니다.") }
         return cursor
     }
+    static func quiesce(_ connection:CodexQueueConnection,target:CodexAccountTransitionTarget,server:String,id:String,token:String) throws {
+        func current() throws -> CodexAccountTransitionThread {
+            try Task.checkCancellation()
+            guard try identity(target)==server else {throw AppError.message("작업 정리 중 Codex 서버가 바뀌었습니다.")}
+            let value=try thread(connection,id:id)
+            guard value.stopToken==token else {throw AppError.message("작업 정리 중 새 실행 차례가 시작됐습니다. 새 작업은 중단하지 않았습니다.")}
+            return value
+        }
+        _ = try current()
+        let goal=try connection.request("thread/goal/get",["threadId":id])
+        if (goal["goal"] as? JSONObject)?["status"] as? String == "active" {
+            let latest=try current();try Task.checkCancellation()
+            if latest.blocker == "활성 Goal" {
+                let paused=try connection.request("thread/goal/set",["threadId":id,"status":"paused","origin":"automatic"])
+                guard (paused["goal"] as? JSONObject)?["status"] as? String == "paused" else {throw AppError.message("Goal 일시정지 결과를 확인하지 못했습니다. 같은 요청은 반복하지 않습니다.")}
+            }
+        }
+        var cursor:String?,seen=Set<String>(),processes=Set<String>()
+        repeat {
+            var params:JSONObject=["threadId":id,"limit":100]
+            if let cursor {params["cursor"]=cursor}
+            let page=try connection.request("thread/backgroundTerminals/list",params)
+            guard let data=page["data"] as? [JSONObject],data.count<=100 else {throw AppError.message("정리할 Codex 백그라운드 작업 목록을 확인하지 못했습니다.")}
+            for row in data {
+                guard let process=row["processId"] as? String,!process.isEmpty,process.utf8.count<=256,
+                      processes.insert(process).inserted,processes.count<=1000 else {throw AppError.message("백그라운드 작업 식별자가 중복되거나 불명확합니다.")}
+            }
+            cursor=try nextCursor(page)
+            guard cursor==nil || seen.insert(cursor!).inserted,seen.count<100 else {throw AppError.message("백그라운드 작업 목록이 반복됐습니다.")}
+        } while cursor != nil
+        // One durable thread reservation precedes this entire operation. On
+        // partial/unknown delivery none of its mutations are replayed.
+        for process in processes.sorted() {
+            _ = try current();try Task.checkCancellation()
+            let result=try connection.request("thread/backgroundTerminals/terminate",["threadId":id,"processId":process])
+            guard result["terminated"] is Bool else {throw AppError.message("백그라운드 작업 종료 결과를 확인하지 못했습니다.")}
+        }
+        let value=try current()
+        if value.active {
+            guard let turn=value.turnID else {throw AppError.message("중단할 실행 차례를 확인하지 못했습니다.")}
+            try Task.checkCancellation()
+            _ = try connection.request("turn/interrupt",["threadId":id,"turnId":turn])
+        }
+    }
     static func thread(_ connection: CodexQueueConnection, id: String) throws -> CodexAccountTransitionThread {
         let result = try connection.request("thread/read", ["threadId": id, "includeTurns": false])
         guard let row = result["thread"] as? JSONObject, row["id"] as? String == id,
@@ -214,13 +258,13 @@ private enum CodexAccountTransitionLocal {
             guard let data = page["data"] as? [JSONObject], data.count <= 1 else { throw AppError.message("대기 입력·백그라운드 작업을 확인하지 못했습니다.") }
             let next = try nextCursor(page)
             guard !data.isEmpty || next == nil else { throw AppError.message("대기 작업 목록이 불완전합니다.") }
-            if !data.isEmpty { blocker = blocker ?? reason }
+            if !data.isEmpty { blocker = reason == "백그라운드 작업" ? reason : blocker ?? reason }
         }
         let goalResult = try connection.request("thread/goal/get", ["threadId": id])
         if let goal = goalResult["goal"], !(goal is NSNull) {
             guard let object = goal as? JSONObject, let value = object["status"] as? String,
                   CodexGoal.Status(rawValue: value) != nil else { throw AppError.message("Goal 실행 상태를 확인하지 못했습니다.") }
-            if value == "active" { blocker = blocker ?? "활성 Goal" }
+            if value == "active" { blocker = "활성 Goal" }
         }
         return .init(id: id, turnID: turnID, active: status == "active", blocker: blocker)
     }

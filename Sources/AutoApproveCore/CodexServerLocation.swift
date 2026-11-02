@@ -4,8 +4,8 @@ import Darwin
 /// Accept a launch home only when the original process is connected to its
 /// exact user-owned control socket. Never guess by project or recent history.
 public enum CodexServerLocation {
-    public static func connectedHome(pid: Int32, hints: [String]) -> String? {
-        let paths = connectedSocketPaths(pid: pid)
+    public static func connectedHome(pid: Int32, hints: [String], peerPID: Int32? = nil) -> String? {
+        let paths = connectedSocketPaths(pid: pid, peerPID: peerPID)
         guard !paths.isEmpty else { return nil }
         var matches = Set<String>()
         for hint in hints where hint.hasPrefix("/") {
@@ -22,25 +22,45 @@ public enum CodexServerLocation {
         }
         return matches.count == 1 ? matches.first : nil
     }
-    private static func connectedSocketPaths(pid: Int32) -> Set<String> {
+    private struct UnixConnection {let socket:UInt64,peer:UInt64,path:String?}
+    private static func connectedSocketPaths(pid:Int32,peerPID:Int32?) -> Set<String> {
+        let clients=connections(pid:pid)
+        var peers:[UInt64:UInt64]?
+        if let peerPID {
+            var owner=proc_bsdinfo()
+            let size=Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard peerPID>0,proc_pidinfo(peerPID,PROC_PIDTBSDINFO,0,&owner,size)==size,owner.pbi_uid==getuid() else{return []}
+            peers=[:]
+            for value in connections(pid:peerPID) {peers?[value.socket]=value.peer}
+        }
+        return Set(clients.compactMap { value in
+            guard let path=value.path,peers == nil || peers?[value.peer]==value.socket else{return nil}
+            return path
+        })
+    }
+    private static func connections(pid: Int32) -> [UnixConnection] {
         let required = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
         let entrySize = MemoryLayout<proc_fdinfo>.size
         guard required > 0, required <= 131_072 else { return [] }
         var entries = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(required) / entrySize + 16)
         let count = entries.withUnsafeMutableBytes { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, $0.baseAddress, Int32($0.count)) }
         guard count > 0 else { return [] }
-        var paths = Set<String>()
+        var sockets:[UnixConnection]=[]
         for entry in entries.prefix(Int(count) / entrySize) where entry.proc_fdtype == PROX_FDTYPE_SOCKET {
             var info = socket_fdinfo()
             let size = Int32(MemoryLayout<socket_fdinfo>.size)
             guard proc_pidfdinfo(pid, Int32(entry.proc_fd), PROC_PIDFDSOCKETINFO, &info, size) == size,
-                  info.psi.soi_family == AF_UNIX else { continue }
+                  info.psi.soi_family == AF_UNIX,
+                  Int(info.psi.soi_state) & Int(SOI_S_ISCONNECTED) != 0,
+                  Int(info.psi.soi_state) & Int(SOI_S_ISDISCONNECTED | SOI_S_ISDISCONNECTING | SOI_S_CANTSENDMORE | SOI_S_CANTRCVMORE) == 0,
+                  info.psi.soi_so != 0,info.psi.soi_proto.pri_un.unsi_conn_so != 0 else { continue }
             let path: String? = withUnsafeBytes(of: info.psi.soi_proto.pri_un.unsi_caddr.ua_sun.sun_path) { bytes in
                 guard bytes.first == 47, let end = bytes.firstIndex(of: 0) else { return nil }
                 return String(decoding: bytes[..<end], as: UTF8.self)
             }
-            if let path { paths.insert(URL(fileURLWithPath: path).resolvingSymlinksInPath().path) }
+            sockets.append(.init(socket:info.psi.soi_so,peer:info.psi.soi_proto.pri_un.unsi_conn_so,
+                path:path.map{URL(fileURLWithPath:$0).resolvingSymlinksInPath().path}))
         }
-        return paths
+        return sockets
     }
 }

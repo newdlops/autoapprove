@@ -227,6 +227,11 @@ final class CodexQueueConnection {
         }
     }
     deinit { if fd >= 0 { Darwin.close(fd) } }
+    func peerProcessID() throws -> Int32 {
+        var pid:Int32=0,size=socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd,SOL_LOCAL,LOCAL_PEERPID,&pid,&size)==0,size==socklen_t(MemoryLayout<Int32>.size),pid>0 else {throw AppError.message("현재 Codex 서버의 프로세스 연결을 확인하지 못했습니다.")}
+        return pid
+    }
     func request(_ method: String, _ params: JSONObject, classifyError: Bool = false) throws -> JSONObject {
         sequence += 1; let id = sequence
         try send(["id": id, "method": method, "params": params])
