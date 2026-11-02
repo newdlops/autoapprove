@@ -80,6 +80,8 @@ extension CodexAccountTransitionServices {
                 guard try CodexAccountTransitionLocal.identity(target) == before else {throw AppError.message("창 재연결 확인 중 Codex 서버가 바뀌었습니다.")}
                 return verified
             }
+        },resume:{target,expected,original,receipt in
+            try await CodexAccountBackground.run {try CodexAccountContinuationLocal.resume(target,expected:expected,original:original,receipt:receipt)}
         })
     }
 }
@@ -102,7 +104,7 @@ private enum CodexAccountBackground {
 
 /// All inspection is local metadata. This adapter never reads credentials,
 /// resumes a conversation, creates a turn, edits a queue or types into a TUI.
-private enum CodexAccountTransitionLocal {
+enum CodexAccountTransitionLocal {
     static func environment(_ target: CodexAccountTransitionTarget) -> [String: String] {
         ["HOME": NSHomeDirectory(), "CODEX_HOME": target.home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "NO_COLOR": "1"]
     }
@@ -179,7 +181,7 @@ private enum CodexAccountTransitionLocal {
                     // Unknown/user ephemeral threads still fail closed below.
                     continue
                 }
-                threads.append(try thread(connection, id: id,metadata:metadata))
+                threads.append(try thread(connection, id: id,metadata:metadata,home:target.home))
             }
             cursor = try nextCursor(page)
             guard cursor == nil || seen.insert(cursor!).inserted, seen.count < 100 else { throw AppError.message("실행 대화 목록 조회가 반복됐습니다.") }
@@ -196,7 +198,7 @@ private enum CodexAccountTransitionLocal {
         func current() throws -> CodexAccountTransitionThread {
             try Task.checkCancellation()
             guard try identity(target)==server else {throw AppError.message("작업 정리 중 Codex 서버가 바뀌었습니다.")}
-            let value=try thread(connection,id:id)
+            let value=try thread(connection,id:id,home:target.home)
             guard value.stopToken==token else {throw AppError.message("작업 정리 중 새 실행 차례가 시작됐습니다. 새 작업은 중단하지 않았습니다.")}
             return value
         }
@@ -236,7 +238,7 @@ private enum CodexAccountTransitionLocal {
             _ = try connection.request("turn/interrupt",["threadId":id,"turnId":turn])
         }
     }
-    static func thread(_ connection: CodexQueueConnection, id: String,metadata:JSONObject?=nil) throws -> CodexAccountTransitionThread {
+    static func thread(_ connection: CodexQueueConnection, id: String,metadata:JSONObject?=nil,home:String?=nil) throws -> CodexAccountTransitionThread {
         let result = try metadata ?? connection.request("thread/read", ["threadId": id, "includeTurns": false])
         guard let row = result["thread"] as? JSONObject, row["id"] as? String == id,
               let status = (row["status"] as? JSONObject)?["type"] as? String, ["active", "idle", "systemError"].contains(status) else {
@@ -290,13 +292,19 @@ private enum CodexAccountTransitionLocal {
                   CodexGoal.Status(rawValue: value) != nil else { throw AppError.message("Goal 실행 상태를 확인하지 못했습니다.") }
             if value == "active" { blocker = "활성 Goal" }
         }
-        return .init(id: id, turnID: turnID, active: status == "active", blocker: blocker)
+        let cwd=row["cwd"] as? String,provider=row["modelProvider"] as? String
+        let continuable=row["source"] is String && row["threadSource"] as? String=="user" && row["ephemeral"] as? Bool==false &&
+            (row["parentThreadId"]==nil || row["parentThreadId"] is NSNull) && cwd?.hasPrefix("/")==true && provider?.isEmpty==false
+        var goal=continuable ? try CodexGoalTransport.decode(goalResult,threadID:id):nil
+        if let home,let current=goal,let stored=try? CodexGoalTransport.readDatabase(home:home,threadID:id),
+           stored.createdAt==current.createdAt,stored.objective==current.objective,stored.tokenBudget==current.tokenBudget {goal?.instanceID=stored.instanceID}
+        return .init(id: id, turnID: turnID, active: status == "active", blocker: blocker,continuable:continuable,cwd:cwd,modelProvider:provider,goal:goal,turnStatus:latest.first?["status"] as? String)
     }
 }
 
 /// A short-lived, non-TTY app-server reads freshly stored login metadata.
 /// Only this owned child is stopped. Responses are bounded and never logged.
-private enum CodexAccountMetadataProcess {
+enum CodexAccountMetadataProcess {
     static func read(_ target: CodexAccountTransitionTarget) throws -> String? {
         let process = Process(), input = Pipe(), output = Pipe(), exited = DispatchSemaphore(value: 0)
         process.executableURL = URL(fileURLWithPath: target.executable)

@@ -5,7 +5,7 @@ import Foundation
 import AutoApproveCore
 #endif
 
-@MainActor private final class AccountTransitionRig {
+@MainActor final class AccountTransitionRig {
     var target = CodexAccountTransitionTarget(home: "/fixture/home", executable: "/fixture/codex",
         witnesses: [.init(pid: 42, started: "original", tty: "/dev/fixture", threadID: "a")])
     var observation = CodexAccountTransitionObservation(savedAccount: "new", serverAccount: "old", serverID: "server-1",
@@ -240,29 +240,38 @@ extension ApprovalTests {
         }
         try expectEqual(engine.agentAccounts.nativeCodexLogin?.phase,"succeeded","The owned native login fixture must finish before checking application")
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.stopping,"The native completion callback must enable and begin the transition")
-        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        func advance(until ready:()->Bool) async throws {
+            let deadline=Date().addingTimeInterval(5)
+            repeat {
+                await engine.checkCodexAccountTransitions()
+                if ready(){return}
+                try await Task.sleep(for:.milliseconds(10))
+            } while Date()<deadline
+            try expect(ready(),"The asynchronous native completion/check must settle before the next transition step")
+        }
+        try await advance{r.effects.count==1}
         try expectEqual(r.effects,["interrupt:server-1:a:turn-a"],"A successful same-account login must refresh existing authentication instead of being ignored")
         r.idle(0)
-        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try await advance{r.effects.count==2}
         try expectEqual(r.effects,["interrupt:server-1:a:turn-a","interrupt:server-1:b:turn-b"])
         r.idle(1)
-        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try await advance{r.effects.last=="restart"}
         try expectEqual(r.effects.last,"restart")
         r.observation.serverID="server-2"
-        for _ in 0..<4 {await engine.checkCodexAccountTransitions()}
+        try await advance{engine.codexAccountTransitionStates[target.home]?.phase == .complete}
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
         try expectEqual(r.effects.filter{$0=="restart"}.count,1,"The same completed login receipt must not restart twice")
         r.observeFails=true
         await engine.checkCodexAccountTransitions()
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete,"A later read-only failure must not freeze every session behind an already completed restart")
         r.observeFails=false
-        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try await advance{!engine.codexAccountTransitionBusy}
         try expectEqual(r.effects.filter{$0=="restart"}.count,1)
         try await engine.reconnectCodexLogin(home:target.home)
-        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try await advance{r.effects.filter{$0=="restart"}.count==2}
         try expectEqual(r.effects.filter{$0=="restart"}.count,2,"A later manual reconnect must supersede the completed native login receipt")
         r.observation.serverID="server-3"
-        for _ in 0..<6 {await engine.checkCodexAccountTransitions()}
+        try await advance{engine.codexAccountTransitionStates[target.home]?.phase == .complete}
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
         try expectEqual(r.effects.filter{$0=="restart"}.count,2,"The old successful native job must not replay after a newer manual reconnect")
         let restored=try ApprovalEngine(paths:.init(directory:root.appendingPathComponent("profile")),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]})

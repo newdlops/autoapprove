@@ -5771,7 +5771,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let covered = targets.reduce(0) { $0 + $1.witnesses.count }
             let homes=Set(targets.map(\.home))
             let journal=codexAccountTransitionStates.filter {home,state in
-                homes.contains(home) || state.phase != .unsupported || state.restartReserved || !state.reservations.isEmpty || !state.threads.isEmpty || !state.witnesses.isEmpty
+                homes.contains(home) || state.phase != .unsupported || state.restartReserved || !state.reservations.isEmpty || !(state.resumeReservations ?? [:]).isEmpty || !state.threads.isEmpty || !state.witnesses.isEmpty
             }
             if journal.count != codexAccountTransitionStates.count {
                 try store.set(Self.codexAccountJournalKey,String(decoding:JSONEncoder().encode(journal),as:UTF8.self))

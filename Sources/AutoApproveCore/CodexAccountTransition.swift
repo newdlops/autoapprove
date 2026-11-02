@@ -24,12 +24,25 @@ public struct CodexAccountTransitionWitness: Codable, Equatable, Sendable {
 public struct CodexAccountTransitionThread: Codable, Equatable, Sendable {
     public var id: String
     public var turnID: String?
+    public var turnStatus:String?
     public var active: Bool
     public var blocker: String?
+    public var continuable:Bool?
+    public var cwd:String?
+    public var modelProvider:String?
+    public var goal:CodexGoal?
     var needsQuiescence:Bool {active || blocker == "활성 Goal" || blocker == "백그라운드 작업"}
     var stopToken:String {turnID ?? "__autoapprove_idle__"}
-    public init(id: String, turnID: String? = nil, active: Bool = false, blocker: String? = nil) {
+    public init(id: String, turnID: String? = nil, active: Bool = false, blocker: String? = nil,continuable:Bool?=nil,cwd:String?=nil,modelProvider:String?=nil,goal:CodexGoal?=nil,turnStatus:String?=nil) {
         self.id = id; self.turnID = turnID; self.active = active; self.blocker = blocker
+        self.continuable=continuable;self.cwd=cwd;self.modelProvider=modelProvider;self.goal=goal
+        self.turnStatus=turnStatus
+    }
+    public static func ==(lhs:Self,rhs:Self)->Bool {
+        // Usage can flush after a Goal pauses. Its identity/lifecycle/budget
+        // revision remains the authority for the restart barrier.
+        lhs.id==rhs.id && lhs.turnID==rhs.turnID && lhs.turnStatus==rhs.turnStatus && lhs.active==rhs.active && lhs.blocker==rhs.blocker &&
+        lhs.continuable==rhs.continuable && lhs.cwd==rhs.cwd && lhs.modelProvider==rhs.modelProvider && lhs.goal?.revision==rhs.goal?.revision
     }
 }
 public struct CodexAccountTransitionObservation: Sendable {
@@ -47,15 +60,18 @@ public struct CodexAccountTransitionObservation: Sendable {
     public var interrupt: (CodexAccountTransitionTarget, String, String, String) async throws -> Void
     public var restart: (CodexAccountTransitionTarget, CodexAccountTransitionObservation) async throws -> Void
     public var verify: (CodexAccountTransitionTarget, [CodexAccountTransitionWitness], [CodexAccountTransitionThread]) async throws -> Int
+    public var resume:((CodexAccountTransitionTarget,CodexAccountTransitionObservation,CodexAccountTransitionThread,String) async throws -> CodexAccountContinuationResult)?
     public init(observe: @escaping (CodexAccountTransitionTarget) async throws -> CodexAccountTransitionObservation,
                 interrupt: @escaping (CodexAccountTransitionTarget, String, String, String) async throws -> Void,
                 restart: @escaping (CodexAccountTransitionTarget, CodexAccountTransitionObservation) async throws -> Void,
-                verify: @escaping (CodexAccountTransitionTarget, [CodexAccountTransitionWitness], [CodexAccountTransitionThread]) async throws -> Int) {
+                verify: @escaping (CodexAccountTransitionTarget, [CodexAccountTransitionWitness], [CodexAccountTransitionThread]) async throws -> Int,
+                resume:((CodexAccountTransitionTarget,CodexAccountTransitionObservation,CodexAccountTransitionThread,String) async throws -> CodexAccountContinuationResult)?=nil) {
         self.observe = observe; self.interrupt = interrupt; self.restart = restart; self.verify = verify
+        self.resume=resume
     }
 }
 public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
-    public enum Phase: String, Codable, Sendable { case ready, stopping, waiting, restarting, reconnecting, complete, review, cancelled, unsupported }
+    public enum Phase: String, Codable, Sendable { case ready, stopping, waiting, restarting, reconnecting, resuming, complete, review, cancelled, unsupported }
     public var phase: Phase = .ready
     public var detail = "계정 변경을 기다립니다."
     public var account = ""
@@ -70,7 +86,11 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var verified = 0
     public var loginRequestID: String?
     public var continuationHolds: [String:String]?
-    public var held: Bool { [.stopping, .waiting, .restarting, .reconnecting, .review].contains(phase) }
+    public var resumeEnabled:Bool?
+    public var resumeServerID:String?
+    public var resumeReservations:[String:String]?
+    public var resumeResults:[String:CodexAccountContinuationResult]?
+    public var held: Bool { [.stopping, .waiting, .restarting, .reconnecting, .resuming, .review].contains(phase) }
     public var canCancel: Bool { held && ![.restarting, .reconnecting].contains(phase) }
     public init() {}
 }
@@ -98,6 +118,9 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         do {
             let observed = try await services.observe(target)
             try Task.checkCancellation()
+            if state.resumeServerID != nil,[.resuming,.review].contains(state.phase) {
+                try await continueInterruptedWork(observed);return
+            }
             if state.restartReserved, [.reconnecting,.review].contains(state.phase) {
                 guard observed.savedAccount == state.account else {
                     throw AppError.message("전환 중 로그인이 다시 바뀌었습니다. 현재 계정과 연결을 확인해주세요.")
@@ -112,8 +135,14 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                               fresh.savedAccount == state.account, reconnectedThreads(fresh) else {
                             throw AppError.message("재연결 확인 중 계정·서버·원래 대화 상태가 바뀌었습니다. 전환 명령은 반복하지 않았습니다.")
                         }
-                        state.phase = .complete
-                        state.detail = "새 로그인으로 서버 전환 · 기존 창 \(verified)개 재연결을 확인했습니다. 중단한 작업은 대기 상태입니다."
+                        if state.resumeEnabled==true,!continuations.isEmpty {
+                            state.phase = .resuming;state.resumeServerID=fresh.serverID
+                            state.resumeReservations=[:];state.resumeResults=[:]
+                            state.detail="기존 창 \(verified)개 연결 확인 · 전환으로 중단한 작업 \(continuations.count)개를 이어갑니다."
+                        } else {
+                            state.phase = .complete
+                            state.detail = "새 로그인으로 서버 전환 · 기존 창 \(verified)개 재연결을 확인했습니다. 원래 대기 중이던 대화는 유지합니다."
+                        }
                         try persist(); return
                     }
                 }
@@ -145,6 +174,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 var next = CodexAccountTransitionState()
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
                 next.originalAccount = observed.serverAccount; next.loginRequestID = loginRequestID
+                next.resumeEnabled=services.resume != nil
                 next.threads = observed.threads.sorted { $0.id < $1.id }; next.witnesses = target.witnesses; next.since = now
                 next.continuationHolds=observed.threads.filter{!$0.active}.reduce(into:[:]){$0[$1.id]=$1.stopToken}
                 next.detail = "계정 변경 감지 · \(next.threads.count)개 대화를 순차 중단할 준비 중"
@@ -246,6 +276,34 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         try requireReview("원래 Codex 서버·창을 찾지 못했습니다. 자동 명령을 반복하지 않고 대기합니다.")
     }
     private func persist() throws { try save(state); changed(state) }
+    private var continuations:[CodexAccountTransitionThread] {
+        state.threads.filter{$0.continuable==true && ($0.active || $0.goal?.status == .active) && state.reservations[$0.id]==$0.stopToken}.sorted{$0.id<$1.id}
+    }
+    private func continueInterruptedWork(_ observed:CodexAccountTransitionObservation) async throws {
+        guard state.resumeEnabled==true,let resume=services.resume,
+              observed.savedAccount==state.account,observed.serverAccount==state.account,observed.serverID==state.resumeServerID else {
+            throw AppError.message("작업을 이어가기 전 계정·서버 연결이 바뀌었습니다. 요청을 반복하지 않고 대기합니다.")
+        }
+        let reservations=state.resumeReservations ?? [:],results=state.resumeResults ?? [:]
+        guard reservations.keys.allSatisfy({results[$0] != nil}) else {
+            throw AppError.message("이어서 진행 요청의 전달 결과를 확인하지 못했습니다. 같은 요청을 자동으로 다시 보내지 않습니다.")
+        }
+        guard let original=continuations.first(where:{results[$0.id]==nil}) else {
+            state.phase = .complete
+            let resumed=results.values.filter{$0 != .skipped}.count,skipped=results.count-resumed
+            state.detail="새 로그인으로 기존 창 \(state.verified)개 연결 · 중단 작업 \(resumed)개 이어가기 완료"+(skipped>0 ? " · 상태가 바뀐 \(skipped)개는 유지했습니다.":". 원래 대기 중이던 대화는 유지합니다.")
+            try persist();return
+        }
+        let receipt=UUID().uuidString
+        state.phase = .resuming
+        state.resumeReservations=reservations.merging([original.id:receipt]){_,new in new}
+        state.detail="전환으로 중단한 작업 이어가기 · \(results.count)/\(continuations.count)개"
+        try persist();try Task.checkCancellation()
+        var originalTarget=target;originalTarget.witnesses=state.witnesses
+        let result=try await resume(originalTarget,observed,original,receipt)
+        state.resumeResults=results.merging([original.id:result]){_,new in new}
+        try persist()
+    }
     private func reconnectedThreads(_ observed: CodexAccountTransitionObservation) -> Bool {
         // Official TUIs resume their own in-memory thread IDs. The shared
         // server owns rollout files, so a per-TUI rollout FD is not required.

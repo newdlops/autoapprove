@@ -13,7 +13,7 @@ private struct AccountTransitionPreview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Picker("검사 상태", selection: $phase) {
-                        ForEach([CodexAccountTransitionState.Phase.ready, .stopping, .waiting, .restarting, .reconnecting, .complete, .review, .unsupported], id: \.self) { Text($0.rawValue).tag($0) }
+                        ForEach([CodexAccountTransitionState.Phase.ready, .stopping, .waiting, .restarting, .reconnecting, .resuming, .complete, .review, .unsupported], id: \.self) { Text($0.rawValue).tag($0) }
                     }
                     CodexAccountTransitionSettings(enabled: enabled, busy: phase == .restarting,
                         states: enabled ? ["/fixture/긴 프로젝트 이름/개발용 Codex 환경/" + String(repeating: "nested-folder/", count: 12): Self.state(phase)] : [:],
@@ -29,11 +29,12 @@ private struct AccountTransitionPreview: View {
         state.threads = (0..<24).map { .init(id: "thread-\($0)", turnID: "turn-\($0)", active: true) }
         state.witnesses = (0..<24).map { .init(pid: Int32($0 + 100), started: "synthetic", tty: "/dev/fixture\($0)", threadID: "thread-\($0)") }
         state.reservations = Dictionary(uniqueKeysWithValues: (0..<12).map { ("thread-\($0)", "turn-\($0)") })
-        state.restartReserved = [.restarting, .reconnecting, .complete].contains(phase); state.verified = phase == .complete ? 24 : 12
+        state.restartReserved = [.restarting, .reconnecting, .resuming, .complete].contains(phase); state.verified = [.resuming,.complete].contains(phase) ? 24 : 12
         switch phase {
         case .waiting: state.detail = "모든 작업 중단 확인 · 대기 입력이 남아 서버 전환을 기다립니다. 원래 Codex의 메시지 대기열을 확인해주세요."
         case .reconnecting: state.detail = "새 계정과 기존 대화 재연결 확인 중 · 12/24개"
-        case .complete: state.detail = "새 로그인으로 서버 전환 · 기존 창 24개 재연결을 확인했습니다. 중단한 작업은 대기 상태입니다."
+        case .resuming: state.detail = "전환으로 중단한 작업 이어가기 · 12/24개"
+        case .complete: state.detail = "새 로그인으로 기존 창 24개 연결 · 중단 작업 12개 이어가기 완료. 원래 대기 중이던 대화는 유지합니다."
         case .review: state.detail = "서버 전환 뒤 기존 창 12/24개의 연결만 확인했습니다. 같은 요청을 반복하지 말고 Mac에서 나머지 대화를 확인해주세요."
         case .unsupported: state.detail = "공식 관리형 Codex 0.166.0 이상과 같은 버전의 CLI가 필요합니다. 현재 실행 방식은 자동 전환을 지원하지 않습니다."
         default: state.detail = "작업을 순차 중단하고 실제 대기 상태를 확인합니다. 작성 중인 입력과 원래 창은 유지합니다."
@@ -47,7 +48,7 @@ private struct AccountTransitionPreview: View {
         NSApp.setActivationPolicy(.regular)
         let directory = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : NSTemporaryDirectory() + "aa-account-preview")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        for phase in [CodexAccountTransitionState.Phase.ready, .waiting, .reconnecting, .complete, .review, .unsupported] {
+        for phase in [CodexAccountTransitionState.Phase.ready, .waiting, .reconnecting, .resuming, .complete, .review, .unsupported] {
             for (name, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
                 let view = ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
@@ -72,6 +73,6 @@ private struct AccountTransitionPreview: View {
             window.contentView = NSHostingView(rootView: AccountTransitionPreview())
             window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); NSApp.run()
         }
-        print("Rendered 12 native states at 600×660; synthetic controls only")
+        print("Rendered 14 native states at 600×660; synthetic controls only")
     }
 }
