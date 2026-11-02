@@ -12,17 +12,39 @@ struct SessionProfileDraft: Identifiable {
 
 struct SessionProfileEntryFilter:Equatable {
     enum Agent:String,CaseIterable {case all="전체",codex="Codex",claude="Claude"}
-    enum Order:String,CaseIterable {case saved="저장 순서",repository="레포",agent="도구",title="이름"}
+    enum Order:String,CaseIterable {case saved="저장 순서",window="창·탭",repository="레포",agent="도구",title="이름"}
+    struct WindowChoice:Identifiable,Equatable {let id:String;let title:String}
     var agent:Agent = .all
+    var window=""
     var repository=""
     var query=""
     var order:Order = .saved
     var ascending=true
-    var active:Bool {agent != .all || !repository.isEmpty || !query.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
+    var active:Bool {agent != .all || !window.isEmpty || !repository.isEmpty || !query.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
+    static func windowKey(_ entry:TerminalProfileEntry) -> String {
+        guard entry.host == .terminal else {return "iterm:unknown"}
+        return "terminal:"+(entry.terminalTab?.window.uuidString ?? "unknown")
+    }
+    static func windowName(_ entry:TerminalProfileEntry) -> String {
+        guard entry.host == .terminal else {return "iTerm2 · 창 정보 없음"}
+        return entry.terminalTab.map {"Terminal 창 \($0.windowOrder+1)"} ?? "Terminal · 창 정보 없음"
+    }
+    static func windowPosition(_ entry:TerminalProfileEntry) -> String {
+        entry.host == .terminal ? entry.terminalTab.map {"창 \($0.windowOrder+1) · 탭 \($0.tabOrder+1)"} ?? "창 정보 없음":"창 정보 없음"
+    }
+    private static func windowOrder(_ entry:TerminalProfileEntry,_ offset:Int) -> (Int,Int,Int) {
+        (entry.host == .terminal ? 0:1,entry.host == .terminal ? entry.terminalTab?.windowOrder ?? 512:512,entry.host == .terminal ? entry.terminalTab?.tabOrder ?? offset:offset)
+    }
+    static func windows(for entries:[TerminalProfileEntry]) -> [WindowChoice] {
+        let groups=Dictionary(grouping:entries,by:windowKey)
+        return groups.sorted {left,right in windowOrder(left.value[0],0)<windowOrder(right.value[0],0)}
+            .map {WindowChoice(id:$0.key,title:windowName($0.value[0])+" · \($0.value.count)개")}
+    }
     func entries(_ entries:[TerminalProfileEntry],repositories:[String:String]) -> [TerminalProfileEntry] {
         let query=query.trimmingCharacters(in:.whitespacesAndNewlines)
         return entries.enumerated().filter {_,entry in
             (agent == .all || entry.agent == (agent == .codex ? "codex":"claude")) &&
+            (window.isEmpty || Self.windowKey(entry) == window) &&
             (repository.isEmpty || (repositories[entry.cwd] ?? entry.cwd) == repository) &&
             (query.isEmpty || [entry.title,entry.cwd,entry.conversationID,repositories[entry.cwd] ?? entry.cwd]
                 .contains { $0.localizedStandardContains(query) })
@@ -30,6 +52,9 @@ struct SessionProfileEntryFilter:Equatable {
             let comparison:ComparisonResult
             switch order {
             case .saved:return ascending ? left.offset<right.offset:left.offset>right.offset
+            case .window:
+                let a=Self.windowOrder(left.element,left.offset),b=Self.windowOrder(right.element,right.offset)
+                return a == b ? left.offset<right.offset:(ascending ? a<b:a>b)
             case .repository:comparison=(repositories[left.element.cwd] ?? left.element.cwd).localizedStandardCompare(repositories[right.element.cwd] ?? right.element.cwd)
             case .agent:comparison=left.element.agent.localizedStandardCompare(right.element.agent)
             case .title:comparison=left.element.title.localizedStandardCompare(right.element.title)
@@ -100,6 +125,7 @@ struct SessionProfileEntryFilter:Equatable {
     var selected:TerminalSessionProfile? {profiles.first {$0.id == selectedID}}
     var visibleEntries:[TerminalProfileEntry] {entryFilter.entries(selected?.entries ?? [],repositories:repositories)}
     var selectedVisibleIDs:Set<UUID> {selectedEntries.intersection(visibleEntries.map(\.id))}
+    var windowChoices:[SessionProfileEntryFilter.WindowChoice] {SessionProfileEntryFilter.windows(for:selected?.entries ?? [])}
     var repositoryChoices:[String] {Array(Set((selected?.entries ?? []).map {repositories[$0.cwd] ?? $0.cwd})).sorted {$0.localizedStandardCompare($1) == .orderedAscending}}
     var canRestoreSelection:Bool {!busy && !loading && !resolvingRepositories && !selectedVisibleIDs.isEmpty}
     func selectVisible(_ included:Bool) {

@@ -105,15 +105,15 @@ struct SessionProfilesWindow: View {
             if controller.visibleEntries.isEmpty {
                 ContentUnavailableView {
                     Label("조건에 맞는 세션이 없습니다",systemImage:"line.3.horizontal.decrease.circle")
-                } description: {Text("도구·레포 또는 검색어를 바꿔보세요.")}
+                } description: {Text("창·도구·레포 또는 검색어를 바꿔보세요.")}
                 actions: {Button("필터 초기화") {controller.entryFilter = .init()}.disabled(controller.busy)}
             } else {List(controller.visibleEntries) {entry in
                 VStack(alignment:.leading,spacing:6) {
                     Toggle(isOn:Binding(get:{controller.selectedEntries.contains(entry.id)},set:{if $0 {controller.selectedEntries.insert(entry.id)} else {controller.selectedEntries.remove(entry.id)}})) {
                         Text(entry.title.isEmpty ? entry.agent:entry.title).font(.body.weight(.medium)).lineLimit(2)
                     }.toggleStyle(.checkbox).disabled(controller.busy || controller.loading)
-                        .accessibilityLabel("\(entry.agent == "codex" ? "Codex":"Claude") · \(entry.title) · \(entry.cwd)")
-                    Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal"))
+                        .accessibilityLabel("\(entry.agent == "codex" ? "Codex":"Claude") · \(entry.title) · \(SessionProfileEntryFilter.windowPosition(entry)) · \(entry.cwd)")
+                    Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal")+" · "+SessionProfileEntryFilter.windowPosition(entry))
                         .font(.caption).foregroundStyle(.secondary)
                     Text(entry.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(entry.cwd)
                     DisclosureGroup("대화·창 정보") {
@@ -144,9 +144,19 @@ struct SessionProfilesWindow: View {
     }
     private func entryControls(_ profile:TerminalSessionProfile) -> some View {
         VStack(alignment:.leading,spacing:8) {
-            Picker("복원할 도구",selection:$controller.entryFilter.agent) {
-                ForEach(SessionProfileEntryFilter.Agent.allCases,id:\.self) {Text($0.rawValue).tag($0)}
-            }.pickerStyle(.segmented).labelsHidden().accessibilityLabel("복원할 도구")
+            HStack(spacing:10) {
+                Picker("복원할 도구",selection:$controller.entryFilter.agent) {
+                    ForEach(SessionProfileEntryFilter.Agent.allCases,id:\.self) {Text($0.rawValue).tag($0)}
+                }.pickerStyle(.segmented).labelsHidden().accessibilityLabel("복원할 도구").frame(width:192)
+                Picker("저장된 창",selection:$controller.entryFilter.window) {
+                    Text("모든 창").tag("")
+                    ForEach(controller.windowChoices) {Text($0.title).tag($0.id)}
+                    if !controller.entryFilter.window.isEmpty && !controller.windowChoices.contains(where:{$0.id == controller.entryFilter.window}) {
+                        Text("선택한 창 · 현재 없음").tag(controller.entryFilter.window)
+                    }
+                }.labelsHidden().frame(minWidth:0,maxWidth:.infinity).accessibilityLabel("복원할 저장된 창")
+                    .help("저장 시점의 창 번호입니다. 항목 수는 전체 저장 프로필 기준이며 도구·레포·검색과 함께 적용됩니다. 창 정보가 없는 기록은 별도로 표시합니다.")
+            }
             HStack(spacing:8) {
                 Image(systemName:"magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
                 TextField("이름·레포·폴더·대화 ID 검색",text:$controller.entryFilter.query)

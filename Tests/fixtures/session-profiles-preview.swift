@@ -32,9 +32,9 @@ private actor FixtureLaunches {
         func entry(_ number:Int,_ title:String,_ agent:String,_ leaf:String) throws -> TerminalProfileEntry {
             let cwd=root.appendingPathComponent(leaf)
             try FileManager.default.createDirectory(at:cwd,withIntermediateDirectories:true)
-            let current=number>=300,group=current ? (number==400 ? 21:20):10
-            let order=number==400 ? 0:number%100
-            return .init(title:title,agent:agent,cwd:cwd.path,conversationID:id(number),terminalTab:.init(window:UUID(uuidString:id(group))!,windowOrder:group==21 ? 1:0,tabOrder:order,selected:order==0,settingsName:"Pro"))
+            let current=number>=300,group=current ? (number==400 ? 21:20):(number>=200 ? 10+(number-200)/6:10+(number-100)/2)
+            let order=current ? (number==400 ? 0:number%100):(number>=200 ? (number-200)%6:(number-100)%2)
+            return .init(title:title,agent:agent,cwd:cwd.path,conversationID:id(number),terminalTab:.init(window:UUID(uuidString:id(group))!,windowOrder:current ? (group==21 ? 1:0):group-10,tabOrder:order,selected:order==0,settingsName:"Pro"))
         }
         do {
             if try store.list().profiles.isEmpty {
@@ -46,6 +46,9 @@ private actor FixtureLaunches {
                     try entry(102,"웹 관리자 · Codex","codex","repos/web"),try entry(103,"웹 화면 · Claude","claude","repos/web/apps/admin"),
                     try entry(104,"문서 · Codex","codex","repos/docs"),try entry(105,"가이드 · Claude","claude","repos/docs/guides")]))
                 _ = try store.save(.init(id:UUID(uuidString:id(2))!,name:"긴 이름의 프로필 · 여러 프로젝트와 재부팅 뒤 이어갈 작업",entries:try (0..<18).map {try entry(200+$0,"긴 작업 이름 \($0+1) · 한국어와 English 프로젝트의 작업 상태",$0%2==0 ? "codex":"claude","dense/team-\($0%3)/repo/component-\($0)/long-project-directory")}))
+                var legacy=try entry(500,"이전 Terminal 기록","codex","legacy-terminal");legacy.terminalTab=nil
+                var iterm=try entry(501,"iTerm2 기록","claude","legacy-iterm");iterm.terminalTab=nil;iterm.host = .iterm
+                _ = try store.save(.init(id:UUID(uuidString:id(3))!,name:"이전 창 정보 없는 프로필",entries:[legacy,iterm]))
             }
             var ambiguous=try entry(400,"대화 ID 없이 새 Codex","codex","current-choice");ambiguous.conversationID=""
             var freshClaude=try entry(402,"대화 ID 없이 새 Claude","claude","current-claude");freshClaude.conversationID=""

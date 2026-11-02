@@ -19,7 +19,12 @@ private actor LaunchLog {
         func entry(_ number:Int,_ agent:String,_ cwd:String,_ title:String) -> TerminalProfileEntry {
             .init(title:title,agent:agent,cwd:cwd,conversationID:String(format:"00000000-0000-4000-8000-%012d",number))
         }
-        let entries=[entry(1,"codex",api,"결제 API"),entry(2,"claude",sub,"인증"),entry(3,"codex",web,"웹"),entry(4,"claude",web,"화면"),entry(5,"codex",nested,"Nested"),entry(6,"claude",plain,"문서")]
+        var entries=[entry(1,"codex",api,"결제 API"),entry(2,"claude",sub,"인증"),entry(3,"codex",web,"웹"),entry(4,"claude",web,"화면"),entry(5,"codex",nested,"Nested"),entry(6,"claude",plain,"문서")]
+        let first=UUID(),second=UUID()
+        for i in 0..<4 {entries[i].terminalTab = .init(window:i<2 ? first:second,windowOrder:i<2 ? 0:2,tabOrder:i%2,selected:i%2==0)}
+        entries[5].host = .iterm
+        // Even imported iTerm metadata cannot masquerade as a captured Terminal window.
+        entries[5].terminalTab=entries[0].terminalTab
         let repositories=SessionProfileEntryFilter.repositories(for:entries.map(\.cwd)+[root.appendingPathComponent("missing").path])
         var checks=0
         func check(_ value:Bool,_ message:String) throws {guard value else {throw AppError.message(message)};checks+=1}
@@ -40,12 +45,48 @@ private actor LaunchLog {
         filter.order = .title
         let descending=filter.entries(entries,repositories:repositories);filter.ascending=true
         try check(descending.map(\.id)==filter.entries(entries,repositories:repositories).reversed().map(\.id),"Title sort direction")
+        let firstKey=SessionProfileEntryFilter.windowKey(entries[0]),secondKey=SessionProfileEntryFilter.windowKey(entries[2])
+        let choices=SessionProfileEntryFilter.windows(for:entries)
+        try check(choices.map(\.title)==["Terminal 창 1 · 2개","Terminal 창 3 · 2개","Terminal · 창 정보 없음 · 1개","iTerm2 · 창 정보 없음 · 1개"],"Window choices retain saved sparse numbering and explicit host-specific unknown groups")
+        filter = .init();filter.window=firstKey
+        try check(filter.active && filter.entries(entries,repositories:repositories).map(\.id)==[entries[0].id,entries[1].id],"Window filter uses exact saved UUID and excludes other hosts")
+        filter.agent = .claude;filter.repository=api;filter.query="인증"
+        try check(filter.entries(entries,repositories:repositories).map(\.id)==[entries[1].id],"Window, agent, repository and Unicode search intersect")
+        filter.window=secondKey
+        try check(filter.entries(entries,repositories:repositories).isEmpty,"A conflicting window keeps an empty intersection")
+        filter = .init();filter.window="terminal:unknown"
+        try check(filter.entries(entries,repositories:repositories).map(\.id)==[entries[4].id],"Legacy Terminal group excludes iTerm and known windows")
+        filter.window="iterm:unknown"
+        try check(filter.entries(entries,repositories:repositories).map(\.id)==[entries[5].id],"iTerm unknown group does not guess Terminal metadata")
+        filter = .init();filter.order = .window
+        try check(filter.entries(Array(entries.reversed()),repositories:repositories).map(\.id)==entries.map(\.id),"Window sorting uses saved window and tab order")
+        filter.ascending=false
+        try check(filter.entries(entries,repositories:repositories).map(\.id)==entries.reversed().map(\.id),"Reverse window sorting")
         let store=TerminalProfileStore(directory:root.appendingPathComponent("profiles"))
         let profile=try store.save(.init(name:"Selection fixture",entries:entries))
         let other=try store.save(.init(name:"Other",entries:[entry(7,"codex",plain,"Other")]))
         let before=try TerminalProfileStore.read(store.file(profile.id)),log=LaunchLog()
         let controller=SessionProfilesController(store:store,capture:{throw AppError.message("Unexpected capture")},activeSessions:{try await Task.sleep(for:.milliseconds(50));return await log.active()},launch:{entry,_ in await log.launch(entry)})
         await controller.reload();controller.selectedID=profile.id;await controller.waitForRepositories()
+        let windowLog=LaunchLog()
+        let windows=SessionProfilesController(store:store,capture:{[]},activeSessions:{try await Task.sleep(for:.milliseconds(50));return await windowLog.active()},launch:{entry,_ in await windowLog.launch(entry)})
+        await windows.reload();windows.selectedID=profile.id;await windows.waitForRepositories()
+        windows.entryFilter.window=firstKey;windows.entryFilter.order = .window;windows.entryFilter.ascending=false
+        let restoreWindow=Task {await windows.restoreSelection()}
+        while !windows.busy {await Task.yield()}
+        windows.entryFilter.window=secondKey
+        await restoreWindow.value
+        try check(await windowLog.opened.map(\.id)==[entries[0].id,entries[1].id],"Window target is fixed before awaits and reverse display keeps original tab launch order")
+        windows.selectVisible(false)
+        try check(windows.selectedEntries.count==4 && !windows.canRestoreSelection,"Bulk deselect changes only the displayed window")
+        windows.selectVisible(true);await windows.restoreSelection()
+        try check(await windowLog.opened.map(\.id)==Array(entries.prefix(4)).map(\.id),"Switching window restores only its missing two tabs")
+        windows.entryFilter.window="missing-window"
+        let windowReads=await windowLog.reads
+        await windows.restoreSelection()
+        try check(await windowLog.reads==windowReads && !windows.canRestoreSelection,"A vanished window cannot broaden restore or query active sessions")
+        windows.selectedID=other.id;await windows.waitForRepositories()
+        try check(windows.entryFilter.window.isEmpty && windows.windowChoices.count==1,"Switching profiles resets the saved window filter")
         controller.entryFilter.agent = .codex
         let task=Task {await controller.restoreSelection()}
         while !controller.busy {await Task.yield()}

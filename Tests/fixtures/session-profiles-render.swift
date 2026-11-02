@@ -24,6 +24,10 @@ import AutoApproveCore
                 try await render(SessionProfilesWindow(controller:controller),name:name+"-"+theme,width:width,height:height,scheme:scheme,root:root)
             }
         }
+        controller.entryFilter.window=SessionProfileEntryFilter.windowKey(entries[8]);controller.entryFilter.order = .window
+        for scheme in [ColorScheme.light,.dark] {
+            try await render(SessionProfilesWindow(controller:controller),name:scheme == .dark ? "window-filter-dark":"window-filter-light",width:700,height:480,scheme:scheme,root:root)
+        }
         controller.entryFilter.agent = .codex
         try await render(SessionProfilesWindow(controller:controller),name:"codex-filter-light",width:700,height:480,scheme:.light,root:root)
         controller.entryFilter.query="검색 결과가 없는 작업"
