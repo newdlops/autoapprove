@@ -5,7 +5,6 @@ import AutoApproveCore
 
 struct SessionProfilesWindow: View {
     @ObservedObject var controller:SessionProfilesController
-    @State private var selectedEntries=Set<UUID>()
     var body:some View {
         VStack(spacing:0) {
             if let error=controller.error {
@@ -39,7 +38,7 @@ struct SessionProfilesWindow: View {
                                     Text(profile.savedAt.formatted(date:.abbreviated,time:.shortened)).font(.caption).foregroundStyle(.secondary)
                                 }.padding(.vertical,6).tag(profile.id)
                             }
-                        }.listStyle(.inset).disabled(controller.busy)
+                        }.listStyle(.inset).disabled(controller.busy || controller.loading)
                     }
                 }.frame(minWidth:210,idealWidth:245,maxWidth:300)
                 Group {
@@ -76,14 +75,11 @@ struct SessionProfilesWindow: View {
                     .help("프로필 파일 목록을 다시 읽습니다.")
             }
         }
-        .task {await controller.reload();selectAll()}
-        .onChange(of:controller.selectedID) {_,_ in selectAll()}
-        .onChange(of:controller.selected?.entries.map(\.id)) {_,_ in selectAll()}
+        .task {await controller.reload()}
         .sheet(item:$controller.draft) {draft in
             SessionProfileEditor(draft:draft,save:controller.save,cancel:{controller.draft=nil})
         }
     }
-    private func selectAll() {selectedEntries=Set(controller.selected?.entries.map(\.id) ?? [])}
     private func detail(_ profile:TerminalSessionProfile) -> some View {
         VStack(alignment:.leading,spacing:12) {
             HStack(alignment:.top) {
@@ -105,46 +101,85 @@ struct SessionProfilesWindow: View {
                     .accessibilityLabel("프로필 관리").help("이름·대화 편집, 현재 창으로 갱신, 파일 내보내기 또는 휴지통 이동")
                     .disabled(controller.busy)
             }
-            Text("복원할 세션을 선택하세요. 대화 ID가 있으면 이어가고, 없으면 저장한 폴더에서 새 CLI를 엽니다.")
-                .font(.callout).foregroundStyle(.secondary)
-            if profile.entries.contains(where:{$0.host == .terminal && $0.terminalTab == nil}) {
-                Text("창 정보가 없는 Terminal 세션은 한 창의 탭으로 모아 엽니다. ‘현재 창으로 갱신’하면 원래 구성을 저장합니다.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-            }
-            Divider()
-            List(profile.entries) {entry in
+            entryControls(profile)
+            if controller.visibleEntries.isEmpty {
+                ContentUnavailableView {
+                    Label("조건에 맞는 세션이 없습니다",systemImage:"line.3.horizontal.decrease.circle")
+                } description: {Text("도구·레포 또는 검색어를 바꿔보세요.")}
+                actions: {Button("필터 초기화") {controller.entryFilter = .init()}.disabled(controller.busy)}
+            } else {List(controller.visibleEntries) {entry in
                 VStack(alignment:.leading,spacing:6) {
-                    Toggle(isOn:Binding(get:{selectedEntries.contains(entry.id)},set:{if $0 {selectedEntries.insert(entry.id)} else {selectedEntries.remove(entry.id)}})) {
+                    Toggle(isOn:Binding(get:{controller.selectedEntries.contains(entry.id)},set:{if $0 {controller.selectedEntries.insert(entry.id)} else {controller.selectedEntries.remove(entry.id)}})) {
                         Text(entry.title.isEmpty ? entry.agent:entry.title).font(.body.weight(.medium)).lineLimit(2)
-                    }.toggleStyle(.checkbox).disabled(controller.busy)
+                    }.toggleStyle(.checkbox).disabled(controller.busy || controller.loading)
+                        .accessibilityLabel("\(entry.agent == "codex" ? "Codex":"Claude") · \(entry.title) · \(entry.cwd)")
                     Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal"))
                         .font(.caption).foregroundStyle(.secondary)
-                    if !entry.terminalTabSummary.isEmpty {Text(entry.terminalTabSummary).font(.caption).foregroundStyle(.secondary).lineLimit(2).help(entry.terminalTabSummary)}
                     Text(entry.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(entry.cwd)
-                    if let home=entry.providerHome {
-                        Text("CLI 설정 폴더: "+home).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(home)
-                    }
-                    if entry.resumesConversation {
-                        Text(entry.conversationID).font(.system(.caption,design:.monospaced)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                    } else {Text("새 CLI 실행").font(.caption).foregroundStyle(.secondary)}
+                    DisclosureGroup("대화·창 정보") {
+                        VStack(alignment:.leading,spacing:4) {
+                            if !entry.terminalTabSummary.isEmpty {Text(entry.terminalTabSummary).help(entry.terminalTabSummary)}
+                            if let home=entry.providerHome {Text("CLI 설정 폴더: "+home).textSelection(.enabled)}
+                            if entry.resumesConversation {Text(entry.conversationID).font(.system(.caption,design:.monospaced)).textSelection(.enabled)}
+                            else {Text("새 CLI 실행")}
+                        }.font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    }.font(.caption).foregroundStyle(.secondary)
                     if let result=controller.results[entry.id] {
                         Label(result.detail,systemImage:result.phase == .opened ? "checkmark.circle":result.phase == .alreadyOpen ? "arrow.uturn.forward.circle":"exclamationmark.triangle")
                             .font(.callout).foregroundStyle(result.phase == .failed ? Color.red:Color.primary)
                     }
                 }.padding(.vertical,8)
-            }.listStyle(.inset).padding(.horizontal,-8)
+            }.listStyle(.inset).padding(.horizontal,-8)}
             Divider()
             HStack(spacing:10) {
-                Button(selectedEntries.count == profile.entries.count ? "모두 해제":"모두 선택") {
-                    if selectedEntries.count == profile.entries.count {selectedEntries=[]} else {selectAll()}
-                }.disabled(controller.busy)
+                Button(controller.selectedVisibleIDs.count == controller.visibleEntries.count ? "표시 항목 해제":"표시 항목 선택") {
+                    controller.selectVisible(controller.selectedVisibleIDs.count != controller.visibleEntries.count)
+                }.disabled(controller.busy || controller.loading || controller.resolvingRepositories || controller.visibleEntries.isEmpty)
                 Spacer(minLength:4)
-                Text("\(selectedEntries.count)개 선택").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                Button("선택한 세션 복원") {Task {await controller.restore(profile,selected:selectedEntries)}}
-                    .keyboardShortcut("r",modifiers:[.command,.shift]).disabled(controller.busy || selectedEntries.isEmpty)
-                    .help("이미 실행 중인 대화는 건너뛰고 선택한 저장 대화를 다시 엽니다. ⌘⇧R")
+                Button("선택한 \(controller.selectedVisibleIDs.count)개 복원") {Task {await controller.restoreSelection()}}
+                    .keyboardShortcut("r",modifiers:[.command,.shift]).disabled(!controller.canRestoreSelection)
+                    .help("현재 필터에 표시된 선택 항목만 복원합니다. 이미 실행 중인 대화는 건너뜁니다. ⌘⇧R")
             }
         }.padding(20)
+    }
+    private func entryControls(_ profile:TerminalSessionProfile) -> some View {
+        VStack(alignment:.leading,spacing:8) {
+            Picker("복원할 도구",selection:$controller.entryFilter.agent) {
+                ForEach(SessionProfileEntryFilter.Agent.allCases,id:\.self) {Text($0.rawValue).tag($0)}
+            }.pickerStyle(.segmented).labelsHidden().accessibilityLabel("복원할 도구")
+            HStack(spacing:8) {
+                Image(systemName:"magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+                TextField("이름·레포·폴더·대화 ID 검색",text:$controller.entryFilter.query)
+                    .textFieldStyle(.roundedBorder).accessibilityLabel("복원할 세션 검색")
+                if !controller.entryFilter.query.isEmpty {Button {controller.entryFilter.query=""} label:{Image(systemName:"xmark.circle.fill")}
+                    .buttonStyle(.plain).accessibilityLabel("검색어 지우기")}
+            }
+            HStack(spacing:10) {
+                Picker("레포/작업 폴더",selection:$controller.entryFilter.repository) {
+                    Text("모든 레포/작업 폴더").tag("")
+                    ForEach(controller.repositoryChoices,id:\.self) {path in
+                        Text((path as NSString).lastPathComponent+" · "+((path as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath).tag(path)
+                    }
+                    if !controller.entryFilter.repository.isEmpty && !controller.repositoryChoices.contains(controller.entryFilter.repository) {
+                        Text(controller.entryFilter.repository+" · 현재 없음").tag(controller.entryFilter.repository)
+                    }
+                }.labelsHidden().frame(minWidth:0,maxWidth:.infinity).help(controller.entryFilter.repository.isEmpty ? "같은 레포의 하위 폴더를 함께 고릅니다. Git 표식이 없으면 저장된 작업 폴더로 구분합니다.":controller.entryFilter.repository)
+                    .accessibilityLabel("레포 또는 작업 폴더")
+                Picker("정렬",selection:$controller.entryFilter.order) {
+                    ForEach(SessionProfileEntryFilter.Order.allCases,id:\.self) {Text($0.rawValue).tag($0)}
+                }.frame(width:125).help("목록의 정렬 기준입니다. 복원할 때는 저장된 창·탭 순서를 유지합니다.")
+                Button {controller.entryFilter.ascending.toggle()} label: {Image(systemName:controller.entryFilter.ascending ? "arrow.up":"arrow.down")}
+                    .accessibilityLabel(controller.entryFilter.ascending ? "오름차순 · 내림차순으로 변경":"내림차순 · 오름차순으로 변경")
+                    .help("정렬 방향 전환")
+            }
+            HStack {
+                Text(controller.resolvingRepositories ? "레포 확인 중…":"표시 \(controller.visibleEntries.count)/\(profile.entries.count)개 · 선택 \(controller.selectedVisibleIDs.count)개")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Spacer(minLength:4)
+                if controller.entryFilter.active {Button("필터 초기화") {controller.entryFilter = .init()}.font(.caption)}
+            }
+            Text("복원은 현재 표시된 선택 항목에만 적용됩니다.").font(.caption).foregroundStyle(.secondary)
+        }.disabled(controller.busy || controller.loading || controller.resolvingRepositories)
     }
 }
 

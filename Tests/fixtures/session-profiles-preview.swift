@@ -38,9 +38,14 @@ private actor FixtureLaunches {
         }
         do {
             if try store.list().profiles.isEmpty {
+                for path in ["repos/api","repos/web","repos/docs","dense/team-0/repo","dense/team-1/repo","dense/team-2/repo"] {
+                    try FileManager.default.createDirectory(at:root.appendingPathComponent(path+"/.git"),withIntermediateDirectories:true)
+                }
                 _ = try store.save(.init(id:UUID(uuidString:id(1))!,name:"개발 작업",entries:[
-                    try entry(100,"결제 API · Codex","codex","old-api"),try entry(101,"웹 관리자 · Claude Code","claude","old-web")]))
-                _ = try store.save(.init(id:UUID(uuidString:id(2))!,name:"긴 이름의 프로필 · 여러 프로젝트와 재부팅 뒤 이어갈 작업",entries:try (0..<18).map {try entry(200+$0,"긴 작업 이름 \($0+1) · 한국어와 English 프로젝트의 작업 상태","codex","dense/project-\($0)/long-project-directory")}))
+                    try entry(100,"결제 API · Codex","codex","repos/api"),try entry(101,"API 인증 · Claude","claude","repos/api/services/auth"),
+                    try entry(102,"웹 관리자 · Codex","codex","repos/web"),try entry(103,"웹 화면 · Claude","claude","repos/web/apps/admin"),
+                    try entry(104,"문서 · Codex","codex","repos/docs"),try entry(105,"가이드 · Claude","claude","repos/docs/guides")]))
+                _ = try store.save(.init(id:UUID(uuidString:id(2))!,name:"긴 이름의 프로필 · 여러 프로젝트와 재부팅 뒤 이어갈 작업",entries:try (0..<18).map {try entry(200+$0,"긴 작업 이름 \($0+1) · 한국어와 English 프로젝트의 작업 상태",$0%2==0 ? "codex":"claude","dense/team-\($0%3)/repo/component-\($0)/long-project-directory")}))
             }
             var ambiguous=try entry(400,"대화 ID 없이 새 Codex","codex","current-choice");ambiguous.conversationID=""
             var freshClaude=try entry(402,"대화 ID 없이 새 Claude","claude","current-claude");freshClaude.conversationID=""

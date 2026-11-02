@@ -18,16 +18,23 @@ import AutoApproveCore
         }
         let profile=try store.save(.init(name:"여러 창 작업 프로필 · 재부팅 뒤 이어가기",entries:entries))
         let controller=SessionProfilesController(store:store,capture:{[]},launch:{_,_ in "/dev/fixture-render"})
-        await controller.reload();controller.selectedID=profile.id
+        await controller.reload();controller.selectedID=profile.id;await controller.waitForRepositories()
         for (name,width,height) in [("minimum",700,480),("default",860,640),("wide",1100,800)] {
             for (theme,scheme) in [("light",ColorScheme.light),("dark",ColorScheme.dark)] {
                 try await render(SessionProfilesWindow(controller:controller),name:name+"-"+theme,width:width,height:height,scheme:scheme,root:root)
             }
         }
+        controller.entryFilter.agent = .codex
+        try await render(SessionProfilesWindow(controller:controller),name:"codex-filter-light",width:700,height:480,scheme:.light,root:root)
+        controller.entryFilter.query="검색 결과가 없는 작업"
+        try await render(SessionProfilesWindow(controller:controller),name:"filtered-empty-dark",width:700,height:480,scheme:.dark,root:root)
+        controller.entryFilter = .init();controller.selectedEntries=[]
+        try await render(SessionProfilesWindow(controller:controller),name:"none-selected-light",width:860,height:640,scheme:.light,root:root)
+        controller.selectVisible(true)
         var legacy=TerminalSessionProfile(name:"기존 작업 프로필 · 창 정보가 없는 이전 프로필",entries:Array(entries.prefix(2)).map {value in var entry=value;entry.terminalTab=nil;return entry})
-        legacy.schema=1;_ = try store.save(legacy);await controller.reload();controller.selectedID=legacy.id
+        legacy.schema=1;_ = try store.save(legacy);await controller.reload();controller.selectedID=legacy.id;await controller.waitForRepositories()
         try await render(SessionProfilesWindow(controller:controller),name:"legacy-light",width:700,height:480,scheme:.light,root:root)
-        controller.selectedID=profile.id
+        controller.selectedID=profile.id;await controller.waitForRepositories()
         controller.error="프로필 파일을 읽지 못했습니다. 파일 형식을 확인한 뒤 다시 불러와주세요. "+String(repeating:"긴 오류 안내. ",count:16)
         try await render(SessionProfilesWindow(controller:controller),name:"error-light",width:700,height:480,scheme:.light,root:root)
         for (name,error) in [("access-denied",TerminalProfileAccessError.accessibilityDenied),("terminal-closed",.terminalNotRunning)] {
@@ -52,7 +59,15 @@ import AutoApproveCore
         let host=NSHostingView(rootView:view.frame(width:CGFloat(width),height:CGFloat(height)).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,scheme))
         host.frame=NSRect(x:0,y:0,width:width,height:height);host.appearance=NSAppearance(named:scheme == .dark ? .darkAqua:.aqua)
         let window=NSWindow(contentRect:host.frame,styleMask:[.borderless],backing:.buffered,defer:false);window.isReleasedWhenClosed=false;window.contentView=host
-        try await Task.sleep(for:.milliseconds(120));host.layoutSubtreeIfNeeded();host.displayIfNeeded()
+        try await Task.sleep(for:.milliseconds(120))
+        if let view=view as? SessionProfilesWindow {
+            for _ in 0..<200 {
+                if !view.controller.loading && !view.controller.resolvingRepositories {break}
+                try await Task.sleep(for:.milliseconds(10))
+            }
+            guard !view.controller.loading && !view.controller.resolvingRepositories else {throw AppError.message("Profile render did not settle")}
+        }
+        host.layoutSubtreeIfNeeded();host.displayIfNeeded()
         guard let bitmap=host.bitmapImageRepForCachingDisplay(in:host.bounds) else {throw AppError.message("Native profile render missing")}
         host.cacheDisplay(in:host.bounds,to:bitmap)
         guard let png=bitmap.representation(using:.png,properties:[:]) else {throw AppError.message("Native profile PNG missing")}

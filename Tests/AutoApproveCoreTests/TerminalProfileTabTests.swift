@@ -157,6 +157,12 @@ extension ApprovalTests {
         let partial=TerminalProfileRestorer()
         _ = try await partial.restore(profile,selected:[b.id],active:[a],activeTerminalTTYs:[a.key:"/dev/ttys799"],directoryExists:{_ in true},launch:{await log.launch($0,$1)})
         try expectEqual(await log.entries.last?.1,"/dev/ttys799","An unselected but already open member anchors missing tabs")
+        var hidden=a;hidden.agent="claude";hidden.terminalTab?.selected=true
+        var chosen=b;chosen.terminalTab?.selected=false
+        let filteredLog=TabLaunchLog()
+        _ = try await TerminalProfileRestorer().restore(.init(name:"Codex only",entries:[hidden,chosen]),selected:[chosen.id],active:[hidden],activeTerminalTTYs:[hidden.key:"/dev/ttys799"],directoryExists:{_ in true},launch:{await filteredLog.launch($0,$1)},selectTab:{await filteredLog.select($0)})
+        try expectEqual(await filteredLog.entries.map(\.0),[chosen.id],"The hidden Claude is not relaunched")
+        try expectEqual(await filteredLog.selections,["/dev/ttys701"],"Final focus stays in the selected restore subset")
         var old=profile;old.schema=1;old.entries=old.entries.map {value in var entry=value;entry.terminalTab=nil;return entry}
         let legacy=TabLaunchLog()
         _ = try await TerminalProfileRestorer().restore(old,selected:Set(old.entries.map(\.id)),active:[],directoryExists:{_ in true},launch:{await legacy.launch($0,$1)})

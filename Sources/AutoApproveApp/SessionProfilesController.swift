@@ -10,10 +10,64 @@ struct SessionProfileDraft: Identifiable {
     var candidates: [TerminalProfileCandidate]
 }
 
+struct SessionProfileEntryFilter:Equatable {
+    enum Agent:String,CaseIterable {case all="전체",codex="Codex",claude="Claude"}
+    enum Order:String,CaseIterable {case saved="저장 순서",repository="레포",agent="도구",title="이름"}
+    var agent:Agent = .all
+    var repository=""
+    var query=""
+    var order:Order = .saved
+    var ascending=true
+    var active:Bool {agent != .all || !repository.isEmpty || !query.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
+    func entries(_ entries:[TerminalProfileEntry],repositories:[String:String]) -> [TerminalProfileEntry] {
+        let query=query.trimmingCharacters(in:.whitespacesAndNewlines)
+        return entries.enumerated().filter {_,entry in
+            (agent == .all || entry.agent == (agent == .codex ? "codex":"claude")) &&
+            (repository.isEmpty || (repositories[entry.cwd] ?? entry.cwd) == repository) &&
+            (query.isEmpty || [entry.title,entry.cwd,entry.conversationID,repositories[entry.cwd] ?? entry.cwd]
+                .contains { $0.localizedStandardContains(query) })
+        }.sorted {left,right in
+            let comparison:ComparisonResult
+            switch order {
+            case .saved:return ascending ? left.offset<right.offset:left.offset>right.offset
+            case .repository:comparison=(repositories[left.element.cwd] ?? left.element.cwd).localizedStandardCompare(repositories[right.element.cwd] ?? right.element.cwd)
+            case .agent:comparison=left.element.agent.localizedStandardCompare(right.element.agent)
+            case .title:comparison=left.element.title.localizedStandardCompare(right.element.title)
+            }
+            if comparison == .orderedSame {return left.offset<right.offset}
+            return comparison == (ascending ? .orderedAscending:.orderedDescending)
+        }.map(\.element)
+    }
+    // Read markers only, off the main actor. No Git subprocess, config, or CLI
+    // conversation lookup. Missing repositories remain exact working folders.
+    static func repositories(for paths:[String]) -> [String:String] {
+        let manager=FileManager.default;var roots:[String:String]=[:],missing=Set<String>(),result:[String:String]=[:]
+        for path in Set(paths) {
+            var directory=URL(fileURLWithPath:path).standardizedFileURL,visited:[String]=[],root:String?
+            for _ in 0..<128 {
+                let current=directory.path
+                if let cached=roots[current] {root=cached;break}
+                if missing.contains(current) {break}
+                visited.append(current)
+                if manager.fileExists(atPath:directory.appendingPathComponent(".git").path) {root=current;break}
+                if current == "/" {break};directory.deleteLastPathComponent()
+            }
+            if let root {for item in visited {roots[item]=root}}
+            else {missing.formUnion(visited)}
+            result[path]=root ?? path
+        }
+        return result
+    }
+}
+
 @MainActor final class SessionProfilesController: ObservableObject {
     let store: TerminalProfileStore
     @Published private(set) var profiles:[TerminalSessionProfile]=[]
-    @Published var selectedID:UUID?
+    @Published var selectedID:UUID? {didSet {if oldValue != selectedID {message=nil;results=[:];prepareEntries(reset:true)}}}
+    @Published var entryFilter=SessionProfileEntryFilter()
+    @Published var selectedEntries=Set<UUID>()
+    @Published private(set) var repositories:[String:String]=[:]
+    @Published private(set) var resolvingRepositories=false
     @Published var draft:SessionProfileDraft?
     @Published private(set) var busy=false
     @Published private(set) var loading=false
@@ -25,6 +79,8 @@ struct SessionProfileDraft: Identifiable {
     private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
     private let selectTab:@Sendable (String) async throws -> Void
     private let restorer=TerminalProfileRestorer()
+    private var repositoryTask:Task<Void,Never>?
+    private var repositoryGeneration=UUID()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
          activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
@@ -42,13 +98,45 @@ struct SessionProfileDraft: Identifiable {
                   activeSessions:{try await engine.terminalProfileCandidates(includeLayout:false)})
     }
     var selected:TerminalSessionProfile? {profiles.first {$0.id == selectedID}}
+    var visibleEntries:[TerminalProfileEntry] {entryFilter.entries(selected?.entries ?? [],repositories:repositories)}
+    var selectedVisibleIDs:Set<UUID> {selectedEntries.intersection(visibleEntries.map(\.id))}
+    var repositoryChoices:[String] {Array(Set((selected?.entries ?? []).map {repositories[$0.cwd] ?? $0.cwd})).sorted {$0.localizedStandardCompare($1) == .orderedAscending}}
+    var canRestoreSelection:Bool {!busy && !loading && !resolvingRepositories && !selectedVisibleIDs.isEmpty}
+    func selectVisible(_ included:Bool) {
+        let ids=Set(visibleEntries.map(\.id))
+        if included {selectedEntries.formUnion(ids)} else {selectedEntries.subtract(ids)}
+    }
+    func restoreSelection() async {
+        guard canRestoreSelection,let profile=selected else {return}
+        // Capture the visible intersection before the first await. Hidden checked
+        // rows and display sorting never widen or reorder the restore plan.
+        let ids=selectedVisibleIDs
+        await restore(profile,selected:ids)
+    }
+    func waitForRepositories() async {await repositoryTask?.value}
+    private func prepareEntries(reset:Bool) {
+        repositoryTask?.cancel();let generation=UUID();repositoryGeneration=generation
+        guard let profile=selected else {selectedEntries=[];repositories=[:];resolvingRepositories=false;return}
+        if reset {entryFilter = .init();selectedEntries=Set(profile.entries.map(\.id))}
+        else {selectedEntries.formIntersection(profile.entries.map(\.id))}
+        resolvingRepositories=true
+        let paths=profile.entries.map(\.cwd)
+        repositoryTask=Task { [weak self] in
+            let value=await Task.detached(priority:.utility) {SessionProfileEntryFilter.repositories(for:paths)}.value
+            guard let self,self.repositoryGeneration==generation,self.selectedID==profile.id else {return}
+            self.repositories=value;self.resolvingRepositories=false
+        }
+    }
     func reload() async {
         guard !loading else {return};loading=true;defer {loading=false}
         let store=store
         do {
             let listing=try await Task.detached(priority:.utility) {try store.list()}.value
+            let previousID=selectedID,previousEntries=selected?.entries.map(\.id)
             profiles=listing.profiles
             if !profiles.contains(where:{$0.id == selectedID}) {selectedID=profiles.first?.id}
+            if previousID==selectedID {prepareEntries(reset:previousEntries != selected?.entries.map(\.id))}
+            await waitForRepositories()
             if !listing.warnings.isEmpty {error="읽지 못한 프로필 \(listing.warnings.count)개가 있습니다. 파일을 확인한 뒤 다시 불러와주세요.\n"+listing.warnings.prefix(3).joined(separator:"\n")}
         } catch {self.error=error.localizedDescription}
     }

@@ -287,7 +287,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
         }
         func finishGroup(_ key:String) async {
             guard openedGroups.contains(key),!Task.isCancelled else {return}
-            let candidates=entries.filter {group($0)==key && knownTTYs[$0.key] != nil}
+            let candidates=entries.filter {selected.contains($0.id) && group($0)==key && knownTTYs[$0.key] != nil}
             guard let target=candidates.first(where:{$0.terminalTab?.selected == true}) ?? candidates.first,
                   let tty=knownTTYs[target.key] else {return}
             do {try await selectTab(tty)}
