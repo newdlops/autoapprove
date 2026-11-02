@@ -126,7 +126,10 @@ enum RemoteTunnelCredentials {
         let root=directory.appendingPathComponent("tunnel-runs/"+UUID().uuidString)
         metricsPort = nil;monitor?.setMetricsPort(nil)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]); runDirectory=root
-        var arguments=["tunnel","--no-autoupdate","--protocol","auto","--edge-ip-version","auto","--metrics","127.0.0.1:0"]
+        // The native default (8 address failures) can postpone HTTP2 fallback
+        // beyond our 60-second readiness watchdog and restart QUIC forever.
+        // Keep automatic protocol selection but give both transports a turn.
+        var arguments=["tunnel","--no-autoupdate","--protocol","auto","--max-edge-addr-retries","2","--edge-ip-version","auto","--metrics","127.0.0.1:0"]
         if configuration.provider == .managed {
             guard let id=configuration.tunnelID,let data=managedCredentials,data.count <= 65536,
                   let value=try? JSONSerialization.jsonObject(with:data) as? JSONObject,

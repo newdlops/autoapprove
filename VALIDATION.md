@@ -1,5 +1,21 @@
 # AutoApprove 검증 기록
 
+## 2026-11-02 · QUIC 재시도 예산과 HTTP2 전환 · 0.2.225/252
+
+- 제품 controller/gateway와 기존 공식 **cloudflared 2026.10.3**의 격리 Quick Tunnel은 180초 안에 준비되지 못했다. 직접 TCP 7844 두 edge와 API 443 연결 자체는 성공했으므로 단순 포트 차단으로 표시하지 않는다. 같은 공식 커넥터의 자동 모드는 66초 동안 QUIC timeout 6회·HTTP2 전환 0회, 181초 연속 관찰에서는 QUIC timeout 9회 뒤 HTTP2 전환 1회였다. HTTP2 단독 66초는 TLS 핸드셰이크의 `connection reset by peer`로 등록되지 못했다. 정상 터널 검증으로 간주하지 않는다.
+- 제품의 60초 준비 watchdog이 주소별 기본 재시도 8회의 누적을 초기화해 대체 경로를 잃는 충돌을 확인했다. 공식 커넥터에서 주소별 재시도만 2회로 바꾼 비교는 QUIC timeout 3회 뒤 **25.915초**에 HTTP2로 전환했다. TLS 검증과 `--protocol auto`는 유지했다. 이후 HTTP2 TLS reset은 남았으므로 네트워크 전체 연결 성공을 주장하지 않는다.
+- 새 opt-in `scripts/cloudflared-fallback-check.mjs`는 실제 제품 controller/gateway·공식 커넥터와 관찰 wrapper로 QUIC 등록 또는 HTTP2 전환이 준비 watchdog 전에 가능한지 확인한다. 수정 전 **55초·QUIC timeout 6회·등록/전환 0회**로 실패했고 보고서 `passed:false`를 보존했다. 초기 Swift fixture는 실패를 top-level throw로 끝내 exit signal이 발생했으나, 미전환 보고서를 먼저 기록하고 소유 커넥터가 종료됐음을 확인했다. 최종 fixture는 명시적 exit 1로 바꿨다. 수정은 launch argv의 주소별 재시도 한도 2회 지정 하나다. 최종 release 빌드 **150.83초**와 같은 외부 회귀가 통과했으며 QUIC timeout 3회 뒤 **29.238초에 HTTP2 전환**을 확인했다. 전체 Core와 기존 커넥터 설정/인증 브라우저 회귀는 진행 중이다.
+- 모든 외부 진단은 인증된 임시 합성 gateway 또는 고정 합성 응답 서버만 사용했다. 운영 Cloudflare 계정·도메인·원본 세션·사용자 입력은 사용하지 않았고 방화벽·TLS 검증·OS 권한을 바꾸지 않았다. 가린 에러 분류와 수치만 기록한다. 소유 connector 종료와 임시 광고 포트 해제를 확인했다. 비공개 근거는 `.runtime/stability-quick-20261102/`와 `.runtime/stability-udp-20261102/`에 보관한다.
+- 기존 named/managed 커넥터의 Chromium 인증/설정 회귀는 **6개 검사군·JS 오류 0개**로 통과했고 새 공통 옵션을 포함한 managed config를 공식 CLI로 검증했다. 합성 HTTPS 프록시·합성 원본·전용 PTY를 사용하며 현재 외부 경로의 TLS 준비 성공과 구분한다.
+- 최초 전체 Core 실행은 **615/616**으로, `AI account login: private PTY ownership, exact code, cancel and hidden inventory`가 합성 코드 파일의 **빈 문자열 != SENSITIVE + newline**로 실패했다. shell append가 파일을 연 직후 기록 전에 존재 조건이 성립할 수 있으므로, 테스트만 기존 600ms 상한 안에서 완전한 newline을 기다린 후 정확한 내용/중복 여부를 검증하도록 고쳤다. 제품 계정 입력 코드는 바꾸지 않았다. 검사 실행 파일 재빌드 **16.70초**, 대상 재검사 **1/1**이 통과했다. 최초 실행은 종료 코드 1로 보존하며 최종 전체 재실행은 **616/616·종료 코드 0**으로 통과했다. JavaScript 구문·`git diff --check`도 통과했다. 공개 배포·설치는 후속 확인 대상이다.
+
+## 2026-11-02 · 외부 TLS 20분과 실제 mDNS UDP 수명 주기
+
+- 제품 `CloudflareRelayServices.live`의 WSS 팩토리·HTTPS probe로 공식 Postman Echo에 합성 데이터만 전송했다. 원래 실행 핸들에서 **1,201초·110개 표본·HTTPS 실패 0개**, 에코 p50/p95 **177.4/180.9ms**, ping **177.9/180.9ms**, HTTPS GET **223.0/238.7ms**, 마지막 명시적 WSS 재개방 **1회**가 통과했다. 기본 TLS 검증을 유지했고 사용자 자격 증명·대화·터미널 입력은 0이다. Cloudflare controller/인증/실제 중계 전체 검증과 구분한다. 비공개 자료는 `.runtime/stability-native-20261102/tls/`다.
+- 제품 Bonjour 광고 소스 그대로와 실제 mDNSResponder/UDP에서 등록·동일 레코드 유지·포트/TXT 변경·철회·재등록·다른 이름 거부 **6개**가 통과했다. 멀티캐스트 질의 **10개**, 소스 UDP 5353의 일치 응답 **4개/644B**, 정확한 SRV 포트/TXT를 확인했다. 같은 호스트의 Wi-Fi 주소를 사용한 데이터그램 결과이며 다른 기기·NIC 패킷 캡처·손실 환경 결과는 아니다.
+- 초기 충돌 검사는 신규 소유자만 실패한다고 가정해 타임아웃됐다. 실제로 기존 소유자가 실패한 상태를 확인해 어느 소유자가 실패하든 추적하도록 진단을 수정했다. 후속 실제 충돌/재시도·중지 검사는 정상 소유자 UDP 유지, 충돌 해제 후 등록 복구 **5,245ms**·이후 UDP 일치 응답 **702ms**, pending retry 중지 후 **5.6초** 뒤에도 광고 없음으로 통과했다. 의도한 등록 실패 **2회**와 최초 실패 기록은 보존한다. 제품 수정은 없다.
+- 진단 포트는 listen 없이 예약해 다른 앱 서비스를 광고하지 않았고, 종료 후 소유 광고 프로세스 0개·예약 포트 3개 해제를 확인했다. 운영 Cloudflare 외부 연결이 꺼져 있음을 읽기 전용 UI에서 확인했다. UDP 범위에는 Bonjour 외에 `cloudflared --protocol auto`의 QUIC/UDP 7844도 포함하므로 별도의 격리 Quick Tunnel 측정을 진행한다. 실제 Terminal 수동 시험은 도구 차단/답변 대기로 남아 있으며 전체 목표는 active다.
+
 ## 2026-11-02 · 0.2.224/251 공개 배포·정식 설치
 
 - 소스/공개 태그 **0213de272297b53ccdb0a0f1f113d98005e0c609**의 [v0.2.224](https://github.com/newdlops/autoapprove/releases/tag/v0.2.224)을 최신 릴리스로 게시했다. DMG·서명 업데이트 ZIP·각 SHA 파일 4개를 공개 재다운로드해 태그·GitHub digest·체크섬·추출 앱 버전/서명·주요 파일을 확인했다. DMG **10,290,435B**, SHA-256 **90718e003c24a6f21b7bfa12f033b8b10d0be709db2d531883086adf96a5aa89**, ZIP **10,620,754B**, SHA-256 **69cf4e6f0bf347fe5fd0596f8d1d2a8b206a51601dc12f52795c7c565a671599**다.

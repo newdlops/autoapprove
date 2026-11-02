@@ -80,8 +80,16 @@ extension ApprovalTests {
         engine.updateDiscovery([session],records:[]);try expectEqual(engine.snapshot.sessions.count,0);try expectEqual(engine.managedPTY.inventory.count,0)
         let submit=try await client.call(accounts,pin:pin,["action":"submit","id":id,"code":"SENSITIVE","token":token]);try expectEqual(submit["phase"] as? String,"verifying")
         let again=try await client.call(accounts,pin:pin,["action":"submit","id":id,"code":"SENSITIVE","token":token]);try expectEqual(again["status"] as? Int,409)
-        for _ in 0..<30 {if FileManager.default.fileExists(atPath:root.appendingPathComponent("codes").path){break};try await Task.sleep(for:.milliseconds(20))}
-        try expectEqual(try String(contentsOf:root.appendingPathComponent("codes"),encoding:.utf8),"SENSITIVE\n")
+        // The shell opens its append file before writing. File existence can
+        // race the actual bytes; wait for a complete line, then assert its exact
+        // value so a wrong/duplicate code still fails instead of being retried.
+        var recorded:String?
+        for _ in 0..<30 {
+            recorded=try? String(contentsOf:root.appendingPathComponent("codes"),encoding:.utf8)
+            if recorded?.hasSuffix("\n") == true {break}
+            try await Task.sleep(for:.milliseconds(20))
+        }
+        try expectEqual(recorded,"SENSITIVE\n")
         _ = try await client.call(accounts,pin:pin,["action":"cancel","agent":"claude","token":otherToken]);try expectFalse(accounts.busy)
         accounts.stop();try expect(accounts.privateTTYs.contains(tty),"An in-flight discovery cannot expose a just-cancelled auth PTY")
     }

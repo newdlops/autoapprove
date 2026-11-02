@@ -10,13 +10,13 @@
 | --- | --- | --- |
 | HTTP/TCP 장기 연결과 속도 | RemoteHTTP, RemoteHTTPReadPool, RemoteNetwork | 장기 직접/중계 연결·자원 상한·half-open/과부하/실제 입력 지연·단절 복구 측정 |
 | HTTPS/WSS 장기 연결과 속도 | CloudflareRelayAgent/Controller, RemoteTunnelController, relay.mjs | TLS/실제 중계의 ping 무응답·중계 교체·유실 응답·기한·재접속, 장기 자원/속도 측정 |
-| UDP 관련 검색·복구 | NWBrowser Bonjour, 물리 LAN 직접 검색/이웃 힌트 | 실제 mDNS/UDP 경로의 네트워크 변경·검색 실패/복구 및 트래픽 상한 검증 |
+| UDP 관련 검색·복구 | NWBrowser Bonjour, mDNS, 물리 LAN 직접 검색/이웃 힌트, cloudflared의 QUIC/UDP 7844 | 실제 mDNS 질의·등록 실패/복구와 QUIC 전송/HTTP2 대체 경로 검증 |
 | 줄바꿈·크기 변화 | DetectionLines, ScreenAnalysis, PromptDetector, TerminalAdapter | 여러 CLI/실제 셀 폭·높이에서 정확한 질의·동일 요청 식별, 조작 직전 변화와 재개 검사 |
 | 스크롤/이전 출력 | 원본 contents와 별도 display/scrollback 경로 | 현재 요청과 과거 출력 분리, 현재 창이 과거로 스크롤된 상태에서 잘못된 승인 없음 및 최신 요청 재감지·재개 검증 |
 | 자동화가 꼬인 상태의 복구 | 승인 예약/receipt, 원본 PID·시작 시각·TTY 검증, progress recovery | 지연·취소·종료·새 질의·불명확 화면 왕복에 중복/오입력 0회, 감지 지연/복구 시간 측정 |
 | 배포 | 프로젝트 AGENTS.md의 기존 절차 | 원인 수정 후 관련 검사·같은 소스 빌드/서명·GitHub DMG/ZIP/SHA·공개 다운로드·정식 설치와 실행 버전 검증 |
 
-UDP는 별도의 터미널 명령 전송 프로토콜로 구현돼 있지 않다. Bonjour 경로와 운영체제의 이름 검색을 조사 대상으로 유지하며, 루프백 TCP 검사만으로 UDP를 검증했다고 표시하지 않는다.
+UDP는 별도의 터미널 명령 전송 프로토콜로 구현돼 있지 않지만, Bonjour/mDNS와 cloudflared의 QUIC 전송에 사용된다. 초기 조사에서 QUIC 범위가 빠졌으므로 이를 명시적으로 포함한다. [Cloudflare 문서](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/)와 제품의 `--protocol auto` 실행 경로를 대조했고 QUIC은 UDP 7844, HTTP2 대체 경로는 TCP 7844다. 루프백 TCP 또는 같은 호스트의 Bonjour 결과만으로 전체 UDP 범위를 완료 처리하지 않는다.
 
 ## 2026-11-02 기준선
 
@@ -57,3 +57,20 @@ UDP는 별도의 터미널 명령 전송 프로토콜로 구현돼 있지 않다
 - 여섯 합성 원본의 Core→HTTP→브라우저 fixture도 Claude 상태 줄을 실제 40×24 셀로 렌더링하도록 보강한다. 제품 원본 입력·정책·승인용 화면은 변경하지 않는다. 최종 빌드·전체 검사·배포·설치 결과는 후속 기록한다.
 - [Postman 공식 Echo 문서](https://learning.postman.com/docs/developer/echo-api)의 WSS/HTTPS 서비스로 제품 `CloudflareRelayServices.live` 연결 팩토리·probe를 사용하는 20분 측정을 시작했다. 인증 정보·사용자 대화 대신 고정 합성 에코 문자열만 전송하고 기본 TLS 검증을 유지한다. 이는 외부 TLS 전송 경로 검사이며 Cloudflare controller/인증/중계 프로토콜 전체나 LAN UDP를 검증한 결과는 아니다. 최종 실행 핸들/결과를 확인하기 전 성공으로 표시하지 않는다.
 - 정형 상태 줄의 제한된 복원은 **v0.2.224/251**, 소스/공개 태그 `0213de272297b53ccdb0a0f1f113d98005e0c609`로 전체 Core 616/616·footer 7/7·40~120칸 70개 셀 조건·실제 Core/HTTP/두 브라우저를 확인하고 배포·공개 다운로드·정식 설치를 마쳤다. 기존 진단 30개는 unknown 8개→0개, 실제 설치는 원본 19/19개를 보존했다. 자유 형식 필드의 줄바꿈과 실제 Terminal 과거 스크롤 검증은 남아 있으며, CUA 차단에 따른 수동 시험 가용 여부를 질문했다. 전체 목표는 계속 active다.
+
+## 외부 TLS 완료 및 실제 mDNS 데이터그램
+
+- 외부 TLS 실행은 같은 핸들을 이어 **1,201초·110개 표본·HTTPS 실패 0개**로 완료했다. 한 WSS task에서 합성 에코·native ping을 유지한 뒤 명시적으로 닫고 새 연결 1회를 확인했다. 에코 p50/p95 **177.4/180.9ms**(최대 993.5ms), ping **177.9/180.9ms**, HTTPS GET **223.0/238.7ms**다. 제품 live 연결 팩토리/probe와 기본 TLS 검증을 사용했고 사용자 데이터·자격 증명·터미널 입력은 0이다. 실제 Cloudflare controller/중계 프로토콜 전체의 외부 종단 검증과 구분한다.
+- 제품 `RemoteServiceAdvertisement.swift` 파일을 그대로 컴파일한 진단에서 실제 DNSServiceRegister·mDNSResponder·IPv4 UDP 질의/응답을 사용했다. [RFC 6762 §6.7](https://www.rfc-editor.org/rfc/rfc6762.html#section-6.7)의 임시 소스 포트 질의와 unicast 응답을 사용하며, 같은 Wi-Fi 인터페이스 주소에 바인딩했다. 임시 합성 레코드 등록·동일 설정·포트/TXT 변경·철회·재등록·다른 인스턴스 거부 6개가 통과했다. 질의 10개·UDP 5353 응답 4개/644B에서 정확한 포트/TXT를 확인했다. 정상 질의 완료는 416/91/702/702ms였고 철회/다른 이름은 각각 1.404초 동안 일치 응답이 없었다. 실제 패킷 캡처·다른 기기의 mDNS 또는 손실 네트워크를 검증한 결과는 아니다.
+- 실제 이름 충돌 검사에서 처음에는 새 광고가 실패한다고 가정해 시간 초과됐다. 상태 기록은 기존 광고가 실패하고 새 광고가 살아 있음을 보여 가정을 보정했다. 관찰된 실패 광고를 추적한 후속 검사는 유효한 소유자의 UDP 응답 유지, 충돌 해제 후 **5,245ms** 자동 등록 복구와 이후 일치 UDP 응답 **702ms**, 중지 후 5.6초 경과에도 재등록 없음이 통과했다. 의도한 등록 실패 2회가 있었고 제품 코드를 변경하지 않았다. 최초 실패 기록은 보존한다.
+- UDP 진단은 실제 TCP 서비스를 공개하지 않도록 해당 포트를 bind만 하고 listen하지 않았고, 종료 후 소유 광고 프로세스 0개·임시 포트 3개 해제를 확인했다. 공개 저장소에는 본문·호스트 주소·생성한 인스턴스 이름을 넣지 않는다.
+- 운영 앱을 읽기 전용으로 확인한 결과 Cloudflare 승인/PIN은 있으나 외부 연결은 꺼져 있었다. 완료된 에코 검사를 운영 중계 검증으로 표시하지 않는다. 운영 계정/도메인을 바꾸지 않는 GET 전용 합성 handler의 격리 Quick Tunnel로 실제 controller·gateway·cloudflared의 HTTPS/QUIC 및 소유 커넥터 중단 후 복구를 추가 측정 중이다. Quick Tunnel은 SSE를 지원하지 않으므로 이를 SSE 검증으로 대체하지 않는다([공식 제한](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/#limitations)).
+
+## QUIC 재시도와 준비 기한의 충돌
+
+- 격리 Quick Tunnel의 제품 controller는 180초 동안 `connecting/reconnecting`을 반복하고 준비되지 못했다. 같은 edge TCP 7844 두 곳과 API 443의 연결 검사 자체는 성공했으므로 단순한 TCP 포트 차단으로 분류하지 않았다.
+- 기존 공식 커넥터 **2026.10.3**의 실제 자동 모드 관찰은 66초 동안 QUIC dial timeout 6회·HTTP2 전환 0회였다. 연속 181초 관찰에서는 QUIC timeout 9회 뒤 HTTP2로 전환했고 그 뒤 TLS handshake reset이 관찰됐다. HTTP2 단독 66초도 TLS 핸드셰이크 리셋으로 등록되지 못했다. 현재 외부 경로는 QUIC 응답 없음과 HTTP2 TLS 연결 리셋을 보이며 포트 연결 성공만으로 정상으로 판정하지 않는다.
+- [동일 공식 버전 소스](https://github.com/cloudflare/cloudflared/blob/2026.10.3/supervisor/tunnel.go)와 [주소별 기본 재시도 8회](https://github.com/cloudflare/cloudflared/blob/2026.10.3/cmd/cloudflared/tunnel/cmd.go)를 확인했다. 제품의 60초 watchdog이 해당 시도 누적을 초기화해 HTTP2 전환 기회를 잃을 수 있다. 공식 주소별 재시도를 2회로 제한한 비교에서는 QUIC timeout 3회 뒤 **25.915초**에 HTTP2로 전환했다. 이후 TLS reset은 남았으므로 전체 터널 준비 성공으로 표시하지 않는다.
+- `scripts/cloudflared-fallback-check.mjs`는 제품 controller/gateway와 공식 커넥터의 바이트 스트림을 그대로 중계하는 관찰 wrapper로 60초 watchdog 전 QUIC 등록 또는 HTTP2 전환을 검사한다. 외부 경로·임시 합성 gateway를 사용하는 opt-in 회귀이며 정상 QUIC 환경은 등록으로 통과한다. 사용자 계정·도메인·원본 세션은 읽지 않는다. 수정 전후 실제 실행 결과와 배포는 후속 기록한다.
+- 실제 제품 controller의 수정 전 회귀는 **55초·QUIC timeout 6회·QUIC 등록/HTTP2 전환 0회**로 실패했다. 주소별 재시도 2회 지정 후 같은 외부 회귀는 QUIC timeout 3회 뒤 **29.238초에 HTTP2 전환**으로 통과했다. 기본 auto 선택과 TLS 검증을 유지하며, 수정은 커넥터 내부의 대체 전송 기회 복구다. 현재 네트워크의 HTTP2 TLS reset과 전체 실제 중계 준비 실패는 해결됐다고 표시하지 않는다. 최종 전체 검사·배포·설치는 후속 기록한다.
+- 최종 전체 Core **616/616**과 기존 터널 설정·인증 브라우저 회귀 6개 검사군이 통과했다. 최초 Core는 합성 PTY 파일 존재를 기록 완료로 간주한 검사 1개의 빈 파일 관찰로 615/616이었고, 같은 제한 시간 안에서 newline 완료 후 정확한 값을 확인하도록 테스트만 고친 뒤 전체를 다시 확인했다. 제품 계정 입력은 변경하지 않았으며 최초 실패를 보존한다. 서명·배포·설치는 후속 확인 대상이다.
