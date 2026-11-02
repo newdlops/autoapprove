@@ -7,6 +7,30 @@ private func foreignActivityFooter(_ text: String) -> String {
 }
 
 extension ApprovalTests {
+    func testClaudeFeedbackCardShortcutsSurviveCellWrapping() throws {
+        let shortcuts="1 to review · 2 to send · 0 to dismiss"
+        let footer="⏵⏵ auto mode on · 1 shell · 1 feedback draft"
+        func frame(_ before:[String]) -> String {
+            (before+["────────","❯","────────","fixture | main | Opus 5.5",footer]).joined(separator:"\r\n")
+        }
+        for columns in 24...80 {for rows in [24,40] {
+            let raw=try OriginalTerminalScreen.render(ansi:frame(["Feedback draft",shortcuts]),columns:columns,rows:rows,tty:"/dev/feedback-card-fixture").contents
+            let ready=try OriginalTerminalScreen.render(ansi:frame(["Completed synthetic task"]),columns:columns,rows:rows,tty:"/dev/feedback-card-fixture").contents
+            for foreign in [false,true] {
+                let card=foreign ? foreignActivityFooter(raw) : raw
+                try expectEqual(ActivityDetector.detect(card,agent:.claude).phase,.unknown,"Foreground card at \(columns)x\(rows)")
+                try expectEqual(ActivityDetector.detect(card.replacingOccurrences(of:"❯",with:"❯ Draft 한글"),agent:.claude).phase,.input,"Typing deactivates feedback shortcuts")
+                try expectEqual(ActivityDetector.detect(foreign ? foreignActivityFooter(ready) : ready,agent:.claude).phase,.idle)
+            }
+        }}
+        let oldCard=frame(["Feedback draft",shortcuts]+Array(repeating:"Old output",count:12))
+        try expectEqual(ActivityDetector.detect(oldCard,agent:.claude).phase,.unknown,"A card still in the visible tail remains unverified")
+        let outsideTail=frame(["Feedback draft",shortcuts]+Array(repeating:"Old output",count:24))
+        try expectEqual(ActivityDetector.detect(outsideTail,agent:.claude).phase,.idle,"Old shortcuts outside the visible tail do not block readiness")
+        let longHistory=frame([String(repeating:"Old output ",count:100_000),"Feedback draft",shortcuts])
+        try expectEqual(ActivityDetector.detect(longHistory,agent:.claude).phase,.unknown,"Bounded adjacent rows retain the foreground card")
+    }
+
     func testClaudeCompactActivityFooterPreservesMonitoringAndBoundaries() throws {
         let metadata="fixture | main | Opus 5.5 | ctx 35% | 5h 51% 7d 29%"
         let compact="⏵⏵ auto mode on · 1 shell · 1 feedback draft"

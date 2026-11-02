@@ -60,9 +60,6 @@ public enum ActivityDetector {
         let footer = compact.map { value in
             value.start > index ? Array(tail[(index+1)..<value.start])+[value.text] : Array(tail.dropFirst(index+1))
         } ?? Array(tail.dropFirst(index+1))
-        // A feedback review card has its own active shortcuts. Its count in the
-        // footer does not make that foreground choice a ready chat composer.
-        if compact != nil, matches(tail.joined(separator:" "), #"(?i)\b1 (?:to )?review\s*·\s*2 (?:to )?send\s*·\s*0 (?:to )?dismiss\b"#) {return unknown}
         let isHint: (String) -> Bool = { line in
             matches(line, #"\?\s*for shortcuts|shift\+tab to cycle"#)
                 || (agent == .claude && isCompactClaudeFooter(line))
@@ -82,6 +79,11 @@ public enum ActivityDetector {
         guard prompt.isEmpty || placeholder else {
             return ActivityObservation(phase: .input, detail: "CLI 입력창에 내용이 있습니다. 터미널에서 확인해주세요.")
         }
+        // The card's numeric shortcuts own an empty composer. Terminal reflow
+        // can split even a label's letters; tolerate whitespace only inside this
+        // fixed negative guard, never in command identities or arbitrary text.
+        // A real draft disables these shortcuts and keeps the input phase above.
+        if compact != nil, matches(tail.joined(separator:" "), #"(?i)\b1\s*(?:t\s*o\s*)?r\s*e\s*v\s*i\s*e\s*w\s*·\s*2\s*(?:t\s*o\s*)?s\s*e\s*n\s*d\s*·\s*0\s*(?:t\s*o\s*)?d\s*i\s*s\s*m\s*i\s*s\s*s\b"#) {return unknown}
         return ActivityObservation(phase: .idle,
             detail: background ? "다음 지시를 받을 수 있습니다. 백그라운드 작업이 남아 있어 모니터링 중으로 표시합니다." : "CLI의 입력 대기 화면을 반복 확인했습니다. 새 지시를 기다리고 있습니다.",
             monitoring: background)
