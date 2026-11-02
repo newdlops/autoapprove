@@ -21,4 +21,4 @@
 - [x] Tests RED: native CLI rejects --device-auth/SSH/BROWSER overrides; browser-only URL parser accepts official OAuth and rejects foreign/duplicate/invalid callbacks; native browser job preserves remote isolation.
 - [x] Implement default browser child and explicit parser mode; native UI removes code entry/copy and shows browser wait/reopen/completion.
 - [x] GREEN focused checks, native synthetic start/cancel/retry/completion interaction, 600×660 light/dark visual verification and fresh reviews. Final full-suite results are recorded in VALIDATION.md.
-- [ ] Release0.2.233/build260: matching source/build/tag, signed DMG+ZIP/checksums, public download and installed running version/session preservation.
+- [x] Release0.2.233/build260: source/tag e22b68d4f39d7f3164504f61d236ca0dd050847b, signed DMG+ZIP/checksums published and re-downloaded, /Applications running version verified, original18/18 sessions preserved. Final debug661/661 and release640/640; publication/install evidence recorded in VALIDATION.md.
