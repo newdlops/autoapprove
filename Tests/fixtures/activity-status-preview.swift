@@ -19,11 +19,15 @@ private final class StatusFrames: @unchecked Sendable {
     @MainActor static func main() async throws {
         let root=URL(fileURLWithPath:CommandLine.arguments[1]),frames=StatusFrames()
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
-        let claude="Completed synthetic task\n────────\n❯\n────────\nfixture-project | feature/status | Opus 5.5 | ctx 42% | 5h 14% 7d 94%\n⏵⏵ auto mode on (shift+tab to cycle)"
+        let unwrappedClaude="Completed synthetic task\n────────\n❯\n────────\nfixture-project | feature/status | Opus 5.5 | ctx 42% | 5h 14% 7d 94%\n⏵⏵ auto mode on (shift+tab to cycle)"
+        func wrappedClaude(_ text:String) throws -> String {
+            try OriginalTerminalScreen.render(ansi:text.replacingOccurrences(of:"\n",with:"\r\n"),columns:40,rows:24,tty:"/dev/status-cells").contents
+        }
+        let claude=try wrappedClaude(unwrappedClaude)
         let codex="Completed synthetic task\n›\nGPT-6.1-Sol max · ~/fixture · Ready · Context 35% left\n⚠ 2 warnings · f2 to view"
         let waiting="Giving this request a little extra thought\n› 1. Dismiss and keep waiting\n2. Learn more\nNo action is required. Codex will keep waiting, and this menu will close when the response is ready."
-        let compact=claude.replacingOccurrences(of:" | ctx 42% | 5h 14% 7d 94%",with:"")
-        let contextOnly=claude.replacingOccurrences(of:"ctx 42% | 5h 14% 7d 94%",with:"ctx 0%")
+        let compact=try wrappedClaude(unwrappedClaude.replacingOccurrences(of:" | ctx 42% | 5h 14% 7d 94%",with:""))
+        let contextOnly=try wrappedClaude(unwrappedClaude.replacingOccurrences(of:"ctx 42% | 5h 14% 7d 94%",with:"ctx 0%"))
         let names=["Claude ready","Claude draft","Codex warnings","Codex server wait","Claude compact","Claude context"]
         let sessions=(0..<6).map {index in
             var session=AgentSession(id:"process:\(2_000_000_000+index):status",agent:index<2 || index>=4 ? .claude : .codex,pid:Int32(2_000_000_000+index),started:"synthetic-status",tty:"/dev/status-fixture-\(index)",cwd:"/fixture/status-\(index)",terminal:.terminal)

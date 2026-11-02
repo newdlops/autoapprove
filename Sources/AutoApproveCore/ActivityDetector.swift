@@ -59,9 +59,11 @@ public enum ActivityDetector {
             matches(line, #"\?\s*for shortcuts|shift\+tab to cycle"#)
                 || (agent == .codex && matches(line, #"[0-9]{1,3}% (?:context )?left|^[^·]+ · [~/]"#))
         }
+        let isDecoration: (String) -> Bool = { isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } }
         guard !footer.isEmpty, footer.count <= 6, !bottom.contains("```"),
               footer.contains(where: isHint),
-              (footer.allSatisfy({ isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } || isStatusFooter($0,agent:agent) })
+              (footer.allSatisfy({ isDecoration($0) || isStatusFooter($0,agent:agent) })
+                || (agent == .claude && isWrappedClaudeStatusFooter(footer,decoration:isDecoration))
                 || (agent == .codex && CodexResumeCheck.goalStalled(tail))) else { return unresolved }
         // Option menus and questions also use prompt glyphs; they are never idle composers.
         if matches(prompt, #"^[0-9]+\."#) { return unknown }
@@ -78,6 +80,24 @@ public enum ActivityDetector {
 
     private static func isBackgroundHint(_ line: String) -> Bool {
         matches(line, #"(?i)^[•·⏵▶↳\s]*[0-9]+ (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b"#)
+    }
+
+    /// Restore wrapped structured model/usage fields only after both freeform
+    /// fields are complete. Never join across a hint/rule or rewrite the screen
+    /// used for permissions; freeform continuations remain unverified.
+    private static func isWrappedClaudeStatusFooter(_ footer:[String],decoration:(String)->Bool) -> Bool {
+        let indices=footer.indices.filter { !decoration(footer[$0]) }
+        guard (2...4).contains(indices.count),let first=indices.first,let last=indices.last,
+              last-first+1==indices.count else {return false}
+        let rows=Array(footer[first...last])
+        // A question between branch fragments is indistinguishable from a hard
+        // line break in plain text. Do not concatenate those freeform fields.
+        guard rows.allSatisfy({$0.utf16.count<=512}),rows.reduce(0,{$0+$1.utf16.count})<=1024,
+              rows[0].filter({$0=="|"}).count>=2 else {return false}
+        // At most eight bounded candidates; trimmed rows may have lost a space.
+        var candidates=[rows[0]]
+        for row in rows.dropFirst() {candidates=candidates.flatMap {[$0+row,$0+" "+row]}}
+        return candidates.contains {isStatusFooter($0,agent:.claude)}
     }
 
     /// A user status line can sit between the composer and the CLI's own hint.

@@ -7,6 +7,40 @@ private func foreignActivityFooter(_ text: String) -> String {
 }
 
 extension ApprovalTests {
+    func testClaudeWrappedStatusFooterRequiresCompleteVisibleMetadata() throws {
+        let statuses = [
+            "fixture-project | feature/status* | Opus 5.5",
+            "fixture-project | feature/status* | Opus 5.5 | ctx 0%",
+            "fixture-project | feature/status* | Opus 5.5 | ctx 29% | 5h 14% 7d 23%",
+            "fixture-project-x | feature/status* | Sonnet 10.12.123 | ctx 100% | 5h 100% 7d 100%",
+            "한글🙂 e\u{301} | feat/한글* | Sonnet 5.1 | ctx 100% | 7d 0%"
+        ]
+        let hint = "⏵⏵ auto mode on (shift+tab to cycle)"
+        for columns in [40,44,48,52,60,80,120] { for rows in [24,40] { for status in statuses {
+            func frame(_ composer:String="❯",_ metadata:String?=nil,_ suffix:String="") throws -> String {
+                let rule=String(repeating:"─",count:columns)
+                let text=["Finished synthetic task",rule,composer,rule,metadata ?? status,hint+suffix].joined(separator:"\r\n")
+                return try OriginalTerminalScreen.render(ansi:text,columns:columns,rows:rows,tty:"/dev/footer-fixture").contents
+            }
+            let screen=try frame()
+            try expectEqual(ActivityDetector.detect(screen,agent:.claude).phase,.idle,"Wrapped metadata at \(columns)x\(rows)")
+            try expectEqual(ActivityDetector.detect(try frame("❯ Draft 한글"),agent:.claude).phase,.input)
+            try expectEqual(ActivityDetector.detect(try frame("❯ 1. Choice"),agent:.claude).phase,.unknown)
+            try expectEqual(ActivityDetector.detect(try frame("❯",nil,"\r\nNew unrecognized request"),agent:.claude).phase,.unknown)
+            try expectEqual(ActivityDetector.detect(screen.replacingOccurrences(of:hint,with:""),agent:.claude).phase,.unknown)
+            try expectEqual(ActivityDetector.detect(try frame("❯","fixture | main | Opus 5.5 | ctx 101%"),agent:.claude).phase,.unknown)
+        }}}
+        for screen in ["❯\nfixture | main |\n? for shortcuts\nOpus 5.5",
+                       "❯\nNew unrelated question\nfixture | main | Opus 5.5\n? for shortcuts",
+                       "❯\nfixture | feature/\nShould I continue?\nstatus | Opus 5.5\n? for shortcuts",
+                       "❯\nfixture | feature/\nstatus | Opus 5.5\n? for shortcuts",
+                       "❯\nfixture | main |\n```\nOpus 5.5\n? for shortcuts",
+                       "❯\nfixture | main |\nOpus 5.5\nUnknown continuation\n? for shortcuts",
+                       "❯\n"+Array(repeating:"fixture",count:7).joined(separator:"\n")+"\n? for shortcuts"] {
+            try expectEqual(ActivityDetector.detect(screen,agent:.claude).phase,.unknown,"Unrecognized footer boundary: "+screen)
+        }
+    }
+
     func testClaudeCompactAndCombinedUsageStatusFooters() throws {
         // Redacted shapes observed in live idle composers. Losing optional usage
         // fields, or adding the five-hour quota, must not strand a ready session.

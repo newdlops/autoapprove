@@ -1092,6 +1092,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Activity footer: goals, drafts and generation", tests.testActivityFooterGoalsDraftsAndGenerationChecks),
             ("Activity footer: Claude custom metadata and genuine hints", tests.testClaudeCustomStatusFooterRequiresComposerHint),
             ("Activity footer: Claude compact and combined usage metadata", tests.testClaudeCompactAndCombinedUsageStatusFooters),
+            ("Activity footer: Claude wrapped metadata and exact footer boundaries", tests.testClaudeWrappedStatusFooterRequiresCompleteVisibleMetadata),
             ("Activity footer: Codex warnings, drafts and menus", tests.testCodexWarningFooterPreservesDraftsAndRejectsMenus),
             ("Activity footer: Codex server waiting dialog", tests.testCodexServerWaitDialogRemainsWorkingWithoutInput),
             ("prompt line normalization preserves CR/LF, canonical text and trailing blank removal", tests.testPromptLineNormalizationPreservesNewlinesAndCanonicalText),
