@@ -63,28 +63,32 @@ try{
  assert.equal(await page.locator('.conversation-page').count(),3);assert.equal(await page.locator('.conversation-message').count(),6);assert.equal(await page.locator('#terminal-history-older').isDisabled(),true);
  await output.hover();await page.mouse.wheel(0,-10000);await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('1 /'));
  assert.equal(await page.locator('#terminal-history-start').textContent(),'대화의 처음');assert.equal(await page.locator('#terminal-history-end').textContent(),'아래로 스크롤 · 이후 대화');
- await page.locator('#terminal-history-jump').selectOption('2');await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('3 /'));
+ await page.locator('#terminal-history-outline a').nth(1).click();await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('3 /'));
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
- assert.equal(await page.locator('#terminal-history-jump').inputValue(),'2');assert.match(await page.locator('#terminal-history-jump option:checked').textContent(),/사용자 대화 7/);
+ assert.equal(await page.locator('#terminal-history-outline [aria-current]').getAttribute('data-message-index'),'2');assert.match(await page.locator('#terminal-history-topic').textContent(),/사용자 대화 7/);
  await page.screenshot({path:out+'/'+engine+'-reading-position.png'});
  await page.locator('#terminal-history-seek').focus();await page.keyboard.press('Home');await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('1 /'));
  await output.hover();await page.mouse.wheel(0,350);await page.waitForFunction(()=>Number(document.getElementById('terminal-history-seek').value)>0);
- assert.equal(await page.locator('#terminal-history-jump').inputValue(),String(Number((await page.locator('#terminal-history-position').textContent()).split(' /')[0])-1));
+ assert.equal(await page.locator('#terminal-history-outline [aria-current]').count(),1);
  for(let i=5;i>=0;i--){await output.hover();await page.mouse.wheel(0,10000);await page.waitForFunction(index=>terminalHistoryViewer.pages.at(-1)?.index===index&&!terminalHistoryViewer.busy,i);}
  assert.equal(await page.locator('#terminal-history-end').textContent(),'최신 기록');assert.equal(await page.locator('.conversation-page').count(),3);
  await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>document.querySelectorAll('.conversation-message').length===2&&document.getElementById('terminal-history-output').textContent.includes('Codex 답변 0'));
- await page.locator('#terminal-history-jump').focus();await output.hover();await page.mouse.wheel(0,350);await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('2 /'));assert.equal(await page.locator('#terminal-history-jump').inputValue(),'1');
+ await output.hover();await page.mouse.wheel(0,350);await page.waitForFunction(()=>document.getElementById('terminal-history-position').textContent.startsWith('2 /'));assert.equal(await page.locator('#terminal-history-outline [aria-current]').getAttribute('data-message-index'),'0');assert.match(await page.locator('#terminal-history-topic').textContent(),/사용자 대화 0/);
  await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&document.getElementById('terminal-history-position').textContent.startsWith('1 /'));
- checks.push('Gesture-driven older/newer round trip, viewport anchor, current-message selector and keyboard position seek; three DOM pages retained');
+ checks.push('Gesture-driven older/newer round trip, viewport anchor, current-question outline, persistent topic and keyboard seek; three DOM pages retained');
  const screenshots=[];
  for(const theme of ['light','dark'])for(const [name,width,height]of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
   await page.emulateMedia({colorScheme:theme});await page.setViewportSize({width,height});
   await page.waitForFunction(()=>!terminalHistoryViewer.busy);await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   await page.screenshot({path:out+'/'+engine+'-'+theme+'-'+name+'.png',animations:'disabled',caret:'hide'});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-  for(const selector of ['#terminal-history-close','#terminal-history-jump','#terminal-history-seek','#terminal-history-refresh']){
+  assert.equal(!await page.locator('#terminal-history-outline-nav').evaluate(e=>e.hidden),width>1024);
+  for(const selector of ['#terminal-history-close','#terminal-history-seek','#terminal-history-refresh']){
    const box=await page.locator(selector).boundingBox();assert.ok(box&&box.width>=44&&box.height>=44,`${selector}: ${JSON.stringify(box)}`);assert.ok(box.y>=0&&box.y+box.height<=height);
-  }screenshots.push({theme,width,height});
+  }
+  if(width<=1024){await page.locator('#terminal-history-outline-toggle').click();await page.locator('#terminal-history-outline a').first().click();assert.equal(await page.locator('#terminal-history-outline-nav').evaluate(e=>e.hidden),true);assert.equal(await output.evaluate(e=>e===document.activeElement),true);}
+  else{const link=page.locator('#terminal-history-outline a').first();await link.focus();await page.keyboard.press('Enter');assert.equal(await output.evaluate(e=>e===document.activeElement),true);}
+  screenshots.push({theme,width,height});
  }
  const route='**/api/codex/history?**',retained=await page.locator('#terminal-history-output').textContent();
  const paragraph=await page.locator('[data-message-id="user-0"] .conversation-text p').first().boundingBox();
@@ -101,6 +105,26 @@ try{
  await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.messages[0]?.dataset.messageId==='short-new');assert.equal(await page.locator('#terminal-history-older').isVisible(),true);
  await page.waitForTimeout(150);assert.equal(await page.locator('#terminal-history-older').isVisible(),true);await page.locator('#terminal-history-older').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.pages.length===2);assert.equal(await page.locator('#terminal-history-older').isVisible(),false);
  await page.unroute(route);await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.pages.length===1);checks.push('Text selection suppresses paging; short content retains a stable keyboard-accessible previous-page action');
+ const denseMessages=Array.from({length:32},(_,i)=>({id:'dense-'+i,role:i%2?'assistant':'user',text:i%2?'답변 '+i+'\n\n'+('긴 답변의 문단과 줄바꿈을 읽습니다. '.repeat(50))+'\n\n```txt\n'+('long-code-'.repeat(70))+'\n```':'질문 '+(i/2+1)+' · '+('긴 한글 질문과 폴더 경로 /workspace/이름을 확인합니다. '.repeat(9)),truncated:false}));
+ await page.route(route,route=>route.fulfill({json:{...shortIdentity,messages:denseMessages,nextCursor:null}}));await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.messages.length===32);
+ assert.equal(await page.locator('#terminal-history-outline a').count(),16);assert.match(await page.locator('#terminal-history-topic').textContent(),/^질문 16/);
+ for(const [name,width,height]of [['desktop',1440,900],['tablet',768,1024],['mobile',390,844]]){
+  await page.setViewportSize({width,height});await page.waitForTimeout(80);
+  assert.ok(await output.evaluate(e=>e.clientHeight>250),'Dense outline leaves room to read');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  if(width>1024){const visible=await page.locator('.conversation-outline nav').evaluate(e=>{const active=e.querySelector('[aria-current]'),a=active.getBoundingClientRect(),n=e.getBoundingClientRect();return {scroll:e.scrollTop,activeTop:a.top,activeBottom:a.bottom,navTop:n.top,navBottom:n.bottom};});assert.ok(visible.scroll>0&&visible.activeTop>=visible.navTop-1&&visible.activeBottom<=visible.navBottom+1,'Current question is visible in a dense outline: '+JSON.stringify(visible));await page.locator('#terminal-history-outline a').nth(4).focus();}
+  else await page.locator('#terminal-history-outline-toggle').click();
+  await page.screenshot({path:out+'/'+engine+'-dense-'+name+'.png',animations:'disabled'});
+  await page.locator('#terminal-history-outline a').nth(4).click();await page.waitForFunction(()=>document.getElementById('terminal-history-topic').textContent.startsWith('질문 5'));
+  assert.equal(await output.evaluate(e=>e===document.activeElement),true);
+  if(width<=1024)assert.equal(await page.locator('#terminal-history-outline-nav').evaluate(e=>e.hidden),true);
+ }
+ await page.unroute(route);await page.route(route,route=>route.fulfill({json:{...shortIdentity,messages:[{id:'orphan-answer',role:'assistant',text:'이전 질문에서 이어지는 답변입니다.',truncated:false}],nextCursor:null}}));
+ await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.messages[0]?.dataset.messageId==='orphan-answer');assert.equal(await page.locator('#terminal-history-topic').textContent(),'이전 질문에 이어지는 답변');assert.equal(await page.locator('#terminal-history-outline [aria-current]').count(),0);assert.equal(await page.locator('#terminal-history-outline-empty').isVisible(),false);
+ await page.locator('#terminal-history-outline-toggle').click();assert.equal(await page.locator('#terminal-history-outline-empty').isVisible(),true);
+ await page.unroute(route);await page.locator('#terminal-history-refresh').click();await page.waitForFunction(()=>!terminalHistoryViewer.busy&&terminalHistoryViewer.messages[0]?.dataset.messageId==='user-0');
+ checks.push('Dense 16-question outline, long text/code overflow, visible active question, mobile/tablet disclosure, keyboard focus and answer-without-question state');
+ await page.setViewportSize({width:1440,height:900});
  await page.keyboard.press('Escape');assert.equal(await page.locator('#terminal-history-dialog').isVisible(),false);assert.equal(await page.locator('#terminal-input').inputValue(),'PRESERVE UNSENT DRAFT');
  await page.route(route,route=>route.fulfill({status:409,json:{error:'대화를 확정하지 못했습니다. 확인할 대화를 선택해주세요.'}}));await page.locator('#codex-conversation-open').click();await page.locator('#terminal-history-picker').waitFor();
  assert.equal(await page.locator('#terminal-history-use').isDisabled(),true);await page.unroute(route);

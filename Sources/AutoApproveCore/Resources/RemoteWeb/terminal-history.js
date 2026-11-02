@@ -12,13 +12,20 @@ window.AutoApproveTerminalHistory=class {
     this.el('previous').onclick=()=>void this.edge(-1,true);
     this.el('next').onclick=()=>void this.edge(1,true);
     this.el('older').onclick=()=>void this.readConversation(true);
-    this.el('jump').onchange=()=>{const message=this.messages?.[Number(this.el('jump').value)];if(message){this.scrollToMessage(message);this.position();}};
-    this.el('jump').onblur=()=>this.schedulePosition();
+    this.compact=matchMedia('(max-width: 1024px)');
+    this.compact.addEventListener('change',()=>{this.outlineLayout();this.schedulePosition();});
+    this.el('outline-toggle').onclick=()=>{this.outlineExpanded(!this.el('outline-nav').hidden);this.schedulePosition();};
+    this.el('outline').onclick=event=>{
+      const link=event.target.closest('a[data-message-index]');if(!link)return;
+      event.preventDefault();const message=this.messages?.[Number(link.dataset.messageIndex)];if(!message)return;
+      if(this.compact.matches)this.outlineExpanded(true);
+      this.scrollToMessage(message);this.position();this.output.focus({preventScroll:true});
+    };
     this.el('seek').oninput=()=>{this.output.scrollTop=Number(this.el('seek').value);this.schedulePosition();};
     this.el('conversation').onchange=()=>{this.el('use').disabled=!this.el('conversation').value||this.busy;};
     this.el('use').onclick=()=>{this.threadID=this.el('conversation').value;void this.readConversation();};
     this.el('refresh').onclick=()=>void (this.conversation?this.readConversation():this.read(null,{refresh:true}));
-    this.dialog.addEventListener('close',()=>{++this.epoch;this.controller?.abort();cancelAnimationFrame(this.positionFrame);this.busy=false;this.pages=[];this.messages=[];this.boundaries?.clear();this.output.replaceChildren();this.el('jump').replaceChildren();this.info=null;this.item=null;});
+    this.dialog.addEventListener('close',()=>{++this.epoch;this.controller?.abort();cancelAnimationFrame(this.positionFrame);this.busy=false;this.pages=[];this.messages=[];this.boundaries?.clear();this.output.replaceChildren();this.el('outline').replaceChildren();this.el('topic').textContent='';this.info=null;this.item=null;});
     this.output.addEventListener('scroll',()=>{
       if(this.conversation){this.schedulePosition();if(Date.now()-this.gestureAt<300)this.conversationGesture(this.gestureDirection,false);return;}
       if(this.busy||!this.info||this.selectedText())return;
@@ -35,11 +42,37 @@ window.AutoApproveTerminalHistory=class {
   selectedText() {const selection=window.getSelection();return selection&&!selection.isCollapsed&&(this.output.contains(selection.anchorNode)||this.output.contains(selection.focusNode));}
   schedulePosition(){cancelAnimationFrame(this.positionFrame);this.positionFrame=requestAnimationFrame(()=>{if(this.dialog.open&&this.conversation)this.position();});}
   scrollToMessage(message){this.output.scrollTop+=message.getBoundingClientRect().top-this.output.getBoundingClientRect().top-16;}
+  outlineExpanded(hidden){this.activeQuestionID=null;this.el('outline-nav').hidden=hidden;this.el('outline-toggle').setAttribute('aria-expanded',String(!hidden));this.el('outline-toggle').textContent=hidden?'질문 목차 펼치기':'질문 목차 접기';}
+  outlineLayout(){this.outlineExpanded(this.compact.matches);}
+  outline(){
+    this.el('outline').replaceChildren();let questions=0;
+    this.messages.forEach((message,index)=>{
+      if(message.dataset.role!=='user')return;questions++;
+      const row=document.createElement('li'),link=document.createElement('a');
+      link.href='#'+message.id;link.dataset.messageIndex=String(index);
+      const preview=document.createElement('span');preview.textContent=message.dataset.question;link.append(preview);
+      row.append(link);this.el('outline').append(row);
+    });
+    this.el('outline-count').textContent=questions?`불러온 ${questions}개`:'';
+    this.el('outline-empty').hidden=!!questions;
+    this.el('outline-empty').textContent=this.busy&&!this.info?'대화를 불러오는 중…':this.messages.length?'이 구간에는 질문이 없습니다. 위로 스크롤해 이전 대화를 불러오세요.':'표시할 질문이 없습니다.';
+  }
   position(){
     const count=this.messages.length,top=this.output.getBoundingClientRect().top+24,distance=Math.max(0,this.output.scrollHeight-this.output.clientHeight);
     const fallbackSpace=this.el('older').hidden?0:this.el('older').getBoundingClientRect().height+12;
     const index=Math.max(0,this.messages.findIndex(message=>message.getBoundingClientRect().bottom>top));
-    this.el('jump').value=count?String(index):'';
+    let question=index;while(question>=0&&this.messages[question]?.dataset.role!=='user')question--;
+    this.el('topic').textContent=question>=0?this.messages[question].dataset.question:count?'이전 질문에 이어지는 답변':this.busy?'대화를 불러오는 중…':'표시할 대화가 없습니다.';
+    for(const link of this.el('outline').querySelectorAll('a')){
+      if(Number(link.dataset.messageIndex)===question)link.setAttribute('aria-current','location');else link.removeAttribute('aria-current');
+    }
+    const active=this.el('outline').querySelector('[aria-current]');
+    if(active&&this.activeQuestionID!==active.hash&&!this.el('outline-nav').hidden){
+      const nav=active.closest('nav'),rect=active.getBoundingClientRect(),bounds=nav.getBoundingClientRect();
+      if(rect.top<bounds.top)nav.scrollTop+=rect.top-bounds.top;
+      else if(rect.bottom>bounds.bottom)nav.scrollTop+=rect.bottom-bounds.bottom;
+    }
+    this.activeQuestionID=active?.hash;
     this.el('position').textContent=count?`${index+1} / ${count}개 메시지`:(this.busy?'불러오는 중…':'표시할 메시지 없음');
     const scroll=Math.max(0,Math.min(distance,this.output.scrollTop)),value=distance?Math.round(scroll/distance*1000):0;
     this.el('seek').max=String(Math.max(1,Math.ceil(distance)));this.el('seek').value=String(Math.round(scroll));
@@ -79,11 +112,11 @@ window.AutoApproveTerminalHistory=class {
     this.dialog.dataset.conversation=String(conversation);
     this.el('title').textContent=conversation?'Codex 대화 기록':'터미널 전체 기록';
     this.el('close').setAttribute('aria-label',conversation?'대화 기록 닫기':'전체 기록 닫기');
-    this.el('help').textContent=conversation?'읽기 전용 대화입니다. 위아래로 스크롤하면 앞뒤 대화를 연결합니다. 읽는 메시지 선택기와 불러온 범위의 위치 막대로 이동할 수 있습니다. 도구 실행 출력은 포함하지 않습니다.':'Mac의 Terminal이 보관한 출력을 읽기 전용으로 봅니다. 위아래로 스크롤하면 앞뒤 기록을 불러옵니다. 원본에서 삭제된 기록은 포함되지 않습니다.';
+    this.el('help').textContent=conversation?'읽기 전용 대화입니다. 위아래로 스크롤하면 앞뒤 대화를 연결합니다. 질문 목차에서 이동하고 현재 읽는 질문을 확인할 수 있습니다. 개수와 위치 막대는 불러온 범위에 해당합니다. 도구 실행 출력은 포함하지 않습니다.':'Mac의 Terminal이 보관한 출력을 읽기 전용으로 봅니다. 위아래로 스크롤하면 앞뒤 기록을 불러옵니다. 원본에서 삭제된 기록은 포함되지 않습니다.';
     this.el('help').className=conversation?'sr-only':'muted small';
     this.el('status').className=conversation?'sr-only':'muted small';
     this.el('location').hidden=!conversation;this.el('wayfinding').hidden=!conversation;this.el('navigation').hidden=conversation;
-    this.el('jump').replaceChildren(new Option('대화를 불러오는 중…',''));
+    this.el('outline-panel').hidden=!conversation;this.outlineLayout();this.activeQuestionID=null;this.outline();
     this.output.classList.toggle('conversation-output',conversation);this.output.setAttribute('aria-label',conversation?'읽기 전용 Codex 대화 기록':'읽기 전용 전체 터미널 기록');
     this.el('picker').hidden=true;this.el('conversation').replaceChildren(new Option('대화를 선택해주세요.',''));
     for(const name of ['first','previous','next','last'])this.el(name).hidden=conversation;
@@ -102,7 +135,9 @@ window.AutoApproveTerminalHistory=class {
       this.el('use').disabled=this.busy||!this.el('conversation').value;this.el('conversation').disabled=this.busy;
       this.output.setAttribute('aria-busy',String(this.busy));
       this.el('status').textContent=this.busy?'대화 기록을 불러오는 중…':this.info?'대화 기록을 불러왔습니다. 위아래로 스크롤해 읽을 수 있습니다.':'';
-      this.el('jump').disabled=this.busy||!this.messages.length;this.position();
+      this.el('outline').setAttribute('aria-busy',String(this.busy));
+      if(!this.el('outline').children.length)this.el('outline-empty').textContent=this.busy&&!this.info?'대화를 불러오는 중…':this.messages.length?'이 구간에는 질문이 없습니다. 위로 스크롤해 이전 대화를 불러오세요.':'표시할 질문이 없습니다.';
+      this.position();
       return;
     }
     const first=this.pages[0]?.page,last=this.pages.at(-1)?.page,info=this.info;
@@ -169,9 +204,9 @@ window.AutoApproveTerminalHistory=class {
       const existing=new Set(older||newer?this.pages.flatMap(page=>page.ids):[]),ids=[];
       for(const message of value.messages){
         if(existing.has(message.id))continue;existing.add(message.id);ids.push(message.id);
-        const article=document.createElement('article');article.className='conversation-message';article.dataset.role=message.role;article.dataset.messageId=message.id;
+        const article=document.createElement('article');article.className='conversation-message';article.dataset.role=message.role;article.dataset.messageId=message.id;article.id=`conversation-${epoch}-${index}-${ids.length}`;
         const author=document.createElement('strong');author.textContent=message.role==='user'?'사용자':message.phase==='commentary'?'Codex · 진행':'Codex · 답변';
-        article.dataset.preview=author.textContent+' · '+(message.text.replace(/\s+/g,' ').trim().slice(0,90)||'텍스트 없는 메시지');
+        if(message.role==='user')article.dataset.question=message.text.replace(/\s+/g,' ').trim().slice(0,180)||'텍스트 없는 질문';
         const body=document.createElement('div');body.className='conversation-text';this.conversationBody(body,message.text||'(텍스트 없는 메시지)');article.append(author,body);
         if(message.truncated){const note=document.createElement('p');note.className='muted small';note.textContent='긴 메시지의 앞부분만 표시합니다. 전체 내용은 Codex에서 확인해주세요.';article.append(note);}
         page.append(article);
@@ -193,8 +228,7 @@ window.AutoApproveTerminalHistory=class {
       // Keep cursor metadata, never old message bodies, within a bounded window.
       while(this.boundaries.size>128){const farthest=[...this.boundaries.keys()].sort((a,b)=>Math.abs(b-index)-Math.abs(a-index))[0];this.boundaries.delete(farthest);}
       this.messages=[...this.output.querySelectorAll('.conversation-message')];
-      this.el('jump').replaceChildren(...this.messages.map((message,index)=>new Option(message.dataset.preview,String(index))));
-      if(!this.messages.length)this.el('jump').add(new Option('표시할 메시지가 없습니다.',''));
+      this.outline();
       this.threadID=value.threadID;this.info=value;
       this.el('picker').hidden=true;
     }catch(error){
