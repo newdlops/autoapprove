@@ -7,6 +7,37 @@ private func foreignActivityFooter(_ text: String) -> String {
 }
 
 extension ApprovalTests {
+    func testClaudeCompactAndCombinedUsageStatusFooters() throws {
+        // Redacted shapes observed in live idle composers. Losing optional usage
+        // fields, or adding the five-hour quota, must not strand a ready session.
+        let statuses = [
+            "fixture-project | feature/status* | Opus 5.5",
+            "fixture-project | feature/status* | Opus 5.5 | ctx 0%",
+            "fixture-project | feature/status* | Opus 5.5 | ctx 100%",
+            "fixture-project | feature/status* | Opus 5.5 | ctx 29% | 5h 14% 7d 23%",
+            "fixture-project | feature/status* | Sonnet 5.1 | ctx 100% | 5h 0% 7d 100%"
+        ]
+        let hint = "⏵⏵ auto mode on (shift+tab to cycle)"
+        for status in statuses {
+            for newline in ["\n", "\r\n", "\u{2028}"] {
+                let screen = ["Finished synthetic task", "────────", "❯", "────────", status, hint].joined(separator:newline)
+                try expectEqual(ActivityDetector.detect(screen,agent:.claude).phase,.idle,status)
+                try expectEqual(ActivityDetector.detect(screen.replacingOccurrences(of:"❯",with:"❯ Draft 한글"),agent:.claude).phase,.input)
+                try expectEqual(ActivityDetector.detect(screen.replacingOccurrences(of:"❯",with:"❯ 1. Choice"),agent:.claude).phase,.unknown)
+                try expectEqual(ActivityDetector.detect(screen+newline+"New unrecognized question",agent:.claude).phase,.unknown)
+                try expectEqual(ActivityDetector.detect(screen.replacingOccurrences(of:newline+hint,with:""),agent:.claude).phase,.unknown)
+            }
+        }
+        for status in ["fixture | main | Opus 5.5 | ctx 29% | 5h 101% 7d 23%",
+                       "fixture | main | Opus 5.5 | ctx 29% | 5h 14% 7d 101%",
+                       "fixture | main | Opus 5.5 | ctx 101%",
+                       "fixture | main | Opus 5.5 | 5h 14% 7d 23%",
+                       "fixture | main | Opus 5.5 | unknown",
+                       "fixture | main | Opus 5.5 | ctx 29% | 5h 14% 7d 23% | unknown"] {
+            try expectEqual(ActivityDetector.detect("❯\n"+status+"\n"+hint,agent:.claude).phase,.unknown)
+        }
+    }
+
     func testClaudeCustomStatusFooterRequiresComposerHint() throws {
         for model in ["Opus 5.5","Sonnet 5.1","Haiku 4.5"] { for percent in [0,42,100] {
             let status="fixture-project | feature/status | \(model) | ctx \(percent)% | 7d 94%"

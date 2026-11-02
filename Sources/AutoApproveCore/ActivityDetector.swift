@@ -85,8 +85,10 @@ public enum ActivityDetector {
     private static func isStatusFooter(_ line: String, agent: AgentKind) -> Bool {
         switch agent {
         case .claude:
-            guard line.contains("|"), line.contains("ctx"), line.contains("7d") else { return false }
-            return matches(line, #"^[^|\r\n]{1,200}\|[^|\r\n]{1,200}\|\s*(?:Opus|Sonnet|Haiku) [0-9]+(?:\.[0-9]+){0,2}\s*\|\s*ctx (?:100|[0-9]{1,2})%\s*\|\s*7d (?:100|[0-9]{1,2})%$"#)
+            guard line.contains("|") else { return false }
+            // Usage metadata can be absent, or show both five-hour and weekly
+            // quotas. It remains supplemental to a visible composer and hint.
+            return matches(line, #"^[^|\r\n]{1,200}\|[^|\r\n]{1,200}\|\s*(?:Opus|Sonnet|Haiku) [0-9]+(?:\.[0-9]+){0,2}(?:\s*\|\s*ctx (?:100|[0-9]{1,2})%(?:\s*\|\s*(?:5h (?:100|[0-9]{1,2})%\s+)?7d (?:100|[0-9]{1,2})%)?)?\s*$"#)
         case .codex:
             return line.hasPrefix("⚠") && matches(line, #"^⚠\s*[1-9][0-9]{0,2} warnings? · f2 to view$"#)
         case .shell: return false

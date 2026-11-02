@@ -19,13 +19,13 @@ try{
  if(process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS!==undefined){const previous=process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS||'';process.env.PORT_MANAGER_PRESERVE_LISTEN_PORTS=[...new Set([...previous.split(',').filter(Boolean),new URL(info.url).port])].join(',');}
  const control=async action=>{await writeFile(info.control,JSON.stringify({action,generation:++generation}));await until(async()=>JSON.parse(await readFile(info.stats,'utf8')).generation===generation,'Control '+action);};
  const phases=async()=>{const response=await fetch(info.url+'/api/state');assert.equal(response.status,200);const value=await response.json();return info.sessions.map(id=>value.sessions.find(view=>view.session.id===id)?.session.phase);};
- const expected=baseline?['unknown','unknown','unknown','unknown']:['idle','input','idle','working'];
- await until(async()=>JSON.stringify(await phases())===JSON.stringify(expected),'Four production phases');checks.push('Production engine states: '+expected.join(', '));
+ const expected=baseline?['unknown','unknown','unknown','unknown','unknown','unknown']:['idle','input','idle','working','idle','idle'];
+ await until(async()=>JSON.stringify(await phases())===JSON.stringify(expected),'Six production phases');checks.push('Production engine states: '+expected.join(', '));
  const playwright=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');
  for(const engine of ['chromium','webkit']){
   browser=await playwright[engine].launch({headless:true,...(engine==='chromium'&&process.env.AUTOAPPROVE_CHROMIUM_PATH?{executablePath:process.env.AUTOAPPROVE_CHROMIUM_PATH}:{})});
   const page=await browser.newPage({viewport:{width:390,height:844}});page.on('pageerror',error=>errors.push(engine+': '+error.message));page.on('request',request=>{if(request.method()!=='GET')posts++;});
-  await page.goto(info.url);await page.waitForFunction(()=>typeof allSessions!=='undefined'&&allSessions.length===4&&connected);
+  await page.goto(info.url);await page.waitForFunction(()=>typeof allSessions!=='undefined'&&allSessions.length===6&&connected);
   const rendered=await page.locator('.session-row .phase').allTextContents();
   for(const text of baseline?['상태 미확인']:['대기 중','응답 필요','작업 중'])assert.ok(rendered.includes(text),JSON.stringify(rendered));
   if(!baseline){
@@ -48,7 +48,7 @@ try{
   await browser.close();browser=null;
  }
  assert.deepEqual(errors,[]);assert.equal(posts,0);assert.equal(JSON.parse(await readFile(info.stats,'utf8')).inputs,0);
- await control('stop');const report={passed:true,baseline,checks,screenshots,errors,writeRequests:posts,terminalInputs:0,scope:'Production Swift engine and loopback HTTP; four synthetic terminals in Chromium/WebKit; no user terminal, account, permission or network settings changed.'};
+ await control('stop');const report={passed:true,baseline,checks,screenshots,errors,writeRequests:posts,terminalInputs:0,scope:'Production Swift engine and loopback HTTP; six synthetic terminals in Chromium/WebKit; no user terminal, account, permission or network settings changed.'};
  await writeFile(out+'/report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
 }finally{
  await browser?.close();if(child&&child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(resolve=>child.once('exit',resolve));}
