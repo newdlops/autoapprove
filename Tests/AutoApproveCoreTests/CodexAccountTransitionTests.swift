@@ -2,17 +2,20 @@ import Foundation
 import AutoApproveCore
 
 @MainActor private final class AccountTransitionRig {
-    let target = CodexAccountTransitionTarget(home: "/fixture/home", executable: "/fixture/codex",
+    var target = CodexAccountTransitionTarget(home: "/fixture/home", executable: "/fixture/codex",
         witnesses: [.init(pid: 42, started: "original", tty: "/dev/fixture", threadID: "a")])
     var observation = CodexAccountTransitionObservation(savedAccount: "new", serverAccount: "old", serverID: "server-1",
         threads: [.init(id: "a", turnID: "turn-a", active: true), .init(id: "b", turnID: "turn-b", active: true)])
     var effects: [String] = [], saved: [CodexAccountTransitionState] = []
     var saveFails = false, interruptFails = false, restartFails = false, verified = 1
     var checkReservations = true
+    var observeFails = false
     var observeCount = 0
     var mutateOnObserve: ((Int) -> Void)?
     lazy var services = CodexAccountTransitionServices(observe: { [unowned self] _ in
-        observeCount += 1; mutateOnObserve?(observeCount); return observation
+        observeCount += 1; mutateOnObserve?(observeCount)
+        if observeFails { throw AppError.message("temporary login inspection failure") }
+        return observation
     }, interrupt: { [unowned self] _, server, thread, turn in
         if checkReservations {
             try expectEqual(saved.last?.waitingThread, thread, "An interrupt reservation must be durable before submission")
@@ -38,17 +41,117 @@ import AutoApproveCore
 private final class AccountInputProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
+    private var screen = AccountInputProbe.prompt
     static let prompt = "Would you like to run the following command?\n\n$ npm test\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
     func sent() { lock.lock(); count += 1; lock.unlock() }
     var writes: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func setScreen(_ value: String) { lock.lock(); screen = value; lock.unlock() }
+    func currentScreen() -> String { lock.lock(); defer { lock.unlock() }; return screen }
     var adapter: ScreenHostAdapter {
-        ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: Self.prompt) }) },
+        ScreenHostAdapter(screens: { [self] targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: currentScreen()) }) },
             approve: { [self] _, _, _ in sent(); return .sent }, reveal: { _ in nil },
-            resume: { [self] _, _, _ in sent(); return .typed }, input: { [self] _, _, _, _ in sent(); return .sent })
+            resume: { [self] _, _, _ in sent(); return .sent }, input: { [self] _, _, _, _ in sent(); return .sent })
     }
+}
+private final class AccountTargetList: @unchecked Sendable {
+    private let lock = NSLock()
+    private var listed = true
+    let target: CodexAccountTransitionTarget
+    init(_ target: CodexAccountTransitionTarget) { self.target = target }
+    func hide() { lock.lock(); listed = false; lock.unlock() }
+    func show() { lock.lock(); listed = true; lock.unlock() }
+    func read() -> [CodexAccountTransitionTarget] { lock.lock(); defer { lock.unlock() }; return listed ? [target] : [] }
 }
 
 extension ApprovalTests {
+    func testAccountTransitionCancelledReservationSurvivesSignedOutAndUnknownReads() async throws {
+        let r = AccountTransitionRig(), c = r.coordinator()
+        await c.check(); await c.check(); try c.cancel()
+        r.observation.savedAccount = nil; await c.check()
+        r.observation.savedAccount = "new"; await c.check(); await c.check()
+        r.observeFails = true; await c.check(); r.observeFails = false
+        let restored = r.coordinator(restored: r.saved.last)
+        for _ in 0..<3 { await restored.check() }
+        try expectEqual(r.effects.count, 1, "Signed-out/unknown observations must never rearm the cancelled interrupt")
+        try expectEqual(restored.state.phase, .cancelled)
+        try expectEqual(restored.state.reservations["a"], "turn-a")
+    }
+    func testAccountTransitionMissingTargetCanCancelWithoutAppRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-missing-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let r = AccountTransitionRig(); r.checkReservations = false; r.idle(0); r.idle(1)
+        let targets = AccountTargetList(r.target)
+        let engine = try ApprovalEngine(paths: .init(directory: root), processReader: { [] },
+            codexAccountTransitions: r.services, codexAccountTargets: { _ in targets.read() })
+        defer { engine.stop() }
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions(); await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase, .reconnecting)
+        targets.hide(); await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase, .review)
+        try engine.cancelCodexAccountTransition(home: r.target.home)
+        try engine.setCodexAccountTransitionEnabled(false)
+        try expectFalse(engine.codexAccountTransitionHeld)
+        targets.show(); try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(r.effects, ["restart"], "Rediscovery must not repeat a reserved restart")
+    }
+    func testAccountTransitionInterruptedWorkNeverAutomaticallyContinuesAfterCompletionOrCancellation() async throws {
+        let official = "■ Conversation interrupted - use /feedback if something went wrong\n\n› Ask Codex to do anything\n\n? for shortcuts"
+        for completed in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-stopped-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let records = ProcessDiscovery.parse("41 1 ttys971 41 41 Wed Oct 21 09:00:00 2026 /fixture/codex")
+            var session = ProcessDiscovery.sessions(records)[0]; session.terminal = .terminal; session.channel = .terminalScreen
+            let r = AccountTransitionRig(), probe = AccountInputProbe()
+            r.checkReservations = false
+            r.target.witnesses = [.init(pid: session.pid, started: session.started, tty: session.tty, threadID: "a")]
+            let target = r.target
+            func create() throws -> ApprovalEngine {
+                let engine = try ApprovalEngine(paths: .init(directory: root), processReader: { records }, screenAdapters: [.terminal: probe.adapter],
+                    codexAccountTransitions: r.services, codexAccountTargets: { _ in [target] })
+                engine.interruptionResumeDelays = [0.02]
+                engine.updateDiscovery([session], records: records); try engine.setAutomatic(session.id, enabled: true)
+                return engine
+            }
+            var engine = try create(); defer { engine.stop() }
+            try engine.setCodexAccountTransitionEnabled(true)
+            await engine.checkCodexAccountTransitions(); await engine.checkCodexAccountTransitions()
+            if completed {
+                r.idle(0); await engine.checkCodexAccountTransitions(); await engine.checkCodexAccountTransitions()
+                r.idle(1); await engine.checkCodexAccountTransitions(); await engine.checkCodexAccountTransitions()
+                r.observation.serverID = "server-2"; r.observation.serverAccount = "new"
+                await engine.checkCodexAccountTransitions()
+                try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase, .complete)
+            } else { try engine.cancelCodexAccountTransition(home: target.home) }
+            for restored in [false, true] {
+                if restored { engine.stop(); engine = try create() }
+                probe.setScreen(official)
+                engine.receiveScreen(sessionID: session.id, raw: official, generation: "official-interrupted")
+                try await Task.sleep(for: .milliseconds(120))
+                try expectEqual(probe.writes, 0, "Normal interruption must stay waiting after completion/cancellation and restoration")
+                // A stale provider error must not revive the same interrupted turn either.
+                let stale = "■ Synthetic provider error from stopped turn\n\n› Ask Codex to do anything\n\n? for shortcuts"
+                engine.updateCodexQuestions([.init(sessionID: session.id, turn: .init(threadID: "a", turnID: "turn-a", status: "interrupted"))])
+                probe.setScreen(stale); engine.receiveScreen(sessionID: session.id, raw: stale, generation: "stale-error")
+                try await Task.sleep(for: .milliseconds(120))
+                try expectEqual(probe.writes, 0, "A durable stopped-turn reservation must outlive the temporary global hold")
+            }
+            // A new authoritative turn permits the user's existing recovery preference again.
+            let fresh = "■ Synthetic provider error from new user turn\n\n› Ask Codex to do anything\n\n? for shortcuts"
+            engine.updateCodexQuestions([.init(sessionID: session.id, turn: .init(threadID: "a", turnID: "new-user-turn", status: "failed"))])
+            probe.setScreen(fresh); engine.receiveScreen(sessionID: session.id, raw: fresh, generation: "new-turn")
+            let deadline = Date().addingTimeInterval(3)
+            while probe.writes == 0, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            try expect(probe.writes > 0, "A new user turn must not inherit the old interrupted-turn hold")
+        }
+    }
+    func testCodexNormalInterruptedCellIsNotARetryableProviderFailure() throws {
+        for cell in ["■ Conversation interrupted - use /feedback if something went wrong", "■ Conversation interrupted - use /feedback if\nsomething went wrong"] {
+            let frame = cell + "\n\n› Ask Codex to do anything\n\n? for shortcuts"
+            try expect(CodexCapacityStop.detect(frame, agent: .codex) == nil, "Normal interruption must not enter automatic error recovery")
+        }
+    }
     func testAccountTransitionEngineOptInAndJournalSurviveRestart() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-engine-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

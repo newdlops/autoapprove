@@ -109,7 +109,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 changed(state); return
             }
             if !state.held {
-                if state.phase == .cancelled, observed.savedAccount == state.account { return }
+                if state.phase == .cancelled, observed.savedAccount == nil || observed.savedAccount == state.account { return }
                 guard let account = observed.savedAccount, account != observed.serverAccount else {
                     // Preserve the completion summary until a later account
                     // change. Token refresh/session-id rotation is not a change.
@@ -178,6 +178,11 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             state.detail = "서버 전환 요청 완료 · 원래 창과 대화의 재연결을 확인합니다."
             try persist()
         } catch {
+            if state.phase == .cancelled {
+                // A logout or transient inspection failure is not a new login.
+                // Keep the cancellation identity and all effect reservations.
+                changed(state); return
+            }
             state.phase = state.held || state.restartReserved || !state.reservations.isEmpty ? .review : .unsupported
             state.detail = error is CancellationError ? "전환 확인이 중단됐습니다. 명령을 반복하지 않고 현재 연결을 확인해주세요." : error.localizedDescription
             // A failed journal write must itself hold automation. In-memory
@@ -191,6 +196,12 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         next.phase = .cancelled
         next.detail = "나머지 자동 전환을 중지했습니다. 이미 중단한 작업은 대기 상태로 유지합니다."
         try save(next); state = next; changed(state)
+    }
+    func requireReview(_ detail: String) throws {
+        state.phase = .review; state.detail = detail
+        // The coordinator, published controls and restored journal must agree.
+        // A vanished target cannot remain reconnecting behind a review button.
+        try persist()
     }
     private func persist() throws { try save(state); changed(state) }
     private func validate(_ observed: CodexAccountTransitionObservation) throws {

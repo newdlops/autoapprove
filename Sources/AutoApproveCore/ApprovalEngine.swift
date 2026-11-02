@@ -2116,7 +2116,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if manualGoalHoldCache.count>512 {manualGoalHoldCache=manualGoalHoldCache.filter {sessions[$0.key] != nil || $0.key==id}}
         return value
     }
-    private func hasManualGoalHold(_ id:String)->Bool {codexAccountInputHeld(id) || !manualGoalHold(id).isEmpty}
+    private func hasManualGoalHold(_ id:String)->Bool {codexAccountInputHeld(id) || codexAccountContinuationHeld(id) || !manualGoalHold(id).isEmpty}
+    private func codexAccountContinuationHeld(_ id: String) -> Bool {
+        guard let session = sessions[id], session.agent == .codex else { return false }
+        for state in codexAccountTransitionStates.values where !state.reservations.isEmpty {
+            guard state.witnesses.contains(where: { $0.pid == session.pid && $0.started == session.started && $0.tty == session.tty }) else { continue }
+            // Without fresh per-session turn evidence, keep recovery paused.
+            // This does not change automatic-approval preferences or block a
+            // user's native/web continuation. A new authoritative turn releases
+            // only the old turn's continuation hold, including after restore.
+            guard let current = codexTurns[id], current.observedAt >= state.since else { return true }
+            if let stopped = state.reservations[current.state.threadID] {
+                if current.state.turnID == nil || current.state.turnID == stopped { return true }
+            }
+        }
+        return false
+    }
     private func setManualGoalHold(_ id:String,_ value:String) throws {
         try store.set("manualGoalHold:"+id,value);manualGoalHoldCache[id]=value
     }
@@ -3273,7 +3288,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// single-use; an ambiguous write is never part of this recovery loop.
     private func prepareQuestionReply(_ session: AgentSession, question: QueuedQuestion, automaticToken: UUID?) async throws -> CodexReplyTarget {
         for attempt in 0...2 {
-            guard !Task.isCancelled, !remoteInputStopped, !codexAccountInputHeld(session.id), let current = sessions[session.id], current.phase != .ended,
+            guard !Task.isCancelled, !remoteInputStopped, !codexAccountInputHeld(session.id),
+                  automaticToken == nil || !codexAccountContinuationHeld(session.id), let current = sessions[session.id], current.phase != .ended,
                   current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌어 전송 전에 멈췄습니다.")
             }
@@ -3319,7 +3335,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw AppError.message("세션이나 질문이 바뀌었습니다. 목록을 새로고침해주세요.")
             }
             if let automaticToken {
-                guard !Task.isCancelled, !snapshot.paused, current.automatic, current.canApprove,
+                guard !Task.isCancelled, !snapshot.paused, !codexAccountContinuationHeld(sessionID), current.automatic, current.canApprove,
                       !nativeUserInputHasPriority(sessionID),
                       automaticQuestionReplies[questionID]?.token == automaticToken else {
                     throw AppError.message("자동 응답이 취소되었습니다. 필요하면 직접 답변을 보내주세요.")
@@ -5674,9 +5690,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 await codexAccountCoordinators[target.home]?.check()
             }
             for home in codexAccountTransitionStates.keys where codexAccountTransitionStates[home]?.held == true && !targets.contains(where: { $0.home == home }) {
-                var state = codexAccountTransitionStates[home]!
-                state.phase = .review; state.detail = "원래 Codex 서버·창을 찾지 못했습니다. 자동 명령을 반복하지 않고 대기합니다."
-                codexAccountTransitionStates[home] = state
+                let detail = "원래 Codex 서버·창을 찾지 못했습니다. 자동 명령을 반복하지 않고 대기합니다."
+                if let coordinator = codexAccountCoordinators[home] { try coordinator.requireReview(detail) }
+                else {
+                    var state = codexAccountTransitionStates[home]!
+                    state.phase = .review; state.detail = detail
+                    var journal = codexAccountTransitionStates; journal[home] = state
+                    try store.set(Self.codexAccountJournalKey, String(decoding: JSONEncoder().encode(journal), as: UTF8.self))
+                    codexAccountTransitionStates = journal
+                }
             }
         } catch {
             guard epoch == codexAccountTransitionEpoch else { return }

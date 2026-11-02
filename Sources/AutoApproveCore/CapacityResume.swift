@@ -80,6 +80,9 @@ public struct CodexCapacityStop: Codable, Equatable, Sendable {
         // Inspect the first retained character before filtering the whole cell.
         guard isError || (agent == .codex && lowercase.first(where: { !$0.isWhitespace }) == "■") else { return nil }
         let compact = lowercase.filter { !$0.isWhitespace }
+        // Official normal user/RPC interruption is a waiting state. It shares
+        // the error-cell glyph but must never submit an automatic continuation.
+        if agent == .codex, compact.hasPrefix("■conversationinterrupted") { return nil }
         if agent == .codex, ["■selectedmodelisatcapacity", "■selectedmodelisatcapacity.",
                             ("■ " + message).lowercased().filter({ !$0.isWhitespace })].contains(compact) { return .capacity }
         guard isError, !cell.contains("```"), !cell.contains("❯"), !cell.contains("›") else { return nil }
