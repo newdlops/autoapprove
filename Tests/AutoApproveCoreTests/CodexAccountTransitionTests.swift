@@ -433,9 +433,19 @@ extension ApprovalTests {
         for _ in 0..<100 {if engine.codexAccountTransitionStates[target.home]?.phase == .stopping {break};try await Task.sleep(for:.milliseconds(20))}
         try expect(engine.codexAccountTransitionEnabled,"Successful native login must start application without a settings view")
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.stopping)
-        await engine.checkCodexAccountTransitions()
+        let restartDeadline=Date().addingTimeInterval(5)
+        while Date()<restartDeadline,engine.codexAccountTransitionStates[target.home]?.phase != .reconnecting {
+            await engine.checkCodexAccountTransitions()
+            try await Task.sleep(for:.milliseconds(10))
+        }
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.reconnecting,"Wait for the in-flight native completion check to release before changing server evidence")
+        try expectEqual(r.effects,["restart"])
         r.observation.serverID="server-2";r.observation.serverAccount="new"
-        await engine.checkCodexAccountTransitions()
+        let connectedDeadline=Date().addingTimeInterval(5)
+        while Date()<connectedDeadline,engine.codexAccountTransitionStates[target.home]?.phase != .complete {
+            await engine.checkCodexAccountTransitions()
+            try await Task.sleep(for:.milliseconds(10))
+        }
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
         try expectEqual(engine.codexAccountTransitionStates[target.home]?.verified,2)
     }
