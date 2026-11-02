@@ -39,7 +39,7 @@ extension CodexAccountTransitionServices {
             try await CodexAccountBackground.run {
                 let fresh = try CodexAccountTransitionLocal.observe(target)
                 guard fresh.serverID == expected.serverID, fresh.savedAccount == expected.savedAccount,
-                      fresh.savedAccount != nil, fresh.serverAccount != fresh.savedAccount,
+                      fresh.savedAccount != nil, fresh.serverAccount != fresh.savedAccount || expected.loginRefreshRequested,
                       fresh.threads == expected.threads, fresh.threads.allSatisfy({ !$0.active && $0.blocker == nil }) else {
                     throw AppError.message("서버 전환 직전 계정·작업·대기 입력이 바뀌었습니다. 전환을 보류했습니다.")
                 }
@@ -51,7 +51,10 @@ extension CodexAccountTransitionServices {
                 }
                 guard try CodexAccountTransitionLocal.identity(target) == expected.serverID else { throw AppError.message("전환할 서버가 바뀌었습니다.") }
                 try Task.checkCancellation()
-                let result = try CommandRunner.run(target.executable, ["app-server", "daemon", "restart"], timeout: 30,
+                // Official 0.166 defaults to a 60s graceful stop, permits
+                // 300s, then allows forced-exit and readiness checks. A 30s
+                // wrapper kills a valid restart before its drain completes.
+                let result = try CommandRunner.run(target.executable, ["app-server", "daemon", "restart"], timeout: 375,
                     environment: CodexAccountTransitionLocal.environment(target), inheritEnvironment: false, outputLimit: 32_768, errorLimit: 32_768)
                 guard result.status == 0 else { throw AppError.message("공통 서버 전환 결과를 확인하지 못했습니다. 같은 요청을 반복하지 말고 Mac에서 연결을 확인해주세요.") }
             }
@@ -166,7 +169,17 @@ private enum CodexAccountTransitionLocal {
             guard let rows = page["data"] as? [String], rows.count <= 100 else { throw AppError.message("전체 실행 대화 목록을 확인하지 못했습니다.") }
             for id in rows {
                 guard UUID(uuidString: id) != nil, ids.insert(id).inserted, ids.count <= 1000 else { throw AppError.message("실행 대화 목록이 중복되거나 지원 범위를 넘었습니다.") }
-                threads.append(try thread(connection, id: id))
+                let metadata=try connection.request("thread/read",["threadId":id,"includeTurns":false])
+                if let row=metadata["thread"] as? JSONObject,row["id"] as? String==id,
+                   row["ephemeral"] as? Bool==true,row["threadSource"] as? String=="thread_title",
+                   let status=(row["status"] as? JSONObject)?["type"] as? String,["active","idle","systemError","notLoaded"].contains(status) {
+                    // Official TUI title generation has neither paginated
+                    // turns nor retained history. The daemon lifecycle owns
+                    // cancelling this internal job; it is not a user session.
+                    // Unknown/user ephemeral threads still fail closed below.
+                    continue
+                }
+                threads.append(try thread(connection, id: id,metadata:metadata))
             }
             cursor = try nextCursor(page)
             guard cursor == nil || seen.insert(cursor!).inserted, seen.count < 100 else { throw AppError.message("실행 대화 목록 조회가 반복됐습니다.") }
@@ -223,11 +236,11 @@ private enum CodexAccountTransitionLocal {
             _ = try connection.request("turn/interrupt",["threadId":id,"turnId":turn])
         }
     }
-    static func thread(_ connection: CodexQueueConnection, id: String) throws -> CodexAccountTransitionThread {
-        let result = try connection.request("thread/read", ["threadId": id, "includeTurns": false])
+    static func thread(_ connection: CodexQueueConnection, id: String,metadata:JSONObject?=nil) throws -> CodexAccountTransitionThread {
+        let result = try metadata ?? connection.request("thread/read", ["threadId": id, "includeTurns": false])
         guard let row = result["thread"] as? JSONObject, row["id"] as? String == id,
-              let status = (row["status"] as? JSONObject)?["type"] as? String, ["active", "idle"].contains(status) else {
-            throw AppError.message("대화의 실행 상태를 확인하지 못했습니다. 오류·연결 해제 상태에서는 전환하지 않습니다.")
+              let status = (row["status"] as? JSONObject)?["type"] as? String, ["active", "idle", "systemError"].contains(status) else {
+            throw AppError.message("대화의 실행 상태를 확인하지 못했습니다. 연결 상태가 불명확해 전환을 보류했습니다.")
         }
         let turns: JSONObject
         do {
@@ -252,6 +265,17 @@ private enum CodexAccountTransitionLocal {
             }
             turnID = value
         } else if status == "active" { throw AppError.message("중단할 현재 실행 차례가 없습니다.") }
+        if status == "systemError" {
+            // Official ThreadWatchManager clears running on systemError. An
+            // expired login must not prevent replacing that very login. A
+            // terminal last turn and a fresh dormant read are both required;
+            // in-progress/stale error snapshots remain a restart barrier.
+            let fresh=try connection.request("thread/read",["threadId":id,"includeTurns":false])
+            guard latest.count==1,let row=fresh["thread"] as? JSONObject,row["id"] as? String==id,
+                  let freshStatus=(row["status"] as? JSONObject)?["type"] as? String,["idle","systemError"].contains(freshStatus) else {
+                throw AppError.message("오류 대화의 종료를 확인하는 중 상태가 바뀌었습니다. 새 작업은 중단하지 않았습니다.")
+            }
+        }
         var blocker: String?
         for (method, reason) in [("thread/queue/list", "대기 입력"), ("thread/backgroundTerminals/list", "백그라운드 작업")] {
             let page = try connection.request(method, ["threadId": id, "limit": 1])

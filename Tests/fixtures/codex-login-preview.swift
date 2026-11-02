@@ -16,7 +16,7 @@ import AutoApproveCore
             Divider()
             ScrollView {
                 VStack(alignment:.leading,spacing:16) {
-                    CodexLoginSettings(accounts:accounts,targets:{[.init(home:"/fixture/개발 계정/"+String(repeating:"long-repository/",count:8),executable:"/fixture/codex")]},transitionEnabled:true,transitionBusy:false,completed:{completed+=1})
+                    CodexLoginSettings(accounts:accounts,targets:{[.init(home:"/fixture/개발 계정/"+String(repeating:"long-repository/",count:8),executable:"/fixture/codex")]},transitionEnabled:true,transitionBusy:false,completed:{completed+=1},reconnect:{_ in completed+=1})
                     Divider()
                     CodexAccountTransitionSettings(enabled:false,busy:false,states:[:],notice:nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
                 }
@@ -33,7 +33,7 @@ import AutoApproveCore
             let oauth="https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&code_challenge="+String(repeating:"A",count:43)+"&code_challenge_method=S256&state=synthetic-private-state-12345"
             let job=NativeCodexLoginState(id:"synthetic",home:"/fixture/개발 계정/"+String(repeating:"long-repository/",count:8),phase:phase,url:phase=="waiting" ? oauth:nil,message:phase=="succeeded" ? "이 Mac에서 로그인했습니다.":"로그인 상태를 확인해주세요. 다시 로그인할 수 있습니다.")
             let host=NSHostingView(rootView:ScrollView {
-                CodexLoginContent(homes:["/fixture/default",job.home],selected:.constant(job.home),loading:false,job:job,disabled:false,error:phase=="failed" ? "연결이 종료되었습니다. 다시 로그인해주세요.":nil,transitionEnabled:false,begin:{},cancel:{},open:{_ in}).padding(24)
+                CodexLoginContent(homes:["/fixture/default",job.home],selected:.constant(job.home),loading:false,job:job,disabled:false,error:phase=="failed" ? "연결이 종료되었습니다. 다시 로그인해주세요.":nil,transitionEnabled:false,begin:{},cancel:{},open:{_ in},reconnect:{}).padding(24)
             }.font(.callout).foregroundStyle(.secondary).frame(width:600,height:660).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,dark ? .dark:.light))
             host.frame=NSRect(x:0,y:0,width:600,height:660);host.appearance=NSAppearance(named:dark ? .darkAqua:.aqua)
             let w=NSWindow(contentRect:host.frame,styleMask:[.borderless],backing:.buffered,defer:false);w.contentView=host

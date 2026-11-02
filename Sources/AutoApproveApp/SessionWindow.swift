@@ -296,6 +296,11 @@ import AutoApproveCore
                 Spacer()
             }.padding(24)
         } else if let id = selection.first, let session = engine.snapshot.sessions.first(where: { $0.id == id }) {
+            VStack(spacing:0) {
+                if session.agent == .codex {
+                    CodexSessionAccountView(engine:engine,sessionID:id).id(session.id)
+                    Divider()
+                }
             SessionDetail(session: session, events: engine.snapshot.events.filter { event in event.sessionID == id || session.backgroundChildren.contains(where: { $0.id == event.sessionID }) }, paused: engine.snapshot.paused, openingTerminal: openingTerminal,
                           setAutomatic: { enabled in perform { try engine.setAutomatic(id, enabled: enabled) } },
                           resetAutomation: { try engine.resetAutomation(id) },
@@ -315,6 +320,7 @@ import AutoApproveCore
                           removeOSPermissionTarget:{try engine.removeOSPermissionTarget(id,targetID:$0)},
                           acknowledgeOSPermission:{try engine.acknowledgeOSPermission(id,requestID:$0,token:$1)})
                 .id(session.id)
+            }
         } else {
             ContentUnavailableView { Label("터미널 작업을 한곳에서", systemImage: "terminal").help("목록에서 세션을 선택하면 요청과 승인 내역을 볼 수 있습니다.") } description: {
                 Text("세션을 선택해 상태를 확인하고 자동 승인을 켜세요.\n처음 사용하는 경우 연결 설정부터 시작하세요.")

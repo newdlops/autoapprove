@@ -1,0 +1,15 @@
+# Codex Login Recovery Implementation Plan
+
+> Use superpowers:executing-plans inline; review the complete corrective branch once after verification.
+
+**Goal:** Apply an explicit completed login even when account IDs match, stop all original work serially, and reconnect without treating a stopped systemError as active work or unsupported state.
+**Architecture:** Persist a unique native-login receipt per home; pass it into the existing durable coordinator and consume it with that transition. An explicit receipt can authorize a same-account refresh, while passive unchanged-account polling still does nothing. Preserve existing unknown-effect reservations and require a new server identity plus original process/history proof before completion. The official systemError state is dormant; accept it only with a terminal last turn and all existing queue/Goal/background checks.
+**Evidence:** Live read-only state showed saved/server account and login-owner metadata equal, five original processes connected, fourteen loaded conversations, and an unsupported journal with zero reservations/restarts. Official login source revokes old auth before browser login. Official thread_status.rs marks systemError runtime.running=false. The old implementation ignores explicit same-account logins and rejects every systemError. The same-account end-to-end engine regression failed with no interrupt instead of the first original interrupt.
+
+- [ ] RED/GREEN same-account native login → first stop, next stop, one restart, complete, app restoration without replay; passive unchanged account stays inert.
+- [ ] RED/GREEN real Unix RPC systemError with failed/completed turn accepted; in-progress/malformed unknown status still rejected; queue/Goal/background barriers retained.
+- [ ] Add explicit native reconnect action for an already completed login, with durable receipt and no new prompt. Expose connected server identity and shared scope on the selected Codex session using official account/read metadata, never infer an account from auth.json or the latest login alone.
+- [ ] Verify two owned official active TUIs and an errored turn, with continuously drained PTYs; original PID/history/draft retention, serial stops and new-server account; no production QA restart.
+- [ ] Full Debug/release checks, native interaction/visual QA, one independent corrective-branch review, signed release0.2.234/build261, public re-download and local installation/running-version/session check.
+
+**Additional user scope:** Per-session account display and selected-session login. Same-server sessions share authentication; a dedicated home supports independent login already. Migrating one existing shared-server TUI requires its own home/server and exact conversation mapping plus a controlled TUI restart. Do not present a shared login as single-session login, duplicate credentials or silently choose a conversation. Establish that migration separately after the urgent recovery path; the existing user-approved internal-restart/window-and-conversation-preservation preference applies.

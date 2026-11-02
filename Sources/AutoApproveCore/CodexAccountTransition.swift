@@ -33,6 +33,7 @@ public struct CodexAccountTransitionObservation: Sendable {
     public var serverAccount: String
     public var serverID: String
     public var threads: [CodexAccountTransitionThread]
+    public var loginRefreshRequested = false
     public init(savedAccount: String?, serverAccount: String, serverID: String, threads: [CodexAccountTransitionThread]) {
         self.savedAccount = savedAccount; self.serverAccount = serverAccount; self.serverID = serverID; self.threads = threads
     }
@@ -63,6 +64,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var restartReserved = false
     public var since = Date()
     public var verified = 0
+    public var loginRequestID: String?
     public var held: Bool { [.stopping, .waiting, .restarting, .reconnecting, .review].contains(phase) }
     public var canCancel: Bool { held && ![.restarting, .reconnecting].contains(phase) }
     public init() {}
@@ -85,7 +87,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             self.state.detail = "이전 전환 결과를 확인해주세요. 중단·서버 전환 명령을 다시 보내지 않았습니다."
         }
     }
-    public func check(now: Date = Date()) async {
+    public func check(now: Date = Date(), loginRequestID: String? = nil) async {
         guard !checking, state.phase != .review else { return }
         checking = true; defer { checking = false }
         do {
@@ -117,8 +119,9 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 changed(state); return
             }
             if !state.held {
-                if state.phase == .cancelled, observed.savedAccount == nil || observed.savedAccount == state.account { return }
-                guard let account = observed.savedAccount, account != observed.serverAccount else {
+                let explicitLogin = loginRequestID != nil && loginRequestID != state.loginRequestID
+                if state.phase == .cancelled, !explicitLogin, observed.savedAccount == nil || observed.savedAccount == state.account { return }
+                guard let account = observed.savedAccount, account != observed.serverAccount || explicitLogin else {
                     // Preserve the completion summary until a later account
                     // change. Token refresh/session-id rotation is not a change.
                     if state.phase != .complete {
@@ -130,7 +133,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 }
                 var next = CodexAccountTransitionState()
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
-                next.originalAccount = observed.serverAccount
+                next.originalAccount = observed.serverAccount; next.loginRequestID = loginRequestID
                 next.threads = observed.threads.sorted { $0.id < $1.id }; next.witnesses = target.witnesses; next.since = now
                 next.detail = "계정 변경 감지 · \(next.threads.count)개 대화를 순차 중단할 준비 중"
                 state = next
@@ -174,7 +177,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             // The RPC walk is not an atomic server maintenance lock. A second
             // complete barrier catches changes during the first inspection;
             // the adapter repeats it on its own connection before lifecycle.
-            let fresh = try await services.observe(target)
+            var fresh = try await services.observe(target)
             try Task.checkCancellation(); try validate(fresh)
             guard fresh.threads == observed.threads else {
                 throw AppError.message("전환 직전 대화 상태가 바뀌었습니다. 서버를 전환하지 않았습니다.")
@@ -182,11 +185,19 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             state.restartReserved = true; state.phase = .restarting; state.since = now
             state.detail = "모든 작업 대기 확인 · 공통 서버를 새 로그인으로 전환 중"
             try persist()
+            fresh.loginRefreshRequested = state.loginRequestID != nil
+            let lifecycleStarted=Date()
             try await services.restart(target, fresh)
             state.phase = .reconnecting
+            state.since=now.addingTimeInterval(max(0,Date().timeIntervalSince(lifecycleStarted)))
             state.detail = "서버 전환 요청 완료 · 원래 창과 대화의 재연결을 확인합니다."
             try persist()
         } catch {
+            if state.phase == .complete {
+                // A later read-only poll cannot make a completed restart
+                // uncertain again or re-arm its already consumed login.
+                changed(state); return
+            }
             if state.phase == .cancelled {
                 // A logout or transient inspection failure is not a new login.
                 // Keep the cancellation identity and all effect reservations.

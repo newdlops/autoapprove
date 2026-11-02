@@ -12,6 +12,7 @@ const build=path.resolve(process.env.AUTOAPPROVE_CHECK_BUILD||'.build/debug');
 const directory=await mkdtemp('/private/tmp/aa-account-rpc-'),cli=directory+'/codex';
 const server=http.createServer(),websocket=new ws.wsServer({noServer:true}),clients=new Set(),methods=[];
 const ids=['00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000002'];
+const housekeeping='00000000-0000-4000-8000-000000000003';
 let mode='active',child,interrupts=0,refusals=0,goalPauses=0,backgroundStops=0;
 const pausedGoals=new Set(),stoppedBackground=new Set();
 const goalReads=new Map(),quiescenceFailures=[];
@@ -38,10 +39,10 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
    switch(m.method){
     case 'initialize':socket.send(JSON.stringify({id:m.id,result:{userAgent:'fixture'}}));socket.send(JSON.stringify({id:'approval',method:'item/commandExecution/requestApproval',params:{}}));return;
     case 'accountSession/list':assert.equal(m.params.refreshWorkspaceMetadata,false);result={activeSessionId:'session-old',sessions:[{sessionId:'session-old',isActive:true,userId:'user-old',selectedWorkspaceAccountId:'workspace'}]};if(mode==='bad-account')delete result.sessions[0].userId;break;
-    case 'thread/loaded/list':result=mode==='repeat'?{data:[],nextCursor:'repeat'}:mode==='duplicate'?{data:[ids[0],ids[0]]}:m.params.cursor==='next'?{data:[ids[1]],nextCursor:null}:{data:[ids[0]],nextCursor:'next'};break;
-    case 'thread/read':reads++;result={thread:{id:m.params.threadId,status:{type:mode==='system-error'?'systemError':((mode==='active'||mode==='empty-active'||mode==='empty-race'&&reads>1)&&m.params.threadId===ids[0])?'active':'idle'}}};break;
-    case 'thread/turns/list':if(mode.startsWith('empty')){socket.send(JSON.stringify({id:m.id,error:{code:mode==='empty-code'?-32000:-32600,message:mode==='empty-other'?'different error':`thread ${mode==='empty-wrong'?'unrelated':m.params.threadId} is not materialized yet; thread/turns/list is unavailable before first user message`}}));return;}assert.equal(m.params.itemsView,'notLoaded');assert.equal(m.params.sortDirection,'desc');result={data:mode==='missing-turn'?[]:[{id:'turn-'+m.params.threadId,status:mode==='active'&&m.params.threadId===ids[0]?'inProgress':'completed'}]};break;
-    case 'thread/queue/list':result={data:mode.startsWith('queue')?[{id:'queued'}]:[],nextCursor:null};break;
+    case 'thread/loaded/list':result=mode==='repeat'?{data:[],nextCursor:'repeat'}:mode==='duplicate'?{data:[ids[0],ids[0]]}:m.params.cursor==='next'?{data:[ids[1]],nextCursor:null}:{data:mode.startsWith('housekeeping')?[ids[0],housekeeping]:[ids[0]],nextCursor:'next'};break;
+    case 'thread/read':reads++;result={thread:{id:m.params.threadId,status:{type:mode==='unknown-status'?'unknown':mode.startsWith('system-error')&&!(mode==='system-error-race'&&reads>1)?'systemError':((mode==='active'||mode==='empty-active'||mode==='system-error-race'||mode==='empty-race'&&reads>1)&&m.params.threadId===ids[0])?'active':'idle'}}};if(m.params.threadId===housekeeping)Object.assign(result.thread,{id:mode==='housekeeping-bad-id'?ids[0]:housekeeping,ephemeral:mode!=='housekeeping-not-ephemeral',threadSource:mode==='housekeeping'?'thread_title':mode==='housekeeping-user'?'user':mode==='housekeeping-not-ephemeral'||mode==='housekeeping-bad-id'?'thread_title':'unknown',status:{type:'active',activeFlags:[]}});break;
+    case 'thread/turns/list':if(m.params.threadId===housekeeping){socket.send(JSON.stringify({id:m.id,error:{code:-32600,message:'ephemeral threads do not support thread/turns/list'}}));return;}if(mode.startsWith('empty')){socket.send(JSON.stringify({id:m.id,error:{code:mode==='empty-code'?-32000:-32600,message:mode==='empty-other'?'different error':`thread ${mode==='empty-wrong'?'unrelated':m.params.threadId} is not materialized yet; thread/turns/list is unavailable before first user message`}}));return;}assert.equal(m.params.itemsView,'notLoaded');assert.equal(m.params.sortDirection,'desc');result={data:mode==='missing-turn'?[]:[{id:'turn-'+m.params.threadId,status:(mode==='active'&&m.params.threadId===ids[0])||mode==='system-error-in-progress'?'inProgress':mode.startsWith('system-error')?'failed':'completed'}]};break;
+    case 'thread/queue/list':result={data:mode.startsWith('queue')||mode==='system-error-queue'?[{id:'queued'}]:[],nextCursor:null};break;
     case 'thread/backgroundTerminals/list':result={data:mode.includes('background')&&!stoppedBackground.has(m.params.threadId)?[{processId:'owned-background'}]:[],nextCursor:null};break;
     case 'thread/goal/get':if(mode==='goal-race'){const n=(goalReads.get(m.params.threadId)||0)+1;goalReads.set(m.params.threadId,n);result={goal:{status:n>=4?'complete':'active'}};}else result={goal:mode.includes('goal')?{status:pausedGoals.has(m.params.threadId)?'paused':'active'}:null};break;
     case 'thread/goal/set':assert.equal(m.params.status,'paused');assert.equal(m.params.origin,'automatic');assert.equal(m.params.objective,undefined);assert.equal(m.params.tokenBudget,undefined);pausedGoals.add(m.params.threadId);goalPauses++;result={goal:{status:'paused'}};break;
@@ -65,11 +66,15 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
   catch(error){quiescenceFailures.push(value+': '+error.message.slice(0,300));}
  }
  mode='empty';assert.equal((await run('restart')).verified,true);
- for(const value of ['system-error','bad-account','duplicate','repeat','empty-code','empty-other','empty-wrong','empty-active','empty-race']){mode=value;assert.equal((await run('reject')).rejected,true);}
+ mode='system-error';assert.equal((await run('restart')).verified,true,'A failed dormant conversation must allow login recovery');
+ mode='system-error-queue';assert.equal((await run('block')).blocked,true);
+ mode='housekeeping';assert.equal((await run('restart')).verified,true,'Internal ephemeral title generation has no retained user conversation');
+ for(const value of ['housekeeping-user','housekeeping-unknown','housekeeping-not-ephemeral','housekeeping-bad-id']){mode=value;assert.equal((await run('reject')).rejected,true);}
+ for(const value of ['system-error-in-progress','system-error-race','unknown-status','bad-account','duplicate','repeat','empty-code','empty-other','empty-wrong','empty-active','empty-race']){mode=value;assert.equal((await run('reject')).rejected,true);}
  mode='active';// Missing current-turn metadata must be rejected while active.
  // A successful all-idle barrier is the only route to the official lifecycle.
  mode='idle';assert.equal((await run('restart')).verified,true);
- assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\n');
+ assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\nrestart\nrestart\n');
  mode='active';assert.equal((await run('cancel-interrupt')).cancelled,true);assert.equal(interrupts,1,'Cancellation during inspection must not stop a user turn');
  assert.ok(refusals>0);
  assert.ok(methods.every(m=>['initialize','initialized','accountSession/list','thread/loaded/list','thread/read','thread/turns/list','thread/queue/list','thread/backgroundTerminals/list','thread/backgroundTerminals/terminate','thread/goal/get','thread/goal/set','turn/interrupt'].includes(m)));

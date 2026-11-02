@@ -27,6 +27,19 @@ private struct AccountTestClient {
 private let nativeCodexBrowserURL="https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&code_challenge="+String(repeating:"A",count:43)+"&code_challenge_method=S256&state=synthetic-private-state-12345"
 
 extension ApprovalTests {
+    func testCodexConnectedServerAccountIdentityIsLiteralAndModeSpecific() throws {
+        let chat=try CodexServerAccountIdentity.decode(["account":["type":"chatgpt","email":"session@example.test","planType":"pro"]])
+        try expectEqual(chat.email,"session@example.test");try expectEqual(chat.plan,"pro");try expect(chat.authenticated)
+        let missing=try CodexServerAccountIdentity.decode(["account":["type":"chatgpt","email":NSNull(),"planType":NSNull()]])
+        try expectEqual(missing.email,nil);try expect(missing.authenticated)
+        let api=try CodexServerAccountIdentity.decode(["account":["type":"apiKey","email":"must-not-display@example.test"]])
+        try expectEqual(api.email,nil);try expectEqual(api.provider,"API 키")
+        let absent=try CodexServerAccountIdentity.decode(["account":NSNull()])
+        try expectFalse(absent.authenticated);try expectEqual(absent.email,nil)
+        var rejected=false
+        do {_=try CodexServerAccountIdentity.decode(["account":["type":"chatgpt","email":"one\ntwo@example.test"]])} catch {rejected=true}
+        try expect(rejected,"Malformed account labels must not become session identity")
+    }
     func testNativeCodexBrowserURLScopeAndRemoteDeviceIsolation() throws {
         let parsed=AgentAccountOutput.challenge(nativeCodexBrowserURL,agent:"codex-browser")
         try expectEqual(parsed.url,nativeCodexBrowserURL);try expectNil(parsed.code)

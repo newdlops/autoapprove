@@ -6,7 +6,8 @@ import AutoApproveCore
         let args = CommandLine.arguments
         var target = CodexAccountTransitionTarget(home: args[1], executable: args[2])
         let mode = args[3], service = CodexAccountTransitionServices.live
-        if mode == "official-lifecycle" {
+        if mode == "official-lifecycle" || mode == "official-recovery" {
+            let recovery=mode == "official-recovery"
             guard target.home.hasPrefix("/private/tmp/aa-account-real-cli-"), args.count == 6,
                   let first=Int32(args[4]),let second=Int32(args[5]),first != second else {throw AppError.message("Owned temporary official fixture required")}
             let pids:Set<Int32>=[first,second]
@@ -16,14 +17,15 @@ import AutoApproveCore
             guard discovered.count==1,discovered[0].home==canonical,discovered[0].witnesses.count==2 else {throw AppError.message("Owned TUI identity or common server missing")}
             target=discovered[0]
             let before=try await service.observe(target)
-            guard before.threads.count==2,before.threads.allSatisfy({!$0.active && $0.blocker==nil}),target.witnesses.allSatisfy({$0.threadID==nil}) else {throw AppError.message("Expected two empty owned conversations without rollout witnesses")}
+            guard (recovery ? before.threads.count>=2:before.threads.count==2),(recovery ? before.threads.allSatisfy(\.active):before.threads.allSatisfy({!$0.active && $0.blocker==nil})),target.witnesses.allSatisfy({$0.threadID==nil}) else {throw AppError.message("Expected owned conversations in the fixture's exact activity state")}
             let journal=URL(fileURLWithPath:target.home).appendingPathComponent("autoapprove-transition-fixture.json")
             let coordinator=CodexAccountTransitionCoordinator(target:target,services:service,save:{state in try JSONEncoder().encode(state).write(to:journal,options:.atomic)})
             for _ in 0..<100 {
-                await coordinator.check()
+                await coordinator.check(loginRequestID:recovery ? "00000000-0000-4000-8000-000000000234":nil)
                 if coordinator.state.phase == .complete {
                     guard coordinator.state.verified==2 else {throw AppError.message("Not every owned TUI reconnected")}
-                    print("{\"verified\":true,\"officialLifecycle\":true,\"originalProcesses\":2,\"originalConversations\":2,\"withoutRolloutWitnesses\":true}");return
+                    if recovery {guard coordinator.state.reservations.count==before.threads.count else {throw AppError.message("Every original active conversation must be stopped")}}
+                    print("{\"verified\":true,\"officialLifecycle\":true,\"originalProcesses\":2,\"originalConversations\":\(before.threads.count),\"withoutRolloutWitnesses\":true}");return
                 }
                 if [.review,.unsupported].contains(coordinator.state.phase) {throw AppError.message(coordinator.state.detail)}
                 try await Task.sleep(for:.milliseconds(250))

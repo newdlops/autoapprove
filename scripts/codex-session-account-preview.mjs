@@ -1,0 +1,12 @@
+import {execFileSync} from 'node:child_process';
+import {mkdir,copyFile,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
+const build=path.resolve('.build',process.argv.includes('--release')?'release':'debug'),output=path.resolve('dist/qa/codex-session-account');
+await mkdir(output,{recursive:true});
+const binary=output+'/SessionAccountPreview';
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/SessionAccountPreview'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Sources/AutoApproveApp/CodexLoginSettings.swift','Sources/AutoApproveApp/CodexAccountTransitionSettings.swift','Sources/AutoApproveApp/CodexSessionAccountView.swift','Tests/fixtures/codex-session-account-preview.swift','-o',binary],{stdio:'inherit',timeout:120000});
+const app=output+'/SessionAccountPreview.app';await mkdir(app+'/Contents/MacOS',{recursive:true});await copyFile(binary,app+'/Contents/MacOS/SessionAccountPreview');
+await writeFile(app+'/Contents/Info.plist','<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.autoapprove.qa.sessionaccount</string><key>CFBundleName</key><string>SessionAccountPreview</string><key>CFBundleExecutable</key><string>SessionAccountPreview</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>');
+if(!process.argv.includes('--build-only'))execFileSync(binary,[output],{stdio:'inherit',timeout:30000});
+console.log(binary);
