@@ -1,5 +1,12 @@
 # AutoApprove 검증 기록
 
+## 2026-11-02 · 0.2.225/252 공개 배포·정식 설치
+
+- 소스/공개 태그 **233fd7a627d9c697e2782256c94c4274dcc0d1fc**로 [v0.2.225](https://github.com/newdlops/autoapprove/releases/tag/v0.2.225)을 최신 릴리스로 게시했다. 공개 파일 4개 재다운로드에서 태그·GitHub digest·체크섬·추출 앱 버전/서명·주요 파일이 일치했다. DMG **10,290,368B**, SHA-256 **ccbbc1b78c0ec9080e9fed5b9baddb7578034a265698d0637cf261c1496c820c**, ZIP **10,620,835B**, SHA-256 **99fa7e3d3f594f412f7194c25ec5cc8a6e6ce3edf14c85a7db04b4f013d668ef**다.
+- 기존 게시자로 서명하고 키체인 검색/잠금을 원상 복원했다. 입력 설치·네트워크·Worker·release 심볼 패키지 검사 4개와 DMG 무결성/읽기 전용 마운트/주요 파일·서명 검사도 통과했다. 관리자·ACL/신뢰·새 키체인·OS 권한·서비스·quarantine 변경은 없다.
+- 설치 직전 앱 소유 PTY·화면 공유 0개와 원본 20개를 확인하고 백업·정상 종료·교체·재실행했다. `/Applications/AutoApprove.app/Contents/MacOS/AutoApproveApp`의 실제 실행 **0.2.225/252**, 원본 **20/20개**의 동일 PID·시작 시각·TTY·node ID 보존, 공개 앱 파일·설치 서명 일치가 확인됐다. 설치 앱의 웹 파일 4개가 소스와 일치하고 실제 Codex 대화 메시지 2개를 읽었다. 본문은 출력/저장하지 않았다. 비공개 근거는 `.runtime/stability-225/`다.
+- 대체 전송 기회 복구의 배포·설치는 완료했다. 현재 네트워크의 QUIC 응답 없음/HTTP2 TLS reset에 따른 전체 Cloudflare 준비 실패, 실제 Terminal 창의 크기/과거 스크롤 조작 검증은 남아 있다. CUA 차단을 우회하거나 네트워크·TLS 설정을 바꾸지 않았다. 전체 안정성 목표는 active다.
+
 ## 2026-11-02 · QUIC 재시도 예산과 HTTP2 전환 · 0.2.225/252
 
 - 제품 controller/gateway와 기존 공식 **cloudflared 2026.10.3**의 격리 Quick Tunnel은 180초 안에 준비되지 못했다. 직접 TCP 7844 두 edge와 API 443 연결 자체는 성공했으므로 단순 포트 차단으로 표시하지 않는다. 같은 공식 커넥터의 자동 모드는 66초 동안 QUIC timeout 6회·HTTP2 전환 0회, 181초 연속 관찰에서는 QUIC timeout 9회 뒤 HTTP2 전환 1회였다. HTTP2 단독 66초는 TLS 핸드셰이크의 `connection reset by peer`로 등록되지 못했다. 정상 터널 검증으로 간주하지 않는다.
