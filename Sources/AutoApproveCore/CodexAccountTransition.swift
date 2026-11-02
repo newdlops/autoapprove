@@ -53,6 +53,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var detail = "계정 변경을 기다립니다."
     public var account = ""
     public var serverID = ""
+    public var originalAccount = ""
     public var threads: [CodexAccountTransitionThread] = []
     public var witnesses: [CodexAccountTransitionWitness] = []
     public var reservations: [String: String] = [:]
@@ -121,6 +122,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 }
                 var next = CodexAccountTransitionState()
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
+                next.originalAccount = observed.serverAccount
                 next.threads = observed.threads.sorted { $0.id < $1.id }; next.witnesses = target.witnesses; next.since = now
                 next.detail = "계정 변경 감지 · \(next.threads.count)개 대화를 순차 중단할 준비 중"
                 state = next
@@ -192,7 +194,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     }
     private func persist() throws { try save(state); changed(state) }
     private func validate(_ observed: CodexAccountTransitionObservation) throws {
-        guard observed.savedAccount == state.account, observed.serverID == state.serverID,
+        guard observed.savedAccount == state.account, observed.serverID == state.serverID, observed.serverAccount == state.originalAccount,
               Set(observed.threads.map(\.id)) == Set(state.threads.map(\.id)),
               observed.threads.count == state.threads.count else {
             throw AppError.message("로그인·서버·대화 목록이 전환 준비 중 바뀌었습니다. 현재 연결을 확인해주세요.")

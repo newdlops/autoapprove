@@ -17,7 +17,7 @@ try {
  await mkdir(directory+'/app-server-control');
  await writeFile(cli,`#!${process.execPath}\nimport fs from 'node:fs';import readline from 'node:readline';
 const args=process.argv.slice(2),home=process.env.CODEX_HOME;
-if(args.join(' ')==='app-server daemon version'){console.log(JSON.stringify({status:'running',backend:'pid',managedCodexPath:process.argv[1],managedCodexVersion:'0.166.0',socketPath:home+'/app-server-control/app-server-control.sock',cliVersion:'0.166.0',appServerVersion:'0.166.0'}));process.exit(0);}
+if(args.join(' ')==='app-server daemon version'){if(fs.existsSync(home+'/delay-version'))await new Promise(r=>setTimeout(r,500));console.log(JSON.stringify({status:'running',backend:'pid',managedCodexPath:process.argv[1],managedCodexVersion:'0.166.0',socketPath:home+'/app-server-control/app-server-control.sock',cliVersion:'0.166.0',appServerVersion:'0.166.0'}));process.exit(0);}
 if(args.join(' ')==='app-server daemon restart'){fs.appendFileSync(home+'/restart.log','restart\\n');process.exit(0);}
 if(args.join(' ')!=='app-server --listen stdio://')process.exit(91);
 for await(const line of readline.createInterface({input:process.stdin})){const m=JSON.parse(line);if(m.method==='initialized')continue;let result;if(m.method==='initialize')result={userAgent:'fixture'};else if(m.method==='accountSession/list'&&m.params.refreshWorkspaceMetadata===false)result={activeSessionId:'session-new',sessions:[{sessionId:'session-new',isActive:true,userId:'user-new',selectedWorkspaceAccountId:'workspace'}]};else process.exit(92);console.log(JSON.stringify({id:m.id,result}));}
@@ -57,6 +57,7 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  // A successful all-idle barrier is the only route to the official lifecycle.
  mode='idle';assert.equal((await run('restart')).verified,true);
  assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\n');
+ mode='active';assert.equal((await run('cancel-interrupt')).cancelled,true);assert.equal(interrupts,1,'Cancellation during inspection must not stop a user turn');
  assert.ok(refusals>0);
  assert.ok(methods.every(m=>['initialize','initialized','accountSession/list','thread/loaded/list','thread/read','thread/turns/list','thread/queue/list','thread/backgroundTerminals/list','thread/goal/get','turn/interrupt'].includes(m)));
  console.log(JSON.stringify({verified:true,checks:['saved metadata from owned stdio helper','complete loaded pagination','exact normal interrupt','queue/background/goal barriers','unknown/malformed/repeated pages fail closed','one official restart after fresh idle barrier','no resume, prompt or terminal input'],interrupts}));

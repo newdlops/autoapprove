@@ -15,6 +15,7 @@ import AutoApproveCore
     @State private var keepAwakeError: String?
     @State private var mouseActivityError: String?
     @State private var codexProgressError:String?
+    @State private var codexAccountTransitionError: String?
     @State private var terminalWindowSharingAllowed = false
     @State private var screenControlAllowed=false
     @State private var terminalInputStatus = TerminalInputStatus.notInstalled
@@ -138,6 +139,17 @@ import AutoApproveCore
                     Divider()
                     section("Codex", icon: "command", status: engine.snapshot.health.codex) {
                         Text("연결된 원본 터미널의 승인 화면을 감지합니다. 휴대폰에서 같은 실행 세션에 직접 입력할 수 있으며 새 CLI를 만들지 않습니다.")
+                        CodexAccountTransitionSettings(enabled: engine.codexAccountTransitionEnabled, busy: engine.codexAccountTransitionBusy,
+                            states: engine.codexAccountTransitionStates, notice: engine.codexAccountTransitionNotice, error: codexAccountTransitionError,
+                            setEnabled: { enabled in
+                                do {
+                                    try engine.setCodexAccountTransitionEnabled(enabled); codexAccountTransitionError = nil
+                                    if enabled { Task { await engine.checkCodexAccountTransitions() } }
+                                } catch { codexAccountTransitionError = error.localizedDescription }
+                            }, check: { Task { await engine.checkCodexAccountTransitions() } }, cancel: { home in
+                                do { try engine.cancelCodexAccountTransition(home: home); codexAccountTransitionError = nil }
+                                catch { codexAccountTransitionError = error.localizedDescription }
+                            })
                     }
                     if let notice {
                         Label(notice, systemImage: "info.circle").font(.callout).foregroundStyle(.primary).textSelection(.enabled)

@@ -2,22 +2,46 @@ import Foundation
 import Darwin
 import CryptoKit
 
+extension CodexAccountTransitionTarget {
+    public static func discover(_ records: [ProcessRecord]) async throws -> [Self] {
+        try await Task.detached(priority: .utility) {
+            let sessions = ProcessDiscovery.sessions(records).filter { $0.agent == .codex && $0.tty.hasPrefix("/dev/") }
+            var grouped: [String: Self] = [:]
+            for session in sessions {
+                try Task.checkCancellation()
+                guard let record = records.first(where: { $0.key == session.id }), record.executable.hasPrefix("/"),
+                      FileManager.default.isExecutableFile(atPath: record.executable) else { continue }
+                let hints = [ProcessEnvironment.read(record)?["CODEX_HOME"], NSHomeDirectory() + "/.codex"].compactMap { $0 }
+                guard let home = CodexServerLocation.connectedHome(pid: record.pid, hints: hints) else { continue }
+                let location = try? CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: record.pid, expectedStart: record.started))
+                let witness = CodexAccountTransitionWitness(pid: record.pid, started: record.started, tty: session.tty, threadID: location?.threadID)
+                if grouped[home] == nil { grouped[home] = Self(home: home, executable: record.executable) }
+                grouped[home]?.witnesses.append(witness)
+            }
+            return grouped.values.map { target in
+                var copy = target; copy.witnesses.sort { $0.pid < $1.pid }; return copy
+            }.sorted { $0.home < $1.home }
+        }.value
+    }
+}
+
 extension CodexAccountTransitionServices {
     public static var live: Self {
         Self(observe: { target in
-            try await Task.detached(priority: .utility) { try CodexAccountTransitionLocal.observe(target) }.value
+            try await CodexAccountBackground.run { try CodexAccountTransitionLocal.observe(target) }
         }, interrupt: { target, server, thread, turn in
-            try await Task.detached(priority: .utility) {
+            try await CodexAccountBackground.run {
                 guard try CodexAccountTransitionLocal.identity(target) == server else { throw AppError.message("중단 직전 Codex 서버가 바뀌었습니다.") }
+                try Task.checkCancellation()
                 let connection = try CodexQueueConnection(home: target.home)
                 let current = try CodexAccountTransitionLocal.thread(connection, id: thread)
                 guard current.active, current.turnID == turn,
                       try CodexAccountTransitionLocal.identity(target) == server else { throw AppError.message("중단할 실행 차례나 서버가 바뀌었습니다.") }
                 try Task.checkCancellation()
                 _ = try connection.request("turn/interrupt", ["threadId": thread, "turnId": turn])
-            }.value
+            }
         }, restart: { target, expected in
-            try await Task.detached(priority: .utility) {
+            try await CodexAccountBackground.run {
                 let fresh = try CodexAccountTransitionLocal.observe(target)
                 guard fresh.serverID == expected.serverID, fresh.savedAccount == expected.savedAccount,
                       fresh.savedAccount != nil, fresh.serverAccount != fresh.savedAccount,
@@ -35,9 +59,9 @@ extension CodexAccountTransitionServices {
                 let result = try CommandRunner.run(target.executable, ["app-server", "daemon", "restart"], timeout: 30,
                     environment: CodexAccountTransitionLocal.environment(target), inheritEnvironment: false, outputLimit: 32_768, errorLimit: 32_768)
                 guard result.status == 0 else { throw AppError.message("공통 서버 전환 결과를 확인하지 못했습니다. 같은 요청을 반복하지 말고 Mac에서 연결을 확인해주세요.") }
-            }.value
+            }
         }, verify: { target, witnesses in
-            try await Task.detached(priority: .utility) {
+            try await CodexAccountBackground.run {
                 var verified = 0
                 for witness in witnesses {
                     guard CodexAccountTransitionLocal.sameProcess(witness),
@@ -52,8 +76,24 @@ extension CodexAccountTransitionServices {
                     verified += 1
                 }
                 return verified
-            }.value
+            }
         })
+    }
+}
+
+private enum CodexAccountBackground {
+    static func run<Value: Sendable>(_ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        let child = Task.detached(priority: .utility, operation: operation)
+        return try await withTaskCancellationHandler(operation: {
+            do {
+                let result = try await child.value
+                try Task.checkCancellation(); return result
+            } catch {
+                // The socket client also stops on cancellation, using its
+                // historical timeout error. Preserve cancellation at this API.
+                try Task.checkCancellation(); throw error
+            }
+        }, onCancel: { child.cancel() })
     }
 }
 
@@ -189,8 +229,10 @@ private enum CodexAccountMetadataProcess {
             try? input.fileHandleForWriting.close(); try? output.fileHandleForReading.close()
             if process.isRunning {
                 process.terminate()
-                if exited.wait(timeout: .now() + 0.25) == .timedOut, process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
-                _ = exited.wait(timeout: .now() + 0.25)
+                if exited.wait(timeout: .now() + 0.25) == .timedOut {
+                    if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+                    _ = exited.wait(timeout: .now() + 0.25)
+                }
             }
         }
         try process.run()

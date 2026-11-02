@@ -16,7 +16,15 @@ import AutoApproveCore
               observed.threads.count == 2, Set(observed.threads.map(\.id)).count == 2 else {
             throw AppError.message("Account or complete loaded membership differs")
         }
-        if mode == "interrupt" {
+        if mode == "cancel-interrupt" {
+            try Data("delay".utf8).write(to: URL(fileURLWithPath: target.home).appendingPathComponent("delay-version"))
+            let thread = observed.threads.first(where: \.active)!
+            let task = Task { try await service.interrupt(target, observed.serverID, thread.id, thread.turnID!) }
+            try await Task.sleep(for: .milliseconds(50)); task.cancel()
+            do { try await task.value }
+            catch is CancellationError { print("{\"cancelled\":true}"); return }
+            throw AppError.message("Cancelled inspection still sent an interrupt")
+        } else if mode == "interrupt" {
             let thread = observed.threads.first(where: \.active)!
             try await service.interrupt(target, observed.serverID, thread.id, thread.turnID!)
         } else if mode == "restart" {

@@ -44,9 +44,8 @@ import AutoApproveCore
             "Menu inspection should trim only its bounded visible tail")
 
         let permissionLines = DetectionLines(codex)
-        try expectNotNil(PromptDetector.detect(codex, agent: .codex, prepared: permissionLines))
-        try expect(permissionLines.debugHasMaterializedTrimmedRows,
-            "A real dialog retains its full normalized and trimmed context for exact validation")
+        try expectEqual(PromptDetector.detect(codex, agent: .codex, prepared: permissionLines)?.dialog, codex,
+            "The native scanner must retain the exact real dialog without requiring a full row-array allocation")
     }
 
     func testScreenAnalysisPreservesSourceUTF8ByteCountAcrossLinePreparation() throws {
@@ -683,10 +682,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("LAN updates: reject unsafe ZIP paths, links, duplicates and bombs", tests.testLANUpdateArchiveRejectsTraversalLinksDuplicatesAndBombs),
             ("LAN updates: preference persists across engine restart", tests.testLANUpdatePreferenceSurvivesEngineRestart),
             ("Account transition: sequential normal stops await actual idle before shared restart", tests.testAccountTransitionSequentialStopsAwaitActualIdle),
+            ("Account transition: engine opt-in and durable hold survive app restart", tests.testAccountTransitionEngineOptInAndJournalSurviveRestart),
+            ("Account transition: engine hold blocks real approval dispatch and preserves preferences", tests.testAccountTransitionEngineHoldBlocksRealDispatchAndKeepsAutomaticSettings),
             ("Account transition: same account, logout and queue/background/goal barriers", tests.testAccountTransitionSameAccountLogoutAndBarriers),
             ("Account transition: ambiguous effects and persistence never retry", tests.testAccountTransitionAmbiguousEffectsAndPersistenceAreNotRetried),
             ("Account transition: fresh barrier rejects turn, account and server races", tests.testAccountTransitionFreshBarrierTurnAndAccountRaces),
             ("Account transition: cancellation, timeout and per-TUI reconnect proof", tests.testAccountTransitionCancellationTimeoutAndReconnectProof),
+            ("Account transition: server authentication race without socket replacement", tests.testAccountTransitionRejectsServerAccountChangeWithoutSocketReplacement),
             ("Codex queue: snapshot deletion preserves new inputs, consumed inputs and original session", tests.testCodexQueueSnapshotDeletionPreservesNewAndConsumedInputs),
             ("Codex queue: partial deletion, audit and exited-process rejection", tests.testCodexQueuePartialFailureKeepsUndeletedInputsAndAudit),
             ("Codex Goal: exact lifecycle, stale/replaced goal and original identity",tests.testCodexGoalLifecycleUsesExactRevisionAndPreservesOriginal),

@@ -10,6 +10,9 @@ extension ApprovalTests {
 #if DEBUG
     func testIdleObservationWaitsForChangeOrCancellation() async throws {
         let signal = RemoteTerminalChangeSignal(), observation = signal.observe()
+        // A new observation deliberately delivers the initial frame once.
+        // Only its subsequent wait is an inactive poller's parked state.
+        await observation.waitForChange(timeout: 0)
         var entered = false, finished = false
         let waiting = Task {
             entered = true

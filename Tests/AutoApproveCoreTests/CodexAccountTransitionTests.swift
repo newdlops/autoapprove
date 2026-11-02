@@ -8,17 +8,20 @@ import AutoApproveCore
         threads: [.init(id: "a", turnID: "turn-a", active: true), .init(id: "b", turnID: "turn-b", active: true)])
     var effects: [String] = [], saved: [CodexAccountTransitionState] = []
     var saveFails = false, interruptFails = false, restartFails = false, verified = 1
+    var checkReservations = true
     var observeCount = 0
     var mutateOnObserve: ((Int) -> Void)?
     lazy var services = CodexAccountTransitionServices(observe: { [unowned self] _ in
         observeCount += 1; mutateOnObserve?(observeCount); return observation
     }, interrupt: { [unowned self] _, server, thread, turn in
-        try expectEqual(saved.last?.waitingThread, thread, "An interrupt reservation must be durable before submission")
-        try expectEqual(saved.last?.reservations[thread], turn)
+        if checkReservations {
+            try expectEqual(saved.last?.waitingThread, thread, "An interrupt reservation must be durable before submission")
+            try expectEqual(saved.last?.reservations[thread], turn)
+        }
         effects.append("interrupt:\(server):\(thread):\(turn)")
         if interruptFails { throw AppError.message("unknown acknowledgement") }
     }, restart: { [unowned self] _, _ in
-        try expect(saved.last?.restartReserved == true, "Restart must be durably reserved before submission")
+        if checkReservations { try expect(saved.last?.restartReserved == true, "Restart must be durably reserved before submission") }
         effects.append("restart")
         if restartFails { throw AppError.message("unknown restart") }
     }, verify: { [unowned self] _, witnesses in
@@ -32,7 +35,79 @@ import AutoApproveCore
     func idle(_ index: Int) { observation.threads[index].active = false }
 }
 
+private final class AccountInputProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    static let prompt = "Would you like to run the following command?\n\n$ npm test\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
+    func sent() { lock.lock(); count += 1; lock.unlock() }
+    var writes: Int { lock.lock(); defer { lock.unlock() }; return count }
+    var adapter: ScreenHostAdapter {
+        ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: Self.prompt) }) },
+            approve: { [self] _, _, _ in sent(); return .sent }, reveal: { _ in nil },
+            resume: { [self] _, _, _ in sent(); return .typed }, input: { [self] _, _, _, _ in sent(); return .sent })
+    }
+}
+
 extension ApprovalTests {
+    func testAccountTransitionEngineOptInAndJournalSurviveRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-engine-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let r = AccountTransitionRig(), target = r.target
+        r.checkReservations = false
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), processReader: { [] },
+            codexAccountTransitions: r.services, codexAccountTargets: { _ in [target] })
+        defer { engine.stop() }
+        await engine.checkCodexAccountTransitions(); try expectEqual(r.observeCount, 0, "Default off must not inspect authentication")
+        try engine.setCodexAccountTransitionEnabled(true)
+        try expect(engine.codexAccountTransitionEnabled)
+        await engine.checkCodexAccountTransitions()
+        try expect(engine.codexAccountTransitionHeld)
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(r.effects.count, 1)
+        engine.stop()
+        let restored = try ApprovalEngine(paths: AppPaths(directory: root), processReader: { [] },
+            codexAccountTransitions: r.services, codexAccountTargets: { _ in [target] })
+        defer { restored.stop() }
+        try expect(restored.codexAccountTransitionEnabled)
+        try expect(restored.codexAccountTransitionHeld, "A prior unconfirmed reservation must hold automation even before discovery")
+        await restored.checkCodexAccountTransitions()
+        try expectEqual(r.effects.count, 1); try expectEqual(restored.codexAccountTransitionStates[target.home]?.phase, .review)
+        try restored.cancelCodexAccountTransition(home: target.home)
+        try expectFalse(restored.codexAccountTransitionHeld)
+        try restored.setCodexAccountTransitionEnabled(false)
+    }
+    func testAccountTransitionEngineHoldBlocksRealDispatchAndKeepsAutomaticSettings() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-hold-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let records = ProcessDiscovery.parse("41 1 ttys971 41 41 Wed Oct 21 09:00:00 2026 /fixture/codex")
+        var session = AgentSession(id: records[0].key, agent: .codex, pid: 41, started: records[0].started,
+            tty: "/dev/ttys971", cwd: "/fixture", terminal: .iterm)
+        session.channel = .itermScreen
+        let r = AccountTransitionRig(), target = r.target, probe = AccountInputProbe()
+        let transport = CodexReplyTransport(prepare: { _, q in .init(executable: "/fixture/codex", home: "/fixture/home", threadID: q.threadID) },
+            send: { _, _ in probe.sent(); return "receipt" }, prepareMessage: { _ in .init(executable: "/fixture/codex", home: "/fixture/home", threadID: "a") })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), questionTransport: transport, processReader: { records }, screenAdapters: [.iterm: probe.adapter],
+            codexAccountTransitions: r.services, codexAccountTargets: { _ in [target] })
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: records); try engine.setAutomatic(session.id, enabled: true)
+        try engine.setCodexAccountTransitionEnabled(true); await engine.checkCodexAccountTransitions()
+        engine.receiveScreen(sessionID: session.id, raw: AccountInputProbe.prompt, generation: "account-hold")
+        try await Task.sleep(for: .milliseconds(250))
+        try expectEqual(probe.writes, 0, "Transition must block the actual automatic approval transport")
+        try expect(engine.snapshot.sessions.first?.automatic == true, "A temporary hold must preserve the user's automatic preference")
+        try expectFalse(engine.snapshot.paused)
+        do {
+            _ = try await engine.remoteAction(["action": "sendMessage", "sessionID": session.id, "text": "must remain unsent"])
+            throw AppError.message("Message accepted while switching")
+        } catch let error as RemoteHTTPError {
+            try expectEqual(error.status, 409); try expectEqual(error.diagnostics?["delivery"], "not_started")
+        }
+        try expectEqual(probe.writes, 0, "A new remote message must not enter the existing queue during transition")
+        try engine.cancelCodexAccountTransition(home: target.home)
+        engine.receiveScreen(sessionID: session.id, raw: AccountInputProbe.prompt.replacingOccurrences(of: "npm test", with: "npm run check"), generation: "after-hold")
+        // A fresh screen is required after releasing the hold; original flags remain unchanged.
+        try expect(engine.snapshot.sessions.first?.automatic == true)
+    }
     func testAccountTransitionSequentialStopsAwaitActualIdle() async throws {
         let r = AccountTransitionRig(), c = r.coordinator()
         await c.check()
@@ -99,6 +174,14 @@ extension ApprovalTests {
         r.mutateOnObserve = { count in if count == 3 { r.observation.threads[0].active = true } }
         await c.check()
         try expectFalse(r.effects.contains("restart"), "Restart must recheck the complete barrier immediately before submission")
+    }
+    func testAccountTransitionRejectsServerAccountChangeWithoutSocketReplacement() async throws {
+        let r = AccountTransitionRig(), c = r.coordinator()
+        await c.check()
+        r.observation.serverAccount = "unexpected-account"
+        await c.check()
+        try expectEqual(c.state.phase, .review, "Authentication can change inside an existing server without replacing its socket")
+        try expect(r.effects.isEmpty)
     }
     func testAccountTransitionCancellationTimeoutAndReconnectProof() async throws {
         let r = AccountTransitionRig(), c = r.coordinator()

@@ -355,6 +355,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let mouseActivity: MouseActivity
     private var mouseActivityTask: Task<Void, Never>?
     private var discovering = false
+    @Published public private(set) var codexAccountTransitionEnabled = false
+    @Published public private(set) var codexAccountTransitionStates: [String: CodexAccountTransitionState] = [:]
+    @Published public private(set) var codexAccountTransitionBusy = false
+    @Published public private(set) var codexAccountTransitionNotice: String?
+    public var codexAccountTransitionHeld: Bool { codexAccountTransitionStates.values.contains(where: \.held) }
+    private let codexAccountTransitionServices: CodexAccountTransitionServices
+    private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
+    private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
+    private var codexAccountTransitionTask: Task<Void, Never>?
+    private var codexAccountTransitionEpoch = UUID()
+    private static let codexAccountJournalKey = "codexAccountTransitions.v1"
+    private func codexAccountInputHeld(_ id: String) -> Bool { sessions[id]?.agent == .codex && codexAccountTransitionHeld }
+    private static let codexAccountHoldMessage = "계정 전환을 위해 Codex 작업을 중단·대기하고 있습니다. 전환 결과를 확인한 뒤 입력해주세요."
     private var revision: UInt64 = 0
     private struct ScreenState {
         var raw: String
@@ -375,7 +388,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
-                osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live) throws {
+                osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live,
+                codexAccountTransitions:CodexAccountTransitionServices? = nil,
+                codexAccountTargets:(@Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget])? = nil) throws {
+        self.codexAccountTransitionServices = codexAccountTransitions ?? .live
+        if let codexAccountTargets { self.codexAccountTargetReader = codexAccountTargets }
+        else if processReader == nil { self.codexAccountTargetReader = { try await CodexAccountTransitionTarget.discover($0) } }
+        else { self.codexAccountTargetReader = { _ in [] } }
         self.codexConversation=codexConversation
         self.paths = paths
         self.osPermissionServices=osPermissionServices ?? (processReader == nil ? OSPermissionAutomation.live:.inactive)
@@ -455,6 +474,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if !lanUpdate.enabled { lanUpdate.phase = "off"; lanUpdate.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다." }
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
         snapshot.codexProgressRecoveryEnabled=store.value("codexProgressRecoveryEnabled") != "false"
+        codexAccountTransitionEnabled = store.value("codexAccountTransitionEnabled") == "true"
+        if let journal = store.value(Self.codexAccountJournalKey),
+           let restored = try? JSONDecoder().decode([String: CodexAccountTransitionState].self, from: Data(journal.utf8)) {
+            codexAccountTransitionStates = restored.mapValues { state in
+                var copy = state
+                if copy.held { copy.phase = .review; copy.detail = "이전 전환 결과를 확인해주세요. 중단·서버 전환 명령을 반복하지 않았습니다." }
+                return copy
+            }
+        }
         keepAwakeEnabled = store.value("keepAwake") == "true"
         mouseActivity.setEnabled(store.value("mouseActivity") == "true")
         snapshot.mouseActivity = mouseActivity.status
@@ -531,6 +559,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         if poll {
+            startCodexAccountTransitionPolling()
             if osPermissionMonitoringEnabled {osPermissionTask=Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refreshOSPermissions()
@@ -560,6 +589,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        codexAccountTransitionEpoch = UUID()
+        codexAccountTransitionTask?.cancel(); codexAccountTransitionTask = nil
         osPermissionEpoch=UUID()
         osPermissionTransitions.removeAll()
         osPermissionTask?.cancel();osPermissionTask=nil
@@ -995,6 +1026,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return basic + interactive
     }
     private func remoteInputReason(_ session: AgentSession) -> String? {
+        if codexAccountInputHeld(session.id) { return Self.codexAccountHoldMessage }
         if !remoteCanRead(session) { return "이 세션의 화면 연결이 없습니다. Mac의 연결 설정에서 터미널을 연결해주세요. 훅으로 받은 질문은 아래에서 답할 수 있습니다." }
         if session.terminal == .vscode {
             let registration = session.bridgeID.flatMap { bridges[$0] }?.first { $0["id"] as? String == session.terminalID }
@@ -1778,7 +1810,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[id].map {nativeKeyboardActivity.hasPriority(terminal:$0.terminal) || testScreens.remoteControl.hasInputPriority(terminal:$0.terminal)} ?? false
     }
     private func userInputHasPriority(_ id:String) -> Bool {
-        changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
+        codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
@@ -1875,6 +1907,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard let id = object["sessionID"] as? String, let session = sessions[id],
               session.phase != .ended || ["cancelCapacity","read"].contains(action) else { throw RemoteHTTPError(404, "세션이 종료되었거나 찾을 수 없습니다.") }
+        if codexAccountInputHeld(id), ["sendMessage", "replyTerminalQuestion", "resumeGoal", "approve", "approveOnce", "resume", "recover", "checkProgress"].contains(action) {
+            throw RemoteHTTPError(409, Self.codexAccountHoldMessage, diagnostics: ["delivery": "not_started"])
+        }
         if ["osPermissionPolicy","assignOSPermission","removeOSPermissionTarget","acknowledgeOSPermission","respondOSPermission"].contains(action) {
             guard object["policyRevision"] as? String == (session.osPermissionPolicy?.revision ?? "initial"),
                   try remoteProcessVerifier(session) else {
@@ -1987,7 +2022,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 try validateCodexQueueSession(session, threadID: thread)
             } else { target = try await questionTransport.prepareMessage(session) } }
             catch { throw RemoteHTTPError((error as? RemoteHTTPError)?.status ?? 409, error.localizedDescription, diagnostics: ["delivery": "not_started"]) }
-            guard !remoteInputStopped, let current = sessions[id], current.phase != .ended,
+            guard !remoteInputStopped, !codexAccountInputHeld(id), let current = sessions[id], current.phase != .ended,
                   current.pid == session.pid, current.started == session.started, current.tty == session.tty,
                   questionThreadBySession[id] == nil || questionThreadBySession[id] == target.threadID else {
                 throw RemoteHTTPError(409, "Codex 대화가 바뀌었습니다. 현재 대화를 확인해주세요.", diagnostics: ["delivery": "not_started"])
@@ -2081,7 +2116,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if manualGoalHoldCache.count>512 {manualGoalHoldCache=manualGoalHoldCache.filter {sessions[$0.key] != nil || $0.key==id}}
         return value
     }
-    private func hasManualGoalHold(_ id:String)->Bool {!manualGoalHold(id).isEmpty}
+    private func hasManualGoalHold(_ id:String)->Bool {codexAccountInputHeld(id) || !manualGoalHold(id).isEmpty}
     private func setManualGoalHold(_ id:String,_ value:String) throws {
         try store.set("manualGoalHold:"+id,value);manualGoalHoldCache[id]=value
     }
@@ -3238,7 +3273,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// single-use; an ambiguous write is never part of this recovery loop.
     private func prepareQuestionReply(_ session: AgentSession, question: QueuedQuestion, automaticToken: UUID?) async throws -> CodexReplyTarget {
         for attempt in 0...2 {
-            guard !Task.isCancelled, !remoteInputStopped, let current = sessions[session.id], current.phase != .ended,
+            guard !Task.isCancelled, !remoteInputStopped, !codexAccountInputHeld(session.id), let current = sessions[session.id], current.phase != .ended,
                   current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌어 전송 전에 멈췄습니다.")
             }
@@ -3279,7 +3314,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let message = try CodexReplyTransport.message(question: question, answer: answer)
             try setReply(sending, sessionID: sessionID, question: question, persist: false)
             let target = try await prepareQuestionReply(session, question: question, automaticToken: automaticToken)
-            guard !Task.isCancelled, !remoteInputStopped, target.threadID == question.threadID, let current = sessions[sessionID], current.phase != .ended,
+            guard !Task.isCancelled, !remoteInputStopped, !codexAccountInputHeld(sessionID), target.threadID == question.threadID, let current = sessions[sessionID], current.phase != .ended,
                   current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌었습니다. 목록을 새로고침해주세요.")
             }
@@ -5589,6 +5624,100 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexProgressTrackers.removeAll()
         for id in sessions.keys {sessions[id]?.codexProgressRecovery=nil}
         publish()
+    }
+    public func setCodexAccountTransitionEnabled(_ enabled: Bool) throws {
+        guard !codexAccountTransitionBusy else { throw AppError.message("진행 중인 계정 확인·전환 결과를 기다려주세요.") }
+        if !enabled {
+            for home in codexAccountTransitionStates.keys where codexAccountTransitionStates[home]?.held == true {
+                try cancelCodexAccountTransition(home: home)
+            }
+        }
+        try store.set("codexAccountTransitionEnabled", enabled ? "true" : "false")
+        codexAccountTransitionEnabled = enabled
+        if enabled, pollTask != nil { startCodexAccountTransitionPolling() }
+    }
+    public func checkCodexAccountTransitions() async {
+        guard !remoteInputStopped, !codexAccountTransitionBusy, codexAccountTransitionEnabled || codexAccountTransitionHeld else { return }
+        codexAccountTransitionBusy = true; defer { codexAccountTransitionBusy = false }
+        let epoch = codexAccountTransitionEpoch
+        do {
+            let reader = processReader
+            let records = try await Task.detached(priority: .utility) { try reader() }.value
+            let targets = try await codexAccountTargetReader(records)
+            guard !Task.isCancelled, epoch == codexAccountTransitionEpoch else { return }
+            guard Set(targets.map(\.home)).count == targets.count else { throw AppError.message("같은 Codex 홈의 연결이 중복되어 전환을 보류했습니다.") }
+            let visible = ProcessDiscovery.sessions(records).filter { $0.agent == .codex && $0.phase != .ended }.count
+            let covered = targets.reduce(0) { $0 + $1.witnesses.count }
+            codexAccountTransitionNotice = targets.isEmpty ? "연결된 관리형 Codex 서버가 없습니다. 실행 중인 Codex와 로컬 서버 연결을 확인해주세요."
+                : visible > covered ? "Codex \(visible - covered)개는 관리형 서버 연결을 확인하지 못해 자동 전환에서 제외했습니다." : nil
+            for target in targets.sorted(by: { $0.home < $1.home }) {
+                guard !Task.isCancelled, epoch == codexAccountTransitionEpoch else { return }
+                if codexAccountCoordinators[target.home] == nil || (codexAccountCoordinators[target.home]?.target != target && codexAccountTransitionStates[target.home]?.held != true) {
+                    let home = target.home
+                    let coordinator = CodexAccountTransitionCoordinator(target: target, state: codexAccountTransitionStates[home],
+                        services: codexAccountTransitionServices, save: { [weak self] state in
+                            guard let self, epoch == self.codexAccountTransitionEpoch else { throw CancellationError() }
+                            var journal = self.codexAccountTransitionStates; journal[home] = state
+                            try self.store.set(Self.codexAccountJournalKey, String(decoding: JSONEncoder().encode(journal), as: UTF8.self))
+                        }, changed: { [weak self] state in
+                            guard let self, epoch == self.codexAccountTransitionEpoch else { return }
+                            let alreadyHeld = self.codexAccountTransitionHeld
+                            self.codexAccountTransitionStates[home] = state
+                            if !alreadyHeld, state.held { self.holdCodexAccountInputs() }
+                        })
+                    codexAccountCoordinators[home] = coordinator
+                    codexAccountTransitionStates[home] = coordinator.state
+                }
+                // A cancelled task cannot retract bytes already dispatched.
+                // Drain all owned input transports before interrupting a turn.
+                if codexAccountTransitionHeld, !codexAccountInputsDrained { continue }
+                await codexAccountCoordinators[target.home]?.check()
+            }
+            for home in codexAccountTransitionStates.keys where codexAccountTransitionStates[home]?.held == true && !targets.contains(where: { $0.home == home }) {
+                var state = codexAccountTransitionStates[home]!
+                state.phase = .review; state.detail = "원래 Codex 서버·창을 찾지 못했습니다. 자동 명령을 반복하지 않고 대기합니다."
+                codexAccountTransitionStates[home] = state
+            }
+        } catch {
+            guard epoch == codexAccountTransitionEpoch else { return }
+            codexAccountTransitionNotice = error.localizedDescription
+        }
+    }
+    public func cancelCodexAccountTransition(home: String) throws {
+        guard !codexAccountTransitionBusy else { throw AppError.message("현재 계정 확인·전환 결과를 기다려주세요.") }
+        if let coordinator = codexAccountCoordinators[home] { try coordinator.cancel(); return }
+        guard var state = codexAccountTransitionStates[home], state.canCancel else { return }
+        state.phase = .cancelled; state.detail = "나머지 자동 전환을 중지했습니다. 이미 중단한 작업은 대기 상태로 유지합니다."
+        var journal = codexAccountTransitionStates; journal[home] = state
+        try store.set(Self.codexAccountJournalKey, String(decoding: JSONEncoder().encode(journal), as: UTF8.self))
+        codexAccountTransitionStates = journal
+    }
+    private var codexAccountInputsDrained: Bool {
+        sessions.values.filter { $0.agent == .codex }.allSatisfy { session in
+            !automaticInputBusy(session.id) && !remoteInputSessions.contains(session.id) && !sendingMessages.contains(session.id) &&
+                !changingGoals.contains(session.id) && !session.questions.contains { replyingQuestions.contains($0.id) }
+        }
+    }
+    private func holdCodexAccountInputs() {
+        revision &+= 1
+        for id in sessions.keys where sessions[id]?.agent == .codex {
+            automationRuntime.reset(id)
+            screens[id]?.scheduledID = nil
+            cancelCodexProgressCheck(id); codexProgressTrackers.removeValue(forKey: id)
+            cancelModelRetention(id); cancelCapacityResume(id)
+            for question in sessions[id]?.questions ?? [] { cancelAutomaticQuestionReply(question.id) }
+        }
+        publish()
+    }
+    private func startCodexAccountTransitionPolling() {
+        guard codexAccountTransitionTask == nil else { return }
+        codexAccountTransitionTask = Task { [weak self] in
+            while !Task.isCancelled, let self {
+                await self.checkCodexAccountTransitions()
+                let delay: Double = self.codexAccountTransitionHeld && !self.codexAccountTransitionStates.values.allSatisfy({ !$0.held || $0.phase == .review }) ? 2 : 30
+                do { try await Task.sleep(for: .seconds(delay)) } catch { break }
+            }
+        }
     }
     private func codexProgressToken(_ id:String,at date:Date)->String? {
         guard let value=codexProgressHistory[id],date.timeIntervalSince(value.at)>=(-5),date.timeIntervalSince(value.at)<20 else {return nil}
