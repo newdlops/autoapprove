@@ -1,15 +1,26 @@
 import Foundation
 import CryptoKit
 
+public struct NativeCodexLoginState: Equatable, Sendable {
+    public var id:String,home:String,phase:String,url:String?,code:String?,message:String?
+    public var active:Bool {["starting","waiting","verifying"].contains(phase)}
+    public init(id:String,home:String,phase:String,url:String?=nil,code:String?=nil,message:String?=nil) {
+        self.id=id;self.home=home;self.phase=phase;self.url=url;self.code=code;self.message=message
+    }
+}
+
 /// A Mac-local account coordinator. Its private login PTYs never enter the
 /// session manager, inventory, output streams, audit log or receipt archive.
 @MainActor public final class AgentAccounts {
     private final class Job {
         let id:String,owner:String,agent:String,expires:Date,tty:String
+        let services:AgentAccountServices
+        var codexHome:String?
         var terminal:ManagedPTY?,task:Task<Void,Never>?,sequence=0
         let writer=UUID().uuidString
         var phase="starting",url:String?,code:String?,message:String?,submitted=false
-        init(id:String,owner:String,agent:String,terminal:ManagedPTY,now:Date) {
+        init(id:String,owner:String,agent:String,terminal:ManagedPTY,now:Date,services:AgentAccountServices) {
+            self.services=services
             self.id=id;self.owner=owner;self.agent=agent;self.terminal=terminal;tty=terminal.descriptor.tty;expires=now.addingTimeInterval(600)
         }
         var active:Bool {["starting","waiting","verifying"].contains(phase)}
@@ -23,12 +34,27 @@ import CryptoKit
         }
     }
     private let services:AgentAccountServices
+    private let codexServices:@Sendable(CodexAccountTransitionTarget) throws -> AgentAccountServices
+    private let nativeOwner=UUID().uuidString
+    private var nativeJob:String?
     private var crypto=AgentAccountCrypto(),generation=UUID()
     private var grants:[String:Date]=[:],jobs:[String:Job]=[:],seen:[String:Date]=[:]
     private var failures:[Date]=[],unlocking=false,pinStamp=""
     private var retiredTTYs:[String:Date]=[:]
     private var cached:[AgentAccountState]=[],cachedAt=Date.distantPast,checking:Task<[AgentAccountState],Never>?
-    public init(services:AgentAccountServices = .live) {self.services=services}
+    public init(services:AgentAccountServices = .live,codexServices:@escaping @Sendable(CodexAccountTransitionTarget) throws -> AgentAccountServices = {try AgentAccountServices.codex($0)}) {self.services=services;self.codexServices=codexServices}
+    public var nativeCodexLogin:NativeCodexLoginState? {
+        guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner else {return nil}
+        return .init(id:id,home:job.codexHome ?? "",phase:job.phase,url:job.url,code:job.code,message:job.message)
+    }
+    public func beginNativeCodexLogin(_ target:CodexAccountTransitionTarget) throws {
+        let job=try begin(agent:"codex",id:UUID().uuidString,owner:nativeOwner,services:codexServices(target))
+        job.codexHome=target.home;nativeJob=job.id
+    }
+    public func cancelNativeCodexLogin() {
+        guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner,job.active else {return}
+        job.task?.cancel();job.finish("cancelled","로그인을 취소했습니다.")
+    }
     public var privateTTYs:Set<String> {Set(jobs.values.map(\.tty)).union(retiredTTYs.filter{$0.value>Date()}.keys)}
     public var busy:Bool {jobs.values.contains(where:\.active)}
     public func hello(node:String,pin:RemoteTunnelPIN?) -> JSONObject {
@@ -54,7 +80,7 @@ import CryptoKit
             let stamp=SHA256.hash(data:try encoder.encode(pin)).map{String(format:"%02x",$0)}.joined()
             if pinStamp != stamp {grants.removeAll();pinStamp=stamp}
             grants=grants.filter{$0.value>now}
-            for job in jobs.values where job.active && (job.expires<=now || grants[job.owner]==nil) {job.task?.cancel();job.finish("expired","인증 시간이 만료됐습니다. 다시 로그인해주세요.")}
+            for job in jobs.values where job.active && (job.expires<=now || job.owner != nativeOwner && grants[job.owner]==nil) {job.task?.cancel();job.finish("expired","인증 시간이 만료됐습니다. 다시 로그인해주세요.")}
             jobs=jobs.filter{$0.value.expires.addingTimeInterval(120)>now}
             let object=request.object
             if object["action"] as? String=="unlock" {
@@ -97,11 +123,7 @@ import CryptoKit
         case "begin":
             guard let agent=object["agent"] as? String,["codex","claude"].contains(agent),let id=object["id"] as? String,UUID(uuidString:id) != nil else {throw RemoteHTTPError(400,"로그인할 도구를 선택해주세요.")}
             if let old=jobs[id] {guard old.owner==owner,old.agent==agent else {throw RemoteHTTPError(403,"다른 로그인 요청입니다.")};return old.view}
-            guard !jobs.values.contains(where:{$0.agent==agent && $0.active}) else {throw RemoteHTTPError(409,"이 Mac에서 해당 도구의 로그인이 진행 중입니다. 이전 로그인을 취소한 뒤 시작해주세요.")}
-            guard jobs.count<16 else {throw RemoteHTTPError(429,"로그인 요청이 많습니다. 잠시 후 다시 시도해주세요.")}
-            let terminal=try services.launch(agent),job=Job(id:id,owner:owner,agent:agent,terminal:terminal,now:Date())
-            jobs[id]=job;let epoch=generation
-            job.task=Task{[weak self,weak job] in guard let self,let job else {return};await self.follow(job,epoch:epoch)}
+            let job=try begin(agent:agent,id:id,owner:owner,services:services)
             return job.view
         case "submit":
             guard let id=object["id"] as? String,let job=jobs[id],job.owner==owner,job.agent=="claude",job.phase=="waiting",!job.submitted,let terminal=job.terminal else {throw RemoteHTTPError(409,"인증 코드를 다시 보내지 말고 진행 상태를 확인해주세요.")}
@@ -121,6 +143,15 @@ import CryptoKit
         default:throw RemoteHTTPError(400,"지원하지 않는 계정 작업입니다.")
         }
     }
+    private func begin(agent:String,id:String,owner:String,services:AgentAccountServices) throws -> Job {
+        guard !jobs.values.contains(where:{$0.agent==agent && $0.active}) else {throw RemoteHTTPError(409,"이 Mac에서 해당 도구의 로그인이 진행 중입니다. 이전 로그인을 취소한 뒤 시작해주세요.")}
+        jobs=jobs.filter{$0.value.expires.addingTimeInterval(120)>Date() || $0.value.active}
+        guard jobs.count<16 else {throw RemoteHTTPError(429,"로그인 요청이 많습니다. 잠시 후 다시 시도해주세요.")}
+        let terminal=try services.launch(agent),job=Job(id:id,owner:owner,agent:agent,terminal:terminal,now:Date(),services:services)
+        jobs[id]=job;let epoch=generation
+        job.task=Task{[weak self,weak job] in guard let self,let job else {return};await self.follow(job,epoch:epoch)}
+        return job
+    }
     private func follow(_ job:Job,epoch:UUID) async {
         var offset=0,buffer=""
         defer {buffer="";job.terminal?.close();job.terminal=nil}
@@ -132,7 +163,7 @@ import CryptoKit
                 let challenge=AgentAccountOutput.challenge(buffer,agent:job.agent)
                 if let url=challenge.url {job.url=url;if let code=challenge.code {job.code=code};if job.phase=="starting" {job.phase="waiting"}}
                 if let exit=output.exitCode {
-                    job.phase="verifying";let state=try await services.check(job.agent)
+                    job.phase="verifying";let state=try await job.services.check(job.agent)
                     guard !Task.isCancelled,epoch==generation,job.active else {return}
                     if exit==0,state.phase=="authenticated" {job.finish("succeeded","이 Mac에서 로그인했습니다.")}
                     else if buffer.lowercased().contains("expired") {job.finish("expired","인증 코드가 만료됐습니다. 다시 로그인해주세요.")}

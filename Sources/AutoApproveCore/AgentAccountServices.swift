@@ -10,17 +10,26 @@ public struct AgentAccountServices:Sendable {
     public var check:@Sendable(String) async throws -> AgentAccountState
     public var launch:@Sendable(String) throws -> ManagedPTY
     public init(home:String,check:@escaping @Sendable(String) async throws -> AgentAccountState,launch:@escaping @Sendable(String) throws -> ManagedPTY) {self.home=home;self.check=check;self.launch=launch}
-    public static var live:Self {
+    public static var live:Self { live(codexHome:nil,executable:nil) }
+    public static func codex(_ target:CodexAccountTransitionTarget) throws -> Self {
+        guard target.home.hasPrefix("/"), !target.home.contains("\0"),
+              target.executable == "codex" || target.executable.hasPrefix("/") && !target.executable.contains("\0") else {throw AppError.message("로그인할 Codex 위치를 확인해주세요.")}
+        return live(codexHome:target.home,executable:target.executable)
+    }
+    private static func live(codexHome:String?,executable:String?) -> Self {
         let home=NSHomeDirectory()
         var environment=ProcessInfo.processInfo.environment
         environment["HOME"]=home;environment["BROWSER"]="true";environment["NO_COLOR"]="1"
+        if let codexHome {environment["CODEX_HOME"]=codexHome}
         // Match the login-shell environment used by AutoApprove's normal PTYs.
         // Never read/copy auth.json, API keys or credential-store entries here.
         let env=environment
         return Self(home:home,check:{agent in
             try await Task.detached(priority:.utility) {
                 let args=agent=="codex" ? "login status" : "auth status --json"
-                let result=try CommandRunner.run("/bin/zsh",["-l","-i","-c","command -v \(agent) >/dev/null 2>&1 || exit 127; exec \(agent) \(args)"],timeout:8,environment:env,inheritEnvironment:false,outputLimit:32768,errorLimit:32768)
+                let command=agent=="codex" ? executable ?? agent : agent
+                let script=codexHome != nil && agent=="codex" ? "command -v -- \"$1\" >/dev/null 2>&1 || exit 127; exec /usr/bin/env \"CODEX_HOME=$2\" \"$1\" \(args)" : "command -v -- \"$1\" >/dev/null 2>&1 || exit 127; exec \"$1\" \(args)"
+                let result=try CommandRunner.run("/bin/zsh",["-l","-i","-c",script,"autoapprove-login",command,codexHome ?? ""],timeout:8,environment:env,inheritEnvironment:false,outputLimit:32768,errorLimit:32768)
                 if result.status==127 {return AgentAccountState(agent:agent,phase:"missing")}
                 if agent=="claude",let data=result.output.data(using:.utf8),let json=try? JSONSerialization.jsonObject(with:data) as? JSONObject,let logged=json["loggedIn"] as? Bool {
                     let raw=json["authMethod"] as? String ?? ""
@@ -33,7 +42,7 @@ public struct AgentAccountServices:Sendable {
                 return AgentAccountState(agent:agent,phase:"unknown")
             }.value
         },launch:{agent in
-            try ManagedPTY(cwd:home,program:"shell",command:["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]+(agent=="codex" ? ["codex","login","--device-auth"]:["claude","auth","login","--claudeai"]),columns:240,rows:40,environment:env)
+            try ManagedPTY(cwd:home,program:"shell",command:["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]+(agent=="codex" ? (codexHome.map{["CODEX_HOME="+$0]} ?? [])+[executable ?? "codex","login","--device-auth"]:["claude","auth","login","--claudeai"]),columns:240,rows:40,environment:env)
         })
     }
 }

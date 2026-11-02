@@ -1,0 +1,9 @@
+# Codex login and empty-thread inspection
+
+Fix account-transition inspection of a new Codex conversation before its first message. Only the official, exact unmaterialized-thread rejection for an idle thread is equivalent to no turns; re-read its status before accepting. Continue queue, background terminal and Goal barriers. Other errors fail closed and identify the failed RPC without displaying server payloads.
+
+If an original TUI has no provable conversation identity, explain this limitation before interrupting any turn or restarting. Do not accept mere process/socket membership as proof of a selected conversation. The user can close unused empty TUIs or restore a provable conversation binding and recheck.
+
+Add native Codex login to Connection Settings using the existing private login coordinator and official device authentication CLI. Display and select the target Codex home (default home plus discovered connected homes). Use the selected CLI when known. Show starting, code/link waiting, verifying, success, failure, expiry and cancellation. Copy code and open the allowlisted official page; never collect a password. Native login and web login share mutual exclusion and private TTY filtering. A native login does not require a remote PIN; remote actions retain PIN authorization and cannot read native challenges. Login does not enable automatic interruption; existing opt-in transition detects completed changes.
+
+Preserve SwiftUI system styling, 600×660 scrolling settings, keyboard access, selectable wrapped paths and explicit disabled states. Test synthetic login/cancellation/isolation plus actual installed official Codex in an isolated home. Publish 0.2.232/build259 with four release assets and verify local installation. Preserve unrelated notification drafts and all real Codex conversations.

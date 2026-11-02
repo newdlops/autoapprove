@@ -26,6 +26,7 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/AccountTransport'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-account-transition-transport.swift','-o',directory+'/check'],{stdio:'inherit',timeout:120000});
  server.on('upgrade',(request,socket,head)=>websocket.handleUpgrade(request,socket,head,connection=>websocket.emit('connection',connection)));
  websocket.on('connection',socket=>{
+  let reads=0;
   clients.add(socket);socket.on('close',()=>clients.delete(socket));
   socket.on('message',bytes=>{
    const m=JSON.parse(bytes.toString());
@@ -36,8 +37,8 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
     case 'initialize':socket.send(JSON.stringify({id:m.id,result:{userAgent:'fixture'}}));socket.send(JSON.stringify({id:'approval',method:'item/commandExecution/requestApproval',params:{}}));return;
     case 'accountSession/list':assert.equal(m.params.refreshWorkspaceMetadata,false);result={activeSessionId:'session-old',sessions:[{sessionId:'session-old',isActive:true,userId:'user-old',selectedWorkspaceAccountId:'workspace'}]};if(mode==='bad-account')delete result.sessions[0].userId;break;
     case 'thread/loaded/list':result=mode==='repeat'?{data:[],nextCursor:'repeat'}:mode==='duplicate'?{data:[ids[0],ids[0]]}:m.params.cursor==='next'?{data:[ids[1]],nextCursor:null}:{data:[ids[0]],nextCursor:'next'};break;
-    case 'thread/read':result={thread:{id:m.params.threadId,status:{type:mode==='system-error'?'systemError':mode==='active'&&m.params.threadId===ids[0]?'active':'idle'}}};break;
-    case 'thread/turns/list':assert.equal(m.params.itemsView,'notLoaded');assert.equal(m.params.sortDirection,'desc');result={data:mode==='missing-turn'?[]:[{id:'turn-'+m.params.threadId,status:mode==='active'&&m.params.threadId===ids[0]?'inProgress':'completed'}]};break;
+    case 'thread/read':reads++;result={thread:{id:m.params.threadId,status:{type:mode==='system-error'?'systemError':((mode==='active'||mode==='empty-active'||mode==='empty-race'&&reads>1)&&m.params.threadId===ids[0])?'active':'idle'}}};break;
+    case 'thread/turns/list':if(mode.startsWith('empty')){socket.send(JSON.stringify({id:m.id,error:{code:mode==='empty-code'?-32000:-32600,message:mode==='empty-other'?'different error':`thread ${mode==='empty-wrong'?'unrelated':m.params.threadId} is not materialized yet; thread/turns/list is unavailable before first user message`}}));return;}assert.equal(m.params.itemsView,'notLoaded');assert.equal(m.params.sortDirection,'desc');result={data:mode==='missing-turn'?[]:[{id:'turn-'+m.params.threadId,status:mode==='active'&&m.params.threadId===ids[0]?'inProgress':'completed'}]};break;
     case 'thread/queue/list':result={data:mode==='queue'?[{id:'queued'}]:[],nextCursor:null};break;
     case 'thread/backgroundTerminals/list':result={data:mode==='background'?[{processId:'owned-background'}]:[],nextCursor:null};break;
     case 'thread/goal/get':result={goal:mode==='goal'?{status:'active'}:null};break;
@@ -52,11 +53,12 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  async function run(action){child=spawn(directory+'/check',[directory,cli,action],{stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',c=>output+=c);child.stderr.on('data',c=>error+=c);const status=await new Promise(resolve=>child.once('exit',resolve));assert.equal(status,0,error);return JSON.parse(output);}
  assert.equal((await run('interrupt')).verified,true);assert.equal(interrupts,1);
  for(const value of ['queue','background','goal']){mode=value;assert.equal((await run('block')).blocked,true);}
- for(const value of ['system-error','bad-account','duplicate','repeat']){mode=value;assert.equal((await run('reject')).rejected,true);}
+ mode='empty';assert.equal((await run('restart')).verified,true);
+ for(const value of ['system-error','bad-account','duplicate','repeat','empty-code','empty-other','empty-wrong','empty-active','empty-race']){mode=value;assert.equal((await run('reject')).rejected,true);}
  mode='active';// Missing current-turn metadata must be rejected while active.
  // A successful all-idle barrier is the only route to the official lifecycle.
  mode='idle';assert.equal((await run('restart')).verified,true);
- assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\n');
+ assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\n');
  mode='active';assert.equal((await run('cancel-interrupt')).cancelled,true);assert.equal(interrupts,1,'Cancellation during inspection must not stop a user turn');
  assert.ok(refusals>0);
  assert.ok(methods.every(m=>['initialize','initialized','accountSession/list','thread/loaded/list','thread/read','thread/turns/list','thread/queue/list','thread/backgroundTerminals/list','thread/goal/get','turn/interrupt'].includes(m)));

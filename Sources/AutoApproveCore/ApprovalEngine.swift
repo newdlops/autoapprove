@@ -5652,6 +5652,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexAccountTransitionEnabled = enabled
         if enabled, pollTask != nil { startCodexAccountTransitionPolling() }
     }
+    public func codexLoginTargets() async throws -> [CodexAccountTransitionTarget] {
+        let reader = processReader
+        let records = try await Task.detached(priority: .utility) { try reader() }.value
+        return try await codexAccountTargetReader(records)
+    }
     public func checkCodexAccountTransitions() async {
         guard !remoteInputStopped, !codexAccountTransitionBusy, codexAccountTransitionEnabled || codexAccountTransitionHeld else { return }
         codexAccountTransitionBusy = true; defer { codexAccountTransitionBusy = false }

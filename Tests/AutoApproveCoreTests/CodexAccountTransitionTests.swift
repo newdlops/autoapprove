@@ -64,6 +64,21 @@ private final class AccountTargetList: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testAccountTransitionMissingConversationProofStopsBeforeAnyEffect() async throws {
+        for idle in [false,true] {
+            let r=AccountTransitionRig()
+            r.target.witnesses.append(.init(pid:43,started:"empty-window",tty:"/dev/fixture-empty",threadID:nil))
+            if idle {r.idle(0);r.idle(1)}
+            let c=r.coordinator()
+            await c.check();await c.check();await c.check(now:Date().addingTimeInterval(121))
+            try expectEqual(c.state.phase,.unsupported)
+            try expectFalse(c.state.held)
+            try expect(r.effects.isEmpty,"Missing conversation identity must block before interrupt or restart")
+            try expect(c.state.detail.contains("대화 ID"))
+            try expect(c.state.detail.contains("현재 로그인 확인"))
+            try expect(c.state.reservations.isEmpty);try expectFalse(c.state.restartReserved)
+        }
+    }
     func testAccountTransitionCancelledReservationSurvivesSignedOutAndUnknownReads() async throws {
         let r = AccountTransitionRig(), c = r.coordinator()
         await c.check(); await c.check(); try c.cancel()

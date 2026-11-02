@@ -12,6 +12,12 @@ import AutoApproveCore
             throw AppError.message("Malformed or unsupported server was accepted")
         }
         let observed = try await service.observe(target)
+        if mode == "official-empty" {
+            guard observed.threads.count == 2, observed.threads.allSatisfy({ !$0.active && $0.turnID == nil && $0.blocker == nil }) else {
+                throw AppError.message("Official empty conversations did not pass every idle barrier")
+            }
+            print("{\"officialEmptyThreads\":2,\"verified\":true}"); return
+        }
         guard observed.savedAccount != nil, observed.savedAccount != observed.serverAccount,
               observed.threads.count == 2, Set(observed.threads.map(\.id)).count == 2 else {
             throw AppError.message("Account or complete loaded membership differs")

@@ -139,6 +139,10 @@ import AutoApproveCore
                     Divider()
                     section("Codex", icon: "command", status: engine.snapshot.health.codex) {
                         Text("연결된 원본 터미널의 승인 화면을 감지합니다. 휴대폰에서 같은 실행 세션에 직접 입력할 수 있으며 새 CLI를 만들지 않습니다.")
+                        CodexLoginSettings(accounts: engine.agentAccounts, targets: { try await engine.codexLoginTargets() },
+                            transitionEnabled: engine.codexAccountTransitionEnabled, transitionBusy: engine.codexAccountTransitionBusy || engine.codexAccountTransitionHeld,
+                            completed: { await engine.checkCodexAccountTransitions() })
+                        Divider()
                         CodexAccountTransitionSettings(enabled: engine.codexAccountTransitionEnabled, busy: engine.codexAccountTransitionBusy,
                             states: engine.codexAccountTransitionStates, notice: engine.codexAccountTransitionNotice, error: codexAccountTransitionError,
                             setEnabled: { enabled in

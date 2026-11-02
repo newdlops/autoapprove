@@ -1,0 +1,12 @@
+import {execFileSync} from 'node:child_process';
+import {mkdir,copyFile,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
+const build=path.resolve('.build',process.argv.includes('--release')?'release':'debug'),output=path.resolve('dist/qa/codex-login');
+await mkdir(output,{recursive:true});
+const binary=output+'/CodexLoginPreview';
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/LoginPreview'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Sources/AutoApproveApp/CodexLoginSettings.swift','Sources/AutoApproveApp/CodexAccountTransitionSettings.swift','Tests/fixtures/AgentAccountFixture.swift','Tests/fixtures/codex-login-preview.swift','-o',binary],{stdio:'inherit',timeout:120000});
+const app=output+'/CodexLoginPreview.app';await mkdir(app+'/Contents/MacOS',{recursive:true});await copyFile(binary,app+'/Contents/MacOS/CodexLoginPreview');
+await writeFile(app+'/Contents/Info.plist','<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.autoapprove.qa.codexlogin</string><key>CFBundleName</key><string>CodexLoginPreview</string><key>CFBundleExecutable</key><string>CodexLoginPreview</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>');
+if(!process.argv.includes('--build-only'))execFileSync(binary,[output],{stdio:'inherit',timeout:30000});
+console.log(binary);

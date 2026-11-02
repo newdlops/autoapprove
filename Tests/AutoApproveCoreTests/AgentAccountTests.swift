@@ -25,6 +25,49 @@ private struct AccountTestClient {
 }
 
 extension ApprovalTests {
+    func testNativeCodexLoginLiteralExecutableAndHome() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-scope-"+UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);defer{try? FileManager.default.removeItem(at:root)}
+        let cli=root.appendingPathComponent("codex ; literal"),home=root.appendingPathComponent("home $(literal) ; space").path
+        let script="#!/bin/zsh -f\nif [[ $1 == login && $2 == status ]]; then print 'Logged in using ChatGPT'; exit 0; fi\nprint -r -- \"$CODEX_HOME\" > \"$0.home\"\nprint 'https://auth.openai.com/codex/device'\nprint 'ABCD-1234'\nexit 0\n"
+        try Data(script.utf8).write(to:cli);try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:cli.path)
+        let accounts=AgentAccounts();defer{accounts.stop()}
+        try accounts.beginNativeCodexLogin(.init(home:home,executable:cli.path))
+        for _ in 0..<100 {if accounts.nativeCodexLogin?.phase=="succeeded"{break};try await Task.sleep(for:.milliseconds(30))}
+        try expectEqual(accounts.nativeCodexLogin?.phase,"succeeded")
+        try expectEqual(try String(contentsOfFile:cli.path+".home",encoding:.utf8),home+"\n")
+        try expectNil(accounts.nativeCodexLogin?.code);try expectNil(accounts.nativeCodexLogin?.url)
+    }
+    func testNativeCodexLoginSharedOwnershipAndScopedHome() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-native-login-"+UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let target=CodexAccountTransitionTarget(home:root.appendingPathComponent("home with spaces;literal").path,executable:"/fixture/codex")
+        let services=AgentAccountServices(home:root.path,check:{agent in .init(agent:agent,phase:"authenticated")},launch:{_ in
+            try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","print 'https://auth.openai.com/codex/device'; print 'ABCD-1234'; sleep 10"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
+        })
+        let accounts=AgentAccounts(services:services,codexServices:{ received in
+            guard received == target else {throw AppError.message("Wrong selected Codex home")};return services
+        });defer{accounts.stop()}
+        try accounts.beginNativeCodexLogin(target)
+        try expect(accounts.busy);try expectEqual(accounts.privateTTYs.count,1)
+        for _ in 0..<60 {if accounts.nativeCodexLogin?.phase=="waiting"{break};try await Task.sleep(for:.milliseconds(30))}
+        try expectEqual(accounts.nativeCodexLogin?.code,"ABCD-1234")
+        try expectEqual(accounts.nativeCodexLogin?.home,target.home)
+        let pin=try RemoteTunnelPIN.create("001234"),client=AccountTestClient(accounts,pin:pin)
+        let unlock=try await client.call(accounts,pin:pin,["action":"unlock","pin":"001234"]),token=unlock["token"] as! String
+        let status=try await client.call(accounts,pin:pin,["action":"status","token":token])
+        try expectEqual((status["jobs"] as? [JSONObject])?.count,0)
+        try expectFalse(String(decoding:try JSONSerialization.data(withJSONObject:status),as:UTF8.self).contains("ABCD-1234"))
+        let blocked=try await client.call(accounts,pin:pin,["action":"begin","agent":"codex","id":UUID().uuidString,"token":token])
+        try expectEqual(blocked["status"] as? Int,409)
+        accounts.cancelNativeCodexLogin();try expectFalse(accounts.busy)
+        try expectEqual(accounts.nativeCodexLogin?.phase,"cancelled")
+        let remote=try await client.call(accounts,pin:pin,["action":"begin","agent":"codex","id":UUID().uuidString,"token":token])
+        try expectEqual(remote["phase"] as? String,"starting")
+        do{try accounts.beginNativeCodexLogin(target);throw AppError.message("Duplicate login launched")}
+        catch let e as RemoteHTTPError {try expectEqual(e.status,409)}
+    }
     func testAccountCryptoPINReplayAndScope() async throws {
         let accounts=AgentAccounts(),pin=try RemoteTunnelPIN.create("001234"),client=AccountTestClient(accounts,pin:pin)
         defer{accounts.stop()}

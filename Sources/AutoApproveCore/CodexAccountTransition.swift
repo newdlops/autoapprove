@@ -120,6 +120,12 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                     }
                     return
                 }
+                let missing = target.witnesses.filter { $0.threadID == nil }.count
+                guard missing == 0 else {
+                    state.phase = .unsupported
+                    state.detail = "대화 ID를 확인할 수 없는 Codex 창 \(missing)개가 있습니다. 빈 대화 창을 닫거나 대화 기록의 연결을 확인한 뒤 ‘현재 로그인 확인’을 눌러주세요. 작업·서버는 변경하지 않았습니다."
+                    changed(state); return
+                }
                 var next = CodexAccountTransitionState()
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
                 next.originalAccount = observed.serverAccount

@@ -185,7 +185,19 @@ private enum CodexAccountTransitionLocal {
               let status = (row["status"] as? JSONObject)?["type"] as? String, ["active", "idle"].contains(status) else {
             throw AppError.message("대화의 실행 상태를 확인하지 못했습니다. 오류·연결 해제 상태에서는 전환하지 않습니다.")
         }
-        let turns = try connection.request("thread/turns/list", ["threadId": id, "limit": 1, "itemsView": "notLoaded", "sortDirection": "desc"])
+        let turns: JSONObject
+        do {
+            turns = try connection.request("thread/turns/list", ["threadId": id, "limit": 1, "itemsView": "notLoaded", "sortDirection": "desc"], classifyError: true)
+        } catch let error as CodexControlRPCError where status == "idle" && error.isUnmaterialized(id) {
+            // Official Codex rejects history before the first user message.
+            // Confirm idle again: never hide an active turn or another error.
+            let fresh = try connection.request("thread/read", ["threadId": id, "includeTurns": false])
+            guard let row = fresh["thread"] as? JSONObject, row["id"] as? String == id,
+                  (row["status"] as? JSONObject)?["type"] as? String == "idle" else {
+                throw AppError.message("빈 대화 확인 중 작업이 시작됐습니다. 현재 상태를 다시 확인해주세요.")
+            }
+            turns = ["data": [JSONObject]()]
+        }
         guard let latest = turns["data"] as? [JSONObject], latest.count <= 1 else { throw AppError.message("현재 실행 차례를 확인하지 못했습니다.") }
         var turnID: String?
         if let turn = latest.first {

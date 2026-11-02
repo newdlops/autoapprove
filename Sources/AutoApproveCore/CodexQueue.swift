@@ -227,7 +227,7 @@ final class CodexQueueConnection {
         }
     }
     deinit { if fd >= 0 { Darwin.close(fd) } }
-    func request(_ method: String, _ params: JSONObject) throws -> JSONObject {
+    func request(_ method: String, _ params: JSONObject, classifyError: Bool = false) throws -> JSONObject {
         sequence += 1; let id = sequence
         try send(["id": id, "method": method, "params": params])
         while true {
@@ -239,7 +239,9 @@ final class CodexQueueConnection {
             guard object["id"] as? Int == id else { continue }
             if let error = object["error"] as? JSONObject {
                 if error["code"] as? Int == -32601 { throw RemoteHTTPError(409,"이 Codex 버전은 요청한 제어 기능을 지원하지 않습니다. Codex를 업데이트해주세요.",diagnostics:["delivery":"not_started"]) }
-                throw RemoteHTTPError(409,"Codex 제어 요청이 거절되었습니다. 현재 대화 상태를 다시 확인해주세요. (\(error["code"] as? Int ?? 0))",diagnostics:["delivery":"not_started"])
+                let failure = CodexControlRPCError(method: method, code: error["code"] as? Int ?? 0, reason: error["message"] as? String ?? "")
+                if classifyError { throw failure }
+                throw RemoteHTTPError(409, failure.localizedDescription, diagnostics: ["delivery": "not_started"])
             }
             guard let result = object["result"] as? JSONObject else { throw AppError.message("Codex 제어 응답을 확인하지 못했습니다.") }
             return result
@@ -313,5 +315,15 @@ final class CodexQueueConnection {
                 offset += size
             }
         }
+    }
+}
+
+struct CodexControlRPCError: LocalizedError {
+    let method: String
+    let code: Int
+    let reason: String
+    var errorDescription: String? { "Codex 제어 요청 \(method)이 거절되었습니다. 현재 대화 상태를 다시 확인해주세요. (\(code))" }
+    func isUnmaterialized(_ threadID: String) -> Bool {
+        method == "thread/turns/list" && code == -32600 && reason == "thread \(threadID) is not materialized yet; thread/turns/list is unavailable before first user message"
     }
 }
