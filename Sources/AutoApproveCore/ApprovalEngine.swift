@@ -5769,6 +5769,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard Set(targets.map(\.home)).count == targets.count else { throw AppError.message("같은 Codex 홈의 연결이 중복되어 전환을 보류했습니다.") }
             let visible = ProcessDiscovery.sessions(records).filter { $0.agent == .codex && $0.phase != .ended }.count
             let covered = targets.reduce(0) { $0 + $1.witnesses.count }
+            let homes=Set(targets.map(\.home))
+            let journal=codexAccountTransitionStates.filter {home,state in
+                homes.contains(home) || state.phase != .unsupported || state.restartReserved || !state.reservations.isEmpty || !state.threads.isEmpty || !state.witnesses.isEmpty
+            }
+            if journal.count != codexAccountTransitionStates.count {
+                try store.set(Self.codexAccountJournalKey,String(decoding:JSONEncoder().encode(journal),as:UTF8.self))
+                codexAccountTransitionStates=journal
+                codexAccountCoordinators=codexAccountCoordinators.filter{journal[$0.key] != nil}
+            }
             codexAccountTransitionNotice = targets.isEmpty ? "연결된 관리형 Codex 서버가 없습니다. 실행 중인 Codex와 로컬 서버 연결을 확인해주세요."
                 : visible > covered ? "Codex \(visible - covered)개는 관리형 서버 연결을 확인하지 못해 자동 전환에서 제외했습니다." : nil
             for target in targets.sorted(by: { $0.home < $1.home }) {
@@ -5805,7 +5814,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             for home in codexAccountTransitionStates.keys where codexAccountTransitionStates[home]?.held == true && !targets.contains(where: { $0.home == home }) {
                 let detail = "원래 Codex 서버·창을 찾지 못했습니다. 자동 명령을 반복하지 않고 대기합니다."
-                if let coordinator = codexAccountCoordinators[home] { try coordinator.requireReview(detail) }
+                if let coordinator = codexAccountCoordinators[home] { try coordinator.targetUnavailable() }
                 else {
                     var state = codexAccountTransitionStates[home]!
                     state.phase = .review; state.detail = detail

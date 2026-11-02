@@ -71,6 +71,47 @@ private final class AccountTargetList: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testAccountTransitionDiscoveryGapReturnsToVerifiedConnectionWithoutManualCancellation() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-gap-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.checkReservations=false
+        let targets=AccountTargetList(r.target)
+        func create() throws -> ApprovalEngine {try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in targets.read()})}
+        var engine=try create();defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions();await engine.checkCodexAccountTransitions()
+        targets.hide();await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase,.reconnecting,"A disappearing socket/process inventory during restart must retain its reconnect window")
+        engine.stop();engine=try create()
+        r.observation.serverID="server-2";r.observation.serverAccount="new";targets.show()
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase,.complete,"Restored restart reservations must reconcile read-only when every original connection is proved")
+        try expectEqual(r.effects,["restart"],"Read-only recovery must not repeat a reserved restart")
+    }
+    func testAccountTransitionStaleNoEffectUnsupportedHomesDoNotKeepShowingErrors() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-stale-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig();r.observeFails=true;r.checkReservations=false
+        let targets=AccountTargetList(r.target)
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in targets.read()});defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true);await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates.count,1)
+        targets.hide();await engine.checkCodexAccountTransitions()
+        try expect(engine.codexAccountTransitionStates.isEmpty,"A vanished unsupported home with no conversation or effect reservation must stop displaying stale RPC failures")
+        try expect(r.effects.isEmpty)
+    }
+    func testAccountTransitionUnknownRestartReconcilesOnlyWithNewServerAndOriginalProof() async throws {
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.restartFails=true
+        let c=r.coordinator();await c.check();await c.check()
+        try expectEqual(c.state.phase,.review)
+        let restored=r.coordinator(restored:r.saved.last)
+        await restored.check();try expectEqual(restored.state.phase,.review)
+        r.observation.serverID="server-2";r.observation.serverAccount="new";r.verified=0
+        await restored.check();try expectEqual(restored.state.phase,.review)
+        r.verified=1;await restored.check()
+        try expectEqual(restored.state.phase,.complete,"A lost restart acknowledgement may be resolved by fresh read-only account/history/process proof")
+        try expectEqual(r.effects,["restart"])
+    }
     func testNativeCodexLoginCannotStartDuringHeldTransition() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-login-gate-"+UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);defer{try? FileManager.default.removeItem(at:root)}
@@ -404,14 +445,14 @@ extension ApprovalTests {
     func testAccountTransitionMissingTargetCanCancelWithoutAppRestart() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-missing-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let r = AccountTransitionRig(); r.checkReservations = false; r.idle(0); r.idle(1)
+        let r = AccountTransitionRig(); r.checkReservations = false
         let targets = AccountTargetList(r.target)
         let engine = try ApprovalEngine(paths: .init(directory: root), processReader: { [] },
             codexAccountTransitions: r.services, codexAccountTargets: { _ in targets.read() })
         defer { engine.stop() }
         try engine.setCodexAccountTransitionEnabled(true)
         await engine.checkCodexAccountTransitions(); await engine.checkCodexAccountTransitions()
-        try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase, .reconnecting)
+        try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase, .waiting)
         targets.hide(); await engine.checkCodexAccountTransitions()
         try expectEqual(engine.codexAccountTransitionStates[r.target.home]?.phase, .review)
         try engine.cancelCodexAccountTransition(home: r.target.home)
@@ -419,7 +460,7 @@ extension ApprovalTests {
         try expectFalse(engine.codexAccountTransitionHeld)
         targets.show(); try engine.setCodexAccountTransitionEnabled(true)
         await engine.checkCodexAccountTransitions()
-        try expectEqual(r.effects, ["restart"], "Rediscovery must not repeat a reserved restart")
+        try expectEqual(r.effects, ["interrupt:server-1:a:turn-a"], "Rediscovery must not repeat a reserved interruption")
     }
     func testAccountTransitionInterruptedWorkNeverAutomaticallyContinuesAfterCompletionOrCancellation() async throws {
         let official = "■ Conversation interrupted - use /feedback if something went wrong\n\n› Ask Codex to do anything\n\n? for shortcuts"

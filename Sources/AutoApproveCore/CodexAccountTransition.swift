@@ -93,12 +93,12 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         }
     }
     public func check(now: Date = Date(), loginRequestID: String? = nil) async {
-        guard !checking, state.phase != .review else { return }
+        guard !checking, state.phase != .review || state.restartReserved else { return }
         checking = true; defer { checking = false }
         do {
             let observed = try await services.observe(target)
             try Task.checkCancellation()
-            if state.restartReserved, state.phase == .reconnecting {
+            if state.restartReserved, [.reconnecting,.review].contains(state.phase) {
                 guard observed.savedAccount == state.account else {
                     throw AppError.message("전환 중 로그인이 다시 바뀌었습니다. 현재 계정과 연결을 확인해주세요.")
                 }
@@ -116,6 +116,12 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                         state.detail = "새 로그인으로 서버 전환 · 기존 창 \(verified)개 재연결을 확인했습니다. 중단한 작업은 대기 상태입니다."
                         try persist(); return
                     }
+                }
+                if state.phase == .review {
+                    // A reserved restart is never retransmitted. New server,
+                    // account, retained history and original process proof may
+                    // still resolve its result without a manual cancellation.
+                    changed(state);return
                 }
                 guard now.timeIntervalSince(state.since) < 120 else {
                     throw AppError.message("서버 전환 뒤 기존 창 \(state.verified)/\(state.witnesses.count)개의 연결만 확인했습니다. Mac에서 나머지 대화를 확인해주세요.")
@@ -231,6 +237,13 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         // The coordinator, published controls and restored journal must agree.
         // A vanished target cannot remain reconnecting behind a review button.
         try persist()
+    }
+    func targetUnavailable(now:Date=Date()) throws {
+        if state.restartReserved,state.phase == .reconnecting,now.timeIntervalSince(state.since)<120 {
+            state.detail="서버 재시작 뒤 기존 창의 연결을 기다립니다. 전환 명령은 반복하지 않습니다."
+            changed(state);return
+        }
+        try requireReview("원래 Codex 서버·창을 찾지 못했습니다. 자동 명령을 반복하지 않고 대기합니다.")
     }
     private func persist() throws { try save(state); changed(state) }
     private func reconnectedThreads(_ observed: CodexAccountTransitionObservation) -> Bool {
