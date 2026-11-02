@@ -7,6 +7,57 @@ private func foreignActivityFooter(_ text: String) -> String {
 }
 
 extension ApprovalTests {
+    func testClaudeCompactActivityFooterPreservesMonitoringAndBoundaries() throws {
+        let metadata="fixture | main | Opus 5.5 | ctx 35% | 5h 51% 7d 29%"
+        let compact="⏵⏵ auto mode on · 1 shell · 1 feedback draft"
+        func frame(_ footer:String,_ composer:String="❯",_ before:String="Completed synthetic task") -> String {
+            [before,"────────",composer,"────────",metadata,footer].joined(separator:"\n")
+        }
+        for (footer,monitoring) in [(compact,true),("⏵⏵ auto mode on · 2 shells",true),
+                                    ("⏵⏵ auto mode on · 10 feedback drafts",false)] {
+            for columns in [24,40,52,80,184] { for rows in [24,40] {
+                let screen=try OriginalTerminalScreen.render(ansi:frame(footer).replacingOccurrences(of:"\n",with:"\r\n"),columns:columns,rows:rows,tty:"/dev/compact-footer-fixture").contents
+                for foreign in [false,true] {
+                    let value=foreign ? foreignActivityFooter(screen) : screen
+                    let ready=ActivityDetector.detect(value,agent:.claude)
+                    try expectEqual(ready.phase,.idle,"Compact footer at \(columns)x\(rows): "+footer)
+                    try expectEqual(ready.monitoring,monitoring)
+                    try expectNil(PromptDetector.detect(value,agent:.claude))
+                    try expectEqual(ActivityDetector.detect(value.replacingOccurrences(of:"❯",with:"❯ Draft 한글"),agent:.claude).phase,.input)
+                    try expectEqual(ActivityDetector.detect(value.replacingOccurrences(of:"❯",with:"❯ 1. Choice"),agent:.claude).phase,.unknown)
+                    try expectEqual(ActivityDetector.detect(value+"\nWorking (esc to interrupt)",agent:.claude).phase,.working)
+                    try expect(ActivityDetector.detect(value+"\nUnrecognized request",agent:.claude).phase != .idle)
+                }
+            }}
+        }
+        for invalid in ["⏵⏵ auto mode on","⏵⏵ auto mode on · 0 shells","⏵⏵ auto mode on · 1000 shells",
+                        "⏵⏵ auto mode on · 1 shell · new request","⏵⏵ auto mode on · 1 feedback draft · send now",
+                        "⏵⏵ auto mode on · 1 shell\nUnrecognized request\n1 feedback draft",
+                        "Unknown prefix · 1 shell · 1 feedback draft"] {
+            try expect(ActivityDetector.detect(frame(invalid),agent:.claude).phase != .idle,invalid)
+        }
+        for value in [frame(compact,"❯", "Feedback draft\n1 to review · 2 to send · 0 to dismiss"),
+                      frame(compact)+"\n1 to review · 2 to send · 0 to dismiss",
+                      "```\n"+frame(compact),frame(compact,"❯ 1. Yes, allow once")] {
+            try expect(ActivityDetector.detect(value,agent:.claude).phase != .idle)
+        }
+        try expect(ActivityDetector.detect(frame(compact).replacingOccurrences(of:"❯",with:"›"),agent:.codex).phase != .idle)
+        try expectFalse(ActivityDetector.detect(frame(compact),agent:.shell).monitoring)
+        var tracker=ActivityTracker();let now=Date(timeIntervalSince1970:1000)
+        try expectEqual(tracker.observe(frame(compact),agent:.claude,generation:"one",at:now).phase,.unknown)
+        try expectEqual(tracker.observe(frame(compact),agent:.claude,generation:"one",at:now.addingTimeInterval(2)).phase,.idle)
+        try expectEqual(tracker.observe(frame(compact),agent:.claude,generation:"two",at:now.addingTimeInterval(3)).phase,.unknown)
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-compact-footer-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory))
+        var session=AgentSession(id:"process:42:start",agent:.claude,pid:42,started:"start",tty:"/dev/test",cwd:"/tmp/compact",terminal:.terminal)
+        session.channel = .terminalScreen;engine.updateDiscovery([session],records:[])
+        engine.receiveScreen(sessionID:session.id,raw:frame(compact),generation:"one",at:now)
+        engine.receiveScreen(sessionID:session.id,raw:frame(compact),generation:"one",at:now.addingTimeInterval(2))
+        try expectEqual(engine.snapshot.sessions[0].phase,.idle);try expect(engine.snapshot.sessions[0].isMonitoring)
+        try expect(AttentionRequest.completions(engine.snapshot).isEmpty,"A visible background shell is not a completed turn")
+    }
+
     func testClaudeWrappedStatusFooterRequiresCompleteVisibleMetadata() throws {
         let statuses = [
             "fixture-project | feature/status* | Opus 5.5",

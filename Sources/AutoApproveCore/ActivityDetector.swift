@@ -49,14 +49,23 @@ public enum ActivityDetector {
                 return ActivityObservation(phase:.working,detail:"Codex가 서버 응답을 기다리고 있습니다. 응답이 준비되면 작업을 계속합니다.")
             }
         }
-        let background = matches(bottom, #"(?i)\b[1-9][0-9]* (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b|running in (?:the )?background"#)
+        let compact = agent == .claude ? compactClaudeFooter(tail) : nil
+        let background = compact?.monitoring == true || matches(bottom, #"(?i)\b[1-9][0-9]* (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b|running in (?:the )?background"#)
         let unresolved = background ? ActivityObservation(phase: .working, detail: "백그라운드 작업이 보이지만 다음 지시를 받을 준비가 됐는지 아직 확인하지 못했습니다.") : unknown
         let glyphs = agent == .claude ? "❯" : "›»"
         guard let index = tail.lastIndex(where: { line in line.first.map { glyphs.contains($0) } == true }) else { return unresolved }
         let prompt = String(tail[index].dropFirst()).trimmingCharacters(in: .whitespaces)
-        let footer = Array(tail.dropFirst(index + 1))
+        // The CLI replaces its shortcut hint with activity counts when space is
+        // tight. Rejoin only this fixed suffix, never freeform project/body rows.
+        let footer = compact.map { value in
+            value.start > index ? Array(tail[(index+1)..<value.start])+[value.text] : Array(tail.dropFirst(index+1))
+        } ?? Array(tail.dropFirst(index+1))
+        // A feedback review card has its own active shortcuts. Its count in the
+        // footer does not make that foreground choice a ready chat composer.
+        if compact != nil, matches(tail.joined(separator:" "), #"(?i)\b1 (?:to )?review\s*·\s*2 (?:to )?send\s*·\s*0 (?:to )?dismiss\b"#) {return unknown}
         let isHint: (String) -> Bool = { line in
             matches(line, #"\?\s*for shortcuts|shift\+tab to cycle"#)
+                || (agent == .claude && isCompactClaudeFooter(line))
                 || (agent == .codex && matches(line, #"[0-9]{1,3}% (?:context )?left|^[^·]+ · [~/]"#))
         }
         let isDecoration: (String) -> Bool = { isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } }
@@ -80,6 +89,25 @@ public enum ActivityDetector {
 
     private static func isBackgroundHint(_ line: String) -> Bool {
         matches(line, #"(?i)^[•·⏵▶↳\s]*[0-9]+ (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b"#)
+    }
+
+    private static func isCompactClaudeFooter(_ line:String) -> Bool {
+        matches(line, #"^⏵⏵ auto mode on · (?:[1-9][0-9]{0,2} shells?(?: · [1-9][0-9]{0,2} feedback drafts?)?|[1-9][0-9]{0,2} feedback drafts?)$"#)
+    }
+
+    /// At most three short rows and seven fixed-grammar candidates. A missing
+    /// suffix, unknown item, or unrelated row cannot be discarded as decoration.
+    private static func compactClaudeFooter(_ lines:[String]) -> (start:Int,text:String,monitoring:Bool)? {
+        for start in max(0,lines.count-3)..<lines.count where lines[start].hasPrefix("⏵⏵ auto mode on ·") {
+            let rows=Array(lines[start...])
+            guard rows.allSatisfy({$0.utf16.count<=128}),rows.reduce(0,{$0+$1.utf16.count})<=256 else {continue}
+            var candidates=[rows[0]]
+            for row in rows.dropFirst() {candidates=candidates.flatMap {[$0+row,$0+" "+row]}}
+            if let text=candidates.first(where:isCompactClaudeFooter) {
+                return (start,text,matches(text,#" · [1-9][0-9]{0,2} shells?(?: ·|$)"#))
+            }
+        }
+        return nil
     }
 
     /// Restore wrapped structured model/usage fields only after both freeform
