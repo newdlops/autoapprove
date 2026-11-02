@@ -28,4 +28,4 @@ No production account changes or Codex restart as QA. Preserve interruption rese
 
 ### Task 3: Verification and publication
 - [x] Run relevant/full checks and release build; one independent whole-branch review; fix important findings with RED→GREEN. Debug652/652, release633/633, transition13/13, login6/6; one Important fixed before effects.
-- [ ] Bump matching metadata, commit, sign/package/check, push/tag/release; verify four public assets and installed running app, original sessions retained.
+- [x] Bump matching metadata, commit, sign/package/check, push/tag/release; verify four public assets and installed running app, original sessions18/18 retained. Published v0.2.232 source51c9931, running232/259.
