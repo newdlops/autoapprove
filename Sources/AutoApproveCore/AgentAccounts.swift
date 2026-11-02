@@ -3,9 +3,10 @@ import CryptoKit
 
 public struct NativeCodexLoginState: Equatable, Sendable {
     public var id:String,home:String,phase:String,url:String?,code:String?,message:String?
+    public var resolvedHome:String?
     public var active:Bool {["starting","waiting","verifying"].contains(phase)}
-    public init(id:String,home:String,phase:String,url:String?=nil,code:String?=nil,message:String?=nil) {
-        self.id=id;self.home=home;self.phase=phase;self.url=url;self.code=code;self.message=message
+    public init(id:String,home:String,phase:String,url:String?=nil,code:String?=nil,message:String?=nil,resolvedHome:String?=nil) {
+        self.id=id;self.home=home;self.phase=phase;self.url=url;self.code=code;self.message=message;self.resolvedHome=resolvedHome
     }
 }
 
@@ -17,6 +18,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
         let services:AgentAccountServices
         var browser=false
         var codexHome:String?
+        var resolvedCodexHome:String?
         var terminal:ManagedPTY?,task:Task<Void,Never>?,sequence=0
         let writer=UUID().uuidString
         var phase="starting",url:String?,code:String?,message:String?,submitted=false
@@ -39,6 +41,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     private let nativeOwner=UUID().uuidString
     private var nativeJob:String?
     var nativeCodexLoginCompleted:((String)->Void)?
+    var nativeCodexLoginWillStart:((CodexAccountTransitionTarget)throws->Void)?
     private var crypto=AgentAccountCrypto(),generation=UUID()
     private var grants:[String:Date]=[:],jobs:[String:Job]=[:],seen:[String:Date]=[:]
     private var failures:[Date]=[],unlocking=false,pinStamp=""
@@ -47,11 +50,13 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     public init(services:AgentAccountServices = .live,codexServices:@escaping @Sendable(CodexAccountTransitionTarget) throws -> AgentAccountServices = {try AgentAccountServices.codex($0)}) {self.services=services;self.codexServices=codexServices}
     public var nativeCodexLogin:NativeCodexLoginState? {
         guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner else {return nil}
-        return .init(id:id,home:job.codexHome ?? "",phase:job.phase,url:job.url,code:job.code,message:job.message)
+        return .init(id:id,home:job.codexHome ?? "",phase:job.phase,url:job.url,code:job.code,message:job.message,resolvedHome:job.resolvedCodexHome)
     }
     public func beginNativeCodexLogin(_ target:CodexAccountTransitionTarget) throws {
+        try nativeCodexLoginWillStart?(target)
+        let resolved=try CodexAccountTransitionTarget.canonicalHome(target.home)
         let job=try begin(agent:"codex",id:UUID().uuidString,owner:nativeOwner,services:codexServices(target))
-        job.browser=true;job.codexHome=target.home;nativeJob=job.id
+        job.browser=true;job.codexHome=target.home;job.resolvedCodexHome=resolved;nativeJob=job.id
     }
     public func cancelNativeCodexLogin() {
         guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner,job.active else {return}
@@ -169,7 +174,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
                     guard !Task.isCancelled,epoch==generation,job.active else {return}
                     if exit==0,state.phase=="authenticated" {
                         job.finish("succeeded","이 Mac에서 로그인했습니다.")
-                        if job.owner==nativeOwner,let home=job.codexHome {nativeCodexLoginCompleted?(home)}
+                        if job.owner==nativeOwner,let home=job.resolvedCodexHome ?? job.codexHome {nativeCodexLoginCompleted?(home)}
                     }
                     else if buffer.lowercased().contains("expired") {job.finish("expired","인증 코드가 만료됐습니다. 다시 로그인해주세요.")}
                     else {job.finish("failed","로그인을 완료하지 못했습니다. CLI 버전·인터넷 연결·계정의 인증 허용 설정을 확인한 뒤 다시 시도해주세요.")}

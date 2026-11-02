@@ -601,6 +601,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account transition: same-account native relogin refreshes all original processes once",tests.testNativeCodexSameAccountReloginStillRefreshesEveryOriginalProcessOnce),
             ("Account transition: explicit reconnect validates the live home before enabling automation",tests.testExplicitCodexReconnectRejectsUnknownHomeBeforeEnablingAutomation),
             ("Account transition: reconnect window begins after server restart acknowledgement",tests.testAccountTransitionReconnectWindowStartsAfterLifecycleAcknowledgement),
+            ("Account transition: native login gate rejects a held transition before auth starts",tests.testNativeCodexLoginCannotStartDuringHeldTransition),
+            ("Account transition: home aliases preserve native manual and restored login receipts",tests.testCodexLoginAliasesReachCanonicalServerAndSurviveRestoration),
+            ("Account transition: dormant failed turns stay waiting with zero mutation reservations",tests.testDormantFailedTurnsRemainWaitingWithoutMutationReservations),
             ("AI account login: literal executable and Codex home with shell punctuation",tests.testNativeCodexLoginLiteralExecutableAndHome),
             ("AI account login: native browser OAuth URL scope and remote device isolation",tests.testNativeCodexBrowserURLScopeAndRemoteDeviceIsolation),
             ("AI account login: official challenge URL allowlist",tests.testAccountChallengeOnlyAcceptsOfficialProviderURLs),
@@ -1152,6 +1155,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         cases.insert(contentsOf: [
             ("Account transition: queued completion is invalid after manager replacement", tests.testNativeCodexLoginReplacementInvalidatesAlreadyQueuedCompletion),
             ("Account transition: native login wakes parked polling immediately", tests.testNativeCodexLoginWakesPollingWithoutWaitingThirtySeconds),
+            ("Account transition: deferred native completion cannot cause a second refresh",tests.testNativeLoginCompletionReceiptBindsBeforeItsDeferredCallback),
             ("Idle poller observations park until source change or cancellation", tests.testIdleObservationWaitsForChangeOrCancellation),
             ("Terminal stream: reused JSON encoder preserves equivalent screen and heartbeat data", tests.testTerminalStreamEncoderReusePreservesWireBytes),
             ("Managed Mac load: stale NFS descriptor paths do not abort open-file discovery", tests.testDescriptorPathReaderSkipsOnlyTransientFDPathErrors),

@@ -7,6 +7,10 @@ public struct CodexAccountTransitionTarget: Equatable, Sendable {
     public init(home: String, executable: String, witnesses: [CodexAccountTransitionWitness] = []) {
         self.home = home; self.executable = executable; self.witnesses = witnesses
     }
+    public static func canonicalHome(_ home:String) throws -> String {
+        guard home.hasPrefix("/"),home.utf8.count<=4096,!home.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains) else {throw AppError.message("Codex 설정 폴더의 전체 경로를 확인해주세요.")}
+        return URL(fileURLWithPath:home).standardizedFileURL.resolvingSymlinksInPath().path
+    }
 }
 public struct CodexAccountTransitionWitness: Codable, Equatable, Sendable {
     public var pid: Int32
@@ -65,6 +69,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var since = Date()
     public var verified = 0
     public var loginRequestID: String?
+    public var continuationHolds: [String:String]?
     public var held: Bool { [.stopping, .waiting, .restarting, .reconnecting, .review].contains(phase) }
     public var canCancel: Bool { held && ![.restarting, .reconnecting].contains(phase) }
     public init() {}
@@ -135,6 +140,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
                 next.originalAccount = observed.serverAccount; next.loginRequestID = loginRequestID
                 next.threads = observed.threads.sorted { $0.id < $1.id }; next.witnesses = target.witnesses; next.since = now
+                next.continuationHolds=observed.threads.filter{!$0.active}.reduce(into:[:]){$0[$1.id]=$1.stopToken}
                 next.detail = "계정 변경 감지 · \(next.threads.count)개 대화를 순차 중단할 준비 중"
                 state = next
                 // Publishing the hold comes before any side effect. The next
@@ -142,6 +148,9 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 changed(state); try persist(); return
             }
             try validate(observed)
+            var continuationHolds=state.continuationHolds ?? [:]
+            for thread in observed.threads where !thread.active {continuationHolds[thread.id]=thread.stopToken}
+            if continuationHolds != state.continuationHolds {state.continuationHolds=continuationHolds;try persist()}
             if let waiting = state.waitingThread {
                 guard let thread = observed.threads.first(where: { $0.id == waiting }) else {
                     throw AppError.message("중단 중 대화 연결이 바뀌었습니다.")

@@ -71,6 +71,87 @@ private final class AccountTargetList: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testNativeCodexLoginCannotStartDuringHeldTransition() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-login-gate-"+UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig(),target=r.target,probe=AccountInputProbe()
+        let engine=try ApprovalEngine(paths:.init(directory:root.appendingPathComponent("profile")),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        let login=AgentAccountServices(home:root.path,check:{agent in .init(agent:agent,phase:"authenticated")},launch:{_ in probe.sent();return try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","exit 0"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])})
+        engine.agentAccounts=AgentAccounts(services:login,codexServices:{_ in login})
+        try engine.setCodexAccountTransitionEnabled(true);await engine.checkCodexAccountTransitions()
+        var rejected=false
+        do {try engine.agentAccounts.beginNativeCodexLogin(target)} catch {rejected=true}
+        try expect(rejected,"A stale login button must not start authentication while a transition is held")
+        try expectEqual(probe.writes,0,"Reject before creating an authentication PTY")
+        try engine.cancelCodexAccountTransition(home:target.home)
+        try engine.agentAccounts.beginNativeCodexLogin(target)
+        try expectEqual(probe.writes,1,"Normal login remains available after the explicit hold is cancelled")
+    }
+    func testCodexLoginAliasesReachCanonicalServerAndSurviveRestoration() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-login-alias-"+UUID().uuidString)
+        let real=root.appendingPathComponent("real-home"),alias=root.appendingPathComponent("alias-home")
+        try FileManager.default.createDirectory(at:real,withIntermediateDirectories:true)
+        try FileManager.default.createSymbolicLink(at:alias,withDestinationURL:real)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let canonical=real.standardizedFileURL.resolvingSymlinksInPath().path
+        for mode in ["native","manual","restored"] {
+            let r=AccountTransitionRig();r.target.home=canonical;r.idle(0);r.idle(1);r.observation.savedAccount="old";r.checkReservations=false
+            let target=r.target,paths=AppPaths(directory:root.appendingPathComponent("profile-"+mode))
+            if mode=="restored" {
+                try paths.prepare();let store=try AuditStore(path:paths.database)
+                try store.set("codexAccountTransitionEnabled","true")
+                try store.set("codexAccountLoginRequests.v1",String(decoding:JSONEncoder().encode([alias.path:UUID().uuidString]),as:UTF8.self))
+            }
+            let engine=try ApprovalEngine(paths:paths,processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+            if mode=="manual" {try await engine.reconnectCodexLogin(home:alias.path)}
+            else if mode=="restored" {await engine.checkCodexAccountTransitions()}
+            else {
+                let login=AgentAccountServices(home:root.path,check:{agent in .init(agent:agent,phase:"authenticated")},launch:{_ in try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","exit 0"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])})
+                engine.agentAccounts=AgentAccounts(services:login,codexServices:{_ in login})
+                try engine.agentAccounts.beginNativeCodexLogin(.init(home:alias.path,executable:target.executable))
+                for _ in 0..<100 {if engine.codexAccountTransitionStates[canonical]?.phase == .stopping {break};try await Task.sleep(for:.milliseconds(20))}
+            }
+            try expectEqual(engine.codexAccountTransitionStates[canonical]?.phase,.stopping,"Alias login must reach the canonical shared server: "+mode)
+            await engine.checkCodexAccountTransitions();r.observation.serverID="server-2"
+            await engine.checkCodexAccountTransitions();try expectEqual(engine.codexAccountTransitionStates[canonical]?.phase,.complete)
+            engine.stop()
+            let restored=try ApprovalEngine(paths:paths,processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{restored.stop()}
+            await restored.checkCodexAccountTransitions();try expectEqual(r.effects,["restart"],"Alias restoration must not replay an already applied login")
+        }
+    }
+    func testDormantFailedTurnsRemainWaitingWithoutMutationReservations() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-dormant-hold-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let records=ProcessDiscovery.parse("41 1 ttys971 41 41 Wed Oct 21 09:00:00 2026 /fixture/codex")
+        var session=AgentSession(id:records[0].key,agent:.codex,pid:41,started:records[0].started,tty:"/dev/ttys971",cwd:"/fixture",terminal:.terminal)
+        session.channel = .terminalScreen
+        let r=AccountTransitionRig(),probe=AccountInputProbe();r.idle(0);r.idle(1);r.checkReservations=false
+        r.target.witnesses=[.init(pid:session.pid,started:session.started,tty:session.tty,threadID:nil)]
+        let target=r.target
+        func create() throws -> ApprovalEngine {
+            let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{records},screenAdapters:[.terminal:probe.adapter],codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]})
+            engine.interruptionResumeDelays=[0.02];engine.updateDiscovery([session],records:records);try engine.setAutomatic(session.id,enabled:true);return engine
+        }
+        var engine=try create();defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions();await engine.checkCodexAccountTransitions()
+        r.observation.serverID="server-2";r.observation.serverAccount="new";await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        try expect(engine.codexAccountTransitionStates[target.home]?.reservations.isEmpty==true)
+        let error="■ Synthetic provider error from dormant failed turn\n\n› Ask Codex to do anything\n\n? for shortcuts"
+        for restored in [false,true] {
+            if restored {engine.stop();engine=try create()}
+            engine.updateCodexQuestions([.init(sessionID:session.id,turn:.init(threadID:"a",turnID:"turn-a",status:"failed"))])
+            probe.setScreen(error);engine.receiveScreen(sessionID:session.id,raw:error,generation:restored ? "restored-error":"late-error")
+            try await Task.sleep(for:.milliseconds(150))
+            try expectEqual(probe.writes,0,"An original dormant failure must remain waiting after completion and app restoration")
+        }
+        engine.updateCodexQuestions([.init(sessionID:session.id,turn:.init(threadID:"a",turnID:"new-user-turn",status:"failed"))])
+        engine.receiveScreen(sessionID:session.id,raw:error,generation:"new-user-turn")
+        let deadline=Date().addingTimeInterval(3)
+        while probe.writes==0,Date()<deadline {try await Task.sleep(for:.milliseconds(20))}
+        try expect(probe.writes>0,"A new user turn must release only the old continuation hold")
+    }
     func testAccountTransitionReconnectWindowStartsAfterLifecycleAcknowledgement() async throws {
         let r=AccountTransitionRig();r.idle(0);r.idle(1);r.verified=0
         var services=r.services
@@ -112,8 +193,12 @@ extension ApprovalTests {
         })
         engine.agentAccounts=AgentAccounts(services:login,codexServices:{_ in login})
         try engine.agentAccounts.beginNativeCodexLogin(target)
-        for _ in 0..<100 {if engine.agentAccounts.nativeCodexLogin?.phase=="succeeded" {break};try await Task.sleep(for:.milliseconds(20))}
-        for _ in 0..<10 {await Task.yield()}
+        let loginDeadline=Date().addingTimeInterval(5)
+        while Date()<loginDeadline,engine.agentAccounts.nativeCodexLogin?.phase != "succeeded" || engine.codexAccountTransitionStates[target.home]?.phase != .stopping {
+            try await Task.sleep(for:.milliseconds(20))
+        }
+        try expectEqual(engine.agentAccounts.nativeCodexLogin?.phase,"succeeded","The owned native login fixture must finish before checking application")
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.stopping,"The native completion callback must enable and begin the transition")
         for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
         try expectEqual(r.effects,["interrupt:server-1:a:turn-a"],"A successful same-account login must refresh existing authentication instead of being ignored")
         r.idle(0)
@@ -132,10 +217,17 @@ extension ApprovalTests {
         r.observeFails=false
         for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
         try expectEqual(r.effects.filter{$0=="restart"}.count,1)
+        try await engine.reconnectCodexLogin(home:target.home)
+        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try expectEqual(r.effects.filter{$0=="restart"}.count,2,"A later manual reconnect must supersede the completed native login receipt")
+        r.observation.serverID="server-3"
+        for _ in 0..<6 {await engine.checkCodexAccountTransitions()}
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        try expectEqual(r.effects.filter{$0=="restart"}.count,2,"The old successful native job must not replay after a newer manual reconnect")
         let restored=try ApprovalEngine(paths:.init(directory:root.appendingPathComponent("profile")),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]})
         defer{restored.stop()}
         await restored.checkCodexAccountTransitions()
-        try expectEqual(r.effects.filter{$0=="restart"}.count,1,"App restoration must retain the consumed login receipt")
+        try expectEqual(r.effects.filter{$0=="restart"}.count,2,"App restoration must retain the newest consumed login receipt")
     }
     func testAccountTransitionManualCheckStopsRemainingMutationsOnEngineStop() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-stop-check-"+UUID().uuidString)
@@ -176,6 +268,33 @@ extension ApprovalTests {
         try expectEqual(c.state.phase,.complete,"Persisted offscreen conversations need not be reattached by a TUI before account application completes")
     }
     #if DEBUG
+    func testNativeLoginCompletionReceiptBindsBeforeItsDeferredCallback() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-login-race-"+UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);defer{try? FileManager.default.removeItem(at:root)}
+        let marker=root.appendingPathComponent("finish"),r=AccountTransitionRig(),target=r.target
+        r.idle(0);r.idle(1);r.checkReservations=false
+        let engine=try ApprovalEngine(paths:.init(directory:root.appendingPathComponent("profile")),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        let login=AgentAccountServices(home:root.path,check:{agent in .init(agent:agent,phase:"authenticated")},launch:{_ in
+            try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","while [[ ! -f \"$1\" ]]; do /bin/sleep 0.02; done","owned-login",marker.path],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
+        })
+        engine.agentAccounts=AgentAccounts(services:login,codexServices:{_ in login})
+        let forward=engine.agentAccounts.nativeCodexLoginCompleted
+        var delayedHome:String?
+        engine.agentAccounts.nativeCodexLoginCompleted={delayedHome=$0}
+        try engine.setCodexAccountTransitionEnabled(true);try engine.agentAccounts.beginNativeCodexLogin(target)
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(r.observeCount,0,"Passive polling must wait for the native ceremony to finish")
+        try Data().write(to:marker)
+        for _ in 0..<100 {if engine.agentAccounts.nativeCodexLogin?.phase=="succeeded" {break};try await Task.sleep(for:.milliseconds(20))}
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.loginRequestID,engine.agentAccounts.nativeCodexLogin?.id,"The observed successful login must bind before its queued completion callback")
+        try expectNotNil(delayedHome);forward?(delayedHome!)
+        for _ in 0..<10 {await engine.checkCodexAccountTransitions();if r.effects.contains("restart"){break};await Task.yield()}
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        for _ in 0..<6 {await engine.checkCodexAccountTransitions();await Task.yield()}
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        try expectEqual(r.effects,["restart"],"Late completion must not turn one native login into a second refresh")
+    }
     func testNativeCodexLoginReplacementInvalidatesAlreadyQueuedCompletion() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-native-replace-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}

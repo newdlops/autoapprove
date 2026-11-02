@@ -18,7 +18,9 @@ import AutoApproveCore
     @State private var otherLogin=false
     private var scopedJob:NativeCodexLoginState? {
         let current=accounts.nativeCodexLogin
-        return preferredHome==nil || current?.home==preferredHome ? current:nil
+        let home=current?.resolvedHome ?? current.flatMap{try? CodexAccountTransitionTarget.canonicalHome($0.home)}
+        let preferred=preferredHome.flatMap{try? CodexAccountTransitionTarget.canonicalHome($0)}
+        return preferredHome==nil || home==preferred ? current:nil
     }
     var body: some View {
         CodexLoginContent(homes: homes.map(\.home), selected: $selected, loading: loading,
@@ -49,11 +51,12 @@ import AutoApproveCore
             job = scopedJob
             do {
                 var found = try await targets()
-                let defaultHome = NSHomeDirectory() + "/.codex"
+                let defaultHome = try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory() + "/.codex")
                 if preferredHome==nil,!found.contains(where: { $0.home == defaultHome }) { found.insert(.init(home: defaultHome, executable: "codex"), at: 0) }
                 homes = found
-                if let preferredHome {selected=preferredHome}
-                else if let job, found.contains(where: { $0.home == job.home }) { selected = job.home }
+                if let preferredHome {selected=try CodexAccountTransitionTarget.canonicalHome(preferredHome)}
+                else if let job,let home=job.resolvedHome ?? (try? CodexAccountTransitionTarget.canonicalHome(job.home)),found.contains(where:{$0.home==home}) {selected=home}
+                else if !found.contains(where:{$0.home==selected}) {selected=found.first?.home ?? defaultHome}
             } catch { self.error = "실행 중인 Codex 위치를 조회하지 못했습니다. 기본 홈으로 로그인할 수 있습니다." }
             loading = false
             while !Task.isCancelled {
