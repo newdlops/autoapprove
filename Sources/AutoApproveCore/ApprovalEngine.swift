@@ -5878,7 +5878,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if state.phase == .needsPause,codexAttachmentToolHostGrants[home]?[id]==nil {wait(original,"Goal 일시정지·재연결 직접 요청 대기");continue}
                 guard authorized(id),let host=ScreenHost(kind:original.terminal),screenConnections[host]?.enabled==true,let adapter=screenAdapters[host],let restart=adapter.restart else{return}
                 codexAttachmentActiveIDs.insert(id)
-                let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
+                let frozenIdentity=state.phase == .needsPause && host == .terminal ? try? TTYInputIdentity.capture(pid:original.pid):nil
+                let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started,sourceIdentity:frozenIdentity)
                 func cleanupFinished(_ records:[ProcessRecord])->Bool {
                     let witnesses=state.toolHostShutdownWitnesses ?? state.authorizedToolHosts ?? []
                     return !witnesses.contains {host in records.contains(where:{$0.key==host.key})}
@@ -5988,9 +5989,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         guard let saved=self.store.value("codexStatusIdentity:"+id),let data=saved.data(using:.utf8),let proof=try? JSONDecoder().decode(CodexStatusIdentity.self,from:data),proof.threadID==thread,
                               proof.matches(before,thread:thread) || working && Date().timeIntervalSince(proof.requested)<120 && proof.freshThread(in:before)==thread else{throw AppError.message("Goal 중단 전 대화 화면이 바뀌었습니다.")}
                     }
+                    if working,host == .terminal {
+                        guard target.sourceIdentity != nil,adapter.goalInterrupt != nil || self.terminalInputAvailable() else{throw RemoteHTTPError(409,"Mac 연결 설정의 직접 입력 연결과 원본 Codex 신원을 확인해주세요.",diagnostics:["delivery":"not_started"])}
+                    }
                     guard working || CodexGoalScreen.ready(before),!RemoteMessageReadiness.hasMenu(before,agent:.codex),CodexProgressScreen.emptyComposer(before) else{throw AppError.message("질문·초안·입력을 유지하고 Goal 중단을 보류했습니다.")}
                     guard self.log(AuditEvent(sessionID:id,summary:"기존 Codex Goal 서버 연결",outcome:"사용자 재연결 요청 · 원래 Goal 일시정지·중단 예약",source:host.title,context:AuditContext(session:original))) else{throw AppError.message("Goal 중단 기록을 저장하지 못했습니다.")}
-                    return try await Task.detached(priority:.utility){try adapter.input(target,before,.codex,.init(kind:working ? .escape:.submit,text:working ? "":"/goal pause")) == .sent}.value
+                    return try await Task.detached(priority:.utility){
+                        if working,let interrupt=adapter.goalInterrupt {return try interrupt(target,before) == .sent}
+                        return try adapter.input(target,before,.codex,.init(kind:working ? .escape:.submit,text:working ? "":"/goal pause")) == .sent
+                    }.value
                 },pauseReady:{
                     guard authorized(id),let before=state.goalBeforePause,let thread=context.conversationID else{throw CancellationError()}
                     let current=try await Task.detached(priority:.utility){try reader()}.value
@@ -6143,6 +6150,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         defer {
             codexAttachmentToolHostGrants.removeValue(forKey:attachmentHome)
             revokeUnspentCodexToolHostGrants(home:attachmentHome)
+        }
+        // Only an explicit request may discard a Goal pause plan whose input
+        // was proved absent. Rediscover its current thread/Goal from scratch.
+        let unsent=codexSessionAttachments.values.filter{$0.home==attachmentHome && grants[$0.context.session.id] != nil && $0.canRetryUnsentGoalPause}.map{$0.context.session.id}
+        if !unsent.isEmpty {
+            var journal=codexSessionAttachments;for id in unsent {journal.removeValue(forKey:id)}
+            try store.set("codexSessionAttachments",String(decoding:JSONEncoder().encode(journal),as:UTF8.self));codexSessionAttachments=journal
         }
         // A cancelled pre-exit Goal request can be resumed only after the same
         // Goal is independently observed paused. Never send its interrupt again.

@@ -1,5 +1,7 @@
 import Foundation
+import CoreGraphics
 import AutoApproveCore
+import TerminalInputSupport
 import CSQLite
 
 private final class OwnedEnginePTY:@unchecked Sendable {
@@ -10,6 +12,8 @@ private final class OwnedEnginePTY:@unchecked Sendable {
     let client=UUID().uuidString
     private let lock=NSLock()
     private var sequence=0
+    var nativeAvailable=true,interruptWrites=0,losePauseAck=false
+    var keyboardAvailable=false,keyboardPosts=0,permissionRequests=0
     var delayedStatus=false,workingReads=0
     var interruptCalls=0,pauseCalls=0
     var statusCalls=0,exitCalls=0,launchCalls=0,prepareCalls=0
@@ -26,6 +30,26 @@ private final class OwnedEnginePTY:@unchecked Sendable {
         } else if let i=records.firstIndex(where:{$0.pid==descriptor.pid}) {records[i].parent=host.pid}
         return [host]+records+(replacement?.read() ?? [])
     }
+    func directInterrupt(_ target:ScreenTarget,_ expected:String)throws->TerminalDelivery {
+        self.interruptCalls+=1
+        return try TerminalDeviceInput.deliver(target:target,agent:.codex,input:.init(kind:.escape),screen:expected,environment:.init(available:{true},capture:{try TTYInputIdentity.capture(pid:$0)},send:{request in
+            guard request.tty==self.descriptor.tty,request.identity.pid==target.sourcePID else{throw AppError.message("Wrong owned transport target")}
+            self.interruptWrites+=1
+            try self.write(String(decoding:request.bytes,as:UTF8.self));if self.losePauseAck {throw AppError.message("Owned interrupt acknowledgement lost")};return .init(error:0,written:request.bytes.count)
+        }))
+    }
+    func keyboardInterrupt(_ target:ScreenTarget,_ expected:String)throws->TerminalDelivery {
+        self.interruptCalls+=1
+        let env=TerminalKeyboard.Environment(trusted:{true},postingAllowed:{true},run:{_ in "ready:77"},
+            metadata:{tty in .init(tty:tty,windowID:77,ownerPID:990001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)},
+            ownerBundle:{_ in "com.apple.Terminal"},focused:{_ in !self.wrongWindow},processes:{self.read()},postPair:{pid,down,up in
+                guard pid==990001,down.getIntegerValueField(.keyboardEventKeycode)==53,down.flags.isEmpty,up.flags.isEmpty else{throw AppError.message("Wrong Goal keyboard event")}
+                self.keyboardPosts+=1;self.interruptWrites+=1
+                try self.write("\u{1b}")
+                if self.losePauseAck {throw AppError.message("Owned keyboard acknowledgement lost")}
+            })
+        return try TerminalGoalInterrupt.keyboard(target:target,expected:expected,environment:env,userHasPriority:{false})
+    }
     func adapter()->ScreenHostAdapter {
         ScreenHostAdapter(screens:{targets in TerminalSnapshot(screens:targets.map{TerminalScreen(tty:$0.tty,contents:self.screen($0.tty))})},approve:{_,_,_ in .screenChanged},reveal:{_ in nil},restart:{target,expected,command in
             guard self.screen(target.tty)==expected,SessionExitRecovery.emptyShellPrompt(expected) else{return .screenChanged}
@@ -35,7 +59,9 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             try receiver.write(command+"\n");return .sent
         },input:{target,expected,_,input in
             guard self.screen(target.tty)==expected else{return .screenChanged}
-            if input.kind == .escape {self.interruptCalls+=1}
+            if input.kind == .escape {
+                return try self.directInterrupt(target,expected)
+            }
             else if input.text=="/goal pause" {self.pauseCalls+=1}
             else if input.text=="/status" {self.statusCalls+=1;if self.delayedStatus,self.statusCalls==1 {Thread.sleep(forTimeInterval:11)}}
             else if input.text=="/exit" {self.exitCalls+=1}
@@ -63,6 +89,8 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             return shell
         },replacementShellValid:{_,shell in
             !self.wrongWindow && self.replacement?.read().contains(where:{$0==shell}) == true
+        },goalInterrupt:{target,expected in
+            try TerminalGoalInterrupt.deliver(target:target,expected:expected,environment:.init(directAvailable:{self.nativeAvailable},keyboardAvailable:{self.keyboardAvailable},direct:{try self.directInterrupt($0,$1)},keyboard:{try self.keyboardInterrupt($0,$1)},requestPermission:{self.permissionRequests+=1}))
         })
     }
 }
@@ -78,7 +106,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             let sql="CREATE TABLE IF NOT EXISTS thread_goals(thread_id TEXT PRIMARY KEY,goal_id TEXT,objective TEXT,status TEXT,token_budget INTEGER,tokens_used INTEGER,time_used_seconds INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER); INSERT OR REPLACE INTO thread_goals VALUES('\(thread)','fixture-goal','Owned test','\(status)',NULL,0,0,100000,110000);"
             guard sqlite3_exec(db,sql,nil,nil,nil)==SQLITE_OK else{throw AppError.message("Owned Goal update failed")}
         }
-        let manualGoal=CommandLine.arguments.contains("--manual-goal"),pauseUnconfirmed=CommandLine.arguments.contains("--pause-unconfirmed"),existingManaged=CommandLine.arguments.contains("--existing-managed"),nativeGoalFailure=CommandLine.arguments.contains("--native-goal-failure"),nativeGoal=CommandLine.arguments.contains("--native-goal"),replaceManager=CommandLine.arguments.contains("--replace-login-manager"),idleGoal=CommandLine.arguments.contains("--idle-goal"),pausedGoal=CommandLine.arguments.contains("--paused-goal"),retryGoal=CommandLine.arguments.contains("--retry-goal"),vimGoal=CommandLine.arguments.contains("--vim-goal"),delayedStatus=CommandLine.arguments.contains("--delayed-goal-status")
+        let manualGoal=CommandLine.arguments.contains("--manual-goal"),pauseUnconfirmed=CommandLine.arguments.contains("--pause-unconfirmed"),existingManaged=CommandLine.arguments.contains("--existing-managed"),nativeGoalFailure=CommandLine.arguments.contains("--native-goal-failure"),nativeGoal=CommandLine.arguments.contains("--native-goal"),replaceManager=CommandLine.arguments.contains("--replace-login-manager"),idleGoal=CommandLine.arguments.contains("--idle-goal"),pausedGoal=CommandLine.arguments.contains("--paused-goal"),retryGoal=CommandLine.arguments.contains("--retry-goal"),vimGoal=CommandLine.arguments.contains("--vim-goal"),delayedStatus=CommandLine.arguments.contains("--delayed-goal-status"),missingInputRetry=CommandLine.arguments.contains("--missing-input-retry"),unknownGoalAck=CommandLine.arguments.contains("--unknown-goal-ack")
         if goalWait || manualGoal {try goal(pausedGoal ? "paused":"active")}
         var ownedEnvironment=["HOME":root,"CODEX_HOME":home,"PATH":root+":/usr/bin:/bin","PS1":"fixture% ","READY_FILE":root+"/ready","FIXTURE_SOCKET":root+"/daemon.sock","EXPECTED_THREAD":thread,"STATUS_THREAD":wrong ? "00000000-0000-4000-8000-000000000062":thread,"TOOL_HOST_PATH":toolHosts ? root+"/ChatGPT.app/Contents/Resources/cua_node/bin/node":""]
         if manualGoal {ownedEnvironment["FIXTURE_ACTIVE_GOAL"]="1"}
@@ -90,7 +118,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
         let manager=ManagedPTYManager(environment:ownedEnvironment);defer{manager.stop()}
         let descriptor=try manager.create(cwd:root,program:"shell",command:noShell ? [root+"/codex"]:(loginShell ? [root+"/codex","--fixture-login-shell"]:["/bin/zsh","-f"]),columns:100,rows:50),terminal=try manager.terminal(descriptor.ptyID),probe=OwnedEnginePTY(terminal,descriptor)
         func wait(_ test:()throws->Bool) async throws {let end=Date().addingTimeInterval(8);while Date()<end{if try test(){return};try await Task.sleep(for:.milliseconds(100))};throw AppError.message("Owned fixture not ready")}
-        probe.delayedStatus=delayedStatus;probe.noShell=noShell;probe.manager=manager;probe.wrongWindow=wrongWindow;probe.busyReplacement=busyReplacement;probe.prepareFails=prepareFails;probe.definiteRetry=definiteRetry;probe.addHostDuringPrepare=cancelBeforeExit;probe.lingerToolHost=lingerToolHost
+        probe.losePauseAck=unknownGoalAck;probe.delayedStatus=delayedStatus;probe.noShell=noShell;probe.manager=manager;probe.wrongWindow=wrongWindow;probe.busyReplacement=busyReplacement;probe.prepareFails=prepareFails;probe.definiteRetry=definiteRetry;probe.addHostDuringPrepare=cancelBeforeExit;probe.lingerToolHost=lingerToolHost
         if !noShell {
             try await wait{SessionExitRecovery.emptyShellPrompt(terminal.screen())}
             let command=profileCommand ? try TerminalProfileEntry(title:"Owned fixture",agent:"codex",cwd:root,conversationID:"",providerHome:home).resumeCommand():HookInstaller.quote(root+"/codex")
@@ -111,12 +139,13 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             guard manualGoal,verifiedAccount,restarts==1,original.goal?.status == .active,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .paused else{throw AppError.message("Goal resumed before account verification")}
             resumes+=1;try goal("active");return .goal
         })
-        @MainActor func createEngine() throws -> ApprovalEngine {try ApprovalEngine(paths:.init(directory:URL(fileURLWithPath:root+"/state")),processReader:{probe.read()},screenAdapters:[.terminal:probe.adapter()],terminalInputAvailable:{true},codexAccountTransitions:accountServices,codexAccountTargets:{rows in
+        @MainActor func createEngine() throws -> ApprovalEngine {try ApprovalEngine(paths:.init(directory:URL(fileURLWithPath:root+"/state")),processReader:{probe.read()},screenAdapters:[.terminal:probe.adapter()],terminalInputAvailable:{probe.nativeAvailable},codexAccountTransitions:accountServices,codexAccountTargets:{rows in
             var targets=try await CodexAccountTransitionTarget.discover(rows)
             if existingManaged,targets.isEmpty {targets=[.init(home:home,executable:root+"/codex",witnesses:[.init(pid:990099,started:"owned-existing",tty:"/dev/owned-existing",threadID:nil)])]}
             return targets
         },codexManagedServers:setup)}
         let engine=try createEngine()
+        if CommandLine.arguments.contains("--keyboard-goal") || CommandLine.arguments.contains("--keyboard-focus") {probe.nativeAvailable=false;probe.keyboardAvailable=true}
         defer{engine.stop()}
         func beginOwnedLogin() throws {
             let login=AgentAccountServices(home:root,check:{_ in .init(agent:"codex",phase:"authenticated")},launch:{_ in try ManagedPTY(cwd:root,command:["/bin/zsh","-f","-c","exit 0"],environment:["HOME":root,"PATH":"/usr/bin:/bin"])})
@@ -135,6 +164,22 @@ private final class OwnedEnginePTY:@unchecked Sendable {
         try await Task.sleep(for:.seconds(2))
         engine.receiveScreen(sessionID:original.key,raw:terminal.screen(),generation:"owned",source:.terminalScreen)
         guard engine.snapshot.sessions.contains(where:{$0.id==original.key && $0.terminal == .terminal && $0.phase == (pausedGoal ? .unknown:manualGoal && !idleGoal ? .working:.idle)}) else{throw AppError.message("Owned engine inventory: "+engine.snapshot.sessions.map{"pid=\($0.pid) host=\($0.terminal.rawValue) phase=\($0.phase.rawValue)"}.joined(separator:",")+" screen="+terminal.screen())}
+        if CommandLine.arguments.contains("--keyboard-focus") {
+            probe.wrongWindow=true
+            var rejected=false
+            do {try await engine.reconnectCodexLogin(home:home)}catch {rejected=true}
+            guard rejected,probe.interruptWrites==0,probe.keyboardPosts==0,probe.exitCalls==0,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .active else{throw AppError.message("Changed focused window must not receive Goal keys")}
+            print("{\"verified\":true,\"focusChangePreserved\":true,\"interruptWrites\":0,\"exitRequests\":0,\"userTerminalActions\":0}");return
+        }
+        if unknownGoalAck {
+            var rejected=false
+            do {try await engine.reconnectCodexLogin(home:home)}catch {rejected=true}
+            try await wait{try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .paused}
+            for _ in 0..<3 {await engine.ensureCodexManagedServers()}
+            do {try await engine.reconnectCodexLogin(home:home)}catch {}
+            guard rejected,probe.interruptWrites==1,probe.interruptCalls==1,probe.exitCalls==0 else{throw AppError.message("Unknown input acknowledgement was replayed")}
+            print("{\"verified\":true,\"unknownAckNotReplayed\":true,\"interruptWrites\":1,\"exitRequests\":0,\"userTerminalActions\":0}");return
+        }
         if vimGoal {
             do {try await engine.reconnectCodexLogin(home:home)}catch {}
             guard probe.statusCalls==0,probe.interruptCalls==0,probe.exitCalls==0,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .active else{throw AppError.message("Standalone Goal reconnect typed into Vim Normal mode")}
@@ -178,6 +223,13 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             print("{\"verified\":true,\"cancelledGoalPreserved\":true,\"managerReplaced\":\(replaceManager),\"explicitRetry\":\(retryGoal),\"interrupts\":\(probe.interruptCalls),\"exitRequests\":\(probe.exitCalls),\"userTerminalActions\":0}");return
         }
         if manualGoal {
+            if missingInputRetry {
+                probe.nativeAvailable=false
+                var rejected=false
+                do {try await engine.reconnectCodexLogin(home:home)}catch {rejected=true}
+                guard rejected,probe.permissionRequests==1,probe.interruptWrites==0,probe.interruptCalls==0,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .active else{throw AppError.message("Unavailable input must not write or stop Goal")}
+                probe.nativeAvailable=true
+            }
             if nativeGoal {try beginOwnedLogin()}
             let task=Task {if nativeGoal {
                 let end=Date().addingTimeInterval(22);while engine.codexAccountTransitionStates[home]?.loginRequestID==nil,Date()<end {try await Task.sleep(for:.milliseconds(100))}
@@ -185,10 +237,10 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             }else{try await engine.reconnectCodexLogin(home:home)}}
             let timeout=Task {try await Task.sleep(for:.seconds(delayedStatus ? 40:25));task.cancel()};defer{timeout.cancel()}
             do {try await task.value}catch {throw AppError.message("Running Goal reconnect did not pause and attach: "+error.localizedDescription)}
-            guard probe.interruptCalls==(idleGoal || pausedGoal ? 0:1),probe.pauseCalls==(idleGoal && !pausedGoal ? 1:0),probe.exitCalls==1,probe.launchCalls==1,(try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .paused || nativeGoal && resumes==1) else{throw AppError.message("Goal must actually pause before a single exit and resume")}
+            guard probe.interruptWrites==(idleGoal || pausedGoal ? 0:1),probe.interruptCalls==(idleGoal || pausedGoal ? 0:1),probe.pauseCalls==(idleGoal && !pausedGoal ? 1:0),probe.exitCalls==1,probe.launchCalls==1,(try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .paused || nativeGoal && resumes==1) else{throw AppError.message("Goal must actually pause before a single exit and resume")}
             for _ in 0..<12 {await engine.checkCodexAccountTransitions()}
             guard restarts==1,resumes==(pausedGoal ? 0:1),try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == (pausedGoal ? .paused:.active) else{throw AppError.message("Goal did not resume exactly once after account verification: restart=\(restarts) resume=\(resumes)")}
-            print("{\"verified\":true,\"pausedGoalBeforeAttachment\":true,\"goalResumedAfterLogin\":\(resumes==1),\"goalInitiallyPaused\":\(pausedGoal),\"nativeLogin\":\(nativeGoal),\"goalPauseCommands\":\(probe.pauseCalls),\"interrupts\":\(probe.interruptCalls),\"exitRequests\":1,\"launchRequests\":1,\"userTerminalActions\":0}");return
+            print("{\"verified\":true,\"pausedGoalBeforeAttachment\":true,\"goalResumedAfterLogin\":\(resumes==1),\"goalInitiallyPaused\":\(pausedGoal),\"nativeLogin\":\(nativeGoal),\"goalPauseCommands\":\(probe.pauseCalls),\"interrupts\":\(probe.interruptCalls),\"interruptWrites\":\(probe.interruptWrites),\"keyboardPosts\":\(probe.keyboardPosts),\"retryAfterUnavailable\":\(missingInputRetry),\"exitRequests\":1,\"launchRequests\":1,\"userTerminalActions\":0}");return
         }
         if toolHosts {
             let expected=CodexSessionAttachment.toolHosts(process:original,records:probe.read())

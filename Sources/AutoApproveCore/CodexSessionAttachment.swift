@@ -9,6 +9,7 @@ public struct CodexSessionAttachment:Codable {
     public var home:String
     public var phase:Phase = .ready
     public var detail:String = "원래 대화의 관리형 서버 연결을 준비합니다."
+    public var pauseNotStarted:Bool?
     public var exitNotStarted:Bool?
     public var goalBeforePause:CodexGoal?
     public var pausedGoal:CodexGoal?
@@ -23,6 +24,9 @@ public struct CodexSessionAttachment:Codable {
     public init(context:SessionExitRecovery,home:String,originalLogin:ProcessRecord?=nil,authorizedToolHosts:[ProcessRecord]?=nil) {
         self.context=context;self.home=home;self.originalLogin=originalLogin;self.authorizedToolHosts=authorizedToolHosts
         if originalLogin != nil {phase = .needsTab;detail="원래 창에 복구용 탭을 먼저 준비합니다."}
+    }
+    public var canRetryUnsentGoalPause:Bool {
+        phase == .review && goalBeforePause != nil && pausedGoal==nil && (pauseNotStarted == true || detail=="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다.")
     }
     public var replacesTab:Bool {originalLogin != nil}
     /// Separate jobs remain live work. Only an explicit reconnect's exact
@@ -86,9 +90,9 @@ public struct CodexSessionAttachment:Codable {
             if state.phase == .pauseReserved {throw AppError.message("이전 Goal 중단 요청의 결과를 확인해주세요. 중단 입력을 반복하지 않습니다.")}
             if state.phase == .needsPause {
                 guard state.goalBeforePause?.status == .active,let pause else{throw AppError.message("원래 Goal 중단 대상을 확인하지 못했습니다.")}
-                state.context.deadline=Date().addingTimeInterval(120)
+                state.pauseNotStarted=nil;state.context.deadline=Date().addingTimeInterval(120)
                 try persist(.pauseReserved,"원래 Goal 일시정지·작업 중단 요청을 예약했습니다.")
-                guard try await pause() else{throw AppError.message("Goal 중단 요청의 전달 결과를 확인하지 못했습니다.")}
+                guard try await pause() else{throw RemoteHTTPError(409,"Goal 중단 요청의 전달 결과를 확인하지 못했습니다.",diagnostics:["delivery":"not_started"])}
                 try persist(.waitingPause,"Goal 일시정지와 원래 작업의 실제 대기 상태를 확인합니다.")
             }
             if state.phase == .waitingPause {
@@ -146,7 +150,10 @@ public struct CodexSessionAttachment:Codable {
             if state.phase == .verifying,try await verify() {try persist(.connected,"기존 창·같은 대화의 관리형 서버 연결을 확인했습니다.")}
         } catch {
             state.authorizedToolHosts=nil
-            if state.phase == .tabReserved,(error as? RemoteHTTPError)?.diagnostics?["delivery"]=="not_started" {
+            if state.phase == .pauseReserved,(error as? RemoteHTTPError)?.diagnostics?["delivery"]=="not_started" {
+                state.pauseNotStarted=true
+                try persist(.review,"Goal 중단 입력이 시작되지 않았습니다. 직접 입력 연결을 확인한 뒤 현재 로그인으로 세션 재연결을 다시 시도해주세요. "+String(error.localizedDescription.prefix(160)))
+            } else if state.phase == .tabReserved,(error as? RemoteHTTPError)?.diagnostics?["delivery"]=="not_started" {
                 state.preparationNotStarted=true
                 try persist(.review,"복구 탭 준비가 시작되지 않았습니다. 권한·창 상태를 확인한 뒤 ‘현재 로그인으로 세션 재연결’로 다시 시도할 수 있습니다. "+String(error.localizedDescription.prefix(160)))
             } else {

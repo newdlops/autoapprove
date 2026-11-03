@@ -78,6 +78,7 @@ public struct ScreenHostAdapter: Sendable {
     public var restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
     public var replacementShell: (@Sendable (ScreenTarget) throws -> ProcessRecord)?
     public var replacementShellValid: (@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)?
+    public var goalInterrupt: (@Sendable (ScreenTarget,String) throws -> TerminalDelivery)?
     public var input: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
     public init(screens: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot,
                 approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
@@ -91,11 +92,13 @@ public struct ScreenHostAdapter: Sendable {
                 validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
                 history:(@Sendable (ScreenTarget) throws -> String)? = nil,
                 replacementShell:(@Sendable (ScreenTarget) throws -> ProcessRecord)? = nil,
-                replacementShellValid:(@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)? = nil) {
+                replacementShellValid:(@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)? = nil,
+                goalInterrupt:(@Sendable (ScreenTarget,String) throws -> TerminalDelivery)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
         self.initialScreens = initialScreens
         self.validationScreens = validationScreens
+        self.goalInterrupt=goalInterrupt
         self.history=history;self.replacementShell=replacementShell;self.replacementShellValid=replacementShellValid
     }
     /// Validation consumes only fresh text. A channel failure must propagate;
@@ -117,7 +120,8 @@ public struct ScreenHostAdapter: Sendable {
                 initialScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty), includeCursor: false) },
                 validationScreens: { try TerminalAdapter.screens(ttys:$0.map(\.tty),includeCursor:false,includeTitles:false,purpose:.validation) },
                 history:{try TerminalAppleEvents.history(tty:$0.tty)},
-                replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)})
+                replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)},
+                goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)})
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
                 adapter.validationScreens = nil

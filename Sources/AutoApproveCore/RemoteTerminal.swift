@@ -95,7 +95,7 @@ public enum TerminalKeyboard {
     }
 
     public static func deliver(target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput,
-                               environment: Environment = .live, timeout: TimeInterval = 8) throws -> TerminalDelivery {
+                               environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false) throws -> TerminalDelivery {
         try input.validate()
         guard agent != .shell, needsNative(input), timeout.isFinite, timeout > 0 else { throw RemoteHTTPError(400, "이 직접 입력 방식은 지원하지 않습니다.") }
         let deadline = environment.clock() + min(timeout, 8)
@@ -115,7 +115,7 @@ public enum TerminalKeyboard {
             try checkPermissionAndTime()
             let initialRecords = try environment.processes()
             guard let original = source(target, agent: agent, records: initialRecords) else { return .agentMissing }
-            let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input))
+            let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
             if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
             guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
                   let window = try environment.metadata(target.tty), window.tty == target.tty, window.windowID == windowID,
@@ -257,14 +257,14 @@ public enum RemoteTerminalAdapter {
         guard let delivery = TerminalDelivery(rawValue: result) else { throw AppError.message("입력 전달 결과를 확인하지 못했습니다. 화면을 확인해주세요.") }
         return delivery
     }
-    public static func script(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput) throws -> String {
+    public static func script(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput, goalWorkingComparison: Bool = false) throws -> String {
         guard agent != .shell, host != .orca else { throw RemoteHTTPError(400, "이 터미널의 입력 방식은 지원하지 않습니다.") }
         try input.validate()
         let terminalKeyboard = host == .terminal && TerminalKeyboard.needsNative(input)
         let data = try AutomationScript.literal(["tty": target.tty, "expected": expected, "agent": agent.rawValue,
             "text": host == .terminal && [.text, .submit].contains(input.kind) ? input.text : input.kind == .enter && host == .terminal ? "" : input.bytes,
             "jobPIDs": target.jobPIDs.map(Int.init), "relay": input.isRelay] as JSONObject)
-        let helpers = """
+        var helpers = """
         function normalize(text) { return String(text).normalize('NFC').replace(/\\r\\n?/g, '\\n'); }
         function skipClosed(read) {
           try { return read(); } catch (error) {
@@ -273,6 +273,19 @@ public enum RemoteTerminalAdapter {
           }
         }
         """
+        if goalWorkingComparison {
+            guard host == .terminal,agent == .codex,input.kind == .escape,!input.isRelay,CodexGoalScreen.workingReady(expected) else{throw RemoteHTTPError(400,"Goal 중단 비교 대상이 아닙니다.")}
+            helpers += #"""
+
+            const normalizeOriginal = normalize;
+            normalize = text => normalizeOriginal(text).split('\n').map(line => {
+              if (!/esc to interrupt|tab to queue/i.test(line)) return line;
+              return line.replace(/^[\u2800-\u28ff\s]+/u,'')
+                .replace(/\([^\n]*(?:esc to interrupt|tab to queue)[^\n]*\)/ig,'(busy)')
+                .replace(/\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|m|mins?|h|hrs?)\b/g,'time');
+            }).join('\n');
+            """#
+        }
         if host == .terminal {
             let delivery = terminalKeyboard ? """
               window.miniaturized = false; window.selectedTab = tab; window.index = 1; app.activate();

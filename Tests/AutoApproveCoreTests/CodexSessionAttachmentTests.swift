@@ -198,3 +198,22 @@ extension ApprovalTests {
         try expectFalse(CodexGoalScreen.ready(raw.replacingOccurrences(of:"› Ask Codex to do anything",with:"› UNSENT-DRAFT")))
     }
 }
+
+extension ApprovalTests {
+    func testCodexUnsentGoalPauseKeepsExplicitRetry() async throws {
+        var state=attachmentPlan();state.phase = .needsPause
+        state.goalBeforePause=CodexGoal(threadId:"00000000-0000-4000-8000-000000000061",objective:"Owned Goal",status:.active,createdAt:100,updatedAt:110)
+        let service=CodexSessionAttachmentServices(exit:{throw AppError.message("Unexpected exit")},shellReady:{false},launch:{false},verify:{false},pause:{throw RemoteHTTPError(409,"Owned input unavailable",diagnostics:["delivery":"not_started"])})
+        state=try await service.advance(state,save:{_ in})
+        let row=try JSONSerialization.jsonObject(with:JSONEncoder().encode(state)) as! [String:Any]
+        try expectEqual(row["pauseNotStarted"] as? Bool,true,"Known unsent input must retain explicit retry without replaying unknown writes")
+        try expect(state.canRetryUnsentGoalPause)
+        var legacy=state;legacy.pauseNotStarted=nil;legacy.detail="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다."
+        let restored=try JSONDecoder().decode(CodexSessionAttachment.self,from:JSONEncoder().encode(legacy))
+        try expect(restored.canRetryUnsentGoalPause,"0.2.246 confirmed no-write result remains explicitly retryable")
+        legacy.detail="자동 연결 보류: unknown acknowledgement"
+        try expectFalse(legacy.canRetryUnsentGoalPause)
+        legacy.pausedGoal=legacy.goalBeforePause;legacy.detail="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다."
+        try expectFalse(legacy.canRetryUnsentGoalPause,"Never replay an already observed pause")
+    }
+}
