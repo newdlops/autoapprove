@@ -721,6 +721,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("LAN updates: reject unsafe ZIP paths, links, duplicates and bombs", tests.testLANUpdateArchiveRejectsTraversalLinksDuplicatesAndBombs),
             ("LAN updates: preference persists across engine restart", tests.testLANUpdatePreferenceSurvivesEngineRestart),
             ("Account transition: sequential normal stops await actual idle before shared restart", tests.testAccountTransitionSequentialStopsAwaitActualIdle),
+            ("Account transition: hold is scoped to verified server cohorts across restoration",tests.testAccountTransitionHoldIsScopedToVerifiedServerCohort),
             ("Account transition: engine opt-in and durable hold survive app restart", tests.testAccountTransitionEngineOptInAndJournalSurviveRestart),
             ("Account transition: engine hold blocks real approval dispatch and preserves preferences", tests.testAccountTransitionEngineHoldBlocksRealDispatchAndKeepsAutomaticSettings),
             ("Account transition: same account, logout and queue/background/goal barriers", tests.testAccountTransitionSameAccountLogoutAndBarriers),

@@ -69,8 +69,97 @@ private final class AccountTargetList: @unchecked Sendable {
     func show() { lock.lock(); listed = true; lock.unlock() }
     func read() -> [CodexAccountTransitionTarget] { lock.lock(); defer { lock.unlock() }; return listed ? [target] : [] }
 }
+private final class AccountMembershipList: @unchecked Sendable {
+    private let lock=NSLock()
+    private var failed=false
+    let targets:[CodexAccountTransitionTarget]
+    init(_ targets:[CodexAccountTransitionTarget]) {self.targets=targets}
+    func fail(_ value:Bool) {lock.lock();failed=value;lock.unlock()}
+    func read() throws ->[CodexAccountTransitionTarget] {
+        lock.lock();defer{lock.unlock()}
+        if failed {throw AppError.message("Synthetic membership observation failure")}
+        return targets
+    }
+}
+private final class AccountPendingRead: @unchecked Sendable {
+    private let lock=NSLock(),gate=DispatchSemaphore(value:0)
+    private var armed=false,entered=false
+    let records:[ProcessRecord]
+    init(_ records:[ProcessRecord]) {self.records=records}
+    func arm() {lock.lock();armed=true;entered=false;lock.unlock()}
+    var waiting:Bool {lock.lock();defer{lock.unlock()};return entered}
+    func release() {gate.signal()}
+    func read()->[ProcessRecord] {
+        lock.lock();let block=armed;armed=false;if block {entered=true};lock.unlock()
+        if block {_ = gate.wait(timeout:.now()+5)}
+        return records
+    }
+}
 
 extension ApprovalTests {
+    func testAccountTransitionHoldIsScopedToVerifiedServerCohort() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-scope-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let records=ProcessDiscovery.parse("41 1 ttys971 41 41 Wed Oct 21 09:00:00 2026 /fixture/codex\n42 1 ttys972 42 42 Wed Oct 21 09:00:01 2026 /fixture/codex\n43 1 ttys973 43 43 Wed Oct 21 09:00:02 2026 /fixture/codex")
+        let sessions=records.map {record -> AgentSession in
+            var s=AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/"+record.tty,cwd:"/fixture",terminal:.iterm)
+            s.channel = .itermScreen;return s
+        }
+        let r=AccountTransitionRig(),probe=AccountInputProbe(),pending=AccountPendingRead(records)
+        defer{pending.release()}
+        r.target.witnesses=[.init(pid:41,started:sessions[0].started,tty:sessions[0].tty,threadID:"a")]
+        let target=r.target,independent=CodexAccountTransitionTarget(home:"/fixture/independent",executable:"/fixture/codex",witnesses:[.init(pid:42,started:sessions[1].started,tty:sessions[1].tty,threadID:"other")])
+        let membership=AccountMembershipList([target,independent])
+        var services=r.services
+        services.observe={candidate in
+            if candidate.home==independent.home {return .init(savedAccount:"independent",serverAccount:"independent",serverID:"independent-server",threads:[])}
+            return r.observation
+        }
+        let paths=AppPaths(directory:root)
+        func make() throws -> ApprovalEngine {
+            let e=try ApprovalEngine(paths:paths,processReader:{pending.read()},screenAdapters:[.iterm:probe.adapter],codexAccountTransitions:services,codexAccountTargets:{_ in try membership.read()})
+            e.updateDiscovery(sessions,records:records)
+            for s in sessions {try e.setAutomatic(s.id,enabled:true)}
+            return e
+        }
+        var engine=try make();defer{engine.stop()}
+        pending.arm()
+        engine.receiveScreen(sessionID:sessions[1].id,raw:AccountInputProbe.prompt,generation:"independent-before-hold")
+        let readDeadline=Date().addingTimeInterval(3)
+        while !pending.waiting,Date()<readDeadline {try await Task.sleep(for:.milliseconds(10))}
+        try expect(pending.waiting,"The independent approval must be awaiting live process verification")
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions()
+        pending.release()
+        let queuedDeadline=Date().addingTimeInterval(3)
+        while probe.writes==0,Date()<queuedDeadline {try await Task.sleep(for:.milliseconds(20))}
+        try expect(probe.writes>0,"Activating another home's hold must not invalidate an independently queued approval")
+        for restored in [false,true] {
+            if restored {engine.stop();engine=try make();await engine.checkCodexAccountTransitions()}
+            let views=engine.remoteSessionViews()
+            func held(_ index:Int)->Bool {views.first{$0.session.id==sessions[index].id}?.inputReason?.contains("계정 전환") == true}
+            try expect(held(0),"The exact original cohort must retain its transition barrier")
+            try expectFalse(held(1),"A verified independent home must not inherit another home's transition hold")
+            try expect(held(2),"An unknown home must remain conservative until its independence is proved")
+        }
+        let prior=probe.writes
+        engine.receiveScreen(sessionID:sessions[1].id,raw:AccountInputProbe.prompt,generation:"independent-server-approval")
+        let deadline=Date().addingTimeInterval(3)
+        while probe.writes==prior,Date()<deadline {try await Task.sleep(for:.milliseconds(20))}
+        try expect(probe.writes>prior,"Independent approval must reach its real injected transport while another home is held")
+        membership.fail(true)
+        await engine.checkCodexAccountTransitions()
+        try expect(engine.remoteSessionViews().first{$0.session.id==sessions[1].id}?.inputReason?.contains("계정 전환") == true,
+                   "A failed membership read must invalidate the prior independent-server release")
+        membership.fail(false)
+        let priorEffects=r.effects,refreshDeadline=Date().addingTimeInterval(5)
+        while engine.remoteSessionViews().first(where:{$0.session.id==sessions[1].id})?.inputReason?.contains("계정 전환") == true,Date()<refreshDeadline {
+            try await Task.sleep(for:.milliseconds(20))
+        }
+        try expectFalse(engine.remoteSessionViews().first{$0.session.id==sessions[1].id}?.inputReason?.contains("계정 전환") == true,
+                        "The independent read-only refresh must restore approval without advancing another home's transition")
+        try expectEqual(r.effects,priorEffects,"Membership refresh must never interrupt or restart native work")
+    }
     func testAccountReconnectJoinsExistingTransitionWithoutNewRestart() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-reconnect-join-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}

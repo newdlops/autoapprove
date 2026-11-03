@@ -387,6 +387,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var codexManagedServerStartTask:Task<CodexManagedServerStatus,Error>?
     private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
     private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
+    private var codexAccountObservedTargets: [CodexAccountTransitionTarget] = []
+    private var codexAccountMembershipVerifiedAt:Date?
+    private var codexAccountMembershipRefreshTask:Task<Void,Never>?
     private var codexAccountTransitionTask: Task<Void, Never>?
     private var codexAccountCheckTask:Task<Void,Never>?
     private var codexAccountNativeWakePending=false
@@ -398,8 +401,60 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var recordedNativeCodexLoginIDs:Set<String>=[]
     private func codexAccountInputHeld(_ id: String) -> Bool {
         guard let session=sessions[id],session.agent == .codex else{return false}
-        return codexAccountTransitionHeld || codexAttachmentActiveIDs.contains(id) || codexSessionAttachments.values.contains {
+        return codexAccountTransitionInputHeld(session) || codexAttachmentActiveIDs.contains(id) || codexSessionAttachments.values.contains {
             [.needsPause,.pauseReserved,.waitingPause,.needsTab,.tabReserved,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase) && ($0.context.session.tty==session.tty || ($0.replacesTab && "/dev/"+$0.context.shell.tty==session.tty))
+        }
+    }
+    private func codexAccountTransitionInputHeld(_ session:AgentSession,home:String?=nil)->Bool {
+        let held=codexAccountTransitionStates.filter {key,state in state.held && (home==nil || home==key)}
+        guard !held.isEmpty else{return false}
+        func matches(_ witness:CodexAccountTransitionWitness)->Bool {
+            witness.pid==session.pid && witness.started==session.started && witness.tty==session.tty
+        }
+        // Retain the original barrier even while its socket disappears during
+        // restart. PID alone cannot authorize a reused process or terminal.
+        if held.values.contains(where:{$0.witnesses.contains(where:matches)}) {return true}
+        guard codexAccountMembershipFresh else{return true}
+        let homes=Set(codexAccountObservedTargets.filter{$0.witnesses.contains(where:matches)}.map(\.home))
+        // Release unrelated inputs only with positive, unambiguous evidence of
+        // a different server. Unknown clients retain the conservative barrier.
+        guard homes.count==1,let connected=homes.first else{return true}
+        return held[connected] != nil
+    }
+    private var codexAccountMembershipFresh:Bool {
+        guard let checked=codexAccountMembershipVerifiedAt else{return false}
+        let age=Date().timeIntervalSince(checked)
+        return age>=0 && age<8
+    }
+    private func updateCodexAccountMembership(_ targets:[CodexAccountTransitionTarget]) throws {
+        guard Set(targets.map(\.home)).count==targets.count else {throw AppError.message("같은 Codex 홈의 연결이 중복되어 전환을 보류했습니다.")}
+        codexAccountObservedTargets=targets;codexAccountMembershipVerifiedAt=Date()
+        if codexAccountTransitionHeld {startCodexAccountMembershipRefresh()}
+    }
+    private func startCodexAccountMembershipRefresh() {
+        guard codexAccountMembershipRefreshTask==nil,!remoteInputStopped else{return}
+        let epoch=codexAccountTransitionEpoch
+        codexAccountMembershipRefreshTask=Task { [weak self] in
+            // A daemon restart can await its graceful drain for several minutes.
+            // Membership has its own read-only loop, independent of that wait.
+            while !Task.isCancelled {
+                do {try await Task.sleep(for:.seconds(2))} catch {break}
+                guard let self,epoch==self.codexAccountTransitionEpoch,!self.remoteInputStopped,self.codexAccountTransitionHeld else{break}
+                do {
+                    let reader=self.processReader
+                    let records=try await Task.detached(priority:.utility){try reader()}.value
+                    let targets=try await self.codexAccountTargetReader(records)
+                    guard !Task.isCancelled,epoch==self.codexAccountTransitionEpoch else{break}
+                    let changed=targets != self.codexAccountObservedTargets || !self.codexAccountMembershipFresh
+                    try self.updateCodexAccountMembership(targets)
+                    if changed {self.publish()}
+                } catch {
+                    guard !Task.isCancelled,epoch==self.codexAccountTransitionEpoch else{break}
+                    self.codexAccountObservedTargets=[];self.codexAccountMembershipVerifiedAt=nil
+                    self.publish()
+                }
+            }
+            if let self,epoch==self.codexAccountTransitionEpoch {self.codexAccountMembershipRefreshTask=nil}
         }
     }
     private static let codexAccountHoldMessage = "계정 전환을 위해 Codex 작업을 중단·대기하고 있습니다. 전환 결과를 확인한 뒤 입력해주세요."
@@ -692,6 +747,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexNativeAttachmentTask?.cancel();codexNativeAttachmentTask=nil;codexNativeAttachmentPending.removeAll()
         codexAccountTransitionTask?.cancel(); codexAccountTransitionTask = nil
         codexAccountCheckTask?.cancel();codexAccountCheckTask=nil
+        codexAccountMembershipRefreshTask?.cancel();codexAccountMembershipRefreshTask=nil
+        codexAccountObservedTargets=[];codexAccountMembershipVerifiedAt=nil
         codexManagedServerAutomaticTask?.cancel();codexManagedServerAutomaticTask=nil
         codexManagedServerStartTask?.cancel();codexManagedServerStartTask=nil
         codexAccountTransitionBusy=false;codexAccountNativeWakePending=false
@@ -6473,6 +6530,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let targets = try await codexAccountTargetReader(records)
             guard !Task.isCancelled, epoch == codexAccountTransitionEpoch else { return }
             guard Set(targets.map(\.home)).count == targets.count else { throw AppError.message("같은 Codex 홈의 연결이 중복되어 전환을 보류했습니다.") }
+            try updateCodexAccountMembership(targets)
             let visible = ProcessDiscovery.sessions(records).filter { $0.agent == .codex && $0.phase != .ended }.count
             let covered = targets.reduce(0) { $0 + $1.witnesses.count }
             let homes=Set(targets.map(\.home))
@@ -6498,18 +6556,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             try self.store.set(Self.codexAccountJournalKey, String(decoding: JSONEncoder().encode(journal), as: UTF8.self))
                         }, changed: { [weak self] state in
                             guard let self, epoch == self.codexAccountTransitionEpoch else { return }
-                            let alreadyHeld = self.codexAccountTransitionHeld
                             let previous=self.codexAccountTransitionStates[home]
                             self.codexAccountTransitionStates[home] = state
                             if previous?.phase != state.phase {self.invalidateCodexAccountInspection(home:home)}
-                            if !alreadyHeld, state.held { self.holdCodexAccountInputs() }
+                            if previous?.held != true, state.held {
+                                self.holdCodexAccountInputs(home:home)
+                                self.startCodexAccountMembershipRefresh()
+                            }
                         })
                     codexAccountCoordinators[home] = coordinator
                     codexAccountTransitionStates[home] = coordinator.state
                 }
                 // A cancelled task cannot retract bytes already dispatched.
                 // Drain all owned input transports before interrupting a turn.
-                if codexAccountTransitionHeld, !codexAccountInputsDrained { continue }
+                if codexAccountTransitionStates[target.home]?.held == true, !codexAccountInputsDrained(home:target.home) { continue }
                 let native=agentAccounts.nativeCodexLogin
                 let nativeHome=native?.resolvedHome ?? native.flatMap{try? CodexAccountTransitionTarget.canonicalHome($0.home)}
                 if nativeHome==target.home,native?.active==true {continue}
@@ -6535,6 +6595,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         } catch {
             guard epoch == codexAccountTransitionEpoch else { return }
+            codexAccountObservedTargets=[];codexAccountMembershipVerifiedAt=nil
             codexAccountTransitionNotice = error.localizedDescription
         }
     }
@@ -6547,15 +6608,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try store.set(Self.codexAccountJournalKey, String(decoding: JSONEncoder().encode(journal), as: UTF8.self))
         codexAccountTransitionStates = journal
     }
-    private var codexAccountInputsDrained: Bool {
-        sessions.values.filter { $0.agent == .codex }.allSatisfy { session in
+    private func codexAccountInputsDrained(home:String)->Bool {
+        sessions.values.filter { $0.agent == .codex && codexAccountTransitionInputHeld($0,home:home) }.allSatisfy { session in
             !automaticInputBusy(session.id) && !remoteInputSessions.contains(session.id) && !sendingMessages.contains(session.id) &&
                 !changingGoals.contains(session.id) && !session.questions.contains { replyingQuestions.contains($0.id) }
         }
     }
-    private func holdCodexAccountInputs() {
-        revision &+= 1
-        for id in sessions.keys where sessions[id]?.agent == .codex {
+    private func holdCodexAccountInputs(home:String) {
+        // Each affected session has its own cancellation epoch and dispatch
+        // barrier. A global revision also cancels unrelated queued approvals.
+        for id in sessions.keys where sessions[id].map({$0.agent == .codex && codexAccountTransitionInputHeld($0,home:home)}) == true {
             automationRuntime.reset(id)
             screens[id]?.scheduledID = nil
             cancelCodexProgressCheck(id); codexProgressTrackers.removeValue(forKey: id)
