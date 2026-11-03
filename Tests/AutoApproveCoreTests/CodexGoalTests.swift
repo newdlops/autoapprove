@@ -110,3 +110,14 @@ extension ApprovalTests {
         changed.instanceID="replacement";try expect(changed.revision != goal?.revision)
     }
 }
+
+extension ApprovalTests {
+    func testCodexGoalWorkingReadinessPreservesVimAndDraft() throws {
+        let raw="• Working (1s • esc to interrupt)\n\n› Ask Codex to do anything\n\n? for shortcuts"
+        try expect(CodexGoalScreen.workingReady(raw))
+        try expect(CodexGoalScreen.workingReady(raw+"\nVim: Insert"))
+        for mode in ["Normal","Replace"] {try expectFalse(CodexGoalScreen.workingReady(raw+"\nVim: "+mode))}
+        try expectFalse(CodexGoalScreen.workingReady(raw.replacingOccurrences(of:"› Ask Codex to do anything",with:"› UNSENT-DRAFT")))
+        try expectFalse(CodexGoalScreen.workingReady("› Ask Codex to do anything\n? for shortcuts"))
+    }
+}

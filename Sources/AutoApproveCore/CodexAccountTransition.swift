@@ -112,7 +112,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             self.state.detail = "이전 전환 결과를 확인해주세요. 중단·서버 전환 명령을 다시 보내지 않았습니다."
         }
     }
-    public func check(now: Date = Date(), loginRequestID: String? = nil) async {
+    public func check(now: Date = Date(), loginRequestID: String? = nil,preStoppedGoals:[CodexAccountTransitionThread]=[]) async {
         guard !checking else { return }
         checking = true; defer { checking = false }
         do {
@@ -189,7 +189,15 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 next.phase = .stopping; next.account = account; next.serverID = observed.serverID
                 next.originalAccount = observed.serverAccount; next.loginRequestID = loginRequestID
                 next.resumeEnabled=services.resume != nil
-                next.threads = observed.threads.sorted { $0.id < $1.id }; next.witnesses = target.witnesses; next.since = now
+                next.threads = observed.threads.sorted { $0.id < $1.id }
+                for original in preStoppedGoals {
+                    guard let i=next.threads.firstIndex(where:{$0.id==original.id}),let prior=original.goal,prior.status == .active,
+                          !next.threads[i].active,next.threads[i].blocker==nil,next.threads[i].turnID==original.turnID,
+                          let goal=next.threads[i].goal,goal.status == .paused,goal.threadId==prior.threadId,goal.createdAt==prior.createdAt,goal.objective==prior.objective,goal.tokenBudget==prior.tokenBudget,
+                          prior.instanceID==nil || goal.instanceID==prior.instanceID else{continue}
+                    next.threads[i]=original;next.reservations[original.id]=original.stopToken
+                }
+                next.witnesses = target.witnesses; next.since = now
                 next.continuationHolds=observed.threads.filter{!$0.active}.reduce(into:[:]){$0[$1.id]=$1.stopToken}
                 next.detail = "계정 변경 감지 · \(next.threads.count)개 대화를 순차 중단할 준비 중"
                 state = next

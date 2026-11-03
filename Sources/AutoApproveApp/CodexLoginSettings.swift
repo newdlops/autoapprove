@@ -228,7 +228,7 @@ struct CodexLoginContent: View {
             if let reconnect {
                 HStack(spacing:8) {
                     Button("현재 로그인으로 세션 재연결",action:reconnect).disabled(active || loading || disabled || !canReconnect)
-                        .help(canReconnect ? "기존 터미널의 빈 입력 대기 세션을 같은 대화로 먼저 연결한 뒤 저장된 로그인을 적용합니다. 진행 중 작업·Goal·질문·초안은 대기합니다. 직접 요청한 시점에 확인한 상주 도구 호스트는 Codex 정상 종료 때 정리합니다.":"선택한 홈의 실제 연결을 먼저 확인해주세요. 로그인은 연결 확인 없이도 시작할 수 있습니다.")
+                        .help(canReconnect ? "기존 터미널을 같은 대화로 연결한 뒤 저장된 로그인을 적용합니다. 실행 중 Goal은 먼저 일시정지하고 작업 중단을 확인합니다. 질문·초안은 유지합니다. 직접 요청한 시점에 확인한 상주 도구 호스트는 Codex 정상 종료 때 정리합니다.":"선택한 홈의 실제 연결을 먼저 확인해주세요. 로그인은 연결 확인 없이도 시작할 수 있습니다.")
                     if let refreshTargets {
                         Button("연결 다시 확인",systemImage:"arrow.clockwise",action:refreshTargets).disabled(active || loading || disabled)
                             .help("이 Mac의 서버·세션 연결만 다시 읽습니다. 작업을 중단하거나 계정을 바꾸지 않습니다.")
@@ -241,7 +241,7 @@ struct CodexLoginContent: View {
                         .font(.caption).fixedSize(horizontal:false,vertical:true)
                 }
             }
-            Text("직접 세션 재연결을 요청하면 빈 입력 대기의 Codex를 정상 종료해 확인한 상주 도구 호스트를 정리합니다. 셸이 없으면 같은 창의 복구 탭으로 대화를 옮깁니다. 로그인 완료 후 연결이 확인된 관리형 Codex 작업을 순차 중단합니다. Goal은 일시정지하고 Codex 백그라운드 작업은 종료한 뒤 새 계정으로 전환합니다. 이 창을 닫아도 계속 진행합니다.")
+            Text("직접 재연결하면 실행 중 Goal을 먼저 일시정지하고 작업 중단을 확인합니다. 이후 Codex를 정상 종료해 확인한 상주 도구 호스트를 정리합니다. 셸이 없으면 같은 창의 복구 탭으로 대화를 옮깁니다. 로그인 완료 후 연결이 확인된 관리형 Codex 작업을 순차 중단합니다. Goal은 일시정지하고 Codex 백그라운드 작업은 종료한 뒤 새 계정으로 전환합니다. 이 창을 닫아도 계속 진행합니다.")
                 .font(.caption).fixedSize(horizontal: false, vertical: true)
         }
     }

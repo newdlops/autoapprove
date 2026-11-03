@@ -162,3 +162,39 @@ extension ApprovalTests {
         try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+agent))
     }
 }
+
+extension ApprovalTests {
+    func testCodexAttachmentGoalPauseWaitsBeforeExitAndNeverReplays() async throws {
+        let goal=CodexGoal(threadId:"00000000-0000-4000-8000-000000000061",objective:"Owned objective",status:.active,createdAt:100,updatedAt:110,instanceID:"goal")
+        var state=attachmentPlan(),pauses=0,exits=0,settled=false,saved:[CodexSessionAttachment.Phase]=[]
+        state.goalBeforePause=goal;state.phase = .needsPause
+        var paused=goal;paused.status = .paused
+        let service=CodexSessionAttachmentServices(exit:{exits+=1;return true},shellReady:{false},launch:{false},verify:{false},pause:{pauses+=1;try expectEqual(saved.last,.pauseReserved);return true},pauseReady:{settled ? paused:nil})
+        state=try await service.advance(state,save:{saved.append($0.phase)})
+        try expectEqual(state.phase,.waitingPause);try expectEqual(pauses,1);try expectEqual(exits,0)
+        state=try await service.advance(state,save:{saved.append($0.phase)})
+        try expectEqual(pauses,1);try expectEqual(exits,0)
+        settled=true;state=try await service.advance(state,save:{saved.append($0.phase)})
+        try expectEqual(state.phase,.ready);try expectEqual(state.pausedGoal,paused);try expectEqual(exits,0)
+        state=try await service.advance(state,save:{saved.append($0.phase)})
+        try expectEqual(exits,1);try expectEqual(pauses,1)
+        state.phase = .pauseReserved
+        let restored=try JSONDecoder().decode(CodexSessionAttachment.self,from:JSONEncoder().encode(state))
+        state=try await service.advance(restored,save:{_ in})
+        try expectEqual(state.phase,.review);try expectEqual(pauses,1);try expectEqual(exits,1)
+        var uncertain=attachmentPlan();uncertain.phase = .needsPause;uncertain.goalBeforePause=goal
+        let failing=CodexSessionAttachmentServices(exit:{throw AppError.message("Unexpected")},shellReady:{false},launch:{false},verify:{false},pause:{throw AppError.message("Unknown acknowledgement")})
+        uncertain=try await failing.advance(uncertain,save:{_ in})
+        try expectEqual(uncertain.phase,.review)
+    }
+}
+
+extension ApprovalTests {
+    func testCodexPausedGoalFooterUsesExplicitReadiness() throws {
+        let raw="Ready\n\n› Ask Codex to do anything\n\n? for shortcuts\nGoal paused (/goal resume)"
+        try expectEqual(ActivityDetector.detect(raw,agent:.codex).phase,.unknown,"Generic automation must continue holding paused Goals")
+        try expect(CodexGoalScreen.ready(raw))
+        try expect(CodexCapacityStop.detect(raw,agent:.codex)==nil,"A paused Goal never authorizes automatic blocked-Goal recovery")
+        try expectFalse(CodexGoalScreen.ready(raw.replacingOccurrences(of:"› Ask Codex to do anything",with:"› UNSENT-DRAFT")))
+    }
+}

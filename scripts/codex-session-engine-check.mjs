@@ -19,11 +19,11 @@ const server=net.createServer(socket=>{
 });
 try {
  await mkdir(root+'/home/.codex/app-server-control',{recursive:true});await symlink(root+'/daemon.sock',root+'/home/.codex/app-server-control/app-server-control.sock');
- execFileSync('/usr/bin/xcrun',['clang','Tests/fixtures/codex-session-engine.c','-o',root+'/codex'],{stdio:'inherit'});
+ execFileSync('/usr/bin/xcrun',['clang','Tests/fixtures/codex-session-engine.c','-lsqlite3','-o',root+'/codex'],{stdio:'inherit'});
  if(process.argv.includes('--tool-hosts')){await mkdir(root+'/ChatGPT.app/Contents/Resources/cua_node/bin',{recursive:true});await symlink(root+'/codex',root+'/ChatGPT.app/Contents/Resources/cua_node/bin/node');}
  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/AttachmentEngine'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-session-engine-check.swift','-o',root+'/check'],{stdio:'inherit',timeout:120000});
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(root+'/daemon.sock',resolve)});
- const args=[root,...process.argv.slice(2).filter(v=>['--expect-unresolved','--wrong-thread','--goal-wait','--login-shell','--manual-reconnect','--screen-disconnected','--no-shell','--wrong-window','--busy-replacement','--prepare-fails','--profile-command','--definite-retry','--tool-hosts','--auto-tool-wait','--cancel-before-exit','--cancel-and-retry','--linger-tool-host'].includes(v))],child=spawn(root+'/check',args,{stdio:['ignore','pipe','inherit']});let output='';child.stdout.on('data',d=>output+=d);
+ const args=[root,...process.argv.slice(2).filter(v=>['--expect-unresolved','--wrong-thread','--goal-wait','--login-shell','--manual-reconnect','--screen-disconnected','--no-shell','--wrong-window','--busy-replacement','--prepare-fails','--profile-command','--definite-retry','--tool-hosts','--auto-tool-wait','--cancel-before-exit','--cancel-and-retry','--linger-tool-host','--manual-goal','--pause-unconfirmed','--existing-managed','--native-goal-failure','--native-goal','--replace-login-manager','--idle-goal','--paused-goal','--retry-goal','--vim-goal','--delayed-goal-status'].includes(v))],child=spawn(root+'/check',args,{stdio:['ignore','pipe','inherit']});let output='';child.stdout.on('data',d=>output+=d);
  const status=await new Promise(resolve=>child.on('close',resolve));if(status!==0)throw Error('Production engine fixture failed');
  const report=JSON.parse(output.trim());if(!report.verified)throw Error('Missing engine proof');console.log(JSON.stringify({...report,controlRequests:requests}));
  }finally{

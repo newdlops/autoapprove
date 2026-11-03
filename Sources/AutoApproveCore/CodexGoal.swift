@@ -42,6 +42,10 @@ struct ManualGoalHold:Codable {
 public enum CodexGoalScreen {
     /// A lifecycle footer does not make the composer user text. Keep the CLI's
     /// own idle hint mandatory and reject working, Vim and permission menus.
+    public static func workingReady(_ raw:String)->Bool {
+        let footer=CodexResumeCheck.rows(raw).suffix(8).joined(separator:"\n")
+        return footer.range(of:#"Vim: (?:Normal|Replace)"#,options:.regularExpression)==nil && CodexProgressScreen.workingFingerprint(raw) != nil
+    }
     public static func ready(_ raw:String)->Bool {
         let rows=CodexResumeCheck.rows(raw)
         guard !CodexResumeCheck.blocked(rows),let composer=rows.lastIndex(where:CodexResumeCheck.isComposer) else {return false}

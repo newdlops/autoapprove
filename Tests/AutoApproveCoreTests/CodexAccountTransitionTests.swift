@@ -775,3 +775,20 @@ extension ApprovalTests {
         try expectEqual(p.state.phase, .review, "Server account alone cannot prove original TUI conversation reconnection")
     }
 }
+
+extension ApprovalTests {
+    func testAccountTransitionAdoptsOnlyExactPreviouslyPausedGoal() async throws {
+        for mode in 0..<4 {
+            let r=AccountTransitionRig();let active=CodexGoal(threadId:"a",objective:"Original",status:mode==3 ? .paused:.active,createdAt:100,updatedAt:110,instanceID:"original")
+            let original=CodexAccountTransitionThread(id:"a",turnID:"turn-a",continuable:true,cwd:"/fixture",modelProvider:"openai",goal:active,turnStatus:"interrupted")
+            var current=original;current.goal?.status = .paused
+            if mode==1 {current.turnID="new-turn"}
+            if mode==2 {current.goal?.instanceID="replacement"}
+            r.observation.threads=[current]
+            let c=r.coordinator();await c.check(loginRequestID:"request",preStoppedGoals:[original])
+            try expectEqual(c.state.reservations["a"],mode==0 ? "turn-a":nil)
+            try expectEqual(c.state.threads.first?.goal?.status,mode==0 ? .active:.paused)
+            try expect(r.effects.isEmpty,"Adoption only records prior stop; it never interrupts again")
+        }
+    }
+}

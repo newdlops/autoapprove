@@ -4,11 +4,16 @@ import Darwin
 /// Delivery reservations survive application restarts. Unknown exit/launch
 /// outcomes require review rather than replaying terminal input.
 public struct CodexSessionAttachment:Codable {
-    public enum Phase:String,Codable {case needsTab,tabReserved,ready,exitReserved,waitingShell,launchReserved,verifying,connected,review}
+    public enum Phase:String,Codable {case needsPause,pauseReserved,waitingPause,needsTab,tabReserved,ready,exitReserved,waitingShell,launchReserved,verifying,connected,review}
     public var context:SessionExitRecovery
     public var home:String
     public var phase:Phase = .ready
     public var detail:String = "원래 대화의 관리형 서버 연결을 준비합니다."
+    public var exitNotStarted:Bool?
+    public var goalBeforePause:CodexGoal?
+    public var pausedGoal:CodexGoal?
+    public var stoppedThread:CodexAccountTransitionThread?
+    public var continuationLoginRequestID:String?
     public var originalLogin:ProcessRecord?
     public var preparationNotStarted:Bool?
     /// Only the exact cohort captured by an explicit reconnect may be stopped.
@@ -58,9 +63,11 @@ public struct CodexSessionAttachment:Codable {
     public var shellReady:() async throws ->Bool
     public var launch:() async throws ->Bool
     public var verify:() async throws ->Bool
+    public var pause:(() async throws ->Bool)?
+    public var pauseReady:(() async throws ->CodexGoal?)?
     public var prepareReplacement:(() async throws ->ProcessRecord)?
-    public init(exit:@escaping()async throws->Bool,shellReady:@escaping()async throws->Bool,launch:@escaping()async throws->Bool,verify:@escaping()async throws->Bool,prepareReplacement:(()async throws->ProcessRecord)?=nil) {
-        self.exit=exit;self.shellReady=shellReady;self.launch=launch;self.verify=verify;self.prepareReplacement=prepareReplacement
+    public init(exit:@escaping()async throws->Bool,shellReady:@escaping()async throws->Bool,launch:@escaping()async throws->Bool,verify:@escaping()async throws->Bool,prepareReplacement:(()async throws->ProcessRecord)?=nil,pause:(()async throws->Bool)?=nil,pauseReady:(()async throws->CodexGoal?)?=nil) {
+        self.exit=exit;self.shellReady=shellReady;self.launch=launch;self.verify=verify;self.prepareReplacement=prepareReplacement;self.pause=pause;self.pauseReady=pauseReady
     }
     public func advance(_ original:CodexSessionAttachment,save:(CodexSessionAttachment)throws->Void) async throws ->CodexSessionAttachment {
         var state=original
@@ -76,6 +83,21 @@ public struct CodexSessionAttachment:Codable {
         }
         do {
             try Task.checkCancellation()
+            if state.phase == .pauseReserved {throw AppError.message("이전 Goal 중단 요청의 결과를 확인해주세요. 중단 입력을 반복하지 않습니다.")}
+            if state.phase == .needsPause {
+                guard state.goalBeforePause?.status == .active,let pause else{throw AppError.message("원래 Goal 중단 대상을 확인하지 못했습니다.")}
+                state.context.deadline=Date().addingTimeInterval(120)
+                try persist(.pauseReserved,"원래 Goal 일시정지·작업 중단 요청을 예약했습니다.")
+                guard try await pause() else{throw AppError.message("Goal 중단 요청의 전달 결과를 확인하지 못했습니다.")}
+                try persist(.waitingPause,"Goal 일시정지와 원래 작업의 실제 대기 상태를 확인합니다.")
+            }
+            if state.phase == .waitingPause {
+                guard let deadline=state.context.deadline,Date()<deadline else{throw AppError.message("Goal 중단 확인 시간이 지났습니다. 요청을 반복하지 않습니다.")}
+                guard let paused=try await pauseReady?() else{return state}
+                state.pausedGoal=paused;state.context.deadline=Date().addingTimeInterval(120)
+                try persist(state.replacesTab ? .needsTab:.ready,"원래 Goal 일시정지·작업 대기를 확인했습니다. 같은 대화를 서버에 연결합니다.")
+                return state
+            }
             if state.phase == .tabReserved {
                 state.authorizedToolHosts=nil
                 try persist(.review,"이전 복구 탭 준비의 결과를 확인하지 못했습니다. 새 탭을 반복해서 열거나 원래 Codex를 종료하지 않습니다.");return state
