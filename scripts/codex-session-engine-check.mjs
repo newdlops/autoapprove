@@ -26,4 +26,12 @@ try {
  const args=[root,...process.argv.slice(2).filter(v=>['--expect-unresolved','--wrong-thread','--goal-wait','--login-shell','--manual-reconnect','--screen-disconnected','--no-shell','--wrong-window','--busy-replacement','--prepare-fails','--profile-command','--definite-retry','--tool-hosts','--auto-tool-wait','--cancel-before-exit','--cancel-and-retry','--linger-tool-host'].includes(v))],child=spawn(root+'/check',args,{stdio:['ignore','pipe','inherit']});let output='';child.stdout.on('data',d=>output+=d);
  const status=await new Promise(resolve=>child.on('close',resolve));if(status!==0)throw Error('Production engine fixture failed');
  const report=JSON.parse(output.trim());if(!report.verified)throw Error('Missing engine proof');console.log(JSON.stringify({...report,controlRequests:requests}));
-}finally{for(const socket of sockets)socket.destroy();if(server.listening)await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true,maxRetries:8,retryDelay:100})}
+ }finally{
+ // The PTY manager can kill its foreground group before the CLI reaps its
+ // separate-group helper. Clean only this invocation's exact fixture paths.
+ const ownedRoots=new Set([root,cwd,root.replace(/^\/private\/tmp\//,'/tmp/')]);
+ const owned=()=>execFileSync('/bin/ps',['-axo','pid=,comm='],{encoding:'utf8'}).split('\n').map(v=>v.trim().match(/^(\d+)\s+(.+)$/)).filter(Boolean).filter(v=>[...ownedRoots].some(r=>v[2]===r+'/ChatGPT.app/Contents/Resources/cua_node/bin/node')).map(v=>Number(v[1]));
+ for(const pid of owned()){try{process.kill(pid,'SIGTERM')}catch(error){if(error.code!=='ESRCH')throw error}}
+ const deadline=Date.now()+4000;while(owned().length&&Date.now()<deadline)await new Promise(r=>setTimeout(r,50));
+ if(owned().length)throw Error('Owned fixture helpers did not stop');
+ for(const socket of sockets)socket.destroy();if(server.listening)await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true,maxRetries:8,retryDelay:100})}

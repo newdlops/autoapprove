@@ -54,3 +54,5 @@ Files: Sources/AutoApproveCore/TerminalSessionProfile.swift; Tests/AutoApproveCo
 
 - Cancellation, timeout and every explicit request return revoke unused grants. A consumed grant becomes a read-only shutdown witness, which blocks launch until each original PID/start identity has actually disappeared. The slow-shutdown and canceled-request regressions were reproduced before the fixes.
 - Default profiles that start a program instead of an empty shell remain unsupported for replacement preparation; preserve the original session and explain failure. Native Terminal replacement was not exercised on a user session.
+
+- Final harness cleanup check found separate-group synthetic helpers; scoped cleanup was added and ten Debug/Release scenarios rerun. No owned fixture processes remain; user processes were not signaled.
