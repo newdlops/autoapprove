@@ -3,7 +3,7 @@ import Foundation
 import CSQLite
 @testable import AutoApproveCore
 
-private final class GoalReturnFixture {
+final class GoalReturnFixture {
     let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-goal-return-"+UUID().uuidString)
     let thread="00000000-0000-4000-8000-000000000091"
     let store:AuditStore,journal:CodexMigrationJournal

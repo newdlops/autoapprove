@@ -10,6 +10,7 @@ struct CodexGoalReturnState:Codable,Equatable {
     var originalPayload:Data
     var stage:Stage = .prepared
     var result:Result?=nil
+    var rollout:CodexRolloutReturnState?=nil
 }
 final class CodexGoalReturn {
     private let journal:CodexMigrationJournal

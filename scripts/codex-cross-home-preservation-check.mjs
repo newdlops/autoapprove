@@ -21,6 +21,7 @@ assert.ok(!checkClearedSlot || restoreGoal);
 assert.ok(!checkSettings || restoreGoal);
 assert.ok(!checkRetirement || restoreGoal);
 assert.ok(!returnOriginal || restoreGoal&&process.argv.includes('--archive-source'));
+assert.ok(!returnOriginal || checkRetirement,'Direct return requires typed retirement and independent backup');
 const root=await mkdtemp('/private/tmp/aa-cross-home-'),children=[];
 const env={...process.env};for(const k of Object.keys(env))if(/TOKEN|API_KEY|CODEX_HOME|NODE_OPTIONS/.test(k))delete env[k];
 let requests=0;const requestBodies=[];
@@ -153,12 +154,18 @@ try{
   if(process.argv.includes('--archive-source')){
    closedRollout=await archivedRollout(b.home,id);
   }
-  const returning=path.join(c.home,relative);await mkdir(path.dirname(returning),{recursive:true});await copyFile(closedRollout,returning);
-  if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:73}));
+  const returning=path.join(c.home,relative);await mkdir(path.dirname(returning),{recursive:true});
+  if(!returnOriginal)await copyFile(closedRollout,returning);
+  if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:returnCleared?null:73}));
   if(returnOriginal&&checkRetirement){
    const result=JSON.parse(execFileSync(transfer,['--return-goal',b.home,c.home,id,closedRollout],{encoding:'utf8',timeout:10000}));
    assert.equal(result.exactGoalReturned,true);assert.equal(result.nativeOwnershipCommitted,false);
+   assert.equal(result.latestHistoryReturned,true);
    console.error(JSON.stringify({stage:'goal-storage-return',exactGoalReturned:true,nativeOwnershipCommitted:false,clearedSource:returnCleared}));
+   // The owned fixture has only this root and unrelated roots, no spawned
+   // subtree. A production unarchive adapter still needs complete scope proof.
+   const unarchived=await c.request('thread/unarchive',{threadId:id});
+   assert.equal(unarchived.thread.id,id);assert.equal(unarchived.thread.path,returning);
   }else assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
   const last=await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
   if(checkSettings){
@@ -168,12 +175,13 @@ try{
   const returned=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.deepEqual(returned.turns,expectedReturnTurns,'Return transfer must retain all latest user/assistant history');
   for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(last[key],start[key],key+' must survive return resume');
   assert.deepEqual((await c.request('thread/goal/get',{threadId:id})).goal,expectedReturnGoal);assert.equal(rowJSON(c.home),expectedReturnRow);
+  assert.equal(Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),Number(sql(b.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),'Native resume must retain the current source deferral, including its absence');
   assert.deepEqual((await b.request('thread/goal/get',{threadId:unselected})).goal,unselectedGoal);
   assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
   assert.ok((await b.request('thread/loaded/list',{})).data.includes(unselected));process.kill(b.pid,0);
   if(returnOriginal&&checkRetirement){
    assert.equal(JSON.parse(execFileSync(transfer,['--commit-goal-return',b.home,c.home,id],{encoding:'utf8',timeout:10000})).destinationOwnershipCommitted,true);
-   Object.assign(report,{retiredOwnerReturnVerified:true,clearedGoalNotResurrected:returnCleared,returnGoal:expectedReturnGoal});
+   Object.assign(report,{retiredOwnerReturnVerified:true,journaledArchiveReturn:true,clearedGoalNotResurrected:returnCleared,returnGoal:expectedReturnGoal});
   }
   Object.assign(report,{ownedHomes:returnOriginal?2:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,returnedToOriginalHome:returnOriginal,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
   if(checkClearedSlot){

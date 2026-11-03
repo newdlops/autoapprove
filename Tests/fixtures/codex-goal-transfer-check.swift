@@ -19,10 +19,13 @@ import Foundation
                 guard result == .applied || result == .unchanged else{throw AppError.message("Owned return not applied")}
                 let target=try CodexGoalTransferStore.captureSlot(home:a[3],threadID:a[4])
                 guard target.row==sourceRetirement.goal.row,target.continuationDeferred==sourceRetirement.goal.continuationDeferred else{throw AppError.message("Owned return differs")}
+                let history=CodexRolloutReturn(journal:journal)
+                _=try history.prepare(id:request.id,source:sourceRetirement)
+                guard try history.apply(id:request.id) == .applied,try history.observe(id:request.id) == .applied else{throw AppError.message("Owned history return differs")}
                 try backup.verify();try sourceRetirement.verifyCurrent()
                 try store.set("owned-goal-return-id",request.id)
                 try store.set("owned-goal-return-source",String(decoding:try JSONEncoder().encode(sourceRetirement),as:UTF8.self))
-                print("{\"verified\":true,\"exactGoalReturned\":true,\"nativeOwnershipCommitted\":false}")
+                print("{\"verified\":true,\"exactGoalReturned\":true,\"latestHistoryReturned\":true,\"nativeOwnershipCommitted\":false}")
                 return
             }
             if a.count==5,a[1]=="--commit-goal-return" {
@@ -32,7 +35,7 @@ import Foundation
                 guard let id=store.value("owned-goal-return-id"),let encoded=store.value("owned-goal-return-source"),let previous=try journal.owner(threadID:a[4]) else{throw AppError.message("Owned return intent missing")}
                 let source=try JSONDecoder().decode(CodexMigrationRetirement.self,from:Data(encoded.utf8))
                 let record=try journal.repair(id:id),engine=CodexGoalReturn(journal:journal),state=try engine.state(id:id)
-                guard state.stage == .verified,try engine.observe(id:id) == .applied,
+                guard state.stage == .verified,state.rollout?.stage == .verified,try engine.observe(id:id) == .applied,
                       let destination=record.homes.first(where:{$0.path==a[3]}) else{throw AppError.message("Owned verified return missing")}
                 _=try journal.complete(id:id,payload:JSONEncoder().encode(state),expectedRevision:record.revision,
                     ownership:[.init(threadID:a[4],previous:previous,destination:destination,retirement:source)])
