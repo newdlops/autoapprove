@@ -35,6 +35,12 @@ struct CodexMigrationJournalRecord:Codable,Equatable {
                     try previous.validate()
                     guard previous.threadID==change.threadID,homes.contains(previous.home),previous.home != change.destination else{throw CodexMigrationJournal.failure}
                 }
+                if let retired=change.retirement {
+                    try retired.validate()
+                    let source=Home(path:retired.goal.sourceHome,identity:retired.goal.homeIdentity)
+                    guard retired.goal.threadID==change.threadID,homes.contains(source),source != change.destination,
+                          change.previous.map({$0.home==source}) ?? true else{throw CodexMigrationJournal.failure}
+                }
             }
         }
     }
@@ -57,6 +63,7 @@ struct CodexMigrationOwner:Codable,Equatable {
 }
 struct CodexMigrationOwnerChange:Codable,Equatable {
     let threadID:String,previous:CodexMigrationOwner?,destination:CodexMigrationJournalRecord.Home
+    var retirement:CodexMigrationRetirement?=nil
 }
 
 final class CodexMigrationJournal {
@@ -245,10 +252,64 @@ final class CodexMigrationJournal {
               loaded.record.revision==expectedRevision,let handles=leases[id] else{throw Self.failure}
         let record=try CodexMigrationJournalRecord(id:id,revision:expectedRevision+1,homes:loaded.record.homes,payload:payload,previousDigest:loaded.record.digest,terminal:true,ownership:ownership)
         try record.validate()
-        for change in ownership {guard try owner(threadID:change.threadID)==change.previous else{throw Self.failure}}
+        for change in ownership {
+            guard try owner(threadID:change.threadID)==change.previous else{throw Self.failure}
+            try change.retirement?.verifyCurrent()
+        }
         for h in handles{try h.check()}
         try persist(record,expectedRevision:expectedRevision,handles:handles)
         return record
+    }
+    func retired(threadID:String,toHome:String,expectedOwner:CodexMigrationOwner)throws->CodexMigrationRetirement {
+        guard try owner(threadID:threadID)==expectedOwner else{throw Self.failure}
+        let destination=try Self.home(toHome)
+        guard destination != expectedOwner.home else{throw Self.failure}
+        var cursor:CodexMigrationOwner?=expectedOwner,seen=Set<String>()
+        while let current=cursor {
+            try current.validate()
+            guard seen.count<512,seen.insert(current.journalID).inserted,
+                  let loaded=try load(id:current.journalID),loaded.consistent,loaded.record.terminal,
+                  loaded.record.digest==current.journalDigest,
+                  let change=loaded.record.ownership?.first(where:{$0.threadID==threadID}),
+                  try CodexMigrationOwner.after(change,loaded.record)==current else{throw Self.failure}
+            if let retired=change.retirement,retired.goal.sourceHome==destination.path {
+                guard retired.goal.homeIdentity==destination.identity else{throw Self.failure}
+                try retired.verifyCurrent()
+                guard try owner(threadID:threadID)==expectedOwner else{throw Self.failure}
+                return retired
+            }
+            // Missing native retirement evidence is a gap, not permission to
+            // adopt an even older retired copy after a later untracked reuse.
+            guard change.retirement != nil else{throw Self.failure}
+            cursor=change.previous
+        }
+        throw Self.failure
+    }
+    func backupRetired(_ retirement:CodexMigrationRetirement,expectedOwner:CodexMigrationOwner,requestID:String,expectedRevision:Int)throws->CodexMigrationRetiredBackup {
+        let id=try Self.id(requestID)
+        guard let loaded=try load(id:id),loaded.consistent,!loaded.record.terminal,loaded.record.revision==expectedRevision,
+              let handles=leases[id],loaded.record.homes.contains(expectedOwner.home),
+              let destination=loaded.record.homes.first(where:{$0.path==retirement.goal.sourceHome}),
+              destination.identity==retirement.goal.homeIdentity,
+              try retired(threadID:retirement.goal.threadID,toHome:retirement.goal.sourceHome,expectedOwner:expectedOwner)==retirement,
+              let handle=handles.first(where:{$0.ref==destination}) else{throw Self.failure}
+        for h in handles{try h.check()}
+        let backup=try CodexMigrationRetiredBackup.create(retirement,owner:expectedOwner,request:loaded.record,directoryFD:handle.dirFD)
+        try verifyBackup(backup,expectedRevision:expectedRevision)
+        for h in handles{try h.check()}
+        return backup
+    }
+    func verifyBackup(_ backup:CodexMigrationRetiredBackup,expectedRevision:Int)throws {
+        let id=try Self.id(backup.requestID)
+        guard let loaded=try load(id:id),loaded.consistent,!loaded.record.terminal,loaded.record.revision==expectedRevision,
+              loaded.record.digest==backup.requestDigest,let handles=leases[id],
+              loaded.record.homes.contains(backup.currentOwner.home),
+              loaded.record.homes.contains(.init(path:backup.retirement.goal.sourceHome,identity:backup.retirement.goal.homeIdentity)),
+              try retired(threadID:backup.retirement.goal.threadID,toHome:backup.retirement.goal.sourceHome,expectedOwner:backup.currentOwner)==backup.retirement else{throw Self.failure}
+        for h in handles{try h.check()}
+        try backup.verify()
+        guard let fresh=try load(id:id),fresh.consistent,fresh.record==loaded.record,
+              try owner(threadID:backup.retirement.goal.threadID)==backup.currentOwner else{throw Self.failure}
     }
     func repair(id value:String)throws->CodexMigrationJournalRecord {
         let id=try Self.id(value);guard let initial=try load(id:id) else{throw Self.failure}

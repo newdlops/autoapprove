@@ -14,8 +14,10 @@ const requireGoal=process.argv.includes('--require-goal-preservation')||restoreG
 const returnOriginal=process.argv.includes('--return-original-home');
 const checkClearedSlot=process.argv.includes('--check-cleared-slot');
 const checkSettings=process.argv.includes('--check-settings');
+const checkRetirement=process.argv.includes('--check-retirement');
 assert.ok(!checkClearedSlot || restoreGoal);
 assert.ok(!checkSettings || restoreGoal);
+assert.ok(!checkRetirement || restoreGoal);
 assert.ok(!returnOriginal || restoreGoal&&process.argv.includes('--archive-source'));
 const root=await mkdtemp('/private/tmp/aa-cross-home-'),children=[];
 const env={...process.env};for(const k of Object.keys(env))if(/TOKEN|API_KEY|CODEX_HOME|NODE_OPTIONS/.test(k))delete env[k];
@@ -81,9 +83,9 @@ try{
  const before=JSON.parse(sql(a.home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`));
  assert.equal(before.tokens_used,37);assert.equal(before.time_used_seconds,19);
  a=await server(a.home);await a.request('thread/resume',{threadId:id});const sourceGoal=(await a.request('thread/goal/get',{threadId:id})).goal;assert.equal(sourceGoal.tokensUsed,37);assert.equal(sourceGoal.timeUsedSeconds,19);
- if(returnOriginal)await a.request('thread/archive',{threadId:id});await a.stop();
+ if(returnOriginal||checkRetirement)await a.request('thread/archive',{threadId:id});await a.stop();
  if(restoreGoal)sql(a.home,`INSERT OR IGNORE INTO thread_goal_continuation_deferrals(thread_id) VALUES ('${id}');`);
- const firstRollout=returnOriginal ? await archivedRollout(a.home,id):source.path;
+ const firstRollout=returnOriginal||checkRetirement ? await archivedRollout(a.home,id):source.path;
  const b=await server(root+'/b'),destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(firstRollout,destination);assert.notEqual((await stat(firstRollout)).ino,(await stat(destination)).ino);
  let unselected,unselectedGoal;
  if(restoreGoal){
@@ -108,6 +110,16 @@ try{
   const rowJSON=home=>sql(home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`);
   assert.equal(rowJSON(b.home),rowJSON(a.home),'Native resume must retain exact Goal instance and millisecond counters');
   console.error(JSON.stringify({stage:'first-transfer',sameUUID:true,exactGoalRow:true,publicGoal:true,unselectedGoal:true}));
+  if(checkRetirement){
+   assert.equal(JSON.parse(execFileSync(transfer,['--record-retirement',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:10000})).nativeRetirementWitnessed,true);
+   const originalRow=rowJSON(a.home),originalHistory=await readFile(firstRollout);
+   const receipt=JSON.parse(execFileSync(transfer,['--backup-retired',a.home,b.home,id],{encoding:'utf8',timeout:10000}));
+   assert.equal(receipt.retiredBackupVerified,true);assert.equal(receipt.goalReplacementPerformed,false);
+   const recovered=JSON.parse(execFileSync(transfer,['--verify-retired-backup',root],{encoding:'utf8',timeout:10000}));
+   assert.equal(recovered.backupSurvivedProcessExit,true);assert.equal(recovered.cancelledReservationRejected,true);
+   assert.equal(rowJSON(a.home),originalRow);assert.deepEqual(await readFile(firstRollout),originalHistory);
+   Object.assign(report,{nativeRetirementAndIndependentBackup:true,backupPreservedOriginalGoalAndHistory:true,backupVerifiedAfterProcessExit:true,cancelledBackupDoesNotAuthorizeReplacement:true});
+  }
   const unsubscribed=await b.request('thread/unsubscribe',{threadId:id});assert.equal(unsubscribed.status,'unsubscribed');
   if(process.argv.includes('--archive-source'))await b.request('thread/archive',{threadId:id});
   const end=Date.now()+5000;let loaded;
