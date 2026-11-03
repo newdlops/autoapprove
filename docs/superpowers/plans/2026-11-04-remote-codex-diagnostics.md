@@ -10,7 +10,7 @@
 - [x] Implement isolated Codex request lifecycle, deduplication, structured results, bounded failure/cancellation and live service proof.
 - [x] Implement per-Mac UI with explicit diagnosis, progress, result/evidence, refresh and export; real browser QA.
 - [x] Integrate HTTP/CLI collection, verify Origin and exact node identity, active-diagnosis update/stop behavior.
-- [ ] Run relevant checks and source/UI review; release 0.2.249/build276 with signed assets and checksums, install/verify locally and test target-Mac diagnostics.
+- [x] Run relevant checks and source/UI review; release 0.2.249/build276 with signed assets and checksums, install/verify locally and test target-Mac diagnostics.
 
 Independent runner and UI files follow .runtime/diagnostics-249/contract.md during implementation. They do not edit the shared engine, routing or registry.
 
