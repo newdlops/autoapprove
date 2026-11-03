@@ -32,6 +32,8 @@ import AutoApproveCore
                 for index in sessions.indices { sessions[index].cwd = directories[sessions[index].pid] ?? "" }
                 let data = try JSONEncoder().encode(sessions)
                 try printJSON(JSONSerialization.jsonObject(with: data))
+            case "diagnostics":
+                try printJSON(SocketClient.request(path:paths.socket,message:["method":"diagnostics"],timeout:25))
             case "doctor":
                 var versions: [String: Any] = [
                     "socket": paths.socket,
@@ -108,6 +110,7 @@ import AutoApproveCore
 
                   autoapprove scan          Claude Code·Codex 세션 탐색 (읽기 전용)
                   autoapprove doctor        연결 상태 확인
+                  autoapprove diagnostics   진단 상태 조회 (읽기 전용)
                   autoapprove local-name status  이 Mac의 autoapprove 주소 설정 확인
                   autoapprove local-name apply   관리자 권한으로 이 Mac의 로컬 주소 설정
                   autoapprove mcp           휴대폰 질문·테스트 화면 공유 MCP (stdio)

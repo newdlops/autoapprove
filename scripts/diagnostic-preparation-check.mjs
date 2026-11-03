@@ -1,0 +1,3 @@
+import{execFileSync}from'node:child_process';import path from'node:path';import{coreLinkArguments,coreSwiftObjects}from'./swift-core-link.mjs';
+const build=path.resolve(process.env.AUTOAPPROVE_CHECK_BUILD??'.build/debug'),out=path.resolve('.runtime/diagnostics-249/preparation-check');
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/DiagnosticPreparation'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/diagnostic-preparation-check.swift','-o',out],{stdio:'inherit',timeout:120000});execFileSync(out,[],{stdio:'inherit',timeout:20000});

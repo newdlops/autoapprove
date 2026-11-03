@@ -1305,8 +1305,9 @@ function renderMachines() {
       row = make('article', 'machine'); const info = make('div', 'machine-info');
       const resetResult=make('p','error-text small machine-reset-result');resetResult.setAttribute('role','status');resetResult.hidden=true;
       info.append(make('p', 'machine-name'), make('p', 'machine-version'), make('p', 'machine-status'),resetResult);
-      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), reset=make('button','secondary machine-reset','모든 세션 초기화'), clean = make('button','secondary machine-clean','목록에서 정리'), accounts=make('button','secondary machine-accounts','AI 계정');
-      toggle.type = reset.type = clean.type = accounts.type = 'button'; actions.append(accounts,toggle,reset,clean); row.append(info,actions);
+      const actions = make('div','machine-actions'), toggle = make('button','secondary machine-toggle'), reset=make('button','secondary machine-reset','모든 세션 초기화'), clean = make('button','secondary machine-clean','목록에서 정리'), accounts=make('button','secondary machine-accounts','AI 계정'), diagnose=make('button','secondary machine-diagnostics','진단');
+      toggle.type = reset.type = clean.type = accounts.type = diagnose.type = 'button'; const inspect=make('div','machine-inspection-actions');inspect.append(accounts,diagnose);actions.append(inspect,toggle,reset,clean); row.append(info,actions);
+      diagnose.addEventListener('click',()=>void openDiagnostics(node.id));
       accounts.addEventListener('click',()=>void openAgentAccounts(node.id));
       reset.addEventListener('click',()=>void resetAllAutomations(node.id));
       clean.addEventListener('click',()=>cleanOfflineMacs([node.id]));
@@ -1326,6 +1327,7 @@ function renderMachines() {
     status.title = node.error || '';
     const button = row.querySelector('.machine-toggle'); text(button, node.online && node.state.snapshot.paused ? '재개' : '일시정지');
     button.disabled = mutation || !connected || !node.online;
+    const diagnose=row.querySelector('.machine-diagnostics');diagnose.disabled=!connected;diagnose.setAttribute('aria-label',`${node.name} 원격 진단`);diagnose.title='이 Mac의 연결 상태와 별도 Codex 진단을 확인합니다.';
     const accounts=row.querySelector('.machine-accounts');accounts.disabled=!connected||!node.online;accounts.setAttribute('aria-label',`${node.name} AI 계정 로그인`);show(accounts,node.online);
     button.setAttribute('aria-label', `${node.name} 자동 승인 ${node.online && node.state.snapshot.paused ? '재개' : '일시정지'}`);
     button.title = !node.online ? 'Mac의 웹 접속이 다시 연결되면 사용할 수 있습니다.' : '이 Mac의 자동 승인만 변경합니다. 터미널 작업은 계속됩니다.';
@@ -3160,6 +3162,21 @@ window.addEventListener('online', () => {
   void refreshNetwork(false,true); void refreshFrame();
 });
 window.addEventListener('hashchange', restoreSelection);
+let diagnosticsModuleLoading,diagnosticsUI;
+async function openDiagnostics(id){
+  const node=nodes.find(item=>item.id===id);if(!node)return;
+  try{
+    if(!window.AutoApproveDiagnostics){
+      if(!diagnosticsModuleLoading)diagnosticsModuleLoading=new Promise((resolve,reject)=>{
+        const script=document.createElement('script');script.src='/diagnostics.js';
+        const timer=setTimeout(()=>{script.remove();diagnosticsModuleLoading=null;reject(Error('진단 화면을 받지 못했습니다. 다시 눌러주세요.'));},8000);
+        script.onload=()=>{clearTimeout(timer);resolve();};script.onerror=()=>{clearTimeout(timer);script.remove();diagnosticsModuleLoading=null;reject(Error('진단 화면을 불러오지 못했습니다. 다시 눌러주세요.'));};document.head.append(script);
+      });await diagnosticsModuleLoading;
+    }
+    if(!diagnosticsUI)diagnosticsUI=new window.AutoApproveDiagnostics({api,endpoint,uuid});
+    await diagnosticsUI.open(node);
+  }catch(error){feedback(error.message,true);}
+}
 let accountModuleLoading,accountUI;
 async function openAgentAccounts(id){
   const node=nodes.find(item=>item.id===id);if(!node?.online)return;

@@ -1670,6 +1670,16 @@ struct RemoteTerminalUpdate: Encodable {
                 case "/vendor/xterm.js", "/vendor/xterm-fit.js": return try asset(String(request.path.dropFirst()), type: "text/javascript; charset=utf-8")
                 case "/vendor/xterm.css": return try asset("vendor/xterm.css", type: "text/css; charset=utf-8")
                 case "/favicon.svg": return try asset("favicon.svg", type: "image/svg+xml")
+                case "/diagnostics.js": return try asset("diagnostics.js",type:"text/javascript; charset=utf-8")
+                case "/diagnostics.css": return try asset("diagnostics.css",type:"text/css; charset=utf-8")
+                case "/api/diagnostics":
+                    if let forwarded=try await forward(request) {return forwarded}
+                    guard let engine else{throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
+                    return try .object(await engine.diagnostics(nodeID:nodeID,name:name))
+                case "/api/diagnostics/codex":
+                    if let forwarded=try await forward(request) {return forwarded}
+                    guard let engine else{throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
+                    return try .object(engine.diagnosticCodexStatus(requestID:request.parameter("request")))
                 case "/api/state":
                     if let forwarded = try await forward(request) { return forwarded }
                     return try .json(localState())
@@ -1799,6 +1809,10 @@ struct RemoteTerminalUpdate: Encodable {
             }
             let object = try request.json()
             switch request.path {
+            case "/api/diagnostics/codex":
+                if let forwarded=try await forward(request) {return forwarded}
+                guard let engine else{throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}
+                return try await .object(engine.diagnosticCodexAction(object,nodeID:nodeID,name:name))
             case "/api/agent-account":
                 if let forwarded=try await forward(request) {return forwarded}
                 guard let engine else {throw RemoteHTTPError(503,"Mac에 다시 연결해주세요.")}

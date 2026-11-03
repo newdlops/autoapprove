@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CoreGraphics
 import TerminalInputSupport
 
 private struct ScreenAnalysisStorageKey: Hashable {
@@ -40,6 +41,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let nativeKeyboardActivity:NativeKeyboardActivity
     let publishedUpdateServices:PublishedUpdateServices
     public let managedPTY: ManagedPTYManager
+    public let codexDiagnostics:CodexDiagnostics
+    private let diagnosticEnvironment:@Sendable(ProcessRecord)->[String:String]?
+    private var diagnosticRequestIntents:[String:String]=[:]
+    private var diagnosticCollectingRequest:String?
+    private var diagnosticPreparations:[String:CodexDiagnosticJob]=[:]
+    private var diagnosticPreparationTask:Task<Void,Never>?
+    private var latestDiagnosticRequestID:String?
     public var agentAccounts=AgentAccounts() {didSet {configureNativeCodexLogin()}}
     let accountPINReader=RemoteAccountPINReader()
     public let webQuestions = WebQuestionInbox()
@@ -415,7 +423,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live,
                 codexAccountTransitions:CodexAccountTransitionServices? = nil,
                 codexAccountTargets:(@Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget])? = nil,
-                codexManagedServers:CodexManagedServerServices = .live) throws {
+                codexManagedServers:CodexManagedServerServices = .live,diagnosticServices:CodexDiagnosticServices = .live) throws {
+        self.codexDiagnostics=CodexDiagnostics(services:diagnosticServices)
+        if processReader==nil {self.diagnosticEnvironment={ProcessEnvironment.read($0)}}
+        else {self.diagnosticEnvironment={_ in nil}}
         self.codexManagedServerServices=codexManagedServers
         self.codexAccountTransitionServices = codexAccountTransitions ?? .live
         let accountTargetReader:@Sendable([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
@@ -673,6 +684,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         osPermissionTransitions.removeAll()
         osPermissionTask?.cancel();osPermissionTask=nil
         accountPINReader.invalidate()
+        diagnosticPreparationTask?.cancel()
+        for (id,var job) in diagnosticPreparations where job.phase=="running" {job.phase="cancelled";job.message="앱 종료로 진단 준비를 취소했습니다.";diagnosticPreparations[id]=job}
+        codexDiagnostics.stop()
         agentAccounts.stop()
         tunnelStartEpoch = UUID()
         tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
@@ -771,6 +785,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     func updateWaitReason(allowTunnelRestart:Bool) -> String? {
         if cloudflareStatus.busy || tunnelPINSetupID != nil {return "외부 접속 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
         if tunnelStatus.active && (!allowTunnelRestart || tunnelStatus.provider == .quick) { return tunnelStatus.provider == .quick && allowTunnelRestart ? "임시 주소는 앱 재시작 시 바뀝니다. Mac에서 임시 연결을 종료하면 업데이트합니다." : "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
+        if codexDiagnostics.busy || diagnosticCollectingRequest != nil {return "Codex 진단이 진행 중입니다. 완료하거나 취소한 뒤 업데이트합니다."}
         if agentAccounts.busy {return "AI 계정 로그인이 진행 중입니다. 인증을 마치거나 취소한 뒤 업데이트합니다."}
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||
@@ -1929,6 +1944,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case "get_user_answers":
             guard let id = object["requestID"] as? String else { throw RemoteHTTPError(400, "질문 ID를 지정해주세요.") }
             return ["request": try encoded(webQuestions.get(id, owner: owner))]
+        case "get_diagnostics": return await diagnostics()
         case "list_screens": return ["sources": try await encoded(testScreens.availableSources())]
         case "start_screen_share":
             guard webStatus.ready else { throw RemoteHTTPError(409, "Mac에서 AutoApprove 웹 접속을 켠 뒤 공유해주세요.") }
@@ -4617,6 +4633,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             claudeHookWaitTasks[peer.id] = (token, task)
             return
         }
+        if method == "diagnostics" {
+            Task { @MainActor [weak self] in
+                guard let self else{return}
+                var response:JSONObject=["result":await self.diagnostics()]
+                if let id=message["id"] {response["id"]=id}
+                _ = peer.send(response)
+            }
+            return
+        }
         if method == "mcp" {
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -6025,11 +6050,125 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 live=try await Task.detached(priority:.utility){try reader()}.value
             }
-            let review=codexSessionAttachments.values.filter{$0.home==home && $0.phase == .review}.sorted{$0.context.session.pid<$1.context.session.pid}
+            // This notice is global: a later healthy home must not erase
+            // another home's still-live blocker. Preserve the journal itself.
+            let review=RemoteDiagnostics.currentReviews(Array(codexSessionAttachments.values),records:live).sorted{$0.context.session.pid<$1.context.session.pid}
+            let progress=codexSessionAttachments.values.filter{$0.phase != .review && $0.phase != .connected && RemoteDiagnostics.isCurrent($0,records:live)}.sorted{$0.context.session.pid<$1.context.session.pid}
+            let pending=codexAttachmentWaitReasons.filter{key,_ in live.contains(where:{$0.key==key}) && !connectedIDs.contains(key)}.sorted{$0.key<$1.key}
             if let first=review.first {codexSessionAttachmentNotice="기존 세션 \(review.count)개 확인 필요 · PID \(first.context.session.pid): "+first.detail}
-            else if waiting>0 {codexSessionAttachmentNotice="기존 세션 \(waiting)개 연결 대기\n"+waitDetails.joined(separator:"\n")}
+            else if let first=progress.first {codexSessionAttachmentNotice="기존 세션 \(progress.count)개 연결 중 · PID \(first.context.session.pid): "+first.detail}
+            else if !pending.isEmpty {
+                let details=pending.map {id,reason in
+                    guard let session=snapshot.sessions.first(where:{$0.id==id}) else{return "• "+reason}
+                    return "• "+session.project+" · "+session.tty.replacingOccurrences(of:"/dev/",with:"")+": "+reason
+                }
+                codexSessionAttachmentNotice="기존 세션 \(pending.count)개 연결 대기\n"+details.joined(separator:"\n")
+            } else {codexSessionAttachmentNotice=nil}
         } catch {codexSessionAttachmentNotice="기존 세션 자동 연결 보류: "+String(error.localizedDescription.prefix(240))}
     }
+    /// Returns a bounded, allowlisted diagnostic report. Collection never starts
+    /// a daemon, sends terminal input, reads auth files or changes a Goal.
+    public func diagnostics(nodeID:String?=nil,name:String?=nil) async -> JSONObject {
+        let sessionCopy=snapshot.sessions,journal=Array(codexSessionAttachments.values),transitions=codexAccountTransitionStates,eventCopy=snapshot.events
+        let reader=processReader,targetReader=codexAccountTargetReader,services=codexManagedServerServices
+        var failures:[String]=[],rows:[ProcessRecord]?,targets:[CodexAccountTransitionTarget]?
+        do {rows=try await Task.detached(priority:.utility){try reader()}.value}
+        catch {failures.append("프로세스 목록을 읽지 못했습니다. 원본 실행은 확인 불가로 표시합니다.")}
+        if let rows {
+            do {targets=try await targetReader(rows)}
+            catch {failures.append("관리형 서버의 실제 세션 연결 증거를 읽지 못했습니다.")}
+        }
+        var homes=Set((targets ?? []).map(\.home))
+        if let home=try? CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex"){homes.insert(home)}
+        for row in (rows ?? []).filter({$0.agent == .codex}) {
+            if let raw=diagnosticEnvironment(row)?["CODEX_HOME"],let home=try? CodexAccountTransitionTarget.canonicalHome(raw){homes.insert(home)}
+        }
+        for state in journal.prefix(8) {homes.insert(state.home)}
+        var statuses:[String:CodexManagedServerStatus]=[:]
+        let selected=Array(homes.sorted().prefix(8)),records=rows ?? []
+        await withTaskGroup(of:(String,CodexManagedServerStatus).self) {group in
+            for home in selected {group.addTask {
+                let state=await withTaskGroup(of:CodexManagedServerStatus.self) {race in
+                    race.addTask {do{return try await services.inspect(home,records)}catch{return .init(phase:.unavailable,detail:"서버 상태 조회를 완료하지 못했습니다.")}}
+                    race.addTask {try? await Task.sleep(for:.seconds(6));return .init(phase:.unavailable,detail:"서버 상태 조회 시간이 지났습니다. 세션은 변경하지 않았습니다.")}
+                    let first=await race.next()!;race.cancelAll();return first
+                }
+                return (home,state)
+            }}
+            for await (home,status) in group {statuses[home]=status}
+        }
+        if homes.count>8 {failures.append("설정 홈이 많아 처음 8개만 조회했습니다.")}
+        let keyboard=TerminalKeyboard.isAvailable,posting=CGPreflightPostEventAccess(),direct=terminalInputAvailable()
+        let permissions:[JSONObject]=[
+            ["id":"accessibility","label":"손쉬운 사용","state":keyboard ? "ok":"attention","detail":keyboard ? "이 앱의 권한이 허용되어 있습니다.":"원래 창을 검증하는 키보드 입력에는 이 Mac의 승인이 필요합니다."],
+            ["id":"event_posting","label":"키 입력 권한","state":posting ? "ok":"attention","detail":posting ? "키 이벤트 게시가 허용되어 있습니다.":"이 앱의 키 이벤트 게시 허용을 확인해주세요."],
+            ["id":"direct_input","label":"직접 입력 도우미","state":direct ? "ok":"unavailable","detail":direct ? "기존 입력 도우미와 연결되어 있습니다.":"현재 도우미 연결을 확인하지 못했습니다. Goal 중단은 허용된 손쉬운 사용 경로도 사용합니다."]]
+        return RemoteDiagnostics.report(nodeID:nodeID ?? store.value("webNodeID") ?? "local",name:name ?? Host.current().localizedName ?? "Mac",sessions:sessionCopy,records:rows,targets:targets,servers:statuses,attachments:journal,transitions:transitions,events:eventCopy,permissions:permissions,errors:failures)
+    }
+    public func diagnosticCodexAction(_ object:JSONObject,nodeID:String,name:String) async throws -> JSONObject {
+        guard let action=object["action"] as? String,let request=object["requestID"] as? String,UUID(uuidString:request) != nil else{throw RemoteHTTPError(400,"진단 요청 ID를 확인해주세요.")}
+        if action=="cancel" {
+            if codexDiagnostics.status(requestID:request) != nil {return try diagnosticJobObject(codexDiagnostics.cancel(requestID:request))}
+            guard var preparation=diagnosticPreparations[request] else{throw RemoteHTTPError(404,"진단 요청을 찾을 수 없습니다.")}
+            if preparation.phase=="running" {
+                preparation.phase="cancelled";preparation.message="진단 자료 수집을 취소했습니다.";preparation.updatedAt=ISO8601DateFormatter().string(from:Date());diagnosticPreparations[request]=preparation
+                if diagnosticCollectingRequest==request {diagnosticPreparationTask?.cancel()}
+            }
+            return try diagnosticJobObject(preparation)
+        }
+        guard action=="start",!remoteInputStopped else{throw RemoteHTTPError(400,"지원하지 않는 진단 요청입니다.")}
+        guard !agentAccounts.busy else{throw RemoteHTTPError(409,"이 Mac의 로그인이 끝난 뒤 진단을 시작해주세요.",diagnostics:["delivery":"not_started"])}
+        let question=object["question"] as? String ?? "",serverID=object["serverID"] as? String ?? ""
+        guard question.count<=2000,serverID.count<=64 else{throw RemoteHTTPError(400,"진단 질문은 2,000자 이내로 입력해주세요.")}
+        let intent=String(decoding:try JSONSerialization.data(withJSONObject:["question":question,"serverID":serverID],options:.sortedKeys),as:UTF8.self)
+        if let previous=diagnosticRequestIntents[request] {
+            guard previous==intent else{throw RemoteHTTPError(409,"같은 진단 ID의 요청 내용이 다릅니다.")}
+            return try diagnosticCodexStatus(requestID:request)
+        }
+        guard !codexDiagnostics.busy,diagnosticCollectingRequest==nil else{throw RemoteHTTPError(409,"이 Mac의 다른 진단이 끝난 뒤 시작해주세요.")}
+        guard diagnosticRequestIntents.count<256 else{throw RemoteHTTPError(429,"진단 요청 한도에 도달했습니다. 앱을 다시 시작해주세요.")}
+        let stamp=ISO8601DateFormatter().string(from:Date())
+        let preparation=CodexDiagnosticJob(id:request,phase:"running",startedAt:stamp,updatedAt:stamp,message:"이 Mac의 진단 자료를 수집 중입니다.",result:nil)
+        diagnosticRequestIntents[request]=intent;diagnosticPreparations[request]=preparation;latestDiagnosticRequestID=request;diagnosticCollectingRequest=request
+        // Reservation is immediately observable. Losing the HTTP reply cannot
+        // hide preparation or silently create a second diagnostic child.
+        diagnosticPreparationTask=Task { @MainActor [weak self] in
+            guard let self else{return}
+            defer{if self.diagnosticCollectingRequest==request {self.diagnosticCollectingRequest=nil;self.diagnosticPreparationTask=nil}}
+            do {
+                let report=await self.diagnostics(nodeID:nodeID,name:name)
+                guard !Task.isCancelled,!self.remoteInputStopped,self.diagnosticPreparations[request]?.phase=="running" else{return}
+                let reader=self.processReader,records=try await Task.detached(priority:.utility){try reader()}.value
+                var allowed=Set<String>()
+                for target in (try? await self.codexAccountTargetReader(records)) ?? [] {allowed.insert(target.home)}
+                if let home=try? CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex"){allowed.insert(home)}
+                for row in records where row.agent == .codex {
+                    if let value=diagnosticEnvironment(row)?["CODEX_HOME"],let home=try? CodexAccountTransitionTarget.canonicalHome(value){allowed.insert(home)}
+                }
+                let home:String
+                if serverID.isEmpty {home=try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")}
+                else {guard let matched=allowed.first(where:{RemoteDiagnostics.homeID($0)==serverID}) else{throw RemoteHTTPError(409,"진단 대상 홈이 바뀌었습니다.")};home=matched}
+                let executable=records.filter{$0.agent == .codex}.first(where:{(self.diagnosticEnvironment($0)?["CODEX_HOME"] ?? NSHomeDirectory()+"/.codex")==home}).flatMap{CodexServerLocation.executable($0)}
+                let data=try JSONSerialization.data(withJSONObject:report,options:.sortedKeys)
+                guard !Task.isCancelled,self.diagnosticPreparations[request]?.phase=="running" else{return}
+                _ = try self.codexDiagnostics.start(requestID:request,home:home,executable:executable,snapshot:data,question:RemoteDiagnostics.text(question,limit:2000))
+            } catch {
+                guard var failed=self.diagnosticPreparations[request],failed.phase=="running" else{return}
+                failed.phase=Task.isCancelled ? "cancelled":"failed";failed.updatedAt=ISO8601DateFormatter().string(from:Date());failed.message=Task.isCancelled ? "진단 준비를 취소했습니다.":"진단 준비를 완료하지 못했습니다. 상태와 로그인 홈을 새로 확인해주세요.";self.diagnosticPreparations[request]=failed
+            }
+        }
+        return try diagnosticJobObject(preparation)
+    }
+    private func diagnosticJobObject(_ job:CodexDiagnosticJob?) throws -> JSONObject {
+        guard let job else{return ["job":NSNull()]}
+        return ["job":try JSONSerialization.jsonObject(with:JSONEncoder().encode(job))]
+    }
+    public func diagnosticCodexStatus(requestID:String?=nil)throws->JSONObject {
+        if let requestID,UUID(uuidString:requestID)==nil {throw RemoteHTTPError(400,"진단 요청 ID가 올바르지 않습니다.")}
+        let request=requestID ?? latestDiagnosticRequestID
+        return try diagnosticJobObject(codexDiagnostics.status(requestID:request) ?? request.flatMap{diagnosticPreparations[$0]})
+    }
+
     public func codexManagedServerStatus(home:String) async throws ->CodexManagedServerStatus {
         let reader=processReader
         let records=try await Task.detached(priority:.utility){try reader()}.value

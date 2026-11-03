@@ -508,3 +508,6 @@ body.terminal-focus .feedback { bottom: max(132px, env(safe-area-inset-bottom));
 body.terminal-focus.terminal-compact .web-update span { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 body.terminal-focus.terminal-compact main > .web-update { padding-top: max(4px, env(safe-area-inset-top)); padding-bottom: 4px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+
+.machine-inspection-actions { display: flex; gap: 6px; }
+.machine-inspection-actions button { flex: 1; white-space: nowrap; }
