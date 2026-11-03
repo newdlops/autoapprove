@@ -1168,6 +1168,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account transition: cancelled reconnect lookup releases without effects",tests.testManualCodexReconnectCancellationAndStopReleaseLookupWithoutEffects),
             ("Account transition: unverified connection does not claim absent server",tests.testUnverifiedCodexServerNoticeDoesNotClaimServerIsAbsent),
             ("Account transition: reconnect uses each machine home and CLI",tests.testManualCodexReconnectUsesEachMachineHomeAndExecutableWithoutGuessing),
+            ("Managed server: automatic failure does not repeat",tests.testAutomaticManagedServerFailureDoesNotRepeat),
+            ("Managed server: automatic preparation once",tests.testAutomaticManagedServerPreparationOnce),
             ("Managed server: preparation serializes with account control",tests.testManagedServerPreparationSerializesWithAccountControl),
             ("Managed server: cancellation and manager stop precede remaining effects",tests.testManagedServerPreparationCancellationAndManagerStop),
             ("Managed server: ready daemon without original clients cannot authorize reconnect",tests.testPreparedServerWithoutOriginalClientsDoesNotAuthorizeReconnect),

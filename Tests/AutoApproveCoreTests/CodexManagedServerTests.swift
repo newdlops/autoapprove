@@ -10,6 +10,29 @@ import AutoApproveCore
 }
 
 extension ApprovalTests {
+    func testAutomaticManagedServerFailureDoesNotRepeat() async throws {
+        let root=URL(fileURLWithPath:"/private/tmp/aa-auto-failure-"+UUID().uuidString),gate=ManagedServerGate()
+        defer{try? FileManager.default.removeItem(at:root)}
+        gate.release()
+        let services=CodexManagedServerServices(inspect:{_,_ in .init(phase:.stopped,detail:"Synthetic")},prepare:{_,_ in await gate.wait();throw AppError.message("Synthetic failure")})
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexManagedServers:services)
+        defer{engine.stop()}
+        await engine.ensureCodexManagedServers();await engine.ensureCodexManagedServers()
+        try expectEqual(gate.calls,1);try expect(engine.codexAccountTransitionNotice != nil)
+        try expectFalse(engine.codexAccountTransitionBusy)
+    }
+    func testAutomaticManagedServerPreparationOnce() async throws {
+        let root=URL(fileURLWithPath:"/private/tmp/aa-auto-server-"+UUID().uuidString),gate=ManagedServerGate()
+        defer{try? FileManager.default.removeItem(at:root)}
+        gate.release()
+        let services=CodexManagedServerServices(inspect:{_,_ in .init(phase:.stopped,detail:"Synthetic")},prepare:{_,_ in await gate.wait();return try await gate.finish()})
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexManagedServers:services)
+        defer{engine.stop()}
+        await engine.ensureCodexManagedServers();await engine.ensureCodexManagedServers()
+        try expectEqual(gate.calls,1);try expectEqual(gate.effects,1)
+        try expectFalse(engine.codexAccountTransitionEnabled)
+        engine.stop();await engine.ensureCodexManagedServers();try expectEqual(gate.calls,1)
+    }
     func testManagedServerPreparationSerializesWithAccountControl() async throws {
         let root=URL(fileURLWithPath:"/private/tmp/aa-setup-engine-"+UUID().uuidString),gate=ManagedServerGate(),rig=AccountTransitionRig()
         defer{try? FileManager.default.removeItem(at:root)}

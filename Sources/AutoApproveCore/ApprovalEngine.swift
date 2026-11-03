@@ -362,6 +362,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public var codexAccountTransitionHeld: Bool { codexAccountTransitionStates.values.contains(where: \.held) }
     private let codexAccountTransitionServices: CodexAccountTransitionServices
     private let codexManagedServerServices:CodexManagedServerServices
+    private var codexManagedServerAutomaticTask:Task<Void,Never>?
+    private var codexManagedServerAutomaticHomes:Set<String>=[]
     private var codexManagedServerStartTask:Task<CodexManagedServerStatus,Error>?
     private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
     private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
@@ -607,6 +609,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         if poll {
             startCodexAccountTransitionPolling()
+            startCodexManagedServerPolling()
             if osPermissionMonitoringEnabled {osPermissionTask=Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refreshOSPermissions()
@@ -639,6 +642,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexAccountTransitionEpoch = UUID()
         codexAccountTransitionTask?.cancel(); codexAccountTransitionTask = nil
         codexAccountCheckTask?.cancel();codexAccountCheckTask=nil
+        codexManagedServerAutomaticTask?.cancel();codexManagedServerAutomaticTask=nil
         codexManagedServerStartTask?.cancel();codexManagedServerStartTask=nil
         codexAccountTransitionBusy=false;codexAccountNativeWakePending=false
         osPermissionEpoch=UUID()
@@ -5723,6 +5727,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
             ProcessEnvironment.read(record)?["CODEX_HOME"].flatMap{try? CodexAccountTransitionTarget.canonicalHome($0)}
         })).sorted()
     }
+    /// One automatic attempt per home and manager lifetime, including failures.
+    public func ensureCodexManagedServers() async {
+        guard !Task.isCancelled,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
+        let epoch=codexAccountTransitionEpoch
+        do {
+            let homes=try await codexServerSetupHomes()
+            for home in Set(homes+[try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")]).sorted() {
+                guard !Task.isCancelled,epoch==codexAccountTransitionEpoch,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
+                guard codexManagedServerAutomaticHomes.insert(home).inserted else{continue}
+                do {
+                    let status=try await codexManagedServerStatus(home:home)
+                    guard epoch==codexAccountTransitionEpoch,!Task.isCancelled else{return}
+                    guard status.canPrepare else{continue}
+                    let result=try await prepareCodexManagedServer(home:home)
+                    guard epoch==codexAccountTransitionEpoch,!Task.isCancelled else{return}
+                    if result.phase != .running {codexAccountTransitionNotice=result.detail}
+                } catch is CancellationError {return}
+                catch {if epoch==codexAccountTransitionEpoch {codexAccountTransitionNotice="관리형 Codex 서버 자동 준비를 완료하지 못했습니다. 계정·로그인에서 연결을 다시 확인해주세요."}}
+            }
+        } catch { /* Retry discovery before reserving a start. */ }
+    }
     public func codexManagedServerStatus(home:String) async throws ->CodexManagedServerStatus {
         let reader=processReader
         let records=try await Task.detached(priority:.utility){try reader()}.value
@@ -5903,6 +5928,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             for question in sessions[id]?.questions ?? [] { cancelAutomaticQuestionReply(question.id) }
         }
         publish()
+    }
+    private func startCodexManagedServerPolling() {
+        guard codexManagedServerAutomaticTask==nil else{return}
+        codexManagedServerAutomaticTask=Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.ensureCodexManagedServers()
+                do {try await Task.sleep(for:.seconds(30))} catch {break}
+            }
+        }
     }
     private func startCodexAccountTransitionPolling() {
         guard codexAccountTransitionTask == nil else { return }
