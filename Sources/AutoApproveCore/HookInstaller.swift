@@ -37,8 +37,35 @@ public enum HookInstaller {
               let hooks = settings["hooks"] as? [String: [JSONObject]] else { return false }
         return (hooks["PermissionRequest"] ?? []).contains { (($0["hooks"] as? [JSONObject]) ?? []).contains(where: owned) }
     }
-    /// Upgrade this enabled installation. Preserve other helpers and explicitly removed failure hooks.
-    @discardableResult public static func upgradeTimeouts(executable: String, url: URL = settingsURL) throws -> URL? {
+    private static func bundledHelper(_ path:String)->Bool {
+        guard path.hasPrefix("/"),!path.contains("\0"),!path.contains("\n"),!path.contains("\r"),
+              !path.split(separator:"/").contains(where:{$0=="." || $0==".."}) else{return false}
+        let url=URL(fileURLWithPath:path)
+        return url.lastPathComponent=="autoapprove"
+            && url.deletingLastPathComponent().lastPathComponent=="MacOS"
+            && url.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent=="Contents"
+            && url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().lastPathComponent=="AutoApprove.app"
+    }
+    private static func upgradedCommand(_ command:String,executable:String,home:String?)->String? {
+        let suffix=" hook --autoapprove-managed"
+        // Older callers without a known data home retain the existing exact
+        // executable upgrade; they cannot claim another installation's path.
+        guard let home else{return command.hasSuffix(quote(executable)+suffix) ? command:nil}
+        let prefix="AUTOAPPROVE_HOME="+quote(home)+" ",current=prefix+quote(executable)+suffix
+        if command==current {return command}
+        guard command.hasPrefix(prefix),command.hasSuffix(suffix),bundledHelper(executable),
+              FileManager.default.isExecutableFile(atPath:executable) else{return nil}
+        let encoded=String(command.dropFirst(prefix.count).dropLast(suffix.count))
+        guard encoded.hasPrefix("'"),encoded.hasSuffix("'"),encoded.count>=2 else{return nil}
+        let previous=String(encoded.dropFirst().dropLast()).replacingOccurrences(of:"'\\''",with:"'")
+        // Parse only the exact quoting emitted by this installer, never shell
+        // wrappers or extra commands. The old build need not exist anymore.
+        guard quote(previous)==encoded,bundledHelper(previous) else{return nil}
+        return current
+    }
+    /// Upgrade the enabled bridge in this data home after an app move. Preserve
+    /// foreign/custom helpers and explicitly removed failure hooks.
+    @discardableResult public static func upgradeTimeouts(executable: String, home: String? = nil, url: URL = settingsURL) throws -> URL? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
         guard var settings = try JSONSerialization.jsonObject(with: data) as? JSONObject,
@@ -51,8 +78,10 @@ public enum HookInstaller {
             for index in groups.indices {
                 guard var handlers = groups[index]["hooks"] as? [JSONObject] else { continue }
                 for position in handlers.indices {
-                    guard owned(handlers[position]), let command = handlers[position]["command"] as? String,
-                          command.hasSuffix(quote(executable) + " hook --autoapprove-managed") else { continue }
+                    guard owned(handlers[position]),handlers[position]["type"] as? String == "command",
+                          let previous=handlers[position]["command"] as? String,
+                          let command=upgradedCommand(previous,executable:executable,home:home) else { continue }
+                    if command != previous {handlers[position]["command"]=command;changed=true}
                     if event == "PermissionRequest" { installedCommand = command }
                     let timeout = ["PreToolUse", "PermissionRequest"].contains(event) ? 660 : 10
                     if (handlers[position]["timeout"] as? Int ?? 0) < timeout {

@@ -3975,8 +3975,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         _ = try HookInstaller.install(executable: executable, home: paths.directory.path)
         snapshot.health.claude = "설치됨 · 다음 세션 이벤트 대기"
     }
-    public func upgradeClaudeHooks(executable: String) {
-        do { try HookInstaller.upgradeTimeouts(executable: executable) }
+    public func upgradeClaudeHooks(executable: String, settingsURL:URL = HookInstaller.settingsURL) {
+        // A duplicate/failed launch must not replace the active app's helper.
+        guard server != nil else{return}
+        do { try HookInstaller.upgradeTimeouts(executable: executable,home:paths.directory.path,url:settingsURL) }
         catch { snapshot.health.claude = "훅 응답 대기 설정을 갱신하지 못했습니다. 연결 설정에서 Claude 훅을 다시 설치해주세요." }
     }
     public func removeClaude(settingsURL: URL = HookInstaller.settingsURL) throws {

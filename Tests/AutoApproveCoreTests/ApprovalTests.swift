@@ -1164,6 +1164,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("enrollment, pause, duplicate requests, isolation", tests.testHookRequiresEnrollmentHonorsPauseAndDoesNotReplay),
             ("discovery capability and process exit", tests.testDiscoveryDoesNotClaimControlAndEndsMissingSessions),
             ("hook installation preserves settings", tests.testHookInstallPreservesOtherSettingsAndIsIdempotent),
+            ("Hook relocation: same home, existing or missing build, backup and idempotence",tests.testHookRelocationMovesSameHomeWithBackupAndIdempotence),
+            ("Hook relocation: foreign, disabled and noncanonical commands remain untouched",tests.testHookRelocationKeepsForeignDisabledAndNoncanonicalCommands),
+            ("Hook relocation: startup scopes repair to engine home",tests.testHookRelocationStartupScopesToEngineHome),
             ("SQLite persistence", tests.testAuditPersistsSettingsAndEvents),
             ("disconnected controls and reveal capability", tests.testDisconnectedEnrollmentCanBeDisabled)
         ]

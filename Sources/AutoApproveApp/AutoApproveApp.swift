@@ -12,8 +12,8 @@ import AutoApproveCore
         do {
             let engine = try ApprovalEngine()
             engine.finishLANUpdate = { NSApp.terminate(nil) }
-            engine.upgradeClaudeHooks(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path)
             try engine.start(webByDefault: true)
+            engine.upgradeClaudeHooks(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path)
             self.engine = engine; self.error = nil
             self.notifications = QuestionNotifications(engine: engine)
             self.sessionProfiles = SessionProfilesController(engine: engine)
