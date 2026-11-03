@@ -361,6 +361,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     @Published public private(set) var codexAccountTransitionNotice: String?
     public var codexAccountTransitionHeld: Bool { codexAccountTransitionStates.values.contains(where: \.held) }
     private let codexAccountTransitionServices: CodexAccountTransitionServices
+    private let codexManagedServerServices:CodexManagedServerServices
+    private var codexManagedServerStartTask:Task<CodexManagedServerStatus,Error>?
     private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
     private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
     private var codexAccountTransitionTask: Task<Void, Never>?
@@ -396,7 +398,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
                 osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live,
                 codexAccountTransitions:CodexAccountTransitionServices? = nil,
-                codexAccountTargets:(@Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget])? = nil) throws {
+                codexAccountTargets:(@Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget])? = nil,
+                codexManagedServers:CodexManagedServerServices = .live) throws {
+        self.codexManagedServerServices=codexManagedServers
         self.codexAccountTransitionServices = codexAccountTransitions ?? .live
         let accountTargetReader:@Sendable([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
         if let codexAccountTargets {accountTargetReader=codexAccountTargets}
@@ -635,6 +639,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexAccountTransitionEpoch = UUID()
         codexAccountTransitionTask?.cancel(); codexAccountTransitionTask = nil
         codexAccountCheckTask?.cancel();codexAccountCheckTask=nil
+        codexManagedServerStartTask?.cancel();codexManagedServerStartTask=nil
         codexAccountTransitionBusy=false;codexAccountNativeWakePending=false
         osPermissionEpoch=UUID()
         osPermissionTransitions.removeAll()
@@ -5709,6 +5714,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let reader = processReader
         let records = try await Task.detached(priority: .utility) { try reader() }.value
         return try await codexAccountTargetReader(records)
+    }
+    public func codexServerSetupHomes() async throws -> [String] {
+        let reader=processReader
+        let records=try await Task.detached(priority:.utility){try reader()}.value
+        try Task.checkCancellation()
+        return Array(Set(records.filter{$0.agent == .codex}.compactMap {record in
+            ProcessEnvironment.read(record)?["CODEX_HOME"].flatMap{try? CodexAccountTransitionTarget.canonicalHome($0)}
+        })).sorted()
+    }
+    public func codexManagedServerStatus(home:String) async throws ->CodexManagedServerStatus {
+        let reader=processReader
+        let records=try await Task.detached(priority:.utility){try reader()}.value
+        try Task.checkCancellation()
+        return try await codexManagedServerServices.inspect(home,records)
+    }
+    public func prepareCodexManagedServer(home:String) async throws ->CodexManagedServerStatus {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+            throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")
+        }
+        let epoch=codexAccountTransitionEpoch,reader=processReader
+        codexAccountTransitionBusy=true
+        defer {if epoch==codexAccountTransitionEpoch {codexAccountTransitionBusy=false;codexManagedServerStartTask=nil}}
+        let home=try CodexAccountTransitionTarget.canonicalHome(home)
+        let records=try await Task.detached(priority:.utility){try reader()}.value
+        try Task.checkCancellation()
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+        let services=codexManagedServerServices
+        let task=Task {try await services.prepare(home,records)}
+        codexManagedServerStartTask=task
+        let result=try await withTaskCancellationHandler(operation:{try await task.value},onCancel:{task.cancel()})
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+        return result
     }
     public func codexSessionAccount(sessionID:String) async throws -> CodexSessionAccount {
         guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")}

@@ -4,6 +4,28 @@ import Darwin
 /// Accept a launch home only when the original process is connected to its
 /// exact user-owned control socket. Never guess by project or recent history.
 public enum CodexServerLocation {
+    /// argv[0] may be just "codex" for a normal PATH launch. Resolve the
+    /// executable from the kernel, never from cwd or an unrelated PATH entry.
+    static func executable(_ record:ProcessRecord) -> String? {
+        func sameOriginal() -> Bool {
+            (try? ProcessDiscovery.read(pid:record.pid))?.contains {
+                $0.key==record.key && $0.tty==record.tty && $0.executable==record.executable && $0.agent == .codex
+            } == true
+        }
+        var owner=proc_bsdinfo(),buffer=[UInt8](repeating:0,count:4096)
+        let size=Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard record.pid>0,sameOriginal(),proc_pidinfo(record.pid,PROC_PIDTBSDINFO,0,&owner,size)==size,
+              owner.pbi_uid==getuid(),proc_pidpath(record.pid,&buffer,UInt32(buffer.count))>0,
+              let end=buffer.firstIndex(of:0),end>0 else{return nil}
+        let path=String(decoding:buffer[..<end],as:UTF8.self)
+        var binary=stat(),identity=record;identity.executable=path
+        var after=proc_bsdinfo()
+        guard path.hasPrefix("/"),identity.agent == .codex,FileManager.default.isExecutableFile(atPath:path),
+              stat(path,&binary)==0,[getuid(),0].contains(binary.st_uid),sameOriginal(),
+              proc_pidinfo(record.pid,PROC_PIDTBSDINFO,0,&after,size)==size,after.pbi_uid==getuid(),
+              after.pbi_start_tvsec==owner.pbi_start_tvsec,after.pbi_start_tvusec==owner.pbi_start_tvusec else{return nil}
+        return path
+    }
     public static func connectedHome(pid: Int32, hints: [String], peerPID: Int32? = nil) -> String? {
         let paths = connectedSocketPaths(pid: pid, peerPID: peerPID)
         guard !paths.isEmpty else { return nil }

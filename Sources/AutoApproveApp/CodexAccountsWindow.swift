@@ -32,7 +32,9 @@ struct CodexAccountsLayout<Content:View>:View {
                 .fixedSize(horizontal:false,vertical:true)
             CodexLoginSettings(accounts:engine.agentAccounts,targets:{try await engine.codexLoginTargets()},
                 transitionEnabled:engine.codexAccountTransitionEnabled,transitionBusy:engine.codexAccountTransitionBusy || engine.codexAccountTransitionHeld,
-                completed:{},reconnect:{try await engine.reconnectCodexLogin(home:$0)})
+                completed:{},reconnect:{try await engine.reconnectCodexLogin(home:$0)},
+                setupHomes:{try await engine.codexServerSetupHomes()},serverStatus:{try await engine.codexManagedServerStatus(home:$0)},
+                prepareServer:{try await engine.prepareCodexManagedServer(home:$0)})
             Divider()
             CodexAccountTransitionSettings(enabled:engine.codexAccountTransitionEnabled,busy:engine.codexAccountTransitionBusy,
                 states:engine.codexAccountTransitionStates,notice:engine.codexAccountTransitionNotice,error:error,

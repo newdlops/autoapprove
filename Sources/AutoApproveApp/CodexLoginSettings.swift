@@ -10,6 +10,9 @@ import AutoApproveCore
     let completed: () async -> Void
     var preferredHome:String? = nil
     var reconnect:((String) async throws -> Void)? = nil
+    var setupHomes:(() async throws->[String])? = nil
+    var serverStatus:((String) async throws->CodexManagedServerStatus)? = nil
+    var prepareServer:((String) async throws->CodexManagedServerStatus)? = nil
     @State private var homes: [CodexAccountTransitionTarget] = []
     @State private var liveHomes:Set<String>=[]
     @State private var selected = NSHomeDirectory() + "/.codex"
@@ -17,6 +20,8 @@ import AutoApproveCore
     @State private var job: NativeCodexLoginState?
     @State private var error: String?
     @State private var otherLogin=false
+    @State private var managedServer:CodexManagedServerStatus?
+    @State private var preparingServer=false
     private var scopedJob:NativeCodexLoginState? {
         let current=accounts.nativeCodexLogin
         let home=current?.resolvedHome ?? current.flatMap{try? CodexAccountTransitionTarget.canonicalHome($0.home)}
@@ -67,7 +72,25 @@ import AutoApproveCore
                     }
                 }
             }},canReconnect:liveHomes.contains(selected),connectedCount:homes.first(where:{$0.home==selected})?.witnesses.count,
-            refreshTargets:{Task {await reloadTargets()}})
+            refreshTargets:{Task {await reloadTargets()}},serverStatus:managedServer,preparingServer:preparingServer,
+            prepareServer:prepareServer.map {action in {
+                loading=true;preparingServer=true
+                let home=selected
+                Task {
+                    defer{loading=false;preparingServer=false}
+                    do {
+                        let result=try await action(home)
+                        await reloadTargets()
+                        if selected==home,result.phase == .unavailable,managedServer?.phase != .running {managedServer=result}
+                    } catch {self.error=error.localizedDescription;await reloadServerStatus()}
+                }
+            }})
+        .onChange(of:selected) {_,_ in
+            guard !loading else{return}
+            managedServer=nil
+            loading=true
+            Task {defer{loading=false};await reloadServerStatus()}
+        }
         .task {
             job = scopedJob
             await reloadTargets(preferJob:true)
@@ -86,12 +109,16 @@ import AutoApproveCore
         do {
             var found=try await targets();try Task.checkCancellation()
             liveHomes=Set(found.map(\.home))
+            let candidates:[String]
+            if let setupHomes {candidates=(try? await setupHomes()) ?? []} else {candidates=[]}
+            for home in candidates where !found.contains(where:{$0.home==home}) {found.append(.init(home:home,executable:"codex"))}
             let defaultHome=try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")
             if preferredHome==nil,!found.contains(where:{$0.home==defaultHome}) {found.insert(.init(home:defaultHome,executable:"codex"),at:0)}
             homes=found
             if let preferredHome {selected=try CodexAccountTransitionTarget.canonicalHome(preferredHome)}
             else if preferJob,let job,let home=job.resolvedHome ?? (try? CodexAccountTransitionTarget.canonicalHome(job.home)),found.contains(where:{$0.home==home}) {selected=home}
             else if preferJob,!liveHomes.contains(selected),let live=found.first(where:{liveHomes.contains($0.home)}) {selected=live.home}
+            else if preferJob,liveHomes.isEmpty,let candidate=candidates.first {selected=candidate}
             else if !found.contains(where:{$0.home==selected}) {selected=found.first?.home ?? defaultHome}
             error=nil
         } catch is CancellationError {return}
@@ -100,6 +127,17 @@ import AutoApproveCore
             self.error=preferredHome==nil
                 ? "실행 중인 Codex 연결을 확인하지 못했습니다. 연결을 다시 확인하거나 선택한 홈으로 로그인할 수 있습니다."
                 : "선택한 세션의 연결을 확인하지 못했습니다. 연결을 다시 확인해주세요."
+        }
+        await reloadServerStatus()
+    }
+    private func reloadServerStatus() async {
+        guard let serverStatus else{return}
+        let home=selected
+        do {
+            let state=try await serverStatus(home);try Task.checkCancellation()
+            if selected==home {managedServer=state}
+        } catch is CancellationError {} catch {
+            if selected==home {managedServer = .init(phase:.unavailable,detail:"관리형 서버 상태를 읽지 못했습니다. 연결을 다시 확인해주세요.")}
         }
     }
 }
@@ -119,6 +157,9 @@ struct CodexLoginContent: View {
     var canReconnect=true
     var connectedCount:Int? = nil
     var refreshTargets:(()->Void)? = nil
+    var serverStatus:CodexManagedServerStatus? = nil
+    var preparingServer=false
+    var prepareServer:(()->Void)? = nil
     private var active: Bool { job?.active == true }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -132,6 +173,29 @@ struct CodexLoginContent: View {
                 .font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             if canReconnect,let connectedCount,connectedCount>0 {
                 Label("연결 확인 · Codex \(connectedCount)개",systemImage:"checkmark.circle").font(.caption)
+            }
+            if let state=serverStatus {
+                VStack(alignment:.leading,spacing:8) {
+                    Label {Text(state.detail).foregroundStyle(.primary)} icon: {
+                        Image(systemName:state.phase == .running ? "checkmark.circle":"info.circle")
+                    }.fixedSize(horizontal:false,vertical:true)
+                    if let version=state.version {Text("Codex \(version)").font(.caption)}
+                    if state.canPrepare,let prepareServer {
+                        Button("관리형 서버 준비",systemImage:"server.rack",action:prepareServer)
+                            .disabled(active || loading || disabled)
+                            .help("선택한 홈에서 공식 Codex 데몬을 시작합니다. 기존 작업을 종료하거나 서버를 재시작하지 않습니다.")
+                    }
+                    if preparingServer {Label("관리형 서버 준비 중…",systemImage:"hourglass").accessibilityLabel("관리형 서버 준비 중")}
+                    if state.phase == .running,!canReconnect {
+                        Text("서버는 실행 중이지만 이 홈에 연결된 Codex 세션은 아직 확인되지 않았습니다. 독립 실행 중이라면 해당 대화를 일반 Codex 실행으로 다시 연 뒤 ‘연결 다시 확인’을 눌러주세요.")
+                            .font(.caption).fixedSize(horizontal:false,vertical:true)
+                    }
+                    if [.missingCLI,.unsupported].contains(state.phase) {
+                        Link(destination:URL(string:"https://developers.openai.com/codex/cli")!) {
+                            Label("Codex 설치·업데이트 안내",systemImage:"arrow.up.right")
+                        }.foregroundStyle(Color(nsColor:.linkColor))
+                    }
+                }.padding(.vertical,4)
             }
             Text("기본 브라우저에서 계정을 선택하면 이 창에 로그인 완료가 표시됩니다. 기존 창은 유지됩니다.")
                 .fixedSize(horizontal: false, vertical: true)

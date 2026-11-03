@@ -33,12 +33,19 @@ import AutoApproveCore
                 let data = try JSONEncoder().encode(sessions)
                 try printJSON(JSONSerialization.jsonObject(with: data))
             case "doctor":
-                let versions: [String: Any] = [
+                var versions: [String: Any] = [
                     "socket": paths.socket,
                     "appRunning": (try? SocketClient.request(path: paths.socket, message: ["method": "status"])) != nil,
                     "claudeHookInstalled": HookInstaller.isInstalled(),
                     "codexSharedSocketExists": FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/app-server-control/app-server-control.sock").path)
                 ]
+                if arguments.contains("--codex") {
+                    let index=arguments.firstIndex(of:"--codex-home")
+                    let home=index.flatMap{arguments.indices.contains($0+1) ? arguments[$0+1]:nil}
+                        ?? ProcessInfo.processInfo.environment["CODEX_HOME"] ?? NSHomeDirectory()+"/.codex"
+                    let state=try await CodexManagedServerServices.live.inspect(home,ProcessDiscovery.readSessions())
+                    versions["codexManagedServer"]=try JSONSerialization.jsonObject(with:JSONEncoder().encode(state))
+                }
                 try printJSON(versions)
             case "terminal-input":
                 guard arguments.count == 2, ["prepare", "install"].contains(arguments[1]) else {

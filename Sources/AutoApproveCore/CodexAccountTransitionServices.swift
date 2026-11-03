@@ -9,12 +9,12 @@ extension CodexAccountTransitionTarget {
             var grouped: [String: Self] = [:]
             for session in sessions {
                 try Task.checkCancellation()
-                guard let record = records.first(where: { $0.key == session.id }), record.executable.hasPrefix("/"),
-                      FileManager.default.isExecutableFile(atPath: record.executable) else { continue }
+                guard let record = records.first(where: { $0.key == session.id }),
+                      let executable=CodexServerLocation.executable(record) else { continue }
                 let hints = [ProcessEnvironment.read(record)?["CODEX_HOME"], NSHomeDirectory() + "/.codex"].compactMap { $0 }
                 guard let home = CodexServerLocation.connectedHome(pid: record.pid, hints: hints) else { continue }
                 let witness = CodexAccountTransitionWitness(pid: record.pid, started: record.started, tty: session.tty, threadID: nil)
-                if grouped[home] == nil { grouped[home] = Self(home: home, executable: record.executable) }
+                if grouped[home] == nil { grouped[home] = Self(home: home, executable: executable) }
                 grouped[home]?.witnesses.append(witness)
             }
             return grouped.values.map { target in
