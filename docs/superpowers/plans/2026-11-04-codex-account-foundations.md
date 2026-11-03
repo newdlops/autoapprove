@@ -36,11 +36,11 @@
 
 **Interfaces:** Produces CodexCLIContext with resolved executable/environment and run(_ arguments:[String],timeout:TimeInterval) throws -> CommandResult. Consumes existing CommandRunner, ProcessRecord and CodexServerLocation witnesses.
 
-- [ ] Write an owned fixture with a Mach-O fake CLI, a PATH-dependent wrapper and a slow/banner-producing .zshrc; assert native inspection initializes zero shells, wrapper inspection at most one, all three real service commands still run with exact selected home and literal arguments.
-- [ ] Run the fixture against current production objects and observe the repeated-shell assertion fail.
-- [ ] Implement native recognition/ownership/path validation and a bounded marker-delimited fallback PATH/executable lookup once per context; preserve only relevant PATH from exact live witnesses. Execute argument arrays directly and propagate cancellation without replay.
-- [ ] Reuse the context in managed-server inspection/preparation and scoped Codex login status; preserve Claude behavior.
-- [ ] Verify fixture, existing managed-server cases, native login ownership/path/cancellation cases, Account and Diagnostics filters; commit source and ledger evidence.
+- [x] Write an owned fixture with a Mach-O fake CLI, a PATH-dependent wrapper and a slow/banner-producing .zshrc; assert native inspection initializes zero shells, wrapper inspection at most one, all three real service commands still run with exact selected home and literal arguments.
+- [x] Run the fixture against current production objects and observe the repeated-shell assertion fail.
+- [x] Implement native recognition/ownership/path validation and a bounded marker-delimited fallback PATH/executable lookup once per context; preserve only relevant PATH from exact live witnesses. Execute argument arrays directly and propagate cancellation without replay.
+- [x] Reuse the context in managed-server inspection/preparation and scoped Codex login status; preserve Claude behavior.
+- [x] Verify fixture, existing managed-server cases, native login ownership/path/cancellation cases, Account and Diagnostics filters; commit source and ledger evidence.
 
 ### Task 2: Readonly observation separate from transition control
 
@@ -48,11 +48,11 @@
 
 **Interfaces:** Produces a home-scoped inspection result containing connected identity, saved identity when safely available, verified session membership, observed timestamp and partial failure. ApprovalEngine.inspectCodexAccount(home:) async throws returns this result without calling a coordinator advance method.
 
-- [ ] Write an injected service/engine regression where saved and server accounts differ and auto transition is enabled; a new inspection must return mismatch with zero interrupt/restart/resume/config writes.
-- [ ] Observe the old check/control coupling fail in a focused fixture.
-- [ ] Implement keyed in-flight read coalescing and stale-home/process invalidation. A cancelled reader must not cancel an unrelated consumer or permit an old read to authorize a mutation.
-- [ ] Keep existing explicit reconnect and automatic transition paths; make their names/entry points distinct from the read API.
-- [ ] Verify mismatch, missing login, offline/unverified server, two homes, concurrent readers, stop/cancel and existing transition/Goal suites; commit and ledger evidence.
+- [x] Write an injected service/engine regression where saved and server accounts differ and auto transition is enabled; a new inspection must return mismatch with zero interrupt/restart/resume/config writes.
+- [x] Observe the old check/control coupling fail in a focused fixture.
+- [x] Implement keyed in-flight read coalescing and stale-home/process invalidation. A cancelled reader must not cancel an unrelated consumer or permit an old read to authorize a mutation.
+- [x] Keep existing explicit reconnect and automatic transition paths; make their names/entry points distinct from the read API.
+- [x] Verify mismatch, missing login, offline/unverified server, two homes, concurrent readers, stop/cancel and existing transition/Goal suites; commit and ledger evidence.
 
 ### Task 3: Independently responsive native account UI
 
@@ -60,10 +60,10 @@
 
 **Interfaces:** Consumes Task 2 inspection state and Task 1 fast status; separate loadingTargets, loadingServer and mutation state, with current-home generation guards.
 
-- [ ] Extend the owned account UI fixture to hold a server lookup open while login remains operable and to change homes before an older result returns; observe current combined-loading behavior fail.
-- [ ] Separate readonly confirmation from reconnect/automatic switching. Display known identity/last successful time, mismatch or partial failure; keep target-specific mutation controls scoped.
-- [ ] Preserve system components, account icon, 600×660 scrolling and accessibility names; cover long content, failure, waiting, stale data, active login and cancellation.
-- [ ] Exercise actual synthetic native controls and independently inspect light/dark rendering; run relevant Core and UI regressions; commit and ledger evidence.
+- [x] Extend the owned account UI fixture to hold a server lookup open while login remains operable and to change homes before an older result returns; observe current combined-loading behavior fail.
+- [x] Separate readonly confirmation from reconnect/automatic switching. Display known identity/last successful time, mismatch or partial failure; keep target-specific mutation controls scoped.
+- [x] Preserve system components, account icon, 600×660 scrolling and accessibility names; cover long content, failure, waiting, stale data, active login and cancellation.
+- [x] Exercise actual synthetic native controls and independently inspect light/dark rendering; run relevant Core and UI regressions; commit and ledger evidence.
 
 ### Task 4: Cross-home feasibility evidence for the full goal
 
@@ -71,22 +71,51 @@
 
 **Interfaces:** Consumes actual installed 0.166 CLI and generated schema. Produces a machine-readable report proving or contradicting same UUID, independent rollout, effective settings and exact Goal instance/budget/usage/time.
 
-- [ ] Build a failing preservation oracle over two owned homes and a synthetic conversation/Goal with nonzero usage. Never use a user conversation or auth contents.
-- [ ] Test documented path resume behavior without inference, background work or credential copying; compare before/after identities and writes.
-- [ ] If public import does not preserve required data, record the precise gap and design the version/schema-validated transfer contract before implementing migration. Do not claim this task implements merge/split.
-- [ ] Specify two-home durable ownership, selected cohort and recovery interfaces in the next migration plan using the observed result; retain all full-goal acceptance requirements.
+- [x] Build a failing preservation oracle over two owned homes and a synthetic conversation/Goal with nonzero usage. Never use a user conversation or auth contents.
+- [x] Test documented path resume behavior without inference, background work or credential copying; compare before/after identities and writes.
+- [x] If public import does not preserve required data, record the precise gap and design the version/schema-validated transfer contract before implementing migration. Do not claim this task implements merge/split.
+- [x] Specify two-home durable ownership, selected cohort and recovery interfaces in the next migration plan using the observed result; retain all full-goal acceptance requirements.
 
 ### Task 5: Verify, review, release and measure the foundation
 
 **Files:** Relevant tests, docs/releases/v0.2.250.md, web-version.json, VALIDATION.md; private signing/release verification helpers.
 
-- [ ] Freeze source, run Debug/Release builds and appropriate account/Goal/attachment/diagnostic/MCP checks plus new owned fixtures; run the project check command once and investigate any failure.
-- [ ] Obtain a fresh whole-branch source review and fix Important/Critical findings through RED→GREEN.
-- [ ] Package matching 0.2.250/build277 with the existing publisher; verify all packages, tag/source, four public assets and public download signature/hash/version.
-- [ ] Install locally and on the connected Mac, preserving original kernel session identities and existing hooks; measure fresh inspection latency and verify queries do not cause transitions.
-- [ ] Record exact verified scope, remaining merge/split/account-selection work and full-goal status; commit/push validation. Do not mark the overall goal complete.
+- [x] Freeze source, run Debug/Release builds and appropriate account/Goal/attachment/diagnostic/MCP checks plus new owned fixtures; run the project check command once and investigate any failure.
+- [x] Obtain a fresh whole-branch source review and fix Important/Critical findings through RED→GREEN.
+- [x] Package matching 0.2.250/build277 with the existing publisher; verify all packages, tag/source, four public assets and public download signature/hash/version.
+- [x] Install locally and on the connected Mac, preserving original kernel session identities and existing hooks; measure fresh inspection latency and verify queries do not cause transitions.
+- [x] Record exact verified scope, remaining merge/split/account-selection work and full-goal status; commit/push validation. Do not mark the overall goal complete.
 
 ## Execution ruling
 
 The active user goal and explicit continuation authorize the confirmed existing-behavior fixes in Tasks 1–3; the requested goals and already selected preservation behavior are unchanged. No claim is made that an unanswered design question is approval. New cross-home mutation architecture is gated on Task 4 evidence and its reviewed contract. Implementation is inline because these shared engine/UI interfaces are coupled; one independent source review precedes release.
+
+## Next migration plan — owned Goal preservation gate
+
+This section is the next bounded feasibility plan, not authorization to migrate user conversations. The full account-group spec remains binding. Keep inline execution and the existing isolated worktree; preserve the shipped 0.2.250 source tag.
+
+### Task 6: Exact Goal row preservation in two owned homes
+
+**Files:** Create `Sources/AutoApproveCore/CodexGoalTransferStore.swift` and `Tests/AutoApproveCoreTests/CodexGoalTransferTests.swift`; extend `scripts/codex-cross-home-preservation-check.mjs` and the check registry.
+
+**Interfaces:** `CodexGoalTransferSnapshot: Codable, Sendable` contains canonical home/database identity, CLI/schema fingerprint, thread UUID, exact typed Goal row and capture digest. Internal `CodexGoalTransferStore.capture(home: String, threadID: String) throws -> CodexGoalTransferSnapshot?` reads a quiescent owned source. Internal `restore(_:toHome: String, expectedSchema: String) throws` performs insert-only destination transaction; no production IPC/UI entry point yet.
+
+- [ ] Write an owned fixture assertion requiring destination goal/get and DB row to equal the original goal_id/objective/status/token_budget/tokens_used/time_used_seconds/created_at_ms/updated_at_ms, including tokens37/time19/budget1234 and paused status. Observe public resume alone fail this oracle.
+- [ ] Capture actual owned goals DB schema/version and all columns. Add tests rejecting unknown versions/columns, non-regular/symlink-replaced DBs, changed source digest, malformed UUIDs and any existing destination Goal; no replace/upsert or goal/set fallback.
+- [ ] Implement typed exact snapshot and insert-only restore before destination thread loading. Use bounded SQLite transactions and compare source/destination file identities before commit. Persist no auth, rollout content or raw DB data to public inventory.
+- [ ] Extend the actual 0.166 probe to restore before resume, compare exact DB rows plus public goal/get, nonempty history, effective settings and independent rollout. Transfer back to a third owned home and verify exact Goal identity/counters again. Existing unrelated destination thread/Goal/server must remain unchanged without daemon restart.
+- [ ] Run the new `Goal transfer:` filter, actual owned preservation script, existing Account/Goal suites and commit evidence. If public runtime cannot observe the restored row without disturbing unselected sessions, record that precise gap and keep production migration unavailable.
+
+### Task 7: Two-home ownership journal and recovery contract
+
+**Files:** Create `Sources/AutoApproveCore/CodexSessionMigration.swift` and `Tests/AutoApproveCoreTests/CodexSessionMigrationTests.swift`; extend AuditStore with a migration journal and register checks.
+
+**Interfaces:** `CodexSessionMigrationRequest` identifies exact selected client cohort, all its threads/children, source/destination identities and intended account/workspace. `CodexSessionMigrationState` persists stage, writer ownership, snapshots and unknown-delivery observations. `CodexSessionMigrationCoordinator.prepare(_:)`, `advance(id:)`, `cancel(id:)` consume injected observation/transfer/launch services; production service binding remains gated.
+
+- [ ] Write injected RED tests for two clients owning one conversation, changed selected membership, drafts/questions/queued/background work, Goal identity change, non-independent credentials/server backend and reversed-home concurrent requests; all must reject with zero termination/import/launch effects.
+- [ ] Implement deterministic canonical-home lock order and a durable two-home journal before effects. Source close/flush verification must precede independent import; only one writer may be launched. Persist selection/destination mappings so app restart and saved restoration cannot relaunch the old owner.
+- [ ] Test crashes before/after every journal/import/launch boundary. Unknown launch delivery must query for exact ownership and never replay or automatically relaunch the source. Cancel before effects releases locks; after effects it preserves known ownership for review.
+- [ ] Use owned clients and two real servers to prove unselected destination sessions keep their kernel identities/account/Goal. Then obtain the next architecture/source review before binding this coordinator to user sessions.
+
+Remaining full-goal work after these gates: saved-account/workspace/SSO handling with actual credential isolation, selected-session group UI and durable mappings, exact-source Goal pause/one continuation, actual selected merge/split round trip, human-completed authentication where needed, release/install and cross-Mac verification. These requirements are not discharged by the 0.2.250 foundation release.
 
