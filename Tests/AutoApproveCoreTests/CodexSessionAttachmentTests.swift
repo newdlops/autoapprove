@@ -2,6 +2,23 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testCodexFreshStatusIdentityRequiresFreshCompleteUnambiguousCard() throws {
+        let id="00000000-0000-4000-8000-000000000061",other="00000000-0000-4000-8000-000000000062"
+        func card(_ value:String)->String {">_ OpenAI Codex (v0.166.0)\nModel: synthetic\nDirectory: /fixture\nPermissions: Read Only\nAgents.md: none\nSession: "+value+"\n› Ask anything\n? for shortcuts"}
+        var proof=CodexStatusIdentity(screen:card(id))
+        try expect(proof.freshThread(in:card(id))==nil,"An old card is not a response")
+        try expect(proof.freshThread(in:"Session: "+other)==nil)
+        try expect(proof.freshThread(in:card(id)+"\n"+card(other))==other)
+        try expect(CodexStatusIdentity(screen:"").freshThread(in:card(id)+"\n"+card(other))==nil)
+        try expect(proof.identify(card(id)+"\n"+card(other)))
+        let restored=try JSONDecoder().decode(CodexStatusIdentity.self,from:JSONEncoder().encode(proof))
+        try expect(restored.matches(card(id)+"\n"+card(other),thread:other))
+        try expectFalse(restored.matches(card(id),thread:other))
+        try expectFalse(restored.matches(card(id)+"\n"+card(other)+"\nchanged",thread:other))
+        let wrapped=card(String(id.prefix(20))+"\n"+String(id.dropFirst(20)))
+        try expectEqual(CodexStatusIdentity(screen:"").freshThread(in:wrapped),id)
+        try expect(CodexStatusIdentity(screen:"").freshThread(in:card(id).replacingOccurrences(of:"Permissions:",with:"unrelated:"))==nil)
+    }
     private func attachmentPlan() ->CodexSessionAttachment {
         let records=ProcessDiscovery.parse("""
         810 1 ttys031 810 811 Mon Nov 2 10:00:00 2026 /bin/zsh

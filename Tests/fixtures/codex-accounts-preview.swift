@@ -127,7 +127,7 @@ private struct FixtureApp:App {
             CodexLoginContent(homes:[fixtureHomes[0],home],selected:.constant(home),loading:kind=="loading" || kind=="server-preparing",job:job,disabled:kind=="transition",error:kind=="failed" ? "실행 중인 Codex 연결을 확인하지 못했습니다. 연결을 다시 확인하거나 선택한 홈으로 로그인할 수 있습니다.":nil,transitionEnabled:true,begin:{},cancel:{},open:{_ in},reconnect:{},canReconnect:!["empty","failed"].contains(kind) && server==nil,connectedCount:3,refreshTargets:{},serverStatus:server,preparingServer:kind=="server-preparing",prepareServer:{})
             Divider()
             if kind.hasPrefix("server-") {CodexSessionAttachmentStatus(detail:"기존 세션 3개: 작업·Goal·질문·초안이 끝나고 원본 대화를 확인하면 같은 창에서 자동 연결합니다.")}
-            CodexAccountTransitionSettings(enabled:kind=="transition",busy:kind=="transition",states:[:],notice:kind=="empty" ? "관리형 Codex 서버 연결을 아직 확인하지 못했습니다. 실행 중인 Codex를 유지하고 연결을 다시 확인해주세요.":nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
+            CodexAccountTransitionSettings(enabled:kind=="transition",busy:kind=="transition",states:kind=="transition-complete" ? ["synthetic":{var state=CodexAccountTransitionState();state.phase = .complete;state.detail="새 로그인으로 서버 전환 · 기존 창 1개 재연결을 확인했습니다.";state.verified=1;return state}()]:[:],notice:kind=="empty" ? "관리형 Codex 서버 연결을 아직 확인하지 못했습니다. 실행 중인 Codex를 유지하고 연결을 다시 확인해주세요.":nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
         }
     }
 }
@@ -137,7 +137,7 @@ private struct FixtureApp:App {
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         if CommandLine.arguments.contains("--render") {
             _=NSApplication.shared
-            for kind in ["connected","loading","empty","waiting","succeeded","failed","transition","server-stopped","server-missing","server-unsupported","server-ready-empty","server-unavailable","server-preparing","server-disabled"] {for dark in [false,true] {
+            for kind in ["connected","loading","empty","waiting","succeeded","failed","transition","server-stopped","server-missing","server-unsupported","server-ready-empty","server-unavailable","server-preparing","server-disabled","transition-complete"] {for dark in [false,true] {
                 let host=NSHostingView(rootView:Snapshot(kind:kind,home:fixtureHomes[1]).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,dark ? .dark:.light))
                 host.frame=NSRect(x:0,y:0,width:600,height:660);host.appearance=NSAppearance(named:dark ? .darkAqua:.aqua)
                 let window=NSWindow(contentRect:host.frame,styleMask:.borderless,backing:.buffered,defer:false);window.contentView=host
@@ -145,7 +145,7 @@ private struct FixtureApp:App {
                 let bitmap=host.bitmapImageRepForCachingDisplay(in:host.bounds)!;host.cacheDisplay(in:host.bounds,to:bitmap)
                 try bitmap.representation(using:.png,properties:[:])!.write(to:root.appendingPathComponent("\(kind)-\(dark ? "dark":"light").png"))
             }}
-            print("Rendered 28 production account-layout states at 600×660")
+            print("Rendered 30 production account-layout states at 600×660")
         } else {FixtureApp.main()}
     }
 }

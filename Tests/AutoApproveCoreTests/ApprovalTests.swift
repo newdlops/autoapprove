@@ -1168,6 +1168,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account transition: cancelled reconnect lookup releases without effects",tests.testManualCodexReconnectCancellationAndStopReleaseLookupWithoutEffects),
             ("Account transition: unverified connection does not claim absent server",tests.testUnverifiedCodexServerNoticeDoesNotClaimServerIsAbsent),
             ("Account transition: reconnect uses each machine home and CLI",tests.testManualCodexReconnectUsesEachMachineHomeAndExecutableWithoutGuessing),
+            ("Codex attachment: fresh status identity without rollout",tests.testCodexFreshStatusIdentityRequiresFreshCompleteUnambiguousCard),
             ("Codex attachment: sequential persisted reservations and verification",tests.testCodexAttachmentSequentialReservationsAndVerification),
             ("Codex attachment: uncertain delivery and restart never replay",tests.testCodexAttachmentRestartAndAmbiguousDeliveryDoNotReplay),
             ("Codex attachment: persistence failure prevents input",tests.testCodexAttachmentPersistenceFailurePreventsTerminalInput),

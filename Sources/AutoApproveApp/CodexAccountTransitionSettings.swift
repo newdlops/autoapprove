@@ -82,7 +82,7 @@ struct CodexAccountTransitionSettings: View {
         case .restarting: return "공통 서버 전환"
         case .reconnecting: return "기존 대화 재연결 확인"
         case .resuming: return "중단 작업 이어가기"
-        case .complete: return "계정 전환 완료"
+        case .complete: return "연결된 세션 전환 완료"
         case .review: return "확인 필요"
         case .cancelled: return "자동 전환 중지됨"
         case .unsupported: return "지원 여부 확인 필요"
