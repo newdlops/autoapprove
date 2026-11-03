@@ -38,10 +38,11 @@ private let fixtureHomes=["/Users/alex/.codex","/Users/서연/Library/Applicatio
     func serverStatus() ->CodexManagedServerStatus {
         switch mode {
         case "stopped":return .init(phase:.stopped,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 아직 준비되지 않았습니다.")
+        case "disabled":return .init(phase:.running,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.",autoStartEnabled:false)
         case "missing":return .init(phase:.missingCLI,detail:"이 Mac의 로그인 셸에서 Codex CLI를 찾지 못했습니다. Codex를 설치한 뒤 연결을 다시 확인해주세요.")
         case "unsupported":return .init(phase:.unsupported,version:"0.165.0",detail:"Codex 0.165.0은 관리형 서버 자동 전환 대상이 아닙니다. Codex 0.166.0 이상으로 업데이트해주세요.")
         case "error":return .init(phase:.unavailable,detail:"관리형 서버 상태를 읽지 못했습니다. 연결을 다시 확인해주세요.")
-        default:return .init(phase:.running,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.")
+        default:return .init(phase:.running,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.",autoStartEnabled:true)
         }
     }
     func prepare() async throws ->CodexManagedServerStatus {
@@ -63,6 +64,7 @@ private let fixtureHomes=["/Users/alex/.codex","/Users/서연/Library/Applicatio
             Picker("연결 대역",selection:$fixture.mode) {
                 Text("연결됨").tag("connected");Text("연결 미확인").tag("empty");Text("조회 실패").tag("error")
                 Text("서버 미준비").tag("stopped");Text("서버만 실행 중").tag("ready-empty");Text("구버전 CLI").tag("unsupported");Text("CLI 미설치").tag("missing")
+                Text("자동 시작 꺼짐").tag("disabled")
             }
             Picker("머신 프로필",selection:$fixture.profile) {ForEach(0..<3,id:\.self) {Text("프로필 \($0+1)").tag($0)}}
             Toggle("재연결 중 연결 유실",isOn:$fixture.reconnectFails)
@@ -85,6 +87,7 @@ private let fixtureHomes=["/Users/alex/.codex","/Users/서연/Library/Applicatio
             Text("이 Mac에서 실행 중인 Codex의 로그인과 세션 연결을 관리합니다.")
             CodexLoginSettings(accounts:fixture.accounts,targets:{try await fixture.targets()},transitionEnabled:true,transitionBusy:false,completed:{},reconnect:{try await fixture.reconnect($0)},
                 setupHomes:{[fixtureHomes[fixture.profile]]},serverStatus:{_ in fixture.serverStatus()},prepareServer:{_ in try await fixture.prepare()})
+            CodexSessionAttachmentStatus(detail:"기존 세션 3개: 작업·Goal·질문·초안이 끝나고 원본 대화를 확인하면 같은 창에서 자동 연결합니다.")
             Divider()
             CodexAccountTransitionSettings(enabled:false,busy:false,states:[:],notice:nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
         }
@@ -111,7 +114,8 @@ private struct FixtureApp:App {
             switch kind {
             case "server-missing":return .init(phase:.missingCLI,detail:"이 Mac의 로그인 셸에서 Codex CLI를 찾지 못했습니다. Codex를 설치한 뒤 연결을 다시 확인해주세요.")
             case "server-unsupported":return .init(phase:.unsupported,version:"0.165.0",detail:"Codex 0.165.0은 관리형 서버 자동 전환 대상이 아닙니다. Codex 0.166.0 이상으로 업데이트해주세요.")
-            case "server-ready-empty":return .init(phase:.running,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.")
+            case "server-ready-empty":return .init(phase:.running,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.",autoStartEnabled:true)
+            case "server-disabled":return .init(phase:.running,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.",autoStartEnabled:false)
             case "server-unavailable":return .init(phase:.unavailable,version:"0.166.0",detail:"서버 소켓의 상태를 확인하지 못했습니다. 서버를 다시 시작하지 않았습니다. 연결을 다시 확인해주세요.")
             default:return .init(phase:.stopped,version:"0.166.0",detail:"이 홈의 관리형 Codex 서버가 아직 준비되지 않았습니다.")
             }
@@ -122,6 +126,7 @@ private struct FixtureApp:App {
             Text("이 Mac에서 실행 중인 Codex의 로그인과 세션 연결을 관리합니다.")
             CodexLoginContent(homes:[fixtureHomes[0],home],selected:.constant(home),loading:kind=="loading" || kind=="server-preparing",job:job,disabled:kind=="transition",error:kind=="failed" ? "실행 중인 Codex 연결을 확인하지 못했습니다. 연결을 다시 확인하거나 선택한 홈으로 로그인할 수 있습니다.":nil,transitionEnabled:true,begin:{},cancel:{},open:{_ in},reconnect:{},canReconnect:!["empty","failed"].contains(kind) && server==nil,connectedCount:3,refreshTargets:{},serverStatus:server,preparingServer:kind=="server-preparing",prepareServer:{})
             Divider()
+            if kind.hasPrefix("server-") {CodexSessionAttachmentStatus(detail:"기존 세션 3개: 작업·Goal·질문·초안이 끝나고 원본 대화를 확인하면 같은 창에서 자동 연결합니다.")}
             CodexAccountTransitionSettings(enabled:kind=="transition",busy:kind=="transition",states:[:],notice:kind=="empty" ? "관리형 Codex 서버 연결을 아직 확인하지 못했습니다. 실행 중인 Codex를 유지하고 연결을 다시 확인해주세요.":nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
         }
     }
@@ -132,7 +137,7 @@ private struct FixtureApp:App {
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         if CommandLine.arguments.contains("--render") {
             _=NSApplication.shared
-            for kind in ["connected","loading","empty","waiting","succeeded","failed","transition","server-stopped","server-missing","server-unsupported","server-ready-empty","server-unavailable","server-preparing"] {for dark in [false,true] {
+            for kind in ["connected","loading","empty","waiting","succeeded","failed","transition","server-stopped","server-missing","server-unsupported","server-ready-empty","server-unavailable","server-preparing","server-disabled"] {for dark in [false,true] {
                 let host=NSHostingView(rootView:Snapshot(kind:kind,home:fixtureHomes[1]).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,dark ? .dark:.light))
                 host.frame=NSRect(x:0,y:0,width:600,height:660);host.appearance=NSAppearance(named:dark ? .darkAqua:.aqua)
                 let window=NSWindow(contentRect:host.frame,styleMask:.borderless,backing:.buffered,defer:false);window.contentView=host
@@ -140,7 +145,7 @@ private struct FixtureApp:App {
                 let bitmap=host.bitmapImageRepForCachingDisplay(in:host.bounds)!;host.cacheDisplay(in:host.bounds,to:bitmap)
                 try bitmap.representation(using:.png,properties:[:])!.write(to:root.appendingPathComponent("\(kind)-\(dark ? "dark":"light").png"))
             }}
-            print("Rendered 26 production account-layout states at 600×660")
+            print("Rendered 28 production account-layout states at 600×660")
         } else {FixtureApp.main()}
     }
 }

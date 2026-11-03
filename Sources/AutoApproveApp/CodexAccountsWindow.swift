@@ -1,6 +1,14 @@
 import SwiftUI
 import AutoApproveCore
 
+struct CodexSessionAttachmentStatus:View {
+    let detail:String
+    var body:some View {
+        Label(detail,systemImage:"arrow.triangle.2.circlepath").font(.caption)
+            .fixedSize(horizontal:false,vertical:true)
+    }
+}
+
 struct CodexAccountsLayout<Content:View>:View {
     let close:()->Void
     @ViewBuilder var content:Content
@@ -35,6 +43,9 @@ struct CodexAccountsLayout<Content:View>:View {
                 completed:{},reconnect:{try await engine.reconnectCodexLogin(home:$0)},
                 setupHomes:{try await engine.codexServerSetupHomes()},serverStatus:{try await engine.codexManagedServerStatus(home:$0)},
                 prepareServer:{try await engine.prepareCodexManagedServer(home:$0)})
+            if let notice=engine.codexSessionAttachmentNotice {
+                CodexSessionAttachmentStatus(detail:notice)
+            }
             Divider()
             CodexAccountTransitionSettings(enabled:engine.codexAccountTransitionEnabled,busy:engine.codexAccountTransitionBusy,
                 states:engine.codexAccountTransitionStates,notice:engine.codexAccountTransitionNotice,error:error,

@@ -180,14 +180,15 @@ struct CodexLoginContent: View {
                         Image(systemName:state.phase == .running ? "checkmark.circle":"info.circle")
                     }.fixedSize(horizontal:false,vertical:true)
                     if let version=state.version {Text("Codex \(version)").font(.caption)}
+                    if let enabled=state.autoStartEnabled {Text("일반 Codex 실행의 데몬 자동 시작 · \(enabled ? "켜짐":"꺼짐")").font(.caption)}
                     if state.canPrepare,let prepareServer {
-                        Button("관리형 서버 준비",systemImage:"server.rack",action:prepareServer)
+                        Button(state.phase == .running ? "데몬 자동 시작 켜기":"관리형 서버 준비",systemImage:"server.rack",action:prepareServer)
                             .disabled(active || loading || disabled)
-                            .help("선택한 홈에서 공식 Codex 데몬을 시작합니다. 기존 작업을 종료하거나 서버를 재시작하지 않습니다.")
+                            .help("선택한 홈의 데몬 자동 시작을 켜고, 서버가 없으면 준비합니다. 실행 중인 서버는 재시작하지 않습니다.")
                     }
                     if preparingServer {Label("관리형 서버 준비 중…",systemImage:"hourglass").accessibilityLabel("관리형 서버 준비 중")}
                     if state.phase == .running,!canReconnect {
-                        Text("서버는 실행 중이지만 이 홈에 연결된 Codex 세션은 아직 확인되지 않았습니다. 독립 실행 중이라면 해당 대화를 일반 Codex 실행으로 다시 연 뒤 ‘연결 다시 확인’을 눌러주세요.")
+                        Text("서버는 실행 중이며 기존 Codex의 자동 연결을 확인합니다. 작업·Goal·질문·초안이 있으면 기다리고, 원본 셸과 대화를 확인한 세션은 같은 창에서 다시 연결합니다. 확인할 수 없는 경우 아래에 보류 이유를 표시합니다.")
                             .font(.caption).fixedSize(horizontal:false,vertical:true)
                     }
                     if [.missingCLI,.unsupported].contains(state.phase) {
@@ -234,7 +235,9 @@ struct CodexLoginContent: View {
                     }
                 }
                 if !loading,!canReconnect {
-                    Label("이 홈의 서버·세션 연결은 아직 확인되지 않았습니다. 연결을 다시 확인하거나 먼저 로그인해주세요.",systemImage:"info.circle")
+                    Label(serverStatus?.phase == .running
+                        ? "관리형 서버는 실행 중입니다. 기존 세션 연결 진행·보류 이유는 아래에서 확인할 수 있습니다."
+                        : "이 홈의 서버·세션 연결은 아직 확인되지 않았습니다. 연결을 다시 확인하거나 먼저 로그인해주세요.",systemImage:"info.circle")
                         .font(.caption).fixedSize(horizontal:false,vertical:true)
                 }
             }

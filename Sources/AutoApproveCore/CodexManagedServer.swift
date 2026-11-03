@@ -6,11 +6,12 @@ public struct CodexManagedServerStatus:Codable,Equatable,Sendable {
     public let phase:Phase
     public let version:String?
     public let detail:String
-    public var canPrepare:Bool {phase == .stopped}
-    public init(phase:Phase,version:String?=nil,detail:String) {self.phase=phase;self.version=version;self.detail=detail}
+    public let autoStartEnabled:Bool?
+    public var canPrepare:Bool {phase == .stopped || phase == .running && autoStartEnabled == false}
+    public init(phase:Phase,version:String?=nil,detail:String,autoStartEnabled:Bool?=nil) {self.phase=phase;self.version=version;self.detail=detail;self.autoStartEnabled=autoStartEnabled}
 }
 
-/// Preparation starts only a missing local daemon. It never bootstraps a
+/// Preparation enables automatic daemon use and starts only a missing daemon. It never bootstraps a
 /// launch agent, enables remote control, restarts work or changes credentials.
 public struct CodexManagedServerServices:Sendable {
     public var inspect:@Sendable(String,[ProcessRecord]) async throws -> CodexManagedServerStatus
@@ -28,6 +29,9 @@ public struct CodexManagedServerServices:Sendable {
             let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records)
             let before=try client.inspect()
             guard before.canPrepare else{return before}
+            let enabled=try client.run(["features","enable","daemon_auto_start"])
+            guard enabled.status==0,try client.autoStart() else {throw AppError.message("Codex 데몬 자동 시작 설정을 적용하지 못했습니다. 관리 정책과 선택한 홈의 설정 권한을 확인해주세요.")}
+            if before.phase == .running {return try client.inspect()}
             try Task.checkCancellation()
             let backup=try client.archiveDanglingSocket()
             var verified=false
@@ -108,6 +112,12 @@ private struct CodexManagedServerClient {
         }
         return backup
     }
+    func autoStart() throws ->Bool {
+        let result=try run(["features","list"])
+        let rows=result.output.split(separator:"\n").map{$0.split(whereSeparator:{$0.isWhitespace})}.filter{$0.first=="daemon_auto_start"}
+        guard result.status==0,rows.count==1,rows[0].count==3,["true","false"].contains(String(rows[0][2])) else {throw AppError.message("Codex 데몬 자동 시작의 유효 설정을 확인하지 못했습니다.")}
+        return rows[0][2]=="true"
+    }
     func inspect() throws ->CodexManagedServerStatus {
         guard let executable,FileManager.default.isExecutableFile(atPath:executable) else {
             return .init(phase:.missingCLI,detail:"이 Mac의 로그인 셸에서 Codex CLI를 찾지 못했습니다. Codex를 설치한 뒤 연결을 다시 확인해주세요.")
@@ -135,7 +145,7 @@ private struct CodexManagedServerClient {
                   stat(managed,&managedInfo)==0,[getuid(),0].contains(managedInfo.st_uid) else {
                 return .init(phase:.unavailable,version:version,detail:"기존 서버의 버전·소켓 연결을 확인하지 못했습니다. 실행 중인 작업을 유지하고 Codex 설치 상태를 확인해주세요.")
             }
-            return .init(phase:.running,version:version,detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.")
+            return .init(phase:.running,version:version,detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.",autoStartEnabled:try autoStart())
         }
         guard result.status != 0 else {
             return .init(phase:.unavailable,version:version,detail:"관리형 서버의 응답 형식을 확인하지 못했습니다. 서버를 시작하거나 다시 시작하지 않았습니다.")
@@ -155,7 +165,7 @@ private struct CodexManagedServerClient {
         }
         return .init(phase:.stopped,version:version,detail:dangling
             ? "이전 서버의 연결 경로가 사라졌습니다. 관리형 서버를 준비해주세요."
-            : "이 홈의 관리형 Codex 서버가 아직 준비되지 않았습니다.")
+            : "이 홈의 관리형 Codex 서버가 아직 준비되지 않았습니다.",autoStartEnabled:try autoStart())
     }
 }
 
