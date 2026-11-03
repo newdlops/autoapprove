@@ -1218,6 +1218,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         ]
 #if DEBUG
         cases.insert(contentsOf: [
+            ("Session migration: exact selected cohort reserves without changing ownership",tests.testSessionMigrationPreparesExactCohortWithoutChangingOwnership),
+            ("Session migration: shared writers and incomplete child membership reject",tests.testSessionMigrationRejectsSharedWritersAndIncompleteChildren),
+            ("Session migration: drafts questions queues and independent work reject",tests.testSessionMigrationRejectsDraftQuestionQueueAndIndependentWork),
+            ("Session migration: changed identities and shared credential backends reject",tests.testSessionMigrationRejectsChangedIdentityAndSharedBackends),
+            ("Session migration: post-reservation membership recheck releases untouched scope",tests.testSessionMigrationRechecksAfterDurableReservationAndReleasesOnChange),
+            ("Session migration: app restoration retains two-home ownership against reverse requests",tests.testSessionMigrationRestorationRetainsBothHomeReservations),
+            ("Session migration: cancellation during pending reads never prepares late or retains untouched locks",tests.testSessionMigrationCancellationDuringReadReleasesOnlyUntouchedReservation),
             ("Migration journal: mirrored revisions and terminal-only release",tests.testMigrationJournalMirrorsAndTerminalRelease),
             ("Migration journal: reversed locks and restart ownership",tests.testMigrationJournalLocksSurviveCoordinatorRestart),
             ("Migration journal: partial mirror repair preserves attempted intent",tests.testMigrationJournalRepairsPartialMirrorWithoutRevisingIntent),
