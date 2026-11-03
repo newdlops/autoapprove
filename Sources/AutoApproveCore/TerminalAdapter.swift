@@ -76,6 +76,8 @@ public struct ScreenHostAdapter: Sendable {
     public var completeResume: (@Sendable (ScreenTarget, CodexCapacityStop) throws -> ResumeDelivery)?
     /// The source is an already verified, idle original shell after an observed CLI error.
     public var restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
+    public var replacementShell: (@Sendable (ScreenTarget) throws -> ProcessRecord)?
+    public var replacementShellValid: (@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)?
     public var input: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
     public init(screens: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot,
                 approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
@@ -87,12 +89,14 @@ public struct ScreenHostAdapter: Sendable {
                 presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
                 initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
                 validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,
-                history:(@Sendable (ScreenTarget) throws -> String)? = nil) {
+                history:(@Sendable (ScreenTarget) throws -> String)? = nil,
+                replacementShell:(@Sendable (ScreenTarget) throws -> ProcessRecord)? = nil,
+                replacementShellValid:(@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
         self.initialScreens = initialScreens
         self.validationScreens = validationScreens
-        self.history=history
+        self.history=history;self.replacementShell=replacementShell;self.replacementShellValid=replacementShellValid
     }
     /// Validation consumes only fresh text. A channel failure must propagate;
     /// retrying through presentation could compare a different original frame.
@@ -112,7 +116,8 @@ public struct ScreenHostAdapter: Sendable {
                 presentationScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty)) },
                 initialScreens: { try TerminalAdapter.remoteScreens(ttys: $0.map(\.tty), includeCursor: false) },
                 validationScreens: { try TerminalAdapter.screens(ttys:$0.map(\.tty),includeCursor:false,includeTitles:false,purpose:.validation) },
-                history:{try TerminalAppleEvents.history(tty:$0.tty)})
+                history:{try TerminalAppleEvents.history(tty:$0.tty)},
+                replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)})
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
                 adapter.validationScreens = nil
@@ -270,7 +275,7 @@ public enum TerminalAdapter {
           for (const window of app.windows()) for (const tab of window.tabs()) {
             if (tab.tty() !== target.tty) continue;
             if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
-            const jobs = tab.processes().map(p => String(p).toLowerCase());
+            const jobs = tab.processes().map(p => String(p).toLowerCase()).filter(p => p !== 'login');
             if (jobs.length !== 1 || !/^(?:-)?(?:zsh|bash|sh|fish|dash|ksh)$/.test(jobs[0])) return 'agentMissing';
             app.doScript(String(target.command).normalize('NFC'), {in:tab});
             return 'sent';

@@ -19,6 +19,45 @@ extension ApprovalTests {
         try expectEqual(CodexStatusIdentity(screen:"").freshThread(in:wrapped),id)
         try expect(CodexStatusIdentity(screen:"").freshThread(in:card(id).replacingOccurrences(of:"Permissions:",with:"unrelated:"))==nil)
     }
+    func testCodexReplacementPreparationIsReservedBeforeExitAndNeverReplayed() async throws {
+        let rows=ProcessDiscovery.parse("""
+        910 1 ttys040 910 911 Mon Nov 2 10:00:00 2026 login
+        911 910 ttys040 911 911 Mon Nov 2 10:00:01 2026 /fixture/codex
+        920 1 ttys041 920 920 Mon Nov 2 10:00:02 2026 /bin/zsh
+        """)
+        var state=attachmentPlan();state.originalLogin=rows[0];state.context.shell=rows[0];state.phase = .needsTab;state.authorizedToolHosts=[rows[2]]
+        var prepared=0,exits=0,saved:[CodexSessionAttachment.Phase]=[]
+        let services=CodexSessionAttachmentServices(exit:{exits+=1;return true},shellReady:{false},launch:{throw AppError.message("Unexpected")},verify:{false},prepareReplacement:{prepared+=1;try expectEqual(saved.last,.tabReserved);return rows[2]})
+        state=try await services.advance(state,save:{saved.append($0.phase)})
+        try expectEqual(state.phase,.ready);try expectEqual(state.context.shell,rows[2]);try expectEqual(prepared,1);try expectEqual(exits,0)
+        state=try await services.advance(state,save:{saved.append($0.phase)})
+        try expectEqual(state.phase,.waitingShell);try expectEqual(exits,1);try expectEqual(prepared,1);try expect(state.authorizedToolHosts==nil);try expectEqual(state.toolHostShutdownWitnesses,[rows[2]])
+        state.phase = .tabReserved
+        let restored=try JSONDecoder().decode(CodexSessionAttachment.self,from:JSONEncoder().encode(state))
+        let uncertain=try await services.advance(restored,save:{_ in})
+        try expectEqual(uncertain.phase,.review);try expectEqual(prepared,1);try expectEqual(exits,1)
+        state.phase = .needsTab
+        let failed=CodexSessionAttachmentServices(exit:{exits+=1;return true},shellReady:{true},launch:{true},verify:{false},prepareReplacement:{throw AppError.message("Owned tab failed")})
+        let rejected=try await failed.advance(state,save:{_ in});try expectEqual(rejected.phase,.review);try expectEqual(exits,1)
+        try expect(rejected.preparationNotStarted != true)
+        let notStarted=CodexSessionAttachmentServices(exit:{exits+=1;return true},shellReady:{true},launch:{true},verify:{false},prepareReplacement:{throw RemoteHTTPError(409,"Not started",diagnostics:["delivery":"not_started"])})
+        let retryable=try await notStarted.advance(state,save:{_ in})
+        try expectEqual(retryable.phase,.review);try expectEqual(retryable.preparationNotStarted,true);try expectEqual(exits,1)
+    }
+    func testCodexReplacementShellAllowsItsOwnLoginButNotSiblingWork() throws {
+        let rows=ProcessDiscovery.parse("""
+        810 1 ttys031 810 810 Mon Nov 2 10:00:00 2026 login
+        811 810 ttys031 810 810 Mon Nov 2 10:00:01 2026 /bin/zsh
+        """)
+        var state=attachmentPlan();state.context.shell=rows[1]
+        try expectEqual(state.context.verifiedShell(in:rows),rows[1],"A shell's own login supervisor is not sibling work")
+        let other=ProcessDiscovery.parse("812 811 ttys031 810 810 Mon Nov 2 10:00:02 2026 /bin/sleep")
+        try expect(state.context.verifiedShell(in:rows+other)==nil)
+        let unrelated=ProcessDiscovery.parse("813 1 ttys031 810 810 Mon Nov 2 10:00:02 2026 login")
+        try expect(state.context.verifiedShell(in:rows+unrelated)==nil)
+        var loginOnly=state;loginOnly.context.shell=rows[0]
+        try expect(loginOnly.context.verifiedShell(in:[rows[0]])==nil)
+    }
     private func attachmentPlan() ->CodexSessionAttachment {
         let records=ProcessDiscovery.parse("""
         810 1 ttys031 810 811 Mon Nov 2 10:00:00 2026 /bin/zsh
@@ -94,6 +133,29 @@ extension ApprovalTests {
         813 811 ttys031 813 811 Mon Nov 2 10:01:02 2026 /fixture/bin/codex-code-mode-host
         """)
         try expectFalse(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records),"Idle tool hosts sharing the CLI job do not block attachment")
+        let toolHosts=ProcessDiscovery.parse("""
+        816 811 ttys031 816 811 Mon Nov 2 10:01:04 2026 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl
+        817 811 ttys031 817 811 Mon Nov 2 10:01:04 2026 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node
+        """)
+        try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+toolHosts),"Automatic attachment cannot assume tool hosts are idle")
+        let grant=CodexSessionAttachment.toolHosts(process:records[1],records:records+toolHosts)
+        try expectEqual(grant.count,2)
+        try expectFalse(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+toolHosts,authorizedToolHosts:grant))
+        for field in ["executable","tty","group"] {
+            var other=toolHosts[0]
+            if field=="executable" {other.executable=other.executable.replacingOccurrences(of:"node_repl",with:"node")}
+            if field=="tty" {other.tty="ttys099"}
+            if field=="group" {other.processGroup=999}
+            try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+[other],authorizedToolHosts:grant))
+        }
+        let descendant=ProcessDiscovery.parse("819 816 ttys031 816 811 Mon Nov 2 10:01:05 2026 /bin/sleep")
+        try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+toolHosts+descendant,authorizedToolHosts:grant))
+        var changed=toolHosts[0];changed.started="new instance"
+        try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+[changed],authorizedToolHosts:grant))
+        changed=toolHosts[0];changed.pid=999
+        try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+[changed],authorizedToolHosts:grant))
+        let unrelatedNode=ProcessDiscovery.parse("818 811 ttys031 818 811 Mon Nov 2 10:01:05 2026 /opt/bin/node")
+        try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+unrelatedNode))
         let work=ProcessDiscovery.parse("814 811 ttys032 814 814 Mon Nov 2 10:01:03 2026 /bin/bash")
         try expect(CodexSessionAttachment.hasIndependentChildWork(process:records[1],records:records+work))
         let agent=ProcessDiscovery.parse("815 811 ttys031 811 811 Mon Nov 2 10:01:04 2026 /fixture/bin/codex")

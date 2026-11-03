@@ -46,12 +46,23 @@ public struct SessionExitRecovery: Codable {
         // Agent composers and dialogs are never shell prompts.
         return !row.hasPrefix("›") && !row.hasPrefix("❯") && !row.hasPrefix("API Error:") && !row.hasPrefix("■")
     }
+    public static func foregroundShell(in records:[ProcessRecord],tty:String)->ProcessRecord? {
+        let shells=records.filter {$0.tty==tty && $0.isForeground && isShell($0)}
+        guard shells.count==1,let shell=shells.first else{return nil}
+        // Count by the selected shell's foreground group. A stale per-record
+        // tpgid must not hide a conflicting job in that same group.
+        let foreground=records.filter {$0.tty==tty && $0.processGroup==shell.foregroundGroup}
+        let ancestors=Set(ProcessDiscovery.ancestors(of:shell.parent,records:records).filter {
+            $0.tty==tty && ($0.executable as NSString).lastPathComponent=="login"
+        }.map(\.key))
+        guard foreground.allSatisfy({$0.key==shell.key || ancestors.contains($0.key)}) else{return nil}
+        return shell
+    }
     public func verifiedShell(in records: [ProcessRecord]) -> ProcessRecord? {
         guard !records.contains(where:{$0.pid == session.pid && $0.started == session.started}),
               let live = records.first(where:{$0.pid == shell.pid && $0.started == shell.started && $0.tty == shell.tty}),
               Self.isShell(live), live.isForeground else { return nil }
-        let foreground = records.filter {$0.tty == live.tty && $0.processGroup == live.foregroundGroup}
-        guard foreground.count == 1, foreground[0].pid == live.pid else { return nil }
+        guard Self.foregroundShell(in:records,tty:live.tty)?.key==live.key else{return nil}
         return live
     }
     public var command: String? {

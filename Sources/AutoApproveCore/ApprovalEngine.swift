@@ -365,6 +365,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     @Published public private(set) var codexSessionAttachmentNotice:String?
     private var codexSessionAttachments:[String:CodexSessionAttachment]=[:]
     private var codexAttachmentWaitReasons:[String:String]=[:]
+    private var codexAttachmentToolHostGrants:[String:[String:[ProcessRecord]]]=[:]
     private var codexAttachmentHomes:Set<String>=[]
     private var codexAttachmentActiveIDs:Set<String>=[]
     private var codexManagedServerAutomaticTask:Task<Void,Never>?
@@ -384,7 +385,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func codexAccountInputHeld(_ id: String) -> Bool {
         guard let session=sessions[id],session.agent == .codex else{return false}
         return codexAccountTransitionHeld || codexAttachmentActiveIDs.contains(id) || codexSessionAttachments.values.contains {
-            [.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase) && $0.context.session.tty==session.tty
+            [.needsTab,.tabReserved,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase) && ($0.context.session.tty==session.tty || ($0.replacesTab && "/dev/"+$0.context.shell.tty==session.tty))
         }
     }
     private static let codexAccountHoldMessage = "계정 전환을 위해 Codex 작업을 중단·대기하고 있습니다. 전환 결과를 확인한 뒤 입력해주세요."
@@ -554,7 +555,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         configureNativeCodexLogin()
-        if let saved=store.value("codexSessionAttachments"),let data=saved.data(using:.utf8),let states=try? JSONDecoder().decode([String:CodexSessionAttachment].self,from:data) {codexSessionAttachments=states}
+        if let saved=store.value("codexSessionAttachments"),let data=saved.data(using:.utf8),let states=try? JSONDecoder().decode([String:CodexSessionAttachment].self,from:data) {codexSessionAttachments=states.mapValues {var restored=$0;restored.authorizedToolHosts=nil;return restored}}
     }
     private func configureNativeCodexLogin() {
         let accounts=agentAccounts
@@ -5822,7 +5823,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 waitDetails.append("• "+session.project+" · "+session.tty.replacingOccurrences(of:"/dev/",with:"")+": "+reason)
             }
             for original in snapshot.sessions.filter({$0.agent == .codex && $0.phase != .ended && !connectedIDs.contains($0.id)}).sorted(by:{$0.pid<$1.pid}) {
-                let id=original.id
+                let id=original.id,approvedToolHosts=codexAttachmentToolHostGrants[home]?[original.id] ?? []
                 guard authorized(id) else{return}
                 guard codexSessionAttachments[id]==nil else{continue}
                 guard let host=ScreenHost(kind:original.terminal),[ScreenHost.terminal,.iterm].contains(host),screenConnections[host]?.enabled == true,
@@ -5833,13 +5834,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 guard let process=live.first(where:{$0.key==id && $0.agent == .codex && "/dev/"+$0.tty==original.tty}),process.isForeground,
                       let executable=CodexServerLocation.executable(process) else {wait(original,"원본 실행 정보 확인 필요");continue}
-                guard let shell=ProcessDiscovery.ancestors(of:process.parent,byPID:ProcessDiscovery.index(live)).first(where:{$0.tty==process.tty && SessionExitRecovery.isShell($0)}) else{wait(original,"원본 셸 확인 필요");continue}
+                let parents=ProcessDiscovery.ancestors(of:process.parent,byPID:ProcessDiscovery.index(live))
+                let originalShell=parents.first(where:{$0.tty==process.tty && SessionExitRecovery.isShell($0)})
+                let login=originalShell==nil ? parents.first(where:{$0.pid==process.parent && $0.tty==process.tty && ($0.executable as NSString).lastPathComponent=="login"}):nil
+                guard let shell=originalShell ?? login else{wait(original,"원본 셸·직접 실행 login 확인 필요");continue}
+                if login != nil,host != .terminal || screenAdapters[host]?.replacementShell==nil || screenAdapters[host]?.replacementShellValid==nil {wait(original,"셸 없는 실행 · 같은 창의 복구 탭 준비 필요");continue}
                 let location=try? await Task.detached(priority:.utility){try CodexThreadLocation.locate(paths:ProcessOpenFiles.codexRolloutPaths(pid:process.pid,expectedStart:process.started))}.value
                 var threadID:String?
                 if let location,try CodexAccountTransitionTarget.canonicalHome(URL(fileURLWithPath:location.database).deletingLastPathComponent().path)==home {threadID=location.threadID}
                 else {
                     guard let selected=try? await CodexReplyTransport.selectedQueueTarget(original),selected.home==home else{wait(original,"실행 중인 Codex의 설정 홈 확인 필요");continue}
-                    guard !CodexSessionAttachment.hasIndependentChildWork(process:process,records:live),let adapter=screenAdapters[host] else{wait(original,"하위 작업 완료 대기");continue}
+                    guard !CodexSessionAttachment.hasIndependentChildWork(process:process,records:live,authorizedToolHosts:approvedToolHosts),let adapter=screenAdapters[host] else{wait(original,"하위 작업 완료 대기");continue}
                     codexAttachmentActiveIDs.insert(id)
                     threadID=try await identifyStandaloneCodex(original,home:home,adapter:adapter,authorized:{authorized(id)})
                     codexAttachmentActiveIDs.remove(id)
@@ -5849,23 +5854,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard goal?.status != .active else {wait(original,"활성 Goal · 완료 후 자동 연결");continue}
                 var context=SessionExitRecovery(session:original,process:process,shell:shell,conversationID:threadID)
                 context.executable=executable
-                try saveCodexSessionAttachment(.init(context:context,home:home))
+                try saveCodexSessionAttachment(.init(context:context,home:home,originalLogin:login,authorizedToolHosts:approvedToolHosts))
             }
             for state in codexSessionAttachments.values.filter({$0.home==home && ![.connected,.review].contains($0.phase)}).sorted(by:{$0.context.session.pid<$1.context.session.pid}) {
                 let context=state.context,original=context.session,id=original.id
                 guard authorized(id),let host=ScreenHost(kind:original.terminal),screenConnections[host]?.enabled==true,let adapter=screenAdapters[host],let restart=adapter.restart else{return}
                 codexAttachmentActiveIDs.insert(id)
                 let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
+                func cleanupFinished(_ records:[ProcessRecord])->Bool {
+                    let witnesses=state.toolHostShutdownWitnesses ?? state.authorizedToolHosts ?? []
+                    return !witnesses.contains {host in records.contains(where:{$0.key==host.key})}
+                }
                 func screen(_ target:ScreenTarget) async throws->String {
                     guard authorized(id) else{throw CancellationError()}
                     let result=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
                     guard authorized(id),result.failures.isEmpty,result.screens.count==1,let raw=result.screens.first?.contents else{throw AppError.message("원본 터미널 화면을 확인하지 못했습니다.")}
                     return raw
                 }
-                if state.phase == .ready {
+                if state.phase == .ready || state.phase == .needsTab {
                     let current=try await Task.detached(priority:.utility){try reader()}.value
                     guard sessions[id]?.phase == .idle,sessions[id]?.needsReview == false,
-                          let process=current.first(where:{$0.key==id}),!CodexSessionAttachment.hasIndependentChildWork(process:process,records:current),
+                          let process=current.first(where:{$0.key==id}),!CodexSessionAttachment.hasIndependentChildWork(process:process,records:current,authorizedToolHosts:state.authorizedToolHosts ?? []),
                           CodexProgressScreen.ready(try await screen(target)) else {
                         codexSessionAttachmentNotice="기존 작업·질문·초안·하위 작업이 끝날 때까지 같은 창에서 연결을 기다립니다."
                         codexAttachmentActiveIDs.remove(id);continue
@@ -5873,12 +5882,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 let services=CodexSessionAttachmentServices(exit:{
                     let current=try await Task.detached(priority:.utility){try reader()}.value
-                    guard authorized(id),let process=current.first(where:{$0.key==id && $0.tty==context.shell.tty && $0.isForeground}),
+                    guard authorized(id),let process=current.first(where:{$0.key==id && "/dev/"+$0.tty==original.tty && $0.isForeground}),
                           current.contains(where:{$0.key==context.shell.key}),self.sessions[id]?.phase == .idle,self.sessions[id]?.needsReview == false,
                           CodexServerLocation.executable(process)==context.executable,
                           CodexServerLocation.connectedHome(pid:process.pid,hints:[home])==nil else{throw AppError.message("원래 실행이나 입력 상태가 바뀌어 종료하지 않았습니다.")}
-                    guard !CodexSessionAttachment.hasIndependentChildWork(process:process,records:current) else{throw AppError.message("분리된 하위 작업이 있어 자동 연결을 보류했습니다.")}
+                    guard !CodexSessionAttachment.hasIndependentChildWork(process:process,records:current,authorizedToolHosts:state.authorizedToolHosts ?? []) else{throw AppError.message("분리된 하위 작업이 있어 자동 연결을 보류했습니다.")}
+                    if let login=state.originalLogin {
+                        guard process.parent==login.pid,current.contains(where:{$0==login}),SessionExitRecovery.foregroundShell(in:current,tty:context.shell.tty)?.key==context.shell.key,
+                              let validate=adapter.replacementShellValid else{throw AppError.message("복구 셸이나 원래 login 실행이 바뀌었습니다.")}
+                        let sameWindow=try await Task.detached(priority:.utility){try validate(target,context.shell)}.value
+                        guard sameWindow else{throw AppError.message("복구 탭이 원래 창과 같은 창이 아닙니다.")}
+                        let replacementTarget=ScreenTarget(tty:"/dev/"+context.shell.tty,jobPIDs:[context.shell.pid],sourcePID:context.shell.pid,sourceStarted:context.shell.started)
+                        guard context.shell.isForeground,SessionExitRecovery.emptyShellPrompt(try await screen(replacementTarget)) else{throw AppError.message("복구 탭에 다른 작업·입력이 있어 원래 Codex를 종료하지 않았습니다.")}
+                    }
                     let files=try ProcessOpenFiles.codexRolloutPaths(pid:process.pid,expectedStart:process.started)
+                    if state.replacesTab,files.isEmpty {
+                        let identified=try await self.identifyStandaloneCodex(original,home:home,adapter:adapter,authorized:{authorized(id)})
+                        guard identified==context.conversationID else{throw AppError.message("탭 준비 뒤 원래 대화가 바뀌었습니다.")}
+                    }
                     let before=try await screen(target)
                     if let location=try? CodexThreadLocation.locate(paths:files) {
                         guard location.threadID==context.conversationID else{throw AppError.message("원래 대화가 바뀌었습니다.")}
@@ -5901,24 +5922,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     guard goal?.status != .active else{throw AppError.message("새로 활성화된 Goal을 유지하고 자동 연결을 보류했습니다.")}
                     _ = try await Task.detached(priority:.utility){try CodexQueueConnection(home:home).peerProcessID()}.value
                     guard try await screen(target)==before else{throw AppError.message("서버 확인 중 화면이 바뀌어 종료하지 않았습니다.")}
-                    guard self.log(AuditEvent(sessionID:id,summary:"기존 Codex 서버 연결",outcome:"같은 창·대화 연결을 위한 종료 요청 예약",source:host.title,context:AuditContext(session:original))) else{throw AppError.message("연결 기록을 저장하지 못했습니다.")}
+                    guard self.log(AuditEvent(sessionID:id,summary:"기존 Codex 서버 연결",outcome:state.authorizedToolHosts?.isEmpty == false ? "사용자 재연결 요청 · 확인한 도구 호스트 정리를 포함한 정상 종료 예약":"같은 창·대화 연결을 위한 종료 요청 예약",source:host.title,context:AuditContext(session:original))) else{throw AppError.message("연결 기록을 저장하지 못했습니다.")}
                     return try await Task.detached(priority:.utility){try adapter.input(target,before,.codex,.init(kind:.submit,text:"/exit")) == .sent}.value
                 },shellReady:{
                     let current=try await Task.detached(priority:.utility){try reader()}.value
-                    guard authorized(id),let shell=context.verifiedShell(in:current) else{return false}
-                    let source=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
+                    guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current) else{return false}
+                    let source=ScreenTarget(tty:"/dev/"+shell.tty,handle:state.replacesTab ? nil:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
                     return SessionExitRecovery.emptyShellPrompt(try await screen(source))
                 },launch:{
                     let current=try await Task.detached(priority:.utility){try reader()}.value
-                    guard authorized(id),let shell=context.verifiedShell(in:current),let command=state.command,FileManager.default.isExecutableFile(atPath:context.executable) else{throw AppError.message("원래 셸·실행 파일·대화를 확인하지 못했습니다.")}
-                    let source=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
+                    guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current),let command=state.command,FileManager.default.isExecutableFile(atPath:context.executable) else{throw AppError.message("원래 셸·실행 파일·대화를 확인하지 못했습니다.")}
+                    let source=ScreenTarget(tty:"/dev/"+shell.tty,handle:state.replacesTab ? nil:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
                     let before=try await screen(source)
                     guard SessionExitRecovery.emptyShellPrompt(before) else{throw AppError.message("셸 입력창이 비어 있지 않습니다.")}
                     return try await Task.detached(priority:.utility){try restart(source,before,command) == .sent}.value
                 },verify:{
                     let current=try await Task.detached(priority:.utility){try reader()}.value
                     let candidates=current.filter{$0.agent == .codex && $0.tty==context.shell.tty && $0.key != id && ProcessDiscovery.ancestors(of:$0.parent,byPID:ProcessDiscovery.index(current)).contains(where:{$0.key==context.shell.key})}
-                    guard authorized(id),candidates.count==1,let next=candidates.first,CodexServerLocation.connectedHome(pid:next.pid,hints:[home])==home,let thread=context.conversationID else{return false}
+                    guard authorized(id),cleanupFinished(current),candidates.count==1,let next=candidates.first,CodexServerLocation.connectedHome(pid:next.pid,hints:[home])==home,let thread=context.conversationID else{return false}
                     let loaded=try await Task.detached(priority:.utility){
                         let result=try CodexQueueConnection(home:home).request("thread/read",["threadId":thread,"includeTurns":false])
                         guard let row=result["thread"] as? JSONObject else{return false}
@@ -5928,6 +5949,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     self.sessions[next.key]?.automatic=original.automatic
                     try self.store.set("automatic:"+next.key,original.automatic ? "true":"false")
                     return true
+                },prepareReplacement:{
+                    guard authorized(id),let prepare=adapter.replacementShell else{throw AppError.message("원래 창의 복구 탭 준비를 지원하지 않습니다.")}
+                    let current=try await Task.detached(priority:.utility){try reader()}.value
+                    guard let process=current.first(where:{$0.key==id && $0.isForeground}),!CodexSessionAttachment.hasIndependentChildWork(process:process,records:current,authorizedToolHosts:state.authorizedToolHosts ?? []),
+                          CodexProgressScreen.ready(try await screen(target)) else{throw AppError.message("원래 작업·질문·입력이 끝나기를 기다립니다.")}
+                    return try await Task.detached(priority:.utility){try prepare(target)}.value
                 })
                 _ = try await services.advance(state,save:{try self.saveCodexSessionAttachment($0)})
                 codexAttachmentActiveIDs.remove(id)
@@ -6036,18 +6063,52 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         return false
     }
+    private func revokeUnspentCodexToolHostGrants(home:String) {
+        for var state in codexSessionAttachments.values.filter({$0.home==home && [.needsTab,.ready].contains($0.phase) && $0.authorizedToolHosts?.isEmpty == false}) {
+            state.authorizedToolHosts=nil
+            state.detail="직접 재연결 요청이 끝나 도구 호스트 정리 허용을 해제했습니다. 자동 연결은 남은 작업이 끝나기를 기다립니다."
+            do {try saveCodexSessionAttachment(state)}
+            catch {
+                // Revoke in memory even if disk is unavailable. Restoration
+                // always drops grants, so the stale disk value cannot re-arm.
+                codexSessionAttachments[state.context.session.id]=state
+                codexSessionAttachmentNotice="도구 호스트 정리 허용을 해제했습니다. 연결 기록 저장을 확인해주세요."
+            }
+        }
+    }
     public func reconnectCodexLogin(home:String) async throws {
         // Explicit reconnect first advances standalone-session attachment.
         // Account refresh must wait until an exit/launch has been verified.
         let attachmentHome=try CodexAccountTransitionTarget.canonicalHome(home)
         if try await joinCodexAccountControl(home:attachmentHome) {return}
+        let grantReader=processReader
+        let grantRecords=try await Task.detached(priority:.utility){try grantReader()}.value
+        let roots=Set(ProcessDiscovery.sessions(grantRecords).filter{$0.agent == .codex}.map(\.id))
+        var grants:[String:[ProcessRecord]]=[:]
+        for process in grantRecords where roots.contains(process.key) {grants[process.key]=CodexSessionAttachment.toolHosts(process:process,records:grantRecords)}
+        codexAttachmentToolHostGrants[attachmentHome]=grants
+        defer {
+            codexAttachmentToolHostGrants.removeValue(forKey:attachmentHome)
+            revokeUnspentCodexToolHostGrants(home:attachmentHome)
+        }
+        // Only a user-triggered reconnect may retry a tab effect proved absent.
+        // Unknown outcomes retain review and never create a second tab.
+        for var state in codexSessionAttachments.values.filter({$0.home==attachmentHome && $0.phase == .review && $0.replacesTab && $0.preparationNotStarted == true}) {
+            state.phase = .needsTab;state.preparationNotStarted=nil
+            state.detail="사용자 요청으로 시작되지 않은 복구 탭 준비를 다시 확인합니다."
+            try saveCodexSessionAttachment(state)
+        }
+        for var state in codexSessionAttachments.values.filter({$0.home==attachmentHome && [.ready,.needsTab].contains($0.phase)}) {
+            state.authorizedToolHosts=grants[state.context.session.id] ?? []
+            try saveCodexSessionAttachment(state)
+        }
         let attachmentEpoch=codexAccountTransitionEpoch,attachmentReader=processReader
         let standalone=try await Task.detached(priority:.utility){
             try attachmentReader().contains {record in
                 record.agent == .codex && record.tty != "??" && CodexServerLocation.executable(record) != nil && CodexServerLocation.connectedHome(pid:record.pid,hints:[attachmentHome])==nil
             }
         }.value
-        if standalone || codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && [.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}) {
+        if standalone || codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && [.needsTab,.tabReserved,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}) {
             // A manual attempt can recover an earlier automatic setup failure.
             let status=try await codexManagedServerStatus(home:attachmentHome)
             let ready=status.canPrepare ? try await prepareCodexManagedServer(home:attachmentHome):status
@@ -6057,7 +6118,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard attachmentEpoch==codexAccountTransitionEpoch,!Task.isCancelled else{throw CancellationError()}
         let attachmentDeadline=Date().addingTimeInterval(125)
-        while codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && [.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}) {
+        while codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && [.needsTab,.tabReserved,.ready,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}) {
             guard !Task.isCancelled,attachmentEpoch==codexAccountTransitionEpoch,!remoteInputStopped,!agentAccounts.busy else{throw CancellationError()}
             guard Date()<attachmentDeadline else{throw AppError.message("기존 세션 연결 결과를 확인하고 있습니다. 같은 종료·실행 입력을 반복하지 않습니다.")}
             try await Task.sleep(for:.seconds(2));await ensureCodexManagedServers()
@@ -6073,7 +6134,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else {throw CancellationError()}
         guard !codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")}
         guard targets.contains(where:{$0.home==home}) else {
-            throw AppError.message("재연결할 Codex 서버·세션이 바뀌었습니다. 현재 계정을 다시 확인해주세요.")
+            if let issue=codexSessionAttachments.values.filter({$0.home==home && $0.phase == .review}).sorted(by:{$0.context.session.pid<$1.context.session.pid}).first {
+                throw AppError.message("기존 세션 연결을 완료하지 못했습니다. "+issue.detail)
+            }
+            throw AppError.message("이 홈의 관리형 서버에 연결된 세션이 아직 없습니다. "+(codexSessionAttachmentNotice ?? "기존 대화의 연결 상태를 확인해주세요."))
         }
         try persistCodexAccountTransitionEnabled(true)
         try recordCodexLoginRefresh(home:home,id:UUID().uuidString)
@@ -6085,7 +6149,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func performCodexAccountTransitionCheck(epoch:UUID) async {
         guard epoch==codexAccountTransitionEpoch else{return}
         guard !remoteInputStopped, !codexAccountTransitionBusy,
-              !codexSessionAttachments.values.contains(where:{[.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}),
+              !codexSessionAttachments.values.contains(where:{[.needsTab,.tabReserved,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}),
               codexAccountTransitionEnabled || codexAccountTransitionHeld else { return }
         codexAccountTransitionBusy = true; defer {if epoch==codexAccountTransitionEpoch {codexAccountTransitionBusy = false}}
         do {

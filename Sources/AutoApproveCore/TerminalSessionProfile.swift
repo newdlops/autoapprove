@@ -64,7 +64,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         if let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
         arguments.append(agent)
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
-        return "cd -- "+HookInstaller.quote(entry.cwd)+" && exec "+arguments.map(HookInstaller.quote).joined(separator:" ")
+        return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+(entry.agent == "codex" ? "":"exec ")+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
 }
 

@@ -1173,6 +1173,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account reconnect: review preserves reservations on changed identity",tests.testAccountReviewNeverRetriesReservedInterruptOrChangedIdentity),
             ("Account reconnect: join pending transition without duplicate restart",tests.testAccountReconnectJoinsExistingTransitionWithoutNewRestart),
             ("Account reconnect: review reconciles a stopped reserved turn read-only",tests.testAccountReviewReadsQuiescenceBeforeContinuingWithoutRepeatedInterrupt),
+            ("Codex attachment: replacement preparation is reserved before original exit",tests.testCodexReplacementPreparationIsReservedBeforeExitAndNeverReplayed),
+            ("Codex attachment: replacement shell distinguishes login supervisor and sibling work",tests.testCodexReplacementShellAllowsItsOwnLoginButNotSiblingWork),
             ("Codex attachment: fresh status identity without rollout",tests.testCodexFreshStatusIdentityRequiresFreshCompleteUnambiguousCard),
             ("Codex attachment: sequential persisted reservations and verification",tests.testCodexAttachmentSequentialReservationsAndVerification),
             ("Codex attachment: uncertain delivery and restart never replay",tests.testCodexAttachmentRestartAndAmbiguousDeliveryDoNotReplay),

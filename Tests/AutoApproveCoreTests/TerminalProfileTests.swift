@@ -90,6 +90,7 @@ extension ApprovalTests {
         entry.providerHome=home
         let command=try entry.resumeCommand()
         try expect(command.contains("'codex' 'resume' '"+entry.conversationID+"'"))
+        try expectFalse(command.contains("&& exec "),"Codex restoration must retain the interactive shell")
         try expect(command.contains("'CODEX_HOME="));try expect(command.contains("'\\''"))
         for forbidden in ["--last","--yolo","dangerously","이어서","continue this"] {try expect(!command.contains(forbidden))}
         for host in TerminalProfileEntry.Host.allCases {
@@ -118,7 +119,7 @@ extension ApprovalTests {
         var codex=profileEntry(cwd:"/tmp/fresh-workspace");codex.conversationID=" \n "
         let normalized=try codex.validated()
         try expectEqual(normalized.conversationID,"");try expect(!normalized.resumesConversation)
-        try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && exec 'env' 'codex'")
+        try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' 'codex'")
         var claude=normalized;claude.id=UUID();claude.agent="claude";claude.providerHome="/tmp/provider with space"
         try expectEqual(try claude.resumeCommand(),"cd -- '/tmp/fresh-workspace' && exec 'env' 'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'claude'")
         var another=normalized;another.id=UUID()
