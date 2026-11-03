@@ -138,6 +138,33 @@ public struct YesNoConfirmation {
         return text
     }
 
+    /// Terminal cell wrapping can split even the letters in a fixed action.
+    /// This projection is only for a fully bounded Codex permission dialog;
+    /// hook questions and arbitrary task labels keep their original policy.
+    static func codexTerminalLabel(_ value:String)->String {
+        let text=cleaned(value)
+        guard !text.contains("…") else{return value}
+        var compact=text.replacingOccurrences(of:#"[‘’ʼ]"#,with:"'",options:.regularExpression)
+            .filter{!$0.isWhitespace}.lowercased()
+        compact=compact.replacingOccurrences(of:#"(?:\((?:[a-z]|esc|recommended)\)|\[(?:[a-z]|esc|recommended)\])+$"#,with:"",options:.regularExpression)
+        switch compact {
+        case "yes":return "Yes"
+        case "yes,proceed":return "Yes, proceed"
+        case "yes,continue":return "Yes, continue"
+        case "no":return "No"
+        case "no,andtellcodexwhattododifferently":return "No, and tell Codex what to do differently"
+        case "no,andtellclaudewhattododifferently":return "No, and tell Claude what to do differently"
+        case "no,andtelltheagentwhattododifferently":return "No, and tell the agent what to do differently"
+        default:break
+        }
+        // This scope is never selected. Recognize its fixed permission prefix,
+        // retaining the complete raw scope/command in final validation and audit.
+        if compact.range(of:#"^yes,and(?:don't|donot)ask(?:me)?again(?:for.+|in.+|during.+|thissession)?$"#,options:.regularExpression) != nil {
+            return "Yes, and don't ask again for this command"
+        }
+        return value
+    }
+
     static func isToolPermissionMenu(_ labels: [String]) -> Bool {
         let labels = labels.map { permissionLabel($0).lowercased() }
         let known: Set<String> = ["allow", "allow once", "allow this time", "allow this request only",

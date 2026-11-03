@@ -6823,6 +6823,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         self.log(event); return
                     }
                     if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
+                    if delivery == .screenChanged {
+                        await self.refreshRejectedApproval(session,target:target,generation:state.generation,
+                            requestIdentity:current.prompt.requestIdentity,epoch:epoch,read:adapter.validationScreens ?? adapter.screens)
+                    }
                     if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
                     event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     self.log(event)
@@ -6849,6 +6853,42 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
             self.publish()
+        }
+    }
+
+    /// A proven non-write may mean a bulk monitor frame has lagged behind the
+    /// original. Re-read only that target; never replay a sent/uncertain input.
+    private func refreshRejectedApproval(_ original:AgentSession,target:ScreenTarget,generation:String,
+        requestIdentity:String,epoch:UInt64,read:@escaping @Sendable([ScreenTarget]) throws->TerminalSnapshot) async {
+        let id=original.id,startedAt=Date(),reader=processReader
+        guard let before=remoteObservedScreens[id] else{return}
+        let worker=Task.detached(priority:.userInitiated) {() throws -> (String,ScreenAnalysis)? in
+            func stillOriginal() throws -> Bool {
+                try Task.checkCancellation()
+                return try reader().contains{$0.pid==original.pid && $0.started==original.started && $0.agent==original.agent && "/dev/"+$0.tty==original.tty && $0.isForeground}
+            }
+            guard try stillOriginal() else{return nil}
+            let snapshot=try read([target]),frames=snapshot.screens.filter{$0.tty==original.tty}
+            guard frames.count==1,!snapshot.failures.contains(where:{$0.tty==nil || $0.tty==original.tty}),try stillOriginal() else{return nil}
+            let raw=frames[0].contents
+            return (raw,ScreenAnalysis(raw:raw,agent:original.agent))
+        }
+        do {
+            let value=try await withTaskCancellationHandler(operation:{try await worker.value},onCancel:{worker.cancel()})
+            guard let value,!Task.isCancelled,automationRuntime.epoch(id)==epoch,!remoteInputStopped,!snapshot.paused,
+                  !automationNeedsFreshScreen.contains(id),!userInputHasPriority(id),sessions[id]?.automatic==true,
+                  sessions[id]?.pid==original.pid,sessions[id]?.started==original.started,sessions[id]?.tty==original.tty,
+                  sessions[id]?.channel==original.channel,sessions[id]?.screenHandle==original.screenHandle,
+                  screens[id]?.generation==generation,screens[id]?.prompt.requestIdentity==requestIdentity,
+                  screens[id]?.attempted==false,let observed=remoteObservedScreens[id],
+                  observed.observedAt<=startedAt || (observed.generation==before.generation && ScreenTextEquality.identical(observed.raw,before.raw)) else{return}
+            // Unchanged monitor ticks are not newer content. They must not
+            // starve a slower original read; a changed frame still wins.
+            receiveScreen(sessionID:id,raw:value.0,generation:generation,source:original.channel,at:Date(),
+                precomputed:value.1,screenContentsUnchanged:false)
+        } catch {
+            // A failed read does not authorize input. The existing non-write
+            // backoff and normal monitor remain responsible for another check.
         }
     }
 }

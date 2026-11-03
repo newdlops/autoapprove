@@ -14,14 +14,20 @@ private final class ApprovalRecoveryProbe: @unchecked Sendable {
     var blockedTTY: String?
     var rejectFirst = false
     var throwFirst = false
+    var requiredFrame:String?
+    var readsAtAcceptance:(@Sendable()->Int)?
+    private var acceptedReads:[Int]=[]
     func approve(_ target: ScreenTarget, _ raw: String) throws -> TerminalDelivery {
         lock.lock(); calls.append((target, raw)); let first = calls.count == 1; lock.unlock()
         if first && target.tty == blockedTTY { _ = gate.wait(timeout: .now() + 5) }
         if first && throwFirst { throw AppError.message("Fixture lost delivery receipt") }
+        if let requiredFrame,raw != requiredFrame {return .screenChanged}
+        if let count=readsAtAcceptance?() {lock.lock();acceptedReads.append(count);lock.unlock()}
         return first && rejectFirst ? .screenChanged : .sent
     }
     func release() { gate.signal() }
     var inputs: [(ScreenTarget, String)] { lock.lock(); defer { lock.unlock() }; return calls }
+    var acceptanceReadCounts:[Int] {lock.lock();defer {lock.unlock()};return acceptedReads}
 }
 
 private final class NativeTypingActivity:@unchecked Sendable {
@@ -64,6 +70,70 @@ private final class DeliveredFrameProbe:@unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testApprovalReflowLateValidationCannotOverridePauseDisableOrNewQuestion() async throws {
+        for mode in ["pause","disable","new-question"] {
+            let stale=recoveryPrompt("echo stale-read"),fresh=recoveryPrompt("echo fresh-read"),gate=NativeTypingValidationGate()
+            let probe=ApprovalRecoveryProbe();probe.requiredFrame=fresh
+            let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{targets in
+                gate.wait();return .init(screens:targets.map{.init(tty:$0.tty,contents:fresh)})
+            })
+            defer{gate.release();engine.stop();try? FileManager.default.removeItem(at:directory)}
+            let id=sessions[0].id
+            engine.receiveScreen(sessionID:id,raw:stale,generation:"late-read")
+            try await waitForRecovery({gate.started},"A definitive mismatch starts the original-only validation read")
+            if mode=="pause" {try engine.setPaused(true)}
+            else if mode=="disable" {try engine.setAutomatic(id,enabled:false)}
+            else {engine.receiveScreen(sessionID:id,raw:"Which environment?\n› 1. Staging\n  2. Production\nEnter to confirm or esc to cancel",generation:"late-read")}
+            gate.release();try await Task.sleep(for:.milliseconds(120))
+            try expectEqual(probe.inputs.count,1,"A suspended validation read must not authorize another input after \(mode)")
+            if mode=="new-question" {try expectEqual(engine.snapshot.sessions.first?.phase,.input)}
+        }
+    }
+    func testApprovalReflowUnknownDeliveryNeverStartsRefreshOrRetry() async throws {
+        let probe=ApprovalRecoveryProbe();probe.throwFirst=true
+        let frames=DeliveredFrameProbe(recoveryPrompt("echo fresh-but-unknown"))
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{frames.read($0)})
+        defer{engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let raw=recoveryPrompt("echo unknown-delivery")
+        engine.receiveScreen(sessionID:sessions[0].id,raw:raw,generation:"unknown")
+        try await waitForRecovery({engine.snapshot.sessions.first?.pendingInTerminal==true},"An unknown delivery remains reserved for review")
+        for _ in 0..<3 {engine.receiveScreen(sessionID:sessions[0].id,raw:raw,generation:"unknown");try await Task.sleep(for:.milliseconds(30))}
+        try expectEqual(probe.inputs.count,1)
+        try expectEqual(frames.targets.count,0,"Fresh-frame recovery must never be used to repeat a possibly delivered permission")
+    }
+    func testApprovalReflowDefinitiveMismatchReadsFreshOriginalWithoutAnotherEvent() async throws {
+        for repeatedMonitor in [false,true] {
+        let stale=recoveryPrompt("echo stale-monitor"),fresh=recoveryPrompt("echo fresh-original")
+        let probe=ApprovalRecoveryProbe();probe.requiredFrame=fresh
+        let frames=DeliveredFrameProbe(fresh),gate=NativeTypingValidationGate()
+        probe.readsAtAcceptance={frames.targets.count}
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{targets in
+            let result=frames.read(targets);if repeatedMonitor {gate.wait()};return result
+        })
+        defer{gate.release();engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id=sessions[0].id
+        engine.receiveScreen(sessionID:id,raw:stale,generation:"same-original")
+        if repeatedMonitor {
+            try await waitForRecovery({gate.started},"Hold the fresh read while unchanged monitor frames arrive")
+            for _ in 0..<3 {engine.receiveScreen(sessionID:id,raw:stale,generation:"same-original");try await Task.sleep(for:.milliseconds(10))}
+            gate.release()
+        }
+        try await waitForRecovery({probe.inputs.contains{$0.1==fresh}},"A definitive mismatch must refresh its exact original without a resize or another monitor event")
+        try expectEqual(probe.inputs.map{$0.1},[stale,fresh])
+        try expect(frames.targets.allSatisfy{$0.tty==sessions[0].tty})
+        try expectEqual(probe.acceptanceReadCounts,[1],"Unchanged monitor frames cannot starve the first fresh original read; post-delivery checks are separate")
+        }
+    }
+    func testApprovalReflowFreshQuestionRetiresOldPermissionWithoutAnAnswer() async throws {
+        let stale=recoveryPrompt("echo old-permission"),question="Which environment should we use?\n\n› 1. Staging\n  2. Production\n\nEnter to confirm or esc to cancel"
+        let probe=ApprovalRecoveryProbe();probe.requiredFrame="never-valid"
+        let frames=DeliveredFrameProbe(question)
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,validation:{frames.read($0)})
+        defer{engine.stop();try? FileManager.default.removeItem(at:directory)}
+        engine.receiveScreen(sessionID:sessions[0].id,raw:stale,generation:"same-original")
+        try await waitForRecovery({engine.snapshot.sessions.first?.phase == .input},"The fresh intervening question must replace the stale permission")
+        try expectEqual(probe.inputs.count,1,"No numeric permission answer may enter a task question")
+    }
     func testComputerUseFieldSubmissionUsesReturnWithoutTextPaste() throws {
         let context=JSContext()!
         context.setObject(computerUsePermission,forKeyedSubscript:"frame" as NSString)

@@ -107,13 +107,14 @@ extension ApprovalTests {
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);defer {try? FileManager.default.removeItem(at:root)}
         for message in ["Provided Tunnel token is not valid.","Unauthorized: Invalid tunnel secret"] {
             let executable = root.appendingPathComponent("synthetic-connector")
-            try Data(("#!/bin/sh\nprintf '%s\\n' '"+message+"'\nexec /bin/sleep 2\n").utf8).write(to:executable)
+            try Data(("#!/bin/sh\nprintf '%s\\n' '"+message+"'\nexec /bin/sleep 30\n").utf8).write(to:executable)
             try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:executable.path)
             let recovery = RemoteNetworkRecovery(observesSystem:false,deadline:{_ in .now()+0.005})
             let controller = RemoteTunnelController(directory:root,handler:{_ in RemoteHTTPResponse(body:Data(),contentType:"text/plain")},recovery:recovery,onStatus:{_ in})
             defer {controller.stop(waitForExit:true)}
             var config = RemoteTunnelConfiguration();config.executable = executable.path;try await controller.start(config)
-            for _ in 0..<200 where controller.status.phase != "failed" {try await Task.sleep(for:.milliseconds(5))}
+            let deadline=ContinuousClock.now.advanced(by:.seconds(10))
+            while controller.status.phase != "failed",ContinuousClock.now<deadline {try await Task.sleep(for:.milliseconds(10))}
             try expectEqual(controller.status.phase,"failed");try expectNil(controller.accessKey)
             try expectFalse(controller.status.detail.contains(message));try expectFalse(controller.status.detail.contains(root.path))
             try await Task.sleep(for:.milliseconds(30));try expectEqual(controller.status.phase,"failed");try expectEqual(controller.status.quality.reconnects,0)

@@ -75,7 +75,8 @@ public enum PromptDetector {
         if agent == .codex, heading.marker == "Allow " || heading.marker == "Approve app tool call?" {
             guard YesNoConfirmation.isToolPermissionMenu(labels) else { return nil }
         }
-        guard YesNoConfirmation.singleApprovalIndex(labels) == 0 else { return nil }
+        let permissionLabels=agent == .codex ? labels.map(YesNoConfirmation.codexTerminalLabel):labels
+        guard YesNoConfirmation.singleApprovalIndex(permissionLabels) == 0 else { return nil }
         let summary = dialog.prefix(selectedYes).filter { !$0.isEmpty }.joined(separator: "\n")
         guard !dialog.contains(where: { $0.contains("```") }), !summary.isEmpty,
               lines[..<promptIndex].filter({ $0.hasPrefix("```") }).count % 2 == 0 else { return nil }
@@ -289,7 +290,8 @@ public enum PromptDetector {
     }
 
     static func permissionHeading(count: Int, lineAt: (Int) -> String,
-                                          agent: AgentKind, mayStart: ((Int) -> Bool)? = nil) -> (index: Int, end: Int, marker: String)? {
+                                          agent: AgentKind, mayStart: ((Int) -> Bool)? = nil,
+                                          excludingAllow:Bool=false) -> (index: Int, end: Int, marker: String)? {
         let headings = agent == .codex ? codexHeadings : claudeHeadings
         for index in (0..<count).reversed() {
             if let mayStart, !mayStart(index) { continue }
@@ -301,6 +303,7 @@ public enum PromptDetector {
             let candidates = headings.filter { $0.compact.hasPrefix(compact) || compact.hasPrefix($0.compact) }
             guard !candidates.isEmpty, !isOption(first), !first.contains("```") else { continue }
             for (marker, expected) in candidates {
+                if excludingAllow && marker == "Allow " {continue}
                 var candidate = compact
                 for row in index..<min(count, index + 8) {
                     let line = lineAt(row).trimmingCharacters(in: .whitespaces)
@@ -323,6 +326,29 @@ public enum PromptDetector {
                         if marker == "Allow " {
                             guard first.hasPrefix("Allow") else { break }
                             if let boundary = first.dropFirst(5).first, !boundary.isWhitespace { break }
+                            if agent == .codex,index>0,
+                               let enclosing=permissionHeading(count:index,lineAt:lineAt,agent:agent,mayStart:mayStart,excludingAllow:true),
+                               enclosing.marker=="Would you like to run the following command?" {
+                                let reason=(enclosing.end..<index).contains { position in
+                                    let text=lineAt(position).trimmingCharacters(in:.whitespaces).lowercased()
+                                    return text.hasPrefix("reason:") || text.hasPrefix("justification:")
+                                }
+                                let priorRequest=(enclosing.end..<index).contains { position in
+                                    let text=lineAt(position).trimmingCharacters(in:.whitespaces)
+                                    return isOption(text) || text.range(of:#"^\$\s+\S"#,options:.regularExpression) != nil
+                                }
+                                if reason && !priorRequest {
+                                    var commandBelow=false
+                                    for position in (row+1)..<count {
+                                        let text=lineAt(position).trimmingCharacters(in:.whitespaces)
+                                        if isOption(text){break}
+                                        if text.range(of:#"^\$\s+\S"#,options:.regularExpression) != nil {commandBelow=true;break}
+                                    }
+                                    // A sentence in the reason before the real
+                                    // command cannot replace its permission title.
+                                    if commandBelow {break}
+                                }
+                            }
                         }
                         return (index, row, marker)
                     }
@@ -372,7 +398,9 @@ public enum PromptDetector {
         // `or o to open thread` when a sub-agent's request is shown in the parent session.
         let action = #"(?:(?:press\s+)?enter\s+to\s+(?:confirm|select|submit)|esc\s+to\s+cancel|tab\s+to\s+amend|ctrl-g\s+to\s+edit|tab/arrow\s+keys\s+to\s+navigate|o\s+to\s+open\s+thread)"#
         let pattern = "(?i)^" + action + #"(?:(?:\s*(?:[,·•|/]|or|and)\s*|\s+)"# + action + #")*[.!]?$"#
-        let prefixes=["press","enter","esc","ctrl-g","tab/arrow"]
+        let prefixes=["pressentertoconfirm","pressentertoselect","pressentertosubmit",
+                      "entertoconfirm","entertoselect","entertosubmit","esctocancel",
+                      "ctrl-gtoedit","tab/arrowkeystonavigate"]
         for start in (lastOption+1)..<lines.count {
             let first=lines[start].filter {!$0.isWhitespace}.lowercased()
             guard !first.isEmpty,prefixes.contains(where:{$0.hasPrefix(first)||first.hasPrefix($0)}) else {continue}

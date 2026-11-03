@@ -57,7 +57,8 @@ extension ApprovalTests {
         try Data(script.utf8).write(to:cli);try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:cli.path)
         let accounts=AgentAccounts();defer{accounts.stop()}
         try accounts.beginNativeCodexLogin(.init(home:home,executable:cli.path))
-        for _ in 0..<100 {if accounts.nativeCodexLogin?.phase=="succeeded"{break};try await Task.sleep(for:.milliseconds(30))}
+        let deadline=ContinuousClock.now.advanced(by:.seconds(10))
+        while accounts.nativeCodexLogin?.phase != "succeeded",ContinuousClock.now<deadline {try await Task.sleep(for:.milliseconds(30))}
         try expectEqual(accounts.nativeCodexLogin?.phase,"succeeded")
         try expectEqual(try String(contentsOfFile:cli.path+".home",encoding:.utf8),home+"\n")
         try expectNil(accounts.nativeCodexLogin?.code);try expectNil(accounts.nativeCodexLogin?.url)
@@ -68,14 +69,15 @@ extension ApprovalTests {
         defer{try? FileManager.default.removeItem(at:root)}
         let target=CodexAccountTransitionTarget(home:root.appendingPathComponent("home with spaces;literal").path,executable:"/fixture/codex")
         let services=AgentAccountServices(home:root.path,check:{agent in .init(agent:agent,phase:"authenticated")},launch:{_ in
-            try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","print '\(nativeCodexBrowserURL)'; sleep 10"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
+            try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","print '\(nativeCodexBrowserURL)'; sleep 30"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
         })
         let accounts=AgentAccounts(services:services,codexServices:{ received in
             guard received == target else {throw AppError.message("Wrong selected Codex home")};return services
         });defer{accounts.stop()}
         try accounts.beginNativeCodexLogin(target)
         try expect(accounts.busy);try expectEqual(accounts.privateTTYs.count,1)
-        for _ in 0..<60 {if accounts.nativeCodexLogin?.phase=="waiting"{break};try await Task.sleep(for:.milliseconds(30))}
+        let deadline=ContinuousClock.now.advanced(by:.seconds(10))
+        while accounts.nativeCodexLogin?.phase != "waiting",ContinuousClock.now<deadline {try await Task.sleep(for:.milliseconds(30))}
         try expectEqual(accounts.nativeCodexLogin?.url,nativeCodexBrowserURL);try expectNil(accounts.nativeCodexLogin?.code)
         try expectEqual(accounts.nativeCodexLogin?.home,target.home)
         let pin=try RemoteTunnelPIN.create("001234"),client=AccountTestClient(accounts,pin:pin)
