@@ -42,6 +42,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     private var nativeJob:String?
     var nativeCodexLoginCompleted:((String)->Void)?
     var nativeCodexLoginWillStart:((CodexAccountTransitionTarget)throws->Void)?
+    var nativeCodexLoginDidStart:((String)->Void)?
     private var crypto=AgentAccountCrypto(),generation=UUID()
     private var grants:[String:Date]=[:],jobs:[String:Job]=[:],seen:[String:Date]=[:]
     private var failures:[Date]=[],unlocking=false,pinStamp=""
@@ -57,6 +58,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
         let resolved=try CodexAccountTransitionTarget.canonicalHome(target.home)
         let job=try begin(agent:"codex",id:UUID().uuidString,owner:nativeOwner,services:codexServices(target))
         job.browser=true;job.codexHome=target.home;job.resolvedCodexHome=resolved;nativeJob=job.id
+        nativeCodexLoginDidStart?(resolved)
     }
     public func cancelNativeCodexLogin() {
         guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner,job.active else {return}

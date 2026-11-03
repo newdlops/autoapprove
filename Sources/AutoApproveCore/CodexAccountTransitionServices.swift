@@ -305,11 +305,11 @@ enum CodexAccountTransitionLocal {
 /// A short-lived, non-TTY app-server reads freshly stored login metadata.
 /// Only this owned child is stopped. Responses are bounded and never logged.
 enum CodexAccountMetadataProcess {
-    static func read(_ target: CodexAccountTransitionTarget) throws -> String? {
+    static func read(_ target: CodexAccountTransitionTarget,environment:[String:String]?=nil) throws -> String? {
         let process = Process(), input = Pipe(), output = Pipe(), exited = DispatchSemaphore(value: 0)
         process.executableURL = URL(fileURLWithPath: target.executable)
         process.arguments = ["app-server", "--listen", "stdio://"]
-        process.environment = CodexAccountTransitionLocal.environment(target)
+        process.environment = environment ?? CodexAccountTransitionLocal.environment(target)
         process.currentDirectoryURL = URL(fileURLWithPath: target.home)
         process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
         process.terminationHandler = { _ in exited.signal() }

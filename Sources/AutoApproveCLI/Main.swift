@@ -48,6 +48,12 @@ import AutoApproveCore
                     let state=try await CodexManagedServerServices.live.inspect(home,ProcessDiscovery.readSessions())
                     versions["codexManagedServer"]=try JSONSerialization.jsonObject(with:JSONEncoder().encode(state))
                 }
+                if arguments.contains("--codex-account") {
+                    let index=arguments.firstIndex(of:"--codex-home")
+                    let home=index.flatMap{arguments.indices.contains($0+1) ? arguments[$0+1]:nil}
+                        ?? ProcessInfo.processInfo.environment["CODEX_HOME"] ?? NSHomeDirectory()+"/.codex"
+                    versions["codexAccount"]=try SocketClient.request(path:paths.socket,message:["method":"codexAccountInspection","params":["home":home]],timeout:25)
+                }
                 try printJSON(versions)
             case "terminal-input":
                 guard arguments.count == 2, ["prepare", "install"].contains(arguments[1]) else {
@@ -109,7 +115,7 @@ import AutoApproveCore
                 AutoApprove — local terminal approval manager
 
                   autoapprove scan          Claude Code·Codex 세션 탐색 (읽기 전용)
-                  autoapprove doctor        연결 상태 확인
+                  autoapprove doctor        연결 상태 확인 (--codex / --codex-account)
                   autoapprove diagnostics   진단 상태 조회 (읽기 전용)
                   autoapprove local-name status  이 Mac의 autoapprove 주소 설정 확인
                   autoapprove local-name apply   관리자 권한으로 이 Mac의 로컬 주소 설정

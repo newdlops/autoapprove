@@ -370,6 +370,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public var codexAccountTransitionHeld: Bool { codexAccountTransitionStates.values.contains(where: \.held) }
     private let codexAccountTransitionServices: CodexAccountTransitionServices
     private let codexManagedServerServices:CodexManagedServerServices
+    private let codexAccountInspectionServices:CodexAccountInspectionServices
+    private var codexAccountInspectionTasks:[String:(id:UUID,task:Task<CodexAccountInspection,Error>)]=[:]
+    private var codexAccountInspectionEpochs:[String:UUID]=[:]
     @Published public private(set) var codexSessionAttachmentNotice:String?
     private var codexSessionAttachments:[String:CodexSessionAttachment]=[:]
     private var codexAttachmentWaitReasons:[String:String]=[:]
@@ -423,11 +426,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live,
                 codexAccountTransitions:CodexAccountTransitionServices? = nil,
                 codexAccountTargets:(@Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget])? = nil,
-                codexManagedServers:CodexManagedServerServices = .live,diagnosticServices:CodexDiagnosticServices = .live) throws {
+                codexManagedServers:CodexManagedServerServices = .live,diagnosticServices:CodexDiagnosticServices = .live,
+                codexAccountInspections:CodexAccountInspectionServices?=nil) throws {
         self.codexDiagnostics=CodexDiagnostics(services:diagnosticServices)
         if processReader==nil {self.diagnosticEnvironment={ProcessEnvironment.read($0)}}
         else {self.diagnosticEnvironment={_ in nil}}
         self.codexManagedServerServices=codexManagedServers
+        self.codexAccountInspectionServices=codexAccountInspections ?? (processReader==nil ? .live:.inactive)
         self.codexAccountTransitionServices = codexAccountTransitions ?? .live
         let accountTargetReader:@Sendable([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
         if let codexAccountTargets {accountTargetReader=codexAccountTargets}
@@ -578,6 +583,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         accounts.nativeCodexLoginWillStart={ [weak self,weak accounts] _ in
             guard let self,let accounts,self.agentAccounts===accounts,!self.remoteInputStopped,!self.codexAccountTransitionBusy,!self.codexAccountTransitionHeld else {throw AppError.message("진행 중인 계정 확인·전환이 끝난 뒤 로그인해주세요.")}
         }
+        accounts.nativeCodexLoginDidStart={ [weak self,weak accounts] home in
+            guard let self,let accounts,self.agentAccounts===accounts,!self.remoteInputStopped else{return}
+            self.invalidateCodexAccountInspection(home:home)
+        }
         accounts.nativeCodexLoginCompleted={ [weak self,weak accounts] home in
             guard let self,let accounts,self.agentAccounts === accounts,!self.remoteInputStopped else{return}
             let epoch=self.codexAccountTransitionEpoch
@@ -674,6 +683,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func stop() {
         codexAccountTransitionEpoch = UUID()
+        for entry in codexAccountInspectionTasks.values {entry.task.cancel()};codexAccountInspectionTasks.removeAll()
+        codexAccountInspectionEpochs.removeAll()
         codexNativeAttachmentTask?.cancel();codexNativeAttachmentTask=nil;codexNativeAttachmentPending.removeAll()
         codexAccountTransitionTask?.cancel(); codexAccountTransitionTask = nil
         codexAccountCheckTask?.cancel();codexAccountCheckTask=nil
@@ -4633,6 +4644,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
             claudeHookWaitTasks[peer.id] = (token, task)
             return
         }
+        if method == "codexAccountInspection" {
+            Task { @MainActor [weak self] in
+                guard let self else{return}
+                var response:JSONObject
+                do {response=["result":try await self.inspectCodexAccount(home:params["home"] as? String ?? NSHomeDirectory()+"/.codex").json]}
+                catch {response=["error":error.localizedDescription]}
+                if let id=message["id"] {response["id"]=id};_ = peer.send(response)
+            }
+            return
+        }
         if method == "diagnostics" {
             Task { @MainActor [weak self] in
                 guard let self else{return}
@@ -6194,6 +6215,63 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if result.phase == .running {codexAttachmentHomes.insert(home)}
         return result
     }
+    /// Explicitly observational; never calls the account-transition coordinator.
+    public func inspectCodexAccount(home:String) async throws ->CodexAccountInspection {
+        try Task.checkCancellation()
+        guard !remoteInputStopped else{throw CancellationError()}
+        let home=try CodexAccountTransitionTarget.canonicalHome(home)
+        let scopeEpoch=codexAccountTransitionEpoch
+        let readEpoch=codexAccountInspectionEpochs[home] ?? UUID()
+        codexAccountInspectionEpochs[home]=readEpoch
+        let entry:(id:UUID,task:Task<CodexAccountInspection,Error>)
+        if let pending=codexAccountInspectionTasks[home] {entry=pending}
+        else {
+            let epoch=codexAccountTransitionEpoch
+            entry=(UUID(),Task { @MainActor [weak self] in
+                guard let self else{throw CancellationError()}
+                return try await self.performCodexAccountInspection(home:home,epoch:epoch)
+            })
+            codexAccountInspectionTasks[home]=entry
+        }
+        defer {if codexAccountInspectionTasks[home]?.id==entry.id {codexAccountInspectionTasks.removeValue(forKey:home)}}
+        let result=try await entry.task.value
+        try Task.checkCancellation()
+        guard scopeEpoch==codexAccountTransitionEpoch,codexAccountInspectionEpochs[home]==readEpoch,!remoteInputStopped else{throw CancellationError()}
+        return result
+    }
+    private func invalidateCodexAccountInspection(home:String) {
+        codexAccountInspectionEpochs[home]=UUID()
+        codexAccountInspectionTasks.removeValue(forKey:home)?.task.cancel()
+    }
+    private func performCodexAccountInspection(home:String,epoch:UUID) async throws ->CodexAccountInspection {
+        let reader=processReader,targetReader=codexAccountTargetReader
+        let rows=try await Task.detached(priority:.utility){try reader()}.value
+        try Task.checkCancellation()
+        let targets=try await targetReader(rows)
+        let known=Set(rows.filter{$0.agent == .codex}.compactMap{diagnosticEnvironment($0)?["CODEX_HOME"].flatMap{try? CodexAccountTransitionTarget.canonicalHome($0)}})
+        let target:CodexAccountTransitionTarget
+        if let current=targets.first(where:{$0.home==home}) {target=current}
+        else {
+            guard home==(try? CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")) || known.contains(home) else{throw AppError.message("확인할 Codex 홈을 다시 선택해주세요.")}
+            target = .init(home:home,executable:"codex")
+        }
+        func current(_ value:CodexAccountTransitionTarget,_ records:[ProcessRecord])->Bool {
+            value.witnesses.allSatisfy{w in records.contains{$0.pid==w.pid && $0.started==w.started && "/dev/"+$0.tty==w.tty && $0.agent == .codex}}
+        }
+        guard current(target,rows) else{throw AppError.message("계정 확인 전 세션 연결이 바뀌었습니다.")}
+        let result=try await codexAccountInspectionServices.read(target)
+        try Task.checkCancellation()
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped,result.home==home,
+              result.connectedSessions==target.witnesses.count else{throw CancellationError()}
+        let fresh=try await Task.detached(priority:.utility){try reader()}.value
+        let live=try await targetReader(fresh)
+        try Task.checkCancellation()
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped,current(target,fresh),
+              live.first(where:{$0.home==home})==targets.first(where:{$0.home==home}) else{
+            throw AppError.message("계정 확인 중 서버·세션 연결이 바뀌었습니다. 다시 확인해주세요.")
+        }
+        return result
+    }
     public func codexSessionAccount(sessionID:String) async throws -> CodexSessionAccount {
         guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")}
         let targets=try await codexLoginTargets()
@@ -6417,7 +6495,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         }, changed: { [weak self] state in
                             guard let self, epoch == self.codexAccountTransitionEpoch else { return }
                             let alreadyHeld = self.codexAccountTransitionHeld
+                            let previous=self.codexAccountTransitionStates[home]
                             self.codexAccountTransitionStates[home] = state
+                            if previous?.phase != state.phase {self.invalidateCodexAccountInspection(home:home)}
                             if !alreadyHeld, state.held { self.holdCodexAccountInputs() }
                         })
                     codexAccountCoordinators[home] = coordinator
