@@ -33,7 +33,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
 @main struct EngineAttachmentCheck {
     @MainActor static func main() async throws {
         let root=URL(fileURLWithPath:CommandLine.arguments[1]).resolvingSymlinksInPath().path
-        let home=try CodexAccountTransitionTarget.canonicalHome(root+"/home/.codex"),thread="00000000-0000-4000-8000-000000000061",red=CommandLine.arguments.contains("--expect-unresolved"),wrong=CommandLine.arguments.contains("--wrong-thread"),goalWait=CommandLine.arguments.contains("--goal-wait")
+        let home=try CodexAccountTransitionTarget.canonicalHome(root+"/home/.codex"),thread="00000000-0000-4000-8000-000000000061",red=CommandLine.arguments.contains("--expect-unresolved"),wrong=CommandLine.arguments.contains("--wrong-thread"),goalWait=CommandLine.arguments.contains("--goal-wait"),loginShell=CommandLine.arguments.contains("--login-shell"),manual=CommandLine.arguments.contains("--manual-reconnect"),screenOff=CommandLine.arguments.contains("--screen-disconnected")
         func goal(_ status:String)throws {
             var db:OpaquePointer?
             guard sqlite3_open(home+"/goals_1.sqlite",&db)==SQLITE_OK else{throw AppError.message("Owned Goal database failed")}
@@ -43,16 +43,29 @@ private final class OwnedEnginePTY:@unchecked Sendable {
         }
         if goalWait {try goal("active")}
         let manager=ManagedPTYManager(environment:["HOME":root,"CODEX_HOME":home,"PATH":"/usr/bin:/bin","PS1":"fixture% ","READY_FILE":root+"/ready","FIXTURE_SOCKET":root+"/daemon.sock","EXPECTED_THREAD":thread,"STATUS_THREAD":wrong ? "00000000-0000-4000-8000-000000000062":thread]);defer{manager.stop()}
-        let descriptor=try manager.create(cwd:root,program:"shell",command:["/bin/zsh","-f"],columns:100,rows:50),terminal=try manager.terminal(descriptor.ptyID),probe=OwnedEnginePTY(terminal,descriptor)
+        let descriptor=try manager.create(cwd:root,program:"shell",command:loginShell ? [root+"/codex","--fixture-login-shell"]:["/bin/zsh","-f"],columns:100,rows:50),terminal=try manager.terminal(descriptor.ptyID),probe=OwnedEnginePTY(terminal,descriptor)
         func wait(_ test:()throws->Bool) async throws {let end=Date().addingTimeInterval(8);while Date()<end{if try test(){return};try await Task.sleep(for:.milliseconds(100))};throw AppError.message("Owned fixture not ready")}
         try await wait{SessionExitRecovery.emptyShellPrompt(terminal.screen())};try probe.write(HookInstaller.quote(root+"/codex")+"\n")
         try await wait{CodexProgressScreen.ready(terminal.screen())}
+        if loginShell {guard probe.read().contains(where:{$0.pid==descriptor.pid && $0.executable=="-zsh"}) else{throw AppError.message("Expected real login-shell argv identity")}}
         guard let original=probe.read().first(where:{$0.agent == .codex}) else{throw AppError.message("Owned Codex not found")}
         guard try ProcessOpenFiles.codexRolloutPaths(pid:original.pid,expectedStart:original.started).isEmpty else{throw AppError.message("Fixture must have no JSONL")}
         let setup=CodexManagedServerServices(inspect:{selected,_ in .init(phase:selected==home ? .running:.unavailable,version:"0.166.0",detail:"Owned fixture",autoStartEnabled:true)},prepare:{_,_ in throw AppError.message("Must not prepare")})
-        let engine=try ApprovalEngine(paths:.init(directory:URL(fileURLWithPath:root+"/state")),processReader:{probe.read()},screenAdapters:[.terminal:probe.adapter()],terminalInputAvailable:{true},codexAccountTargets:{try await CodexAccountTransitionTarget.discover($0)},codexManagedServers:setup)
+        var accountObservations=0
+        let accountServices=CodexAccountTransitionServices(observe:{_ in
+            guard probe.exitCalls==1,probe.launchCalls==1 else{throw AppError.message("Account check preceded original-session attachment")}
+            accountObservations+=1
+            return .init(savedAccount:"fixture",serverAccount:"fixture",serverID:"fixture",threads:[])
+        },interrupt:{_,_,_,_ in throw AppError.message("Unexpected fixture interrupt")},restart:{_,_ in throw AppError.message("Fixture account server must not restart")},verify:{_,_,_ in 1})
+        let engine=try ApprovalEngine(paths:.init(directory:URL(fileURLWithPath:root+"/state")),processReader:{probe.read()},screenAdapters:[.terminal:probe.adapter()],terminalInputAvailable:{true},codexAccountTransitions:accountServices,codexAccountTargets:{try await CodexAccountTransitionTarget.discover($0)},codexManagedServers:setup)
         defer{engine.stop()}
-        await engine.refresh();await engine.connectScreenHost(.terminal);try engine.setAutomatic(original.key,enabled:true)
+        await engine.refresh()
+        if screenOff {
+            await engine.ensureCodexManagedServers()
+            guard engine.codexSessionAttachmentNotice?.contains("Terminal·iTerm 화면 연결 필요") == true,engine.codexSessionAttachmentNotice?.contains(descriptor.tty.replacingOccurrences(of:"/dev/",with:"")) == true,probe.statusCalls==0,probe.exitCalls==0 else{throw AppError.message("Missing screen connection must identify this terminal")}
+            print("{\"verified\":true,\"screenConnectionRequired\":true,\"perTerminalReason\":true,\"userTerminalActions\":0}");return
+        }
+        await engine.connectScreenHost(.terminal);try engine.setAutomatic(original.key,enabled:true)
         engine.receiveScreen(sessionID:original.key,raw:terminal.screen(),generation:"owned",source:.terminalScreen)
         try await Task.sleep(for:.seconds(2))
         engine.receiveScreen(sessionID:original.key,raw:terminal.screen(),generation:"owned",source:.terminalScreen)
@@ -66,6 +79,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             try await Task.sleep(for:.seconds(2))
             engine.receiveScreen(sessionID:original.key,raw:terminal.screen(),generation:"owned",source:.terminalScreen)
         }
+        if manual {try await engine.reconnectCodexLogin(home:home);guard accountObservations>0 else{throw AppError.message("Manual reconnect must reach account check after attachment")}}
         let deadline=Date().addingTimeInterval(red || wrong ? 3:20)
         var attached=false
         repeat {
@@ -75,12 +89,12 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             if attached,engine.codexSessionAttachmentNotice?.contains("기존 창·같은 대화의 관리형 서버 연결을 확인했습니다.") == true {break};try await Task.sleep(for:.milliseconds(150))
         }while Date()<deadline
         if red {
-            guard !attached,probe.statusCalls==0,probe.exitCalls==0,engine.codexSessionAttachmentNotice?.contains("대화 ID") == true else{throw AppError.message("Expected SQLite-only discovery failure not reproduced: \(engine.codexSessionAttachmentNotice ?? "none") inventory=\(engine.snapshot.sessions.map{"\($0.phase.rawValue) pending=\($0.pendingInTerminal) review=\($0.needsReview)"})")}
+            guard !attached,probe.statusCalls==0,probe.exitCalls==0,engine.codexSessionAttachmentNotice?.contains(loginShell ? "원본 셸":"대화 ID") == true else{throw AppError.message("Expected SQLite-only discovery failure not reproduced: \(engine.codexSessionAttachmentNotice ?? "none") inventory=\(engine.snapshot.sessions.map{"\($0.phase.rawValue) pending=\($0.pendingInTerminal) review=\($0.needsReview)"})")}
         } else if wrong {
             guard !attached,probe.statusCalls==1,probe.exitCalls==0,probe.launchCalls==0,probe.read().contains(where:{$0.key==original.key}) else{throw AppError.message("Mismatched thread must retain the original process")}
         } else {
             guard attached,engine.codexSessionAttachmentNotice?.contains("기존 창·같은 대화의 관리형 서버 연결을 확인했습니다.") == true,probe.statusCalls==(goalWait ? 2:1),probe.exitCalls==1,probe.launchCalls==1 else{throw AppError.message("Engine attachment failed: "+(engine.codexSessionAttachmentNotice ?? "none")+" status=\(probe.statusCalls) exit=\(probe.exitCalls) launch=\(probe.launchCalls)")}
         }
-        print("{\"verified\":true,\"productionEngine\":true,\"sqliteOnly\":true,\"expectedUnresolved\":\(red),\"mismatchedThread\":\(wrong),\"goalWait\":\(goalWait),\"statusRequests\":\(probe.statusCalls),\"exitRequests\":\(probe.exitCalls),\"launchRequests\":\(probe.launchCalls),\"userTerminalActions\":0}")
+        print("{\"verified\":true,\"productionEngine\":true,\"sqliteOnly\":true,\"expectedUnresolved\":\(red),\"mismatchedThread\":\(wrong),\"goalWait\":\(goalWait),\"loginShell\":\(loginShell),\"manualReconnect\":\(manual),\"accountObservations\":\(accountObservations),\"statusRequests\":\(probe.statusCalls),\"exitRequests\":\(probe.exitCalls),\"launchRequests\":\(probe.launchCalls),\"userTerminalActions\":0}")
     }
 }

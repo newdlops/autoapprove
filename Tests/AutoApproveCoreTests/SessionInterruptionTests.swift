@@ -245,6 +245,16 @@ extension ApprovalTests {
         41 1 ttys901 41 42 Mon Sep 21 09:00:00 2026 /bin/zsh
         42 41 ttys901 42 42 Mon Sep 21 09:00:01 2026 /tmp/qa folder/codex
         """)
+        for name in ["-zsh","-bash","-sh","-fish","-dash","-ksh"] {
+            var login=records[0];login.executable=name;login.foregroundGroup=login.processGroup
+            try expect(SessionExitRecovery.isShell(login))
+            let selected=ProcessDiscovery.sessions(records).first!
+            let saved=SessionExitRecovery(session:selected,process:records[1],shell:login,conversationID:nil)
+            try expectNotNil(saved.verifiedShell(in:[login]))
+        }
+        for name in ["--zsh","-python","/tmp/-zsh","-zsh command","-","-zsh\0ignored"] {
+            var other=records[0];other.executable=name;try expectFalse(SessionExitRecovery.isShell(other))
+        }
         let session = AgentSession(id:records[1].key,agent:.codex,pid:42,started:records[1].started,tty:"/dev/ttys901",cwd:"/tmp/qa",terminal:.terminal)
         let plan = SessionExitRecovery(session:session,process:records[1],shell:records[0],conversationID:"00000000-0000-4000-8000-000000000061")
         try expect(plan.command?.contains("'resume' '00000000-0000-4000-8000-000000000061'") == true)

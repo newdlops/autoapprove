@@ -64,14 +64,14 @@ import AutoApproveCore
                 loading=true
                 Task {
                     defer{loading=false}
-                    do {try await action(selected);error=nil}
+                    do {try await action(selected);error=nil;await reloadTargets()}
                     catch {
                         let message=error.localizedDescription
                         await reloadTargets()
                         self.error=message
                     }
                 }
-            }},canReconnect:liveHomes.contains(selected),connectedCount:homes.first(where:{$0.home==selected})?.witnesses.count,
+            }},canReconnect:liveHomes.contains(selected) || managedServer?.phase == .running,connectedCount:homes.first(where:{$0.home==selected})?.witnesses.count,
             refreshTargets:{Task {await reloadTargets()}},serverStatus:managedServer,preparingServer:preparingServer,
             prepareServer:prepareServer.map {action in {
                 loading=true;preparingServer=true
@@ -187,7 +187,7 @@ struct CodexLoginContent: View {
                             .help("선택한 홈의 데몬 자동 시작을 켜고, 서버가 없으면 준비합니다. 실행 중인 서버는 재시작하지 않습니다.")
                     }
                     if preparingServer {Label("관리형 서버 준비 중…",systemImage:"hourglass").accessibilityLabel("관리형 서버 준비 중")}
-                    if state.phase == .running,!canReconnect {
+                    if state.phase == .running,(connectedCount ?? 0)==0 {
                         Text("서버는 실행 중이며 기존 Codex의 자동 연결을 확인합니다. 작업·Goal·질문·초안이 있으면 기다리고, 원본 셸과 대화를 확인한 세션은 같은 창에서 다시 연결합니다. 확인할 수 없는 경우 아래에 보류 이유를 표시합니다.")
                             .font(.caption).fixedSize(horizontal:false,vertical:true)
                     }
@@ -228,7 +228,7 @@ struct CodexLoginContent: View {
             if let reconnect {
                 HStack(spacing:8) {
                     Button("현재 로그인으로 세션 재연결",action:reconnect).disabled(active || loading || disabled || !canReconnect)
-                        .help(canReconnect ? "브라우저 로그인 없이 저장된 인증을 연결된 Codex 전체에 다시 적용합니다. 작업을 순차 중단한 뒤 창·대화를 재연결합니다.":"선택한 홈의 실제 연결을 먼저 확인해주세요. 로그인은 연결 확인 없이도 시작할 수 있습니다.")
+                        .help(canReconnect ? "기존 터미널의 빈 입력 대기 세션을 같은 대화로 먼저 연결한 뒤 저장된 로그인을 적용합니다. 진행 중 작업·Goal·질문·초안은 대기합니다.":"선택한 홈의 실제 연결을 먼저 확인해주세요. 로그인은 연결 확인 없이도 시작할 수 있습니다.")
                     if let refreshTargets {
                         Button("연결 다시 확인",systemImage:"arrow.clockwise",action:refreshTargets).disabled(active || loading || disabled)
                             .help("이 Mac의 서버·세션 연결만 다시 읽습니다. 작업을 중단하거나 계정을 바꾸지 않습니다.")

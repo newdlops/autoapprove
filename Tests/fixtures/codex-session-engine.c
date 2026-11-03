@@ -8,6 +8,7 @@
 #include <sys/un.h>
 static void ready(void){puts("\n› Ask Codex to do anything\n\n? for shortcuts");fflush(stdout);}
 int main(int argc,char **argv) {
+    if(argc==2&&!strcmp(argv[1],"--fixture-login-shell")){execl("/bin/zsh","-zsh","-f","-i",NULL);return 20;}
     char db[4096],cwd[4096];getcwd(cwd,sizeof(cwd));snprintf(db,sizeof(db),"%s/logs_2.sqlite",getenv("CODEX_HOME"));
     int metadata=open(db,O_CREAT|O_RDWR,0600);if(metadata<0)return 10;
     int fd=-1;

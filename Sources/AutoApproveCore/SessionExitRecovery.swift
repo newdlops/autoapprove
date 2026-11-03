@@ -23,7 +23,11 @@ public struct SessionExitRecovery: Codable {
         // retain Foundation's legacy truncation. Ordinary names need no stat.
         let name = component.isEmpty || component == "." || component == ".." || record.executable.utf8.contains(0)
             ? URL(fileURLWithPath: record.executable).lastPathComponent : component
-        return ["zsh","bash","sh","fish","dash","ksh"].contains(name)
+        let shells=["zsh","bash","sh","fish","dash","ksh"]
+        if shells.contains(name) {return true}
+        // macOS login shells conventionally launch with argv[0] = "-zsh".
+        // Accept one marker on a bare known shell name, never arbitrary paths.
+        return !record.executable.contains("/") && name.hasPrefix("-") && shells.contains(String(name.dropFirst()))
     }
     public static func conversation(in screen: String) -> String? {
         let pattern = #"^To continue this session, run codex resume ([0-9a-fA-F-]{36})\s*$"#

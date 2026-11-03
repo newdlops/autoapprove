@@ -87,7 +87,7 @@ private let fixtureHomes=["/Users/alex/.codex","/Users/서연/Library/Applicatio
             Text("이 Mac에서 실행 중인 Codex의 로그인과 세션 연결을 관리합니다.")
             CodexLoginSettings(accounts:fixture.accounts,targets:{try await fixture.targets()},transitionEnabled:true,transitionBusy:false,completed:{},reconnect:{try await fixture.reconnect($0)},
                 setupHomes:{[fixtureHomes[fixture.profile]]},serverStatus:{_ in fixture.serverStatus()},prepareServer:{_ in try await fixture.prepare()})
-            CodexSessionAttachmentStatus(detail:"기존 세션 3개: 작업·Goal·질문·초안이 끝나고 원본 대화를 확인하면 같은 창에서 자동 연결합니다.")
+            CodexSessionAttachmentStatus(detail:"기존 세션 3개 연결 대기\n• server · ttys001: 작업 실행 중 · 완료 후 자동 연결\n• api · ttys002: 원본 셸 확인 필요\n• client · ttys003: Terminal·iTerm 화면 연결 필요 · Mac 연결 설정에서 연결해주세요")
             Divider()
             CodexAccountTransitionSettings(enabled:false,busy:false,states:[:],notice:nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
         }
@@ -124,9 +124,9 @@ private struct FixtureApp:App {
             ? .init(id:"synthetic",home:home,phase:kind,url:kind=="waiting" ? "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&code_challenge="+String(repeating:"A",count:43)+"&code_challenge_method=S256&state=synthetic-preview":nil,message:kind=="succeeded" ? "이 Mac에서 로그인했습니다.":"로그인을 완료하지 못했습니다. 다시 로그인해주세요.") : nil
         CodexAccountsLayout(close:{}) {
             Text("이 Mac에서 실행 중인 Codex의 로그인과 세션 연결을 관리합니다.")
-            CodexLoginContent(homes:[fixtureHomes[0],home],selected:.constant(home),loading:kind=="loading" || kind=="server-preparing",job:job,disabled:kind=="transition",error:kind=="failed" ? "실행 중인 Codex 연결을 확인하지 못했습니다. 연결을 다시 확인하거나 선택한 홈으로 로그인할 수 있습니다.":nil,transitionEnabled:true,begin:{},cancel:{},open:{_ in},reconnect:{},canReconnect:!["empty","failed"].contains(kind) && server==nil,connectedCount:3,refreshTargets:{},serverStatus:server,preparingServer:kind=="server-preparing",prepareServer:{})
+            CodexLoginContent(homes:[fixtureHomes[0],home],selected:.constant(home),loading:kind=="loading" || kind=="server-preparing",job:job,disabled:kind=="transition",error:kind=="failed" ? "실행 중인 Codex 연결을 확인하지 못했습니다. 연결을 다시 확인하거나 선택한 홈으로 로그인할 수 있습니다.":nil,transitionEnabled:true,begin:{},cancel:{},open:{_ in},reconnect:{},canReconnect:server?.phase == .running || (!["empty","failed"].contains(kind) && server==nil),connectedCount:server == nil && !["empty","failed"].contains(kind) ? 3:0,refreshTargets:{},serverStatus:server,preparingServer:kind=="server-preparing",prepareServer:{})
             Divider()
-            if kind.hasPrefix("server-") {CodexSessionAttachmentStatus(detail:"기존 세션 3개: 작업·Goal·질문·초안이 끝나고 원본 대화를 확인하면 같은 창에서 자동 연결합니다.")}
+            if kind.hasPrefix("server-") {CodexSessionAttachmentStatus(detail:"기존 세션 3개 연결 대기\n• server · ttys001: 작업 실행 중 · 완료 후 자동 연결\n• api · ttys002: 원본 셸 확인 필요\n• client · ttys003: Terminal·iTerm 화면 연결 필요 · Mac 연결 설정에서 연결해주세요")}
             CodexAccountTransitionSettings(enabled:kind=="transition",busy:kind=="transition",states:kind=="transition-complete" ? ["synthetic":{var state=CodexAccountTransitionState();state.phase = .complete;state.detail="새 로그인으로 서버 전환 · 기존 창 1개 재연결을 확인했습니다.";state.verified=1;return state}()]:[:],notice:kind=="empty" ? "관리형 Codex 서버 연결을 아직 확인하지 못했습니다. 실행 중인 Codex를 유지하고 연결을 다시 확인해주세요.":nil,error:nil,setEnabled:{_ in},check:{},cancel:{_ in})
         }
     }

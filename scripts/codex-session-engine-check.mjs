@@ -22,7 +22,7 @@ try {
  execFileSync('/usr/bin/xcrun',['clang','Tests/fixtures/codex-session-engine.c','-o',root+'/codex'],{stdio:'inherit'});
  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/AttachmentEngine'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-session-engine-check.swift','-o',root+'/check'],{stdio:'inherit',timeout:120000});
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(root+'/daemon.sock',resolve)});
- const args=[root,...process.argv.slice(2).filter(v=>['--expect-unresolved','--wrong-thread','--goal-wait'].includes(v))],child=spawn(root+'/check',args,{stdio:['ignore','pipe','inherit']});let output='';child.stdout.on('data',d=>output+=d);
+ const args=[root,...process.argv.slice(2).filter(v=>['--expect-unresolved','--wrong-thread','--goal-wait','--login-shell','--manual-reconnect','--screen-disconnected'].includes(v))],child=spawn(root+'/check',args,{stdio:['ignore','pipe','inherit']});let output='';child.stdout.on('data',d=>output+=d);
  const status=await new Promise(resolve=>child.on('close',resolve));if(status!==0)throw Error('Production engine fixture failed');
  const report=JSON.parse(output.trim());if(!report.verified)throw Error('Missing engine proof');console.log(JSON.stringify({...report,controlRequests:requests}));
 }finally{for(const socket of sockets)socket.destroy();if(server.listening)await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true,maxRetries:8,retryDelay:100})}
