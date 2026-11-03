@@ -119,8 +119,14 @@ import AutoApproveCore
             while !Task.isCancelled {
                 let next=scopedJob
                 otherLogin=accounts.busy && (next?.active != true || !belongsToSelection(next))
-                let succeeded=next?.phase=="succeeded" && job?.phase != "succeeded"
+                let succeeded=next?.phase=="succeeded" && (job?.phase != "succeeded" || next?.id != job?.id)
+                let changed=next?.id != job?.id || next?.phase != job?.phase
+                let relevant=belongsToSelection(next) || belongsToSelection(job)
                 job=next
+                if changed,relevant {
+                    invalidateInspection(keepingValue:true)
+                    if next?.active != true{requestAccountInspection(force:true)}
+                }
                 if succeeded{error=nil;await completed();await reloadTargets()}
                 do{try await Task.sleep(for:.milliseconds(250))}catch{return}
             }
@@ -186,7 +192,7 @@ import AutoApproveCore
     private func requestAccountInspection(force:Bool=false) {
         guard visible,let inspectAccount else{return}
         let home=selected
-        if checkingAccount,inspectionHome==home{return}
+        if !force,checkingAccount,inspectionHome==home{return}
         if !force,inspectionHome==home,inspection != nil{return}
         if inspectionHome != home{inspection=nil;inspectionError=nil}
         inspectionTask?.cancel();inspectionHome=home;checkingAccount=true;inspectionStale=inspection != nil;inspectionError=nil
@@ -196,7 +202,7 @@ import AutoApproveCore
             do{
                 let value=try await inspectAccount(home);try Task.checkCancellation()
                 guard visible,selected==home,inspectionRequest==request else{return}
-                inspection=value;inspectionStale=false
+                inspection=value;inspectionStale=belongsToSelection(scopedJob) && scopedJob?.active==true
             }catch is CancellationError{}catch{
                 guard visible,selected==home,inspectionRequest==request else{return}
                 inspectionError=error.localizedDescription;inspectionStale=inspection != nil

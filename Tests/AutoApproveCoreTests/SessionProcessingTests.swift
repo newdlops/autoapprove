@@ -14,7 +14,10 @@ extension ApprovalTests {
         for prefix in prefixes { for name in names { for ending in endings {
             let path = prefix + name + ending
             record.executable = path
+            // v0.2.243 deliberately added bare argv[0] login-shell markers.
+            // All other paths retain the Foundation component oracle.
             let expected = ["zsh", "bash", "sh", "fish", "dash", "ksh"].contains(URL(fileURLWithPath: path).lastPathComponent)
+                || ["-zsh", "-bash", "-sh", "-fish", "-dash", "-ksh"].contains(path)
             try expectEqual(SessionExitRecovery.isShell(record), expected, "Shell classification changed for \(path.debugDescription)")
             try expectEqual(record.key, identity)
         }}}

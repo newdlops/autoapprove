@@ -64,8 +64,8 @@ public struct CodexAccountInspectionServices:Sendable {
             guard lstat(socket,&before)==0 else{throw AppError.message("No socket identity")}
             let connection=try CodexQueueConnection(home:target.home)
             let peer=try connection.peerProcessID()
-            let identity=try CodexServerAccountIdentity.decode(connection.request("account/read",["refreshToken":false]))
             let server=try CodexAccountTransitionLocal.account(connection.request("accountSession/list",["refreshWorkspaceMetadata":false]))
+            let identity=try CodexServerAccountIdentity.decode(connection.request("account/read",["refreshToken":false]))
             try Task.checkCancellation()
             let afterAccount=try CodexAccountTransitionLocal.account(connection.request("accountSession/list",["refreshWorkspaceMetadata":false]))
             var after=stat()

@@ -85,6 +85,14 @@
 - 기존 대화/Goal의 다른 홈 이관에서 공식 경로가 정확한 Goal instance와 누적 사용량을 보존하는지 실제 소유 시험으로 확인해야 한다.
 - 사용자가 겪는 AutoApprove 계정 변경 실패가 브라우저 전인지, 인증 후 계정 반영인지, 세션/Goal 연결 단계인지 마지막 확인 질문의 답을 기다린다. 이 답은 우선 재현 경로를 바꾸며 전체 목표를 축소하지 않는다.
 
+## 실제 0.166 보존 시험 · 2026-11-04
+
+`scripts/codex-cross-home-preservation-check.mjs`는 사용자의 대화·인증을 읽지 않고 두 임시 홈, 실제 설치된 0.166 CLI, loopback 합성 Responses 공급자로 시험한다. 사용자/assistant 메시지를 포함한 비어 있지 않은 이력을 만들고 Goal을 paused/예산 1234로 둔다. 원본을 종료한 뒤 소유 시험 DB에 누적 토큰 37/시간 19초를 넣고 다시 열어 실제 goal/get으로 해당 누적 값을 확인한다.
+
+원래 sessions 상대 경로와 rollout 파일 이름을 보존한 독립 복사본의 path resume는 같은 대화 UUID·이력·모델/공급자·승인 정책·sandbox를 복구했다. 임의 imported.jsonl 이름은 재개되지 않았다. 대상의 goal/get은 null이었다. 즉 rollout 복사/공식 resume만으로는 Goal instance·예산·누적 사용량 이관이 되지 않는다. 이 결과는 계정 이관 성공이나 Goal 보존 성공을 뜻하지 않는다.
+
+후속 이관 계약은 원본 writer 종료·flush 후 실제 goals DB의 버전/스키마와 열 전체를 검사하고 해당 thread/goal instance의 한 행만 독립 저장해야 한다. 알 수 없는 스키마, 대상 Goal 충돌, 타 홈의 동일 대화 writer, stale fingerprint에서는 쓰지 않는다. 원본 행의 goal_id/objective/status/token_budget/tokens_used/time_used_seconds/created_at_ms/updated_at_ms와 새 버전의 추가 열을 전부 보존하고, 대상이 로드하기 전에 영속 저널과 함께 원자적으로 반영한다. 대상 서버의 기존 무관한 대화를 재시작하지 않고 실제 goal/get·DB 행·이력·설정으로 재검증해야 한다. API goal/set으로 새 Goal을 만드는 것은 대체가 아니다. 이 계약의 실행 가능성·복구·왕복 시험을 통과하기 전 제품의 통합/분리 쓰기 경로를 제공하지 않는다.
+
 ## 구현자 검토 · 2026-11-04
 
 독립 읽기 전용 검토에서 cross-home 이관의 구현 가능성, 공유 계정 변경/선택 이관의 영향 범위 차이, 양방향 영속 저널/단일 writer, 계정+워크스페이스+SSO, 초안/하위 작업/설정 보존, 실제 인증 격리와 순수 조회 입증을 선행 조건으로 지적했다. 위 요구에 반영했다. 디렉터리/잠금/캐시 표현은 구현자가 정하며 추가 사용자 선택은 필요하지 않았다. 확인되지 않은 이관 기능을 이미 가능하다고 표시하지 않는다.

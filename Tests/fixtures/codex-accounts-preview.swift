@@ -102,6 +102,12 @@ private let fixtureHomes=["/Users/alex/.codex","/Users/서연/Library/Applicatio
     @Environment(\.dismiss) var dismiss
     var body:some View {
         CodexAccountsLayout(close:{dismiss()}) {
+            if ProcessInfo.processInfo.environment["AUTOAPPROVE_LOGIN_LIFECYCLE_QA"] == "1" || FileManager.default.fileExists(atPath:fixture.root.appendingPathComponent("lifecycle-qa").path) {
+                HStack {
+                    Button("다른 뷰에서 합성 로그인") {try? fixture.accounts.beginNativeCodexLogin(.init(home:fixtureHomes[fixture.profile],executable:"codex"))}
+                    Button("다른 뷰에서 합성 취소") {fixture.accounts.cancelNativeCodexLogin()}
+                }
+            }
             Text("이 Mac에서 실행 중인 Codex의 로그인과 세션 연결을 관리합니다.")
             CodexLoginSettings(accounts:fixture.accounts,targets:{try await fixture.targets()},transitionEnabled:true,transitionBusy:false,completed:{},reconnect:{try await fixture.reconnect($0)},
                 setupHomes:{[fixtureHomes[fixture.profile]]},serverStatus:{_ in try await fixture.readServerStatus()},prepareServer:{_ in try await fixture.prepare()},inspectAccount:{try await fixture.inspectAccount($0)})

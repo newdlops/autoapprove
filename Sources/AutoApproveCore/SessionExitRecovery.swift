@@ -27,7 +27,7 @@ public struct SessionExitRecovery: Codable {
         if shells.contains(name) {return true}
         // macOS login shells conventionally launch with argv[0] = "-zsh".
         // Accept one marker on a bare known shell name, never arbitrary paths.
-        return !record.executable.contains("/") && name.hasPrefix("-") && shells.contains(String(name.dropFirst()))
+        return record.executable.hasPrefix("-") && shells.contains(String(record.executable.dropFirst()))
     }
     public static func conversation(in screen: String) -> String? {
         let pattern = #"^To continue this session, run codex resume ([0-9a-fA-F-]{36})\s*$"#
