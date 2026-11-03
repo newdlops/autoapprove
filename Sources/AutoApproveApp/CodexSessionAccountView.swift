@@ -44,7 +44,7 @@ private struct CodexAccountLoginPresentation:Identifiable {
                                     .fixedSize(horizontal:false,vertical:true)
                                 CodexLoginSettings(accounts:engine.agentAccounts,targets:{try await verifiedTargets(account)},
                                     transitionEnabled:engine.codexAccountTransitionEnabled,transitionBusy:busy || held,completed:{},preferredHome:account.target.home,
-                                    reconnect:{try await engine.reconnectCodexLogin(home:$0)})
+                                    reconnect:{try await engine.reconnectCodexLogin(home:$0)},inspectAccount:{try await engine.inspectCodexAccount(home:$0)})
                                 Divider()
                                 CodexAccountTransitionSettings(enabled:engine.codexAccountTransitionEnabled,busy:busy,
                                     states:engine.codexAccountTransitionStates,notice:engine.codexAccountTransitionNotice,error:error,

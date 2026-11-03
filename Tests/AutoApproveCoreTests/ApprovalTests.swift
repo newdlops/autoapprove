@@ -596,6 +596,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account inspection: coalesced reads have independent caller cancellation",tests.testAccountInspectionCoalescesAndCallerCancellationIsIndependent),
             ("Account inspection: changed membership and engine stop reject stale results",tests.testAccountInspectionRejectsChangedMembershipAndEngineStop),
             ("Account inspection: starting login invalidates an older account observation",tests.testAccountInspectionCannotFinishWithPreLoginAccountAfterLoginStarts),
+            ("Account inspection: cancelling login invalidates a pending account observation",tests.testAccountInspectionCannotFinishWithPendingLoginAccountAfterCancellation),
             ("Account transition: all original conversations and processes prove empty TUI reconnection",tests.testAccountTransitionMissingConversationProofStopsBeforeAnyEffect),
             ("Account transition: fresh reconnect barrier rejects account and membership races",tests.testAccountTransitionReconnectionFreshBarrierRejectsAccountAndMembershipRaces),
             ("Account transition: persisted offscreen conversations need not stay loaded",tests.testAccountTransitionOffscreenConversationsDoNotNeedToStayLoaded),

@@ -587,6 +587,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let self,let accounts,self.agentAccounts===accounts,!self.remoteInputStopped else{return}
             self.invalidateCodexAccountInspection(home:home)
         }
+        accounts.nativeCodexLoginDidEnd={ [weak self,weak accounts] home in
+            guard let self,let accounts,self.agentAccounts===accounts,!self.remoteInputStopped else{return}
+            self.invalidateCodexAccountInspection(home:home)
+        }
         accounts.nativeCodexLoginCompleted={ [weak self,weak accounts] home in
             guard let self,let accounts,self.agentAccounts === accounts,!self.remoteInputStopped else{return}
             let epoch=self.codexAccountTransitionEpoch

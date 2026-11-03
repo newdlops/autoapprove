@@ -42,7 +42,7 @@ struct CodexAccountsLayout<Content:View>:View {
                 transitionEnabled:engine.codexAccountTransitionEnabled,transitionBusy:engine.codexAccountTransitionBusy || engine.codexAccountTransitionHeld,
                 completed:{},reconnect:{try await engine.reconnectCodexLogin(home:$0)},
                 setupHomes:{try await engine.codexServerSetupHomes()},serverStatus:{try await engine.codexManagedServerStatus(home:$0)},
-                prepareServer:{try await engine.prepareCodexManagedServer(home:$0)})
+                prepareServer:{try await engine.prepareCodexManagedServer(home:$0)},inspectAccount:{try await engine.inspectCodexAccount(home:$0)})
             if let notice=engine.codexSessionAttachmentNotice {
                 CodexSessionAttachmentStatus(detail:notice)
             }

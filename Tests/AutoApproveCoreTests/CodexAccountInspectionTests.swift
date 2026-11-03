@@ -98,5 +98,23 @@ extension ApprovalTests {
         if case .success=await checking.result {throw AppError.message("Pre-login account observation became current after login started")}
         try expect(engine.codexAccountTransitionStates.isEmpty)
     }
+    func testAccountInspectionCannotFinishWithPendingLoginAccountAfterCancellation() async throws {
+        let(root,rows,target)=inspectionFixture(),gate=InspectionGate()
+        defer{gate.release();try? FileManager.default.removeItem(at:root)}
+        let service=CodexAccountInspectionServices(read:{await gate.read($0)})
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{rows},codexAccountTargets:{_ in [target]},codexAccountInspections:service)
+        defer{engine.stop()}
+        let auth=AgentAccountServices(home:root.path,check:{_ in .init(agent:"codex",phase:"authenticated")},launch:{_ in
+            try ManagedPTY(cwd:root.path,command:["/bin/sleep","30"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
+        })
+        engine.agentAccounts=AgentAccounts(services:auth,codexServices:{_ in auth})
+        try engine.agentAccounts.beginNativeCodexLogin(target)
+        let checking=Task{try await engine.inspectCodexAccount(home:target.home)}
+        try await gate.entered()
+        engine.agentAccounts.cancelNativeCodexLogin()
+        gate.release()
+        if case .success=await checking.result {throw AppError.message("Pending-login account observation survived cancellation")}
+        try expectFalse(engine.agentAccounts.busy);try expect(engine.codexAccountTransitionStates.isEmpty)
+    }
 }
 

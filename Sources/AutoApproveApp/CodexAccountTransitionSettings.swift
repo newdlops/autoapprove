@@ -18,7 +18,7 @@ struct CodexAccountTransitionSettings: View {
             Text("로그인 변경을 감지하면 작업을 하나씩 중단합니다. 새 로그인으로 서버를 전환하고 기존 창·대화를 확인한 뒤, 전환으로 중단한 작업만 이어갑니다.")
                 .fixedSize(horizontal: false, vertical: true)
             if !enabled, states.isEmpty {
-                Label("꺼짐 · 계정 변경을 확인하거나 작업을 중단하지 않습니다.", systemImage: "pause.circle")
+                Label("꺼짐 · 자동으로 계정을 바꾸거나 작업을 중단하지 않습니다.", systemImage: "pause.circle")
                     .font(.caption)
             }
             ForEach(states.keys.sorted(), id: \.self) { home in
@@ -59,9 +59,11 @@ struct CodexAccountTransitionSettings: View {
             if let notice { Label(notice, systemImage: "info.circle").fixedSize(horizontal: false, vertical: true) }
             if let error { Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
             HStack(spacing: 8) {
-                Button("현재 로그인 확인") { check() }.disabled(!enabled || busy)
-                    .help(enabled ? "현재 저장된 로그인과 연결된 서버를 다시 비교합니다. 확인 필요 상태의 명령은 반복하지 않습니다." : "자동 전환을 켜면 현재 로그인을 확인할 수 있습니다.")
-                if busy { ProgressView().controlSize(.small); Text("확인 중…").font(.caption) }
+                if states.values.contains(where:\.held) {
+                    Button("전환 진행 확인") { check() }.disabled(busy)
+                        .help("예약된 전환의 진행 상태를 확인하고 조건이 충족되면 계속합니다. 계정만 읽으려면 위의 현재 로그인 확인을 사용하세요.")
+                }
+                if busy { ProgressView().controlSize(.small); Text("전환 확인 중…").font(.caption) }
             }
             Text("전환으로 중단한 Goal은 기존 목표를 재개하고, 일반 작업은 같은 대화에 이어가기 요청을 한 번 보냅니다. 원래 대기 중이던 대화와 작성 중인 초안은 유지합니다. 대기 메시지가 남아 있으면 전환을 기다립니다.")
                 .font(.caption).fixedSize(horizontal: false, vertical: true)

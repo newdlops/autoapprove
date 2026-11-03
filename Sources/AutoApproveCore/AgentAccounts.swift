@@ -22,6 +22,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
         var terminal:ManagedPTY?,task:Task<Void,Never>?,sequence=0
         let writer=UUID().uuidString
         var phase="starting",url:String?,code:String?,message:String?,submitted=false
+        var nativeFinishNotified=false
         init(id:String,owner:String,agent:String,terminal:ManagedPTY,now:Date,services:AgentAccountServices) {
             self.services=services
             self.id=id;self.owner=owner;self.agent=agent;self.terminal=terminal;tty=terminal.descriptor.tty;expires=now.addingTimeInterval(600)
@@ -43,6 +44,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     var nativeCodexLoginCompleted:((String)->Void)?
     var nativeCodexLoginWillStart:((CodexAccountTransitionTarget)throws->Void)?
     var nativeCodexLoginDidStart:((String)->Void)?
+    var nativeCodexLoginDidEnd:((String)->Void)?
     private var crypto=AgentAccountCrypto(),generation=UUID()
     private var grants:[String:Date]=[:],jobs:[String:Job]=[:],seen:[String:Date]=[:]
     private var failures:[Date]=[],unlocking=false,pinStamp=""
@@ -63,6 +65,12 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     public func cancelNativeCodexLogin() {
         guard let id=nativeJob,let job=jobs[id],job.owner==nativeOwner,job.active else {return}
         job.task?.cancel();job.finish("cancelled","로그인을 취소했습니다.")
+        notifyNativeLoginFinished(job)
+    }
+    private func notifyNativeLoginFinished(_ job:Job) {
+        guard job.owner==nativeOwner,!job.active,!job.nativeFinishNotified,
+              let home=job.resolvedCodexHome ?? job.codexHome else{return}
+        job.nativeFinishNotified=true;nativeCodexLoginDidEnd?(home)
     }
     public var privateTTYs:Set<String> {Set(jobs.values.map(\.tty)).union(retiredTTYs.filter{$0.value>Date()}.keys)}
     public var busy:Bool {jobs.values.contains(where:\.active)}
@@ -163,7 +171,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     }
     private func follow(_ job:Job,epoch:UUID) async {
         var offset=0,buffer=""
-        defer {buffer="";job.terminal?.close();job.terminal=nil}
+        defer {if epoch==generation {notifyNativeLoginFinished(job)};buffer="";job.terminal?.close();job.terminal=nil}
         while !Task.isCancelled,epoch==generation,job.active,let terminal=job.terminal {
             if Date()>=job.expires {job.finish("expired","인증 시간이 만료됐습니다. 다시 로그인해주세요.");return}
             do {
