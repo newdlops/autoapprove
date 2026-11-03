@@ -23,5 +23,22 @@ try{
    results.push({mode,abruptProcessExit:true,mirroredRevisions:revisions,pendingOwnerBlockedForeignRequest:true,sameAttemptedIntentRecovered:true,terminalRelease:true});
   }finally{for(const name of['a','b'])try{await chmod(root+'/'+name+'/.autoapprove-migrations',0o700)}catch{}await rm(root,{recursive:true,force:true});}
  }
+ for(const boundary of['crash-central','crash-first-mirror','crash-synced']){
+  const root=await mkdtemp('/private/tmp/aa-migration-crash-owner-'),id=randomUUID(),mode='owner-'+boundary;
+  try{
+   await Promise.all(['a','b'].map(n=>mkdir(root+'/'+n,{mode:0o700})));
+   const created=run(root,id,'create');assert.equal(created.status,0,created.stderr);const homes=JSON.parse(created.stdout).homes;
+   const crashed=run(root,id,mode);assert.equal(crashed.status,boundary==='crash-synced'?71:70,crashed.stderr);
+   for(const home of homes)await chmod(home.path+'/.autoapprove-migrations',0o700);
+   const inspected=run(root,id,'inspect-owner');assert.equal(inspected.status,0,inspected.stderr);
+   const before=JSON.parse(inspected.stdout);
+   assert.deepEqual(before,{revision:2,consistent:boundary==='crash-synced',terminal:true,centralOwnerRevision:1,ownerVerified:boundary==='crash-synced'});
+   const repaired=run(root,id,'repair');assert.equal(repaired.status,0,repaired.stderr);
+   const after=run(root,id,'inspect-owner');assert.equal(after.status,0,after.stderr);
+   assert.deepEqual(JSON.parse(after.stdout),{revision:2,consistent:true,terminal:true,centralOwnerRevision:1,ownerVerified:true});
+   assert.equal(run(root,id,'release-owner').status,0);
+   results.push({mode,abruptProcessExit:true,atomicCentralOwnerAndReceipt:true,unverifiedMirrorsBlockOwnership:true,repairWithoutNewOwnerRevision:true});
+  }finally{for(const name of['a','b'])try{await chmod(root+'/'+name+'/.autoapprove-migrations',0o700)}catch{}await rm(root,{recursive:true,force:true});}
+ }
  console.log(JSON.stringify({verified:true,nativeEffectsPerformed:0,existingSessionsTouched:false,results}));
 }finally{await rm(workspace,{recursive:true,force:true});}

@@ -54,6 +54,14 @@ public final class AuditStore {
         // connection-local; do not weaken the existing approval connection.
         // https://www.sqlite.org/pragma.html#pragma_fullfsync
         try execute("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; CREATE TABLE IF NOT EXISTS codex_migration_journals (id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL, terminal INTEGER NOT NULL, json BLOB NOT NULL)")
+        var ownerTable:OpaquePointer?
+        guard sqlite3_prepare_v2(db,"SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_migration_thread_owners'",-1,&ownerTable,nil)==SQLITE_OK else{throw AppError.message("대화 소유권 테이블을 확인하지 못했습니다.")}
+        let ownerTableResult=sqlite3_step(ownerTable);sqlite3_finalize(ownerTable)
+        guard ownerTableResult==SQLITE_ROW || ownerTableResult==SQLITE_DONE else{throw AppError.message("대화 소유권 테이블 조회에 실패했습니다.")}
+        if ownerTableResult==SQLITE_DONE {
+            guard try !migrationOwnershipExists() else{throw AppError.message("완료 이관의 소유권 기록이 없습니다. 빈 기록으로 다시 시작하지 않습니다.")}
+            try execute("CREATE TABLE codex_migration_thread_owners (thread_id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL, json BLOB NOT NULL)")
+        }
         for (pragma,expected) in [("synchronous",2),("fullfsync",1)] {
             var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
             guard sqlite3_prepare_v2(db,"PRAGMA "+pragma,-1,&statement,nil)==SQLITE_OK,
@@ -95,6 +103,55 @@ public final class AuditStore {
             bind(row.id,to:statement,at:4);sqlite3_bind_int64(statement,5,Int64(expectedRevision))
         }
         guard sqlite3_step(statement)==SQLITE_DONE,sqlite3_changes(db)==1 else{throw AppError.message("이관 저널 저장 또는 순서 검증에 실패했습니다.")}
+    }
+    struct MigrationOwnerRow {let id:String,revision:Int,data:Data}
+    struct MigrationOwnerUpdate {let previous:MigrationOwnerRow?,next:MigrationOwnerRow}
+    func migrationOwnershipExists(threadID:String?=nil)throws->Bool {
+        var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
+        let sql=threadID==nil
+            ? "SELECT 1 FROM codex_migration_journals WHERE json_type(CAST(json AS TEXT),'$.ownership') IS NOT NULL LIMIT 1"
+            : "SELECT 1 FROM codex_migration_journals AS journals,json_each(CAST(journals.json AS TEXT),'$.ownership') AS ownership WHERE json_extract(ownership.value,'$.threadID')=? LIMIT 1"
+        guard sqlite3_prepare_v2(db,sql,-1,&statement,nil)==SQLITE_OK else{throw AppError.message("이관 소유권 이력을 확인하지 못했습니다.")}
+        if let threadID{bind(threadID,to:statement,at:1)}
+        let result=sqlite3_step(statement)
+        guard result==SQLITE_ROW || result==SQLITE_DONE else{throw AppError.message("이관 소유권 이력 조회에 실패했습니다.")}
+        return result==SQLITE_ROW
+    }
+    func migrationOwner(threadID:String)throws->MigrationOwnerRow? {
+        var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
+        guard sqlite3_prepare_v2(db,"SELECT thread_id,revision,json FROM codex_migration_thread_owners WHERE thread_id=?",-1,&statement,nil)==SQLITE_OK else{throw AppError.message("대화 소유권을 읽지 못했습니다.")}
+        bind(threadID,to:statement,at:1)
+        let result=sqlite3_step(statement);if result==SQLITE_DONE{return nil}
+        guard result==SQLITE_ROW,sqlite3_column_type(statement,0)==SQLITE_TEXT,sqlite3_column_type(statement,1)==SQLITE_INTEGER,
+              sqlite3_column_type(statement,2)==SQLITE_BLOB,let key=sqlite3_column_text(statement,0),let bytes=sqlite3_column_blob(statement,2) else{throw AppError.message("대화 소유권 형식을 확인하지 못했습니다.")}
+        let size=Int(sqlite3_column_bytes(statement,2)),revision=sqlite3_column_int64(statement,1)
+        guard size>0,size<=65536,revision>0,revision<Int64(Int.max) else{throw AppError.message("대화 소유권 범위를 확인하지 못했습니다.")}
+        return .init(id:String(cString:key),revision:Int(revision),data:Data(bytes:bytes,count:size))
+    }
+    private func saveMigrationOwner(_ update:MigrationOwnerUpdate)throws {
+        let previous=update.previous,next=update.next
+        guard next.revision==(previous?.revision ?? 0)+1,next.data.count>0,next.data.count<=65536,
+              previous.map({$0.id==next.id}) ?? true else{throw AppError.message("대화 소유권 순서가 바뀌었습니다.")}
+        var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
+        let sql=previous==nil ? "INSERT INTO codex_migration_thread_owners(thread_id,revision,json) VALUES (?,?,?)":"UPDATE codex_migration_thread_owners SET revision=?,json=? WHERE thread_id=? AND revision=? AND json=?"
+        guard sqlite3_prepare_v2(db,sql,-1,&statement,nil)==SQLITE_OK else{throw AppError.message("대화 소유권을 저장하지 못했습니다.")}
+        let transient=unsafeBitCast(-1,to:sqlite3_destructor_type.self)
+        if let previous {
+            sqlite3_bind_int64(statement,1,Int64(next.revision));_=next.data.withUnsafeBytes{sqlite3_bind_blob(statement,2,$0.baseAddress,Int32(next.data.count),transient)}
+            bind(next.id,to:statement,at:3);sqlite3_bind_int64(statement,4,Int64(previous.revision))
+            _=previous.data.withUnsafeBytes{sqlite3_bind_blob(statement,5,$0.baseAddress,Int32(previous.data.count),transient)}
+        }else{
+            bind(next.id,to:statement,at:1);sqlite3_bind_int64(statement,2,Int64(next.revision))
+            _=next.data.withUnsafeBytes{sqlite3_bind_blob(statement,3,$0.baseAddress,Int32(next.data.count),transient)}
+        }
+        guard sqlite3_step(statement)==SQLITE_DONE,sqlite3_changes(db)==1 else{throw AppError.message("대화 소유권 저장 또는 비교에 실패했습니다.")}
+    }
+    func saveMigrationCompletion(_ row:MigrationRow,expectedRevision:Int,ownership:[MigrationOwnerUpdate])throws {
+        guard row.terminal,!ownership.isEmpty,ownership.count<=512,Set(ownership.map{$0.next.id}).count==ownership.count else{throw AppError.message("이관 완료 범위를 확인하지 못했습니다.")}
+        try execute("BEGIN IMMEDIATE");var committed=false;defer{if !committed{try? execute("ROLLBACK")}}
+        try saveMigrationRow(row,expectedRevision:expectedRevision)
+        for update in ownership {try saveMigrationOwner(update)}
+        try execute("COMMIT");committed=true
     }
     public func append(_ event: AuditEvent) throws {
         let data = try JSONEncoder().encode(event)

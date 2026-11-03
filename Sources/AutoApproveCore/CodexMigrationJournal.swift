@@ -8,24 +8,55 @@ struct CodexMigrationJournalRecord:Codable,Equatable {
     struct Home:Codable,Equatable {let path:String,identity:String}
     let formatVersion:Int,id:String,revision:Int,homes:[Home],payload:Data
     let previousDigest:String?,terminal:Bool,digest:String
+    let ownership:[CodexMigrationOwnerChange]?
     private struct Body:Codable {
         let formatVersion:Int,id:String,revision:Int,homes:[Home],payload:Data
         let previousDigest:String?,terminal:Bool
+        let ownership:[CodexMigrationOwnerChange]?
     }
-    private var body:Body {.init(formatVersion:formatVersion,id:id,revision:revision,homes:homes,payload:payload,previousDigest:previousDigest,terminal:terminal)}
+    private var body:Body {.init(formatVersion:formatVersion,id:id,revision:revision,homes:homes,payload:payload,previousDigest:previousDigest,terminal:terminal,ownership:ownership)}
     fileprivate static func serialized<T:Encodable>(_ value:T)throws->Data {let e=JSONEncoder();e.outputFormatting=[.sortedKeys,.withoutEscapingSlashes];return try e.encode(value)}
     private static func hash(_ body:Body)throws->String {SHA256.hash(data:try serialized(body)).map{String(format:"%02x",$0)}.joined()}
-    fileprivate init(id:String,revision:Int,homes:[Home],payload:Data,previousDigest:String?,terminal:Bool)throws {
-        formatVersion=1;self.id=id;self.revision=revision;self.homes=homes;self.payload=payload;self.previousDigest=previousDigest;self.terminal=terminal
-        digest=try Self.hash(Body(formatVersion:1,id:id,revision:revision,homes:homes,payload:payload,previousDigest:previousDigest,terminal:terminal))
+    fileprivate init(id:String,revision:Int,homes:[Home],payload:Data,previousDigest:String?,terminal:Bool,ownership:[CodexMigrationOwnerChange]?=nil)throws {
+        formatVersion=ownership==nil ? 1:2;self.id=id;self.revision=revision;self.homes=homes;self.payload=payload;self.previousDigest=previousDigest;self.terminal=terminal;self.ownership=ownership
+        digest=try Self.hash(Body(formatVersion:formatVersion,id:id,revision:revision,homes:homes,payload:payload,previousDigest:previousDigest,terminal:terminal,ownership:ownership))
     }
     fileprivate func validate() throws {
-        guard formatVersion==1,UUID(uuidString:id)?.uuidString.lowercased()==id,revision>0,revision<Int.max,
+        guard formatVersion==(ownership==nil ? 1:2),UUID(uuidString:id)?.uuidString.lowercased()==id,revision>0,revision<Int.max,
               homes.count==2,homes.map(\.path)==homes.map(\.path).sorted(),Set(homes.map(\.identity)).count==2,
               homes.allSatisfy({$0.path.hasPrefix("/") && $0.path.utf8.count<=4096 && !$0.path.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains) && !$0.identity.isEmpty && $0.identity.count<=128}),
               payload.count<=8*1024*1024,digest == (try Self.hash(body)),
               revision==1 ? previousDigest==nil:previousDigest?.count==64 else{throw CodexMigrationJournal.failure}
+        if let ownership {
+            guard terminal,!ownership.isEmpty,ownership.count<=512,Set(ownership.map(\.threadID)).count==ownership.count else{throw CodexMigrationJournal.failure}
+            for change in ownership {
+                guard UUID(uuidString:change.threadID)?.uuidString.lowercased()==change.threadID,homes.contains(change.destination) else{throw CodexMigrationJournal.failure}
+                if let previous=change.previous {
+                    try previous.validate()
+                    guard previous.threadID==change.threadID,homes.contains(previous.home),previous.home != change.destination else{throw CodexMigrationJournal.failure}
+                }
+            }
+        }
     }
+}
+
+// These are journal-backed storage facts, not native ownership observations.
+// Only a future verified native completion path may publish these in production.
+struct CodexMigrationOwner:Codable,Equatable {
+    let threadID:String,revision:Int,home:CodexMigrationJournalRecord.Home,journalID:String,journalDigest:String
+    fileprivate func validate()throws {
+        guard UUID(uuidString:threadID)?.uuidString.lowercased()==threadID,revision>0,revision<Int.max,
+              UUID(uuidString:journalID)?.uuidString.lowercased()==journalID,journalDigest.count==64,
+              home.path.hasPrefix("/"),home.path.utf8.count<=4096,!home.identity.isEmpty,home.identity.count<=128 else{throw CodexMigrationJournal.failure}
+    }
+    fileprivate static func after(_ change:CodexMigrationOwnerChange,_ record:CodexMigrationJournalRecord)throws->Self {
+        let previous=change.previous?.revision ?? 0
+        guard previous<Int.max-1 else{throw CodexMigrationJournal.failure}
+        return .init(threadID:change.threadID,revision:previous+1,home:change.destination,journalID:record.id,journalDigest:record.digest)
+    }
+}
+struct CodexMigrationOwnerChange:Codable,Equatable {
+    let threadID:String,previous:CodexMigrationOwner?,destination:CodexMigrationJournalRecord.Home
 }
 
 final class CodexMigrationJournal {
@@ -144,7 +175,15 @@ final class CodexMigrationJournal {
     }
     private func persist(_ record:CodexMigrationJournalRecord,expectedRevision:Int,handles:[HomeHandle])throws {
         try record.validate()
-        try store.saveMigrationRow(.init(id:record.id,revision:record.revision,terminal:record.terminal,data:try CodexMigrationJournalRecord.serialized(record)),expectedRevision:expectedRevision)
+        let row=AuditStore.MigrationRow(id:record.id,revision:record.revision,terminal:record.terminal,data:try CodexMigrationJournalRecord.serialized(record))
+        if let ownership=record.ownership {
+            let updates=try ownership.map {change in
+                let owner=try CodexMigrationOwner.after(change,record)
+                let previous=try change.previous.map {value in AuditStore.MigrationOwnerRow(id:value.threadID,revision:value.revision,data:try CodexMigrationJournalRecord.serialized(value))}
+                return AuditStore.MigrationOwnerUpdate(previous:previous,next:.init(id:owner.threadID,revision:owner.revision,data:try CodexMigrationJournalRecord.serialized(owner)))
+            }
+            try store.saveMigrationCompletion(row,expectedRevision:expectedRevision,ownership:updates)
+        }else{try store.saveMigrationRow(row,expectedRevision:expectedRevision)}
         try mirror(record,handles)
     }
     private func mirror(_ record:CodexMigrationJournalRecord,_ handles:[HomeHandle])throws {
@@ -185,6 +224,31 @@ final class CodexMigrationJournal {
         for h in handles{try h.check()}
         let record=try CodexMigrationJournalRecord(id:id,revision:expectedRevision+1,homes:loaded.record.homes,payload:payload,previousDigest:loaded.record.digest,terminal:terminal)
         try persist(record,expectedRevision:expectedRevision,handles:handles);return record
+    }
+    func owner(threadID:String)throws->CodexMigrationOwner? {
+        let threadID=try Self.id(threadID)
+        guard let row=try store.migrationOwner(threadID:threadID) else{
+            guard try !store.migrationOwnershipExists(threadID:threadID) else{throw Self.failure}
+            return nil
+        }
+        let owner=try JSONDecoder().decode(CodexMigrationOwner.self,from:row.data);try owner.validate()
+        guard owner.threadID==threadID,row.id==threadID,row.revision==owner.revision,
+              let loaded=try load(id:owner.journalID),loaded.consistent,loaded.record.terminal,
+              loaded.record.digest==owner.journalDigest,
+              let change=loaded.record.ownership?.first(where:{$0.threadID==threadID}),
+              try CodexMigrationOwner.after(change,loaded.record)==owner else{throw Self.failure}
+        return owner
+    }
+    func complete(id value:String,payload:Data,expectedRevision:Int,ownership:[CodexMigrationOwnerChange])throws->CodexMigrationJournalRecord {
+        let id=try Self.id(value)
+        guard payload.count<=8*1024*1024,let loaded=try load(id:id),loaded.consistent,!loaded.record.terminal,
+              loaded.record.revision==expectedRevision,let handles=leases[id] else{throw Self.failure}
+        let record=try CodexMigrationJournalRecord(id:id,revision:expectedRevision+1,homes:loaded.record.homes,payload:payload,previousDigest:loaded.record.digest,terminal:true,ownership:ownership)
+        try record.validate()
+        for change in ownership {guard try owner(threadID:change.threadID)==change.previous else{throw Self.failure}}
+        for h in handles{try h.check()}
+        try persist(record,expectedRevision:expectedRevision,handles:handles)
+        return record
     }
     func repair(id value:String)throws->CodexMigrationJournalRecord {
         let id=try Self.id(value);guard let initial=try load(id:id) else{throw Self.failure}
