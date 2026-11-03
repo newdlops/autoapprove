@@ -239,4 +239,31 @@ enum CodexGoalTransferStore {
               try capture(home:snapshot.sourceHome,threadID:v.threadID)==snapshot else{throw failure}
         try Task.checkCancellation();try connection.check();try connection.exec("COMMIT");committed=true
     }
+    // The return coordinator must durably reserve/attempt the exact backed-up
+    // retirement before calling this. BEGIN IMMEDIATE protects the exact-row
+    // comparison and replacement as one transaction; arbitrary upsert is absent.
+    static func replaceRetired(_ source:CodexGoalTransferSlot,expected:CodexGoalTransferSlot,verifyAuthority:()throws->Void)throws {
+        try source.validate();try expected.validate();try verifyAuthority()
+        guard source.threadID==expected.threadID,source.sourceHome != expected.sourceHome,
+              source.schemaFingerprint==expected.schemaFingerprint,
+              try physicalHome(expected.sourceHome)==expected.sourceHome,
+              try homeIdentity(expected.sourceHome)==expected.homeIdentity else{throw failure}
+        try verifyCurrent(source)
+        let connection=try Connection(home:expected.sourceHome,writable:true)
+        guard connection.identity==expected.databaseIdentity else{throw failure}
+        try connection.exec("BEGIN IMMEDIATE");var committed=false;defer{if !committed{try? connection.exec("ROLLBACK")}}
+        let current=try row(connection,source.threadID)
+        guard try schema(connection)==expected.schemaFingerprint,current.0==expected.row,current.1==expected.continuationDeferred else{throw failure}
+        try connection.exec("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id=?",[.text(source.threadID)])
+        try connection.exec("DELETE FROM thread_goals WHERE thread_id=?",[.text(source.threadID)])
+        if let v=source.row {
+            try connection.exec("INSERT INTO thread_goals (\(columns)) VALUES (?,?,?,?,?,?,?,?,?)",[.text(v.threadID),.text(v.goalID),.text(v.objective),.text(v.status),v.tokenBudget.map(Cell.integer) ?? .null,.integer(v.tokensUsed),.integer(v.timeUsedSeconds),.integer(v.createdAtMs),.integer(v.updatedAtMs)])
+            if source.continuationDeferred{try connection.exec("INSERT INTO thread_goal_continuation_deferrals(thread_id) VALUES (?)",[.text(source.threadID)])}
+        }
+        let changed=try row(connection,source.threadID)
+        guard changed.0==source.row,changed.1==source.continuationDeferred else{throw failure}
+        try verifyAuthority();try verifyCurrent(source);try connection.check()
+        guard try homeIdentity(expected.sourceHome)==expected.homeIdentity else{throw failure}
+        try Task.checkCancellation();try connection.exec("COMMIT");committed=true
+    }
 }

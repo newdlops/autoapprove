@@ -15,6 +15,8 @@ const returnOriginal=process.argv.includes('--return-original-home');
 const checkClearedSlot=process.argv.includes('--check-cleared-slot');
 const checkSettings=process.argv.includes('--check-settings');
 const checkRetirement=process.argv.includes('--check-retirement');
+const returnCleared=process.argv.includes('--return-cleared-goal');
+assert.ok(!returnCleared || returnOriginal&&checkRetirement);
 assert.ok(!checkClearedSlot || restoreGoal);
 assert.ok(!checkSettings || restoreGoal);
 assert.ok(!checkRetirement || restoreGoal);
@@ -110,6 +112,7 @@ try{
   const rowJSON=home=>sql(home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`);
   assert.equal(rowJSON(b.home),rowJSON(a.home),'Native resume must retain exact Goal instance and millisecond counters');
   console.error(JSON.stringify({stage:'first-transfer',sameUUID:true,exactGoalRow:true,publicGoal:true,unselectedGoal:true}));
+  let expectedReturnTurns=source.turns;
   if(checkRetirement){
    assert.equal(JSON.parse(execFileSync(transfer,['--record-retirement',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:10000})).nativeRetirementWitnessed,true);
    const originalRow=rowJSON(a.home),originalHistory=await readFile(firstRollout);
@@ -120,6 +123,15 @@ try{
    assert.equal(rowJSON(a.home),originalRow);assert.deepEqual(await readFile(firstRollout),originalHistory);
    Object.assign(report,{nativeRetirementAndIndependentBackup:true,backupPreservedOriginalGoalAndHistory:true,backupVerifiedAfterProcessExit:true,cancelledBackupDoesNotAuthorizeReplacement:true});
   }
+  if(returnOriginal&&checkRetirement){
+   const follow=await b.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned new history created only in home B.',text_elements:[]}]});
+   const finished=await b.wait('turn/completed',p=>p.threadId===id&&p.turn.id===follow.turn.id);
+   assert.equal(finished.turn.status,'completed');
+   expectedReturnTurns=(await b.request('thread/read',{threadId:id,includeTurns:true})).thread.turns;
+   assert.ok(expectedReturnTurns.length>source.turns.length,'Direct return must preserve newer B history, not merely reopen the stale A archive');
+   console.error(JSON.stringify({stage:'direct-return-new-history',newerBHistory:true}));
+  }
+  if(returnCleared)await b.request('thread/goal/clear',{threadId:id,origin:'user'});
   const unsubscribed=await b.request('thread/unsubscribe',{threadId:id});assert.equal(unsubscribed.status,'unsubscribed');
   if(process.argv.includes('--archive-source'))await b.request('thread/archive',{threadId:id});
   const end=Date.now()+5000;let loaded;
@@ -128,7 +140,10 @@ try{
   const files=execFileSync('/usr/sbin/lsof',['-nP','-p',String(b.pid),'-Fn'],{encoding:'utf8',timeout:10000});
   assert.ok(!files.split('\n').some(line=>line.startsWith('n')&&line.includes(id)),'Selected rollout writer must actually close and flush');
   let expectedReturnGoal=sourceGoal;
-  if(returnOriginal){sql(b.home,`UPDATE thread_goals SET tokens_used=73,time_used_seconds=29 WHERE thread_id='${id}';`);expectedReturnGoal={...sourceGoal,tokensUsed:73,timeUsedSeconds:29};}
+  if(returnOriginal){
+   if(returnCleared){expectedReturnGoal=null;assert.equal(rowJSON(b.home),'');}
+   else{sql(b.home,`UPDATE thread_goals SET tokens_used=73,time_used_seconds=29 WHERE thread_id='${id}';`);expectedReturnGoal={...sourceGoal,tokensUsed:73,timeUsedSeconds:29};}
+  }
   const expectedReturnRow=rowJSON(b.home);
   const c=await server(returnOriginal?a.home:root+'/c'),third=(await c.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
   await c.request('thread/goal/set',{threadId:third,objective:'Third home unselected Goal',status:'paused',origin:'user'});
@@ -140,18 +155,26 @@ try{
   }
   const returning=path.join(c.home,relative);await mkdir(path.dirname(returning),{recursive:true});await copyFile(closedRollout,returning);
   if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:73}));
-  assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
+  if(returnOriginal&&checkRetirement){
+   const result=JSON.parse(execFileSync(transfer,['--return-goal',b.home,c.home,id,closedRollout],{encoding:'utf8',timeout:10000}));
+   assert.equal(result.exactGoalReturned,true);assert.equal(result.nativeOwnershipCommitted,false);
+   console.error(JSON.stringify({stage:'goal-storage-return',exactGoalReturned:true,nativeOwnershipCommitted:false,clearedSource:returnCleared}));
+  }else assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
   const last=await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
   if(checkSettings){
    assert.equal(last.reasoningEffort,'high');assert.equal(last.serviceTier,'flex');
    assert.deepEqual(last.disabledPluginIds,disabledPlugins);assert.deepEqual(last.runtimeWorkspaceRoots,[workspaceRoot]);
   }
-  const returned=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.deepEqual(returned.turns,source.turns,'Return transfer must retain all user/assistant history');
+  const returned=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.deepEqual(returned.turns,expectedReturnTurns,'Return transfer must retain all latest user/assistant history');
   for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(last[key],start[key],key+' must survive return resume');
   assert.deepEqual((await c.request('thread/goal/get',{threadId:id})).goal,expectedReturnGoal);assert.equal(rowJSON(c.home),expectedReturnRow);
   assert.deepEqual((await b.request('thread/goal/get',{threadId:unselected})).goal,unselectedGoal);
   assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
   assert.ok((await b.request('thread/loaded/list',{})).data.includes(unselected));process.kill(b.pid,0);
+  if(returnOriginal&&checkRetirement){
+   assert.equal(JSON.parse(execFileSync(transfer,['--commit-goal-return',b.home,c.home,id],{encoding:'utf8',timeout:10000})).destinationOwnershipCommitted,true);
+   Object.assign(report,{retiredOwnerReturnVerified:true,clearedGoalNotResurrected:returnCleared,returnGoal:expectedReturnGoal});
+  }
   Object.assign(report,{ownedHomes:returnOriginal?2:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,returnedToOriginalHome:returnOriginal,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
   if(checkClearedSlot){
    await c.request('thread/goal/clear',{threadId:id,origin:'user'});
@@ -167,7 +190,7 @@ try{
    const follow=await c.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned settings continuation only.',text_elements:[]}]});
    const finished=await c.wait('turn/completed',p=>p.threadId===id&&p.turn.id===follow.turn.id);
    assert.equal(finished.turn.status,'completed',JSON.stringify(finished.turn.error));
-   assert.equal(requestBodies.length,2);checkRequest(requestBodies[1]);
+   assert.equal(requestBodies.length,returnOriginal&&checkRetirement?3:2);checkRequest(requestBodies.at(-1));
    Object.assign(report,{providerRequests:requests,nondefaultSettings:{reasoning:true,serviceTier:true,baseInstructions:true,developerInstructions:true,disabledPluginIDs:true,runtimeWorkspaceRoots:true},settingsInferenceRequests:requestBodies.length});
   }
  }

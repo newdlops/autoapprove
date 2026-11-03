@@ -311,6 +311,11 @@ final class CodexMigrationJournal {
         guard let fresh=try load(id:id),fresh.consistent,fresh.record==loaded.record,
               try owner(threadID:backup.retirement.goal.threadID)==backup.currentOwner else{throw Self.failure}
     }
+    func validateReservation(_ expected:CodexMigrationJournalRecord)throws {
+        guard let loaded=try load(id:expected.id),loaded.consistent,loaded.record==expected,!expected.terminal,
+              let handles=leases[expected.id] else{throw Self.failure}
+        for handle in handles{try handle.check()}
+    }
     func repair(id value:String)throws->CodexMigrationJournalRecord {
         let id=try Self.id(value);guard let initial=try load(id:id) else{throw Self.failure}
         if initial.record.terminal,initial.consistent{return initial.record}
