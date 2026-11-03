@@ -1217,6 +1217,14 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         ]
 #if DEBUG
         cases.insert(contentsOf: [
+            ("Migration journal: mirrored revisions and terminal-only release",tests.testMigrationJournalMirrorsAndTerminalRelease),
+            ("Migration journal: reversed locks and restart ownership",tests.testMigrationJournalLocksSurviveCoordinatorRestart),
+            ("Migration journal: partial mirror repair preserves attempted intent",tests.testMigrationJournalRepairsPartialMirrorWithoutRevisingIntent),
+            ("Migration journal: corrupt and symbolic mirrors fail closed",tests.testMigrationJournalRejectsCorruptAndLinkedMirrors),
+            ("Migration journal: physical aliases and linked directories rejected",tests.testMigrationJournalRejectsAliasesAndMissingCentralAuthority),
+            ("Migration journal: duplicate request IDs release foreign leases",tests.testMigrationJournalDuplicateIDFailureReleasesForeignLease),
+            ("Migration journal: terminal history remains readable during a newer request",tests.testMigrationJournalTerminalHistoryRemainsReadableDuringAnotherRequest),
+            ("Migration journal: central failures never become absent authority",tests.testMigrationJournalCentralReadAndWriteFailuresNeverBecomeAbsence),
             ("Goal transfer: exact row, counters, deferral and round trip",tests.testGoalTransferPreservesExactRowAndDeferral),
             ("Goal transfer: unknown schema, migration and trigger rejection",tests.testGoalTransferRejectsUnknownSchemaAndMigrations),
             ("Goal transfer: stale source, same home and destination conflict",tests.testGoalTransferRejectsStaleOrConflictingRows),

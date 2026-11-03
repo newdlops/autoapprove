@@ -11,6 +11,8 @@ assert.ok(cli&&path.isAbsolute(cli),'Set AUTOAPPROVE_CODEX_BIN to a native insta
 const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.match(version,/^codex-cli 0\.166\./);
 const restoreGoal=process.argv.includes('--restore-goal');
 const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
+const returnOriginal=process.argv.includes('--return-original-home');
+assert.ok(!returnOriginal || restoreGoal&&process.argv.includes('--archive-source'));
 const root=await mkdtemp('/private/tmp/aa-cross-home-'),children=[];
 const env={...process.env};for(const k of Object.keys(env))if(/TOKEN|API_KEY|CODEX_HOME|NODE_OPTIONS/.test(k))delete env[k];
 let requests=0;
@@ -41,6 +43,7 @@ async function server(home){
  return {request,wait,stop,home,pid:child.pid};
 }
 const sql=(home,q)=>execFileSync('/usr/bin/sqlite3',[home+'/goals_1.sqlite',q],{encoding:'utf8'}).trim();
+async function archivedRollout(home,id){const entries=await readdir(home+'/archived_sessions',{recursive:true});const found=entries.filter(name=>name.endsWith('.jsonl')&&name.includes(id));assert.equal(found.length,1);return path.join(home,'archived_sessions',found[0]);}
 try{
  let transfer;
  if(restoreGoal){
@@ -59,9 +62,11 @@ try{
  sql(a.home,`UPDATE thread_goals SET tokens_used=37,time_used_seconds=19 WHERE thread_id='${id}';`);
  const before=JSON.parse(sql(a.home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`));
  assert.equal(before.tokens_used,37);assert.equal(before.time_used_seconds,19);
- a=await server(a.home);await a.request('thread/resume',{threadId:id});const sourceGoal=(await a.request('thread/goal/get',{threadId:id})).goal;assert.equal(sourceGoal.tokensUsed,37);assert.equal(sourceGoal.timeUsedSeconds,19);await a.stop();
+ a=await server(a.home);await a.request('thread/resume',{threadId:id});const sourceGoal=(await a.request('thread/goal/get',{threadId:id})).goal;assert.equal(sourceGoal.tokensUsed,37);assert.equal(sourceGoal.timeUsedSeconds,19);
+ if(returnOriginal)await a.request('thread/archive',{threadId:id});await a.stop();
  if(restoreGoal)sql(a.home,`INSERT OR IGNORE INTO thread_goal_continuation_deferrals(thread_id) VALUES ('${id}');`);
- const b=await server(root+'/b'),destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(source.path,destination);assert.notEqual((await stat(source.path)).ino,(await stat(destination)).ino);
+ const firstRollout=returnOriginal ? await archivedRollout(a.home,id):source.path;
+ const b=await server(root+'/b'),destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(firstRollout,destination);assert.notEqual((await stat(firstRollout)).ino,(await stat(destination)).ino);
  let unselected,unselectedGoal;
  if(restoreGoal){
   unselected=(await b.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
@@ -88,24 +93,28 @@ try{
   assert.ok(!loaded.includes(id),'Selected writer must actually unload before return transfer');assert.ok(loaded.includes(unselected));
   const files=execFileSync('/usr/sbin/lsof',['-nP','-p',String(b.pid),'-Fn'],{encoding:'utf8',timeout:10000});
   assert.ok(!files.split('\n').some(line=>line.startsWith('n')&&line.includes(id)),'Selected rollout writer must actually close and flush');
-  const c=await server(root+'/c'),third=(await c.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
+  let expectedReturnGoal=sourceGoal;
+  if(returnOriginal){sql(b.home,`UPDATE thread_goals SET tokens_used=73,time_used_seconds=29 WHERE thread_id='${id}';`);expectedReturnGoal={...sourceGoal,tokensUsed:73,timeUsedSeconds:29};}
+  const expectedReturnRow=rowJSON(b.home);
+  const c=await server(returnOriginal?a.home:root+'/c'),third=(await c.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
   await c.request('thread/goal/set',{threadId:third,objective:'Third home unselected Goal',status:'paused',origin:'user'});
   const thirdGoal=(await c.request('thread/goal/get',{threadId:third})).goal;
   const relative=path.relative(a.home,source.path);assert.ok(!relative.startsWith('..'));
   let closedRollout=target.path;
   if(process.argv.includes('--archive-source')){
-   const entries=await readdir(b.home+'/archived_sessions',{recursive:true});const found=entries.filter(name=>name.endsWith('.jsonl')&&name.includes(id));assert.equal(found.length,1);closedRollout=path.join(b.home,'archived_sessions',found[0]);
+   closedRollout=await archivedRollout(b.home,id);
   }
   const returning=path.join(c.home,relative);await mkdir(path.dirname(returning),{recursive:true});await copyFile(closedRollout,returning);
+  if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:73}));
   assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
   const last=await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
   const returned=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.deepEqual(returned.turns,source.turns,'Return transfer must retain all user/assistant history');
   for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(last[key],start[key],key+' must survive return resume');
-  assert.deepEqual((await c.request('thread/goal/get',{threadId:id})).goal,sourceGoal);assert.equal(rowJSON(c.home),rowJSON(a.home));
+  assert.deepEqual((await c.request('thread/goal/get',{threadId:id})).goal,expectedReturnGoal);assert.equal(rowJSON(c.home),expectedReturnRow);
   assert.deepEqual((await b.request('thread/goal/get',{threadId:unselected})).goal,unselectedGoal);
   assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
   assert.ok((await b.request('thread/loaded/list',{})).data.includes(unselected));process.kill(b.pid,0);
-  Object.assign(report,{ownedHomes:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
+  Object.assign(report,{ownedHomes:returnOriginal?2:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,returnedToOriginalHome:returnOriginal,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
  }
  console.log(JSON.stringify(report));
 }finally{

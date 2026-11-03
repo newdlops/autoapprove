@@ -46,6 +46,56 @@ public final class AuditStore {
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }
     }
+    // Private migration authority. Reads distinguish an absent row from a read
+    // failure; the general settings getter deliberately has weaker semantics.
+    struct MigrationRow {let id:String,revision:Int,terminal:Bool,data:Data}
+    func prepareMigrationJournal() throws {
+        // Use a dedicated AuditStore connection for migrations. These flags are
+        // connection-local; do not weaken the existing approval connection.
+        // https://www.sqlite.org/pragma.html#pragma_fullfsync
+        try execute("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; CREATE TABLE IF NOT EXISTS codex_migration_journals (id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL, terminal INTEGER NOT NULL, json BLOB NOT NULL)")
+        for (pragma,expected) in [("synchronous",2),("fullfsync",1)] {
+            var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
+            guard sqlite3_prepare_v2(db,"PRAGMA "+pragma,-1,&statement,nil)==SQLITE_OK,
+                  sqlite3_step(statement)==SQLITE_ROW,sqlite3_column_int(statement,0)==expected else{throw AppError.message("이관 저널 동기화를 확인하지 못했습니다.")}
+        }
+    }
+    func migrationRows(id:String?=nil,activeOnly:Bool=false) throws ->[MigrationRow] {
+        var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
+        let sql="SELECT id,revision,terminal,json FROM codex_migration_journals"+(id != nil ? " WHERE id=?":activeOnly ? " WHERE terminal=0":"")+" ORDER BY id"
+        guard sqlite3_prepare_v2(db,sql,-1,&statement,nil)==SQLITE_OK else{throw AppError.message("이관 저널을 읽지 못했습니다.")}
+        if let id{bind(id,to:statement,at:1)}
+        var rows:[MigrationRow]=[],totalBytes=0
+        while true {
+            let result=sqlite3_step(statement);if result==SQLITE_DONE{return rows}
+            guard result==SQLITE_ROW,rows.count<512,sqlite3_column_type(statement,0)==SQLITE_TEXT,
+                  sqlite3_column_type(statement,1)==SQLITE_INTEGER,sqlite3_column_type(statement,2)==SQLITE_INTEGER,
+                  sqlite3_column_type(statement,3)==SQLITE_BLOB,
+                  let key=sqlite3_column_text(statement,0),let bytes=sqlite3_column_blob(statement,3) else{throw AppError.message("이관 저널 형식을 확인하지 못했습니다.")}
+            let size=Int(sqlite3_column_bytes(statement,3)),revision=sqlite3_column_int64(statement,1),terminal=sqlite3_column_int(statement,2)
+            totalBytes+=max(0,size)
+            guard size>0,size<=12*1024*1024,totalBytes<=32*1024*1024,revision>0,revision<=Int64(Int.max),[0,1].contains(terminal) else{throw AppError.message("이관 저널 범위를 확인하지 못했습니다.")}
+            rows.append(.init(id:String(cString:key),revision:Int(revision),terminal:terminal==1,data:Data(bytes:bytes,count:size)))
+        }
+    }
+    func saveMigrationRow(_ row:MigrationRow,expectedRevision:Int) throws {
+        var statement:OpaquePointer?;defer{sqlite3_finalize(statement)}
+        guard row.revision==expectedRevision+1,row.data.count<=12*1024*1024 else{throw AppError.message("이관 저널 순서가 바뀌었습니다.")}
+        let sql=expectedRevision==0
+            ? "INSERT INTO codex_migration_journals(id,revision,terminal,json) VALUES (?,?,?,?)"
+            : "UPDATE codex_migration_journals SET revision=?,terminal=?,json=? WHERE id=? AND revision=?"
+        guard sqlite3_prepare_v2(db,sql,-1,&statement,nil)==SQLITE_OK else{throw AppError.message("이관 저널을 저장하지 못했습니다.")}
+        let transient=unsafeBitCast(-1,to:sqlite3_destructor_type.self)
+        if expectedRevision==0 {
+            bind(row.id,to:statement,at:1);sqlite3_bind_int64(statement,2,Int64(row.revision));sqlite3_bind_int(statement,3,row.terminal ? 1:0)
+            _=row.data.withUnsafeBytes{sqlite3_bind_blob(statement,4,$0.baseAddress,Int32(row.data.count),transient)}
+        }else{
+            sqlite3_bind_int64(statement,1,Int64(row.revision));sqlite3_bind_int(statement,2,row.terminal ? 1:0)
+            _=row.data.withUnsafeBytes{sqlite3_bind_blob(statement,3,$0.baseAddress,Int32(row.data.count),transient)}
+            bind(row.id,to:statement,at:4);sqlite3_bind_int64(statement,5,Int64(expectedRevision))
+        }
+        guard sqlite3_step(statement)==SQLITE_DONE,sqlite3_changes(db)==1 else{throw AppError.message("이관 저널 저장 또는 순서 검증에 실패했습니다.")}
+    }
     public func append(_ event: AuditEvent) throws {
         let data = try JSONEncoder().encode(event)
         var statement: OpaquePointer?

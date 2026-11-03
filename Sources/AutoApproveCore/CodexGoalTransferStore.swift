@@ -62,7 +62,13 @@ enum CodexGoalTransferStore {
             let opened=sqlite3_open_v2(path,&pointer,flags,nil)
             guard opened==SQLITE_OK,let pointer else {sqlite3_close(pointer);throw AppError.message("Goal transfer: SQLite open \(opened)")}
             db=pointer;sqlite3_busy_timeout(db,250);sqlite3_limit(db,SQLITE_LIMIT_LENGTH,524288)
-            do{try check();try exec("PRAGMA trusted_schema=OFF");try exec("PRAGMA foreign_keys=ON")}
+            do{
+                try check();try exec("PRAGMA trusted_schema=OFF");try exec("PRAGMA foreign_keys=ON")
+                if writable {
+                    try exec("PRAGMA synchronous=FULL");try exec("PRAGMA fullfsync=ON")
+                    guard try rows("PRAGMA synchronous")==[[.integer(2)]],try rows("PRAGMA fullfsync")==[[.integer(1)]] else{throw failure}
+                }
+            }
             catch{close();throw error}
         }
         deinit{close()}
