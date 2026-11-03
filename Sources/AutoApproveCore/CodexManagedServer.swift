@@ -57,39 +57,17 @@ public struct CodexManagedServerServices:Sendable {
 }
 
 private struct CodexManagedServerClient {
-    let home:String,userHome:String,executable:String?
+    let home:String,userHome:String
+    let context:CodexCLIContext?
+    var executable:String? {context?.executable}
     init(home:String,userHome:String,executable:String?,records:[ProcessRecord]) throws {
         let canonicalHome=try CodexAccountTransitionTarget.canonicalHome(home)
         self.home=canonicalHome;self.userHome=userHome
-        if let executable {
-            guard executable.hasPrefix("/"),!executable.contains("\0") else {throw AppError.message("Codex 실행 파일의 전체 경로가 필요합니다.")}
-            self.executable=executable
-        } else {
-            let candidates=records.filter{$0.agent == .codex}.compactMap { record->String? in
-                let launch=ProcessEnvironment.read(record)?["CODEX_HOME"] ?? userHome+"/.codex"
-                guard (try? CodexAccountTransitionTarget.canonicalHome(launch))==canonicalHome else{return nil}
-                return CodexServerLocation.executable(record)
-            }
-            if let first=candidates.first {self.executable=first}
-            else {
-                let result=try CommandRunner.run("/bin/zsh",["-l","-i","-c","whence -p -- codex"],timeout:8,
-                    environment:["HOME":userHome,"NO_COLOR":"1"],outputLimit:32768,errorLimit:32768)
-                let paths=result.output.split(separator:"\n").map(String.init).filter{$0.hasPrefix("/") && FileManager.default.isExecutableFile(atPath:$0)}
-                self.executable=result.status==0 && paths.count==1 ? paths[0]:nil
-            }
-        }
+        context=try CodexCLIContext.resolve(home:canonicalHome,userHome:userHome,executable:executable,records:records)
     }
     func run(_ arguments:[String],timeout:TimeInterval=8) throws ->CommandResult {
-        guard let executable else {throw AppError.message("Codex CLI를 찾지 못했습니다.")}
-        try Task.checkCancellation()
-        let marker="AUTOAPPROVE_CODEX_"+UUID().uuidString
-        // Literal positional arguments survive spaces, quotes and shell
-        // punctuation. The login shell supplies nvm/Homebrew PATH on this Mac.
-        let script="aa_codex_executable=$1; aa_codex_home=$2; aa_codex_marker=$3; shift 3; print -r -- \"$aa_codex_marker\"; exec /usr/bin/env \"CODEX_HOME=$aa_codex_home\" \"$aa_codex_executable\" \"$@\""
-        let result=try CommandRunner.run("/bin/zsh",["-l","-i","-c",script,"autoapprove-server",executable,home,marker]+arguments,
-            timeout:timeout,environment:["HOME":userHome,"NO_COLOR":"1"],outputLimit:32768,errorLimit:32768)
-        guard let range=result.output.range(of:marker+"\n") else {throw AppError.message("Codex 명령의 응답 경계를 확인하지 못했습니다.")}
-        return .init(output:String(result.output[range.upperBound...]),error:"",status:result.status)
+        guard let context else {throw AppError.message("Codex CLI를 찾지 못했습니다.")}
+        return try context.run(arguments,timeout:timeout)
     }
     func archiveDanglingSocket() throws ->CodexControlSocketBackup? {
         let entry=URL(fileURLWithPath:home).appendingPathComponent("app-server-control/app-server-control.sock").path

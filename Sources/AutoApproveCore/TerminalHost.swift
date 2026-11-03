@@ -84,6 +84,9 @@ public enum ProcessEnvironment {
 
     /// KERN_PROCARGS2 layout: argc, executable path, NUL padding, argv, then environment until an empty string.
     public static func parse(_ bytes: [UInt8]) -> [String: String] {
+        parse(bytes,names:names)
+    }
+    static func parse(_ bytes:[UInt8],names:Set<String>)->[String:String] {
         guard bytes.count > MemoryLayout<Int32>.size else { return [:] }
         let argc = bytes.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
         var index = MemoryLayout<Int32>.size
@@ -111,6 +114,9 @@ public enum ProcessEnvironment {
     /// Returns nil unless the PID still belongs to the scanned process. Test records and reused
     /// PIDs therefore never borrow another process's terminal identity.
     public static func read(_ record: ProcessRecord) -> [String: String]? {
+        read(record,names:names)
+    }
+    static func read(_ record:ProcessRecord,names:Set<String>)->[String:String]? {
         guard record.pid > 0, let started = startDate(record.started) else { return nil }
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
@@ -121,7 +127,7 @@ public enum ProcessEnvironment {
         var bytes = [UInt8](repeating: 0, count: Int(limit)), count = Int(limit)
         mib = [CTL_KERN, KERN_PROCARGS2, record.pid]
         guard sysctl(&mib, 3, &bytes, &count, nil, 0) == 0 else { return nil }
-        return parse(Array(bytes.prefix(count)))
+        return parse(Array(bytes.prefix(count)),names:names)
     }
     private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
