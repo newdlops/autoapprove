@@ -71,6 +71,93 @@ private final class AccountTargetList: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testAccountReconnectJoinsExistingTransitionWithoutNewRestart() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-reconnect-join-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.checkReservations=false
+        let target=r.target
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions();await engine.checkCodexAccountTransitions()
+        try expectEqual(r.effects,["restart"])
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        try await engine.reconnectCodexLogin(home:target.home)
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try expectEqual(r.effects,["restart"],"A duplicate reconnect must only reconcile the existing reservation")
+    }
+    func testAccountReviewReadsQuiescenceBeforeContinuingWithoutRepeatedInterrupt() async throws {
+        let r=AccountTransitionRig();r.interruptFails=true
+        let c=r.coordinator();await c.check();await c.check()
+        try expectEqual(c.state.phase,.review);try expectEqual(r.effects.count,1)
+        await c.check();try expectEqual(c.state.phase,.review);try expectEqual(r.effects.count,1)
+        r.idle(0);await c.check()
+        try expectEqual(c.state.phase,.stopping,"Fresh proof that the reserved turn stopped can release review")
+        try expectEqual(r.effects.count,1,"The recovery inspection must not send any lifecycle command")
+        r.interruptFails=false;await c.check()
+        try expectEqual(r.effects.count,2);try expect(r.effects.last?.contains(":b:")==true)
+        r.idle(1);await c.check();await c.check()
+        try expectEqual(r.effects.filter{$0=="restart"}.count,1)
+    }
+    func testAccountReconnectWaitsForReadOnlyInspection() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-reconnect-busy-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.checkReservations=false;r.observation.savedAccount="old"
+        var reads=0
+        var services=r.services
+        services.observe={_ in reads+=1;try await Task.sleep(for:.milliseconds(150));return r.observation}
+        let target=r.target
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true)
+        let checking=Task {await engine.checkCodexAccountTransitions()}
+        while reads==0 {await Task.yield()}
+        try expect(engine.codexAccountTransitionBusy)
+        try await engine.reconnectCodexLogin(home:target.home)
+        await checking.value
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.stopping)
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(r.effects,["restart"])
+    }
+    func testAccountReconnectWaitsForCompletionWithoutCreatingAnotherRequest() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-reconnect-completing-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.checkReservations=false
+        var verifying=false;var services=r.services
+        services.verify={_,_,_ in verifying=true;try await Task.sleep(for:.milliseconds(150));return 1}
+        let target=r.target
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{[]},codexAccountTransitions:services,codexAccountTargets:{_ in [target]});defer{engine.stop()}
+        try engine.setCodexAccountTransitionEnabled(true)
+        await engine.checkCodexAccountTransitions();await engine.checkCodexAccountTransitions()
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        let checking=Task {await engine.checkCodexAccountTransitions()}
+        let deadline=Date().addingTimeInterval(3)
+        while !verifying,Date()<deadline {try await Task.sleep(for:.milliseconds(10))}
+        try expect(verifying)
+        try await engine.reconnectCodexLogin(home:target.home);await checking.value
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        for _ in 0..<3 {await engine.checkCodexAccountTransitions()}
+        try expectEqual(r.effects,["restart"])
+    }
+    func testAccountReviewNeverRetriesReservedInterruptOrChangedIdentity() async throws {
+        for changed in ["account","server","turn","missing","active"] {
+            let r=AccountTransitionRig();r.interruptFails=true
+            let c=r.coordinator();await c.check();await c.check()
+            r.idle(0)
+            switch changed {
+            case "account":r.observation.savedAccount="another"
+            case "server":r.observation.serverID="another"
+            case "turn":r.observation.threads[0].turnID="another"
+            case "missing":r.observation.threads.removeFirst()
+            default:r.observation.threads[0].active=true
+            }
+            for _ in 0..<3 {await c.check()}
+            try expectEqual(c.state.phase,.review);try expectEqual(r.effects.count,1)
+        }
+        let r=AccountTransitionRig();r.interruptFails=true;let c=r.coordinator();await c.check();await c.check()
+        let restored=r.coordinator(restored:c.state);r.idle(0)
+        await restored.check();try expectEqual(restored.state.phase,.stopping)
+        try expectEqual(r.effects.count,1);try expectEqual(restored.state.reservations["a"],"turn-a")
+    }
     func testAccountTransitionDiscoveryGapReturnsToVerifiedConnectionWithoutManualCancellation() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-account-gap-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}

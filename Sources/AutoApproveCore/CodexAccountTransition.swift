@@ -113,11 +113,25 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         }
     }
     public func check(now: Date = Date(), loginRequestID: String? = nil) async {
-        guard !checking, state.phase != .review || state.restartReserved else { return }
+        guard !checking else { return }
         checking = true; defer { checking = false }
         do {
             let observed = try await services.observe(target)
             try Task.checkCancellation()
+            if state.phase == .review,!state.restartReserved,state.resumeServerID==nil {
+                // A missing acknowledgement is not proof that the interrupt
+                // failed. Inspect the exact reserved turns; never send again.
+                try validate(observed)
+                for (id,turn) in state.reservations {
+                    guard let thread=observed.threads.first(where:{$0.id==id}),thread.stopToken==turn,!thread.needsQuiescence else {
+                        state.detail="이전 중단 요청의 결과 확인 중입니다. 해당 작업·Goal·백그라운드 작업이 대기 상태가 되면 기존 전환을 이어갑니다. 중단 요청은 반복하지 않습니다."
+                        changed(state);return
+                    }
+                }
+                state.waitingThread=nil;state.phase = .stopping;state.since=now
+                state.detail="이전 중단 결과를 현재 대화에서 확인했습니다. 기존 전환을 이어서 확인합니다."
+                try persist();return
+            }
             if state.resumeServerID != nil,[.resuming,.review].contains(state.phase) {
                 try await continueInterruptedWork(observed);return
             }

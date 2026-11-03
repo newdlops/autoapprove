@@ -5947,7 +5947,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func prepareCodexManagedServer(home:String) async throws ->CodexManagedServerStatus {
         guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
-            throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")
+            throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")
         }
         let epoch=codexAccountTransitionEpoch,reader=processReader
         codexAccountTransitionBusy=true
@@ -6003,11 +6003,45 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try recordCodexLoginRefresh(home:home,id:id)
         recordedNativeCodexLoginIDs.insert(id)
     }
+    private func codexAccountControlBlockReason()->String? {
+        if remoteInputStopped {return "앱이 종료 중이어서 새 로그인·전환 요청을 받지 않습니다."}
+        if agentAccounts.busy {return agentAccounts.nativeCodexLogin?.active == true
+            ? "브라우저 로그인이 진행 중입니다. 브라우저에서 로그인을 완료하거나 로그인 취소를 누른 뒤 다시 확인해주세요."
+            : "Claude 또는 Codex 로그인이 진행 중입니다. 해당 로그인의 완료·취소 상태를 확인해주세요."}
+        if let state=codexAccountTransitionStates.sorted(by:{$0.key<$1.key}).first(where:{$0.value.held})?.value {
+            return "기존 계정 전환을 확인 중입니다. "+state.detail
+        }
+        if codexAccountTransitionBusy {return "서버·세션 상태를 확인 중입니다. 현재 확인이 끝나면 다시 시도할 수 있습니다."}
+        return nil
+    }
+    /// Repeated requests join the in-flight inspection, then reconcile its
+    /// original journal instead of creating a new login/restart receipt.
+    private func joinCodexAccountControl(home:String) async throws->Bool {
+        let epoch=codexAccountTransitionEpoch,deadline=Date().addingTimeInterval(20)
+        let joinedExisting=codexAccountTransitionStates[home]?.held == true
+        while codexAccountTransitionBusy {
+            guard !Task.isCancelled,epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+            if agentAccounts.busy {throw AppError.message(codexAccountControlBlockReason()!)}
+            guard Date()<deadline else{throw AppError.message(codexAccountControlBlockReason() ?? "현재 서버·세션 확인이 끝나기를 기다립니다.")}
+            try await Task.sleep(for:.milliseconds(100))
+        }
+        guard epoch==codexAccountTransitionEpoch,!Task.isCancelled else{throw CancellationError()}
+        if remoteInputStopped || agentAccounts.busy {throw AppError.message(codexAccountControlBlockReason()!)}
+        if joinedExisting || codexAccountTransitionHeld {
+            guard joinedExisting || codexAccountTransitionStates[home]?.held == true else{throw AppError.message(codexAccountControlBlockReason()!)}
+            if codexAccountTransitionStates[home]?.held == true {await checkCodexAccountTransitions()}
+            codexAccountTransitionSignal.notify()
+            codexAccountTransitionNotice=codexAccountTransitionStates[home]?.detail
+            return true
+        }
+        return false
+    }
     public func reconnectCodexLogin(home:String) async throws {
         // Explicit reconnect first advances standalone-session attachment.
         // Account refresh must wait until an exit/launch has been verified.
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")}
-        let attachmentHome=try CodexAccountTransitionTarget.canonicalHome(home),attachmentEpoch=codexAccountTransitionEpoch,attachmentReader=processReader
+        let attachmentHome=try CodexAccountTransitionTarget.canonicalHome(home)
+        if try await joinCodexAccountControl(home:attachmentHome) {return}
+        let attachmentEpoch=codexAccountTransitionEpoch,attachmentReader=processReader
         let standalone=try await Task.detached(priority:.utility){
             try attachmentReader().contains {record in
                 record.agent == .codex && record.tty != "??" && CodexServerLocation.executable(record) != nil && CodexServerLocation.connectedHome(pid:record.pid,hints:[attachmentHome])==nil
@@ -6028,7 +6062,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard Date()<attachmentDeadline else{throw AppError.message("기존 세션 연결 결과를 확인하고 있습니다. 같은 종료·실행 입력을 반복하지 않습니다.")}
             try await Task.sleep(for:.seconds(2));await ensureCodexManagedServers()
         }
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")}
+        if try await joinCodexAccountControl(home:attachmentHome) {return}
         let epoch=codexAccountTransitionEpoch
         var ownsBusy=true
         codexAccountTransitionBusy=true
@@ -6037,7 +6071,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let targets=try await codexLoginTargets()
         try Task.checkCancellation()
         guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else {throw CancellationError()}
-        guard !codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")}
+        guard !codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")}
         guard targets.contains(where:{$0.home==home}) else {
             throw AppError.message("재연결할 Codex 서버·세션이 바뀌었습니다. 현재 계정을 다시 확인해주세요.")
         }
