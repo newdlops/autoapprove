@@ -43,8 +43,8 @@ Files: Sources/AutoApproveCore/ApprovalEngine.swift; TerminalAdapter.swift; new 
 Files: Sources/AutoApproveCore/TerminalSessionProfile.swift; Tests/AutoApproveCoreTests/TerminalProfileTests.swift; release docs/version/VALIDATION.md.
 - [x] Test and remove Codex-only `exec` from restoration commands; retain Claude behavior.
 - [x] Run Debug/Release account, attachment, profile/opener and actual-owned-PTY checks; review the final diff.
-- [ ] Package matching version, publish DMG/signed ZIP/checksums, re-download verify and install via existing updater.
-- [ ] Verify running version, original kernel PID/start/TTY preservation and hooks; publish final validation record.
+- [x] Package matching version, publish DMG/signed ZIP/checksums, re-download verify and install via existing updater.
+- [x] Verify running version, original kernel PID/start/TTY preservation and hooks; publish final validation record.
 
 ## Execution ledger
 
@@ -56,3 +56,5 @@ Files: Sources/AutoApproveCore/TerminalSessionProfile.swift; Tests/AutoApproveCo
 - Default profiles that start a program instead of an empty shell remain unsupported for replacement preparation; preserve the original session and explain failure. Native Terminal replacement was not exercised on a user session.
 
 - Final harness cleanup check found separate-group synthetic helpers; scoped cleanup was added and ten Debug/Release scenarios rerun. No owned fixture processes remain; user processes were not signaled.
+
+- Published v0.2.245/build272, verified all four public assets and tag de50455dd849104afa333ab45e6097df9af6c0ae, installed with the built-in signed updater, verified actual running version and all 19 original kernel PID/start/TTY identities. Managed server 0.166.0 is running with automatic start enabled; eight hooks and unrelated drafts remain valid. Other-Mac native tab replacement remains unverified.
