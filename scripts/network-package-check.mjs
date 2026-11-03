@@ -82,7 +82,7 @@ try {
   const css = await fetch(url + '/app.css'); assert.equal(css.status, 200);
   assert.ok((await css.text()).includes(marker), 'Relocated helper must use its packaged resources');
   const first = await (await fetch(url + '/api/state')).json();
-  for(const filename of ['agent-accounts.js','vendor/account-crypto.js','terminal-history.js']) {
+  for(const filename of ['agent-accounts.js','vendor/account-crypto.js','terminal-history.js','diagnostics.js','diagnostics.css']) {
     const response=await fetch(url+'/'+filename);assert.equal(response.status,200);
     assert.deepEqual(Buffer.from(await response.arrayBuffer()),await readFile(path.join(app,'Contents/Resources/AutoApprove_AutoApproveCore.bundle/RemoteWeb',filename)),'Relocated login resources must come from the signed bundle');
   }
@@ -145,7 +145,9 @@ try {
   async function tool(name, args={}) { const result=await rpc('tools/call',{name,arguments:args}); assert.equal(result.isError,false,JSON.stringify(result)); return result.structuredContent; }
   assert.equal((await rpc('initialize',{protocolVersion:'2025-11-25'})).serverInfo.version, JSON.parse(originalVersion).version);
   mcp.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
-  assert.equal((await rpc('tools/list')).tools.length,5);
+  const tools=(await rpc('tools/list')).tools;
+  assert.deepEqual(tools.map(tool=>tool.name).sort(),['ask_user','get_diagnostics','get_user_answers','list_screens','start_screen_share','stop_screen_share'].sort());
+  assert.equal(tools.find(tool=>tool.name==='get_diagnostics').annotations.readOnlyHint,true);
   const publication=await tool('ask_user',{questions:[{id:'fixture',question:'격리한 패키지의 질문 응답을 확인할까요?',options:[{label:'확인'}]}]});
   const questionID=publication.request.id;
   assert.equal((await tool('get_user_answers',{requestID:questionID})).request.phase,'waiting');
