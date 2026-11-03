@@ -4,11 +4,13 @@ import AutoApproveCore
 import TerminalInputSupport
 import CSQLite
 
-private final class OwnedEnginePTY:@unchecked Sendable {
+final class OwnedEnginePTY:@unchecked Sendable {
     let terminal:ManagedPTY,descriptor:ManagedPTYDescriptor
     var noShell=false,includeLoginAncestor=false,wrongWindow=false,busyReplacement=false,prepareFails=false,definiteRetry=false,addHostDuringPrepare=false,lingerToolHost=false
     var trackedHosts:[ProcessRecord]=[]
     var manager:ManagedPTYManager?,replacement:OwnedEnginePTY?
+    var additional:OwnedEnginePTY?
+    var event:@Sendable (String)->Void = {_ in}
     let client=UUID().uuidString
     private let lock=NSLock()
     private var sequence=0
@@ -19,7 +21,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
     var statusCalls=0,exitCalls=0,launchCalls=0,prepareCalls=0
     init(_ terminal:ManagedPTY,_ descriptor:ManagedPTYDescriptor){self.terminal=terminal;self.descriptor=descriptor}
     func write(_ text:String)throws {lock.lock();defer{lock.unlock()};sequence+=1;try terminal.input(Data(text.utf8),streamID:descriptor.streamID,client:client,sequence:sequence)}
-    func screen(_ tty:String)->String {let raw=tty==descriptor.tty ? terminal.screen():replacement?.terminal.screen() ?? "";if delayedStatus,raw.contains("Session:"){workingReads+=1;return raw.replacingOccurrences(of:"Working (1s",with:"Working (\(min(workingReads,2))s")};return raw}
+    func screen(_ tty:String)->String {if let additional,tty==additional.descriptor.tty{return additional.screen(tty)};let raw=tty==descriptor.tty ? terminal.screen():replacement?.terminal.screen() ?? "";if delayedStatus,raw.contains("Session:"){workingReads+=1;return raw.replacingOccurrences(of:"Working (1s",with:"Working (\(min(workingReads,2))s")};return raw}
     func read()->[ProcessRecord] {
         let host=ProcessDiscovery.parse("990001 1 ?? 990001 0 Mon Nov 2 10:00:00 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")[0]
         var records=((try? ProcessDiscovery.read()) ?? []).filter {row in "/dev/"+row.tty==descriptor.tty || self.trackedHosts.contains(where:{$0.key==row.key})}
@@ -28,13 +30,13 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             if let i=records.firstIndex(where:{$0.pid==descriptor.pid}) {records[i].parent=login.pid}
             records.insert(login,at:0)
         } else if let i=records.firstIndex(where:{$0.pid==descriptor.pid}) {records[i].parent=host.pid}
-        return [host]+records+(replacement?.read() ?? [])
+        return [host]+records+(replacement?.read() ?? [])+(additional?.read() ?? [])
     }
     func directInterrupt(_ target:ScreenTarget,_ expected:String)throws->TerminalDelivery {
         self.interruptCalls+=1
         return try TerminalDeviceInput.deliver(target:target,agent:.codex,input:.init(kind:.escape),screen:expected,environment:.init(available:{true},capture:{try TTYInputIdentity.capture(pid:$0)},send:{request in
             guard request.tty==self.descriptor.tty,request.identity.pid==target.sourcePID else{throw AppError.message("Wrong owned transport target")}
-            self.interruptWrites+=1
+            self.interruptWrites+=1;self.event("pause")
             try self.write(String(decoding:request.bytes,as:UTF8.self));if self.losePauseAck {throw AppError.message("Owned interrupt acknowledgement lost")};return .init(error:0,written:request.bytes.count)
         }))
     }
@@ -44,7 +46,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             metadata:{tty in .init(tty:tty,windowID:77,ownerPID:990001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)},
             ownerBundle:{_ in "com.apple.Terminal"},focused:{_ in !self.wrongWindow},processes:{self.read()},postPair:{pid,down,up in
                 guard pid==990001,down.getIntegerValueField(.keyboardEventKeycode)==53,down.flags.isEmpty,up.flags.isEmpty else{throw AppError.message("Wrong Goal keyboard event")}
-                self.keyboardPosts+=1;self.interruptWrites+=1
+                self.keyboardPosts+=1;self.interruptWrites+=1;self.event("pause")
                 try self.write("\u{1b}")
                 if self.losePauseAck {throw AppError.message("Owned keyboard acknowledgement lost")}
             })
@@ -52,19 +54,21 @@ private final class OwnedEnginePTY:@unchecked Sendable {
     }
     func adapter()->ScreenHostAdapter {
         ScreenHostAdapter(screens:{targets in TerminalSnapshot(screens:targets.map{TerminalScreen(tty:$0.tty,contents:self.screen($0.tty))})},approve:{_,_,_ in .screenChanged},reveal:{_ in nil},restart:{target,expected,command in
+            if let other=self.additional,target.tty==other.descriptor.tty {return try other.adapter().restart!(target,expected,command)}
             guard self.screen(target.tty)==expected,SessionExitRecovery.emptyShellPrompt(expected) else{return .screenChanged}
             if self.lingerToolHost,self.trackedHosts.contains(where:{host in (try? ProcessDiscovery.read(pid:host.pid))?.contains(where:{$0.key==host.key}) == true}) {throw AppError.message("Launch preceded actual tool-host shutdown")}
-            self.launchCalls+=1
+            self.launchCalls+=1;self.event("launch")
             let receiver=target.tty==self.descriptor.tty ? self:self.replacement!
             try receiver.write(command+"\n");return .sent
-        },input:{target,expected,_,input in
+        },input:{target,expected,agent,input in
+            if let other=self.additional,target.tty==other.descriptor.tty {return try other.adapter().input(target,expected,agent,input)}
             guard self.screen(target.tty)==expected else{return .screenChanged}
             if input.kind == .escape {
                 return try self.directInterrupt(target,expected)
             }
             else if input.text=="/goal pause" {self.pauseCalls+=1}
             else if input.text=="/status" {self.statusCalls+=1;if self.delayedStatus,self.statusCalls==1 {Thread.sleep(forTimeInterval:11)}}
-            else if input.text=="/exit" {self.exitCalls+=1}
+            else if input.text=="/exit" {self.exitCalls+=1;self.event("exit")}
             else {throw AppError.message("Unexpected owned fixture input")}
             try self.write(input.bytes);return .sent
         },replacementShell:{target in
@@ -90,11 +94,13 @@ private final class OwnedEnginePTY:@unchecked Sendable {
         },replacementShellValid:{_,shell in
             !self.wrongWindow && self.replacement?.read().contains(where:{$0==shell}) == true
         },goalInterrupt:{target,expected in
-            try TerminalGoalInterrupt.deliver(target:target,expected:expected,environment:.init(directAvailable:{self.nativeAvailable},keyboardAvailable:{self.keyboardAvailable},direct:{try self.directInterrupt($0,$1)},keyboard:{try self.keyboardInterrupt($0,$1)},requestPermission:{self.permissionRequests+=1}))
+            if let other=self.additional,target.tty==other.descriptor.tty {return try other.adapter().goalInterrupt!(target,expected)}
+            return try TerminalGoalInterrupt.deliver(target:target,expected:expected,environment:.init(directAvailable:{self.nativeAvailable},keyboardAvailable:{self.keyboardAvailable},direct:{try self.directInterrupt($0,$1)},keyboard:{try self.keyboardInterrupt($0,$1)},requestPermission:{self.permissionRequests+=1}))
         })
     }
 }
 
+#if !MULTI_ATTACHMENT_CHECK
 @main struct EngineAttachmentCheck {
     @MainActor static func main() async throws {
         let root=URL(fileURLWithPath:CommandLine.arguments[1]).resolvingSymlinksInPath().path
@@ -168,7 +174,7 @@ private final class OwnedEnginePTY:@unchecked Sendable {
             probe.wrongWindow=true
             var rejected=false
             do {try await engine.reconnectCodexLogin(home:home)}catch {rejected=true}
-            guard rejected,probe.interruptWrites==0,probe.keyboardPosts==0,probe.exitCalls==0,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .active else{throw AppError.message("Changed focused window must not receive Goal keys")}
+            guard rejected,probe.interruptCalls==1,probe.interruptWrites==0,probe.keyboardPosts==0,probe.exitCalls==0,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .active else{throw AppError.message("Changed focused window must not receive Goal keys")}
             print("{\"verified\":true,\"focusChangePreserved\":true,\"interruptWrites\":0,\"exitRequests\":0,\"userTerminalActions\":0}");return
         }
         if unknownGoalAck {
@@ -315,3 +321,5 @@ private final class OwnedEnginePTY:@unchecked Sendable {
         print("{\"verified\":true,\"productionEngine\":true,\"sqliteOnly\":true,\"expectedUnresolved\":\(red),\"mismatchedThread\":\(wrong),\"goalWait\":\(goalWait),\"loginShell\":\(loginShell),\"noShell\":\(noShell),\"profileCommand\":\(profileCommand),\"preparationAttempts\":\(probe.prepareCalls),\"preparedTabs\":\(probe.replacement == nil ? 0:1),\"definiteRetry\":\(definiteRetry),\"toolHosts\":\(toolHosts),\"waitedForToolHostExit\":\(lingerToolHost),\"replacementRejected\":\(wrongWindow || busyReplacement || prepareFails),\"manualReconnect\":\(manual),\"accountObservations\":\(accountObservations),\"statusRequests\":\(probe.statusCalls),\"exitRequests\":\(probe.exitCalls),\"launchRequests\":\(probe.launchCalls),\"userTerminalActions\":0}")
     }
 }
+
+#endif

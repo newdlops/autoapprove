@@ -5810,9 +5810,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return nil
     }
     private func saveCodexSessionAttachment(_ state:CodexSessionAttachment) throws {
+        let previous=codexSessionAttachments[state.context.session.id]
         var states=codexSessionAttachments;states[state.context.session.id]=state
         try store.set("codexSessionAttachments",String(decoding:JSONEncoder().encode(states),as:UTF8.self))
         codexSessionAttachments=states;codexSessionAttachmentNotice=state.detail
+        if previous?.phase != state.phase || state.phase == .review && previous?.detail != state.detail {
+            _ = log(AuditEvent(sessionID:state.context.session.id,summary:"Codex 세션 서버 연결",
+                outcome:"["+state.phase.rawValue+"] "+state.detail,source:"세션 재연결",context:AuditContext(session:state.context.session)))
+        }
     }
     /// Idle standalone conversations move sequentially through their own shell.
     /// Active work, Goals, questions and drafts wait without being discarded.

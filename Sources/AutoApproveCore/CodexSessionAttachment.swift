@@ -26,7 +26,7 @@ public struct CodexSessionAttachment:Codable {
         if originalLogin != nil {phase = .needsTab;detail="원래 창에 복구용 탭을 먼저 준비합니다."}
     }
     public var canRetryUnsentGoalPause:Bool {
-        phase == .review && goalBeforePause != nil && pausedGoal==nil && (pauseNotStarted == true || detail=="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다.")
+        phase == .review && goalBeforePause != nil && pausedGoal==nil && (pauseNotStarted == true || detail=="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다." || detail=="자동 연결 보류: "+TerminalDeviceInput.unavailableBeforeInputMessage)
     }
     public var replacesTab:Bool {originalLogin != nil}
     /// Separate jobs remain live work. Only an explicit reconnect's exact
@@ -152,7 +152,7 @@ public struct CodexSessionAttachment:Codable {
             state.authorizedToolHosts=nil
             if state.phase == .pauseReserved,(error as? RemoteHTTPError)?.diagnostics?["delivery"]=="not_started" {
                 state.pauseNotStarted=true
-                try persist(.review,"Goal 중단 입력이 시작되지 않았습니다. 직접 입력 연결을 확인한 뒤 현재 로그인으로 세션 재연결을 다시 시도해주세요. "+String(error.localizedDescription.prefix(160)))
+                try persist(.review,"Goal 중단 입력이 시작되지 않았습니다. 아래 권한·원본 창 상태를 확인한 뒤 현재 로그인으로 세션 재연결을 다시 시도해주세요. "+String(error.localizedDescription.prefix(160)))
             } else if state.phase == .tabReserved,(error as? RemoteHTTPError)?.diagnostics?["delivery"]=="not_started" {
                 state.preparationNotStarted=true
                 try persist(.review,"복구 탭 준비가 시작되지 않았습니다. 권한·창 상태를 확인한 뒤 ‘현재 로그인으로 세션 재연결’로 다시 시도할 수 있습니다. "+String(error.localizedDescription.prefix(160)))

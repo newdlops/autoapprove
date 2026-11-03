@@ -211,6 +211,13 @@ extension ApprovalTests {
         var legacy=state;legacy.pauseNotStarted=nil;legacy.detail="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다."
         let restored=try JSONDecoder().decode(CodexSessionAttachment.self,from:JSONEncoder().encode(legacy))
         try expect(restored.canRetryUnsentGoalPause,"0.2.246 confirmed no-write result remains explicitly retryable")
+        legacy.detail="자동 연결 보류: Mac 연결 설정의 ‘직접 입력 연결’을 확인해주세요. 새 연결은 macOS 로그인 항목 설정에서 허용하며 원래 CLI를 유지합니다."
+        let helperFailure=try JSONDecoder().decode(CodexSessionAttachment.self,from:JSONEncoder().encode(legacy))
+        try expect(helperFailure.canRetryUnsentGoalPause,"Legacy service-availability guard rejected before any input; explicit reconnect must recover it")
+        for message in [TerminalDeviceInput.unavailableBeforeInputMessage+" extra", "원본 터미널에 일부 입력이 전달되었을 수 있습니다.", "입력 전달 결과를 확인하지 못했습니다."] {
+            legacy.detail="자동 연결 보류: "+message
+            try expectFalse(legacy.canRetryUnsentGoalPause,"Never infer no-write from partial or similar-looking error text")
+        }
         legacy.detail="자동 연결 보류: unknown acknowledgement"
         try expectFalse(legacy.canRetryUnsentGoalPause)
         legacy.pausedGoal=legacy.goalBeforePause;legacy.detail="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다."

@@ -3,6 +3,7 @@ import Darwin
 import TerminalInputSupport
 
 public enum TerminalDeviceInput {
+    public static let unavailableBeforeInputMessage="Mac 연결 설정의 ‘직접 입력 연결’을 확인해주세요. 새 연결은 macOS 로그인 항목 설정에서 허용하며 원래 CLI를 유지합니다."
     public struct Environment: Sendable {
         public var available: @Sendable () -> Bool
         public var capture: @Sendable (Int32) throws -> TTYInputIdentity
@@ -20,7 +21,7 @@ public enum TerminalDeviceInput {
                                environment: Environment = .live) throws -> TerminalDelivery {
         try input.validate()
         guard agent != .shell, environment.available() else {
-            throw RemoteHTTPError(409, "Mac 연결 설정의 ‘직접 입력 연결’을 확인해주세요. 새 연결은 macOS 로그인 항목 설정에서 허용하며 원래 CLI를 유지합니다.")
+            throw RemoteHTTPError(409, unavailableBeforeInputMessage,diagnostics:["delivery":"not_started"])
         }
         guard let pid = target.sourcePID, let started = target.sourceStarted, target.jobPIDs.contains(pid),
               let original = target.sourceIdentity else { return .agentMissing }

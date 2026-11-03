@@ -11,7 +11,7 @@
 #include <termios.h>
 #include <sqlite3.h>
 static int busy_goal=0,paused_goal=0;
-static void pause_goal(void){char path[4096];snprintf(path,sizeof(path),"%s/goals_1.sqlite",getenv("CODEX_HOME"));sqlite3 *db=NULL;if(sqlite3_open(path,&db)==SQLITE_OK)sqlite3_exec(db,"UPDATE thread_goals SET status='paused',updated_at_ms=120000 WHERE status='active'",NULL,NULL,NULL);if(db)sqlite3_close(db);busy_goal=0;paused_goal=1;}
+static void pause_goal(void){char path[4096];snprintf(path,sizeof(path),"%s/goals_1.sqlite",getenv("CODEX_HOME"));sqlite3 *db=NULL;if(sqlite3_open(path,&db)==SQLITE_OK){sqlite3_stmt *stmt=NULL;if(sqlite3_prepare_v2(db,"UPDATE thread_goals SET status='paused',updated_at_ms=120000 WHERE status='active' AND thread_id=?",-1,&stmt,NULL)==SQLITE_OK){sqlite3_bind_text(stmt,1,getenv("EXPECTED_THREAD"),-1,SQLITE_TRANSIENT);sqlite3_step(stmt);}sqlite3_finalize(stmt);}if(db)sqlite3_close(db);busy_goal=0;paused_goal=1;}
 static void ready(void);
 static char *input_line(char *line,size_t size){size_t n=0;for(;;){int c=getchar();if(c==EOF)return NULL;if(c==27&&busy_goal){if(getenv("IGNORE_GOAL_PAUSE"))continue;pause_goal();fputs("\033[2J\033[H",stdout);ready();continue;}if(n+1<size)line[n++]=(char)c;if(c=='\n'||c=='\r'){line[n-1]='\n';line[n]=0;return line;}}}
 static pid_t tool_child=-1,extra_tool=-1;

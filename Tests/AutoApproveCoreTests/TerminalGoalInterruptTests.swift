@@ -4,7 +4,7 @@ import TerminalInputSupport
 import AutoApproveCore
 
 private final class GoalInterruptProbe: @unchecked Sendable {
-    var directAvailable=true,keyboardAvailable=true,unknown=false
+    var directAvailable=true,keyboardAvailable=false,unknown=false
     var direct=0,keyboard=0,permissions=0
     var environment:TerminalGoalInterrupt.Environment {
         .init(directAvailable:{self.directAvailable},keyboardAvailable:{self.keyboardAvailable},direct:{_,_ in
@@ -23,6 +23,11 @@ extension ApprovalTests {
         probe.unknown=true
         try expectThrows(try TerminalGoalInterrupt.deliver(target:target,expected:raw,environment:probe.environment))
         try expectEqual(probe.direct,2);try expectEqual(probe.keyboard,0)
+        probe.keyboardAvailable=true;probe.unknown=false
+        try expectEqual(try TerminalGoalInterrupt.deliver(target:target,expected:raw,environment:probe.environment),.sent)
+        try expectEqual(probe.keyboard,1,"Authorized exact-window keyboard must not depend on helper health")
+        try expectEqual(probe.direct,2)
+        probe.keyboard=0
         probe.directAvailable=false;probe.unknown=false
         try expectEqual(try TerminalGoalInterrupt.deliver(target:target,expected:raw,environment:probe.environment),.sent)
         try expectEqual(probe.keyboard,1)

@@ -32,8 +32,10 @@ public enum TerminalGoalInterrupt {
     }
     public static func deliver(target:ScreenTarget,expected:String,environment:Environment = .live)throws->TerminalDelivery {
         guard CodexGoalScreen.workingReady(expected),target.sourceIdentity != nil else{return .screenChanged}
-        if environment.directAvailable() {return try environment.direct(target,expected)}
+        // Explicit Goal interruption can use the already-authorized keyboard
+        // without relying on an asynchronously cached helper status.
         if environment.keyboardAvailable() {return try environment.keyboard(target,expected)}
+        if environment.directAvailable() {return try environment.direct(target,expected)}
         environment.requestPermission()
         throw RemoteHTTPError(409,"Goal 중단 입력 전입니다. macOS 손쉬운 사용에서 실행 중인 AutoApprove를 허용한 뒤 ‘현재 로그인으로 세션 재연결’을 다시 눌러주세요.",diagnostics:["delivery":"not_started"])
     }
