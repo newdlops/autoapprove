@@ -12,6 +12,8 @@ const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.ma
 const restoreGoal=process.argv.includes('--restore-goal');
 const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
 const returnOriginal=process.argv.includes('--return-original-home');
+const checkClearedSlot=process.argv.includes('--check-cleared-slot');
+assert.ok(!checkClearedSlot || restoreGoal);
 assert.ok(!returnOriginal || restoreGoal&&process.argv.includes('--archive-source'));
 const root=await mkdtemp('/private/tmp/aa-cross-home-'),children=[];
 const env={...process.env};for(const k of Object.keys(env))if(/TOKEN|API_KEY|CODEX_HOME|NODE_OPTIONS/.test(k))delete env[k];
@@ -115,6 +117,16 @@ try{
   assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
   assert.ok((await b.request('thread/loaded/list',{})).data.includes(unselected));process.kill(b.pid,0);
   Object.assign(report,{ownedHomes:returnOriginal?2:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,returnedToOriginalHome:returnOriginal,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
+  if(checkClearedSlot){
+   await c.request('thread/goal/clear',{threadId:id,origin:'user'});
+   assert.equal((await c.request('thread/goal/get',{threadId:id})).goal,null);
+   assert.equal(JSON.parse(execFileSync(transfer,['--cleared-slot',c.home,id],{encoding:'utf8',timeout:10000})).clearedGoalSlotWitnessed,true);
+   await c.request('thread/resume',{threadId:id});
+   assert.equal((await c.request('thread/goal/get',{threadId:id})).goal,null);
+   assert.equal(JSON.parse(execFileSync(transfer,['--cleared-slot',c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
+   assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
+   Object.assign(report,{clearedGoalSlotWitnessed:true,clearedGoalRetainedAfterResume:true});
+  }
  }
  console.log(JSON.stringify(report));
 }finally{

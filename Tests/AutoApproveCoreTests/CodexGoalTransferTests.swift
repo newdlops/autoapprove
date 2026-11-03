@@ -28,6 +28,80 @@ private final class GoalTransferFixture {
 }
 
 extension ApprovalTests {
+    func testGoalTransferSlotWitnessesClearedState() throws {
+        let f=try GoalTransferFixture()
+        let old=try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id)
+        try expectEqual(old.row?.tokensUsed,37)
+        try f.exec("a","DELETE FROM thread_goal_continuation_deferrals WHERE thread_id='\(f.id)'; DELETE FROM thread_goals WHERE thread_id='\(f.id)';")
+        let cleared=try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id)
+        try expectNil(cleared.row);try expectFalse(cleared.continuationDeferred)
+        try expectEqual(cleared.threadID,f.id)
+        try expectEqual(cleared.databaseIdentity,old.databaseIdentity)
+        try expect(cleared.digest != old.digest)
+        try CodexGoalTransferStore.verifyCurrent(cleared)
+        try expectThrows(CodexGoalTransferStore.verifyCurrent(old))
+        let decoded=try JSONDecoder().decode(CodexGoalTransferSlot.self,from:JSONEncoder().encode(cleared))
+        try CodexGoalTransferStore.verifyCurrent(decoded)
+        try expectEqual(decoded,cleared)
+        try f.exec("a","INSERT INTO thread_goals VALUES ('\(f.id)','new-instance','A new Goal','paused',500,73,29,1100,1200)")
+        try expectThrows(CodexGoalTransferStore.verifyCurrent(cleared))
+        try expectEqual(try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id).row?.tokensUsed,73)
+    }
+    func testGoalTransferAbsentSlotRejectsReplacementAndUnknownState() throws {
+        let f=try GoalTransferFixture()
+        let empty=try CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id)
+        try expectNil(empty.row)
+        try Data(contentsOf:URL(fileURLWithPath:f.path("b"))).write(to:URL(fileURLWithPath:f.path("b")),options:.atomic)
+        try expectThrows(CodexGoalTransferStore.verifyCurrent(empty))
+        let changed=try CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id)
+        try expect(changed.digest != empty.digest)
+        try f.exec("b","INSERT INTO thread_goal_continuation_deferrals VALUES ('\(f.id)')")
+        try expectThrows(CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id))
+        try FileManager.default.removeItem(atPath:f.path("b"))
+        try expectThrows(CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id))
+        try expectFalse(FileManager.default.fileExists(atPath:f.path("b")))
+        try f.exec("c","PRAGMA user_version=99")
+        try expectThrows(CodexGoalTransferStore.captureSlot(home:f.home("c"),threadID:f.id))
+    }
+    func testGoalTransferSlotRejectsForgedAbsenceAndTracksDeferral() throws {
+        let f=try GoalTransferFixture()
+        let original=try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id)
+        var json=try JSONSerialization.jsonObject(with:JSONEncoder().encode(original)) as! [String:Any]
+        json.removeValue(forKey:"row")
+        let forged=try JSONDecoder().decode(CodexGoalTransferSlot.self,from:JSONSerialization.data(withJSONObject:json))
+        try expectThrows(CodexGoalTransferStore.verifyCurrent(forged))
+        try f.exec("a","DELETE FROM thread_goal_continuation_deferrals")
+        try expectThrows(CodexGoalTransferStore.verifyCurrent(original))
+        let current=try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id)
+        try expectEqual(current.row,original.row);try expectFalse(current.continuationDeferred)
+        try CodexGoalTransferStore.verifyCurrent(current)
+        try expectEqual(try CodexGoalTransferStore.capture(home:f.home("a"),threadID:f.id)?.row,current.row)
+    }
+    func testGoalTransferSlotRejectsReplacedHomeWithSameDatabase() throws {
+        let f=try GoalTransferFixture()
+        let empty=try CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id)
+        try FileManager.default.moveItem(atPath:f.home("b"),toPath:f.home("retired-b"))
+        try FileManager.default.createDirectory(atPath:f.home("b"),withIntermediateDirectories:true)
+        try FileManager.default.moveItem(atPath:f.path("retired-b"),toPath:f.path("b"))
+        let changed=try CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id)
+        try expectEqual(changed.databaseIdentity,empty.databaseIdentity)
+        try expect(changed.homeIdentity != empty.homeIdentity)
+        try expectThrows(CodexGoalTransferStore.verifyCurrent(empty))
+        try CodexGoalTransferStore.verifyCurrent(changed)
+        let other=try CodexGoalTransferStore.captureSlot(home:f.home("c"),threadID:f.other)
+        let sameHomeOtherSlot=try CodexGoalTransferStore.captureSlot(home:f.home("c"),threadID:f.id)
+        try expectNil(other.row);try expectNil(sameHomeOtherSlot.row)
+        try expect(other.digest != sameHomeOtherSlot.digest,"Absent states must still bind the exact thread")
+    }
+    func testGoalTransferSnapshotRejectsReplacedHomeWithSameDatabase() throws {
+        let f=try GoalTransferFixture()
+        let snapshot=try CodexGoalTransferStore.capture(home:f.home("a"),threadID:f.id)!
+        try FileManager.default.moveItem(atPath:f.home("a"),toPath:f.home("retired-a"))
+        try FileManager.default.createDirectory(atPath:f.home("a"),withIntermediateDirectories:true)
+        try FileManager.default.moveItem(atPath:f.path("retired-a"),toPath:f.path("a"))
+        try expectThrows(CodexGoalTransferStore.restore(snapshot,toHome:f.home("b"),expectedSchema:snapshot.schemaFingerprint))
+        try expectNil(CodexGoalTransferStore.capture(home:f.home("b"),threadID:f.id))
+    }
     func testGoalTransferPreservesExactRowAndDeferral() throws {
         let f=try GoalTransferFixture()
         let a=try CodexGoalTransferStore.capture(home:f.home("a"),threadID:f.id)!
@@ -101,7 +175,7 @@ extension ApprovalTests {
     func testGoalTransferRejectsActiveGoalsAndForgedSnapshots() throws {
         let f=try GoalTransferFixture(),s=try CodexGoalTransferStore.capture(home:f.home("a"),threadID:f.id)!
         var json=try JSONSerialization.jsonObject(with:JSONEncoder().encode(s)) as! [String:Any]
-        json["formatVersion"]=2
+        json["formatVersion"]=99
         let forged=try JSONDecoder().decode(CodexGoalTransferSnapshot.self,from:JSONSerialization.data(withJSONObject:json))
         try expectThrows(CodexGoalTransferStore.restore(forged,toHome:f.home("b"),expectedSchema:s.schemaFingerprint))
         try f.exec("a","UPDATE thread_goals SET status='active'")

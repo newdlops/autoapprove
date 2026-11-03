@@ -13,25 +13,55 @@ struct CodexGoalTransferRow:Codable,Equatable,Sendable {
 }
 struct CodexGoalTransferSnapshot:Codable,Equatable,Sendable {
     let formatVersion:Int
-    let sourceHome:String,databaseIdentity:String,schemaFingerprint:String
+    let sourceHome:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String
     let row:CodexGoalTransferRow
     let continuationDeferred:Bool
     let digest:String
     fileprivate struct Payload:Codable {
         let formatVersion:Int
-        let sourceHome:String,databaseIdentity:String,schemaFingerprint:String
+        let sourceHome:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String
         let row:CodexGoalTransferRow
         let continuationDeferred:Bool
     }
-    fileprivate var payload:Payload {.init(formatVersion:formatVersion,sourceHome:sourceHome,databaseIdentity:databaseIdentity,schemaFingerprint:schemaFingerprint,row:row,continuationDeferred:continuationDeferred)}
+    fileprivate var payload:Payload {.init(formatVersion:formatVersion,sourceHome:sourceHome,homeIdentity:homeIdentity,databaseIdentity:databaseIdentity,schemaFingerprint:schemaFingerprint,row:row,continuationDeferred:continuationDeferred)}
     fileprivate static func hash<T:Encodable>(_ value:T) throws ->String {
         let encoder=JSONEncoder();encoder.outputFormatting=[.sortedKeys,.withoutEscapingSlashes]
         return SHA256.hash(data:try encoder.encode(value)).map{String(format:"%02x",$0)}.joined()
     }
-    fileprivate init(home:String,identity:String,schema:String,row:CodexGoalTransferRow,deferred:Bool) throws {
-        formatVersion=1;sourceHome=home;databaseIdentity=identity;schemaFingerprint=schema
+    fileprivate init(home:String,homeIdentity:String,identity:String,schema:String,row:CodexGoalTransferRow,deferred:Bool) throws {
+        formatVersion=2;sourceHome=home;self.homeIdentity=homeIdentity;databaseIdentity=identity;schemaFingerprint=schema
         self.row=row;continuationDeferred=deferred
-        digest=try Self.hash(Payload(formatVersion:1,sourceHome:home,databaseIdentity:identity,schemaFingerprint:schema,row:row,continuationDeferred:deferred))
+        digest=try Self.hash(Payload(formatVersion:2,sourceHome:home,homeIdentity:homeIdentity,databaseIdentity:identity,schemaFingerprint:schema,row:row,continuationDeferred:deferred))
+    }
+}
+
+// An absent Goal is a witnessed state, not a missing observation. This record
+// is suitable for a future retired-owner receipt, but grants no overwrite or
+// native migration authority by itself.
+struct CodexGoalTransferSlot:Codable,Equatable,Sendable {
+    let formatVersion:Int
+    let sourceHome:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String,threadID:String
+    let row:CodexGoalTransferRow?
+    let continuationDeferred:Bool
+    let digest:String
+    private struct Payload:Codable {
+        let formatVersion:Int
+        let sourceHome:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String,threadID:String
+        let row:CodexGoalTransferRow?
+        let continuationDeferred:Bool
+    }
+    private var payload:Payload {.init(formatVersion:formatVersion,sourceHome:sourceHome,homeIdentity:homeIdentity,databaseIdentity:databaseIdentity,schemaFingerprint:schemaFingerprint,threadID:threadID,row:row,continuationDeferred:continuationDeferred)}
+    fileprivate init(home:String,homeIdentity:String,identity:String,schema:String,threadID:String,row:CodexGoalTransferRow?,deferred:Bool)throws {
+        formatVersion=1;sourceHome=home;self.homeIdentity=homeIdentity;databaseIdentity=identity;schemaFingerprint=schema
+        self.threadID=threadID;self.row=row;continuationDeferred=deferred
+        digest=try CodexGoalTransferSnapshot.hash(Payload(formatVersion:1,sourceHome:home,homeIdentity:homeIdentity,databaseIdentity:identity,schemaFingerprint:schema,threadID:threadID,row:row,continuationDeferred:deferred))
+    }
+    fileprivate func validate()throws {
+        guard formatVersion==1,UUID(uuidString:threadID)?.uuidString.lowercased()==threadID,
+              row.map({$0.threadID==threadID}) ?? !continuationDeferred,
+              digest == (try CodexGoalTransferSnapshot.hash(payload)) else{
+            throw AppError.message("Goal 이관의 존재·부재 기록을 확인하지 못했습니다. 원본을 유지했습니다.")
+        }
     }
 }
 
@@ -132,6 +162,11 @@ enum CodexGoalTransferStore {
         guard lstat(home,&info)==0,info.st_mode&S_IFMT==S_IFDIR,info.st_uid==getuid() else{throw failure}
         return home
     }
+    private static func homeIdentity(_ home:String)throws->String {
+        var info=stat()
+        guard lstat(home,&info)==0,info.st_mode&S_IFMT==S_IFDIR,info.st_uid==getuid() else{throw failure}
+        return "\(info.st_dev):\(info.st_ino)"
+    }
     private static func text(_ value:Cell) throws ->String {guard case .text(let text)=value else{throw failure};return text}
     private static func integer(_ value:Cell) throws ->Int64 {guard case .integer(let number)=value else{throw failure};return number}
     private static func schema(_ connection:Connection) throws ->String {
@@ -166,20 +201,31 @@ enum CodexGoalTransferStore {
         return(value,!deferred.isEmpty)
     }
     static func capture(home:String,threadID:String) throws ->CodexGoalTransferSnapshot? {
+        let slot=try captureSlot(home:home,threadID:threadID)
+        return try slot.row.map{try .init(home:slot.sourceHome,homeIdentity:slot.homeIdentity,identity:slot.databaseIdentity,schema:slot.schemaFingerprint,row:$0,deferred:slot.continuationDeferred)}
+    }
+    static func captureSlot(home:String,threadID:String)throws->CodexGoalTransferSlot {
         try Task.checkCancellation()
         guard let uuid=UUID(uuidString:threadID) else{throw failure}
         let home=try physicalHome(home),id=uuid.uuidString.lowercased()
+        let homeID=try homeIdentity(home)
         let connection=try Connection(home:home,writable:false)
         try connection.exec("BEGIN");var committed=false;defer{if !committed{try? connection.exec("ROLLBACK")}}
         let fingerprint=try schema(connection),entry=try row(connection,id)
+        guard try homeIdentity(home)==homeID else{throw failure}
         try connection.check();try Task.checkCancellation()
         try connection.exec("COMMIT");committed=true;try connection.check()
-        return try entry.0.map{try .init(home:home,identity:connection.identity,schema:fingerprint,row:$0,deferred:entry.1)}
+        guard try homeIdentity(home)==homeID else{throw failure}
+        return try .init(home:home,homeIdentity:homeID,identity:connection.identity,schema:fingerprint,threadID:id,row:entry.0,deferred:entry.1)
+    }
+    static func verifyCurrent(_ slot:CodexGoalTransferSlot)throws {
+        try slot.validate()
+        guard try captureSlot(home:slot.sourceHome,threadID:slot.threadID)==slot else{throw failure}
     }
     static func restore(_ snapshot:CodexGoalTransferSnapshot,toHome:String,expectedSchema:String) throws {
         try Task.checkCancellation()
         let home=try physicalHome(toHome)
-        guard home != snapshot.sourceHome,snapshot.formatVersion==1,expectedSchema==snapshot.schemaFingerprint,
+        guard home != snapshot.sourceHome,snapshot.formatVersion==2,expectedSchema==snapshot.schemaFingerprint,
               snapshot.digest == (try CodexGoalTransferSnapshot.hash(snapshot.payload)),
               try capture(home:snapshot.sourceHome,threadID:snapshot.row.threadID)==snapshot else{throw failure}
         let connection=try Connection(home:home,writable:true)
