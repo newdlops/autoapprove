@@ -8,7 +8,7 @@ import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const cli=process.env.AUTOAPPROVE_CODEX_BIN;
 assert.ok(cli&&path.isAbsolute(cli),'Set AUTOAPPROVE_CODEX_BIN to a native installed CLI');
-const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.match(version,/^codex-cli 0\.166\./);
+const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.equal(version,'codex-cli 0.166.0','Owned preservation evidence is pinned to 0.166.0');
 const restoreGoal=process.argv.includes('--restore-goal');
 const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
 const returnOriginal=process.argv.includes('--return-original-home');
@@ -16,6 +16,8 @@ const checkClearedSlot=process.argv.includes('--check-cleared-slot');
 const checkSettings=process.argv.includes('--check-settings');
 const checkRetirement=process.argv.includes('--check-retirement');
 const returnCleared=process.argv.includes('--return-cleared-goal');
+const crashNativeAcks=process.argv.includes('--crash-native-acks');
+assert.ok(!crashNativeAcks || returnOriginal&&checkRetirement);
 assert.ok(!returnCleared || returnOriginal&&checkRetirement);
 assert.ok(!checkClearedSlot || restoreGoal);
 assert.ok(!checkSettings || restoreGoal);
@@ -50,7 +52,7 @@ async function server(home){
  const wait=async(method,predicate=()=>true)=>{const end=Date.now()+25000;while(Date.now()<end){const m=notifications.find(m=>m.method===method&&predicate(m.params));if(m)return m.params;await new Promise(r=>setTimeout(r,20));}throw Error(method+' missing: '+stderr.slice(-1000));};
  const stop=async()=>{if(child.exitCode!==null||child.signalCode!==null)return;process.kill(-child.pid,'SIGTERM');await new Promise(r=>{child.once('close',r);setTimeout(r,1500)});};
  await request('initialize',{clientInfo:{name:'owned_preservation_fixture',version:'1'},capabilities:{experimentalApi:true}});child.stdin.write(JSON.stringify({method:'initialized'})+'\n');
- return {request,wait,stop,home,pid:child.pid};
+ return {request,wait,stop,home,pid:child.pid,identity:'owned:'+child.pid+':'+process.hrtime.bigint(),alive:()=>child.exitCode===null&&child.signalCode===null};
 }
 const sql=(home,q)=>execFileSync('/usr/bin/sqlite3',[home+'/goals_1.sqlite',q],{encoding:'utf8'}).trim();
 async function archivedRollout(home,id){const entries=await readdir(home+'/archived_sessions',{recursive:true});const found=entries.filter(name=>name.endsWith('.jsonl')&&name.includes(id));assert.equal(found.length,1);return path.join(home,'archived_sessions',found[0]);}
@@ -58,7 +60,7 @@ try{
  let transfer;
  if(restoreGoal){
   transfer=root+'/transfer';const build=path.resolve('.build/debug');
-  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/GoalTransfer'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-goal-transfer-check.swift','-o',transfer],{stdio:'inherit',timeout:120000});
+  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/GoalTransfer'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-goal-transfer-check.swift','Tests/fixtures/codex-native-return-bridge.swift','-o',transfer],{stdio:'inherit',timeout:120000});
  }
  let a=await server(root+'/a');
  const workspaceRoot=root+'/selected-workspace';
@@ -124,6 +126,7 @@ try{
    assert.equal(rowJSON(a.home),originalRow);assert.deepEqual(await readFile(firstRollout),originalHistory);
    Object.assign(report,{nativeRetirementAndIndependentBackup:true,backupPreservedOriginalGoalAndHistory:true,backupVerifiedAfterProcessExit:true,cancelledBackupDoesNotAuthorizeReplacement:true});
   }
+  let nativeResumeResult,nativeRestoreResult;
   if(returnOriginal&&checkRetirement){
    const follow=await b.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned new history created only in home B.',text_elements:[]}]});
    const finished=await b.wait('turn/completed',p=>p.threadId===id&&p.turn.id===follow.turn.id);
@@ -162,12 +165,59 @@ try{
    assert.equal(result.exactGoalReturned,true);assert.equal(result.nativeOwnershipCommitted,false);
    assert.equal(result.latestHistoryReturned,true);
    console.error(JSON.stringify({stage:'goal-storage-return',exactGoalReturned:true,nativeOwnershipCommitted:false,clearedSource:returnCleared}));
-   // The owned fixture has only this root and unrelated roots, no spawned
-   // subtree. A production unarchive adapter still needs complete scope proof.
-   const unarchived=await c.request('thread/unarchive',{threadId:id});
-   assert.equal(unarchived.thread.id,id);assert.equal(unarchived.thread.path,returning);
+   // The parent owns the only stdio connection and constructed all root-only
+   // threads. This is not a discovery implementation for preexisting TUIs.
+   const nativeCounts={'thread/unarchive':0,'thread/resume':0},dropped=new Set();let controllerRestarts=0;
+   const nativeAttempt=()=>new Promise((resolve,reject)=>{
+    const helper=spawn(transfer,['--native-restore',b.home,c.home,id],{stdio:['pipe','pipe','pipe']});
+    let stderr='',final,error;
+    helper.stderr.on('data',bytes=>stderr+=bytes);
+    const send=value=>helper.stdin.write(JSON.stringify(value)+'\n');
+    helper.stdin.on('error',()=>{});
+    createInterface({input:helper.stdout}).on('line',line=>{void(async()=>{
+     const message=JSON.parse(line);
+     if(message.type==='result'){final=message.result;return;}
+     assert.equal(message.type,'rpc');assert.equal(message.params.threadId,id);
+     try {
+      let result;
+      assert.equal(c.alive(),true);
+      if(message.method==='owned/observe'){
+       assert.equal((await c.request('account/read',{refreshToken:false})).account,null);
+       const thread=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;
+       const loadedIDs=(await c.request('thread/loaded/list',{limit:100})).data;
+       assert.equal(c.alive(),true);
+       result={serverID:c.identity,thread,loadedIDs,ownedCompleteScope:true,settingsAcknowledgment:nativeResumeResult??null};
+      }else{
+       assert.ok(['thread/unarchive','thread/resume'].includes(message.method));
+       nativeCounts[message.method]++;
+       result=await c.request(message.method,message.params);
+       assert.equal(result.thread.id,id);
+       if(message.method==='thread/resume')nativeResumeResult=result;
+       if(crashNativeAcks&&!dropped.has(message.method)){
+        dropped.add(message.method);send({id:message.id,ownedInjectedDrop:true});return;
+       }
+      }
+      send({id:message.id,result});
+     }catch(problem){error=problem;send({id:message.id,error:{message:'Owned native bridge request failed'}});}
+    })().catch(problem=>{error=problem;helper.kill('SIGTERM');});});
+    const timer=setTimeout(()=>helper.kill('SIGTERM'),90000);
+    helper.once('error',problem=>{clearTimeout(timer);reject(problem);});
+    helper.once('exit',code=>{clearTimeout(timer);if(error)return reject(error);if(code===52&&crashNativeAcks)return resolve({restart:true});if(code!==0||!final)return reject(Error(stderr||'Owned native restoration bridge failed'));resolve(final);});
+    send({serverID:c.identity,sessionRelativePath:relative,history:expectedReturnTurns,settings:resumed});
+   });
+   for(let attempt=0;attempt<3;attempt++){
+    nativeRestoreResult=await nativeAttempt();
+    if(!nativeRestoreResult.restart)break;
+    controllerRestarts++;
+   }
+   assert.ok(!nativeRestoreResult.restart,'Owned controller never reached verified completion');
+   assert.equal(nativeCounts['thread/unarchive'],1);assert.equal(nativeCounts['thread/resume'],1);
+   if(crashNativeAcks){assert.equal(controllerRestarts,2);assert.equal(dropped.size,2);}
+   Object.assign(nativeRestoreResult,{unarchiveRequests:nativeCounts['thread/unarchive'],resumeRequests:nativeCounts['thread/resume'],controllerRestarts});
+   assert.equal(nativeRestoreResult.journaledNativeRestore,true);
+   assert.equal(nativeRestoreResult.unarchiveRequests,1);assert.equal(nativeRestoreResult.resumeRequests,1);
   }else assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
-  const last=await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
+  const last=nativeResumeResult||await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
   if(checkSettings){
    assert.equal(last.reasoningEffort,'high');assert.equal(last.serviceTier,'flex');
    assert.deepEqual(last.disabledPluginIds,disabledPlugins);assert.deepEqual(last.runtimeWorkspaceRoots,[workspaceRoot]);
@@ -180,8 +230,8 @@ try{
   assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
   assert.ok((await b.request('thread/loaded/list',{})).data.includes(unselected));process.kill(b.pid,0);
   if(returnOriginal&&checkRetirement){
-   assert.equal(JSON.parse(execFileSync(transfer,['--commit-goal-return',b.home,c.home,id],{encoding:'utf8',timeout:10000})).destinationOwnershipCommitted,true);
-   Object.assign(report,{retiredOwnerReturnVerified:true,journaledArchiveReturn:true,clearedGoalNotResurrected:returnCleared,returnGoal:expectedReturnGoal});
+   assert.equal(nativeRestoreResult.destinationOwnershipCommitted,true);
+   Object.assign(report,{retiredOwnerReturnVerified:true,journaledArchiveReturn:true,journaledNativeRestore:true,unarchiveRequests:1,resumeRequests:1,controllerRestarts:nativeRestoreResult.controllerRestarts,clearedGoalNotResurrected:returnCleared,returnGoal:expectedReturnGoal});
   }
   Object.assign(report,{ownedHomes:returnOriginal?2:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,returnedToOriginalHome:returnOriginal,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
   if(checkClearedSlot){

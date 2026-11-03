@@ -11,6 +11,7 @@ struct CodexGoalReturnState:Codable,Equatable {
     var stage:Stage = .prepared
     var result:Result?=nil
     var rollout:CodexRolloutReturnState?=nil
+    var nativeRestore:CodexNativeReturnState?=nil
 }
 final class CodexGoalReturn {
     private let journal:CodexMigrationJournal

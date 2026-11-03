@@ -4,6 +4,7 @@ import Foundation
     static func main() {
         do {
             let a=CommandLine.arguments
+            if a.count==5,a[1]=="--native-restore" {try NativeReturnBridge.run(a);return}
             if a.count==6,a[1]=="--return-goal" {
                 guard a[2].hasPrefix("/private/tmp/aa-cross-home-"),a[3].hasPrefix("/private/tmp/aa-cross-home-") else{throw AppError.message("Owned return homes required")}
                 let store=try AuditStore(path:URL(fileURLWithPath:a[2]).deletingLastPathComponent().appendingPathComponent("retirement-audit.sqlite").path)
@@ -26,22 +27,6 @@ import Foundation
                 try store.set("owned-goal-return-id",request.id)
                 try store.set("owned-goal-return-source",String(decoding:try JSONEncoder().encode(sourceRetirement),as:UTF8.self))
                 print("{\"verified\":true,\"exactGoalReturned\":true,\"latestHistoryReturned\":true,\"nativeOwnershipCommitted\":false}")
-                return
-            }
-            if a.count==5,a[1]=="--commit-goal-return" {
-                guard a[2].hasPrefix("/private/tmp/aa-cross-home-"),a[3].hasPrefix("/private/tmp/aa-cross-home-") else{throw AppError.message("Owned commit homes required")}
-                let store=try AuditStore(path:URL(fileURLWithPath:a[2]).deletingLastPathComponent().appendingPathComponent("retirement-audit.sqlite").path)
-                let journal=try CodexMigrationJournal(store:store)
-                guard let id=store.value("owned-goal-return-id"),let encoded=store.value("owned-goal-return-source"),let previous=try journal.owner(threadID:a[4]) else{throw AppError.message("Owned return intent missing")}
-                let source=try JSONDecoder().decode(CodexMigrationRetirement.self,from:Data(encoded.utf8))
-                let record=try journal.repair(id:id),engine=CodexGoalReturn(journal:journal),state=try engine.state(id:id)
-                guard state.stage == .verified,state.rollout?.stage == .verified,try engine.observe(id:id) == .applied,
-                      let destination=record.homes.first(where:{$0.path==a[3]}) else{throw AppError.message("Owned verified return missing")}
-                _=try journal.complete(id:id,payload:JSONEncoder().encode(state),expectedRevision:record.revision,
-                    ownership:[.init(threadID:a[4],previous:previous,destination:destination,retirement:source)])
-                try journal.release(id:id)
-                guard try journal.owner(threadID:a[4])?.home==destination else{throw AppError.message("Owned destination commit differs")}
-                print("{\"verified\":true,\"destinationOwnershipCommitted\":true}")
                 return
             }
             if a.count==6,a[1]=="--record-retirement" {
