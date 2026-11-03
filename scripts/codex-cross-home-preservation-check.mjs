@@ -1,13 +1,16 @@
 // Owned-only feasibility probe. Never reads a user's CODEX_HOME or credentials.
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,copyFile,rm,stat} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,copyFile,rm,stat,readdir} from 'node:fs/promises';
 import {spawn,execFileSync} from 'node:child_process';
 import {createServer} from 'node:http';
 import {createInterface} from 'node:readline';
 import path from 'node:path';
+import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const cli=process.env.AUTOAPPROVE_CODEX_BIN;
 assert.ok(cli&&path.isAbsolute(cli),'Set AUTOAPPROVE_CODEX_BIN to a native installed CLI');
 const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.match(version,/^codex-cli 0\.166\./);
+const restoreGoal=process.argv.includes('--restore-goal');
+const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
 const root=await mkdtemp('/private/tmp/aa-cross-home-'),children=[];
 const env={...process.env};for(const k of Object.keys(env))if(/TOKEN|API_KEY|CODEX_HOME|NODE_OPTIONS/.test(k))delete env[k];
 let requests=0;
@@ -35,10 +38,15 @@ async function server(home){
  const wait=async(method,predicate=()=>true)=>{const end=Date.now()+25000;while(Date.now()<end){const m=notifications.find(m=>m.method===method&&predicate(m.params));if(m)return m.params;await new Promise(r=>setTimeout(r,20));}throw Error(method+' missing: '+stderr.slice(-1000));};
  const stop=async()=>{if(child.exitCode!==null||child.signalCode!==null)return;process.kill(-child.pid,'SIGTERM');await new Promise(r=>{child.once('close',r);setTimeout(r,1500)});};
  await request('initialize',{clientInfo:{name:'owned_preservation_fixture',version:'1'},capabilities:{experimentalApi:true}});child.stdin.write(JSON.stringify({method:'initialized'})+'\n');
- return {request,wait,stop,home};
+ return {request,wait,stop,home,pid:child.pid};
 }
 const sql=(home,q)=>execFileSync('/usr/bin/sqlite3',[home+'/goals_1.sqlite',q],{encoding:'utf8'}).trim();
 try{
+ let transfer;
+ if(restoreGoal){
+  transfer=root+'/transfer';const build=path.resolve('.build/debug');
+  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/GoalTransfer'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-goal-transfer-check.swift','-o',transfer],{stdio:'inherit',timeout:120000});
+ }
  let a=await server(root+'/a');
  const start=await a.request('thread/start',{cwd:root,model:'owned-fixture',modelProvider:'owned',approvalPolicy:'never',sandbox:'read-only'}),id=start.thread.id;
  await a.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned synthetic history only. Reply with the fixture response.',text_elements:[]}]});
@@ -47,16 +55,60 @@ try{
  const source=(await a.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.ok(source.turns.length>0);assert.ok(source.turns.some(t=>t.items.some(i=>i.type==='agentMessage')),'Nonempty assistant history required');
  console.error(JSON.stringify({sourcePath:source.path,pathExists:source.path?await stat(source.path).then(s=>s.size).catch(()=>false):false}));await a.stop();
  const columns=sql(a.home,'PRAGMA table_info(thread_goals);');assert.match(columns,/goal_id/);
+ if(requireGoal)console.error(JSON.stringify({goalSchema:sql(a.home,'.schema'),migrations:sql(a.home,'SELECT version,description,success,hex(checksum) FROM _sqlx_migrations ORDER BY version;')}));
  sql(a.home,`UPDATE thread_goals SET tokens_used=37,time_used_seconds=19 WHERE thread_id='${id}';`);
  const before=JSON.parse(sql(a.home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`));
  assert.equal(before.tokens_used,37);assert.equal(before.time_used_seconds,19);
  a=await server(a.home);await a.request('thread/resume',{threadId:id});const sourceGoal=(await a.request('thread/goal/get',{threadId:id})).goal;assert.equal(sourceGoal.tokensUsed,37);assert.equal(sourceGoal.timeUsedSeconds,19);await a.stop();
+ if(restoreGoal)sql(a.home,`INSERT OR IGNORE INTO thread_goal_continuation_deferrals(thread_id) VALUES ('${id}');`);
  const b=await server(root+'/b'),destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(source.path,destination);assert.notEqual((await stat(source.path)).ino,(await stat(destination)).ino);
+ let unselected,unselectedGoal;
+ if(restoreGoal){
+  unselected=(await b.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
+  await b.request('thread/goal/set',{threadId:unselected,objective:'Unselected owned Goal',status:'paused',tokenBudget:999,origin:'user'});
+  unselectedGoal=(await b.request('thread/goal/get',{threadId:unselected})).goal;
+  assert.equal(JSON.parse(execFileSync(transfer,[a.home,b.home,id],{encoding:'utf8',timeout:10000})).verified,true);
+ }
  const resumed=await b.request('thread/resume',{threadId:id,path:destination}),target=(await b.request('thread/read',{threadId:resumed.thread.id,includeTurns:true})).thread;
+ for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(resumed[key],start[key],key+' must survive first resume');
  const goal=(await b.request('thread/goal/get',{threadId:id})).goal;
  const report={verified:true,actualInstalledCodex:version,ownedHomes:2,realCredentialsUsed:false,existingSessionsTouched:false,providerRequests:requests,sameUUID:target.id===id,nonemptyHistoryPreserved:JSON.stringify(source.turns)===JSON.stringify(target.turns),sourceGoal:{tokensUsed:sourceGoal.tokensUsed,timeUsedSeconds:sourceGoal.timeUsedSeconds,tokenBudget:sourceGoal.tokenBudget,status:sourceGoal.status},destinationGoal:goal,goalPreserved:JSON.stringify(goal)===JSON.stringify(sourceGoal),independentRollout:true,settings:{model:resumed.model,modelProvider:resumed.modelProvider,approvalPolicy:resumed.approvalPolicy,sandbox:resumed.sandbox},gap:goal===null?'Public rollout resume does not import the Goal record. Exact goal_id/counters require a separately validated transfer contract.':null};
- console.log(JSON.stringify(report));assert.ok(report.sameUUID);assert.ok(report.nonemptyHistoryPreserved);assert.equal(goal,null,'Reassess preservation contract if public resume starts importing Goals');
+ assert.ok(report.sameUUID);assert.ok(report.nonemptyHistoryPreserved);
+ if(requireGoal)assert.deepEqual(goal,sourceGoal,'Cross-home resume must preserve the exact nonzero Goal state');
+ else assert.equal(goal,null,'Reassess preservation contract if public resume starts importing Goals');
+ if(restoreGoal){
+  assert.deepEqual((await b.request('thread/goal/get',{threadId:unselected})).goal,unselectedGoal);
+  const rowJSON=home=>sql(home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`);
+  assert.equal(rowJSON(b.home),rowJSON(a.home),'Native resume must retain exact Goal instance and millisecond counters');
+  console.error(JSON.stringify({stage:'first-transfer',sameUUID:true,exactGoalRow:true,publicGoal:true,unselectedGoal:true}));
+  const unsubscribed=await b.request('thread/unsubscribe',{threadId:id});assert.equal(unsubscribed.status,'unsubscribed');
+  if(process.argv.includes('--archive-source'))await b.request('thread/archive',{threadId:id});
+  const end=Date.now()+5000;let loaded;
+  do{loaded=(await b.request('thread/loaded/list',{})).data;if(!loaded.includes(id))break;await new Promise(r=>setTimeout(r,25));}while(Date.now()<end);
+  assert.ok(!loaded.includes(id),'Selected writer must actually unload before return transfer');assert.ok(loaded.includes(unselected));
+  const files=execFileSync('/usr/sbin/lsof',['-nP','-p',String(b.pid),'-Fn'],{encoding:'utf8',timeout:10000});
+  assert.ok(!files.split('\n').some(line=>line.startsWith('n')&&line.includes(id)),'Selected rollout writer must actually close and flush');
+  const c=await server(root+'/c'),third=(await c.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
+  await c.request('thread/goal/set',{threadId:third,objective:'Third home unselected Goal',status:'paused',origin:'user'});
+  const thirdGoal=(await c.request('thread/goal/get',{threadId:third})).goal;
+  const relative=path.relative(a.home,source.path);assert.ok(!relative.startsWith('..'));
+  let closedRollout=target.path;
+  if(process.argv.includes('--archive-source')){
+   const entries=await readdir(b.home+'/archived_sessions',{recursive:true});const found=entries.filter(name=>name.endsWith('.jsonl')&&name.includes(id));assert.equal(found.length,1);closedRollout=path.join(b.home,'archived_sessions',found[0]);
+  }
+  const returning=path.join(c.home,relative);await mkdir(path.dirname(returning),{recursive:true});await copyFile(closedRollout,returning);
+  assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
+  const last=await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
+  const returned=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.deepEqual(returned.turns,source.turns,'Return transfer must retain all user/assistant history');
+  for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(last[key],start[key],key+' must survive return resume');
+  assert.deepEqual((await c.request('thread/goal/get',{threadId:id})).goal,sourceGoal);assert.equal(rowJSON(c.home),rowJSON(a.home));
+  assert.deepEqual((await b.request('thread/goal/get',{threadId:unselected})).goal,unselectedGoal);
+  assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
+  assert.ok((await b.request('thread/loaded/list',{})).data.includes(unselected));process.kill(b.pid,0);
+  Object.assign(report,{ownedHomes:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
+ }
+ console.log(JSON.stringify(report));
 }finally{
- for(const child of children)if(child.exitCode===null&&child.signalCode===null){try{process.kill(-child.pid,'SIGTERM')}catch{}}
+ for(const child of children)if(child.exitCode===null&&child.signalCode===null){try{process.kill(-child.pid,'SIGTERM')}catch{}await new Promise(r=>{child.once('close',r);setTimeout(r,1000)});if(child.exitCode===null&&child.signalCode===null){try{process.kill(-child.pid,'SIGKILL')}catch{}}}
  provider.closeAllConnections();await new Promise(r=>provider.close(r));await rm(root,{recursive:true,force:true});
 }

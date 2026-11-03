@@ -1217,6 +1217,14 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         ]
 #if DEBUG
         cases.insert(contentsOf: [
+            ("Goal transfer: exact row, counters, deferral and round trip",tests.testGoalTransferPreservesExactRowAndDeferral),
+            ("Goal transfer: unknown schema, migration and trigger rejection",tests.testGoalTransferRejectsUnknownSchemaAndMigrations),
+            ("Goal transfer: stale source, same home and destination conflict",tests.testGoalTransferRejectsStaleOrConflictingRows),
+            ("Goal transfer: replaced and symlinked database rejection",tests.testGoalTransferRejectsReplacedAndSymlinkedDatabases),
+            ("Goal transfer: malformed rows and exact embedded NUL preservation",tests.testGoalTransferValidatesRowsAndPreservesEmbeddedNUL),
+            ("Goal transfer: changed deferral and orphan destination rejection",tests.testGoalTransferRejectsChangedDeferralAndOrphan),
+            ("Goal transfer: active Goal and forged snapshot rejection",tests.testGoalTransferRejectsActiveGoalsAndForgedSnapshots),
+            ("Goal transfer: bounded destination locks and special files",tests.testGoalTransferBoundsLockedDestinationsAndSpecialFiles),
             ("Account transition: queued completion is invalid after manager replacement", tests.testNativeCodexLoginReplacementInvalidatesAlreadyQueuedCompletion),
             ("Account transition: native login wakes parked polling immediately", tests.testNativeCodexLoginWakesPollingWithoutWaitingThirtySeconds),
             ("Account transition: deferred native completion cannot cause a second refresh",tests.testNativeLoginCompletionReceiptBindsBeforeItsDeferredCallback),
