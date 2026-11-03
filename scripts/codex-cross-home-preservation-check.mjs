@@ -13,14 +13,17 @@ const restoreGoal=process.argv.includes('--restore-goal');
 const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
 const returnOriginal=process.argv.includes('--return-original-home');
 const checkClearedSlot=process.argv.includes('--check-cleared-slot');
+const checkSettings=process.argv.includes('--check-settings');
 assert.ok(!checkClearedSlot || restoreGoal);
+assert.ok(!checkSettings || restoreGoal);
 assert.ok(!returnOriginal || restoreGoal&&process.argv.includes('--archive-source'));
 const root=await mkdtemp('/private/tmp/aa-cross-home-'),children=[];
 const env={...process.env};for(const k of Object.keys(env))if(/TOKEN|API_KEY|CODEX_HOME|NODE_OPTIONS/.test(k))delete env[k];
-let requests=0;
+let requests=0;const requestBodies=[];
 const provider=createServer(async(req,res)=>{
  let data='';for await(const chunk of req)data+=chunk;
  if(!req.url.endsWith('/responses')){res.writeHead(404);res.end();return;}
+ requestBodies.push(JSON.parse(data));
  requests++;const id='resp_owned_'+requests,item={id:'msg_owned_'+requests,type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'Owned preservation fixture response.',annotations:[]}]};
  res.writeHead(200,{'Content-Type':'text/event-stream','Connection':'close'});
  const emit=(type,body)=>res.write('data: '+JSON.stringify({type,...body})+'\n\n');
@@ -53,9 +56,22 @@ try{
   execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/GoalTransfer'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-goal-transfer-check.swift','-o',transfer],{stdio:'inherit',timeout:120000});
  }
  let a=await server(root+'/a');
- const start=await a.request('thread/start',{cwd:root,model:'owned-fixture',modelProvider:'owned',approvalPolicy:'never',sandbox:'read-only'}),id=start.thread.id;
+ const workspaceRoot=root+'/selected-workspace';
+ if(checkSettings)await mkdir(workspaceRoot);
+ const settings=checkSettings?{serviceTier:'flex',baseInstructions:'Owned base instruction sentinel 731.',developerInstructions:'Owned developer instruction sentinel 829.',config:{model_reasoning_effort:'high'},runtimeWorkspaceRoots:[workspaceRoot]}:{};
+ const start=await a.request('thread/start',{cwd:root,model:'owned-fixture',modelProvider:'owned',approvalPolicy:'never',sandbox:'read-only',...settings}),id=start.thread.id;
+ const disabledPlugins=['owned-disabled-plugin@example.invalid'];
+ if(checkSettings)await a.request('thread/settings/update',{threadId:id,effort:'high',serviceTier:'flex',disabledPluginIds:disabledPlugins});
  await a.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned synthetic history only. Reply with the fixture response.',text_elements:[]}]});
  const turn=await a.wait('turn/completed',p=>p.threadId===id);assert.equal(turn.turn.status,'completed',JSON.stringify(turn.turn.error));
+ const checkRequest=body=>{
+  assert.equal(body.reasoning?.effort,'high','Nondefault reasoning must reach inference');
+  assert.equal(body.service_tier,'flex','Nondefault service tier must reach inference');
+  const content=JSON.stringify((body.input||[]).filter(item=>['system','developer'].includes(item.role)));
+  assert.ok(content.includes('Owned base instruction sentinel 731.'),'Base instructions must reach inference');
+  assert.ok(content.includes('Owned developer instruction sentinel 829.'),'Developer instructions must reach inference');
+ };
+ if(checkSettings)checkRequest(requestBodies[0]);
  await a.request('thread/goal/set',{threadId:id,objective:'Owned preservation objective',status:'paused',tokenBudget:1234,origin:'user'});
  const source=(await a.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.ok(source.turns.length>0);assert.ok(source.turns.some(t=>t.items.some(i=>i.type==='agentMessage')),'Nonempty assistant history required');
  console.error(JSON.stringify({sourcePath:source.path,pathExists:source.path?await stat(source.path).then(s=>s.size).catch(()=>false):false}));await a.stop();
@@ -77,6 +93,10 @@ try{
   assert.equal(JSON.parse(execFileSync(transfer,[a.home,b.home,id],{encoding:'utf8',timeout:10000})).verified,true);
  }
  const resumed=await b.request('thread/resume',{threadId:id,path:destination}),target=(await b.request('thread/read',{threadId:resumed.thread.id,includeTurns:true})).thread;
+ if(checkSettings){
+  assert.equal(resumed.reasoningEffort,'high');assert.equal(resumed.serviceTier,'flex');
+  assert.deepEqual(resumed.disabledPluginIds,disabledPlugins);assert.deepEqual(resumed.runtimeWorkspaceRoots,[workspaceRoot]);
+ }
  for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(resumed[key],start[key],key+' must survive first resume');
  const goal=(await b.request('thread/goal/get',{threadId:id})).goal;
  const report={verified:true,actualInstalledCodex:version,ownedHomes:2,realCredentialsUsed:false,existingSessionsTouched:false,providerRequests:requests,sameUUID:target.id===id,nonemptyHistoryPreserved:JSON.stringify(source.turns)===JSON.stringify(target.turns),sourceGoal:{tokensUsed:sourceGoal.tokensUsed,timeUsedSeconds:sourceGoal.timeUsedSeconds,tokenBudget:sourceGoal.tokenBudget,status:sourceGoal.status},destinationGoal:goal,goalPreserved:JSON.stringify(goal)===JSON.stringify(sourceGoal),independentRollout:true,settings:{model:resumed.model,modelProvider:resumed.modelProvider,approvalPolicy:resumed.approvalPolicy,sandbox:resumed.sandbox},gap:goal===null?'Public rollout resume does not import the Goal record. Exact goal_id/counters require a separately validated transfer contract.':null};
@@ -110,6 +130,10 @@ try{
   if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:73}));
   assert.equal(JSON.parse(execFileSync(transfer,[b.home,c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
   const last=await c.request('thread/resume',{threadId:id,path:returning});assert.equal(last.thread.id,id);
+  if(checkSettings){
+   assert.equal(last.reasoningEffort,'high');assert.equal(last.serviceTier,'flex');
+   assert.deepEqual(last.disabledPluginIds,disabledPlugins);assert.deepEqual(last.runtimeWorkspaceRoots,[workspaceRoot]);
+  }
   const returned=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;assert.deepEqual(returned.turns,source.turns,'Return transfer must retain all user/assistant history');
   for(const key of ['model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','reasoningEffort'])if(Object.hasOwn(start,key))assert.deepEqual(last[key],start[key],key+' must survive return resume');
   assert.deepEqual((await c.request('thread/goal/get',{threadId:id})).goal,expectedReturnGoal);assert.equal(rowJSON(c.home),expectedReturnRow);
@@ -126,6 +150,13 @@ try{
    assert.equal(JSON.parse(execFileSync(transfer,['--cleared-slot',c.home,id],{encoding:'utf8',timeout:10000})).verified,true);
    assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
    Object.assign(report,{clearedGoalSlotWitnessed:true,clearedGoalRetainedAfterResume:true});
+  }
+  if(checkSettings){
+   const follow=await c.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned settings continuation only.',text_elements:[]}]});
+   const finished=await c.wait('turn/completed',p=>p.threadId===id&&p.turn.id===follow.turn.id);
+   assert.equal(finished.turn.status,'completed',JSON.stringify(finished.turn.error));
+   assert.equal(requestBodies.length,2);checkRequest(requestBodies[1]);
+   Object.assign(report,{providerRequests:requests,nondefaultSettings:{reasoning:true,serviceTier:true,baseInstructions:true,developerInstructions:true,disabledPluginIDs:true,runtimeWorkspaceRoots:true},settingsInferenceRequests:requestBodies.length});
   }
  }
  console.log(JSON.stringify(report));
