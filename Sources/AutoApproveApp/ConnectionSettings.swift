@@ -7,6 +7,7 @@ import AutoApproveCore
     let notifications: QuestionNotifications
     @StateObject private var viewUpdates = WindowViewUpdates()
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @State private var busy = false
     @State private var notice: String?
     @State private var questionDelayText = ""
@@ -15,7 +16,6 @@ import AutoApproveCore
     @State private var keepAwakeError: String?
     @State private var mouseActivityError: String?
     @State private var codexProgressError:String?
-    @State private var codexAccountTransitionError: String?
     @State private var terminalWindowSharingAllowed = false
     @State private var screenControlAllowed=false
     @State private var terminalInputStatus = TerminalInputStatus.notInstalled
@@ -139,21 +139,8 @@ import AutoApproveCore
                     Divider()
                     section("Codex", icon: "command", status: engine.snapshot.health.codex) {
                         Text("연결된 원본 터미널의 승인 화면을 감지합니다. 휴대폰에서 같은 실행 세션에 직접 입력할 수 있으며 새 CLI를 만들지 않습니다.")
-                        CodexLoginSettings(accounts: engine.agentAccounts, targets: { try await engine.codexLoginTargets() },
-                            transitionEnabled: engine.codexAccountTransitionEnabled, transitionBusy: engine.codexAccountTransitionBusy || engine.codexAccountTransitionHeld,
-                            completed: {},reconnect:{try await engine.reconnectCodexLogin(home:$0)})
-                        Divider()
-                        CodexAccountTransitionSettings(enabled: engine.codexAccountTransitionEnabled, busy: engine.codexAccountTransitionBusy,
-                            states: engine.codexAccountTransitionStates, notice: engine.codexAccountTransitionNotice, error: codexAccountTransitionError,
-                            setEnabled: { enabled in
-                                do {
-                                    try engine.setCodexAccountTransitionEnabled(enabled); codexAccountTransitionError = nil
-                                    if enabled { Task { await engine.checkCodexAccountTransitions() } }
-                                } catch { codexAccountTransitionError = error.localizedDescription }
-                            }, check: { Task { await engine.checkCodexAccountTransitions() } }, cancel: { home in
-                                do { try engine.cancelCodexAccountTransition(home: home); codexAccountTransitionError = nil }
-                                catch { codexAccountTransitionError = error.localizedDescription }
-                            })
+                        Button {openWindow(id:"accounts")} label: {Label("계정·로그인 열기",systemImage:"person.crop.circle")}
+                            .help("메인 창 상단의 계정 아이콘에서도 바로 열 수 있습니다. ⌘⇧L")
                     }
                     if let notice {
                         Label(notice, systemImage: "info.circle").font(.callout).foregroundStyle(.primary).textSelection(.enabled)

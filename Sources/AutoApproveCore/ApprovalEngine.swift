@@ -5698,6 +5698,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 try cancelCodexAccountTransition(home: home)
             }
         }
+        try persistCodexAccountTransitionEnabled(enabled)
+    }
+    private func persistCodexAccountTransitionEnabled(_ enabled:Bool) throws {
         try store.set("codexAccountTransitionEnabled", enabled ? "true" : "false")
         codexAccountTransitionEnabled = enabled
         if enabled, pollTask != nil { startCodexAccountTransitionPolling() }
@@ -5721,7 +5724,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return .init(sessionID:sessionID,target:verified,identity:identity,sharedSessions:connected.count)
     }
     public func checkCodexAccountTransitions() async {
-        guard codexAccountCheckTask==nil else{return}
+        guard codexAccountCheckTask==nil,!codexAccountTransitionBusy else{return}
         let epoch=codexAccountTransitionEpoch
         let task=Task { [weak self] in
             guard let self else{return}
@@ -5748,14 +5751,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func reconnectCodexLogin(home:String) async throws {
         guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")}
+        let epoch=codexAccountTransitionEpoch
+        var ownsBusy=true
+        codexAccountTransitionBusy=true
+        defer {if ownsBusy,epoch==codexAccountTransitionEpoch {codexAccountTransitionBusy=false}}
         let home=try CodexAccountTransitionTarget.canonicalHome(home)
         let targets=try await codexLoginTargets()
         try Task.checkCancellation()
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy,targets.contains(where:{$0.home==home}) else {
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else {throw CancellationError()}
+        guard !codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message("진행 중인 로그인·전환을 먼저 확인해주세요.")}
+        guard targets.contains(where:{$0.home==home}) else {
             throw AppError.message("재연결할 Codex 서버·세션이 바뀌었습니다. 현재 계정을 다시 확인해주세요.")
         }
-        try setCodexAccountTransitionEnabled(true)
+        try persistCodexAccountTransitionEnabled(true)
         try recordCodexLoginRefresh(home:home,id:UUID().uuidString)
+        codexAccountTransitionBusy=false;ownsBusy=false
+        if codexAccountCheckTask != nil {codexAccountNativeWakePending=true}
         await checkCodexAccountTransitions()
         codexAccountTransitionSignal.notify()
     }
@@ -5780,7 +5791,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 codexAccountTransitionStates=journal
                 codexAccountCoordinators=codexAccountCoordinators.filter{journal[$0.key] != nil}
             }
-            codexAccountTransitionNotice = targets.isEmpty ? "연결된 관리형 Codex 서버가 없습니다. 실행 중인 Codex와 로컬 서버 연결을 확인해주세요."
+            codexAccountTransitionNotice = targets.isEmpty ? "관리형 Codex 서버 연결을 아직 확인하지 못했습니다. 실행 중인 Codex를 유지하고 연결을 다시 확인해주세요."
                 : visible > covered ? "Codex \(visible - covered)개는 관리형 서버 연결을 확인하지 못해 자동 전환에서 제외했습니다." : nil
             for target in targets.sorted(by: { $0.home < $1.home }) {
                 guard !Task.isCancelled, epoch == codexAccountTransitionEpoch else { return }

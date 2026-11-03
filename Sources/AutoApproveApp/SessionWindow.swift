@@ -227,6 +227,9 @@ import AutoApproveCore
         ])
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button { openWindow(id: "accounts") } label: { Label("계정·로그인", systemImage: "person.crop.circle") }
+                    .labelStyle(.iconOnly).accessibilityIdentifier("account-login-entry")
+                    .help("이 Mac의 Codex 계정·로그인과 세션 재연결을 엽니다. ⌘⇧L")
                 Button { openWindow(id: "help") } label: { Label("도움말", systemImage: "questionmark.circle") }
                     .help(AppHelp.guide)
                 Button { openWindow(id: "history") } label: { Label("승인 내역", systemImage: "clock.arrow.circlepath") }

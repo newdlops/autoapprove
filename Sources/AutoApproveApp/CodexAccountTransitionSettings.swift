@@ -25,8 +25,9 @@ struct CodexAccountTransitionSettings: View {
                 if let state = states[home] {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
-                            Label(title(state.phase), systemImage: icon(state.phase))
-                                .font(.callout.weight(.semibold)).foregroundStyle(color(state.phase))
+                            Label {Text(title(state.phase)).foregroundStyle(.primary)} icon: {
+                                Image(systemName:icon(state.phase)).foregroundStyle(color(state.phase))
+                            }.font(.callout.weight(.semibold))
                             Spacer(minLength: 4)
                             if state.held, state.phase != .review { ProgressView().controlSize(.small).accessibilityLabel("계정 전환 진행 중") }
                         }

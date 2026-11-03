@@ -25,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         #selector(NSWindow.performMiniaturize(_:)), #selector(NSWindow.performZoom(_:))]
                     for entry in submenu.items where !entry.isSeparatorItem {
                         if entry.action.map(windowActions.contains) != true,
-                           ![AppCommands.mainWindowTitle, AppCommands.historyTitle,AppCommands.profilesTitle].contains(entry.title) {
+                           ![AppCommands.mainWindowTitle, AppCommands.historyTitle,AppCommands.profilesTitle,AppCommands.accountsTitle].contains(entry.title) {
                             submenu.removeItem(entry)
                         }
                     }
@@ -51,6 +51,7 @@ struct AppCommands: Commands {
     static let mainWindowTitle = "관리 창 열기"
     static let historyTitle = "승인 내역 보기"
     static let profilesTitle = "세션 프로필"
+    static let accountsTitle = "계정·로그인"
     var connectionsAvailable: Bool
     @Environment(\.openWindow) private var openWindow
 
@@ -72,6 +73,8 @@ struct AppCommands: Commands {
                 .disabled(!connectionsAvailable)
             Button(Self.profilesTitle) {show("profiles")}
                 .keyboardShortcut("p",modifiers:[.command,.shift]).disabled(!connectionsAvailable)
+            Button(Self.accountsTitle) {show("accounts")}
+                .keyboardShortcut("l",modifiers:[.command,.shift]).disabled(!connectionsAvailable)
         }
         CommandGroup(replacing: .help) {
             Button("AutoApprove 도움말") { show("help") }

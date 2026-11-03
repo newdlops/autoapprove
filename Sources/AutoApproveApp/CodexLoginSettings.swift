@@ -11,6 +11,7 @@ import AutoApproveCore
     var preferredHome:String? = nil
     var reconnect:((String) async throws -> Void)? = nil
     @State private var homes: [CodexAccountTransitionTarget] = []
+    @State private var liveHomes:Set<String>=[]
     @State private var selected = NSHomeDirectory() + "/.codex"
     @State private var loading = true
     @State private var job: NativeCodexLoginState?
@@ -22,15 +23,26 @@ import AutoApproveCore
         let preferred=preferredHome.flatMap{try? CodexAccountTransitionTarget.canonicalHome($0)}
         return preferredHome==nil || home==preferred ? current:nil
     }
+    private func belongsToSelection(_ job:NativeCodexLoginState?) -> Bool {
+        guard let job,let home=job.resolvedHome ?? (try? CodexAccountTransitionTarget.canonicalHome(job.home)) else{return false}
+        return home == (try? CodexAccountTransitionTarget.canonicalHome(selected))
+    }
     var body: some View {
         CodexLoginContent(homes: homes.map(\.home), selected: $selected, loading: loading,
-            job: job, disabled: transitionBusy || otherLogin, error: error, transitionEnabled: transitionEnabled,
+            job: belongsToSelection(job) ? job:nil, disabled: transitionBusy || otherLogin, error: error, transitionEnabled: transitionEnabled,
             begin: {
                 loading=true
                 Task {
                     defer{loading=false}
                     do {
-                        let found=try await targets()
+                        let found:[CodexAccountTransitionTarget]
+                        do {found=try await targets()}
+                        catch {
+                            try Task.checkCancellation()
+                            guard preferredHome==nil else {throw error}
+                            found=[]
+                        }
+                        try Task.checkCancellation()
                         let target:CodexAccountTransitionTarget
                         if let live=found.first(where:{$0.home==selected}) {target=live}
                         else if preferredHome==nil {target = .init(home:selected,executable:"codex")}
@@ -45,28 +57,49 @@ import AutoApproveCore
                 }
             }, reconnect:reconnect.map { action in {
                 loading=true
-                Task {defer{loading=false};do{_ = try await targets();try await action(selected);error=nil}catch{self.error=error.localizedDescription}}
-            }})
+                Task {
+                    defer{loading=false}
+                    do {try await action(selected);error=nil}
+                    catch {
+                        let message=error.localizedDescription
+                        await reloadTargets()
+                        self.error=message
+                    }
+                }
+            }},canReconnect:liveHomes.contains(selected),connectedCount:homes.first(where:{$0.home==selected})?.witnesses.count,
+            refreshTargets:{Task {await reloadTargets()}})
         .task {
             job = scopedJob
-            do {
-                var found = try await targets()
-                let defaultHome = try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory() + "/.codex")
-                if preferredHome==nil,!found.contains(where: { $0.home == defaultHome }) { found.insert(.init(home: defaultHome, executable: "codex"), at: 0) }
-                homes = found
-                if let preferredHome {selected=try CodexAccountTransitionTarget.canonicalHome(preferredHome)}
-                else if let job,let home=job.resolvedHome ?? (try? CodexAccountTransitionTarget.canonicalHome(job.home)),found.contains(where:{$0.home==home}) {selected=home}
-                else if !found.contains(where:{$0.home==selected}) {selected=found.first?.home ?? defaultHome}
-            } catch { self.error = "실행 중인 Codex 위치를 조회하지 못했습니다. 기본 홈으로 로그인할 수 있습니다." }
-            loading = false
+            await reloadTargets(preferJob:true)
             while !Task.isCancelled {
                 let next = scopedJob
-                otherLogin=accounts.busy && next?.active != true
+                otherLogin=accounts.busy && (next?.active != true || !belongsToSelection(next))
                 let succeeded = next?.phase == "succeeded" && job?.phase != "succeeded"
                 job = next
-                if succeeded { await completed() }
+                if succeeded {error=nil;await completed();await reloadTargets()}
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             }
+        }
+    }
+    private func reloadTargets(preferJob:Bool=false) async {
+        loading=true;defer{loading=false}
+        do {
+            var found=try await targets();try Task.checkCancellation()
+            liveHomes=Set(found.map(\.home))
+            let defaultHome=try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")
+            if preferredHome==nil,!found.contains(where:{$0.home==defaultHome}) {found.insert(.init(home:defaultHome,executable:"codex"),at:0)}
+            homes=found
+            if let preferredHome {selected=try CodexAccountTransitionTarget.canonicalHome(preferredHome)}
+            else if preferJob,let job,let home=job.resolvedHome ?? (try? CodexAccountTransitionTarget.canonicalHome(job.home)),found.contains(where:{$0.home==home}) {selected=home}
+            else if preferJob,!liveHomes.contains(selected),let live=found.first(where:{liveHomes.contains($0.home)}) {selected=live.home}
+            else if !found.contains(where:{$0.home==selected}) {selected=found.first?.home ?? defaultHome}
+            error=nil
+        } catch is CancellationError {return}
+        catch {
+            liveHomes=[]
+            self.error=preferredHome==nil
+                ? "실행 중인 Codex 연결을 확인하지 못했습니다. 연결을 다시 확인하거나 선택한 홈으로 로그인할 수 있습니다."
+                : "선택한 세션의 연결을 확인하지 못했습니다. 연결을 다시 확인해주세요."
         }
     }
 }
@@ -83,17 +116,23 @@ struct CodexLoginContent: View {
     let cancel: () -> Void
     let open: (String) -> Void
     var reconnect:(()->Void)? = nil
+    var canReconnect=true
+    var connectedCount:Int? = nil
+    var refreshTargets:(()->Void)? = nil
     private var active: Bool { job?.active == true }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Codex 로그인").font(.callout.weight(.semibold)).foregroundStyle(.primary)
             if homes.count > 1 {
                 Picker("로그인할 Codex 홈", selection: $selected) {
-                    ForEach(homes, id: \.self) { Text($0).tag($0) }
+                    ForEach(homes, id: \.self) { Text($0).lineLimit(1).truncationMode(.middle).tag($0) }
                 }.disabled(active || loading || disabled)
             }
             Text(active ? job?.home ?? selected : selected)
                 .font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            if canReconnect,let connectedCount,connectedCount>0 {
+                Label("연결 확인 · Codex \(connectedCount)개",systemImage:"checkmark.circle").font(.caption)
+            }
             Text("기본 브라우저에서 계정을 선택하면 이 창에 로그인 완료가 표시됩니다. 기존 창은 유지됩니다.")
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -106,7 +145,8 @@ struct CodexLoginContent: View {
             if let job {
                 HStack(spacing: 6) {
                     if ["starting", "verifying"].contains(job.phase) { ProgressView().controlSize(.small) }
-                    Text(title(job)).foregroundStyle(job.phase == "succeeded" ? Color.green : .primary)
+                    if job.phase=="succeeded" {Image(systemName:"checkmark.circle.fill").foregroundStyle(.green)}
+                    Text(title(job)).foregroundStyle(.primary)
                         .fixedSize(horizontal: false, vertical: true)
                 }.accessibilityElement(children: .combine)
                 if job.phase == "waiting", let url = job.url, AgentAccountOutput.validURL(url, agent: "codex-browser") {
@@ -116,12 +156,25 @@ struct CodexLoginContent: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if let error { Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
-            if let reconnect {
-                Button("현재 로그인으로 세션 재연결",action:reconnect).disabled(active || loading || disabled)
-                    .help("브라우저 로그인 없이 저장된 인증을 연결된 Codex 전체에 다시 적용합니다. 작업을 순차 중단한 뒤 창·대화를 재연결합니다.")
+            if let error {
+                Label {Text(error).foregroundStyle(.primary)} icon: {Image(systemName:"exclamationmark.circle").foregroundStyle(.red)}
+                    .fixedSize(horizontal:false,vertical:true)
             }
-            Text("로그인 완료 후 열린 Codex 작업을 순차 중단합니다. Goal은 일시정지하고 Codex 백그라운드 작업은 종료한 뒤 새 계정으로 전환합니다. 설정 창을 닫아도 계속 진행합니다.")
+            if let reconnect {
+                HStack(spacing:8) {
+                    Button("현재 로그인으로 세션 재연결",action:reconnect).disabled(active || loading || disabled || !canReconnect)
+                        .help(canReconnect ? "브라우저 로그인 없이 저장된 인증을 연결된 Codex 전체에 다시 적용합니다. 작업을 순차 중단한 뒤 창·대화를 재연결합니다.":"선택한 홈의 실제 연결을 먼저 확인해주세요. 로그인은 연결 확인 없이도 시작할 수 있습니다.")
+                    if let refreshTargets {
+                        Button("연결 다시 확인",systemImage:"arrow.clockwise",action:refreshTargets).disabled(active || loading || disabled)
+                            .help("이 Mac의 서버·세션 연결만 다시 읽습니다. 작업을 중단하거나 계정을 바꾸지 않습니다.")
+                    }
+                }
+                if !loading,!canReconnect {
+                    Label("이 홈의 서버·세션 연결은 아직 확인되지 않았습니다. 연결을 다시 확인하거나 먼저 로그인해주세요.",systemImage:"info.circle")
+                        .font(.caption).fixedSize(horizontal:false,vertical:true)
+                }
+            }
+            Text("로그인 완료 후 연결이 확인된 관리형 Codex 작업을 순차 중단합니다. Goal은 일시정지하고 Codex 백그라운드 작업은 종료한 뒤 새 계정으로 전환합니다. 이 창을 닫아도 계속 진행합니다.")
                 .font(.caption).fixedSize(horizontal: false, vertical: true)
         }
     }

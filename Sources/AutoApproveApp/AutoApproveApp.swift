@@ -52,6 +52,10 @@ import AutoApproveCore
             if let controller=container.sessionProfiles {SessionProfilesWindow(controller:controller)}
         }.defaultSize(width:860,height:640).windowResizability(.contentMinSize).commandsRemoved()
 
+        Window("계정·로그인", id: "accounts") {
+            if let engine=container.engine {CodexAccountsWindow(engine:engine)}
+        }.windowResizability(.contentSize).commandsRemoved()
+
         Window("연결 설정", id: "settings") {
             if let engine = container.engine, let notifications = container.notifications {
                 ConnectionSettings(engine: engine, notifications: notifications)
@@ -124,6 +128,8 @@ private struct StatusMenu: View {
             .help(AppHelp.history)
         Button("연결 설정…") { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
             .help(AppHelp.connections)
+        Button("계정·로그인…") {openWindow(id:"accounts");NSApp.activate(ignoringOtherApps:true)}
+            .help("이 Mac의 Codex 로그인과 서버·세션 연결을 확인합니다. ⌘⇧L")
         Button("세션 프로필…") {openWindow(id:"profiles");NSApp.activate(ignoringOtherApps:true)}
             .help("창별 Codex·Claude Code 대화를 여러 프로필 파일로 저장하고 다시 엽니다.")
         Button(engine.snapshot.paused ? "자동 승인 재개" : "자동 승인 일시정지") { try? engine.setPaused(!engine.snapshot.paused) }
