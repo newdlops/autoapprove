@@ -1,5 +1,38 @@
 # Cooperative native observation proposal
 
+## Official-only route revalidation · 2026-11-04
+
+The official repository's latest release still resolves to
+[`rust-v0.166.0`](https://github.com/openai/codex/releases/tag/rust-v0.166.0)
+(published 2026-10-29T19:47:53Z), matching the inspected native source. No newer
+stable release was available to substitute for the missing client producer.
+
+The current [official API overview](https://learn.chatgpt.com/docs/app-server#api-overview)
+describes persisted thread reads and the in-memory loaded-thread list separately.
+It does not establish that either list inventories a TUI's retained local state.
+The source-backed counterexamples below therefore still govern migration.
+
+Two additional exact-version API candidates were inspected rather than assumed
+to solve that gap:
+
+- `remoteControl/client/list` takes an environment ID and returns registered
+  device/client display metadata. Its response has no native process identity,
+  thread membership, retained draft/replay state or admission barrier. It is not
+  a local TUI ownership census. See
+  [`protocol/v2/remote_control.rs`](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server-protocol/src/protocol/v2/remote_control.rs).
+- The daemon recovery handoff snapshots persistent root IDs and resumes runtimes
+  with cold-resume semantics. It does not export all selected TUI-local state or
+  transfer a chosen client between credential homes. See
+  [`daemon_thread_recovery.rs`](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/daemon_thread_recovery.rs).
+
+The existing account-group design explicitly excludes a Codex fork. A question
+is now pending on whether to change that architecture constraint and prepare an
+opt-in managed extension alongside the official CLI. Until the user answers,
+do not build or install that extension, replace existing clients, or represent
+an official-only thread list as complete membership. This is an architecture
+decision, not an automatic-approval rejection. Full selected-session migration
+remains incomplete; its requirements are unchanged.
+
 Status: proposed, awaiting the user's managed-build preference. No custom Codex
 has been built, installed or connected to user sessions. This proposal does not
 relax the account-groups preservation contract or enable migration effects.
