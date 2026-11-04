@@ -25,17 +25,21 @@ to solve that gap:
   transfer a chosen client between credential homes. See
   [`daemon_thread_recovery.rs`](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/daemon_thread_recovery.rs).
 
-The existing account-group design explicitly excludes a Codex fork. A question
-is now pending on whether to change that architecture constraint and prepare an
-opt-in managed extension alongside the official CLI. Until the user answers,
-do not build or install that extension, replace existing clients, or represent
-an official-only thread list as complete membership. This is an architecture
-decision, not an automatic-approval rejection. Full selected-session migration
-remains incomplete; its requirements are unchanged.
+The no-fork wording in the account-group design was an implementation proposal,
+not an explicit user prohibition on isolated source preparation. Treating it as
+requiring permission before any prototype work was overly restrictive. The open
+managed-build preference can steer distribution, but source-only preparation and
+owned tests can proceed under the requested integration goal. Do not install an
+extension, replace existing clients, or represent an official-only list as
+complete membership without the required preservation and review evidence. This
+is not an automatic-approval rejection. Full selected-session migration remains
+incomplete; its requirements are unchanged.
 
-Status: proposed, awaiting the user's managed-build preference. No custom Codex
-has been built, installed or connected to user sessions. This proposal does not
-relax the account-groups preservation contract or enable migration effects.
+Status: isolated source prototype in progress; distribution preference remains
+open. The [source patch and preparation tools](../../../patches/codex/README.md)
+connect a private read-only diagnostic socket to actual TUI App stores. Native
+compilation/tests remain pending. No custom Codex is installed or connected to
+user sessions. This does not relax preservation gates or enable migration effects.
 
 ## Why both sides are required
 

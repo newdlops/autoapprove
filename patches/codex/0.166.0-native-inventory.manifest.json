@@ -1,0 +1,65 @@
+{
+  "format": 1,
+  "upstreamCommit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+  "archiveSHA256": "f4693ca48d5b3ffaf7b13c3c490481c0d7a68ad29f945753fea9cc08a570db72",
+  "kind": "source-only-readonly-prototype",
+  "migrationAdmission": false,
+  "pins": {
+    "Cargo.lock": "22bd51f50864ce40f6686f3350c0547fdd50a8213240f54435ed394f68bf08e6",
+    "Cargo.toml": "4f9c16fb73cc8487e40dcbfca545f69e7595e6806e1a59b81ea8045b15364e49",
+    "rust-toolchain.toml": "570656042681cfd8795403a455baf9a33035331a07db0645e866bbcea89a3d64"
+  },
+  "files": [
+    {
+      "path": "tui/Cargo.toml",
+      "before": "1eb18f1181bf947cee297f229517e66f687f491cb7068979fc20f60b476b4ca8",
+      "after": "1deddf7313bbef13ecaaf5263b7988883cc3a3b97d6e1ccbe9ebeeb06624a4ec"
+    },
+    {
+      "path": "tui/src/lib.rs",
+      "before": "29707ceac6f1d8b206fe483153b3e083be7795e18ae9eee8e27720dc555806ba",
+      "after": "916fd0f889e631ccb6395f358a18edd9add113e48bbcee494ae0dbfd0347fc27"
+    },
+    {
+      "path": "tui/src/app.rs",
+      "before": "09941d72547d9addd5d9e650d66d0998296f4ccec380422762138442c5fe9746",
+      "after": "c18570f7e319d9c99d4d01cfaabe110005f48ea2d93169e6c2783d4541705763"
+    },
+    {
+      "path": "tui/src/app_event.rs",
+      "before": "c18323cd9ed311be071fff3af980b9e0046ca2864da33d668266488c139daf5a",
+      "after": "36c48efbb0ebe0df130ff7c82df1fe94b6cbe59a40b27816f844809189c08338"
+    },
+    {
+      "path": "tui/src/app/startup.rs",
+      "before": "42e4b0946b5d4b4684803d079299a1efb91e7067d55a14fda594fcc83da90793",
+      "after": "37cf946fe10e064c3de2503718c691347c1c7ec08d0d02ace0b08096650069bc"
+    },
+    {
+      "path": "tui/src/app/event_dispatch.rs",
+      "before": "a3aca35adfc72a7df1c9a3e3e84b161bcea5e3267f9a2cede681a5d547636e26",
+      "after": "8d36f72656eab84185acb306bfda916e12b95a527fc0e40d2c1536112b2d7049"
+    },
+    {
+      "path": "tui/src/app/agent_navigation.rs",
+      "before": "27895563f0a07c0f7a2d16f45454c81307bf67e1f972c690370b541f7f4453cf",
+      "after": "9d7598edbc92f6acf7dad1f1d6f76dc753a1c27332a748923eec9eeb4d82ea19"
+    },
+    {
+      "path": "tui/src/chatwidget/user_messages.rs",
+      "before": "509b543ada723b1e8abccfb6424369e7c54ea1053680aee786aa47df5f4523e0",
+      "after": "5f27ec5d7be1e66cafeabe67f55b21abfe669a3b303d3c51d0e5dbd769c3df72"
+    },
+    {
+      "path": "tui/src/native_inventory.rs",
+      "before": null,
+      "after": "28f5c64cf73d774dbd00ac8d7199adb6a86a4c38b6b386c4ec042be2e78ad24d"
+    },
+    {
+      "path": "tui/src/app/native_inventory.rs",
+      "before": null,
+      "after": "05d1ac870a33ba91d2b46f6cb940c634a3c85634b11a7f4e2e1c4733beac7249"
+    }
+  ],
+  "patchSHA256": "6705c959ce5123477ec45e576db7227faa4dd283a1757314b2a28fea977c409c"
+}

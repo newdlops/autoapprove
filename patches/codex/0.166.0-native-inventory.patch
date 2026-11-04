@@ -1,0 +1,526 @@
+--- a/tui/Cargo.toml
++++ b/tui/Cargo.toml
+@@ -20,6 +20,9 @@
+
+ [lints]
+ workspace = true
++
++[features]
++autoapprove-native-inventory = []
+
+ [dependencies]
+ codex-build-info = { workspace = true }
+--- a/tui/src/lib.rs
++++ b/tui/src/lib.rs
+@@ -136,6 +136,8 @@
+ mod daybreak;
+ mod experimental_features;
+ mod markdown_copy;
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++mod native_inventory;
+ mod permission_discovery;
+ mod pets;
+ mod security_setup;
+--- a/tui/src/app.rs
++++ b/tui/src/app.rs
+@@ -208,6 +208,8 @@
+ mod agents_overview_threads;
+ mod agents_overview_usage;
+ mod agents_overview_view;
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++mod native_inventory;
+ pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
+ mod activity_groups;
+ mod app_server_event_targets;
+--- a/tui/src/app_event.rs
++++ b/tui/src/app_event.rs
+@@ -295,6 +295,11 @@
+ #[allow(clippy::large_enum_variant)]
+ #[derive(Debug, IntoStaticStr)]
+ pub(crate) enum AppEvent {
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    AutoapproveInventoryRead {
++        nonce: String,
++        reply: tokio::sync::oneshot::Sender<serde_json::Value>,
++    },
+     AccountEmailLoaded {
+         request_id: uuid::Uuid,
+         email: Option<String>,
+--- a/tui/src/app/startup.rs
++++ b/tui/src/app/startup.rs
+@@ -313,6 +313,8 @@
+         }
+         let (app_event_tx, mut app_event_rx) = unbounded_channel();
+         let app_event_tx = AppEventSender::new(app_event_tx);
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let _native_inventory = crate::native_inventory::start(app_event_tx.clone())?;
+         if let Some(message) = project_config_warning(&config) {
+             app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                 history_cell::StartupWarningsCell::new(vec![message]),
+--- a/tui/src/app/event_dispatch.rs
++++ b/tui/src/app/event_dispatch.rs
+@@ -33,6 +33,14 @@
+         app_server: &mut AppServerSession,
+         event: AppEvent,
+     ) -> Result<AppRunControl> {
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let event = match event {
++            AppEvent::AutoapproveInventoryRead { nonce, reply } => {
++                let _ = reply.send(self.autoapprove_inventory(nonce));
++                return Ok(AppRunControl::Continue);
++            }
++            event => event,
++        };
+         let from_agents_overview = matches!(event, AppEvent::ForkAgentsOverviewThreadReady { .. });
+         let event = if let AppEvent::ForkAgentsOverviewThreadReady { thread_id } = event {
+             if self.current_displayed_thread_id() != Some(thread_id)
+@@ -167,6 +175,8 @@
+             event => (event, None),
+         };
+         match event {
++            #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++            AppEvent::AutoapproveInventoryRead {nonce, reply} => { let _ = reply.send(self.autoapprove_inventory(nonce)); },
+             AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
+             AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
+             AppEvent::RunDaemonRestart => {
+--- a/tui/src/app/agent_navigation.rs
++++ b/tui/src/app/agent_navigation.rs
+@@ -78,6 +78,27 @@
+ }
+
+ impl AgentNavigationState {
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(super) fn autoapprove_retained_ids(&self) -> Vec<String> {
++        let mut ids: Vec<_> = self
++            .threads
++            .keys()
++            .chain(self.order.iter())
++            .chain(self.stopped_threads.iter())
++            .chain(self.parent_owned_threads.iter())
++            .chain(self.picker_excluded_threads.iter())
++            .copied()
++            .collect();
++        if let Some(refresh) = &self.picker_refresh {
++            ids.push(refresh.root);
++            ids.extend(refresh.visibility_changed_threads.iter().copied());
++        }
++        let mut result: Vec<_> = ids.into_iter().map(|v| v.to_string()).collect();
++        result.sort();
++        result.dedup();
++        result
++    }
++
+     pub(crate) fn begin_picker_refresh(&mut self, thread_id: ThreadId) -> Option<Uuid> {
+         if self
+             .picker_refresh
+--- a/tui/src/chatwidget/user_messages.rs
++++ b/tui/src/chatwidget/user_messages.rs
+@@ -852,6 +852,24 @@
+ }
+
+ impl ThreadInputState {
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(crate) fn autoapprove_inventory_flags(&self) -> serde_json::Value {
++        serde_json::json!({
++            "hasDraft": self.composer.as_ref().is_some_and(ThreadComposerState::has_content),
++            "retainedQuestionState": self.questions.is_some(),
++            "startupInput": self.initial_user_message.is_some() || self.startup_submission.is_some(),
++            "queuedInput": !self.queued_user_messages.is_empty() || !self.rejected_steers_queue.is_empty(),
++            "pendingSteers": !self.pending_steers.is_empty(),
++            "unconfirmedInput": self.has_unconfirmed_messages(),
++            "pendingStart": self.user_turn_pending_start,
++            "taskRunning": self.task_running,
++            "agentTurnRunning": self.agent_turn_running,
++            "reconnectPending": self.reconnect_pending,
++            "protectedBuffer": self.safety_buffering_prompt.is_some(),
++            "settingsPending": self.pending_thread_settings.is_some()
++        })
++    }
++
+     pub(crate) fn has_unconfirmed_messages(&self) -> bool {
+         self.queued_user_messages
+             .iter()
+--- /dev/null
++++ b/tui/src/native_inventory.rs
+@@ -0,0 +1,201 @@
++//! Opt-in, local read-only prototype. Never an admission grant for migration.
++use crate::app_event::AppEvent;
++use crate::app_event_sender::AppEventSender;
++use serde::Deserialize;
++use serde_json::Value;
++use std::io;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::PermissionsExt;
++use std::path::PathBuf;
++use std::time::Duration;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::net::UnixListener;
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ReadRequest {
++    nonce: String,
++}
++
++pub(crate) struct InventoryServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++}
++
++impl Drop for InventoryServer {
++    fn drop(&mut self) {
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++fn private_parent(path: &std::path::Path) -> io::Result<()> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    Ok(())
++}
++
++pub(crate) fn start(events: AppEventSender) -> io::Result<Option<InventoryServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_INVENTORY_SOCKET") else {
++        return Ok(None);
++    };
++    start_at(PathBuf::from(path), events).map(Some)
++}
++
++fn start_at(path: PathBuf, events: AppEventSender) -> io::Result<InventoryServer> {
++    private_parent(&path)?;
++    // bind is exclusive: existing sockets, files and links are never replaced.
++    let listener = UnixListener::bind(&path)?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let task = tokio::spawn(async move {
++        loop {
++            let Ok((mut stream, _)) = listener.accept().await else {
++                break;
++            };
++            let Ok(peer) = stream.peer_cred() else {
++                continue;
++            };
++            if peer.uid() != unsafe { libc::geteuid() } {
++                continue;
++            }
++            // One bounded request at a time; no detached per-client task flood.
++            let _ = tokio::time::timeout(Duration::from_secs(2), async {
++                let mut line = String::new();
++                let mut reader = BufReader::new((&mut stream).take(1025));
++                reader.read_line(&mut line).await?;
++                if line.len() > 1024 || !line.ends_with('\n') {
++                    return Err::<(), io::Error>(io::ErrorKind::InvalidInput.into());
++                }
++                let request: ReadRequest = serde_json::from_str(&line)?;
++                if request.nonce.len() != 32
++                    || !request.nonce.bytes().all(|v| v.is_ascii_hexdigit())
++                {
++                    return Err(io::ErrorKind::InvalidInput.into());
++                }
++                let (reply, received) = oneshot::channel::<Value>();
++                // Bypass session logging: this is not user input or a Codex turn.
++                events
++                    .app_event_tx
++                    .send(AppEvent::AutoapproveInventoryRead {
++                        nonce: request.nonce,
++                        reply,
++                    })
++                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let response = received.await.map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let mut bytes = serde_json::to_vec(&response)?;
++                if bytes.len() > 1024 * 1024 {
++                    return Err(io::ErrorKind::InvalidData.into());
++                }
++                bytes.push(b'\n');
++                drop(reader);
++                stream.write_all(&bytes).await?;
++                stream.shutdown().await
++            })
++            .await;
++        }
++    });
++    Ok(InventoryServer {
++        task,
++        path,
++        identity,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn exclusive_private_socket_and_event_loop_nonce() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("inventory.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        let events = AppEventSender::new(tx);
++        let server = start_at(path.clone(), events.clone())?;
++        assert!(start_at(path.clone(), events).is_err());
++        assert_eq!(std::fs::symlink_metadata(&path)?.mode() & 0o777, 0o600);
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"0123456789abcdef0123456789abcdef\"}\n")
++            .await?;
++        let AppEvent::AutoapproveInventoryRead { nonce, reply } = rx.recv().await.unwrap() else {
++            panic!("unexpected event")
++        };
++        reply
++            .send(serde_json::json!({"nonce":nonce,"eligibleForMigration":false}))
++            .unwrap();
++        let mut line = String::new();
++        BufReader::new(socket).read_line(&mut line).await?;
++        assert_eq!(
++            serde_json::from_str::<Value>(&line)?["nonce"],
++            "0123456789abcdef0123456789abcdef"
++        );
++        drop(server);
++        assert!(!path.exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn rejects_public_or_linked_parent_without_touching_files() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        let actual = root.path().join("actual");
++        std::fs::create_dir(&actual)?;
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o755))?;
++        assert!(private_parent(&actual.join("i.sock")).is_err());
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o700))?;
++        let alias = root.path().join("alias");
++        std::os::unix::fs::symlink(&actual, &alias)?;
++        assert!(private_parent(&alias.join("i.sock")).is_err());
++        assert!(!actual.join("i.sock").exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn malformed_request_enqueues_nothing_and_existing_file_is_preserved()
++    -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("i.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        let events = AppEventSender::new(tx);
++        std::fs::write(&path, b"existing")?;
++        assert!(start_at(path.clone(), events.clone()).is_err());
++        assert_eq!(std::fs::read(&path)?, b"existing");
++        std::fs::remove_file(&path)?;
++        let server = start_at(path.clone(), events)?;
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"bad\",\"command\":\"run\"}\n")
++            .await?;
++        let mut bytes = Vec::new();
++        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes)).await??;
++        assert!(bytes.is_empty());
++        assert!(rx.try_recv().is_err());
++        std::fs::remove_file(&path)?;
++        std::fs::write(&path, b"replacement")?;
++        drop(server);
++        assert_eq!(std::fs::read(&path)?, b"replacement");
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/tui/src/app/native_inventory.rs
+@@ -0,0 +1,177 @@
++//! Event-loop snapshot of actual retained TUI state, with no text or auth export.
++use super::App;
++use codex_protocol::ThreadId;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::BTreeMap;
++
++fn ids(values: impl IntoIterator<Item = ThreadId>) -> Vec<String> {
++    let mut result: Vec<_> = values.into_iter().map(|v| v.to_string()).collect();
++    result.sort();
++    result.dedup();
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::app::side::SideThreadState;
++
++    #[tokio::test]
++    async fn includes_unsubscribed_navigation_side_parent_and_retained_draft_without_mutation() {
++        let mut app = crate::app::test_support::make_test_app().await;
++        let primary = ThreadId::new();
++        let offscreen = ThreadId::new();
++        let side = ThreadId::new();
++        let parked = ThreadId::new();
++        app.primary_thread_id = Some(primary);
++        app.active_thread_id = Some(primary);
++        app.agent_navigation.upsert(offscreen, None, None, false);
++        app.side_threads.insert(side, SideThreadState::new(primary));
++        app.chat_widget
++            .insert_str("PRIVATE DRAFT: must stay in the native widget");
++        let retained = app.chat_widget.capture_thread_input_state().unwrap();
++        app.agents_overview
++            .input_states
++            .insert(parked, retained.clone());
++        let before = app.chat_widget.composer_text_with_pending();
++        let value = app.autoapprove_inventory("0123456789abcdef0123456789abcdef".into());
++        assert_eq!(
++            value["stores"]["navigation"],
++            json!([offscreen.to_string()])
++        );
++        assert_eq!(value["stores"]["sideThreads"], json!([side.to_string()]));
++        assert_eq!(value["stores"]["sideParents"], json!([primary.to_string()]));
++        assert_eq!(
++            value["stores"]["overviewInput"],
++            json!([parked.to_string()])
++        );
++        assert_eq!(
++            value["retainedInputs"][parked.to_string()]["hasDraft"],
++            true
++        );
++        assert_eq!(value["currentWidget"]["hasDraft"], true);
++        assert_eq!(app.chat_widget.composer_text_with_pending(), before);
++        assert_eq!(app.agents_overview.input_states[&parked], retained);
++        assert!(!value.to_string().contains("PRIVATE DRAFT"));
++        assert!(app.thread_event_listener_tasks.is_empty());
++        assert_eq!(value["membershipComplete"], false);
++        assert_eq!(value["admissionGranted"], false);
++    }
++}
++
++impl App {
++    pub(super) fn autoapprove_inventory(&self, nonce: String) -> Value {
++        let mut stores = BTreeMap::<&str, Vec<String>>::new();
++        stores.insert("primary", ids(self.primary_thread_id));
++        stores.insert("active", ids(self.active_thread_id));
++        stores.insert("displayedWidget", ids(self.chat_widget.thread_id()));
++        stores.insert("channels", ids(self.thread_event_channels.keys().copied()));
++        stores.insert(
++            "listeners",
++            ids(self.thread_event_listener_tasks.keys().copied()),
++        );
++        stores.insert(
++            "navigation",
++            self.agent_navigation.autoapprove_retained_ids(),
++        );
++        stores.insert("sideThreads", ids(self.side_threads.keys().copied()));
++        stores.insert(
++            "sideParents",
++            ids(self.side_threads.values().map(|v| v.parent_thread_id)),
++        );
++        stores.insert(
++            "abandonedSides",
++            ids(self.abandoned_side_threads.iter().copied()),
++        );
++        stores.insert(
++            "speechReplay",
++            ids(self.pending_realtime_speech_replay.keys().copied()),
++        );
++        stores.insert(
++            "transcriptReplay",
++            ids(self.pending_realtime_transcript_replay.keys().copied()),
++        );
++        stores.insert(
++            "replayOrder",
++            ids(self.realtime_replay_order.iter().copied()),
++        );
++        stores.insert(
++            "backgroundVoice",
++            ids(self.background_voice.as_ref().and_then(|v| v.thread_id())),
++        );
++        stores.insert(
++            "backgroundVoiceError",
++            ids(self.background_voice_error.as_ref().map(|v| v.0)),
++        );
++        stores.insert(
++            "temporaryRequests",
++            ids(self.temporary_structured_requests.keys().copied()),
++        );
++        stores.insert(
++            "pendingTitles",
++            ids(self.pending_thread_titles.keys().map(|v| v.0)),
++        );
++        stores.insert(
++            "overviewInput",
++            ids(self.agents_overview.input_states.keys().copied()),
++        );
++        stores.insert(
++            "overviewBlankSessions",
++            ids(self.agents_overview.blank_sessions.keys().copied()),
++        );
++        stores.insert(
++            "overviewRequests",
++            ids(self.agents_overview.dispatched_requests.keys().copied()),
++        );
++        stores.insert(
++            "pendingProfiles",
++            ids(self.pending_server_profiles.keys().copied()),
++        );
++        // Catalog references are deliberately distinct from routing/input ownership.
++        stores.insert(
++            "catalogReferences",
++            ids(self.agents_overview.threads.keys().copied()),
++        );
++        let retained_inputs: BTreeMap<_, _> = self
++            .agents_overview
++            .input_states
++            .iter()
++            .map(|(id, state)| (id.to_string(), state.autoapprove_inventory_flags()))
++            .collect();
++        json!({
++            "schemaVersion": 1,
++            "producer": "autoapprove-native-tui-prototype",
++            "upstreamCommit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
++            "cliVersion": env!("CARGO_PKG_VERSION"),
++            "pid": std::process::id(),
++            "nonce": nonce,
++            "stores": stores,
++            "retainedInputs": retained_inputs,
++            "currentWidget": {
++                "hasDraft": !self.chat_widget.composer_is_empty(),
++                "hasProtectedRequest": self.chat_widget.has_pending_protected_request(),
++                "hasQueuedInput": self.chat_widget.has_queued_follow_up_messages(),
++                "hasActiveView": self.chat_widget.has_active_view()
++            },
++            "pending": {
++                "voiceOwner": self.background_voice.is_some(),
++                "primaryEvents": !self.pending_primary_events.is_empty(),
++                "threadSwitches": self.pending_thread_switch_resets,
++                "dynamicTools": self.dynamic_tool_tasks.len(),
++                "startupThread": self.pending_startup_thread_start,
++                "resumePicker": self.pending_open_resume_picker,
++                "workingDirectory": self.pending_working_directory_change.is_some(),
++                "worktreeStart": self.pending_start_managed_worktree.is_some(),
++                "worktreeCreation": self.pending_managed_worktree_creation,
++                "worktreeCreated": self.pending_managed_worktree_created.is_some(),
++                "worktreeTransition": self.pending_managed_worktree_transition.is_some(),
++                "worktreeAttach": self.pending_managed_worktree_attach.is_some(),
++                "newSessionDraft": self.agents_overview.new_session_draft.is_some()
++            },
++            "membershipComplete": false,
++            "admissionGranted": false,
++            "limitations": ["daemon-peer-census-required", "revision-and-admission-barrier-required", "full-preservation-export-required"]
++        })
++    }
++}
