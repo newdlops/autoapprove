@@ -1,26 +1,33 @@
 --- a/app-server/Cargo.toml
 +++ b/app-server/Cargo.toml
-@@ -20,6 +20,9 @@
- name = "codex_app_server"
+@@ -21,10 +21,15 @@
  path = "src/lib.rs"
  doctest = false
-+
-+[features]
-+autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
 
++[features]
++autoapprove-native-transition = ["autoapprove-native-inventory", "dep:codex-uds"]
++autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
++
  [lints]
  workspace = true
+
+ [dependencies]
++codex-uds = { workspace = true, optional = true }
+ codex-utils-process = { workspace = true }
+ anyhow = { workspace = true }
+ base64 = { workspace = true }
 --- a/app-server/src/lib.rs
 +++ b/app-server/src/lib.rs
-@@ -105,6 +105,7 @@
+@@ -105,6 +105,8 @@
  mod codex_home_metrics;
  mod command_exec;
  mod config_layer;
 +mod native_inventory;
++mod native_transition;
  mod startup_config;
  pub use startup_config::StartupConfigArgs;
  pub use startup_config::print_startup_config;
-@@ -1041,6 +1042,16 @@
+@@ -1041,12 +1043,36 @@
          let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
          let mut active_admissions_rx = processor.turn_admission.subscribe_active();
          let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
@@ -34,10 +41,30 @@
 +            .as_ref()
 +            .map(|_| uuid::Uuid::now_v7().to_string())
 +            .unwrap_or_default();
++        let native_transition_server = if native_inventory_generation.is_empty() {
++            None
++        } else {
++            native_transition::start(
++                processor.turn_admission.clone(),
++                native_inventory_generation.clone(),
++            )
++            .await
++            .unwrap_or_else(|error| {
++                warn!(%error, "native transition socket unavailable");
++                None
++            })
++        };
          let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
          let mut thread_listener_tasks = tokio::task::JoinSet::new();
          let mut remote_control_status_rx = remote_control_handle.status_receiver();
-@@ -1113,6 +1124,14 @@
+         let mut remote_control_status = remote_control_status_rx.borrow().clone();
+         let transport_shutdown_token = transport_shutdown_token.clone();
+         async move {
++            let _native_transition_server = native_transition_server;
+             let recovery_task = if managed_daemon {
+                 match daemon_thread_recovery::start_recovery(
+                     recovery_file.clone(),
+@@ -1113,6 +1139,14 @@
                  }
 
                  tokio::select! {
@@ -52,7 +79,7 @@
                      _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
                          snapshot_finished = true;
                      }
-@@ -1192,6 +1211,11 @@
+@@ -1192,6 +1226,11 @@
                                          outbound_opted_out_notification_methods,
                                      ),
                                  );
@@ -494,6 +521,497 @@
 +        Ok(())
 +    }
 +}
+--- /dev/null
++++ b/app-server/src/native_transition.rs
+@@ -0,0 +1,26 @@
++//! Separately enabled, whole-server runtime-start lease. No login or migration.
++use crate::turn_admission::TurnAdmission;
++use std::io;
++
++#[cfg(all(feature = "autoapprove-native-transition", unix))]
++#[path = "native_transition_transport.rs"]
++mod transport;
++#[cfg(all(feature = "autoapprove-native-transition", unix))]
++pub(crate) use transport::TransitionServer;
++#[cfg(not(all(feature = "autoapprove-native-transition", unix)))]
++pub(crate) struct TransitionServer;
++
++pub(crate) async fn start(
++    admission: TurnAdmission,
++    generation: String,
++) -> io::Result<Option<TransitionServer>> {
++    #[cfg(all(feature = "autoapprove-native-transition", unix))]
++    {
++        transport::start(admission, generation).await
++    }
++    #[cfg(not(all(feature = "autoapprove-native-transition", unix)))]
++    {
++        drop((admission, generation));
++        Ok(None)
++    }
++}
+--- /dev/null
++++ b/app-server/src/native_transition_transport.rs
+@@ -0,0 +1,459 @@
++use crate::turn_admission::TurnAdmission;
++use codex_app_server_transport::NativePeerIdentity;
++use codex_app_server_transport::native_unix_peer_identity;
++use codex_uds::UnixStream;
++use serde::Deserialize;
++use serde_json::Value;
++use serde_json::json;
++use std::io;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::PermissionsExt;
++use std::path::PathBuf;
++use std::time::Duration;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncRead;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWrite;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::task::JoinHandle;
++use tokio::task::JoinSet;
++use tokio::time::Instant;
++
++const SCOPE: &str = "server-all-runtimes";
++const LEASE_TTL: Duration = Duration::from_secs(30);
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct Request {
++    op: String,
++    nonce: String,
++    server_generation: String,
++    scope: String,
++    lease_id: Option<String>,
++}
++
++pub(crate) struct TransitionServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++}
++
++impl Drop for TransitionServer {
++    fn drop(&mut self) {
++        // Dropping the accept task drops its JoinSet and every owned pause guard.
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++pub(super) async fn start(
++    admission: TurnAdmission,
++    generation: String,
++) -> io::Result<Option<TransitionServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_TRANSITION_SOCKET") else {
++        return Ok(None);
++    };
++    start_at(PathBuf::from(path), admission, generation, LEASE_TTL)
++        .await
++        .map(Some)
++}
++
++async fn start_at(
++    path: PathBuf,
++    admission: TurnAdmission,
++    generation: String,
++    ttl: Duration,
++) -> io::Result<TransitionServer> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++        || uuid::Uuid::parse_str(&generation).is_err()
++        || codex_app_server_transport::native_current_process_identity().is_none()
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    let mut listener = codex_uds::UnixListener::bind(&path).await?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let task = tokio::spawn(async move {
++        let mut connections = JoinSet::new();
++        loop {
++            tokio::select! {
++                accepted = listener.accept() => {
++                    let Ok(stream) = accepted else { break; };
++                    // Bound private clients, including a waiting prepare request.
++                    if connections.len() >= 4 { continue; }
++                    let Some(peer) = native_unix_peer_identity(&stream) else { continue; };
++                    if peer.effective_uid != unsafe { libc::geteuid() } { continue; }
++                    let admission = admission.clone();
++                    let generation = generation.clone();
++                    connections.spawn(async move {
++                        let _ = session(stream, peer, admission, generation, ttl).await;
++                    });
++                }
++                _ = connections.join_next(), if !connections.is_empty() => {}
++            }
++        }
++    });
++    Ok(TransitionServer {
++        task,
++        path,
++        identity,
++    })
++}
++
++async fn request<R: AsyncRead + Unpin>(
++    reader: &mut BufReader<R>,
++    duration: Duration,
++    generation: &str,
++) -> io::Result<Request> {
++    let mut line = String::new();
++    tokio::time::timeout(duration, (&mut *reader).take(2049).read_line(&mut line))
++        .await
++        .map_err(|_| io::ErrorKind::TimedOut)??;
++    if line.len() > 2048 || !line.ends_with('\n') {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    let value: Request = serde_json::from_str(&line)?;
++    if value.nonce.len() != 32
++        || !value.nonce.bytes().all(|v| v.is_ascii_hexdigit())
++        || value.server_generation != generation
++        || value.scope != SCOPE
++    {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    Ok(value)
++}
++
++async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) -> io::Result<()> {
++    let mut bytes = serde_json::to_vec(&value)?;
++    bytes.push(b'\n');
++    tokio::time::timeout(Duration::from_secs(2), writer.write_all(&bytes))
++        .await
++        .map_err(|_| io::ErrorKind::TimedOut)??;
++    Ok(())
++}
++
++fn reply(
++    request: &Request,
++    peer: NativePeerIdentity,
++    lease: &str,
++    paused: bool,
++    ttl: Duration,
++) -> Value {
++    json!({
++        "schemaVersion":1,"producer":"autoapprove-native-transition-prototype",
++        "nonce":request.nonce,"serverGeneration":request.server_generation,
++        "pid":std::process::id(),"owner":peer,"scope":SCOPE,"leaseID":lease,
++        "runtimeStartPauseHeld":paused,"leaseActive":paused,"leaseTTLMillis":ttl.as_millis() as u64,
++        "existingWorkStopped":false,"goalLifecycleManaged":false,
++        "credentialsTouched":false,"migrationAuthorized":false
++    })
++}
++
++async fn session(
++    stream: UnixStream,
++    peer: NativePeerIdentity,
++    admission: TurnAdmission,
++    generation: String,
++    ttl: Duration,
++) -> io::Result<()> {
++    let (read, mut writer) = tokio::io::split(stream);
++    let mut reader = BufReader::new(read);
++    let first = request(&mut reader, Duration::from_secs(2), &generation).await?;
++    if first.op != "pause" || first.lease_id.is_some() {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    // EOF or pipelined input before the prepare ACK cancels a waiting pause.
++    let pause = tokio::select! {
++        result = admission.pause() => result,
++        _ = reader.fill_buf() => return Err(io::ErrorKind::ConnectionAborted.into()),
++    };
++    let Ok(pause) = pause else {
++        send(
++            &mut writer,
++            json!({"nonce":first.nonce,"error":"runtime-admission-unavailable"}),
++        )
++        .await?;
++        return Ok(());
++    };
++    let lease = uuid::Uuid::now_v7().to_string();
++    send(&mut writer, reply(&first, peer, &lease, true, ttl)).await?;
++    let mut deadline = Instant::now() + ttl;
++    loop {
++        if Instant::now() >= deadline {
++            return Err(io::ErrorKind::TimedOut.into());
++        }
++        let next = request(
++            &mut reader,
++            deadline.saturating_duration_since(Instant::now()),
++            &generation,
++        )
++        .await?;
++        // A ready buffered read can beat Tokio's elapsed timer. Never let an
++        // already-expired lease be renewed or treated as a live status reply.
++        if Instant::now() >= deadline {
++            return Err(io::ErrorKind::TimedOut.into());
++        }
++        if next.lease_id.as_deref() != Some(&lease) {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        match next.op.as_str() {
++            "renew" => {
++                deadline = Instant::now() + ttl;
++            }
++            "status" => {}
++            "release" => {
++                drop(pause);
++                send(&mut writer, reply(&next, peer, &lease, false, ttl)).await?;
++                return Ok(());
++            }
++            _ => return Err(io::ErrorKind::InvalidInput.into()),
++        }
++        send(&mut writer, reply(&next, peer, &lease, true, ttl)).await?;
++    }
++}
++
++#[cfg(all(test, target_os = "macos"))]
++mod tests {
++    use super::*;
++
++    async fn fixture(
++        ttl: Duration,
++    ) -> (
++        tempfile::TempDir,
++        PathBuf,
++        String,
++        TurnAdmission,
++        TransitionServer,
++    ) {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("transition.sock");
++        let generation = uuid::Uuid::now_v7().to_string();
++        let admission = TurnAdmission::default();
++        let server = start_at(path.clone(), admission.clone(), generation.clone(), ttl)
++            .await
++            .unwrap();
++        (root, path, generation, admission, server)
++    }
++
++    async fn command(
++        client: &mut BufReader<tokio::net::UnixStream>,
++        generation: &str,
++        op: &str,
++        lease: Option<&str>,
++    ) -> Value {
++        let mut data =
++            serde_json::to_vec(&json!({"op":op,"nonce":"0123456789abcdef0123456789abcdef",
++            "serverGeneration":generation,"scope":SCOPE,"leaseId":lease}))
++            .unwrap();
++        data.push(b'\n');
++        client.get_mut().write_all(&data).await.unwrap();
++        let mut line = String::new();
++        tokio::time::timeout(Duration::from_secs(2), client.read_line(&mut line))
++            .await
++            .unwrap()
++            .unwrap();
++        serde_json::from_str(&line).unwrap()
++    }
++
++    async fn client(path: &std::path::Path) -> BufReader<tokio::net::UnixStream> {
++        BufReader::new(tokio::net::UnixStream::connect(path).await.unwrap())
++    }
++
++    async fn restored(admission: &TurnAdmission) {
++        for _ in 0..100 {
++            if admission.admit().is_ok() {
++                return;
++            }
++            tokio::time::sleep(Duration::from_millis(2)).await;
++        }
++        panic!("owned runtime admission was not restored");
++    }
++
++    #[tokio::test]
++    async fn pause_is_exclusive_renewable_and_released_without_other_server_effects() {
++        let (_root, path, generation, admission, _server) = fixture(LEASE_TTL).await;
++        let other = TurnAdmission::default();
++        let mut first = client(&path).await;
++        let paused = command(&mut first, &generation, "pause", None).await;
++        assert_eq!(paused["runtimeStartPauseHeld"], true);
++        assert_eq!(paused["owner"]["pid"], std::process::id());
++        assert_eq!(paused["existingWorkStopped"], false);
++        assert_eq!(paused["goalLifecycleManaged"], false);
++        assert_eq!(paused["credentialsTouched"], false);
++        assert_eq!(paused["migrationAuthorized"], false);
++        assert!(admission.admit().is_err());
++        assert!(other.admit().is_ok());
++        let mut second = client(&path).await;
++        let busy = command(&mut second, &generation, "pause", None).await;
++        assert_eq!(busy["error"], "runtime-admission-unavailable");
++        let lease = paused["leaseID"].as_str().unwrap();
++        assert_eq!(
++            command(&mut first, &generation, "renew", Some(lease)).await["runtimeStartPauseHeld"],
++            true
++        );
++        assert_eq!(
++            command(&mut first, &generation, "release", Some(lease)).await["runtimeStartPauseHeld"],
++            false
++        );
++        restored(&admission).await;
++    }
++
++    #[tokio::test]
++    async fn dropped_owner_and_server_each_restore_admission() {
++        let (_root, path, generation, admission, server) = fixture(LEASE_TTL).await;
++        let mut owner = client(&path).await;
++        command(&mut owner, &generation, "pause", None).await;
++        drop(owner);
++        restored(&admission).await;
++        let mut owner = client(&path).await;
++        command(&mut owner, &generation, "pause", None).await;
++        drop(server);
++        restored(&admission).await;
++        assert!(!path.exists());
++    }
++
++    #[tokio::test]
++    async fn expiry_and_wrong_lease_do_not_leave_a_pause() {
++        let (_root, path, generation, admission, _server) =
++            fixture(Duration::from_millis(40)).await;
++        let mut owner = client(&path).await;
++        command(&mut owner, &generation, "pause", None).await;
++        restored(&admission).await;
++        let mut owner = client(&path).await;
++        command(&mut owner, &generation, "pause", None).await;
++        let data = json!({"op":"release","nonce":"0123456789abcdef0123456789abcdef",
++            "serverGeneration":generation,"scope":SCOPE,"leaseId":"another-owner"})
++        .to_string()
++            + "\n";
++        owner.get_mut().write_all(data.as_bytes()).await.unwrap();
++        restored(&admission).await;
++    }
++
++    #[tokio::test]
++    async fn stale_generation_and_selected_scope_are_rejected_before_pause() {
++        let (_root, path, generation, admission, _server) = fixture(LEASE_TTL).await;
++        for (selected_generation, scope) in
++            [("stale", SCOPE), (generation.as_str(), "selected-clients")]
++        {
++            let mut owner = client(&path).await;
++            let data = json!({"op":"pause","nonce":"0123456789abcdef0123456789abcdef",
++                "serverGeneration":selected_generation,"scope":scope})
++            .to_string()
++                + "\n";
++            owner.get_mut().write_all(data.as_bytes()).await.unwrap();
++            let mut line = String::new();
++            assert_eq!(owner.read_line(&mut line).await.unwrap(), 0);
++            assert!(admission.admit().is_ok());
++        }
++    }
++
++    #[tokio::test]
++    async fn waiting_prepare_does_not_ack_until_earlier_start_permit_is_released() {
++        let (_root, path, generation, admission, _server) = fixture(LEASE_TTL).await;
++        let permit = admission.admit().unwrap();
++        let mut owner = client(&path).await;
++        let data = json!({"op":"pause","nonce":"0123456789abcdef0123456789abcdef",
++            "serverGeneration":generation,"scope":SCOPE})
++        .to_string()
++            + "\n";
++        owner.get_mut().write_all(data.as_bytes()).await.unwrap();
++        let mut line = String::new();
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), owner.read_line(&mut line))
++                .await
++                .is_err()
++        );
++        drop(permit);
++        owner.read_line(&mut line).await.unwrap();
++        assert_eq!(
++            serde_json::from_str::<Value>(&line).unwrap()["runtimeStartPauseHeld"],
++            true
++        );
++        drop(owner);
++        restored(&admission).await;
++    }
++
++    #[tokio::test]
++    async fn existing_paths_and_public_parents_are_preserved() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        let path = root.path().join("existing");
++        std::fs::write(&path, b"keep").unwrap();
++        let generation = uuid::Uuid::now_v7().to_string();
++        assert!(
++            start_at(
++                path.clone(),
++                TurnAdmission::default(),
++                generation.clone(),
++                LEASE_TTL
++            )
++            .await
++            .is_err()
++        );
++        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
++        assert!(
++            start_at(
++                root.path().join("new"),
++                TurnAdmission::default(),
++                generation,
++                LEASE_TTL
++            )
++            .await
++            .is_err()
++        );
++        assert!(!root.path().join("new").exists());
++    }
++
++    #[tokio::test]
++    async fn expired_buffered_renewal_cannot_resurrect_a_lease() {
++        let (_root, path, generation, admission, _server) =
++            fixture(Duration::from_millis(40)).await;
++        let mut owner = client(&path).await;
++        let paused = command(&mut owner, &generation, "pause", None).await;
++        // Delay this owned current-thread runtime so socket readiness and an
++        // elapsed timeout can become ready together, with a renewal buffered.
++        std::thread::sleep(Duration::from_millis(70));
++        let data = json!({"op":"renew","nonce":"0123456789abcdef0123456789abcdef",
++            "serverGeneration":generation,"scope":SCOPE,"leaseId":paused["leaseID"]})
++        .to_string()
++            + "\n";
++        let _ = owner.get_mut().write_all(data.as_bytes()).await;
++        let mut line = String::new();
++        assert_eq!(owner.read_line(&mut line).await.unwrap(), 0);
++        restored(&admission).await;
++    }
++
++    #[tokio::test]
++    async fn owner_loss_cancels_a_waiting_prepare_before_earlier_permit_finishes() {
++        let (_root, path, generation, admission, _server) = fixture(LEASE_TTL).await;
++        let _permit = admission.admit().unwrap();
++        let mut owner = client(&path).await;
++        let data = json!({"op":"pause","nonce":"0123456789abcdef0123456789abcdef",
++            "serverGeneration":generation,"scope":SCOPE})
++        .to_string()
++            + "\n";
++        owner.get_mut().write_all(data.as_bytes()).await.unwrap();
++        for _ in 0..100 {
++            if admission.admit().is_err() {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(2)).await;
++        }
++        assert!(admission.admit().is_err());
++        drop(owner);
++        restored(&admission).await;
++    }
++}
 --- a/app-server/src/transport.rs
 +++ b/app-server/src/transport.rs
 @@ -37,6 +37,7 @@
@@ -565,19 +1083,20 @@
  workspace = true
 --- a/app-server-transport/src/lib.rs
 +++ b/app-server-transport/src/lib.rs
-@@ -8,6 +8,9 @@
+@@ -8,6 +8,10 @@
  /// Only managed app-server launches accept the local socket shutdown request.
  pub const DAEMON_SHUTDOWN_SOCKET_ENV: &str = "CODEX_DAEMON_SHUTDOWN_SOCKET";
  mod connection_auth;
 +mod native_peer;
 +pub use native_peer::NativePeerIdentity;
 +pub use native_peer::native_current_process_identity;
++pub use native_peer::native_unix_peer_identity;
  mod outgoing_message;
  mod transport;
  mod websocket_compression;
 --- /dev/null
 +++ b/app-server-transport/src/native_peer.rs
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,147 @@
 +//! Kernel process-instance identity. Never infer it from initialize metadata.
 +use serde::Serialize;
 +
@@ -600,6 +1119,10 @@
 +    {
 +        None
 +    }
++}
++
++pub fn native_unix_peer_identity(stream: &codex_uds::UnixStream) -> Option<NativePeerIdentity> {
++    capture(stream)
 +}
 +
 +pub(crate) fn capture(stream: &codex_uds::UnixStream) -> Option<NativePeerIdentity> {

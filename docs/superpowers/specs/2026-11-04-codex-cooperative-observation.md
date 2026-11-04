@@ -90,7 +90,7 @@ direct daemon peers match the TUI self identity and independently read kernel
 credentials on its private socket; forwarded connections correctly identify the
 proxy process rather than either named TUI. Both preserve two/one/two subscriber
 counts, exact draft return and all 19 original controller identities after cleanup.
-The overlay is now reproduced as 28 unique final postimages in two checked phases.
+The overlay is now reproduced as 30 unique final postimages in two checked phases.
 Even successful peer capture leaves `clientInventoryBound`, consistency,
 completeness and admission ungranted until the remaining bindings are implemented.
 
@@ -204,3 +204,21 @@ round-trip migration and release verification remain required.
   credentials and the installed app unchanged.
 - Separate tests prove preparation barriers and subsequent preservation effects;
   census tests alone cannot authorize those effects.
+
+
+## Separately enabled runtime-start control prototype
+
+A private, native-credential-bound server lease can hold the real TurnAdmission
+pause guard without blocking the main RPC loop. This is explicitly separate from
+read-only observation and requires the optional `autoapprove-native-transition`
+feature and `AUTOAPPROVE_NATIVE_TRANSITION_SOCKET`. Its only scope is the whole
+server's runtime starts; no selected-client pause is claimed. Disconnect, teardown,
+expiry and invalid requests release the guard. Buffered renewals after the
+monotonic expiry cannot resurrect it, and controller loss cancels a pending pause.
+
+Existing work and active Goals require separate native Goal pause and turn
+interrupt calls. The lease neither changes credentials nor transfers ownership
+of browser authentication callbacks. Full account switching still requires
+verified quiescence, official auth invalidations, exact Goal state preservation,
+resume-once coordination and real account/SSO verification. Selected merge/split
+also requires the full native ownership cohort and persistent mappings.

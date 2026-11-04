@@ -2,18 +2,31 @@
   "format": 1,
   "upstreamCommit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
   "requiresInventoryPatchSHA256": "6705c959ce5123477ec45e576db7227faa4dd283a1757314b2a28fea977c409c",
-  "kind": "source-only-readonly-server-prototype",
+  "kind": "source-only-server-prototype",
   "migrationAdmission": false,
+  "runtimeStartControl": {
+    "feature": "autoapprove-native-transition",
+    "endpointEnvironment": "AUTOAPPROVE_NATIVE_TRANSITION_SOCKET",
+    "scope": "server-all-runtimes",
+    "operations": [
+      "pause",
+      "status",
+      "renew",
+      "release"
+    ],
+    "changesCredentials": false,
+    "managesGoalLifecycle": false
+  },
   "files": [
     {
       "path": "app-server/Cargo.toml",
       "before": "cceb3af7ee41633a33b14f55f1193b32fc75afb830c0dfa22393cf24af3d6f3d",
-      "after": "6ca457cb10a22130b705c2f12d7c8d8ffac71f97f75ef7d72cb16eefd010923a"
+      "after": "9deb84fb40211f8be5b23363a3478ac56a90d5226ff3a4a364213a775aec095d"
     },
     {
       "path": "app-server/src/lib.rs",
       "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
-      "after": "d0457c9582cc69f693ebec83aa506be22ef3153b7faf31c7f4e1db448eb463bc"
+      "after": "19419b72dfe731025cdc5ff734cb17e074bb682b1380bf3089792140d9ee0658"
     },
     {
       "path": "app-server/src/message_processor.rs",
@@ -34,6 +47,16 @@
       "path": "app-server/src/native_inventory_transport.rs",
       "before": null,
       "after": "b3622a3bbea952e3ea522d14e7ded28be689f86e38354d2208b7a95bcf2a095f"
+    },
+    {
+      "path": "app-server/src/native_transition.rs",
+      "before": null,
+      "after": "c8c5df5afdd9bce99628833166fd011e92e48d4c4d695362babcc9b87be3e963"
+    },
+    {
+      "path": "app-server/src/native_transition_transport.rs",
+      "before": null,
+      "after": "31672cc50fbe019de3d39b6cd3c7d5ef8be29eca7dd01f25e60c14f11392e140"
     },
     {
       "path": "app-server/src/transport.rs",
@@ -63,12 +86,12 @@
     {
       "path": "app-server-transport/src/lib.rs",
       "before": "748b9972623b8aeaca5dfd95540591edd27213b38c98662f250672153e9877c1",
-      "after": "cfceab426794198e1ab14258af5532a6db4390f210fcd31a345e2da958de0c2f"
+      "after": "85621358ea5d5dc1ef7bca174d22162e44f06f283e0441cac0c13a79192b5698"
     },
     {
       "path": "app-server-transport/src/native_peer.rs",
       "before": null,
-      "after": "d5d215c6ea658e65f90df975b1ef32b0c9786b267ca51996da5c32a8a6c2f442"
+      "after": "ed5c3ea69659b72e7578b0bb568e9a92a2698f7dcf7b805555ee07a707bb554f"
     },
     {
       "path": "app-server-transport/src/transport/mod.rs",
@@ -106,5 +129,5 @@
       "after": "ef12807812af175dbdf2034f77c7fef22134f4d3199de22365ce82ea3ddac66f"
     }
   ],
-  "patchSHA256": "40630071efa2a97f1966818c55d3233d9ffa2362928964f87fbb782cb6f9b5db"
+  "patchSHA256": "0ad66fc86d5b4005d481cc8ad2a903fa4b976ad8c61c6084532b41fd3ef71ad3"
 }

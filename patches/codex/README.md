@@ -171,7 +171,7 @@ No production feature completion follows from this diagnostic prototype.
 ## Optional native server observation
 
 `0.166.0-native-server-inventory.patch` adds a separate, opt-in server producer.
-Prepare both patches with `--with-server-inventory`; preparation verifies all 28
+Prepare both patches with `--with-server-inventory`; preparation verifies all 30
 final source postimages, the two patch digests and the same local-only lock correction.
 The server overlay extends two TUI files after checking their exact TUI-phase
 postimages. The original source and all other preimages remain pinned separately.
@@ -262,3 +262,42 @@ preserve license material before any distribution.
 
 Upstream source context in the patch is from OpenAI's Apache-2.0 licensed Codex;
 the unmodified upstream license and notice are preserved alongside this patch.
+
+### Runtime-start pause lease (separate optional control)
+
+The server overlay also contains an explicitly enabled control endpoint. It is
+separate from both read-only inventory sockets. Building with
+`codex-app-server/autoapprove-native-transition` and setting
+`AUTOAPPROVE_NATIVE_TRANSITION_SOCKET` enables it; default builds do not.
+The endpoint requires an owner-only parent, native same-user kernel credentials,
+the exact server generation and `server-all-runtimes` scope. It supports only
+`pause`, `status`, `renew` and `release`, with a connection-bound lease and a
+30-second monotonic expiry. Owner loss, server teardown and invalid or expired
+requests release the pause. A second owner cannot acquire the existing lease.
+
+This holds the actual server's runtime-start admission guard. Existing work
+continues until explicitly stopped; Goal status, credentials and accounts are
+not changed by the endpoint. It does not authorize selected-session migration,
+provide a complete census, or prove callback/SSO quiescence. Different native
+server instances have independent admission guards. Eight native lease tests
+and five inventory tests passed; an upstream auth-revision proof regression also
+passed with an explicit 32 MiB Rust test stack. The initial broader filter run
+failed from stack overflow and is not a successful verification.
+
+Both source patches reproduce 30 final postimages from the pinned upstream tree;
+the local-version-only lock normalization still changes 170 entries with no
+external dependency changes. Live control verification is recorded separately
+from these source and unit checks.
+
+The full CLI and standalone TUI built with the transition feature enabled and
+`--locked`. The owned two-TUI live fixture then passed with `--server-inventory
+--direct-server --navigation --peer-cli=... --admission`: new runtime starts
+were rejected while the lease was held, an existing active Goal required an
+explicit native Goal pause and turn interrupt, and its exposed paused Goal
+fields remained unchanged after release. A separate real backend and its Goal
+were unaffected. The original TUI's exact unsent draft survived a fresh repaint
+after the whole sequence; native subscriber counts remained two/one/two across
+navigation. All 19 original user session identities survived fixture cleanup.
+Five loopback synthetic inference requests were served; rejected input never
+reached the provider. This proves the owned pause/interrupt sequence, not a real
+credential switch, exact full persistent Goal row preservation, or resume-once.

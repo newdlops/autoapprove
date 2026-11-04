@@ -39,6 +39,7 @@ parser.add_argument('--peer-cli', help='Optional patched full CLI for a second o
 parser.add_argument('--server-inventory', action='store_true', help='Require the patched server native observation socket')
 parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
 parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
+parser.add_argument('--admission', action='store_true', help='Verify separately enabled whole-server runtime-start lease')
 args = parser.parse_args()
 assert not args.navigation or args.server, 'Navigation requires the owned shared server'
 assert not args.return_via_resume or args.navigation, 'Direct return requires navigation'
@@ -46,6 +47,7 @@ assert not args.peer_cli or args.navigation, 'A shared peer requires the owned n
 assert not args.server_inventory or args.server, 'Server observation requires the owned server'
 assert not args.direct_server or args.server_inventory, 'Direct peer validation requires server inventory'
 assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
+assert not args.admission or (args.direct_server and args.navigation), 'Admission test requires direct native server binding and navigation'
 tui = pathlib.Path(args.tui).resolve(strict=True)
 assert tui.name == 'codex-tui', 'Only the explicitly built standalone test TUI is allowed'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -70,7 +72,9 @@ fixture_home.mkdir(mode=0o700)
 work.mkdir(mode=0o700)
 endpoint = fixture/'inventory.sock'
 server_endpoint = fixture/'server-inventory.sock'
+transition_endpoint = fixture/'transition.sock'
 counts = {'inference': 0, 'externalBlocked': 0}
+admission_stream_stop = threading.Event()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *unused):
@@ -92,8 +96,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        request_body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
         counts['inference'] += 1
+        if b'OWNED_REJECTED_ADMISSION_TASK' in request_body:
+            counts['rejectedAdmissionInputs'] = counts.get('rejectedAdmissionInputs', 0)+1
         if args.navigation:
             rid = 'owned-inventory-response-'+str(counts['inference'])
             item = {'id': rid+'-message', 'type': 'message', 'role': 'assistant', 'status': 'completed',
@@ -107,6 +113,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Connection', 'close')
             self.end_headers()
+            if args.admission and b'OWNED_ADMISSION_ACTIVE_TASK' in request_body:
+                counts['heldAdmissionRequests'] = counts.get('heldAdmissionRequests', 0)+1
+                live = [{'type': 'response.created', 'response': {'id': rid, 'status': 'in_progress', 'output': []}},
+                        {'type': 'response.output_item.added', 'output_index': 0,
+                         'item': {'id': rid+'-message', 'type': 'message', 'role': 'assistant', 'content': []}},
+                        {'type': 'response.content_part.added', 'item_id': rid+'-message', 'output_index': 0, 'content_index': 0,
+                         'part': {'type': 'output_text', 'text': ''}},
+                        {'type': 'response.output_text.delta', 'item_id': rid+'-message', 'output_index': 0, 'content_index': 0,
+                         'delta': 'Owned active admission task.'}]
+                try:
+                    for event in live:
+                        self.wfile.write(('data: '+json.dumps(event)+'\n\n').encode())
+                    self.wfile.flush()
+                    while not admission_stream_stop.wait(.1):
+                        self.wfile.write(b': owned admission heartbeat\n\n')
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             for event in events:
                 self.wfile.write(('data: '+json.dumps(event)+'\n\n').encode())
             return
@@ -123,6 +148,7 @@ chatgpt_base_url = "http://127.0.0.1:{port}"
 [analytics]
 enabled = false
 [features]
+goals = {str(args.admission).lower()}
 daemon_auto_start = false
 apps = false
 plugins = false
@@ -145,6 +171,8 @@ env = {'HOME': str(fixture_home), 'CODEX_HOME': str(fixture_home), 'PATH': '/usr
        'NO_PROXY': '127.0.0.1,localhost'}
 server = None
 server_log = None
+other_server = None
+other_server_log = None
 control_socket = fixture_home/'app-server-control/app-server-control.sock'
 backend_socket = control_socket if args.direct_server else fixture/'backend.sock'
 proxy_listener = None
@@ -227,10 +255,10 @@ def accept_proxy():
 
 class Wire:
     """Owned observer connection; reads never subscribe or submit a turn."""
-    def __init__(self):
+    def __init__(self, socket_path=control_socket):
         self.stream = socket.socket(socket.AF_UNIX)
         self.stream.settimeout(4)
-        self.stream.connect(str(control_socket))
+        self.stream.connect(str(socket_path))
         key = base64.b64encode(os.urandom(16)).decode()
         self.stream.sendall(('GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n'
                              'Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n'
@@ -261,7 +289,7 @@ class Wire:
     def send(self, value):
         self.frame(1, json.dumps(value).encode())
 
-    def call(self, method, params):
+    def call(self, method, params, expect_error=False):
         self.seq += 1
         self.send({'id': self.seq, 'method': method, 'params': params})
         while True:
@@ -283,6 +311,9 @@ class Wire:
                 continue
             value = json.loads(data)
             if value.get('id') == self.seq:
+                if expect_error:
+                    assert 'error' in value, 'Owned request unexpectedly bypassed admission'
+                    return value['error']
                 assert 'error' not in value, f'Owned read rejected: {method}'
                 return value['result']
 
@@ -304,6 +335,8 @@ if args.server:
     server_env = dict(env)
     if args.server_inventory:
         server_env['AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET'] = str(server_endpoint)
+    if args.admission:
+        server_env['AUTOAPPROVE_NATIVE_TRANSITION_SOCKET'] = str(transition_endpoint)
     server = subprocess.Popen([str(server_path), 'app-server', '--listen', 'unix://'+str(backend_socket)],
                               env=server_env, cwd=work, stdin=subprocess.DEVNULL,
                               stdout=server_log, stderr=server_log, start_new_session=True)
@@ -527,6 +560,148 @@ def stop_owned_tui(own_pid, own_fd, own_done, own_reader, already_reaped):
     own_reader.join(timeout=1)
     os.close(own_fd)
 
+class AdmissionLease:
+    def __init__(self):
+        self.stream = socket.socket(socket.AF_UNIX)
+        self.stream.settimeout(12)
+        self.stream.connect(str(transition_endpoint))
+        assert kernel_socket_identity(self.stream)['pid'] == server.pid
+        self.lease = None
+
+    def call(self, op, expect_busy=False):
+        nonce = secrets.token_hex(16)
+        request = {'op': op, 'nonce': nonce, 'serverGeneration': server_generation,
+                   'scope': 'server-all-runtimes'}
+        if self.lease:
+            request['leaseId'] = self.lease
+        self.stream.sendall(json.dumps(request).encode()+b'\n')
+        data = bytearray()
+        while not data.endswith(b'\n'):
+            part = self.stream.recv(4096)
+            assert part, 'Native lease closed without an ACK'
+            data.extend(part)
+            assert len(data) <= 4096
+        reply = json.loads(data)
+        assert reply['nonce'] == nonce
+        if expect_busy:
+            assert reply['error'] == 'runtime-admission-unavailable'
+            return reply
+        assert reply['producer'] == 'autoapprove-native-transition-prototype'
+        assert reply['pid'] == server.pid and reply['serverGeneration'] == server_generation
+        assert reply['scope'] == 'server-all-runtimes'
+        assert reply['owner']['pid'] == os.getpid() and reply['owner']['effectiveUid'] == os.geteuid()
+        assert not reply['existingWorkStopped'] and not reply['goalLifecycleManaged']
+        assert not reply['credentialsTouched'] and not reply['migrationAuthorized']
+        if self.lease:
+            assert reply['leaseID'] == self.lease
+        self.lease = reply['leaseID']
+        assert reply['leaseActive'] == (op != 'release')
+        assert reply['runtimeStartPauseHeld'] == (op != 'release')
+        return reply
+
+    def close(self):
+        self.stream.close()
+
+def admission_probe():
+    global other_server, other_server_log
+    # A second real backend demonstrates that the whole-server lease does not
+    # silently become a cross-home/process pause.
+    other_home = fixture/'other-home'
+    other_home.mkdir(mode=0o700)
+    shutil.copyfile(fixture_home/'config.toml', other_home/'config.toml')
+    other_env = dict(env, HOME=str(other_home), CODEX_HOME=str(other_home))
+    other_env.pop('AUTOAPPROVE_NATIVE_INVENTORY_SOCKET', None)
+    other_socket = fixture/'other.sock'
+    other_server_log = (output/'owned-other-server-private.log').open('wb')
+    other_server = subprocess.Popen([str(server_path), 'app-server', '--listen', 'unix://'+str(other_socket)],
+                                    env=other_env, cwd=work, stdin=subprocess.DEVNULL,
+                                    stdout=other_server_log, stderr=other_server_log, start_new_session=True)
+    deadline = time.monotonic()+15
+    while not other_socket.exists():
+        assert other_server.poll() is None and time.monotonic() < deadline
+        time.sleep(.05)
+    main, other = Wire(), Wire(other_socket)
+    owner = contender = None
+    try:
+        background = main.call('thread/start', {'cwd': str(work)})['thread']['id']
+        idle = main.call('thread/start', {'cwd': str(work)})['thread']['id']
+        independent = other.call('thread/start', {'cwd': str(work)})['thread']['id']
+        for wire, identifier in [(main, background), (other, independent)]:
+            wire.call('turn/start', {'threadId': identifier,
+                                     'input': [{'type': 'text', 'text': 'OWNED_ADMISSION_GOAL_SETUP'}]})
+            deadline = time.monotonic()+10
+            while time.monotonic() < deadline:
+                if wire.call('thread/read', {'threadId': identifier, 'includeTurns': False})['thread']['status']['type'] == 'idle':
+                    break
+                time.sleep(.05)
+            else:
+                raise RuntimeError('Owned Goal setup turn did not finish')
+        goal_params = {'status': 'paused', 'objective': 'Owned admission Goal', 'tokenBudget': 20000, 'origin': 'user'}
+        main.call('thread/goal/set', {'threadId': background, **goal_params})
+        independent_goal = other.call('thread/goal/set', {'threadId': independent, **goal_params})['goal']
+        started = main.call('turn/start', {'threadId': background,
+                                          'input': [{'type': 'text', 'text': 'OWNED_ADMISSION_ACTIVE_TASK'}]})['turn']
+        main.call('thread/goal/set', {'threadId': background, 'status': 'active', 'origin': 'user'})
+        deadline = time.monotonic()+10
+        while time.monotonic() < deadline:
+            row = main.call('thread/read', {'threadId': background, 'includeTurns': False})['thread']
+            if row['status']['type'] == 'active' and counts.get('heldAdmissionRequests', 0) > 0:
+                break
+            time.sleep(.05)
+        else:
+            raise RuntimeError('Owned background Goal task did not become active')
+        owner = AdmissionLease()
+        owner.call('pause')
+        # Admission holds new starts; it must not claim to have stopped work.
+        assert main.call('thread/read', {'threadId': background, 'includeTurns': False})['thread']['status']['type'] == 'active'
+        contender = AdmissionLease()
+        contender.call('pause', expect_busy=True)
+        denied = main.call('thread/start', {'cwd': str(work)}, expect_error=True)
+        assert denied['code'] == -32600 and 'progress' in denied['message'].lower()
+        denied = main.call('turn/start', {'threadId': idle,
+                                        'input': [{'type': 'text', 'text': 'OWNED_REJECTED_ADMISSION_TASK'}]}, expect_error=True)
+        assert denied['code'] == -32600
+        other.call('thread/start', {'cwd': str(work)})
+        assert other.call('thread/goal/get', {'threadId': independent})['goal'] == independent_goal
+        paused = main.call('thread/goal/set', {'threadId': background, 'status': 'paused', 'origin': 'user'})['goal']
+        if main.call('thread/read', {'threadId': background, 'includeTurns': False})['thread']['status']['type'] == 'active':
+            main.call('turn/interrupt', {'threadId': background, 'turnId': started['id']})
+        admission_stream_stop.set()
+        deadline = time.monotonic()+10
+        while time.monotonic() < deadline:
+            if main.call('thread/read', {'threadId': background, 'includeTurns': False})['thread']['status']['type'] == 'idle':
+                break
+            time.sleep(.05)
+        else:
+            raise RuntimeError('Owned active Goal task did not stop under the lease')
+        paused = main.call('thread/goal/get', {'threadId': background})['goal']
+        assert paused['status'] == 'paused' and paused['tokenBudget'] == 20000
+        owner.call('renew')
+        time.sleep(.15)
+        assert main.call('thread/goal/get', {'threadId': background})['goal'] == paused
+        owner.call('release')
+        main.call('thread/start', {'cwd': str(work)})
+        assert main.call('thread/goal/get', {'threadId': background})['goal'] == paused
+        assert other.call('thread/goal/get', {'threadId': independent})['goal'] == independent_goal
+        assert other_server.poll() is None
+        assert counts.get('rejectedAdmissionInputs', 0) == 0
+        state = controller()
+        assert all(row['session']['pid'] != other_server.pid for row in state['sessions'])
+        original_sessions_unchanged()
+        assert inventory()['currentWidget']['hasDraft']
+        return {'runtimeStartsRejected': True, 'existingTaskNeededExplicitStop': True,
+                'activeGoalPausedAndTaskInterruptedViaNativeRPC': True,
+                'pausedGoalFieldsRetainedAfterRelease': True, 'independentServerAndGoalUnaffected': True,
+                'rejectedInputNeverReachedProvider': True,
+                'credentialSwitchVerified': False}
+    finally:
+        if owner:
+            owner.close()
+        if contender:
+            contender.close()
+        main.close()
+        other.close()
+
 def shared_identity(primary):
     if not server:
         return
@@ -708,7 +883,22 @@ try:
     else:
         assert counts['inference'] == 0, 'Read-only probe unexpectedly submitted a turn'
         assert not unsubscribes, 'Read-only probe unexpectedly unsubscribed a thread'
+    admission_result = admission_probe() if args.admission else None
+    if args.admission:
+        # Repaint after the actual pause/interrupt/release sequence, not merely
+        # before it: a draft-presence flag cannot prove exact input retention.
+        with capture_lock:
+            offset = len(captured)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 37, 119, 0, 0))
+        os.kill(pid, signal.SIGWINCH)
+        time.sleep(.5)
+        with capture_lock:
+            repaint = bytes(captured[offset:])
+        repaint = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', repaint)
+        assert draft in repaint, 'Native transition lost the exact owned unsent draft'
+        admission_result['exactDraftPreservedAfterLease'] = True
     result = {'verified': True, 'nativeTUIProducer': True, 'fixturePID': pid,
+              'runtimeAdmissionProbe': admission_result,
               'originalSessions': len(before), 'preserved': len(before), 'fixtureExcludedFromController': True,
               'primaryIdentityPreserved': True, 'exactDraftPreservedOnFreshRepaint': True,
               'draftContentNotExported': True, 'inferenceRequests': counts['inference'],
@@ -736,9 +926,19 @@ except BaseException:
             (output/'owned-peer-failure-private.bin').write_bytes(peer['captured'])
     raise
 finally:
+    admission_stream_stop.set()
     if peer:
         stop_owned_tui(peer['pid'], peer['fd'], peer['done'], peer['reader'], peer['reaped'])
     stop_owned_tui(pid, fd, done, reader, reaped)
+    if other_server:
+        if other_server.poll() is None:
+            os.killpg(other_server.pid, signal.SIGTERM)
+            try:
+                other_server.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(other_server.pid, signal.SIGKILL)
+                other_server.wait(timeout=3)
+        other_server_log.close()
     http.shutdown()
     http.server_close()
     if server:
