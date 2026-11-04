@@ -7,15 +7,14 @@ homes, auth files, existing daemons or terminal sessions are mutated.
 import argparse, base64, datetime, fcntl, http.server, json, os, pathlib
 import pty, re, shutil, signal, socket, struct, subprocess, tempfile, termios
 import threading, time
+from codex_tui_isolation import IsolationGuard, require_no_production_controller
 parser=argparse.ArgumentParser()
 parser.add_argument('--cli',required=True)
 parser.add_argument('--check',required=True)
 parser.add_argument('--different-account',action='store_true')
 parser.add_argument('--keep-fixture',action='store_true')
 args=parser.parse_args()
-processes=subprocess.run(['/bin/ps','-axo','comm='],check=True,stdout=subprocess.PIPE,text=True).stdout.splitlines()
-assert not any(pathlib.Path(value.strip()).name=='AutoApproveApp' for value in processes), \
-    'Quit AutoApprove before this opt-in native probe: two independent transition controllers must not operate the same temporary server'
+require_no_production_controller()
 cli=str(pathlib.Path(args.cli).resolve(strict=True))
 checker=str(pathlib.Path(args.check).resolve(strict=True))
 package=pathlib.Path(cli).parent.parent
@@ -147,7 +146,9 @@ def snapshot():
         rows=[c.call('thread/read',{'threadId':id,'includeTurns':False})['thread'] for id in loaded['data']]
         return account,{row['id']:{'cwd':row['cwd'],'status':row['status']['type'],'model':row.get('model'),'child':bool(row.get('parentThreadId')),'ephemeral':bool(row.get('ephemeral')),'sourceType':type(row.get('source')).__name__}for row in rows}
     finally:c.close()
+isolation=IsolationGuard()
 try:
+    isolation.start()
     command('app-server','daemon','start');started=True
     version=json.loads(command('app-server','daemon','version'));assert version['backend']=='pid'
     for index,path in enumerate(work):
@@ -239,6 +240,7 @@ try:
     assert counts['post']>=requests_before+2,'Both interrupted conversations must execute a new local fixture request'
     print(json.dumps({'verified':True,'officialCLI':'0.166.0','ownedTUIs':3,'idlePausedControl':True,'originalPIDsRetained':True,'originalThreadIDsRetained':True,'draftsRetainedAfterFreshRepaint':True,'cwdAndActivityRetained':True,'newServerAccountConfirmed':True,'localFixtureRequests':counts['post'],'externalModelCalls':0,'sameAccountRelogin':new_user=='fixture-user-a','differentAccountMetadata':new_user=='fixture-user-b','syntheticAuthOnly':True,'realAuthenticationPerformed':False,'originalActiveTurnsStopped':sum(v['status']=='active' for v in before.values()),'internalTitleJobs':initial_titles,'productionServerTouched':False,'root':str(root)}))
 finally:
+    isolation.stop()
     if check is not None and check.poll() is None:
         os.killpg(check.pid,signal.SIGKILL);check.wait()
     for child in children:

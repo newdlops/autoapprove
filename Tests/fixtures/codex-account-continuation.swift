@@ -19,6 +19,14 @@ import AutoApproveCore
         }
         var services=CodexAccountTransitionServices.live
         let liveRestart=services.restart
+        let liveResume=services.resume
+        var continuationCalls:[String:Int]=[:]
+        if let liveResume {
+            services.resume={target,expected,original,receipt in
+                continuationCalls[original.id,default:0]+=1
+                return try await liveResume(target,expected,original,receipt)
+            }
+        }
         var pausedBeforeRestart=false,restartCount=0
         services.restart={target,expected in
             if official {
@@ -81,6 +89,11 @@ import AutoApproveCore
         let restored=CodexAccountTransitionCoordinator(target:target,state:saved,services:services,save:{saved=$0})
         for _ in 0..<3 {await restored.check(loginRequestID:"00000000-0000-4000-8000-000000000235")}
         if official,restartCount != 1 {throw AppError.message("Restored coordinator must never repeat the restart")}
+        if official {
+            guard Set(continuationCalls.keys)==active,continuationCalls.values.allSatisfy({$0==1}) else {
+                throw AppError.message("Every interrupted conversation must receive exactly one continuation, including after coordinator restoration")
+            }
+        }
         print("{\"verified\":true,\"resumedWork\":2,\"idleControl\":1}")
     }
 }

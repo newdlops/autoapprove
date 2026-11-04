@@ -94,6 +94,12 @@ terminate it. Any future managed transport observer must also handle existing
 clients and is not itself implemented or authorized by this evidence document.
 
 The public and installed local product remains 0.2.251. The remote update is
-waiting for the user to open the lid. Actual account isolation/SSO, complete
-native client inventory, exact Goal pause/one continuation, retired-owner
-A→B→A receipts, effect recovery and selected-group UI remain unproven.
+waiting for the user to open the lid. A clean owned three-TUI probe now proves
+existing-home Goal pause, original client/draft retention and one continuation
+service call per interrupted conversation, including after coordinator restore.
+Production AutoApprove is stopped for this opt-in probe; a live process guard
+refuses startup or aborts on controller arrival/inspection failure. This does not
+establish arbitrary existing-client membership or real authentication. Controlled
+root-only A→B→A and native effect recovery evidence is recorded in the foundation
+plan. Actual account isolation/SSO, complete native client inventory, cross-home
+user-client binding and selected-group UI remain unproven.
