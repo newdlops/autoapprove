@@ -34,9 +34,11 @@ parser.add_argument('--output', required=True)
 parser.add_argument('--server', help='Optional exact-version CLI for an owned shared Unix app-server')
 parser.add_argument('--navigation', action='store_true', help='Exercise owned offscreen unsubscribe and draft return')
 parser.add_argument('--return-via-resume', action='store_true', help='Regression check for the distinct direct /resume path')
+parser.add_argument('--peer-cli', help='Optional patched full CLI for a second owned TUI on the same root')
 args = parser.parse_args()
 assert not args.navigation or args.server, 'Navigation requires the owned shared server'
 assert not args.return_via_resume or args.navigation, 'Direct return requires navigation'
+assert not args.peer_cli or args.navigation, 'A shared peer requires the owned navigation test'
 tui = pathlib.Path(args.tui).resolve(strict=True)
 assert tui.name == 'codex-tui', 'Only the explicitly built standalone test TUI is allowed'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -324,8 +326,9 @@ done = threading.Event()
 captured = bytearray()
 capture_lock = threading.Lock()
 reaped = False
+peer = None
 
-def pump():
+def pump(own_fd, own_capture, own_lock, own_done):
     pending = b''
     replies = [(b'\x1b[6n', b'\x1b[1;1R'), (b'\x1b[c', b'\x1b[?1;2c'),
                (b'\x1b[>c', b'\x1b[>0;0;0c'), (b'\x1b[?u', b'\x1b[?0u'),
@@ -333,34 +336,34 @@ def pump():
                (b'\x1b]11;?\x07', b'\x1b]11;rgb:0000/0000/0000\x07')]
     replies.extend([(b'\x1b]10;?\x1b\\', b'\x1b]10;rgb:ffff/ffff/ffff\x1b\\'),
                     (b'\x1b]11;?\x1b\\', b'\x1b]11;rgb:0000/0000/0000\x1b\\')])
-    while not done.is_set():
+    while not own_done.is_set():
         try:
-            if not select.select([fd], [], [], .05)[0]:
+            if not select.select([own_fd], [], [], .05)[0]:
                 continue
-            data = os.read(fd, 65536)
+            data = os.read(own_fd, 65536)
             if not data:
                 break
-            with capture_lock:
-                captured.extend(data)
+            with own_lock:
+                own_capture.extend(data)
             pending += data
             for query, reply in replies:
                 while query in pending:
                     pending = pending.replace(query, b'', 1)
-                    os.write(fd, reply)
+                    os.write(own_fd, reply)
             pending = pending[-32:]
         except (OSError, BlockingIOError):
             break
 
-reader = threading.Thread(target=pump, daemon=True)
+reader = threading.Thread(target=pump, args=(fd, captured, capture_lock, done), daemon=True)
 reader.start()
 
-def inventory():
-    info = endpoint.lstat()
+def inventory(own_endpoint=endpoint, own_pid=pid):
+    info = own_endpoint.lstat()
     assert stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
     nonce = secrets.token_hex(16)
     with socket.socket(socket.AF_UNIX) as stream:
         stream.settimeout(3)
-        stream.connect(str(endpoint))
+        stream.connect(str(own_endpoint))
         stream.sendall(json.dumps({'nonce': nonce}).encode()+b'\n')
         data = bytearray()
         while not data.endswith(b'\n'):
@@ -369,7 +372,7 @@ def inventory():
             data.extend(chunk)
             assert len(data) <= 1024*1024
     value = json.loads(data)
-    assert value['nonce'] == nonce and value['pid'] == pid and value['schemaVersion'] == 1
+    assert value['nonce'] == nonce and value['pid'] == own_pid and value['schemaVersion'] == 1
     assert value['producer'] == 'autoapprove-native-tui-prototype'
     assert value['membershipComplete'] is False and value['admissionGranted'] is False
     return value
@@ -381,6 +384,63 @@ def original_sessions_unchanged():
     if server:
         assert server.poll() is None, 'Owned shared server exited'
         assert all(row['session']['pid'] != server.pid for row in state['sessions'])
+    if peer:
+        assert all(row['session']['pid'] != peer['pid'] for row in state['sessions'])
+
+def local_owners(value):
+    # Catalog metadata is deliberately excluded: visiting the overview does not
+    # make every listed conversation this client's retained owner.
+    return set(value['retainedInputs']) | {
+        identifier for name, values in value['stores'].items() if name != 'catalogReferences'
+        for identifier in values
+    }
+
+def launch_peer(primary):
+    peer_binary = fixture/'owned-inventory-cli'
+    shutil.copyfile(pathlib.Path(args.peer_cli).resolve(strict=True), peer_binary)
+    peer_binary.chmod(0o700)
+    version = subprocess.run([str(peer_binary), '--version'], env=env, cwd=work,
+                             capture_output=True, timeout=10, check=True)
+    assert version.stdout.strip() == b'codex-cli 0.166.0'
+    peer_endpoint = fixture/'peer.sock'
+    peer_env = dict(env, AUTOAPPROVE_NATIVE_INVENTORY_SOCKET=str(peer_endpoint))
+    peer_pid, peer_fd = pty.fork()
+    if peer_pid == 0:
+        os.chdir(work)
+        os.execve(str(peer_binary), [str(peer_binary), '--no-alt-screen', '--sandbox', 'read-only',
+                                    '--ask-for-approval', 'never', '-C', str(work), 'resume', primary], peer_env)
+    fcntl.ioctl(peer_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
+    os.set_blocking(peer_fd, False)
+    value = {'pid': peer_pid, 'fd': peer_fd, 'endpoint': peer_endpoint, 'captured': bytearray(),
+             'done': threading.Event(), 'lock': threading.Lock(), 'reaped': False}
+    value['reader'] = threading.Thread(target=pump, args=(peer_fd, value['captured'], value['lock'], value['done']), daemon=True)
+    value['reader'].start()
+    return value
+
+def peer_inventory():
+    ended, _ = os.waitpid(peer['pid'], os.WNOHANG)
+    if ended:
+        peer['reaped'] = True
+        raise RuntimeError('Owned peer TUI exited')
+    return inventory(peer['endpoint'], peer['pid'])
+
+def stop_owned_tui(own_pid, own_fd, own_done, own_reader, already_reaped):
+    if not already_reaped:
+        ended, _ = os.waitpid(own_pid, os.WNOHANG)
+        if not ended:
+            os.killpg(own_pid, signal.SIGTERM)
+            until = time.monotonic()+3
+            while time.monotonic() < until:
+                ended, _ = os.waitpid(own_pid, os.WNOHANG)
+                if ended:
+                    break
+                time.sleep(.05)
+            if not ended:
+                os.killpg(own_pid, signal.SIGKILL)
+                os.waitpid(own_pid, 0)
+    own_done.set()
+    own_reader.join(timeout=1)
+    os.close(own_fd)
 
 def shared_identity(primary):
     if not server:
@@ -434,6 +494,22 @@ try:
             time.sleep(.1)
         else:
             raise RuntimeError('Owned materialized thread did not finish')
+    if args.peer_cli:
+        peer = launch_peer(first['stores']['primary'][0])
+        deadline = time.monotonic()+25
+        while time.monotonic() < deadline:
+            original_sessions_unchanged()
+            try:
+                peer_state = peer_inventory()
+                if peer_state['stores']['primary'] == first['stores']['primary'] and not peer_state['currentWidget']['hasActiveView']:
+                    break
+            except OSError:
+                pass
+            time.sleep(.1)
+        else:
+            raise RuntimeError('Owned peer did not expose the shared primary root')
+        assert first['stores']['primary'][0] in local_owners(peer_state)
+        shared_identity(peer_state['stores']['primary'])
     draft = b'UNSENT_NATIVE_INVENTORY_DRAFT_8e932b'
     os.write(fd, draft)
     limit = time.monotonic()+5
@@ -450,6 +526,8 @@ try:
         assert draft.decode() not in json.dumps(value), 'Draft content escaped inventory'
         original_sessions_unchanged()
         shared_identity(value['stores']['primary'])
+        if peer:
+            assert peer_inventory()['stores']['primary'] == first['stores']['primary']
     with capture_lock:
         offset = len(captured)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 119, 0, 0))
@@ -489,6 +567,13 @@ try:
         offscreen = True
         original_sessions_unchanged()
         assert any(v['threadID'] == original and v['acknowledged'] for v in unsubscribes), 'No actual unsubscribe ACK for the retained root'
+        shared_owners = 1
+        if peer:
+            peer_parked = peer_inventory()
+            assert peer_parked['stores']['primary'] == [original]
+            assert original in local_owners(parked) and original in local_owners(peer_parked)
+            shared_owners = 2
+            (output/'owned-peer-inventory.json').write_text(json.dumps(peer_parked, indent=2)+'\n')
         # The overview owns/restores parked input. A direct /resume takes a
         # different upstream path and is not evidence of that preservation.
         if args.return_via_resume:
@@ -527,6 +612,8 @@ try:
         assert draft in repaint, 'Returning to the original root lost the exact draft'
         returned = True
         original_sessions_unchanged()
+        if peer:
+            assert peer_inventory()['stores']['primary'] == [original]
     else:
         assert counts['inference'] == 0, 'Read-only probe unexpectedly submitted a turn'
         assert not unsubscribes, 'Read-only probe unexpectedly unsubscribed a thread'
@@ -538,6 +625,8 @@ try:
               'unsubscribeACKObserved': any(v['acknowledged'] for v in unsubscribes),
               'unsubscribeRequests': len(unsubscribes),
               'ownedWireProxy': server is not None,
+              'sampledClients': 2 if peer else 1,
+              'sampledOwnersAfterUnsubscribe': shared_owners if args.navigation else None,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,
               'externalRequestsBlocked': counts['externalBlocked'], 'membershipComplete': False,
               'sharedUnixAppServer': server is not None, 'managedDaemonSupervisor': False,
@@ -545,24 +634,14 @@ try:
 except BaseException:
     with capture_lock:
         (output/'owned-tui-failure-private.bin').write_bytes(captured)
+    if peer:
+        with peer['lock']:
+            (output/'owned-peer-failure-private.bin').write_bytes(peer['captured'])
     raise
 finally:
-    if not reaped:
-        ended, _ = os.waitpid(pid, os.WNOHANG)
-        if not ended:
-            os.killpg(pid, signal.SIGTERM)
-            until = time.monotonic()+3
-            while time.monotonic() < until:
-                ended, _ = os.waitpid(pid, os.WNOHANG)
-                if ended:
-                    break
-                time.sleep(.05)
-            if not ended:
-                os.killpg(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-    done.set()
-    reader.join(timeout=1)
-    os.close(fd)
+    if peer:
+        stop_owned_tui(peer['pid'], peer['fd'], peer['done'], peer['reader'], peer['reaped'])
+    stop_owned_tui(pid, fd, done, reader, reaped)
     http.shutdown()
     http.server_close()
     if server:

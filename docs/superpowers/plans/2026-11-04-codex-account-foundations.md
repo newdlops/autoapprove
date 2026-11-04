@@ -171,7 +171,7 @@ by relabeling that API. Preserve the full original account-switch requirement.
   installation/running-version checks and session preservation for the bound
   user-visible improvement. Keep remote installation deferred until the lid opens.
 
-Task 8 implementation and 0.2.252/279 are published and locally installed. Debug810/810 and group9/9, optimized account62/62, actual native light/dark and functional paths are recorded in VALIDATION.md. Programmatic picker focus after sheet dismissal remains unconfirmed by AX; keep the QA item open for that keyboard follow-up rather than claiming full acceptance. Other Mac remains deferred.
+Task 8 implementation and 0.2.252/279 are published and locally installed. Debug810/810 and group9/9, optimized account62/62, actual native light/dark and functional paths are recorded in VALIDATION.md. Programmatic picker focus after sheet dismissal remains unconfirmed by AX; keep the QA item open for that keyboard follow-up rather than claiming full acceptance. After the user opened the other Mac, its running 0.2.252/279, idle updater, three preserved original session identities, three managed connections and granted permissions were verified. A fresh real-account switch there remains untested.
 
 Full native client ownership, actual authentication/SSO, migration/restoration
 destination mappings and the requested selected-session merge/split flow remain

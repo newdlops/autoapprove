@@ -54,6 +54,16 @@ unsent draft. The server still listed that root as loaded. A separate direct
 insufficient preservation evidence. These are one-client observations; complete
 peer census, independent voice/replay state and migration barriers remain open.
 
+A later owned two-client probe uses the fully built patched CLI for the second
+TUI's native `resume` launch. Both producers report the same primary root. After
+the first TUI unsubscribes and parks its draft, the second still reports the
+original root; excluding catalog-only references leaves two sampled local owners.
+The first TUI's overview return restores its exact draft, and all 19 original
+controller identities survive cleanup. These explicit per-client observations do
+not establish a daemon peer census or two live subscriber relations. The next
+native producer must obtain the daemon's own connection and subscriber stores
+before this can be used for effect-producing selection.
+
 ## Why both sides are required
 
 The inspected official version is 0.166.0, commit

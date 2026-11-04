@@ -52,6 +52,8 @@ From the prepared directory, owned native validation uses Rust 1.95.0:
 ```sh
 cargo +stable test -p codex-tui --lib --features autoapprove-native-inventory native_inventory --locked --jobs 2
 cargo +stable build -p codex-tui --features autoapprove-native-inventory --bin codex-tui --locked --jobs 2
+# Optional full CLI for the owned second-client resume check:
+cargo +stable build -p codex-cli --features codex-tui/autoapprove-native-inventory --bin codex --locked --jobs 2
 ```
 
 Only use the resulting binary in a fresh owned test home/PTY, with private socket
@@ -124,6 +126,18 @@ A distinct direct `/resume <ID>` return restored the conversation but did not
 restore the parked draft in this exact upstream version. That attempt failed the
 preservation gate; the overview result does not make it pass. Reproduce this
 still-failing regression with `--navigation --return-via-resume`.
+
+The optional full CLI also built successfully with the same source patch and
+pinned dependency graph. With `--navigation --peer-cli=/absolute/target/debug/codex`,
+the fixture copies it under a non-agent basename before starting a second owned
+TUI via `resume`. Both native producers reported the same primary root. After
+the first TUI navigated away and received an actual unsubscribe ACK, it retained
+the original root's unsent draft while the second TUI still reported that root.
+The union excluding catalog-only references therefore had two sampled owners of
+the original conversation. Overview return restored the first TUI's exact draft;
+both trial clients were cleaned up and all 19 original controller identities
+remained present. This is evidence from two independently queried clients, not a
+daemon-attested census of all peers or proof of two live subscriptions.
 
 Run the owned checks with an independently known local controller node UUID:
 
