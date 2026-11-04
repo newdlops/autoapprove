@@ -103,6 +103,46 @@ node scripts/codex-native-inventory-read.mjs \
   This proves embedded TUI observation only, not daemon-connected peer coverage,
   actual offscreen unsubscribe/replay lifecycles, Goal continuation or login change.
 
+The same fixture subsequently connected the actual TUI to an owned, unmodified
+0.166.0 app-server on the standard private Unix socket. The server's live thread
+ID and cwd matched the TUI snapshot; repeated reads preserved the draft with no
+inference or unsubscribe request. This directly launches the shared server and
+does not exercise the managed daemon supervisor.
+
+With `--navigation`, the fixture materialized an owned thread using only a
+loopback synthetic provider (two requests including background title work),
+parked its unsent draft through the native overview and created another thread.
+An owned wire proxy observed the actual `thread/unsubscribe` request and success
+response. The old thread disappeared from local listeners/channels/navigation
+while remaining in `overviewInput` with `hasDraft=true`; its text was not exported.
+Selecting it through the overview restored the exact draft on a fresh repaint.
+All 19 original controller identities remained intact. The unsubscribed runtime
+remained server-loaded, so loaded IDs cannot replace subscriber or retained-input
+ownership evidence.
+
+A distinct direct `/resume <ID>` return restored the conversation but did not
+restore the parked draft in this exact upstream version. That attempt failed the
+preservation gate; the overview result does not make it pass. Reproduce this
+still-failing regression with `--navigation --return-via-resume`.
+
+Run the owned checks with an independently known local controller node UUID:
+
+```sh
+python3 Tests/fixtures/codex-native-inventory-live.py \
+  --tui /absolute/prototype/codex-rs/target/debug/codex-tui \
+  --server /absolute/reviewed-0.166.0/bin/codex \
+  --expected-node YOUR_LOCAL_CONTROLLER_UUID \
+  --output /absolute/private/check-output
+# Add --navigation for the loopback-only turn, unsubscribe and overview return.
+# Omit --server for the embedded read-only probe.
+```
+
+The optional server is copied into the private fixture with a basename excluded
+from production agent discovery. No real daemon or user session is stopped. The
+wire proxy retains only owned unsubscribe metadata; it is not native peer
+attestation. These tests do not prove complete multi-client ownership, independent
+voice/replay preservation, Goal continuation, real credentials or migration.
+
 Complete daemon connection/peer census, revision binding, reversible admission
 barriers, full pending-state preservation, actual credential/backend attestation
 and end-to-end selected migration still need implementation and owned verification.

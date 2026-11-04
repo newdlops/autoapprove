@@ -45,6 +45,15 @@ reads and exact unsent-draft preservation on a fresh repaint while preserving al
 connected to user sessions. Daemon peer coverage and migration remain unverified;
 this does not relax preservation gates or enable migration effects.
 
+An additional owned shared-Unix-server probe now verifies an actual offscreen
+navigation branch: a loopback-materialized root received a real unsubscribe ACK,
+then remained represented in the TUI's retained overview input after its local
+channel/navigation entries were removed. Overview selection restored its exact
+unsent draft. The server still listed that root as loaded. A separate direct
+`/resume` return did not restore the draft, so same-ID resume alone remains
+insufficient preservation evidence. These are one-client observations; complete
+peer census, independent voice/replay state and migration barriers remain open.
+
 ## Why both sides are required
 
 The inspected official version is 0.166.0, commit
