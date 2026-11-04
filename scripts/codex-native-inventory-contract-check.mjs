@@ -52,6 +52,9 @@ try{
  await consumer(value=>JSON.stringify({...value,consistentRevision:true})+'\n',false,true);
  await consumer(value=>JSON.stringify({...value,serverGeneration:'not-a-generation'})+'\n',false,true);
  await consumer(value=>JSON.stringify({...value,connections:[{connectionID:2,nativePeerIdentified:true,clientInventoryBound:false}]})+'\n',false,true);
+ const nativePeer={source:'macos-audit-token',pid:321,effectiveUid:501,effectiveGid:20,auditPidVersion:9};
+ await consumer(value=>JSON.stringify({...value,connections:[{connectionID:2,nativePeerIdentified:true,clientInventoryBound:false,nativePeer}]})+'\n',true,true);
+ await consumer(value=>JSON.stringify({...value,connections:[{connectionID:2,nativePeerIdentified:true,clientInventoryBound:false,nativePeer:{...nativePeer,auditPidVersion:0}}]})+'\n',false,true);
  const file=root+'/plain';await writeFile(file,'sentinel',{mode:0o600});
  assert.notEqual((await run(script,['--socket='+file,'--expected-pid=12345'])).code,0);checks++;
  await chmod(root,0o755);
@@ -72,7 +75,9 @@ try{
  await assert.rejects(lstat(refused),{code:'ENOENT'});checks++;
  const serverManifest=JSON.parse(await readFile('patches/codex/0.166.0-native-server-inventory.manifest.json','utf8'));
  const serverCorrupt=root+'/changed-server-source';await mkdir(serverCorrupt);
- for(const file of [...Object.keys(manifest.pins),...[...manifest.files,...serverManifest.files].filter(v=>v.before!==null).map(v=>v.path)]){
+ const basePaths=new Set(manifest.files.map(v=>v.path));
+ const sourcePreimages=[...manifest.files,...serverManifest.files.filter(v=>!basePaths.has(v.path))];
+ for(const file of [...Object.keys(manifest.pins),...sourcePreimages.filter(v=>v.before!==null).map(v=>v.path)]){
   await mkdir(path.dirname(serverCorrupt+'/'+file),{recursive:true});
   await copyFile(source+'/'+file,serverCorrupt+'/'+file);
  }

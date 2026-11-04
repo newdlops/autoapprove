@@ -38,7 +38,13 @@ if(server){
  assert.ok(value.subscriptions.byConnection&&value.subscriptions.subscribers);
  for(const row of value.connections){
   assert.ok(Number.isSafeInteger(row.connectionID)&&row.connectionID>=0);
-  assert.equal(row.nativePeerIdentified,false);assert.equal(row.clientInventoryBound,false);
+  assert.equal(row.clientInventoryBound,false);
+  if(row.nativePeerIdentified){
+   const peer=row.nativePeer;assert.equal(peer?.source,'macos-audit-token');
+   assert.ok(Number.isSafeInteger(peer.pid)&&peer.pid>0);
+   for(const key of ['effectiveUid','effectiveGid','auditPidVersion'])assert.ok(Number.isSafeInteger(peer[key])&&peer[key]>=0&&peer[key]<=0xffffffff);
+   assert.ok(peer.auditPidVersion>0);
+  }else assert.equal(row.nativePeerIdentified,false);
  }
  console.log(JSON.stringify(process.argv.includes('--json')?value:{
   verifiedResponse:true,pid:value.pid,serverGeneration:value.serverGeneration,

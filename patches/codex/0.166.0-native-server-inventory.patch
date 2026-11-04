@@ -6,7 +6,7 @@
  doctest = false
 +
 +[features]
-+autoapprove-native-inventory = []
++autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
 
  [lints]
  workspace = true
@@ -52,6 +52,18 @@
                      _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
                          snapshot_finished = true;
                      }
+@@ -1192,6 +1211,11 @@
+                                         outbound_opted_out_notification_methods,
+                                     ),
+                                 );
++                            }
++                            TransportEvent::NativePeerIdentified { connection_id, peer } => {
++                                if let Some(connection) = connections.get_mut(&connection_id) {
++                                    connection.native_peer = Some(peer);
++                                }
+                             }
+                             TransportEvent::ConnectionClosed { connection_id } => {
+                                 let Some(connection_state) = connections.remove(&connection_id) else {
 --- a/app-server/src/message_processor.rs
 +++ b/app-server/src/message_processor.rs
 @@ -147,6 +147,7 @@
@@ -123,7 +135,7 @@
          &self,
 --- /dev/null
 +++ b/app-server/src/native_inventory.rs
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,156 @@
 +//! Local diagnostic observation, never a census-completeness or migration grant.
 +use crate::message_processor::MessageProcessor;
 +use crate::transport::ConnectionId;
@@ -172,7 +184,8 @@
 +                "initialized":connection.session.initialized(),
 +                "untrustedClientName":connection.session.app_server_client_name(),
 +                "untrustedClientVersion":connection.session.client_version(),
-+                "nativePeerIdentified":false,
++                "nativePeerIdentified":connection.native_peer.is_some(),
++                "nativePeer":connection.native_peer,
 +                "clientInventoryBound":false
 +            })
 +        })
@@ -212,7 +225,7 @@
 +        "membershipComplete":false,
 +        "admissionGranted":false,
 +        "limitations":[
-+            "native-peer-identity-required",
++            "native-peer-to-client-inventory-binding-required",
 +            "client-inventory-binding-required",
 +            "pending-transport-and-subscriber-revision-required",
 +            "native-admission-and-backend-attestation-required"
@@ -481,3 +494,384 @@
 +        Ok(())
 +    }
 +}
+--- a/app-server/src/transport.rs
++++ b/app-server/src/transport.rs
+@@ -37,6 +37,7 @@
+ pub use codex_app_server_transport::verified_local_daemon_socket;
+
+ pub(crate) struct ConnectionState {
++    pub(crate) native_peer: Option<codex_app_server_transport::NativePeerIdentity>,
+     pub(crate) origin: ConnectionOrigin,
+     pub(crate) outbound_initialized: Arc<AtomicBool>,
+     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
+@@ -57,6 +58,7 @@
+         rpc_gate.auth = auth;
+         session.rpc_gate = Arc::new(rpc_gate);
+         Self {
++            native_peer: None,
+             origin,
+             outbound_initialized,
+             outbound_experimental_api_enabled,
+--- a/uds/src/lib.rs
++++ b/uds/src/lib.rs
+@@ -71,6 +71,13 @@
+         platform::connect_stream(socket_path.as_ref())
+             .await
+             .map(|inner| Self { inner })
++    }
++}
++
++#[cfg(unix)]
++impl std::os::fd::AsRawFd for UnixStream {
++    fn as_raw_fd(&self) -> std::os::fd::RawFd {
++        std::os::fd::AsRawFd::as_raw_fd(&self.inner)
+     }
+ }
+
+--- a/app-server-client/Cargo.toml
++++ b/app-server-client/Cargo.toml
+@@ -8,6 +8,9 @@
+ name = "codex_app_server_client"
+ path = "src/lib.rs"
+ doctest = false
++
++[features]
++autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
+
+ [lints]
+ workspace = true
+--- a/app-server-client/src/lib.rs
++++ b/app-server-client/src/lib.rs
+@@ -19,6 +19,8 @@
+ //! bridging async `mpsc` channels on both sides. Commands and the underlying
+ //! runtime remain bounded; the local consumer event queue is unbounded so
+ //! unread notifications cannot prevent request responses from being delivered.
++
++pub use codex_app_server_transport::native_current_process_identity;
+
+ mod cloud;
+ mod path;
+--- a/app-server-transport/Cargo.toml
++++ b/app-server-transport/Cargo.toml
+@@ -8,6 +8,9 @@
+ name = "codex_app_server_transport"
+ path = "src/lib.rs"
+ doctest = false
++
++[features]
++autoapprove-native-inventory = []
+
+ [lints]
+ workspace = true
+--- a/app-server-transport/src/lib.rs
++++ b/app-server-transport/src/lib.rs
+@@ -8,6 +8,9 @@
+ /// Only managed app-server launches accept the local socket shutdown request.
+ pub const DAEMON_SHUTDOWN_SOCKET_ENV: &str = "CODEX_DAEMON_SHUTDOWN_SOCKET";
+ mod connection_auth;
++mod native_peer;
++pub use native_peer::NativePeerIdentity;
++pub use native_peer::native_current_process_identity;
+ mod outgoing_message;
+ mod transport;
+ mod websocket_compression;
+--- /dev/null
++++ b/app-server-transport/src/native_peer.rs
+@@ -0,0 +1,143 @@
++//! Kernel process-instance identity. Never infer it from initialize metadata.
++use serde::Serialize;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct NativePeerIdentity {
++    pub source: &'static str,
++    pub pid: u32,
++    pub effective_uid: u32,
++    pub effective_gid: u32,
++    pub audit_pid_version: u32,
++}
++
++pub fn native_current_process_identity() -> Option<NativePeerIdentity> {
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    {
++        apple::current()
++    }
++    #[cfg(not(all(feature = "autoapprove-native-inventory", target_os = "macos")))]
++    {
++        None
++    }
++}
++
++pub(crate) fn capture(stream: &codex_uds::UnixStream) -> Option<NativePeerIdentity> {
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    {
++        use std::os::fd::AsRawFd;
++        apple::peer(stream.as_raw_fd())
++    }
++    #[cfg(not(all(feature = "autoapprove-native-inventory", target_os = "macos")))]
++    {
++        let _ = stream;
++        None
++    }
++}
++
++#[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++mod apple {
++    use super::NativePeerIdentity;
++
++    // The SDK declares this opaque 8-word token in mach/message.h. Interpret it
++    // only with libbsm accessors, not assumptions about word offsets.
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct AuditToken {
++        words: [u32; 8],
++    }
++
++    #[link(name = "bsm")]
++    unsafe extern "C" {
++        fn audit_token_to_euid(token: AuditToken) -> libc::uid_t;
++        fn audit_token_to_egid(token: AuditToken) -> libc::gid_t;
++        fn audit_token_to_pid(token: AuditToken) -> libc::pid_t;
++        fn audit_token_to_pidversion(token: AuditToken) -> libc::c_int;
++    }
++
++    fn identity(token: AuditToken) -> Option<NativePeerIdentity> {
++        let pid = unsafe { audit_token_to_pid(token) };
++        let version = unsafe { audit_token_to_pidversion(token) } as u32;
++        if pid <= 0 || version == 0 {
++            return None;
++        }
++        Some(NativePeerIdentity {
++            source: "macos-audit-token",
++            pid: pid as u32,
++            effective_uid: unsafe { audit_token_to_euid(token) },
++            effective_gid: unsafe { audit_token_to_egid(token) },
++            audit_pid_version: version,
++        })
++    }
++
++    pub(super) fn peer(fd: libc::c_int) -> Option<NativePeerIdentity> {
++        let mut token = AuditToken { words: [0; 8] };
++        let mut size = std::mem::size_of::<AuditToken>() as libc::socklen_t;
++        let status = unsafe {
++            libc::getsockopt(
++                fd,
++                libc::SOL_LOCAL,
++                libc::LOCAL_PEERTOKEN,
++                (&mut token as *mut AuditToken).cast(),
++                &mut size,
++            )
++        };
++        if status != 0 || size as usize != std::mem::size_of::<AuditToken>() {
++            return None;
++        }
++        identity(token)
++    }
++
++    pub(super) fn current() -> Option<NativePeerIdentity> {
++        // TASK_AUDIT_TOKEN and COUNT are defined as 15 and 8 by mach/task_info.h.
++        let mut token = AuditToken { words: [0; 8] };
++        let mut count: libc::mach_msg_type_number_t = 8;
++        let status = unsafe {
++            libc::task_info(
++                libc::mach_task_self(),
++                15,
++                (&mut token as *mut AuditToken).cast(),
++                &mut count,
++            )
++        };
++        if status != libc::KERN_SUCCESS || count != 8 {
++            return None;
++        }
++        let value = identity(token)?;
++        (value.pid == std::process::id()
++            && value.effective_uid == unsafe { libc::geteuid() }
++            && value.effective_gid == unsafe { libc::getegid() })
++        .then_some(value)
++    }
++}
++
++#[cfg(all(test, feature = "autoapprove-native-inventory", target_os = "macos"))]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn native_peer_identity_matches_current_process_instance() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        let path = root.path().join("peer.sock");
++        let mut listener = codex_uds::UnixListener::bind(&path).await.unwrap();
++        let client = codex_uds::UnixStream::connect(&path).await.unwrap();
++        let server = listener.accept().await.unwrap();
++        let expected = native_current_process_identity().expect("current kernel identity");
++        assert_eq!(expected.pid, std::process::id());
++        assert_ne!(expected.audit_pid_version, 0);
++        assert_eq!(capture(&server), Some(expected));
++        assert_eq!(capture(&client), Some(expected));
++        assert_eq!(native_current_process_identity(), Some(expected));
++        let mut reused_pid = expected;
++        reused_pid.audit_pid_version = expected.audit_pid_version.wrapping_add(1);
++        assert_ne!(expected, reused_pid);
++    }
++}
++
++#[cfg(all(test, not(feature = "autoapprove-native-inventory")))]
++mod disabled_tests {
++    #[test]
++    fn native_peer_identity_is_absent_without_explicit_feature() {
++        assert!(super::native_current_process_identity().is_none());
++    }
++}
+--- a/app-server-transport/src/transport/mod.rs
++++ b/app-server-transport/src/transport/mod.rs
+@@ -190,6 +190,11 @@
+     },
+     ConnectionClosed {
+         connection_id: ConnectionId,
++    },
++    /// Kernel credentials captured from an accepted local Unix stream.
++    NativePeerIdentified {
++        connection_id: ConnectionId,
++        peer: crate::NativePeerIdentity,
+     },
+     IncomingMessage {
+         connection_id: ConnectionId,
+--- a/app-server-transport/src/transport/unix_socket.rs
++++ b/app-server-transport/src/transport/unix_socket.rs
+@@ -6,7 +6,7 @@
+ use std::path::Path;
+
+ use super::TransportEvent;
+-use crate::transport::websocket::run_websocket_connection;
++use crate::transport::websocket::run_websocket_connection_with_peer;
+ use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+ use crate::websocket_compression::WebSocketCompression;
+ use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
+@@ -178,6 +178,7 @@
+             }
+         };
+
++        let native_peer = crate::native_peer::capture(&stream);
+         let transport_event_tx = transport_event_tx.clone();
+         tokio::spawn(async move {
+             let mut shutdown_request = false;
+@@ -236,11 +237,12 @@
+                 return;
+             }
+             let (websocket_writer, websocket_reader) = websocket_stream.split();
+-            run_websocket_connection(
++            run_websocket_connection_with_peer(
+                 websocket_writer,
+                 websocket_reader,
+                 transport_event_tx,
+                 negotiated_compression,
++                native_peer,
+             )
+             .await;
+         });
+--- a/app-server-transport/src/transport/unix_socket_tests.rs
++++ b/app-server-transport/src/transport/unix_socket_tests.rs
+@@ -157,6 +157,24 @@
+         _ => panic!("expected connection opened event"),
+     };
+
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    {
++        let peer = timeout(Duration::from_secs(1), transport_event_rx.recv())
++            .await
++            .expect("kernel peer event should arrive")
++            .expect("kernel peer event");
++        match peer {
++            TransportEvent::NativePeerIdentified {
++                connection_id: peer_connection,
++                peer,
++            } => {
++                assert_eq!(peer_connection, connection_id);
++                assert_eq!(Some(peer), crate::native_current_process_identity());
++            }
++            _ => panic!("expected native kernel peer before incoming application messages"),
++        }
++    }
++
+     let notification = JSONRPCMessage::Notification(JSONRPCNotification {
+         method: "initialized".to_string(),
+         params: None,
+--- a/app-server-transport/src/transport/websocket.rs
++++ b/app-server-transport/src/transport/websocket.rs
+@@ -212,6 +212,27 @@
+     SinkError: Send + 'static,
+     StreamError: std::fmt::Display + Send + 'static,
+ {
++    run_websocket_connection_with_peer(
++        websocket_writer,
++        websocket_reader,
++        transport_event_tx,
++        compression,
++        None,
++    )
++    .await;
++}
++
++pub(crate) async fn run_websocket_connection_with_peer<M, SinkError, StreamError>(
++    websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
++    websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
++    transport_event_tx: mpsc::Sender<TransportEvent>,
++    compression: WebSocketCompression,
++    native_peer: Option<crate::NativePeerIdentity>,
++) where
++    M: AppServerWebSocketMessage + Send + 'static,
++    SinkError: Send + 'static,
++    StreamError: std::fmt::Display + Send + 'static,
++{
+     let connection_id = next_connection_id();
+     let (encoder, decoder) = match compression {
+         WebSocketCompression::Plain => (None, None),
+@@ -246,6 +267,18 @@
+         return;
+     }
+
++    if let Some(peer) = native_peer {
++        if transport_event_tx
++            .send(TransportEvent::NativePeerIdentified {
++                connection_id,
++                peer,
++            })
++            .await
++            .is_err()
++        {
++            return;
++        }
++    }
+     let (writer_control_tx, writer_control_rx) = mpsc::channel::<M>(CHANNEL_CAPACITY);
+     let mut outbound_task = tokio::spawn(run_websocket_outbound_loop(
+         websocket_writer,
+--- a/app-server-transport/src/transport/remote_control/client_tracker.rs
++++ b/app-server-transport/src/transport/remote_control/client_tracker.rs
+@@ -427,6 +427,7 @@
+         TransportEvent::ConnectionClosed { .. } => "connection_closed",
+         TransportEvent::IncomingMessage { .. } => "incoming_message",
+         TransportEvent::DaemonShutdown => "daemon_shutdown",
++        TransportEvent::NativePeerIdentified { .. } => "native_peer_identified",
+     }
+ }
+
+--- a/tui/Cargo.toml
++++ b/tui/Cargo.toml
+@@ -22,7 +22,7 @@
+ workspace = true
+
+ [features]
+-autoapprove-native-inventory = []
++autoapprove-native-inventory = ["codex-app-server-client/autoapprove-native-inventory"]
+
+ [dependencies]
+ codex-build-info = { workspace = true }
+--- a/tui/src/app/native_inventory.rs
++++ b/tui/src/app/native_inventory.rs
+@@ -145,6 +145,7 @@
+             "upstreamCommit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+             "cliVersion": env!("CARGO_PKG_VERSION"),
+             "pid": std::process::id(),
++            "processIdentity": codex_app_server_client::native_current_process_identity(),
+             "nonce": nonce,
+             "stores": stores,
+             "retainedInputs": retained_inputs,

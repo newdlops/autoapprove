@@ -27,9 +27,15 @@ if(serverManifest){
 }
 assert.equal(manifest.format,1);assert.equal(manifest.migrationAdmission,false);
 assert.equal(hash(await readFile(patch)),manifest.patchSHA256,'Patch differs from reviewed manifest');
-const files=[...manifest.files,...(serverManifest?.files||[])];
+const baseFiles=new Map(manifest.files.map(file=>[file.path,file]));
+assert.equal(baseFiles.size,manifest.files.length);
+const serverFiles=serverManifest?.files||[];
+assert.equal(new Set(serverFiles.map(file=>file.path)).size,serverFiles.length);
+for(const file of serverFiles){
+ if(baseFiles.has(file.path))assert.equal(file.before,baseFiles.get(file.path).after,'Server phase must match the exact TUI postimage');
+}
+const files=[...new Map([...manifest.files,...serverFiles].map(file=>[file.path,file])).values()];
 const paths=files.map(v=>v.path);
-assert.equal(new Set(paths).size,paths.length);
 for(const file of [...Object.keys(manifest.pins),...paths])assert.ok(/^[a-zA-Z0-9_./-]+$/.test(file)&&!file.startsWith('/')&&!file.split('/').includes('..'));
 async function verify(root,file,expected){
  const selected=path.join(root,file);
@@ -38,7 +44,8 @@ async function verify(root,file,expected){
  assert.equal(hash(await readFile(selected)),expected,'Source identity mismatch: '+file);
 }
 for(const [file,digest]of Object.entries(manifest.pins))await verify(source,file,digest);
-for(const item of files)await verify(source,item.path,item.before);
+for(const item of manifest.files)await verify(source,item.path,item.before);
+for(const item of serverFiles)if(!baseFiles.has(item.path))await verify(source,item.path,item.before);
 // An existing output is never reused, reset or removed, including on failure.
 await mkdir(output,{mode:0o700});
 for(const name of await readdir(source)) {
@@ -48,7 +55,9 @@ for(const name of await readdir(source)) {
 }
 execFileSync('/usr/bin/git',['apply','--check',patch],{cwd:output,stdio:'pipe'});
 execFileSync('/usr/bin/git',['apply',patch],{cwd:output,stdio:'pipe'});
+for(const item of manifest.files)await verify(output,item.path,item.after);
 if(serverManifest){
+ for(const item of serverFiles)await verify(output,item.path,item.before);
  execFileSync('/usr/bin/git',['apply','--check',serverPatch],{cwd:output,stdio:'pipe'});
  execFileSync('/usr/bin/git',['apply',serverPatch],{cwd:output,stdio:'pipe'});
 }

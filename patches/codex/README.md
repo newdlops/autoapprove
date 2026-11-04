@@ -49,6 +49,12 @@ node scripts/prepare-codex-native-inventory.mjs \
 
 From the prepared directory, owned native validation uses Rust 1.95.0:
 
+For owned debug builds, prefix Cargo commands with
+`env CARGO_INCREMENTAL=0 MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
+This matches the app's macOS 14 baseline and avoids accumulating multi-gigabyte
+incremental compiler caches. An initial peer-enabled binary link failed when the
+prototype cache filled the disk; only that owned cache was removed before retry.
+
 ```sh
 cargo +stable test -p codex-tui --lib --features autoapprove-native-inventory native_inventory --locked --jobs 2
 cargo +stable build -p codex-tui --features autoapprove-native-inventory --bin codex-tui --locked --jobs 2
@@ -73,7 +79,7 @@ node scripts/codex-native-inventory-read.mjs \
 - The patch was reproduced from clean pinned source, with all 10 postimages
   checked. Rustfmt parsed/formatted the changed Rust files; that is not a Rust
   compilation or semantic test pass by itself.
-- `node scripts/codex-native-inventory-contract-check.mjs` passed 19 checks for
+- `node scripts/codex-native-inventory-contract-check.mjs` passed 21 checks for
   nonce/PID/admission rejection, invalid/oversized responses, private socket/file
   handling, no-overwrite source preparation, changed-source rejection and exact
   local-only lock normalization. This uses synthetic socket replies
@@ -165,8 +171,10 @@ No production feature completion follows from this diagnostic prototype.
 ## Optional native server observation
 
 `0.166.0-native-server-inventory.patch` adds a separate, opt-in server producer.
-Prepare both patches with `--with-server-inventory`; preparation verifies all 16
-source postimages, the two patch digests and the same local-only lock correction.
+Prepare both patches with `--with-server-inventory`; preparation verifies all 28
+final source postimages, the two patch digests and the same local-only lock correction.
+The server overlay extends two TUI files after checking their exact TUI-phase
+postimages. The original source and all other preimages remain pinned separately.
 The first reproduction detected Git skipping a Git-style patch inside the
 ignored nested fixture; the final patch uses the same unified-diff format as the
 TUI patch and was reproduced successfully. Existing output trees are never reset.
@@ -181,8 +189,8 @@ no transcript, draft, Goal, account or token content and exposes no new LAN RPC.
 A contended subscription snapshot times out after 100 ms; local socket requests
 retain the two-second/1 MiB bounds, private ownership and exclusive binding checks.
 
-These stores are not yet bound to native peer identity, pending transport events
-or one topology revision. Every response therefore has `consistentRevision`,
+These stores are not yet bound to collected client inventories, pending transport
+events or one topology revision. Every response therefore has `consistentRevision`,
 `membershipComplete` and `admissionGranted` false, including successful reads.
 This is a server-side observation component, not permission to migrate a client.
 
@@ -216,8 +224,36 @@ inference requests were served and two external startup requests were blocked.
 The short-lived observer RPC connections can close asynchronously; the fixture
 waits up to five seconds for its owned setup to settle, without claiming revision
 consistency. No managed supervisor, native peer attestation, real auth, admission
-barrier or migration was verified. The 19 passing Node checks separately prove
+barrier or migration was verified. The 21 passing Node checks separately prove
 consumer/bootstrap boundaries only.
+
+### macOS process-instance identity extension
+
+The optional server overlay now captures the kernel `LOCAL_PEERTOKEN` on accepted
+Unix streams and decodes it with the SDK's libbsm accessors. It records PID,
+effective UID/GID and audit PID version. The latter identifies the process
+instance without treating a PID alone or a client-declared version as identity.
+The TUI inventory also reports its own `TASK_AUDIT_TOKEN` identity. TCP/remote
+connections and unsupported platforms receive no manufactured identity.
+
+The actual macOS kernel identity test passed, and all 11 Unix socket tests passed
+with the peer event delivered before ordinary application messages. The explicit
+feature-off test also passed. The five full server inventory tests passed again
+with the new event. The full CLI and standalone TUI then built successfully with
+incremental caching disabled and the macOS 14 deployment target.
+
+The owned fixture's `--direct-server` mode bypasses its wire proxy and compares
+the daemon's recorded subscriber identity, the TUI's self identity and kernel
+credentials on the independently queried private TUI socket. In contrast,
+`--expect-proxy-peer` requires the daemon to report the actual proxy process,
+not either TUI, despite forwarded client names. Both live checks passed with two
+real TUIs: direct peers matched all three identity sources, and proxy peers were
+correctly distinguished. Subscriber counts remained two/one/two across navigation
+and return, exact drafts were restored, and all 19 original controller identities
+survived cleanup. Both are owned observation tests; the daemon still reports
+`clientInventoryBound=false` and grants no admission, credential switching or
+selected-session effects. This does not prove a complete peer census, a consistent
+cohort revision, executable attestation, real SSO or migration.
 
 The local reviewed-source import used for the initial experiment excluded a
 bubblewrap license symlink. It is suitable only as the recorded source inspection

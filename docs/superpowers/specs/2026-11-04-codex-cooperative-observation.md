@@ -78,6 +78,22 @@ Native peer identity, client-response binding and a consistent topology revision
 are still absent, so even a successful response explicitly denies completeness
 and admission. This component does not yet fulfill the complete census proposal.
 
+The optional server overlay has since added opt-in macOS kernel peer credentials:
+PID, effective UID/GID and audit PID version, decoded from `LOCAL_PEERTOKEN` using
+libbsm. The TUI reports its own `TASK_AUDIT_TOKEN` identity as well. A PID alone,
+initialize name/version or a timestamp from a potentially reused PID is not the
+process-instance proof. Kernel identity, all 11 Unix socket tests, the explicit
+feature-off test and the five server inventory tests pass. The CLI and TUI built
+successfully after removing only the owned incremental cache and disabling its
+regrowth, with a macOS 14 deployment target. Two-client live checks now pass:
+direct daemon peers match the TUI self identity and independently read kernel
+credentials on its private socket; forwarded connections correctly identify the
+proxy process rather than either named TUI. Both preserve two/one/two subscriber
+counts, exact draft return and all 19 original controller identities after cleanup.
+The overlay is now reproduced as 28 unique final postimages in two checked phases.
+Even successful peer capture leaves `clientInventoryBound`, consistency,
+completeness and admission ungranted until the remaining bindings are implemented.
+
 ## Why both sides are required
 
 The inspected official version is 0.166.0, commit

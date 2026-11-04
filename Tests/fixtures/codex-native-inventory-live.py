@@ -7,6 +7,7 @@ preservation of the original process/session identities throughout the probe.
 """
 import argparse
 import base64
+import ctypes
 import fcntl
 import http.server
 import json
@@ -36,11 +37,15 @@ parser.add_argument('--navigation', action='store_true', help='Exercise owned of
 parser.add_argument('--return-via-resume', action='store_true', help='Regression check for the distinct direct /resume path')
 parser.add_argument('--peer-cli', help='Optional patched full CLI for a second owned TUI on the same root')
 parser.add_argument('--server-inventory', action='store_true', help='Require the patched server native observation socket')
+parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
+parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
 args = parser.parse_args()
 assert not args.navigation or args.server, 'Navigation requires the owned shared server'
 assert not args.return_via_resume or args.navigation, 'Direct return requires navigation'
 assert not args.peer_cli or args.navigation, 'A shared peer requires the owned navigation test'
 assert not args.server_inventory or args.server, 'Server observation requires the owned server'
+assert not args.direct_server or args.server_inventory, 'Direct peer validation requires server inventory'
+assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
 tui = pathlib.Path(args.tui).resolve(strict=True)
 assert tui.name == 'codex-tui', 'Only the explicitly built standalone test TUI is allowed'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -141,7 +146,7 @@ env = {'HOME': str(fixture_home), 'CODEX_HOME': str(fixture_home), 'PATH': '/usr
 server = None
 server_log = None
 control_socket = fixture_home/'app-server-control/app-server-control.sock'
-backend_socket = fixture/'backend.sock'
+backend_socket = control_socket if args.direct_server else fixture/'backend.sock'
 proxy_listener = None
 proxy_done = threading.Event()
 proxy_threads = []
@@ -312,13 +317,14 @@ if args.server:
             server_log.close()
             raise RuntimeError('Owned shared server did not start; inspect its private log')
         time.sleep(.05)
-    proxy_listener = socket.socket(socket.AF_UNIX)
-    proxy_listener.bind(str(control_socket))
-    control_socket.chmod(0o600)
-    proxy_listener.listen(10)
-    proxy_listener.settimeout(.2)
-    proxy_acceptor = threading.Thread(target=accept_proxy, daemon=True)
-    proxy_acceptor.start()
+    if not args.direct_server:
+        proxy_listener = socket.socket(socket.AF_UNIX)
+        proxy_listener.bind(str(control_socket))
+        control_socket.chmod(0o600)
+        proxy_listener.listen(10)
+        proxy_listener.settimeout(.2)
+        proxy_acceptor = threading.Thread(target=accept_proxy, daemon=True)
+        proxy_acceptor.start()
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -363,6 +369,28 @@ def pump(own_fd, own_capture, own_lock, own_done):
 reader = threading.Thread(target=pump, args=(fd, captured, capture_lock, done), daemon=True)
 reader.start()
 
+kernel_identities = {}
+
+class AuditToken(ctypes.Structure):
+    _fields_ = [('words', ctypes.c_uint32*8)]
+
+def kernel_socket_identity(stream):
+    # SDK: LOCAL_PEERTOKEN=6, SOL_LOCAL=0; decode the opaque audit token only
+    # through libbsm accessors, independently of the native producer's JSON.
+    token = AuditToken.from_buffer_copy(stream.getsockopt(0, 6, 32))
+    bsm = ctypes.CDLL('/usr/lib/libbsm.dylib')
+    result = {'source': 'macos-audit-token'}
+    for key, name, result_type in [('pid', 'pid', ctypes.c_int),
+                                   ('effectiveUid', 'euid', ctypes.c_uint32),
+                                   ('effectiveGid', 'egid', ctypes.c_uint32),
+                                   ('auditPidVersion', 'pidversion', ctypes.c_uint32)]:
+        function = getattr(bsm, 'audit_token_to_'+name)
+        function.argtypes, function.restype = [AuditToken], result_type
+        result[key] = function(token)
+    assert result['pid'] > 0 and result['auditPidVersion'] > 0
+    assert result['effectiveUid'] == os.geteuid()
+    return result
+
 def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-tui-prototype'):
     info = own_endpoint.lstat()
     assert stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
@@ -370,6 +398,12 @@ def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-t
     with socket.socket(socket.AF_UNIX) as stream:
         stream.settimeout(3)
         stream.connect(str(own_endpoint))
+        if args.direct_server:
+            kernel = kernel_socket_identity(stream)
+            assert kernel['pid'] == own_pid, 'Private endpoint belongs to a different native process'
+            if own_pid in kernel_identities:
+                assert kernel_identities[own_pid] == kernel, 'Native process generation changed'
+            kernel_identities[own_pid] = kernel
         stream.sendall(json.dumps({'nonce': nonce}).encode()+b'\n')
         data = bytearray()
         while not data.endswith(b'\n'):
@@ -381,6 +415,8 @@ def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-t
     assert value['nonce'] == nonce and value['pid'] == own_pid and value['schemaVersion'] == 1
     assert value['producer'] == producer
     assert value['membershipComplete'] is False and value['admissionGranted'] is False
+    if args.direct_server and producer == 'autoapprove-native-tui-prototype':
+        assert value['processIdentity'] == kernel, 'TUI self identity does not match its actual socket peer'
     return value
 
 def original_sessions_unchanged():
@@ -421,11 +457,24 @@ def server_subscribers(root_id, expected_count):
         subscriptions = value['subscriptions']
         ids = subscriptions['subscribers'].get(root_id, [])
         transports = {row['connectionID'] for row in value['connections']}
-        assert all(not row['nativePeerIdentified'] and not row['clientInventoryBound'] for row in value['connections'])
+        assert all(not row['clientInventoryBound'] for row in value['connections'])
         coherent = set(ids) <= set(subscriptions['initializedConnectionIDs']) <= transports
         if coherent and len(ids) == expected_count:
             for connection_id in ids:
                 assert root_id in subscriptions['byConnection'][str(connection_id)]
+                row = next(row for row in value['connections'] if row['connectionID'] == connection_id)
+                if args.direct_server:
+                    assert row['nativePeerIdentified'], 'Actual local TUI peer was not identified'
+                    peer_identity = row['nativePeer']
+                    assert peer_identity == kernel_identities[peer_identity['pid']], 'Daemon peer and TUI endpoint identities disagree'
+                elif args.expect_proxy_peer:
+                    assert row['nativePeerIdentified']
+                    assert row['nativePeer']['pid'] == os.getpid(), 'Owned proxy PID was not captured as the real peer'
+                    assert row['nativePeer']['pid'] != pid and (not peer or row['nativePeer']['pid'] != peer['pid'])
+            if args.direct_server:
+                actual_pids = {row['nativePeer']['pid'] for row in value['connections'] if row['connectionID'] in ids}
+                expected_pids = {pid, peer['pid']} if peer and expected_count == 2 else ({peer['pid']} if peer and expected_count == 1 else ({pid} if expected_count == 1 else set()))
+                assert actual_pids == expected_pids, 'Native subscriber peers did not match the owned clients'
             return set(ids)
         time.sleep(.05)
     (output/'owned-server-inventory-mismatch.json').write_text(json.dumps(value, indent=2)+'\n')
@@ -603,7 +652,8 @@ try:
         assert draft.decode() not in json.dumps(parked)
         offscreen = True
         original_sessions_unchanged()
-        assert any(v['threadID'] == original and v['acknowledged'] for v in unsubscribes), 'No actual unsubscribe ACK for the retained root'
+        if not args.direct_server:
+            assert any(v['threadID'] == original and v['acknowledged'] for v in unsubscribes), 'No actual unsubscribe ACK for the retained root'
         shared_owners = 1
         if peer:
             peer_parked = peer_inventory()
@@ -665,13 +715,15 @@ try:
               'offscreenUnsubscribedDraftObserved': offscreen, 'exactDraftReturnedAfterNavigation': returned,
               'unsubscribeACKObserved': any(v['acknowledged'] for v in unsubscribes),
               'unsubscribeRequests': len(unsubscribes),
-              'ownedWireProxy': server is not None,
+              'ownedWireProxy': server is not None and not args.direct_server,
               'sampledClients': 2 if peer else 1,
               'sampledOwnersAfterUnsubscribe': shared_owners if args.navigation else None,
               'nativeServerSubscriptionsVerified': args.server_inventory,
               'nativeSubscriberCounts': [len(before_subscribers), len(after_subscribers), len(return_subscribers)]
                   if args.server_inventory and args.navigation else None,
               'nativeServerPeerAttestationVerified': False,
+              'ownedKernelPeerProcessBindingVerified': args.direct_server,
+              'proxyPeerMismatchVerified': args.expect_proxy_peer,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,
               'externalRequestsBlocked': counts['externalBlocked'], 'membershipComplete': False,
               'sharedUnixAppServer': server is not None, 'managedDaemonSupervisor': False,
@@ -690,11 +742,12 @@ finally:
     http.shutdown()
     http.server_close()
     if server:
-        proxy_done.set()
-        proxy_listener.close()
-        proxy_acceptor.join(timeout=1)
-        for worker in proxy_threads:
-            worker.join(timeout=1)
+        if proxy_listener:
+            proxy_done.set()
+            proxy_listener.close()
+            proxy_acceptor.join(timeout=1)
+            for worker in proxy_threads:
+                worker.join(timeout=1)
         if server.poll() is None:
             os.killpg(server.pid, signal.SIGTERM)
             try:

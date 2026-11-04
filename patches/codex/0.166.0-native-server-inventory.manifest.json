@@ -8,12 +8,12 @@
     {
       "path": "app-server/Cargo.toml",
       "before": "cceb3af7ee41633a33b14f55f1193b32fc75afb830c0dfa22393cf24af3d6f3d",
-      "after": "e58807f27c2afd8a92ee08560136f025574260afa51cedcb23c89e2e02d96f06"
+      "after": "6ca457cb10a22130b705c2f12d7c8d8ffac71f97f75ef7d72cb16eefd010923a"
     },
     {
       "path": "app-server/src/lib.rs",
       "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
-      "after": "dadf1087051563ef129435a1b86511cf34f4c5d71e82c0141e61fd1e0a069047"
+      "after": "d0457c9582cc69f693ebec83aa506be22ef3153b7faf31c7f4e1db448eb463bc"
     },
     {
       "path": "app-server/src/message_processor.rs",
@@ -28,13 +28,83 @@
     {
       "path": "app-server/src/native_inventory.rs",
       "before": null,
-      "after": "925bc371d6daefac3b23522e571d1296488b7c6f2c99a644ecfa7563f08742a9"
+      "after": "83dfc95c063c6beffb641f19077dd876120c7b5b8f81feed7f1bb7554b5e50ad"
     },
     {
       "path": "app-server/src/native_inventory_transport.rs",
       "before": null,
       "after": "b3622a3bbea952e3ea522d14e7ded28be689f86e38354d2208b7a95bcf2a095f"
+    },
+    {
+      "path": "app-server/src/transport.rs",
+      "before": "5b4cb5599deae1af2153976fee7586be3f87df53a2e2816f2011bddf638bda06",
+      "after": "d7ab0acc4b5a9df3807563421a6d4cbd125b163f28d2a96ba014659f5ae886df"
+    },
+    {
+      "path": "uds/src/lib.rs",
+      "before": "a6c126e70fc54ce15e5508819bfa6b5b7d0b13274be20e5a6c13261056bc19be",
+      "after": "66b37a199317135a213ea4c489d8351dba40d6328381331db455228258d82217"
+    },
+    {
+      "path": "app-server-client/Cargo.toml",
+      "before": "9f941218c5bc7932bf1d675cbea2715820a563a41e5d871dd45207e1c285ba3e",
+      "after": "0eefdbcc4e450e9b6a1f4f1fb653edd4b9f1155814861f3594a482dd1e9ee49d"
+    },
+    {
+      "path": "app-server-client/src/lib.rs",
+      "before": "1dadc18f61860172658f7dab20a7a349fa7ceb34a40c1998609e1c2cf147d3be",
+      "after": "c8038de57da22e271825595ffdda8cb810054f30375d316d0b6774f66c7d24c0"
+    },
+    {
+      "path": "app-server-transport/Cargo.toml",
+      "before": "90e2b999c62733e9de5cc7d0e2c20757751ef417889330ce910c4294ddf0fd59",
+      "after": "ba306d8ef48b1e3ee1a72e9000280349bf37ba1a24527dfb3e5bcbb63c3c7114"
+    },
+    {
+      "path": "app-server-transport/src/lib.rs",
+      "before": "748b9972623b8aeaca5dfd95540591edd27213b38c98662f250672153e9877c1",
+      "after": "cfceab426794198e1ab14258af5532a6db4390f210fcd31a345e2da958de0c2f"
+    },
+    {
+      "path": "app-server-transport/src/native_peer.rs",
+      "before": null,
+      "after": "d5d215c6ea658e65f90df975b1ef32b0c9786b267ca51996da5c32a8a6c2f442"
+    },
+    {
+      "path": "app-server-transport/src/transport/mod.rs",
+      "before": "4592c67d84ebd276133f47d29c63327de8d945b30a89b64a59868db30546caf1",
+      "after": "d5f7ae1c5ebe1a98f496b9faf559d7ba20dca9146580e7c91f5a681702618e4d"
+    },
+    {
+      "path": "app-server-transport/src/transport/unix_socket.rs",
+      "before": "a2ff08a28cb52c8a11895bb4cff41401180fb0efd0491984b77af381e7efafe3",
+      "after": "312c13b384cfa21d38a0721227352807f2d7d7f918add455ac41a34c22f56c21"
+    },
+    {
+      "path": "app-server-transport/src/transport/unix_socket_tests.rs",
+      "before": "7665be7cadd9a6f309620674fd2f39a61c6c4fc22d6fbfe719c575dc5af89ec5",
+      "after": "eaf84aa7dfd3c8389d126e634a708fd49df0679e221a29791901abc071d9cc11"
+    },
+    {
+      "path": "app-server-transport/src/transport/websocket.rs",
+      "before": "c9d2b13f46e34e3cabb8783f6d50073015ce388d748fdf5e9af57f323a24a860",
+      "after": "e7e5bfe75d486b3fc2596069b0188996378ababdfe2ca98c7e68269bc23ccf17"
+    },
+    {
+      "path": "app-server-transport/src/transport/remote_control/client_tracker.rs",
+      "before": "eb962402dfa0dcd44de5f433ecb91db44ae2f07077e6680c38bb077e24ae874e",
+      "after": "cae24e806b94480ee1f720ad6ca2738afb97192de1f99330cce7e132cf9e43ab"
+    },
+    {
+      "path": "tui/Cargo.toml",
+      "before": "1deddf7313bbef13ecaaf5263b7988883cc3a3b97d6e1ccbe9ebeeb06624a4ec",
+      "after": "6a2aebdb80b4a83bac58f4f99aa1d2eb19e1f3ddc9b5c49dab13e7a152ba8c8d"
+    },
+    {
+      "path": "tui/src/app/native_inventory.rs",
+      "before": "05d1ac870a33ba91d2b46f6cb940c634a3c85634b11a7f4e2e1c4733beac7249",
+      "after": "ef12807812af175dbdf2034f77c7fef22134f4d3199de22365ce82ea3ddac66f"
     }
   ],
-  "patchSHA256": "ca58cbd26c05c8bf752112946751adc1bc42152adce7ddf6982422bce104041a"
+  "patchSHA256": "40630071efa2a97f1966818c55d3233d9ffa2362928964f87fbb782cb6f9b5db"
 }
