@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import {execFileSync,spawn} from 'node:child_process';
 import {mkdtemp,mkdir,rm,symlink,writeFile,readFile,chmod} from 'node:fs/promises';
@@ -16,11 +17,12 @@ const housekeeping='00000000-0000-4000-8000-000000000003';
 let mode='active',child,interrupts=0,refusals=0,goalPauses=0,backgroundStops=0;
 const pausedGoals=new Set(),stoppedBackground=new Set();
 const goalReads=new Map(),quiescenceFailures=[];
+let interruptRejected=false,settlementReads=0;
 try {
  await mkdir(directory+'/app-server-control');
  await writeFile(cli,`#!${process.execPath}\nimport fs from 'node:fs';import readline from 'node:readline';
 const args=process.argv.slice(2),home=process.env.CODEX_HOME;
-if(args.join(' ')==='app-server daemon version'){if(fs.existsSync(home+'/delay-version'))await new Promise(r=>setTimeout(r,500));console.log(JSON.stringify({status:'running',backend:'pid',managedCodexPath:process.argv[1],managedCodexVersion:'0.166.0',socketPath:home+'/app-server-control/app-server-control.sock',cliVersion:'0.166.0',appServerVersion:'0.166.0'}));process.exit(0);}
+if(args.join(' ')==='app-server daemon version'){if(fs.existsSync(home+'/delay-version'))await new Promise(r=>setTimeout(r,500));const version=fs.existsSync(home+'/changed-server')?'0.167.0':'0.166.0';console.log(JSON.stringify({status:'running',backend:'pid',managedCodexPath:process.argv[1],managedCodexVersion:version,socketPath:home+'/app-server-control/app-server-control.sock',cliVersion:version,appServerVersion:version}));process.exit(0);}
 if(args.join(' ')==='app-server daemon restart'){fs.appendFileSync(home+'/restart.log','restart\\n');process.exit(0);}
 if(args.join(' ')!=='app-server --listen stdio://')process.exit(91);
 for await(const line of readline.createInterface({input:process.stdin})){const m=JSON.parse(line);if(m.method==='initialized')continue;let result;if(m.method==='initialize')result={userAgent:'fixture'};else if(m.method==='accountSession/list'&&m.params.refreshWorkspaceMetadata===false)result={activeSessionId:'session-new',sessions:[{sessionId:'session-new',isActive:true,userId:'user-new',selectedWorkspaceAccountId:'workspace'}]};else process.exit(92);console.log(JSON.stringify({id:m.id,result}));}
@@ -47,8 +49,21 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
     case 'thread/goal/get':if(mode==='goal-race'){const n=(goalReads.get(m.params.threadId)||0)+1;goalReads.set(m.params.threadId,n);result={goal:{status:n>=4?'complete':'active'}};}else result={goal:mode.includes('goal')?{status:pausedGoals.has(m.params.threadId)?'paused':'active'}:null};break;
     case 'thread/goal/set':assert.equal(m.params.status,'paused');assert.equal(m.params.origin,'automatic');assert.equal(m.params.objective,undefined);assert.equal(m.params.tokenBudget,undefined);pausedGoals.add(m.params.threadId);goalPauses++;result={goal:{status:'paused'}};break;
     case 'thread/backgroundTerminals/terminate':assert.equal(m.params.processId,'owned-background');stoppedBackground.add(m.params.threadId);backgroundStops++;result={terminated:true};break;
-    case 'turn/interrupt':assert.equal(m.params.threadId,ids[0]);assert.equal(m.params.turnId,'turn-'+ids[0]);interrupts++;result={};break;
+    case 'turn/interrupt':assert.equal(m.params.threadId,ids[0]);assert.equal(m.params.turnId,'turn-'+ids[0]);interrupts++;
+     if(mode.startsWith('interrupt-race')){interruptRejected=true;if(mode.endsWith('changed-server'))writeFileSync(directory+'/changed-server','changed');socket.send(JSON.stringify({id:m.id,error:{code:mode.endsWith('wrong-code')?-32000:-32600,message:mode.endsWith('wrong-reason')?'different interruption failure':'no active turn to interrupt'}}));return;}
+     result={};break;
     default:throw new Error('Unexpected RPC '+m.method);
+   }
+   if(mode.startsWith('interrupt-race') && m.params.threadId===ids[0]){
+    const active=!interruptRejected || mode.endsWith('still-active') || mode.endsWith('lag')&&settlementReads<3;
+    if(m.method==='thread/read'){
+     if(interruptRejected)settlementReads++;
+     result={thread:{id:ids[0],status:{type:interruptRejected&&mode.endsWith('unknown-status')?'unknown':(!interruptRejected||mode.endsWith('still-active')||mode.endsWith('lag')&&settlementReads<3)?'active':'idle'}}};
+    }
+    if(m.method==='thread/turns/list')result={data:interruptRejected&&mode.endsWith('missing-turn')?[]:[{id:interruptRejected&&mode.endsWith('changed-turn')?'replacement-turn':'turn-'+ids[0],status:active?'inProgress':'interrupted'}]};
+    if(m.method==='thread/goal/get')result={goal:{status:interruptRejected&&mode.endsWith('reactivated')?'active':pausedGoals.has(ids[0])?'paused':'active'}};
+    if(m.method==='thread/queue/list'&&mode.endsWith('queue'))result={data:[{id:'queued'}],nextCursor:null};
+    if(m.method==='thread/backgroundTerminals/list'&&interruptRejected&&mode.endsWith('background'))result={data:[{processId:'new-owned-background'}],nextCursor:null};
    }
    socket.send(JSON.stringify({id:m.id,result}));
   });
@@ -79,5 +94,16 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  assert.ok(refusals>0);
  assert.ok(methods.every(m=>['initialize','initialized','accountSession/list','thread/loaded/list','thread/read','thread/turns/list','thread/queue/list','thread/backgroundTerminals/list','thread/backgroundTerminals/terminate','thread/goal/get','thread/goal/set','turn/interrupt'].includes(m)));
  assert.deepEqual(quiescenceFailures,[],'Quiescence state/queue races');
- console.log(JSON.stringify({verified:true,checks:['saved metadata from owned stdio helper','complete loaded pagination','exact normal interrupt','queue/background/goal barriers','unknown/malformed/repeated pages fail closed','one official restart after fresh idle barrier','no resume, prompt or terminal input'],interrupts}));
+ const settledInterruptChecks=[];
+ for(const [suffix,accepted]of [['idle',true],['lag',true],['queue',true],['changed-turn',false],['missing-turn',false],['still-active',false],['reactivated',false],['background',false],['unknown-status',false],['wrong-code',false],['wrong-reason',false],['changed-server',false]]){
+  await rm(directory+'/changed-server',{force:true});mode='interrupt-race-goal-'+suffix;interruptRejected=false;settlementReads=0;pausedGoals.clear();stoppedBackground.clear();goalReads.clear();
+  const priorInterrupts=interrupts,priorPauses=goalPauses;
+  const result=await run(accepted?'interrupt':'reject-interrupt');assert.equal(result[accepted?'verified':'rejected'],true,suffix);
+  assert.equal(interrupts,priorInterrupts+1,'Never retry an interrupted-turn mutation: '+suffix);
+  assert.equal(goalPauses,priorPauses+1,'Pause the original Goal exactly once: '+suffix);
+  settledInterruptChecks.push(suffix);
+ }
+ assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\nrestart\nrestart\n','Interrupt settlement must never restart a server');
+
+ console.log(JSON.stringify({verified:true,checks:['saved metadata from owned stdio helper','complete loaded pagination','exact normal interrupt','queue/background/goal barriers','unknown/malformed/repeated pages fail closed','one official restart after fresh idle barrier','no resume, prompt or terminal input'],settledInterruptChecks,interrupts}));
 } finally {if(child&&child.exitCode===null)child.kill();for(const socket of clients)socket.terminate();websocket.close();server.close();await rm(directory,{recursive:true,force:true});}

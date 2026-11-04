@@ -235,7 +235,30 @@ enum CodexAccountTransitionLocal {
         if value.active {
             guard let turn=value.turnID else {throw AppError.message("중단할 실행 차례를 확인하지 못했습니다.")}
             try Task.checkCancellation()
-            _ = try connection.request("turn/interrupt",["threadId":id,"turnId":turn])
+            do {
+                _ = try connection.request("turn/interrupt",["threadId":id,"turnId":turn],classifyError:true)
+            } catch let error as CodexControlRPCError where error.method == "turn/interrupt" && error.code == -32600 && error.reason == "no active turn to interrupt" {
+                // Goal pause can finish this turn between inspection and the
+                // interrupt. Read back the reserved turn; never send it again.
+                for attempt in 0..<5 {
+                    try Task.checkCancellation()
+                    let metadata=try connection.request("thread/read",["threadId":id,"includeTurns":false])
+                    guard let row=metadata["thread"] as? JSONObject,row["id"] as? String==id,
+                          let status=(row["status"] as? JSONObject)?["type"] as? String,["active","idle"].contains(status) else {throw error}
+                    if status == "idle" {
+                        let settled=try current()
+                        guard !settled.needsQuiescence,settled.turnID==turn,
+                              ["completed","interrupted","failed"].contains(settled.turnStatus ?? "") else {throw error}
+                        let fresh=try connection.request("thread/read",["threadId":id,"includeTurns":false])
+                        guard let latest=fresh["thread"] as? JSONObject,latest["id"] as? String==id,
+                              (latest["status"] as? JSONObject)?["type"] as? String == "idle",
+                              try identity(target)==server else {throw error}
+                        return
+                    }
+                    if attempt < 4 {Thread.sleep(forTimeInterval:0.05)}
+                }
+                throw error
+            }
         }
     }
     static func thread(_ connection: CodexQueueConnection, id: String,metadata:JSONObject?=nil,home:String?=nil) throws -> CodexAccountTransitionThread {

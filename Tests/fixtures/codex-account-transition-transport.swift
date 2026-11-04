@@ -61,6 +61,11 @@ import AutoApproveCore
             if mode == "queued-worker" {guard ["활성 Goal","백그라운드 작업"].contains(thread.blocker ?? "") else {throw AppError.message("Queue masked a worker that must stop")}}
             try await service.interrupt(target,observed.serverID,thread.id,thread.turnID!)
             if mode == "queued-worker" {let after=try await service.observe(target);guard after.threads.first(where:{$0.id==thread.id})?.blocker=="대기 입력" else {throw AppError.message("Queued message was lost during work cleanup")}}
+        } else if mode == "reject-interrupt" {
+            let thread=observed.threads.first(where: \.active)!
+            do {try await service.interrupt(target,observed.serverID,thread.id,thread.turnID!)}
+            catch {print("{\"rejected\":true}");return}
+            throw AppError.message("Unverified interrupt completion was accepted")
         } else if mode == "interrupt" {
             let thread = observed.threads.first(where: \.active)!
             try await service.interrupt(target, observed.serverID, thread.id, thread.turnID!)
