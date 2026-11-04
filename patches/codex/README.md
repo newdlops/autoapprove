@@ -128,10 +128,10 @@ All 19 original controller identities remained intact. The unsubscribed runtime
 remained server-loaded, so loaded IDs cannot replace subscriber or retained-input
 ownership evidence.
 
-A distinct direct `/resume <ID>` return restored the conversation but did not
+Before the input-preservation fix, a distinct direct `/resume <ID>` return restored the conversation but did not
 restore the parked draft in this exact upstream version. That attempt failed the
-preservation gate; the overview result does not make it pass. Reproduce this
-still-failing regression with `--navigation --return-via-resume`.
+preservation gate; the overview result did not make it pass. The optional
+overlay fix and its direct-resume revalidation are recorded below.
 
 The optional full CLI also built successfully with the same source patch and
 pinned dependency graph. With `--navigation --peer-cli=/absolute/target/debug/codex`,
@@ -171,7 +171,7 @@ No production feature completion follows from this diagnostic prototype.
 ## Optional native server observation
 
 `0.166.0-native-server-inventory.patch` adds a separate, opt-in server producer.
-Prepare both patches with `--with-server-inventory`; preparation verifies all 30
+Prepare both patches with `--with-server-inventory`; preparation verifies all 32
 final source postimages, the two patch digests and the same local-only lock correction.
 The server overlay extends two TUI files after checking their exact TUI-phase
 postimages. The original source and all other preimages remain pinned separately.
@@ -284,7 +284,7 @@ and five inventory tests passed; an upstream auth-revision proof regression also
 passed with an explicit 32 MiB Rust test stack. The initial broader filter run
 failed from stack overflow and is not a successful verification.
 
-Both source patches reproduce 30 final postimages from the pinned upstream tree;
+Both source patches reproduce 32 final postimages from the pinned upstream tree;
 the local-version-only lock normalization still changes 170 entries with no
 external dependency changes. Live control verification is recorded separately
 from these source and unit checks.
@@ -301,3 +301,26 @@ navigation. All 19 original user session identities survived fixture cleanup.
 Five loopback synthetic inference requests were served; rejected input never
 reached the provider. This proves the owned pause/interrupt sequence, not a real
 credential switch, exact full persistent Goal row preservation, or resume-once.
+
+### Preserve parked input during explicit resume
+
+The server overlay now also fixes the TUI's explicit prepared-resume path.
+Previously it retained input only for a displayed external-writer view, ignoring
+input parked by overview navigation. It now copies the exact destination's
+retained input and consumes that parked entry only after successful attachment.
+An active live turn uses the same in-flight preservation rule as overview return;
+the patch does not auto-submit the restored queue.
+
+The pre-fix owned direct-resume probe reproduced the missing draft again. The
+native integration test passed all nine configured/explicit/runtime/remote cwd
+combinations with distinct displayed and parked destination drafts; preparation
+kept the displayed draft, and activation restored only the destination draft.
+The adjacent missing-cwd metadata regression passed. Both binaries built, and
+the owned two-TUI direct-resume plus admission probe passed: exact draft on fresh
+repaint before and after Goal pause/interrupt/release, two/one/two subscribers,
+separate backend unaffected and all 19 user session identities retained after
+cleanup. The fixture accepts only the exact native `-32600`/`no active turn to
+interrupt` race after Goal pause and still requires independently observed idle.
+It does not end its held provider response until native idle is proved. This
+fix and its tests do not establish real account switching or visual layout QA;
+no browser viewport or manual terminal visual signoff is claimed.

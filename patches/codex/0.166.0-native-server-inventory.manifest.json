@@ -127,7 +127,17 @@
       "path": "tui/src/app/native_inventory.rs",
       "before": "05d1ac870a33ba91d2b46f6cb940c634a3c85634b11a7f4e2e1c4733beac7249",
       "after": "ef12807812af175dbdf2034f77c7fef22134f4d3199de22365ce82ea3ddac66f"
+    },
+    {
+      "path": "tui/src/app/session_lifecycle.rs",
+      "before": "8cfe5730b1a351b42c8b9280d8f373087f1f2d573a214df833208e230be7cbbc",
+      "after": "35bb5275fc16757c10de6207631d1400d74065c09c0b47d38e5255b607c00310"
+    },
+    {
+      "path": "tui/src/app/tests.rs",
+      "before": "17eea60ec3e817d5e8da45d4b7ba2f7fd049c0ff032c4abc9e5902e73eecaaf6",
+      "after": "0ba995bea67844be0ab73fe5bcbe81d9aae11166ab6205b9dd6fd60390d8695a"
     }
   ],
-  "patchSHA256": "0ad66fc86d5b4005d481cc8ad2a903fa4b976ad8c61c6084532b41fd3ef71ad3"
+  "patchSHA256": "6b9738c706f2702179c396c7030426d1e6825b52bbf48e9ba56b3559c16593b0"
 }

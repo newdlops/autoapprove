@@ -1398,3 +1398,74 @@
              "nonce": nonce,
              "stores": stores,
              "retainedInputs": retained_inputs,
+--- a/tui/src/app/session_lifecycle.rs
++++ b/tui/src/app/session_lifecycle.rs
+@@ -1403,7 +1403,16 @@
+         let retained_input = (self.chat_widget.is_external_writer_view()
+             && self.chat_widget.thread_id() == Some(resumed_thread_id))
+         .then(|| self.chat_widget.capture_thread_input_state())
+-        .flatten();
++        .flatten()
++        // Explicit resume can select a root whose channel was removed while
++        // its input remained parked in the overview. Retain a copy until
++        // attachment succeeds so a failed handoff cannot consume the draft.
++        .or_else(|| {
++            self.agents_overview
++                .input_states
++                .get(&resumed_thread_id)
++                .cloned()
++        });
+         self.detach_current_thread_for_navigation(app_server, Some(resumed_thread_id))
+             .await;
+         self.local_settings = local_settings;
+@@ -1426,12 +1435,18 @@
+         {
+             Ok(()) => {
+                 if let Some(input) = retained_input {
++                    let preserve_in_flight_turn = !read_only
++                        && self
++                            .active_turn_id_for_thread(resumed_thread_id)
++                            .await
++                            .is_some();
+                     self.chat_widget.restore_thread_input_state(
+                         Some(input),
+                         ThreadInputStateRestoreMode {
+-                            preserve_in_flight_turn: false,
++                            preserve_in_flight_turn,
+                         },
+                     );
++                    self.agents_overview.input_states.remove(&resumed_thread_id);
+                 }
+                 if read_only {
+                     self.ensure_thread_channel(resumed_thread_id)
+--- a/tui/src/app/tests.rs
++++ b/tui/src/app/tests.rs
+@@ -8497,6 +8497,16 @@
+         app.config.codex_home = other_home.path().to_path_buf().abs();
+         let active_settings = (app.config.clone(), app.local_settings.clone());
+         let active_thread_id = app.chat_widget.thread_id();
++        // Resume must restore the destination's parked input, not the
++        // unrelated composer currently displayed during preparation.
++        let (mut parked_app, _, _) = make_test_app_with_channels().await;
++        parked_app
++            .chat_widget
++            .insert_str("parked destination draft");
++        let parked_input = parked_app.chat_widget.capture_thread_input_state().unwrap();
++        app.agents_overview
++            .input_states
++            .insert(thread_id, parked_input);
+         app.chat_widget
+             .insert_str("keep this draft until attachment");
+         let prepared = match app
+@@ -8542,6 +8552,11 @@
+             &expected_cwd,
+         ));
+         assert_eq!(app.chat_widget.thread_id(), Some(thread_id));
++        assert_eq!(
++            app.chat_widget.composer_text_with_pending(),
++            "parked destination draft"
++        );
++        assert!(!app.agents_overview.input_states.contains_key(&thread_id));
+     }
+
+     if let Some(app_server) = local_app_server {

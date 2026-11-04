@@ -49,7 +49,7 @@ An additional owned shared-Unix-server probe now verifies an actual offscreen
 navigation branch: a loopback-materialized root received a real unsubscribe ACK,
 then remained represented in the TUI's retained overview input after its local
 channel/navigation entries were removed. Overview selection restored its exact
-unsent draft. The server still listed that root as loaded. A separate direct
+unsent draft. The server still listed that root as loaded. A separate pre-fix direct
 `/resume` return did not restore the draft, so same-ID resume alone remains
 insufficient preservation evidence. These are one-client observations; complete
 peer census, independent voice/replay state and migration barriers remain open.
@@ -90,7 +90,7 @@ direct daemon peers match the TUI self identity and independently read kernel
 credentials on its private socket; forwarded connections correctly identify the
 proxy process rather than either named TUI. Both preserve two/one/two subscriber
 counts, exact draft return and all 19 original controller identities after cleanup.
-The overlay is now reproduced as 30 unique final postimages in two checked phases.
+The overlay is now reproduced as 32 unique final postimages in two checked phases.
 Even successful peer capture leaves `clientInventoryBound`, consistency,
 completeness and admission ungranted until the remaining bindings are implemented.
 
@@ -222,3 +222,41 @@ of browser authentication callbacks. Full account switching still requires
 verified quiescence, official auth invalidations, exact Goal state preservation,
 resume-once coordination and real account/SSO verification. Selected merge/split
 also requires the full native ownership cohort and persistent mappings.
+
+
+## Auth integration constraints found after the pause-lease probe
+
+The pinned account processor's normal managed browser flow passes no admission
+pause, while its workspace switch drains and unloads existing runtimes before
+reloading configuration. A cache-only cross-account reload is therefore not a
+verified substitute for rebuilding policy-bearing runtimes. The successful
+login completion path reloads auth and invalidates MCP runtimes, managed config,
+residency requirements and the model catalog before broadcasting account state.
+Any extension must preserve these behaviors rather than updating an auth file
+and declaring every loaded runtime switched.
+
+Runtime unload is also not a transparent TUI operation: the native
+`thread_close_exits_only_when_displayed_thread_is_unloaded` test explicitly
+requires a genuine unloaded displayed root to exit. A coordinated transition must
+retain the native widget state before teardown and reattach it deliberately;
+blindly reusing workspace unload would violate the requested window/conversation
+continuity. Browser callbacks additionally need ownership of the admission guard
+until their completion or confirmed cancellation; controller lease expiry alone
+must not permit an eventual callback to replace credentials after work resumes.
+
+The direct-resume parked-input regression is a prerequisite preservation fix,
+not proof that runtime unload or account switching is safe. The owned pre-fix
+reproduction failed again after overview parking, while overview return is
+already verified independently. Full TUI/Goal/queue/voice preservation and
+cross-account policy reconstruction remain separate requirements.
+
+
+The explicit-resume input fix is now verified in the optional source overlay.
+It restores the selected root's parked ThreadInputState after attachment and
+retains the saved copy on attachment failure. The native cwd matrix and adjacent
+metadata regression passed. The rebuilt two-TUI owned direct-resume + admission
+probe passed exact draft repaint both before and after native Goal pause/interrupt
+and lease release, with the separate backend unaffected and 19/19 original user
+identities preserved after cleanup. This resolves the observed parked-draft
+counterexample for this path. It does not verify full migration state, browser
+callback ownership, account-policy reconstruction or real SSO.

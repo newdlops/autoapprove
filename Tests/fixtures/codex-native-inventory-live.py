@@ -253,6 +253,11 @@ def accept_proxy():
         proxy_threads.append(worker)
         worker.start()
 
+class OwnedRPCError(RuntimeError):
+    def __init__(self, method, error):
+        self.code, self.message = error.get('code'), error.get('message')
+        super().__init__(f'Owned RPC rejected: {method}: {self.code}: {self.message}')
+
 class Wire:
     """Owned observer connection; reads never subscribe or submit a turn."""
     def __init__(self, socket_path=control_socket):
@@ -314,7 +319,8 @@ class Wire:
                 if expect_error:
                     assert 'error' in value, 'Owned request unexpectedly bypassed admission'
                     return value['error']
-                assert 'error' not in value, f'Owned read rejected: {method}'
+                if 'error' in value:
+                    raise OwnedRPCError(method, value['error'])
                 return value['result']
 
     def close(self):
@@ -665,8 +671,13 @@ def admission_probe():
         assert other.call('thread/goal/get', {'threadId': independent})['goal'] == independent_goal
         paused = main.call('thread/goal/set', {'threadId': background, 'status': 'paused', 'origin': 'user'})['goal']
         if main.call('thread/read', {'threadId': background, 'includeTurns': False})['thread']['status']['type'] == 'active':
-            main.call('turn/interrupt', {'threadId': background, 'turnId': started['id']})
-        admission_stream_stop.set()
+            try:
+                main.call('turn/interrupt', {'threadId': background, 'turnId': started['id']})
+            except OwnedRPCError as error:
+                # Goal pause may already have ended this exact turn between
+                # the status read and interrupt. Never retry a mutation; only
+                # accept this precise native result plus verified idle below.
+                assert error.code == -32600 and error.message == 'no active turn to interrupt'
         deadline = time.monotonic()+10
         while time.monotonic() < deadline:
             if main.call('thread/read', {'threadId': background, 'includeTurns': False})['thread']['status']['type'] == 'idle':
@@ -674,6 +685,9 @@ def admission_probe():
             time.sleep(.05)
         else:
             raise RuntimeError('Owned active Goal task did not stop under the lease')
+        # Do not make the fake model response end to manufacture an idle turn.
+        # Provider cleanup follows proof that native Goal pause/interrupt won.
+        admission_stream_stop.set()
         paused = main.call('thread/goal/get', {'threadId': background})['goal']
         assert paused['status'] == 'paused' and paused['tokenBudget'] == 20000
         owner.call('renew')
@@ -839,8 +853,8 @@ try:
         after_subscribers = server_subscribers(original, 1 if peer else 0)
         if after_subscribers is not None:
             assert after_subscribers < before_subscribers
-        # The overview owns/restores parked input. A direct /resume takes a
-        # different upstream path and is not evidence of that preservation.
+        # Exercise both return routes independently: the upstream direct
+        # /resume path historically lost the overview's parked input.
         if args.return_via_resume:
             os.write(fd, ('/resume '+original).encode())
         else:
