@@ -150,26 +150,28 @@ by relabeling that API. Preserve the full original account-switch requirement.
   existing DESIGN/PRODUCT instructions and SwiftUI design guidance. Establish
   the login-group contract in DESIGN.md before implementation. This is baseline
   inspection and a contract, not new UI functional/visual signoff.
-- [ ] Add an app-private named group registry and separate owned homes. Persist
+- [x] Add an app-private named group registry and separate owned homes. Persist
   group identity/name/home identity without copying credentials. Reject changed,
   missing or linked homes and corrupt metadata; never clear/reset the index after
   a read failure. Bounded lists and duplicate/failed creation must preserve
   existing groups and all user homes. No deletion workflow is implied.
-- [ ] Expose valid stored groups alongside existing detected homes for login and
+- [x] Expose valid stored groups alongside existing detected homes for login and
   server setup. Resolve the actual installed CLI without machine-specific paths.
   Creating an empty group must not start login, stop work, restart a server or
   imply that an existing session moved. Preserve per-home observation generations
   and explicit login/change locks.
-- [ ] Implement native group naming/creation/selection using the existing
+- [x] Implement native group naming/creation/selection using the existing
   account-window visual language. Keep the currently selected session's account
   actions scoped; creating a separate group is a global account-window action.
   The new group must remain selectable after app restart with no open clients.
 - [ ] Verify private filesystem behavior and native view interactions independently;
   exercise loading/error/cancel/success/duplicate/stale-home and long/dense states.
   Inspect actual 600×660 light/dark rendering and main-window account entry.
-- [ ] Complete the matching signed release, public artifact verification, local
+- [x] Complete the matching signed release, public artifact verification, local
   installation/running-version checks and session preservation for the bound
   user-visible improvement. Keep remote installation deferred until the lid opens.
+
+Task 8 implementation and 0.2.252/279 are published and locally installed. Debug810/810 and group9/9, optimized account62/62, actual native light/dark and functional paths are recorded in VALIDATION.md. Programmatic picker focus after sheet dismissal remains unconfirmed by AX; keep the QA item open for that keyboard follow-up rather than claiming full acceptance. Other Mac remains deferred.
 
 Full native client ownership, actual authentication/SSO, migration/restoration
 destination mappings and the requested selected-session merge/split flow remain
