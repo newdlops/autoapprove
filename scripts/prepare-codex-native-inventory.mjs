@@ -16,9 +16,19 @@ const assets=fileURLToPath(new URL('../patches/codex/',import.meta.url));
 const manifest=JSON.parse(await readFile(assets+'0.166.0-native-inventory.manifest.json','utf8'));
 const patch=assets+'0.166.0-native-inventory.patch';
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+const serverManifest=process.argv.includes('--with-server-inventory')
+ ? JSON.parse(await readFile(assets+'0.166.0-native-server-inventory.manifest.json','utf8')):null;
+const serverPatch=assets+'0.166.0-native-server-inventory.patch';
+if(serverManifest){
+ assert.equal(serverManifest.format,1);assert.equal(serverManifest.migrationAdmission,false);
+ assert.equal(serverManifest.upstreamCommit,manifest.upstreamCommit);
+ assert.equal(serverManifest.requiresInventoryPatchSHA256,manifest.patchSHA256);
+ assert.equal(hash(await readFile(serverPatch)),serverManifest.patchSHA256);
+}
 assert.equal(manifest.format,1);assert.equal(manifest.migrationAdmission,false);
 assert.equal(hash(await readFile(patch)),manifest.patchSHA256,'Patch differs from reviewed manifest');
-const paths=manifest.files.map(v=>v.path);
+const files=[...manifest.files,...(serverManifest?.files||[])];
+const paths=files.map(v=>v.path);
 assert.equal(new Set(paths).size,paths.length);
 for(const file of [...Object.keys(manifest.pins),...paths])assert.ok(/^[a-zA-Z0-9_./-]+$/.test(file)&&!file.startsWith('/')&&!file.split('/').includes('..'));
 async function verify(root,file,expected){
@@ -28,7 +38,7 @@ async function verify(root,file,expected){
  assert.equal(hash(await readFile(selected)),expected,'Source identity mismatch: '+file);
 }
 for(const [file,digest]of Object.entries(manifest.pins))await verify(source,file,digest);
-for(const item of manifest.files)await verify(source,item.path,item.before);
+for(const item of files)await verify(source,item.path,item.before);
 // An existing output is never reused, reset or removed, including on failure.
 await mkdir(output,{mode:0o700});
 for(const name of await readdir(source)) {
@@ -38,11 +48,16 @@ for(const name of await readdir(source)) {
 }
 execFileSync('/usr/bin/git',['apply','--check',patch],{cwd:output,stdio:'pipe'});
 execFileSync('/usr/bin/git',['apply',patch],{cwd:output,stdio:'pipe'});
-for(const item of manifest.files)await verify(output,item.path,item.after);
+if(serverManifest){
+ execFileSync('/usr/bin/git',['apply','--check',serverPatch],{cwd:output,stdio:'pipe'});
+ execFileSync('/usr/bin/git',['apply',serverPatch],{cwd:output,stdio:'pipe'});
+}
+for(const item of files)await verify(output,item.path,item.after);
 const buildLock=normalizeNativeBuildLock(await readFile(path.join(output,'Cargo.lock'),'utf8'),manifest);
 await writeFile(path.join(output,'Cargo.lock'),buildLock);
 await writeFile(path.join(output,'autoapprove-native-prototype.json'),JSON.stringify({
  upstreamCommit:manifest.upstreamCommit,patchSHA256:manifest.patchSHA256,
+ serverPatchSHA256:serverManifest?.patchSHA256||null,
  buildLockSHA256:manifest.buildLock.after,
  sourceOnly:true,built:false,installed:false,migrationAdmission:false
 },null,2)+'\n',{mode:0o600});

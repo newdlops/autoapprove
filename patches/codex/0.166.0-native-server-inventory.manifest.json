@@ -1,0 +1,40 @@
+{
+  "format": 1,
+  "upstreamCommit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+  "requiresInventoryPatchSHA256": "6705c959ce5123477ec45e576db7227faa4dd283a1757314b2a28fea977c409c",
+  "kind": "source-only-readonly-server-prototype",
+  "migrationAdmission": false,
+  "files": [
+    {
+      "path": "app-server/Cargo.toml",
+      "before": "cceb3af7ee41633a33b14f55f1193b32fc75afb830c0dfa22393cf24af3d6f3d",
+      "after": "e58807f27c2afd8a92ee08560136f025574260afa51cedcb23c89e2e02d96f06"
+    },
+    {
+      "path": "app-server/src/lib.rs",
+      "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
+      "after": "dadf1087051563ef129435a1b86511cf34f4c5d71e82c0141e61fd1e0a069047"
+    },
+    {
+      "path": "app-server/src/message_processor.rs",
+      "before": "6d81a0b5bab7172bf9ab24a6e8e05375f5623f0a8ac6d6da97c4ed184ad1085f",
+      "after": "f386cf64d82d5a2ffde3e78ca5c0ede6be16c538b69d14c3385e61379d6ae62c"
+    },
+    {
+      "path": "app-server/src/thread_state.rs",
+      "before": "3375cddd55a0ff09a3564ec5843a5d97c589c4276a963233dde4a594dfddfe39",
+      "after": "836f5f7fce901ea8369b7c03b6d8e4ad12c7779827b39230a14d6efdeb965f17"
+    },
+    {
+      "path": "app-server/src/native_inventory.rs",
+      "before": null,
+      "after": "925bc371d6daefac3b23522e571d1296488b7c6f2c99a644ecfa7563f08742a9"
+    },
+    {
+      "path": "app-server/src/native_inventory_transport.rs",
+      "before": null,
+      "after": "b3622a3bbea952e3ea522d14e7ded28be689f86e38354d2208b7a95bcf2a095f"
+    }
+  ],
+  "patchSHA256": "ca58cbd26c05c8bf752112946751adc1bc42152adce7ddf6982422bce104041a"
+}

@@ -1,4 +1,4 @@
-# Native TUI inventory prototype
+# Native TUI and server inventory prototypes
 
 This source-only, opt-in patch targets Codex 0.166.0, upstream commit
 `6ff1e1ca3b30fc8b914720681fcf5fe62e95f856`. It is not installed by AutoApprove,
@@ -73,7 +73,7 @@ node scripts/codex-native-inventory-read.mjs \
 - The patch was reproduced from clean pinned source, with all 10 postimages
   checked. Rustfmt parsed/formatted the changed Rust files; that is not a Rust
   compilation or semantic test pass by itself.
-- `node scripts/codex-native-inventory-contract-check.mjs` passed 13 checks for
+- `node scripts/codex-native-inventory-contract-check.mjs` passed 19 checks for
   nonce/PID/admission rejection, invalid/oversized responses, private socket/file
   handling, no-overwrite source preparation, changed-source rejection and exact
   local-only lock normalization. This uses synthetic socket replies
@@ -161,6 +161,63 @@ Complete daemon connection/peer census, revision binding, reversible admission
 barriers, full pending-state preservation, actual credential/backend attestation
 and end-to-end selected migration still need implementation and owned verification.
 No production feature completion follows from this diagnostic prototype.
+
+## Optional native server observation
+
+`0.166.0-native-server-inventory.patch` adds a separate, opt-in server producer.
+Prepare both patches with `--with-server-inventory`; preparation verifies all 16
+source postimages, the two patch digests and the same local-only lock correction.
+The first reproduction detected Git skipping a Git-style patch inside the
+ignored nested fixture; the final patch uses the same unified-diff format as the
+TUI patch and was reproduced successfully. Existing output trees are never reset.
+
+With the server Cargo feature `autoapprove-native-inventory` and explicit private
+`AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET`, the actual server transport loop
+answers nonce-bound reads from its connection map and the `ThreadStateManager`
+subscription stores. This includes uninitialized transport connections, native
+connection IDs, initialized-client IDs, per-connection thread IDs and per-thread
+subscriber IDs. Client-declared names/versions are labeled untrusted. It exports
+no transcript, draft, Goal, account or token content and exposes no new LAN RPC.
+A contended subscription snapshot times out after 100 ms; local socket requests
+retain the two-second/1 MiB bounds, private ownership and exclusive binding checks.
+
+These stores are not yet bound to native peer identity, pending transport events
+or one topology revision. Every response therefore has `consistentRevision`,
+`membershipComplete` and `admissionGranted` false, including successful reads.
+This is a server-side observation component, not permission to migrate a client.
+
+```sh
+node scripts/prepare-codex-native-inventory.mjs \
+  --source=/absolute/upstream/codex-rs --output=/absolute/new/prototype \
+  --with-server-inventory
+# From the newly prepared source:
+cargo +stable test -p codex-app-server --lib \
+  --features autoapprove-native-inventory native_inventory --locked --jobs 2
+cargo +stable build -p codex-cli --bin codex --locked --jobs 2 \
+  --features codex-tui/autoapprove-native-inventory,codex-app-server/autoapprove-native-inventory
+# Read only an owned server with its independently known PID:
+node scripts/codex-native-inventory-read.mjs --server \
+  --socket=/private/test-directory/server-inventory.sock --expected-pid=12345
+```
+
+The owned live fixture's `--server-inventory` option requires this producer and
+checks its real subscriber sets before navigation, after unsubscribe and after
+return. Combine it with `--navigation --peer-cli=...` to require two actual TUI
+clients. The full native server library compiled with `--locked` and passed all
+five filtered tests: actual two-client subscription changes and read non-mutation,
+uninitialized transport inclusion without attestation, and the three private IPC
+boundary tests. The full CLI then built with both optional features and `--locked`.
+The owned two-TUI live check also passed: the actual server reported two subscribers
+before navigation, one after the first client unsubscribed, and two after overview
+return. Both clients still retained the original root after unsubscribe, including
+the first client's offscreen draft; its exact draft returned on a fresh repaint.
+All 19 original controller identities survived cleanup. Two loopback synthetic
+inference requests were served and two external startup requests were blocked.
+The short-lived observer RPC connections can close asynchronously; the fixture
+waits up to five seconds for its owned setup to settle, without claiming revision
+consistency. No managed supervisor, native peer attestation, real auth, admission
+barrier or migration was verified. The 19 passing Node checks separately prove
+consumer/bootstrap boundaries only.
 
 The local reviewed-source import used for the initial experiment excluded a
 bubblewrap license symlink. It is suitable only as the recorded source inspection

@@ -35,10 +35,12 @@ parser.add_argument('--server', help='Optional exact-version CLI for an owned sh
 parser.add_argument('--navigation', action='store_true', help='Exercise owned offscreen unsubscribe and draft return')
 parser.add_argument('--return-via-resume', action='store_true', help='Regression check for the distinct direct /resume path')
 parser.add_argument('--peer-cli', help='Optional patched full CLI for a second owned TUI on the same root')
+parser.add_argument('--server-inventory', action='store_true', help='Require the patched server native observation socket')
 args = parser.parse_args()
 assert not args.navigation or args.server, 'Navigation requires the owned shared server'
 assert not args.return_via_resume or args.navigation, 'Direct return requires navigation'
 assert not args.peer_cli or args.navigation, 'A shared peer requires the owned navigation test'
+assert not args.server_inventory or args.server, 'Server observation requires the owned server'
 tui = pathlib.Path(args.tui).resolve(strict=True)
 assert tui.name == 'codex-tui', 'Only the explicitly built standalone test TUI is allowed'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -62,6 +64,7 @@ fixture_home, work = fixture/'home', fixture/'work'
 fixture_home.mkdir(mode=0o700)
 work.mkdir(mode=0o700)
 endpoint = fixture/'inventory.sock'
+server_endpoint = fixture/'server-inventory.sock'
 counts = {'inference': 0, 'externalBlocked': 0}
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -293,8 +296,11 @@ if args.server:
     assert version.stdout.strip() == b'codex-cli 0.166.0'
     control_socket.parent.mkdir(mode=0o700)
     server_log = (output/'owned-server-private.log').open('wb')
+    server_env = dict(env)
+    if args.server_inventory:
+        server_env['AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET'] = str(server_endpoint)
     server = subprocess.Popen([str(server_path), 'app-server', '--listen', 'unix://'+str(backend_socket)],
-                              env=env, cwd=work, stdin=subprocess.DEVNULL,
+                              env=server_env, cwd=work, stdin=subprocess.DEVNULL,
                               stdout=server_log, stderr=server_log, start_new_session=True)
     deadline = time.monotonic()+15
     while not backend_socket.exists():
@@ -357,7 +363,7 @@ def pump(own_fd, own_capture, own_lock, own_done):
 reader = threading.Thread(target=pump, args=(fd, captured, capture_lock, done), daemon=True)
 reader.start()
 
-def inventory(own_endpoint=endpoint, own_pid=pid):
+def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-tui-prototype'):
     info = own_endpoint.lstat()
     assert stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
     nonce = secrets.token_hex(16)
@@ -373,7 +379,7 @@ def inventory(own_endpoint=endpoint, own_pid=pid):
             assert len(data) <= 1024*1024
     value = json.loads(data)
     assert value['nonce'] == nonce and value['pid'] == own_pid and value['schemaVersion'] == 1
-    assert value['producer'] == 'autoapprove-native-tui-prototype'
+    assert value['producer'] == producer
     assert value['membershipComplete'] is False and value['admissionGranted'] is False
     return value
 
@@ -394,6 +400,36 @@ def local_owners(value):
         identifier for name, values in value['stores'].items() if name != 'catalogReferences'
         for identifier in values
     }
+
+server_generation = None
+
+def server_subscribers(root_id, expected_count):
+    global server_generation
+    if not args.server_inventory:
+        return None
+    # Short-lived observer RPC connections close asynchronously. Wait for the
+    # owned setup's cleanup to settle; this remains an observation, never an
+    # atomic census or authorization to mutate a selected session.
+    deadline = time.monotonic()+5
+    while time.monotonic() < deadline:
+        value = inventory(server_endpoint, server.pid, 'autoapprove-native-server-prototype')
+        assert value['error'] is None and value['consistentRevision'] is False
+        assert value['serverGeneration']
+        if server_generation is None:
+            server_generation = value['serverGeneration']
+        assert value['serverGeneration'] == server_generation, 'Owned native server generation changed'
+        subscriptions = value['subscriptions']
+        ids = subscriptions['subscribers'].get(root_id, [])
+        transports = {row['connectionID'] for row in value['connections']}
+        assert all(not row['nativePeerIdentified'] and not row['clientInventoryBound'] for row in value['connections'])
+        coherent = set(ids) <= set(subscriptions['initializedConnectionIDs']) <= transports
+        if coherent and len(ids) == expected_count:
+            for connection_id in ids:
+                assert root_id in subscriptions['byConnection'][str(connection_id)]
+            return set(ids)
+        time.sleep(.05)
+    (output/'owned-server-inventory-mismatch.json').write_text(json.dumps(value, indent=2)+'\n')
+    raise RuntimeError('Native subscriber snapshot did not settle to the owned setup')
 
 def launch_peer(primary):
     peer_binary = fixture/'owned-inventory-cli'
@@ -510,6 +546,7 @@ try:
             raise RuntimeError('Owned peer did not expose the shared primary root')
         assert first['stores']['primary'][0] in local_owners(peer_state)
         shared_identity(peer_state['stores']['primary'])
+    before_subscribers = server_subscribers(first['stores']['primary'][0], 2 if peer else 1)
     draft = b'UNSENT_NATIVE_INVENTORY_DRAFT_8e932b'
     os.write(fd, draft)
     limit = time.monotonic()+5
@@ -574,6 +611,9 @@ try:
             assert original in local_owners(parked) and original in local_owners(peer_parked)
             shared_owners = 2
             (output/'owned-peer-inventory.json').write_text(json.dumps(peer_parked, indent=2)+'\n')
+        after_subscribers = server_subscribers(original, 1 if peer else 0)
+        if after_subscribers is not None:
+            assert after_subscribers < before_subscribers
         # The overview owns/restores parked input. A direct /resume takes a
         # different upstream path and is not evidence of that preservation.
         if args.return_via_resume:
@@ -614,6 +654,7 @@ try:
         original_sessions_unchanged()
         if peer:
             assert peer_inventory()['stores']['primary'] == [original]
+        return_subscribers = server_subscribers(original, 2 if peer else 1)
     else:
         assert counts['inference'] == 0, 'Read-only probe unexpectedly submitted a turn'
         assert not unsubscribes, 'Read-only probe unexpectedly unsubscribed a thread'
@@ -627,6 +668,10 @@ try:
               'ownedWireProxy': server is not None,
               'sampledClients': 2 if peer else 1,
               'sampledOwnersAfterUnsubscribe': shared_owners if args.navigation else None,
+              'nativeServerSubscriptionsVerified': args.server_inventory,
+              'nativeSubscriberCounts': [len(before_subscribers), len(after_subscribers), len(return_subscribers)]
+                  if args.server_inventory and args.navigation else None,
+              'nativeServerPeerAttestationVerified': False,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,
               'externalRequestsBlocked': counts['externalBlocked'], 'membershipComplete': False,
               'sharedUnixAppServer': server is not None, 'managedDaemonSupervisor': False,

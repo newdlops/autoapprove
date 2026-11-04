@@ -14,7 +14,7 @@ const run=(file,args)=>new Promise((resolve,reject)=>{
  child.once('error',reject);child.once('close',code=>resolve({code,out,err}));
 });
 let socketIndex=0,checks=0;
-async function consumer(transform,success){
+async function consumer(transform,success,serverMode=false){
  const socket=root+'/i'+(++socketIndex)+'.sock',peers=new Set();
  const server=createServer(stream=>{
   peers.add(stream);stream.once('close',()=>peers.delete(stream));let input='';
@@ -23,11 +23,14 @@ async function consumer(transform,success){
    const request=JSON.parse(input),reply={nonce:request.nonce,pid:12345,schemaVersion:1,
     producer:'autoapprove-native-tui-prototype',membershipComplete:false,admissionGranted:false,
     stores:{navigation:[]},retainedInputs:{},currentWidget:{hasDraft:false},limitations:['fixture']};
-   stream.end(transform(reply));
+   const selected=serverMode?{...reply,producer:'autoapprove-native-server-prototype',error:null,consistentRevision:false,
+    serverGeneration:'019a49af-2d20-74aa-8c6c-000000000001',connections:[{connectionID:2,nativePeerIdentified:false,clientInventoryBound:false}],
+    subscriptions:{initializedConnectionIDs:[2],byConnection:{},subscribers:{}}}:reply;
+   stream.end(transform(selected));
   });
  });
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(socket,resolve);});await chmod(socket,0o600);
- try{const result=await run(script,['--socket='+socket,'--expected-pid=12345']);
+ try{const result=await run(script,['--socket='+socket,'--expected-pid=12345',...(serverMode?['--server']:[])]);
   assert.equal(result.code===0,success,result.err);if(success){const value=JSON.parse(result.out);assert.equal(value.admissionGranted,false);}
   checks++;
  }finally{for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));}
@@ -44,6 +47,11 @@ try{
  await consumer(value=>JSON.stringify({...value,admissionGranted:true})+'\n',false);
  await consumer(()=>'{broken}\n',false);
  await consumer(()=>Buffer.alloc(1024*1024+1,32),false);
+ await consumer(value=>JSON.stringify(value)+'\n',true,true);
+ await consumer(value=>JSON.stringify({...value,error:'subscription-snapshot-timeout'})+'\n',false,true);
+ await consumer(value=>JSON.stringify({...value,consistentRevision:true})+'\n',false,true);
+ await consumer(value=>JSON.stringify({...value,serverGeneration:'not-a-generation'})+'\n',false,true);
+ await consumer(value=>JSON.stringify({...value,connections:[{connectionID:2,nativePeerIdentified:true,clientInventoryBound:false}]})+'\n',false,true);
  const file=root+'/plain';await writeFile(file,'sentinel',{mode:0o600});
  assert.notEqual((await run(script,['--socket='+file,'--expected-pid=12345'])).code,0);checks++;
  await chmod(root,0o755);
@@ -62,5 +70,15 @@ try{
  const refused=root+'/must-not-create';
  assert.notEqual((await run(prepare,['--source='+corrupt,'--output='+refused])).code,0);
  await assert.rejects(lstat(refused),{code:'ENOENT'});checks++;
+ const serverManifest=JSON.parse(await readFile('patches/codex/0.166.0-native-server-inventory.manifest.json','utf8'));
+ const serverCorrupt=root+'/changed-server-source';await mkdir(serverCorrupt);
+ for(const file of [...Object.keys(manifest.pins),...[...manifest.files,...serverManifest.files].filter(v=>v.before!==null).map(v=>v.path)]){
+  await mkdir(path.dirname(serverCorrupt+'/'+file),{recursive:true});
+  await copyFile(source+'/'+file,serverCorrupt+'/'+file);
+ }
+ await writeFile(serverCorrupt+'/app-server/Cargo.toml','changed server source');
+ const serverRefused=root+'/server-output-must-not-exist';
+ assert.notEqual((await run(prepare,['--source='+serverCorrupt,'--output='+serverRefused,'--with-server-inventory'])).code,0);
+ await assert.rejects(lstat(serverRefused),{code:'ENOENT'});checks++;
  console.log(JSON.stringify({verified:true,checks,nativeProducerVerified:false,migrationVerified:false}));
 }finally{await rm(root,{recursive:true,force:true});}

@@ -64,6 +64,20 @@ not establish a daemon peer census or two live subscriber relations. The next
 native producer must obtain the daemon's own connection and subscriber stores
 before this can be used for effect-producing selection.
 
+The optional source server producer now reads its actual transport connection map
+and `ThreadStateManager` initialized-client/subscriber stores through a separate
+private socket. Its full native library compiled and passed five focused tests,
+including actual shared-store subscribe/unsubscribe changes without read mutation
+and explicit inclusion of uninitialized connections. All 16 source postimages
+were reproduced with the optional patch. The full CLI built and the owned two-TUI
+live probe verified actual subscriber counts of two before navigation, one after
+unsubscribe and two after return. Local inventories still represented both owners
+after unsubscribe, including the parked draft; exact overview draft return and
+all 19 original controller identities were preserved through cleanup.
+Native peer identity, client-response binding and a consistent topology revision
+are still absent, so even a successful response explicitly denies completeness
+and admission. This component does not yet fulfill the complete census proposal.
+
 ## Why both sides are required
 
 The inspected official version is 0.166.0, commit

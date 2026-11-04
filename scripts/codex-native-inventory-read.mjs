@@ -7,8 +7,9 @@ import path from 'node:path';
 
 const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3);
 const socket=option('socket'),pid=Number(option('expected-pid'));
+const server=process.argv.includes('--server');
 assert.ok(socket&&path.isAbsolute(socket)&&Number.isSafeInteger(pid)&&pid>0,
- 'Provide --socket=/private/socket --expected-pid=N from the launched test TUI');
+ 'Provide --socket=/private/socket --expected-pid=N from the launched owned process');
 const parent=await lstat(path.dirname(socket)),info=await lstat(socket);
 assert.ok(parent.isDirectory()&&parent.uid===process.getuid()&&(parent.mode&0o077)===0);
 assert.ok(info.isSocket()&&info.uid===process.getuid()&&(info.mode&0o077)===0);
@@ -28,8 +29,25 @@ const value=await new Promise((resolve,reject)=>{
  client.once('end',()=>{if(!settled)finish(Error('Native inventory closed without a complete response'));});
 });
 assert.equal(value.nonce,nonce);assert.equal(value.pid,pid);assert.equal(value.schemaVersion,1);
-assert.equal(value.producer,'autoapprove-native-tui-prototype');
+assert.equal(value.producer,server?'autoapprove-native-server-prototype':'autoapprove-native-tui-prototype');
 assert.equal(value.membershipComplete,false);assert.equal(value.admissionGranted,false);
+if(server){
+ assert.equal(value.error,null);assert.equal(value.consistentRevision,false);
+ assert.match(value.serverGeneration,/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i);
+ assert.ok(Array.isArray(value.connections)&&value.subscriptions&&Array.isArray(value.subscriptions.initializedConnectionIDs));
+ assert.ok(value.subscriptions.byConnection&&value.subscriptions.subscribers);
+ for(const row of value.connections){
+  assert.ok(Number.isSafeInteger(row.connectionID)&&row.connectionID>=0);
+  assert.equal(row.nativePeerIdentified,false);assert.equal(row.clientInventoryBound,false);
+ }
+ console.log(JSON.stringify(process.argv.includes('--json')?value:{
+  verifiedResponse:true,pid:value.pid,serverGeneration:value.serverGeneration,
+  transportConnections:value.connections.length,initializedConnections:value.subscriptions.initializedConnectionIDs.length,
+  observedThreadEntries:Object.keys(value.subscriptions.subscribers).length,
+  consistentRevision:false,membershipComplete:false,admissionGranted:false,limitations:value.limitations
+ }));
+ process.exit(0);
+}
 assert.ok(value.stores&&value.currentWidget&&value.retainedInputs);
 console.log(JSON.stringify(process.argv.includes('--json')?value:{
  verifiedResponse:true,pid:value.pid,stores:Object.fromEntries(Object.entries(value.stores).map(([k,v])=>[k,v.length])),

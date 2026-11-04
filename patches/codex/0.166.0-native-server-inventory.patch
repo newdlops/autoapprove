@@ -1,0 +1,483 @@
+--- a/app-server/Cargo.toml
++++ b/app-server/Cargo.toml
+@@ -20,6 +20,9 @@
+ name = "codex_app_server"
+ path = "src/lib.rs"
+ doctest = false
++
++[features]
++autoapprove-native-inventory = []
+
+ [lints]
+ workspace = true
+--- a/app-server/src/lib.rs
++++ b/app-server/src/lib.rs
+@@ -105,6 +105,7 @@
+ mod codex_home_metrics;
+ mod command_exec;
+ mod config_layer;
++mod native_inventory;
+ mod startup_config;
+ pub use startup_config::StartupConfigArgs;
+ pub use startup_config::print_startup_config;
+@@ -1041,6 +1042,16 @@
+         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
+         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
+         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
++        let (native_inventory_tx, mut native_inventory_rx) = mpsc::channel(1);
++        let native_inventory_server =
++            native_inventory::start(native_inventory_tx).unwrap_or_else(|error| {
++                warn!(%error, "native inventory socket unavailable");
++                None
++            });
++        let native_inventory_generation = native_inventory_server
++            .as_ref()
++            .map(|_| uuid::Uuid::now_v7().to_string())
++            .unwrap_or_default();
+         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+         let mut thread_listener_tasks = tokio::task::JoinSet::new();
+         let mut remote_control_status_rx = remote_control_handle.status_receiver();
+@@ -1113,6 +1124,14 @@
+                 }
+
+                 tokio::select! {
++                    request = native_inventory_rx.recv(), if native_inventory_server.is_some() => {
++                        if let Some(request) = request {
++                            let response = native_inventory::snapshot(
++                                request.nonce, &native_inventory_generation, &connections, &processor,
++                            ).await;
++                            let _ = request.reply.send(response);
++                        }
++                    }
+                     _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
+                         snapshot_finished = true;
+                     }
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -147,6 +147,7 @@
+
+ pub(crate) struct MessageProcessor {
+     pub(crate) turn_admission: TurnAdmission,
++    native_inventory_threads: ThreadStateManager,
+     user_verification: Arc<crate::user_verification::Service>,
+     outgoing: Arc<OutgoingMessageSender>,
+     startup_warnings: StartupWarnings,
+@@ -541,6 +542,7 @@
+             config_warnings.clone(),
+             sample_responses,
+         );
++        let native_inventory_threads = thread_state_manager.clone();
+         let turn_processor = TurnRequestProcessor::new(
+             auth_manager,
+             Arc::clone(&thread_manager),
+@@ -610,6 +612,7 @@
+
+         Self {
+             turn_admission,
++            native_inventory_threads,
+             user_verification,
+             outgoing,
+             startup_warnings: StartupWarnings {
+@@ -643,6 +646,12 @@
+             windows_sandbox_processor,
+             request_serialization_queues,
+         }
++    }
++
++    pub(crate) async fn native_inventory_subscriptions(&self) -> serde_json::Value {
++        self.native_inventory_threads
++            .native_inventory_snapshot()
++            .await
+     }
+
+     pub(crate) fn clear_runtime_references(&self) {
+--- a/app-server/src/thread_state.rs
++++ b/app-server/src/thread_state.rs
+@@ -408,6 +408,27 @@
+ }
+
+ impl ThreadStateManager {
++    /// One read of the actual initialized-client and subscription stores. This
++    /// does not establish transport-peer identity, revision stability or admission.
++    pub(crate) async fn native_inventory_snapshot(&self) -> serde_json::Value {
++        let state = self.state.lock().await;
++        let mut live: Vec<_> = state.live_connections.keys().map(|id| id.0).collect();
++        live.sort_unstable();
++        let mut by_connection = std::collections::BTreeMap::new();
++        for (id, threads) in &state.thread_ids_by_connection {
++            let mut ids: Vec<_> = threads.iter().map(ToString::to_string).collect();
++            ids.sort();
++            by_connection.insert(id.0.to_string(), ids);
++        }
++        let mut subscribers = std::collections::BTreeMap::new();
++        for (id, entry) in &state.threads {
++            let mut ids: Vec<_> = entry.connection_ids.iter().map(|id| id.0).collect();
++            ids.sort_unstable();
++            subscribers.insert(id.to_string(), ids);
++        }
++        serde_json::json!({"initializedConnectionIDs":live,"byConnection":by_connection,"subscribers":subscribers})
++    }
++
+     /// Coordinates goal edits with cold/path-based resume for just this thread.
+     pub(crate) async fn lock_goal_resume(
+         &self,
+--- /dev/null
++++ b/app-server/src/native_inventory.rs
+@@ -0,0 +1,155 @@
++//! Local diagnostic observation, never a census-completeness or migration grant.
++use crate::message_processor::MessageProcessor;
++use crate::transport::ConnectionId;
++use crate::transport::ConnectionState;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::HashMap;
++use std::io;
++use std::time::Duration;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++
++pub(crate) struct InventoryRead {
++    pub(crate) nonce: String,
++    pub(crate) reply: oneshot::Sender<Value>,
++}
++
++#[cfg(all(feature = "autoapprove-native-inventory", unix))]
++#[path = "native_inventory_transport.rs"]
++mod transport;
++#[cfg(all(feature = "autoapprove-native-inventory", unix))]
++pub(crate) use transport::InventoryServer;
++#[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
++pub(crate) struct InventoryServer;
++
++pub(crate) fn start(events: mpsc::Sender<InventoryRead>) -> io::Result<Option<InventoryServer>> {
++    #[cfg(all(feature = "autoapprove-native-inventory", unix))]
++    {
++        transport::start(events)
++    }
++    #[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
++    {
++        drop(events);
++        Ok(None)
++    }
++}
++
++fn connection_rows(connections: &HashMap<ConnectionId, ConnectionState>) -> Vec<Value> {
++    let mut rows: Vec<_> = connections.iter().collect();
++    rows.sort_by_key(|(id, _)| id.0);
++    rows.into_iter()
++        .map(|(id, connection)| {
++            json!({
++                "connectionID":id.0,
++                "origin":format!("{:?}",connection.origin),
++                "initialized":connection.session.initialized(),
++                "untrustedClientName":connection.session.app_server_client_name(),
++                "untrustedClientVersion":connection.session.client_version(),
++                "nativePeerIdentified":false,
++                "clientInventoryBound":false
++            })
++        })
++        .collect()
++}
++
++pub(crate) async fn snapshot(
++    nonce: String,
++    generation: &str,
++    connections: &HashMap<ConnectionId, ConnectionState>,
++    processor: &MessageProcessor,
++) -> Value {
++    // Keep a diagnostic from holding the transport loop behind a contended
++    // subscription lock. Neither the two stores nor pending transport events
++    // are revision-bound yet, so this must never authorize effects.
++    let subscriptions = tokio::time::timeout(
++        Duration::from_millis(100),
++        processor.native_inventory_subscriptions(),
++    )
++    .await;
++    let (subscriptions, error) = match subscriptions {
++        Ok(value) => (value, None),
++        Err(_) => (Value::Null, Some("subscription-snapshot-timeout")),
++    };
++    json!({
++        "schemaVersion":1,
++        "producer":"autoapprove-native-server-prototype",
++        "upstreamCommit":"6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
++        "cliVersion":env!("CARGO_PKG_VERSION"),
++        "pid":std::process::id(),
++        "serverGeneration":generation,
++        "nonce":nonce,
++        "connections":connection_rows(connections),
++        "subscriptions":subscriptions,
++        "error":error,
++        "consistentRevision":false,
++        "membershipComplete":false,
++        "admissionGranted":false,
++        "limitations":[
++            "native-peer-identity-required",
++            "client-inventory-binding-required",
++            "pending-transport-and-subscriber-revision-required",
++            "native-admission-and-backend-attestation-required"
++        ]
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::thread_state::ConnectionCapabilities;
++    use crate::thread_state::ThreadStateManager;
++    use crate::transport::ConnectionOrigin;
++    use codex_protocol::ThreadId;
++    use std::collections::HashSet;
++    use std::sync::Arc;
++    use std::sync::RwLock;
++    use std::sync::atomic::AtomicBool;
++
++    #[test]
++    fn uninitialized_transport_connection_is_not_omitted_or_attested() {
++        let connection = ConnectionState::new(
++            ConnectionOrigin::WebSocket,
++            None,
++            Arc::new(AtomicBool::new(false)),
++            Arc::new(AtomicBool::new(false)),
++            Arc::new(RwLock::new(HashSet::new())),
++        );
++        let rows = connection_rows(&HashMap::from([(ConnectionId(8), connection)]));
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0]["connectionID"], 8);
++        assert_eq!(rows[0]["initialized"], false);
++        assert_eq!(rows[0]["untrustedClientName"], Value::Null);
++        assert_eq!(rows[0]["nativePeerIdentified"], false);
++        assert_eq!(rows[0]["clientInventoryBound"], false);
++    }
++
++    #[tokio::test]
++    async fn actual_shared_subscription_store_changes_without_read_mutation() {
++        let state = ThreadStateManager::new();
++        let root = ThreadId::new();
++        for id in [ConnectionId(2), ConnectionId(7)] {
++            state
++                .connection_initialized(id, ConnectionCapabilities::default())
++                .await;
++            assert!(state.try_add_connection_to_thread(root, id).await);
++        }
++        let before = state.native_inventory_snapshot().await;
++        assert_eq!(before["subscribers"][root.to_string()], json!([2, 7]));
++        assert_eq!(state.native_inventory_snapshot().await, before);
++        assert!(
++            state
++                .unsubscribe_connection_from_thread(root, ConnectionId(2))
++                .await
++        );
++        let after = state.native_inventory_snapshot().await;
++        assert_eq!(after["subscribers"][root.to_string()], json!([7]));
++        assert!(after["byConnection"].get("2").is_none());
++        assert_eq!(after["byConnection"]["7"], json!([root.to_string()]));
++        assert_eq!(after["initializedConnectionIDs"], json!([2, 7]));
++        state.remove_connection(ConnectionId(7)).await;
++        let closed = state.native_inventory_snapshot().await;
++        assert_eq!(closed["initializedConnectionIDs"], json!([2]));
++        assert_eq!(closed["subscribers"][root.to_string()], json!([]));
++    }
++}
+--- /dev/null
++++ b/app-server/src/native_inventory_transport.rs
+@@ -0,0 +1,199 @@
++//! Opt-in, local read-only prototype. Never an admission grant for migration.
++use super::InventoryRead;
++use serde::Deserialize;
++use serde_json::Value;
++use std::io;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::PermissionsExt;
++use std::path::PathBuf;
++use std::time::Duration;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::net::UnixListener;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ReadRequest {
++    nonce: String,
++}
++
++pub(crate) struct InventoryServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++}
++
++impl Drop for InventoryServer {
++    fn drop(&mut self) {
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++fn private_parent(path: &std::path::Path) -> io::Result<()> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    Ok(())
++}
++
++pub(crate) fn start(events: mpsc::Sender<InventoryRead>) -> io::Result<Option<InventoryServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET") else {
++        return Ok(None);
++    };
++    start_at(PathBuf::from(path), events).map(Some)
++}
++
++fn start_at(path: PathBuf, events: mpsc::Sender<InventoryRead>) -> io::Result<InventoryServer> {
++    private_parent(&path)?;
++    // bind is exclusive: existing sockets, files and links are never replaced.
++    let listener = UnixListener::bind(&path)?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let task = tokio::spawn(async move {
++        loop {
++            let Ok((mut stream, _)) = listener.accept().await else {
++                break;
++            };
++            let Ok(peer) = stream.peer_cred() else {
++                continue;
++            };
++            if peer.uid() != unsafe { libc::geteuid() } {
++                continue;
++            }
++            // One bounded request at a time; no detached per-client task flood.
++            let _ = tokio::time::timeout(Duration::from_secs(2), async {
++                let mut line = String::new();
++                let mut reader = BufReader::new((&mut stream).take(1025));
++                reader.read_line(&mut line).await?;
++                if line.len() > 1024 || !line.ends_with('\n') {
++                    return Err::<(), io::Error>(io::ErrorKind::InvalidInput.into());
++                }
++                let request: ReadRequest = serde_json::from_str(&line)?;
++                if request.nonce.len() != 32
++                    || !request.nonce.bytes().all(|v| v.is_ascii_hexdigit())
++                {
++                    return Err(io::ErrorKind::InvalidInput.into());
++                }
++                let (reply, received) = oneshot::channel::<Value>();
++                // Bypass session logging: this is not user input or a Codex turn.
++                events
++                    .send(InventoryRead {
++                        nonce: request.nonce,
++                        reply,
++                    })
++                    .await
++                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let response = received.await.map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let mut bytes = serde_json::to_vec(&response)?;
++                if bytes.len() > 1024 * 1024 {
++                    return Err(io::ErrorKind::InvalidData.into());
++                }
++                bytes.push(b'\n');
++                drop(reader);
++                stream.write_all(&bytes).await?;
++                stream.shutdown().await
++            })
++            .await;
++        }
++    });
++    Ok(InventoryServer {
++        task,
++        path,
++        identity,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn exclusive_private_socket_and_event_loop_nonce() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("inventory.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
++        let events = tx;
++        let server = start_at(path.clone(), events.clone())?;
++        assert!(start_at(path.clone(), events).is_err());
++        assert_eq!(std::fs::symlink_metadata(&path)?.mode() & 0o777, 0o600);
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"0123456789abcdef0123456789abcdef\"}\n")
++            .await?;
++        let InventoryRead { nonce, reply } = rx.recv().await.unwrap();
++        reply
++            .send(serde_json::json!({"nonce":nonce,"eligibleForMigration":false}))
++            .unwrap();
++        let mut line = String::new();
++        BufReader::new(socket).read_line(&mut line).await?;
++        assert_eq!(
++            serde_json::from_str::<Value>(&line)?["nonce"],
++            "0123456789abcdef0123456789abcdef"
++        );
++        drop(server);
++        assert!(!path.exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn rejects_public_or_linked_parent_without_touching_files() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        let actual = root.path().join("actual");
++        std::fs::create_dir(&actual)?;
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o755))?;
++        assert!(private_parent(&actual.join("i.sock")).is_err());
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o700))?;
++        let alias = root.path().join("alias");
++        std::os::unix::fs::symlink(&actual, &alias)?;
++        assert!(private_parent(&alias.join("i.sock")).is_err());
++        assert!(!actual.join("i.sock").exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn malformed_request_enqueues_nothing_and_existing_file_is_preserved()
++    -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("i.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
++        let events = tx;
++        std::fs::write(&path, b"existing")?;
++        assert!(start_at(path.clone(), events.clone()).is_err());
++        assert_eq!(std::fs::read(&path)?, b"existing");
++        std::fs::remove_file(&path)?;
++        let server = start_at(path.clone(), events)?;
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"bad\",\"command\":\"run\"}\n")
++            .await?;
++        let mut bytes = Vec::new();
++        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes)).await??;
++        assert!(bytes.is_empty());
++        assert!(rx.try_recv().is_err());
++        std::fs::remove_file(&path)?;
++        std::fs::write(&path, b"replacement")?;
++        drop(server);
++        assert_eq!(std::fs::read(&path)?, b"replacement");
++        Ok(())
++    }
++}
