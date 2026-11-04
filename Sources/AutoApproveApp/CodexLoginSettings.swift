@@ -14,6 +14,12 @@ import AutoApproveCore
     var serverStatus:((String) async throws->CodexManagedServerStatus)? = nil
     var prepareServer:((String) async throws->CodexManagedServerStatus)? = nil
     var inspectAccount:((String) async throws->CodexAccountInspection)? = nil
+    var homeNames:[String:String]=[:]
+    var requestedHome:String?=nil
+    var groupFocusRequest:String?=nil
+    var onLoginActivityChanged:((Bool)->Void)?=nil
+    private struct GroupInputs:Equatable {let names:[String:String];let home:String?}
+    @State private var handledGroupHome:String?
     @State private var homes:[CodexAccountTransitionTarget]=[]
     @State private var liveHomes:Set<String>=[]
     @State private var selected=NSHomeDirectory()+"/.codex"
@@ -63,7 +69,7 @@ import AutoApproveCore
                         try Task.checkCancellation()
                         let target:CodexAccountTransitionTarget
                         if let live=found.first(where:{$0.home==home}){target=live}
-                        else if preferredHome==nil{target = .init(home:home,executable:"codex")}
+                        else if preferredHome==nil{target = .init(home:home,executable:found.first?.executable ?? "codex")}
                         else{throw AppError.message("선택한 세션의 연결이 바뀌었습니다. 계정을 새로 확인해주세요.")}
                         try accounts.beginNativeCodexLogin(target);job=accounts.nativeCodexLogin;error=nil
                     }catch{self.error=error.localizedDescription}
@@ -97,7 +103,17 @@ import AutoApproveCore
                 }
             }},checkingServer:checkingServer,serverObservedAt:serverObservedAt,
             inspection:inspection,inspectionError:inspectionError,checkingAccount:checkingAccount,inspectionStale:inspectionStale,
-            inspectAccount:inspectAccount.map{_ in {requestAccountInspection(force:true)}})
+            inspectAccount:inspectAccount.map{_ in {requestAccountInspection(force:true)}},homeNames:homeNames,focusRequest:groupFocusRequest)
+        .onChange(of:GroupInputs(names:homeNames,home:requestedHome)){_,input in
+            guard preferredHome==nil else{return}
+            Task {
+                await reloadTargets()
+                guard visible,GroupInputs(names:homeNames,home:requestedHome)==input,let home=input.home,handledGroupHome != home,
+                      let canonical=try? CodexAccountTransitionTarget.canonicalHome(home),homes.contains(where:{$0.home==canonical}) else{return}
+                handledGroupHome=home
+                selected=canonical;requestServerStatus(force:true);requestAccountInspection(force:true)
+            }
+        }
         .onChange(of:selected){_,_ in
             if serverHome != selected{
                 serverRequest=UUID();serverTask?.cancel();serverTask=nil;checkingServer=false;managedServer=nil;serverObservedAt=nil;serverHome=nil
@@ -115,8 +131,12 @@ import AutoApproveCore
         }
         .task {
             visible=true;job=scopedJob
+            var reportedBusy=accounts.busy
+            onLoginActivityChanged?(reportedBusy)
             await reloadTargets(preferJob:true)
             while !Task.isCancelled {
+                let busy=accounts.busy
+                if busy != reportedBusy{reportedBusy=busy;onLoginActivityChanged?(busy)}
                 let next=scopedJob
                 otherLogin=accounts.busy && (next?.active != true || !belongsToSelection(next))
                 let succeeded=next?.phase=="succeeded" && (job?.phase != "succeeded" || next?.id != job?.id)
@@ -236,19 +256,31 @@ struct CodexLoginContent: View {
     var checkingAccount=false
     var inspectionStale=false
     var inspectAccount:(()->Void)? = nil
+    var homeNames:[String:String]=[:]
+    var focusRequest:String?=nil
+    @FocusState private var groupFocused:Bool
     private var active: Bool { job?.active == true }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Codex 로그인").font(.callout.weight(.semibold)).foregroundStyle(.primary)
+            if homeNames.isEmpty{Text("Codex 로그인").font(.callout.weight(.semibold)).foregroundStyle(.primary)}
             if homes.count > 1 {
-                Picker("로그인할 Codex 홈", selection: $selected) {
-                    ForEach(homes, id: \.self) { Text($0).lineLimit(1).truncationMode(.middle).tag($0) }
-                }.disabled(active || loading || disabled)
+                Picker(homeNames.isEmpty ? "로그인할 Codex 홈":"로그인 그룹", selection: $selected) {
+                    ForEach(homes, id: \.self) { Text(homeNames[$0] ?? $0).lineLimit(1).truncationMode(.middle).help($0).tag($0) }
+                }.disabled(active || loading || disabled).focused($groupFocused)
+                    .onChange(of:focusRequest){_,home in
+                        if let home,selected==(try? CodexAccountTransitionTarget.canonicalHome(home)){groupFocused=true}
+                    }
+                    .onChange(of:selected){_,home in
+                        if let focusRequest,home==(try? CodexAccountTransitionTarget.canonicalHome(focusRequest)){groupFocused=true}
+                    }
             }
+            if homes.count==1,let name=homeNames[selected]{Text(name).font(.callout.weight(.semibold))}
             Text(active ? job?.home ?? selected : selected)
                 .font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             if canReconnect,let connectedCount,connectedCount>0 {
                 Label("연결 확인 · Codex \(connectedCount)개",systemImage:"checkmark.circle").font(.caption)
+            }else if homeNames[selected] != nil,connectedCount==0 {
+                Label("연결 확인된 Codex 0개",systemImage:"info.circle").font(.caption).foregroundStyle(.secondary)
             }
             accountSummary
             Text("기본 브라우저에서 계정을 선택하면 이 창에 로그인 완료가 표시됩니다. 기존 창은 유지됩니다.")
@@ -314,7 +346,8 @@ struct CodexLoginContent: View {
                     Text(inspectionStale ? "마지막으로 확인한 연결 계정":"연결 서버 계정").font(.caption).foregroundStyle(.secondary)
                     if let identity=inspection.identity {
                         Text(identity.email ?? identity.provider).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-                        Text([identity.provider,identity.plan].compactMap{$0}.joined(separator:" · ")).font(.caption).foregroundStyle(.secondary)
+                        let detail=[identity.email != nil ? identity.provider:nil,identity.plan].compactMap{$0}.joined(separator:" · ")
+                        if !detail.isEmpty{Text(detail).font(.caption).foregroundStyle(.secondary)}
                     }
                     Label(inspection.detail,systemImage:inspection.comparison == .same ? "checkmark.circle":"info.circle")
                         .font(.caption).fixedSize(horizontal:false,vertical:true)

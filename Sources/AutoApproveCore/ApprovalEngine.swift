@@ -635,8 +635,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func configureNativeCodexLogin() {
         codexNativeAttachmentTask?.cancel();codexNativeAttachmentTask=nil;codexNativeAttachmentPending.removeAll()
         let accounts=agentAccounts
-        accounts.nativeCodexLoginWillStart={ [weak self,weak accounts] _ in
+        accounts.nativeCodexLoginWillStart={ [weak self,weak accounts] target in
             guard let self,let accounts,self.agentAccounts===accounts,!self.remoteInputStopped,!self.codexAccountTransitionBusy,!self.codexAccountTransitionHeld else {throw AppError.message("진행 중인 계정 확인·전환이 끝난 뒤 로그인해주세요.")}
+            try self.codexLoginGroupStore.validate(home:target.home)
         }
         accounts.nativeCodexLoginDidStart={ [weak self,weak accounts] home in
             guard let self,let accounts,self.agentAccounts===accounts,!self.remoteInputStopped else{return}
@@ -5850,20 +5851,36 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let records = try await Task.detached(priority: .utility) { try reader() }.value
         return try await codexAccountTargetReader(records)
     }
-    public func codexServerSetupHomes() async throws -> [String] {
+    public var codexLoginGroupStore:CodexLoginGroupStore {
+        .init(directory:paths.directory.appendingPathComponent("codex-login-groups",isDirectory:true))
+    }
+    public func codexLoginGroups() async throws->[CodexLoginGroup] {
+        let store=codexLoginGroupStore
+        return try await Task.detached(priority:.utility){try store.list()}.value
+    }
+    public func createCodexLoginGroup(name:String) async throws->CodexLoginGroup {
+        guard !remoteInputStopped else{throw CancellationError()}
+        let store=codexLoginGroupStore
+        let group=try await Task.detached(priority:.utility){try store.create(name:name)}.value
+        objectWillChange.send()
+        return group
+    }
+    public func codexServerSetupHomes(includeStoredGroups:Bool=true) async throws -> [String] {
         let reader=processReader
         let records=try await Task.detached(priority:.utility){try reader()}.value
         try Task.checkCancellation()
-        return Array(Set(records.filter{$0.agent == .codex}.compactMap {record in
+        var homes=Set(records.filter{$0.agent == .codex}.compactMap {record in
             ProcessEnvironment.read(record)?["CODEX_HOME"].flatMap{try? CodexAccountTransitionTarget.canonicalHome($0)}
-        })).sorted()
+        })
+        if includeStoredGroups {for group in try await codexLoginGroups(){homes.insert(try CodexAccountTransitionTarget.canonicalHome(group.home))}}
+        return homes.sorted()
     }
     /// One automatic attempt per home and manager lifetime, including failures.
     public func ensureCodexManagedServers() async {
         guard !Task.isCancelled,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
         let epoch=codexAccountTransitionEpoch
         do {
-            let homes=try await codexServerSetupHomes()
+            let homes=try await codexServerSetupHomes(includeStoredGroups:false)
             for home in Set(homes+[try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")]).sorted() {
                 guard !Task.isCancelled,epoch==codexAccountTransitionEpoch,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
                 guard codexManagedServerAutomaticHomes.insert(home).inserted else{continue}
@@ -6252,12 +6269,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     public func codexManagedServerStatus(home:String) async throws ->CodexManagedServerStatus {
+        try codexLoginGroupStore.validate(home:home)
         let reader=processReader
         let records=try await Task.detached(priority:.utility){try reader()}.value
         try Task.checkCancellation()
-        return try await codexManagedServerServices.inspect(home,records)
+        let result=try await codexManagedServerServices.inspect(home,records)
+        try codexLoginGroupStore.validate(home:home)
+        return result
     }
     public func prepareCodexManagedServer(home:String) async throws ->CodexManagedServerStatus {
+        try codexLoginGroupStore.validate(home:home)
+        let selectedHome=home
         guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
             throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")
         }
@@ -6268,11 +6290,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let records=try await Task.detached(priority:.utility){try reader()}.value
         try Task.checkCancellation()
         guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+        try codexLoginGroupStore.validate(home:selectedHome)
+        guard try CodexAccountTransitionTarget.canonicalHome(selectedHome)==home else{throw AppError.message("준비할 로그인 그룹의 홈이 바뀌었습니다.")}
         let services=codexManagedServerServices
         let task=Task {try await services.prepare(home,records)}
         codexManagedServerStartTask=task
         let result=try await withTaskCancellationHandler(operation:{try await task.value},onCancel:{task.cancel()})
         guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+        try codexLoginGroupStore.validate(home:selectedHome)
         if result.phase == .running {codexAttachmentHomes.insert(home)}
         return result
     }
@@ -6280,6 +6305,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func inspectCodexAccount(home:String) async throws ->CodexAccountInspection {
         try Task.checkCancellation()
         guard !remoteInputStopped else{throw CancellationError()}
+        let selectedHome=home
+        try codexLoginGroupStore.validate(home:selectedHome)
         let home=try CodexAccountTransitionTarget.canonicalHome(home)
         let scopeEpoch=codexAccountTransitionEpoch
         let readEpoch=codexAccountInspectionEpochs[home] ?? UUID()
@@ -6298,6 +6325,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let result=try await entry.task.value
         try Task.checkCancellation()
         guard scopeEpoch==codexAccountTransitionEpoch,codexAccountInspectionEpochs[home]==readEpoch,!remoteInputStopped else{throw CancellationError()}
+        try codexLoginGroupStore.validate(home:selectedHome)
         return result
     }
     private func invalidateCodexAccountInspection(home:String) {
@@ -6305,6 +6333,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexAccountInspectionTasks.removeValue(forKey:home)?.task.cancel()
     }
     private func performCodexAccountInspection(home:String,epoch:UUID) async throws ->CodexAccountInspection {
+        try codexLoginGroupStore.validate(home:home)
         let reader=processReader,targetReader=codexAccountTargetReader
         let rows=try await Task.detached(priority:.utility){try reader()}.value
         try Task.checkCancellation()
@@ -6313,8 +6342,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let target:CodexAccountTransitionTarget
         if let current=targets.first(where:{$0.home==home}) {target=current}
         else {
-            guard home==(try? CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")) || known.contains(home) else{throw AppError.message("확인할 Codex 홈을 다시 선택해주세요.")}
-            target = .init(home:home,executable:"codex")
+            let ordinary=home==(try? CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")) || known.contains(home)
+            let groups:[CodexLoginGroup]=ordinary ? []:try codexLoginGroupStore.list()
+            guard ordinary
+                    || groups.contains(where:{(try? CodexAccountTransitionTarget.canonicalHome($0.home))==home}) else{throw AppError.message("확인할 Codex 홈을 다시 선택해주세요.")}
+            target = .init(home:home,executable:groups.isEmpty ? "codex":targets.first?.executable ?? "codex")
         }
         func current(_ value:CodexAccountTransitionTarget,_ records:[ProcessRecord])->Bool {
             value.witnesses.allSatisfy{w in records.contains{$0.pid==w.pid && $0.started==w.started && "/dev/"+$0.tty==w.tty && $0.agent == .codex}}
