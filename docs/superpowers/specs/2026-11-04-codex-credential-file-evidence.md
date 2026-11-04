@@ -36,6 +36,13 @@ AUTOAPPROVE_CODEX_BIN=/absolute/path/to/native/codex \
   node scripts/codex-auth-file-isolation-check.mjs
 ```
 
+Add `--check-session-switch` to verify the account-session identity boundary.
+Each owned server lists one current managed login. Re-selecting its current
+workspace preserves its credential witness, loaded thread and exact paused Goal;
+trying the other server's login session ID is explicitly rejected with -32600
+and leaves those values unchanged. This tests a no-op and a rejected selection,
+not a successful different-workspace exchange or a real account change.
+
 Five real-filesystem cases cover present/absent independent slots, aliased and
 replaced homes, retargeted selected aliases, linked/public/special entries,
 changed/deleted/replaced credentials and metadata serialization without secrets.

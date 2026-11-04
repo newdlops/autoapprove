@@ -138,3 +138,40 @@ This section is the next bounded feasibility plan, not authorization to migrate 
 
 Remaining full-goal work after these gates: saved-account/workspace/SSO handling with actual credential isolation, selected-session group UI and durable mappings, complete existing-client membership and exact-source Goal handling during cross-home migration, actual selected merge/split round trip, human-completed authentication where needed, release/install and cross-Mac verification. These requirements are not discharged by the 0.2.250 foundation release.
 
+### Task 8: User-visible login groups alongside existing sessions
+
+This runs alongside the unfinished native migration gate; creating a group does
+not move sessions or complete integration/separation. Exact 0.166 source and the
+owned `--check-session-switch` probe show one managed login per server and
+workspace-only switching within it. Do not implement a saved-user-account picker
+by relabeling that API. Preserve the full original account-switch requirement.
+
+- [x] Inspect the current installed account window, adjacent SwiftUI components,
+  existing DESIGN/PRODUCT instructions and SwiftUI design guidance. Establish
+  the login-group contract in DESIGN.md before implementation. This is baseline
+  inspection and a contract, not new UI functional/visual signoff.
+- [ ] Add an app-private named group registry and separate owned homes. Persist
+  group identity/name/home identity without copying credentials. Reject changed,
+  missing or linked homes and corrupt metadata; never clear/reset the index after
+  a read failure. Bounded lists and duplicate/failed creation must preserve
+  existing groups and all user homes. No deletion workflow is implied.
+- [ ] Expose valid stored groups alongside existing detected homes for login and
+  server setup. Resolve the actual installed CLI without machine-specific paths.
+  Creating an empty group must not start login, stop work, restart a server or
+  imply that an existing session moved. Preserve per-home observation generations
+  and explicit login/change locks.
+- [ ] Implement native group naming/creation/selection using the existing
+  account-window visual language. Keep the currently selected session's account
+  actions scoped; creating a separate group is a global account-window action.
+  The new group must remain selectable after app restart with no open clients.
+- [ ] Verify private filesystem behavior and native view interactions independently;
+  exercise loading/error/cancel/success/duplicate/stale-home and long/dense states.
+  Inspect actual 600×660 light/dark rendering and main-window account entry.
+- [ ] Complete the matching signed release, public artifact verification, local
+  installation/running-version checks and session preservation for the bound
+  user-visible improvement. Keep remote installation deferred until the lid opens.
+
+Full native client ownership, actual authentication/SSO, migration/restoration
+destination mappings and the requested selected-session merge/split flow remain
+required. Task 8 is not a replacement success criterion for Task 7 or the goal.
+

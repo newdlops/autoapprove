@@ -9,6 +9,8 @@ import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 assert.ok(process.env.AUTOAPPROVE_CODEX_BIN&&path.isAbsolute(process.env.AUTOAPPROVE_CODEX_BIN),'Set AUTOAPPROVE_CODEX_BIN to an absolute native CLI path');
 const cli=await realpath(process.env.AUTOAPPROVE_CODEX_BIN);
 assert.equal(execFileSync(cli,['--version'],{encoding:'utf8'}).trim(),'codex-cli 0.166.0');
+const sessionSwitchProbe=process.argv.includes('--check-session-switch');
+assert.ok(process.argv.slice(2).every(value=>value==='--check-session-switch'),'Unknown owned probe option');
 const build=path.resolve('.build/debug'),root=await mkdtemp('/private/tmp/aa-auth-isolation-'),children=[];
 let loopbackRequests=0;
 const provider=createServer((_req,res)=>{loopbackRequests++;res.writeHead(503);res.end('{}');});
@@ -59,7 +61,8 @@ try{
   const lines=createInterface({input:child.stdout});
   lines.on('line',line=>{let message;try{message=JSON.parse(line);}catch{return;}
    const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);
-   message.error?entry.reject(Error('Owned RPC rejected '+entry.method+' ('+message.error.code+')')):entry.resolve(message.result);
+   message.error?entry.reject(Object.assign(Error('Owned RPC rejected '+entry.method+' ('+message.error.code+')'),
+    {code:message.error.code,method:entry.method})):entry.resolve(message.result);
   });
   const request=(method,params={})=>new Promise((resolve,reject)=>{
    const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(Error('Owned RPC timed out '+method));},15000);
@@ -74,6 +77,33 @@ try{
  assert.deepEqual(await users(a),['owned-a']);assert.deepEqual(await users(b),['owned-b']);
  const snapshots=capture(),bBytes=await readFile(homes[1]+'/auth.json'),bIdentity=await stat(homes[1]+'/auth.json');
  verify(snapshots[0]);verify(snapshots[1]);
+ let accountSessionProbe;
+ if(sessionSwitchProbe){
+  const list=await a.request('accountSession/list',{refreshWorkspaceMetadata:false});
+  const other=await b.request('accountSession/list',{refreshWorkspaceMetadata:false});
+  assert.equal(list.sessions.length,1);assert.equal(other.sessions.length,1);
+  assert.equal(list.activeSessionId,list.sessions[0].sessionId);
+  const session=list.sessions[0],foreign=other.sessions[0];
+  assert.notEqual(session.sessionId,foreign.sessionId);
+  assert.notEqual(session.userId,session.selectedWorkspaceAccountId,'User and workspace IDs are distinct');
+  const started=await a.request('thread/start',{cwd:homes[0],approvalPolicy:'never',sandbox:'read-only'});
+  const threadID=started.thread.id;
+  await a.request('thread/goal/set',{threadId:threadID,status:'paused',objective:'Owned workspace identity guard',tokenBudget:2000,origin:'user'});
+  const goal=(await a.request('thread/goal/get',{threadId:threadID})).goal;
+  const loaded=(await a.request('thread/loaded/list',{limit:100})).data.sort();
+  assert.ok(loaded.includes(threadID));
+  const noop=await a.request('accountSession/switch',{sessionId:session.sessionId,accountId:session.selectedWorkspaceAccountId,allowBrowserLogin:false});
+  assert.equal(noop.activeSessionId,session.sessionId);
+  assert.equal(noop.sessions[0].selectedWorkspaceAccountId,session.selectedWorkspaceAccountId);
+  await assert.rejects(a.request('accountSession/switch',{sessionId:foreign.sessionId,accountId:session.selectedWorkspaceAccountId,allowBrowserLogin:false}),
+   error=>error.code===-32600&&error.method==='accountSession/switch');
+  assert.deepEqual((await a.request('thread/loaded/list',{limit:100})).data.sort(),loaded);
+  assert.deepEqual((await a.request('thread/goal/get',{threadId:threadID})).goal,goal);
+  assert.deepEqual(await users(a),['owned-a']);assert.deepEqual(await users(b),['owned-b']);
+  verify(snapshots[0]);verify(snapshots[1]);
+  accountSessionProbe={singleManagedLogin:true,currentWorkspaceNoOpKeepsLoadedPausedGoal:true,foreignLoginSessionRejected:true,
+   originalCredentialWitnessesRetained:true};
+ }
  await a.request('account/logout');
  assert.equal(await stat(homes[0]+'/auth.json').then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;}),false);
  assert.throws(()=>verify(snapshots[0]),error=>error.status===1&&error.signal===null&&error.stderr.includes('Owned credential witness rejected'),
@@ -90,7 +120,7 @@ try{
  console.log(JSON.stringify({verified:true,cliVersion:'0.166.0',ownedServersStarted:3,
   fileWitnessesIndependent:true,logoutInvalidatesOnlySourceWitness:true,destinationFileAndAccountUnchanged:true,
   changedSourceMetadataObservedAfterRestart:true,syntheticAuthOnly:true,realAuthenticationPerformed:false,
-  userHomesTouched:false,loopbackRequests}));
+  userHomesTouched:false,loopbackRequests,...(accountSessionProbe?{accountSessionProbe}:{})}));
 }finally{
  for(const child of children)await stop(child);
  provider.closeAllConnections();await new Promise(resolve=>provider.close(resolve));
