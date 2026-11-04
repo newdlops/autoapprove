@@ -36,6 +36,11 @@ Observed on the installed native CLI:
    fork mode. The fork has a different UUID, `ephemeral=true`, and
    `forkedFromId` equal to the root. Its `parentThreadId` and `sessionId` do **not**
    equal the root UUID. Both root and side remain loaded together.
+4. B reads the materialized root with `thread/read(includeTurns=true)` and
+   receives nonempty history. B's following `thread/unsubscribe` still returns
+   `notSubscribed`. Only its later `thread/resume` creates a subscription. This
+   proves that a client can receive replay history without appearing in a
+   subscriber census; it does not itself execute the TUI replay path below.
 
 Therefore, neither a server-wide loaded list nor a root's parent/session tree
 is a complete per-client ownership inventory. The native side-thread relation
@@ -76,6 +81,27 @@ evidence for complete local TUI ownership. Native anonymous
 `server/diagnostics` returned process memory and gauges, not subscriber maps.
 This is a statement about the inspected interfaces, not proof that no future
 official observation path can exist.
+
+## Retained TUI state after unsubscribe
+
+Inspection of the complete exact-version source adds a second reason why a
+daemon-only subscriber API would be insufficient:
+
+- [Navigation detach](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/tui/src/app/voice_owner.rs)
+  calls `thread_unsubscribe` and aborts eligible thread listeners, while retaining
+  the channel/navigation stores.
+- [Listener abort](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/tui/src/app/thread_routing.rs)
+  removes the listener task rather than the cached channel.
+- [Replay fallback](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/tui/src/app/session_lifecycle.rs)
+  can hydrate a replay-only channel from `thread/read` after live attachment fails.
+  Input states are also retained separately in the agents overview.
+
+These are source observations. The native probe verifies read-without-subscribe;
+the clean three-root TUI test does not verify all these navigation branches.
+The [cooperative observation proposal](2026-11-04-codex-cooperative-observation.md)
+therefore requires both daemon connection relations and a capable TUI's complete
+local inventory. It is pending a managed-build decision, and no custom CLI has
+been built or installed. A daemon update alone cannot upgrade running old TUIs.
 
 ## Consequence for the migration producer
 

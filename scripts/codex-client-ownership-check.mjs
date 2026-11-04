@@ -78,6 +78,8 @@ try {
   assert.equal(code, 0, stderr);
   const report = {...JSON.parse(stdout), cliVersion: version, providerRequests: requests};
   assert.equal(report.verified, true);
+  assert.equal(report.readReturnedMaterializedHistory, true);
+  assert.equal(report.readDidNotSubscribe, true);
   assert.equal(report.sideForkEphemeral, true);
   assert.equal(report.sideForkParentMatchesRoot, false);
   assert.equal(report.sideForkSessionMatchesRoot, false);
