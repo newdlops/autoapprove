@@ -5,6 +5,7 @@ import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {normalizeNativeBuildLock} from './codex-native-build-lock.mjs';
 
 const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3);
 assert.ok(option('source')&&option('output'),'Provide --source=/exact/upstream/codex-rs --output=/new/private/tree');
@@ -38,8 +39,11 @@ for(const name of await readdir(source)) {
 execFileSync('/usr/bin/git',['apply','--check',patch],{cwd:output,stdio:'pipe'});
 execFileSync('/usr/bin/git',['apply',patch],{cwd:output,stdio:'pipe'});
 for(const item of manifest.files)await verify(output,item.path,item.after);
+const buildLock=normalizeNativeBuildLock(await readFile(path.join(output,'Cargo.lock'),'utf8'),manifest);
+await writeFile(path.join(output,'Cargo.lock'),buildLock);
 await writeFile(path.join(output,'autoapprove-native-prototype.json'),JSON.stringify({
  upstreamCommit:manifest.upstreamCommit,patchSHA256:manifest.patchSHA256,
+ buildLockSHA256:manifest.buildLock.after,
  sourceOnly:true,built:false,installed:false,migrationAdmission:false
 },null,2)+'\n',{mode:0o600});
-console.log(JSON.stringify({prepared:true,output,changedFiles:paths.length,built:false,installed:false}));
+console.log(JSON.stringify({prepared:true,output,changedFiles:paths.length,normalizedLocalVersions:manifest.buildLock.entries,externalDependenciesUnchanged:true,built:false,installed:false}));

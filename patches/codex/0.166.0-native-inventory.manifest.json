@@ -61,5 +61,12 @@
       "after": "05d1ac870a33ba91d2b46f6cb940c634a3c85634b11a7f4e2e1c4733beac7249"
     }
   ],
-  "patchSHA256": "6705c959ce5123477ec45e576db7227faa4dd283a1757314b2a28fea977c409c"
+  "patchSHA256": "6705c959ce5123477ec45e576db7227faa4dd283a1757314b2a28fea977c409c",
+  "buildLock": {
+    "kind": "local-workspace-version-only",
+    "version": "0.166.0",
+    "entries": 170,
+    "before": "22bd51f50864ce40f6686f3350c0547fdd50a8213240f54435ed394f68bf08e6",
+    "after": "360ea1e0ec391255ffc153a73548be524aa5d50c3476f247631cec184c21d4cb"
+  }
 }

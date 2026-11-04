@@ -38,8 +38,12 @@ incomplete; its requirements are unchanged.
 Status: isolated source prototype in progress; distribution preference remains
 open. The [source patch and preparation tools](../../../patches/codex/README.md)
 connect a private read-only diagnostic socket to actual TUI App stores. Native
-compilation/tests remain pending. No custom Codex is installed or connected to
-user sessions. This does not relax preservation gates or enable migration effects.
+library tests passed 4/4 and the standalone TUI binary built with the pinned
+dependency graph. An owned embedded TUI/PTY probe verified repeated event-loop
+reads and exact unsent-draft preservation on a fresh repaint while preserving all
+19 original controller session identities. No custom Codex is installed or
+connected to user sessions. Daemon peer coverage and migration remain unverified;
+this does not relax preservation gates or enable migration effects.
 
 ## Why both sides are required
 

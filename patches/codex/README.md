@@ -34,6 +34,11 @@ alone is not daemon peer/backend attestation.
 Obtain and review the exact upstream source separately. The preparation command
 expects its `codex-rs` directory, checks pinned lock/toolchain/source preimages,
 copies to a new output, applies the reviewed patch and checks every postimage.
+The pinned release manifest says 0.166.0 while its lockfile's 170 local workspace
+entries still say 0.0.0. Preparation normalizes only those local version fields,
+checks the exact resulting lock hash and preserves every registry/Git dependency
+byte. The same mismatch was reproduced in unmodified upstream source; no external
+dependency update is authorized by this normalization.
 It never builds, installs, launches or deletes a Codex installation.
 
 ```sh
@@ -45,8 +50,8 @@ node scripts/prepare-codex-native-inventory.mjs \
 From the prepared directory, owned native validation uses Rust 1.95.0:
 
 ```sh
-cargo +stable test -p codex-tui --features autoapprove-native-inventory native_inventory --jobs 2
-cargo +stable build -p codex-tui --features autoapprove-native-inventory --bin codex-tui --jobs 2
+cargo +stable test -p codex-tui --lib --features autoapprove-native-inventory native_inventory --locked --jobs 2
+cargo +stable build -p codex-tui --features autoapprove-native-inventory --bin codex-tui --locked --jobs 2
 ```
 
 Only use the resulting binary in a fresh owned test home/PTY, with private socket
@@ -65,25 +70,38 @@ node scripts/codex-native-inventory-read.mjs \
 
 - The patch was reproduced from clean pinned source, with all 10 postimages
   checked. Rustfmt parsed/formatted the changed Rust files; that is not a Rust
-  compilation or semantic test pass.
-- `node scripts/codex-native-inventory-contract-check.mjs` passed 11 checks for
+  compilation or semantic test pass by itself.
+- `node scripts/codex-native-inventory-contract-check.mjs` passed 13 checks for
   nonce/PID/admission rejection, invalid/oversized responses, private socket/file
-  handling, no-overwrite source preparation and changed-source rejection. This uses synthetic socket replies
+  handling, no-overwrite source preparation, changed-source rejection and exact
+  local-only lock normalization. This uses synthetic socket replies
   and does not prove the native producer.
 - Four native Rust tests cover actual retained App state, draft non-disclosure
   and non-mutation, exclusive socket/nonce delivery, private-parent rejection and
   invalid request/file preservation. The three transport tests passed using the
   actual patched transport source with minimal event-channel types and matching
-  direct dependency pins. The App snapshot test and full TUI compile remain
-  pending. This does not verify the full upstream dependency graph or actual TUI
-  event dispatch.
+  direct dependency pins. The full native TUI library subsequently compiled and
+  passed all four filtered tests with the pinned dependency graph and `--locked`.
+  The standalone `codex-tui` binary also built successfully.
 - Reproduce that isolated transport check with
   `node scripts/codex-native-inventory-transport-check.mjs --source=/prepared/codex-rs`.
-  It uses its own Cargo cache and never launches a Codex session. The original
-  full-workspace dependency fetch remains a separate job.
-- The initial offline baseline could not resolve the official pinned Git
-  dependencies. Their existing fetch is retrying Chromium/V8 submodule network
-  failures; native build/test results remain pending.
+  It uses its own Cargo cache and never launches a Codex session.
+- The initial offline baseline lacked pinned Git dependencies. The subsequent
+  fetch progressed through Chromium/V8 despite transport retries, then ended
+  because the local package version metadata required lock normalization.
+  Unmodified upstream source reproduced that error. After the exact local-only
+  correction, the full TUI tests and standalone binary build passed with `--locked`.
+- `Tests/fixtures/codex-native-inventory-live.py` ran the built binary in its own
+  PTY with `--no-daemon`, an empty private home and a loopback model fixture.
+  Repeated real App event-loop reads retained the primary identity and an unsent
+  draft; a fresh resize repaint retained the exact draft and inventory exported
+  none of its text. No inference request was submitted. All 19 original controller
+  session identities remained present, and the test TUI was excluded from product
+  discovery. One external startup request was blocked by the fixture proxy.
+  The first probe omitted `--no-daemon` and exited because the standalone binary
+  has no complete daemon package; that failed attempt is not migration evidence.
+  This proves embedded TUI observation only, not daemon-connected peer coverage,
+  actual offscreen unsubscribe/replay lifecycles, Goal continuation or login change.
 
 Complete daemon connection/peer census, revision binding, reversible admission
 barriers, full pending-state preservation, actual credential/backend attestation

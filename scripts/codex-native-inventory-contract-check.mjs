@@ -4,6 +4,7 @@ import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
 import {mkdtemp,chmod,readFile,writeFile,lstat,rm,mkdir,copyFile} from 'node:fs/promises';
 import path from 'node:path';
+import {normalizeNativeBuildLock} from './codex-native-build-lock.mjs';
 const root=await mkdtemp('/private/tmp/aa-native-ipc-');await chmod(root,0o700);
 const script=path.resolve('scripts/codex-native-inventory-read.mjs'),prepare=path.resolve('scripts/prepare-codex-native-inventory.mjs');
 const source=path.resolve('.runtime/login-ownership/native-extension-reviewed-source/codex-rs');
@@ -32,6 +33,11 @@ async function consumer(transform,success){
  }finally{for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));}
 }
 try{
+ const manifest=JSON.parse(await readFile('patches/codex/0.166.0-native-inventory.manifest.json','utf8'));
+ const original=await readFile(source+'/Cargo.lock','utf8');
+ const normalized=normalizeNativeBuildLock(original,manifest);
+ assert.equal(normalized.replaceAll('version = "0.166.0"','version = "0.0.0"'),original);checks++;
+ assert.throws(()=>normalizeNativeBuildLock(original.replace('Inflector','changed-external-pin'),manifest));checks++;
  await consumer(value=>JSON.stringify(value)+'\n',true);
  await consumer(value=>JSON.stringify({...value,nonce:'f'.repeat(32)})+'\n',false);
  await consumer(value=>JSON.stringify({...value,pid:54321})+'\n',false);

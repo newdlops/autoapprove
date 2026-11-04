@@ -12,7 +12,7 @@ const source=path.resolve(option('source')),module=source+'/tui/src/native_inven
 const manifest=JSON.parse(await readFile(fileURLToPath(new URL('../patches/codex/0.166.0-native-inventory.manifest.json',import.meta.url)),'utf8'));
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 assert.equal(hash(await readFile(module)),manifest.files.find(v=>v.path==='tui/src/native_inventory.rs').after);
-const lock=await readFile(source+'/Cargo.lock','utf8');assert.equal(hash(Buffer.from(lock)),manifest.pins['Cargo.lock']);
+const lock=await readFile(source+'/Cargo.lock','utf8');assert.equal(hash(Buffer.from(lock)),manifest.buildLock.after);
 function version(name){
  const block=lock.split('[[package]]').find(v=>v.includes('\nname = "'+name+'"\n'));
  assert.ok(block,'Missing native direct dependency: '+name);return block.match(/version = "([^"]+)"/)[1];
