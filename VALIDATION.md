@@ -1,3 +1,9 @@
+## 0.2.255 후보 검증
+
+- Codex 부모 대화를 명시적으로 연결해 로드된 자식 스레드의 명령·파일 변경·빈 MCP 허가 폼만 서버 RPC로 일회 응답한다. 일반 폼과 사람 확인은 직접 확인으로 남긴다.
+- `swift build --product AutoApproveApp` 통과. `scripts/codex-subagent-approval-check.mjs`의 부모/자식 관계·무관/사람 확인 거절·일시정지·재개·중복 방지 검사가 통과했다.
+- 최신 0.2.254 엔진에 이식한 후보. Release 빌드와 서명 앱·업데이트 ZIP 생성, DMG 무결성·마운트 내용·앱 서명 검증이 통과했다. DMG SHA-256: `cfcf06726622d57e58746b9a49782efa37b4e14f8b522ddf6d9dc6a37b7b5aa4`. 설치·공개 배포 결과는 이후 확인한다.
+
 ## 2026-11-04 · 0.2.253 로그인 전환 중단 완료 확인
 
 - 고정된 Codex 0.166.0 실제 서버 시험에서 Goal 일시정지와 `turn/interrupt` 사이에 작업이 먼저 종료되어 `-32600 / no active turn to interrupt`가 발생할 수 있음을 확인했다. AutoApprove는 이 정확한 응답에 한해서 원래 서버·실행 차례·종료 상태와 Goal/백그라운드 작업의 정지를 다시 확인한다. 중단 명령은 재전송하지 않는다.

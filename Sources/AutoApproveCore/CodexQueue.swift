@@ -160,8 +160,11 @@ public struct CodexQueueTransport: Sendable {
 /// All blocking I/O runs off the main actor and is bounded by one deadline.
 final class CodexQueueConnection {
     private var fd: Int32 = -1
-    private let deadline = Date().addingTimeInterval(8)
+    private var deadline = Date().addingTimeInterval(8)
     private var sequence = 0
+    private let captureApprovals: Bool
+    var pendingRequests: [JSONObject] = []
+    var resolvedRequests = Set<String>()
     static func socketPath(home: String) -> String? {
         let entry = URL(fileURLWithPath: home).appendingPathComponent("app-server-control/app-server-control.sock")
         var link = stat()
@@ -177,7 +180,9 @@ final class CodexQueueConnection {
         }
         return path
     }
-    init(home: String) throws {
+    init(home: String, captureApprovals: Bool = false) throws {
+        self.captureApprovals = captureApprovals
+        deadline = Date().addingTimeInterval(8)
         guard let path = Self.socketPath(home: home) else {
             throw RemoteHTTPError(409, CodexQueueTransport.unavailableMessage, diagnostics: ["delivery": "not_started"])
         }
@@ -233,14 +238,17 @@ final class CodexQueueConnection {
         return pid
     }
     func request(_ method: String, _ params: JSONObject, classifyError: Bool = false) throws -> JSONObject {
+        if captureApprovals { deadline = Date().addingTimeInterval(8) }
         sequence += 1; let id = sequence
         try send(["id": id, "method": method, "params": params])
         while true {
             guard let object = try JSONSerialization.jsonObject(with: message()) as? JSONObject else { throw AppError.message("Codex 응답을 읽지 못했습니다.") }
             if let incoming = object["id"], object["method"] != nil {
+                if captureApprovals { pendingRequests.append(object); continue }
                 // Unrelated permission requests must stay with the original client.
                 try send(["id": incoming, "error": ["code": -32601, "message": "Unsupported request"]]); continue
             }
+            if object["method"] as? String == "serverRequest/resolved", let params = object["params"] as? JSONObject, let requestID = params["requestId"], let key = Self.requestKey(requestID) { resolvedRequests.insert(key) }
             guard object["id"] as? Int == id else { continue }
             if let error = object["error"] as? JSONObject {
                 if error["code"] as? Int == -32601 { throw RemoteHTTPError(409,"이 Codex 버전은 요청한 제어 기능을 지원하지 않습니다. Codex를 업데이트해주세요.",diagnostics:["delivery":"not_started"]) }
@@ -309,6 +317,23 @@ final class CodexQueueConnection {
         }
         return result
     }
+    static func requestKey(_ id: Any) -> String? {
+        if let value=id as? String { return "s:"+value }
+        if let value=id as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() { return "n:"+value.stringValue }
+        return nil
+    }
+    func collectRequests(untilResolved key: String? = nil) throws {
+        deadline=Date().addingTimeInterval(2)
+        for _ in 0..<256 {
+            if let key,resolvedRequests.contains(key) { return }
+            var descriptor=pollfd(fd:fd,events:Int16(POLLIN),revents:0)
+            guard Darwin.poll(&descriptor,1,150)>0 else { return }
+            let object=try JSONSerialization.jsonObject(with:message()) as? JSONObject ?? [:]
+            if object["id"] != nil,object["method"] != nil { pendingRequests.append(object) }
+            if object["method"] as? String == "serverRequest/resolved",let params=object["params"] as? JSONObject,let id=params["requestId"],let rpcKey=Self.requestKey(id) { resolvedRequests.insert(rpcKey) }
+        }
+    }
+    func respond(id:Any,result:JSONObject) throws { deadline=Date().addingTimeInterval(8);try send(["id":id,"result":result]) }
     private func write(_ data: Data) throws {
         try data.withUnsafeBytes { bytes in
             var offset = 0

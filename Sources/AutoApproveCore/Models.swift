@@ -138,6 +138,7 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var queuedQuestions: [QueuedQuestion]?
     public var codexQuestionsObservedAt: Date?
     public var codexQuestionsError: String?
+    public var codexApprovalBinding: CodexApprovalBinding?
     public var completion: WorkCompletion?
     public var completionError: String?
     /// A Codex turn stopped at model capacity, while this session's auto-approval is on.

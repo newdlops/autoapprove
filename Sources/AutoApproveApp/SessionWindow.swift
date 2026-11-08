@@ -316,6 +316,7 @@ import AutoApproveCore
                           approveClaude: { sourceID, requestID, automatic in try engine.answerClaudeApproval(sessionID: sourceID, requestID: requestID, enableAutomatic: automatic) },
                           releaseClaude: { sourceID, requestID in try engine.releaseClaudeApproval(sessionID: sourceID, requestID: requestID) },
                           questionDrafts: questionDrafts,
+                          approvalEngine:engine,
                           checkCodexProgress:{try engine.requestCodexProgressCheck(id)},cancelCodexProgress:{engine.cancelCodexProgressCheck(id)},
                           osPermissionStatus:engine.snapshot.osPermissions,
                           setOSPermissionAllowed:{try engine.setOSPermissionPolicy(id,allowed:$0)},
@@ -533,6 +534,7 @@ private struct SessionDetail: View {
     let approveClaude: (String, String, Bool) throws -> Void
     let releaseClaude: (String, String) throws -> Void
     var questionDrafts: QuestionReplyDrafts? = nil
+    var approvalEngine: ApprovalEngine? = nil
     var checkCodexProgress:(() throws -> Void)?=nil
     var cancelCodexProgress:(() -> Void)?=nil
     var osPermissionStatus:OSPermissionMonitorStatus?=nil
@@ -693,6 +695,10 @@ private struct SessionDetail: View {
                     CodexQuestionList(session: session, openingTerminal: openingTerminal, dismiss: dismissQuestion,
                         reply: replyQuestion, reveal: reveal, beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply,
                         drafts: questionDrafts)
+                    Divider()
+                }
+                if session.agent == .codex, let approvalEngine, session.phase != .ended {
+                    CodexApprovalConnectionView(session:session,engine:approvalEngine)
                     Divider()
                 }
                 if session.agent == .shell {
