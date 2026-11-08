@@ -7584,6 +7584,30 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try validateCodexQueueSession(session, threadID: nil)
         return choices
     }
+    public func connectCurrentCodexApprovals(sessionID: String) async throws {
+        guard let session = sessions[sessionID], session.agent == .codex, session.phase != .ended else { throw AppError.message("실행 중인 Codex 세션을 선택해주세요.") }
+        if session.codexApprovalBinding != nil { return }
+        let thread: String
+        var matchedName: String?
+        if let known = questionThreadBySession[sessionID] { thread = known }
+        else {
+            do { thread = try await questionTransport.prepareMessage(session).threadID }
+            catch {
+                let home = try await questionTransport.queueHome(session)
+                let conversations = try await codexQueue.conversations(home, session.cwd)
+                try validateCodexQueueSession(session, threadID: nil)
+                guard let current = sessions[sessionID],
+                      let match = CodexProfileConversationBinding.match(title: current.terminalTitle, cwd: session.cwd, conversations: conversations),
+                      let name = match.name else { throw AppError.message("현재 세션의 대화를 확인하지 못했습니다. 대화 연결 확인에서 선택해주세요.") }
+                thread = match.id; matchedName = name.precomposedStringWithCanonicalMapping
+            }
+        }
+        try validateCodexQueueSession(session, threadID: thread)
+        if let matchedName {
+            guard CodexProfileConversationBinding.terminalName(sessions[sessionID]?.terminalTitle, cwd: session.cwd) == matchedName else { throw AppError.message("현재 세션의 대화가 바뀌었습니다.") }
+        }
+        try await connectCodexApprovals(sessionID: sessionID, threadID: thread)
+    }
     public func codexApprovalSubagents(sessionID: String) async throws -> [CodexSubagentRow] {
         guard let session = sessions[sessionID], let binding = session.codexApprovalBinding,
               session.agent == .codex, session.phase != .ended else { throw AppError.message("연결된 Codex 부모 대화를 선택해주세요.") }

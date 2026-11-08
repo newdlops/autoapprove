@@ -16,6 +16,8 @@ import Foundation
         precondition(Set(CodexSubagentApprovals.ownedThreads(root: root, rows: rows).keys) == Set([root, child]))
         let safety: JSONObject = ["id": "protected", "method": "item/commandExecution/requestApproval", "params": ["threadId": child, "turnId": "turn", "itemId": "command", "cwd": "/fixture", "command": "sudo launchctl bootstrap system /Library/LaunchDaemons/fixture.plist", "availableDecisions": ["accept", "cancel"]]]
         precondition(CodexServerApproval.parse(safety, threads: [child: rows[1]])?.result["decision"] as? String == "cancel")
+        let children = try CodexSubagentApprovals.children(target: target, cwd: "/fixture")
+        precondition(children.count == 1 && children[0].id == child && children[0].title == "/root/worker")
         if !uncertain {
         let authorized = Counter(), confirmed = Counter()
         let count = try await Task.detached {
@@ -43,7 +45,7 @@ import Foundation
         engine.updateDiscovery([session], records: [record])
         try engine.setPaused(true)
         try engine.setAutomatic(session.id, enabled: true)
-        try await engine.connectCodexApprovals(sessionID: session.id, threadID: root)
+        try await engine.connectCurrentCodexApprovals(sessionID: session.id)
         try await Task.sleep(for: .milliseconds(200))
         let before = engine.snapshot.events.filter { $0.source == "Codex 부모·서브에이전트" }.count
         try await Task.sleep(for: .milliseconds(200))

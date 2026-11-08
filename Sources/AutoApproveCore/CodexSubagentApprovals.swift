@@ -92,12 +92,36 @@ enum CodexSubagentApprovals {
         }
         let owned = ownedThreads(root: target.threadID, rows: try loadedThreads(connection))
         guard owned[target.threadID] != nil else { throw AppError.message("부모 대화가 실행 중이 아닙니다.") }
+        var paths: [String: String] = [:]
+        let parents = Set(owned.values.compactMap { $0["parentThreadId"] as? String })
+        for parent in parents.sorted() {
+            var cursor: String?, seen = Set<String>()
+            for _ in 0..<20 {
+                var params: JSONObject = ["threadId": parent, "limit": 50, "itemsView": "full", "sortDirection": "desc"]
+                if let cursor { params["cursor"] = cursor }
+                let page = try connection.request("thread/turns/list", params)
+                guard let turns = page["data"] as? [JSONObject] else { throw AppError.message("서브에이전트 작업 이름을 읽지 못했습니다.") }
+                for turn in turns {
+                    for item in turn["items"] as? [JSONObject] ?? [] {
+                        guard item["type"] as? String == "subAgentActivity",
+                              let id = item["agentThreadId"] as? String,
+                              owned[id]?["parentThreadId"] as? String == parent,
+                              let path = item["agentPath"] as? String,
+                              path.hasPrefix("/root/"), !path.contains("\n"), !path.contains("\r"),
+                              paths[id] == nil else { continue }
+                        paths[id] = path
+                    }
+                }
+                cursor = page["nextCursor"] as? String
+                guard let cursor, seen.insert(cursor).inserted else { break }
+            }
+        }
         return owned.compactMap { id, row in
             guard id != target.threadID else { return nil }
-            let label = row["agentNickname"] as? String ?? row["name"] as? String ?? row["preview"] as? String ?? id
+            let label = paths[id] ?? "작업 이름 미확인"
             let state = row["status"] as? JSONObject ?? [:]
             let waiting = (state["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
-            return CodexSubagentRow(id: id, title: String(label.prefix(180)), status: waiting ? "승인 대기" : (state["type"] as? String ?? "상태 미확인"))
+            return CodexSubagentRow(id: id, title: label, status: waiting ? "승인 대기" : (state["type"] as? String ?? "상태 미확인"))
         }.sorted { $0.title == $1.title ? $0.id < $1.id : $0.title < $1.title }
     }
     /// Validate ancestry independently of server-side filtering. Missing parents,

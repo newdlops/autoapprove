@@ -16,11 +16,11 @@ struct Preview: View {
             ScrollView {
                 if let session = engine.snapshot.sessions.first(where: { $0.id == id }) {
                     VStack(alignment: .leading, spacing: 24) {
+                        CodexApprovalConnectionView(session: session, engine: engine)
+                        Divider()
                         Text("Fixture Lab").font(.title)
                         Toggle("자동 승인", isOn: Binding(get: { session.automatic }, set: { try? engine.setAutomatic(id, enabled: $0) }))
                         Toggle("전체 일시정지", isOn: Binding(get: { engine.snapshot.paused }, set: { try? engine.setPaused($0) }))
-                        Divider()
-                        CodexApprovalConnectionView(session: session, engine: engine)
                     }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.frame(minWidth: 350)

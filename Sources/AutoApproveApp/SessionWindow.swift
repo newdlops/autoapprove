@@ -300,10 +300,6 @@ import AutoApproveCore
             }.padding(24)
         } else if let id = selection.first, let session = engine.snapshot.sessions.first(where: { $0.id == id }) {
             VStack(spacing:0) {
-                if session.agent == .codex {
-                    CodexSessionAccountView(engine:engine,sessionID:id).id(session.id)
-                    Divider()
-                }
             SessionDetail(session: session, events: engine.snapshot.events.filter { event in event.sessionID == id || session.backgroundChildren.contains(where: { $0.id == event.sessionID }) }, paused: engine.snapshot.paused, openingTerminal: openingTerminal,
                           setAutomatic: { enabled in perform { try engine.setAutomatic(id, enabled: enabled) } },
                           resetAutomation: { try engine.resetAutomation(id) },
@@ -547,6 +543,14 @@ private struct SessionDetail: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
+                if session.agent == .codex, let approvalEngine, session.phase != .ended {
+                    CodexApprovalConnectionView(session:session,engine:approvalEngine)
+                    Divider()
+                }
+                if session.agent == .codex, let approvalEngine {
+                    CodexSessionAccountView(engine:approvalEngine,sessionID:session.id)
+                    Divider()
+                }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text(session.agent.title).font(.callout.weight(.medium)).foregroundStyle(.secondary)
@@ -695,10 +699,6 @@ private struct SessionDetail: View {
                     CodexQuestionList(session: session, openingTerminal: openingTerminal, dismiss: dismissQuestion,
                         reply: replyQuestion, reveal: reveal, beginReply: beginReply, cancelAutomaticReply: cancelAutomaticReply,
                         drafts: questionDrafts)
-                    Divider()
-                }
-                if session.agent == .codex, let approvalEngine, session.phase != .ended {
-                    CodexApprovalConnectionView(session:session,engine:approvalEngine)
                     Divider()
                 }
                 if session.agent == .shell {

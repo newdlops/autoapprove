@@ -39,6 +39,7 @@ try {
       if(m.method==='initialize'){assert.equal(m.params.capabilities.requiredHumanApproval,undefined);reply({userAgent:'fixture'});return;}
       if(m.method==='initialized')return;
       if(m.method==='thread/read'){assert.equal(m.params.includeTurns,false);reply({thread:m.params.threadId===root?parent:m.params.threadId===child?worker:{...worker,id:other,parentThreadId:other}});return;}
+      if(m.method==='thread/turns/list'){reply({data:[{items:[{type:'subAgentActivity',agentThreadId:child,agentPath:'/root/worker'},{type:'subAgentActivity',agentThreadId:other,agentPath:'/root/unrelated'}]}],nextCursor:null});return;}
       if(m.method==='thread/loaded/list'){reply({data:[root,child,other],nextCursor:null});return;}
       if(m.method==='thread/list'){
         if(m.params.ancestorThreadId){assert.equal(m.params.ancestorThreadId,root);reply({data:[worker,{...worker,id:other,parentThreadId:other}],nextCursor:null});}
