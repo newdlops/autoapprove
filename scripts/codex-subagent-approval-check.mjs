@@ -10,7 +10,7 @@ const require=createRequire(import.meta.url),ws=require(path.join(path.dirname(g
 const dir=await mkdtemp('/private/tmp/aa-subagent-'),build=path.resolve('.build/debug');
 const root='00000000-0000-4000-8000-000000000001',child='00000000-0000-4000-8000-000000000002',other='00000000-0000-4000-8000-000000000003';
 const parent={id:root,cwd:'/fixture',name:'parent',source:'cli',parentThreadId:null,status:{type:'active',activeFlags:[]}};
-const worker={id:child,cwd:'/fixture',agentNickname:'worker',source:{subAgent:{}},parentThreadId:root,status:{type:'active',activeFlags:['waitingOnApproval']}};
+const worker={id:child,cwd:'/fixture',agentNickname:'worker',source:{subagent:{thread_spawn:{parent_thread_id:root,depth:1,agent_path:'/root/worker',agent_nickname:'worker',agent_role:null}}},parentThreadId:root,status:{type:'active',activeFlags:['waitingOnApproval']}};
 const server=http.createServer(),wss=new ws.wsServer({noServer:true}),connections=new Set(),responses=[];
 let process, acknowledge=true;
 const preview=globalThis.process.argv.includes('--ui');
@@ -39,7 +39,6 @@ try {
       if(m.method==='initialize'){assert.equal(m.params.capabilities.requiredHumanApproval,undefined);reply({userAgent:'fixture'});return;}
       if(m.method==='initialized')return;
       if(m.method==='thread/read'){assert.equal(m.params.includeTurns,false);reply({thread:m.params.threadId===root?parent:m.params.threadId===child?worker:{...worker,id:other,parentThreadId:other}});return;}
-      if(m.method==='thread/turns/list'){reply({data:[{items:[{type:'subAgentActivity',agentThreadId:child,agentPath:'/root/worker'},{type:'subAgentActivity',agentThreadId:other,agentPath:'/root/unrelated'}]}],nextCursor:null});return;}
       if(m.method==='thread/loaded/list'){reply({data:[root,child,other],nextCursor:null});return;}
       if(m.method==='thread/list'){
         if(m.params.ancestorThreadId){assert.equal(m.params.ancestorThreadId,root);reply({data:[worker,{...worker,id:other,parentThreadId:other}],nextCursor:null});}

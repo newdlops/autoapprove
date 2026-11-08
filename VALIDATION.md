@@ -1,3 +1,10 @@
+## 0.2.258 · 서브에이전트 목록 응답 크기 수정
+
+- Release 빌드·앱/ZIP 서명·DMG 무결성/마운트 내용/서명 검증 통과. DMG SHA-256: `04354d767e7c1320eb895c195edb760878854d3971488964fe4d8bd2418254ab`.
+
+- 작업 이름 조회의 thread/turns/list 전체 본문 요청을 제거했다. 공식 Codex 0.167.0 SubAgentSource의 source.subagent.thread_spawn.agent_path와 parent_thread_id를 사용한다. 스레드 ID와 부모 관계를 확인하고 이름이 없으면 미확인으로 표시한다. 기존 2MB 프레임 한도는 유지한다.
+- Debug 앱 빌드와 실제 Swift 엔진/소켓 합성 서버 검사를 통과했다. 서버 fixture는 턴/항목 이력 조회를 지원하지 않으며 해당 호출은 검사 실패가 된다. 메타데이터의 실제 작업 경로 표시와 무관한 트리 제외, 자동 연결, 승인·일시정지·중복·재시작 검증을 통과했다. UI 배치는 변경하지 않았다.
+
 ## 0.2.257 · 서브에이전트 우선 표시
 
 - Release 빌드·앱/ZIP 서명과 DMG 무결성·마운트 내용·서명 검증 통과. DMG SHA-256: `83fe71e7f768ef2cdfee090a26f6451b4a0d3917f7b94a9006ac676e2664a3da`.
