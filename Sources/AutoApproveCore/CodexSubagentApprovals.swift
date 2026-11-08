@@ -9,6 +9,12 @@ public struct CodexApprovalBinding: Codable, Equatable, Sendable {
     }
 }
 
+public struct CodexSubagentRow: Identifiable, Sendable {
+    public let id: String
+    public let title: String
+    public let status: String
+}
+
 struct CodexServerApproval {
     let id: Any
     let key: String
@@ -77,6 +83,23 @@ struct CodexServerApproval {
 }
 
 enum CodexSubagentApprovals {
+    static func children(target: CodexReplyTarget, cwd: String) throws -> [CodexSubagentRow] {
+        let connection = try CodexQueueConnection(home: target.home, captureApprovals: true)
+        let root = try connection.request("thread/read", ["threadId": target.threadID, "includeTurns": false])["thread"] as? JSONObject
+        guard let root, root["id"] as? String == target.threadID, root["cwd"] as? String == cwd,
+              root["parentThreadId"] == nil || root["parentThreadId"] is NSNull else {
+            throw AppError.message("연결한 부모 대화가 바뀌었습니다.")
+        }
+        let owned = ownedThreads(root: target.threadID, rows: try loadedThreads(connection))
+        guard owned[target.threadID] != nil else { throw AppError.message("부모 대화가 실행 중이 아닙니다.") }
+        return owned.compactMap { id, row in
+            guard id != target.threadID else { return nil }
+            let label = row["agentNickname"] as? String ?? row["name"] as? String ?? row["preview"] as? String ?? id
+            let state = row["status"] as? JSONObject ?? [:]
+            let waiting = (state["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
+            return CodexSubagentRow(id: id, title: String(label.prefix(180)), status: waiting ? "승인 대기" : (state["type"] as? String ?? "상태 미확인"))
+        }.sorted { $0.title == $1.title ? $0.id < $1.id : $0.title < $1.title }
+    }
     /// Validate ancestry independently of server-side filtering. Missing parents,
     /// cycles, unrelated roots, forks and unloaded threads cannot acquire a policy.
     static func ownedThreads(root: String, rows: [JSONObject]) -> [String: JSONObject] {

@@ -11,6 +11,8 @@ struct CodexApprovalConnectionView: View {
     @State private var loading = false
     @State private var loaded = false
     @State private var error: String?
+    @State private var subagents: [CodexSubagentRow] = []
+    @State private var subagentsLoaded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -21,6 +23,19 @@ struct CodexApprovalConnectionView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Text(binding.status).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                Text("서브에이전트 목록").font(.callout.weight(.medium))
+                if subagentsLoaded && subagents.isEmpty {
+                    Text("현재 로드된 서브에이전트가 없습니다.").font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(subagents) { child in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack { Text(child.title).lineLimit(2); Spacer(minLength: 8); Text(child.status).foregroundStyle(.secondary) }
+                        Text(child.id).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    }.font(.callout)
+                }
+                Button(subagentsLoaded ? "목록 새로고침" : "서브에이전트 보기") {
+                    perform { subagents = try await engine.codexApprovalSubagents(sessionID: session.id); subagentsLoaded = true }
+                }.disabled(loading)
                 Button("연결 해제") { perform { try await engine.connectCodexApprovals(sessionID: session.id, threadID: nil) } }
                     .disabled(loading)
             } else {

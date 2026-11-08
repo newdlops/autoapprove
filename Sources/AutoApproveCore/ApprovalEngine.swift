@@ -7584,6 +7584,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try validateCodexQueueSession(session, threadID: nil)
         return choices
     }
+    public func codexApprovalSubagents(sessionID: String) async throws -> [CodexSubagentRow] {
+        guard let session = sessions[sessionID], let binding = session.codexApprovalBinding,
+              session.agent == .codex, session.phase != .ended else { throw AppError.message("연결된 Codex 부모 대화를 선택해주세요.") }
+        let target = try await questionTransport.prepareQueue(session, binding.threadID)
+        try validateCodexQueueSession(session, threadID: binding.threadID)
+        let rows = try await Task.detached(priority: .utility) { try CodexSubagentApprovals.children(target: target, cwd: session.cwd) }.value
+        try validateCodexQueueSession(session, threadID: binding.threadID)
+        return rows
+    }
 
     public func connectCodexApprovals(sessionID: String, threadID: String?) async throws {
         guard let session = sessions[sessionID], session.agent == .codex, session.phase != .ended,
