@@ -245,8 +245,11 @@ final class CodexQueueConnection {
             guard let object = try JSONSerialization.jsonObject(with: message()) as? JSONObject else { throw AppError.message("Codex 응답을 읽지 못했습니다.") }
             if let incoming = object["id"], object["method"] != nil {
                 if captureApprovals { pendingRequests.append(object); continue }
-                // Unrelated permission requests must stay with the original client.
-                try send(["id": incoming, "error": ["code": -32601, "message": "Unsupported request"]]); continue
+                // Requests are shared across clients. Even an error consumes the
+                // server callback and can strand the original TUI approval.
+                // Observers must leave the request to its owning approval client.
+                _ = incoming
+                continue
             }
             if object["method"] as? String == "serverRequest/resolved", let params = object["params"] as? JSONObject, let requestID = params["requestId"], let key = Self.requestKey(requestID) { resolvedRequests.insert(key) }
             guard object["id"] as? Int == id else { continue }

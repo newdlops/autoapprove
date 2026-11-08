@@ -5213,6 +5213,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleSystemSafety(_ id: String) {
+        guard sessions[id]?.codexApprovalBinding == nil else { return }
         guard !hasOSPermissionWait(id),let state = systemSafetyStates[id], state.generation != nil,
               state.notice.phase != .guided, state.notice.phase != .uncertain,
               state.retryAfter.map({ $0 > Date() }) != true,
@@ -5235,6 +5236,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func safetyInputAllowed(_ original: AgentSession, noticeID: String, automationEpoch: UInt64) -> Bool {
+        guard sessions[original.id]?.codexApprovalBinding == nil else { return false }
         guard !hasOSPermissionWait(original.id),!Task.isCancelled, automationRuntime.epoch(original.id) == automationEpoch,
               !automationNeedsFreshScreen.contains(original.id),
               !remoteInputStopped, !snapshot.paused, effectiveAutomatic(original.id), !userInputHasPriority(original.id),
@@ -7691,6 +7693,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private func reserveCodexApproval(_ original: AgentSession, threadID: String, epoch: UUID, approval: CodexServerApproval) -> Bool {
         guard !remoteInputStopped, !snapshot.paused, let current = sessions[original.id], current.automatic,
+              !userInputHasPriority(original.id), !automaticInputBusy(original.id),
               current.phase != .ended, current.pid == original.pid, current.started == original.started,
               current.tty == original.tty, current.cwd == original.cwd,
               current.codexApprovalBinding?.threadID == threadID,
