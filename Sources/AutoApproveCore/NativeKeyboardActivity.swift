@@ -6,19 +6,21 @@ import Foundation
 /// keyboard recording or additional input-monitoring permission is needed.
 public struct NativeKeyboardActivity:Sendable {
     public var idleSeconds:@Sendable()->TimeInterval
+    public var modifierFlags:@Sendable()->CGEventFlags
     public var frontmostBundle:@Sendable()->String?
-    public init(idleSeconds:@escaping @Sendable()->TimeInterval,frontmostBundle:@escaping @Sendable()->String?) {
-        self.idleSeconds = idleSeconds;self.frontmostBundle = frontmostBundle
+    public init(idleSeconds:@escaping @Sendable()->TimeInterval,frontmostBundle:@escaping @Sendable()->String?,modifierFlags:@escaping @Sendable()->CGEventFlags = {[]}) {
+        self.modifierFlags = modifierFlags;self.idleSeconds = idleSeconds;self.frontmostBundle = frontmostBundle
     }
     public static let inactive = Self(idleSeconds:{.infinity},frontmostBundle:{nil})
     public static let live = Self(idleSeconds:{
         min(CGEventSource.secondsSinceLastEventType(.hidSystemState,eventType:.keyDown),
             CGEventSource.secondsSinceLastEventType(.hidSystemState,eventType:.keyUp))
-    },frontmostBundle:{NSWorkspace.shared.frontmostApplication?.bundleIdentifier})
+    },frontmostBundle:{NSWorkspace.shared.frontmostApplication?.bundleIdentifier},modifierFlags:{CGEventSource.flagsState(.hidSystemState)})
     public func hasPriority(terminal:TerminalKind) -> Bool {
         guard ![.pty,.claudeBackground,.unknown].contains(terminal) else {return false}
         let idle = idleSeconds()
-        guard idle.isFinite,idle >= 0,idle < 1.2,let bundle = frontmostBundle() else {return false}
+        let held = !modifierFlags().intersection([.maskShift,.maskControl,.maskAlternate,.maskCommand]).isEmpty
+        guard held || (idle.isFinite && idle >= 0 && idle < 1.5),let bundle = frontmostBundle() else {return false}
         switch terminal {
         case .terminal:return bundle == ScreenHost.terminal.bundleID
         case .iterm:return bundle == ScreenHost.iterm.bundleID

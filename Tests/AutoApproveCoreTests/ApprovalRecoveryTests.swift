@@ -1,5 +1,6 @@
 import Foundation
 import JavaScriptCore
+import CoreGraphics
 import AutoApproveCore
 
 private func recoveryPrompt(_ command: String, agent: AgentKind = .codex) -> String {
@@ -205,7 +206,13 @@ extension ApprovalTests {
             state.set(idle:0.1,bundle:bundle);try expect(activity.hasPriority(terminal:terminal));try expect(activity.hasPriority(terminal:.tmux))
             try expectFalse(activity.hasPriority(terminal:.pty));try expectFalse(activity.hasPriority(terminal:.unknown))
             state.set(idle:0.1,bundle:"fixture.other-app");try expectFalse(activity.hasPriority(terminal:terminal),"Typing in another app cannot stall background approvals")
-            for idle in [1.2,2,.infinity,.nan,-1] {state.set(idle:idle,bundle:bundle);try expectFalse(activity.hasPriority(terminal:terminal))}
+            state.set(idle:1.4,bundle:bundle);try expect(activity.hasPriority(terminal:terminal))
+            for flag:CGEventFlags in [.maskShift,.maskControl,.maskAlternate,.maskCommand] {
+                let held = NativeKeyboardActivity(idleSeconds:{20},frontmostBundle:{bundle},modifierFlags:{flag})
+                try expect(held.hasPriority(terminal:terminal));try expectFalse(held.hasPriority(terminal:.pty))
+                try expectFalse(NativeKeyboardActivity(idleSeconds:{20},frontmostBundle:{"fixture.other-app"},modifierFlags:{flag}).hasPriority(terminal:terminal))
+            }
+            for idle in [1.5,2,.infinity,.nan,-1] {state.set(idle:idle,bundle:bundle);try expectFalse(activity.hasPriority(terminal:terminal))}
         }
     }
     func testNativeTypingYieldsApprovalWithoutDisablingAutomation() async throws {
