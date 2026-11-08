@@ -16,6 +16,12 @@ import Foundation
         precondition(Set(CodexSubagentApprovals.ownedThreads(root: root, rows: rows).keys) == Set([root, child]))
         let safety: JSONObject = ["id": "protected", "method": "item/commandExecution/requestApproval", "params": ["threadId": child, "turnId": "turn", "itemId": "command", "cwd": "/fixture", "command": "sudo launchctl bootstrap system /Library/LaunchDaemons/fixture.plist", "availableDecisions": ["accept", "cancel"]]]
         precondition(CodexServerApproval.parse(safety, threads: [child: rows[1]])?.result["decision"] as? String == "cancel")
+        for key in ["subAgent", "subagent"] {
+            let row: JSONObject = ["parentThreadId": root, "source": [key: ["thread_spawn": ["parent_thread_id": root, "agent_path": "/root/worker"]]]]
+            precondition(CodexSubagentApprovals.taskPath(row) == "/root/worker")
+            var mismatch = row; mismatch["parentThreadId"] = other
+            precondition(CodexSubagentApprovals.taskPath(mismatch) == nil)
+        }
         let children = try CodexSubagentApprovals.children(target: target, cwd: "/fixture")
         precondition(children.count == 1 && children[0].id == child && children[0].title == "/root/worker")
         if !uncertain {

@@ -83,6 +83,16 @@ struct CodexServerApproval {
 }
 
 enum CodexSubagentApprovals {
+    static func taskPath(_ row: JSONObject) -> String? {
+        guard let source = row["source"] as? JSONObject,
+              let subagent = (source["subAgent"] ?? source["subagent"]) as? JSONObject,
+              let spawn = subagent["thread_spawn"] as? JSONObject,
+              let parent = row["parentThreadId"] as? String,
+              spawn["parent_thread_id"] as? String == parent,
+              let path = spawn["agent_path"] as? String, path.hasPrefix("/root/"),
+              !path.contains("\n"), !path.contains("\r") else { return nil }
+        return path
+    }
     static func children(target: CodexReplyTarget, cwd: String) throws -> [CodexSubagentRow] {
         let connection = try CodexQueueConnection(home: target.home, captureApprovals: true)
         let root = try connection.request("thread/read", ["threadId": target.threadID, "includeTurns": false])["thread"] as? JSONObject
@@ -94,13 +104,7 @@ enum CodexSubagentApprovals {
         guard owned[target.threadID] != nil else { throw AppError.message("부모 대화가 실행 중이 아닙니다.") }
         return owned.compactMap { id, row in
             guard id != target.threadID else { return nil }
-            let source = row["source"] as? JSONObject
-            let subagent = source?["subagent"] as? JSONObject
-            let spawn = subagent?["thread_spawn"] as? JSONObject
-            let path = spawn?["agent_path"] as? String
-            let validPath = spawn?["parent_thread_id"] as? String == row["parentThreadId"] as? String
-                && path?.hasPrefix("/root/") == true && path?.contains("\n") == false && path?.contains("\r") == false
-            let label = validPath ? path! : "작업 이름 미확인"
+            let label = taskPath(row) ?? "작업 이름 미확인"
             let state = row["status"] as? JSONObject ?? [:]
             let waiting = (state["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
             return CodexSubagentRow(id: id, title: label, status: waiting ? "승인 대기" : (state["type"] as? String ?? "상태 미확인"))
