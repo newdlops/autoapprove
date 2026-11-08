@@ -39,14 +39,9 @@ import AutoApproveCore
          openSession: ((String) async throws -> Void)? = nil) {
         self.engine = engine; self.center = center
         self.openSession = openSession ?? { id in
-            await engine.refresh()
-            // A notification can cold-launch the app while its first scan is in flight.
-            for _ in 0..<50 {
-                if engine.initialDiscoveryComplete { break }
-                try await Task.sleep(nanoseconds: 100_000_000)
+            try await NotificationSessionOpener.open(id,engine:engine) {session in
+                try await TerminalNavigator.open(session,engine:engine)
             }
-            let session = try AttentionRequest.target(sessionID: id, sessions: engine.snapshot.sessions)
-            try await TerminalNavigator.open(session, engine: engine)
         }
         super.init()
         center.delegate = self

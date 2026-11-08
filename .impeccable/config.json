@@ -29,6 +29,15 @@
         ],
         "createdAt": "2026-10-06T06:57:42.113Z",
         "reason": "Agent: the interaction dialog has no wrapper padding because its heading, scrolling body and message form each supply their own 24px horizontal inset, verified in the browser."
+      },
+      {
+        "rule": "flat-type-hierarchy",
+        "value": "*",
+        "files": [
+          ".runtime/performance/terminal-wire-179-20261025/source/Sources/AutoApproveCore/Resources/RemoteWeb/index.html"
+        ],
+        "createdAt": "2026-10-25T15:26:21.368Z",
+        "reason": "Agent: CSS가 없는 측정용 부분 사본이다. HTML SHA-256은 제품 파일과 일치하고 제품에는 app.css가 존재한다. 기존 한 파일·한 규칙 예외를 유지한다."
       }
     ]
   }
