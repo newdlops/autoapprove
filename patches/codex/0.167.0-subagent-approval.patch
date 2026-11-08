@@ -1,0 +1,530 @@
+--- a/tui/src/app/app_server_events.rs
++++ b/tui/src/app/app_server_events.rs
+@@ -326,8 +326,12 @@
+                 if let Some(resolved) = self
+                     .pending_app_server_requests
+                     .resolve_notification(&notification.thread_id, &notification.request_id)
+-                    && self.chat_widget.thread_id().map(|id| id.to_string())
+-                        == Some(resolved.thread_id)
++                    // Parent widgets also display child approvals. Dismiss by the
++                    // request's scoped identity; only user input remains widget-local.
++                    && (!matches!(resolved.request,
++                        super::app_server_requests::ResolvedAppServerRequest::UserInput { .. })
++                        || self.chat_widget.thread_id().map(|id| id.to_string())
++                            == Some(resolved.thread_id))
+                 {
+                     self.chat_widget
+                         .dismiss_app_server_request(&resolved.request);
+--- a/tui/src/app/app_server_requests.rs
++++ b/tui/src/app/app_server_requests.rs
+@@ -46,6 +46,7 @@
+         call_id: String,
+     },
+     McpElicitation {
++        thread_id: String,
+         server_name: String,
+         request_id: AppServerRequestId,
+     },
+@@ -73,6 +74,9 @@
+ 
+ #[derive(Debug, Default)]
+ pub(super) struct PendingAppServerRequests {
++    // A user can click just before an external decision is delivered. Retain a
++    // bounded set of exact identities so that queued clicks become no-ops.
++    resolved_approvals: VecDeque<ResolvedThreadAppServerRequest>,
+     exec_approvals: HashMap<(String, String), PendingServerRequest>,
+     file_change_approvals: HashMap<(String, String), PendingServerRequest>,
+     permissions_approvals: HashMap<(String, String), PendingServerRequest>,
+@@ -89,6 +93,7 @@
+     }
+ 
+     pub(super) fn clear(&mut self) {
++        self.resolved_approvals.clear();
+         self.exec_approvals.clear();
+         self.file_change_approvals.clear();
+         self.permissions_approvals.clear();
+@@ -406,7 +411,56 @@
+         Ok(resolution)
+     }
+ 
++    pub(super) fn was_resolved(&self, thread_id: &str, op: &AppCommand) -> bool {
++        let thread_id = Self::canonical_thread_id(thread_id);
++        self.resolved_approvals.iter().any(|resolved| {
++            if resolved.thread_id != thread_id {
++                return false;
++            }
++            match (&resolved.request, op) {
++                (
++                    ResolvedAppServerRequest::ExecApproval { id, .. },
++                    AppCommand::ExecApproval { id: other, .. },
++                )
++                | (
++                    ResolvedAppServerRequest::FileChangeApproval { id, .. },
++                    AppCommand::PatchApproval { id: other, .. },
++                )
++                | (
++                    ResolvedAppServerRequest::PermissionsApproval { id, .. },
++                    AppCommand::RequestPermissionsResponse { id: other, .. },
++                ) => id == other,
++                (
++                    ResolvedAppServerRequest::McpElicitation {
++                        server_name,
++                        request_id,
++                        ..
++                    },
++                    AppCommand::ResolveElicitation {
++                        server_name: other_server,
++                        request_id: other_id,
++                        ..
++                    },
++                ) => server_name == other_server && request_id == other_id,
++                _ => false,
++            }
++        })
++    }
++
+     pub(super) fn resolve_notification(
++        &mut self,
++        thread_id: &str,
++        request_id: &AppServerRequestId,
++    ) -> Option<ResolvedThreadAppServerRequest> {
++        let resolved = self.take_resolved_notification(thread_id, request_id)?;
++        if self.resolved_approvals.len() == 256 {
++            self.resolved_approvals.pop_front();
++        }
++        self.resolved_approvals.push_back(resolved.clone());
++        Some(resolved)
++    }
++
++    fn take_resolved_notification(
+         &mut self,
+         thread_id: &str,
+         request_id: &AppServerRequestId,
+@@ -467,8 +521,9 @@
+             self.user_verification
+                 .remove(&key.thread_id, &key.server_name, &key.request_id);
+             return Some(ResolvedThreadAppServerRequest {
+-                thread_id: key.thread_id,
++                thread_id: key.thread_id.clone(),
+                 request: ResolvedAppServerRequest::McpElicitation {
++                    thread_id: key.thread_id,
+                     server_name: key.server_name,
+                     request_id: key.request_id,
+                 },
+@@ -1127,6 +1182,7 @@
+             Some(ResolvedThreadAppServerRequest {
+                 thread_id: "thread-1".to_string(),
+                 request: ResolvedAppServerRequest::McpElicitation {
++                    thread_id: "thread-1".into(),
+                     server_name: "example".to_string(),
+                     request_id: AppServerRequestId::Integer(12),
+                 },
+@@ -1209,3 +1265,37 @@
+ #[cfg(test)]
+ #[path = "retained_reply_tests.rs"]
+ mod retained_reply_tests;
++
++#[cfg(test)]
++mod autoapprove_resolution_tests {
++    use super::*;
++    use codex_app_server_protocol::{FileChangeApprovalDecision, FileChangeRequestApprovalParams};
++    #[test]
++    fn resolved_identity_is_bounded_scoped_and_cleared() {
++        let mut requests = PendingAppServerRequests::default();
++        for n in 0..257 {
++            requests.note_server_request(&ServerRequest::FileChangeRequestApproval {
++                request_id: AppServerRequestId::Integer(n),
++                params: FileChangeRequestApprovalParams {
++                    thread_id: "child".into(),
++                    turn_id: "turn".into(),
++                    item_id: n.to_string(),
++                    started_at_ms: 0,
++                    reason: None,
++                    grant_root: None,
++                },
++            });
++            requests.resolve_notification("child", &AppServerRequestId::Integer(n));
++        }
++        let op = |id: &str| AppCommand::PatchApproval {
++            id: id.into(),
++            decision: FileChangeApprovalDecision::Accept,
++        };
++        assert!(!requests.was_resolved("child", &op("0")));
++        assert!(requests.was_resolved("child", &op("256")));
++        assert!(!requests.was_resolved("other", &op("256")));
++        assert!(!requests.was_resolved("child", &op("unknown")));
++        requests.clear();
++        assert!(!requests.was_resolved("child", &op("256")));
++    }
++}
+--- a/tui/src/app/tests.rs
++++ b/tui/src/app/tests.rs
+@@ -10485,3 +10485,112 @@
+ 
+ #[path = "tests/backend_event_tests.rs"]
+ mod backend_event_tests;
++
++#[tokio::test]
++async fn autoapprove_resolved_child_overlay_and_queued_click_are_cleared() -> Result<()> {
++    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
++    let app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let parent = ThreadId::new();
++    let child = ThreadId::new();
++    let sibling = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(parent, test_path_buf("/tmp/project")),
++        Vec::new(),
++    )
++    .await?;
++    while events.try_recv().is_ok() {}
++    for (thread, rpc) in [(child, 101), (sibling, 102)] {
++        let mut request = exec_approval_request(thread, "turn", "same-item", None);
++        let ServerRequest::CommandExecutionRequestApproval { request_id, .. } = &mut request else {
++            unreachable!()
++        };
++        *request_id = AppServerRequestId::Integer(rpc);
++        app.pending_app_server_requests
++            .note_server_request(&request);
++        app.enqueue_thread_request(thread, request).await?;
++    }
++    assert_eq!(app.chat_widget.thread_id(), Some(parent));
++    assert!(app.chat_widget.has_active_view());
++    app.handle_app_server_event(
++        &app_server,
++        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
++            ServerNotification::ServerRequestResolved(
++                codex_app_server_protocol::ServerRequestResolvedNotification {
++                    thread_id: child.to_string(),
++                    request_id: AppServerRequestId::Integer(101),
++                },
++            ),
++        )),
++    )
++    .await;
++    // Only the sibling remains actionable even though its item ID is identical.
++    assert!(app.chat_widget.has_active_view());
++    app.chat_widget
++        .handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
++    let target = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
++        AppEvent::SubmitThreadOp { thread_id, .. } => Some(thread_id),
++        _ => None,
++    });
++    assert_eq!(target, Some(sibling));
++    assert!(!app.chat_widget.has_active_view());
++    let stale_click = crate::app_command::AppCommand::ExecApproval {
++        id: "same-item".into(),
++        turn_id: None,
++        decision: codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
++    };
++    assert!(
++        app.try_resolve_app_server_request(child, &stale_click)
++            .await?
++    );
++    assert!(
++        !app.try_resolve_app_server_request(ThreadId::new(), &stale_click)
++            .await?
++    );
++    app_server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn autoapprove_resolved_child_file_and_mcp_dialogs_close_on_parent() -> Result<()> {
++    let (mut app, _events, _ops) = make_test_app_with_channels().await;
++    let app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let parent = ThreadId::new();
++    let child = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(parent, test_path_buf("/tmp/project")),
++        Vec::new(),
++    )
++    .await?;
++    let requests = [
++        serde_json::json!({"id":201,"method":"item/fileChange/requestApproval","params":{
++            "threadId":child.to_string(),"turnId":"turn","itemId":"file","startedAtMs":0,
++            "reason":null,"grantRoot":null}}),
++        serde_json::json!({"id":202,"method":"mcpServer/elicitation/request","params":{
++            "threadId":child.to_string(),"turnId":"turn","serverName":"fixture","mode":"form",
++            "message":"Allow fixture?","requestedSchema":{"type":"object","properties":{}}}}),
++    ];
++    for wire in requests {
++        let request: ServerRequest = serde_json::from_value(wire)?;
++        let request_id = request.id().clone();
++        app.pending_app_server_requests
++            .note_server_request(&request);
++        app.enqueue_thread_request(child, request).await?;
++        assert!(app.chat_widget.has_active_view());
++        app.handle_app_server_event(
++            &app_server,
++            codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
++                ServerNotification::ServerRequestResolved(
++                    codex_app_server_protocol::ServerRequestResolvedNotification {
++                        thread_id: child.to_string(),
++                        request_id,
++                    },
++                ),
++            )),
++        )
++        .await;
++        assert!(!app.chat_widget.has_active_view());
++        assert_eq!(app.chat_widget.thread_id(), Some(parent));
++    }
++    app_server.shutdown().await?;
++    Ok(())
++}
+--- a/tui/src/app/thread_routing.rs
++++ b/tui/src/app/thread_routing.rs
+@@ -382,6 +382,7 @@
+                         } => Some(ThreadInteractiveRequest::UserVerification {
+                             thread_id,
+                             request: crate::bottom_pane::user_verification::UserVerificationRequest {
++                            thread_id: thread_id.to_string(),
+                                 thread_label,
+                                 server_name: params.server_name.clone(),
+                                 request_id: request_id.clone(),
+@@ -982,7 +983,9 @@
+             .take_resolution_record(&thread_id.to_string(), op)
+             .map_err(|err| color_eyre::eyre::eyre!(err))?
+         else {
+-            return Ok(false);
++            return Ok(self
++                .pending_app_server_requests
++                .was_resolved(&thread_id.to_string(), op));
+         };
+         let Some(reply) = resolution.request.reply else {
+             return Err(color_eyre::eyre::eyre!(
+--- a/tui/src/app/user_verification.rs
++++ b/tui/src/app/user_verification.rs
+@@ -34,6 +34,7 @@
+         if app_server.uses_remote_workspace() {
+             self.chat_widget.dismiss_app_server_request(
+                 &ResolvedAppServerRequest::McpElicitation {
++                    thread_id: thread_id.to_string(),
+                     server_name: server_name.clone(),
+                     request_id: request_id.clone(),
+                 },
+@@ -136,6 +137,7 @@
+         };
+         self.chat_widget
+             .dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++                thread_id: thread_id.to_string(),
+                 server_name: server_name.clone(),
+                 request_id: request_id.clone(),
+             });
+--- a/tui/src/app/user_verification_requests_tests.rs
++++ b/tui/src/app/user_verification_requests_tests.rs
+@@ -180,6 +180,7 @@
+         Some(ResolvedThreadAppServerRequest {
+             thread_id: thread_id(&request).to_string(),
+             request: ResolvedAppServerRequest::McpElicitation {
++                thread_id: thread_id(&request).to_string(),
+                 server_name: "deployments".to_string(),
+                 request_id: request.id().clone(),
+             },
+--- a/tui/src/bottom_pane/app_link_view.rs
++++ b/tui/src/bottom_pane/app_link_view.rs
+@@ -793,6 +793,7 @@
+ 
+     fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
+         let ResolvedAppServerRequest::McpElicitation {
++            thread_id,
+             server_name,
+             request_id,
+         } = request
+@@ -802,7 +803,10 @@
+         let Some(target) = self.elicitation_target.as_ref() else {
+             return false;
+         };
+-        if target.server_name != *server_name || target.request_id != *request_id {
++        if target.thread_id.to_string() != *thread_id
++            || target.server_name != *server_name
++            || target.request_id != *request_id
++        {
+             return false;
+         }
+ 
+@@ -1571,6 +1575,7 @@
+ 
+         assert!(
+             view.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++                thread_id: suggestion_target().thread_id.to_string(),
+                 server_name: "codex_apps".to_string(),
+                 request_id: AppServerRequestId::String("request-1".to_string()),
+             })
+@@ -1600,6 +1605,7 @@
+ 
+         assert!(
+             !view.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++                thread_id: suggestion_target().thread_id.to_string(),
+                 server_name: "other_server".to_string(),
+                 request_id: AppServerRequestId::String("request-1".to_string()),
+             })
+--- a/tui/src/bottom_pane/approval_overlay.rs
++++ b/tui/src/bottom_pane/approval_overlay.rs
+@@ -169,11 +169,13 @@
+             (
+                 ApprovalRequest::McpElicitation(request),
+                 ResolvedAppServerRequest::McpElicitation {
++                    thread_id,
+                     server_name: resolved_server_name,
+                     request_id: resolved_request_id,
+                 },
+             ) => {
+-                request.server_name == *resolved_server_name
++                request.thread_id.to_string() == *thread_id
++                    && request.server_name == *resolved_server_name
+                     && request.request_id == *resolved_request_id
+             }
+             _ => false,
+--- a/tui/src/bottom_pane/mcp_server_elicitation.rs
++++ b/tui/src/bottom_pane/mcp_server_elicitation.rs
+@@ -1234,6 +1234,7 @@
+ 
+     fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
+         let ResolvedAppServerRequest::McpElicitation {
++            thread_id,
+             server_name,
+             request_id,
+         } = request
+@@ -1243,9 +1244,14 @@
+ 
+         let queue_len = self.queue.len();
+         self.queue.retain(|queued_request| {
+-            queued_request.server_name != *server_name || queued_request.request_id != *request_id
++            queued_request.thread_id.to_string() != *thread_id
++                || queued_request.server_name != *server_name
++                || queued_request.request_id != *request_id
+         });
+-        if self.request.server_name == *server_name && self.request.request_id == *request_id {
++        if self.request.thread_id.to_string() == *thread_id
++            && self.request.server_name == *server_name
++            && self.request.request_id == *request_id
++        {
+             self.advance_queue_or_complete();
+             return true;
+         }
+@@ -2610,6 +2616,7 @@
+ 
+         assert!(
+             overlay.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++                thread_id: thread_id.to_string(),
+                 server_name: "server-1".to_string(),
+                 request_id: request_id("request-1"),
+             })
+@@ -2622,6 +2629,7 @@
+ 
+         assert!(
+             overlay.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++                thread_id: thread_id.to_string(),
+                 server_name: "server-1".to_string(),
+                 request_id: request_id("request-2"),
+             })
+--- a/tui/src/bottom_pane/user_verification.rs
++++ b/tui/src/bottom_pane/user_verification.rs
+@@ -32,6 +32,7 @@
+ 
+ #[derive(Clone, Debug)]
+ pub(crate) struct UserVerificationRequest {
++    pub thread_id: String,
+     pub title: String,
+     pub description: String,
+     pub thread_label: Option<String>,
+@@ -202,8 +203,8 @@
+     }
+ 
+     fn matches_app_server_request(&self, request: &ResolvedAppServerRequest) -> bool {
+-        matches!(request, ResolvedAppServerRequest::McpElicitation { server_name, request_id }
+-            if server_name == &self.request.server_name && request_id == &self.request.request_id)
++        matches!(request, ResolvedAppServerRequest::McpElicitation { thread_id, server_name, request_id }
++            if thread_id == &self.request.thread_id && server_name == &self.request.server_name && request_id == &self.request.request_id)
+     }
+ 
+     fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
+@@ -322,6 +323,7 @@
+     ) {
+         // App-server request IDs are shared across threads, unlike raw MCP request IDs.
+         let request_key = ResolvedAppServerRequest::McpElicitation {
++            thread_id: thread_id.to_string(),
+             server_name: request.server_name.clone(),
+             request_id: request.request_id.clone(),
+         };
+--- a/tui/src/bottom_pane/user_verification_tests.rs
++++ b/tui/src/bottom_pane/user_verification_tests.rs
+@@ -25,6 +25,7 @@
+     tokio::sync::mpsc::UnboundedReceiver<UserVerificationDecision>,
+ ) {
+     make_view_for_request(UserVerificationRequest {
++        thread_id: "verification-thread".into(),
+         title: "Production deployment needs your approval.".to_string(),
+         description: "Approve deploying the reviewed release?".to_string(),
+         thread_label: None,
+@@ -118,12 +119,14 @@
+     view.state = UserVerificationState::Waiting;
+     assert!(
+         !view.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++            thread_id: "verification-thread".into(),
+             server_name: "other".to_string(),
+             request_id: RequestId::Integer(12)
+         })
+     );
+     assert!(
+         view.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
++            thread_id: "verification-thread".into(),
+             server_name: "deployments".to_string(),
+             request_id: RequestId::Integer(12)
+         })
+@@ -158,6 +161,7 @@
+ #[test]
+ fn long_url_tokens_remain_visible_in_a_narrow_verification_prompt() {
+     let (mut view, _) = make_view_for_request(UserVerificationRequest {
++        thread_id: "verification-thread".into(),
+         title: "Approve https://example.com/production/release/candidate?".to_string(),
+         description: "Deploy https://example.com/production/critical-release-candidate".to_string(),
+         thread_label: None,
+@@ -205,6 +209,7 @@
+ #[tokio::test]
+ async fn full_screen_pager_reaches_the_end_of_a_long_request() -> std::io::Result<()> {
+     let (view, _) = make_view_for_request(UserVerificationRequest {
++        thread_id: "verification-thread".into(),
+         title: "Approve release?".to_string(),
+         description: format!(
+             "{}Final approval details.",
+--- a/tui/src/chatwidget.rs
++++ b/tui/src/chatwidget.rs
+@@ -1031,11 +1031,11 @@
+         let request_thread_id = match request {
+             ResolvedAppServerRequest::ExecApproval { thread_id, .. }
+             | ResolvedAppServerRequest::FileChangeApproval { thread_id, .. }
+-            | ResolvedAppServerRequest::PermissionsApproval { thread_id, .. } => {
++            | ResolvedAppServerRequest::PermissionsApproval { thread_id, .. }
++            | ResolvedAppServerRequest::McpElicitation { thread_id, .. } => {
+                 Some(thread_id.as_str())
+             }
+-            ResolvedAppServerRequest::UserInput { .. }
+-            | ResolvedAppServerRequest::McpElicitation { .. } => None,
++            ResolvedAppServerRequest::UserInput { .. } => None,
+         };
+         let removed_deferred = request_thread_id.is_none_or(|request_thread_id| {
+             self.thread_id
+--- a/tui/src/chatwidget/interrupts.rs
++++ b/tui/src/chatwidget/interrupts.rs
+@@ -154,7 +154,8 @@
+                 matches!(request, ResolvedAppServerRequest::McpElicitation {
+                     server_name,
+                     request_id: resolved_request_id,
+-                } if params.server_name == server_name.as_str() && request_id == resolved_request_id)
++                    thread_id,
++                } if params.thread_id == *thread_id && params.server_name == server_name.as_str() && request_id == resolved_request_id)
+             }
+             QueuedInterrupt::RequestPermissions(ev) => {
+                 matches!(request, ResolvedAppServerRequest::PermissionsApproval { id, .. }
+--- a/tui/src/chatwidget/tool_requests.rs
++++ b/tui/src/chatwidget/tool_requests.rs
+@@ -379,6 +379,7 @@
+                     self.bottom_pane.push_user_verification_request(
+                         thread_id,
+                         crate::bottom_pane::user_verification::UserVerificationRequest {
++                            thread_id: thread_id.to_string(),
+                             thread_label: None,
+                             server_name: params.server_name,
+                             request_id,

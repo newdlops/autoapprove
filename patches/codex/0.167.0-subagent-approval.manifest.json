@@ -1,0 +1,83 @@
+{
+  "format": 1,
+  "upstreamVersion": "0.167.0",
+  "upstreamTag": "rust-v0.167.0",
+  "sourceArchiveSHA256": "313e49728fba6c3d44683554c28018f36781f9f9b6bd09eaa65dccdd6c13b1a7",
+  "patchSHA256": "c1dbe8980e8fcf71ff9153a4cf45a53994842c850e23a6d1fa0df5d80d4833b9",
+  "files": [
+    {
+      "path": "tui/src/app/app_server_events.rs",
+      "before": "c084fd94a9778b0f7f27560a3a667e8f39c65a04ff2c4b0af28d210c9fc196b1",
+      "after": "b7858cc765c9f962a6e4b1b9bd385f68df6507d47f0081e45cd63922a6cb4ed6"
+    },
+    {
+      "path": "tui/src/app/app_server_requests.rs",
+      "before": "df5dc1a65ebac88a02961f77eb5a25f7ef280a06c76a5320e0075a851db24777",
+      "after": "0632ff2bf627eb1570759aff301ece86fb55bb268d3d3878e0f4238f030f3a35"
+    },
+    {
+      "path": "tui/src/app/tests.rs",
+      "before": "4f71285a953a11aa35dd06c8165d8819c7000b678e40e94e381bfbad639a5b0a",
+      "after": "325b26803cc7864a281e83db3c758202e7b20f7577cd72369340cb419dbc5d6d"
+    },
+    {
+      "path": "tui/src/app/thread_routing.rs",
+      "before": "66c033a471500ecb9a02cc81e43eecc44cef4442513dfa55853f2616079a5a94",
+      "after": "ee97ac2b926f4786a663e85e540b0eb2a15db487f7e52033b244276c23aa31e4"
+    },
+    {
+      "path": "tui/src/app/user_verification.rs",
+      "before": "91db65134055480f0ccab1af067ca91a99961147f4630d69bd43be918ed63c5b",
+      "after": "eff20d2a4197f86889d59d7bafc74ab429ada3b0bdf1bc2be36dfd37bf6f90b3"
+    },
+    {
+      "path": "tui/src/app/user_verification_requests_tests.rs",
+      "before": "a0ac841389b61a9e442bf485adb168884e3d541dee09c282168b8a043cbd7e30",
+      "after": "d2bdf97cbfe8a5fddfa02ce8bf685102e33a2ebc644b31e222f4357bca2884bc"
+    },
+    {
+      "path": "tui/src/bottom_pane/app_link_view.rs",
+      "before": "773473dd85d49d22d9f632f961091427d16ea419dd93aabfc589c4251bc9c801",
+      "after": "d7c4bc5d4b33d31baf83545a5abfa00976a37e2021bdd328d033490c5cfd0ab8"
+    },
+    {
+      "path": "tui/src/bottom_pane/approval_overlay.rs",
+      "before": "060c90587bf660fc653b61554843f7d2053a3e889059aea86d9cf33387f32116",
+      "after": "f945f3f3c855cea6ad47b0fb3db05ca2ba7f5c3ef33cff564c27af4d36b17ef5"
+    },
+    {
+      "path": "tui/src/bottom_pane/mcp_server_elicitation.rs",
+      "before": "0e44ec41ad5021970634a4362aa9897a50ad0e4f8c94f776b8bc71c2e3398b3d",
+      "after": "b34ecc9f1d1a383d2f3cf3b5b5bd1c063943b22b99bbeab53450ef13c1b952e7"
+    },
+    {
+      "path": "tui/src/bottom_pane/user_verification.rs",
+      "before": "630a2a9810128ecaf1eff742eb34808a2cdc4d51ce9991998f7967b28d62b0ec",
+      "after": "c85c6fdb0a58de61ce1a61abf84cf72d75cdfb659683640c01b27ab5071d8bcf"
+    },
+    {
+      "path": "tui/src/bottom_pane/user_verification_tests.rs",
+      "before": "ccea227a4c124567dab49e5421ece9cf4c6f3b1683437152073b617bbde3fffd",
+      "after": "7b318162e995e60db69cd854c123ba9288f88083cf93602ec08aee6d17f59325"
+    },
+    {
+      "path": "tui/src/chatwidget.rs",
+      "before": "b4ad748e85d24e5e9238b9de78eb05897521fd492de5a52438a721a3142b9d2e",
+      "after": "5e39a76eafa33c9c6ec0d4d0fc69df72c254dc8238a535a9aa30e747884eb9ad"
+    },
+    {
+      "path": "tui/src/chatwidget/interrupts.rs",
+      "before": "fcc4fd95568a693c660b57785c91e8cb9a6e0748107f66d95e4b242cc5cbc7c5",
+      "after": "604a4fea65b0c2964ad4750c2ee42a564e8417f03edd9e7f34b68316436cef3d"
+    },
+    {
+      "path": "tui/src/chatwidget/tool_requests.rs",
+      "before": "b40527c4014b8f7d35f7a6dd08339f089b66da01533c79de3229a86d590db129",
+      "after": "00a54e24c709753cf4f16f442116d772d238c3561ccb88ed8ec91bbcfc5cb537"
+    }
+  ],
+  "localWorkspaceLockVersions": 171,
+  "v8SourceCommit": "350c5a859a9b3c84ab8701b3ad51e3b7699b30c0",
+  "upstreamCommit": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
+  "originalBinarySHA256": "030316ecfbb41f4e7946e584b0063ef333b7a36cd312ba349f2f6869e39b62cc"
+}
