@@ -47,6 +47,7 @@ private final class NativeProbe: @unchecked Sendable {
     var trusted = true, posting = true, focused = true, cancelled = false, ownerBundle = "com.apple.Terminal", now: TimeInterval = 0
     var focusedRole = kAXTextAreaRole
     var metadataReads = 0, prepares = 0, faultAt = 0, fault: Fault?, throwPairAt = 0
+    var focusOnPrepare = false
     var identity: TTYInputIdentity = {
         let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
         return TTYInputIdentity(pid:81001,processGroup:81001,uid:getuid(),effectiveUID:geteuid(),device:42,
@@ -102,7 +103,7 @@ private final class NativeProbe: @unchecked Sendable {
     }
     var environment: TerminalKeyboard.Environment {
         TerminalKeyboard.Environment(trusted: { self.read { $0.trusted } }, postingAllowed: { self.read { $0.posting } }, run: { script in
-            self.mutate { $0.prepares += 1 }
+            self.mutate { $0.prepares += 1; if $0.focusOnPrepare { $0.focused = true } }
             let context = preparationContext()
             if self.read({ $0.records.last?.agent == .claude }) { context.evaluateScript("processes = ['claude'];") }
             let value = context.evaluateScript(script)?.toString()
@@ -148,6 +149,19 @@ private final class NativeProbe: @unchecked Sendable {
             && !$0.units.first.map({ (0xdc00...0xdfff).contains($0) })! && !$0.units.last.map({ (0xd800...0xdbff).contains($0) })!
             && $0.downFlags == 0 && $0.upFlags == 0 }, "Every Unicode pair must target only the exact owner and keep complete surrogate sequences without modifiers")
         checks.append("bounded Unicode down/up pairs target only the original owner, with no surrogate cuts or modifier leakage")
+
+        try require(unicode.read{$0.prepares == 0}, "Focused exact-source live typing must not launch a preparation script")
+        let focusChange = NativeProbe(); focusChange.mutate{$0.focused = false; $0.focusOnPrepare = true}
+        try require(try TerminalKeyboard.deliver(target:focusChange.target,expected:"screen",agent:.codex,
+            input:.init(kind:.characters,text:"live",relay:true),environment:focusChange.environment) == .sent,
+            "A different foreground app must still use the selection/activation preparation")
+        try require(focusChange.read{$0.prepares == 1 && $0.pairs.count == 1}, "Unfocused input must prepare exactly once before posting")
+        let boundRevision = NativeProbe()
+        try require(try TerminalKeyboard.deliver(target:boundRevision.target,expected:"screen",agent:.codex,
+            input:.init(kind:.characters,text:"bound"),environment:boundRevision.environment) == .sent,
+            "Revision-bound input must retain its fresh script comparison")
+        try require(boundRevision.read{$0.prepares == 1}, "Only live typing may skip scripted screen preparation")
+        checks.append("focused live typing uses fresh native checks without a script; focus changes and revision-bound input retain preparation")
 
         let special = NativeProbe()
         let keyCodes: [(RemoteTerminalInput.Kind, Int64)] = [(.enter,36),(.escape,53),(.interrupt,8),(.up,126),(.down,125),(.left,123),(.right,124),(.backspace,51),(.delete,117),(.home,115),(.end,119),(.tab,48)]

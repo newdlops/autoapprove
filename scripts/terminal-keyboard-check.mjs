@@ -17,7 +17,13 @@ try {
     const declaration=source.split(head)[1]?.split('\n}\n')[0];
     if(!declaration)throw Error('The exact production ScreenTarget declaration was not found');
     const target=path.join(directory,'ScreenTarget.swift');await writeFile(target,'import TerminalInputSupport\n'+head+declaration+'\n}\n');
-    extra.push('-D','TERMINAL_KEYBOARD_ISOLATED','-module-name','TerminalKeyboardIsolation','Sources/AutoApproveCore/RemoteTerminal.swift','Sources/AutoApproveCore/TerminalDeviceInput.swift','Tests/fixtures/terminal-keyboard-isolation.swift',target);
+    const currentSources=[];
+    for(const name of ['RemoteTerminal.swift','TerminalDeviceInput.swift']) {
+      const file=path.join(directory,name);
+      await writeFile(file,'import AutoApproveCore\n'+await readFile('Sources/AutoApproveCore/'+name,'utf8'));
+      currentSources.push(file);
+    }
+    extra.push('-D','TERMINAL_KEYBOARD_ISOLATED','-module-name','TerminalKeyboardIsolation',...currentSources,'Tests/fixtures/terminal-keyboard-isolation.swift',target);
   }
   execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',cache,'-I',path.join(build,'Modules'),'-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,...extra,'Tests/fixtures/terminal-keyboard-check.swift','-o',binary],{stdio:'inherit'});
   execFileSync(binary,[],{stdio:'inherit',timeout:30000});

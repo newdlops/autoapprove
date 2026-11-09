@@ -14,6 +14,7 @@ public typealias TerminalAdapter = AutoApproveCore.TerminalAdapter
 public typealias TerminalAdapterError = AutoApproveCore.TerminalAdapterError
 public typealias AppError = AutoApproveCore.AppError
 public typealias RemoteHTTPError = AutoApproveCore.RemoteHTTPError
+public typealias RemoteTerminalPerformance = AutoApproveCore.RemoteTerminalPerformance
 public typealias JSONObject = [String: Any]
 
 enum AutomationScript {
@@ -25,6 +26,11 @@ enum AutomationScript {
     }
 }
 enum ITermAdapter { static let visibleFunction = "throw Error('The isolated native check cannot use iTerm');" }
+enum TerminalAppleEvents {
+    static func profileWindowMetadata(tty:String) throws -> TerminalWindowMetadata? {
+        throw AppError.message("Isolated native checks must inject window metadata")
+    }
+}
 enum OrcaAdapter {
     static func readScreen(handle: String) throws -> String { throw AppError.message("Isolated native checks cannot access Orca") }
     static func normalize(_ value: String) -> String { preconditionFailure("Isolated native checks cannot access Orca") }

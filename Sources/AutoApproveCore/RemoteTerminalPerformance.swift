@@ -9,11 +9,13 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
         case terminalContents, terminalMetadata
         case firstFrame, liveFrame, responseEncoding, transferPreparation, initialWrite
         case relayHTTP, relayStreamOpen, inputDispatch
+        case inputPreparation, inputWindowCheck, inputFocusCheck, inputProcessCheck, inputEventPost
     }
     public enum Counter: String, CaseIterable, Codable, Sendable {
         case initialReads, sharedInitialReads, abandonedInitialReads
         case liveProducers, liveReads, sharedSubscribers, resumeHits, resumeMisses, compactPulses
         case nativeObservers, sharedNativeObservers, releasedNativeObservers
+        case nativeInputPreparations, scriptedInputPreparations
     }
     public struct Summary: Codable, Sendable {
         public var count: UInt64

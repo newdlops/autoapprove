@@ -49,11 +49,17 @@ public enum TerminalKeyboard {
         }
         public static var live: Self {
             Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
-                run: { try AutomationScript.run($0, app: "Terminal", denied: .permissionDenied, timeout: 3) },
-                metadata: { try TerminalAdapter.windowMetadata(tty: $0) },
-                ownerBundle: { TerminalProcessLookup.ownerBundle(pid:$0) }, focused: { TerminalKeyboard.isFocused($0) },
-                processes: { try ProcessDiscovery.read() }, postPair: { pid, down, up in
-                    down.postToPid(pid); up.postToPid(pid)
+                run: { script in try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
+                    try AutomationScript.run(script, app: "Terminal", denied: .permissionDenied, timeout: 3)
+                } },
+                metadata: { tty in try RemoteTerminalPerformance.shared.measure(.inputWindowCheck) {
+                    try TerminalAppleEvents.profileWindowMetadata(tty:tty)
+                } },
+                ownerBundle: { TerminalProcessLookup.ownerBundle(pid:$0) }, focused: { window in
+                    RemoteTerminalPerformance.shared.measure(.inputFocusCheck) { TerminalKeyboard.isFocused(window) }
+                },
+                processes: { try RemoteTerminalPerformance.shared.measure(.inputProcessCheck) { try ProcessDiscovery.read() } }, postPair: { pid, down, up in
+                    RemoteTerminalPerformance.shared.measure(.inputEventPost) { down.postToPid(pid); up.postToPid(pid) }
                 }, preparePasteboard: { try TerminalKeyboard.preparePasteboard($0) }, pasteReady: { target, text, before in
                     let latest = try TerminalAdapter.screens(ttys:[target.tty],includeCursor:false,includeTitles:false,purpose:.validation)
                     guard let screen = latest.screens.first(where:{$0.tty == target.tty})?.contents,screen != before else { return false }
@@ -150,11 +156,26 @@ public enum TerminalKeyboard {
             try checkPermissionAndTime()
             let initialRecords = try environment.processes()
             guard let original = source(target, agent: agent, records: initialRecords) else { return .agentMissing }
-            let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
-            if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
-            guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
-                  let window = try environment.metadata(target.tty), window.tty == target.tty, window.windowID == windowID,
-                  window.ownerPID > 0, window.ownerBundleID == "com.apple.Terminal", window.selected, !window.minimized else { return .missingTarget }
+            let window: TerminalWindowMetadata
+            // Live keys already bind the source lifetime, rather than a screen
+            // revision. A fresh selected-TTY query and exact focused window can
+            // prepare them without launching osascript for every keystroke.
+            // Changing focus/selection and revision-bound sends retain JXA.
+            if input.isRelay, ![.message,.choice].contains(input.kind),
+               let current = try environment.metadata(target.tty), current.tty == target.tty,
+               current.windowID > 0, current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal",
+               current.selected, !current.minimized, environment.focused(current) {
+                window = current
+                RemoteTerminalPerformance.shared.increment(.nativeInputPreparations)
+            } else {
+                let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
+                if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
+                guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
+                      let current = try environment.metadata(target.tty), current.tty == target.tty, current.windowID == windowID,
+                      current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal", current.selected, !current.minimized else { return .missingTarget }
+                window = current
+                RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
+            }
             let preparedRecords = try environment.processes()
             guard source(target, agent: agent, records: preparedRecords) == original,
                   let owner = preparedRecords.first(where: { $0.pid == window.ownerPID }), !owner.started.isEmpty,
