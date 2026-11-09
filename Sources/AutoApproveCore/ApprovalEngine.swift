@@ -3982,9 +3982,35 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let targets = suppliedTargets ?? sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
         do {
-            let requests = targets.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
             let reader = adapter.screens
             let readStartedAt = Date()
+            var sharedScreens: [String: TerminalScreen] = [:]
+            var sharedDates: [String: Date] = [:]
+            let sharedPermission: Bool
+            let hasRecentViewerFrame = targets.contains { target in
+                guard let frame = remoteFrames[target.id], !userInputHasPriority(target.id) else { return false }
+                return (0..<0.18).contains(readStartedAt.timeIntervalSince(frame.frame.observedAt))
+            }
+            if host == .terminal, hasRecentViewerFrame, let target = targets.first, let capture = nativeWindowCapture(for: target) {
+                sharedPermission = try await capture.checkAutomationPermission()
+            } else { sharedPermission = false }
+            if host == .terminal, sharedPermission {
+                for target in targets where !userInputHasPriority(target.id) {
+                    guard let frame = remoteFrames[target.id], frame.usesRawPresentation,
+                          frame.generation == remoteGeneration(target, host: host),
+                          let read = remoteScreenReads[target.id], !read.task.isCancelled,
+                          read.target == ScreenTarget(tty: target.tty, handle: target.screenHandle),
+                          read.generation == frame.generation, read.observedAt == frame.frame.observedAt,
+                          read.sourceRevision == remoteTerminalChanges[target.id]?.revision,
+                          (0..<0.18).contains(Date().timeIntervalSince(frame.frame.observedAt)) else { continue }
+                    sharedScreens[target.tty] = TerminalScreen(tty: target.tty, contents: frame.raw,
+                        appearance: frame.frame.appearance?.validated(for: frame.raw),
+                        cursor: frame.frame.cursor?.validated(for: frame.raw))
+                    sharedDates[target.id] = frame.frame.observedAt
+                }
+            }
+            let requests = targets.filter { sharedDates[$0.id] == nil }.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
+            let reusedScreens = sharedScreens, reusedDates = sharedDates
             // The worker needs only this host's active sessions. Retaining the
             // entire cross-host cache pins unrelated terminal scrollback for
             // the duration of a potentially slow Apple Event read.
@@ -4003,8 +4029,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             // A large scrollback in many tabs must not monopolize the UI actor.
             // One bounded worker per host reads and parses; no policy or input is run here.
             let worker = Task.detached(priority: .utility) {
-                let result = try reader(requests)
-                var screensByTTY: [String: TerminalScreen] = [:]
+                let result = requests.isEmpty ? TerminalSnapshot() : try reader(requests)
+                var screensByTTY = reusedScreens
                 screensByTTY.reserveCapacity(result.screens.count)
                 for screen in result.screens where screensByTTY[screen.tty] == nil {
                     screensByTTY[screen.tty] = screen
@@ -4049,6 +4075,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       let current = sessions[target.id], current.phase != .ended,
                       current.pid == target.pid, current.started == target.started,
                       current.tty == target.tty, current.terminal == host.kind else { return false }
+                if let at = reusedDates[target.id] {
+                    guard !userInputHasPriority(target.id),
+                          remoteFrames[target.id]?.frame.observedAt == at,
+                          remoteFrames[target.id]?.generation == remoteGeneration(current, host: host),
+                          remoteScreenReads[target.id]?.sourceRevision == remoteTerminalChanges[target.id]?.revision,
+                          (0..<0.18).contains(Date().timeIntervalSince(at)) else { return false }
+                }
                 if host == .pty {
                     guard let id = ptySessionBindings[target.id], (try? managedPTY.terminal(id).isRunning) == true else { return false }
                 }
@@ -4102,7 +4135,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         sessions[target.id]?.terminalTitle = title
                         sessionProjectionChanged = true
                     }
-                    if [.terminal, .iterm].contains(host) {
+                    if reusedDates[target.id] != nil { RemoteTerminalPerformance.shared.increment(.sharedMonitorScreens) }
+                    if [.terminal, .iterm].contains(host), reusedDates[target.id] == nil {
                         remoteMonitorFrames[target.id] = RemoteObservedScreen(raw: screen.contents,
                             generation: remoteGeneration(target, host: host), observedAt: readStartedAt,
                             appearance: screen.appearance?.validated(for: screen.contents), cursor: screen.cursor?.validated(for: screen.contents), display: screen.display?.validated())
@@ -4121,7 +4155,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         // this host read was suspended; only trust the skip if the
                         // captured observation timestamp still owns the current one.
                         let contentsUnchanged = unchangedObservedAt[target.id].map { $0 == remoteObservedScreens[target.id]?.observedAt } ?? false
-                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, appearance: screen.appearance, cursor: screen.cursor, display: screen.display, precomputed: analyses[target.id], screenContentsUnchanged: contentsUnchanged)
+                        receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, at: reusedDates[target.id] ?? readStartedAt, appearance: screen.appearance, cursor: screen.cursor, display: screen.display, precomputed: analyses[target.id], screenContentsUnchanged: contentsUnchanged)
                     }
                 }
                 if sessionProjectionChanged { publish() }

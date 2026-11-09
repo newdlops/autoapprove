@@ -14,6 +14,7 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
     public enum Counter: String, CaseIterable, Codable, Sendable {
         case initialReads, sharedInitialReads, abandonedInitialReads
         case initialLiveCacheHits
+        case sharedMonitorScreens
         case liveProducers, liveReads, sharedSubscribers, resumeHits, resumeMisses, compactPulses
         case nativeObservers, sharedNativeObservers, releasedNativeObservers
         case nativeInputPreparations, scriptedInputPreparations
