@@ -946,7 +946,7 @@ extension ApprovalTests {
         keyboard.evaluateScript("wrongTab=true;")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
         keyboard.evaluateScript("wrongTab=false; front=false;")
-        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
+        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "ready:96", "Native delivery waits for asynchronous focus after exact-window preparation")
         keyboard.evaluateScript("front=true; changeOnActivate=true;")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "screenChanged")
         try expectEqual(keyboard.evaluateScript("keys.length")?.toInt32(), 0)

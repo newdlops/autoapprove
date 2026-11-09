@@ -32,6 +32,9 @@ public enum TerminalKeyboard {
         public var cancelled: @Sendable () -> Bool
         public var preparePasteboard: @Sendable (String) throws -> PasteboardLease
         public var pasteReady: @Sendable (ScreenTarget, String, String) throws -> Bool
+        public var frontmost: @Sendable () -> Bool
+        public var activate: @Sendable () throws -> Void
+        public var pause: @Sendable (TimeInterval) -> Void
         public init(trusted: @escaping @Sendable () -> Bool, postingAllowed: @escaping @Sendable () -> Bool,
                     run: @escaping @Sendable (String) throws -> String,
                     metadata: @escaping @Sendable (String) throws -> TerminalWindowMetadata?,
@@ -41,11 +44,15 @@ public enum TerminalKeyboard {
                     clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                     cancelled: @escaping @Sendable () -> Bool = { Task<Never, Never>.isCancelled },
                     preparePasteboard: @escaping @Sendable (String) throws -> PasteboardLease = { _ in throw RemoteHTTPError(409,"붙여넣기 연결이 없습니다.") },
-                    pasteReady: @escaping @Sendable (ScreenTarget,String,String) throws -> Bool = { _,_,_ in false }) {
+                    pasteReady: @escaping @Sendable (ScreenTarget,String,String) throws -> Bool = { _,_,_ in false },
+                    frontmost: @escaping @Sendable () -> Bool = { false },
+                    activate: @escaping @Sendable () throws -> Void = {},
+                    pause: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval:$0) }) {
             self.trusted = trusted; self.postingAllowed = postingAllowed; self.run = run; self.metadata = metadata
             self.ownerBundle = ownerBundle; self.focused = focused; self.processes = processes; self.postPair = postPair
             self.clock = clock; self.cancelled = cancelled
             self.preparePasteboard = preparePasteboard; self.pasteReady = pasteReady
+            self.frontmost = frontmost; self.activate = activate; self.pause = pause
         }
         public static var live: Self {
             Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
@@ -65,6 +72,13 @@ public enum TerminalKeyboard {
                     guard let screen = latest.screens.first(where:{$0.tty == target.tty})?.contents,screen != before else { return false }
                     func compact(_ value:String)->String {String(value.precomposedStringWithCanonicalMapping.filter{!$0.isWhitespace})}
                     return compact(screen).contains(compact(text))
+                }, frontmost: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" },
+                activate: {
+                    let owner=try TerminalProcessLookup.running()
+                    guard let app=NSRunningApplication(processIdentifier:owner.pid),app.bundleIdentifier == "com.apple.Terminal",
+                          TerminalProcessLookup.identity(pid:owner.pid)==owner else {throw RemoteHTTPError(409,"원래 Terminal 앱을 확인하지 못했습니다.")}
+                    app.unhide()
+                    guard app.activate(options:[]) else {throw RemoteHTTPError(409,"Terminal 창을 활성화하지 못했습니다. Mac 화면을 확인해주세요.")}
                 })
         }
     }
@@ -161,13 +175,18 @@ public enum TerminalKeyboard {
             // revision. A fresh selected-TTY query and exact focused window can
             // prepare them without launching osascript for every keystroke.
             // Changing focus/selection and revision-bound sends retain JXA.
-            if input.isRelay, ![.message,.choice].contains(input.kind),
+            if input.isRelay, ![.message,.choice].contains(input.kind), environment.frontmost(),
                let current = try environment.metadata(target.tty), current.tty == target.tty,
                current.windowID > 0, current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal",
                current.selected, !current.minimized, environment.focused(current) {
                 window = current
                 RemoteTerminalPerformance.shared.increment(.nativeInputPreparations)
             } else {
+                // Wake the existing app before asking its scripting interface
+                // for windows. A background read can time out before JXA's
+                // later activate command ever runs.
+                try environment.activate()
+                try checkPermissionAndTime()
                 let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
                 if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
                 guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
@@ -175,6 +194,17 @@ public enum TerminalKeyboard {
                       current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal", current.selected, !current.minimized else { return .missingTarget }
                 window = current
                 RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
+                // App activation/tab selection is asynchronous. Wait only for
+                // readiness; never retry activation or an input event.
+                let focusDeadline=min(deadline,environment.clock()+0.5)
+                var ready=false
+                for attempt in 0..<26 {
+                    try checkPermissionAndTime()
+                    if environment.focused(current) {ready=true;break}
+                    guard attempt<25,environment.clock()<focusDeadline else {break}
+                    environment.pause(max(0,min(0.02,focusDeadline-environment.clock())))
+                }
+                guard ready else {throw RemoteHTTPError(409,"원래 Terminal 창으로 초점을 옮기지 못해 입력하지 않았습니다. Mac 화면을 확인해주세요.")}
             }
             let preparedRecords = try environment.processes()
             guard source(target, agent: agent, records: preparedRecords) == original,
@@ -366,7 +396,7 @@ public enum RemoteTerminalAdapter {
         if host == .terminal {
             let delivery = """
               window.miniaturized = false; window.selectedTab = tab; window.index = 1; app.activate();
-              if (!app.frontmost() || window.selectedTab().tty() !== target.tty) return 'missingTarget';
+              if (window.selectedTab().tty() !== target.tty) return 'missingTarget';
               if (!target.relay && normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
               const windowID = Number(window.id());
               if (!Number.isSafeInteger(windowID) || windowID <= 0 || windowID > 4294967295) return 'missingTarget';

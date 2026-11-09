@@ -47,7 +47,8 @@ private final class NativeProbe: @unchecked Sendable {
     var trusted = true, posting = true, focused = true, cancelled = false, ownerBundle = "com.apple.Terminal", now: TimeInterval = 0
     var focusedRole = kAXTextAreaRole
     var metadataReads = 0, prepares = 0, faultAt = 0, fault: Fault?, throwPairAt = 0
-    var focusOnPrepare = false
+    var focusOnPrepare = false, frontmost = true, activationFails = false, metadataNeedsActivation = false
+    var activations = 0, pauses = 0, focusAfterPauses = 0
     var identity: TTYInputIdentity = {
         let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
         return TTYInputIdentity(pid:81001,processGroup:81001,uid:getuid(),effectiveUID:geteuid(),device:42,
@@ -111,12 +112,22 @@ private final class NativeProbe: @unchecked Sendable {
             try require(context.evaluateScript("childAXChecks + systemEvents + writes.length")?.toInt32() == 0,
                 "Native delivery must not depend on child AX/System Events or make JXA input writes")
             return value
-        }, metadata: { self.metadata($0) }, ownerBundle: { _ in self.read { $0.ownerBundle } }, focused: { _ in self.read { $0.focused && $0.focusedRole == kAXTextAreaRole } },
+        }, metadata: {
+            if self.read({ $0.metadataNeedsActivation && $0.activations == 0 }) { throw AppError.message("Background metadata timed out before activation") }
+            return self.metadata($0)
+        }, ownerBundle: { _ in self.read { $0.ownerBundle } }, focused: { _ in self.read { $0.focused && $0.focusedRole == kAXTextAreaRole } },
            processes: { self.read { $0.records } }, postPair: { try self.submit($0, $1, $2) }, clock: { self.read { $0.now } }, cancelled: { self.read { $0.cancelled } },
            preparePasteboard: { text in
                self.mutate { $0.clipboardText = text }
                return .init(isCurrent: { self.read { $0.clipboardCurrent } }, restore: { self.mutate { $0.restores += 1 } })
-           }, pasteReady: { _, text, _ in self.read { $0.pasteConfirmed && $0.clipboardText == text } })
+           }, pasteReady: { _, text, _ in self.read { $0.pasteConfirmed && $0.clipboardText == text } },
+           frontmost: { self.read { $0.frontmost } }, activate: {
+               self.mutate { $0.activations += 1 }
+               if self.read({ $0.activationFails }) { throw RemoteHTTPError(409,"Activation refused") }
+           }, pause: { interval in self.mutate {
+               $0.pauses += 1; $0.now += interval
+               if $0.focusAfterPauses > 0 && $0.pauses >= $0.focusAfterPauses { $0.focused = true }
+           } })
     }
 }
 #endif
@@ -135,7 +146,9 @@ private final class NativeProbe: @unchecked Sendable {
         context.evaluateScript("wrongTab = true;")
         try require(context.evaluateScript(script)?.toString() == "missingTarget", "Another selected TTY must fail before native delivery")
         context.evaluateScript("wrongTab = false; front = false;")
-        try require(context.evaluateScript(script)?.toString() == "missingTarget", "Unfocused exact window must fail before native delivery")
+        try require(context.evaluateScript(script)?.toString() == "ready:96", "JXA must leave asynchronous focus readiness to the native guard")
+        try require(context.evaluateScript("win.miniaturized === false && win.index === 1")?.toBool() == true,
+            "Preparation must restore and raise the exact target window")
         var checks = ["exact original JXA preparation uses no child AX, System Events or terminal writes"]
 #if !KEYBOARD_PREFLIGHT_ONLY
         let unicode = NativeProbe(), text = "한글 🧪 e\u{301} " + String(repeating: "a", count: 19) + "🧪" + String(repeating: "끝", count: 30)
@@ -150,7 +163,7 @@ private final class NativeProbe: @unchecked Sendable {
             && $0.downFlags == 0 && $0.upFlags == 0 }, "Every Unicode pair must target only the exact owner and keep complete surrogate sequences without modifiers")
         checks.append("bounded Unicode down/up pairs target only the original owner, with no surrogate cuts or modifier leakage")
 
-        try require(unicode.read{$0.prepares == 0}, "Focused exact-source live typing must not launch a preparation script")
+        try require(unicode.read{$0.prepares == 0 && $0.activations == 0 && $0.pauses == 0}, "Focused exact-source live typing must not activate or launch a preparation script")
         let focusChange = NativeProbe(); focusChange.mutate{$0.focused = false; $0.focusOnPrepare = true}
         try require(try TerminalKeyboard.deliver(target:focusChange.target,expected:"screen",agent:.codex,
             input:.init(kind:.characters,text:"live",relay:true),environment:focusChange.environment) == .sent,
@@ -162,6 +175,42 @@ private final class NativeProbe: @unchecked Sendable {
             "Revision-bound input must retain its fresh script comparison")
         try require(boundRevision.read{$0.prepares == 1}, "Only live typing may skip scripted screen preparation")
         checks.append("focused live typing uses fresh native checks without a script; focus changes and revision-bound input retain preparation")
+
+        let background = NativeProbe()
+        background.mutate { $0.frontmost = false; $0.focused = false; $0.metadataNeedsActivation = true; $0.focusAfterPauses = 3 }
+        try require(try TerminalKeyboard.deliver(target:background.target,expected:"screen",agent:.codex,
+            input:.init(kind:.characters,text:"restore",relay:true),environment:background.environment) == .sent,
+            "Background input must activate before metadata and wait for asynchronous focus")
+        try require(background.read { $0.activations == 1 && $0.prepares == 1 && $0.pauses == 3 && $0.pairs.count == 1 },
+            "Delayed focus must prepare and deliver once without retrying events")
+        for mode in ["refused", "neverFocused", "wrongRole", "focusStolen", "cancelled", "deadline", "permission", "staleSource"] {
+            let blocked = NativeProbe(); let originalTarget = blocked.target
+            blocked.mutate {
+                $0.frontmost = false; $0.focused = false
+                switch mode {
+                case "refused": $0.activationFails = true
+                case "wrongRole": $0.focused = true; $0.focusedRole = kAXTextFieldRole
+                case "focusStolen": $0.focusOnPrepare = true; $0.fault = .focus; $0.faultAt = 2
+                case "cancelled": $0.cancelled = true
+                case "deadline": $0.fault = .deadline; $0.faultAt = 1
+                case "permission": $0.trusted = false
+                case "staleSource": $0.records[1].started = "replaced source"
+                default: break
+                }
+            }
+            do {
+                let result = try TerminalKeyboard.deliver(target:originalTarget,expected:"screen",agent:.codex,
+                    input:.init(kind:.characters,text:"blocked",relay:true),environment:blocked.environment)
+                try require(mode == "staleSource" && result == .agentMissing,"Unready background input must reject: \(mode)")
+            } catch is RemoteHTTPError {} catch is CancellationError {}
+            try require(blocked.read { $0.pairs.isEmpty && $0.activations <= 1 && $0.pauses <= 25 },
+                "Unready background input must stay bounded and post nothing: \(mode)")
+            if ["cancelled","permission","staleSource"].contains(mode) {
+                try require(blocked.read { $0.activations == 0 && $0.prepares == 0 },"Invalid input must fail before revealing Terminal")
+            }
+            if mode == "refused" { try require(blocked.read { $0.prepares == 0 && $0.metadataReads == 0 },"Refused activation must not query or script Terminal") }
+        }
+        checks.append("background preparation activates before metadata, waits for exact focus, and rejects failed or stolen focus with zero posts")
 
         let special = NativeProbe()
         let keyCodes: [(RemoteTerminalInput.Kind, Int64)] = [(.enter,36),(.escape,53),(.interrupt,8),(.up,126),(.down,125),(.left,123),(.right,124),(.backspace,51),(.delete,117),(.home,115),(.end,119),(.tab,48)]
