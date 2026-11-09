@@ -34,6 +34,25 @@ private final class HistoryFixture {
 }
 
 extension ApprovalTests {
+    func testCodexServerBoundQuestionsWithoutOpenRollout() async throws {
+        let fixture=try HistoryFixture()
+        var session=AgentSession(id:"process:42:first",agent:.codex,pid:42,started:"first",tty:"/dev/fixture",cwd:"/tmp/project",terminal:.terminal)
+        session.phase = .working
+        session.codexApprovalBinding = .init(threadID:"root",title:"Bound original")
+        let collector=CodexQuestionCollector(fileReader:{_,_ in []},boundLocation:{_ in fixture.location})
+        let first=await collector.collect([session])
+        try expectEqual(first.first?.questions?.map(\.title),["첫 질문"])
+        try expectNil(first.first?.error)
+        try fixture.sql("DELETE FROM thread_items; UPDATE thread_history_projection_state SET next_rollout_ordinal=0;")
+        try expectEqual(await collector.collect([session]).first?.questions?.count,0)
+        let wrong=CodexQuestionCollector(fileReader:{_,_ in []},boundLocation:{_ in .init(threadID:"other",database:fixture.location.database)})
+        try expect(await wrong.collect([session]).first?.error != nil,"A different root must never supply questions")
+        session.codexApprovalBinding=nil
+        try expect(await collector.collect([session]).first?.error != nil,"Do not infer an unbound root from a folder")
+        session.codexApprovalBinding = .init(threadID:"root",title:"Bound original")
+        let denied=CodexQuestionCollector(fileReader:{_,_ in throw AppError.message("descriptor denied")},boundLocation:{_ in fixture.location})
+        try expectEqual(await denied.collect([session]).first?.error,"descriptor denied","A descriptor failure must not enter fallback")
+    }
     func testCodexProgressHistoryTokenIsBoundToExactThread() throws {
         let fixture=try HistoryFixture(),reader=CodexSessionHistoryReader()
         let first=reader.read(sessionID:"one",location:fixture.location)

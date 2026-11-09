@@ -3,6 +3,23 @@ import JavaScriptCore
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testCodexStructuredQuestionRepliesMatchExactItemAndIndex() throws {
+        let request=CodexQuestionHistory.Item(ordinal:1,json:["type":"agentMessage","id":"call_one","delivery":"async",
+            "questions":[["title":"같은 질문"],["title":"같은 질문"]]])
+        func reply(_ call:String="call_one",index:Any=1,title:String="같은 질문",value:String="답변") throws -> CodexQuestionHistory.Item {
+            let key=String(decoding:try JSONSerialization.data(withJSONObject:["request_user_input_async",call,index]),as:UTF8.self)
+            let payload=String(decoding:try JSONSerialization.data(withJSONObject:[["answer":value,"question":title,"questionItemId":key]]),as:UTF8.self)
+            return answer("<send_user_message_question_reply>\n"+payload+"\n</send_user_message_question_reply>",ordinal:2)
+        }
+        let pending=CodexQuestionHistory.pending(threadID:"root",items:[request,try reply()])
+        try expectEqual(pending.map(\.id),["codex:root:call_one:0"],"Same-title siblings require the exact index")
+        for invalid in [try reply("other"),try reply(index:-1),try reply(index:true),try reply(title:"다른 질문"),try reply(value:" ")] {
+            try expectEqual(CodexQuestionHistory.pending(threadID:"root",items:[request,invalid]).count,2)
+        }
+        let ordinary=answer("다음 작업도 계속해주세요.",ordinal:3)
+        try expectEqual(CodexQuestionHistory.pending(threadID:"root",items:[request,try reply(),ordinary]).count,1)
+        try expectEqual(CodexQuestionHistory.pending(threadID:"root",items:[try reply(),request]).count,1,"Order follows recorded ordinals")
+    }
     func testCodexHistoryCompactCacheMatchesRawDecisionsAndOldEdits() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-history-projection-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

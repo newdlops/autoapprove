@@ -2228,7 +2228,7 @@ function renderQuestions() {
   const { session, node } = selectedItem;
   const terminalQuestion = latestFrame?.sessionID === session.id ? latestFrame.question : null;
   const sources = [session, ...(session.backgroundSessions || [])];
-  const signature = JSON.stringify([terminalQuestion, terminalQuestion && [latestFrame.keys.includes('choice'),latestFrame.inputReason], sources.map(source => [source.id, source.claudeApprovals, source.queuedQuestions, source.pendingSummary, source.capacityResume, source.systemCommandRisk, source.systemSafety])]);
+  const signature = JSON.stringify([terminalQuestion, terminalQuestion && [latestFrame.keys.includes('choice'),latestFrame.inputReason], sources.map(source => [source.id, source.claudeApprovals, source.queuedQuestions, source.codexQuestionsError, source.pendingSummary, source.capacityResume, source.systemCommandRisk, source.systemSafety])]);
   if (signature === questionSignature) return;
   // Capture every draft before status-driven rerender; never discard a typed answer on a polling tick.
   for (const form of $('questions').querySelectorAll('form')) {
@@ -2281,7 +2281,7 @@ function renderQuestions() {
       section.append(actions); $('questions').append(section);
     }
     for (const question of source.queuedQuestions || []) {
-      if (pastQuestionEligible(node,source,question)) {
+      if (question.reply?.phase === 'queued' && pastQuestionEligible(node,source,question)) {
         const key = pastQuestionKey(node,source,question);
         if (!cleanup.questions.has(key)) past.push({key,question,source});
         continue;
@@ -2292,7 +2292,7 @@ function renderQuestions() {
         state.error = question.reply.phase === 'failed' ? question.reply.message : ''; state.message = question.reply.phase === 'cancelled' ? question.reply.message : ''; questionDeliveries.set(questionKey,state);
       }
       const form = make('form', 'question'); form.dataset.questionKey = questionKey; form.append(make('h4', '', question.title));
-      const unavailable = ['sending', 'queued', 'uncertain'].includes(question.reply?.phase);
+      const unavailable = !!source.codexQuestionsError || ['sending', 'queued', 'uncertain'].includes(question.reply?.phase);
       form.dataset.readOnly = String(unavailable);
       if (question.reply?.phase) form.append(make('p', 'muted small', question.reply.message || { sending: '답변을 전달하고 있습니다.', queued: '답변을 접수했습니다.', uncertain: '전달 결과를 확인하지 못했습니다. 터미널에서 확인해주세요.', failed: '답변 전달에 실패했습니다.', cancelled: '대기 입력을 삭제해 답변 전달을 취소했습니다.' }[question.reply.phase] || question.reply.phase));
       const options = make('div', 'question-options');
@@ -2352,7 +2352,12 @@ function renderQuestions() {
     clean.disabled=questionCleanupBusy || !!question.cleanupToken && !node.online;clean.addEventListener('click',()=>void cleanPastQuestions([key])); row.append(clean); $('past-question-list').append(row);
   }
   $('clear-past-questions').onclick=()=>cleanPastQuestions(past.map(value=>value.key));
-  show($('questions-section'), count > 0);
+  const questionErrors=sources.filter(source=>source.codexQuestionsError);
+  for (const source of questionErrors) {
+    const error=make('p','error-text',`질문을 확인하지 못했습니다. ${source.codexQuestionsError}`);
+    error.setAttribute('role','status'); $('questions').append(error);
+  }
+  show($('questions-section'), count > 0 || questionErrors.length > 0);
   text($('question-count'), count || '');
   updateInteractionControls();
   updateQuestionCleanupControls();
@@ -2416,7 +2421,7 @@ function appendQuestionDelivery(form) {
 function interactionSources() { return selectedItem ? [selectedItem.session, ...(selectedItem.session.backgroundSessions || [])] : []; }
 function renderInteractions() {
   const pending = interactionSources().reduce((count, source) => count + (source.claudeApprovals || []).filter(item => !item.sending).length
-    + (source.queuedQuestions || []).filter(item => !['sending','queued'].includes(item.reply?.phase) && !pastQuestionEligible(selectedItem.node,source,item)).length
+    + (source.queuedQuestions || []).filter(item => !['sending','queued'].includes(item.reply?.phase)).length
     + (source.pendingSummary && !(source.claudeApprovals || []).length && !(source.queuedQuestions || []).length ? 1 : 0), 0);
   const forms = nodes.flatMap(node => (node.state?.questionForms || []).map(request => ({node, request})));
   const signature = JSON.stringify(forms.map(({node,request})=>[node.id,node.online,request]));
@@ -2435,7 +2440,7 @@ function renderInteractions() {
   }
   text($('question-count'), pending + forms.length || '');
   text($('global-questions'), `질문 ${forms.length}`); show($('global-questions'), forms.length > 0);
-  show($('interaction-empty'), !pending && !forms.length);
+  show($('interaction-empty'), !pending && !forms.length && !interactionSources().some(source=>source.codexQuestionsError));
   text($('interaction-session'), selectedItem ? `${selectedItem.node.name} · ${agents[selectedItem.session.agent]} · ${selectedItem.view.title}` : '터미널을 선택하면 새 메시지를 보낼 수 있습니다.');
   renderTestScreenList(); updateInteractionControls();
   const link = new URLSearchParams(location.hash.slice(1));

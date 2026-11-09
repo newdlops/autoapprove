@@ -34,23 +34,22 @@ try {
  const count=async(p,expected)=>p.waitForFunction(n=>typeof pastQuestionRecords==='function'&&pastQuestionRecords().length===n,expected,{timeout:20000});
  await Promise.all([count(page,150),count(observer,150)]);
  await page.locator('.session-row').filter({hasText:'cleanup-0'}).click();await page.locator('#terminal-questions').click();
- assert.equal(await page.locator('#questions form').count(),2);assert.equal(await page.locator('#past-question-list>li').count(),10);assert.equal(await page.locator('#past-questions').evaluate(e=>e.open),false);
+ assert.equal(await page.locator('#questions form').count(),69);assert.equal(await page.locator('#past-question-list>li').count(),0);assert.equal(await page.locator('#past-questions').isVisible(),false);
  assert.equal(await page.evaluate(()=>[...messageDeliveries].filter(([k,v])=>k.startsWith(selectedKey+'#')&&v.phase==='accepted').length),20);
  assert.equal(await page.evaluate(()=>[...messageDeliveries.values()].filter(v=>v.phase==='uncertain'||v.phase==='failed').length),2);
  assert.equal(await page.locator('#message-input').inputValue(),'보존할 새 메시지 초안 🙂');
- await page.locator('#past-question-count').scrollIntoViewIfNeeded();await page.screenshot({path:out+'/mobile-past-records.png'});
- checks.push('150 past questions fold into compact records while current and uncertain questions remain; confirmed message archives are bounded to 20 and unknown/failed/drafts survive');
+ await page.locator('#questions form').first().scrollIntoViewIfNeeded();await page.screenshot({path:out+'/mobile-pending-questions.png'});
+ checks.push('Unanswered questions stay visible after later messages; explicit cleanup remains available, confirmed message archives stay bounded to 20, and unknown/failed/drafts survive');
  const current=page.locator('#questions form').filter({hasText:'현재 응답이 필요한 질문 0'});await current.locator('textarea').fill('현재 질문의 미전송 답변');
- await page.locator('#past-question-count').click();await page.locator('#past-question-list').getByRole('button',{name:'답변하기',exact:true}).first().click();
  await page.locator('#questions form').filter({hasText:'지난 합성 질문 0-66'}).locator('textarea').fill('지난 질문에 작성 중인 답변');
- await count(page,149);assert.equal(await page.locator('#questions form').count(),3);
+ await count(page,149);assert.equal(await page.locator('#questions form').count(),69);
  for(const [name,width,height]of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
   await page.setViewportSize({width,height});await page.locator('#send-message').scrollIntoViewIfNeeded();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
   const box=await page.locator('#send-message').boundingBox();assert.ok(box.y>=0&&box.y+box.height<=height&&box.height>=44);
   await page.screenshot({path:out+'/'+name+'-drafts.png'});views.push([width,height]);
  }
- checks.push('Review reopens exactly one past editor; current/past drafts remain editable and excluded from cleanup; three viewport composer controls stay reachable');
+ checks.push('Older unanswered editors remain directly available; current/older drafts are excluded from cleanup and three viewport composer controls stay reachable');
  await page.setViewportSize({width:390,height:844});await page.keyboard.press('Escape');
  await page.locator(await page.locator('#terminal-back').isVisible() ? '#terminal-back':'#back').click();
  await writeFile(root+'/fail','synthetic failure');await until(async()=>JSON.parse(await readFile(root+'/observed.json','utf8')).fail,'Storage failure enabled');

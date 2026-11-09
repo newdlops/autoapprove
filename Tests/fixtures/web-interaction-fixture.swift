@@ -95,7 +95,10 @@ private actor FixtureQueue {
             engine.stop(); return
         }
         engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: codex.key, questions: [], threadID: thread)])
-        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: codex.key, questions: [QueuedQuestion(id: "fixture-q1", threadID: thread, title: "합성 모바일 테스트를 진행할까요?", options: ["예", "아니요"]), QueuedQuestion(id: "fixture-q2", threadID: thread, title: "한글·이모지·긴 선택지의 줄바꿈과 전송 결과를 함께 확인할까요?", options: ["질문을 먼저 확인", "긴 선택지와 추가 설명을 함께 보내기"])] )])
+        var questions=[QueuedQuestion(id: "fixture-q1", threadID: thread, title: "합성 모바일 테스트를 진행할까요?", options: ["예", "아니요"]), QueuedQuestion(id: "fixture-q2", threadID: thread, title: "한글·이모지·긴 선택지의 줄바꿈과 전송 결과를 함께 확인할까요?", options: ["질문을 먼저 확인", "긴 선택지와 추가 설명을 함께 보내기"])]
+        let queuedQuestions=CommandLine.arguments.contains("--queued-questions")
+        if queuedQuestions {questions[0].hasLaterUserMessage=true}
+        engine.updateCodexQuestions([CodexQuestionUpdate(sessionID:codex.key,questions:questions)])
         let now = Date()
         let payload: JSONObject = ["autoapproveProtocol":1, "requestID":UUID().uuidString, "autoapproveExpiresAt":now.addingTimeInterval(600).timeIntervalSince1970,
             "hook_event_name":"PreToolUse", "session_id":"fixture-claude", "agentPID":51, "agentStarted":claude.started, "tty":"/dev/ttys081", "cwd":"/fixture/mobile-test", "tool_name":"AskUserQuestion", "tool_use_id":"fixture-tool",
@@ -103,7 +106,15 @@ private actor FixtureQueue {
         _ = try engine.handleClaudeHook(payload)
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(["port":String(engine.webStatus.port!), "codex":codex.key, "claude":claude.key]).write(to: directory.appendingPathComponent("ready.json"))
+        var historyFailed=false
         while !Task.isCancelled {
+            if queuedQuestions {
+                let failed=FileManager.default.fileExists(atPath:directory.appendingPathComponent("question-history-error").path)
+                if failed != historyFailed {
+                    historyFailed=failed
+                    engine.updateCodexQuestions([CodexQuestionUpdate(sessionID:codex.key,questions:failed ? nil:questions,error:failed ? "합성 질문 기록 연결 오류":nil)])
+                }
+            }
             let result = try engine.handleClaudeHook(payload)
             if let response = (result["autoapproveBridge"] as? JSONObject)?["response"] as? JSONObject, !response.isEmpty {
                 try JSONSerialization.data(withJSONObject: response, options: .sortedKeys).write(to: directory.appendingPathComponent("claude-answer.json"))

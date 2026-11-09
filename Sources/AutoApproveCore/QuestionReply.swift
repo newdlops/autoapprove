@@ -85,10 +85,22 @@ public struct CodexReplyTransport: Sendable {
                 throw AppError.message("이 Codex 실행이 종료되었거나 바뀌었습니다.")
             }
             let files = try ProcessOpenFiles.codexRolloutPaths(pid: session.pid, expectedStart: session.started)
-            let location = try CodexThreadLocation.locate(paths: files)
+            let location = try await historyLocation(session, paths: files)
             let home = URL(fileURLWithPath: location.database).deletingLastPathComponent().path
             return CodexReplyTarget(executable: "", home: home, threadID: location.threadID, queueAvailable: CodexQueueTransport.isAvailable(home: home))
         }.value
+    }
+    /// A server-backed CLI may hold only its log database open. Use its
+    /// explicitly bound root conversation, never the newest same-folder thread.
+    public static func historyLocation(_ session: AgentSession, paths: [String]) async throws -> CodexThreadLocation {
+        if !paths.isEmpty { return try CodexThreadLocation.locate(paths: paths) }
+        guard let thread=session.codexApprovalBinding?.threadID,UUID(uuidString:thread) != nil else {
+            throw AppError.message("이 Codex 세션의 질문 기록을 찾지 못했습니다. 원래 대화를 연결해주세요.")
+        }
+        let target=try await selectedQueueTarget(session,threadID:thread)
+        guard target.queueAvailable else {throw AppError.message(CodexQueueTransport.unavailableMessage)}
+        try await CodexQueueTransport.live.validate(target,session.cwd)
+        return CodexThreadLocation(threadID:thread,database:URL(fileURLWithPath:target.home).appendingPathComponent("thread_history_1.sqlite").path)
     }
     public static let live = CodexReplyTransport(prepare: { session, question in
         try await Task.detached(priority: .utility) {
@@ -97,7 +109,7 @@ public struct CodexReplyTransport: Sendable {
                 throw AppError.message("이 Codex 세션이 종료되었거나 바뀌었습니다. 목록을 새로고침해주세요.")
             }
             let files = try ProcessOpenFiles.codexRolloutPaths(pid: session.pid, expectedStart: session.started)
-            let location = try CodexThreadLocation.locate(paths: files)
+            let location = try await historyLocation(session, paths: files)
             let questions = try CodexHistoryReader().read(location)
             guard location.threadID == question.threadID,
                   let current = questions.first(where: { $0.isSameRequest(as: question) }) else {

@@ -985,6 +985,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("restored history, duplicate titles, unquoted answers and root changes remain manual", tests.testQuestionHistoryGuardsAutomaticResponses),
             ("fresh transport history blocks automatic answers while preserving manual responses", tests.testAutomaticReplyHonorsFreshTransportHistory),
             ("Codex async queue and exact, partial, ambiguous answer resolution", tests.testCodexQuestionResolution),
+            ("Codex queued questions: exact structured reply identity", tests.testCodexStructuredQuestionRepliesMatchExactItemAndIndex),
+            ("Codex queued questions: bound server history without rollout", tests.testCodexServerBoundQuestionsWithoutOpenRollout),
             ("Codex read-only history, incremental updates and restart", tests.testCodexHistoryReadOnlyAndIncremental),
             ("Managed Mac load: native file metadata follows live descriptors and exact Unicode", tests.testNativeOpenFilesFollowDescriptorChangesAndUnicode),
             ("Managed Mac load: native file metadata rejects bounds, stale identity and cancellation", tests.testNativeOpenFilesRejectBoundsChangedIdentityAndCancellation),

@@ -2976,7 +2976,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let codexTargets = sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
         let updates = await codexQuestions.collect(codexTargets)
         guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
-        updateCodexQuestions(updates.filter { (automationEpochs[$0.sessionID] ?? automationDefaultEpoch) == automationRuntime.epoch($0.sessionID) })
+        let bindings=Dictionary(uniqueKeysWithValues:codexTargets.map {($0.id,$0.codexApprovalBinding?.threadID)})
+        updateCodexQuestions(updates.filter {
+            (automationEpochs[$0.sessionID] ?? automationDefaultEpoch) == automationRuntime.epoch($0.sessionID)
+                && (bindings[$0.sessionID] ?? nil) == sessions[$0.sessionID]?.codexApprovalBinding?.threadID
+        })
         let responsive = codexTargets.contains { target in
             guard let current = sessions[target.id] else { return false }
             return current.unansweredQuestions.contains(where: { $0.hasLaterUserMessage != true }) ||
@@ -3520,6 +3524,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for attempt in 0...2 {
             guard !Task.isCancelled, !remoteInputStopped, !codexAccountInputHeld(session.id),
                   automaticToken == nil || !codexAccountContinuationHeld(session.id), let current = sessions[session.id], current.phase != .ended,
+                  current.codexApprovalBinding?.threadID == session.codexApprovalBinding?.threadID,
                   current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌어 전송 전에 멈췄습니다.")
             }
@@ -3561,6 +3566,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try setReply(sending, sessionID: sessionID, question: question, persist: false)
             let target = try await prepareQuestionReply(session, question: question, automaticToken: automaticToken)
             guard !Task.isCancelled, !remoteInputStopped, !codexAccountInputHeld(sessionID), target.threadID == question.threadID, let current = sessions[sessionID], current.phase != .ended,
+                  current.codexApprovalBinding?.threadID == session.codexApprovalBinding?.threadID,
                   current.questions.contains(where: { $0.isSameRequest(as: question) }) else {
                 throw AppError.message("세션이나 질문이 바뀌었습니다. 목록을 새로고침해주세요.")
             }

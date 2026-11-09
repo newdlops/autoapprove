@@ -70,7 +70,12 @@ public struct CodexQuestionUpdate {
 /// tool completion, compaction, and a new turn must not discard unanswered questions.
 struct CodexQuestionProjection: Equatable {
     struct Question: Equatable { let title: String; let options: [String]; let multiSelect: Bool? }
-    enum Kind: Equatable { case asynchronous(id: String, questions: [Question?]?); case userMessage(answers: [String]) }
+    struct Reply: Equatable { let call: String; let index: Int; let title: String }
+    enum Kind: Equatable {
+        case asynchronous(id: String, questions: [Question?]?)
+        case userMessage(answers: [String])
+        case replies([Reply])
+    }
     let kind: Kind
     var isAsynchronous: Bool { if case .asynchronous = kind { return true }; return false }
 }
@@ -109,7 +114,7 @@ public enum CodexQuestionHistory {
                 }
                 // Most user input is ordinary text. Stop scanning as soon as
                 // the leading non-whitespace scalar rules out an answer quote.
-                guard firstSignificant.value == 62 else {
+                guard firstSignificant.value == 62 || firstSignificant.value == 60 else {
                     return CodexQuestionProjection(kind: .userMessage(answers: []))
                 }
                 quotedAnswerCandidate = true
@@ -118,7 +123,9 @@ public enum CodexQuestionHistory {
         }
         guard quotedAnswerCandidate else { return nil }
         // Only messages beginning with a quote need full text joining and analysis.
-        let quotes = answeredQuotes(textParts.joined(separator: "\n"))
+        let text=textParts.joined(separator: "\n")
+        if let replies=structuredReplies(text) {return CodexQuestionProjection(kind:.replies(replies))}
+        let quotes = answeredQuotes(text)
         // Retain only normalized question titles, never the answer or surrounding text.
         return CodexQuestionProjection(kind: .userMessage(answers: quotes))
     }
@@ -158,7 +165,31 @@ public enum CodexQuestionHistory {
                 // The transcript does not identify which copy was answered.
                 if matches.count == 1 { pending.remove(at: matches[0]) }
             }
+        case let .replies(replies):
+            for reply in replies {
+                let id="codex:\(threadID):\(reply.call):\(reply.index)"
+                pending.removeAll { $0.id==id && normalized($0.title)==reply.title }
+            }
         }
+    }
+    private static func structuredReplies(_ value:String) -> [CodexQuestionProjection.Reply]? {
+        let text=value.trimmingCharacters(in:.whitespacesAndNewlines)
+        let opening="<send_user_message_question_reply>",closing="</send_user_message_question_reply>"
+        guard text.hasPrefix(opening),text.hasSuffix(closing),
+              let rows=try? JSONSerialization.jsonObject(with:Data(text.dropFirst(opening.count).dropLast(closing.count).utf8)) as? [JSONObject],
+              !rows.isEmpty,rows.count<=100 else {return nil}
+        var replies:[CodexQuestionProjection.Reply]=[]
+        for row in rows {
+            guard let answer=row["answer"] as? String,!normalized(answer).isEmpty,
+                  let title=row["question"] as? String,!normalized(title).isEmpty,
+                  let encoded=row["questionItemId"] as? String,
+                  let key=try? JSONSerialization.jsonObject(with:Data(encoded.utf8)) as? [Any],key.count==3,
+                  key[0] as? String=="request_user_input_async",let call=key[1] as? String,!call.isEmpty,
+                  let number=key[2] as? NSNumber,CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  let index=key[2] as? Int,index>=0 else {continue}
+            replies.append(.init(call:call,index:index,title:normalized(title)))
+        }
+        return replies.isEmpty ? nil:replies
     }
     private static func normalized(_ value: String) -> String {
         value.precomposedStringWithCanonicalMapping.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
@@ -536,10 +567,13 @@ public actor CodexQuestionCollector {
     private var metadata = CodexRolloutMetadataCache()
     private var hasCollectedMetadata = false
     private let fileReader: @Sendable (AgentSession, TimeInterval) throws -> [String]
+    private let boundLocation: @Sendable (AgentSession) async throws -> CodexThreadLocation
     public init(fileReader: @escaping @Sendable (AgentSession, TimeInterval) throws -> [String] = {
         try ProcessOpenFiles.codexRolloutPaths(pid:$0.pid,expectedStart:$0.started,timeout:$1)
-    }) { self.fileReader = fileReader }
-    public func collect(_ sessions: [AgentSession]) -> [CodexQuestionUpdate] {
+    }, boundLocation: @escaping @Sendable (AgentSession) async throws -> CodexThreadLocation = {
+        try await CodexReplyTransport.historyLocation($0,paths:[])
+    }) { self.fileReader = fileReader; self.boundLocation=boundLocation }
+    public func collect(_ sessions: [AgentSession]) async -> [CodexQuestionUpdate] {
         let targets = sessions.filter { $0.agent == .codex && $0.phase != .ended }
         let liveIDs = Set(targets.map(\.id))
         readers = readers.filter { liveIDs.contains($0.key) }
@@ -557,7 +591,13 @@ public actor CodexQuestionCollector {
         for session in targets {
             do {
                 let files = try fileReader(session,max(0,deadline-ProcessInfo.processInfo.systemUptime))
-                if cacheMetadata {
+                if files.isEmpty,session.codexApprovalBinding != nil {
+                    let location=try await boundLocation(session)
+                    guard location.threadID==session.codexApprovalBinding?.threadID else {
+                        throw AppError.message("질문을 읽는 Codex 대화 연결이 바뀌었습니다.")
+                    }
+                    locations[session.id]=location
+                } else if cacheMetadata {
                     locations[session.id] = try CodexThreadLocation.locate(paths:files, rootThreadID: { path, data in
                         liveMetadataPaths.insert(path)
                         return metadata.rootThreadID(path: path, data: data, decode: CodexThreadLocation.rootThreadID)
