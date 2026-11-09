@@ -93,6 +93,13 @@ import AutoApproveCore
                     params["enabled"] = arguments[1] == "on"
                 }
                 try printJSON(SocketClient.request(path: paths.socket, message: ["method": "web", "params": params]))
+            case "isolate":
+                var params: JSONObject = [:]
+                if arguments.count > 1 {
+                    guard ["on", "off"].contains(arguments[1]) else { throw AppError.message("autoapprove isolate on 또는 off를 사용해주세요.") }
+                    params["enabled"] = arguments[1] == "on"
+                }
+                try printJSON(SocketClient.request(path: paths.socket, message: ["method": "isolation", "params": params]))
             case "hook":
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()

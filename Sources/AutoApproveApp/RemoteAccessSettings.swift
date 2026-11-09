@@ -7,6 +7,7 @@ import AutoApproveCore
     @StateObject private var viewUpdates = WindowViewUpdates()
     @State private var qrCodes = QRCodeImageCache()
     @State private var error: String?
+    @State private var confirmingLAN = false
     @State private var selectedURL = ""
     @State private var localAddressStatus = LocalDashboardAddress.status()
     @State private var localAddressBusy = false
@@ -16,13 +17,35 @@ import AutoApproveCore
         let phoneURLs = status.directURLs
         let url = phoneURLs.contains(selectedURL) ? selectedURL : phoneURLs.first
         VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: Binding(get: { engine.networkIsolated }, set: { enabled in
+                    if enabled { do { try engine.setNetworkIsolation(true); error = nil } catch { self.error = error.localizedDescription } }
+                    else { confirmingLAN = true }
+                })) {
+                    Label("네트워크 격리 (공용 컴퓨터용)", systemImage: "lock.shield").font(.headline)
+                }.toggleStyle(.switch).accessibilityIdentifier("network-isolation")
+                    .help("켜면 웹 서버가 꺼지고 같은 네트워크 탐색·다른 Mac 연결·휴대폰 접속·LAN 업데이트·외부 터널이 모두 중단됩니다.")
+                Text(engine.networkIsolated
+                     ? "켜짐 · 웹 서버가 꺼져 있습니다. 같은 네트워크를 탐색하거나 광고하지 않고, 다른 Mac·휴대폰·외부 터널 연결과 LAN 업데이트를 사용하지 않습니다."
+                     : "여러 사람이 쓰는 컴퓨터나 공용 네트워크에서는 켜 두세요. 웹 서버와 같은 네트워크 탐색, 외부 접속을 한 번에 중단합니다.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .confirmationDialog("같은 네트워크 연결을 켤까요?", isPresented: $confirmingLAN, titleVisibility: .visible) {
+                Button("개인용 컴퓨터입니다. 연결 켜기", role: .destructive) {
+                    do { try engine.setNetworkIsolation(false); error = nil } catch { self.error = error.localizedDescription }
+                }
+                Button("취소", role: .cancel) {}
+            } message: {
+                Text("같은 네트워크의 누구나 로그인 없이 이 Mac의 터미널과 자동 승인을 보고 제어할 수 있습니다. 회사·학교·카페·공용 Wi-Fi나 여럿이 쓰는 컴퓨터에서는 켜지 마세요.")
+            }
+            Divider()
             Label("같은 네트워크에서 웹 접속", systemImage: "iphone.and.arrow.forward").font(.headline)
             Text(status.detail).font(.callout.weight(.medium)).textSelection(.enabled)
             Text("앱을 처음 실행하면 웹페이지를 열고 같은 네트워크의 AutoApprove를 자동으로 찾습니다. 어느 Mac의 주소로 접속해도 발견한 모든 Mac의 세션·터미널을 보고 제어할 수 있습니다. 휴대폰 앱 설치나 연결 코드는 필요 없습니다.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("같은 네트워크에서 웹 접속", isOn: Binding(get: { status.enabled }, set: { enabled in
+            Toggle("같은 네트워크에서 웹 접속", isOn: Binding(get: { status.enabled && !engine.networkIsolated }, set: { enabled in
                 do { try engine.setWebEnabled(enabled); error = nil } catch { self.error = error.localizedDescription }
-            })).toggleStyle(.switch)
+            })).toggleStyle(.switch).disabled(engine.networkIsolated)
                 .help("개인 핫스팟의 기기에서 로그인 없이 터미널과 자동 승인을 제어할 수 있습니다. 끄면 웹 접속과 Mac 자동 발견을 중단합니다.")
             if status.enabled && !status.ready {
                 Button("웹 연결 다시 시도") {

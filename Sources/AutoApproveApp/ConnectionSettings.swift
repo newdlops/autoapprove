@@ -32,7 +32,12 @@ import AutoApproveCore
                 VStack(alignment: .leading, spacing: 24) {
                     RemoteAccessSettings(engine: engine)
                     Divider()
-                    TunnelSettings(engine: engine)
+                    if engine.networkIsolated {
+                        Label("네트워크 격리 모드에서는 외부 접속을 사용할 수 없습니다. 위에서 격리를 끄면 다시 설정할 수 있습니다.", systemImage: "lock.shield")
+                            .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        TunnelSettings(engine: engine)
+                    }
                     Divider()
                     section("tmux로 같은 터미널 공유", icon: "terminal", status: engine.snapshot.health.screen(.tmux).status) {
                         TmuxSharingSettings(installed: TmuxRelay.executable != nil, health: engine.snapshot.health.screen(.tmux),

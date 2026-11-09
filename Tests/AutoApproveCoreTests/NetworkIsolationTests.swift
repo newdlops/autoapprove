@@ -60,3 +60,35 @@ extension ApprovalTests {
         try expectEqual(try Data(contentsOf: knownFile), knownData, "A local-only run must preserve existing saved peers")
     }
 }
+
+extension ApprovalTests {
+    @MainActor func testNetworkIsolationStopsWebServerAndPersists() async throws {
+        let home = URL(fileURLWithPath: "/tmp/aai-" + UUID().uuidString.prefix(8))
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let fresh = try ApprovalEngine(paths: AppPaths(directory: home), processReader: { [] }, isolateByDefault: true)
+        try expect(fresh.networkIsolated, "A fresh install starts isolated")
+        try fresh.start(poll: false, webByDefault: true)
+        try expect(fresh.webService == nil && !fresh.webStatus.ready, "Isolated start must not open the web server")
+        fresh.stop()
+        let engine = try ApprovalEngine(paths: AppPaths(directory: home), processReader: { [] })
+        defer { engine.stop() }
+        try expect(engine.networkIsolated, "Isolation must persist across launches")
+        do { try engine.setWebEnabled(true); try expect(false, "Web must be refused while isolated") } catch {}
+        do { try await engine.startTunnel(RemoteTunnelConfiguration()); try expect(false, "Tunnel must be refused") } catch {}
+        try expectEqual(engine.lanUpdate.enabled, false)
+        try engine.setNetworkIsolation(false)
+        for _ in 0..<150 where !engine.webStatus.ready { try await Task.sleep(for: .milliseconds(20)) }
+        try expect(engine.webStatus.ready, "Turning isolation off restores the web server")
+        try engine.setNetworkIsolation(true)
+        try expect(engine.webService == nil && !engine.webStatus.ready && !engine.webStatus.enabled, "Isolation stops the running web server")
+        let existing = URL(fileURLWithPath: "/tmp/aai-" + UUID().uuidString.prefix(8))
+        try FileManager.default.createDirectory(at: existing, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: existing) }
+        let old = try ApprovalEngine(paths: AppPaths(directory: existing), processReader: { [] })
+        try old.setWebEnabled(true, port: 0, bonjourEnabled: false, discoveryAddresses: { [] }); old.stop()
+        let upgraded = try ApprovalEngine(paths: AppPaths(directory: existing), processReader: { [] }, isolateByDefault: true)
+        defer { upgraded.stop() }
+        try expect(!upgraded.networkIsolated, "An existing LAN setup is not closed by the default")
+    }
+}
