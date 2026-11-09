@@ -111,6 +111,7 @@ extension ApprovalEngine {
         objectWillChange.send()
     }
     public func startTunnel(_ supplied: RemoteTunnelConfiguration, token: String = "") async throws {
+        guard !networkIsolated else { throw AppError.message("네트워크 격리 모드에서는 외부 접속을 사용할 수 없습니다. 격리 모드를 끈 뒤 다시 시도해주세요.") }
         let startEpoch = UUID();tunnelStartEpoch = startEpoch
         tunnelRefreshTask?.cancel();tunnelRefreshTask = nil
         tunnelRestoreAttempted=true
@@ -172,7 +173,7 @@ extension ApprovalEngine {
         try store.set("remoteTunnel",String(decoding:JSONEncoder().encode(configuration),as:UTF8.self))
     }
     func restoreTunnelIfRequested() {
-        guard tunnelConfiguration.enabled, tunnelController == nil,relayController == nil, !tunnelRestoreAttempted else { return }
+        guard !networkIsolated, tunnelConfiguration.enabled, tunnelController == nil,relayController == nil, !tunnelRestoreAttempted else { return }
         tunnelRestoreAttempted=true
         Task { [weak self] in
             guard let self, self.tunnelController == nil,self.relayController == nil, self.tunnelConfiguration.enabled, self.webStatus.ready else { return }

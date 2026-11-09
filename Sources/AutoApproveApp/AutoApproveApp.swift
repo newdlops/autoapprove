@@ -10,7 +10,7 @@ import AutoApproveCore
     let error: String?
     init() {
         do {
-            let engine = try ApprovalEngine()
+            let engine = try ApprovalEngine(isolateByDefault: true)
             engine.finishLANUpdate = { NSApp.terminate(nil) }
             try engine.start(webByDefault: true)
             engine.upgradeClaudeHooks(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path)

@@ -1006,6 +1006,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Native Terminal title batch rejects unstable and unsupported metadata", tests.testNativeTerminalTitleBatchRejectsUnstableAndUnsupportedMetadata),
             ("Native Terminal title batch stops on denial, deadline and cancellation", tests.testNativeTerminalTitleBatchStopsOnDenialDeadlineAndCancellation),
             ("Loopback server avoids LAN advertisements, discovery and saved-peer mutations", tests.testLoopbackServerDoesNotDiscoverAdvertiseOrRewritePeers),
+            ("Network isolation stops the web server, defaults on for fresh installs and persists", tests.testNetworkIsolationStopsWebServerAndPersists),
             ("varied yes/no questions, exact labels and ambiguous alternatives", tests.testYesNoConfirmationSelection),
             ("confirmation menus never choose tasks or multiple answers", tests.testConfirmationMenusNeverChooseTasksOrMultipleAnswers),
             ("Permission cleanup: ASCII identities preserve hint order and task rejection", tests.testPermissionCleanupKeepsASCIIHintOrderAndTaskRejection),

@@ -43,7 +43,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         lanUpdateSleepTransferred = true
     }
     public private(set) var webService: RemoteNetworkService?
-    private let webLoopbackOnly: Bool
+    private let launchLoopbackOnly: Bool
+    /// Shared-computer mode: the web server listens only on this Mac, and LAN
+    /// discovery, peer links, LAN updates and external tunnels stay off.
+    @Published public private(set) var networkIsolated = false
+    private var webLoopbackOnly: Bool { launchLoopbackOnly || networkIsolated }
     private let nativeKeyboardActivity:NativeKeyboardActivity
     let publishedUpdateServices:PublishedUpdateServices
     public let managedPTY: ManagedPTYManager
@@ -483,7 +487,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public init(paths: AppPaths = AppPaths(), terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
-                webLoopbackOnly: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
+                webLoopbackOnly: Bool = false, isolateByDefault: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
                 osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live,
@@ -520,7 +524,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.nativeKeyboardActivity = nativeKeyboardActivity ?? (processReader == nil ? .live:.inactive)
         self.cloudflareServices=cloudflareServices
         self.workersServices=workersServices;self.relayServices=relayServices
-        self.webLoopbackOnly = webLoopbackOnly
+        self.launchLoopbackOnly = webLoopbackOnly
         self.testScreens = testScreenSharing ?? TestScreenSharing()
         self.managedPTY = managedPTY
         self.powerControl = powerControl
@@ -581,8 +585,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessionOrder = ids.filter { seen.insert($0).inserted }
         }
         snapshot = EngineSnapshot(sessions: [], events: store.recent(), paused: store.value("paused") == "true", health: ConnectionHealth())
-        lanUpdate.enabled = store.value("lanUpdateEnabled") != "false"
-        if !lanUpdate.enabled { lanUpdate.phase = "off"; lanUpdate.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다." }
+        if store.value("networkIsolation") == nil, isolateByDefault,
+           store.value("webEnabled") == nil, store.value("webNodeID") == nil {
+            // A fresh install starts closed. Existing installs keep their saved LAN setup.
+            try? store.set("networkIsolation", "true")
+        }
+        networkIsolated = store.value("networkIsolation") == "true"
+        lanUpdate = Self.idleLANUpdate(enabled: store.value("lanUpdateEnabled") != "false" && !networkIsolated, isolated: networkIsolated)
         snapshot.questionNotificationDelaySeconds = store.value("questionNotificationDelaySeconds").flatMap(Int.init)
         snapshot.codexProgressRecoveryEnabled=store.value("codexProgressRecoveryEnabled") != "false"
         codexAccountTransitionEnabled = store.value("codexAccountTransitionEnabled") == "true"
@@ -711,7 +720,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         debugQuestionConfirmationDetections += confirmations.detectionCount
 #endif
         let savedWeb = store.value("webEnabled")
-        if savedWeb == "true" || (savedWeb == nil && webByDefault) {
+        if networkIsolated {
+            webStatus = Self.isolatedWebStatus
+        } else if savedWeb == "true" || (savedWeb == nil && webByDefault) {
             do { try setWebEnabled(true) }
             catch {
                 webStatus.enabled = true
@@ -825,8 +836,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         setKeepAwakeActivity(false)
     }
 
+    static var isolatedWebStatus: RemoteNetworkStatus {
+        var status = RemoteNetworkStatus()
+        status.detail = "네트워크 격리 모드라 웹 서버가 꺼져 있습니다."
+        return status
+    }
     public func setWebEnabled(_ enabled: Bool, port: UInt16? = nil, bonjourEnabled: Bool = true, discoveryAddresses: (() -> [String])? = nil) throws {
         if enabled {
+            guard !networkIsolated else { throw AppError.message("네트워크 격리 모드에서는 웹 서버를 켤 수 없습니다. 격리를 끄면 다시 켤 수 있습니다.") }
             if webService != nil {
                 guard port != nil else { return }
                 tunnelController?.stop(); tunnelController=nil; tunnelRestoreAttempted=false
@@ -856,9 +873,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func setLANUpdateEnabled(_ enabled: Bool) throws {
         try store.set("lanUpdateEnabled", enabled ? "true" : "false")
+        let active = enabled && !networkIsolated
+        if !active { webService?.cancelLANUpdate() }
+        lanUpdate = Self.idleLANUpdate(enabled: active, isolated: networkIsolated)
+    }
+    private static func idleLANUpdate(enabled: Bool, isolated: Bool) -> LANUpdateStatus {
         var value = LANUpdateStatus(); value.enabled = enabled
-        if !enabled { value.phase = "off"; value.detail = "같은 네트워크의 자동 업데이트가 꺼져 있습니다."; webService?.cancelLANUpdate() }
-        lanUpdate = value
+        if !enabled {
+            value.phase = "off"
+            value.detail = isolated ? "네트워크 격리 모드라 같은 네트워크의 자동 업데이트가 꺼져 있습니다." : "같은 네트워크의 자동 업데이트가 꺼져 있습니다."
+        }
+        return value
+    }
+    /// Turn shared-computer isolation on or off. Turning it on stops the web
+    /// server, LAN discovery, peer links, LAN updates and external tunnels
+    /// before returning; the saved web preference is kept. Turning it off
+    /// restores the web server unless the user had switched it off; a stopped
+    /// tunnel stays off until the user starts it again.
+    public func setNetworkIsolation(_ enabled: Bool) throws {
+        guard enabled != networkIsolated else { return }
+        try store.set("networkIsolation", enabled ? "true" : "false")
+        networkIsolated = enabled
+        lanUpdate = Self.idleLANUpdate(enabled: store.value("lanUpdateEnabled") != "false" && !enabled, isolated: enabled)
+        if enabled {
+            try? stopTunnel()
+            testScreens.stopAll()
+            webService?.cancelLANUpdate()
+            webService?.stop(); webService = nil
+            webStatus = Self.isolatedWebStatus
+        } else {
+            webStatus = RemoteNetworkStatus()
+            if store.value("webEnabled") != "false" { try setWebEnabled(true) }
+        }
     }
     func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
     var lanUpdateWaitReason: String? {
@@ -4852,6 +4898,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     try setWebEnabled(enabled, port: port)
                 }
                 result = try JSONSerialization.jsonObject(with: JSONEncoder().encode(webStatus)) as? JSONObject ?? [:]
+            case "isolation":
+                if let enabled = params["enabled"] as? Bool { try setNetworkIsolation(enabled) }
+                result = ["enabled": networkIsolated]
             case "hook": result = params["autoapproveProtocol"] as? Int == 1 ? try handleClaudeHook(params) : handleHook(params)
             case "hookAck": try acknowledgeClaudeHook(params)
             case "claudeApprove":
