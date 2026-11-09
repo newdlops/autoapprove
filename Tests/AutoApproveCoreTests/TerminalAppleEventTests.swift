@@ -23,36 +23,106 @@ private func terminalBatchTargets(_ query: NSAppleEventDescriptor) -> [String]? 
     return (1...terms.numberOfItems).compactMap { terms.atIndex($0)?.forKeyword(terminalCode("obj2"))?.stringValue }
 }
 
+private func terminalInputConditions(_ query:NSAppleEventDescriptor) throws -> [String:NSAppleEventDescriptor] {
+    let window=query.forKeyword(terminalCode("from"))!
+    try expectEqual(window.forKeyword(terminalCode("want"))?.typeCodeValue,terminalCode("cwin"))
+    let predicate=window.forKeyword(terminalCode("seld"))!
+    try expectEqual(predicate.forKeyword(terminalCode("logc"))?.enumCodeValue,terminalCode("AND "))
+    let terms=predicate.forKeyword(terminalCode("term"))!
+    var result:[String:NSAppleEventDescriptor]=[:]
+    for index in 1...terms.numberOfItems {
+        let term=terms.atIndex(index)!
+        try expectEqual(term.forKeyword(terminalCode("relo"))?.enumCodeValue,terminalCode("=   "))
+        var item=term.forKeyword(terminalCode("obj1"))!,path:[String]=[]
+        while item.descriptorType != terminalCode("exmn") {
+            let code=terminalProperty(item)
+            path.insert(String(bytes:[UInt8((code>>24)&255),UInt8((code>>16)&255),UInt8((code>>8)&255),UInt8(code&255)],encoding:.utf8)!,at:0)
+            item=item.forKeyword(terminalCode("from"))!
+        }
+        result[path.joined(separator:"/")]=term.forKeyword(terminalCode("obj2"))!
+    }
+    return result
+}
+
 extension ApprovalTests {
     func testTerminalProfileNativeSelectionUsesExactTTYAndStableWindow() throws {
-        for mode in ["ready","missing","ambiguous","unselected","minimized","changed","denied"] {
-            var queries=0,identityReads=0
+        for mode in ["ready","missing","ambiguous","unselected","minimized","denied"] {
+            var queries=0
             let reader=TerminalAppleEventReader {query,budget in
                 queries+=1;try expect(budget>0 && budget<=8)
-                var window=query.forKeyword(terminalCode("from"))!
-                if window.forKeyword(terminalCode("want"))?.typeCodeValue==terminalCode("prop") {window=window.forKeyword(terminalCode("from"))!}
-                try expectEqual(window.forKeyword(terminalCode("want"))?.typeCodeValue,terminalCode("cwin"))
-                let predicate=window.forKeyword(terminalCode("seld"))!
-                try expectEqual(predicate.forKeyword(terminalCode("obj2"))?.stringValue,"/dev/ttys700")
-                let tty=predicate.forKeyword(terminalCode("obj1"))!
-                try expectEqual(terminalProperty(tty),terminalCode("ttty"))
-                try expectEqual(terminalProperty(tty.forKeyword(terminalCode("from"))!),terminalCode("tcnt"))
+                try expectEqual(terminalProperty(query),terminalCode("ID  "))
+                let conditions=try terminalInputConditions(query)
+                try expectEqual(Set(conditions.keys),Set(["tcnt/ttty","tcnt/tbsl","pmnd"]))
+                try expectEqual(conditions["tcnt/ttty"]?.stringValue,"/dev/ttys700")
+                try expectEqual(conditions["tcnt/tbsl"]?.booleanValue,true)
+                try expectEqual(conditions["pmnd"]?.booleanValue,false)
                 if mode=="denied" {throw TerminalAdapterError.permissionDenied}
-                switch terminalProperty(query) {
-                case terminalCode("ID  "):
-                    identityReads+=1
-                    let ids:[Int32]=mode=="missing" ? []:mode=="ambiguous" ? [77,78]:[mode=="changed" && identityReads==2 ? 78:77]
-                    return terminalList(ids.map {.init(int32:$0)})
-                case terminalCode("tbsl"):return terminalList([.init(boolean:mode != "unselected")])
-                case terminalCode("pmnd"):return terminalList([.init(boolean:mode=="minimized")])
-                default:throw AppError.message("Unexpected profile query")
-                }
+                let ids:[Int32]=["missing","unselected","minimized"].contains(mode) ? []:mode=="ambiguous" ? [77,78]:[77]
+                return terminalList(ids.map {.init(int32:$0)})
             }
             if mode=="denied" {try expectThrows(try reader.selectedWindow(tty:"/dev/ttys700"));try expectEqual(queries,1)}
             else {
                 try expectEqual(try reader.selectedWindow(tty:"/dev/ttys700"),mode=="ready" ? 77:nil)
-                try expectEqual(queries,["missing","ambiguous"].contains(mode) ? 1:4,"Four exact native property reads regardless of unrelated terminal count")
+                try expectEqual(queries,1,"One query must check the exact selected TTY and minimized state together")
             }
+        }
+        var id:Int32=77
+        let fresh=TerminalAppleEventReader {_,_ in terminalList([.init(int32:id)])}
+        try expectEqual(try fresh.selectedWindow(tty:"/dev/ttys700"),77)
+        id=78
+        try expectEqual(try fresh.selectedWindow(tty:"/dev/ttys700"),78,"A later input must not reuse an earlier window ID")
+        let expired=TerminalAppleEventReader(timeout:0) {_,_ in throw AppError.message("Expired query must never send")}
+        try expectThrows(try expired.selectedWindow(tty:"/dev/ttys700"))
+    }
+
+    func testTerminalLivePreparationUsesBoundNativeEvents() throws {
+        for mode in ["ready","missing","ambiguous","changedSelection","changedWindow","denied","write1","write2","write3"] {
+            var reads=0,writes=0,now:TimeInterval=0,steps:[String]=[]
+            let reader=TerminalAppleEventReader(timeout:3,clock:{now}) {query,budget in
+                reads+=1;try expect(budget>0 && budget<=3);now+=0.02
+                if mode=="denied" {throw TerminalAdapterError.permissionDenied}
+                if reads==1 {
+                    try expectEqual(terminalProperty(query),terminalCode("ttty"))
+                    try expectEqual(terminalTarget(query),"/dev/ttys700")
+                    steps.append("find")
+                    return terminalStrings(mode=="missing" ? []:mode=="ambiguous" ? ["/dev/ttys700","/dev/ttys700"]:["/dev/ttys700"])
+                }
+                try expectEqual(terminalProperty(query),terminalCode("ID  "))
+                if reads==2 {
+                    try expectEqual(terminalTarget(query),"/dev/ttys700");steps.append("bind")
+                    return terminalList(mode=="changedSelection" ? []:[.init(int32:77)])
+                }
+                let conditions=try terminalInputConditions(query)
+                try expectEqual(conditions["tcnt/ttty"]?.stringValue,"/dev/ttys700")
+                try expectEqual(conditions["ID  "]?.int32Value,77)
+                try expectEqual(conditions["tcnt/tbsl"]?.booleanValue,true)
+                try expectEqual(conditions["pmnd"]?.booleanValue,false)
+                steps.append("verify")
+                return terminalList([.init(int32:mode=="changedWindow" ? 78:77)])
+            }
+            do {
+                let result=try reader.prepareLiveInput(tty:"/dev/ttys700") {query,value,budget in
+                    writes+=1;try expect(budget>0 && budget<=3);now+=0.02
+                    if mode=="write\(writes)" {throw TerminalAdapterError.permissionDenied}
+                    if writes==1 {
+                        try expectEqual(terminalProperty(query),terminalCode("tbsl"));try expectEqual(value.booleanValue,true)
+                        try expectEqual(terminalTarget(query),"/dev/ttys700");steps.append("select")
+                    } else {
+                        let conditions=try terminalInputConditions(query)
+                        try expectEqual(Set(conditions.keys),Set(["tcnt/ttty","ID  "]))
+                        try expectEqual(conditions["tcnt/ttty"]?.stringValue,"/dev/ttys700");try expectEqual(conditions["ID  "]?.int32Value,77)
+                        try expectEqual(terminalProperty(query),terminalCode(writes==2 ? "pmnd":"pidx"))
+                        if writes==2 {try expectEqual(value.booleanValue,false);steps.append("restore")}
+                        else {try expectEqual(value.int32Value,1);steps.append("raise")}
+                    }
+                }
+                try expect(!mode.hasPrefix("write") && mode != "denied")
+                try expectEqual(result,mode=="ready" ? 77:nil)
+            } catch TerminalAdapterError.permissionDenied {try expect(mode=="denied" || mode.hasPrefix("write"))}
+            if mode=="ready" {try expectEqual(steps,["find","select","bind","restore","raise","verify"])}
+            if ["missing","ambiguous","denied"].contains(mode) {try expectEqual(writes,0)}
+            if mode=="changedSelection" {try expectEqual(writes,1)}
+            if mode.hasPrefix("write") {try expectEqual(writes,Int(mode.suffix(1))!)}
         }
     }
 

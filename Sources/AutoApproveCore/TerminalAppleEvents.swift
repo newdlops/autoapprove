@@ -8,7 +8,8 @@ private enum TerminalReadEventError: Error {
     case incompatible, timedOut, ambiguous
 }
 
-/// Read-only Terminal dictionary queries. Content batches contain only requested
+/// Terminal dictionary queries and explicit live-input window preparation.
+/// Content batches contain only requested
 /// exact TTY predicates and are accepted only while their TTY order stays stable;
 /// individual fallback queries also carry an exact predicate. No tab index,
 /// screen or process identity is cached. The injected transport keeps the
@@ -54,6 +55,31 @@ public struct TerminalAppleEventReader {
 
     private func property(_ name: String, of container: NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
         try object("prop", form: "prop", selector: .init(typeCode: aeCode(name)), container: container)
+    }
+
+    private func comparison(_ path:[String],_ value:NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
+        guard var left=NSAppleEventDescriptor(descriptorType:aeCode("exmn"),data:Data()) else {throw TerminalReadEventError.incompatible}
+        for name in path {left=try property(name,of:left)}
+        let record=NSAppleEventDescriptor.record()
+        record.setDescriptor(.init(enumCode:aeCode("=   ")),forKeyword:aeCode("relo"))
+        record.setDescriptor(left,forKeyword:aeCode("obj1"));record.setDescriptor(value,forKeyword:aeCode("obj2"))
+        guard let result=record.coerce(toDescriptorType:aeCode("cmpd")) else {throw TerminalReadEventError.incompatible}
+        return result
+    }
+
+    private func inputWindows(tty:String,ready:Bool,windowID:UInt32?=nil) throws -> NSAppleEventDescriptor {
+        let terms=NSAppleEventDescriptor.list()
+        terms.insert(try comparison(["tcnt","ttty"],.init(string:tty)),at:1)
+        if ready {
+            terms.insert(try comparison(["tcnt","tbsl"],.init(boolean:true)),at:terms.numberOfItems+1)
+            terms.insert(try comparison(["pmnd"],.init(boolean:false)),at:terms.numberOfItems+1)
+        }
+        if let windowID {terms.insert(try comparison(["ID  "],.init(int32:Int32(windowID))),at:terms.numberOfItems+1)}
+        let logical=NSAppleEventDescriptor.record()
+        logical.setDescriptor(.init(enumCode:aeCode("AND ")),forKeyword:aeCode("logc"))
+        logical.setDescriptor(terms,forKeyword:aeCode("term"))
+        guard let test=logical.coerce(toDescriptorType:aeCode("logi")) else {throw TerminalReadEventError.incompatible}
+        return try object("cwin",form:"test",selector:test)
     }
 
     private func matching(_ kind: String, property path: [String], tty: String, container: NSAppleEventDescriptor = .null()) throws -> NSAppleEventDescriptor {
@@ -111,24 +137,11 @@ public struct TerminalAppleEventReader {
         return [UInt32(value.int32Value)]
     }
 
-    private func booleans(_ value:NSAppleEventDescriptor,depth:Int = 0) throws -> [Bool] {
-        guard depth<8,value.numberOfItems<=4096 else {throw TerminalReadEventError.incompatible}
-        if value.descriptorType==aeCode("list") {
-            guard value.numberOfItems>0 else {return []}
-            return try (1...value.numberOfItems).flatMap {index in
-                guard let item=value.atIndex(index) else {throw TerminalReadEventError.incompatible}
-                return try booleans(item,depth:depth+1)
-            }
-        }
-        guard ["bool","true","fals"].contains(where:{value.descriptorType==aeCode($0)}) else {throw TerminalReadEventError.incompatible}
-        return [value.booleanValue]
-    }
-
     /// Exact selected-TTY predicates keep profile checks independent of the
     /// number of unrelated tabs. No osascript process or title/content scan.
     public func selectedWindow(tty:String) throws -> UInt32? {
         try autoreleasepool {
-            let windows=try matching("cwin",property:["tcnt","ttty"],tty:tty)
+            let windows=try inputWindows(tty:tty,ready:true)
             let deadline=clock()+timeout
             func get(_ subject:NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
                 try Task.checkCancellation()
@@ -136,14 +149,38 @@ public struct TerminalAppleEventReader {
                 guard remaining>0 else {throw TerminalReadEventError.timedOut}
                 return try send(subject,remaining)
             }
-            let identity=try property("ID  ",of:windows)
-            let before=try windowIDs(get(identity))
-            guard before.count==1 else {return nil}
-            let selected=try booleans(get(property("tbsl",of:property("tcnt",of:windows))))
-            let minimized=try booleans(get(property("pmnd",of:windows)))
-            let after=try windowIDs(get(identity))
-            guard before==after,selected==[true],minimized==[false] else {return nil}
-            return before[0]
+            // Evaluate the exact TTY, selection and minimized state in the
+            // same query instead of four serial application round trips.
+            let ids=try windowIDs(get(property("ID  ",of:windows)))
+            return ids.count==1 ? ids[0]:nil
+        }
+    }
+
+    /// Live input alone can select the exact TTY without a scripting process.
+    /// No text, command, key or approval is sent by this preparation.
+    public func prepareLiveInput(tty:String,write:(NSAppleEventDescriptor,NSAppleEventDescriptor,TimeInterval)throws->Void) throws -> UInt32? {
+        try autoreleasepool {
+            let deadline=clock()+timeout
+            func budget() throws -> TimeInterval {
+                try Task.checkCancellation()
+                let remaining=deadline-clock()
+                guard remaining>0 else {throw TerminalReadEventError.timedOut}
+                return remaining
+            }
+            func get(_ subject:NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {try send(subject,budget())}
+            func set(_ subject:NSAppleEventDescriptor,_ value:NSAppleEventDescriptor) throws {try write(subject,value,budget())}
+            let all=NSAppleEventDescriptor(descriptorType:aeCode("abso"),data:NSAppleEventDescriptor(enumCode:aeCode("all ")).data)!
+            let tabs=try matching("ttab",property:["ttty"],tty:tty,container:object("cwin",form:"indx",selector:all))
+            guard try strings(get(property("ttty",of:tabs)))==[tty] else {return nil}
+            try set(property("tbsl",of:tabs),.init(boolean:true))
+            let selected=try matching("cwin",property:["tcnt","ttty"],tty:tty)
+            let ids=try windowIDs(get(property("ID  ",of:selected)))
+            guard ids.count==1 else {return nil}
+            let bound=try inputWindows(tty:tty,ready:false,windowID:ids[0])
+            try set(property("pmnd",of:bound),.init(boolean:false))
+            try set(property("pidx",of:bound),.init(int32:1))
+            let verified=try windowIDs(get(property("ID  ",of:inputWindows(tty:tty,ready:true,windowID:ids[0]))))
+            return verified==ids ? ids[0]:nil
         }
     }
 
@@ -403,23 +440,43 @@ enum TerminalAppleEvents {
     static func profileWindowMetadata(tty:String,owner suppliedOwner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
         let owner=try suppliedOwner ?? TerminalProcessLookup.running()
         guard TerminalProcessLookup.identity(pid:owner.pid)==owner else {return nil}
-        let reader=TerminalAppleEventReader(timeout:3) {subject,timeout in
-            let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode("getd"),targetDescriptor:.init(processIdentifier:owner.pid),returnID:-1,transactionID:0)
-            event.setParam(subject,forKeyword:aeCode("----"))
-            let noConsent=NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
-            let reply:NSAppleEventDescriptor
-            do {reply=try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:timeout)}
-            catch {
-                if [-1743,-1744].contains((error as NSError).code) {throw TerminalAdapterError.permissionDenied}
-                throw error
-            }
-            let status=reply.paramDescriptor(forKeyword:aeCode("errn"))?.int32Value ?? 0
-            if [-1743,-1744].contains(status) {throw TerminalAdapterError.permissionDenied}
-            guard status==0 else {throw NSError(domain:NSOSStatusErrorDomain,code:Int(status))}
-            guard let value=reply.paramDescriptor(forKeyword:aeCode("----")) else {throw TerminalReadEventError.incompatible}
-            return value
+        let reader=TerminalAppleEventReader(timeout:3) {try inputEvent(owner:owner,subject:$0,timeout:$1)}
+        guard let windowID=try reader.selectedWindow(tty:tty) else {return nil}
+        return try inputMetadata(tty:tty,windowID:windowID,owner:owner)
+    }
+
+    static func prepareLiveInput(tty:String) throws -> TerminalWindowMetadata? {
+        let owner=try TerminalProcessLookup.running()
+        let reader=TerminalAppleEventReader(timeout:3) {try inputEvent(owner:owner,subject:$0,timeout:$1)}
+        guard let windowID=try reader.prepareLiveInput(tty:tty,write:{subject,value,timeout in
+            _ = try inputEvent(owner:owner,subject:subject,value:value,timeout:timeout)
+        }) else {return nil}
+        return try inputMetadata(tty:tty,windowID:windowID,owner:owner)
+    }
+
+    private static func inputEvent(owner:TerminalProcessIdentity,subject:NSAppleEventDescriptor,value:NSAppleEventDescriptor?=nil,timeout:TimeInterval) throws -> NSAppleEventDescriptor {
+        guard TerminalProcessLookup.identity(pid:owner.pid)==owner else {throw TerminalReadEventError.ambiguous}
+        let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode(value == nil ? "getd":"setd"),targetDescriptor:.init(processIdentifier:owner.pid),returnID:-1,transactionID:0)
+        event.setParam(subject,forKeyword:aeCode("----"))
+        if let value {event.setParam(value,forKeyword:aeCode("data"))}
+        let noConsent=NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
+        let reply:NSAppleEventDescriptor
+        do {reply=try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:timeout)}
+        catch {
+            if [-1743,-1744].contains((error as NSError).code) {throw TerminalAdapterError.permissionDenied}
+            throw error
         }
-        guard let windowID=try reader.selectedWindow(tty:tty),TerminalProcessLookup.identity(pid:owner.pid)==owner else {return nil}
+        let status=reply.paramDescriptor(forKeyword:aeCode("errn"))?.int32Value ?? 0
+        if [-1743,-1744].contains(status) {throw TerminalAdapterError.permissionDenied}
+        guard status==0 else {throw NSError(domain:NSOSStatusErrorDomain,code:Int(status))}
+        guard TerminalProcessLookup.identity(pid:owner.pid)==owner else {throw TerminalReadEventError.ambiguous}
+        if value != nil {return .null()}
+        guard let result=reply.paramDescriptor(forKeyword:aeCode("----")) else {throw TerminalReadEventError.incompatible}
+        return result
+    }
+
+    private static func inputMetadata(tty:String,windowID:UInt32,owner:TerminalProcessIdentity) throws -> TerminalWindowMetadata? {
+        guard TerminalProcessLookup.identity(pid:owner.pid)==owner else {return nil}
         let output=try AutomationScript.literal(["tty":tty,"windowID":windowID,"selected":true,"minimized":false] as JSONObject)
         guard let metadata=try TerminalAdapter.windowMetadata(output:output,tty:tty),metadata.ownerPID==owner.pid else {return nil}
         return metadata

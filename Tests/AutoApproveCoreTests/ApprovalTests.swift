@@ -549,6 +549,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Terminal profile tabs: capture combines previous verification and next selection",tests.testTerminalProfileCaptureFocusVerifiesPreviousAndReturnsSelectionInOneScript),
             ("Terminal profile tabs: captured window IDs bound focus queries independently of unrelated tabs",tests.testTerminalProfileKnownWindowFocusBoundsQueriesAndRejectsChanges),
             ("Terminal profile tabs: native exact TTY selection avoids scripting processes",tests.testTerminalProfileNativeSelectionUsesExactTTYAndStableWindow),
+            ("Terminal live input: bound native selection without scripting processes",tests.testTerminalLivePreparationUsesBoundNativeEvents),
             ("Terminal profile tabs: slow shell startup settles before one command",tests.testTerminalProfileShellReadinessAllowsSlowStartupWithoutRepeatingActions),
             ("Terminal profile tabs: stale trust does not override current AX/posting authorization",tests.testTerminalNativeTabDoesNotTreatStaleTrustAsPermissionDenial),
             ("Terminal profile tabs: authoritative AX read and selected-tab restore replies",tests.testTerminalProfileAccessUsesAuthoritativeReadAndActionReplies),

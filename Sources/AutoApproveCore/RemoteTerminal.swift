@@ -35,6 +35,7 @@ public enum TerminalKeyboard {
         public var frontmost: @Sendable () -> Bool
         public var activate: @Sendable () throws -> Void
         public var pause: @Sendable (TimeInterval) -> Void
+        public var prepareLive: (@Sendable (String) throws -> TerminalWindowMetadata?)?
         public init(trusted: @escaping @Sendable () -> Bool, postingAllowed: @escaping @Sendable () -> Bool,
                     run: @escaping @Sendable (String) throws -> String,
                     metadata: @escaping @Sendable (String) throws -> TerminalWindowMetadata?,
@@ -47,12 +48,14 @@ public enum TerminalKeyboard {
                     pasteReady: @escaping @Sendable (ScreenTarget,String,String) throws -> Bool = { _,_,_ in false },
                     frontmost: @escaping @Sendable () -> Bool = { false },
                     activate: @escaping @Sendable () throws -> Void = {},
-                    pause: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval:$0) }) {
+                    pause: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval:$0) },
+                    prepareLive: (@Sendable (String) throws -> TerminalWindowMetadata?)? = nil) {
             self.trusted = trusted; self.postingAllowed = postingAllowed; self.run = run; self.metadata = metadata
             self.ownerBundle = ownerBundle; self.focused = focused; self.processes = processes; self.postPair = postPair
             self.clock = clock; self.cancelled = cancelled
             self.preparePasteboard = preparePasteboard; self.pasteReady = pasteReady
             self.frontmost = frontmost; self.activate = activate; self.pause = pause
+            self.prepareLive = prepareLive
         }
         public static var live: Self {
             Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
@@ -76,6 +79,8 @@ public enum TerminalKeyboard {
                 activate: { try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
                     let owner=try TerminalProcessLookup.running()
                     try TerminalKeyboard.activateApplication(owner:owner)
+                } }, prepareLive: {tty in try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
+                    try TerminalAppleEvents.prepareLiveInput(tty:tty)
                 } })
         }
     }
@@ -206,13 +211,22 @@ public enum TerminalKeyboard {
                 // later activate command ever runs.
                 try environment.activate()
                 try checkPermissionAndTime()
-                let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
-                if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
-                guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
-                      let current = try environment.metadata(target.tty), current.tty == target.tty, current.windowID == windowID,
-                      current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal", current.selected, !current.minimized else { return .missingTarget }
-                window = current
-                RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
+                let current:TerminalWindowMetadata
+                if input.isRelay, ![.message,.choice].contains(input.kind), let prepare=environment.prepareLive {
+                    guard let prepared=try prepare(target.tty),prepared.tty==target.tty,prepared.windowID>0,
+                          prepared.ownerPID>0,prepared.ownerBundleID=="com.apple.Terminal",prepared.selected,!prepared.minimized else {return .missingTarget}
+                    current=prepared
+                    RemoteTerminalPerformance.shared.increment(.nativeInputPreparations)
+                } else {
+                    let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
+                    if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
+                    guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
+                          let metadata = try environment.metadata(target.tty), metadata.tty == target.tty, metadata.windowID == windowID,
+                          metadata.ownerPID > 0, metadata.ownerBundleID == "com.apple.Terminal", metadata.selected, !metadata.minimized else { return .missingTarget }
+                    current=metadata
+                    RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
+                }
+                window=current
                 // App activation/tab selection is asynchronous. Wait only for
                 // readiness; never retry activation or an input event.
                 let focusDeadline=min(deadline,environment.clock()+0.5)

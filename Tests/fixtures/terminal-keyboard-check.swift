@@ -243,6 +243,25 @@ private final class NativeProbe: @unchecked Sendable {
         }
         checks.append("background preparation activates before metadata, waits for exact focus, and rejects failed or stolen focus with zero posts")
 
+        for mode in ["ready","missing","changed","denied"] {
+            let native=NativeProbe();native.mutate {$0.frontmost=false;$0.focused=false}
+            var environment=native.environment
+            environment.prepareLive={tty in
+                if mode=="denied" {throw RemoteHTTPError(409,"Native preparation denied")}
+                if mode=="missing" {return nil}
+                native.mutate {$0.focused=true;if mode=="changed" {$0.fault = .selected;$0.faultAt=2}}
+                return native.metadata(tty)
+            }
+            do {
+                let result=try TerminalKeyboard.deliver(target:native.target,expected:"screen",agent:.codex,
+                    input:.init(kind:.characters,text:"native",relay:true),environment:environment)
+                try require(mode=="ready" ? result == .sent:mode=="missing" && result == .missingTarget,"Native selection must preserve failures")
+            } catch is RemoteHTTPError {try require(["changed","denied"].contains(mode),"Unexpected native selection failure")}
+            try require(native.read {$0.prepares==0 && $0.activations==1 && $0.pairs.count==(mode=="ready" ? 1:0)},
+                "Native live selection must not launch JXA, retry failure or skip the final selected-tab check")
+        }
+        checks.append("live background selection uses native events without JXA and still rejects changed selection before the first pair")
+
         let special = NativeProbe()
         let keyCodes: [(RemoteTerminalInput.Kind, Int64)] = [(.enter,36),(.escape,53),(.interrupt,8),(.up,126),(.down,125),(.left,123),(.right,124),(.backspace,51),(.delete,117),(.home,115),(.end,119),(.tab,48)]
         for (kind, code) in keyCodes {
