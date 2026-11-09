@@ -49,6 +49,7 @@ private final class NativeProbe: @unchecked Sendable {
     var metadataReads = 0, prepares = 0, faultAt = 0, fault: Fault?, throwPairAt = 0
     var focusOnPrepare = false, frontmost = true, activationFails = false, metadataNeedsActivation = false
     var activations = 0, pauses = 0, focusAfterPauses = 0
+    var targetedReads = 0
     var identity: TTYInputIdentity = {
         let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
         return TTYInputIdentity(pid:81001,processGroup:81001,uid:getuid(),effectiveUID:geteuid(),device:42,
@@ -374,7 +375,10 @@ private final class NativeProbe: @unchecked Sendable {
         let capture = TerminalWindowCapture(permissions: { TerminalWindowPermissions(screen: false, keyboard: true, automation: true) },
             requestPermissions: {}, metadata: { _ in throw AppError.message("Ordinary native input must not inspect a screen capture") },
             capture: { _ in throw AppError.message("Ordinary native input must not capture pixels") })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { receiptRecords }, screenAdapters: [.terminal: adapter], terminalWindowCapture: capture, terminalInputAvailable: { true }, terminalInputIdentity: { _ in receiptIdentity })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { receiptRecords }, screenAdapters: [.terminal: adapter], terminalWindowCapture: capture, terminalInputAvailable: { true }, terminalInputIdentity: { _ in receiptIdentity }, singleProcessReader: { pid in
+            receiptProbe.mutate {$0.targetedReads += 1}
+            return receiptProbe.read {$0.records.filter {$0.pid==pid}}
+        })
         defer { engine.stop() }
         let session = ProcessDiscovery.sessions(receiptRecords)[0]
         engine.updateDiscovery([session], records: receiptRecords); await engine.connectTerminal()
@@ -383,12 +387,20 @@ private final class NativeProbe: @unchecked Sendable {
         let body: JSONObject = ["requestID": UUID().uuidString, "sessionID": session.id, "revision": frame.revision, "streamID": frame.streamID!, "relay": true, "kind": "characters", "text": "한글 original"]
         let data = try JSONSerialization.data(withJSONObject: body)
         let request = try RemoteHTTPRequest.parse(Data("POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\n\r\n".utf8) + data)!
+        let readsBefore=receiptProbe.read {$0.targetedReads}
         let first = await network.handle(request), repeatRequest = await network.handle(request)
         try require(first.status == 200 && repeatRequest.status == 200 && receiptProbe.read({ $0.pairs.count }) == 1,
             "The real original HTTP route must carry exact PID/start/TTY into native delivery and receipt duplicates must not replay it: first=\(first.status) \(String(decoding:first.body,as:UTF8.self)), repeat=\(repeatRequest.status), pairs=\(receiptProbe.read{$0.pairs.count})")
         try require(engine.managedPTY.inventory.isEmpty && engine.snapshot.sessions[0].pid == session.pid && engine.snapshot.sessions[0].tty == session.tty,
             "Native original input must keep the same CLI/TTY and create no PTY")
-        checks.append("original HTTP receipts deliver the exact source once with no window capture or CLI/PTY creation")
+        try require(receiptProbe.read {$0.targetedReads}>readsBefore,"Live Terminal input must use the injected single-source reader")
+        receiptProbe.mutate {$0.records[1].started="replaced original"}
+        var changedBody=body;changedBody["requestID"]=UUID().uuidString
+        let changedData=try JSONSerialization.data(withJSONObject:changedBody)
+        let changedRequest=try RemoteHTTPRequest.parse(Data("POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: \(changedData.count)\r\n\r\n".utf8)+changedData)!
+        let rejected=await network.handle(changedRequest)
+        try require(rejected.status==409 && receiptProbe.read {$0.pairs.count}==1,"Fresh single-source mismatch must reject before another native pair")
+        checks.append("original HTTP receipts use fresh single-source checks, reject replacement and deliver once without window capture or CLI/PTY creation")
 #endif
 #endif
         print(String(decoding: try JSONSerialization.data(withJSONObject: ["checks": checks, "actualEventPosts": 0, "realPermissionPrompts": 0, "ownedPTYCreations": 0]), as: UTF8.self))

@@ -83,6 +83,36 @@ public enum TerminalKeyboard {
                     try TerminalAppleEvents.prepareLiveInput(tty:tty)
                 } })
         }
+        public static func live(sourcePID: Int32) throws -> Self {
+            let chain = try RemoteTerminalPerformance.shared.measure(.inputProcessCheck) {
+                try ProcessDiscovery.readAncestorChain(of:sourcePID)
+            }
+            guard let owner = chain.lazy.compactMap({ TerminalProcessLookup.identity(pid:$0.pid) }).first else {
+                throw RemoteHTTPError(409,"원본 CLI를 실행한 Terminal 프로세스를 확인하지 못했습니다.")
+            }
+            var value = Self.live
+            value.processes = {
+                try RemoteTerminalPerformance.shared.measure(.inputProcessCheck) {
+                    try ProcessDiscovery.readAncestorChain(of:sourcePID,through:owner.pid)
+                }
+            }
+            value.metadata = { tty in
+                try RemoteTerminalPerformance.shared.measure(.inputWindowCheck) {
+                    try TerminalAppleEvents.profileWindowMetadata(tty:tty,owner:owner)
+                }
+            }
+            value.activate = {
+                try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
+                    try TerminalKeyboard.activateApplication(owner:owner)
+                }
+            }
+            value.prepareLive = { tty in
+                try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
+                    try TerminalAppleEvents.prepareLiveInput(tty:tty,owner:owner)
+                }
+            }
+            return value
+        }
     }
 
     /// Accessibility activation works from the authorized sender even when

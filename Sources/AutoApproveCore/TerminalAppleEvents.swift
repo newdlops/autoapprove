@@ -445,8 +445,8 @@ enum TerminalAppleEvents {
         return try inputMetadata(tty:tty,windowID:windowID,owner:owner)
     }
 
-    static func prepareLiveInput(tty:String) throws -> TerminalWindowMetadata? {
-        let owner=try TerminalProcessLookup.running()
+    static func prepareLiveInput(tty:String,owner suppliedOwner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
+        let owner=try suppliedOwner ?? TerminalProcessLookup.running()
         let reader=TerminalAppleEventReader(timeout:3) {try inputEvent(owner:owner,subject:$0,timeout:$1)}
         guard let windowID=try reader.prepareLiveInput(tty:tty,write:{subject,value,timeout in
             _ = try inputEvent(owner:owner,subject:subject,value:value,timeout:timeout)

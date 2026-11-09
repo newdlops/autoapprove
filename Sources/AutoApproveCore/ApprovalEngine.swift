@@ -1837,6 +1837,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(409, "원래 tmux CLI가 종료되거나 입력 대상이 바뀌었습니다. 목록을 새로고침해주세요.")
             }
             currentRecords = [current]
+        } else if session.terminal == .terminal, input.isRelay, ![.message,.choice].contains(kind) {
+            let single = singleProcessReader
+            currentRecords = try await Task.detached { try single(session.pid) }.value
         } else { currentRecords = try await Task.detached { try reader() }.value }
         let tty = session.tty.replacingOccurrences(of: "/dev/", with: "")
         if let orcaOwnerPID, !currentRecords.contains(where: { $0.pid == orcaOwnerPID && $0.tty == tty }) {

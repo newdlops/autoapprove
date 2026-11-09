@@ -28,10 +28,10 @@ enum AutomationScript {
 }
 enum ITermAdapter { static let visibleFunction = "throw Error('The isolated native check cannot use iTerm');" }
 enum TerminalAppleEvents {
-    static func prepareLiveInput(tty:String) throws -> TerminalWindowMetadata? {
+    static func prepareLiveInput(tty:String,owner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
         throw AppError.message("Isolated native checks must inject input preparation")
     }
-    static func profileWindowMetadata(tty:String) throws -> TerminalWindowMetadata? {
+    static func profileWindowMetadata(tty:String,owner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
         throw AppError.message("Isolated native checks must inject window metadata")
     }
 }

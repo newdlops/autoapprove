@@ -9,6 +9,68 @@ private func nativeValue<T>(_ value: T?) throws -> T {
 }
 
 extension ApprovalTests {
+    func testInputAncestorChainIsBoundedFreshAndFailsClosed() throws {
+        let rows = ProcessDiscovery.parse("""
+        10 20 ttys901 10 10 Tue Oct 20 02:00:00 2026 /fixture/codex
+        20 30 ttys901 20 10 Tue Oct 20 01:59:00 2026 /bin/zsh
+        30 1 ?? 30 0 Tue Oct 20 01:58:00 2026 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+        1 0 ?? 1 0 Tue Oct 20 01:00:00 2026 /sbin/launchd
+        """)
+        let graph = Dictionary(uniqueKeysWithValues:rows.map {($0.pid,$0)})
+        var calls = [Int32]()
+        let chain = try ProcessDiscovery.readAncestorChain(of:10,through:30) { pid in
+            calls.append(pid); return graph[pid].map {[$0]} ?? []
+        }
+        try expectEqual(chain,Array(rows.prefix(3)))
+        try expectEqual(calls,[10,20,30,30,20,10],"Only the bound ownership chain is read, then revalidated")
+        try expectEqual(try ProcessDiscovery.readAncestorChain(of:10) {graph[$0].map {[$0]} ?? []},rows)
+        for mode in ["exit","duplicate","pid","parent","start","tty","group","foreground","exec"] {
+            var counts = [Int32:Int]()
+            let rejected = try ProcessDiscovery.readAncestorChain(of:10,through:30) { pid in
+                counts[pid,default:0] += 1
+                guard var row=graph[pid] else {return []}
+                if pid==20,counts[pid]==2 {
+                    switch mode {
+                    case "exit": return []
+                    case "duplicate": return [row,row]
+                    case "pid": row.pid=99
+                    case "parent": row.parent=99
+                    case "start": row.started="replaced"
+                    case "tty": row.tty="ttys999"
+                    case "group": row.processGroup=99
+                    case "foreground": row.foregroundGroup=99
+                    default: row.executable="/fixture/changed"
+                    }
+                }
+                return [row]
+            }
+            try expect(rejected.isEmpty,"Changed ancestor must reject the complete chain: \(mode)")
+        }
+        try expect(try ProcessDiscovery.readAncestorChain(of:10,through:99) {graph[$0].map {[$0]} ?? []}.isEmpty)
+        var boundedCalls=0
+        try expect(try ProcessDiscovery.readAncestorChain(of:10) {pid in
+            boundedCalls += 1; var row=rows[0];row.pid=pid;row.parent=pid+1;return [row]
+        }.isEmpty)
+        try expectEqual(boundedCalls,60)
+        try expect(try ProcessDiscovery.readAncestorChain(of:10) {pid in
+            var row=rows[0];row.pid=pid;row.parent=pid;return [row]
+        }.isEmpty)
+        try expect(try ProcessDiscovery.readAncestorChain(of:0) {_ in throw AppError.message("Invalid PID must not read")}.isEmpty)
+        try expectThrows(ProcessDiscovery.readAncestorChain(of:10) {_ in throw AppError.message("Read failed")})
+    }
+
+    func testNativeInputAncestorChainMatchesFreshProcessRecords() throws {
+        let own=getpid(),chain=try ProcessDiscovery.readAncestorChain(of:own)
+        try expectEqual(chain.first?.pid,own)
+        try expectEqual(chain.last?.parent,0)
+        for row in chain {try expectEqual(try ProcessDiscovery.read(pid:row.pid).first,row)}
+        if chain.count>1 {
+            try expectEqual(try ProcessDiscovery.readAncestorChain(of:own,through:chain[1].pid),Array(chain.prefix(2)))
+        }
+        try expect(try ProcessDiscovery.readAncestorChain(of:own,through:Int32.max).isEmpty)
+        try expect(try ProcessDiscovery.readAncestorChain(of:Int32.max).isEmpty)
+    }
+
     func testProcessAgentNamePrefilterKeepsFoundationClassification() throws {
         // Independent compatibility oracle: the original Foundation path rules,
         // including URL resolution for empty/dot names and Unicode numerals.

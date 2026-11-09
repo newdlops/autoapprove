@@ -13,6 +13,27 @@ enum NativeProcessReader {
     static func readSessions() throws -> [ProcessRecord] {
         try autoreleasepool { try records(pid: nil, sessionsOnly: true) }
     }
+    static func readAncestorChain(of pid:Int32,through ancestor:Int32?) throws -> [ProcessRecord] {
+        try autoreleasepool {
+            func readChain() throws -> [ProcessRecord] {
+                var current=pid,seen=Set<Int32>(),entries=[kinfo_proc]()
+                while current>0 {
+                    guard entries.count<60,seen.insert(current).inserted else {return []}
+                    let values=try snapshot(pid:current)
+                    guard values.count==1,let entry=values.first,entry.kp_eproc.e_ppid>=0 else {return []}
+                    entries.append(entry)
+                    if current==ancestor {break}
+                    current=entry.kp_eproc.e_ppid
+                }
+                guard ancestor==nil || entries.last?.kp_proc.p_pid==ancestor else {return []}
+                let rows=try records(entries:entries)
+                return rows.count==entries.count ? rows:[]
+            }
+            let original=try readChain()
+            guard !original.isEmpty,try readChain()==original else {return []}
+            return original
+        }
+    }
     private static func records(pid: Int32?, sessionsOnly: Bool) throws -> [ProcessRecord] {
         let all = try snapshot(pid: pid)
         let entries: [kinfo_proc]
@@ -22,6 +43,9 @@ enum NativeProcessReader {
             let indices = try sessionIndices(all)
             entries = indices.map { all[$0] }
         } else { entries = all }
+        return try records(entries:entries)
+    }
+    private static func records(entries:[kinfo_proc]) throws -> [ProcessRecord] {
         guard !entries.isEmpty else { return [] }
         // Complete and targeted reads promise the same launch name and start
         // identity as ps, including arbitrary managers, hosts and shell PIDs.

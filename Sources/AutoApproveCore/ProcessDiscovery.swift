@@ -167,6 +167,34 @@ public enum ProcessDiscovery {
         catch is CancellationError { throw CancellationError() }
         catch { return try legacyRead(pid: pid) }
     }
+    /// Fresh ownership proof for one source. Never materialize unrelated
+    /// processes or retain a chain across inputs; recheck every link before use.
+    public static func readAncestorChain(of pid: Int32, through ancestor: Int32? = nil,
+                                         reader: ((Int32) throws -> [ProcessRecord])? = nil) throws -> [ProcessRecord] {
+        guard pid > 0, ancestor == nil || ancestor! > 0 else { return [] }
+        guard let reader else {
+            do { return try NativeProcessReader.readAncestorChain(of:pid,through:ancestor) }
+            catch is CancellationError { throw CancellationError() }
+            catch { return try readAncestorChain(of:pid,through:ancestor,reader:{try legacyRead(pid:$0)}) }
+        }
+        var current = pid, seen: Set<Int32> = [], chain: [ProcessRecord] = []
+        while current > 0 {
+            try Task.checkCancellation()
+            guard chain.count < 60, seen.insert(current).inserted else { return [] }
+            let rows = try reader(current)
+            guard rows.count == 1, let row = rows.first, row.pid == current, row.parent >= 0, !row.started.isEmpty else { return [] }
+            chain.append(row)
+            if current == ancestor { break }
+            current = row.parent
+        }
+        guard ancestor == nil || chain.last?.pid == ancestor else { return [] }
+        for original in chain.reversed() {
+            try Task.checkCancellation()
+            let rows = try reader(original.pid)
+            guard rows.count == 1, rows.first == original else { return [] }
+        }
+        return chain
+    }
     public static func ancestors(of pid: Int32, records: [ProcessRecord]) -> [ProcessRecord] {
         let byID = index(records)
         return ancestors(of: pid, byPID: byID)
