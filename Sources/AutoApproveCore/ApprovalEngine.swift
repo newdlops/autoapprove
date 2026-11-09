@@ -4042,17 +4042,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
             } else { sharedPermission = false }
             if host == .terminal, sharedPermission {
                 for target in targets where !userInputHasPriority(target.id) {
-                    guard let frame = remoteFrames[target.id], frame.usesRawPresentation,
+                    guard let frame = remoteFrames[target.id],
                           frame.generation == remoteGeneration(target, host: host),
                           let read = remoteScreenReads[target.id], !read.task.isCancelled,
                           read.target == ScreenTarget(tty: target.tty, handle: target.screenHandle),
                           read.generation == frame.generation, read.observedAt == frame.frame.observedAt,
                           read.sourceRevision == remoteTerminalChanges[target.id]?.revision,
                           (0..<0.18).contains(Date().timeIntervalSince(frame.frame.observedAt)) else { continue }
-                    sharedScreens[target.tty] = TerminalScreen(tty: target.tty, contents: frame.raw,
-                        appearance: frame.frame.appearance?.validated(for: frame.raw),
-                        cursor: frame.frame.cursor?.validated(for: frame.raw))
-                    sharedDates[target.id] = frame.frame.observedAt
+                    guard let observed = try? await read.task.value,
+                          observed.generation == frame.generation,
+                          observed.observedAt == frame.frame.observedAt,
+                          ScreenTextEquality.identical(observed.raw, frame.raw),
+                          (0..<0.18).contains(Date().timeIntervalSince(observed.observedAt)) else { continue }
+                    sharedScreens[target.tty] = TerminalScreen(tty: target.tty, contents: observed.raw,
+                        appearance: observed.appearance?.validated(for: observed.raw),
+                        cursor: observed.cursor?.validated(for: observed.raw), display: observed.display?.validated())
+                    sharedDates[target.id] = observed.observedAt
                 }
             }
             let requests = targets.filter { sharedDates[$0.id] == nil }.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }

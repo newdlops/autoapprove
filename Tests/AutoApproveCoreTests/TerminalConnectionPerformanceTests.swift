@@ -296,6 +296,11 @@ extension ApprovalTests {
     }
 
     func testInitialReconnectReusesOnlyFreshLiveOriginalWithFreshPermission() async throws {
+        try await checkInitialReconnectSharedObservation(display:nil)
+        try await checkInitialReconnectSharedObservation(display:TerminalTextSnapshot(screen:"Visible projection",cursor:TerminalCursor(offset:7)))
+    }
+
+    private func checkInitialReconnectSharedObservation(display:TerminalTextSnapshot?) async throws {
         let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-initial-live-"+UUID().uuidString)
         defer {try? FileManager.default.removeItem(at:directory)}
         let records=ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /usr/local/bin/codex")
@@ -306,7 +311,7 @@ extension ApprovalTests {
             return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:"Fresh initial")})
         },approve:{_,_,_ in .missingTarget},reveal:{_ in nil},presentationScreens:{targets in
             _ = reads.read("live")
-            return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:"Fresh live",cursor:TerminalCursor(offset:3))})
+            return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:"Fresh live",cursor:TerminalCursor(offset:3),display:display)})
         })
         let capture=TerminalWindowCapture(permissions:{TerminalWindowPermissions(screen:false,keyboard:false,automation:true)},
             automationQuery:{permission.read()},
