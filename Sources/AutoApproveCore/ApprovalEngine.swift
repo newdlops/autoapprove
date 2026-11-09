@@ -1213,6 +1213,35 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                   realtime: Bool = false, initial: Bool = false) async throws -> RemoteObservedScreen {
         let target = ScreenTarget(tty: session.tty, handle: session.screenHandle)
         let generation = remoteGeneration(session, host: host)
+        // A new subscriber still checks permission and the original process.
+        // Reuse only a completed live observation within the live cache's own
+        // freshness window; never join a slow pending presentation read here.
+        if initial, host == .terminal, !userInputHasPriority(session.id),
+           let pending=remoteScreenReads[session.id],pending.target==target,pending.generation==generation,
+           !pending.task.isCancelled,let at=pending.observedAt,
+           (0..<0.18).contains(Date().timeIntervalSince(at)),
+           pending.sourceRevision==remoteTerminalChanges[session.id]?.revision {
+            let verifier=remoteProcessVerifier
+            let verified=try await Task.detached(priority:.userInitiated) {
+                try RemoteTerminalPerformance.shared.measure(.identity) {try verifier(session)}
+            }.value
+            guard verified,!remoteInputStopped,let current=sessions[session.id],current.phase != .ended,
+                  remoteGeneration(current,host:host)==generation,remoteCanRead(current) else {
+                throw RemoteHTTPError(409,"원본 터미널 연결이 바뀌었습니다. 다시 연결해주세요.")
+            }
+            let observed=try await pending.task.value
+            try Task.checkCancellation()
+            guard !remoteInputStopped,let latest=sessions[session.id],latest.phase != .ended,
+                  remoteGeneration(latest,host:host)==generation,remoteCanRead(latest) else {
+                throw RemoteHTTPError(409,"원본 터미널 연결이 바뀌었습니다. 다시 연결해주세요.")
+            }
+            if remoteScreenReads[session.id]?.token==pending.token,pending.observedAt==at,
+               !userInputHasPriority(session.id),(0..<0.18).contains(Date().timeIntervalSince(at)),
+               pending.sourceRevision==remoteTerminalChanges[session.id]?.revision {
+                RemoteTerminalPerformance.shared.increment(.initialLiveCacheHits)
+                return observed
+            }
+        }
         // The monitor already read this exact original process. Only the first
         // subscription can use it, with its real timestamp; later frames and
         // input-triggered reads retain the tighter live-read cache.

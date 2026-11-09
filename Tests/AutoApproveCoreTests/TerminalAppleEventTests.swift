@@ -355,16 +355,18 @@ extension ApprovalTests {
 
     func testSlowBulkContentsIdentityQueryRequestsTemporaryPerTTYFallback() throws {
         let ttys = (0..<4).map { "/dev/slow-batch-\($0)" }
-        for mode in ["fast", "slow", "timeout"] {
+        for mode in ["fast", "before", "contents", "after", "combined", "timeout"] {
             var now = 0.0, identityReads = 0, fallbackRequests = 0
             let reader = TerminalAppleEventReader(timeout:8, clock:{now}, batchTitles:false,
                 slowContentsBatch:{ fallbackRequests += 1 }) { query, _ in
                 guard terminalBatchTargets(query) == ttys else { throw AppError.message("Only the exact enrolled TTYs may be batched") }
+                let property=terminalProperty(query)
+                let phase=property == terminalCode("pcnt") ? "contents" : identityReads == 0 ? "before":"after"
+                now += mode == "combined" ? 0.1 : mode == phase || mode == "timeout" && phase == "contents" ? 0.3:0.01
+                if mode == "timeout",phase == "contents" {throw NSError(domain:NSOSStatusErrorDomain,code:-1712)}
                 switch terminalProperty(query) {
                 case terminalCode("ttty"):
                     identityReads += 1
-                    if identityReads == 1, mode != "fast" { now += 2 }
-                    if identityReads == 1, mode == "timeout" { throw NSError(domain:NSOSStatusErrorDomain,code:-1712) }
                     return terminalStrings(ttys)
                 case terminalCode("pcnt"): return terminalStrings(ttys.map { "screen:" + $0 })
                 default: throw AppError.message("Unexpected Terminal batch property")
@@ -376,7 +378,7 @@ extension ApprovalTests {
                 try expectEqual(result.screens.map(\.contents),ttys.map { "screen:" + $0 })
             }
             try expectEqual(fallbackRequests,mode == "fast" ? 0 : 1,
-                "Only a slow/timed-out bulk identity lookup should enter temporary exact-TTY mode")
+                "Every batch phase and cumulative cost must trigger exact-TTY mode once without retrying the batch")
         }
     }
 

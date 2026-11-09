@@ -28,6 +28,7 @@ public struct TerminalAppleEventReader {
     private let diagnostics: RemoteTerminalPerformance?
     private let purpose: RemoteTerminalPerformance.NativePurpose
     private static let slowBatchThreshold: TimeInterval = 1.5
+    private static let slowContentsThreshold: TimeInterval = 0.25
 
     public init(timeout: TimeInterval = 8, clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                 batchTitles: Bool = true, titleBatchUnavailable: @escaping () -> Void = {},
@@ -214,28 +215,26 @@ public struct TerminalAppleEventReader {
             var seenTitles = Set<String>()
             let titleTargets = (titleTTYS ?? targets).filter { seen.contains($0) && seenTitles.insert($0).inserted }
             let deadline = clock() + max(0, timeout)
-            func recordSlowBatch(_ started: TimeInterval?, query: RemoteTerminalPerformance.NativeQuery) {
+            func recordSlowTitleBatch(_ started: TimeInterval?) {
                 guard let started, clock() - started >= Self.slowBatchThreshold else { return }
-                if query == .bulkContentsBefore { slowContentsBatch() }
-                else { slowTitlesBatch() }
+                slowTitlesBatch()
             }
             func getValue(_ subject: NSAppleEventDescriptor, _ query: RemoteTerminalPerformance.NativeQuery) throws -> NSAppleEventDescriptor {
                 try Task.checkCancellation()
                 let remaining = deadline - clock()
                 guard remaining > 0.02 else { throw TerminalReadEventError.timedOut }
-                let isContentsBatch = query == .bulkContentsBefore
                 let isTitlesBatch = query == .bulkBefore || query == .bulkTitle || query == .bulkAfter
-                let started = isContentsBatch || isTitlesBatch ? clock() : nil
+                let started = isTitlesBatch ? clock() : nil
                 do {
                     let value: NSAppleEventDescriptor
                     if let diagnostics {
                         value = try diagnostics.measureNativeQuery(purpose:purpose,query:query,targets:targets.count,remaining:remaining,
                             reply:{ .init(kind:$0.descriptorType,items:$0.numberOfItems) }) { try send(subject,remaining) }
                     } else { value = try send(subject, remaining) }
-                    recordSlowBatch(started, query: query)
+                    recordSlowTitleBatch(started)
                     return value
                 } catch {
-                    recordSlowBatch(started, query: query)
+                    recordSlowTitleBatch(started)
                     throw error
                 }
             }
@@ -256,6 +255,8 @@ public struct TerminalAppleEventReader {
             // only from four targets onward; keep tiny reads individual.
             if batchContents, targets.count >= 4, targets.count <= 256 {
                 do {
+                    let started=clock()
+                    defer {if clock()-started >= Self.slowContentsThreshold {slowContentsBatch()}}
                     let tabs = try matching("ttab", property: ["ttty"], ttys: targets, container: windows)
                     let values = try RemoteTerminalPerformance.shared.measure(.terminalContents) { () -> [String: String] in
                         let before = try getValue(property("ttty", of: tabs), .bulkContentsBefore)
@@ -531,7 +532,7 @@ enum TerminalAppleEvents {
         }, slowContentsBatch: {
             lock.lock()
             slowContentsBatchPID = pid
-            slowContentsBatchUntil = ProcessInfo.processInfo.systemUptime + 60
+            slowContentsBatchUntil = ProcessInfo.processInfo.systemUptime + 300
             lock.unlock()
         }, slowTitlesBatch: {
             lock.lock()

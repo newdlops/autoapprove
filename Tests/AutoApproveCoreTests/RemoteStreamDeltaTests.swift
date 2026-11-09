@@ -100,6 +100,24 @@ extension ApprovalTests {
         cancelled.cancel()
         do { _ = try await cancelled.value; throw AppError.message("Expected cancellation") } catch is CancellationError {}
         try expectEqual(reads,0)
+        reads=0
+        let resumed=try await RemoteTerminalReadRecovery.read {
+            reads += 1;if reads<3 {throw CancellationError()};return frame
+        }
+        try expectEqual(resumed.revision,frame.revision);try expectEqual(reads,3)
+        reads=0
+        do {_ = try await RemoteTerminalReadRecovery.read {reads += 1;throw CancellationError()};throw AppError.message("Repeated internal cancellation must stop")}
+        catch let error as RemoteHTTPError {try expectEqual(error.status,503);try expectEqual(reads,3)}
+        let inOperation=Task { @MainActor in
+            var attempts=0
+            do {
+                _ = try await RemoteTerminalReadRecovery.read {
+                    attempts += 1;withUnsafeCurrentTask {$0?.cancel()};throw CancellationError()
+                }
+                return false
+            } catch is CancellationError {return attempts==1}
+        }
+        try expect(try await inOperation.value,"A viewer that closes during a read must never retry")
     }
 
     func testTerminalScreenPatchPreservesUTF16AndExactUnicode() throws {

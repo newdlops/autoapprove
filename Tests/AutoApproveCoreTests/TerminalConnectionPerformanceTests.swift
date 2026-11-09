@@ -234,6 +234,7 @@ extension ApprovalTests {
         try expectEqual(probe.count,before+2,"Eight first readers plus another source must make exactly two source reads")
         let live = try await engine.remoteTerminal(sessionID:firstSession.id,realtime:true)
         try expectEqual(live.screen,"Live cursor"); try expect(live.cursor != nil)
+        try await Task.sleep(for:.milliseconds(200))
         _ = try await engine.remoteTerminal(sessionID:firstSession.id,initial:true)
         try expectEqual(probe.count,before+3,"The next first request must perform a fresh read")
         let actual = RemoteTerminalPerformance.shared.snapshot().counters
@@ -292,5 +293,57 @@ extension ApprovalTests {
         let recovered = try await RemoteTerminalReadRecovery.read { try await engine.remoteTerminal(sessionID:session.id,initial:true) }
         try expectEqual(recovered.screen,"After synthetic input"); try expectEqual(writer.count,1)
         try expect(!screen.timedOut)
+    }
+
+    func testInitialReconnectReusesOnlyFreshLiveOriginalWithFreshPermission() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-initial-live-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let records=ProcessDiscovery.parse("88 1 ttys080 88 88 Tue Sep 22 15:00:00 2026 /usr/local/bin/codex")
+        var session=ProcessDiscovery.sessions(records)[0];session.terminal = .terminal
+        let reads=ConnectionReadGate(),identity=ConnectionReadGate(),permission=ConnectionReadGate()
+        let adapter=ScreenHostAdapter(screens:{targets in
+            _ = reads.read("initial")
+            return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:"Fresh initial")})
+        },approve:{_,_,_ in .missingTarget},reveal:{_ in nil},presentationScreens:{targets in
+            _ = reads.read("live")
+            return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:"Fresh live",cursor:TerminalCursor(offset:3))})
+        })
+        let capture=TerminalWindowCapture(permissions:{TerminalWindowPermissions(screen:false,keyboard:false,automation:true)},
+            automationQuery:{permission.read()},
+            requestPermissions:{},metadata:{_ in throw AppError.message("Text connection cannot inspect windows")},
+            capture:{_ in throw AppError.message("Text connection cannot capture pixels")})
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),processReader:{identity.read() ? records:[]},
+            screenAdapters:[.terminal:adapter],terminalWindowCapture:capture,terminalInputAvailable:{false},terminalInputIdentity:{_ in nil})
+        defer {identity.configure(blocked:false);engine.stop()}
+        engine.updateDiscovery([session],records:records);await engine.connectTerminal()
+        try await Task.sleep(for:.milliseconds(2100))
+        let before=reads.count("initial"),hits=RemoteTerminalPerformance.shared.snapshot().counters["initialLiveCacheHits",default:0]
+        let live=try await engine.remoteTerminal(sessionID:session.id,realtime:true)
+        let permissions=permission.count,identities=identity.count
+        let initial=try await engine.remoteTerminal(sessionID:session.id,realtime:true,initial:true)
+        try expectEqual(initial.screen,live.screen);try expectEqual(initial.cursor,live.cursor)
+        try expectEqual(initial.observedAt,live.observedAt,"Reusing a frame must not make its timestamp newer")
+        try expectEqual(initial.streamID,live.streamID);try expectEqual(reads.count("initial"),before)
+        try expectEqual(reads.count("live"),1);try expectEqual(permission.count,permissions+1)
+        try expectEqual(identity.count,identities+1)
+        try expectEqual(RemoteTerminalPerformance.shared.snapshot().counters["initialLiveCacheHits",default:0],hits+1)
+        permission.configure(blocked:false,allowed:false)
+        let denied=try await engine.remoteTerminal(sessionID:session.id,initial:true)
+        try expect(denied.screen.isEmpty && denied.keys.isEmpty,"Revoked permission must never expose the cached source")
+        permission.configure(blocked:false)
+        try await Task.sleep(for:.milliseconds(200))
+        let expired=try await engine.remoteTerminal(sessionID:session.id,initial:true)
+        try expectEqual(expired.screen,"Fresh initial");try expectEqual(reads.count("initial"),before+1)
+        _ = try await engine.remoteTerminal(sessionID:session.id,realtime:true)
+        identity.configure(blocked:false,allowed:false)
+        do {_ = try await engine.remoteTerminal(sessionID:session.id,initial:true);throw AppError.message("Replaced original reused a frame")}
+        catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+        identity.configure(blocked:true)
+        let count=identity.count
+        let pending=Task {try await engine.remoteTerminal(sessionID:session.id,initial:true)}
+        try await awaitConnectionCondition {identity.count>count}
+        engine.disconnectScreenHost(.terminal);identity.configure(blocked:false)
+        do {_ = try await pending.value;throw AppError.message("Disconnected source reused a pending cached frame")}
+        catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
     }
 }
