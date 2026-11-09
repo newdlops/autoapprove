@@ -1,187 +1,19 @@
 import Foundation
-import Security
-import ServiceManagement
-import TerminalInputSupport
 
-/// Explicit Mac setup. Remote reads and input never register or install a service.
+/// Kept for the CLI setup command. It never registers or installs a service.
 public enum TerminalInputInstaller {
-    public static let plistName = TTYInputConfiguration.service + ".plist"
-    public static let bundleProgram = "Contents/MacOS/" + TTYInputConfiguration.helperName
-    public static let nativeBundleProgram = "Contents/Library/LaunchServices/" + TTYInputConfiguration.service
-
-    public enum RegistrationState: Equatable, Sendable {
-        case notRegistered, enabled, requiresApproval, missingBundle
-    }
     public enum Result: Equatable, Sendable {
-        case alreadyConnected, registered, requiresApproval
-        public var message: String {
-            switch self {
-            case .alreadyConnected: return "기존 직접 입력 연결을 확인했습니다. 같은 원본 터미널을 계속 사용합니다."
-            case .registered: return "직접 입력 서비스를 설치하고 원본 터미널 연결을 확인했습니다. 실행 중인 CLI를 그대로 사용합니다."
-            case .requiresApproval: return "시스템 설정 → 일반 → 로그인 항목 및 확장 프로그램에서 AutoApprove의 백그라운드 실행을 허용해주세요."
-            }
-        }
+        case alreadyConnected
+        public var message: String { TerminalInputStatus.available.message }
     }
-
-    public struct Environment: Sendable {
-        var validate: @Sendable (URL, String) throws -> Void
-        var connected: @Sendable () -> Bool
-        var legacyInstalled: @Sendable () -> Bool
-        var state: @Sendable () -> RegistrationState
-        var registrationPolicy: @Sendable (URL, String) throws -> Void
-        var register: @Sendable () throws -> Void
-        var refresh: @Sendable () -> Void
-        static var live: Self {
-            .init(validate: { try validatePackage($0, $1) }, connected: { TerminalInputClient.shared.refreshNow().available },
-                legacyInstalled: { FileManager.default.fileExists(atPath: TTYInputConfiguration.helperPath)
-                    || FileManager.default.fileExists(atPath: TTYInputConfiguration.plistPath) },
-                state: { registrationState }, registrationPolicy: { try validateRegistrationPolicy($0, $1) },
-                register: { try TerminalInputAuthorization.install() },
-                refresh: { TerminalInputClient.shared.resetConnection(); TerminalInputClient.shared.refreshIfNeeded(force: true) })
-        }
-    }
-
-    public static var registrationState: RegistrationState {
-        guard Bundle.main.bundleIdentifier == TTYInputConfiguration.appIdentifier,
-              FileManager.default.fileExists(atPath: Bundle.main.bundleURL
-                .appendingPathComponent("Contents/Library/LaunchDaemons/" + plistName).path) else { return .missingBundle }
-        if FileManager.default.fileExists(atPath: TTYInputConfiguration.plistPath),
-           SMAppService.statusForLegacyPlist(at: URL(fileURLWithPath: TTYInputConfiguration.plistPath)) == .requiresApproval {
-            return .requiresApproval
-        }
-        return serviceRegistrationState(SMAppService.daemon(plistName: plistName).status)
-    }
-
-    static func serviceRegistrationState(_ status: SMAppService.Status) -> RegistrationState {
-        switch status {
-        case .notRegistered: return .notRegistered
-        case .enabled: return .enabled
-        case .requiresApproval: return .requiresApproval
-        // A valid signed app may have no ServiceManagement record before its
-        // first native installation. Bundle presence is checked separately above;
-        // the package and native helper signatures are validated before approval.
-        case .notFound: return .notRegistered
-        @unknown default: return .missingBundle
-        }
-    }
-
-    public static func prepare(app: URL, ownIdentifier: String = TTYInputConfiguration.appIdentifier) throws -> String {
-        try validatePackage(app, ownIdentifier)
-        try validateNativeMetadata(app, ownIdentifier)
-        let plan: [String: Any] = ["registration": "SMJobBless", "application": app.path,
-            "service": TTYInputConfiguration.service, "program": nativeBundleProgram,
-            "approval": "macOS administrator authorization", "administratorShell": false,
-            "developerIDRequired": false]
+    public static func prepare(app: URL, ownIdentifier: String = "local.autoapprove.mac") throws -> String {
+        let plan: [String: Any] = ["registration": "Accessibility", "application": app.path,
+            "administratorShell": false, "privilegedService": false, "requiresAccessibility": true]
         return String(decoding: try JSONSerialization.data(withJSONObject: plan, options: [.prettyPrinted, .sortedKeys]), as: UTF8.self)
     }
-
     @discardableResult public static func install(app: URL = Bundle.main.bundleURL,
-        ownIdentifier: String = TTYInputConfiguration.appIdentifier) throws -> Result {
-        try install(app: app, ownIdentifier: ownIdentifier, environment: .live)
-    }
-
-    static func install(app: URL, ownIdentifier: String, environment: Environment) throws -> Result {
-        try environment.validate(app, ownIdentifier)
-        // Reuse a healthy signed service, including the existing legacy service.
-        // Never stop it, replace its files, or request administrator privileges here.
-        if environment.connected() { return .alreadyConnected }
-        switch environment.state() {
-        case .requiresApproval: return .requiresApproval
-        case .enabled: break
-        case .notRegistered, .missingBundle: break
-        }
-        guard environment.state() != .missingBundle else {
-            throw AppError.message("새 직접 입력 연결은 패키징된 AutoApprove 앱의 연결 설정에서 등록해주세요.")
-        }
-        try environment.registrationPolicy(app, ownIdentifier)
-        try environment.register()
-        environment.refresh()
-        if environment.state() == .requiresApproval { return .requiresApproval }
-        guard environment.connected() else {
-            throw AppError.message("직접 입력 서비스를 설치했지만 연결을 확인하지 못했습니다. Mac의 백그라운드 실행 허용과 서비스 실행 상태를 확인해주세요. 실행 중인 원본 CLI는 유지됩니다.")
-        }
-        return .registered
-    }
-
-    static func installedPublisherMismatch() -> Bool {
-        let helper = URL(fileURLWithPath: TTYInputConfiguration.helperPath)
-        guard FileManager.default.fileExists(atPath: helper.path),
-              let requirement = try? TTYInputSigning.peerRequirements(
-                ownIdentifiers: [TTYInputConfiguration.appIdentifier, TTYInputConfiguration.cliIdentifier],
-                peerIdentifiers: [TTYInputConfiguration.helperIdentifier]) else { return false }
-        do { try checkSignature(helper, requirement: requirement, nested: false); return false }
-        catch { return true }
-    }
-
-    public static func openApprovalSettings() { SMAppService.openSystemSettingsLoginItems() }
-
-    static func validatePlist(_ data: Data) throws {
-        guard let values = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              Set(values.keys) == Set(["Label", "BundleProgram", "MachServices", "UserName", "RunAtLoad", "KeepAlive", "ThrottleInterval"]),
-              values["Label"] as? String == TTYInputConfiguration.service,
-              values["BundleProgram"] as? String == bundleProgram,
-              values["MachServices"] as? [String: Bool] == [TTYInputConfiguration.service: true],
-              values["UserName"] as? String == "root",
-              values["RunAtLoad"] as? Bool == true,
-              values["KeepAlive"] as? [String: Bool] == ["SuccessfulExit": false],
-              values["ThrottleInterval"] as? Int == 10 else {
-            throw AppError.message("앱에 포함된 직접 입력 서비스 등록 정보가 올바르지 않습니다.")
-        }
-    }
-
-    private static func validatePackage(_ app: URL, _ ownIdentifier: String) throws {
-        guard [TTYInputConfiguration.appIdentifier, TTYInputConfiguration.cliIdentifier].contains(ownIdentifier),
-              Bundle(url: app)?.bundleIdentifier == TTYInputConfiguration.appIdentifier else {
-            throw AppError.message("패키징된 AutoApprove 설치본에서 직접 입력 연결을 설정해주세요.")
-        }
-        let source = app.appendingPathComponent(bundleProgram)
-        guard FileManager.default.isExecutableFile(atPath: source.path) else {
-            throw AppError.message("앱의 직접 입력 보조 도구가 없습니다. 최신 설치본이 필요합니다.")
-        }
-        try validatePlist(Data(contentsOf: app.appendingPathComponent("Contents/Library/LaunchDaemons/" + plistName)))
-        let requirement = try TTYInputSigning.peerRequirement(ownIdentifier: ownIdentifier, peerIdentifier: TTYInputConfiguration.helperIdentifier)
-        try checkSignature(source, requirement: requirement, nested: false)
-    }
-
-    private static func validateRegistrationPolicy(_ app: URL, _ ownIdentifier: String) throws {
-        guard ownIdentifier == TTYInputConfiguration.appIdentifier,
-              Bundle.main.bundleURL.resolvingSymlinksInPath() == app.resolvingSymlinksInPath() else {
-            throw AppError.message("새 직접 입력 연결은 AutoApprove 앱의 연결 설정에서 등록해주세요.")
-        }
-        try validateNativeMetadata(app, ownIdentifier)
-    }
-
-    private static func validateNativeMetadata(_ app: URL, _ ownIdentifier: String) throws {
-        let helperRequirement = try TTYInputSigning.peerRequirement(ownIdentifier: ownIdentifier,
-            peerIdentifier: TTYInputConfiguration.helperIdentifier)
-        let appRequirement = try TTYInputSigning.peerRequirement(ownIdentifier: ownIdentifier,
-            peerIdentifier: TTYInputConfiguration.appIdentifier)
-        try checkSignature(app, requirement: appRequirement, nested: true)
-        let helper = app.appendingPathComponent(nativeBundleProgram)
-        guard FileManager.default.isExecutableFile(atPath: helper.path),
-              Bundle(url: app)?.object(forInfoDictionaryKey: "SMPrivilegedExecutables") as? [String: String]
-                == [TTYInputConfiguration.service: helperRequirement] else {
-            throw AppError.message("관리자 승인 설치 정보가 포함된 최신 AutoApprove 앱이 필요합니다. DMG에서 앱을 응용 프로그램으로 복사한 뒤 다시 설정해주세요.")
-        }
-        try checkSignature(helper, requirement: helperRequirement, nested: false)
-        var code: SecStaticCode?, information: CFDictionary?
-        guard SecStaticCodeCreateWithPath(helper as CFURL, [], &code) == errSecSuccess, let code,
-              SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
-              let values = information as? [String: Any], let info = values[kSecCodeInfoPList as String] as? [String: Any],
-              info["CFBundleIdentifier"] as? String == TTYInputConfiguration.helperIdentifier,
-              info["CFBundleVersion"] as? String == Bundle(url: app)?.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
-              info["SMAuthorizedClients"] as? [String] == [appRequirement] else {
-            throw AppError.message("직접 입력 보조 프로그램의 설치 권한과 버전이 앱과 일치하지 않습니다. 최신 설치본을 다시 복사해주세요.")
-        }
-    }
-
-    private static func checkSignature(_ url: URL, requirement text: String, nested: Bool) throws {
-        var code: SecStaticCode?, requirement: SecRequirement?
-        let flags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures | (nested ? kSecCSCheckNestedCode : 0))
-        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code,
-              SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement,
-              SecStaticCodeCheckValidity(code, flags, requirement) == errSecSuccess else {
-            throw AppError.message("직접 입력 서비스의 발행자 서명과 파일 무결성을 확인하지 못했습니다.")
-        }
+        ownIdentifier: String = "local.autoapprove.mac") throws -> Result {
+        guard TerminalInputClient.shared.isAvailable else { throw AppError.message(TerminalInputStatus.notInstalled.message) }
+        return .alreadyConnected
     }
 }

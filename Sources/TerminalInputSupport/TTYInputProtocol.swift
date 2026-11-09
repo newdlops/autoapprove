@@ -2,22 +2,6 @@ import Foundation
 import Darwin
 private import CTTYInput
 
-public enum TTYInputConfiguration {
-    public static let service = "local.autoapprove.tty-input"
-    public static let appIdentifier = "local.autoapprove.mac"
-    public static let cliIdentifier = "local.autoapprove.helper"
-    public static let helperIdentifier = "local.autoapprove.tty-input"
-    public static let helperName = "AutoApproveTTYService"
-    public static let helperPath = "/Library/PrivilegedHelperTools/local.autoapprove.tty-input"
-    public static let plistPath = "/Library/LaunchDaemons/local.autoapprove.tty-input.plist"
-    public static var uptime: Double { ap_tty_uptime() }
-}
-
-@objc public protocol TerminalInputServiceProtocol {
-    func status(withReply reply: @escaping (Int32) -> Void)
-    func deliver(_ packet: Data, withReply reply: @escaping (Data) -> Void)
-}
-
 public struct TTYInputIdentity: Codable, Equatable, Sendable {
     private static let processStartFormatterLock = NSLock()
     private static let processStartFormatter: DateFormatter = {
@@ -49,10 +33,6 @@ public struct TTYInputIdentity: Codable, Equatable, Sendable {
             device: value.device, startSeconds: value.start_seconds, startMicroseconds: value.start_microseconds,
             foregroundGroup: value.foreground_group)
     }
-    fileprivate var raw: APTTYIdentity {
-        APTTYIdentity(pid: pid, process_group: processGroup, foreground_group: foregroundGroup, uid: uid, euid: effectiveUID,
-            device: device, start_seconds: startSeconds, start_microseconds: startMicroseconds)
-    }
     public var processStart: String {
         Self.processStartFormatterLock.lock()
         defer { Self.processStartFormatterLock.unlock() }
@@ -68,41 +48,4 @@ public struct TTYInputIdentity: Codable, Equatable, Sendable {
         pid == other.pid && processGroup == other.processGroup && uid == other.uid && effectiveUID == other.effectiveUID
             && device == other.device && startSeconds == other.startSeconds && startMicroseconds == other.startMicroseconds
     }
-}
-
-public struct TTYInputRequest: Codable, Equatable, Sendable {
-    public var id: UUID
-    public var identity: TTYInputIdentity
-    public var tty: String
-    public var bytes: Data
-    public var deadline: Double
-    public init(identity: TTYInputIdentity, tty: String, bytes: Data, deadline: Double, id: UUID = UUID()) {
-        self.id = id; self.identity = identity; self.tty = tty; self.bytes = bytes; self.deadline = deadline
-    }
-    public func error(now: Double, caller: UInt32) -> Int32 {
-        guard caller != 0, identity.uid == caller, identity.effectiveUID == caller else { return EACCES }
-        guard deadline.isFinite, deadline <= now + 2.1, !bytes.isEmpty, bytes.count <= 8000,
-              identity.pid > 0, identity.processGroup > 0, identity.foregroundGroup == identity.processGroup,
-              identity.startSeconds > 0, identity.startMicroseconds < 1_000_000,
-              tty.hasPrefix("/dev/ttys"), (1...5).contains(tty.dropFirst(9).count),
-              tty.dropFirst(9).utf8.allSatisfy({ (48...57).contains($0) }) else { return EINVAL }
-        return deadline > now ? 0 : ETIMEDOUT
-    }
-    static func write(_ request: Self, caller: UInt32) -> TTYInputReply {
-        var identity = request.identity.raw, result = APTTYWriteResult()
-        let error = request.bytes.withUnsafeBytes { bytes in
-            request.tty.withCString { tty in
-                ap_tty_write(&identity, caller, tty, bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bytes.count,
-                    request.deadline, &result)
-            }
-        }
-        return TTYInputReply(error: error, written: result.written)
-    }
-}
-
-public struct TTYInputReply: Codable, Equatable, Sendable {
-    public var error: Int32
-    /// Submitted to the original TTY; application consumption is not acknowledged.
-    public var written: Int
-    public init(error: Int32, written: Int) { self.error = error; self.written = written }
 }

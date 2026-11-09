@@ -896,25 +896,27 @@ extension ApprovalTests {
     func testRemoteTerminalScriptValidationAndKeys() throws {
         let context = JSContext()!
         context.evaluateScript("""
-        var writes = []; var contents = 'screen'; var processes = ['codex'];
-        function Application() { return {running:()=>true, windows:()=>[
-          {tabs:()=>{throw Error('closed tab');}},
-          {tabs:()=>[{tty:()=>'/dev/ttys081', contents:()=>contents, processes:()=>processes}]}
-        ], doScript:(text)=>writes.push(text)}; }
+        var writes = [], contents = 'screen', processes = ['codex'];
+        var tab = {tty:()=>'/dev/ttys081', contents:()=>contents, processes:()=>processes};
+        var win = {id:()=>96,tabs:()=>[tab]};
+        Object.defineProperty(win,'selectedTab',{set:()=>{},get:()=>()=>tab});
+        function Application() { return {running:()=>true,windows:()=>[
+          {tabs:()=>{throw Error('closed tab');}},win
+        ],frontmost:()=>true,activate:()=>{},doScript:text=>writes.push(text)}; }
         """)
         let target = ScreenTarget(tty: "/dev/ttys081", jobPIDs: [81001])
         let script = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .text, text: "한글 ` $(anything)"))
-        try expectEqual(context.evaluateScript(script)?.toString(), "sent")
-        try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
+        try expectEqual(context.evaluateScript(script)?.toString(), "ready:96")
+        try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 0)
         context.evaluateScript("contents = 'changed';")
         try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged")
         context.evaluateScript("contents = 'screen'; processes = ['zsh'];")
         try expectEqual(context.evaluateScript(script)?.toString(), "agentMissing")
-        try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
+        try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 0)
         context.evaluateScript("processes = ['codex'];")
         let submit = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .submit, text: "한글"))
-        try expectEqual(context.evaluateScript(submit)?.toString(), "sent")
-        try expectEqual(context.evaluateScript("writes.pop()")?.toString(), "한글", "Terminal doScript supplies its own Return")
+        try expectEqual(context.evaluateScript(submit)?.toString(), "ready:96")
+        try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 0, "Text and submit only prepare the native route; JXA must never write or submit")
         try expectThrows(try RemoteTerminalInput(kind: .text, text: "bad\u{1b}").validate())
         try expectThrows(try RemoteTerminalInput(kind: .text, text: "bad\u{7f}").validate())
         try expectThrows(try RemoteTerminalInput(kind: .text, text: String(repeating: "한", count: 3000)).validate())

@@ -4,6 +4,13 @@ import AppKit
 import CoreGraphics
 
 public enum TerminalKeyboard {
+    public struct PasteboardLease: Sendable {
+        public var isCurrent: @Sendable () -> Bool
+        public var restore: @Sendable () -> Void
+        public init(isCurrent: @escaping @Sendable () -> Bool, restore: @escaping @Sendable () -> Void) {
+            self.isCurrent = isCurrent; self.restore = restore
+        }
+    }
     public static var isAvailable: Bool { AXIsProcessTrusted() }
     @MainActor @discardableResult public static func requestPermission() -> Bool {
         if isAvailable { return true }
@@ -23,6 +30,8 @@ public enum TerminalKeyboard {
         public var postPair: @Sendable (Int32, CGEvent, CGEvent) throws -> Void
         public var clock: @Sendable () -> TimeInterval
         public var cancelled: @Sendable () -> Bool
+        public var preparePasteboard: @Sendable (String) throws -> PasteboardLease
+        public var pasteReady: @Sendable (ScreenTarget, String, String) throws -> Bool
         public init(trusted: @escaping @Sendable () -> Bool, postingAllowed: @escaping @Sendable () -> Bool,
                     run: @escaping @Sendable (String) throws -> String,
                     metadata: @escaping @Sendable (String) throws -> TerminalWindowMetadata?,
@@ -30,10 +39,13 @@ public enum TerminalKeyboard {
                     processes: @escaping @Sendable () throws -> [ProcessRecord],
                     postPair: @escaping @Sendable (Int32, CGEvent, CGEvent) throws -> Void,
                     clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-                    cancelled: @escaping @Sendable () -> Bool = { Task<Never, Never>.isCancelled }) {
+                    cancelled: @escaping @Sendable () -> Bool = { Task<Never, Never>.isCancelled },
+                    preparePasteboard: @escaping @Sendable (String) throws -> PasteboardLease = { _ in throw RemoteHTTPError(409,"붙여넣기 연결이 없습니다.") },
+                    pasteReady: @escaping @Sendable (ScreenTarget,String,String) throws -> Bool = { _,_,_ in false }) {
             self.trusted = trusted; self.postingAllowed = postingAllowed; self.run = run; self.metadata = metadata
             self.ownerBundle = ownerBundle; self.focused = focused; self.processes = processes; self.postPair = postPair
             self.clock = clock; self.cancelled = cancelled
+            self.preparePasteboard = preparePasteboard; self.pasteReady = pasteReady
         }
         public static var live: Self {
             Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
@@ -42,14 +54,34 @@ public enum TerminalKeyboard {
                 ownerBundle: { TerminalProcessLookup.ownerBundle(pid:$0) }, focused: { TerminalKeyboard.isFocused($0) },
                 processes: { try ProcessDiscovery.read() }, postPair: { pid, down, up in
                     down.postToPid(pid); up.postToPid(pid)
+                }, preparePasteboard: { try TerminalKeyboard.preparePasteboard($0) }, pasteReady: { target, text, before in
+                    let latest = try TerminalAdapter.screens(ttys:[target.tty],includeCursor:false,includeTitles:false,purpose:.validation)
+                    guard let screen = latest.screens.first(where:{$0.tty == target.tty})?.contents,screen != before else { return false }
+                    func compact(_ value:String)->String {String(value.precomposedStringWithCanonicalMapping.filter{!$0.isWhitespace})}
+                    return compact(screen).contains(compact(text))
                 })
         }
     }
 
-    private static let deliveryLock = NSLock()
-    static func needsNative(_ input: RemoteTerminalInput) -> Bool {
-        ![.text, .submit, .enter].contains(input.kind) || input.kind == .enter && input.isRelay
+    private static func preparePasteboard(_ text: String) throws -> PasteboardLease {
+        let board = NSPasteboard.general
+        let saved = (board.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType:type).map{(type,$0)} } }
+        board.clearContents()
+        let prepared = board.setString(text,forType:.string)
+        let revision = board.changeCount
+        let lease = PasteboardLease(isCurrent:{NSPasteboard.general.changeCount == revision}, restore:{
+            let board = NSPasteboard.general
+            guard board.changeCount == revision else { return }
+            let items = saved.map { values -> NSPasteboardItem in
+                let item=NSPasteboardItem();for (type,data) in values {item.setData(data,forType:type)};return item
+            }
+            board.clearContents();if !items.isEmpty {board.writeObjects(items)}
+        })
+        guard prepared else { lease.restore(); throw RemoteHTTPError(409,"붙여넣기 텍스트를 준비하지 못했습니다.") }
+        return lease
     }
+
+    private static let deliveryLock = NSLock()
     private static func isFocused(_ metadata: TerminalWindowMetadata) -> Bool {
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
               let first = windows.first(where: {
@@ -97,13 +129,16 @@ public enum TerminalKeyboard {
     public static func deliver(target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput,
                                environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false) throws -> TerminalDelivery {
         try input.validate()
-        guard agent != .shell, needsNative(input), timeout.isFinite, timeout > 0 else { throw RemoteHTTPError(400, "이 직접 입력 방식은 지원하지 않습니다.") }
+        guard agent != .shell, timeout.isFinite, timeout > 0 else { throw RemoteHTTPError(400, "이 직접 입력 방식은 지원하지 않습니다.") }
         let deadline = environment.clock() + min(timeout, 8)
         guard deliveryLock.lock(before: Date().addingTimeInterval(min(timeout, 8))) else {
             throw RemoteHTTPError(409, "다른 Terminal 입력이 끝나지 않아 입력하지 않았습니다. 화면을 확인해주세요.")
         }
         defer { deliveryLock.unlock() }
         var attemptedPairs = 0
+        var pasteboard: PasteboardLease?
+        var pasteVerified = false
+        defer { if attemptedPairs == 0 || pasteVerified { pasteboard?.restore() } }
         func checkPermissionAndTime() throws {
             if environment.cancelled() { throw CancellationError() }
             guard environment.clock() < deadline else { throw RemoteHTTPError(409, "입력 준비 시간이 지나 입력하지 않았습니다. 원래 터미널을 확인해주세요.") }
@@ -126,19 +161,30 @@ public enum TerminalKeyboard {
                   ProcessDiscovery.ancestors(of: original.pid, records: preparedRecords).contains(where: { $0.pid == owner.pid && $0.started == owner.started }) else { return .agentMissing }
             let keyCodes: [RemoteTerminalInput.Kind: CGKeyCode] = [.enter: 36, .escape: 53, .interrupt: 8, .up: 126, .down: 125,
                 .left: 123, .right: 124, .backspace: 51, .delete: 117, .home: 115, .end: 119, .tab: 48]
-            let packets: [[UniChar]]
-            if input.kind == .characters { packets = chunks(input.text) }
-            else { guard keyCodes[input.kind] != nil else { throw RemoteHTTPError(400, "이 직접 키는 지원하지 않습니다.") }; packets = [[]] }
+            var packets: [(key:CGKeyCode,flags:CGEventFlags,text:[UniChar],paste:Bool)] = []
+            if input.kind == .characters {
+                packets = chunks(input.text).map{(0,[], $0,false)}
+            } else if [.text,.submit,.message].contains(input.kind) {
+                pasteboard = try environment.preparePasteboard(input.text)
+                packets = [(9,.maskCommand,[],true)]
+                if input.kind != .text { packets.append((36,[],[],false)) }
+            } else if input.kind == .choice {
+                if input.text.hasPrefix("digit:") { packets = chunks(String(input.text.dropFirst(6))).map{(0,[],$0,false)} }
+                else { let delta=Int(input.text) ?? 0;packets=Array(repeating:(delta < 0 ? 126:125,[],[],false),count:abs(delta));packets.append((36,[],[],false)) }
+            } else {
+                guard let key=keyCodes[input.kind] else { throw RemoteHTTPError(400,"이 직접 키는 지원하지 않습니다.") }
+                packets=[(key,input.kind == .interrupt ? .maskControl:[],[],false)]
+            }
             guard let eventSource = CGEventSource(stateID: .privateState) else { throw RemoteHTTPError(409, "입력 이벤트를 준비하지 못했습니다.") }
             for packet in packets {
-                guard let down = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCodes[input.kind] ?? 0, keyDown: true),
-                      let up = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCodes[input.kind] ?? 0, keyDown: false) else {
+                guard let down = CGEvent(keyboardEventSource: eventSource, virtualKey: packet.key, keyDown: true),
+                      let up = CGEvent(keyboardEventSource: eventSource, virtualKey: packet.key, keyDown: false) else {
                     throw RemoteHTTPError(409, "입력 이벤트를 준비하지 못했습니다.")
                 }
-                down.flags = input.kind == .interrupt ? .maskControl : []
+                down.flags = packet.flags
                 up.flags = []
-                if !packet.isEmpty {
-                    packet.withUnsafeBufferPointer { units in
+                if !packet.text.isEmpty {
+                    packet.text.withUnsafeBufferPointer { units in
                         down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units.baseAddress)
                         up.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units.baseAddress)
                     }
@@ -155,10 +201,21 @@ public enum TerminalKeyboard {
                     throw RemoteHTTPError(409, "원래 CLI나 선택한 Terminal 창이 바뀌어 입력하지 않았습니다. 원래 터미널을 확인해주세요.")
                 }
                 try checkPermissionAndTime()
+                if packet.paste, pasteboard?.isCurrent() != true { throw RemoteHTTPError(409,"클립보드가 바뀌어 입력하지 않았습니다.") }
                 // Once submission begins, even a throwing callback is an uncertain
                 // outcome. Both events already exist and the pair is never retried.
                 attemptedPairs += 1
                 try environment.postPair(owner.pid, down, up)
+                if packet.paste {
+                    let until = min(deadline,environment.clock()+2), wall = Date().addingTimeInterval(2)
+                    while environment.clock() < until, Date() < wall {
+                        try checkPermissionAndTime()
+                        guard pasteboard?.isCurrent() == true, let current=try environment.metadata(target.tty),sameWindow(window,current),environment.focused(current) else { break }
+                        if try environment.pasteReady(target,input.text,expected) {pasteVerified=true;break}
+                        Thread.sleep(forTimeInterval:0.02)
+                    }
+                    guard pasteVerified else {throw RemoteHTTPError(409,"붙여넣기 결과를 확인하지 못해 Enter를 보내지 않았습니다. 원본 터미널과 클립보드를 확인해주세요.")}
+                }
             }
             return .sent
         } catch {
@@ -242,7 +299,7 @@ public enum RemoteTerminalAdapter {
             let latest = try TerminalAdapter.screens(ttys: [target.tty], includeCursor: false, includeTitles: false, purpose: .validation)
             guard latest.screens.first(where: { $0.tty == target.tty })?.contents == expected else { return .screenChanged }
         }
-        if host == .terminal, input.isRelay || ![.text, .submit, .enter].contains(input.kind) {
+        if host == .terminal {
             return try TerminalDeviceInput.deliver(target: target, agent: agent, input: input, screen: expected)
         }
         if host == .orca {
@@ -260,7 +317,6 @@ public enum RemoteTerminalAdapter {
     public static func script(host: ScreenHost, target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput, goalWorkingComparison: Bool = false) throws -> String {
         guard agent != .shell, host != .orca else { throw RemoteHTTPError(400, "이 터미널의 입력 방식은 지원하지 않습니다.") }
         try input.validate()
-        let terminalKeyboard = host == .terminal && TerminalKeyboard.needsNative(input)
         let data = try AutomationScript.literal(["tty": target.tty, "expected": expected, "agent": agent.rawValue,
             "text": host == .terminal && [.text, .submit].contains(input.kind) ? input.text : input.kind == .enter && host == .terminal ? "" : input.bytes,
             "jobPIDs": target.jobPIDs.map(Int.init), "relay": input.isRelay] as JSONObject)
@@ -287,14 +343,14 @@ public enum RemoteTerminalAdapter {
             """#
         }
         if host == .terminal {
-            let delivery = terminalKeyboard ? """
+            let delivery = """
               window.miniaturized = false; window.selectedTab = tab; window.index = 1; app.activate();
               if (!app.frontmost() || window.selectedTab().tty() !== target.tty) return 'missingTarget';
               if (!target.relay && normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
               const windowID = Number(window.id());
               if (!Number.isSafeInteger(windowID) || windowID <= 0 || windowID > 4294967295) return 'missingTarget';
               return 'ready:' + windowID;
-            """ : "app.doScript(String(target.text).normalize('NFC'), {in:tab});"
+            """
             return """
             (() => {
             const app = Application('com.apple.Terminal'); const target = \(data);

@@ -1,7 +1,6 @@
-import { mkdir, copyFile, writeFile, readFile, chmod, access, unlink, cp } from 'node:fs/promises';
+import { mkdir, copyFile, writeFile, readFile, chmod, access, unlink, cp, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import {prepareTerminalInputBundle} from './terminal-input-bundle.mjs';
 import {stripReleaseSymbols} from './release-symbols.mjs';
 
 const configuration = process.argv[2] ?? 'debug';
@@ -18,7 +17,7 @@ await mkdir(macOS, { recursive: true });
 await mkdir(resources, { recursive: true });
 // Retire the original GUI name, which collided with the helper on case-insensitive APFS.
 try { await unlink(path.join(macOS, 'AutoApprove')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-for (const binary of ['AutoApproveApp', 'autoapprove', 'AutoApproveTTYService']) {
+for (const binary of ['AutoApproveApp', 'autoapprove']) {
   const source = path.join(build,binary);
   await access(source);
   await copyFile(source, path.join(macOS, binary));
@@ -32,9 +31,12 @@ if (configuration === 'release') {
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
 await copyFile('dist/AppIcon.icns', path.join(resources, 'AppIcon.icns'));
 await cp(path.join(build,'AutoApprove_AutoApproveCore.bundle'), path.join(resources, 'AutoApprove_AutoApproveCore.bundle'), { recursive: true });
-const launchDaemons = path.join(app, 'Contents/Library/LaunchDaemons');
-await mkdir(launchDaemons, { recursive: true });
-await copyFile('scripts/resources/local.autoapprove.tty-input.plist', path.join(launchDaemons, 'local.autoapprove.tty-input.plist'));
+// Remove retired payloads when reusing a bundle from an older build.
+for (const relative of ['Contents/MacOS/AutoApproveTTYService',
+  'Contents/Library/LaunchDaemons/local.autoapprove.tty-input.plist',
+  'Contents/Library/LaunchServices/local.autoapprove.tty-input']) {
+  await rm(path.join(app,relative), {force:true});
+}
 await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -56,5 +58,5 @@ await writeFile(path.join(app, 'Contents/Info.plist'), `<?xml version="1.0" enco
   <key>NSBonjourServices</key><array><string>_autoapprove._tcp</string></array>
 </dict></plist>
 `);
-await (await import('./sign-app.mjs')).signApp(app,{prepare:()=>prepareTerminalInputBundle(app,configuration,webVersion,build)});
+await (await import('./sign-app.mjs')).signApp(app);
 console.log(app);

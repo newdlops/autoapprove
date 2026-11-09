@@ -221,25 +221,10 @@ import AutoApproveCore
     }
     private func requestTerminalInput() {
         terminalInputError = nil
-        if terminalInputStatus == .requiresApproval {
-            TerminalInputInstaller.openApprovalSettings()
-            return
-        }
-        if terminalInputStatus.available {
-            TerminalInputClient.shared.refreshIfNeeded(force: true); refreshTerminalPermissions(); return
-        }
-        terminalInputBusy = true
-        Task {
-            do {
-                let result = try await Task.detached { try TerminalInputInstaller.install() }.value
-                notice = result.message
-                if result == .requiresApproval {
-                    terminalInputStatus = .requiresApproval
-                    TerminalInputInstaller.openApprovalSettings()
-                }
-            } catch { terminalInputError = error.localizedDescription }
-            terminalInputBusy = false; refreshTerminalPermissions()
-        }
+        _ = TerminalKeyboard.requestPermission()
+        TerminalInputClient.shared.refreshIfNeeded(force: true)
+        refreshTerminalPermissions()
+        if !terminalInputStatus.available { openPrivacySettings("Privacy_Accessibility") }
     }
     @ViewBuilder private func section<Content: View>(_ title: String, icon: String, status: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {

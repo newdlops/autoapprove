@@ -6232,7 +6232,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let permissions:[JSONObject]=[
             ["id":"accessibility","label":"손쉬운 사용","state":keyboard ? "ok":"attention","detail":keyboard ? "이 앱의 권한이 허용되어 있습니다.":"원래 창을 검증하는 키보드 입력에는 이 Mac의 승인이 필요합니다."],
             ["id":"event_posting","label":"키 입력 권한","state":posting ? "ok":"attention","detail":posting ? "키 이벤트 게시가 허용되어 있습니다.":"이 앱의 키 이벤트 게시 허용을 확인해주세요."],
-            ["id":"direct_input","label":"직접 입력 도우미","state":direct ? "ok":"unavailable","detail":direct ? "기존 입력 도우미와 연결되어 있습니다.":"현재 도우미 연결을 확인하지 못했습니다. Goal 중단은 허용된 손쉬운 사용 경로도 사용합니다."]]
+            ["id":"direct_input","label":"Terminal 직접 입력","state":direct ? "ok":"unavailable","detail":direct ? "손쉬운 사용 권한으로 원본 터미널에 입력합니다.":"Mac의 손쉬운 사용에서 AutoApprove를 허용해주세요. 별도 입력 서비스를 설치하지 않습니다."]]
         return RemoteDiagnostics.report(nodeID:nodeID ?? store.value("webNodeID") ?? "local",name:name ?? Host.current().localizedName ?? "Mac",sessions:sessionCopy,records:rows,targets:targets,servers:statuses,attachments:journal,transitions:transitions,events:eventCopy,permissions:permissions,errors:failures)
     }
     public func diagnosticCodexAction(_ object:JSONObject,nodeID:String,name:String) async throws -> JSONObject {

@@ -1,5 +1,7 @@
 // Private direct-key delivery checks. No real windows, TCC requests or event posts.
 import Foundation
+import TerminalInputSupport
+import Darwin
 import JavaScriptCore
 #if !TERMINAL_KEYBOARD_ISOLATED
 import AutoApproveCore
@@ -45,10 +47,18 @@ private final class NativeProbe: @unchecked Sendable {
     var trusted = true, posting = true, focused = true, cancelled = false, ownerBundle = "com.apple.Terminal", now: TimeInterval = 0
     var focusedRole = kAXTextAreaRole
     var metadataReads = 0, prepares = 0, faultAt = 0, fault: Fault?, throwPairAt = 0
+    var identity: TTYInputIdentity = {
+        let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
+        return TTYInputIdentity(pid:81001,processGroup:81001,uid:getuid(),effectiveUID:geteuid(),device:42,
+            startSeconds:UInt64(formatter.date(from:"Mon Oct 5 09:00:01 2026")!.timeIntervalSince1970),startMicroseconds:71)
+    }()
+    var replaceIdentityAfterPair = false
     var pairs = [Pair]()
+    var clipboardCurrent = true, pasteConfirmed = true, restores = 0
+    var clipboardText = ""
     func read<T>(_ body: (NativeProbe) -> T) -> T { lock.lock(); defer { lock.unlock() }; return body(self) }
     func mutate(_ body: (NativeProbe) -> Void) { lock.lock(); defer { lock.unlock() }; body(self) }
-    var target: ScreenTarget { read { ScreenTarget(tty: "/dev/ttys081", jobPIDs: [81001], sourcePID: 81001, sourceStarted: $0.records[1].started) } }
+    var target: ScreenTarget { read { ScreenTarget(tty: "/dev/ttys081", jobPIDs: [81001], sourcePID: 81001, sourceStarted: $0.records[1].started, sourceIdentity:$0.identity) } }
     func metadata(_ tty: String) -> TerminalWindowMetadata? {
         lock.lock(); defer { lock.unlock() }
         metadataReads += 1
@@ -87,7 +97,7 @@ private final class NativeProbe: @unchecked Sendable {
             downFlags: down.flags.rawValue, upFlags: up.flags.rawValue, text: String(decoding: units, as: UTF16.self), units: units,
             releaseText: String(decoding: released, as: UTF16.self))
         let fail = read { $0.pairs.count + 1 == $0.throwPairAt }
-        mutate { $0.pairs.append(pair) }
+        mutate { $0.pairs.append(pair); if $0.replaceIdentityAfterPair { $0.identity.startMicroseconds += 1 } }
         if fail { throw AppError.message("Private paired submission outcome unavailable") }
     }
     var environment: TerminalKeyboard.Environment {
@@ -101,7 +111,11 @@ private final class NativeProbe: @unchecked Sendable {
                 "Native delivery must not depend on child AX/System Events or make JXA input writes")
             return value
         }, metadata: { self.metadata($0) }, ownerBundle: { _ in self.read { $0.ownerBundle } }, focused: { _ in self.read { $0.focused && $0.focusedRole == kAXTextAreaRole } },
-           processes: { self.read { $0.records } }, postPair: { try self.submit($0, $1, $2) }, clock: { self.read { $0.now } }, cancelled: { self.read { $0.cancelled } })
+           processes: { self.read { $0.records } }, postPair: { try self.submit($0, $1, $2) }, clock: { self.read { $0.now } }, cancelled: { self.read { $0.cancelled } },
+           preparePasteboard: { text in
+               self.mutate { $0.clipboardText = text }
+               return .init(isCurrent: { self.read { $0.clipboardCurrent } }, restore: { self.mutate { $0.restores += 1 } })
+           }, pasteReady: { _, text, _ in self.read { $0.pasteConfirmed && $0.clipboardText == text } })
     }
 }
 #endif
@@ -151,6 +165,49 @@ private final class NativeProbe: @unchecked Sendable {
             input: .init(kind: .left, relay: true), environment: claude.environment) == .sent, "The original Claude foreground job must use the same exact native route")
         checks.append("all special keys and both CLI kinds use one explicit owner-bound pair, with Control only on interrupt keydown")
 
+        for kind in [RemoteTerminalInput.Kind.text, .submit, .message] {
+            let paste = NativeProbe()
+            try require(try TerminalDeviceInput.deliver(target: paste.target, agent: .codex,
+                input: .init(kind: kind, text: "한글\nsecond line"), screen: "screen", environment: paste.environment, captureIdentity:{_ in paste.read{$0.identity}}) == .sent,
+                "Text and message input must use the Accessibility adapter")
+            let pairs = paste.read { $0.pairs }
+            try require(pairs.map(\.key) == (kind == .text ? [9] : [9,36]) && pairs[0].downFlags == CGEventFlags.maskCommand.rawValue,
+                "Multiline paste must precede submit and use only Cmd-V then Enter")
+            try require(paste.read { $0.clipboardText == "한글\nsecond line" && $0.restores == 1 }, "Confirmed paste must restore the leased clipboard")
+        }
+        let replacedClipboard = NativeProbe(); replacedClipboard.mutate { $0.clipboardCurrent = false }
+        do { _ = try TerminalDeviceInput.deliver(target: replacedClipboard.target, agent: .codex, input: .init(kind: .submit, text: "private"),
+            screen: "screen", environment: replacedClipboard.environment, captureIdentity:{_ in replacedClipboard.read{$0.identity}}); throw AppError.message("Changed clipboard must reject paste") }
+        catch let error as RemoteHTTPError { try require(error.status == 409, "Changed clipboard must fail") }
+        try require(replacedClipboard.read { $0.pairs.isEmpty }, "Changed clipboard must make no posts")
+        let unconfirmed = NativeProbe(); unconfirmed.mutate { $0.pasteConfirmed = false }
+        do { _ = try TerminalDeviceInput.deliver(target: unconfirmed.target, agent: .codex, input: .init(kind: .submit, text: "private"),
+            screen: "screen", environment: unconfirmed.environment, captureIdentity:{_ in unconfirmed.read{$0.identity}}); throw AppError.message("Unconfirmed paste must not submit") }
+        catch let error as RemoteHTTPError { try require(error.message.contains("다시 보내지"), "Unconfirmed paste must report uncertain input") }
+        try require(unconfirmed.read { $0.pairs.map(\.key) == [9] && $0.restores == 0 }, "Never press Enter or restore a different clipboard after unconfirmed paste")
+        for (choice, keys) in [("-2", [126,126,36]), ("2", [125,125,36]), ("0", [36]), ("digit:3", [0])] {
+            let menu = NativeProbe()
+            try require(try TerminalDeviceInput.deliver(target: menu.target, agent: .codex, input: .init(kind: .choice, text: choice),
+                screen: "screen", environment: menu.environment, captureIdentity:{_ in menu.read{$0.identity}}) == .sent, "Menu input must use native keys")
+            try require(menu.read { $0.pairs.map(\.key) } == keys.map(Int64.init), "Menu input must preserve relative direction and confirmation")
+        }
+        for change in [
+            { (value:inout TTYInputIdentity) in value.startMicroseconds += 1 },
+            { value in value.device += 1 }, { value in value.uid += 1 }, { value in value.effectiveUID += 1 },
+            { value in value.foregroundGroup += 1 }
+        ] {
+            let stale = NativeProbe(); let target = stale.target; stale.mutate { change(&$0.identity) }
+            try require(try TerminalDeviceInput.deliver(target:target,agent:.codex,input:unicodeInput,screen:"screen",environment:stale.environment,
+                captureIdentity:{_ in stale.read{$0.identity}}) == .agentMissing,"Changed precise lifetime/device/UID/foreground must reject input")
+            try require(stale.read{$0.pairs.isEmpty && $0.prepares == 0},"Stale identity must reject before revealing the window")
+        }
+        let replaced = NativeProbe(); replaced.mutate{$0.replaceIdentityAfterPair=true}
+        do { _ = try TerminalDeviceInput.deliver(target:replaced.target,agent:.codex,input:unicodeInput,screen:"screen",environment:replaced.environment,
+            captureIdentity:{_ in replaced.read{$0.identity}});throw AppError.message("Replaced precise lifetime must stop remaining pairs") }
+        catch let error as RemoteHTTPError {try require(error.message.contains("다시 보내지"),"Partial adapter input must remain uncertain")}
+        try require(replaced.read{$0.pairs.count == 1},"Every pair must recheck the original precise process lifetime")
+        checks.append("Accessibility adapter pastes multiline messages, confirms before Enter, owns clipboard and handles menu keys without a service")
+
         for postingOnly in [false, true] {
             let blocked = NativeProbe(); blocked.mutate { if postingOnly { $0.posting = false } else { $0.trusted = false } }
             do { _ = try TerminalKeyboard.deliver(target: blocked.target, expected: "screen", agent: .codex, input: unicodeInput, environment: blocked.environment)
@@ -196,14 +253,15 @@ private final class NativeProbe: @unchecked Sendable {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoapprove-native-receipt-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let receiptProbe = NativeProbe(), receiptRecords = receiptProbe.read { $0.records }
+        let receiptIdentity = receiptProbe.read{$0.identity}
         let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "screen") }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, expected, agent, input in
-                try TerminalKeyboard.deliver(target: target, expected: expected, agent: agent, input: input, environment: receiptProbe.environment)
+                try TerminalDeviceInput.deliver(target: target, agent: agent, input: input, screen: expected, environment: receiptProbe.environment, captureIdentity:{_ in receiptProbe.read{$0.identity}})
             })
         let capture = TerminalWindowCapture(permissions: { TerminalWindowPermissions(screen: false, keyboard: true, automation: true) },
             requestPermissions: {}, metadata: { _ in throw AppError.message("Ordinary native input must not inspect a screen capture") },
             capture: { _ in throw AppError.message("Ordinary native input must not capture pixels") })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { receiptRecords }, screenAdapters: [.terminal: adapter], terminalWindowCapture: capture)
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { receiptRecords }, screenAdapters: [.terminal: adapter], terminalWindowCapture: capture, terminalInputAvailable: { true }, terminalInputIdentity: { _ in receiptIdentity })
         defer { engine.stop() }
         let session = ProcessDiscovery.sessions(receiptRecords)[0]
         engine.updateDiscovery([session], records: receiptRecords); await engine.connectTerminal()
@@ -214,7 +272,7 @@ private final class NativeProbe: @unchecked Sendable {
         let request = try RemoteHTTPRequest.parse(Data("POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\n\r\n".utf8) + data)!
         let first = await network.handle(request), repeatRequest = await network.handle(request)
         try require(first.status == 200 && repeatRequest.status == 200 && receiptProbe.read({ $0.pairs.count }) == 1,
-            "The real original HTTP route must carry exact PID/start/TTY into native delivery and receipt duplicates must not replay it")
+            "The real original HTTP route must carry exact PID/start/TTY into native delivery and receipt duplicates must not replay it: first=\(first.status) \(String(decoding:first.body,as:UTF8.self)), repeat=\(repeatRequest.status), pairs=\(receiptProbe.read{$0.pairs.count})")
         try require(engine.managedPTY.inventory.isEmpty && engine.snapshot.sessions[0].pid == session.pid && engine.snapshot.sessions[0].tty == session.tty,
             "Native original input must keep the same CLI/TTY and create no PTY")
         checks.append("original HTTP receipts deliver the exact source once with no window capture or CLI/PTY creation")

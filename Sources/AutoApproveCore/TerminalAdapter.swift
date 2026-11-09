@@ -222,7 +222,7 @@ public enum TerminalAdapter {
         return screen.contents
     }
     public static func resume(target: ScreenTarget, region: String, text: String) throws -> ResumeDelivery {
-        guard TerminalInputClient.shared.isAvailable else { return try resume(tty: target.tty, region: region, text: text) }
+        guard TerminalInputClient.shared.isAvailable else { throw AppError.message(TerminalDeviceInput.unavailableBeforeInputMessage) }
         guard let bound = boundResumeTarget(target) else { return .agentMissing }
         let agent = CodexResumeCheck.agent(in: region)
         return try VerifiedResumeInput.deliver(region: region, text: text, read: { try resumeRead(bound) }, write: { expected,input in
@@ -231,15 +231,12 @@ public enum TerminalAdapter {
         })
     }
     public static func completeResume(target: ScreenTarget, stop: CodexCapacityStop) throws -> ResumeDelivery {
-        if TerminalInputClient.shared.isAvailable {
-            guard let bound = boundResumeTarget(target) else { return .agentMissing }
-            return try VerifiedResumeInput.complete(stop: stop, read: { try resumeRead(bound) }, write: { expected,input in
-                guard try resumeRead(bound) == expected else { return .screenChanged }
-                return try TerminalDeviceInput.deliver(target: bound, agent: stop.agent, input: input, screen: expected)
-            })
-        }
-        let result = try AutomationScript.run(completeResumeScript(tty: target.tty, stop: stop), app: "Terminal", denied: .permissionDenied, timeout: 40)
-        return ResumeDelivery(rawValue: result) ?? .typed
+        guard TerminalInputClient.shared.isAvailable else { throw AppError.message(TerminalDeviceInput.unavailableBeforeInputMessage) }
+        guard let bound = boundResumeTarget(target) else { return .agentMissing }
+        return try VerifiedResumeInput.complete(stop: stop, read: { try resumeRead(bound) }, write: { expected,input in
+            guard try resumeRead(bound) == expected else { return .screenChanged }
+            return try TerminalDeviceInput.deliver(target: bound, agent: stop.agent, input: input, screen: expected)
+        })
     }
     public static func completeResumeScript(tty: String, stop: CodexCapacityStop) throws -> String {
         let data = try AutomationScript.literal(["tty": tty, "region": stop.region, "text": stop.continuationText, "footer": stop.composerFooter as Any? ?? NSNull()])

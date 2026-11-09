@@ -25,11 +25,6 @@ enum AutomationScript {
     }
 }
 enum ITermAdapter { static let visibleFunction = "throw Error('The isolated native check cannot use iTerm');" }
-enum TerminalDeviceInput {
-    static func deliver(target: ScreenTarget, agent: AgentKind, input: RemoteTerminalInput) throws -> TerminalDelivery {
-        throw AppError.message("Legacy isolated keyboard checks cannot invoke the original TTY input service")
-    }
-}
 enum OrcaAdapter {
     static func readScreen(handle: String) throws -> String { throw AppError.message("Isolated native checks cannot access Orca") }
     static func normalize(_ value: String) -> String { preconditionFailure("Isolated native checks cannot access Orca") }

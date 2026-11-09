@@ -120,8 +120,8 @@ import AutoApproveCore
                   autoapprove local-name status  이 Mac의 autoapprove 주소 설정 확인
                   autoapprove local-name apply   관리자 권한으로 이 Mac의 로컬 주소 설정
                   autoapprove mcp           휴대폰 질문·테스트 화면 공유 MCP (stdio)
-                  autoapprove terminal-input prepare  원본 입력 서비스 등록 정보 확인 (읽기 전용 JSON)
-                  autoapprove terminal-input install  기존 직접 입력 연결 확인 (새 등록은 Mac 앱에서)
+                  autoapprove terminal-input prepare  손쉬운 사용 입력 설정 확인 (읽기 전용 JSON)
+                  autoapprove terminal-input install  현재 프로세스의 손쉬운 사용 입력 권한 확인 (서비스 설치 없음)
                   autoapprove status        앱의 세션 및 승인 내역
                   autoapprove terminal-timings  터미널 연결 구간별 시간·병합 횟수 (내용 없는 메모리 통계)
                   autoapprove serve         UI 없이 엔진·웹 관리·Mac 자동 발견 실행

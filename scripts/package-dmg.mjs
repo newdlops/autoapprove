@@ -18,8 +18,8 @@ if (readPlist('CFBundleIdentifier') !== 'local.autoapprove.mac' || readPlist('CF
 
 const architectures = binary => execFileSync('/usr/bin/lipo', ['-archs', path.join(app, 'Contents/MacOS', binary)], { encoding: 'utf8' }).trim().split(/\s+/).sort().join('-');
 const architecture = architectures(readPlist('CFBundleExecutable'));
-if (!['arm64', 'x86_64', 'arm64-x86_64'].includes(architecture) || ['autoapprove', 'AutoApproveTTYService'].some(binary => architectures(binary) !== architecture)) {
-  throw new Error('App, CLI and input service must have the same supported architectures');
+if (!['arm64', 'x86_64', 'arm64-x86_64'].includes(architecture) || ['autoapprove'].some(binary => architectures(binary) !== architecture)) {
+  throw new Error('App and CLI must have the same supported architectures');
 }
 const platform = architecture === 'arm64-x86_64' ? 'universal' : architecture;
 const filename = `AutoApprove-${version}-macOS-${platform}.dmg`;
@@ -53,7 +53,7 @@ try {
   if ((await readFile(path.join(mounted, guideName), 'utf8')) !== guide) {
     throw new Error('Installation instructions differ from source');
   }
-  for (const relative of ['Contents/Info.plist', 'Contents/MacOS/AutoApproveApp', 'Contents/MacOS/autoapprove', 'Contents/MacOS/AutoApproveTTYService', 'Contents/Library/LaunchServices/local.autoapprove.tty-input']) {
+  for (const relative of ['Contents/Info.plist', 'Contents/MacOS/AutoApproveApp', 'Contents/MacOS/autoapprove']) {
     if (!(await readFile(path.join(mountedApp, relative))).equals(await readFile(path.join(app, relative)))) {
       throw new Error(`App differs from the verified source: ${relative}`);
     }

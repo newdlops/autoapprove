@@ -5,9 +5,9 @@ import CryptoKit
 public enum TTYInputSigning {
     public static func requirement(publisherSHA1: String, peerIdentifier: String) throws -> String {
         guard publisherSHA1.utf8.count == 40, publisherSHA1.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
-              [TTYInputConfiguration.appIdentifier, TTYInputConfiguration.cliIdentifier, TTYInputConfiguration.helperIdentifier].contains(peerIdentifier) else {
+              ["local.autoapprove.mac", "local.autoapprove.helper"].contains(peerIdentifier) else {
             throw NSError(domain: "AutoApprove.TerminalInput.Signing", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "입력 서비스의 게시자 서명을 확인하지 못했습니다."])
+                userInfo: [NSLocalizedDescriptionKey: "앱의 게시자 서명을 확인하지 못했습니다."])
         }
         return "identifier \"\(peerIdentifier)\" and certificate leaf = H\"\(publisherSHA1)\""
     }
@@ -15,7 +15,7 @@ public enum TTYInputSigning {
         try peerRequirements(ownIdentifiers: [ownIdentifier], peerIdentifiers: [peerIdentifier])
     }
     public static func peerRequirements(ownIdentifiers: [String], peerIdentifiers: [String]) throws -> String {
-        let allowed = [TTYInputConfiguration.appIdentifier, TTYInputConfiguration.cliIdentifier, TTYInputConfiguration.helperIdentifier]
+        let allowed = ["local.autoapprove.mac", "local.autoapprove.helper"]
         guard !ownIdentifiers.isEmpty, !peerIdentifiers.isEmpty,
               ownIdentifiers.allSatisfy(allowed.contains), peerIdentifiers.allSatisfy(allowed.contains) else {
             throw NSError(domain: "AutoApprove.TerminalInput.Signing", code: 1)

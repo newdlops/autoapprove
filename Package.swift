@@ -7,7 +7,6 @@ let package = Package(
     products: [
         .executable(name: "AutoApproveApp", targets: ["AutoApproveApp"]),
         .executable(name: "autoapprove", targets: ["AutoApproveCLI"]),
-        .executable(name: "AutoApproveTTYService", targets: ["AutoApproveTTYService"]),
         .executable(name: "autoapprove-checks", targets: ["AutoApproveChecks"]),
         .library(name: "AutoApproveCore", targets: ["AutoApproveCore"])
     ],
@@ -18,7 +17,6 @@ let package = Package(
         .target(name: "CLocalDashboard"),
         .target(name: "TerminalInputSupport", dependencies: ["CTTYInput"]),
         .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "TerminalInputSupport"], resources: [.copy("Resources/RemoteWeb"), .copy("Resources/CloudflareRelay")]),
-        .executableTarget(name: "AutoApproveTTYService", dependencies: ["TerminalInputSupport"]),
         .executableTarget(name: "AutoApproveApp", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveCLI", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveChecks", dependencies: ["AutoApproveCore"], path: "Tests/AutoApproveCoreTests", swiftSettings: [.unsafeFlags(["-parse-as-library"]), .unsafeFlags(["-Onone"], .when(configuration: .release))])
