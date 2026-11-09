@@ -151,6 +151,37 @@ private final class NativeProbe: @unchecked Sendable {
             "Preparation must restore and raise the exact target window")
         var checks = ["exact original JXA preparation uses no child AX, System Events or terminal writes"]
 #if !KEYBOARD_PREFLIGHT_ONLY
+        let owner=TerminalProcessIdentity(pid:81000,startedSeconds:10,startedMicroseconds:20)
+        var writes=[String](),identities=0,pids=[Int32]()
+        try TerminalKeyboard.activateApplication(owner:owner,identity:{_ in identities+=1;return owner},setAttribute:{pid,name,value in
+            pids.append(pid);writes.append("\(name)=\(value)");return .success
+        })
+        try require(pids == [owner.pid,owner.pid] && writes == ["AXHidden=false","AXFrontmost=true"] && identities == 3,
+            "Activation must use the authorized Accessibility setter and revalidate the exact lifetime for each operation")
+        for failedWrite in [0,1] {
+            writes=[]
+            do {
+                try TerminalKeyboard.activateApplication(owner:owner,identity:{_ in owner},setAttribute:{_,name,_ in
+                    writes.append(name);return writes.count-1 == failedWrite ? .cannotComplete:.success
+                })
+                throw AppError.message("AX activation failure must be reported")
+            } catch let error as RemoteHTTPError {
+                try require(error.message.contains(String(AXError.cannotComplete.rawValue)) && error.message.contains(writes.last!),
+                    "Activation errors must identify the failed attribute and AX error code")
+            }
+            try require(writes.count == failedWrite+1,"Failed activation must stop without retrying")
+        }
+        for changedIdentityRead in [1,2,3] {
+            writes=[];identities=0
+            do {
+                try TerminalKeyboard.activateApplication(owner:owner,identity:{_ in
+                    identities+=1;return identities == changedIdentityRead ? TerminalProcessIdentity(pid:owner.pid,startedSeconds:10,startedMicroseconds:21):owner
+                },setAttribute:{_,name,_ in writes.append(name);return .success})
+                throw AppError.message("Replaced activation target must reject")
+            } catch is RemoteHTTPError {}
+            try require(writes.count == changedIdentityRead-1,"Replaced app must receive no further activation writes")
+        }
+        checks.append("activation uses exact-PID Accessibility attributes without cooperative AppKit activation; errors and replacements stop immediately")
         let unicode = NativeProbe(), text = "한글 🧪 e\u{301} " + String(repeating: "a", count: 19) + "🧪" + String(repeating: "끝", count: 30)
         let unicodeInput = RemoteTerminalInput(kind: .characters, text: text, relay: true)
         try require(try TerminalKeyboard.deliver(target: unicode.target, expected: "screen", agent: .codex, input: unicodeInput, environment: unicode.environment) == .sent,

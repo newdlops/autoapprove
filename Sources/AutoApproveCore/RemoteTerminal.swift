@@ -73,14 +73,33 @@ public enum TerminalKeyboard {
                     func compact(_ value:String)->String {String(value.precomposedStringWithCanonicalMapping.filter{!$0.isWhitespace})}
                     return compact(screen).contains(compact(text))
                 }, frontmost: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" },
-                activate: {
+                activate: { try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
                     let owner=try TerminalProcessLookup.running()
-                    guard let app=NSRunningApplication(processIdentifier:owner.pid),app.bundleIdentifier == "com.apple.Terminal",
-                          TerminalProcessLookup.identity(pid:owner.pid)==owner else {throw RemoteHTTPError(409,"원래 Terminal 앱을 확인하지 못했습니다.")}
-                    app.unhide()
-                    guard app.activate(options:[]) else {throw RemoteHTTPError(409,"Terminal 창을 활성화하지 못했습니다. Mac 화면을 확인해주세요.")}
-                })
+                    try TerminalKeyboard.activateApplication(owner:owner)
+                } })
         }
+    }
+
+    /// Accessibility activation works from the authorized sender even when
+    /// ordinary cooperative app activation declines a background request.
+    public static func activateApplication(owner:TerminalProcessIdentity,
+        identity:(Int32)->TerminalProcessIdentity? = {TerminalProcessLookup.identity(pid:$0)},
+        setAttribute:(Int32,String,Bool)->AXError = {pid,name,value in
+            let app=AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app,0.3)
+            return AXUIElementSetAttributeValue(app,name as CFString,value ? kCFBooleanTrue:kCFBooleanFalse)
+        }) throws {
+        func checkOwner() throws {
+            guard identity(owner.pid)==owner else {throw RemoteHTTPError(409,"원래 Terminal 앱을 확인하지 못했습니다.")}
+        }
+        for (attribute,value) in [(kAXHiddenAttribute,false),(kAXFrontmostAttribute,true)] {
+            try checkOwner()
+            let result=setAttribute(owner.pid,attribute,value)
+            guard result == .success else {
+                throw RemoteHTTPError(409,"손쉬운 사용으로 Terminal 창을 활성화하지 못했습니다 (\(attribute): \(result.rawValue)). Mac 화면을 확인해주세요.")
+            }
+        }
+        try checkOwner()
     }
 
     private static func preparePasteboard(_ text: String) throws -> PasteboardLease {

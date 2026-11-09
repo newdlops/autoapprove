@@ -8,6 +8,7 @@ public typealias AgentKind = AutoApproveCore.AgentKind
 public typealias ScreenHost = AutoApproveCore.ScreenHost
 public typealias TerminalDelivery = AutoApproveCore.TerminalDelivery
 public typealias TerminalWindowMetadata = AutoApproveCore.TerminalWindowMetadata
+public typealias TerminalProcessIdentity = AutoApproveCore.TerminalProcessIdentity
 public typealias ProcessRecord = AutoApproveCore.ProcessRecord
 public typealias ProcessDiscovery = AutoApproveCore.ProcessDiscovery
 public typealias TerminalAdapter = AutoApproveCore.TerminalAdapter
