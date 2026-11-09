@@ -65,16 +65,21 @@ window.AutoApproveInputChannel = class {
         const sent = new DataView(payload.buffer,payload.byteOffset,8).getFloat64(0);
         if (sent !== this.lastPing) throw new Error('연결 지연 측정 응답을 확인하지 못했습니다.');
         clearTimeout(this.pongTimer);this.pongTimer=null;
-        this.observe(performance.now()-sent); this.lastPing = null; return;
+        // Keepalive RTT is not a key acknowledgement and must not dilute the
+        // input latency samples while the user is idle.
+        this.lastPing = null; return;
       }
       if (kind !== 4 || payload.length || sequence <= this.acknowledged || sequence > this.sequence || !this.pending.has(sequence)) throw new Error('입력 확인 순서가 바뀌었습니다. 화면을 확인해주세요.');
       const now = performance.now();
-      for (const [id,item] of this.pending) if (id <= sequence) { this.pending.delete(id); this.pendingBytes -= item.bytes; this.observe(now-item.sent,false); }
+      for (const [id,item] of this.pending) if (id <= sequence) { this.pending.delete(id); this.pendingBytes -= item.bytes; this.observe(now-item.queued,false); }
       this.acknowledged = sequence; this.armDeadline(); this.quality(); this.changed();
     } catch (error) { this.fail(error); }
   }
   canSend(length) {
     if(this.state!=='ready'||this.socket.readyState!==WebSocket.OPEN||this.pendingCount>=16||this.pendingBytes+length>64000)return false;
+    // Native Terminal verifies its exact destination for each request. Leave
+    // later characters in the owner's coalescing queue until that request ACKs.
+    if(this.binding.mode==='native'&&this.pendingCount>0)return false;
     if(this.socket.bufferedAmount>=64000){this.watchBuffer();return false;}
     this.clearBufferWait();return true;
   }
@@ -96,11 +101,12 @@ window.AutoApproveInputChannel = class {
     if(this.bufferStarted==null)return;
     clearTimeout(this.bufferTimer);this.bufferTimer=null;this.bufferStarted=null;this.bufferDelay=0;
   }
-  send(kind,payload) {
+  send(kind,payload,queuedAt = performance.now()) {
     if (!this.canSend(payload.length)) return false;
     if (this.sequence === 0xffffffff) { this.fail(new Error('입력 연결을 새로 확인해주세요.')); return false; }
     const sequence = ++this.sequence;
-    this.pending.set(sequence,{bytes:payload.length,sent:performance.now()}); this.pendingBytes += payload.length;
+    const sent=performance.now(),queued=Number.isFinite(queuedAt)&&queuedAt>=0&&queuedAt<=sent?queuedAt:sent;
+    this.pending.set(sequence,{bytes:payload.length,sent,queued}); this.pendingBytes += payload.length;
     try { this.socket.send(window.AutoApproveInputChannel.packet(kind,sequence,payload)); this.armDeadline(); this.changed(); }
     catch (_) { this.fail(new Error('입력 전달 결과를 확인하지 못했습니다. 원본 화면을 확인해주세요.')); }
     // A reserved/attempted write is never returned to the unsent queue.

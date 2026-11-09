@@ -405,7 +405,7 @@ function inputQuality(value) {
   show(target,valid);
   const number = amount => Math.round(amount).toLocaleString();
   text(target,valid ? `${number(value.medianMS)}ms` : '');
-  target.title = valid ? `입력 왕복 중앙값 · 95% ${number(value.p95MS)}ms · ${number(value.samples)}회` : '';
+  target.title = valid ? `입력 응답 중앙값 (대기 포함) · 95% ${number(value.p95MS)}ms · ${number(value.samples)}회` : '';
   target.setAttribute('aria-label',valid ? `입력 왕복 지연 중앙값 ${Math.round(value.medianMS)}밀리초` : '입력 왕복 지연 측정 전');
 }
 function ptyReport(state, message, client) {
@@ -2138,7 +2138,7 @@ function queueDirect(kind, value = '') {
   if (directQueue.length >= 64 || byteLength(value,8000) > 8000) { stopDirect(); inputFailure = '입력이 많아 바로 입력을 멈췄습니다. 현재 화면과 작성한 내용을 확인해주세요.'; updateControls(); return false; }
   const previous = directQueue[directQueue.length - 1];
   if (kind === 'characters' && previous?.kind === kind && byteLength(previous.value + value,8000) <= 8000) previous.value += value;
-  else directQueue.push({ key: selectedKey, kind, value, streamID: latestFrame?.streamID || null });
+  else directQueue.push({ key: selectedKey, kind, value, streamID: latestFrame?.streamID || null, queuedAt: performance.now() });
   scheduleDirect(kind === 'characters' && directQueue.length > 1 ? 4 : 0);
   return true;
 }
@@ -2200,7 +2200,7 @@ function pumpDirectChannel() {
     if (index < 0) { stopDirect(); updateControls(); return; }
     const text = new TextEncoder().encode(item.value), payload = new Uint8Array(1+text.length);payload[0] = index;payload.set(text,1);
     if (!directChannel.canSend(payload.length)) break;
-    if (!directChannel.send(3,payload)) break;
+    if (!directChannel.send(3,payload,item.queuedAt)) break;
     directQueue.shift();
   }
   directSending = (directChannel?.pendingCount || 0) > 0; updateControls();
