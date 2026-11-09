@@ -1,5 +1,34 @@
 import Foundation
 
+public struct CodexThreadActivity: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var title: String
+    public var phase: SessionPhase
+}
+
+public struct CodexActivitySnapshot: Codable, Equatable, Sendable {
+    public var observedAt: Date
+    public var parent: CodexThreadActivity
+    public var children: [CodexThreadActivity]
+
+    var phase: SessionPhase {
+        let phases = [parent.phase] + children.map(\.phase)
+        for phase: SessionPhase in [.input, .approval, .working, .unknown] {
+            if phases.contains(phase) { return phase }
+        }
+        return .idle
+    }
+    var summary: String {
+        let counts = Dictionary(grouping: children, by: \.phase)
+        let parts = [SessionPhase.working, .approval, .input, .idle, .unknown].compactMap { phase -> String? in
+            guard let count = counts[phase]?.count else { return nil }
+            return "\(phase.title) \(count)개"
+        }
+        return "부모 \(parent.phase.title) · 서브에이전트 " + (parts.isEmpty ? "없음" : parts.joined(separator: " · "))
+    }
+}
+
+
 public struct CodexApprovalBinding: Codable, Equatable, Sendable {
     public var threadID: String
     public var title: String
@@ -83,6 +112,25 @@ struct CodexServerApproval {
 }
 
 enum CodexSubagentApprovals {
+    static func activity(root: String, rows: [JSONObject]) throws -> CodexActivitySnapshot {
+        let owned = ownedThreads(root: root, rows: rows, includeInactive: true)
+        guard let parent = owned[root] else { throw AppError.message("부모 대화의 실시간 상태를 확인하지 못했습니다.") }
+        func item(_ row: JSONObject) -> CodexThreadActivity {
+            let status = row["status"] as? JSONObject
+            let flags = status?["activeFlags"] as? [String] ?? []
+            let phase: SessionPhase
+            switch status?["type"] as? String {
+            case "idle": phase = .idle
+            case "active": phase = flags.contains("waitingOnUserInput") ? .input : flags.contains("waitingOnApproval") ? .approval : .working
+            default: phase = .unknown
+            }
+            let id = row["id"] as! String
+            return CodexThreadActivity(id: id, title: String((taskPath(row) ?? row["agentNickname"] as? String ?? row["name"] as? String ?? id).prefix(180)), phase: phase)
+        }
+        return CodexActivitySnapshot(observedAt: Date(), parent: item(parent),
+            children: owned.filter { $0.key != root }.values.map(item).sorted { $0.id < $1.id })
+    }
+
     static func taskPath(_ row: JSONObject) -> String? {
         guard let source = row["source"] as? JSONObject,
               let subagent = (source["subAgent"] ?? source["subagent"]) as? JSONObject,
@@ -93,26 +141,21 @@ enum CodexSubagentApprovals {
               !path.contains("\n"), !path.contains("\r") else { return nil }
         return path
     }
-    static func children(target: CodexReplyTarget, cwd: String) throws -> [CodexSubagentRow] {
+    static func readActivity(target: CodexReplyTarget, cwd: String) throws -> CodexActivitySnapshot {
         let connection = try CodexQueueConnection(home: target.home, captureApprovals: true)
         let root = try connection.request("thread/read", ["threadId": target.threadID, "includeTurns": false])["thread"] as? JSONObject
         guard let root, root["id"] as? String == target.threadID, root["cwd"] as? String == cwd,
               root["parentThreadId"] == nil || root["parentThreadId"] is NSNull else {
             throw AppError.message("연결한 부모 대화가 바뀌었습니다.")
         }
-        let owned = ownedThreads(root: target.threadID, rows: try loadedThreads(connection))
-        guard owned[target.threadID] != nil else { throw AppError.message("부모 대화가 실행 중이 아닙니다.") }
-        return owned.compactMap { id, row in
-            guard id != target.threadID else { return nil }
-            let label = taskPath(row) ?? "작업 이름 미확인"
-            let state = row["status"] as? JSONObject ?? [:]
-            let waiting = (state["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
-            return CodexSubagentRow(id: id, title: label, status: waiting ? "승인 대기" : (state["type"] as? String ?? "상태 미확인"))
-        }.sorted { $0.title == $1.title ? $0.id < $1.id : $0.title < $1.title }
+        return try activity(root: target.threadID, rows: loadedThreads(connection))
+    }
+    static func children(target: CodexReplyTarget, cwd: String) throws -> [CodexSubagentRow] {
+        try readActivity(target: target, cwd: cwd).children.map { CodexSubagentRow(id: $0.id, title: $0.title, status: $0.phase.title) }
     }
     /// Validate ancestry independently of server-side filtering. Missing parents,
     /// cycles, unrelated roots, forks and unloaded threads cannot acquire a policy.
-    static func ownedThreads(root: String, rows: [JSONObject]) -> [String: JSONObject] {
+    static func ownedThreads(root: String, rows: [JSONObject], includeInactive: Bool = false) -> [String: JSONObject] {
         var byID: [String: JSONObject] = [:]
         for row in rows {
             guard let id = row["id"] as? String, UUID(uuidString: id) != nil, byID[id] == nil else { return [:] }
@@ -120,7 +163,7 @@ enum CodexSubagentApprovals {
         }
         guard let owner = byID[root], owner["parentThreadId"] == nil || owner["parentThreadId"] is NSNull else { return [:] }
         return byID.filter { id, row in
-            guard let status = row["status"] as? JSONObject, ["active", "idle"].contains(status["type"] as? String ?? "") else { return false }
+            guard includeInactive || ["active", "idle"].contains((row["status"] as? JSONObject)?["type"] as? String ?? "") else { return false }
             var current = id, seen = Set<String>()
             while current != root {
                 guard seen.insert(current).inserted, let parent = byID[current]?["parentThreadId"] as? String else { return false }
@@ -161,14 +204,19 @@ enum CodexSubagentApprovals {
 
     /// Attach only to loaded conversations already waiting for a decision. No
     /// new turn, policy override, model change or terminal navigation is sent.
-    static func poll(target: CodexReplyTarget, cwd: String,
+    static func poll(target: CodexReplyTarget, cwd: String, approvalsEnabled: Bool = true,
+                     observed: @escaping @Sendable (CodexActivitySnapshot) async -> Void = { _ in },
                      authorize: @escaping @Sendable (CodexServerApproval) async -> Bool,
                      completed: @escaping @Sendable (CodexServerApproval, Bool) async -> Void) async throws -> (responded: Int, review: Int) {
+        // Retain unsolicited requests without replying, including during a
+        // read-only refresh. The guard below prevents resume/approval writes.
         let connection = try CodexQueueConnection(home: target.home, captureApprovals: true)
         let root = try connection.request("thread/read", ["threadId": target.threadID, "includeTurns": false])["thread"] as? JSONObject
         guard let root, root["id"] as? String == target.threadID, root["cwd"] as? String == cwd,
               root["parentThreadId"] == nil || root["parentThreadId"] is NSNull else { throw AppError.message("연결한 부모 대화가 바뀌었습니다. 다시 연결해주세요.") }
         let rows = try loadedThreads(connection)
+        await observed(try activity(root: target.threadID, rows: rows))
+        guard approvalsEnabled else { return (0, 0) }
         let owned = ownedThreads(root: target.threadID, rows: rows)
         guard owned[target.threadID] != nil else { throw AppError.message("부모 대화가 실행 중이 아닙니다.") }
         let waiting = owned.filter {

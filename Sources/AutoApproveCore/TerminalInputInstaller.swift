@@ -37,7 +37,7 @@ public enum TerminalInputInstaller {
                     || FileManager.default.fileExists(atPath: TTYInputConfiguration.plistPath) },
                 state: { registrationState }, registrationPolicy: { try validateRegistrationPolicy($0, $1) },
                 register: { try TerminalInputAuthorization.install() },
-                refresh: { TerminalInputClient.shared.refreshIfNeeded(force: true) })
+                refresh: { TerminalInputClient.shared.resetConnection(); TerminalInputClient.shared.refreshIfNeeded(force: true) })
         }
     }
 
@@ -87,12 +87,8 @@ public enum TerminalInputInstaller {
         if environment.connected() { return .alreadyConnected }
         switch environment.state() {
         case .requiresApproval: return .requiresApproval
-        case .enabled:
-            throw AppError.message("등록된 직접 입력 서비스에 연결하지 못했습니다. Mac의 백그라운드 실행 허용과 서비스 실행 상태를 확인해주세요. 기존 서비스는 교체하지 않았습니다.")
+        case .enabled: break
         case .notRegistered, .missingBundle: break
-        }
-        guard !environment.legacyInstalled() else {
-            throw AppError.message("기존 직접 입력 서비스에 연결하지 못했습니다. 서비스의 서명과 실행 상태를 확인해야 합니다. Mac 연결 설정에서 연결을 다시 확인해주세요.")
         }
         guard environment.state() != .missingBundle else {
             throw AppError.message("새 직접 입력 연결은 패키징된 AutoApprove 앱의 연결 설정에서 등록해주세요.")
@@ -105,6 +101,16 @@ public enum TerminalInputInstaller {
             throw AppError.message("직접 입력 서비스를 설치했지만 연결을 확인하지 못했습니다. Mac의 백그라운드 실행 허용과 서비스 실행 상태를 확인해주세요. 실행 중인 원본 CLI는 유지됩니다.")
         }
         return .registered
+    }
+
+    static func installedPublisherMismatch() -> Bool {
+        let helper = URL(fileURLWithPath: TTYInputConfiguration.helperPath)
+        guard FileManager.default.fileExists(atPath: helper.path),
+              let requirement = try? TTYInputSigning.peerRequirements(
+                ownIdentifiers: [TTYInputConfiguration.appIdentifier, TTYInputConfiguration.cliIdentifier],
+                peerIdentifiers: [TTYInputConfiguration.helperIdentifier]) else { return false }
+        do { try checkSignature(helper, requirement: requirement, nested: false); return false }
+        catch { return true }
     }
 
     public static func openApprovalSettings() { SMAppService.openSystemSettingsLoginItems() }

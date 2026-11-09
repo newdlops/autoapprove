@@ -64,7 +64,9 @@ FORM: Existing product's split workspace; mobile advances from list to detail wi
           <div class="detail-heading"><div><p id="session-meta" class="muted small"></p><h2 id="session-title" tabindex="-1"></h2></div><span id="session-phase" class="phase"></span></div>
           <p id="session-path" class="path"></p><p id="session-branch" class="muted small"></p>
           <div class="session-controls"><label class="switch-label"><input id="automatic" type="checkbox" role="switch"><span>자동 승인</span></label><button id="reveal" class="secondary">Mac에서 터미널 열기</button></div>
-          <p id="session-status" class="muted small"></p><p id="session-ended" class="notice error" hidden>이 세션이 종료되었거나 Mac 연결이 끊겼습니다. 목록에서 다른 세션을 선택해주세요.</p>
+          <p id="session-status" class="muted small"></p>
+          <details id="codex-agents" hidden><summary id="codex-agents-summary"></summary><ul id="codex-agents-list" class="small"></ul></details>
+          <p id="session-ended" class="notice error" hidden>이 세션이 종료되었거나 Mac 연결이 끊겼습니다. 목록에서 다른 세션을 선택해주세요.</p>
           </div>
           <section id="session-safety" class="notice error safety-panel" aria-label="시스템 변경 보호 상태" hidden></section>
           <section id="os-permissions" class="question" aria-labelledby="os-permission-heading" hidden>

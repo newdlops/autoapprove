@@ -8,12 +8,17 @@ struct CodexApprovalConnectionView: View {
     @State private var selection = ""
     @State private var loading = false
     @State private var error: String?
-    @State private var subagents: [CodexSubagentRow] = []
     @State private var loaded = false
     @State private var showConnection = false
 
+    private var liveSubagents: [CodexThreadActivity] {
+        guard let activity = session.codexActivity else { return [] }
+        return activity.children
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let subagents = liveSubagents
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("서브에이전트").font(.headline)
                 if loaded { Text("\(subagents.count)").font(.caption).foregroundStyle(.secondary) }
@@ -21,14 +26,16 @@ struct CodexApprovalConnectionView: View {
                 Button("새로고침") { refresh() }.disabled(loading)
             }
             if loading && !loaded { ProgressView("서브에이전트 확인 중…").controlSize(.small) }
-            if loaded && subagents.isEmpty {
+            if session.codexActivity == nil {
+                Text("실시간 상태 확인 중…").font(.callout).foregroundStyle(.secondary)
+            } else if subagents.isEmpty {
                 Text("현재 실행 중인 서브에이전트가 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
             ForEach(subagents) { child in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(child.title).font(.callout.weight(.medium)).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(child.status).font(.caption).foregroundStyle(.secondary)
+                    Text(child.phase.title).font(.caption).foregroundStyle(.secondary)
                     Text(child.id).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -59,8 +66,8 @@ struct CodexApprovalConnectionView: View {
                         Button("선택한 대화로 변경") {
                             perform {
                                 try await engine.connectCodexApprovals(sessionID: session.id, threadID: selection)
-                                subagents = []; loaded = false
-                                subagents = try await engine.codexApprovalSubagents(sessionID: session.id); loaded = true
+                                loaded = false
+                                _ = try await engine.codexApprovalSubagents(sessionID: session.id); loaded = true
                                 showConnection = false
                             }
                         }.disabled(loading || selection.isEmpty)
@@ -80,7 +87,7 @@ struct CodexApprovalConnectionView: View {
         defer { loading = false }
         do {
             try await engine.connectCurrentCodexApprovals(sessionID: session.id)
-            subagents = try await engine.codexApprovalSubagents(sessionID: session.id)
+            _ = try await engine.codexApprovalSubagents(sessionID: session.id)
             loaded = true
         } catch { self.error = error.localizedDescription }
     }

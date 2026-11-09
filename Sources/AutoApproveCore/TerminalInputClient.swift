@@ -49,6 +49,9 @@ public final class TerminalInputClient: @unchecked Sendable {
     }
     private func probe() -> TerminalInputStatus {
         let legacy = FileManager.default.fileExists(atPath: TTYInputConfiguration.helperPath)
+        if legacy, TerminalInputInstaller.installedPublisherMismatch() {
+            return .unavailable("설치된 입력 서비스의 서명이 현재 앱과 일치하지 않습니다. Mac 연결 설정의 ‘직접 입력 연결’에서 관리자 승인으로 서비스를 갱신해주세요.")
+        }
         if legacy, TerminalInputInstaller.registrationState == .requiresApproval { return .requiresApproval }
         if !legacy {
             switch TerminalInputInstaller.registrationState {
@@ -65,6 +68,12 @@ public final class TerminalInputClient: @unchecked Sendable {
             guard try result.wait(seconds: 1.5) == 0 else { throw AppError.message("터미널 입력 서비스의 실행 권한을 확인하지 못했습니다.") }
             return .available
         } catch { return .unavailable("터미널 입력 서비스에 연결하지 못했습니다. Mac 연결 설정에서 실행 상태와 백그라운드 실행 허용을 확인해주세요.") }
+    }
+    /// Discard an old endpoint after explicit native service registration. Input
+    /// is never replayed; only the harmless status probe uses the new connection.
+    public func resetConnection() {
+        lock.lock(); let old = connection; connection = nil; status = .notInstalled; refreshAt = 0; lock.unlock()
+        old?.invalidate()
     }
     private func signedConnection() throws -> NSXPCConnection {
         lock.lock(); defer { lock.unlock() }

@@ -4,6 +4,7 @@ import {createRequire} from 'node:module';
 import {execFileSync,spawn} from 'node:child_process';
 import {mkdtemp,mkdir,readdir,rm,writeFile} from 'node:fs/promises';
 import http from 'node:http';
+import {readFileSync} from 'node:fs';
 import path from 'node:path';
 import {coreLinkArguments} from './swift-core-link.mjs';
 const require=createRequire(import.meta.url),ws=require(path.join(path.dirname(globalThis.process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright')),'../playwright-core/lib/utilsBundle.js'));
@@ -38,7 +39,14 @@ try {
       const reply=result=>socket.send(JSON.stringify({id:m.id,result}));
       if(m.method==='initialize'){assert.equal(m.params.capabilities.requiredHumanApproval,undefined);reply({userAgent:'fixture'});return;}
       if(m.method==='initialized')return;
-      if(m.method==='thread/read'){assert.equal(m.params.includeTurns,false);reply({thread:m.params.threadId===root?parent:m.params.threadId===child?worker:{...worker,id:other,parentThreadId:other}});return;}
+      if(m.method==='thread/read'){
+        assert.equal(m.params.includeTurns,false);
+        let mode='';try{mode=readFileSync(path.join(dir,'activity-mode'),'utf8');}catch{}
+        if(mode==='error'){socket.send(JSON.stringify({id:m.id,error:{code:-32000,message:'fixture disconnected'}}));return;}
+        const p=mode?{...parent,status:{type:mode==='parent-working'?'active':'idle',activeFlags:[]}}:parent;
+        const w=mode?{...worker,status:{type:mode==='child-working'?'active':'idle',activeFlags:[]}}:worker;
+        reply({thread:m.params.threadId===root?p:m.params.threadId===child?w:{...worker,id:other,parentThreadId:other}});return;
+      }
       if(m.method==='thread/loaded/list'){reply({data:[root,child,other],nextCursor:null});return;}
       if(m.method==='thread/list'){
         if(m.params.ancestorThreadId){assert.equal(m.params.ancestorThreadId,root);reply({data:[worker,{...worker,id:other,parentThreadId:other}],nextCursor:null});}

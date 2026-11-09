@@ -155,9 +155,11 @@ private final class SetupProbe: @unchecked Sendable {
         try check(awaiting.run() == .requiresApproval)
         precondition(awaiting.registrations == 0 && awaiting.policyChecks == 0)
         let enabled = SetupProbe(); enabled.state = .enabled
-        do { _ = try enabled.run(); preconditionFailure("Disconnected registered service was reported connected") }
-        catch { }
-        precondition(enabled.registrations == 0 && enabled.policyChecks == 0)
+        try check(enabled.run() == .requiresApproval)
+        precondition(enabled.registrations == 1 && enabled.policyChecks == 1)
+        let legacyRepair = SetupProbe(); legacyRepair.legacy = true; legacyRepair.next = .enabled
+        try check(legacyRepair.run() == .registered)
+        precondition(legacyRepair.registrations == 1 && legacyRepair.policyChecks == 1)
         // The real signed-package probe returns .notFound for a fresh bundled
         // daemon. It must reach native approval rather than claim the app is missing.
         let absentRecord = SetupProbe()
@@ -171,7 +173,7 @@ private final class SetupProbe: @unchecked Sendable {
             let rejected = SetupProbe()
             switch scenario {
             case 0: rejected.packageFailure = true; rejected.connected = true
-            case 1: rejected.legacy = true
+            case 1: rejected.legacy = true; rejected.policyFailure = true
             case 2: rejected.state = .missingBundle
             case 3: rejected.policyFailure = true
             default: rejected.registrationFailure = true
@@ -194,7 +196,7 @@ private final class SetupProbe: @unchecked Sendable {
         catch { }
         precondition(noConnection.registrations == 1 && noConnection.refreshes == 1)
         precondition(TerminalInputStatus.requiresApproval.message == TerminalInputInstaller.Result.requiresApproval.message)
-        print("PASS: original source input guards and exact bytes preserved; substituted executables rejected; native setup preserves healthy, disabled and broken existing services, rejects installation failure and requires a live XPC connection before completion")
+        print("PASS: original input bytes and identity guards; healthy/disabled services preserved, explicit native repair validates policy, failures rejected, live XPC required")
 #else
         print("PASS: original source input guards, Codex editor/list keys, unchanged Claude bytes and no uncertain-input retries")
 #endif

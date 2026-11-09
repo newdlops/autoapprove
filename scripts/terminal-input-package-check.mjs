@@ -2,7 +2,7 @@
 // administrator approval, or sends input to a user terminal.
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {readFileSync} from 'node:fs';
+import {readFileSync,realpathSync} from 'node:fs';
 import path from 'node:path';
 
 const app=path.resolve(process.argv[2]||'dist/AutoApprove.app');
@@ -50,7 +50,7 @@ for(const file of [helper,path.join(app,'Contents/MacOS/AutoApproveTTYService')]
   run('/usr/bin/codesign',['--verify','--strict','-R='+helperRequirement,file]);
 }
 const plan=JSON.parse(run(path.join(app,'Contents/MacOS/autoapprove'),['terminal-input','prepare']));
-assert.equal(plan.registration,'SMJobBless');assert.equal(plan.application,app);
+assert.equal(plan.registration,'SMJobBless');assert.equal(realpathSync(plan.application),realpathSync(app));
 assert.equal(plan.program,'Contents/Library/LaunchServices/'+service);
 assert.equal(plan.developerIDRequired,false);assert.equal(plan.administratorShell,false);
 console.log('PASS: packaged CLI validates sealed native installation metadata, exact root job and version, mutually pinned publisher signatures, and no Developer ID requirement; no installation or permission changes performed.');

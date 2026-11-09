@@ -14,6 +14,27 @@ import Foundation
             ["id": other, "parentThreadId": other, "cwd": "/fixture", "status": ["type": "active"]]
         ]
         precondition(Set(CodexSubagentApprovals.ownedThreads(root: root, rows: rows).keys) == Set([root, child]))
+        var idleRows = rows
+        idleRows[0]["status"] = ["type": "idle"]
+        idleRows[1]["status"] = ["type": "idle"]
+        let idleActivity = try CodexSubagentApprovals.activity(root: root, rows: idleRows)
+        precondition(idleActivity.phase == .idle && idleActivity.children.count == 1 && idleActivity.children[0].phase == .idle)
+        idleRows[0]["status"] = ["type": "active"]
+        let parentWorking = try CodexSubagentApprovals.activity(root: root, rows: idleRows)
+        precondition(parentWorking.phase == .working && parentWorking.children[0].phase == .idle)
+        idleRows[1]["status"] = ["type": "systemError"]
+        idleRows[0]["status"] = ["type": "idle"]
+        let unknownActivity = try CodexSubagentApprovals.activity(root: root, rows: idleRows)
+        precondition(unknownActivity.phase == .unknown)
+        let readOnly = Counter()
+        _ = try await CodexSubagentApprovals.poll(target: target, cwd: "/fixture", approvalsEnabled: false,
+            observed: { activity in
+                precondition(activity.children.count == 1 && activity.children[0].phase == .approval)
+                await readOnly.add()
+            }, authorize: { _ in fatalError("Read-only status must never approve") },
+            completed: { _, _ in fatalError("Read-only status must never respond") })
+        let observations = await readOnly.value
+        precondition(observations == 1)
         let safety: JSONObject = ["id": "protected", "method": "item/commandExecution/requestApproval", "params": ["threadId": child, "turnId": "turn", "itemId": "command", "cwd": "/fixture", "command": "sudo launchctl bootstrap system /Library/LaunchDaemons/fixture.plist", "availableDecisions": ["accept", "cancel"]]]
         precondition(CodexServerApproval.parse(safety, threads: [child: rows[1]])?.result["decision"] as? String == "cancel")
         for key in ["subAgent", "subagent"] {
@@ -53,10 +74,36 @@ import Foundation
         try engine.setAutomatic(session.id, enabled: true)
         try await engine.connectCurrentCodexApprovals(sessionID: session.id)
         try await Task.sleep(for: .milliseconds(200))
+        precondition(engine.snapshot.sessions[0].codexActivity?.children.first?.phase == .approval)
+        precondition(engine.snapshot.sessions[0].phase == .approval)
         let before = engine.snapshot.events.filter { $0.source == "Codex 부모·서브에이전트" }.count
         try await Task.sleep(for: .milliseconds(200))
         precondition(engine.snapshot.events.filter { $0.source == "Codex 부모·서브에이전트" }.count == before)
+        let modeFile = URL(fileURLWithPath: home).appendingPathComponent("activity-mode")
+        for (mode, parentPhase, childPhase, phase) in [("all-idle", SessionPhase.idle, SessionPhase.idle, SessionPhase.idle),
+            ("parent-working", .working, .idle, .working), ("child-working", .idle, .working, .working)] {
+            try Data(mode.utf8).write(to: modeFile)
+            _ = try await engine.codexApprovalSubagents(sessionID: session.id)
+            precondition(engine.snapshot.sessions[0].codexActivity?.parent.phase == parentPhase)
+            precondition(engine.snapshot.sessions[0].codexActivity?.children.first?.phase == childPhase)
+            precondition(engine.snapshot.sessions[0].phase == phase)
+        }
+        try engine.setAutomatic(session.id, enabled: false)
+        try Data("all-idle".utf8).write(to: modeFile)
         try engine.setPaused(false)
+        for _ in 0..<60 {
+            if engine.snapshot.sessions[0].phase == .idle { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        precondition(engine.snapshot.sessions[0].phase == .idle)
+        try Data("error".utf8).write(to: modeFile)
+        for _ in 0..<60 {
+            if engine.snapshot.sessions[0].codexActivity == nil { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        precondition(engine.snapshot.sessions[0].phase == .unknown && engine.snapshot.sessions[0].codexActivity == nil)
+        try FileManager.default.removeItem(at: modeFile)
+        try engine.setAutomatic(session.id, enabled: true)
         for _ in 0..<80 {
             if engine.snapshot.events.contains(where: { $0.outcome == "서버 승인 확인" }) { break }
             try await Task.sleep(for: .milliseconds(100))
@@ -67,7 +114,7 @@ import Foundation
         precondition(attempts == 3)
         if uncertain { precondition(engine.snapshot.events.contains { $0.outcome == "서버 응답 결과 미확인 · 중복 전송하지 않음" }) }
         try await engine.connectCodexApprovals(sessionID: session.id, threadID: nil)
-        precondition(engine.snapshot.sessions[0].codexApprovalBinding == nil)
+        precondition(engine.snapshot.sessions[0].codexApprovalBinding == nil && engine.snapshot.sessions[0].codexActivity == nil)
         engine.stop()
         print("PASS: hidden child RPCs, exact ancestry, human/unrelated/resolved rejection, pause, resume, replay deduplication and disconnect")
     }

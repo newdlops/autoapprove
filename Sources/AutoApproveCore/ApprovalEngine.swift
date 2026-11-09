@@ -2465,6 +2465,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } catch { parentSaveFailed = true }
     }
 
+    private func projectCodexActivity(_ value: AgentSession) -> AgentSession {
+        var session = value
+        if session.phase != .ended, session.codexApprovalBinding != nil {
+            if let activity = session.codexActivity, Date().timeIntervalSince(activity.observedAt) < 12 {
+                session.ownPhase = activity.parent.phase
+                session.phase = activity.phase
+                session.activityDetail = activity.summary
+                session.backgroundMonitoring = activity.children.contains { $0.phase == .working }
+                session.idleSince = nil
+            } else {
+                session.phase = .unknown
+                session.codexActivity = nil
+                session.activityDetail = "Codex의 실시간 상태를 확인하고 있습니다."
+                session.idleSince = nil
+            }
+        }
+        return session
+    }
+
     private func presentedSessions() -> [AgentSession] {
         // Most installs have no verified Claude parent/child relationships.
         // In that common case the ownership graph cannot alter any row, so skip
@@ -2668,7 +2687,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var ranks: [String: Int] = [:]
         ranks.reserveCapacity(sessionOrder.count)
         for (rank, id) in sessionOrder.enumerated() { ranks[id] = rank }
-        let rows = presentedSessions()
+        let rows = presentedSessions().map(projectCodexActivity)
         var projects: [String: String] = [:]
         for row in rows where ranks[row.id] == nil { projects[row.id] = row.project }
         let precedes: (AgentSession, AgentSession) -> Bool = {
@@ -7615,9 +7634,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
               session.agent == .codex, session.phase != .ended else { throw AppError.message("연결된 Codex 부모 대화를 선택해주세요.") }
         let target = try await questionTransport.prepareQueue(session, binding.threadID)
         try validateCodexQueueSession(session, threadID: binding.threadID)
-        let rows = try await Task.detached(priority: .utility) { try CodexSubagentApprovals.children(target: target, cwd: session.cwd) }.value
+        let activity = try await Task.detached(priority: .utility) { try CodexSubagentApprovals.readActivity(target: target, cwd: session.cwd) }.value
         try validateCodexQueueSession(session, threadID: binding.threadID)
-        return rows
+        sessions[sessionID]?.codexActivity = activity
+        publish()
+        return activity.children.map { CodexSubagentRow(id: $0.id, title: $0.title, status: $0.phase.title) }
     }
 
     public func connectCodexApprovals(sessionID: String, threadID: String?) async throws {
@@ -7643,6 +7664,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexApprovalEpochs.removeValue(forKey: sessionID)
         screens.removeValue(forKey: sessionID)
         sessions[sessionID]?.codexApprovalBinding = binding
+        sessions[sessionID]?.codexActivity = nil
         reconcileCodexApprovalTasks(); publish()
     }
 
@@ -7660,31 +7682,39 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     do {
                         guard let current = self.sessions[id], current.phase != .ended,
                               current.codexApprovalBinding?.threadID == binding.threadID else { break }
-                        if current.automatic && !self.snapshot.paused {
+                        do {
+                            let approvalsEnabled = current.automatic && !self.snapshot.paused
                             let target = try await transport.prepareQueue(current, binding.threadID)
                             let reader = self.processReader
                             let engine = self
                             let count = try await Task.detached(priority: .utility) {
-                                try await CodexSubagentApprovals.poll(target: target, cwd: current.cwd, authorize: { approval in
+                                try await CodexSubagentApprovals.poll(target: target, cwd: current.cwd, approvalsEnabled: approvalsEnabled,
+                                    observed: { activity in await engine.setCodexActivity(id, epoch: epoch, activity: activity) }, authorize: { approval in
                                     guard let records = try? reader(), records.contains(where: { $0.key == current.id && $0.agent == .codex && "/dev/" + $0.tty == current.tty }) else { return false }
-                                    return await engine.reserveCodexApproval(current, threadID: binding.threadID, epoch: epoch, approval: approval) ?? false
+                                    return await engine.reserveCodexApproval(current, threadID: binding.threadID, epoch: epoch, approval: approval)
                                 }, completed: { approval, confirmed in
                                     await engine.finishCodexApproval(current, approval: approval, confirmed: confirmed)
                                 })
                             }.value
                             guard self.codexApprovalEpochs[id] == epoch else { break }
-                            self.setCodexApprovalStatus(id, threadID: binding.threadID, message: count.review > 0 ? "직접 확인할 요청 \(count.review)건 · 해당 서브에이전트에서 확인해주세요" : count.responded > 0 ? "승인 응답 \(count.responded)건 처리 · 자식 요청 감시 중" : "부모·서브에이전트 승인 요청 감시 중")
-                        } else {
-                            self.setCodexApprovalStatus(id, threadID: binding.threadID, message: self.snapshot.paused ? "전체 일시정지 중" : "자동 승인이 꺼져 있습니다")
+                            self.setCodexApprovalStatus(id, threadID: binding.threadID, message: !approvalsEnabled ? (self.snapshot.paused ? "전체 일시정지 중 · 상태 확인 중" : "자동 승인 꺼짐 · 상태 확인 중") : count.review > 0 ? "직접 확인할 요청 \(count.review)건 · 해당 서브에이전트에서 확인해주세요" : count.responded > 0 ? "승인 응답 \(count.responded)건 처리 · 자식 요청 감시 중" : "부모·서브에이전트 승인 요청 감시 중")
                         }
                     } catch {
                         guard self.codexApprovalEpochs[id] == epoch else { break }
+                        self.sessions[id]?.codexActivity = nil
+                        self.publish()
                         self.setCodexApprovalStatus(id, threadID: binding.threadID, message: "연결 확인 필요: " + error.localizedDescription)
                     }
                     do { try await Task.sleep(for: .seconds(3)) } catch { break }
                 }
             }
         }
+    }
+    private func setCodexActivity(_ id: String, epoch: UUID, activity: CodexActivitySnapshot) {
+        guard codexApprovalEpochs[id] == epoch, sessions[id]?.phase != .ended,
+              sessions[id]?.codexApprovalBinding?.threadID == activity.parent.id else { return }
+        sessions[id]?.codexActivity = activity
+        publish()
     }
     private func setCodexApprovalStatus(_ id: String, threadID: String, message: String) {
         guard sessions[id]?.codexApprovalBinding?.threadID == threadID,

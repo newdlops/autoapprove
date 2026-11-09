@@ -1583,6 +1583,14 @@ function renderDetail() {
     terminalPlaceholder(session.interruption.detail); terminalState('error','CLI 종료');
   }
   $('automatic').checked = session.automatic; text($('session-status'), node.state.snapshot.paused ? '이 Mac의 자동 승인이 일시정지되어 있습니다.' : session.activityDetail || session.detail);
+  const children = session.codexActivity?.children || [];
+  show($('codex-agents'), children.length > 0);
+  text($('codex-agents-summary'), `서브에이전트 ${children.length}개`);
+  const activityRows = children.map(child => `${child.title} · ${{working:'작업 중',approval:'승인 대기',input:'입력 필요',idle:'대기 중',unknown:'확인 중'}[child.phase] || '확인 중'}`);
+  if ($('codex-agents-list').dataset.rows !== JSON.stringify(activityRows)) {
+    $('codex-agents-list').replaceChildren(...activityRows.map(value => { const li = document.createElement('li'); li.textContent = value; return li; }));
+    $('codex-agents-list').dataset.rows = JSON.stringify(activityRows);
+  }
   renderSessionSafety();
   renderCodexProgress(selectedItem);
   renderOSPermissions(selectedItem);
