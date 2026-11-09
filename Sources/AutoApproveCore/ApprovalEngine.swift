@@ -36,6 +36,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private(set) var remoteDashboardRevision: UInt64 = 0
     let remoteInventoryChanges = RemoteTerminalChangeSignal()
     public var finishLANUpdate: @MainActor () -> Void = {}
+    private var lanUpdateSleepTransferred = false
+
+    func prepareLANUpdateExit() {
+        keepAwakeSwitch.transferNow()
+        lanUpdateSleepTransferred = true
+    }
     public private(set) var webService: RemoteNetworkService?
     private let webLoopbackOnly: Bool
     private let nativeKeyboardActivity:NativeKeyboardActivity
@@ -815,7 +821,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for value in bridgeWindowCaptures.values { value.capture.invalidate() }; bridgeWindowCaptures.removeAll()
         // Quitting gives macOS its normal sleep back, without putting a closed Mac to sleep.
         keepAwakeStopped = true
-        keepAwakeSwitch.releaseNow()
+        if !lanUpdateSleepTransferred { keepAwakeSwitch.releaseNow() }
         setKeepAwakeActivity(false)
     }
 
@@ -871,7 +877,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return "입력 전송이 끝난 뒤 업데이트합니다."
         }
         if !webQuestions.pending().isEmpty || !testScreens.active.isEmpty { return "웹 질문과 화면 공유가 끝난 뒤 업데이트합니다." }
-        if powerControl.read().lidClosed { return "덮개를 열면 업데이트합니다. 닫힌 동안에는 연결을 유지합니다." }
         return nil
     }
 

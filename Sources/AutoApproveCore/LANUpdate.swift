@@ -84,6 +84,31 @@ actor LANUpdateArchive {
     }
 }
 
+/// Carries only an already-owned sleep hold across the short application quit.
+/// A failed/crashed installer leaves its watchdog alive to restore normal sleep.
+@MainActor final class LANUpdateSleepHandoff {
+    private let control: PowerControl
+    private let activity: NSObjectProtocol
+    private let marker: String
+    private var watchdog: KeepAwakeGuard?
+    init(home: String, control: PowerControl) throws {
+        self.control = control
+        marker = URL(fileURLWithPath: home).appendingPathComponent("keep-awake.hold").path
+        activity = control.activity.begin()
+        do {
+            if FileManager.default.fileExists(atPath: marker), control.read().sleepDisabled {
+                watchdog = try control.startGuard(marker, 20)
+            }
+        } catch { control.activity.end(activity); throw error }
+    }
+    func readyForNewOwner(_ status: JSONObject?) -> Bool {
+        watchdog == nil || !FileManager.default.fileExists(atPath: marker)
+            || (status?["keepAwake"] as? JSONObject)?["phase"] as? String == "holding"
+    }
+    func complete() { watchdog?.stop(); watchdog = nil }
+    func finishActivity() { control.activity.end(activity) }
+}
+
 public enum LANUpdateInstallation {
     fileprivate static func matchesExecutable(_ path:String,app:URL)->Bool {
         guard path.hasPrefix("/") else {return false}
@@ -214,7 +239,7 @@ public enum LANUpdateInstallation {
 
     /// A signed helper waits for a cooperative application quit. Never signal a
     /// user's CLI, replace a root service, request sudo or change privacy settings.
-    public static func install(jobFile: URL) async throws {
+    @MainActor public static func install(jobFile: URL, power: PowerControl = .live) async throws {
         let attributes = try FileManager.default.attributesOfItem(atPath: jobFile.path)
         guard attributes[.type] as? FileAttributeType == .typeRegular,
               (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
@@ -230,16 +255,13 @@ public enum LANUpdateInstallation {
         guard try release(candidate) == job.release, try release(app) < job.release,
               let manager = try ProcessDiscovery.read(pid: job.managerPID).first(where: { $0.started == job.managerStarted }),
               matchesExecutable(manager.executable,app:app) else { throw AppError.message("업데이트할 AutoApprove 실행이 바뀌었습니다.") }
+        let sleepHandoff = try LANUpdateSleepHandoff(home: job.home, control: power)
+        defer { sleepHandoff.finishActivity() }
         try Data("ready".utf8).write(to: directory.appendingPathComponent("helper-ready"), options: .atomic)
         let deadline = Date().addingTimeInterval(40)
         while try ProcessDiscovery.read(pid: job.managerPID).contains(where: { $0.started == job.managerStarted }) {
             guard Date() < deadline else { throw AppError.message("앱이 종료되지 않아 업데이트를 적용하지 않았습니다.") }
             try await Task.sleep(for: .milliseconds(250))
-        }
-        let reading = PowerControl.live.read()
-        if reading.lidClosed {
-            try? launch(app,home:job.home)
-            throw AppError.message("덮개가 닫혀 업데이트 적용을 멈추고 기존 AutoApprove를 다시 열었습니다.")
         }
         let parent = app.deletingLastPathComponent(), identifier = UUID().uuidString
         let staged = parent.appendingPathComponent(".AutoApprove-staged-\(identifier).app")
@@ -263,6 +285,9 @@ public enum LANUpdateInstallation {
                    response.status == 200, let object = try? JSONSerialization.jsonObject(with: response.body) as? JSONObject,
                    object["id"] as? String == job.nodeID, let releaseObject = object["release"],
                    let observed = try? JSONDecoder().decode(RemoteWebVersion.self, from: JSONSerialization.data(withJSONObject: releaseObject)), observed == job.release {
+                    let ownerStatus = try? SocketClient.request(path: AppPaths(directory: URL(fileURLWithPath: job.home)).socket, message: ["method": "status"])
+                    guard sleepHandoff.readyForNewOwner(ownerStatus) else { continue }
+                    sleepHandoff.complete()
                     try? FileManager.default.removeItem(at: backup)
                     try? FileManager.default.removeItem(at: directory)
                     return
@@ -387,6 +412,7 @@ public enum LANUpdateInstallation {
                 }
                 self.status("applying", "AutoApprove를 업데이트하고 다시 엽니다. 원본 CLI는 계속 실행됩니다.", version: release.version)
                 self.applying = true
+                engine.prepareLANUpdateExit()
                 engine.finishLANUpdate()
             } catch {
                 if let incoming { try? FileManager.default.removeItem(at: incoming) }

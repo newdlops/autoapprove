@@ -329,6 +329,12 @@ final class KeepAwakeSwitch: @unchecked Sendable {
         }
     }
 
+    /// The signed update helper has started its own watchdog before the app
+    /// quits. Leave the existing hold in place and stop only this PID's guard.
+    func transferNow() {
+        queue.sync { watchdog?.stop(); watchdog = nil }
+    }
+
     func heartbeat() { try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: marker) }
 
     private func watch(_ floor: Int) throws {

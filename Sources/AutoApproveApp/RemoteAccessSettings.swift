@@ -128,7 +128,7 @@ import AutoApproveCore
             if let progress = engine.lanUpdate.progress {
                 ProgressView(value: Double(progress), total: 100).accessibilityLabel("업데이트 다운로드 \(progress)%")
             }
-            Text("웹 접속을 켠 동안 최신 Mac에서 받습니다. 원본 Codex·Claude 세션은 유지합니다. 별도 PTY·입력 전송·화면 공유가 진행 중이거나 덮개가 닫혀 있으면 적용을 기다립니다. 구버전에는 이 기능을 한 번 설치해야 이후부터 자동으로 업데이트됩니다.")
+            Text("웹 접속을 켠 동안 최신 Mac에서 받습니다. 원본 Codex·Claude 세션은 유지합니다. 덮개가 닫혀 있어도 실행 중인 Mac은 업데이트합니다. 별도 PTY·입력 전송·화면 공유 중에는 적용을 기다립니다. 구버전은 덮개를 열고 한 번 업데이트하면 이후부터 닫힌 상태에서도 적용됩니다.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let error { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.red) }
         }.frame(maxWidth: .infinity, alignment: .leading)
