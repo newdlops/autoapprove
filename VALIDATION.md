@@ -5164,3 +5164,11 @@ bash scripts/build.sh
 최종 release에서도 `.build/release/autoapprove-checks`, `node scripts/integration-check.mjs .build/release/autoapprove`, `node scripts/screen-integration-check.mjs .build/release/autoapprove`가 통과했다. 전체 빌드 스크립트로 앱·확장 패키지 생성 및 로컬 ad-hoc 서명을 확인했다. 최종 패키지의 `codesign --verify --deep --strict`와 내장 CLI 실행도 통과했고 앱을 다시 열어 기본 OFF 상태를 확인했다.
 
 로컬 소켓·프로세스·PTY 접근을 차단하는 실행 샌드박스에서는 통합 테스트를 정상적인 로컬 개발 환경에서 실행해야 한다. 테스트는 임시 데이터와 테스트 프로세스를 종료·정리한다.
+
+## 0.2.275 계정 로그인 복구
+
+- DEBUG 빌드 통과. 계정 전환 40/40, 수동 재연결 5/5 통과.
+- `codex-account-transition-check.mjs`의 임시 RPC 서버 검증 통과: 로그아웃 서버의 저장 로그인 적용, 기존 대기 입력·Goal·백그라운드 작업 장벽, 잘못된 메타데이터 거부, 정상 중단 경쟁 12종 및 관찰자의 승인 콜백 무응답 유지.
+- `codex-account-continuation-check.mjs` 통과: Goal 1회 재개, 일반 작업 1회 이어가기, 기존 대기 대화 무변경, 복원 후 중복 요청 없음.
+- `codex-signed-out-recovery-check.mjs`를 실제 관리형 Codex 0.167.0으로 통과: 별도 임시 홈에서 로그아웃 서버를 먼저 시작하고 유효하지 않은 합성 로그인만 저장한 뒤, 실제 Core의 전환 조정기로 서버를 재시작해 새 계정 메타데이터와 서버 교체를 확인. 기존 계정·TUI·사용자 세션은 변경하지 않음. 실제 원격 인증이나 모델 호출을 검증한 것은 아님.
+- Release 빌드 통과. Release의 signed-out 회귀 2/2 및 실제 관리형 Codex 0.167.0 임시 서버 복구 재검증 통과.

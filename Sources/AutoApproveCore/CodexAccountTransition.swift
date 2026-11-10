@@ -47,11 +47,11 @@ public struct CodexAccountTransitionThread: Codable, Equatable, Sendable {
 }
 public struct CodexAccountTransitionObservation: Sendable {
     public var savedAccount: String?
-    public var serverAccount: String
+    public var serverAccount: String?
     public var serverID: String
     public var threads: [CodexAccountTransitionThread]
     public var loginRefreshRequested = false
-    public init(savedAccount: String?, serverAccount: String, serverID: String, threads: [CodexAccountTransitionThread]) {
+    public init(savedAccount: String?, serverAccount: String?, serverID: String, threads: [CodexAccountTransitionThread]) {
         self.savedAccount = savedAccount; self.serverAccount = serverAccount; self.serverID = serverID; self.threads = threads
     }
 }
@@ -76,7 +76,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var detail = "계정 변경을 기다립니다."
     public var account = ""
     public var serverID = ""
-    public var originalAccount = ""
+    public var originalAccount: String? = ""
     public var threads: [CodexAccountTransitionThread] = []
     public var witnesses: [CodexAccountTransitionWitness] = []
     public var reservations: [String: String] = [:]

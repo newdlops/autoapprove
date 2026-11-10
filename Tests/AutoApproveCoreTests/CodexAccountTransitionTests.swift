@@ -160,6 +160,26 @@ extension ApprovalTests {
                         "The independent read-only refresh must restore approval without advancing another home's transition")
         try expectEqual(r.effects,priorEffects,"Membership refresh must never interrupt or restart native work")
     }
+    func testAccountTransitionRecoversSignedOutServerWithSavedLogin() async throws {
+        let r=AccountTransitionRig();r.idle(0);r.idle(1)
+        r.observation.serverAccount=nil
+        let c=r.coordinator()
+        await c.check()
+        try expectNil(c.state.originalAccount)
+        let restored=try JSONDecoder().decode(CodexAccountTransitionState.self,from:JSONEncoder().encode(c.state))
+        try expectNil(restored.originalAccount)
+        await c.check()
+        try expectEqual(r.effects,["restart"])
+        r.observation.serverID="server-2";r.observation.serverAccount="new"
+        await c.check()
+        try expectEqual(c.state.phase,.complete)
+        try expectEqual(r.effects,["restart"])
+    }
+    func testAccountTransitionDoesNotRestartWhenBothLoginsAreSignedOut() async throws {
+        let r=AccountTransitionRig();r.observation.serverAccount=nil;r.observation.savedAccount=nil
+        let c=r.coordinator();await c.check();await c.check()
+        try expectEqual(r.effects,[])
+    }
     func testAccountReconnectJoinsExistingTransitionWithoutNewRestart() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-reconnect-join-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}

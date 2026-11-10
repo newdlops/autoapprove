@@ -39,6 +39,7 @@ extension CodexAccountTransitionServices {
             try await CodexAccountBackground.run {
                 let fresh = try CodexAccountTransitionLocal.observe(target)
                 guard fresh.serverID == expected.serverID, fresh.savedAccount == expected.savedAccount,
+                      fresh.serverAccount == expected.serverAccount,
                       fresh.savedAccount != nil, fresh.serverAccount != fresh.savedAccount || expected.loginRefreshRequested,
                       fresh.threads == expected.threads, fresh.threads.allSatisfy({ !$0.active && $0.blocker == nil }) else {
                     throw AppError.message("서버 전환 직전 계정·작업·대기 입력이 바뀌었습니다. 전환을 보류했습니다.")
@@ -160,9 +161,10 @@ enum CodexAccountTransitionLocal {
         let before = try identity(target)
         let saved = try CodexAccountMetadataProcess.read(target)
         let connection = try CodexQueueConnection(home: target.home)
-        guard let current = try account(connection.request("accountSession/list", ["refreshWorkspaceMetadata": false])) else {
-            throw AppError.message("공통 서버의 현재 계정을 확인하지 못했습니다. 로그인된 관리형 서버가 필요합니다.")
-        }
+        // A validated empty session list is a signed-out server, not a failed
+        // observation. It must be recoverable using the saved login. Malformed
+        // metadata still throws, and restart revalidates this exact nil state.
+        let current = try account(connection.request("accountSession/list", ["refreshWorkspaceMetadata": false]))
         var cursor: String?, seen = Set<String>(), ids = Set<String>(), threads: [CodexAccountTransitionThread] = []
         repeat {
             var params: JSONObject = ["limit": 100]

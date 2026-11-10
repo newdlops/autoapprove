@@ -40,7 +40,7 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
    let result;
    switch(m.method){
     case 'initialize':socket.send(JSON.stringify({id:m.id,result:{userAgent:'fixture'}}));socket.send(JSON.stringify({id:'approval',method:'item/commandExecution/requestApproval',params:{}}));return;
-    case 'accountSession/list':assert.equal(m.params.refreshWorkspaceMetadata,false);result={activeSessionId:'session-old',sessions:[{sessionId:'session-old',isActive:true,userId:'user-old',selectedWorkspaceAccountId:'workspace'}]};if(mode==='bad-account')delete result.sessions[0].userId;break;
+    case 'accountSession/list':assert.equal(m.params.refreshWorkspaceMetadata,false);result={activeSessionId:'session-old',sessions:[{sessionId:'session-old',isActive:true,userId:'user-old',selectedWorkspaceAccountId:'workspace'}]};if(mode==='bad-account')delete result.sessions[0].userId;if(mode==='signed-out')result={activeSessionId:null,sessions:[]};break;
     case 'thread/loaded/list':result=mode==='repeat'?{data:[],nextCursor:'repeat'}:mode==='duplicate'?{data:[ids[0],ids[0]]}:m.params.cursor==='next'?{data:[ids[1]],nextCursor:null}:{data:mode.startsWith('housekeeping')?[ids[0],housekeeping]:[ids[0]],nextCursor:'next'};break;
     case 'thread/read':reads++;result={thread:{id:m.params.threadId,status:{type:mode==='unknown-status'?'unknown':mode.startsWith('system-error')&&!(mode==='system-error-race'&&reads>1)?'systemError':((mode==='active'||mode==='empty-active'||mode==='system-error-race'||mode==='empty-race'&&reads>1)&&m.params.threadId===ids[0])?'active':'idle'}}};if(m.params.threadId===housekeeping)Object.assign(result.thread,{id:mode==='housekeeping-bad-id'?ids[0]:housekeeping,ephemeral:mode!=='housekeeping-not-ephemeral',threadSource:mode==='housekeeping'?'thread_title':mode==='housekeeping-user'?'user':mode==='housekeeping-not-ephemeral'||mode==='housekeeping-bad-id'?'thread_title':'unknown',status:{type:'active',activeFlags:[]}});break;
     case 'thread/turns/list':if(m.params.threadId===housekeeping){socket.send(JSON.stringify({id:m.id,error:{code:-32600,message:'ephemeral threads do not support thread/turns/list'}}));return;}if(mode.startsWith('empty')){socket.send(JSON.stringify({id:m.id,error:{code:mode==='empty-code'?-32000:-32600,message:mode==='empty-other'?'different error':`thread ${mode==='empty-wrong'?'unrelated':m.params.threadId} is not materialized yet; thread/turns/list is unavailable before first user message`}}));return;}assert.equal(m.params.itemsView,'notLoaded');assert.equal(m.params.sortDirection,'desc');result={data:mode==='missing-turn'?[]:[{id:'turn-'+m.params.threadId,status:(mode==='active'&&m.params.threadId===ids[0])||mode==='system-error-in-progress'?'inProgress':mode.startsWith('system-error')?'failed':'completed'}]};break;
@@ -89,9 +89,10 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  mode='active';// Missing current-turn metadata must be rejected while active.
  // A successful all-idle barrier is the only route to the official lifecycle.
  mode='idle';assert.equal((await run('restart')).verified,true);
- assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\nrestart\nrestart\n');
+ mode='signed-out';assert.equal((await run('restart')).verified,true,'A validated signed-out server must recover using the saved login');
+ assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\nrestart\nrestart\nrestart\n');
  mode='active';assert.equal((await run('cancel-interrupt')).cancelled,true);assert.equal(interrupts,1,'Cancellation during inspection must not stop a user turn');
- assert.ok(refusals>0);
+ assert.equal(refusals,0,'Account observers must not consume original TUI approval callbacks');
  assert.ok(methods.every(m=>['initialize','initialized','accountSession/list','thread/loaded/list','thread/read','thread/turns/list','thread/queue/list','thread/backgroundTerminals/list','thread/backgroundTerminals/terminate','thread/goal/get','thread/goal/set','turn/interrupt'].includes(m)));
  assert.deepEqual(quiescenceFailures,[],'Quiescence state/queue races');
  const settledInterruptChecks=[];
@@ -103,7 +104,7 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
   assert.equal(goalPauses,priorPauses+1,'Pause the original Goal exactly once: '+suffix);
   settledInterruptChecks.push(suffix);
  }
- assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\nrestart\nrestart\n','Interrupt settlement must never restart a server');
+ assert.equal(await readFile(directory+'/restart.log','utf8'),'restart\nrestart\nrestart\nrestart\nrestart\n','Interrupt settlement must never restart a server');
 
- console.log(JSON.stringify({verified:true,checks:['saved metadata from owned stdio helper','complete loaded pagination','exact normal interrupt','queue/background/goal barriers','unknown/malformed/repeated pages fail closed','one official restart after fresh idle barrier','no resume, prompt or terminal input'],settledInterruptChecks,interrupts}));
+ console.log(JSON.stringify({verified:true,checks:['saved metadata from owned stdio helper','complete loaded pagination','exact normal interrupt','queue/background/goal barriers','unknown/malformed/repeated pages fail closed','one official restart after fresh idle barrier','signed-out server accepts saved login','observer preserves original approval callbacks','no resume, prompt or terminal input'],settledInterruptChecks,interrupts}));
 } finally {if(child&&child.exitCode===null)child.kill();for(const socket of clients)socket.terminate();websocket.close();server.close();await rm(directory,{recursive:true,force:true});}
