@@ -166,7 +166,10 @@ extension ApprovalTests {
     func testNativeLoginRecoversSharedServerWhileIndependentWorkStaysRunning() async throws {
         try await exerciseSharedLoginRecovery(native:true)
     }
-    private func exerciseSharedLoginRecovery(native:Bool) async throws {
+    func testAccountReconnectIgnoresHistoricalAttachmentReview() async throws {
+        try await exerciseSharedLoginRecovery(native:false,historicalReview:true)
+    }
+    private func exerciseSharedLoginRecovery(native:Bool,historicalReview:Bool=false) async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-shared-recovery-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}
         let rows=ProcessDiscovery.parse("4242 1 ttys142 4242 4242 Wed Nov 4 00:00:01 2026 /fixture/codex\n4243 1 ttys143 4243 4243 Wed Nov 4 00:00:02 2026 /fixture/codex")
@@ -177,6 +180,15 @@ extension ApprovalTests {
         let inspections=CodexAccountInspectionServices(read:{t in
             .init(home:t.home,identity:.init(provider:"로그인되지 않음",authenticated:false),comparison:.different,connectedSessions:t.witnesses.count)
         })
+        if historicalReview {
+            let paths=AppPaths(directory:root);try paths.prepare()
+            var old=AgentSession(id:"historical-process",agent:.codex,pid:999,started:"old",tty:"/dev/ttys199",cwd:"/fixture",terminal:.terminal)
+            old.phase = .working
+            var plan=CodexSessionAttachment(context:.init(session:old,process:rows[0],shell:rows[1],conversationID:nil),home:target.home)
+            plan.phase = .review
+            let store=try AuditStore(path:paths.database)
+            try store.set("codexSessionAttachments",String(decoding:JSONEncoder().encode([old.id:plan]),as:UTF8.self))
+        }
         let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{rows},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]},codexAccountInspections:inspections)
         defer{engine.stop()}
         var independent=AgentSession(id:rows[1].key,agent:.codex,pid:rows[1].pid,started:rows[1].started,tty:"/dev/"+rows[1].tty,cwd:"/fixture",terminal:.terminal)

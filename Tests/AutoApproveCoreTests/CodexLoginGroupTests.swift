@@ -36,6 +36,22 @@ extension ApprovalTests {
             try f.store.validate(home:group.home)
         }
     }
+    func testLoginGroupRenamePreservesHomeIdentityAndAuthentication()throws {
+        let f=try LoginGroupFixture(),a=try f.store.create(name:"Personal"),b=try f.store.create(name:"Work")
+        let auth=Data("synthetic-private-fixture".utf8)
+        try auth.write(to:URL(fileURLWithPath:a.home+"/auth.json"))
+        let updated=try f.store.rename(id:a.id,name:"  개인 계정  ")
+        try expectEqual(updated.name,"개인 계정");try expectEqual(updated.id,a.id)
+        try expectEqual(updated.home,a.home);try expectEqual(updated.homeIdentity,a.homeIdentity);try expectEqual(updated.createdAt,a.createdAt)
+        try expectEqual(try Data(contentsOf:URL(fileURLWithPath:a.home+"/auth.json")),auth)
+        try expectEqual(try f.store.list(),[updated,b])
+        for name in ["work","",String(repeating:"가",count:81),"a\nb"] {try f.rejects{_ = try f.store.rename(id:a.id,name:name)}}
+        try f.rejects{_ = try f.store.rename(id:UUID(),name:"Missing")}
+        try expectEqual(try f.store.list(),[updated,b])
+        try FileManager.default.moveItem(atPath:a.home,toPath:a.home+"-old")
+        try FileManager.default.createDirectory(atPath:a.home,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
+        try f.rejects{_ = try f.store.rename(id:a.id,name:"Changed")}
+    }
     func testLoginGroupsRejectNamesDuplicatesAndCorruptionWithoutReset()throws {
         let f=try LoginGroupFixture(),a=try f.store.create(name:"Personal")
         for name in ["", "  ",String(repeating:"가",count:81),"a\nb","personal"] {

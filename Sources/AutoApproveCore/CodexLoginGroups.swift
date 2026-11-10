@@ -112,6 +112,17 @@ public struct CodexLoginGroupStore:Sendable {
         guard home.hasPrefix(directory.path+"/homes/") || home.hasPrefix(logical) || canonical.hasPrefix(rootCanonical) else{return}
         guard try list().contains(where:{$0.home==canonical || (try? CodexAccountTransitionTarget.canonicalHome($0.home))==canonical}) else{throw Self.failure}
     }
+    @discardableResult public func rename(id:UUID,name raw:String)throws->CodexLoginGroup {
+        let name=try Self.name(raw),root=try Root(directory,create:false,lock:true)
+        var document=try Self.load(root)
+        guard let index=document.groups.firstIndex(where:{$0.id==id}) else{throw AppError.message("이 로그인 그룹을 찾지 못했습니다. 그룹을 다시 확인해주세요.")}
+        guard !document.groups.contains(where:{$0.id != id && Self.nameKey($0.name)==Self.nameKey(name)}) else{throw AppError.message("같은 이름의 로그인 그룹이 있습니다. 다른 이름을 입력해주세요.")}
+        let old=document.groups[index]
+        if old.name==name{return old}
+        let updated=CodexLoginGroup(id:old.id,name:name,home:old.home,homeIdentity:old.homeIdentity,createdAt:old.createdAt)
+        document.groups[index]=updated;try Self.save(document,root)
+        return updated
+    }
     @discardableResult public func create(name raw:String)throws->CodexLoginGroup {
         let name=try Self.name(raw),root=try Root(directory,create:true,lock:true)
         var document=try Self.load(root)

@@ -6022,6 +6022,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         objectWillChange.send()
         return group
     }
+    public func renameCodexLoginGroup(id:UUID,name:String) async throws->CodexLoginGroup {
+        try Task.checkCancellation()
+        guard !remoteInputStopped else{throw CancellationError()}
+        let store=codexLoginGroupStore
+        let group=try await Task.detached(priority:.utility){try store.rename(id:id,name:name)}.value
+        objectWillChange.send()
+        return group
+    }
     public func codexServerSetupHomes(includeStoredGroups:Bool=true) async throws -> [String] {
         let reader=processReader
         let records=try await Task.detached(priority:.utility){try reader()}.value
@@ -6618,6 +6626,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // the already connected cohort, or bypass a partly executed attachment.
         let recoveryEpoch=codexAccountTransitionEpoch
         let inspection:CodexAccountInspection?
+        let recoveryRecords:[ProcessRecord]
         // Reserve lookup before suspending, just like the managed reconnect.
         // Automatic checks and another manual request cannot take ownership
         // while the recovery cohort is being proved.
@@ -6625,12 +6634,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         do {
             defer{if recoveryEpoch==codexAccountTransitionEpoch {codexAccountTransitionBusy=false}}
             inspection=try? await inspectCodexAccount(home:attachmentHome)
+            let reader=processReader
+            recoveryRecords=try await Task.detached(priority:.utility){try reader()}.value
             try Task.checkCancellation()
             guard recoveryEpoch==codexAccountTransitionEpoch,!remoteInputStopped else {throw CancellationError()}
         }
         if let inspection,inspection.comparison == .different,inspection.identity?.authenticated == false,
            inspection.connectedSessions>0,
-           !codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && $0.phase != .connected}) {
+           !codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && $0.phase != .connected && RemoteDiagnostics.isCurrent($0,records:recoveryRecords)}) {
             try await reconnectCodexManagedLogin(home:attachmentHome,loginRequestID:loginRequestID)
             return
         }

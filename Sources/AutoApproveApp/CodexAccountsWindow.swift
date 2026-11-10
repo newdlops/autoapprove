@@ -39,6 +39,7 @@ struct CodexAccountsLayout<Content:View>:View {
     @State private var loadingGroups=true
     @State private var loginBusy=false
     @State private var newGroup=false
+    @State private var groupSettings=false
     @State private var requestedHome:String?
     @State private var focusHome:String?
     @State private var groupsRequest=UUID()
@@ -60,6 +61,12 @@ struct CodexAccountsLayout<Content:View>:View {
                     newGroup=true
                 }.disabled(loadingGroups || loginBusy || engine.agentAccounts.busy)
                     .help("별도 로그인 홈을 준비합니다. 만든 뒤 해당 그룹에서 브라우저 로그인을 시작할 수 있습니다.")
+            }
+            DisclosureGroup("그룹 설정",isExpanded:$groupSettings) {
+                CodexLoginGroupSettings(groups:groups,rename:{id,name in
+                    let group=try await engine.renameCodexLoginGroup(id:id,name:name)
+                    await reloadGroups();return group
+                }).disabled(loadingGroups || loginBusy || engine.agentAccounts.busy)
             }
             if let groupError {
                 VStack(alignment:.leading,spacing:6) {

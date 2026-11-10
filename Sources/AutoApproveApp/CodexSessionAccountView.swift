@@ -109,7 +109,7 @@ struct CodexSessionAccountContent:View {
     @ViewBuilder private func buttons(_ account:CodexSessionAccount) -> some View {
         Button(account.individual ? "이 세션 계정 로그인":"공유 계정 로그인 (\(account.sharedSessions)개 세션)",action:login)
             .disabled(loading).help("연결된 계정의 로그인과 전환 진행 상태를 확인합니다.")
-        Button("현재 로그인으로 재연결",action:reconnect).disabled(disabled || loading || !account.identity.authenticated)
+        Button("현재 로그인으로 재연결",action:reconnect).disabled(disabled || loading)
             .help("같은 서버의 연결된 Codex를 순차 중단하고 저장된 로그인으로 다시 연결합니다.")
     }
 }
