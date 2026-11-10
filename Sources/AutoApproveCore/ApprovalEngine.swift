@@ -6613,6 +6613,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // Account refresh must wait until an exit/launch has been verified.
         let attachmentHome=try CodexAccountTransitionTarget.canonicalHome(home)
         if try await joinCodexAccountControl(home:attachmentHome) {return}
+        // A signed-out shared server can recover its saved login independently
+        // of standalone TUIs. Never stop/migrate unrelated work just to restore
+        // the already connected cohort, or bypass a partly executed attachment.
+        let recoveryEpoch=codexAccountTransitionEpoch
+        let inspection:CodexAccountInspection?
+        // Reserve lookup before suspending, just like the managed reconnect.
+        // Automatic checks and another manual request cannot take ownership
+        // while the recovery cohort is being proved.
+        codexAccountTransitionBusy=true
+        do {
+            defer{if recoveryEpoch==codexAccountTransitionEpoch {codexAccountTransitionBusy=false}}
+            inspection=try? await inspectCodexAccount(home:attachmentHome)
+            try Task.checkCancellation()
+            guard recoveryEpoch==codexAccountTransitionEpoch,!remoteInputStopped else {throw CancellationError()}
+        }
+        if let inspection,inspection.comparison == .different,inspection.identity?.authenticated == false,
+           inspection.connectedSessions>0,
+           !codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && $0.phase != .connected}) {
+            try await reconnectCodexManagedLogin(home:attachmentHome,loginRequestID:loginRequestID)
+            return
+        }
         let grantReader=processReader
         let grantRecords=try await Task.detached(priority:.utility){try grantReader()}.value
         let roots=Set(ProcessDiscovery.sessions(grantRecords).filter{$0.agent == .codex}.map(\.id))
@@ -6678,7 +6699,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for session in ProcessDiscovery.sessions(remaining) where grants[session.id] != nil && session.agent == .codex && CodexServerLocation.connectedHome(pid:session.pid,hints:[attachmentHome])==nil {
             if let selected=try? await CodexReplyTransport.selectedQueueTarget(session),selected.home==attachmentHome {throw AppError.message("기존 세션 연결이 남아 계정 전환을 보류했습니다. "+(codexSessionAttachmentNotice ?? "원래 작업과 Goal 상태를 확인해주세요."))}
         }
-        if try await joinCodexAccountControl(home:attachmentHome) {return}
+        try await reconnectCodexManagedLogin(home:attachmentHome,loginRequestID:loginRequestID)
+    }
+    private func reconnectCodexManagedLogin(home:String,loginRequestID:String?) async throws {
+        if try await joinCodexAccountControl(home:home) {return}
         let epoch=codexAccountTransitionEpoch
         var ownsBusy=true
         codexAccountTransitionBusy=true

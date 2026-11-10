@@ -160,6 +160,45 @@ extension ApprovalTests {
                         "The independent read-only refresh must restore approval without advancing another home's transition")
         try expectEqual(r.effects,priorEffects,"Membership refresh must never interrupt or restart native work")
     }
+    func testAccountReconnectRecoversSharedServerWhileIndependentWorkStaysRunning() async throws {
+        try await exerciseSharedLoginRecovery(native:false)
+    }
+    func testNativeLoginRecoversSharedServerWhileIndependentWorkStaysRunning() async throws {
+        try await exerciseSharedLoginRecovery(native:true)
+    }
+    private func exerciseSharedLoginRecovery(native:Bool) async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-shared-recovery-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let rows=ProcessDiscovery.parse("4242 1 ttys142 4242 4242 Wed Nov 4 00:00:01 2026 /fixture/codex\n4243 1 ttys143 4243 4243 Wed Nov 4 00:00:02 2026 /fixture/codex")
+        let r=AccountTransitionRig();r.idle(0);r.idle(1);r.observation.serverAccount=nil;r.checkReservations=false
+        r.target.home=root.appendingPathComponent("codex").path
+        r.target.witnesses=[.init(pid:rows[0].pid,started:rows[0].started,tty:"/dev/"+rows[0].tty,threadID:nil)]
+        let target=r.target
+        let inspections=CodexAccountInspectionServices(read:{t in
+            .init(home:t.home,identity:.init(provider:"로그인되지 않음",authenticated:false),comparison:.different,connectedSessions:t.witnesses.count)
+        })
+        let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{rows},codexAccountTransitions:r.services,codexAccountTargets:{_ in [target]},codexAccountInspections:inspections)
+        defer{engine.stop()}
+        var independent=AgentSession(id:rows[1].key,agent:.codex,pid:rows[1].pid,started:rows[1].started,tty:"/dev/"+rows[1].tty,cwd:"/fixture",terminal:.terminal)
+        independent.phase = .working
+        engine.updateDiscovery([independent],records:rows)
+        if native {
+            let auth=AgentAccountServices(home:root.path,check:{_ in .init(agent:"codex",phase:"authenticated")},launch:{_ in
+                try ManagedPTY(cwd:root.path,command:["/bin/zsh","-f","-c","exit 0"],environment:["HOME":root.path,"PATH":"/usr/bin:/bin"])
+            })
+            engine.agentAccounts=AgentAccounts(services:auth,codexServices:{_ in auth})
+            try engine.agentAccounts.beginNativeCodexLogin(target)
+        } else {try await engine.reconnectCodexLogin(home:target.home)}
+        let deadline=Date().addingTimeInterval(5)
+        while r.effects.isEmpty,Date()<deadline {await engine.checkCodexAccountTransitions();try await Task.sleep(for:.milliseconds(20))}
+        try expectEqual(r.effects,["restart"])
+        try expectEqual(engine.snapshot.sessions.first?.phase,.working)
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.witnesses,target.witnesses)
+        r.observation.serverAccount="new";r.observation.serverID="server-2"
+        await engine.checkCodexAccountTransitions()
+        try expectEqual(engine.codexAccountTransitionStates[target.home]?.phase,.complete)
+        try expectEqual(r.effects,["restart"])
+    }
     func testAccountTransitionRecoversSignedOutServerWithSavedLogin() async throws {
         let r=AccountTransitionRig();r.idle(0);r.idle(1)
         r.observation.serverAccount=nil

@@ -1198,6 +1198,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account reconnect: completion while waiting never reserves another restart",tests.testAccountReconnectWaitsForCompletionWithoutCreatingAnotherRequest),
             ("Account reconnect: waits for concurrent read-only inspection",tests.testAccountReconnectWaitsForReadOnlyInspection),
             ("Account reconnect: review preserves reservations on changed identity",tests.testAccountReviewNeverRetriesReservedInterruptOrChangedIdentity),
+            ("Account reconnect: shared login recovery preserves independent working session",tests.testAccountReconnectRecoversSharedServerWhileIndependentWorkStaysRunning),
+            ("Account reconnect: browser login completion recovers shared login without migrating independent work",tests.testNativeLoginRecoversSharedServerWhileIndependentWorkStaysRunning),
             ("Account transition: recover signed-out server",tests.testAccountTransitionRecoversSignedOutServerWithSavedLogin),
             ("Account transition: both logins signed out",tests.testAccountTransitionDoesNotRestartWhenBothLoginsAreSignedOut),
             ("Account reconnect: join pending transition without duplicate restart",tests.testAccountReconnectJoinsExistingTransitionWithoutNewRestart),
