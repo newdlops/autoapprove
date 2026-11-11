@@ -48,6 +48,7 @@ parser.add_argument('--retained-backends', action='store_true', help='Require ev
 parser.add_argument('--terminal-input-hold', action='store_true', help='Verify the owned TUI blocks physical input without changing drafts or its peer')
 parser.add_argument('--swift-input-hold-helper', help='Run the real application input-hold transport against the owned TUI')
 parser.add_argument('--runtime-registration', action='store_true', help='Discover native endpoints using only the shared private registration root')
+parser.add_argument('--swift-selected-input-helper', help='Check real application selected input lease against the discovered server')
 parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
 parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
 parser.add_argument('--admission', action='store_true', help='Verify separately enabled whole-server runtime-start lease')
@@ -65,6 +66,7 @@ assert not args.retained_backends or args.connection_binding, 'Retained backend 
 assert not args.terminal_input_hold or (args.retained_backends and args.direct_server and args.navigation), 'Terminal input hold requires the direct owned retained-backend navigation fixture'
 assert not args.swift_input_hold_helper or args.terminal_input_hold, 'Application input-hold transport requires terminal hold tests'
 assert not args.runtime_registration or (args.terminal_input_hold and args.swift_input_hold_helper), 'Runtime registration requires real application input-hold checks'
+assert not args.swift_selected_input_helper or args.runtime_registration, 'Selected application lease requires runtime registration'
 assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
 assert not args.admission or (args.direct_server and args.navigation), 'Admission test requires direct native server binding and navigation'
 assert not args.app_server_binary or args.server, 'Standalone server mode requires --server'
@@ -961,6 +963,32 @@ try:
         assert first['stores']['primary'][0] in local_owners(peer_state)
         shared_identity(peer_state['stores']['primary'])
     before_subscribers = server_subscribers(first['stores']['primary'][0], 2 if peer else 1)
+    if args.swift_selected_input_helper:
+        root_id = first['stores']['primary'][0]
+        wire = Wire()
+        helper = subprocess.Popen([args.swift_selected_input_helper, '--native-runtime-selected-input-lease',
+                                   str(runtime_root), str(fixture_home), str(pid), str(server.pid), root_id],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert select.select([helper.stdout], [], [], 5)[0], 'Application selected lease did not acknowledge'
+            held = json.loads(helper.stdout.readline())
+            assert held == {'paused': True, 'threadIds': [root_id], 'migrationAuthorized': False}, held
+            before_inference = counts['inference']
+            denied = wire.call('turn/start', {'threadId': root_id,
+                              'input': [{'type': 'text', 'text': 'OWNED_SELECTED_MUST_NOT_DISPATCH'}]}, expect_error=True)
+            assert denied['code'] == -32600, denied
+            denied = wire.call('thread/start', {'cwd': str(work)}, expect_error=True)
+            assert denied['code'] == -32600, denied
+            assert wire.call('thread/read', {'threadId': root_id, 'includeTurns': False})['thread']['status']['type'] == 'idle'
+            assert counts['inference'] == before_inference, 'Blocked selected request dispatched inference'
+            stdout, stderr = helper.communicate('release\n', timeout=5)
+            assert helper.returncode == 0, stderr
+            assert json.loads(stdout) == {'released': True, 'migrationAuthorized': False}, stdout
+        finally:
+            wire.close()
+            if helper.poll() is None:
+                helper.kill()
+                helper.communicate(timeout=5)
     draft = b'UNSENT_NATIVE_INVENTORY_DRAFT_8e932b'
     os.write(fd, draft)
     limit = time.monotonic()+5
@@ -1236,6 +1264,7 @@ try:
               'terminalInputHoldVerified': args.terminal_input_hold,
               'applicationTerminalInputHoldVerified': bool(args.swift_input_hold_helper),
               'runtimeRegistrationDiscoveryVerified': args.runtime_registration,
+              'applicationSelectedInputLeaseVerified': bool(args.swift_selected_input_helper),
               'applicationConnectionCollectorVerified': bool(args.swift_binding_helper),
               'proxyPeerMismatchVerified': args.expect_proxy_peer,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,
