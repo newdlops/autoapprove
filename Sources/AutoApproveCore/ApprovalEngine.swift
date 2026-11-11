@@ -6254,8 +6254,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let source=ScreenTarget(tty:"/dev/"+shell.tty,handle:state.replacesTab ? nil:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
                     return SessionExitRecovery.emptyShellPrompt(try await screen(source))
                 },launch:{
+                    let nativeRoot=try await Task.detached(priority:.utility){try CodexNativeRuntimeRoot.prepare()}.value
                     let current=try await Task.detached(priority:.utility){try reader()}.value
-                    guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current),let command=state.command,FileManager.default.isExecutableFile(atPath:context.executable) else{throw AppError.message("원래 셸·실행 파일·대화를 확인하지 못했습니다.")}
+                    guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current),let command=state.command(nativeRuntimeRoot:nativeRoot),FileManager.default.isExecutableFile(atPath:context.executable) else{throw AppError.message("원래 셸·실행 파일·대화를 확인하지 못했습니다.")}
                     let source=ScreenTarget(tty:"/dev/"+shell.tty,handle:state.replacesTab ? nil:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
                     let before=try await screen(source)
                     guard SessionExitRecovery.emptyShellPrompt(before) else{throw AppError.message("셸 입력창이 비어 있지 않습니다.")}
@@ -6552,6 +6553,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
               connected.contains(where:{$0.pid==session.pid && $0.started==session.started}) else {throw AppError.message("계정 조회 중 세션 연결이 바뀌었습니다. 다시 확인해주세요.")}
         var verified=target;verified.witnesses=connected
         return .init(sessionID:sessionID,target:verified,identity:identity,sharedSessions:connected.count,loginGroupName:groupName,serverPID:server)
+    }
+    /// Current transport association only. Migration must still acquire native
+    /// barriers and establish complete ownership before changing either home.
+    func codexNativeRuntime(sessionID:String) async throws ->CodexNativeRuntimePair {
+        guard let original=sessions[sessionID],original.agent == .codex,original.phase != .ended else {
+            throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")
+        }
+        let account=try await codexSessionAccount(sessionID:sessionID)
+        guard let server=account.serverPID,server>0 else{throw AppError.message("실제 연결 서버를 확인하지 못했습니다.")}
+        let runtime=try await CodexNativeRuntimePair.resolve(home:account.target.home,tuiPID:original.pid,serverPID:server)
+        guard !Task.isCancelled,!remoteInputStopped,let current=sessions[sessionID],
+              current.pid==original.pid,current.started==original.started,current.tty==original.tty,current.phase != .ended,
+              runtime.connection.tuiPeer.pid==UInt32(original.pid),runtime.connection.serverPeer.pid==UInt32(server) else {
+            throw AppError.message("제어 연결을 확인하는 중 원래 세션이나 서버가 바뀌었습니다.")
+        }
+        return runtime
     }
     public func checkCodexAccountTransitions() async {
         guard codexAccountCheckTask==nil,!codexAccountTransitionBusy else{return}

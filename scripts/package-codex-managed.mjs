@@ -7,13 +7,19 @@ const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name
 assert.ok(option('binary')&&option('source')&&option('runtime-archive'),'Provide --binary=/release/codex --source=/patched/codex-rs --runtime-archive=/official/package.tar.gz');
 const source=path.resolve(option('source')),pins=JSON.parse(await readFile('patches/codex/0.167.1-child-goal-control.manifest.json','utf8'));
 const approvalPins=JSON.parse(await readFile('patches/codex/0.167.0-subagent-approval.manifest.json','utf8'));
+const nativeRuntime=process.argv.includes('--native-runtime');
+const nativePins=nativeRuntime?JSON.parse(await readFile('patches/codex/0.167.1-selected-input-observation.manifest.json','utf8')):null;
+const buildLabel=nativeRuntime?'autoapprove-managed-1671-2':'autoapprove-managed-1671-1';
 const runtimeArchiveSHA256='5bcbc5866cbca19f9299f7884e9b39b9ccb5469969c170b1f2d2cd6fc4b1ee72';
 const hash=b=>createHash('sha256').update(b).digest('hex');
-for(const file of [...pins.files,...approvalPins.files])assert.equal(hash(await readFile(path.join(source,file.path))),file.after,'Build source changed: '+file.path);
+const finalFiles=new Map([...pins.files,...approvalPins.files,...(nativePins?.files??[])].map(file=>[file.path,file]));
+for(const file of finalFiles.values())assert.equal(hash(await readFile(path.join(source,file.path))),file.after,'Build source changed: '+file.path);
+if(nativePins)assert.equal(hash(await readFile('patches/codex/0.167.1-selected-input-observation.patch')),nativePins.patchSHA256,'Native source patch changed');
 const inputBinary=await readFile(option('binary'));
-assert.ok(inputBinary.includes(Buffer.from('autoapprove-managed-1671-1')),'Maintained-build diagnostic stamp is missing');
+assert.ok(inputBinary.includes(Buffer.from(buildLabel)),'Maintained-build diagnostic stamp is missing');
+if(nativeRuntime)for(const marker of ['autoapprove-native-runtime-registration','autoapprove-native-tui-input-hold'])assert.ok(inputBinary.includes(Buffer.from(marker)),'Native runtime capability marker is missing: '+marker);
 assert.ok(inputBinary.includes(Buffer.from(pins.upstreamCommit)),'Runtime compatibility stamp is missing');
-const name='Codex-0.167.1-AutoApprove-managed1-macOS-arm64',bundle=path.resolve('dist',name);
+const name=`Codex-0.167.1-AutoApprove-managed${nativeRuntime?'2':'1'}-macOS-arm64`,bundle=path.resolve('dist',name);
 await mkdir(path.dirname(bundle),{recursive:true});
 // Refuse to reuse an old staging folder so unrelated files cannot enter a release.
 assert.equal(hash(await readFile(option('runtime-archive'))),runtimeArchiveSHA256,'Wrong official runtime archive');
@@ -68,8 +74,9 @@ for(const [from,to]of [
  ['patches/codex/0.167.0-subagent-approval.manifest.json','source-manifest.json'],
  ['patches/codex/0.167.1-child-goal-control.patch','goal-control.patch'],
  ['patches/codex/0.167.1-child-goal-control.manifest.json','goal-control-manifest.json'],
- ['patches/codex/0.167.1-managed-package.md','README.md']
+ [nativeRuntime?'patches/codex/0.167.1-native-runtime.md':'patches/codex/0.167.1-managed-package.md','README.md']
 ])await copyFile(from,path.join(bundle,to));
+if(nativeRuntime)for(const suffix of ['patch','manifest.json'])await copyFile('patches/codex/0.167.1-selected-input-observation.'+suffix,path.join(bundle,'native-runtime.'+suffix));
 await copyFile(path.resolve(source,'../LICENSE'),path.join(bundle,'LICENSE'));
 await copyFile(path.resolve(source,'../NOTICE'),path.join(bundle,'NOTICE'));
 // Include dependency notices from the exact locked graph; no runtime data.
@@ -86,7 +93,8 @@ for(const pkg of metadata.packages){
 // Preserve helper/resource bytes and update only the primary CLI checksum.
 for(const [file,digest]of Object.entries(originalFiles))if(!['bin/codex',voiceManifestPath].includes(file))assert.equal(hash(await readFile(path.join(bundle,file))),digest,'Runtime helper changed: '+file);
 for(const [file,digest]of Object.entries(voiceManifest.sha256))assert.equal(hash(await readFile(path.join(bundle,file))),digest,'Voice runtime checksum mismatch: '+file);
-const manifest={format:1,name,upstreamVersion:'0.167.1',upstreamCommit:pins.upstreamCommit,buildLabel:'autoapprove-managed-1671-1',runtimeCompatibilityStamp:pins.upstreamCommit,architecture:'arm64',patchSHA256:pins.patchSHA256,approvalPatchSHA256:approvalPins.patchSHA256,sourceArchiveSHA256:pins.sourceArchiveSHA256,runtimeArchiveSHA256,originalBinarySHA256,binarySHA256:hash(await readFile(binary)),voiceManifestSHA256:hash(await readFile(path.join(bundle,voiceManifestPath))),officialRuntimeFiles:originalFiles,features:['codex-app-server/autoapprove-goal-control'],publisher:'AutoApprove Local Code Signing',officialOpenAIRelease:false};
+const manifest={format:1,name,upstreamVersion:'0.167.1',upstreamCommit:pins.upstreamCommit,buildLabel,runtimeCompatibilityStamp:pins.upstreamCommit,architecture:'arm64',patchSHA256:pins.patchSHA256,approvalPatchSHA256:approvalPins.patchSHA256,sourceArchiveSHA256:pins.sourceArchiveSHA256,runtimeArchiveSHA256,originalBinarySHA256,binarySHA256:hash(await readFile(binary)),voiceManifestSHA256:hash(await readFile(path.join(bundle,voiceManifestPath))),officialRuntimeFiles:originalFiles,features:['codex-app-server/autoapprove-goal-control',...(nativeRuntime?['codex-app-server/autoapprove-native-inventory','codex-app-server/autoapprove-selected-transition','codex-tui/autoapprove-native-inventory']:[])],publisher:'AutoApprove Local Code Signing',officialOpenAIRelease:false,
+ ...(nativeRuntime?{nativeRuntimeSchemaVersion:1,nativePatchSHA256:nativePins.patchSHA256,releaseReady:nativePins.releaseReady===true,migrationAuthorized:false}:{})};
 await writeFile(path.join(bundle,'manifest.json'),JSON.stringify(manifest,null,2)+'\n');
 const archive=path.resolve('dist',name+'.zip');execFileSync('/usr/bin/ditto',['-c','-k','--norsrc','--keepParent',bundle,archive]);
 const bytes=await readFile(archive),sha256=hash(bytes);await writeFile(archive+'.sha256',sha256+'  '+path.basename(archive)+'\n');

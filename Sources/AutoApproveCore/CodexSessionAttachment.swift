@@ -56,9 +56,18 @@ public struct CodexSessionAttachment:Codable {
         return try CodexGoalTransport.readDatabase(home:home,threadID:threadID)
     }
     public var command:String? {
+        command(nativeRuntimeRoot:nil)
+    }
+    func command(nativeRuntimeRoot:String?) ->String? {
         guard let id=context.conversationID,UUID(uuidString:id) != nil,context.executable.hasPrefix("/"),home.hasPrefix("/"),context.session.cwd.hasPrefix("/"),
               [home,context.executable,context.session.cwd].allSatisfy({!$0.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)}) else{return nil}
-        return "cd -- "+HookInstaller.quote(context.session.cwd)+" && "+["env","CODEX_HOME="+home,context.executable,"--remote","unix://","resume",id].map(HookInstaller.quote).joined(separator:" ")
+        var arguments=["env","CODEX_HOME="+home]
+        if let root=nativeRuntimeRoot {
+            guard CodexNativeRuntimeRoot.validPath(root) else{return nil}
+            arguments.append("AUTOAPPROVE_NATIVE_RUNTIME_ROOT="+root)
+        }
+        arguments += [context.executable,"--remote","unix://","resume",id]
+        return "cd -- "+HookInstaller.quote(context.session.cwd)+" && "+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
 }
 

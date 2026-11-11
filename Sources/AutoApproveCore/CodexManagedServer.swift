@@ -26,6 +26,7 @@ public struct CodexManagedServerServices:Sendable {
             let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records)
             return try client.inspect()
         }},prepare:{home,records in try await background {
+            try CodexNativeRuntimeRoot.prepare()
             let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records)
             let before=try client.inspect()
             guard before.canPrepare else{return before}

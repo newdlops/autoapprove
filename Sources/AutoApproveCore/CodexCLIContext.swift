@@ -23,6 +23,9 @@ struct CodexCLIContext {
         let home=try CodexAccountTransitionTarget.canonicalHome(home)
         var env=base
         env["HOME"]=userHome;env["CODEX_HOME"]=home;env["NO_COLOR"]="1"
+        if env["AUTOAPPROVE_NATIVE_RUNTIME_ROOT"]==nil,let root=CodexNativeRuntimeRoot.existing() {
+            env["AUTOAPPROVE_NATIVE_RUNTIME_ROOT"]=root
+        }
         var requested=supplied
         if let supplied {
             guard validPath(supplied) else{throw AppError.message("Codex 실행 파일의 전체 경로가 필요합니다.")}

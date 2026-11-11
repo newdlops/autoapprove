@@ -502,6 +502,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         if WorkingDirectoryFixture.runIfRequested() { return }
 #if DEBUG
+        if BundledRuntimeProbe.runIfRequested() { return }
         if await NativeConnectionProbe.runIfRequested() { return }
 #endif
         let tests = ApprovalTests()
@@ -1241,6 +1242,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Native observation: cancellation closes pending read",tests.testNativeObservationCancellationClosesPendingRead),
             ("Native observation: one whole read deadline",tests.testNativeObservationUsesOneWholeReadDeadline),
             ("Native terminal hold: exact peer lease and drained release",tests.testNativeTerminalInputHoldRejectsWrongIdentityAndEarlyRelease),
+            ("Native runtime: private root and aliases preserve existing paths",tests.testNativeRuntimeRootPreservesForeignAndPublicPaths),
+            ("Native runtime: literal environment only reaches Codex",tests.testNativeRuntimeLaunchUsesLiteralCodexOnlyEnvironment),
+            ("Native runtime: malformed foreign and linked records reject",tests.testNativeRuntimeRegistryRejectsMalformedOrForeignDiscoveryHints),
+            ("Native runtime: registry cannot forge a kernel process instance",tests.testNativeRuntimeRegistryFileCannotForgeKernelProcessInstance),
+            ("Bundled Codex runtime: digest markers and launch identity",tests.testBundledCodexRuntimeChecksDigestMarkersAndLaunchIdentity),
+            ("Bundled Codex runtime: profile requires matching server and literal command",tests.testBundledCodexProfileLaunchRequiresMatchingServerAndLiteralCommand),
+            ("Bundled Codex runtime: unsupported capabilities links and missing code reject",tests.testBundledCodexRuntimeRejectsWrongCapabilitiesLinksAndMissingCode),
             ("Native connection: kernel witness and exact displayed association",tests.testNativeConnectionReadsKernelWitnessAndExactAssociation),
             ("Native connection: stale proxy duplicate and authority claim rejection",tests.testNativeConnectionRejectsStaleProxyDuplicateAndAuthorityClaims),
             ("Session migration: exact selected cohort reserves without changing ownership",tests.testSessionMigrationPreparesExactCohortWithoutChangingOwnership),

@@ -14,7 +14,7 @@
     {
       "path": "app-server/src/lib.rs",
       "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
-      "after": "9daea9f648ea9a26619c4dc97b283a663817a2307c05be2ca5f09685cd5279f3"
+      "after": "9ed8142845c35bd7c929e6eec3b17f1ade97555f60de9f536baf10afae65e3f1"
     },
     {
       "path": "app-server/src/turn_admission.rs",
@@ -29,7 +29,7 @@
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "79512a183fb426e84ed2f158ae116f5cbb40a306b1eb57c330ecbf5f079d4b7a"
+      "after": "8844dce031beba4d94e5d774fa15afee69a0fd7f5f95699f67f0951086de5ac8"
     },
     {
       "path": "app-server/src/message_processor.rs",
@@ -79,7 +79,7 @@
     {
       "path": "tui/src/app/startup.rs",
       "before": "fbbedd6664ddb1df28fa49ac055bac130b1c7996815ead701fecddcbd41565cf",
-      "after": "3917e1bd8deb54b1499f920beee39a5dd5643fdcd06e22f553d2251776d5bf7c"
+      "after": "bd5b6b0ba9355b22a5438e3643dc86c5e93cd22048f5f56a436bb133eac189ab"
     },
     {
       "path": "tui/src/app/event_dispatch.rs",
@@ -99,7 +99,7 @@
     {
       "path": "tui/src/native_inventory.rs",
       "before": null,
-      "after": "28f5c64cf73d774dbd00ac8d7199adb6a86a4c38b6b386c4ec042be2e78ad24d"
+      "after": "f7d95e4932c7347a19fbf7ef05a51cdc8da289f985e3ebe03eaa3c9af9c9385a"
     },
     {
       "path": "tui/src/app/native_inventory.rs",
@@ -114,12 +114,12 @@
     {
       "path": "app-server/src/native_inventory.rs",
       "before": null,
-      "after": "abc6eaaf26930adafcd1b6888def0b49dbe6444a8acf052f88329ae17bb083cb"
+      "after": "9e3680a5e870d83e89e29b16c2cfac23e974879845c4d18b76c36999112e7b7b"
     },
     {
       "path": "app-server/src/native_inventory_transport.rs",
       "before": null,
-      "after": "b3622a3bbea952e3ea522d14e7ded28be689f86e38354d2208b7a95bcf2a095f"
+      "after": "622046cca70ecf52a740fa90d848bb5b8fe816e6b70c9c9cf983f3a519be3552"
     },
     {
       "path": "app-server/src/transport.rs",
@@ -139,7 +139,7 @@
     {
       "path": "app-server-client/src/lib.rs",
       "before": "3ab3d894c169989ba9319fb4c7fb9daf09a9de53a2ff80b739ff38abde0f2f75",
-      "after": "2a86235c347f5d1a6ccd7f5cd5056de24a49780282482cebdb65bbd658660432"
+      "after": "d15da4b03c980722bf7e5b7f8b8cc8e5d3fc3ccc7b1a555ad3876ea048fb2c9f"
     },
     {
       "path": "app-server-transport/Cargo.toml",
@@ -149,7 +149,7 @@
     {
       "path": "app-server-transport/src/lib.rs",
       "before": "748b9972623b8aeaca5dfd95540591edd27213b38c98662f250672153e9877c1",
-      "after": "ff47e92af880726e4c9aa668d050da7b4d5de8b0b510234da6246ad9b4b67ede"
+      "after": "8d5ab15da1de0d3cdc9905074be3296aaa73619a6d3809bbaa0cae6ce5ddc5de"
     },
     {
       "path": "app-server-transport/src/native_peer.rs",
@@ -209,10 +209,15 @@
     {
       "path": "tui/src/native_input_hold.rs",
       "before": null,
-      "after": "75057d3193d8c789b0a9cbb8779824cb9359587e5c648a31a189d3f4c7608ec8"
+      "after": "bc2a17e4eae9cd376f0f4f8c33b474b4c889f342dd3bb2ebac2e0d07c62a6683"
+    },
+    {
+      "path": "app-server-transport/src/native_runtime.rs",
+      "before": null,
+      "after": "e2cc6638696d8e87039e0536e6a3b08900848a9ac5a6502ac9096f7bebe643a5"
     }
   ],
-  "patchSHA256": "c10271e0ad004073a0995d86b7e553841206e0defe1b41e1e273b5e0e5a7ddbb",
+  "patchSHA256": "a94c71074fa92ab8d00b499fe780e02c8b22881ad1dc5501c88010319de51f16",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -241,6 +246,21 @@
       "originalActiveSessionsPreserved": 4,
       "completeCensus": false,
       "migrationVerified": false
+    },
+    "native42": {
+      "runtimeModuleTestsPassed": 4,
+      "swiftRuntimeChecksPassed": 4,
+      "startupHooksCompiled": true,
+      "standaloneBuildRunning": false,
+      "liveDiscoveryVerified": true,
+      "productLauncherProvisioningComplete": false,
+      "startupHooksIntegrated": true,
+      "actualSwiftDiscoveryAndHold": true,
+      "originalSessionsPreserved": 4,
+      "terminalSizes": [
+        "120x36",
+        "80x24"
+      ]
     }
   },
   "remaining": [

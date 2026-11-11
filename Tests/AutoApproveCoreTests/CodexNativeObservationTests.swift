@@ -136,26 +136,46 @@ extension ApprovalTests {
 }
 
 enum NativeConnectionProbe {
+    private static func operate(_ binding:CodexNativeDisplayedConnection,path:String)async throws {
+        try await Task.detached {
+            let hold=try CodexNativeTerminalInputHold(path:path,expected:binding)
+            defer{hold.close()}
+            try hold.pause();try hold.status();try hold.renew()
+            try FileHandle.standardOutput.write(contentsOf:Data("{\"paused\":true,\"migrationAuthorized\":false}\n".utf8))
+            var input=pollfd(fd:STDIN_FILENO,events:Int16(POLLIN),revents:0)
+            guard poll(&input,1,5000)>0,readLine()=="release" else{throw AppError.message("Owned release command missing")}
+            try hold.release()
+            try FileHandle.standardOutput.write(contentsOf:Data("{\"released\":true,\"migrationAuthorized\":false}\n".utf8))
+        }.value
+    }
     @MainActor static func runIfRequested() async -> Bool {
         let inputHold = CommandLine.arguments.firstIndex(of: "--native-terminal-input-hold")
-        guard let index = inputHold ?? CommandLine.arguments.firstIndex(of: "--native-binding-observe") else { return false }
+        let runtimeHold=CommandLine.arguments.firstIndex(of:"--native-runtime-input-hold")
+        let runtime=runtimeHold ?? CommandLine.arguments.firstIndex(of:"--native-runtime-resolve")
+        guard let index = runtime ?? inputHold ?? CommandLine.arguments.firstIndex(of: "--native-binding-observe") else { return false }
         do {
+            if runtime != nil {
+                guard index+4<CommandLine.arguments.count,let tuiPID=Int32(CommandLine.arguments[index+3]),
+                      let serverPID=Int32(CommandLine.arguments[index+4]) else{throw AppError.message("Owned root home and PIDs required")}
+                let pair=try await CodexNativeRuntimePair.resolve(root:CommandLine.arguments[index+1],home:CommandLine.arguments[index+2],tuiPID:tuiPID,serverPID:serverPID)
+                if runtimeHold != nil {try await operate(pair.connection,path:pair.tuiControlSocket)}
+                else {
+                    let result:[String:Any]=["verified":true,"connectionID":pair.connection.connectionID,
+                        "tuiPID":pair.connection.tuiPeer.pid,"serverPID":pair.connection.serverPeer.pid,
+                        "tuiInventorySocket":pair.tuiInventorySocket,"serverInventorySocket":pair.serverInventorySocket,
+                        "tuiControlSocket":pair.tuiControlSocket,"serverControlSocket":pair.serverControlSocket,
+                        "membershipComplete":false,"migrationAuthorized":false]
+                    print(String(decoding:try JSONSerialization.data(withJSONObject:result,options:[.sortedKeys]),as:UTF8.self))
+                }
+                return true
+            }
             guard index + 2 < CommandLine.arguments.count else { throw AppError.message("Two owned observation paths required") }
             let binding = try await CodexNativeDisplayedConnection.observe(
                 tuiSocket: CommandLine.arguments[index + 1], serverSocket: CommandLine.arguments[index + 2])
             if inputHold != nil {
                 guard index + 3 < CommandLine.arguments.count else { throw AppError.message("Owned hold socket required") }
                 let path = CommandLine.arguments[index + 3]
-                try await Task.detached {
-                    let hold = try CodexNativeTerminalInputHold(path: path, expected: binding)
-                    defer { hold.close() }
-                    try hold.pause(); try hold.status(); try hold.renew()
-                    try FileHandle.standardOutput.write(contentsOf: Data("{\"paused\":true,\"migrationAuthorized\":false}\n".utf8))
-                    var input = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-                    guard poll(&input, 1, 5000) > 0, readLine() == "release" else { throw AppError.message("Owned release command missing") }
-                    try hold.release()
-                    try FileHandle.standardOutput.write(contentsOf: Data("{\"released\":true,\"migrationAuthorized\":false}\n".utf8))
-                }.value
+                try await operate(binding,path:path)
                 return true
             }
             let result: [String: Any] = ["verified": true, "connectionID": binding.connectionID,

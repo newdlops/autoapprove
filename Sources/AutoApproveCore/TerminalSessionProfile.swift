@@ -58,11 +58,23 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         value.hasPrefix("/") && value.utf8.count <= 4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
     }
     /// Fixed CLI grammar, with every user value quoted. No prompt or approval flag is replayed.
-    public func resumeCommand() throws -> String {
+    public func resumeCommand(nativeRuntimeRoot:String?=nil) throws -> String {
+        try resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
+    }
+    func resumeCommand(nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?) throws -> String {
         let entry=try validated()
+        if let bundledRuntime {
+            guard entry.agent == "codex",nativeRuntimeRoot != nil else {throw AppError.message("Codex 실행 환경을 확인해주세요.")}
+            try bundledRuntime.verifyUnchanged()
+        }
         var arguments=["env"]
+        if let root=nativeRuntimeRoot {
+            guard entry.agent == "codex",CodexNativeRuntimeRoot.validPath(root) else {throw AppError.message("Codex 제어 등록 경로를 확인해주세요.")}
+            arguments.append("AUTOAPPROVE_NATIVE_RUNTIME_ROOT="+root)
+        }
         if let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
-        arguments.append(agent)
+        arguments.append(bundledRuntime?.executable ?? agent)
+        if bundledRuntime != nil {arguments += ["--remote","unix://"]}
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
         return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+(entry.agent == "codex" ? "":"exec ")+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
@@ -343,8 +355,11 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
 
 public enum TerminalProfileLauncher {
     public static func validTTY(_ tty:String)->Bool {tty.range(of:#"^/dev/ttys[0-9]+$"#,options:.regularExpression) != nil}
-    public static func script(_ entry: TerminalProfileEntry,targetTTY:String?=nil) throws -> String {
-        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand())
+    public static func script(_ entry: TerminalProfileEntry,targetTTY:String?=nil,nativeRuntimeRoot:String?=nil) throws -> String {
+        try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
+    }
+    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?) throws ->String {
+        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:bundledRuntime))
         if entry.host == .iterm {
             return "const app=Application('com.googlecode.iterm2'); app.activate(); const window=app.createWindowWithDefaultProfile({command:\(command)}); JSON.stringify({tty:window.currentSession().tty()});"
         }
@@ -375,11 +390,16 @@ public enum TerminalProfileLauncher {
     public static func launch(_ entry: TerminalProfileEntry,anchorTTY:String?=nil) async throws -> String {
         let entry=try entry.validated()
         return try await Task.detached(priority:.userInitiated) {
+            let nativeRoot=entry.agent == "codex" ? try CodexNativeRuntimeRoot.prepare():nil
+            let runtime=entry.agent == "codex" ? try CodexBundledRuntime.bundled():nil
+            if let runtime {
+                try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,server:.local(executable:runtime.executable))
+            }
             var targetTTY:String?
             if entry.host == .terminal,let anchorTTY {
                 targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY,settingsName:entry.terminalTab?.settingsName)
             }
-            let body=try script(entry,targetTTY:targetTTY)
+            let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRoot,bundledRuntime:runtime)
             let text:String
             do {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
             catch let error as TerminalAdapterError {

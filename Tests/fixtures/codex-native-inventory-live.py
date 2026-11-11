@@ -27,6 +27,7 @@ import termios
 import threading
 import time
 import urllib.request
+import uuid
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--tui', required=True)
@@ -46,6 +47,7 @@ parser.add_argument('--swift-binding-helper', help='Run the application connecti
 parser.add_argument('--retained-backends', action='store_true', help='Require event-loop backend and offscreen channel observations')
 parser.add_argument('--terminal-input-hold', action='store_true', help='Verify the owned TUI blocks physical input without changing drafts or its peer')
 parser.add_argument('--swift-input-hold-helper', help='Run the real application input-hold transport against the owned TUI')
+parser.add_argument('--runtime-registration', action='store_true', help='Discover native endpoints using only the shared private registration root')
 parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
 parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
 parser.add_argument('--admission', action='store_true', help='Verify separately enabled whole-server runtime-start lease')
@@ -62,6 +64,7 @@ assert not args.swift_binding_helper or args.connection_binding, 'Application co
 assert not args.retained_backends or args.connection_binding, 'Retained backend checks require connection binding'
 assert not args.terminal_input_hold or (args.retained_backends and args.direct_server and args.navigation), 'Terminal input hold requires the direct owned retained-backend navigation fixture'
 assert not args.swift_input_hold_helper or args.terminal_input_hold, 'Application input-hold transport requires terminal hold tests'
+assert not args.runtime_registration or (args.terminal_input_hold and args.swift_input_hold_helper), 'Runtime registration requires real application input-hold checks'
 assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
 assert not args.admission or (args.direct_server and args.navigation), 'Admission test requires direct native server binding and navigation'
 assert not args.app_server_binary or args.server, 'Standalone server mode requires --server'
@@ -93,6 +96,7 @@ endpoint = fixture/'inventory.sock'
 server_endpoint = fixture/'server-inventory.sock'
 transition_endpoint = fixture/'transition.sock'
 input_hold_endpoint = fixture/'input-hold.sock'
+runtime_root = pathlib.Path(__import__('tempfile').mkdtemp(prefix='aa-nr-', dir='/private/tmp')) if args.runtime_registration else None
 counts = {'inference': 0, 'externalBlocked': 0}
 admission_stream_stop = threading.Event()
 
@@ -189,8 +193,34 @@ env = {'HOME': str(fixture_home), 'CODEX_HOME': str(fixture_home), 'PATH': '/usr
        'AUTOAPPROVE_NATIVE_INVENTORY_SOCKET': str(endpoint),
        'HTTP_PROXY': f'http://127.0.0.1:{port}', 'HTTPS_PROXY': f'http://127.0.0.1:{port}',
        'NO_PROXY': '127.0.0.1,localhost'}
-if args.terminal_input_hold:
+if args.terminal_input_hold and not args.runtime_registration:
     env['AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET'] = str(input_hold_endpoint)
+if args.runtime_registration:
+    env.pop('AUTOAPPROVE_NATIVE_INVENTORY_SOCKET')
+    env['AUTOAPPROVE_NATIVE_RUNTIME_ROOT'] = str(runtime_root)
+
+def runtime_endpoint(role, owner, key):
+    prefix = ('t' if role == 'tui' else 's')+'-'+str(owner)+'-'
+    matches = []
+    for directory in runtime_root.glob(prefix+'*'):
+        try:
+            info = directory.lstat()
+            assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
+            data = (directory/'registration.json').read_bytes()
+            assert len(data) <= 16384
+            value = json.loads(data)
+            assert value['schemaVersion'] == 1 and value['producer'] == 'autoapprove-native-runtime-registration'
+            assert value['cliVersion'] == args.expected_version and value['pid'] == owner and value['role'] == role
+            assert str(uuid.UUID(value['registrationId'])) == value['registrationId']
+            assert directory.name == prefix+value['registrationId'].replace('-', '')
+            assert pathlib.Path(value['home']).resolve() == fixture_home.resolve()
+            assert value['membershipComplete'] is False and value['migrationAuthorized'] is False
+            assert value['inventorySocket'] == 'i.sock' and value['controlSocket'] == 'c.sock'
+            matches.append(directory/value[key])
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    assert len(matches) <= 1, 'Owned process registered more than one native endpoint set'
+    return matches[0] if matches else None
 server = None
 server_log = None
 other_server = None
@@ -362,7 +392,7 @@ if args.server:
     control_socket.parent.mkdir(mode=0o700)
     server_log = (output/'owned-server-private.log').open('wb')
     server_env = dict(env)
-    if args.server_inventory:
+    if args.server_inventory and not args.runtime_registration:
         server_env['AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET'] = str(server_endpoint)
     if args.admission:
         server_env['AUTOAPPROVE_NATIVE_TRANSITION_SOCKET'] = str(transition_endpoint)
@@ -453,7 +483,9 @@ def kernel_socket_identity(stream):
     assert result['effectiveUid'] == os.geteuid()
     return result
 
-def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-tui-prototype'):
+def inventory(own_endpoint=None, own_pid=pid, producer='autoapprove-native-tui-prototype'):
+    if own_endpoint is None:
+        own_endpoint = endpoint
     info = own_endpoint.lstat()
     assert stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
     nonce = secrets.token_hex(16)
@@ -572,8 +604,9 @@ def server_subscribers(root_id, expected_count):
                         assert matched['nativePeer'] == kernel_identities[owner], 'Displayed transport belongs to another client process'
                     if args.swift_binding_helper:
                         owner_endpoint = endpoint if owner == pid else peer['endpoint']
-                        checked = subprocess.run([args.swift_binding_helper, '--native-binding-observe',
-                                                  str(owner_endpoint), str(server_endpoint)],
+                        helper_args = (['--native-runtime-resolve', str(runtime_root), str(fixture_home), str(owner), str(server.pid)]
+                                       if args.runtime_registration else ['--native-binding-observe', str(owner_endpoint), str(server_endpoint)])
+                        checked = subprocess.run([args.swift_binding_helper, *helper_args],
                                                  capture_output=True, text=True, timeout=5)
                         check = json.loads(checked.stdout)
                         assert checked.returncode == (1 if args.expect_proxy_peer else 0), checked.stderr
@@ -582,6 +615,9 @@ def server_subscribers(root_id, expected_count):
                         if not args.expect_proxy_peer:
                             assert check['connectionID'] == matched['connectionID']
                             assert check['tuiPID'] == owner and check['serverPID'] == server.pid
+                            if args.runtime_registration:
+                                assert check['tuiInventorySocket'] == str(owner_endpoint)
+                                assert check['serverInventorySocket'] == str(server_endpoint)
             return set(ids)
         time.sleep(.05)
     (output/'owned-server-inventory-mismatch.json').write_text(json.dumps(value, indent=2)+'\n')
@@ -596,8 +632,10 @@ def launch_peer(primary):
                                  capture_output=True, timeout=10, check=True)
         assert version.stdout.strip() == ('codex-cli '+args.expected_version).encode(), version.stdout
     peer_endpoint = fixture/'peer.sock'
-    peer_env = dict(env, AUTOAPPROVE_NATIVE_INVENTORY_SOCKET=str(peer_endpoint))
-    if args.terminal_input_hold:
+    peer_env = dict(env)
+    if not args.runtime_registration:
+        peer_env['AUTOAPPROVE_NATIVE_INVENTORY_SOCKET'] = str(peer_endpoint)
+    if args.terminal_input_hold and not args.runtime_registration:
         peer_env['AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET'] = str(fixture/'peer-input-hold.sock')
     peer_pid, peer_fd = pty.fork()
     if peer_pid == 0:
@@ -618,6 +656,10 @@ def peer_inventory():
     if ended:
         peer['reaped'] = True
         raise RuntimeError('Owned peer TUI exited')
+    if args.runtime_registration:
+        peer['endpoint'] = runtime_endpoint('tui', peer['pid'], 'inventorySocket')
+        if peer['endpoint'] is None:
+            raise OSError('Owned peer registration is not ready')
     return inventory(peer['endpoint'], peer['pid'])
 
 def stop_owned_tui(own_pid, own_fd, own_done, own_reader, already_reaped):
@@ -860,6 +902,14 @@ try:
         if ended:
             reaped = True
             raise RuntimeError('Owned TUI exited before inventory became ready')
+        if args.runtime_registration:
+            native = runtime_endpoint('tui', pid, 'inventorySocket')
+            host = runtime_endpoint('server', server.pid, 'inventorySocket')
+            if native is None or host is None:
+                time.sleep(.1)
+                continue
+            endpoint, server_endpoint = native, host
+            input_hold_endpoint = runtime_endpoint('tui', pid, 'controlSocket')
         if endpoint.exists():
             try:
                 first = inventory()
@@ -1005,8 +1055,9 @@ try:
         finally:
             hold.close()
         if args.swift_input_hold_helper:
-            helper = subprocess.Popen([args.swift_input_hold_helper, '--native-terminal-input-hold',
-                                       str(endpoint), str(server_endpoint), str(input_hold_endpoint)],
+            helper_args = (['--native-runtime-input-hold', str(runtime_root), str(fixture_home), str(pid), str(server.pid)]
+                           if args.runtime_registration else ['--native-terminal-input-hold', str(endpoint), str(server_endpoint), str(input_hold_endpoint)])
+            helper = subprocess.Popen([args.swift_input_hold_helper, *helper_args],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
             try:
                 assert select.select([helper.stdout], [], [], 5)[0], 'Application hold acknowledgment timed out'
@@ -1184,6 +1235,7 @@ try:
               'retainedBackendAndChannelObservationVerified': args.retained_backends,
               'terminalInputHoldVerified': args.terminal_input_hold,
               'applicationTerminalInputHoldVerified': bool(args.swift_input_hold_helper),
+              'runtimeRegistrationDiscoveryVerified': args.runtime_registration,
               'applicationConnectionCollectorVerified': bool(args.swift_binding_helper),
               'proxyPeerMismatchVerified': args.expect_proxy_peer,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,
@@ -1191,6 +1243,11 @@ try:
               'sharedUnixAppServer': server is not None, 'managedDaemonSupervisor': False,
               'admissionGranted': False, 'migrationVerified': False}
 except BaseException:
+    if runtime_root:
+        diagnostic = {'root': str(runtime_root), 'first': first,
+                      'entries': {str(p.relative_to(runtime_root)): p.read_text()
+                                  for p in runtime_root.glob('*/registration.json')}}
+        (output/'runtime-failure-private.json').write_text(json.dumps(diagnostic, indent=2)+'\n')
     with capture_lock:
         (output/'owned-tui-failure-private.bin').write_bytes(captured)
     if peer:
@@ -1229,6 +1286,8 @@ finally:
                 server.wait(timeout=3)
         server_log.close()
     shutil.rmtree(fixture)
+    if runtime_root:
+        shutil.rmtree(runtime_root)
 
 # Verify again after terminating only owned children and removing only the owned
 # fixture. A successful snapshot before cleanup is insufficient for this claim.

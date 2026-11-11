@@ -28,16 +28,47 @@
  mod server_request_error;
  mod skills_watcher;
  mod startup_warnings;
-@@ -1041,6 +1044,16 @@
+@@ -994,6 +997,16 @@
+         info!("outbound router task exited (channel closed)");
+     });
+ 
++    #[cfg(all(feature = "autoapprove-native-inventory", unix))]
++    let native_runtime =
++        codex_app_server_transport::native_runtime::NativeRuntimeRegistration::from_environment(
++            codex_app_server_transport::native_runtime::NativeRuntimeRole::Server,
++            &config.codex_home,
++        )
++        .unwrap_or_else(|error| {
++            warn!(%error, "native runtime discovery unavailable");
++            None
++        });
+     let recovery_file = daemon_recovery_file_path(&config.codex_home);
+     let daemon_settings_file = managed_daemon.then(|| {
+         config
+@@ -1041,12 +1054,38 @@
          let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
          let mut active_admissions_rx = processor.turn_admission.subscribe_active();
          let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
 +        let (native_inventory_tx, mut native_inventory_rx) = mpsc::channel(1);
-+        let native_inventory_server =
-+            native_inventory::start(native_inventory_tx).unwrap_or_else(|error| {
-+                warn!(%error, "native inventory socket unavailable");
++        let native_inventory_path = {
++            #[cfg(all(feature = "autoapprove-native-inventory", unix))]
++            {
++                native_runtime
++                    .as_ref()
++                    .map(|runtime| runtime.inventory_path())
++            }
++            #[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
++            {
 +                None
-+            });
++            }
++        };
++        let native_inventory_server =
++            native_inventory::start(native_inventory_tx, native_inventory_path).unwrap_or_else(
++                |error| {
++                    warn!(%error, "native inventory socket unavailable");
++                    None
++                },
++            );
 +        let native_inventory_generation = native_inventory_server
 +            .as_ref()
 +            .map(|_| uuid::Uuid::now_v7().to_string())
@@ -45,7 +76,15 @@
          let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
          let mut thread_listener_tasks = tokio::task::JoinSet::new();
          let mut remote_control_status_rx = remote_control_handle.status_receiver();
-@@ -1064,6 +1077,19 @@
+         let mut remote_control_status = remote_control_status_rx.borrow().clone();
+         let transport_shutdown_token = transport_shutdown_token.clone();
+         async move {
++            #[cfg(all(feature = "autoapprove-native-inventory", unix))]
++            let mut _native_runtime = native_runtime;
+             let recovery_task = if managed_daemon {
+                 match daemon_thread_recovery::start_recovery(
+                     recovery_file.clone(),
+@@ -1064,6 +1103,37 @@
                  None
              };
              let mut listen_for_threads = true;
@@ -55,6 +94,18 @@
 +                recovery_task
 +                    .as_ref()
 +                    .map(tokio::task::JoinHandle::abort_handle),
++                {
++                    #[cfg(feature = "autoapprove-native-inventory")]
++                    {
++                        _native_runtime
++                            .as_ref()
++                            .map(|runtime| runtime.control_path())
++                    }
++                    #[cfg(not(feature = "autoapprove-native-inventory"))]
++                    {
++                        None
++                    }
++                },
 +            ) {
 +                Ok(server) => server,
 +                Err(error) => {
@@ -62,10 +113,16 @@
 +                    None
 +                }
 +            };
++            #[cfg(all(feature = "autoapprove-native-inventory", unix))]
++            if let Some(runtime) = _native_runtime.as_mut() {
++                if let Err(error) = runtime.publish() {
++                    warn!(%error, "native runtime registration unavailable");
++                }
++            }
              // Keep force signals and daemon control events responsive while saving.
              let mut snapshot = Box::pin(async {
                  let processor = Arc::clone(&processor);
-@@ -1113,6 +1139,14 @@
+@@ -1113,6 +1183,14 @@
                  }
  
                  tokio::select! {
@@ -80,7 +137,7 @@
                      _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
                          snapshot_finished = true;
                      }
-@@ -1192,6 +1226,12 @@
+@@ -1192,6 +1270,12 @@
                                          outbound_opted_out_notification_methods,
                                      ),
                                  );
@@ -636,7 +693,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,583 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::turn_admission::TurnAdmission;
@@ -686,11 +743,15 @@
 +pub(crate) fn start(
 +    admission: TurnAdmission,
 +    recovery: Option<tokio::task::AbortHandle>,
++    fallback: Option<PathBuf>,
 +) -> io::Result<Option<SelectedTransitionServer>> {
-+    let Some(path) = std::env::var_os("AUTOAPPROVE_SELECTED_TRANSITION_SOCKET") else {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_SELECTED_TRANSITION_SOCKET")
++        .map(PathBuf::from)
++        .or(fallback)
++    else {
 +        return Ok(None);
 +    };
-+    start_with_recovery(PathBuf::from(path), admission, TTL, recovery).map(Some)
++    start_with_recovery(path, admission, TTL, recovery).map(Some)
 +}
 +
 +#[cfg(test)]
@@ -1590,18 +1651,38 @@
          email: Option<String>,
 --- a/tui/src/app/startup.rs
 +++ b/tui/src/app/startup.rs
-@@ -314,6 +314,10 @@
+@@ -314,6 +314,30 @@
          }
          let (app_event_tx, mut app_event_rx) = unbounded_channel();
          let app_event_tx = AppEventSender::new(app_event_tx);
 +        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
-+        let _native_inventory = crate::native_inventory::start(app_event_tx.clone())?;
++        let mut native_runtime =
++            codex_app_server_client::NativeRuntimeRegistration::from_environment(
++                codex_app_server_client::NativeRuntimeRole::Tui,
++                &config.codex_home,
++            )?;
 +        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
-+        let _native_input_server = crate::native_input_hold::start(app_event_tx.clone())?;
++        let _native_inventory = crate::native_inventory::start(
++            app_event_tx.clone(),
++            native_runtime
++                .as_ref()
++                .map(|runtime| runtime.inventory_path()),
++        )?;
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let _native_input_server = crate::native_input_hold::start(
++            app_event_tx.clone(),
++            native_runtime
++                .as_ref()
++                .map(|runtime| runtime.control_path()),
++        )?;
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        if let Some(runtime) = native_runtime.as_mut() {
++            runtime.publish()?;
++        }
          if let Some(message) = project_config_warning(&config) {
              app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
                  history_cell::StartupWarningsCell::new(vec![message]),
-@@ -1284,6 +1288,12 @@
+@@ -1284,6 +1308,12 @@
  
          let mut backends =
              super::backend_sessions::BackendSessions::from_initial(app_server, other_backends);
@@ -1614,7 +1695,7 @@
  
          let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
              Ok(exit_reason)
-@@ -1443,6 +1453,31 @@
+@@ -1443,6 +1473,31 @@
                          AppRunControl::Continue
                      }
                      Some(event) = app_event_rx.recv() => {
@@ -1646,7 +1727,7 @@
                          if let AppEvent::ResumeBackendSession(target) = event {
                              match app.resume_backend_session(tui, &mut backends, target).await {
                                  Ok(AppRunControl::Continue) => continue,
-@@ -1499,9 +1534,52 @@
+@@ -1499,9 +1554,52 @@
                          }
                          AppRunControl::Continue
                      }
@@ -1792,7 +1873,7 @@
              .iter()
 --- /dev/null
 +++ b/tui/src/native_inventory.rs
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,207 @@
 +//! Opt-in, local read-only prototype. Never an admission grant for migration.
 +use crate::app_event::AppEvent;
 +use crate::app_event_sender::AppEventSender;
@@ -1848,11 +1929,17 @@
 +    Ok(())
 +}
 +
-+pub(crate) fn start(events: AppEventSender) -> io::Result<Option<InventoryServer>> {
-+    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_INVENTORY_SOCKET") else {
++pub(crate) fn start(
++    events: AppEventSender,
++    fallback: Option<PathBuf>,
++) -> io::Result<Option<InventoryServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_INVENTORY_SOCKET")
++        .map(PathBuf::from)
++        .or(fallback)
++    else {
 +        return Ok(None);
 +    };
-+    start_at(PathBuf::from(path), events).map(Some)
++    start_at(path, events).map(Some)
 +}
 +
 +fn start_at(path: PathBuf, events: AppEventSender) -> io::Result<InventoryServer> {
@@ -2288,7 +2375,7 @@
          &self,
 --- /dev/null
 +++ b/app-server/src/native_inventory.rs
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,160 @@
 +//! Local diagnostic observation, never a census-completeness or migration grant.
 +use crate::message_processor::MessageProcessor;
 +use crate::transport::ConnectionId;
@@ -2314,14 +2401,17 @@
 +#[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
 +pub(crate) struct InventoryServer;
 +
-+pub(crate) fn start(events: mpsc::Sender<InventoryRead>) -> io::Result<Option<InventoryServer>> {
++pub(crate) fn start(
++    events: mpsc::Sender<InventoryRead>,
++    fallback: Option<std::path::PathBuf>,
++) -> io::Result<Option<InventoryServer>> {
 +    #[cfg(all(feature = "autoapprove-native-inventory", unix))]
 +    {
-+        transport::start(events)
++        transport::start(events, fallback)
 +    }
 +    #[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
 +    {
-+        drop(events);
++        drop((events, fallback));
 +        Ok(None)
 +    }
 +}
@@ -2448,7 +2538,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/native_inventory_transport.rs
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,205 @@
 +//! Opt-in, local read-only prototype. Never an admission grant for migration.
 +use super::InventoryRead;
 +use serde::Deserialize;
@@ -2504,11 +2594,17 @@
 +    Ok(())
 +}
 +
-+pub(crate) fn start(events: mpsc::Sender<InventoryRead>) -> io::Result<Option<InventoryServer>> {
-+    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET") else {
++pub(crate) fn start(
++    events: mpsc::Sender<InventoryRead>,
++    fallback: Option<PathBuf>,
++) -> io::Result<Option<InventoryServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET")
++        .map(PathBuf::from)
++        .or(fallback)
++    else {
 +        return Ok(None);
 +    };
-+    start_at(PathBuf::from(path), events).map(Some)
++    start_at(path, events).map(Some)
 +}
 +
 +fn start_at(path: PathBuf, events: mpsc::Sender<InventoryRead>) -> io::Result<InventoryServer> {
@@ -2698,16 +2794,20 @@
  workspace = true
 --- a/app-server-client/src/lib.rs
 +++ b/app-server-client/src/lib.rs
-@@ -19,6 +19,8 @@
+@@ -19,6 +19,12 @@
  //! bridging async `mpsc` channels on both sides. Commands and the underlying
  //! runtime remain bounded; the local consumer event queue is unbounded so
  //! unread notifications cannot prevent request responses from being delivered.
 +
 +pub use codex_app_server_transport::native_current_process_identity;
++#[cfg(unix)]
++pub use codex_app_server_transport::native_runtime::{
++    NativeRuntimeRegistration, NativeRuntimeRole,
++};
  
  mod cloud;
  mod path;
-@@ -753,6 +755,17 @@
+@@ -753,6 +759,17 @@
      }
  }
  
@@ -2739,7 +2839,7 @@
  workspace = true
 --- a/app-server-transport/src/lib.rs
 +++ b/app-server-transport/src/lib.rs
-@@ -8,6 +8,13 @@
+@@ -8,6 +8,15 @@
  /// Only managed app-server launches accept the local socket shutdown request.
  pub const DAEMON_SHUTDOWN_SOCKET_ENV: &str = "CODEX_DAEMON_SHUTDOWN_SOCKET";
  mod connection_auth;
@@ -2750,6 +2850,8 @@
 +pub use native_peer::native_connection_nonce;
 +pub use native_peer::native_current_process_identity;
 +pub use native_peer::native_unix_peer_identity;
++#[cfg(unix)]
++pub mod native_runtime;
  mod outgoing_message;
  mod transport;
  mod websocket_compression;
@@ -3400,7 +3502,7 @@
      pub(super) fn picker_views(&self) -> Vec<AppServerSession> {
 --- /dev/null
 +++ b/tui/src/native_input_hold.rs
-@@ -0,0 +1,522 @@
+@@ -0,0 +1,528 @@
 +//! Opt-in local terminal input hold. Existing accepted work keeps running.
 +//! No complete ownership, task-stop or migration authority is asserted.
 +use crate::app_event::AppEvent;
@@ -3530,11 +3632,17 @@
 +        }
 +    }
 +}
-+pub(crate) fn start(events: AppEventSender) -> io::Result<Option<InputHoldServer>> {
-+    let Some(path) = std::env::var_os("AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET") else {
++pub(crate) fn start(
++    events: AppEventSender,
++    fallback: Option<PathBuf>,
++) -> io::Result<Option<InputHoldServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET")
++        .map(PathBuf::from)
++        .or(fallback)
++    else {
 +        return Ok(None);
 +    };
-+    start_at(PathBuf::from(path), events, TTL).map(Some)
++    start_at(path, events, TTL).map(Some)
 +}
 +fn start_at(path: PathBuf, events: AppEventSender, ttl: Duration) -> io::Result<InputHoldServer> {
 +    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
@@ -3921,5 +4029,347 @@
 +        if request.op == "release" {
 +            return Ok(());
 +        }
++    }
++}
+--- /dev/null
++++ b/app-server-transport/src/native_runtime.rs
+@@ -0,0 +1,339 @@
++//! Private discovery hints for explicitly enabled maintained native clients.
++//! A registration is never proof of live ownership or migration authorization.
++use crate::native_current_process_identity;
++use serde_json::json;
++use std::fs::{File, OpenOptions};
++use std::io::{self, Write};
++use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
++use std::path::{Path, PathBuf};
++
++#[derive(Clone, Copy)]
++pub enum NativeRuntimeRole {
++    Tui,
++    Server,
++}
++impl NativeRuntimeRole {
++    fn name(self) -> &'static str {
++        match self {
++            Self::Tui => "tui",
++            Self::Server => "server",
++        }
++    }
++    fn prefix(self) -> &'static str {
++        match self {
++            Self::Tui => "t",
++            Self::Server => "s",
++        }
++    }
++    fn control(self) -> &'static str {
++        match self {
++            Self::Tui => "terminal-input-hold",
++            Self::Server => "selected-input-lease",
++        }
++    }
++    fn overrides(self) -> [&'static str; 2] {
++        match self {
++            Self::Tui => [
++                "AUTOAPPROVE_NATIVE_INVENTORY_SOCKET",
++                "AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET",
++            ],
++            Self::Server => [
++                "AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET",
++                "AUTOAPPROVE_SELECTED_TRANSITION_SOCKET",
++            ],
++        }
++    }
++}
++pub struct NativeRuntimeRegistration {
++    root: PathBuf,
++    directory: PathBuf,
++    root_id: (u64, u64),
++    directory_id: (u64, u64),
++    role: NativeRuntimeRole,
++    home: PathBuf,
++    id: String,
++    files: Vec<(PathBuf, (u64, u64), u32)>,
++    _root_guard: File,
++    _directory_guard: File,
++    record: Option<File>,
++}
++fn private_directory(path: &Path) -> io::Result<(u64, u64)> {
++    let metadata = std::fs::symlink_metadata(path)?;
++    if !metadata.is_dir()
++        || metadata.uid() != unsafe { libc::geteuid() }
++        || metadata.mode() & 0o077 != 0
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    Ok((metadata.dev(), metadata.ino()))
++}
++impl NativeRuntimeRegistration {
++    pub fn from_environment(role: NativeRuntimeRole, home: &Path) -> io::Result<Option<Self>> {
++        if !cfg!(feature = "autoapprove-native-inventory") {
++            return Ok(None);
++        }
++        let Some(root) = std::env::var_os("AUTOAPPROVE_NATIVE_RUNTIME_ROOT") else {
++            return Ok(None);
++        };
++        // Explicit endpoint tests/configuration retain their existing behavior.
++        if role
++            .overrides()
++            .iter()
++            .any(|name| std::env::var_os(name).is_some())
++        {
++            return Ok(None);
++        }
++        Self::create(PathBuf::from(root), role, home).map(Some)
++    }
++    fn create(root: PathBuf, role: NativeRuntimeRole, home: &Path) -> io::Result<Self> {
++        if !root.is_absolute()
++            || root.as_os_str().as_encoded_bytes().len() > 40
++            || root.canonicalize()? != root
++        {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
++        let root_id = private_directory(&root)?;
++        let root_guard = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(&root)?;
++        let pinned = root_guard.metadata()?;
++        if (pinned.dev(), pinned.ino()) != root_id {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        let home = home.canonicalize()?;
++        let home_info = std::fs::symlink_metadata(&home)?;
++        if !home_info.is_dir() || home_info.uid() != unsafe { libc::geteuid() } {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        let id = uuid::Uuid::now_v7();
++        let directory = root.join(format!(
++            "{}-{}-{}",
++            role.prefix(),
++            std::process::id(),
++            id.simple()
++        ));
++        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
++        let directory_id = private_directory(&directory)?;
++        let directory_guard = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(&directory)?;
++        let pinned = directory_guard.metadata()?;
++        if (pinned.dev(), pinned.ino()) != directory_id {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        let value = Self {
++            root,
++            directory,
++            root_id,
++            directory_id,
++            role,
++            home,
++            id: id.to_string(),
++            files: Vec::new(),
++            _root_guard: root_guard,
++            _directory_guard: directory_guard,
++            record: None,
++        };
++        value.verify()?;
++        Ok(value)
++    }
++    fn verify(&self) -> io::Result<()> {
++        if private_directory(&self.root)? != self.root_id
++            || private_directory(&self.directory)? != self.directory_id
++        {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        Ok(())
++    }
++    pub fn inventory_path(&self) -> PathBuf {
++        self.directory.join("i.sock")
++    }
++    pub fn control_path(&self) -> PathBuf {
++        self.directory.join("c.sock")
++    }
++    pub fn publish(&mut self) -> io::Result<()> {
++        self.verify()?;
++        if !self.files.is_empty() {
++            return Err(io::ErrorKind::AlreadyExists.into());
++        }
++        for path in [self.inventory_path(), self.control_path()] {
++            let info = std::fs::symlink_metadata(&path)?;
++            if info.mode() & libc::S_IFMT as u32 != libc::S_IFSOCK as u32
++                || info.uid() != unsafe { libc::geteuid() }
++                || info.mode() & 0o077 != 0
++            {
++                return Err(io::ErrorKind::PermissionDenied.into());
++            }
++            self.files
++                .push((path, (info.dev(), info.ino()), libc::S_IFSOCK as u32));
++        }
++        let identity = native_current_process_identity().ok_or(io::ErrorKind::Unsupported)?;
++        let data = serde_json::to_vec(&json!({
++            "schemaVersion":1,"producer":"autoapprove-native-runtime-registration",
++            "cliVersion":env!("CARGO_PKG_VERSION"),"registrationId":self.id,
++            "role":self.role.name(),"controlKind":self.role.control(),"pid":std::process::id(),
++            "processIdentity":identity,"home":self.home,
++            "inventorySocket":"i.sock","controlSocket":"c.sock",
++            "membershipComplete":false,"migrationAuthorized":false
++        }))?;
++        let path = self.directory.join("registration.json");
++        let file = OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(&path)?;
++        let info = file.metadata()?;
++        self.files
++            .push((path, (info.dev(), info.ino()), libc::S_IFREG as u32));
++        self.record = Some(file);
++        let file = self.record.as_mut().unwrap();
++        file.write_all(&data)?;
++        file.sync_all()?;
++        self._directory_guard.sync_all()?;
++        self.verify()
++    }
++}
++impl Drop for NativeRuntimeRegistration {
++    fn drop(&mut self) {
++        if self.verify().is_err() {
++            return;
++        }
++        for (path, id, kind) in &self.files {
++            if let Ok(info) = std::fs::symlink_metadata(path)
++                && (info.dev(), info.ino()) == *id
++                && info.mode() & libc::S_IFMT as u32 == *kind
++                && info.uid() == unsafe { libc::geteuid() }
++            {
++                let _ = std::fs::remove_file(path);
++            }
++        }
++        // Never traverse or delete unexpected files, nor remove the shared root.
++        let _ = std::fs::remove_dir(&self.directory);
++    }
++}
++
++#[cfg(all(test, feature = "autoapprove-native-inventory", target_os = "macos"))]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::PermissionsExt;
++    use std::os::unix::net::UnixListener;
++    fn setup() -> io::Result<tempfile::TempDir> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        std::fs::create_dir(root.path().join("home"))?;
++        Ok(root)
++    }
++    fn sockets(value: &NativeRuntimeRegistration) -> io::Result<Vec<UnixListener>> {
++        [value.inventory_path(), value.control_path()]
++            .into_iter()
++            .map(|path| {
++                let socket = UnixListener::bind(&path)?;
++                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
++                Ok(socket)
++            })
++            .collect()
++    }
++    #[test]
++    fn native_runtime_publishes_ready_kernel_identity_and_cleans_only_owned_paths()
++    -> Result<(), Box<dyn std::error::Error>> {
++        let root = setup()?;
++        let mut value = NativeRuntimeRegistration::create(
++            root.path().to_owned(),
++            NativeRuntimeRole::Tui,
++            &root.path().join("home"),
++        )?;
++        let directory = value.directory.clone();
++        assert!(!directory.join("registration.json").exists());
++        let _sockets = sockets(&value)?;
++        value.publish()?;
++        let data: serde_json::Value =
++            serde_json::from_slice(&std::fs::read(directory.join("registration.json"))?)?;
++        assert_eq!(data["role"], "tui");
++        assert_eq!(data["pid"], std::process::id());
++        assert_eq!(
++            data["processIdentity"],
++            serde_json::to_value(native_current_process_identity())?
++        );
++        assert_eq!(data["migrationAuthorized"], false);
++        drop(value);
++        assert!(!directory.exists());
++        assert!(root.path().join("home").exists());
++        Ok(())
++    }
++    #[test]
++    fn native_runtime_rejects_public_and_linked_roots_without_adopting_them()
++    -> Result<(), Box<dyn std::error::Error>> {
++        let root = setup()?;
++        let home = root.path().join("home");
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))?;
++        assert!(
++            NativeRuntimeRegistration::create(
++                root.path().to_owned(),
++                NativeRuntimeRole::Server,
++                &home
++            )
++            .is_err()
++        );
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let alias = root.path().join("alias");
++        std::os::unix::fs::symlink(root.path(), &alias)?;
++        assert!(NativeRuntimeRegistration::create(alias, NativeRuntimeRole::Tui, &home).is_err());
++        assert_eq!(std::fs::read_dir(root.path())?.count(), 2);
++        Ok(())
++    }
++    #[test]
++    fn native_runtime_preserves_replacements_and_other_registrations()
++    -> Result<(), Box<dyn std::error::Error>> {
++        let root = setup()?;
++        let home = root.path().join("home");
++        let mut first = NativeRuntimeRegistration::create(
++            root.path().to_owned(),
++            NativeRuntimeRole::Tui,
++            &home,
++        )?;
++        let mut second = NativeRuntimeRegistration::create(
++            root.path().to_owned(),
++            NativeRuntimeRole::Server,
++            &home,
++        )?;
++        let _one = sockets(&first)?;
++        let _two = sockets(&second)?;
++        first.publish()?;
++        second.publish()?;
++        let path = first.directory.join("registration.json");
++        std::fs::remove_file(&path)?;
++        std::fs::write(&path, b"replacement")?;
++        let socket = first.inventory_path();
++        std::fs::remove_file(&socket)?;
++        std::fs::write(&socket, b"replacement socket")?;
++        drop(first);
++        assert_eq!(std::fs::read(path)?, b"replacement");
++        assert_eq!(std::fs::read(socket)?, b"replacement socket");
++        assert!(second.directory.join("registration.json").exists());
++        Ok(())
++    }
++    #[test]
++    fn native_runtime_does_not_publish_an_incomplete_listener_set()
++    -> Result<(), Box<dyn std::error::Error>> {
++        let root = setup()?;
++        let mut value = NativeRuntimeRegistration::create(
++            root.path().to_owned(),
++            NativeRuntimeRole::Tui,
++            &root.path().join("home"),
++        )?;
++        let _socket = UnixListener::bind(value.inventory_path())?;
++        std::fs::set_permissions(
++            value.inventory_path(),
++            std::fs::Permissions::from_mode(0o600),
++        )?;
++        assert!(value.publish().is_err());
++        assert!(!value.directory.join("registration.json").exists());
++        let directory = value.directory.clone();
++        drop(value);
++        assert!(!directory.exists());
++        Ok(())
 +    }
 +}
