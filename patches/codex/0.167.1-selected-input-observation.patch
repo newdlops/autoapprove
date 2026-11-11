@@ -19,16 +19,18 @@
  mod startup_config;
  pub use startup_config::StartupConfigArgs;
  pub use startup_config::print_startup_config;
-@@ -142,6 +143,8 @@
+@@ -142,6 +143,10 @@
  mod plugin_config_reload;
  mod request_processors;
  mod request_serialization;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +mod selected_transition;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++mod selected_journal_lock;
  mod server_request_error;
  mod skills_watcher;
  mod startup_warnings;
-@@ -994,6 +997,16 @@
+@@ -994,6 +999,16 @@
          info!("outbound router task exited (channel closed)");
      });
  
@@ -45,7 +47,7 @@
      let recovery_file = daemon_recovery_file_path(&config.codex_home);
      let daemon_settings_file = managed_daemon.then(|| {
          config
-@@ -1041,12 +1054,38 @@
+@@ -1041,12 +1056,38 @@
          let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
          let mut active_admissions_rx = processor.turn_admission.subscribe_active();
          let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
@@ -84,7 +86,7 @@
              let recovery_task = if managed_daemon {
                  match daemon_thread_recovery::start_recovery(
                      recovery_file.clone(),
-@@ -1064,6 +1103,37 @@
+@@ -1064,6 +1105,37 @@
                  None
              };
              let mut listen_for_threads = true;
@@ -122,7 +124,7 @@
              // Keep force signals and daemon control events responsive while saving.
              let mut snapshot = Box::pin(async {
                  let processor = Arc::clone(&processor);
-@@ -1113,6 +1183,14 @@
+@@ -1113,6 +1185,14 @@
                  }
  
                  tokio::select! {
@@ -137,7 +139,7 @@
                      _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
                          snapshot_finished = true;
                      }
-@@ -1192,6 +1270,12 @@
+@@ -1192,6 +1272,12 @@
                                          outbound_opted_out_notification_methods,
                                      ),
                                  );
@@ -776,7 +778,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,637 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::message_processor::NativeSelectedRuntime;
@@ -804,6 +806,7 @@
 +    server_generation: Option<String>,
 +    lease_id: Option<String>,
 +    thread_ids: Option<Vec<String>>,
++    journal: Option<crate::selected_journal_lock::JournalLockRequest>,
 +}
 +
 +pub(crate) struct SelectedTransitionServer {
@@ -962,16 +965,19 @@
 +        || inspect.server_generation.is_some()
 +        || inspect.lease_id.is_some()
 +        || inspect.thread_ids.is_some()
++        || inspect.journal.is_some()
 +    {
 +        return Err(io::ErrorKind::InvalidInput.into());
 +    }
 +    let mut inspected = response(&inspect, &generation, None, &[], false, ttl);
 +    inspected["runtimeCohortSupported"] = json!(runtime.is_some());
++    inspected["journalLockSupported"] = json!(runtime.is_some());
 +    send(&mut writer, inspected).await?;
 +    let first = read_request(&mut reader, Duration::from_secs(2)).await?;
 +    if first.op != "pause"
 +        || first.server_generation.as_deref() != Some(&generation)
 +        || first.lease_id.is_some()
++        || first.journal.is_some()
 +    {
 +        return Err(io::ErrorKind::InvalidInput.into());
 +    }
@@ -1014,6 +1020,7 @@
 +        return Ok(());
 +    };
 +    let lease = uuid::Uuid::now_v7().to_string();
++    let mut journal_lock = None;
 +    let mut deadline = Instant::now() + ttl;
 +    tokio::time::timeout_at(
 +        deadline,
@@ -1040,13 +1047,48 @@
 +        if request.server_generation.as_deref() != Some(&generation)
 +            || request.lease_id.as_deref() != Some(&lease)
 +            || request.thread_ids.is_some()
++            || (request.op != "journal-lock" && request.journal.is_some())
 +        {
 +            return Err(io::ErrorKind::PermissionDenied.into());
 +        }
 +        let mut cohort = None;
++        let mut journal_reply = None;
++        if let Some(lock) = &journal_lock {
++            crate::selected_journal_lock::NativeJournalLock::verify_kernel(lock)?;
++        }
 +        match request.op.as_str() {
 +            "status" => {}
 +            "renew" => deadline = Instant::now() + ttl,
++            "journal-lock" => {
++                if journal_lock.is_some() || !reader.buffer().is_empty() {
++                    return Err(io::ErrorKind::InvalidInput.into());
++                }
++                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
++                let stamp = request.journal.clone().ok_or(io::ErrorKind::InvalidInput)?;
++                pause
++                    .verify_scope(&admission, &threads)
++                    .map_err(|error| io::Error::other(error.message))?;
++                let mut ready = response(
++                    &request,
++                    &generation,
++                    Some(&lease),
++                    &names,
++                    true,
++                    deadline.saturating_duration_since(Instant::now()),
++                );
++                ready["journalDescriptorReady"] = json!(true);
++                tokio::time::timeout_at(deadline, send(&mut writer, ready))
++                    .await
++                    .map_err(|_| io::ErrorKind::TimedOut)??;
++                let received = crate::selected_journal_lock::receive(
++                    reader.get_ref().as_ref(),
++                    deadline.min(Instant::now() + Duration::from_secs(2)),
++                )
++                .await?;
++                let lock = runtime.borrow_journal_lock(&pause, &threads, received, stamp)?;
++                journal_reply = Some(lock.reply("held"));
++                journal_lock = Some(lock);
++            }
 +            "cohort" => {
 +                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
 +                let value = tokio::time::timeout_at(deadline, runtime.cohort(&pause, &threads))
@@ -1055,6 +1097,7 @@
 +                cohort = Some(value.map_err(|error| io::Error::other(error.message))?);
 +            }
 +            "release" => {
++                drop(journal_lock);
 +                drop(pause);
 +                send(
 +                    &mut writer,
@@ -1075,6 +1118,9 @@
 +        );
 +        if let Some(cohort) = cohort {
 +            reply["runtimeCohort"] = cohort;
++        }
++        if let Some(journal) = journal_reply {
++            reply["journalLock"] = journal;
 +        }
 +        tokio::time::timeout_at(deadline, send(&mut writer, reply))
 +            .await
@@ -1380,7 +1426,7 @@
      user_verification: Arc<crate::user_verification::Service>,
      outgoing: Arc<OutgoingMessageSender>,
      startup_warnings: StartupWarnings,
-@@ -177,6 +178,28 @@
+@@ -177,6 +178,39 @@
      turn_processor: TurnRequestProcessor,
      windows_sandbox_processor: WindowsSandboxRequestProcessor,
      request_serialization_queues: RequestSerializationQueues,
@@ -1399,6 +1445,17 @@
 +impl NativeSelectedRuntime {
 +    pub(crate) fn admission(&self) -> TurnAdmission { self.admission.clone() }
 +
++    pub(crate) fn borrow_journal_lock(
++        &self,
++        pause: &crate::turn_admission::SelectedAdmissionPause,
++        ids: &std::collections::HashSet<codex_protocol::ThreadId>,
++        descriptor: std::os::fd::OwnedFd,
++        stamp: crate::selected_journal_lock::JournalLockRequest,
++    ) -> std::io::Result<crate::selected_journal_lock::NativeJournalLock> {
++        pause.verify_scope(&self.admission, ids).map_err(|error| std::io::Error::other(error.message))?;
++        crate::selected_journal_lock::NativeJournalLock::acquire(&self.threads.native_move_home(), descriptor, stamp, ids)
++    }
++
 +    pub(crate) async fn cohort(
 +        &self,
 +        pause: &crate::turn_admission::SelectedAdmissionPause,
@@ -1409,7 +1466,7 @@
  }
  
  #[derive(Debug)]
-@@ -336,7 +359,7 @@
+@@ -336,7 +370,7 @@
              ),
          );
          let goal_service = Arc::new(GoalService::new());
@@ -1418,7 +1475,7 @@
          let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
          let extension_event_sink =
              app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
-@@ -543,6 +566,7 @@
+@@ -543,6 +577,7 @@
              config_warnings.clone(),
              sample_responses,
          );
@@ -1426,7 +1483,7 @@
          let turn_processor = TurnRequestProcessor::new(
              auth_manager,
              Arc::clone(&thread_manager),
-@@ -612,6 +636,7 @@
+@@ -612,6 +647,7 @@
  
          Self {
              turn_admission,
@@ -1434,7 +1491,7 @@
              user_verification,
              outgoing,
              startup_warnings: StartupWarnings {
-@@ -644,6 +669,21 @@
+@@ -644,6 +680,21 @@
              turn_processor,
              windows_sandbox_processor,
              request_serialization_queues,
@@ -1456,7 +1513,7 @@
          }
      }
  
-@@ -1018,6 +1058,9 @@
+@@ -1018,6 +1069,9 @@
          {
              return Err(invalid_request(experimental_required_message(reason)));
          }
@@ -1466,7 +1523,7 @@
          let connection_id = connection_request_id.connection_id;
          self.initialize_processor.track_initialized_request(
              connection_id,
-@@ -1065,6 +1108,7 @@
+@@ -1065,6 +1119,7 @@
          let request = QueuedInitializedRequest::new(
              rpc_gate,
              async move {
@@ -1474,7 +1531,7 @@
                  let _turn_admission = turn_admission;
                  // Runtime changes already admitted before drain finish normally. Turn work
                  // still waiting in serialization must observe the newly closed gate.
-@@ -1406,10 +1450,14 @@
+@@ -1406,10 +1461,14 @@
                      .await
              }
              ClientRequest::AutoapproveGoalRead { params, .. } => {
@@ -4624,7 +4681,7 @@
              startup,
 --- /dev/null
 +++ b/core/src/native_ownership.rs
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,697 @@
 +//! Durable denial of writes to conversations retired from a login home.
 +//! An absent policy directory preserves ordinary Codex behavior. A published
 +//! directory with missing, linked or inconsistent contents fails closed.
@@ -4632,7 +4689,7 @@
 +use std::collections::HashSet;
 +use std::fs::{File, OpenOptions};
 +use std::io::{self, Read};
-+use std::os::fd::{AsRawFd, FromRawFd};
++use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 +use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 +use std::path::Path;
 +
@@ -4648,6 +4705,82 @@
 +    root: File,
 +    directory: File,
 +    lock: File,
++}
++
++/// An exclusive journal lock transferred as an OS descriptor. JSON cannot
++/// construct this witness, and dropping the sender does not release our copy.
++/// This is coordination only; it grants no writer or migration permission.
++pub struct BorrowedMigrationLock {
++    guard: StartupGuard,
++    identity: String,
++}
++impl BorrowedMigrationLock {
++    pub fn home_identity(&self) -> &str {
++        &self.identity
++    }
++    pub fn verify(&self) -> io::Result<()> {
++        self.guard.verify()
++    }
++    pub fn home(&self) -> &Path {
++        &self.guard.home
++    }
++    pub fn journal_record(&self, request_id: &str) -> io::Result<serde_json::Value> {
++        if !canonical_uuid(request_id) {
++            return Err(unavailable());
++        }
++        self.verify()?;
++        let active: serde_json::Value =
++            read(&self.guard.directory, "active.json", 12 * 1024 * 1024)?;
++        let history: serde_json::Value = read(
++            &self.guard.directory,
++            &format!("{request_id}.json"),
++            12 * 1024 * 1024,
++        )?;
++        self.verify()?;
++        if active != history {
++            return Err(unavailable());
++        }
++        Ok(active)
++    }
++}
++pub fn borrow_migration_lock(
++    home: &Path,
++    descriptor: OwnedFd,
++) -> io::Result<BorrowedMigrationLock> {
++    let (home, root, identity) = open_home(home)?;
++    let directory = open_at(
++        &root,
++        ".autoapprove-migrations",
++        libc::O_RDONLY | libc::O_DIRECTORY,
++        0,
++    )?;
++    let lock = File::from(descriptor);
++    let current = open_at(&directory, "lock", libc::O_RDONLY, 0)?;
++    let a = lock.metadata()?;
++    let b = current.metadata()?;
++    if !private(&directory.metadata()?, true)
++        || !private(&a, false)
++        || !private(&b, false)
++        || (a.dev(), a.ino()) != (b.dev(), b.ino())
++        || unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE != libc::O_RDWR
++    {
++        return Err(unavailable());
++    }
++    let flags = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) };
++    if flags < 0
++        || unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0
++        || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
++    {
++        return Err(unavailable());
++    }
++    let guard = StartupGuard {
++        home,
++        root,
++        directory,
++        lock,
++    };
++    guard.verify()?;
++    Ok(BorrowedMigrationLock { guard, identity })
 +}
 +fn open_at(parent: &File, name: &str, flags: i32, mode: u32) -> io::Result<File> {
 +    let name = std::ffi::CString::new(name).map_err(|_| unavailable())?;
@@ -4966,6 +5099,73 @@
 +    use super::*;
 +    use serde_json::{Value, json};
 +    use std::os::unix::fs::{PermissionsExt, symlink};
++
++    fn exclusive_fixture_lock(home: &Path) -> io::Result<File> {
++        drop(startup_guard_enabled(home, true)?);
++        let file = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(home.join(".autoapprove-migrations/lock"))?;
++        assert_eq!(
++            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
++            0
++        );
++        Ok(file)
++    }
++    #[test]
++    fn transferred_exclusive_lock_survives_original_owner_close() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let original = exclusive_fixture_lock(&f.home)?;
++        let borrowed = borrow_migration_lock(&f.home, original.try_clone()?.into())?;
++        assert_eq!(borrowed.home_identity(), f.id);
++        drop(original);
++        assert!(startup_guard_enabled(&f.home, true).is_err());
++        borrowed.verify()?;
++        drop(borrowed);
++        assert!(startup_guard_enabled(&f.home, true)?.is_some());
++        Ok(())
++    }
++    #[test]
++    fn unrelated_descriptor_or_independent_open_cannot_borrow_held_lock() -> io::Result<()> {
++        let source = Fixture::new()?;
++        let other = Fixture::new()?;
++        let original = exclusive_fixture_lock(&source.home)?;
++        drop(startup_guard_enabled(&other.home, true)?);
++        assert!(borrow_migration_lock(&other.home, original.try_clone()?.into()).is_err());
++        let independent = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(source.home.join(".autoapprove-migrations/lock"))?;
++        assert!(borrow_migration_lock(&source.home, independent.into()).is_err());
++        assert!(startup_guard_enabled(&source.home, true).is_err());
++        Ok(())
++    }
++    #[test]
++    fn borrowed_lock_checks_pinned_namespace_and_matching_private_journal() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let original = exclusive_fixture_lock(&f.home)?;
++        let borrowed = borrow_migration_lock(&f.home, original.try_clone()?.into())?;
++        let directory = f.home.join(".autoapprove-migrations");
++        let value = json!({"id": f.request, "revision": 1});
++        for name in ["active.json".to_owned(), format!("{}.json", f.request)] {
++            let path = directory.join(name);
++            std::fs::write(&path, serde_json::to_vec(&value)?)?;
++            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
++        }
++        assert_eq!(borrowed.journal_record(&f.request)?, value);
++        std::fs::write(directory.join("active.json"), b"{}")?;
++        assert!(borrowed.journal_record(&f.request).is_err());
++        std::fs::rename(directory.join("lock"), directory.join("old-lock"))?;
++        let replacement = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(directory.join("lock"))?;
++        assert!(borrowed.verify().is_err());
++        drop(replacement);
++        Ok(())
++    }
 +
 +    struct Fixture {
 +        _root: tempfile::TempDir,
@@ -6105,7 +6305,18 @@
      pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
      pub(super) skills_watcher: Arc<SkillsWatcher>,
      pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-@@ -571,6 +579,7 @@
+@@ -534,6 +542,10 @@
+ }
+ 
+ impl ThreadRequestProcessor {
++    #[cfg(all(feature = "autoapprove-selected-transition", unix))]
++    pub(crate) fn native_move_home(&self) -> std::path::PathBuf {
++        self.config.codex_home.to_path_buf()
++    }
+     #[allow(clippy::too_many_arguments)]
+     pub(crate) fn new(
+         auth_manager: Arc<AuthManager>,
+@@ -571,6 +583,7 @@
              state_db,
              log_db,
              background_tasks: TaskTracker::new(),
@@ -6113,7 +6324,7 @@
              sample_responses,
              skills_watcher,
              turn_cost_worker,
-@@ -1175,24 +1184,38 @@
+@@ -1175,24 +1188,38 @@
          thread_id: ThreadId,
          operation: &str,
      ) -> Result<(), JSONRPCErrorError> {
@@ -6363,3 +6574,306 @@
      }
  
      pub(crate) async fn cancel_requests_for_thread(
+--- /dev/null
++++ b/app-server/src/selected_journal_lock.rs
+@@ -0,0 +1,300 @@
++//! Kernel-backed journal coordination. Holding this is not a migration grant.
++use base64::Engine;
++use codex_core::native_ownership::{BorrowedMigrationLock, borrow_migration_lock};
++use codex_protocol::ThreadId;
++use serde::Deserialize;
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::collections::{BTreeMap, HashSet};
++use std::io;
++use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
++use std::os::unix::fs::MetadataExt;
++use std::path::Path;
++use tokio::net::UnixStream;
++use tokio::time::Instant;
++
++#[derive(Clone, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub(crate) struct JournalLockRequest {
++    pub(crate) request_id: String,
++    pub(crate) revision: u64,
++    pub(crate) digest: String,
++}
++fn invalid() -> io::Error {
++    io::Error::new(
++        io::ErrorKind::InvalidData,
++        "Journal lock or prepared move identity changed",
++    )
++}
++fn uuid(value: &str) -> bool {
++    uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
++}
++fn hash(value: &str) -> bool {
++    value.len() == 64
++        && value
++            .bytes()
++            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++fn canonical(value: &Value) -> Value {
++    match value {
++        Value::Object(map) => {
++            let sorted: BTreeMap<_, _> = map
++                .iter()
++                .map(|(key, value)| (key.clone(), canonical(value)))
++                .collect();
++            Value::Object(sorted.into_iter().collect())
++        }
++        Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
++        value => value.clone(),
++    }
++}
++fn string<'a>(value: &'a Value, path: &str) -> io::Result<&'a str> {
++    value
++        .pointer(path)
++        .and_then(Value::as_str)
++        .ok_or_else(invalid)
++}
++
++pub(crate) struct NativeJournalLock {
++    lock: BorrowedMigrationLock,
++    stamp: JournalLockRequest,
++    role: &'static str,
++}
++impl NativeJournalLock {
++    pub(crate) fn verify_kernel(&self) -> io::Result<()> {
++        self.lock.verify()
++    }
++    pub(crate) fn acquire(
++        home: &Path,
++        descriptor: OwnedFd,
++        stamp: JournalLockRequest,
++        scope: &HashSet<ThreadId>,
++    ) -> io::Result<Self> {
++        if !uuid(&stamp.request_id)
++            || stamp.revision == 0
++            || stamp.revision > i64::MAX as u64
++            || !hash(&stamp.digest)
++        {
++            return Err(invalid());
++        }
++        let lock = borrow_migration_lock(home, descriptor)?;
++        let record = lock.journal_record(&stamp.request_id)?;
++        let object = record.as_object().ok_or_else(invalid)?;
++        let expected_keys = [
++            "formatVersion",
++            "id",
++            "revision",
++            "homes",
++            "payload",
++            "terminal",
++            "digest",
++            "previousDigest",
++        ];
++        if object
++            .keys()
++            .any(|key| !expected_keys.contains(&key.as_str()))
++            || record["formatVersion"] != 1
++            || record["id"] != stamp.request_id
++            || record["revision"].as_u64() != Some(stamp.revision)
++            || record["terminal"] != false
++            || record["digest"] != stamp.digest
++        {
++            return Err(invalid());
++        }
++        if stamp.revision == 1 {
++            if object.contains_key("previousDigest") || object.len() != 7 {
++                return Err(invalid());
++            }
++        } else if object.len() != 8 || !record["previousDigest"].as_str().is_some_and(hash) {
++            return Err(invalid());
++        }
++        let mut body = record.clone();
++        body.as_object_mut().ok_or_else(invalid)?.remove("digest");
++        let digest = format!(
++            "{:x}",
++            Sha256::digest(serde_json::to_vec(&canonical(&body))?)
++        );
++        if digest != stamp.digest {
++            return Err(invalid());
++        }
++        let encoded = string(&record, "/payload")?;
++        if encoded.len() > 12 * 1024 * 1024 {
++            return Err(invalid());
++        }
++        let bytes = base64::engine::general_purpose::STANDARD
++            .decode(encoded)
++            .map_err(|_| invalid())?;
++        if bytes.len() > 8 * 1024 * 1024
++            || base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded
++        {
++            return Err(invalid());
++        }
++        let payload: Value = serde_json::from_slice(&bytes)?;
++        if payload["formatVersion"] != 1
++            || payload["stage"] != "prepared"
++            || string(&payload, "/request/id")? != stamp.request_id
++        {
++            return Err(invalid());
++        }
++        let source = string(&payload, "/request/source/home")?;
++        let destination = string(&payload, "/request/destination/home")?;
++        let source_identity = string(&payload, "/request/source/physicalHomeID")?;
++        let destination_identity = string(&payload, "/request/destination/physicalHomeID")?;
++        if source == destination || source_identity == destination_identity {
++            return Err(invalid());
++        }
++        let mut homes = vec![
++            json!({"path":source,"identity":source_identity}),
++            json!({"path":destination,"identity":destination_identity}),
++        ];
++        homes.sort_by_key(|home| home["path"].as_str().unwrap_or("").to_owned());
++        if record["homes"] != json!(homes) {
++            return Err(invalid());
++        }
++        for (path, identity) in [
++            (source, source_identity),
++            (destination, destination_identity),
++        ] {
++            let actual = std::fs::canonicalize(path)?;
++            let info = std::fs::symlink_metadata(path)?;
++            if actual != Path::new(path)
++                || !info.is_dir()
++                || info.uid() != unsafe { libc::geteuid() }
++                || format!("{}:{}", info.dev(), info.ino()) != identity
++            {
++                return Err(invalid());
++            }
++        }
++        let role = if lock.home() == Path::new(source) && lock.home_identity() == source_identity {
++            "source"
++        } else if lock.home() == Path::new(destination)
++            && lock.home_identity() == destination_identity
++        {
++            "destination"
++        } else {
++            return Err(invalid());
++        };
++        let threads = payload
++            .pointer("/request/threads")
++            .and_then(Value::as_array)
++            .ok_or_else(invalid)?;
++        let names: HashSet<_> = scope.iter().map(ToString::to_string).collect();
++        let recorded: HashSet<_> = threads
++            .iter()
++            .map(|thread| string(thread, "/id").map(str::to_owned))
++            .collect::<io::Result<_>>()?;
++        if threads.len() != names.len()
++            || recorded != names
++            || threads.iter().any(|thread| thread["home"] != source)
++        {
++            return Err(invalid());
++        }
++        let owners = payload["currentOwners"].as_object().ok_or_else(invalid)?;
++        if owners.len() != names.len()
++            || names
++                .iter()
++                .any(|id| owners.get(id).and_then(Value::as_str) != Some(source))
++        {
++            return Err(invalid());
++        }
++        let clients = payload
++            .pointer("/request/clients")
++            .and_then(Value::as_array)
++            .ok_or_else(invalid)?;
++        if clients.is_empty() || clients.len() > 64 {
++            return Err(invalid());
++        }
++        let mut client_scope = HashSet::new();
++        for client in clients {
++            if client["home"] != source {
++                return Err(invalid());
++            }
++            let ids = client["threadIDs"].as_array().ok_or_else(invalid)?;
++            for id in ids {
++                client_scope.insert(id.as_str().ok_or_else(invalid)?.to_owned());
++            }
++        }
++        if client_scope != names {
++            return Err(invalid());
++        }
++        lock.verify()?;
++        Ok(Self { lock, stamp, role })
++    }
++    pub(crate) fn reply(&self, phase: &str) -> Value {
++        json!({"requestId":self.stamp.request_id,"revision":self.stamp.revision,"digest":self.stamp.digest,
++            "homeIdentity":self.lock.home_identity(),"role":self.role,"phase":phase,
++            "migrationAuthorized":false})
++    }
++}
++
++fn receive_now(fd: i32) -> io::Result<OwnedFd> {
++    let mut tag = 0u8;
++    let mut control = [0usize; 8];
++    let mut iov = libc::iovec {
++        iov_base: (&mut tag as *mut u8).cast(),
++        iov_len: 1,
++    };
++    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
++    message.msg_iov = &mut iov;
++    message.msg_iovlen = 1;
++    message.msg_control = control.as_mut_ptr().cast();
++    message.msg_controllen = std::mem::size_of_val(&control) as _;
++    let count = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_DONTWAIT) };
++    if count < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let mut descriptors = Vec::new();
++    let mut valid = count == 1 && tag == 0x46 && message.msg_flags & libc::MSG_CTRUNC == 0;
++    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
++    while !header.is_null() {
++        let current = unsafe { &*header };
++        let base = unsafe { libc::CMSG_LEN(0) } as usize;
++        if current.cmsg_level != libc::SOL_SOCKET
++            || current.cmsg_type != libc::SCM_RIGHTS
++            || (current.cmsg_len as usize) < base
++            || current.cmsg_len > message.msg_controllen
++        {
++            valid = false;
++            break;
++        }
++        let bytes = current.cmsg_len as usize - base;
++        if bytes % std::mem::size_of::<i32>() != 0 {
++            valid = false;
++            break;
++        }
++        let data = unsafe { libc::CMSG_DATA(header) }.cast::<i32>();
++        for index in 0..bytes / std::mem::size_of::<i32>() {
++            let raw = unsafe { data.add(index).read_unaligned() };
++            if raw < 0 {
++                valid = false;
++                continue;
++            }
++            let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
++            let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
++            if flags < 0
++                || unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0
++            {
++                valid = false;
++            }
++            descriptors.push(descriptor);
++        }
++        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
++    }
++    if !valid || descriptors.len() != 1 {
++        return Err(invalid());
++    }
++    descriptors.pop().ok_or_else(invalid)
++}
++pub(crate) async fn receive(stream: &UnixStream, deadline: Instant) -> io::Result<OwnedFd> {
++    loop {
++        tokio::time::timeout_at(deadline, stream.readable())
++            .await
++            .map_err(|_| io::ErrorKind::TimedOut)??;
++        match stream.try_io(tokio::io::Interest::READABLE, || {
++            receive_now(stream.as_raw_fd())
++        }) {
++            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
++            result => return result,
++        }
++    }
++}

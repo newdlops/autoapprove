@@ -6,4 +6,6 @@ typedef struct {
 } aa_native_peer_identity;
 /* Returns errno on failure. Values come from the connected socket, never JSON. */
 int aa_native_peer_from_socket(int fd, aa_native_peer_identity *identity);
+/* Sends one tagged byte and one descriptor. Returns 0 or errno; never retries. */
+int aa_native_send_descriptor(int socket_fd, int descriptor);
 #endif

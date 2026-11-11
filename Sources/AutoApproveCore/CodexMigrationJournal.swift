@@ -2,6 +2,20 @@ import Foundation
 import CryptoKit
 import Darwin
 
+/// A duplicate of the journal's already-held kernel lock. Only the journal can
+/// create it; descriptor transfer keeps the same open-file lock alive if its
+/// original owner closes. This does not grant permission to migrate data.
+final class CodexMigrationLockDescriptor:@unchecked Sendable {
+    let home:String,homeIdentity:String,requestID:String,revision:Int,digest:String
+    private let fd:Int32
+    fileprivate init(fd:Int32,home:CodexMigrationJournalRecord.Home,record:CodexMigrationJournalRecord) {
+        self.fd=fd;self.home=home.path;homeIdentity=home.identity
+        requestID=record.id;revision=record.revision;digest=record.digest
+    }
+    deinit{Darwin.close(fd)}
+    func withDescriptor<T>(_ body:(Int32)throws->T)rethrows->T {try body(fd)}
+}
+
 // Internal storage only: native effects must never run from a record unless
 // the central authority and both private mirrors are consistent.
 struct CodexMigrationJournalRecord:Codable,Equatable {
@@ -315,6 +329,22 @@ final class CodexMigrationJournal {
         guard let loaded=try load(id:expected.id),loaded.consistent,loaded.record==expected,!expected.terminal,
               let handles=leases[expected.id] else{throw Self.failure}
         for handle in handles{try handle.check()}
+    }
+    func duplicateLockDescriptor(id:String,home:String,expectedRevision:Int)throws->CodexMigrationLockDescriptor {
+        guard let loaded=try load(id:id),loaded.consistent,loaded.record.revision==expectedRevision else{throw Self.failure}
+        try validateReservation(loaded.record)
+        let ref=try Self.home(home)
+        guard let handle=leases[loaded.record.id]?.first(where:{$0.ref==ref}),handle.lockFD>=0 else{throw Self.failure}
+        try handle.check()
+        let fd=fcntl(handle.lockFD,F_DUPFD_CLOEXEC,0)
+        guard fd>=0 else{throw Self.failure}
+        do {
+            var info=stat()
+            guard fstat(fd,&info)==0,info.st_mode&S_IFMT==S_IFREG,info.st_uid==getuid(),
+                  info.st_mode&0o077==0,info.st_nlink==1 else{throw Self.failure}
+            try handle.check()
+            return .init(fd:fd,home:ref,record:loaded.record)
+        } catch {Darwin.close(fd);throw error}
     }
     func repair(id value:String)throws->CodexMigrationJournalRecord {
         let id=try Self.id(value);guard let initial=try load(id:id) else{throw Self.failure}

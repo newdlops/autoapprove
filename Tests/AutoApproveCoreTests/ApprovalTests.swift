@@ -1262,6 +1262,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session migration: app restoration retains two-home ownership against reverse requests",tests.testSessionMigrationRestorationRetainsBothHomeReservations),
             ("Session migration: cancellation during pending reads never prepares late or retains untouched locks",tests.testSessionMigrationCancellationDuringReadReleasesOnlyUntouchedReservation),
             ("Migration journal: mirrored revisions and terminal-only release",tests.testMigrationJournalMirrorsAndTerminalRelease),
+            ("Migration journal: descriptor retains exact kernel reservation",tests.testMigrationJournalDescriptorRetainsExactKernelReservation),
             ("Migration journal: reversed locks and restart ownership",tests.testMigrationJournalLocksSurviveCoordinatorRestart),
             ("Migration journal: partial mirror repair preserves attempted intent",tests.testMigrationJournalRepairsPartialMirrorWithoutRevisingIntent),
             ("Migration journal: corrupt and symbolic mirrors fail closed",tests.testMigrationJournalRejectsCorruptAndLinkedMirrors),

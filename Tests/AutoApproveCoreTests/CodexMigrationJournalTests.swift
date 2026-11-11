@@ -1,6 +1,7 @@
 #if DEBUG
 import Foundation
 import CSQLite
+import Darwin
 @testable import AutoApproveCore
 
 private final class MigrationJournalFixture {
@@ -14,6 +15,22 @@ private final class MigrationJournalFixture {
     func payload(_ stage:String)->Data {Data("{\"stage\":\"\(stage)\"}".utf8)}
 }
 extension ApprovalTests {
+    func testMigrationJournalDescriptorRetainsExactKernelReservation()throws {
+        let f=try MigrationJournalFixture(),store=try f.store()
+        var journal:CodexMigrationJournal?=try .init(store:store)
+        let record=try journal!.create(id:f.id,homes:f.homes,payload:f.payload("prepared"))
+        var descriptor:CodexMigrationLockDescriptor?=try journal!.duplicateLockDescriptor(id:f.id,home:f.homes[0],expectedRevision:1)
+        try expectEqual(descriptor!.requestID,record.id)
+        try expectEqual(descriptor!.digest,record.digest)
+        try descriptor!.withDescriptor {fd in try expect(fcntl(fd,F_GETFD)&FD_CLOEXEC != 0)}
+        try expectThrows(journal!.duplicateLockDescriptor(id:f.id,home:f.homes[0],expectedRevision:2))
+        try expectThrows(journal!.duplicateLockDescriptor(id:f.id,home:f.home("c"),expectedRevision:1))
+        journal=nil
+        let recovering=try CodexMigrationJournal(store:store)
+        try expectThrows(recovering.repair(id:f.id))
+        descriptor=nil
+        try expectEqual(try recovering.repair(id:f.id),record)
+    }
     func testMigrationJournalMirrorsAndTerminalRelease() throws {
         let f=try MigrationJournalFixture(),store=try f.store(),j=try CodexMigrationJournal(store:store)
         let first=try j.create(id:f.id,homes:f.homes,payload:f.payload("reserved"))

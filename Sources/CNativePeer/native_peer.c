@@ -25,3 +25,22 @@ int aa_native_peer_from_socket(int fd, aa_native_peer_identity *identity) {
     identity->audit_pid_version = version;
     return 0;
 }
+
+int aa_native_send_descriptor(int socket_fd, int descriptor) {
+    if (descriptor < 0) return EBADF;
+    unsigned char tag = 0x46;
+    struct iovec iov = {.iov_base = &tag, .iov_len = 1};
+    union { struct cmsghdr alignment; unsigned char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov; message.msg_iovlen = 1;
+    message.msg_control = control.bytes; message.msg_controllen = sizeof(control.bytes);
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
+    ssize_t sent = sendmsg(socket_fd, &message, 0);
+    if (sent == 1) return 0;
+    return sent < 0 ? errno : EIO;
+}

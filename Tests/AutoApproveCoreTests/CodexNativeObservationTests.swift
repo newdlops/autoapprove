@@ -136,7 +136,44 @@ extension ApprovalTests {
 }
 
 enum NativeConnectionProbe {
-    private static func selected(_ pair:CodexNativeRuntimePair,threadID:String,cohort:Bool=false)async throws {
+    private struct OwnedJournal {
+        let path:String,record:CodexMigrationJournalRecord,state:CodexSessionMigrationState
+    }
+    private static func borrowOwnedJournal(_ lease:CodexNativeSelectedInputLease,pair:CodexNativeRuntimePair,
+                                           home:String,threadID:String)throws->OwnedJournal {
+        guard home.hasPrefix("/private/tmp/aa-native-ui-"),URL(fileURLWithPath:home).lastPathComponent=="home" else {
+            throw AppError.message("Owned journal fixture home required")
+        }
+        let root=URL(fileURLWithPath:home).deletingLastPathComponent()
+        let destination=root.appendingPathComponent("journal-target-검증")
+        try FileManager.default.createDirectory(at:destination,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
+        func endpoint(_ home:String,_ label:String)throws->CodexMigrationEndpoint {
+            guard let pointer=realpath(home,nil) else{throw AppError.message("Owned home missing")}
+            let physical=String(cString:pointer);free(pointer)
+            var info=stat();guard lstat(physical,&info)==0,info.st_mode&S_IFMT==S_IFDIR else{throw AppError.message("Owned home missing")}
+            return .init(home:physical,physicalHomeID:"\(info.st_dev):\(info.st_ino)",serverID:"owned-"+label,socketID:"owned-socket-"+label,
+                credentialStoreID:"owned-credentials-"+label,cliIdentity:"owned-native-fixture",cliVersion:"0.167.1",
+                account:.init(subjectID:"owned-subject-"+label,sessionID:"owned-login-"+label,workspaceID:"owned-workspace-"+label))
+        }
+        let source=try endpoint(home,"source"),target=try endpoint(destination.path,"destination"),id=UUID().uuidString.lowercased()
+        let client=CodexMigrationClient(identity:.init(pid:Int32(pair.connection.tuiPeer.pid),started:"owned-fixture",tty:"/dev/owned-fixture"),home:source.home,threadIDs:[threadID])
+        let request=CodexSessionMigrationRequest(id:id,source:source,destination:target,clients:[client],threads:[
+            .init(id:threadID,home:source.home,parentID:nil,turnID:nil,goalRevision:nil,configurationID:"owned-settings",resumable:true)])
+        var state=CodexSessionMigrationState(request:request,stage:.reserved,currentOwners:[threadID:source.home])
+        let path=root.appendingPathComponent("journal-native-audit.sqlite").path
+        let journal=try CodexMigrationJournal(store:AuditStore(path:path)),encoder=JSONEncoder()
+        encoder.outputFormatting=[.sortedKeys,.withoutEscapingSlashes]
+        let first=try journal.create(id:id,homes:[source.home,target.home],payload:encoder.encode(state))
+        state.stage = .prepared
+        let record=try journal.save(id:id,payload:encoder.encode(state),expectedRevision:first.revision)
+        let descriptor=try journal.duplicateLockDescriptor(id:id,home:source.home,expectedRevision:record.revision)
+        let receipt=try lease.borrowJournalLock(descriptor)
+        guard receipt.role=="source" else{throw AppError.message("Owned descriptor bound wrong journal role")}
+        // No journal/descriptor escapes: the native server must keep the lock
+        // after both of this sender's OS descriptor owners are destroyed.
+        return .init(path:path,record:record,state:state)
+    }
+    private static func selected(_ pair:CodexNativeRuntimePair,threadID:String,cohort:Bool=false,journalHome:String?=nil)async throws {
         try await Task.detached {
             let lease=try CodexNativeSelectedInputLease(path:pair.serverControlSocket,expected:pair.connection,threadIDs:[threadID])
             defer{lease.close()}
@@ -147,10 +184,27 @@ enum NativeConnectionProbe {
                 reply["runtimeCohortVerified"]=true
                 reply["runtimeCohortReady"]=observed.readyForWriterShutdown
             }
+            var owned:OwnedJournal?
+            if let journalHome {
+                let context=try borrowOwnedJournal(lease,pair:pair,home:journalHome,threadID:threadID)
+                let recovering=try CodexMigrationJournal(store:AuditStore(path:context.path))
+                var blocked=false
+                do {_ = try recovering.repair(id:context.record.id)}catch{blocked=true}
+                guard blocked else{throw AppError.message("Native descriptor did not retain sender's journal lock")}
+                owned=context;reply["journalLockVerified"]=true;reply["journalKernelHeldAfterSenderClose"]=true
+            }
             try FileHandle.standardOutput.write(contentsOf:JSONSerialization.data(withJSONObject:reply)+Data([10]))
             var input=pollfd(fd:STDIN_FILENO,events:Int16(POLLIN),revents:0)
             guard poll(&input,1,5000)>0,readLine()=="release" else{throw AppError.message("Owned selected release command missing")}
             try lease.release()
+            if let owned {
+                let recovering=try CodexMigrationJournal(store:AuditStore(path:owned.path))
+                let record=try recovering.repair(id:owned.record.id)
+                guard record==owned.record else{throw AppError.message("Owned journal changed across descriptor loan")}
+                var cancelled=owned.state;cancelled.stage = .cancelled;cancelled.cancellation = .requested
+                _ = try recovering.save(id:record.id,payload:JSONEncoder().encode(cancelled),expectedRevision:record.revision,terminal:true)
+                try recovering.release(id:record.id)
+            }
             try FileHandle.standardOutput.write(contentsOf:Data("{\"released\":true,\"migrationAuthorized\":false}\n".utf8))
         }.value
     }
@@ -169,7 +223,8 @@ enum NativeConnectionProbe {
     @MainActor static func runIfRequested() async -> Bool {
         let inputHold = CommandLine.arguments.firstIndex(of: "--native-terminal-input-hold")
         let runtimeHold=CommandLine.arguments.firstIndex(of:"--native-runtime-input-hold")
-        let runtimeCohort=CommandLine.arguments.firstIndex(of:"--native-runtime-selected-input-cohort")
+        let runtimeJournal=CommandLine.arguments.firstIndex(of:"--native-runtime-journal-lock")
+        let runtimeCohort=runtimeJournal ?? CommandLine.arguments.firstIndex(of:"--native-runtime-selected-input-cohort")
         let runtimeSelected=runtimeCohort ?? CommandLine.arguments.firstIndex(of:"--native-runtime-selected-input-lease")
         let runtime=runtimeSelected ?? runtimeHold ?? CommandLine.arguments.firstIndex(of:"--native-runtime-resolve")
         guard let index = runtime ?? inputHold ?? CommandLine.arguments.firstIndex(of: "--native-binding-observe") else { return false }
@@ -180,7 +235,8 @@ enum NativeConnectionProbe {
                 let pair=try await CodexNativeRuntimePair.resolve(root:CommandLine.arguments[index+1],home:CommandLine.arguments[index+2],tuiPID:tuiPID,serverPID:serverPID)
                 if runtimeSelected != nil {
                     guard index+5<CommandLine.arguments.count else{throw AppError.message("Owned selected thread ID required")}
-                    try await selected(pair,threadID:CommandLine.arguments[index+5],cohort:runtimeCohort != nil)
+                    try await selected(pair,threadID:CommandLine.arguments[index+5],cohort:runtimeCohort != nil,
+                        journalHome:runtimeJournal != nil ? CommandLine.arguments[index+2]:nil)
                 }else if runtimeHold != nil {try await operate(pair.connection,path:pair.tuiControlSocket)}
                 else {
                     let result:[String:Any]=["verified":true,"connectionID":pair.connection.connectionID,

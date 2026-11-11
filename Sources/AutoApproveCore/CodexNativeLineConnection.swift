@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CNativePeer
 
 /// A private native control connection. Calls serialize on one owned descriptor;
 /// use from a utility task, never the main actor. No JSON can create its peer witness.
@@ -88,6 +89,31 @@ final class CodexNativeLineConnection {
     func exchange(_ request: Data, deadline: UInt64 = CodexNativeLineConnection.deadline) throws -> Data {
         lock.lock(); defer { lock.unlock() }
         do {
+            try sendUnlocked(request,deadline:deadline)
+            return try readUnlocked(deadline:deadline)
+        } catch {closeUnlocked();throw error}
+    }
+    /// A ready acknowledgment prevents a buffered line read from consuming the
+    /// descriptor's tagged byte. The whole handshake has one deadline.
+    func exchangeDescriptor(_ request:Data,descriptor:CodexMigrationLockDescriptor,
+                            validateReady:(Data)throws->Void,deadline:UInt64=CodexNativeLineConnection.deadline)throws->Data {
+        lock.lock();defer{lock.unlock()}
+        do {
+            try sendUnlocked(request,deadline:deadline)
+            try validateReady(readUnlocked(deadline:deadline))
+            try descriptor.withDescriptor { transferred in
+                while true {
+                    try Self.wait(fd,Int16(POLLOUT),deadline:deadline)
+                    let result=aa_native_send_descriptor(fd,transferred)
+                    if result==EINTR || result==EAGAIN || result==EWOULDBLOCK {continue}
+                    guard result==0 else{throw Self.failure}
+                    break
+                }
+            }
+            return try readUnlocked(deadline:deadline)
+        } catch {closeUnlocked();throw error}
+    }
+    private func sendUnlocked(_ request:Data,deadline:UInt64)throws {
             guard fd >= 0, (1...24_576).contains(request.count), !request.contains(10) else { throw Self.failure }
             var framed = request; framed.append(10)
             try framed.withUnsafeBytes { buffer in
@@ -100,6 +126,8 @@ final class CodexNativeLineConnection {
                     offset += count
                 }
             }
+    }
+    private func readUnlocked(deadline:UInt64)throws->Data {
             let maximumBody = 1_048_576
             var data = Data()
             while true {
@@ -116,9 +144,5 @@ final class CodexNativeLineConnection {
                 }
                 guard data.count <= maximumBody else { throw Self.failure }
             }
-        } catch {
-            closeUnlocked()
-            throw error
-        }
     }
 }

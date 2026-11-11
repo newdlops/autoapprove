@@ -14,7 +14,7 @@
     {
       "path": "app-server/src/lib.rs",
       "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
-      "after": "b4a8127aa2fc5f5e3f5e2b9a82b404caa0ae91c6ab1a1f3d24ef40c4f4706264"
+      "after": "e7eaf76e2ad5f6775ec30b7bc817669653e350d158de33f4457672adfda2ab9d"
     },
     {
       "path": "app-server/src/turn_admission.rs",
@@ -29,12 +29,12 @@
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "162bb7defa876239096dcec20d841abe3eacbecbfc9bcc86301745e5fba18389"
+      "after": "5cc51fcf7973ada1437a5990caa2d058a0e42ea9d45d47dc86d72f72535f4cd0"
     },
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "5958b72021e1468b0363da6783420d6519a908bd91151059a122eb7689027675"
+      "after": "d6e382c0875287df273ba849a2ff117e06d658f27f34ac7f14b0863948ae0f36"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -229,7 +229,7 @@
     {
       "path": "core/src/native_ownership.rs",
       "before": null,
-      "after": "f000b55efdd589337f80636ce7503f85e2544bd451faa223e42e58967971d3dc"
+      "after": "2e33b48174f68bb531d9259e40643c7acdb1c158e3e480aa71929ec11d738155"
     },
     {
       "path": "core/Cargo.toml",
@@ -254,7 +254,7 @@
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "2a9217a5ea735817f4aa40562f148bf78775ec0addf0ff7452b126a170e7508a"
+      "after": "ce31ca59dfa298df43303dbafc08b41ef602c054dae4a4f6cb71dd31c33e53b5"
     },
     {
       "path": "core/src/codex_thread.rs",
@@ -285,9 +285,14 @@
       "path": "app-server/src/outgoing_message.rs",
       "before": "c6a200bbced4757e7337a9eeb6e729d124c14dab62eb01baf65833b4742643dd",
       "after": "6ff752f525ac5ca1f6ba53c1ca8ba411d38876cd08fbe3a3cdc74f3bec23b12e"
+    },
+    {
+      "path": "app-server/src/selected_journal_lock.rs",
+      "before": null,
+      "after": "e7ce94c9d6cc4f310f760a8b0b7042737f536d5efa1cf0a9566e4ab148b47fa5"
     }
   ],
-  "patchSHA256": "395d35f226f3204e571d0150a687519d14ecb68ad6ffdb65ee428ea0c6ac41e2",
+  "patchSHA256": "8b714cc8d6a4b6080c9ede716e04c2a2c02c8d660dcb3be729e297b5c3c0a509",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -623,6 +628,91 @@
         "NativeSelectedRuntime is privately constructed only inside MessageProcessor and carries its own admission; native cohort cannot be paired with an independently supplied gate",
         "Native queue preflight reads service storage directly for already-verified threads, including archived cold descendants; no unarchive or resume side effects"
       ]
+    },
+    "native46JournalDescriptor": {
+      "status": "source57-descriptor-handoff-native-and-real-swift-verified",
+      "sourceFiles": 57,
+      "implementation": [
+        "Journal alone creates a CLOEXEC duplicate of its actual reserved home lock",
+        "ready acknowledgment precedes one tagged SCM_RIGHTS descriptor transfer; one2s client deadline",
+        "native receiver bounds ancillary data, requires exactly one descriptor, sets CLOEXEC and closes rejected copies",
+        "Core verifies private regular lock, physical home/namespace inode and exclusive kernel ownership",
+        "native validates active/history mirrors, canonical record SHA, prepared source/destination homes and exact selected client/thread scope",
+        "sealed processor owns actual input gate and home context",
+        "native retains same open-file exclusive lock after all original Swift owners close; release precedes acknowledgment"
+      ],
+      "codeCheck": {
+        "session": 91590,
+        "terminal": true,
+        "passed": true,
+        "elapsed": "2m37s"
+      },
+      "nativeBuild": {
+        "session": 72939,
+        "terminal": true,
+        "passed": true,
+        "elapsed": "11m58s",
+        "binarySHA256": "abe514007d82cbb392b1617c807be31900d1c5cc0999b67490249ae7708739f8",
+        "binary": "/private/tmp/aa-codex-approval-release/release/codex-app-server"
+      },
+      "sourceModuleTests": {
+        "session": 16876,
+        "terminal": true,
+        "passed": 15,
+        "root": "/private/tmp/aa-native-ownership-source-check/check-rACH5R",
+        "moduleSHA256": "2e33b48174f68bb531d9259e40643c7acdb1c158e3e480aa71929ec11d738155"
+      },
+      "swiftJournalTest": {
+        "session": 60278,
+        "terminal": true,
+        "passed": 1,
+        "filter": "descriptor retains exact kernel reservation"
+      },
+      "swiftSelectedRegression": {
+        "session": 25076,
+        "terminal": true,
+        "passed": 2
+      },
+      "liveNativeDescriptor": {
+        "session": 43985,
+        "terminal": true,
+        "passed": true,
+        "report": "/private/tmp/aa-journal-fd-o0w8i_ko/report.json",
+        "cases": [
+          "valid transfer retains after sender closes",
+          "wrong physical home",
+          "independent open of held lock",
+          "wrong tag",
+          "two descriptors",
+          "wrong record digest",
+          "wrong selected scope"
+        ],
+        "modelTurnsSubmitted": 0,
+        "policyWrites": 0
+      },
+      "liveSwiftDescriptor": {
+        "session": 93710,
+        "terminal": true,
+        "passed": true,
+        "report": "/private/tmp/aa-native-journal-swift-live-20261112/report.json",
+        "checks": [
+          "real Swift create/save/duplicate journal codec with Unicode destination home",
+          "actual application SCM_RIGHTS transfer to actual native server",
+          "independent recovery blocked after sender journal/descriptor destruction",
+          "release then recovery succeeds and source fixture journal cancelled",
+          "kernel binding + two native TUI clients + cohort/input holds/direct resume/exact drafts"
+        ],
+        "originalSessions": 4,
+        "preservedAfterCleanup": 4,
+        "migrationVerified": false
+      },
+      "limits": [
+        "coordination only, not migration authority",
+        "no background writer-stop job or private source Retire/Incoming/Activate IPC yet",
+        "complete all-client/backend census and native TUI retarget still absent",
+        "move UI is preparation-only; public release and installation remain"
+      ],
+      "next": "No native builds/tests live. Use the now-proven borrowed kernel EX lock (not a raw metadata/FD number bypass) for private native retirement. Background job may only stop/persist/flush selected captured runtimes; retain Arc of input guard and journal lock until the same shutdown futures terminate, even on EOF. Publish policy only from a later connected-session command with fresh journal stamp validation, exact scope and closed-writer/per-thread guards. Refactor NativeJournalLock validation into shared readonly parser for sequential journal revision refresh (intent/request frozen). Then implement Source Retire, destination Incoming/Activate and ownership observation without replay. Full client census + original-window retarget + actual A-B-A and final release/install remain."
     }
   },
   "remaining": [

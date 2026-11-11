@@ -50,6 +50,7 @@ parser.add_argument('--swift-input-hold-helper', help='Run the real application 
 parser.add_argument('--runtime-registration', action='store_true', help='Discover native endpoints using only the shared private registration root')
 parser.add_argument('--swift-selected-input-helper', help='Check real application selected input lease against the discovered server')
 parser.add_argument('--swift-selected-cohort', action='store_true', help='Read the actual native runtime cohort through that application lease')
+parser.add_argument('--swift-journal-lock', action='store_true', help='Transfer an owned real Swift journal lock to the native server')
 parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
 parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
 parser.add_argument('--admission', action='store_true', help='Verify separately enabled whole-server runtime-start lease')
@@ -69,6 +70,7 @@ assert not args.swift_input_hold_helper or args.terminal_input_hold, 'Applicatio
 assert not args.runtime_registration or (args.terminal_input_hold and args.swift_input_hold_helper), 'Runtime registration requires real application input-hold checks'
 assert not args.swift_selected_input_helper or args.runtime_registration, 'Selected application lease requires runtime registration'
 assert not args.swift_selected_cohort or args.swift_selected_input_helper, 'Application cohort requires its selected input helper'
+assert not args.swift_journal_lock or args.swift_selected_cohort, 'Application journal loan requires native cohort validation'
 assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
 assert not args.admission or (args.direct_server and args.navigation), 'Admission test requires direct native server binding and navigation'
 assert not args.app_server_binary or args.server, 'Standalone server mode requires --server'
@@ -969,6 +971,8 @@ try:
         root_id = first['stores']['primary'][0]
         wire = Wire()
         operation = '--native-runtime-selected-input-cohort' if args.swift_selected_cohort else '--native-runtime-selected-input-lease'
+        if args.swift_journal_lock:
+            operation = '--native-runtime-journal-lock'
         helper = subprocess.Popen([args.swift_selected_input_helper, operation,
                                    str(runtime_root), str(fixture_home), str(pid), str(server.pid), root_id],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -978,6 +982,8 @@ try:
             expected_held = {'paused': True, 'threadIds': [root_id], 'migrationAuthorized': False}
             if args.swift_selected_cohort:
                 expected_held.update(runtimeCohortVerified=True, runtimeCohortReady=True)
+            if args.swift_journal_lock:
+                expected_held.update(journalLockVerified=True, journalKernelHeldAfterSenderClose=True)
             assert held == expected_held, held
             before_inference = counts['inference']
             denied = wire.call('turn/start', {'threadId': root_id,
@@ -1272,6 +1278,7 @@ try:
               'runtimeRegistrationDiscoveryVerified': args.runtime_registration,
               'applicationSelectedInputLeaseVerified': bool(args.swift_selected_input_helper),
               'applicationSelectedRuntimeCohortVerified': args.swift_selected_cohort,
+              'applicationJournalLockDescriptorVerified': args.swift_journal_lock,
               'applicationConnectionCollectorVerified': bool(args.swift_binding_helper),
               'proxyPeerMismatchVerified': args.expect_proxy_peer,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,

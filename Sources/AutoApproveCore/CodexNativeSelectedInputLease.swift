@@ -45,23 +45,33 @@ struct CodexNativeRuntimeCohort:Decodable,Sendable {
 /// One utility-task owner. The lease drains and pauses input admission for an
 /// exact scope. It does not stop accepted work or establish migration ownership.
 final class CodexNativeSelectedInputLease {
-    enum Operation:String {case inspect,pause,status,renew,release,cohort}
+    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock"}
+    struct JournalLockReceipt:Decodable {
+        let requestId:String,revision:Int,digest:String,homeIdentity:String,role:String,phase:String
+        let migrationAuthorized:Bool
+    }
     struct Reply:Decodable {
         let schemaVersion:Int,producer:String,pid:UInt32,nonce:String,serverGeneration:String
         let scope:String,threadIds:[String],leaseId:String?,inputAdmissionPaused:Bool,leaseTTLMillis:UInt32
         let membershipComplete:Bool,existingWorkStopped:Bool,goalLifecycleManaged:Bool,credentialsTouched:Bool,migrationAuthorized:Bool
         let runtimeCohortSupported:Bool?
         let runtimeCohort:CodexNativeRuntimeCohort?
+        let journalLockSupported:Bool?,journalDescriptorReady:Bool?
+        let journalLock:JournalLockReceipt?
     }
     private struct Request:Encodable {
         let op:String,nonce:String,serverGeneration:String?,leaseId:String?,threadIds:[String]?
+        var journal:JournalStamp?=nil
     }
+    private struct JournalStamp:Encodable {let requestId:String,revision:Int,digest:String}
     private let connection:CodexNativeLineConnection
     private let threadIDs:[String]
     private var generation:String?
     private var leaseID:String?
     private var held=false
     private var cohortSupported=false
+    private var journalSupported=false
+    private var journalHeld=false
     private static var failure:AppError {.message("선택한 대화의 서버 입력 차단을 확인하지 못했습니다. 이동을 진행하지 않습니다.")}
     static func checkedScope(_ ids:[String])throws->[String] {
         guard (1...512).contains(ids.count),Set(ids).count==ids.count,
@@ -76,6 +86,7 @@ final class CodexNativeSelectedInputLease {
             let inspected=try call(.inspect)
             generation=inspected.serverGeneration
             cohortSupported=inspected.runtimeCohortSupported==true
+            journalSupported=inspected.journalLockSupported==true
             leaseID=try call(.pause).leaseId
             held=true
         }catch{connection.close();throw error}
@@ -88,6 +99,27 @@ final class CodexNativeSelectedInputLease {
         guard held,cohortSupported else{close();throw Self.failure}
         guard let value=try call(.cohort).runtimeCohort else{close();throw Self.failure}
         return value
+    }
+    func borrowJournalLock(_ descriptor:CodexMigrationLockDescriptor)throws->JournalLockReceipt {
+        guard held,journalSupported,!journalHeld else{close();throw Self.failure}
+        do {
+            let nonce=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
+            let request=Request(op:Operation.journalLock.rawValue,nonce:nonce,serverGeneration:generation,leaseId:leaseID,
+                threadIds:nil,journal:.init(requestId:descriptor.requestID,revision:descriptor.revision,digest:descriptor.digest))
+            let bytes=try connection.exchangeDescriptor(JSONEncoder().encode(request),descriptor:descriptor,validateReady:{data in
+                let reply=try Self.validate(data,operation:.journalLock,nonce:nonce,peer:self.connection.peer.identity,
+                    generation:self.generation,leaseID:self.leaseID,threadIDs:self.threadIDs)
+                guard reply.journalDescriptorReady==true,reply.journalLock==nil else{throw Self.failure}
+            })
+            let reply=try Self.validate(bytes,operation:.journalLock,nonce:nonce,peer:connection.peer.identity,
+                generation:generation,leaseID:leaseID,threadIDs:threadIDs)
+            guard reply.journalDescriptorReady==nil,let receipt=reply.journalLock,receipt.phase=="held",
+                  receipt.requestId==descriptor.requestID,receipt.revision==descriptor.revision,receipt.digest==descriptor.digest,
+                  receipt.homeIdentity==descriptor.homeIdentity,["source","destination"].contains(receipt.role),
+                  !receipt.migrationAuthorized else{throw Self.failure}
+            journalHeld=true
+            return receipt
+        } catch {close();throw error}
     }
     func release()throws {
         guard held else{throw Self.failure}
@@ -130,6 +162,7 @@ final class CodexNativeSelectedInputLease {
                 guard let cohort=reply.runtimeCohort else{throw failure}
                 try cohort.validate(threadIDs:scope)
             }else {guard reply.runtimeCohort==nil else{throw failure}}
+            if operation != .journalLock {guard reply.journalDescriptorReady==nil,reply.journalLock==nil else{throw failure}}
             return reply
         }catch{throw failure}
     }
