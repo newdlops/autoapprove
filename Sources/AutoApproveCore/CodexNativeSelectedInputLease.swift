@@ -42,10 +42,25 @@ struct CodexNativeRuntimeCohort:Decodable,Sendable {
     }
 }
 
+/// A retained operation result, not proof of current writer ownership.
+struct CodexNativeSelectedShutdown:Decodable,Sendable {
+    let requestId:String,state:String,error:String?
+    let runtimesStopped:Bool,writersStopped:Bool,observationOnly:Bool,migrationAuthorized:Bool
+    func validate(requestID:String?=nil)throws {
+        guard UUID(uuidString:requestId)?.uuidString.lowercased()==requestId,
+              requestID==nil || requestID==requestId,
+              ["pending","stopped","failed"].contains(state),runtimesStopped==(state=="stopped"),
+              !writersStopped,observationOnly,!migrationAuthorized,
+              state=="failed" ? (error.map{!$0.isEmpty && $0.utf8.count<=65_536} ?? false):error==nil else {
+            throw AppError.message("선택한 대화의 종료 결과를 확인하지 못했습니다.")
+        }
+    }
+}
+
 /// One utility-task owner. The lease drains and pauses input admission for an
 /// exact scope. It does not stop accepted work or establish migration ownership.
 final class CodexNativeSelectedInputLease {
-    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock"}
+    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status"}
     struct JournalLockReceipt:Decodable {
         let requestId:String,revision:Int,digest:String,homeIdentity:String,role:String,phase:String
         let migrationAuthorized:Bool
@@ -58,6 +73,7 @@ final class CodexNativeSelectedInputLease {
         let runtimeCohort:CodexNativeRuntimeCohort?
         let journalLockSupported:Bool?,journalDescriptorReady:Bool?
         let journalLock:JournalLockReceipt?
+        let shutdown:CodexNativeSelectedShutdown?
     }
     private struct Request:Encodable {
         let op:String,nonce:String,serverGeneration:String?,leaseId:String?,threadIds:[String]?
@@ -72,6 +88,8 @@ final class CodexNativeSelectedInputLease {
     private var cohortSupported=false
     private var journalSupported=false
     private var journalHeld=false
+    private var journalWitness:JournalLockReceipt?
+    private var shutdownRequestID:String?
     private static var failure:AppError {.message("선택한 대화의 서버 입력 차단을 확인하지 못했습니다. 이동을 진행하지 않습니다.")}
     static func checkedScope(_ ids:[String])throws->[String] {
         guard (1...512).contains(ids.count),Set(ids).count==ids.count,
@@ -118,19 +136,46 @@ final class CodexNativeSelectedInputLease {
                   receipt.homeIdentity==descriptor.homeIdentity,["source","destination"].contains(receipt.role),
                   !receipt.migrationAuthorized else{throw Self.failure}
             journalHeld=true
+            journalWitness=receipt
             return receipt
         } catch {close();throw error}
+    }
+    func synchronizeJournal(_ record:CodexMigrationJournalRecord)throws {
+        do {
+            guard held,let previous=journalWitness,record.id==previous.requestId,record.formatVersion==1,
+                  !record.terminal,previous.revision<Int.max,record.revision==previous.revision+1,
+                  record.previousDigest==previous.digest else{throw Self.failure}
+            let reply=try call(.journalSync,journal:.init(requestId:record.id,revision:record.revision,digest:record.digest))
+            guard let receipt=reply.journalLock,receipt.phase=="held",receipt.requestId==record.id,
+                  receipt.revision==record.revision,receipt.digest==record.digest,
+                  receipt.role==previous.role,receipt.homeIdentity==previous.homeIdentity,!receipt.migrationAuthorized else{throw Self.failure}
+            journalWitness=receipt
+        }catch{close();throw error}
+    }
+    func beginShutdown()throws->CodexNativeSelectedShutdown {
+        guard held,let witness=journalWitness,witness.role=="source",shutdownRequestID==nil else{close();throw Self.failure}
+        // Acceptance can be uncertain if the reply is lost. Never resubmit it.
+        shutdownRequestID=witness.requestId
+        return try shutdown(.shutdownBegin)
+    }
+    func shutdownStatus()throws->CodexNativeSelectedShutdown {try shutdown(.shutdownStatus)}
+    private func shutdown(_ operation:Operation)throws->CodexNativeSelectedShutdown {
+        do {
+            guard held,let requestID=shutdownRequestID,let status=try call(operation).shutdown else{throw Self.failure}
+            try status.validate(requestID:requestID)
+            return status
+        }catch{close();throw error}
     }
     func release()throws {
         guard held else{throw Self.failure}
         defer{close()}
         _ = try call(.release)
     }
-    private func call(_ operation:Operation)throws->Reply {
+    private func call(_ operation:Operation,journal:JournalStamp?=nil)throws->Reply {
         do {
             let nonce=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
             let request=Request(op:operation.rawValue,nonce:nonce,serverGeneration:generation,
-                                leaseId:leaseID,threadIds:operation == .pause ? threadIDs:nil)
+                                leaseId:leaseID,threadIds:operation == .pause ? threadIDs:nil,journal:journal)
             let data=try connection.exchange(JSONEncoder().encode(request))
             return try Self.validate(data,operation:operation,nonce:nonce,peer:connection.peer.identity,
                                      generation:generation,leaseID:leaseID,threadIDs:threadIDs)
@@ -162,7 +207,11 @@ final class CodexNativeSelectedInputLease {
                 guard let cohort=reply.runtimeCohort else{throw failure}
                 try cohort.validate(threadIDs:scope)
             }else {guard reply.runtimeCohort==nil else{throw failure}}
-            if operation != .journalLock {guard reply.journalDescriptorReady==nil,reply.journalLock==nil else{throw failure}}
+            if operation != .journalLock && operation != .journalSync {guard reply.journalDescriptorReady==nil,reply.journalLock==nil else{throw failure}}
+            if operation == .journalSync {guard reply.journalDescriptorReady==nil,reply.journalLock != nil else{throw failure}}
+            if operation == .shutdownBegin || operation == .shutdownStatus {
+                guard let status=reply.shutdown else{throw failure};try status.validate()
+            }else {guard reply.shutdown==nil else{throw failure}}
             return reply
         }catch{throw failure}
     }

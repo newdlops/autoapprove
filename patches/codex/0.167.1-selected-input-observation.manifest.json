@@ -29,12 +29,12 @@
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "5cc51fcf7973ada1437a5990caa2d058a0e42ea9d45d47dc86d72f72535f4cd0"
+      "after": "474bb2c4bbbafe6c6b70f24d2f65275d72bc978746c64b70aa273e45db59c23c"
     },
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "d6e382c0875287df273ba849a2ff117e06d658f27f34ac7f14b0863948ae0f36"
+      "after": "21ca18aa75263b31ff9d23e96a7b7a9d91d1d06803ae656fe9941b4086a2b22a"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -254,7 +254,7 @@
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "ce31ca59dfa298df43303dbafc08b41ef602c054dae4a4f6cb71dd31c33e53b5"
+      "after": "1350218a176b05f20b2bf8dea21c9aa9c096f4ee5976afd17b75a0b7d0085c5e"
     },
     {
       "path": "core/src/codex_thread.rs",
@@ -289,10 +289,15 @@
     {
       "path": "app-server/src/selected_journal_lock.rs",
       "before": null,
-      "after": "e7ce94c9d6cc4f310f760a8b0b7042737f536d5efa1cf0a9566e4ab148b47fa5"
+      "after": "e024d5a7eee5238303184946089627492f0d074ffb43ea5400d8a248b891abc9"
+    },
+    {
+      "path": "app-server/src/request_processors/selected_shutdown.rs",
+      "before": null,
+      "after": "892e95b751f69303aca5e7b4c0ab2fc2386634e6423e0d95eb9e257965860994"
     }
   ],
-  "patchSHA256": "8b714cc8d6a4b6080c9ede716e04c2a2c02c8d660dcb3be729e297b5c3c0a509",
+  "patchSHA256": "699c2423c31642e50fc0e2edbecd81792fbec66818de3df4c20f03a8f1783000",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,

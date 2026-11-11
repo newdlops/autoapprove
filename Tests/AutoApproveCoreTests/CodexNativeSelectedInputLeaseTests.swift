@@ -3,6 +3,26 @@ import Foundation
 @testable import AutoApproveCore
 
 extension ApprovalTests {
+    func testNativeSelectedShutdownRejectsOwnershipClaimsAndInconsistentResults()throws {
+        let id=UUID().uuidString.lowercased()
+        func check(_ changes:[String:Any]=[:],requestID:String?=nil)throws {
+            var value:[String:Any]=["requestId":id,"state":"stopped","runtimesStopped":true,
+                "writersStopped":false,"observationOnly":true,"migrationAuthorized":false,"error":NSNull()]
+            value.merge(changes,uniquingKeysWith:{$1})
+            let observation=try JSONDecoder().decode(CodexNativeSelectedShutdown.self,from:JSONSerialization.data(withJSONObject:value))
+            try observation.validate(requestID:requestID ?? id)
+        }
+        try check()
+        try check(["state":"pending","runtimesStopped":false])
+        try check(["state":"failed","runtimesStopped":false,"error":"Shutdown not confirmed"])
+        for changes in [["writersStopped":true],["migrationAuthorized":true],["observationOnly":false],
+                        ["state":"pending"],["state":"failed"],["state":"complete"],
+                        ["state":"failed","runtimesStopped":false,"error":""],
+                        ["error":"Unexpected stopped error"],["requestId":UUID().uuidString.lowercased()]] as [[String:Any]] {
+            try expectThrows(check(changes))
+        }
+    }
+
     func testNativeSelectedCohortRejectsIncompleteOrForgedReadiness()throws {
         let id=UUID().uuidString.lowercased(),other=UUID().uuidString.lowercased()
         let nonce=String(repeating:"a",count:32),generation=UUID().uuidString.lowercased(),lease=UUID().uuidString.lowercased()

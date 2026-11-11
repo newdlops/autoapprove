@@ -778,7 +778,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,700 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::message_processor::NativeSelectedRuntime;
@@ -790,6 +790,7 @@
 +use std::io;
 +use std::os::unix::fs::{MetadataExt, PermissionsExt};
 +use std::path::PathBuf;
++use std::sync::Arc;
 +use std::time::Duration;
 +use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 +use tokio::net::{UnixListener, UnixStream};
@@ -974,10 +975,10 @@
 +    inspected["journalLockSupported"] = json!(runtime.is_some());
 +    send(&mut writer, inspected).await?;
 +    let first = read_request(&mut reader, Duration::from_secs(2)).await?;
-+    if first.op != "pause"
++    if !matches!(first.op.as_str(), "pause" | "shutdown-observe")
 +        || first.server_generation.as_deref() != Some(&generation)
 +        || first.lease_id.is_some()
-+        || first.journal.is_some()
++        || (first.op == "pause" && first.journal.is_some())
 +    {
 +        return Err(io::ErrorKind::InvalidInput.into());
 +    }
@@ -996,6 +997,18 @@
 +        }
 +    }
 +    names.sort();
++    if first.op == "shutdown-observe" {
++        let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
++        let stamp = first.journal.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++        let status = runtime
++            .observe_shutdown(stamp, &threads)
++            .ok_or(io::ErrorKind::NotFound)?;
++        let reply = json!({"schemaVersion":1,"producer":"autoapprove-selected-shutdown-observation",
++            "nonce":first.nonce,"serverGeneration":generation,"pid":std::process::id(),
++            "threadIds":names,"shutdown":status,"migrationAuthorized":false});
++        send(&mut writer, reply).await?;
++        return Ok(());
++    }
 +    // Daemon recovery uses an internal resume path, outside ordinary client
 +    // admission. Never grant a selected hold while that startup path is live.
 +    if recovery.as_ref().is_some_and(|task| !task.is_finished()) {
@@ -1019,7 +1032,9 @@
 +        .await?;
 +        return Ok(());
 +    };
++    let pause = Arc::new(pause);
 +    let lease = uuid::Uuid::now_v7().to_string();
++    let mut shutdown: Option<crate::message_processor::NativeSelectedShutdown> = None;
 +    let mut journal_lock = None;
 +    let mut deadline = Instant::now() + ttl;
 +    tokio::time::timeout_at(
@@ -1047,12 +1062,14 @@
 +        if request.server_generation.as_deref() != Some(&generation)
 +            || request.lease_id.as_deref() != Some(&lease)
 +            || request.thread_ids.is_some()
-+            || (request.op != "journal-lock" && request.journal.is_some())
++            || (!matches!(request.op.as_str(), "journal-lock" | "journal-sync")
++                && request.journal.is_some())
 +        {
 +            return Err(io::ErrorKind::PermissionDenied.into());
 +        }
 +        let mut cohort = None;
 +        let mut journal_reply = None;
++        let mut shutdown_reply = None;
 +        if let Some(lock) = &journal_lock {
 +            crate::selected_journal_lock::NativeJournalLock::verify_kernel(lock)?;
 +        }
@@ -1089,6 +1106,46 @@
 +                journal_reply = Some(lock.reply("held"));
 +                journal_lock = Some(lock);
 +            }
++            "journal-sync" => {
++                let lock = journal_lock.as_mut().ok_or(io::ErrorKind::InvalidInput)?;
++                lock.refresh(
++                    request.journal.clone().ok_or(io::ErrorKind::InvalidInput)?,
++                    &threads,
++                )?;
++                journal_reply = Some(lock.reply("held"));
++            }
++            "shutdown-begin" => {
++                if shutdown.is_some() {
++                    return Err(io::ErrorKind::AlreadyExists.into());
++                }
++                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                lock.require_source()?;
++                lock.require_phase("shutdownAttempted")?;
++                let value = tokio::time::timeout_at(deadline, runtime.cohort(&pause, &threads))
++                    .await
++                    .map_err(|_| io::ErrorKind::TimedOut)?
++                    .map_err(|error| io::Error::other(error.message))?;
++                if value["knownSubtreeCovered"] != true || value["readyForWriterShutdown"] != true {
++                    return Err(io::ErrorKind::WouldBlock.into());
++                }
++                // Acceptance is synchronous after the final live-peer check.
++                // EOF cannot detach a later archive or ownership publication.
++                if Instant::now() >= deadline || !reader.buffer().is_empty() {
++                    return Err(io::ErrorKind::ConnectionAborted.into());
++                }
++                let mut byte = [0u8; 1];
++                match reader.get_ref().as_ref().try_read(&mut byte) {
++                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
++                    _ => return Err(io::ErrorKind::ConnectionAborted.into()),
++                }
++                let job = runtime.start_shutdown(Arc::clone(&pause), threads.clone(), lock)?;
++                shutdown_reply = Some(job.snapshot());
++                shutdown = Some(job);
++            }
++            "shutdown-status" => {
++                shutdown_reply = Some(shutdown.as_ref().ok_or(io::ErrorKind::NotFound)?.snapshot());
++            }
 +            "cohort" => {
 +                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
 +                let value = tokio::time::timeout_at(deadline, runtime.cohort(&pause, &threads))
@@ -1097,6 +1154,9 @@
 +                cohort = Some(value.map_err(|error| io::Error::other(error.message))?);
 +            }
 +            "release" => {
++                if shutdown.as_ref().is_some_and(|job| job.pending()) {
++                    return Err(io::ErrorKind::WouldBlock.into());
++                }
 +                drop(journal_lock);
 +                drop(pause);
 +                send(
@@ -1118,6 +1178,9 @@
 +        );
 +        if let Some(cohort) = cohort {
 +            reply["runtimeCohort"] = cohort;
++        }
++        if let Some(status) = shutdown_reply {
++            reply["shutdown"] = status;
 +        }
 +        if let Some(journal) = journal_reply {
 +            reply["journalLock"] = journal;
@@ -1426,7 +1489,7 @@
      user_verification: Arc<crate::user_verification::Service>,
      outgoing: Arc<OutgoingMessageSender>,
      startup_warnings: StartupWarnings,
-@@ -177,6 +178,39 @@
+@@ -177,6 +178,145 @@
      turn_processor: TurnRequestProcessor,
      windows_sandbox_processor: WindowsSandboxRequestProcessor,
      request_serialization_queues: RequestSerializationQueues,
@@ -1439,11 +1502,108 @@
 +    admission: TurnAdmission,
 +    threads: ThreadRequestProcessor,
 +    queues: ThreadQueueRequestProcessor,
++    shutdowns: Arc<std::sync::Mutex<HashMap<String, NativeSelectedShutdown>>>,
++}
++
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++#[derive(Clone)]
++pub(crate) struct NativeSelectedShutdown {
++    scope: std::collections::HashSet<codex_protocol::ThreadId>,
++    stamp: crate::selected_journal_lock::JournalLockRequest,
++    result: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
++}
++
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++impl NativeSelectedShutdown {
++    pub(crate) fn pending(&self) -> bool {
++        self.result.borrow().is_none() && self.result.has_changed().is_ok()
++    }
++    pub(crate) fn snapshot(&self) -> serde_json::Value {
++        let value = self.result.borrow().clone();
++        let (state, error) = match value {
++            Some(Ok(())) => ("stopped", None),
++            Some(Err(error)) => ("failed", Some(error)),
++            None if self.result.has_changed().is_err() => {
++                ("failed", Some("shutdown-task-ended-without-result".into()))
++            }
++            None => ("pending", None),
++        };
++        serde_json::json!({"requestId":self.stamp.request_id,"state":state,"error":error,
++            "runtimesStopped":state=="stopped","writersStopped":false,"observationOnly":true,"migrationAuthorized":false})
++    }
 +}
 +
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +impl NativeSelectedRuntime {
-+    pub(crate) fn admission(&self) -> TurnAdmission { self.admission.clone() }
++    pub(crate) fn admission(&self) -> TurnAdmission {
++        self.admission.clone()
++    }
++
++    pub(crate) fn observe_shutdown(
++        &self,
++        stamp: &crate::selected_journal_lock::JournalLockRequest,
++        scope: &std::collections::HashSet<codex_protocol::ThreadId>,
++    ) -> Option<serde_json::Value> {
++        let jobs = self
++            .shutdowns
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        jobs.get(&stamp.request_id)
++            .filter(|job| {
++                job.scope == *scope
++                    && job.stamp.revision == stamp.revision
++                    && job.stamp.digest == stamp.digest
++            })
++            .map(NativeSelectedShutdown::snapshot)
++    }
++
++    pub(crate) fn start_shutdown(
++        &self,
++        pause: Arc<crate::turn_admission::SelectedAdmissionPause>,
++        ids: std::collections::HashSet<codex_protocol::ThreadId>,
++        journal: &crate::selected_journal_lock::NativeJournalLock,
++    ) -> std::io::Result<NativeSelectedShutdown> {
++        journal.require_source()?;
++        journal.require_phase("shutdownAttempted")?;
++        pause
++            .verify_scope(&self.admission, &ids)
++            .map_err(|error| std::io::Error::other(error.message))?;
++        let stamp = journal.stamp();
++        let mut jobs = self
++            .shutdowns
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if jobs.contains_key(&stamp.request_id) || jobs.len() >= 1024 {
++            return Err(std::io::Error::other(
++                "Shutdown was already submitted; observe it instead of replaying",
++            ));
++        }
++        let (sender, result) = tokio::sync::watch::channel(None);
++        let job = NativeSelectedShutdown {
++            scope: ids.clone(),
++            stamp: stamp.clone(),
++            result,
++        };
++        jobs.insert(stamp.request_id.clone(), job.clone());
++        let threads = self.threads.clone();
++        let admission = self.admission.clone();
++        let kernel = journal.retain_kernel();
++        tokio::spawn(async move {
++            let result = match kernel.verify() {
++                Err(_) => Err("journal-lock-changed-before-shutdown".to_owned()),
++                Ok(()) => threads
++                    .native_shutdown_selected(&admission, &pause, &ids)
++                    .await
++                    .map_err(|error| error.message),
++            };
++            // This task never publishes ownership. EOF cannot detach a later
++            // archive or policy write; only the accepted shutdown continues.
++            drop(kernel);
++            drop(pause);
++            sender.send_replace(Some(result));
++        });
++        Ok(job)
++    }
 +
 +    pub(crate) fn borrow_journal_lock(
 +        &self,
@@ -1452,8 +1612,15 @@
 +        descriptor: std::os::fd::OwnedFd,
 +        stamp: crate::selected_journal_lock::JournalLockRequest,
 +    ) -> std::io::Result<crate::selected_journal_lock::NativeJournalLock> {
-+        pause.verify_scope(&self.admission, ids).map_err(|error| std::io::Error::other(error.message))?;
-+        crate::selected_journal_lock::NativeJournalLock::acquire(&self.threads.native_move_home(), descriptor, stamp, ids)
++        pause
++            .verify_scope(&self.admission, ids)
++            .map_err(|error| std::io::Error::other(error.message))?;
++        crate::selected_journal_lock::NativeJournalLock::acquire(
++            &self.threads.native_move_home(),
++            descriptor,
++            stamp,
++            ids,
++        )
 +    }
 +
 +    pub(crate) async fn cohort(
@@ -1461,12 +1628,14 @@
 +        pause: &crate::turn_admission::SelectedAdmissionPause,
 +        ids: &std::collections::HashSet<codex_protocol::ThreadId>,
 +    ) -> Result<serde_json::Value, codex_app_server_protocol::JSONRPCErrorError> {
-+        self.threads.native_move_cohort(&self.admission, pause, ids, &self.queues).await
++        self.threads
++            .native_move_cohort(&self.admission, pause, ids, &self.queues)
++            .await
 +    }
  }
  
  #[derive(Debug)]
-@@ -336,7 +370,7 @@
+@@ -336,7 +476,7 @@
              ),
          );
          let goal_service = Arc::new(GoalService::new());
@@ -1475,7 +1644,7 @@
          let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
          let extension_event_sink =
              app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
-@@ -543,6 +577,7 @@
+@@ -543,6 +683,7 @@
              config_warnings.clone(),
              sample_responses,
          );
@@ -1483,7 +1652,7 @@
          let turn_processor = TurnRequestProcessor::new(
              auth_manager,
              Arc::clone(&thread_manager),
-@@ -612,6 +647,7 @@
+@@ -612,6 +753,7 @@
  
          Self {
              turn_admission,
@@ -1491,7 +1660,7 @@
              user_verification,
              outgoing,
              startup_warnings: StartupWarnings {
-@@ -644,6 +680,21 @@
+@@ -644,6 +786,22 @@
              turn_processor,
              windows_sandbox_processor,
              request_serialization_queues,
@@ -1510,10 +1679,11 @@
 +            admission: self.turn_admission.clone(),
 +            threads: self.thread_processor.clone(),
 +            queues: self.thread_queue_processor.clone(),
++            shutdowns: Arc::new(std::sync::Mutex::new(HashMap::new())),
          }
      }
  
-@@ -1018,6 +1069,9 @@
+@@ -1018,6 +1176,9 @@
          {
              return Err(invalid_request(experimental_required_message(reason)));
          }
@@ -1523,7 +1693,7 @@
          let connection_id = connection_request_id.connection_id;
          self.initialize_processor.track_initialized_request(
              connection_id,
-@@ -1065,6 +1119,7 @@
+@@ -1065,6 +1226,7 @@
          let request = QueuedInitializedRequest::new(
              rpc_gate,
              async move {
@@ -1531,7 +1701,7 @@
                  let _turn_admission = turn_admission;
                  // Runtime changes already admitted before drain finish normally. Turn work
                  // still waiting in serialization must observe the newly closed gate.
-@@ -1406,10 +1461,14 @@
+@@ -1406,10 +1568,14 @@
                      .await
              }
              ClientRequest::AutoapproveGoalRead { params, .. } => {
@@ -6283,7 +6453,7 @@
  use uuid::Uuid;
 --- a/app-server/src/request_processors/thread_processor.rs
 +++ b/app-server/src/request_processors/thread_processor.rs
-@@ -5,6 +5,13 @@
+@@ -5,6 +5,16 @@
  mod daemon_snapshot;
  
  mod workspace_switching;
@@ -6294,10 +6464,13 @@
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +#[path = "selected_cohort.rs"]
 +mod selected_cohort;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++#[path = "selected_shutdown.rs"]
++mod selected_shutdown;
  
  use super::persisted_resume_settings::PersistedResumeSettings;
  use super::persisted_resume_settings::latest_owned_thread_settings;
-@@ -510,6 +517,7 @@
+@@ -510,6 +520,7 @@
      pub(super) state_db: Option<StateDbHandle>,
      pub(super) log_db: Option<LogDbLayer>,
      pub(super) background_tasks: TaskTracker,
@@ -6305,7 +6478,7 @@
      pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
      pub(super) skills_watcher: Arc<SkillsWatcher>,
      pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-@@ -534,6 +542,10 @@
+@@ -534,6 +545,10 @@
  }
  
  impl ThreadRequestProcessor {
@@ -6316,7 +6489,7 @@
      #[allow(clippy::too_many_arguments)]
      pub(crate) fn new(
          auth_manager: Arc<AuthManager>,
-@@ -571,6 +583,7 @@
+@@ -571,6 +586,7 @@
              state_db,
              log_db,
              background_tasks: TaskTracker::new(),
@@ -6324,7 +6497,7 @@
              sample_responses,
              skills_watcher,
              turn_cost_worker,
-@@ -1175,24 +1188,38 @@
+@@ -1175,24 +1191,38 @@
          thread_id: ThreadId,
          operation: &str,
      ) -> Result<(), JSONRPCErrorError> {
@@ -6576,7 +6749,7 @@
      pub(crate) async fn cancel_requests_for_thread(
 --- /dev/null
 +++ b/app-server/src/selected_journal_lock.rs
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,361 @@
 +//! Kernel-backed journal coordination. Holding this is not a migration grant.
 +use base64::Engine;
 +use codex_core::native_ownership::{BorrowedMigrationLock, borrow_migration_lock};
@@ -6589,6 +6762,7 @@
 +use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 +use std::os::unix::fs::MetadataExt;
 +use std::path::Path;
++use std::sync::Arc;
 +use tokio::net::UnixStream;
 +use tokio::time::Instant;
 +
@@ -6635,17 +6809,30 @@
 +}
 +
 +pub(crate) struct NativeJournalLock {
-+    lock: BorrowedMigrationLock,
++    lock: Arc<BorrowedMigrationLock>,
 +    stamp: JournalLockRequest,
 +    role: &'static str,
++    record: Value,
++    payload: Value,
 +}
 +impl NativeJournalLock {
++    pub(crate) fn stamp(&self) -> JournalLockRequest {
++        self.stamp.clone()
++    }
 +    pub(crate) fn verify_kernel(&self) -> io::Result<()> {
 +        self.lock.verify()
 +    }
 +    pub(crate) fn acquire(
 +        home: &Path,
 +        descriptor: OwnedFd,
++        stamp: JournalLockRequest,
++        scope: &HashSet<ThreadId>,
++    ) -> io::Result<Self> {
++        let lock = Arc::new(borrow_migration_lock(home, descriptor)?);
++        Self::bind(lock, stamp, scope)
++    }
++    fn bind(
++        lock: Arc<BorrowedMigrationLock>,
 +        stamp: JournalLockRequest,
 +        scope: &HashSet<ThreadId>,
 +    ) -> io::Result<Self> {
@@ -6656,7 +6843,6 @@
 +        {
 +            return Err(invalid());
 +        }
-+        let lock = borrow_migration_lock(home, descriptor)?;
 +        let record = lock.journal_record(&stamp.request_id)?;
 +        let object = record.as_object().ok_or_else(invalid)?;
 +        let expected_keys = [
@@ -6797,7 +6983,55 @@
 +            return Err(invalid());
 +        }
 +        lock.verify()?;
-+        Ok(Self { lock, stamp, role })
++        Ok(Self {
++            lock,
++            stamp,
++            role,
++            record,
++            payload,
++        })
++    }
++    pub(crate) fn refresh(
++        &mut self,
++        stamp: JournalLockRequest,
++        scope: &HashSet<ThreadId>,
++    ) -> io::Result<()> {
++        if stamp.request_id != self.stamp.request_id
++            || self.stamp.revision.checked_add(1) != Some(stamp.revision)
++        {
++            return Err(invalid());
++        }
++        let next = Self::bind(Arc::clone(&self.lock), stamp, scope)?;
++        if next.record["previousDigest"] != self.stamp.digest
++            || next.role != self.role
++            || next.payload["request"] != self.payload["request"]
++        {
++            return Err(invalid());
++        }
++        *self = next;
++        Ok(())
++    }
++    pub(crate) fn require_phase(&self, phase: &str) -> io::Result<()> {
++        self.lock.verify()?;
++        if self.lock.journal_record(&self.stamp.request_id)? != self.record
++            || self
++                .payload
++                .pointer("/execution/phase")
++                .and_then(Value::as_str)
++                != Some(phase)
++        {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++    pub(crate) fn require_source(&self) -> io::Result<()> {
++        if self.role != "source" {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++    pub(crate) fn retain_kernel(&self) -> Arc<BorrowedMigrationLock> {
++        Arc::clone(&self.lock)
 +    }
 +    pub(crate) fn reply(&self, phase: &str) -> Value {
 +        json!({"requestId":self.stamp.request_id,"revision":self.stamp.revision,"digest":self.stamp.digest,
@@ -6875,5 +7109,114 @@
 +            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
 +            result => return result,
 +        }
++    }
++}
+--- /dev/null
++++ b/app-server/src/request_processors/selected_shutdown.rs
+@@ -0,0 +1,106 @@
++//! Stop only captured selected runtimes. This task never archives or publishes
++//! ownership. Its caller retains input and kernel journal guards until terminal.
++use super::*;
++use crate::turn_admission::{SelectedAdmissionPause, TurnAdmission};
++use codex_core::ThreadRegistration;
++
++impl ThreadRequestProcessor {
++    pub(crate) async fn native_shutdown_selected(
++        &self,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++    ) -> Result<(), JSONRPCErrorError> {
++        pause.verify_scope(admission, ids)?;
++        let mut names: Vec<_> = ids.iter().copied().collect();
++        names.sort_by_key(ToString::to_string);
++        let mut captured = Vec::new();
++        for id in &names {
++            if let Some(thread) = self
++                .thread_manager
++                .capture_thread_for_client_removal(id)
++                .await
++                .map_err(|error| core_thread_write_error("prepare move shutdown", error))?
++            {
++                captured.push((*id, thread));
++            }
++        }
++        // Empty persistent sessions must remain resumable under their original
++        // UUID. Finish materializing all of them before submitting shutdown.
++        for (id, _) in &captured {
++            self.thread_store
++                .persist_thread(*id, PersistContext::Standard)
++                .await
++                .map_err(|error| thread_store_mutation_error("prepare move shutdown", error))?;
++        }
++        for (id, thread) in &captured {
++            loop {
++                match self
++                    .retained_removal_shutdowns
++                    .observe(
++                        *id,
++                        Arc::clone(thread),
++                        Duration::from_secs(10),
++                        |thread| async move {
++                            thread
++                                .shutdown_and_wait()
++                                .await
++                                .map_err(|error| error.to_string())
++                        },
++                    )
++                    .await
++                {
++                    retained_shutdown::Observation::Stopped => break,
++                    retained_shutdown::Observation::Pending => continue,
++                    retained_shutdown::Observation::Failed(_) => {
++                        return Err(internal_error(format!(
++                            "Shutdown of selected conversation {id} was not confirmed"
++                        )));
++                    }
++                }
++            }
++        }
++        // No replacement may be torn down. The retained exclusive home lock
++        // prevents a reviewed Core startup crossing this entire operation.
++        for (id, thread) in &captured {
++            let _resume = self.thread_state_manager.lock_goal_resume(*id).await;
++            match self.thread_manager.thread_registration(*id, thread).await {
++                ThreadRegistration::Current => {
++                    if self
++                        .thread_manager
++                        .remove_thread_if_matches(id, thread)
++                        .await
++                        .is_none()
++                    {
++                        return Err(internal_error("Selected runtime changed during teardown"));
++                    }
++                }
++                ThreadRegistration::Absent => {}
++                ThreadRegistration::Replaced => {
++                    return Err(internal_error(
++                        "Selected runtime was replaced during shutdown",
++                    ));
++                }
++            }
++            self.finalize_thread_teardown(*id).await;
++            self.retained_removal_shutdowns
++                .forget_if_matches(id, thread)
++                .await;
++        }
++        for id in &names {
++            if self
++                .thread_manager
++                .capture_thread_for_client_removal(id)
++                .await
++                .map_err(|error| core_thread_write_error("verify move shutdown", error))?
++                .is_some()
++            {
++                return Err(internal_error(
++                    "Selected conversation still has a registered runtime",
++                ));
++            }
++        }
++        pause.verify_scope(admission, ids)?;
++        Ok(())
 +    }
 +}

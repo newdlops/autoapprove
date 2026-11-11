@@ -1250,6 +1250,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session migration: only matching reviewed versions prepare",tests.testSessionMigrationSupportsOnlyMatchingReviewedVersions),
             ("Native selected lease: changed scope and authority claims reject",tests.testNativeSelectedInputLeaseRejectsChangedScopeAndAuthorityClaims),
             ("Native selected cohort: incomplete scope and forged readiness reject",tests.testNativeSelectedCohortRejectsIncompleteOrForgedReadiness),
+            ("Native selected shutdown: retained results never grant writer ownership",tests.testNativeSelectedShutdownRejectsOwnershipClaimsAndInconsistentResults),
             ("Bundled Codex runtime: profile requires matching server and literal command",tests.testBundledCodexProfileLaunchRequiresMatchingServerAndLiteralCommand),
             ("Bundled Codex runtime: unsupported capabilities links and missing code reject",tests.testBundledCodexRuntimeRejectsWrongCapabilitiesLinksAndMissingCode),
             ("Native connection: kernel witness and exact displayed association",tests.testNativeConnectionReadsKernelWitnessAndExactAssociation),
