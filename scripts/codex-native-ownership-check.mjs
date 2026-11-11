@@ -20,7 +20,7 @@ const root=await mkdtemp(parent+'/check-');await mkdir(root+'/src');
 const dependencies=['libc','serde_json','tempfile'].map(name=>`${name}="=${version(name)}"`);
 dependencies.push(`serde={version="=${version('serde')}",features=["derive"]}`);
 dependencies.push(`uuid={version="=${version('uuid')}",features=["v4"]}`);
-await writeFile(root+'/Cargo.toml',`[package]\nname="native-ownership-source-check"\nversion="0.0.0"\nedition="2024"\n[dependencies]\n${dependencies.join('\n')}\n[workspace]\n`);
+await writeFile(root+'/Cargo.toml',`[package]\nname="native-ownership-source-check"\nversion="0.0.0"\nedition="2024"\n[features]\nautoapprove-native-ownership=[]\n[dependencies]\n${dependencies.join('\n')}\n[workspace]\n`);
 await writeFile(root+'/src/lib.rs',`#![allow(dead_code)]\n#[path=${JSON.stringify(module)}] mod native_ownership;\n`);
 const child=spawn(option('cargo')||'/opt/homebrew/bin/cargo',['test','--offline','--jobs','2','--target-dir',parent+'/target'],{cwd:root,stdio:'inherit'});
 const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});

@@ -9,7 +9,7 @@
     {
       "path": "app-server/Cargo.toml",
       "before": "31330479d6efb279fe2f5a1d5a195651a5cb1d941138a0940ab18c3b081b96fc",
-      "after": "efe7c91e869ca9c60ddf55130be1e989e1149125d6bcf51143be8d2cbf935822"
+      "after": "602c9d04a579b79676613c6d1e89daa24e06cfd7d9aacf60ef3f48312e72ec17"
     },
     {
       "path": "app-server/src/lib.rs",
@@ -224,15 +224,20 @@
     {
       "path": "core/src/thread_manager.rs",
       "before": "a694695f3d17d0ed5044a328109c2f6607dc5c809fa463def022439ef7042bd5",
-      "after": "55dfd2e086d85268edb7acf72f6380615958bac0d155b07341d30e154576cea7"
+      "after": "7cb76df1afb5bfebb828bc7a5425af6d9b565d5619fc939fd9f241080fc2a831"
     },
     {
       "path": "core/src/native_ownership.rs",
       "before": null,
-      "after": "aa85f91bcdac99f73546e9c147bd0fe6b9901d2396b6ece1afd01d7a8156eaad"
+      "after": "391a685ee137bcb14343352ad7f328fbd8f0b1b5531365dcb4d8e3a7df48ac33"
+    },
+    {
+      "path": "core/Cargo.toml",
+      "before": "48b3e7817b9b9391a4e05d08859f2ec460d4bcfa709885fa8577a6edd58bb393",
+      "after": "00d847a8bc1428425ad408b9e6a35e43386e5e403dddd5ccb97dc290e1416432"
     }
   ],
-  "patchSHA256": "4d6d66b9e0b2c58a4905c947f59482fb5c6f2a1c5a4d5b4c3a192a18580593c8",
+  "patchSHA256": "8f0da8f102148b1f2467db20ccd64f3eade4971a32cc34338157915162ab796c",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -301,8 +306,15 @@
       "focusedReaderTestsPassed": 4,
       "resumeRaceBarrierStillRequired": true,
       "fullCoreAndServerCodeCheckPassed": true,
-      "fullCodeCheckDuration": "10m44s",
-      "nativeRuntimePolicyEnforcementVerified": false
+      "fullCodeCheckDuration": "3m06s",
+      "nativeRuntimePolicyEnforcementVerified": false,
+      "sharedStartupGuardApplied": true,
+      "controlledRestoreUnderExclusiveReservationStillPending": true,
+      "focusedReaderAndLockTestsPassed": 6,
+      "startupGuardPhysicalLockReplacementRejected": true,
+      "sharedVsExclusiveOSLockTestsPassed": true,
+      "sameLockPathAsSwiftJournalVerified": true,
+      "actualSwiftToCoreStartupIntegrationVerified": false
     }
   },
   "remaining": [

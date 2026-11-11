@@ -4,7 +4,7 @@
  
  [features]
  autoapprove-goal-control = []
-+autoapprove-selected-transition = []
++autoapprove-selected-transition = ["codex-core/autoapprove-native-ownership"]
 +autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
  
  [lints]
@@ -4453,7 +4453,19 @@
  pub use turn_extension_data::WithTurnExtensionData;
 --- a/core/src/thread_manager.rs
 +++ b/core/src/thread_manager.rs
-@@ -2389,7 +2389,15 @@
+@@ -2265,6 +2265,11 @@
+ 
+     /// Spawn a new thread with optional history and register it with the manager.
+     async fn spawn_thread(&self, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
++        #[cfg(unix)]
++        let _native_startup_guard = if request.options.config.ephemeral { None } else {
++            crate::native_ownership::startup_guard(&request.options.config.codex_home)
++                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
++        };
+         let cancellation = request
+             .options
+             .config
+@@ -2389,7 +2394,15 @@
                  "reserved thread ID cannot be used when resuming a thread".to_string(),
              ));
          }
@@ -4469,9 +4481,20 @@
              let mut threads = self.threads.write().await;
              if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                  if thread.is_running() {
+@@ -2584,6 +2597,10 @@
+         } else {
+             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
+         };
++        #[cfg(unix)]
++        if let Some(guard) = &_native_startup_guard {
++            guard.verify().map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
++        }
+         let spawn_result = Session::spawn(SessionSpawnArgs {
+             attached_thread,
+             startup,
 --- /dev/null
 +++ b/core/src/native_ownership.rs
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,484 @@
 +//! Durable denial of writes to conversations retired from a login home.
 +//! Absence of both files preserves ordinary Codex behavior. Once installed,
 +//! missing, linked or inconsistent records fail closed; unrelated IDs remain usable.
@@ -4479,11 +4502,124 @@
 +use std::collections::HashSet;
 +use std::fs::{File, OpenOptions};
 +use std::io::{self, Read};
++use std::os::fd::{AsRawFd, FromRawFd};
 +use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 +use std::path::Path;
 +
 +pub const REQUIRED_FILE: &str = ".autoapprove-ownership-required.json";
 +pub const STATE_FILE: &str = ".autoapprove-ownership.json";
++
++/// Shares the exact home lock used by AutoApprove's migration journal. Holding
++/// this through manager publication prevents a new writer crossing reservation.
++pub struct StartupGuard {
++    home: std::path::PathBuf,
++    root: File,
++    directory: File,
++    lock: File,
++}
++fn open_at(parent: &File, name: &str, flags: i32, mode: u32) -> io::Result<File> {
++    let name = std::ffi::CString::new(name).map_err(|_| unavailable())?;
++    let fd = unsafe {
++        libc::openat(
++            parent.as_raw_fd(),
++            name.as_ptr(),
++            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
++            mode as libc::c_uint,
++        )
++    };
++    if fd < 0 {
++        Err(unavailable())
++    } else {
++        Ok(unsafe { File::from_raw_fd(fd) })
++    }
++}
++fn private(info: &std::fs::Metadata, directory: bool) -> bool {
++    info.uid() == unsafe { libc::geteuid() }
++        && info.mode() & 0o077 == 0
++        && if directory {
++            info.is_dir()
++        } else {
++            info.is_file() && info.nlink() == 1
++        }
++}
++impl StartupGuard {
++    pub fn verify(&self) -> io::Result<()> {
++        let root = self.root.metadata().map_err(|_| unavailable())?;
++        let path = std::fs::symlink_metadata(&self.home).map_err(|_| unavailable())?;
++        if !path.is_dir() || (path.dev(), path.ino()) != (root.dev(), root.ino()) {
++            return Err(unavailable());
++        }
++        let current_dir = open_at(
++            &self.root,
++            ".autoapprove-migrations",
++            libc::O_RDONLY | libc::O_DIRECTORY,
++            0,
++        )?;
++        let dir = self.directory.metadata().map_err(|_| unavailable())?;
++        let current = current_dir.metadata().map_err(|_| unavailable())?;
++        if !private(&current, true) || (current.dev(), current.ino()) != (dir.dev(), dir.ino()) {
++            return Err(unavailable());
++        }
++        let current_lock = open_at(&current_dir, "lock", libc::O_RDONLY, 0)?;
++        let lock = self.lock.metadata().map_err(|_| unavailable())?;
++        let current = current_lock.metadata().map_err(|_| unavailable())?;
++        if !private(&current, false) || (current.dev(), current.ino()) != (lock.dev(), lock.ino()) {
++            return Err(unavailable());
++        }
++        Ok(())
++    }
++}
++pub fn startup_guard(home: &Path) -> io::Result<Option<StartupGuard>> {
++    startup_guard_enabled(home, cfg!(feature = "autoapprove-native-ownership"))
++}
++fn startup_guard_enabled(home: &Path, enabled: bool) -> io::Result<Option<StartupGuard>> {
++    if !enabled && !present(&home.join(REQUIRED_FILE))? && !present(&home.join(STATE_FILE))? {
++        return Ok(None);
++    }
++    let home = home.canonicalize().map_err(|_| unavailable())?;
++    let root = OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(&home)
++        .map_err(|_| unavailable())?;
++    let info = root.metadata().map_err(|_| unavailable())?;
++    if !info.is_dir() || info.uid() != unsafe { libc::geteuid() } {
++        return Err(unavailable());
++    }
++    let name = c".autoapprove-migrations";
++    if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0
++        && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
++    {
++        return Err(unavailable());
++    }
++    let directory = open_at(
++        &root,
++        ".autoapprove-migrations",
++        libc::O_RDONLY | libc::O_DIRECTORY,
++        0,
++    )?;
++    if !private(&directory.metadata().map_err(|_| unavailable())?, true) {
++        return Err(unavailable());
++    }
++    let lock = open_at(&directory, "lock", libc::O_RDWR | libc::O_CREAT, 0o600)?;
++    if !private(&lock.metadata().map_err(|_| unavailable())?, false) {
++        return Err(unavailable());
++    }
++    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::WouldBlock,
++            "A conversation connection is preparing to move; retry after the move",
++        ));
++    }
++    let guard = StartupGuard {
++        home,
++        root,
++        directory,
++        lock,
++    };
++    guard.verify()?;
++    Ok(Some(guard))
++}
 +
 +#[derive(Deserialize)]
 +#[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -4540,7 +4676,6 @@
 +    }
 +}
 +fn read<T: for<'de> Deserialize<'de>>(root: &File, name: &str, limit: u64) -> io::Result<T> {
-+    use std::os::fd::{AsRawFd, FromRawFd};
 +    let name = std::ffi::CString::new(name).map_err(|_| unavailable())?;
 +    let fd = unsafe {
 +        libc::openat(
@@ -4689,6 +4824,64 @@
 +        }
 +    }
 +    #[test]
++    fn startup_shared_lock_and_journal_exclusive_lock_exclude_each_other() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let first = startup_guard_enabled(&f.home, true)?.unwrap();
++        let second = startup_guard_enabled(&f.home, true)?.unwrap();
++        let exclusive = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(f.home.join(".autoapprove-migrations/lock"))?;
++        assert_ne!(
++            unsafe { libc::flock(exclusive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
++            0
++        );
++        drop(first);
++        assert_ne!(
++            unsafe { libc::flock(exclusive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
++            0
++        );
++        drop(second);
++        assert_eq!(
++            unsafe { libc::flock(exclusive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
++            0
++        );
++        assert_eq!(
++            startup_guard_enabled(&f.home, true).err().unwrap().kind(),
++            io::ErrorKind::WouldBlock
++        );
++        // Existing independent turns consult ownership without trying to
++        // acquire a startup lock or changing the migration reservation.
++        check_writer(&f.home, &f.thread)?;
++        drop(exclusive);
++        startup_guard_enabled(&f.home, true)?.unwrap().verify()
++    }
++    #[test]
++    fn startup_guard_rejects_replaced_public_and_linked_lock_paths() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let guard = startup_guard_enabled(&f.home, true)?.unwrap();
++        let directory = f.home.join(".autoapprove-migrations");
++        let lock = directory.join("lock");
++        let saved = directory.join("saved-lock");
++        std::fs::rename(&lock, &saved)?;
++        std::fs::write(&lock, b"")?;
++        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))?;
++        assert!(guard.verify().is_err());
++        drop(guard);
++        std::fs::remove_file(&lock)?;
++        symlink(&saved, &lock)?;
++        assert!(startup_guard_enabled(&f.home, true).is_err());
++        std::fs::remove_file(&lock)?;
++        std::fs::hard_link(&saved, &lock)?;
++        assert!(startup_guard_enabled(&f.home, true).is_err());
++        std::fs::remove_file(&lock)?;
++        std::fs::rename(&saved, &lock)?;
++        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
++        assert!(startup_guard_enabled(&f.home, true).is_err());
++        assert_eq!(std::fs::metadata(&directory)?.mode() & 0o777, 0o755);
++        Ok(())
++    }
++    #[test]
 +    fn absent_policy_does_not_create_files_and_partial_policy_rejects() -> io::Result<()> {
 +        let f = Fixture::new()?;
 +        check_writer(&f.home, &f.thread)?;
@@ -4786,3 +4979,15 @@
 +        Ok(())
 +    }
 +}
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -10,6 +10,9 @@
+ 
+ [lints]
+ workspace = true
++
++[features]
++autoapprove-native-ownership = []
+ 
+ [dependencies]
+ codex-utils-process = { workspace = true }
