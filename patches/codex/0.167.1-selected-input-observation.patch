@@ -1,0 +1,3925 @@
+--- a/app-server/Cargo.toml
++++ b/app-server/Cargo.toml
+@@ -23,6 +23,8 @@
+ 
+ [features]
+ autoapprove-goal-control = []
++autoapprove-selected-transition = []
++autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
+ 
+ [lints]
+ workspace = true
+--- a/app-server/src/lib.rs
++++ b/app-server/src/lib.rs
+@@ -105,6 +105,7 @@
+ mod codex_home_metrics;
+ mod command_exec;
+ mod config_layer;
++mod native_inventory;
+ mod startup_config;
+ pub use startup_config::StartupConfigArgs;
+ pub use startup_config::print_startup_config;
+@@ -142,6 +143,8 @@
+ mod plugin_config_reload;
+ mod request_processors;
+ mod request_serialization;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++mod selected_transition;
+ mod server_request_error;
+ mod skills_watcher;
+ mod startup_warnings;
+@@ -1041,6 +1044,16 @@
+         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
+         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
+         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
++        let (native_inventory_tx, mut native_inventory_rx) = mpsc::channel(1);
++        let native_inventory_server =
++            native_inventory::start(native_inventory_tx).unwrap_or_else(|error| {
++                warn!(%error, "native inventory socket unavailable");
++                None
++            });
++        let native_inventory_generation = native_inventory_server
++            .as_ref()
++            .map(|_| uuid::Uuid::now_v7().to_string())
++            .unwrap_or_default();
+         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+         let mut thread_listener_tasks = tokio::task::JoinSet::new();
+         let mut remote_control_status_rx = remote_control_handle.status_receiver();
+@@ -1064,6 +1077,19 @@
+                 None
+             };
+             let mut listen_for_threads = true;
++            #[cfg(all(feature = "autoapprove-selected-transition", unix))]
++            let _selected_transition_server = match selected_transition::start(
++                processor.turn_admission.clone(),
++                recovery_task
++                    .as_ref()
++                    .map(tokio::task::JoinHandle::abort_handle),
++            ) {
++                Ok(server) => server,
++                Err(error) => {
++                    warn!(%error, "selected input control unavailable");
++                    None
++                }
++            };
+             // Keep force signals and daemon control events responsive while saving.
+             let mut snapshot = Box::pin(async {
+                 let processor = Arc::clone(&processor);
+@@ -1113,6 +1139,14 @@
+                 }
+ 
+                 tokio::select! {
++                    request = native_inventory_rx.recv(), if native_inventory_server.is_some() => {
++                        if let Some(request) = request {
++                            let response = native_inventory::snapshot(
++                                request.nonce, &native_inventory_generation, &connections, &processor,
++                            ).await;
++                            let _ = request.reply.send(response);
++                        }
++                    }
+                     _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
+                         snapshot_finished = true;
+                     }
+@@ -1192,6 +1226,12 @@
+                                         outbound_opted_out_notification_methods,
+                                     ),
+                                 );
++                            }
++                            TransportEvent::NativePeerIdentified { connection_id, peer, connection_nonce } => {
++                                if let Some(connection) = connections.get_mut(&connection_id) {
++                                    connection.native_peer = Some(peer);
++                                    connection.native_connection_nonce = connection_nonce;
++                                }
+                             }
+                             TransportEvent::ConnectionClosed { connection_id } => {
+                                 let Some(connection_state) = connections.remove(&connection_id) else {
+--- a/app-server/src/turn_admission.rs
++++ b/app-server/src/turn_admission.rs
+@@ -1,7 +1,12 @@
+ //! Tracks client runtime changes and turn starts admitted before a shutdown drain.
+ 
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::ClientRequestSerializationScope;
+ use codex_app_server_protocol::JSONRPCErrorError;
+ use codex_extension_api::TurnStartAdmission;
++use codex_protocol::ThreadId;
++use std::collections::HashMap;
++use std::collections::HashSet;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use tokio::sync::watch;
+@@ -14,12 +19,18 @@
+     closed: bool,
+     paused: bool,
+     active: usize,
++    selected: Option<HashSet<ThreadId>>,
++    selected_inputs_closed: bool,
++    selected_active: HashMap<ThreadId, usize>,
++    selected_inputs: HashMap<ThreadId, usize>,
++    unscoped_active: usize,
+ }
+ 
+ #[derive(Clone, Debug)]
+ pub(crate) struct TurnAdmission {
+     state: Arc<Mutex<AdmissionState>>,
+     active_tx: watch::Sender<usize>,
++    selected_revision_tx: watch::Sender<u64>,
+ }
+ 
+ impl Default for TurnAdmission {
+@@ -27,14 +38,83 @@
+         Self {
+             state: Arc::new(Mutex::new(AdmissionState::default())),
+             active_tx: watch::channel(0).0,
++            selected_revision_tx: watch::channel(0).0,
+         }
+     }
+ }
+ 
+ pub(crate) struct TurnPermit(TurnAdmission);
+ pub(crate) struct TurnAdmissionPause(TurnAdmission);
++pub(crate) struct SelectedAdmissionPause(TurnAdmission);
++pub(crate) struct SelectedAdmissionPermit {
++    admission: TurnAdmission,
++    thread: Option<ThreadId>,
++    input: bool,
++}
+ 
+ impl TurnAdmission {
++    /// Read-only observation and explicit stop remain available during a hold.
++    /// Unknown or subtree-wide effects use the unscoped guard, not a guessed
++    /// target. In particular, an unrelated root can archive a selected child.
++    pub(crate) fn admit_selected_request(
++        &self,
++        request: &ClientRequest,
++    ) -> Result<Option<SelectedAdmissionPermit>, JSONRPCErrorError> {
++        match request {
++            ClientRequest::ThreadRead { .. }
++            | ClientRequest::ThreadList { .. }
++            | ClientRequest::ThreadLoadedList { .. }
++            | ClientRequest::ThreadTurnsList { .. }
++            | ClientRequest::ThreadItemsList { .. }
++            | ClientRequest::ThreadItemsRead { .. }
++            | ClientRequest::ThreadGoalGet { .. }
++            | ClientRequest::AutoapproveGoalRead { .. }
++            | ClientRequest::ThreadQueueList { .. }
++            | ClientRequest::ThreadBackgroundTerminalsList { .. }
++            | ClientRequest::TurnInterrupt { .. }
++            | ClientRequest::ThreadRealtimeStop { .. } => return Ok(None),
++            ClientRequest::ThreadResume { params, .. }
++                if params.path.is_none() && params.history.is_none() => {}
++            ClientRequest::ThreadFork { params, .. } if params.path.is_none() => {}
++            ClientRequest::ThreadSettingsUpdate { .. }
++            | ClientRequest::TurnSettingsUpdate { .. }
++            | ClientRequest::TurnStart { .. }
++            | ClientRequest::TurnSteer { .. }
++            | ClientRequest::ReviewStart { .. }
++            | ClientRequest::ThreadCompactStart { .. }
++            | ClientRequest::ThreadShellCommand { .. }
++            | ClientRequest::ThreadSample { .. }
++            | ClientRequest::ThreadGuardianReview { .. }
++            | ClientRequest::ThreadPredictionRequest { .. }
++            | ClientRequest::ThreadGoalSet { .. }
++            | ClientRequest::ThreadGoalClear { .. }
++            | ClientRequest::AutoapproveGoalControl { .. }
++            | ClientRequest::ThreadQueueAdd { .. }
++            | ClientRequest::ThreadQueueUpdate { .. }
++            | ClientRequest::ThreadQueueDelete { .. }
++            | ClientRequest::ThreadQueueReorder { .. }
++            | ClientRequest::ThreadQueueStart { .. }
++            | ClientRequest::ThreadRealtimeStart { .. }
++            | ClientRequest::ThreadRealtimeAppendAudio { .. }
++            | ClientRequest::ThreadRealtimeAppendText { .. }
++            | ClientRequest::ThreadRealtimeAppendSpeech { .. } => {}
++            // A serialization key is not proof of complete mutation scope.
++            // Path/history resume may ignore a supplied ID, archive/unarchive
++            // can affect descendants, and future methods need explicit review.
++            _ => return self.admit_selected_scope(None).map(Some),
++        }
++        let thread = match request.serialization_scope() {
++            Some(ClientRequestSerializationScope::Thread { thread_id }) => Some(
++                ThreadId::try_from(thread_id)
++                    .map_err(|_| invalid_request("Invalid conversation ID"))?,
++            ),
++            // Only reviewed, ID-only requests reach this extraction. Treat a
++            // missing or changed scope as unknown rather than independent.
++            _ => None,
++        };
++        self.admit_selected_scope(thread).map(Some)
++    }
++
+     pub(crate) async fn pause(&self) -> Result<TurnAdmissionPause, JSONRPCErrorError> {
+         let mut active = self.subscribe_active();
+         {
+@@ -42,7 +122,7 @@
+                 .state
+                 .lock()
+                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+-            if state.closed || state.paused {
++            if state.closed || state.paused || state.selected.is_some() {
+                 return Err(invalid_request("Runtime changes are already paused"));
+             }
+             state.paused = true;
+@@ -58,11 +138,136 @@
+         Ok(pause)
+     }
+ 
++    /// Close input admission only for the exact selected cohort. This is not
++    /// proof of idle work, complete membership, client quiescence or migration.
++    /// The caller must establish those separately while retaining this guard.
++    pub(crate) async fn pause_selected(
++        &self,
++        threads: HashSet<ThreadId>,
++    ) -> Result<SelectedAdmissionPause, JSONRPCErrorError> {
++        if threads.is_empty() || threads.len() > 512 {
++            return Err(invalid_request("Select between 1 and 512 conversations"));
++        }
++        let mut revision = self.selected_revision_tx.subscribe();
++        {
++            let mut state = self
++                .state
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if state.closed || state.paused || state.selected.is_some() {
++                return Err(invalid_request(
++                    "Conversation transition is already in progress",
++                ));
++            }
++            state.selected = Some(threads);
++            state.selected_inputs_closed = false;
++        }
++        // Construct before any await: cancellation and timeout reopen admission.
++        let pause = SelectedAdmissionPause(self.clone());
++        tokio::time::timeout(std::time::Duration::from_secs(10), async {
++            loop {
++                {
++                    let mut state = self
++                        .state
++                        .lock()
++                        .unwrap_or_else(std::sync::PoisonError::into_inner);
++                    if state.closed {
++                        return Err(invalid_request(
++                            "Server began shutdown during conversation transition",
++                        ));
++                    }
++                    let selected = state
++                        .selected
++                        .as_ref()
++                        .expect("owned selected admission guard");
++                    let requests_finished = state.unscoped_active == 0
++                        && selected
++                            .iter()
++                            .all(|id| !state.selected_active.contains_key(id));
++                    let inputs_finished = selected
++                        .iter()
++                        .all(|id| !state.selected_inputs.contains_key(id));
++                    // An RPC accepted before closure must be allowed to deliver
++                    // its input through Core. Close Core only after those RPCs
++                    // finish, then drain already-admitted Core submissions.
++                    if requests_finished {
++                        state.selected_inputs_closed = true;
++                    }
++                    if requests_finished && inputs_finished {
++                        return Ok(());
++                    }
++                }
++                revision
++                    .changed()
++                    .await
++                    .map_err(|_| invalid_request("Conversation admission is unavailable"))?;
++            }
++        })
++        .await
++        .map_err(|_| invalid_request("Selected conversations still have pending input"))??;
++        Ok(pause)
++    }
++
++    /// None denotes a mutation whose affected conversation cannot be resolved
++    /// before dispatch (for example a rollout-path resume). It conflicts with
++    /// any selected transition; a known unrelated thread remains admissible.
++    pub(crate) fn admit_selected_scope(
++        &self,
++        thread: Option<ThreadId>,
++    ) -> Result<SelectedAdmissionPermit, JSONRPCErrorError> {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if state
++            .selected
++            .as_ref()
++            .is_some_and(|ids| thread.is_none_or(|id| ids.contains(&id)))
++        {
++            return Err(invalid_request(
++                "Selected conversation is preparing to move; input was not accepted",
++            ));
++        }
++        if let Some(id) = thread {
++            *state.selected_active.entry(id).or_default() += 1;
++        } else {
++            state.unscoped_active += 1;
++        }
++        Ok(SelectedAdmissionPermit {
++            admission: self.clone(),
++            thread,
++            input: false,
++        })
++    }
++
++    fn admit_selected_input(&self, thread: ThreadId) -> Option<SelectedAdmissionPermit> {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if state.selected_inputs_closed
++            && state
++                .selected
++                .as_ref()
++                .is_some_and(|ids| ids.contains(&thread))
++        {
++            return None;
++        }
++        *state.selected_inputs.entry(thread).or_default() += 1;
++        Some(SelectedAdmissionPermit {
++            admission: self.clone(),
++            thread: Some(thread),
++            input: true,
++        })
++    }
++
+     pub(crate) fn begin_drain(&self) {
+         self.state
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .closed = true;
++        self.selected_revision_tx
++            .send_modify(|revision| *revision = revision.wrapping_add(1));
+     }
+ 
+     pub(crate) fn subscribe_active(&self) -> watch::Receiver<usize> {
+@@ -106,6 +311,50 @@
+             .ok()
+             .map(|permit| Box::new(permit) as Box<dyn Send>)
+     }
++
++    fn admit_thread_input(&self, thread_id: ThreadId) -> Option<Box<dyn Send>> {
++        self.admit_selected_input(thread_id)
++            .map(|permit| Box::new(permit) as Box<dyn Send>)
++    }
++}
++
++impl Drop for SelectedAdmissionPause {
++    fn drop(&mut self) {
++        let mut state = self
++            .0
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        state.selected = None;
++        state.selected_inputs_closed = false;
++    }
++}
++
++impl Drop for SelectedAdmissionPermit {
++    fn drop(&mut self) {
++        let mut state = self
++            .admission
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if let Some(id) = self.thread {
++            let counts = if self.input {
++                &mut state.selected_inputs
++            } else {
++                &mut state.selected_active
++            };
++            let count = counts.get_mut(&id).expect("owned admission permit");
++            *count -= 1;
++            if *count == 0 {
++                counts.remove(&id);
++            }
++        } else {
++            state.unscoped_active -= 1;
++        }
++        self.admission
++            .selected_revision_tx
++            .send_modify(|revision| *revision = revision.wrapping_add(1));
++    }
+ }
+ 
+ impl Drop for TurnPermit {
+@@ -123,3 +372,7 @@
+ #[cfg(test)]
+ #[path = "turn_admission_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "selected_admission_tests.rs"]
++mod selected_tests;
+--- /dev/null
++++ b/app-server/src/selected_admission_tests.rs
+@@ -0,0 +1,215 @@
++use super::*;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ThreadArchiveParams;
++use codex_app_server_protocol::ThreadGoalGetParams;
++use codex_app_server_protocol::ThreadGoalSetParams;
++
++#[tokio::test]
++async fn selected_hold_blocks_only_selected_input_and_preserves_global_drain() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let other = ThreadId::new();
++    let hold = gate
++        .pause_selected(HashSet::from([selected]))
++        .await
++        .unwrap();
++    assert!(gate.admit_selected_scope(Some(selected)).is_err());
++    assert!(gate.admit_thread_input(selected).is_none());
++    assert!(gate.admit_selected_scope(None).is_err());
++    drop(gate.admit_selected_scope(Some(other)).unwrap());
++    drop(gate.admit_thread_input(other).unwrap());
++    assert!(gate.pause().await.is_err());
++    assert!(gate.pause_selected(HashSet::from([other])).await.is_err());
++    gate.begin_drain();
++    drop(hold);
++    assert!(gate.admit().is_err());
++    assert!(
++        gate.pause_selected(HashSet::from([selected]))
++            .await
++            .is_err()
++    );
++}
++
++#[tokio::test]
++async fn selected_hold_drains_accepted_rpc_before_closing_core_input() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let other = ThreadId::new();
++    let rpc = gate.admit_selected_scope(Some(selected)).unwrap();
++    let unrelated_rpc = gate.admit_selected_scope(Some(other)).unwrap();
++    let unrelated_input = gate.admit_thread_input(other).unwrap();
++    let pending = gate.pause_selected(HashSet::from([selected]));
++    tokio::pin!(pending);
++    tokio::select! {
++        biased;
++        _ = &mut pending => panic!("accepted RPC must drain"),
++        () = async {} => {}
++    }
++    assert!(gate.admit_selected_scope(Some(selected)).is_err());
++    // Already accepted RPC still delivers its queued input; it is not dropped
++    // by a second admission check inside Core while the RPC drains.
++    let input = gate.admit_thread_input(selected).unwrap();
++    drop(rpc);
++    tokio::select! {
++        biased;
++        _ = &mut pending => panic!("Core submission must drain"),
++        () = async {} => {}
++    }
++    assert!(gate.admit_thread_input(selected).is_none());
++    drop(input);
++    let hold = pending.await.unwrap();
++    // Holding another conversation's permits did not delay acknowledgement.
++    drop((unrelated_rpc, unrelated_input));
++    drop(hold);
++    drop(gate.admit_thread_input(selected).unwrap());
++}
++
++#[tokio::test]
++async fn cancelling_pending_selected_hold_restores_admission() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let rpc = gate.admit_selected_scope(None).unwrap();
++    {
++        let pending = gate.pause_selected(HashSet::from([selected]));
++        tokio::pin!(pending);
++        tokio::select! {
++            biased;
++            _ = &mut pending => panic!("unscoped operation must drain"),
++            () = async {} => {}
++        }
++        assert!(gate.admit_selected_scope(Some(selected)).is_err());
++    }
++    drop(gate.admit_selected_scope(Some(selected)).unwrap());
++    drop(rpc);
++    drop(
++        gate.pause_selected(HashSet::from([selected]))
++            .await
++            .unwrap(),
++    );
++}
++
++#[tokio::test]
++async fn shutdown_during_pending_selected_hold_is_not_a_successful_hold() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let rpc = gate.admit_selected_scope(Some(selected)).unwrap();
++    let pending = gate.pause_selected(HashSet::from([selected]));
++    tokio::pin!(pending);
++    tokio::select! {
++        biased;
++        _ = &mut pending => panic!("accepted request must drain"),
++        () = async {} => {}
++    }
++    gate.begin_drain();
++    assert!(pending.await.is_err());
++    drop(rpc);
++    assert!(gate.admit().is_err());
++}
++
++#[tokio::test]
++async fn selected_rpc_policy_keeps_observation_and_rejects_subtree_writes() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let other = ThreadId::new();
++    let _hold = gate
++        .pause_selected(HashSet::from([selected]))
++        .await
++        .unwrap();
++    let read = ClientRequest::ThreadGoalGet {
++        request_id: RequestId::Integer(1),
++        params: ThreadGoalGetParams {
++            thread_id: selected.to_string(),
++        },
++    };
++    assert!(gate.admit_selected_request(&read).unwrap().is_none());
++    let set = |id: ThreadId| ClientRequest::ThreadGoalSet {
++        request_id: RequestId::Integer(2),
++        params: ThreadGoalSetParams {
++            thread_id: id.to_string(),
++            origin: None,
++            objective: None,
++            status: None,
++            token_budget: None,
++        },
++    };
++    assert!(gate.admit_selected_request(&set(selected)).is_err());
++    drop(gate.admit_selected_request(&set(other)).unwrap());
++    let archive = ClientRequest::ThreadArchive {
++        request_id: RequestId::Integer(3),
++        params: ThreadArchiveParams {
++            thread_id: other.to_string(),
++        },
++    };
++    assert!(gate.admit_selected_request(&archive).is_err());
++}
++
++#[tokio::test]
++async fn selected_hold_rejects_empty_scope_and_global_pause_conflicts() {
++    let gate = TurnAdmission::default();
++    assert!(gate.pause_selected(HashSet::new()).await.is_err());
++    let pause = gate.pause().await.unwrap();
++    assert!(
++        gate.pause_selected(HashSet::from([ThreadId::new()]))
++            .await
++            .is_err()
++    );
++    drop(pause);
++    drop(
++        gate.pause_selected(HashSet::from([ThreadId::new()]))
++            .await
++            .unwrap(),
++    );
++}
++
++#[tokio::test]
++async fn selected_rpc_path_or_history_override_cannot_hide_behind_another_id() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let other = ThreadId::new();
++    let _hold = gate
++        .pause_selected(HashSet::from([selected]))
++        .await
++        .unwrap();
++    for method in ["thread/resume", "thread/fork"] {
++        let from_path: ClientRequest = serde_json::from_value(serde_json::json!({
++            "id": 10, "method": method,
++            "params": {"threadId":other.to_string(),"path":"/private/tmp/selected-rollout.jsonl"}
++        }))
++        .unwrap();
++        // The upstream serialization key prefers `other`; the operation's path
++        // may resolve to `selected`. The selected gate must not trust that key.
++        assert!(matches!(from_path.serialization_scope(),
++            Some(codex_app_server_protocol::ClientRequestSerializationScope::Thread { thread_id })
++            if thread_id == other.to_string()));
++        assert!(gate.admit_selected_request(&from_path).is_err());
++        let by_id: ClientRequest = serde_json::from_value(serde_json::json!({
++            "id":11,"method":method,"params":{"threadId":other.to_string()}
++        }))
++        .unwrap();
++        drop(gate.admit_selected_request(&by_id).unwrap());
++    }
++    let history: ClientRequest = serde_json::from_value(serde_json::json!({
++        "id":12,"method":"thread/resume","params":{"threadId":other.to_string(),"history":[]}
++    }))
++    .unwrap();
++    assert!(gate.admit_selected_request(&history).is_err());
++}
++
++#[tokio::test]
++async fn selected_rpc_unreviewed_effect_is_not_authorized_by_serialization_key() {
++    let gate = TurnAdmission::default();
++    let selected = ThreadId::new();
++    let other = ThreadId::new();
++    let _hold = gate
++        .pause_selected(HashSet::from([selected]))
++        .await
++        .unwrap();
++    let request: ClientRequest = serde_json::from_value(serde_json::json!({
++        "id":13,"method":"thread/unsubscribe","params":{"threadId":other.to_string()}
++    }))
++    .unwrap();
++    assert!(matches!(request.serialization_scope(),
++        Some(codex_app_server_protocol::ClientRequestSerializationScope::Thread { thread_id })
++        if thread_id == other.to_string()));
++    assert!(gate.admit_selected_request(&request).is_err());
++}
+--- /dev/null
++++ b/app-server/src/selected_transition.rs
+@@ -0,0 +1,579 @@
++//! Optional local selected-input lease. Does not attest client ownership or
++//! authorize migration. Enabled only by an explicit feature and local socket path.
++use crate::turn_admission::TurnAdmission;
++use codex_protocol::ThreadId;
++use serde::Deserialize;
++use serde_json::{Value, json};
++use std::collections::HashSet;
++use std::io;
++use std::os::unix::fs::{MetadataExt, PermissionsExt};
++use std::path::PathBuf;
++use std::time::Duration;
++use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
++use tokio::net::{UnixListener, UnixStream};
++use tokio::task::{JoinHandle, JoinSet};
++use tokio::time::Instant;
++
++const TTL: Duration = Duration::from_secs(30);
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct Request {
++    op: String,
++    nonce: String,
++    server_generation: Option<String>,
++    lease_id: Option<String>,
++    thread_ids: Option<Vec<String>>,
++}
++
++pub(crate) struct SelectedTransitionServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++}
++
++impl Drop for SelectedTransitionServer {
++    fn drop(&mut self) {
++        // The accept task owns its JoinSet; aborting it releases every lease.
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++pub(crate) fn start(
++    admission: TurnAdmission,
++    recovery: Option<tokio::task::AbortHandle>,
++) -> io::Result<Option<SelectedTransitionServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_SELECTED_TRANSITION_SOCKET") else {
++        return Ok(None);
++    };
++    start_with_recovery(PathBuf::from(path), admission, TTL, recovery).map(Some)
++}
++
++#[cfg(test)]
++fn start_at(
++    path: PathBuf,
++    admission: TurnAdmission,
++    ttl: Duration,
++) -> io::Result<SelectedTransitionServer> {
++    start_with_recovery(path, admission, ttl, None)
++}
++
++fn start_with_recovery(
++    path: PathBuf,
++    admission: TurnAdmission,
++    ttl: Duration,
++    recovery: Option<tokio::task::AbortHandle>,
++) -> io::Result<SelectedTransitionServer> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    // Never replace an existing socket, file or link.
++    let listener = UnixListener::bind(&path)?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let generation = uuid::Uuid::now_v7().to_string();
++    let task = tokio::spawn(async move {
++        let mut connections = JoinSet::new();
++        loop {
++            tokio::select! {
++                accepted = listener.accept() => {
++                    let Ok((stream, _)) = accepted else { break; };
++                    if connections.len() >= 4 { continue; }
++                    let Ok(peer) = stream.peer_cred() else { continue; };
++                    if peer.uid() != unsafe { libc::geteuid() } { continue; }
++                    let admission = admission.clone();
++                    let generation = generation.clone();
++                    let recovery = recovery.clone();
++                    connections.spawn(async move {
++                        let _ = session(stream, admission, generation, ttl, recovery).await;
++                    });
++                }
++                _ = connections.join_next(), if !connections.is_empty() => {}
++            }
++        }
++    });
++    Ok(SelectedTransitionServer {
++        task,
++        path,
++        identity,
++    })
++}
++
++async fn read_request<R: AsyncRead + Unpin>(
++    reader: &mut BufReader<R>,
++    duration: Duration,
++) -> io::Result<Request> {
++    let mut line = String::new();
++    tokio::time::timeout(duration, (&mut *reader).take(24577).read_line(&mut line))
++        .await
++        .map_err(|_| io::ErrorKind::TimedOut)??;
++    if line.len() > 24576 || !line.ends_with('\n') {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    let value: Request = serde_json::from_str(&line)?;
++    if value.nonce.len() != 32 || !value.nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    Ok(value)
++}
++
++async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) -> io::Result<()> {
++    let mut bytes = serde_json::to_vec(&value)?;
++    if bytes.len() > 65536 {
++        return Err(io::ErrorKind::InvalidData.into());
++    }
++    bytes.push(b'\n');
++    tokio::time::timeout(Duration::from_secs(2), writer.write_all(&bytes))
++        .await
++        .map_err(|_| io::ErrorKind::TimedOut)??;
++    Ok(())
++}
++
++fn response(
++    request: &Request,
++    generation: &str,
++    lease: Option<&str>,
++    threads: &[String],
++    held: bool,
++    ttl: Duration,
++) -> Value {
++    json!({
++        "schemaVersion": 1, "producer": "autoapprove-selected-input-lease",
++        "nonce": request.nonce, "serverGeneration": generation, "pid": std::process::id(),
++        "scope": "selected-thread-input", "threadIds": threads, "leaseId": lease,
++        "inputAdmissionPaused": held, "leaseTTLMillis": if held { ttl.as_millis() as u64 } else { 0 },
++        "membershipComplete": false, "existingWorkStopped": false,
++        "goalLifecycleManaged": false, "credentialsTouched": false, "migrationAuthorized": false
++    })
++}
++
++async fn session(
++    stream: UnixStream,
++    admission: TurnAdmission,
++    generation: String,
++    ttl: Duration,
++    recovery: Option<tokio::task::AbortHandle>,
++) -> io::Result<()> {
++    let (read, mut writer) = stream.into_split();
++    let mut reader = BufReader::new(read);
++    let inspect = read_request(&mut reader, Duration::from_secs(2)).await?;
++    if inspect.op != "inspect"
++        || inspect.server_generation.is_some()
++        || inspect.lease_id.is_some()
++        || inspect.thread_ids.is_some()
++    {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    send(
++        &mut writer,
++        response(&inspect, &generation, None, &[], false, ttl),
++    )
++    .await?;
++    let first = read_request(&mut reader, Duration::from_secs(2)).await?;
++    if first.op != "pause"
++        || first.server_generation.as_deref() != Some(&generation)
++        || first.lease_id.is_some()
++    {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    let mut names = first
++        .thread_ids
++        .clone()
++        .ok_or(io::ErrorKind::InvalidInput)?;
++    if names.is_empty() || names.len() > 512 {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    let mut threads = HashSet::new();
++    for name in &names {
++        let id = ThreadId::try_from(name.as_str()).map_err(|_| io::ErrorKind::InvalidInput)?;
++        if id.to_string() != *name || !threads.insert(id) {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
++    }
++    names.sort();
++    // Daemon recovery uses an internal resume path, outside ordinary client
++    // admission. Never grant a selected hold while that startup path is live.
++    if recovery.as_ref().is_some_and(|task| !task.is_finished()) {
++        send(
++            &mut writer,
++            json!({"nonce":first.nonce,"error":"daemon-recovery-in-progress"}),
++        )
++        .await?;
++        return Ok(());
++    }
++    // EOF or pipelined data cancels a pending drain; no detached lease survives.
++    let pause = tokio::select! {
++        value = admission.pause_selected(threads) => value,
++        _ = reader.fill_buf() => return Err(io::ErrorKind::ConnectionAborted.into()),
++    };
++    let Ok(pause) = pause else {
++        send(
++            &mut writer,
++            json!({"nonce":first.nonce,"error":"selected-input-admission-unavailable"}),
++        )
++        .await?;
++        return Ok(());
++    };
++    let lease = uuid::Uuid::now_v7().to_string();
++    let mut deadline = Instant::now() + ttl;
++    tokio::time::timeout_at(
++        deadline,
++        send(
++            &mut writer,
++            response(&first, &generation, Some(&lease), &names, true, ttl),
++        ),
++    )
++    .await
++    .map_err(|_| io::ErrorKind::TimedOut)??;
++    loop {
++        if Instant::now() >= deadline {
++            return Err(io::ErrorKind::TimedOut.into());
++        }
++        let request = read_request(
++            &mut reader,
++            deadline.saturating_duration_since(Instant::now()),
++        )
++        .await?;
++        // Buffered input must not renew an already-expired lease.
++        if Instant::now() >= deadline {
++            return Err(io::ErrorKind::TimedOut.into());
++        }
++        if request.server_generation.as_deref() != Some(&generation)
++            || request.lease_id.as_deref() != Some(&lease)
++            || request.thread_ids.is_some()
++        {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        match request.op.as_str() {
++            "status" => {}
++            "renew" => deadline = Instant::now() + ttl,
++            "release" => {
++                drop(pause);
++                send(
++                    &mut writer,
++                    response(&request, &generation, Some(&lease), &names, false, ttl),
++                )
++                .await?;
++                return Ok(());
++            }
++            _ => return Err(io::ErrorKind::InvalidInput.into()),
++        }
++        tokio::time::timeout_at(
++            deadline,
++            send(
++                &mut writer,
++                response(
++                    &request,
++                    &generation,
++                    Some(&lease),
++                    &names,
++                    true,
++                    deadline.saturating_duration_since(Instant::now()),
++                ),
++            ),
++        )
++        .await
++        .map_err(|_| io::ErrorKind::TimedOut)??;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_extension_api::TurnStartAdmission;
++
++    async fn rpc(stream: &mut BufReader<UnixStream>, value: Value) -> Value {
++        send(stream.get_mut(), value).await.unwrap();
++        let mut line = String::new();
++        tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut line))
++            .await
++            .unwrap()
++            .unwrap();
++        serde_json::from_str(&line).unwrap()
++    }
++    async fn held(path: &std::path::Path, thread: ThreadId) -> (BufReader<UnixStream>, Value) {
++        let mut stream = BufReader::new(UnixStream::connect(path).await.unwrap());
++        let inspect = rpc(
++            &mut stream,
++            json!({"op":"inspect","nonce":"0123456789abcdef0123456789abcdef"}),
++        )
++        .await;
++        assert_eq!(inspect["migrationAuthorized"], false);
++        let pause = rpc(
++            &mut stream,
++            json!({"op":"pause","nonce":"1123456789abcdef0123456789abcdef",
++            "serverGeneration":inspect["serverGeneration"],"threadIds":[thread.to_string()]}),
++        )
++        .await;
++        assert_eq!(pause["inputAdmissionPaused"], true);
++        (stream, pause)
++    }
++    async fn reopened(gate: &TurnAdmission, thread: ThreadId) {
++        tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                if gate.admit_selected_scope(Some(thread)).is_ok() {
++                    break;
++                }
++                tokio::time::sleep(Duration::from_millis(5)).await;
++            }
++        })
++        .await
++        .unwrap();
++    }
++
++    #[tokio::test]
++    async fn selected_transport_release_keeps_other_thread_available() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let _server = start_at(path.clone(), gate.clone(), TTL).unwrap();
++        assert!(start_at(path.clone(), gate.clone(), TTL).is_err());
++        let (mut stream, pause) = held(&path, thread).await;
++        assert!(gate.admit_thread_input(thread).is_none());
++        drop(gate.admit_thread_input(ThreadId::new()).unwrap());
++        let reply = rpc(
++            &mut stream,
++            json!({"op":"release","nonce":"2123456789abcdef0123456789abcdef",
++            "serverGeneration":pause["serverGeneration"],"leaseId":pause["leaseId"]}),
++        )
++        .await;
++        assert_eq!(reply["inputAdmissionPaused"], false);
++        drop(gate.admit_thread_input(thread).unwrap());
++    }
++
++    #[tokio::test]
++    async fn selected_transport_disconnect_and_server_drop_release_owner() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let server = start_at(path.clone(), gate.clone(), TTL).unwrap();
++        let (stream, _) = held(&path, thread).await;
++        drop(stream);
++        reopened(&gate, thread).await;
++        let (_stream, _) = held(&path, thread).await;
++        drop(server);
++        reopened(&gate, thread).await;
++        assert!(!path.exists());
++    }
++
++    #[tokio::test]
++    async fn selected_transport_expiry_does_not_leave_input_closed() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let _server = start_at(path.clone(), gate.clone(), Duration::from_millis(100)).unwrap();
++        let (_stream, _) = held(&path, thread).await;
++        reopened(&gate, thread).await;
++    }
++
++    #[tokio::test]
++    async fn selected_transport_disconnect_cancels_a_pending_rpc_drain() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let original = gate.admit_selected_scope(Some(thread)).unwrap();
++        let _server = start_at(path.clone(), gate.clone(), TTL).unwrap();
++        let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
++        let inspect = rpc(
++            &mut stream,
++            json!({"op":"inspect","nonce":"0123456789abcdef0123456789abcdef"}),
++        )
++        .await;
++        send(
++            stream.get_mut(),
++            json!({"op":"pause","nonce":"1123456789abcdef0123456789abcdef",
++            "serverGeneration":inspect["serverGeneration"],"threadIds":[thread.to_string()]}),
++        )
++        .await
++        .unwrap();
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while gate.admit_selected_scope(Some(thread)).is_ok() {
++                tokio::time::sleep(Duration::from_millis(5)).await;
++            }
++        })
++        .await
++        .unwrap();
++        drop(stream);
++        // The request accepted before the hold is still present. Disconnect
++        // must cancel preparation rather than waiting for that request forever.
++        reopened(&gate, thread).await;
++        drop(original);
++    }
++
++    #[tokio::test]
++    async fn selected_transport_stale_generation_and_duplicate_scope_do_not_close_input() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let _server = start_at(path.clone(), gate.clone(), TTL).unwrap();
++        for stale in [true, false] {
++            let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
++            let inspect = rpc(
++                &mut stream,
++                json!({"op":"inspect","nonce":"0123456789abcdef0123456789abcdef"}),
++            )
++            .await;
++            let generation = if stale {
++                json!(uuid::Uuid::now_v7().to_string())
++            } else {
++                inspect["serverGeneration"].clone()
++            };
++            let ids = if stale {
++                vec![thread.to_string()]
++            } else {
++                vec![thread.to_string(), thread.to_string()]
++            };
++            send(
++                stream.get_mut(),
++                json!({"op":"pause","nonce":"1123456789abcdef0123456789abcdef",
++                "serverGeneration":generation,"threadIds":ids}),
++            )
++            .await
++            .unwrap();
++            let mut line = String::new();
++            assert_eq!(
++                tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut line))
++                    .await
++                    .unwrap()
++                    .unwrap(),
++                0
++            );
++            drop(gate.admit_thread_input(thread).unwrap());
++        }
++    }
++
++    #[tokio::test]
++    async fn selected_transport_wrong_lease_closes_session_and_releases_guard() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let _server = start_at(path.clone(), gate.clone(), TTL).unwrap();
++        let (mut stream, pause) = held(&path, thread).await;
++        send(stream.get_mut(), json!({"op":"renew","nonce":"2123456789abcdef0123456789abcdef",
++            "serverGeneration":pause["serverGeneration"],"leaseId":uuid::Uuid::now_v7().to_string()})).await.unwrap();
++        let mut line = String::new();
++        assert_eq!(
++            tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut line))
++                .await
++                .unwrap()
++                .unwrap(),
++            0
++        );
++        reopened(&gate, thread).await;
++    }
++
++    #[tokio::test]
++    async fn selected_transport_second_client_cannot_replace_existing_owner() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let _server = start_at(path.clone(), gate.clone(), TTL).unwrap();
++        let (mut owner, lease) = held(&path, thread).await;
++        let mut other = BufReader::new(UnixStream::connect(&path).await.unwrap());
++        let inspect = rpc(
++            &mut other,
++            json!({"op":"inspect","nonce":"0123456789abcdef0123456789abcdef"}),
++        )
++        .await;
++        let rejected = rpc(
++            &mut other,
++            json!({"op":"pause","nonce":"1123456789abcdef0123456789abcdef",
++            "serverGeneration":inspect["serverGeneration"],"threadIds":[thread.to_string()]}),
++        )
++        .await;
++        assert_eq!(rejected["error"], "selected-input-admission-unavailable");
++        drop(other);
++        assert!(gate.admit_thread_input(thread).is_none());
++        let released = rpc(
++            &mut owner,
++            json!({"op":"release","nonce":"2123456789abcdef0123456789abcdef",
++            "serverGeneration":lease["serverGeneration"],"leaseId":lease["leaseId"]}),
++        )
++        .await;
++        assert_eq!(released["inputAdmissionPaused"], false);
++        drop(gate.admit_thread_input(thread).unwrap());
++    }
++
++    #[tokio::test]
++    async fn selected_transport_preserves_replacement_file_and_rejects_public_parent() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let server = start_at(path.clone(), TurnAdmission::default(), TTL).unwrap();
++        std::fs::remove_file(&path).unwrap();
++        std::fs::write(&path, b"replacement").unwrap();
++        drop(server);
++        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
++        assert!(
++            start_at(
++                root.path().join("public.sock"),
++                TurnAdmission::default(),
++                TTL
++            )
++            .is_err()
++        );
++    }
++
++    #[tokio::test]
++    async fn selected_transport_waits_for_internal_daemon_recovery() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = root.path().join("selected.sock");
++        let gate = TurnAdmission::default();
++        let thread = ThreadId::new();
++        let recovery = tokio::spawn(std::future::pending::<()>());
++        let _server = start_with_recovery(
++            path.clone(),
++            gate.clone(),
++            TTL,
++            Some(recovery.abort_handle()),
++        )
++        .unwrap();
++        let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
++        let inspect = rpc(
++            &mut stream,
++            json!({"op":"inspect","nonce":"0123456789abcdef0123456789abcdef"}),
++        )
++        .await;
++        let rejected = rpc(
++            &mut stream,
++            json!({"op":"pause","nonce":"1123456789abcdef0123456789abcdef",
++            "serverGeneration":inspect["serverGeneration"],"threadIds":[thread.to_string()]}),
++        )
++        .await;
++        assert_eq!(rejected["error"], "daemon-recovery-in-progress");
++        drop(gate.admit_thread_input(thread).unwrap());
++        recovery.abort();
++        let _ = recovery.await;
++        let (_stream, pause) = held(&path, thread).await;
++        assert_eq!(pause["inputAdmissionPaused"], true);
++    }
++}
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -147,6 +147,7 @@
+ 
+ pub(crate) struct MessageProcessor {
+     pub(crate) turn_admission: TurnAdmission,
++    native_inventory_threads: ThreadStateManager,
+     user_verification: Arc<crate::user_verification::Service>,
+     outgoing: Arc<OutgoingMessageSender>,
+     startup_warnings: StartupWarnings,
+@@ -543,6 +544,7 @@
+             config_warnings.clone(),
+             sample_responses,
+         );
++        let native_inventory_threads = thread_state_manager.clone();
+         let turn_processor = TurnRequestProcessor::new(
+             auth_manager,
+             Arc::clone(&thread_manager),
+@@ -612,6 +614,7 @@
+ 
+         Self {
+             turn_admission,
++            native_inventory_threads,
+             user_verification,
+             outgoing,
+             startup_warnings: StartupWarnings {
+@@ -645,6 +648,12 @@
+             windows_sandbox_processor,
+             request_serialization_queues,
+         }
++    }
++
++    pub(crate) async fn native_inventory_subscriptions(&self) -> serde_json::Value {
++        self.native_inventory_threads
++            .native_inventory_snapshot()
++            .await
+     }
+ 
+     pub(crate) fn clear_runtime_references(&self) {
+@@ -1018,6 +1027,9 @@
+         {
+             return Err(invalid_request(experimental_required_message(reason)));
+         }
++        // Retain through serialization and Core's reply. A selected transition
++        // waits for requests accepted before closure instead of discarding them.
++        let selected_admission = self.turn_admission.admit_selected_request(&codex_request)?;
+         let connection_id = connection_request_id.connection_id;
+         self.initialize_processor.track_initialized_request(
+             connection_id,
+@@ -1065,6 +1077,7 @@
+         let request = QueuedInitializedRequest::new(
+             rpc_gate,
+             async move {
++                let _selected_admission = selected_admission;
+                 let _turn_admission = turn_admission;
+                 // Runtime changes already admitted before drain finish normally. Turn work
+                 // still waiting in serialization must observe the newly closed gate.
+@@ -1406,10 +1419,14 @@
+                     .await
+             }
+             ClientRequest::AutoapproveGoalRead { params, .. } => {
+-                self.thread_goal_processor.autoapprove_goal_read(params).await
++                self.thread_goal_processor
++                    .autoapprove_goal_read(params)
++                    .await
+             }
+             ClientRequest::AutoapproveGoalControl { params, .. } => {
+-                self.thread_goal_processor.autoapprove_goal_control(params).await
++                self.thread_goal_processor
++                    .autoapprove_goal_control(params)
++                    .await
+             }
+             ClientRequest::ThreadGoalSet { params, .. } => {
+                 self.thread_goal_processor
+--- a/ext/extension-api/src/turn_admission.rs
++++ b/ext/extension-api/src/turn_admission.rs
+@@ -9,4 +9,11 @@
+ /// gate so delegated work can finish before exit. Automatic starts remain gated.
+ pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
+     fn admit_turn_start(&self) -> Option<Box<dyn Send>>;
++
++    /// Optional per-conversation input barrier, distinct from shutdown drain.
++    /// Core retains this permit for starts, steering and recovery submission,
++    /// including delegated input. Default hosts preserve their existing behavior.
++    fn admit_thread_input(&self, _thread_id: codex_protocol::ThreadId) -> Option<Box<dyn Send>> {
++        Some(Box::new(()))
++    }
+ }
+--- a/ext/extension-api/src/registry.rs
++++ b/ext/extension-api/src/registry.rs
+@@ -211,6 +211,15 @@
+         }
+     }
+ 
++    /// Acquire a conversation input permit before inspecting or consuming its
++    /// pending input. This does not change shutdown's delegated-work policy.
++    pub fn admit_thread_input(&self, thread_id: codex_protocol::ThreadId) -> Option<Box<dyn Send>> {
++        match &self.turn_start_admission {
++            Some(admission) => admission.admit_thread_input(thread_id),
++            None => Some(Box::new(())),
++        }
++    }
++
+     /// Returns the host event sink retained by this registry.
+     pub fn event_sink(&self) -> Arc<dyn ExtensionEventSink> {
+         Arc::clone(&self.event_sink)
+--- a/core/src/session/turn_input.rs
++++ b/core/src/session/turn_input.rs
+@@ -238,6 +238,15 @@
+     submission_id: String,
+ ) -> CodexResult<TurnInputSubmission> {
+     let request = request.into();
++    let Some(_selected_admission) = session
++        .services
++        .extensions
++        .admit_thread_input(session.thread_id)
++    else {
++        return Ok(TurnInputSubmission::NotSubmitted {
++            reason: NotSubmittedReason::ServerDraining,
++        });
++    };
+     if let SubmittedTurnInput::ResponseItem(item)
+     | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem { item, .. }) =
+         &request.request.input
+@@ -317,6 +326,15 @@
+     start_options: TurnStartOptions,
+     submission_id: String,
+ ) -> CodexResult<TurnInputSubmission> {
++    let Some(_selected_admission) = session
++        .services
++        .extensions
++        .admit_thread_input(session.thread_id)
++    else {
++        return Ok(TurnInputSubmission::NotSubmitted {
++            reason: NotSubmittedReason::ServerDraining,
++        });
++    };
+     let WithTurnExtensionData {
+         request: thread_settings,
+         turn_extension_init,
+--- a/core/src/session/turn_input_tests.rs
++++ b/core/src/session/turn_input_tests.rs
+@@ -30,6 +30,78 @@
+ use test_case::test_case;
+ use tokio::time::sleep;
+ use tokio_util::sync::CancellationToken;
++
++#[tokio::test]
++async fn selected_admission_rejects_start_steer_and_recovery_before_mutation() {
++    #[derive(Debug)]
++    struct SelectedHold(std::sync::Mutex<Vec<codex_protocol::ThreadId>>);
++    impl codex_extension_api::TurnStartAdmission for SelectedHold {
++        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
++            Some(Box::new(()))
++        }
++        fn admit_thread_input(&self, id: codex_protocol::ThreadId) -> Option<Box<dyn Send>> {
++            self.0.lock().unwrap().push(id);
++            None
++        }
++    }
++    let (mut session, _context, _rx) = make_session_and_context_with_rx().await;
++    let hold = Arc::new(SelectedHold(std::sync::Mutex::new(Vec::new())));
++    let mut extensions =
++        codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
++    extensions.turn_start_admission(hold.clone());
++    Arc::get_mut(&mut session).unwrap().services.extensions = Arc::new(extensions.build());
++    let settings = session.thread_settings_snapshot().await;
++    let expected = TurnInputSubmission::NotSubmitted {
++        reason: NotSubmittedReason::ServerDraining,
++    };
++    for mode in [
++        TurnInputMode::StartOrSteer,
++        TurnInputMode::StartIfIdle,
++        TurnInputMode::Steer {
++            expected_turn_id: "existing-turn".to_string(),
++        },
++    ] {
++        let request = TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "must remain unsubmitted".to_string(),
++            text_elements: Vec::new(),
++        }])
++        .with_thread_settings(ThreadSettingsOverrides {
++            model: Some("must-not-apply".to_string()),
++            ..Default::default()
++        })
++        .on_start(TurnStartOptions {
++            parent_turn_id: Some("parent-turn".to_string()),
++            ..Default::default()
++        });
++        assert_eq!(
++            handle(&session, request, mode, "selected-test".to_string())
++                .await
++                .unwrap(),
++            expected
++        );
++        assert_eq!(session.thread_settings_snapshot().await, settings);
++        assert!(session.active_turn.lock().await.is_none());
++        assert!(
++            !session
++                .input_queue
++                .has_pending_input(&session.active_turn)
++                .await
++        );
++    }
++    assert_eq!(
++        handle_recovery(
++            &session,
++            ThreadSettingsOverrides::default(),
++            TurnStartOptions::default(),
++            "selected-recovery".to_string()
++        )
++        .await
++        .unwrap(),
++        expected
++    );
++    assert_eq!(*hold.0.lock().unwrap(), vec![session.thread_id; 4]);
++    assert_eq!(session.thread_settings_snapshot().await, settings);
++}
+ 
+ #[derive(Clone, Copy)]
+ struct NeverEndingTask {
+@@ -1238,3 +1310,95 @@
+     assert_eq!(ui_ids.len(), 3);
+     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+ }
++
++#[tokio::test]
++async fn selected_admission_preserves_accepted_steering_and_reopens_without_replay() {
++    use std::sync::atomic::AtomicBool;
++    use std::sync::atomic::Ordering;
++
++    #[derive(Debug)]
++    struct InputHold(AtomicBool);
++    impl codex_extension_api::TurnStartAdmission for InputHold {
++        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
++            Some(Box::new(()))
++        }
++        fn admit_thread_input(&self, _id: codex_protocol::ThreadId) -> Option<Box<dyn Send>> {
++            (!self.0.load(Ordering::SeqCst)).then(|| Box::new(()) as Box<dyn Send>)
++        }
++    }
++    let (mut session, context, _rx) = make_session_and_context_with_rx().await;
++    let hold = Arc::new(InputHold(AtomicBool::new(false)));
++    let mut extensions =
++        codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
++    extensions.turn_start_admission(hold.clone());
++    Arc::get_mut(&mut session).unwrap().services.extensions = Arc::new(extensions.build());
++    session
++        .spawn_task(
++            Arc::clone(&context),
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: true,
++            },
++        )
++        .await;
++    let input = |text: &str| {
++        vec![UserInput::Text {
++            text: text.to_string(),
++            text_elements: Vec::new(),
++        }]
++    };
++    let before = input("accepted before hold");
++    assert!(matches!(
++        submit_steer_only(&session, before.clone(), &context.sub_id).await,
++        TurnInputSubmission::Steered { .. }
++    ));
++    let settings = session.thread_settings_snapshot().await;
++    hold.0.store(true, Ordering::SeqCst);
++    let rejected = handle(
++        &session,
++        TurnInputRequest::user_input(input("rejected during hold")).with_thread_settings(
++            ThreadSettingsOverrides {
++                model: Some("must-not-apply".to_string()),
++                ..Default::default()
++            },
++        ),
++        TurnInputMode::Steer {
++            expected_turn_id: context.sub_id.clone(),
++        },
++        "selected-rejected-steer".to_string(),
++    )
++    .await
++    .unwrap();
++    assert_eq!(
++        rejected,
++        TurnInputSubmission::NotSubmitted {
++            reason: NotSubmittedReason::ServerDraining
++        }
++    );
++    assert_eq!(session.thread_settings_snapshot().await, settings);
++    assert!(session.active_turn.lock().await.is_some());
++    // This read drains the queue. Do it only after the rejection so the test
++    // observes preservation instead of emptying the queue before the hold.
++    let pending = session
++        .input_queue
++        .get_pending_input(&session.active_turn)
++        .await
++        .0;
++    assert_eq!(pending.len(), 1);
++    assert!(matches!(&pending[0], TurnInput::UserInput { content, .. } if *content == before));
++    hold.0.store(false, Ordering::SeqCst);
++    let after = input("explicit input after release");
++    assert!(matches!(
++        submit_steer_only(&session, after.clone(), &context.sub_id).await,
++        TurnInputSubmission::Steered { .. }
++    ));
++    let pending = session
++        .input_queue
++        .get_pending_input(&session.active_turn)
++        .await
++        .0;
++    assert_eq!(pending.len(), 1);
++    assert!(matches!(&pending[0], TurnInput::UserInput { content, .. } if *content == after));
++    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++}
+--- a/tui/Cargo.toml
++++ b/tui/Cargo.toml
+@@ -20,6 +20,9 @@
+ 
+ [lints]
+ workspace = true
++
++[features]
++autoapprove-native-inventory = ["codex-app-server-client/autoapprove-native-inventory"]
+ 
+ [dependencies]
+ codex-build-info = { workspace = true }
+--- a/tui/src/lib.rs
++++ b/tui/src/lib.rs
+@@ -136,6 +136,10 @@
+ mod daybreak;
+ mod experimental_features;
+ mod markdown_copy;
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++mod native_input_hold;
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++mod native_inventory;
+ mod permission_discovery;
+ mod pets;
+ mod security_setup;
+--- a/tui/src/app.rs
++++ b/tui/src/app.rs
+@@ -208,6 +208,8 @@
+ mod agents_overview_threads;
+ mod agents_overview_usage;
+ mod agents_overview_view;
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++mod native_inventory;
+ pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
+ mod activity_groups;
+ mod app_server_event_targets;
+--- a/tui/src/app_event.rs
++++ b/tui/src/app_event.rs
+@@ -296,6 +296,16 @@
+ #[allow(clippy::large_enum_variant)]
+ #[derive(Debug, IntoStaticStr)]
+ pub(crate) enum AppEvent {
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    AutoapproveInputHold {
++        hold: std::sync::Arc<crate::native_input_hold::InputHold>,
++        reply: tokio::sync::oneshot::Sender<bool>,
++    },
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    AutoapproveInventoryRead {
++        nonce: String,
++        reply: tokio::sync::oneshot::Sender<serde_json::Value>,
++    },
+     AccountEmailLoaded {
+         request_id: uuid::Uuid,
+         email: Option<String>,
+--- a/tui/src/app/startup.rs
++++ b/tui/src/app/startup.rs
+@@ -314,6 +314,10 @@
+         }
+         let (app_event_tx, mut app_event_rx) = unbounded_channel();
+         let app_event_tx = AppEventSender::new(app_event_tx);
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let _native_inventory = crate::native_inventory::start(app_event_tx.clone())?;
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let _native_input_server = crate::native_input_hold::start(app_event_tx.clone())?;
+         if let Some(message) = project_config_warning(&config) {
+             app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                 history_cell::StartupWarningsCell::new(vec![message]),
+@@ -1284,6 +1288,12 @@
+ 
+         let mut backends =
+             super::backend_sessions::BackendSessions::from_initial(app_server, other_backends);
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let mut native_input_hold: Option<
++            std::sync::Arc<crate::native_input_hold::InputHold>,
++        > = None;
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let mut native_input_drain_failed = false;
+ 
+         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
+             Ok(exit_reason)
+@@ -1443,6 +1453,31 @@
+                         AppRunControl::Continue
+                     }
+                     Some(event) = app_event_rx.recv() => {
++                        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++                        if let AppEvent::AutoapproveInputHold { hold, reply } = event {
++                            if !reply.is_closed() && native_input_hold.is_none() && hold.install() {
++                                app.cancel_pending_key_chord();
++                                native_input_hold = Some(hold.clone());
++                                native_input_drain_failed = false;
++                                if reply.send(true).is_err() { hold.cancel(); }
++                                else {
++                                    app.chat_widget.add_info_message(
++                                        "Terminal input paused while preparing to move this session.".into(),
++                                        Some("Press Esc to cancel. Your draft is preserved; blocked input is not replayed.".into()));
++                                    tui.frame_requester().schedule_frame();
++                                }
++                            } else { hold.cancel(); let _ = reply.send(false); }
++                            continue;
++                        }
++                        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++                        if let AppEvent::AutoapproveInventoryRead { nonce, reply } = event {
++                            let mut value = app.autoapprove_inventory_for_backend(
++                                nonce, backends.session_at(displayed_session));
++                            value["retainedBackends"] = serde_json::json!(backends.autoapprove_observations());
++                            value["terminalInputBlocked"] = serde_json::json!(native_input_hold.is_some());
++                            let _ = reply.send(value);
++                            continue;
++                        }
+                         if let AppEvent::ResumeBackendSession(target) = event {
+                             match app.resume_backend_session(tui, &mut backends, target).await {
+                                 Ok(AppRunControl::Continue) => continue,
+@@ -1499,9 +1534,52 @@
+                         }
+                         AppRunControl::Continue
+                     }
++                    _ = async {
++                        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++                        {
++                        if let Some(hold) = &native_input_hold {
++                            hold.ended().await;
++                            tokio::time::sleep(Duration::from_millis(50)).await;
++                        }
++                        else { std::future::pending::<()>().await; }
++                        }
++                        #[cfg(not(all(unix, feature = "autoapprove-native-inventory")))]
++                        std::future::pending::<()>().await;
++                    } => {
++                        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++                        {
++                        // Keep the gate latched through canceled/expired leases. Raw and
++                        // parsed typeahead must never cross into the next account/session.
++                        match tui.discard_pending_input_before_interactive_screen() {
++                            Ok(()) => {
++                                if let Some(hold) = &native_input_hold { hold.finish(); }
++                                native_input_hold = None;
++                                native_input_drain_failed = false;
++                                app.chat_widget.add_info_message("Terminal input is available again.".into(), None);
++                            }
++                            Err(_) => {
++                                if !native_input_drain_failed {
++                                    app.chat_widget.add_error_message("Terminal input remains paused while buffered paste or key sequences are cleared.".into());
++                                }
++                                native_input_drain_failed = true;
++                            }
++                        }
++                        tui.frame_requester().schedule_frame();
++                        }
++                        AppRunControl::Continue
++                    }
+                     event = tui_events.next(), if app.pending_thread_switch_resets == 0
+                         && (app.reconnect.offline || !block_terminal_input_for_pending_startup_events) => {
+                         if let Some(event) = event {
++                            #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++                            if let Some(hold) = native_input_hold.as_ref()
++                                && matches!(&event, TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::Mouse(_)) {
++                                if matches!(&event, TuiEvent::Key(key) if key.code == KeyCode::Esc
++                                    && key.modifiers == KeyModifiers::NONE
++                                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)) { hold.cancel(); }
++                                tui.frame_requester().schedule_frame();
++                                continue;
++                            }
+                             if (matches!(
+                                 &event,
+                                 TuiEvent::Key(key)
+--- a/tui/src/app/event_dispatch.rs
++++ b/tui/src/app/event_dispatch.rs
+@@ -36,6 +36,18 @@
+         app_server: &mut AppServerSession,
+         event: AppEvent,
+     ) -> Result<AppRunControl> {
++        #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++        let event = match event {
++            AppEvent::AutoapproveInputHold { hold, reply } => {
++                hold.cancel(); let _ = reply.send(false);
++                return Ok(AppRunControl::Continue);
++            }
++            AppEvent::AutoapproveInventoryRead { nonce, reply } => {
++                let _ = reply.send(self.autoapprove_inventory_for_backend(nonce, app_server));
++                return Ok(AppRunControl::Continue);
++            }
++            event => event,
++        };
+         let from_agents_overview = matches!(event, AppEvent::ForkAgentsOverviewThreadReady { .. });
+         let event = if let AppEvent::ForkAgentsOverviewThreadReady { thread_id } = event {
+             if self.current_displayed_thread_id() != Some(thread_id)
+@@ -170,6 +182,10 @@
+             event => (event, None),
+         };
+         match event {
++            #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++            AppEvent::AutoapproveInputHold { hold, reply } => { hold.cancel(); let _ = reply.send(false); },
++            #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++            AppEvent::AutoapproveInventoryRead {nonce, reply} => { let _ = reply.send(self.autoapprove_inventory_for_backend(nonce, app_server)); },
+             AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
+             AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
+             AppEvent::RunDaemonRestart => {
+--- a/tui/src/app/agent_navigation.rs
++++ b/tui/src/app/agent_navigation.rs
+@@ -82,6 +82,29 @@
+ }
+ 
+ impl AgentNavigationState {
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(super) fn autoapprove_retained_ids(&self) -> Vec<String> {
++        let mut ids: Vec<_> = self
++            .threads
++            .keys()
++            .chain(self.order.iter())
++            .chain(self.stopped_threads.iter())
++            .chain(self.parent_owned_threads.iter())
++            .chain(self.picker_excluded_threads.iter())
++            .chain(self.pending_approvals.iter())
++            .chain(self.picker_row_ids.iter())
++            .copied()
++            .collect();
++        if let Some(refresh) = &self.picker_refresh {
++            ids.push(refresh.root);
++            ids.extend(refresh.visibility_changed_threads.iter().copied());
++        }
++        let mut result: Vec<_> = ids.into_iter().map(|v| v.to_string()).collect();
++        result.sort();
++        result.dedup();
++        result
++    }
++
+     pub(crate) fn begin_picker_refresh(&mut self, thread_id: ThreadId) -> Option<Uuid> {
+         if self
+             .picker_refresh
+--- a/tui/src/chatwidget/user_messages.rs
++++ b/tui/src/chatwidget/user_messages.rs
+@@ -853,6 +853,24 @@
+ }
+ 
+ impl ThreadInputState {
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(crate) fn autoapprove_inventory_flags(&self) -> serde_json::Value {
++        serde_json::json!({
++            "hasDraft": self.composer.as_ref().is_some_and(ThreadComposerState::has_content),
++            "retainedQuestionState": self.questions.is_some(),
++            "startupInput": self.initial_user_message.is_some() || self.startup_submission.is_some(),
++            "queuedInput": !self.queued_user_messages.is_empty() || !self.rejected_steers_queue.is_empty(),
++            "pendingSteers": !self.pending_steers.is_empty(),
++            "unconfirmedInput": self.has_unconfirmed_messages(),
++            "pendingStart": self.user_turn_pending_start,
++            "taskRunning": self.task_running,
++            "agentTurnRunning": self.agent_turn_running,
++            "reconnectPending": self.reconnect_pending,
++            "protectedBuffer": self.safety_buffering_prompt.is_some(),
++            "settingsPending": self.pending_thread_settings.is_some()
++        })
++    }
++
+     pub(crate) fn has_unconfirmed_messages(&self) -> bool {
+         self.queued_user_messages
+             .iter()
+--- /dev/null
++++ b/tui/src/native_inventory.rs
+@@ -0,0 +1,201 @@
++//! Opt-in, local read-only prototype. Never an admission grant for migration.
++use crate::app_event::AppEvent;
++use crate::app_event_sender::AppEventSender;
++use serde::Deserialize;
++use serde_json::Value;
++use std::io;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::PermissionsExt;
++use std::path::PathBuf;
++use std::time::Duration;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::net::UnixListener;
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ReadRequest {
++    nonce: String,
++}
++
++pub(crate) struct InventoryServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++}
++
++impl Drop for InventoryServer {
++    fn drop(&mut self) {
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++fn private_parent(path: &std::path::Path) -> io::Result<()> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    Ok(())
++}
++
++pub(crate) fn start(events: AppEventSender) -> io::Result<Option<InventoryServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_INVENTORY_SOCKET") else {
++        return Ok(None);
++    };
++    start_at(PathBuf::from(path), events).map(Some)
++}
++
++fn start_at(path: PathBuf, events: AppEventSender) -> io::Result<InventoryServer> {
++    private_parent(&path)?;
++    // bind is exclusive: existing sockets, files and links are never replaced.
++    let listener = UnixListener::bind(&path)?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let task = tokio::spawn(async move {
++        loop {
++            let Ok((mut stream, _)) = listener.accept().await else {
++                break;
++            };
++            let Ok(peer) = stream.peer_cred() else {
++                continue;
++            };
++            if peer.uid() != unsafe { libc::geteuid() } {
++                continue;
++            }
++            // One bounded request at a time; no detached per-client task flood.
++            let _ = tokio::time::timeout(Duration::from_secs(2), async {
++                let mut line = String::new();
++                let mut reader = BufReader::new((&mut stream).take(1025));
++                reader.read_line(&mut line).await?;
++                if line.len() > 1024 || !line.ends_with('\n') {
++                    return Err::<(), io::Error>(io::ErrorKind::InvalidInput.into());
++                }
++                let request: ReadRequest = serde_json::from_str(&line)?;
++                if request.nonce.len() != 32
++                    || !request.nonce.bytes().all(|v| v.is_ascii_hexdigit())
++                {
++                    return Err(io::ErrorKind::InvalidInput.into());
++                }
++                let (reply, received) = oneshot::channel::<Value>();
++                // Bypass session logging: this is not user input or a Codex turn.
++                events
++                    .app_event_tx
++                    .send(AppEvent::AutoapproveInventoryRead {
++                        nonce: request.nonce,
++                        reply,
++                    })
++                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let response = received.await.map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let mut bytes = serde_json::to_vec(&response)?;
++                if bytes.len() > 1024 * 1024 {
++                    return Err(io::ErrorKind::InvalidData.into());
++                }
++                bytes.push(b'\n');
++                drop(reader);
++                stream.write_all(&bytes).await?;
++                stream.shutdown().await
++            })
++            .await;
++        }
++    });
++    Ok(InventoryServer {
++        task,
++        path,
++        identity,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn exclusive_private_socket_and_event_loop_nonce() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("inventory.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        let events = AppEventSender::new(tx);
++        let server = start_at(path.clone(), events.clone())?;
++        assert!(start_at(path.clone(), events).is_err());
++        assert_eq!(std::fs::symlink_metadata(&path)?.mode() & 0o777, 0o600);
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"0123456789abcdef0123456789abcdef\"}\n")
++            .await?;
++        let AppEvent::AutoapproveInventoryRead { nonce, reply } = rx.recv().await.unwrap() else {
++            panic!("unexpected event")
++        };
++        reply
++            .send(serde_json::json!({"nonce":nonce,"eligibleForMigration":false}))
++            .unwrap();
++        let mut line = String::new();
++        BufReader::new(socket).read_line(&mut line).await?;
++        assert_eq!(
++            serde_json::from_str::<Value>(&line)?["nonce"],
++            "0123456789abcdef0123456789abcdef"
++        );
++        drop(server);
++        assert!(!path.exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn rejects_public_or_linked_parent_without_touching_files() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        let actual = root.path().join("actual");
++        std::fs::create_dir(&actual)?;
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o755))?;
++        assert!(private_parent(&actual.join("i.sock")).is_err());
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o700))?;
++        let alias = root.path().join("alias");
++        std::os::unix::fs::symlink(&actual, &alias)?;
++        assert!(private_parent(&alias.join("i.sock")).is_err());
++        assert!(!actual.join("i.sock").exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn malformed_request_enqueues_nothing_and_existing_file_is_preserved()
++    -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("i.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        let events = AppEventSender::new(tx);
++        std::fs::write(&path, b"existing")?;
++        assert!(start_at(path.clone(), events.clone()).is_err());
++        assert_eq!(std::fs::read(&path)?, b"existing");
++        std::fs::remove_file(&path)?;
++        let server = start_at(path.clone(), events)?;
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"bad\",\"command\":\"run\"}\n")
++            .await?;
++        let mut bytes = Vec::new();
++        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes)).await??;
++        assert!(bytes.is_empty());
++        assert!(rx.try_recv().is_err());
++        std::fs::remove_file(&path)?;
++        std::fs::write(&path, b"replacement")?;
++        drop(server);
++        assert_eq!(std::fs::read(&path)?, b"replacement");
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/tui/src/app/native_inventory.rs
+@@ -0,0 +1,259 @@
++//! Event-loop snapshot of actual retained TUI state, with no text or auth export.
++use super::App;
++use codex_protocol::ThreadId;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::BTreeMap;
++
++fn ids(values: impl IntoIterator<Item = ThreadId>) -> Vec<String> {
++    let mut result: Vec<_> = values.into_iter().map(|v| v.to_string()).collect();
++    result.sort();
++    result.dedup();
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::app::side::SideThreadState;
++
++    #[tokio::test]
++    async fn includes_unsubscribed_navigation_side_parent_and_retained_draft_without_mutation() {
++        let mut app = crate::app::test_support::make_test_app().await;
++        let primary = ThreadId::new();
++        let offscreen = ThreadId::new();
++        let side = ThreadId::new();
++        let parked = ThreadId::new();
++        app.primary_thread_id = Some(primary);
++        app.active_thread_id = Some(primary);
++        app.agent_navigation.upsert(offscreen, None, None, false);
++        app.side_threads.insert(side, SideThreadState::new(primary));
++        app.chat_widget
++            .insert_str("PRIVATE DRAFT: must stay in the native widget");
++        let retained = app.chat_widget.capture_thread_input_state().unwrap();
++        app.agents_overview
++            .input_states
++            .insert(parked, retained.clone());
++        let before = app.chat_widget.composer_text_with_pending();
++        let value = app.autoapprove_inventory("0123456789abcdef0123456789abcdef".into());
++        assert_eq!(
++            value["stores"]["navigation"],
++            json!([offscreen.to_string()])
++        );
++        assert_eq!(value["stores"]["sideThreads"], json!([side.to_string()]));
++        assert_eq!(value["stores"]["sideParents"], json!([primary.to_string()]));
++        assert_eq!(
++            value["stores"]["overviewInput"],
++            json!([parked.to_string()])
++        );
++        assert_eq!(
++            value["retainedInputs"][parked.to_string()]["hasDraft"],
++            true
++        );
++        assert_eq!(value["currentWidget"]["hasDraft"], true);
++        assert_eq!(app.chat_widget.composer_text_with_pending(), before);
++        assert_eq!(app.agents_overview.input_states[&parked], retained);
++        assert!(!value.to_string().contains("PRIVATE DRAFT"));
++        assert!(app.thread_event_listener_tasks.is_empty());
++        assert_eq!(value["membershipComplete"], false);
++        assert_eq!(value["admissionGranted"], false);
++    }
++
++    #[tokio::test]
++    async fn includes_channel_drafts_and_pending_only_navigation_without_claiming_locked_state() {
++        let mut app = crate::app::test_support::make_test_app().await;
++        let offscreen = ThreadId::new();
++        let pending = ThreadId::new();
++        let picker = ThreadId::new();
++        app.agent_navigation.pending_approvals.insert(pending);
++        app.agent_navigation.picker_row_ids.push(picker);
++        app.chat_widget.insert_str("PRIVATE CHANNEL DRAFT");
++        let input = app.chat_widget.capture_thread_input_state().unwrap();
++        let channel = super::super::thread_events::ThreadEventChannel::new(8);
++        channel.store.lock().await.input_state = Some(input.clone());
++        app.thread_event_channels.insert(offscreen, channel);
++        let value = app.autoapprove_inventory("0123456789abcdef0123456789abcdef".into());
++        let navigation = value["stores"]["navigation"].as_array().unwrap();
++        assert!(navigation.contains(&json!(pending.to_string())));
++        assert!(navigation.contains(&json!(picker.to_string())));
++        let state = &value["channelStates"][offscreen.to_string()];
++        assert_eq!(state["readable"], true);
++        assert_eq!(state["input"]["hasDraft"], true);
++        assert_eq!(state["logicalBackendId"], Value::Null);
++        assert!(!value.to_string().contains("PRIVATE CHANNEL DRAFT"));
++        let retained = app.thread_event_channels[&offscreen].store.lock().await;
++        assert_eq!(retained.input_state.as_ref(), Some(&input));
++        let locked = app.autoapprove_inventory("0123456789abcdef0123456789abcdef".into());
++        assert_eq!(
++            locked["channelStates"][offscreen.to_string()]["readable"],
++            false
++        );
++        assert_eq!(
++            locked["channelStates"][offscreen.to_string()]["input"],
++            Value::Null
++        );
++        assert_eq!(locked["membershipComplete"], false);
++    }
++}
++
++impl App {
++    pub(super) fn autoapprove_inventory_for_backend(
++        &self,
++        nonce: String,
++        backend: &crate::app_server_session::AppServerSession,
++    ) -> Value {
++        let mut value = self.autoapprove_inventory(nonce);
++        value["displayedBackend"] = if self.reconnect.offline {
++            Value::Null
++        } else {
++            backend
++                .native_connection_observation()
++                .unwrap_or(Value::Null)
++        };
++        value["backendBindingComplete"] = json!(false);
++        value
++    }
++
++    pub(super) fn autoapprove_inventory(&self, nonce: String) -> Value {
++        let mut stores = BTreeMap::<&str, Vec<String>>::new();
++        stores.insert("primary", ids(self.primary_thread_id));
++        stores.insert("active", ids(self.active_thread_id));
++        stores.insert("displayedWidget", ids(self.chat_widget.thread_id()));
++        stores.insert("channels", ids(self.thread_event_channels.keys().copied()));
++        stores.insert(
++            "listeners",
++            ids(self.thread_event_listener_tasks.keys().copied()),
++        );
++        stores.insert(
++            "navigation",
++            self.agent_navigation.autoapprove_retained_ids(),
++        );
++        stores.insert("sideThreads", ids(self.side_threads.keys().copied()));
++        stores.insert(
++            "sideParents",
++            ids(self.side_threads.values().map(|v| v.parent_thread_id)),
++        );
++        stores.insert(
++            "abandonedSides",
++            ids(self.abandoned_side_threads.iter().copied()),
++        );
++        stores.insert(
++            "speechReplay",
++            ids(self.pending_realtime_speech_replay.keys().copied()),
++        );
++        stores.insert(
++            "transcriptReplay",
++            ids(self.pending_realtime_transcript_replay.keys().copied()),
++        );
++        stores.insert(
++            "replayOrder",
++            ids(self.realtime_replay_order.iter().copied()),
++        );
++        stores.insert(
++            "backgroundVoice",
++            ids(self.background_voice.as_ref().and_then(|v| v.thread_id())),
++        );
++        stores.insert(
++            "backgroundVoiceError",
++            ids(self.background_voice_error.as_ref().map(|v| v.0)),
++        );
++        stores.insert(
++            "temporaryRequests",
++            ids(self.temporary_structured_requests.keys().copied()),
++        );
++        stores.insert(
++            "pendingTitles",
++            ids(self.pending_thread_titles.keys().map(|v| v.0)),
++        );
++        stores.insert(
++            "overviewInput",
++            ids(self.agents_overview.input_states.keys().copied()),
++        );
++        stores.insert(
++            "overviewBlankSessions",
++            ids(self.agents_overview.blank_sessions.keys().copied()),
++        );
++        stores.insert(
++            "overviewRequests",
++            ids(self.agents_overview.dispatched_requests.keys().copied()),
++        );
++        stores.insert(
++            "pendingProfiles",
++            ids(self.pending_server_profiles.keys().copied()),
++        );
++        // Catalog references are deliberately distinct from routing/input ownership.
++        stores.insert(
++            "catalogReferences",
++            ids(self.agents_overview.threads.keys().copied()),
++        );
++        let retained_inputs: BTreeMap<_, _> = self
++            .agents_overview
++            .input_states
++            .iter()
++            .map(|(id, state)| (id.to_string(), state.autoapprove_inventory_flags()))
++            .collect();
++        let channel_states: BTreeMap<_, _> = self
++            .thread_event_channels
++            .iter()
++            .map(|(id, channel)| {
++                let mut value = json!({
++                    "logicalBackendId": channel.backend_id.map(|owner| format!("{owner:?}")),
++                    "readable": false,
++                    "attachment": format!("{:?}", channel.attachment()),
++                    "hasPendingDelivery": channel.sender.capacity() < channel.sender.max_capacity()
++                });
++                if let Ok(state) = channel.store.try_lock() {
++                    value["readable"] = json!(true);
++                    value["active"] = json!(state.active);
++                    value["hasActiveTurn"] = json!(state.active_turn_id.is_some());
++                    value["hasPendingInterrupt"] = json!(state.pending_interrupt_turn_id.is_some());
++                    value["hasBufferedEvents"] = json!(!state.buffer.is_empty());
++                    value["hasProtectedRequest"] =
++                        json!(!state.pending_replay_requests().is_empty());
++                    value["input"] = state
++                        .input_state
++                        .as_ref()
++                        .map(|input| input.autoapprove_inventory_flags())
++                        .unwrap_or(Value::Null);
++                }
++                (id.to_string(), value)
++            })
++            .collect();
++        json!({
++            "schemaVersion": 1,
++            "producer": "autoapprove-native-tui-prototype",
++            "upstreamCommit": "0a94398fa60c4fac0e7659e4213a0a36e613dd46",
++            "cliVersion": env!("CARGO_PKG_VERSION"),
++            "pid": std::process::id(),
++            "processIdentity": codex_app_server_client::native_current_process_identity(),
++            "nonce": nonce,
++            "stores": stores,
++            "retainedInputs": retained_inputs,
++            "channelStates": channel_states,
++            "currentWidget": {
++                "hasDraft": !self.chat_widget.composer_is_empty(),
++                "hasProtectedRequest": self.chat_widget.has_pending_protected_request(),
++                "hasQueuedInput": self.chat_widget.has_queued_follow_up_messages(),
++                "hasActiveView": self.chat_widget.has_active_view()
++            },
++            "pending": {
++                "voiceOwner": self.background_voice.is_some(),
++                "primaryEvents": !self.pending_primary_events.is_empty(),
++                "threadSwitches": self.pending_thread_switch_resets,
++                "dynamicTools": self.dynamic_tool_tasks.len(),
++                "startupThread": self.pending_startup_thread_start,
++                "resumePicker": self.pending_open_resume_picker,
++                "workingDirectory": self.pending_working_directory_change.is_some(),
++                "worktreeStart": self.pending_start_managed_worktree.is_some(),
++                "worktreeCreation": self.pending_managed_worktree_creation,
++                "worktreeCreated": self.pending_managed_worktree_created.is_some(),
++                "worktreeTransition": self.pending_managed_worktree_transition.is_some(),
++                "worktreeAttach": self.pending_managed_worktree_attach.is_some(),
++                "newSessionDraft": self.agents_overview.new_session_draft.is_some()
++            },
++            "membershipComplete": false,
++            "admissionGranted": false,
++            "limitations": ["daemon-peer-census-required", "revision-and-admission-barrier-required", "full-preservation-export-required"]
++        })
++    }
++}
+--- a/app-server/src/thread_state.rs
++++ b/app-server/src/thread_state.rs
+@@ -422,6 +422,27 @@
+ }
+ 
+ impl ThreadStateManager {
++    /// One read of the actual initialized-client and subscription stores. This
++    /// does not establish transport-peer identity, revision stability or admission.
++    pub(crate) async fn native_inventory_snapshot(&self) -> serde_json::Value {
++        let state = self.state.lock().await;
++        let mut live: Vec<_> = state.live_connections.keys().map(|id| id.0).collect();
++        live.sort_unstable();
++        let mut by_connection = std::collections::BTreeMap::new();
++        for (id, threads) in &state.thread_ids_by_connection {
++            let mut ids: Vec<_> = threads.iter().map(ToString::to_string).collect();
++            ids.sort();
++            by_connection.insert(id.0.to_string(), ids);
++        }
++        let mut subscribers = std::collections::BTreeMap::new();
++        for (id, entry) in &state.threads {
++            let mut ids: Vec<_> = entry.connection_ids.iter().map(|id| id.0).collect();
++            ids.sort_unstable();
++            subscribers.insert(id.to_string(), ids);
++        }
++        serde_json::json!({"initializedConnectionIDs":live,"byConnection":by_connection,"subscribers":subscribers})
++    }
++
+     /// Coordinates goal edits with cold/path-based resume for just this thread.
+     pub(crate) async fn lock_goal_resume(
+         &self,
+--- /dev/null
++++ b/app-server/src/native_inventory.rs
+@@ -0,0 +1,157 @@
++//! Local diagnostic observation, never a census-completeness or migration grant.
++use crate::message_processor::MessageProcessor;
++use crate::transport::ConnectionId;
++use crate::transport::ConnectionState;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::HashMap;
++use std::io;
++use std::time::Duration;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++
++pub(crate) struct InventoryRead {
++    pub(crate) nonce: String,
++    pub(crate) reply: oneshot::Sender<Value>,
++}
++
++#[cfg(all(feature = "autoapprove-native-inventory", unix))]
++#[path = "native_inventory_transport.rs"]
++mod transport;
++#[cfg(all(feature = "autoapprove-native-inventory", unix))]
++pub(crate) use transport::InventoryServer;
++#[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
++pub(crate) struct InventoryServer;
++
++pub(crate) fn start(events: mpsc::Sender<InventoryRead>) -> io::Result<Option<InventoryServer>> {
++    #[cfg(all(feature = "autoapprove-native-inventory", unix))]
++    {
++        transport::start(events)
++    }
++    #[cfg(not(all(feature = "autoapprove-native-inventory", unix)))]
++    {
++        drop(events);
++        Ok(None)
++    }
++}
++
++fn connection_rows(connections: &HashMap<ConnectionId, ConnectionState>) -> Vec<Value> {
++    let mut rows: Vec<_> = connections.iter().collect();
++    rows.sort_by_key(|(id, _)| id.0);
++    rows.into_iter()
++        .map(|(id, connection)| {
++            json!({
++                "connectionID":id.0,
++                "origin":format!("{:?}",connection.origin),
++                "initialized":connection.session.initialized(),
++                "untrustedClientName":connection.session.app_server_client_name(),
++                "untrustedClientVersion":connection.session.client_version(),
++                "nativePeerIdentified":connection.native_peer.is_some(),
++                "nativePeer":connection.native_peer,
++                "nativeConnectionNonce":connection.native_connection_nonce,
++                "clientInventoryBound":false
++            })
++        })
++        .collect()
++}
++
++pub(crate) async fn snapshot(
++    nonce: String,
++    generation: &str,
++    connections: &HashMap<ConnectionId, ConnectionState>,
++    processor: &MessageProcessor,
++) -> Value {
++    // Keep a diagnostic from holding the transport loop behind a contended
++    // subscription lock. Neither the two stores nor pending transport events
++    // are revision-bound yet, so this must never authorize effects.
++    let subscriptions = tokio::time::timeout(
++        Duration::from_millis(100),
++        processor.native_inventory_subscriptions(),
++    )
++    .await;
++    let (subscriptions, error) = match subscriptions {
++        Ok(value) => (value, None),
++        Err(_) => (Value::Null, Some("subscription-snapshot-timeout")),
++    };
++    json!({
++        "schemaVersion":1,
++        "producer":"autoapprove-native-server-prototype",
++        "upstreamCommit":"0a94398fa60c4fac0e7659e4213a0a36e613dd46",
++        "cliVersion":env!("CARGO_PKG_VERSION"),
++        "pid":std::process::id(),
++        "serverGeneration":generation,
++        "nonce":nonce,
++        "connections":connection_rows(connections),
++        "subscriptions":subscriptions,
++        "error":error,
++        "consistentRevision":false,
++        "membershipComplete":false,
++        "admissionGranted":false,
++        "limitations":[
++            "native-peer-to-client-inventory-binding-required",
++            "client-inventory-binding-required",
++            "pending-transport-and-subscriber-revision-required",
++            "native-admission-and-backend-attestation-required"
++        ]
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::thread_state::ConnectionCapabilities;
++    use crate::thread_state::ThreadStateManager;
++    use crate::transport::ConnectionOrigin;
++    use codex_protocol::ThreadId;
++    use std::collections::HashSet;
++    use std::sync::Arc;
++    use std::sync::RwLock;
++    use std::sync::atomic::AtomicBool;
++
++    #[test]
++    fn uninitialized_transport_connection_is_not_omitted_or_attested() {
++        let connection = ConnectionState::new(
++            ConnectionOrigin::WebSocket,
++            None,
++            Arc::new(AtomicBool::new(false)),
++            Arc::new(AtomicBool::new(false)),
++            Arc::new(RwLock::new(HashSet::new())),
++        );
++        let rows = connection_rows(&HashMap::from([(ConnectionId(8), connection)]));
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0]["connectionID"], 8);
++        assert_eq!(rows[0]["initialized"], false);
++        assert_eq!(rows[0]["untrustedClientName"], Value::Null);
++        assert_eq!(rows[0]["nativePeerIdentified"], false);
++        assert_eq!(rows[0]["clientInventoryBound"], false);
++    }
++
++    #[tokio::test]
++    async fn actual_shared_subscription_store_changes_without_read_mutation() {
++        let state = ThreadStateManager::new();
++        let root = ThreadId::new();
++        for id in [ConnectionId(2), ConnectionId(7)] {
++            state
++                .connection_initialized(id, ConnectionCapabilities::default())
++                .await;
++            assert!(state.try_add_connection_to_thread(root, id).await);
++        }
++        let before = state.native_inventory_snapshot().await;
++        assert_eq!(before["subscribers"][root.to_string()], json!([2, 7]));
++        assert_eq!(state.native_inventory_snapshot().await, before);
++        assert!(
++            state
++                .unsubscribe_connection_from_thread(root, ConnectionId(2))
++                .await
++        );
++        let after = state.native_inventory_snapshot().await;
++        assert_eq!(after["subscribers"][root.to_string()], json!([7]));
++        assert!(after["byConnection"].get("2").is_none());
++        assert_eq!(after["byConnection"]["7"], json!([root.to_string()]));
++        assert_eq!(after["initializedConnectionIDs"], json!([2, 7]));
++        state.remove_connection(ConnectionId(7)).await;
++        let closed = state.native_inventory_snapshot().await;
++        assert_eq!(closed["initializedConnectionIDs"], json!([2]));
++        assert_eq!(closed["subscribers"][root.to_string()], json!([]));
++    }
++}
+--- /dev/null
++++ b/app-server/src/native_inventory_transport.rs
+@@ -0,0 +1,199 @@
++//! Opt-in, local read-only prototype. Never an admission grant for migration.
++use super::InventoryRead;
++use serde::Deserialize;
++use serde_json::Value;
++use std::io;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::PermissionsExt;
++use std::path::PathBuf;
++use std::time::Duration;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::net::UnixListener;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ReadRequest {
++    nonce: String,
++}
++
++pub(crate) struct InventoryServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++}
++
++impl Drop for InventoryServer {
++    fn drop(&mut self) {
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++fn private_parent(path: &std::path::Path) -> io::Result<()> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    Ok(())
++}
++
++pub(crate) fn start(events: mpsc::Sender<InventoryRead>) -> io::Result<Option<InventoryServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET") else {
++        return Ok(None);
++    };
++    start_at(PathBuf::from(path), events).map(Some)
++}
++
++fn start_at(path: PathBuf, events: mpsc::Sender<InventoryRead>) -> io::Result<InventoryServer> {
++    private_parent(&path)?;
++    // bind is exclusive: existing sockets, files and links are never replaced.
++    let listener = UnixListener::bind(&path)?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let task = tokio::spawn(async move {
++        loop {
++            let Ok((mut stream, _)) = listener.accept().await else {
++                break;
++            };
++            let Ok(peer) = stream.peer_cred() else {
++                continue;
++            };
++            if peer.uid() != unsafe { libc::geteuid() } {
++                continue;
++            }
++            // One bounded request at a time; no detached per-client task flood.
++            let _ = tokio::time::timeout(Duration::from_secs(2), async {
++                let mut line = String::new();
++                let mut reader = BufReader::new((&mut stream).take(1025));
++                reader.read_line(&mut line).await?;
++                if line.len() > 1024 || !line.ends_with('\n') {
++                    return Err::<(), io::Error>(io::ErrorKind::InvalidInput.into());
++                }
++                let request: ReadRequest = serde_json::from_str(&line)?;
++                if request.nonce.len() != 32
++                    || !request.nonce.bytes().all(|v| v.is_ascii_hexdigit())
++                {
++                    return Err(io::ErrorKind::InvalidInput.into());
++                }
++                let (reply, received) = oneshot::channel::<Value>();
++                // Bypass session logging: this is not user input or a Codex turn.
++                events
++                    .send(InventoryRead {
++                        nonce: request.nonce,
++                        reply,
++                    })
++                    .await
++                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let response = received.await.map_err(|_| io::ErrorKind::BrokenPipe)?;
++                let mut bytes = serde_json::to_vec(&response)?;
++                if bytes.len() > 1024 * 1024 {
++                    return Err(io::ErrorKind::InvalidData.into());
++                }
++                bytes.push(b'\n');
++                drop(reader);
++                stream.write_all(&bytes).await?;
++                stream.shutdown().await
++            })
++            .await;
++        }
++    });
++    Ok(InventoryServer {
++        task,
++        path,
++        identity,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn exclusive_private_socket_and_event_loop_nonce() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("inventory.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
++        let events = tx;
++        let server = start_at(path.clone(), events.clone())?;
++        assert!(start_at(path.clone(), events).is_err());
++        assert_eq!(std::fs::symlink_metadata(&path)?.mode() & 0o777, 0o600);
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"0123456789abcdef0123456789abcdef\"}\n")
++            .await?;
++        let InventoryRead { nonce, reply } = rx.recv().await.unwrap();
++        reply
++            .send(serde_json::json!({"nonce":nonce,"eligibleForMigration":false}))
++            .unwrap();
++        let mut line = String::new();
++        BufReader::new(socket).read_line(&mut line).await?;
++        assert_eq!(
++            serde_json::from_str::<Value>(&line)?["nonce"],
++            "0123456789abcdef0123456789abcdef"
++        );
++        drop(server);
++        assert!(!path.exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn rejects_public_or_linked_parent_without_touching_files() -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        let actual = root.path().join("actual");
++        std::fs::create_dir(&actual)?;
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o755))?;
++        assert!(private_parent(&actual.join("i.sock")).is_err());
++        std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o700))?;
++        let alias = root.path().join("alias");
++        std::os::unix::fs::symlink(&actual, &alias)?;
++        assert!(private_parent(&alias.join("i.sock")).is_err());
++        assert!(!actual.join("i.sock").exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn malformed_request_enqueues_nothing_and_existing_file_is_preserved()
++    -> anyhow::Result<()> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let path = root.path().join("i.sock");
++        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
++        let events = tx;
++        std::fs::write(&path, b"existing")?;
++        assert!(start_at(path.clone(), events.clone()).is_err());
++        assert_eq!(std::fs::read(&path)?, b"existing");
++        std::fs::remove_file(&path)?;
++        let server = start_at(path.clone(), events)?;
++        let mut socket = tokio::net::UnixStream::connect(&path).await?;
++        socket
++            .write_all(b"{\"nonce\":\"bad\",\"command\":\"run\"}\n")
++            .await?;
++        let mut bytes = Vec::new();
++        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes)).await??;
++        assert!(bytes.is_empty());
++        assert!(rx.try_recv().is_err());
++        std::fs::remove_file(&path)?;
++        std::fs::write(&path, b"replacement")?;
++        drop(server);
++        assert_eq!(std::fs::read(&path)?, b"replacement");
++        Ok(())
++    }
++}
+--- a/app-server/src/transport.rs
++++ b/app-server/src/transport.rs
+@@ -37,6 +37,8 @@
+ pub use codex_app_server_transport::verified_local_daemon_socket;
+ 
+ pub(crate) struct ConnectionState {
++    pub(crate) native_peer: Option<codex_app_server_transport::NativePeerIdentity>,
++    pub(crate) native_connection_nonce: Option<String>,
+     pub(crate) origin: ConnectionOrigin,
+     pub(crate) outbound_initialized: Arc<AtomicBool>,
+     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
+@@ -57,6 +59,8 @@
+         rpc_gate.auth = auth;
+         session.rpc_gate = Arc::new(rpc_gate);
+         Self {
++            native_peer: None,
++            native_connection_nonce: None,
+             origin,
+             outbound_initialized,
+             outbound_experimental_api_enabled,
+--- a/uds/src/lib.rs
++++ b/uds/src/lib.rs
+@@ -71,6 +71,13 @@
+         platform::connect_stream(socket_path.as_ref())
+             .await
+             .map(|inner| Self { inner })
++    }
++}
++
++#[cfg(unix)]
++impl std::os::fd::AsRawFd for UnixStream {
++    fn as_raw_fd(&self) -> std::os::fd::RawFd {
++        std::os::fd::AsRawFd::as_raw_fd(&self.inner)
+     }
+ }
+ 
+--- a/app-server-client/Cargo.toml
++++ b/app-server-client/Cargo.toml
+@@ -8,6 +8,9 @@
+ name = "codex_app_server_client"
+ path = "src/lib.rs"
+ doctest = false
++
++[features]
++autoapprove-native-inventory = ["codex-app-server-transport/autoapprove-native-inventory"]
+ 
+ [lints]
+ workspace = true
+--- a/app-server-client/src/lib.rs
++++ b/app-server-client/src/lib.rs
+@@ -19,6 +19,8 @@
+ //! bridging async `mpsc` channels on both sides. Commands and the underlying
+ //! runtime remain bounded; the local consumer event queue is unbounded so
+ //! unread notifications cannot prevent request responses from being delivered.
++
++pub use codex_app_server_transport::native_current_process_identity;
+ 
+ mod cloud;
+ mod path;
+@@ -753,6 +755,17 @@
+     }
+ }
+ 
++impl AppServerRequestHandle {
++    pub fn native_local_connection(
++        &self,
++    ) -> Option<&codex_app_server_transport::NativeLocalConnection> {
++        match self {
++            Self::Remote(handle) => handle.native_local_connection(),
++            _ => None,
++        }
++    }
++}
++
+ impl AppServerClient {
+     /// App-server platform family, which can differ from the executor's platform.
+     /// Older remote servers may omit this metadata.
+--- a/app-server-transport/Cargo.toml
++++ b/app-server-transport/Cargo.toml
+@@ -8,6 +8,9 @@
+ name = "codex_app_server_transport"
+ path = "src/lib.rs"
+ doctest = false
++
++[features]
++autoapprove-native-inventory = []
+ 
+ [lints]
+ workspace = true
+--- a/app-server-transport/src/lib.rs
++++ b/app-server-transport/src/lib.rs
+@@ -8,6 +8,13 @@
+ /// Only managed app-server launches accept the local socket shutdown request.
+ pub const DAEMON_SHUTDOWN_SOCKET_ENV: &str = "CODEX_DAEMON_SHUTDOWN_SOCKET";
+ mod connection_auth;
++mod native_peer;
++pub use native_peer::NATIVE_CONNECTION_NONCE_HEADER;
++pub use native_peer::NativeLocalConnection;
++pub use native_peer::NativePeerIdentity;
++pub use native_peer::native_connection_nonce;
++pub use native_peer::native_current_process_identity;
++pub use native_peer::native_unix_peer_identity;
+ mod outgoing_message;
+ mod transport;
+ mod websocket_compression;
+--- /dev/null
++++ b/app-server-transport/src/native_peer.rs
+@@ -0,0 +1,191 @@
++//! Kernel process-instance identity. Never infer it from initialize metadata.
++use serde::Serialize;
++
++pub const NATIVE_CONNECTION_NONCE_HEADER: &str = "sec-websocket-key";
++
++/// Transport observation, not authentication or a migration grant.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct NativeLocalConnection {
++    pub connection_nonce: String,
++    pub server_peer: NativePeerIdentity,
++}
++
++pub fn native_connection_nonce<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Option<String> {
++    let mut values = values.into_iter();
++    let value = values.next()?;
++    if values.next().is_some()
++        || value.len() != 24
++        || &value[22..] != b"=="
++        || !value[..22]
++            .iter()
++            .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
++        || !matches!(value[21], b'A' | b'Q' | b'g' | b'w')
++    {
++        return None;
++    }
++    String::from_utf8(value.to_vec()).ok()
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct NativePeerIdentity {
++    pub source: &'static str,
++    pub pid: u32,
++    pub effective_uid: u32,
++    pub effective_gid: u32,
++    pub audit_pid_version: u32,
++}
++
++pub fn native_current_process_identity() -> Option<NativePeerIdentity> {
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    {
++        apple::current()
++    }
++    #[cfg(not(all(feature = "autoapprove-native-inventory", target_os = "macos")))]
++    {
++        None
++    }
++}
++
++pub fn native_unix_peer_identity(stream: &codex_uds::UnixStream) -> Option<NativePeerIdentity> {
++    capture(stream)
++}
++
++pub(crate) fn capture(stream: &codex_uds::UnixStream) -> Option<NativePeerIdentity> {
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    {
++        use std::os::fd::AsRawFd;
++        apple::peer(stream.as_raw_fd())
++    }
++    #[cfg(not(all(feature = "autoapprove-native-inventory", target_os = "macos")))]
++    {
++        let _ = stream;
++        None
++    }
++}
++
++#[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++mod apple {
++    use super::NativePeerIdentity;
++
++    // The SDK declares this opaque 8-word token in mach/message.h. Interpret it
++    // only with libbsm accessors, not assumptions about word offsets.
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct AuditToken {
++        words: [u32; 8],
++    }
++
++    #[link(name = "bsm")]
++    unsafe extern "C" {
++        fn audit_token_to_euid(token: AuditToken) -> libc::uid_t;
++        fn audit_token_to_egid(token: AuditToken) -> libc::gid_t;
++        fn audit_token_to_pid(token: AuditToken) -> libc::pid_t;
++        fn audit_token_to_pidversion(token: AuditToken) -> libc::c_int;
++    }
++
++    fn identity(token: AuditToken) -> Option<NativePeerIdentity> {
++        let pid = unsafe { audit_token_to_pid(token) };
++        let version = unsafe { audit_token_to_pidversion(token) } as u32;
++        if pid <= 0 || version == 0 {
++            return None;
++        }
++        Some(NativePeerIdentity {
++            source: "macos-audit-token",
++            pid: pid as u32,
++            effective_uid: unsafe { audit_token_to_euid(token) },
++            effective_gid: unsafe { audit_token_to_egid(token) },
++            audit_pid_version: version,
++        })
++    }
++
++    pub(super) fn peer(fd: libc::c_int) -> Option<NativePeerIdentity> {
++        let mut token = AuditToken { words: [0; 8] };
++        let mut size = std::mem::size_of::<AuditToken>() as libc::socklen_t;
++        let status = unsafe {
++            libc::getsockopt(
++                fd,
++                libc::SOL_LOCAL,
++                libc::LOCAL_PEERTOKEN,
++                (&mut token as *mut AuditToken).cast(),
++                &mut size,
++            )
++        };
++        if status != 0 || size as usize != std::mem::size_of::<AuditToken>() {
++            return None;
++        }
++        identity(token)
++    }
++
++    pub(super) fn current() -> Option<NativePeerIdentity> {
++        // TASK_AUDIT_TOKEN and COUNT are defined as 15 and 8 by mach/task_info.h.
++        let mut token = AuditToken { words: [0; 8] };
++        let mut count: libc::mach_msg_type_number_t = 8;
++        let status = unsafe {
++            libc::task_info(
++                libc::mach_task_self(),
++                15,
++                (&mut token as *mut AuditToken).cast(),
++                &mut count,
++            )
++        };
++        if status != libc::KERN_SUCCESS || count != 8 {
++            return None;
++        }
++        let value = identity(token)?;
++        (value.pid == std::process::id()
++            && value.effective_uid == unsafe { libc::geteuid() }
++            && value.effective_gid == unsafe { libc::getegid() })
++        .then_some(value)
++    }
++}
++
++#[cfg(all(test, feature = "autoapprove-native-inventory", target_os = "macos"))]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn connection_nonce_rejects_missing_duplicate_and_noncanonical_keys() {
++        let valid = b"dGhlIHNhbXBsZSBub25jZQ==".as_slice();
++        assert_eq!(
++            native_connection_nonce([valid]).as_deref(),
++            Some("dGhlIHNhbXBsZSBub25jZQ==")
++        );
++        assert!(native_connection_nonce([]).is_none());
++        assert!(native_connection_nonce([valid, valid]).is_none());
++        for bad in [
++            b"bad".as_slice(),
++            b"dGhlIHNhbXBsZSBub25jZR==",
++            b"dGhlIHNhbXBsZSBub25jZQ= ",
++        ] {
++            assert!(native_connection_nonce([bad]).is_none());
++        }
++    }
++
++    #[tokio::test]
++    async fn native_peer_identity_matches_current_process_instance() {
++        let root = tempfile::tempdir_in("/private/tmp").unwrap();
++        let path = root.path().join("peer.sock");
++        let mut listener = codex_uds::UnixListener::bind(&path).await.unwrap();
++        let client = codex_uds::UnixStream::connect(&path).await.unwrap();
++        let server = listener.accept().await.unwrap();
++        let expected = native_current_process_identity().expect("current kernel identity");
++        assert_eq!(expected.pid, std::process::id());
++        assert_ne!(expected.audit_pid_version, 0);
++        assert_eq!(capture(&server), Some(expected));
++        assert_eq!(capture(&client), Some(expected));
++        assert_eq!(native_current_process_identity(), Some(expected));
++        let mut reused_pid = expected;
++        reused_pid.audit_pid_version = expected.audit_pid_version.wrapping_add(1);
++        assert_ne!(expected, reused_pid);
++    }
++}
++
++#[cfg(all(test, not(feature = "autoapprove-native-inventory")))]
++mod disabled_tests {
++    #[test]
++    fn native_peer_identity_is_absent_without_explicit_feature() {
++        assert!(super::native_current_process_identity().is_none());
++    }
++}
+--- a/app-server-transport/src/transport/mod.rs
++++ b/app-server-transport/src/transport/mod.rs
+@@ -190,6 +190,12 @@
+     },
+     ConnectionClosed {
+         connection_id: ConnectionId,
++    },
++    /// Kernel credentials captured from an accepted local Unix stream.
++    NativePeerIdentified {
++        connection_id: ConnectionId,
++        peer: crate::NativePeerIdentity,
++        connection_nonce: Option<String>,
+     },
+     IncomingMessage {
+         connection_id: ConnectionId,
+--- a/app-server-transport/src/transport/unix_socket.rs
++++ b/app-server-transport/src/transport/unix_socket.rs
+@@ -6,7 +6,7 @@
+ use std::path::Path;
+ 
+ use super::TransportEvent;
+-use crate::transport::websocket::run_websocket_connection;
++use crate::transport::websocket::run_websocket_connection_with_peer;
+ use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+ use crate::websocket_compression::WebSocketCompression;
+ use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
+@@ -178,9 +178,11 @@
+             }
+         };
+ 
++        let native_peer = crate::native_peer::capture(&stream);
+         let transport_event_tx = transport_event_tx.clone();
+         tokio::spawn(async move {
+             let mut shutdown_request = false;
++            let mut connection_nonce = None;
+             let mut negotiated_compression = WebSocketCompression::Plain;
+             let websocket_config = WebSocketConfig::default();
+             let max_unfragmented_message_bytes = [
+@@ -194,6 +196,15 @@
+                 stream,
+                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                  mut response: HandshakeResponse| {
++                    if native_peer.is_some() {
++                        connection_nonce = crate::native_connection_nonce(
++                            request
++                                .headers()
++                                .get_all(crate::NATIVE_CONNECTION_NONCE_HEADER)
++                                .iter()
++                                .map(|v| v.as_bytes()),
++                        );
++                    }
+                     if request.uri().path() == "/daemon/shutdown" {
+                         if !matches!(daemon_shutdown_access, DaemonShutdownAccess::Managed) {
+                             let mut rejection = Response::new(Some("unmanaged server".to_string()));
+@@ -236,11 +247,13 @@
+                 return;
+             }
+             let (websocket_writer, websocket_reader) = websocket_stream.split();
+-            run_websocket_connection(
++            run_websocket_connection_with_peer(
+                 websocket_writer,
+                 websocket_reader,
+                 transport_event_tx,
+                 negotiated_compression,
++                native_peer,
++                connection_nonce,
+             )
+             .await;
+         });
+--- a/app-server-transport/src/transport/unix_socket_tests.rs
++++ b/app-server-transport/src/transport/unix_socket_tests.rs
+@@ -123,7 +123,20 @@
+     let stream = connect_to_socket(socket_path.as_path())
+         .await
+         .expect("client should connect");
+-    let (mut websocket, response) = client_async("ws://localhost/rpc", stream)
++    let request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
++        "ws://localhost/rpc",
++    )
++    .expect("client handshake request");
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    let expected_nonce = crate::native_connection_nonce(
++        request
++            .headers()
++            .get_all(crate::NATIVE_CONNECTION_NONCE_HEADER)
++            .iter()
++            .map(|v| v.as_bytes()),
++    )
++    .expect("canonical client handshake nonce");
++    let (mut websocket, response) = client_async(request, stream)
+         .await
+         .expect("websocket upgrade should complete");
+     assert_eq!(response.status().as_u16(), 101);
+@@ -156,6 +169,26 @@
+         TransportEvent::ConnectionOpened { connection_id, .. } => connection_id,
+         _ => panic!("expected connection opened event"),
+     };
++
++    #[cfg(all(feature = "autoapprove-native-inventory", target_os = "macos"))]
++    {
++        let peer = timeout(Duration::from_secs(1), transport_event_rx.recv())
++            .await
++            .expect("kernel peer event should arrive")
++            .expect("kernel peer event");
++        match peer {
++            TransportEvent::NativePeerIdentified {
++                connection_id: peer_connection,
++                peer,
++                connection_nonce,
++            } => {
++                assert_eq!(peer_connection, connection_id);
++                assert_eq!(Some(peer), crate::native_current_process_identity());
++                assert_eq!(connection_nonce.as_deref(), Some(expected_nonce.as_str()));
++            }
++            _ => panic!("expected native kernel peer before incoming application messages"),
++        }
++    }
+ 
+     let notification = JSONRPCMessage::Notification(JSONRPCNotification {
+         method: "initialized".to_string(),
+--- a/app-server-transport/src/transport/websocket.rs
++++ b/app-server-transport/src/transport/websocket.rs
+@@ -212,6 +212,29 @@
+     SinkError: Send + 'static,
+     StreamError: std::fmt::Display + Send + 'static,
+ {
++    run_websocket_connection_with_peer(
++        websocket_writer,
++        websocket_reader,
++        transport_event_tx,
++        compression,
++        None,
++        None,
++    )
++    .await;
++}
++
++pub(crate) async fn run_websocket_connection_with_peer<M, SinkError, StreamError>(
++    websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
++    websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
++    transport_event_tx: mpsc::Sender<TransportEvent>,
++    compression: WebSocketCompression,
++    native_peer: Option<crate::NativePeerIdentity>,
++    connection_nonce: Option<String>,
++) where
++    M: AppServerWebSocketMessage + Send + 'static,
++    SinkError: Send + 'static,
++    StreamError: std::fmt::Display + Send + 'static,
++{
+     let connection_id = next_connection_id();
+     let (encoder, decoder) = match compression {
+         WebSocketCompression::Plain => (None, None),
+@@ -246,6 +269,19 @@
+         return;
+     }
+ 
++    if let Some(peer) = native_peer {
++        if transport_event_tx
++            .send(TransportEvent::NativePeerIdentified {
++                connection_id,
++                peer,
++                connection_nonce,
++            })
++            .await
++            .is_err()
++        {
++            return;
++        }
++    }
+     let (writer_control_tx, writer_control_rx) = mpsc::channel::<M>(CHANNEL_CAPACITY);
+     let mut outbound_task = tokio::spawn(run_websocket_outbound_loop(
+         websocket_writer,
+--- a/app-server-transport/src/transport/remote_control/client_tracker.rs
++++ b/app-server-transport/src/transport/remote_control/client_tracker.rs
+@@ -427,6 +427,7 @@
+         TransportEvent::ConnectionClosed { .. } => "connection_closed",
+         TransportEvent::IncomingMessage { .. } => "incoming_message",
+         TransportEvent::DaemonShutdown => "daemon_shutdown",
++        TransportEvent::NativePeerIdentified { .. } => "native_peer_identified",
+     }
+ }
+ 
+--- a/tui/src/app/session_lifecycle.rs
++++ b/tui/src/app/session_lifecycle.rs
+@@ -1437,7 +1437,14 @@
+             || self.chat_widget.has_provider_error())
+             && self.chat_widget.thread_id() == Some(resumed_thread_id))
+         .then(|| self.chat_widget.capture_thread_input_state())
+-        .flatten();
++        .flatten()
++        // Keep the destination's parked input until attachment succeeds.
++        .or_else(|| {
++            self.agents_overview
++                .input_states
++                .get(&resumed_thread_id)
++                .cloned()
++        });
+         self.detach_current_thread_for_navigation(app_server, Some(resumed_thread_id))
+             .await;
+         self.local_settings = local_settings;
+@@ -1460,14 +1467,20 @@
+         {
+             Ok(()) => {
+                 if let Some(mut input) = retained_input {
++                    let preserve_in_flight_turn = !read_only
++                        && self
++                            .active_turn_id_for_thread(resumed_thread_id)
++                            .await
++                            .is_some();
+                     // A successful resume is the authority for clearing the old rejection.
+                     input.provider_error = None;
+                     self.chat_widget.restore_thread_input_state(
+                         Some(input),
+                         ThreadInputStateRestoreMode {
+-                            preserve_in_flight_turn: false,
++                            preserve_in_flight_turn,
+                         },
+                     );
++                    self.agents_overview.input_states.remove(&resumed_thread_id);
+                 }
+                 if let Some(error) = provider_error {
+                     self.chat_widget
+--- a/tui/src/app/tests.rs
++++ b/tui/src/app/tests.rs
+@@ -8637,6 +8637,14 @@
+         app.config.codex_home = other_home.path().to_path_buf().abs();
+         let active_settings = (app.config.clone(), app.local_settings.clone());
+         let active_thread_id = app.chat_widget.thread_id();
++        let (mut parked_app, _, _) = make_test_app_with_channels().await;
++        parked_app
++            .chat_widget
++            .insert_str("parked destination draft");
++        let parked_input = parked_app.chat_widget.capture_thread_input_state().unwrap();
++        app.agents_overview
++            .input_states
++            .insert(thread_id, parked_input);
+         app.chat_widget
+             .insert_str("keep this draft until attachment");
+         let prepared = match app
+@@ -8682,6 +8690,11 @@
+             &expected_cwd,
+         ));
+         assert_eq!(app.chat_widget.thread_id(), Some(thread_id));
++        assert_eq!(
++            app.chat_widget.composer_text_with_pending(),
++            "parked destination draft"
++        );
++        assert!(!app.agents_overview.input_states.contains_key(&thread_id));
+     }
+ 
+     if let Some(app_server) = local_app_server {
+--- a/app-server-client/src/remote.rs
++++ b/app-server-client/src/remote.rs
+@@ -169,11 +169,25 @@
+     pending_events: VecDeque<AppServerEvent>,
+     metadata: RemoteServerMetadata,
+     worker_handle: tokio::task::JoinHandle<()>,
++    native_connection: Option<codex_app_server_transport::NativeLocalConnection>,
+ }
+ 
+ #[derive(Clone)]
+ pub struct RemoteAppServerRequestHandle {
+     command_tx: mpsc::Sender<RemoteClientCommand>,
++    native_connection: Option<codex_app_server_transport::NativeLocalConnection>,
++}
++
++impl RemoteAppServerRequestHandle {
++    pub fn native_local_connection(
++        &self,
++    ) -> Option<&codex_app_server_transport::NativeLocalConnection> {
++        if self.command_tx.is_closed() {
++            None
++        } else {
++            self.native_connection.as_ref()
++        }
++    }
+ }
+ 
+ enum SocketPeerPolicy {
+@@ -217,10 +231,17 @@
+                     .await
+             }
+             RemoteAppServerEndpoint::UnixSocket { socket_path } => {
+-                let (endpoint, stream) =
++                let (endpoint, stream, native_connection) =
+                     connect_unix_socket_endpoint(socket_path, peer_policy).await?;
+-                Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
+-                    .await
++                let mut client = Self::connect_with_stream(
++                    channel_capacity,
++                    endpoint,
++                    stream,
++                    initialize_params,
++                )
++                .await?;
++                client.native_connection = native_connection;
++                Ok(client)
+             }
+         }
+     }
+@@ -530,12 +551,14 @@
+             pending_events: pending_events.into(),
+             metadata,
+             worker_handle,
++            native_connection: None,
+         })
+     }
+ 
+     pub fn request_handle(&self) -> RemoteAppServerRequestHandle {
+         RemoteAppServerRequestHandle {
+             command_tx: self.command_tx.clone(),
++            native_connection: self.native_connection.clone(),
+         }
+     }
+ 
+@@ -608,6 +631,7 @@
+             pending_events: _pending_events,
+             metadata: _,
+             worker_handle,
++            native_connection: _,
+         } = self;
+         let mut worker_handle = worker_handle;
+         let (response_tx, response_rx) = oneshot::channel();
+@@ -787,7 +811,11 @@
+ async fn connect_unix_socket_endpoint(
+     socket_path: AbsolutePathBuf,
+     peer_policy: SocketPeerPolicy,
+-) -> IoResult<(String, WebSocketHandshake<UnixStream>)> {
++) -> IoResult<(
++    String,
++    WebSocketHandshake<UnixStream>,
++    Option<codex_app_server_transport::NativeLocalConnection>,
++)> {
+     let endpoint = format!("unix://{}", socket_path.display());
+     let request = websocket_request(UDS_WEBSOCKET_HANDSHAKE_URL).map_err(|err| {
+         IoError::new(
+@@ -813,6 +841,20 @@
+         #[cfg(windows)]
+         SocketPeerPolicy::NonElevatedCurrentUser => stream.ensure_non_elevated_peer()?,
+     }
++    let native_connection = codex_app_server_transport::native_unix_peer_identity(&stream)
++        .and_then(|server_peer| {
++            let connection_nonce = codex_app_server_transport::native_connection_nonce(
++                request
++                    .headers()
++                    .get_all(codex_app_server_transport::NATIVE_CONNECTION_NONCE_HEADER)
++                    .iter()
++                    .map(|v| v.as_bytes()),
++            )?;
++            Some(codex_app_server_transport::NativeLocalConnection {
++                connection_nonce,
++                server_peer,
++            })
++        });
+     let websocket_config = remote_websocket_config();
+     let stream = timeout(
+         CONNECT_TIMEOUT,
+@@ -831,7 +873,7 @@
+         ))
+     })?;
+ 
+-    Ok((endpoint, stream))
++    Ok((endpoint, stream, native_connection))
+ }
+ 
+ fn websocket_request(url: &str) -> Result<Request, TungsteniteError> {
+@@ -1095,6 +1137,7 @@
+             pending_events: VecDeque::new(),
+             metadata: RemoteServerMetadata::default(),
+             worker_handle,
++            native_connection: None,
+         };
+ 
+         client
+@@ -1107,3 +1150,27 @@
+             .expect("an in-flight event must not abort the worker during shutdown");
+     }
+ }
++
++#[cfg(all(test, feature = "autoapprove-native-inventory", target_os = "macos"))]
++mod native_connection_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn native_connection_handle_disappears_when_its_worker_closes() {
++        let (tx, rx) = mpsc::channel(1);
++        let observation = codex_app_server_transport::NativeLocalConnection {
++            connection_nonce: "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
++            server_peer: codex_app_server_transport::native_current_process_identity().unwrap(),
++        };
++        let handle = RemoteAppServerRequestHandle {
++            command_tx: tx,
++            native_connection: Some(observation.clone()),
++        };
++        let cloned = handle.clone();
++        assert_eq!(handle.native_local_connection(), Some(&observation));
++        assert_eq!(cloned.native_local_connection(), Some(&observation));
++        drop(rx);
++        assert!(handle.native_local_connection().is_none());
++        assert!(cloned.native_local_connection().is_none());
++    }
++}
+--- a/tui/src/app_server_session.rs
++++ b/tui/src/app_server_session.rs
+@@ -532,6 +532,19 @@
+         }
+     }
+ 
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(crate) fn native_connection_observation(&self) -> Option<serde_json::Value> {
++        self.request_handle
++            .native_local_connection()
++            .map(|connection| {
++                serde_json::json!({
++                    "logicalBackendId": format!("{:?}", self.backend_id),
++                    "transport": connection,
++                    "ownershipVerified": false,
++                })
++            })
++    }
++
+     pub(crate) fn backend_id(&self) -> crate::backend_id::BackendId {
+         self.backend_id
+     }
+--- a/tui/src/app/backend_sessions.rs
++++ b/tui/src/app/backend_sessions.rs
+@@ -107,6 +107,24 @@
+ 
+     pub(super) fn displayed_owner(&self) -> BackendId {
+         self.session_at(self.displayed).backend_id()
++    }
++
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(super) fn autoapprove_observations(&self) -> Vec<serde_json::Value> {
++        self.entries
++            .iter()
++            .enumerate()
++            .map(|(index, entry)| {
++                serde_json::json!({
++                    "logicalBackendId": format!("{:?}", entry.session.backend_id()),
++                    "displayed": index == self.displayed.0,
++                    "listening": entry.listening,
++                    "pendingServerRequests": entry.pending_requests.len(),
++                    "connection": entry.session.native_connection_observation(),
++                    "ownershipVerified": false
++                })
++            })
++            .collect()
+     }
+ 
+     pub(super) fn picker_views(&self) -> Vec<AppServerSession> {
+--- /dev/null
++++ b/tui/src/native_input_hold.rs
+@@ -0,0 +1,522 @@
++//! Opt-in local terminal input hold. Existing accepted work keeps running.
++//! No complete ownership, task-stop or migration authority is asserted.
++use crate::app_event::AppEvent;
++use crate::app_event_sender::AppEventSender;
++use serde::Deserialize;
++use serde_json::{Value, json};
++use std::io;
++use std::os::unix::fs::{MetadataExt, PermissionsExt};
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex, Weak};
++use std::time::{Duration, Instant};
++use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
++use tokio::net::{UnixListener, UnixStream};
++use tokio::sync::oneshot;
++use tokio::task::{JoinHandle, JoinSet};
++
++const TTL: Duration = Duration::from_secs(30);
++
++#[derive(Debug)]
++pub(crate) struct InputHold {
++    id: String,
++    deadline: Mutex<Instant>,
++    cancelled: AtomicBool,
++    installed: AtomicBool,
++}
++impl InputHold {
++    fn new(ttl: Duration) -> Self {
++        Self {
++            id: uuid::Uuid::now_v7().to_string(),
++            deadline: Mutex::new(Instant::now() + ttl),
++            cancelled: AtomicBool::new(false),
++            installed: AtomicBool::new(false),
++        }
++    }
++    pub(crate) fn install(&self) -> bool {
++        if !self.active() {
++            return false;
++        }
++        self.installed.store(true, Ordering::Release);
++        if !self.active() {
++            self.finish();
++            return false;
++        }
++        true
++    }
++    pub(crate) fn installed(&self) -> bool {
++        self.installed.load(Ordering::Acquire)
++    }
++    pub(crate) fn finish(&self) {
++        self.installed.store(false, Ordering::Release);
++    }
++    async fn uninstalled(&self) {
++        while self.installed() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    }
++    pub(crate) fn active(&self) -> bool {
++        !self.cancelled.load(Ordering::Acquire)
++            && self
++                .deadline
++                .lock()
++                .is_ok_and(|deadline| Instant::now() < *deadline)
++    }
++    pub(crate) fn cancel(&self) {
++        self.cancelled.store(true, Ordering::Release);
++    }
++    pub(crate) async fn ended(&self) {
++        while self.active() {
++            tokio::time::sleep(Duration::from_millis(50)).await;
++        }
++    }
++    fn remaining(&self) -> Duration {
++        if self.cancelled.load(Ordering::Acquire) {
++            return Duration::ZERO;
++        }
++        self.deadline
++            .lock()
++            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
++            .unwrap_or_default()
++    }
++    fn renew(&self, ttl: Duration) -> bool {
++        let Ok(mut deadline) = self.deadline.lock() else {
++            return false;
++        };
++        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= *deadline {
++            return false;
++        }
++        *deadline = Instant::now() + ttl;
++        true
++    }
++}
++struct Owner(Arc<InputHold>);
++impl Drop for Owner {
++    fn drop(&mut self) {
++        self.0.cancel();
++    }
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct Request {
++    op: String,
++    nonce: String,
++    generation: Option<String>,
++    lease_id: Option<String>,
++}
++
++pub(crate) struct InputHoldServer {
++    task: JoinHandle<()>,
++    path: PathBuf,
++    identity: (u64, u64),
++    active: Arc<Mutex<Weak<InputHold>>>,
++}
++impl Drop for InputHoldServer {
++    fn drop(&mut self) {
++        if let Ok(active) = self.active.lock()
++            && let Some(hold) = active.upgrade()
++        {
++            hold.cancel();
++        }
++        self.task.abort();
++        if let Ok(info) = std::fs::symlink_metadata(&self.path)
++            && (info.dev(), info.ino()) == self.identity
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++pub(crate) fn start(events: AppEventSender) -> io::Result<Option<InputHoldServer>> {
++    let Some(path) = std::env::var_os("AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET") else {
++        return Ok(None);
++    };
++    start_at(PathBuf::from(path), events, TTL).map(Some)
++}
++fn start_at(path: PathBuf, events: AppEventSender, ttl: Duration) -> io::Result<InputHoldServer> {
++    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
++    let info = std::fs::symlink_metadata(parent)?;
++    if !path.is_absolute()
++        || !info.is_dir()
++        || info.uid() != unsafe { libc::geteuid() }
++        || info.mode() & 0o077 != 0
++        || path.as_os_str().as_encoded_bytes().len() > 100
++    {
++        return Err(io::ErrorKind::PermissionDenied.into());
++    }
++    let listener = UnixListener::bind(&path)?;
++    let info = std::fs::symlink_metadata(&path)?;
++    let identity = (info.dev(), info.ino());
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let generation = uuid::Uuid::now_v7().to_string();
++    let active = Arc::new(Mutex::new(Weak::<InputHold>::new()));
++    let server_active = active.clone();
++    let task = tokio::spawn(async move {
++        let mut sessions = JoinSet::new();
++        loop {
++            tokio::select! {
++                accepted = listener.accept() => {
++                    let Ok((stream, _)) = accepted else { break; };
++                    if sessions.len() >= 4 { continue; }
++                    let Ok(peer) = stream.peer_cred() else { continue; };
++                    if peer.uid() != unsafe { libc::geteuid() } { continue; }
++                    let (events, generation, active) = (events.clone(), generation.clone(), active.clone());
++                    sessions.spawn(async move { let _ = session(stream, events, generation, active, ttl).await; });
++                }
++                _ = sessions.join_next(), if !sessions.is_empty() => {}
++            }
++        }
++    });
++    Ok(InputHoldServer {
++        task,
++        path,
++        identity,
++        active: server_active,
++    })
++}
++async fn request(
++    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
++    timeout: Duration,
++) -> io::Result<Request> {
++    let mut line = String::new();
++    tokio::time::timeout(timeout, (&mut *reader).take(2049).read_line(&mut line))
++        .await
++        .map_err(|_| io::ErrorKind::TimedOut)??;
++    if line.len() > 2048 || !line.ends_with('\n') {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    let request: Request = serde_json::from_str(&line)?;
++    if request.nonce.len() != 32 || !request.nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    Ok(request)
++}
++async fn send(
++    writer: &mut tokio::net::unix::OwnedWriteHalf,
++    value: Value,
++    timeout: Duration,
++) -> io::Result<()> {
++    let mut bytes = serde_json::to_vec(&value)?;
++    if bytes.len() > 65536 {
++        return Err(io::ErrorKind::InvalidData.into());
++    }
++    bytes.push(b'\n');
++    tokio::time::timeout(
++        timeout.min(Duration::from_secs(2)),
++        writer.write_all(&bytes),
++    )
++    .await
++    .map_err(|_| io::ErrorKind::TimedOut)??;
++    Ok(())
++}
++fn response(request: &Request, generation: &str, owner: Option<&Owner>) -> Value {
++    let held = owner.is_some_and(|owner| owner.0.active());
++    json!({"schemaVersion":1,"producer":"autoapprove-native-tui-input-hold","pid":std::process::id(),
++        "nonce":request.nonce,"generation":generation,"leaseId":owner.map(|owner| &owner.0.id),
++        "leaseActive":held,"terminalInputBlocked":owner.is_some_and(|owner| owner.0.installed()),"leaseTTLMillis":owner.filter(|_| held).map(|owner| owner.0.remaining().as_millis() as u64).unwrap_or(0),
++        "acceptedWorkStopped":false,"membershipComplete":false,"migrationAuthorized":false})
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    const NONCE: &str = "0123456789abcdef0123456789abcdef";
++    async fn exchange(client: &mut BufReader<UnixStream>, value: Value) -> anyhow::Result<Value> {
++        let mut bytes = serde_json::to_vec(&value)?;
++        bytes.push(b'\n');
++        client.get_mut().write_all(&bytes).await?;
++        read_reply(client).await
++    }
++    async fn read_reply(client: &mut BufReader<UnixStream>) -> anyhow::Result<Value> {
++        let mut line = String::new();
++        tokio::time::timeout(Duration::from_secs(3), client.read_line(&mut line)).await??;
++        Ok(serde_json::from_str(&line)?)
++    }
++    fn fixture(
++        ttl: Duration,
++    ) -> anyhow::Result<(
++        tempfile::TempDir,
++        InputHoldServer,
++        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++    )> {
++        let root = tempfile::tempdir_in("/private/tmp")?;
++        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;
++        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
++        let server = start_at(root.path().join("hold.sock"), AppEventSender::new(tx), ttl)?;
++        Ok((root, server, rx))
++    }
++    async fn inspect(root: &std::path::Path) -> anyhow::Result<(BufReader<UnixStream>, String)> {
++        let mut client = BufReader::new(UnixStream::connect(root.join("hold.sock")).await?);
++        let value = exchange(&mut client, json!({"op":"inspect","nonce":NONCE})).await?;
++        assert_eq!(value["terminalInputBlocked"], false);
++        Ok((client, value["generation"].as_str().unwrap().to_owned()))
++    }
++    async fn begin(
++        client: &mut BufReader<UnixStream>,
++        generation: &str,
++        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++    ) -> anyhow::Result<Arc<InputHold>> {
++        let mut bytes =
++            serde_json::to_vec(&json!({"op":"pause","nonce":NONCE,"generation":generation}))?;
++        bytes.push(b'\n');
++        client.get_mut().write_all(&bytes).await?;
++        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
++            .await?
++            .unwrap();
++        let AppEvent::AutoapproveInputHold { hold, reply } = event else {
++            panic!("unexpected event")
++        };
++        // No pause acknowledgment exists until the event loop installs the gate.
++        let mut line = String::new();
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), client.read_line(&mut line))
++                .await
++                .is_err()
++        );
++        assert!(hold.install());
++        reply.send(true).unwrap();
++        let value = read_reply(client).await?;
++        assert_eq!(value["terminalInputBlocked"], true);
++        assert_eq!(value["migrationAuthorized"], false);
++        assert_eq!(value["leaseId"], hold.id);
++        Ok(hold)
++    }
++    async fn wait_released(hold: &InputHold) -> anyhow::Result<()> {
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while hold.active() {
++                tokio::time::sleep(Duration::from_millis(5)).await;
++            }
++        })
++        .await?;
++        Ok(())
++    }
++    #[tokio::test]
++    async fn native_hold_requires_event_loop_ack_and_explicit_release() -> anyhow::Result<()> {
++        let (root, _server, mut rx) = fixture(TTL)?;
++        let (mut client, generation) = inspect(root.path()).await?;
++        let hold = begin(&mut client, &generation, &mut rx).await?;
++        let cleanup = async {
++            wait_released(&hold).await.unwrap();
++            assert!(hold.installed());
++            tokio::time::sleep(Duration::from_millis(20)).await;
++            hold.finish();
++        };
++        let (result, ()) = tokio::join!(
++            exchange(
++                &mut client,
++                json!({"op":"release","nonce":NONCE,"generation":generation,"leaseId":hold.id}),
++            ),
++            cleanup
++        );
++        let result = result?;
++        assert_eq!(result["terminalInputBlocked"], false);
++        assert!(!hold.active());
++        Ok(())
++    }
++    #[tokio::test]
++    async fn native_hold_disconnect_and_server_drop_release_synchronously() -> anyhow::Result<()> {
++        let (root, server, mut rx) = fixture(TTL)?;
++        let (mut client, generation) = inspect(root.path()).await?;
++        let hold = begin(&mut client, &generation, &mut rx).await?;
++        drop(client);
++        wait_released(&hold).await?;
++        let (mut client, generation) = inspect(root.path()).await?;
++        let next = begin(&mut client, &generation, &mut rx).await?;
++        drop(server);
++        assert!(!next.active());
++        assert!(!root.path().join("hold.sock").exists());
++        Ok(())
++    }
++    #[tokio::test]
++    async fn native_hold_expiry_cannot_be_renewed_or_replayed() -> anyhow::Result<()> {
++        let (root, _server, mut rx) = fixture(Duration::from_millis(500))?;
++        let (mut client, generation) = inspect(root.path()).await?;
++        let hold = begin(&mut client, &generation, &mut rx).await?;
++        wait_released(&hold).await?;
++        assert!(!hold.renew(TTL));
++        assert!(!hold.active());
++        Ok(())
++    }
++    #[tokio::test]
++    async fn native_hold_wrong_identity_and_competing_client_cannot_take_owner()
++    -> anyhow::Result<()> {
++        let (root, _server, mut rx) = fixture(TTL)?;
++        let (mut client, generation) = inspect(root.path()).await?;
++        let hold = begin(&mut client, &generation, &mut rx).await?;
++        let (mut other, generation) = inspect(root.path()).await?;
++        assert!(
++            exchange(
++                &mut other,
++                json!({"op":"pause","nonce":NONCE,"generation":generation})
++            )
++            .await
++            .is_err()
++        );
++        assert!(hold.active());
++        assert!(rx.try_recv().is_err());
++        assert!(
++            exchange(
++                &mut client,
++                json!({"op":"renew","nonce":NONCE,"generation":generation,"leaseId":"wrong"})
++            )
++            .await
++            .is_err()
++        );
++        wait_released(&hold).await?;
++        let (mut other, _) = inspect(root.path()).await?;
++        assert!(
++            exchange(
++                &mut other,
++                json!({"op":"pause","nonce":NONCE,"generation":"wrong"})
++            )
++            .await
++            .is_err()
++        );
++        assert!(rx.try_recv().is_err());
++        Ok(())
++    }
++    #[tokio::test]
++    async fn native_hold_disconnected_pending_ack_cannot_later_install_live_hold()
++    -> anyhow::Result<()> {
++        let (root, _server, mut rx) = fixture(TTL)?;
++        let (mut client, generation) = inspect(root.path()).await?;
++        client
++            .get_mut()
++            .write_all(
++                format!(
++                    "{{\"op\":\"pause\",\"nonce\":\"{NONCE}\",\"generation\":\"{generation}\"}}\n"
++                )
++                .as_bytes(),
++            )
++            .await?;
++        let AppEvent::AutoapproveInputHold { hold, reply } = rx.recv().await.unwrap() else {
++            panic!("unexpected event")
++        };
++        drop(client);
++        wait_released(&hold).await?;
++        assert!(reply.send(true).is_err());
++        assert!(!hold.active());
++        Ok(())
++    }
++    #[tokio::test]
++    async fn native_hold_cancel_does_not_remove_the_gate_before_event_loop_drain() {
++        let hold = InputHold::new(TTL);
++        assert!(hold.install());
++        hold.cancel();
++        assert!(!hold.active());
++        assert!(hold.installed());
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), hold.uninstalled())
++                .await
++                .is_err()
++        );
++        hold.finish();
++        hold.uninstalled().await;
++        assert!(!hold.installed());
++        assert!(!hold.install());
++    }
++    #[tokio::test]
++    async fn native_hold_private_path_and_replacement_are_preserved() -> anyhow::Result<()> {
++        let (root, server, _rx) = fixture(TTL)?;
++        let path = root.path().join("hold.sock");
++        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
++        assert!(start_at(path.clone(), AppEventSender::new(tx), TTL).is_err());
++        assert_eq!(std::fs::symlink_metadata(&path)?.mode() & 0o777, 0o600);
++        std::fs::remove_file(&path)?;
++        std::fs::write(&path, b"replacement")?;
++        drop(server);
++        assert_eq!(std::fs::read(&path)?, b"replacement");
++        Ok(())
++    }
++}
++async fn session(
++    stream: UnixStream,
++    events: AppEventSender,
++    generation: String,
++    active: Arc<Mutex<Weak<InputHold>>>,
++    ttl: Duration,
++) -> io::Result<()> {
++    let (read, mut write) = stream.into_split();
++    let mut reader = BufReader::new(read);
++    let mut owner: Option<Owner> = None;
++    loop {
++        let limit = owner
++            .as_ref()
++            .map(|owner| owner.0.remaining())
++            .unwrap_or(Duration::from_secs(2));
++        if limit.is_zero() {
++            return Err(io::ErrorKind::TimedOut.into());
++        }
++        let request = request(&mut reader, limit).await?;
++        if let Some(owner) = &owner
++            && !owner.0.active()
++        {
++            return Err(io::ErrorKind::TimedOut.into());
++        }
++        if request.op == "inspect" && owner.is_none() && request.lease_id.is_none() {
++            send(&mut write, response(&request, &generation, None), limit).await?;
++            continue;
++        }
++        if request.generation.as_deref() != Some(&generation) {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
++        if request.op == "pause" && owner.is_none() && request.lease_id.is_none() {
++            let hold = Arc::new(InputHold::new(ttl));
++            {
++                let mut current = active.lock().map_err(|_| io::ErrorKind::Other)?;
++                if current.upgrade().is_some_and(|held| held.active()) {
++                    return Err(io::ErrorKind::WouldBlock.into());
++                }
++                *current = Arc::downgrade(&hold);
++            }
++            owner = Some(Owner(hold.clone()));
++            let (reply, received) = oneshot::channel();
++            events
++                .app_event_tx
++                .send(AppEvent::AutoapproveInputHold { hold, reply })
++                .map_err(|_| io::ErrorKind::BrokenPipe)?;
++            let attached = tokio::select! {
++                result = tokio::time::timeout(Duration::from_secs(2), received) => result.ok().and_then(Result::ok).unwrap_or(false),
++                _ = reader.fill_buf() => false
++            };
++            if !attached || !owner.as_ref().unwrap().0.active() {
++                return Err(io::ErrorKind::Interrupted.into());
++            }
++        } else {
++            let Some(current) = &owner else {
++                return Err(io::ErrorKind::InvalidInput.into());
++            };
++            if request.lease_id.as_deref() != Some(&current.0.id) {
++                return Err(io::ErrorKind::InvalidInput.into());
++            }
++            match request.op.as_str() {
++                "status" => {}
++                "renew" if current.0.renew(ttl) => {}
++                "release" => {
++                    current.0.cancel();
++                    tokio::time::timeout(Duration::from_secs(2), current.0.uninstalled())
++                        .await
++                        .map_err(|_| io::ErrorKind::TimedOut)?;
++                }
++                _ => return Err(io::ErrorKind::InvalidInput.into()),
++            }
++        }
++        let remaining = owner
++            .as_ref()
++            .map(|owner| owner.0.remaining())
++            .unwrap_or(limit);
++        send(
++            &mut write,
++            response(&request, &generation, owner.as_ref()),
++            if request.op == "release" {
++                Duration::from_secs(2)
++            } else {
++                remaining
++            },
++        )
++        .await?;
++        if request.op == "release" {
++            return Ok(());
++        }
++    }
++}

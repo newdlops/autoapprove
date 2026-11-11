@@ -5,11 +5,13 @@ import net from 'node:net';
 import path from 'node:path';
 import {mkdtemp,mkdir,writeFile,readFile,copyFile,chmod,stat,rm,realpath,cp} from 'node:fs/promises';
 import {spawn,execFileSync,execFile} from 'node:child_process';
-import {createHash} from 'node:crypto';
+import {createHash,randomBytes} from 'node:crypto';
 import {promisify} from 'node:util';
 import {createRequire} from 'node:module';
 const option=n=>process.argv.find(v=>v.startsWith('--'+n+'='))?.slice(n.length+3);
 const managedControl=process.argv.includes('--managed-control');
+const selectedAdmission=process.argv.includes('--selected-admission');
+assert.ok(!selectedAdmission||managedControl,'Selected admission requires --managed-control');
 const daemonPackage=option('daemon-package'),execFileAsync=promisify(execFile);
 assert.ok(!daemonPackage||!process.argv.includes('--app-server-binary'),'Daemon test requires the complete CLI');
 const completePackage=process.argv.includes('--complete-package');
@@ -19,6 +21,27 @@ const require=createRequire(import.meta.url),{ws:WS}=require(path.join(path.dirn
 const root=await mkdtemp('/private/tmp/aa-child-goal-'),home=root+'/home',socket=home+'/app-server-control/app-server-control.sock';
 const pending=new Map(),streams=new Set();let processChild,ws,seq=0,childID,rootID,childTurnID,posts=0,stderr='';
 let daemonBinary,daemonEnvironment,daemonAttempted=false,daemonVerified=false;
+let selectedClient,selectedGeneration,selectedLease,selectedBuffer='',selectedPending;
+async function selectedCall(op,extra={}){
+ const nonce=randomBytes(16).toString('hex');
+ const request={op,nonce,...extra,...(selectedGeneration?{serverGeneration:selectedGeneration}:{}),...(selectedLease?{leaseId:selectedLease}:{})};
+ return new Promise((resolve,reject)=>{
+  assert.equal(selectedPending,undefined);
+  const timer=setTimeout(()=>{selectedPending=undefined;reject(Error('Selected lease timeout: '+op));selectedClient.destroy();},5000);
+  selectedPending={resolve:value=>{clearTimeout(timer);selectedPending=undefined;try{assert.equal(value.nonce,nonce);assert.equal(value.error,undefined);resolve(value);}catch(e){reject(e);}},reject:error=>{clearTimeout(timer);selectedPending=undefined;reject(error);}};
+  selectedClient.write(JSON.stringify(request)+'\n');
+ });
+}
+async function holdSelected(){
+ selectedClient=net.connect(root+'/selected.sock');
+ selectedClient.on('data',bytes=>{selectedBuffer+=bytes;assert.ok(selectedBuffer.length<65536);let split;while((split=selectedBuffer.indexOf('\n'))>=0){const line=selectedBuffer.slice(0,split);selectedBuffer=selectedBuffer.slice(split+1);selectedPending?.resolve(JSON.parse(line));}});
+ selectedClient.on('error',error=>selectedPending?.reject(error));
+ await new Promise((resolve,reject)=>{selectedClient.once('connect',resolve);selectedClient.once('error',reject);});
+ selectedGeneration=(await selectedCall('inspect')).serverGeneration;
+ const held=await selectedCall('pause',{threadIds:[rootID,childID]});selectedLease=held.leaseId;
+ assert.equal(held.inputAdmissionPaused,true);assert.equal(held.migrationAuthorized,false);
+ assert.deepEqual(new Set(held.threadIds),new Set([rootID,childID]));
+}
 const sha256=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function daemonCommand(action){
  const {stdout}=await execFileAsync(daemonBinary,['app-server','daemon',action],{cwd:root,env:daemonEnvironment,timeout:30000,maxBuffer:1024*1024});
@@ -59,6 +82,7 @@ try {
  await writeFile(home+'/config.toml',`model="fixture-model"\nmodel_provider="fixture"\napproval_policy="never"\nsandbox_mode="read-only"\ncheck_for_update_on_startup=false\ncli_auth_credentials_store="file"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:${api.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n[features]\nmulti_agent_v2=true\ngoals=true\n[analytics]\nenabled=false\n`);
  const binary=root+'/owned-goal-server';await copyFile(option('codex'),binary);await chmod(binary,0o700);
  const env={HOME:root,CODEX_HOME:home,PATH:'/usr/bin:/bin',NO_COLOR:'1',HTTP_PROXY:'http://127.0.0.1:9',HTTPS_PROXY:'http://127.0.0.1:9',NO_PROXY:'127.0.0.1,localhost'};
+ if(selectedAdmission)env.AUTOAPPROVE_SELECTED_TRANSITION_SOCKET=root+'/selected.sock';
  if(daemonPackage){
   // Assemble only fixture package files. Never use or change the source home,
   // daemon settings, auth, or selected release. The real installer copies this
@@ -131,6 +155,12 @@ try {
   assert.equal(paused.goal.objective,before.objective);assert.equal(paused.goal.tokenBudget,before.tokenBudget);
   assert.ok(paused.goal.tokensUsed>=before.tokensUsed);assert.ok(paused.goal.timeUsedSeconds>=before.timeUsedSeconds);
   await assert.rejects(()=>control(initial.identity,'pause'),e=>e.code===-32600);
+  if(selectedAdmission){
+   await holdSelected();
+   const heldGoal=await inspect();
+   await assert.rejects(()=>control(heldGoal.identity,'resume'),e=>e.code===-32600&&/input was not accepted/.test(e.message));
+   const unchanged=await inspect();assert.deepEqual(unchanged,heldGoal);
+  }
   // Goal continuation is paused first; the existing exact-turn interrupt then
   // stops in-flight work. No new user turn is injected into the child.
   const pausedTurnID=childTurnID;
@@ -139,6 +169,11 @@ try {
   await until(async()=> (await rpc('thread/read',{threadId:childID,includeTurns:false})).thread.status.type==='idle','paused child idle');
   const atRest=await inspect(),postsAtRest=posts;
   assert.equal(atRest.goal.status,'paused');await wait(1200);assert.equal(posts,postsAtRest,'Paused Goal must not autonomously start another turn');
+  if(selectedAdmission){
+   assert.equal((await selectedCall('status')).inputAdmissionPaused,true);
+   assert.deepEqual(await inspect(),atRest,'Held child Goal identity/accounting must stay unchanged while idle');
+   assert.equal((await selectedCall('release')).inputAdmissionPaused,false);selectedClient.end();
+  }
   const swiftRest=swiftInitial?await swiftGoal('read'):undefined;
   const swiftResumed=swiftRest?await swiftGoal('resume',swiftRest):undefined;
   const resumed=swiftResumed?{goal:swiftResumed.goal,goalId:swiftResumed.goal.instanceID}:await control(atRest.identity,'resume');assert.equal(resumed.goal.status,'active');
@@ -147,11 +182,12 @@ try {
   const after=await inspect();assert.equal(after.identity.goalId,originalGoalID);assert.equal(after.goal.objective,before.objective);assert.equal(after.goal.tokenBudget,before.tokenBudget);
   assert.ok(after.goal.tokensUsed>=atRest.goal.tokensUsed);assert.ok(after.goal.timeUsedSeconds>=atRest.goal.timeUsedSeconds);
   assert.deepEqual((await rpc('thread/turns/list',{threadId:rootID,limit:10,itemsView:'notLoaded',sortDirection:'desc'})).data.map(t=>t.id),parentBefore);
-  console.log(JSON.stringify({verified:true,realV2Child:true,pausedAndResumed:true,swiftTransportVerified:Boolean(swiftInitial),managedDaemonVerified:daemonVerified,completePackageVerified:completePackage&&daemonVerified,goalIdentityAndBudgetRetained:true,accountingMonotonic:true,parentTurnsUnchanged:true,staleIdentityRejected:true,ordinaryDirectInputStillRejected:true,existingSessionsTouched:false}));
+  console.log(JSON.stringify({verified:true,realV2Child:true,pausedAndResumed:true,selectedAdmissionVerified:selectedAdmission,swiftTransportVerified:Boolean(swiftInitial),managedDaemonVerified:daemonVerified,completePackageVerified:completePackage&&daemonVerified,goalIdentityAndBudgetRetained:true,accountingMonotonic:true,parentTurnsUnchanged:true,staleIdentityRejected:true,ordinaryDirectInputStillRejected:true,existingSessionsTouched:false}));
  }
  else if(process.argv.includes('--expect-rejection')){assert.equal(rejected?.code,-32600);assert.match(rejected.message,/direct app-server input is not allowed/);console.log(JSON.stringify({verified:true,originalDefectReproduced:true,realV2Child:true,activeGoal:true,managedDaemonVerified:daemonVerified,existingSessionsTouched:false}));}
  else {assert.equal(rejected,undefined,rejected?.message);assert.equal(goalIdentity(),originalGoalID);console.log(JSON.stringify({verified:true,realV2Child:true,pausedWithoutDirectTurnInput:true,goalIdentityAndBudgetRetained:true,existingSessionsTouched:false}));}
 } finally {
+ selectedClient?.destroy();
  for(const request of pending.values())request.reject(Error('Owned fixture closed'));pending.clear();
  for(const res of streams)res.destroy();ws?.terminate();
  if(processChild&&processChild.exitCode===null){const done=new Promise(r=>processChild.once('exit',r));processChild.kill('SIGTERM');const timer=setTimeout(()=>processChild.kill('SIGKILL'),3000);await done;clearTimeout(timer);}

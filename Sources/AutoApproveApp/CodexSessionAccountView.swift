@@ -90,10 +90,19 @@ struct CodexSessionAccountContent:View {
                 if loading {ProgressView().controlSize(.small).accessibilityLabel("연결 계정 확인 중")}
             }
             if let account {
+                Label(account.loginGroupName ?? "기존 Codex 홈",systemImage:"folder")
+                    .font(.caption).foregroundStyle(.secondary).help(account.target.home)
+                    .accessibilityLabel("로그인 그룹: \(account.loginGroupName ?? "기존 Codex 홈")")
+                    .fixedSize(horizontal:false,vertical:true)
                 Text(account.identity.email ?? account.identity.provider).textSelection(.enabled)
                     .fixedSize(horizontal:false,vertical:true)
                 Text([account.identity.provider,account.identity.plan,account.individual ? "열린 세션 1개":"\(account.sharedSessions)개 세션 공유"].compactMap{$0}.joined(separator:" · "))
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                if let server=account.serverPID,server>0 {
+                    Text("연결 서버 · Codex app-server (PID \(String(server)))")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        .fixedSize(horizontal:false,vertical:true)
+                }
                 ViewThatFits(in:.horizontal) {
                     HStack {buttons(account)}
                     VStack(alignment:.leading,spacing:8){buttons(account)}

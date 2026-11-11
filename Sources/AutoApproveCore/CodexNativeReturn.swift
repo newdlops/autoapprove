@@ -50,7 +50,7 @@ final class CodexNativeReturn {
     }
     private func validate(_ plan:CodexNativeReturnPlan,goal:CodexGoalReturnState,record:CodexMigrationJournalRecord)throws {
         guard plan.rootID==goal.source.threadID,plan.server.home==goal.backup.retirement.goal.sourceHome,
-              plan.server.homeIdentity==goal.backup.retirement.goal.homeIdentity,plan.server.cliVersion=="0.166.0",
+              plan.server.homeIdentity==goal.backup.retirement.goal.homeIdentity,["0.166.0","0.167.1"].contains(plan.server.cliVersion),
               !plan.server.serverID.isEmpty,plan.server.serverID.utf8.count<=1024,
               plan.server.accountDigest.map(hash) ?? true,
               !plan.threads.isEmpty,plan.threads.count<=512,Set(plan.threads.map(\.id)).count==plan.threads.count,

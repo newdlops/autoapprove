@@ -501,6 +501,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
 @main struct CheckRunner {
     @MainActor static func main() async {
         if WorkingDirectoryFixture.runIfRequested() { return }
+#if DEBUG
+        if await NativeConnectionProbe.runIfRequested() { return }
+#endif
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
             ("Computer Use: identical permissions after brief real work",tests.testComputerUseSamePermissionAfterFastConfirmedTransition),
@@ -1233,6 +1236,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         ]
 #if DEBUG
         cases.insert(contentsOf: [
+            ("Native observation: private socket kernel and alias protections",tests.testNativeObservationReadsOwnedPrivateSocketAndRejectsAliases),
+            ("Native observation: oversized reply is bounded",tests.testNativeObservationBoundsOversizedResponse),
+            ("Native observation: cancellation closes pending read",tests.testNativeObservationCancellationClosesPendingRead),
+            ("Native observation: one whole read deadline",tests.testNativeObservationUsesOneWholeReadDeadline),
+            ("Native terminal hold: exact peer lease and drained release",tests.testNativeTerminalInputHoldRejectsWrongIdentityAndEarlyRelease),
+            ("Native connection: kernel witness and exact displayed association",tests.testNativeConnectionReadsKernelWitnessAndExactAssociation),
+            ("Native connection: stale proxy duplicate and authority claim rejection",tests.testNativeConnectionRejectsStaleProxyDuplicateAndAuthorityClaims),
             ("Session migration: exact selected cohort reserves without changing ownership",tests.testSessionMigrationPreparesExactCohortWithoutChangingOwnership),
             ("Session migration: shared writers and incomplete child membership reject",tests.testSessionMigrationRejectsSharedWritersAndIncompleteChildren),
             ("Session migration: drafts questions queues and independent work reject",tests.testSessionMigrationRejectsDraftQuestionQueueAndIndependentWork),

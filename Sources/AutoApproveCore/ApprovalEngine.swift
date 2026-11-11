@@ -6543,6 +6543,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")}
         let targets=try await codexLoginTargets()
         guard let target=targets.first(where:{$0.witnesses.contains(where:{$0.pid==session.pid && $0.started==session.started && $0.tty==session.tty})}) else {throw AppError.message(codexAttachmentWaitReasons[sessionID].map{"이 세션은 아직 독립 실행 중입니다. "+$0} ?? "이 세션의 실제 연결 서버를 확인하지 못했습니다.")}
+        let groupName=try await codexLoginGroups().first(where:{$0.home==target.home})?.name
         let (identity,server)=try await CodexServerAccountIdentity.read(home:target.home)
         let connected=await Task.detached(priority:.utility) {
             target.witnesses.filter{CodexServerLocation.connectedHome(pid:$0.pid,hints:[target.home],peerPID:server)==target.home}
@@ -6550,7 +6551,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !Task.isCancelled,!remoteInputStopped,let current=sessions[sessionID],current.pid==session.pid,current.started==session.started,current.phase != .ended,
               connected.contains(where:{$0.pid==session.pid && $0.started==session.started}) else {throw AppError.message("계정 조회 중 세션 연결이 바뀌었습니다. 다시 확인해주세요.")}
         var verified=target;verified.witnesses=connected
-        return .init(sessionID:sessionID,target:verified,identity:identity,sharedSessions:connected.count)
+        return .init(sessionID:sessionID,target:verified,identity:identity,sharedSessions:connected.count,loginGroupName:groupName,serverPID:server)
     }
     public func checkCodexAccountTransitions() async {
         guard codexAccountCheckTask==nil,!codexAccountTransitionBusy else{return}

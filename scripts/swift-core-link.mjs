@@ -9,7 +9,9 @@ export async function coreLinkArguments(build) {
   }
   return ['-I', path.resolve('Sources/CPTY/include'), '-I', path.join(build, 'CTTYInput.build'),
     '-I', path.join(build, 'CLocalDashboard.build'),
+    '-I', path.join(build, 'CNativePeer.build'), '-lbsm',
     ...await objects(path.join(build, 'CPTY.build')), ...await objects(path.join(build, 'CTTYInput.build')),
+    ...await objects(path.join(build, 'CNativePeer.build')),
     ...await objects(path.join(build, 'CLocalDashboard.build')),
     ...await objects(path.join(build, 'TerminalInputSupport.build'))];
 }

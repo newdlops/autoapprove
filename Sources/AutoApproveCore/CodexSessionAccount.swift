@@ -40,8 +40,11 @@ public struct CodexSessionAccount: Equatable, Sendable {
     public var target:CodexAccountTransitionTarget
     public var identity:CodexServerAccountIdentity
     public var sharedSessions:Int
-    public init(sessionID:String,target:CodexAccountTransitionTarget,identity:CodexServerAccountIdentity,sharedSessions:Int) {
+    public var loginGroupName:String?
+    public var serverPID:Int32?
+    public init(sessionID:String,target:CodexAccountTransitionTarget,identity:CodexServerAccountIdentity,sharedSessions:Int,loginGroupName:String?=nil,serverPID:Int32?=nil) {
         self.sessionID=sessionID;self.target=target;self.identity=identity;self.sharedSessions=sharedSessions
+        self.loginGroupName=loginGroupName;self.serverPID=serverPID
     }
     public var individual:Bool {sharedSessions==1}
 }

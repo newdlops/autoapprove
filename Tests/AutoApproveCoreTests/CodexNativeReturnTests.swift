@@ -8,7 +8,7 @@ private final class NativeReturnFixture {
     var observation:CodexNativeReturnObservation
     var unarchives=0,resumes=0
     var loseUnarchive=false,loseResume=false,dropBeforeResume=false,hideSettings=false,hideHistory=false
-    init(unchangedHistory:Bool=false)throws {
+    init(unchangedHistory:Bool=false,cliVersion:String="0.166.0")throws {
         f=try GoalReturnFixture()
         let goals=CodexGoalReturn(journal:f.journal)
         _=try goals.prepare(backup:f.backup,source:f.source(),expectedRevision:1);_=try goals.apply(id:f.backup.requestID)
@@ -19,7 +19,7 @@ private final class NativeReturnFixture {
         _=try history.prepare(id:f.backup.requestID,source:source);_=try history.apply(id:f.backup.requestID)
         let old=f.backup.retirement
         let archive=try CodexMigrationRolloutWitness.capture(home:old.goal.sourceHome,homeIdentity:old.goal.homeIdentity,relative:old.rollout.relativePath)
-        let server=CodexNativeReturnServer(home:old.goal.sourceHome,homeIdentity:old.goal.homeIdentity,serverID:"owned-server-generation",cliVersion:"0.166.0")
+        let server=CodexNativeReturnServer(home:old.goal.sourceHome,homeIdentity:old.goal.homeIdentity,serverID:"owned-server-generation",cliVersion:cliVersion)
         let thread=CodexNativeReturnThread(source:source,archive:archive,sessionRelativePath:"sessions/rollout-"+f.thread+".jsonl",historyDigest:String(repeating:"a",count:64),settingsDigest:String(repeating:"b",count:64),previousOwner:f.owner)
         plan = .init(rootID:f.thread,server:server,threads:[thread])
         observation = .init(server:server,affectedIDs:[f.thread],completeScope:true,threads:[.init(id:f.thread,relativePath:archive.relativePath,archived:true,loaded:false)])
@@ -66,7 +66,8 @@ private extension GoalReturnFixture {
 }
 extension ApprovalTests {
     func testNativeReturnCommitsOnlyAfterHistorySettingsAndLoadVerification()throws {
-        let f=try NativeReturnFixture(),engine=f.engine(),id=f.f.backup.requestID
+        for version in ["0.166.0","0.167.1"] {
+        let f=try NativeReturnFixture(cliVersion:version),engine=f.engine(),id=f.f.backup.requestID
         _=try engine.prepare(id:id,plan:f.plan)
         try expectThrows(engine.commit(id:id))
         try expectEqual(try engine.advance(id:id).phase,.resumePrepared)
@@ -77,6 +78,12 @@ extension ApprovalTests {
         try expectEqual(try f.f.journal.owner(threadID:f.f.thread)?.home.path,f.plan.server.home)
         try expectEqual(try engine.state(id:id).phase,.completed)
         try expectThrows(engine.advance(id:id));try expectThrows(engine.commit(id:id))
+        }
+        for version in ["0.167.0","0.167.2","0.168.0"] {
+            let f=try NativeReturnFixture(cliVersion:version)
+            try expectThrows(f.engine().prepare(id:f.f.backup.requestID,plan:f.plan))
+            try expectEqual(f.unarchives,0);try expectEqual(f.resumes,0)
+        }
     }
     func testNativeReturnLostAcknowledgmentsReconcileWithoutReplaying()throws {
         let f=try NativeReturnFixture(),engine=f.engine(),id=f.f.backup.requestID

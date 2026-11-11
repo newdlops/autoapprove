@@ -1,0 +1,253 @@
+{
+  "format": 1,
+  "kind": "source-only-experiment",
+  "baselineRelease": "codex-0.167.1-autoapprove-managed1",
+  "upstreamCommit": "0a94398fa60c4fac0e7659e4213a0a36e613dd46",
+  "releaseReady": false,
+  "migrationAuthorized": false,
+  "files": [
+    {
+      "path": "app-server/Cargo.toml",
+      "before": "31330479d6efb279fe2f5a1d5a195651a5cb1d941138a0940ab18c3b081b96fc",
+      "after": "efe7c91e869ca9c60ddf55130be1e989e1149125d6bcf51143be8d2cbf935822"
+    },
+    {
+      "path": "app-server/src/lib.rs",
+      "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
+      "after": "9daea9f648ea9a26619c4dc97b283a663817a2307c05be2ca5f09685cd5279f3"
+    },
+    {
+      "path": "app-server/src/turn_admission.rs",
+      "before": "b6549e17e25a56c1768d6bfd77e7e6df18838261e50a5c70e95b46d215e0c5ec",
+      "after": "383be48518a4c911bdfdf4a7d1f576799c58084dd23cf3c7ed0af48be6cae4c3"
+    },
+    {
+      "path": "app-server/src/selected_admission_tests.rs",
+      "before": null,
+      "after": "cc7434aafc59170127a51c1374f13aa22da27ead655fd483aa82816fe7a48b27"
+    },
+    {
+      "path": "app-server/src/selected_transition.rs",
+      "before": null,
+      "after": "79512a183fb426e84ed2f158ae116f5cbb40a306b1eb57c330ecbf5f079d4b7a"
+    },
+    {
+      "path": "app-server/src/message_processor.rs",
+      "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
+      "after": "a6a63df25d5cbffdfa326c61881a4b92a3cd4edf1922d2e7eb10109f00c3895d"
+    },
+    {
+      "path": "ext/extension-api/src/turn_admission.rs",
+      "before": "cbff3a2b374b68b5e0cd459ef6a7152806c41ba86b6411e1883e362dd35dc79d",
+      "after": "b09e6e8a3ba7ae6612dc1d4d2349d224f9e1303d91781ea106904583b14cd535"
+    },
+    {
+      "path": "ext/extension-api/src/registry.rs",
+      "before": "aed4e287533a1a5a7d9cf04a0978bf9018a1818f72b683de1d8ed466a60dae7a",
+      "after": "5b5a9d6892090c7cdd111d97b48fb79274be4bba5664d3e2a8d1555319679068"
+    },
+    {
+      "path": "core/src/session/turn_input.rs",
+      "before": "ca92430590dff971718ae9d9d6220e904e0695e0f7e41ff04508dfd898fcb92f",
+      "after": "0875e760762fe2d38e8d1a604685eba32c16b31a768c3025f04f256106629c49"
+    },
+    {
+      "path": "core/src/session/turn_input_tests.rs",
+      "before": "1c29fe9893dbc3af5c0588783163fdc78c1ac1ed03e60feff234f6e966e05fef",
+      "after": "1fb743725d2ac3eacb4d9ae73f54fc3d404161fdb0ab22091c463d6ddd8b0e2c"
+    },
+    {
+      "path": "tui/Cargo.toml",
+      "before": "1eb18f1181bf947cee297f229517e66f687f491cb7068979fc20f60b476b4ca8",
+      "after": "6a2aebdb80b4a83bac58f4f99aa1d2eb19e1f3ddc9b5c49dab13e7a152ba8c8d"
+    },
+    {
+      "path": "tui/src/lib.rs",
+      "before": "1273443044cb0a130f550029e7f833b1068c35a2c1d7a0ccf4fad552fcf0ac46",
+      "after": "aca80830bae55ec7c9ddd5c488ef43818a636355f6bf55078a1e1d7476eff3bd"
+    },
+    {
+      "path": "tui/src/app.rs",
+      "before": "73f9e01e25cd745ce7a405d49f2cc55f91a6d3ee9e5b1948fbe43e1bdb432b99",
+      "after": "e16cf5cae906025ad75e26bacdd83e40f70f9aafb4bece476d7aecbe739a2012"
+    },
+    {
+      "path": "tui/src/app_event.rs",
+      "before": "ffeafee18ca843195141535ac7040f6ff18fc8b987038570e75acc0eb60a48fc",
+      "after": "caae1681402c470af1abc42510291bef2dba1c94dc63ac5ec272e040eaf77cc6"
+    },
+    {
+      "path": "tui/src/app/startup.rs",
+      "before": "fbbedd6664ddb1df28fa49ac055bac130b1c7996815ead701fecddcbd41565cf",
+      "after": "3917e1bd8deb54b1499f920beee39a5dd5643fdcd06e22f553d2251776d5bf7c"
+    },
+    {
+      "path": "tui/src/app/event_dispatch.rs",
+      "before": "51ad6b4665a4d72ff82baeef3ab92255c8ec1c3e33403a9370709fc7bd958e20",
+      "after": "20e0c5ab5919ff1b06d330bb39a43b962933fe44f191443b9d77f0b34e59a22c"
+    },
+    {
+      "path": "tui/src/app/agent_navigation.rs",
+      "before": "c691c55fc6bc6f8d040328f0459ba03ca4acf9db5babc8b72cbd4182d99cd8c8",
+      "after": "dbfaf71f80c47d133ba7358576e43ce222cc74aa9d74448d4446ab652dbb7258"
+    },
+    {
+      "path": "tui/src/chatwidget/user_messages.rs",
+      "before": "c40598bc5a0443da1a0c84e181a1e50bd29ac2f6a445208309a3c8dc6dcef9ce",
+      "after": "4afc1e2d78ac715b79d6a4a070b2daed75acab80a84f875dd7cc31b831a175d3"
+    },
+    {
+      "path": "tui/src/native_inventory.rs",
+      "before": null,
+      "after": "28f5c64cf73d774dbd00ac8d7199adb6a86a4c38b6b386c4ec042be2e78ad24d"
+    },
+    {
+      "path": "tui/src/app/native_inventory.rs",
+      "before": null,
+      "after": "a965f3ca345edde0322bd3febc363cc1e147d1be4fe7c8ef154fd2a4c07d906a"
+    },
+    {
+      "path": "app-server/src/thread_state.rs",
+      "before": "f9f51519080faba0be7cd6a1fe39f3818a5326db0fe77ee360f23f225c6a7111",
+      "after": "8f006e9b1e9135f9f771aea8acec8bf5df4da3f0f367bae2af4e5d54ded885bc"
+    },
+    {
+      "path": "app-server/src/native_inventory.rs",
+      "before": null,
+      "after": "abc6eaaf26930adafcd1b6888def0b49dbe6444a8acf052f88329ae17bb083cb"
+    },
+    {
+      "path": "app-server/src/native_inventory_transport.rs",
+      "before": null,
+      "after": "b3622a3bbea952e3ea522d14e7ded28be689f86e38354d2208b7a95bcf2a095f"
+    },
+    {
+      "path": "app-server/src/transport.rs",
+      "before": "5b4cb5599deae1af2153976fee7586be3f87df53a2e2816f2011bddf638bda06",
+      "after": "49ef18ecbd1c02bb8da7350bec60a7a044ab7722015df557ac62effccd14cadf"
+    },
+    {
+      "path": "uds/src/lib.rs",
+      "before": "a6c126e70fc54ce15e5508819bfa6b5b7d0b13274be20e5a6c13261056bc19be",
+      "after": "66b37a199317135a213ea4c489d8351dba40d6328381331db455228258d82217"
+    },
+    {
+      "path": "app-server-client/Cargo.toml",
+      "before": "9f941218c5bc7932bf1d675cbea2715820a563a41e5d871dd45207e1c285ba3e",
+      "after": "0eefdbcc4e450e9b6a1f4f1fb653edd4b9f1155814861f3594a482dd1e9ee49d"
+    },
+    {
+      "path": "app-server-client/src/lib.rs",
+      "before": "3ab3d894c169989ba9319fb4c7fb9daf09a9de53a2ff80b739ff38abde0f2f75",
+      "after": "2a86235c347f5d1a6ccd7f5cd5056de24a49780282482cebdb65bbd658660432"
+    },
+    {
+      "path": "app-server-transport/Cargo.toml",
+      "before": "90e2b999c62733e9de5cc7d0e2c20757751ef417889330ce910c4294ddf0fd59",
+      "after": "ba306d8ef48b1e3ee1a72e9000280349bf37ba1a24527dfb3e5bcbb63c3c7114"
+    },
+    {
+      "path": "app-server-transport/src/lib.rs",
+      "before": "748b9972623b8aeaca5dfd95540591edd27213b38c98662f250672153e9877c1",
+      "after": "ff47e92af880726e4c9aa668d050da7b4d5de8b0b510234da6246ad9b4b67ede"
+    },
+    {
+      "path": "app-server-transport/src/native_peer.rs",
+      "before": null,
+      "after": "9cd7283466d4e0539ef386b7316dec1bd919d75dec6beff680edd7ec07fd0af8"
+    },
+    {
+      "path": "app-server-transport/src/transport/mod.rs",
+      "before": "4592c67d84ebd276133f47d29c63327de8d945b30a89b64a59868db30546caf1",
+      "after": "cdce46f1aa53213cc1fdeaa6125540c6de6f96b0f48ff287b4372b640eff3162"
+    },
+    {
+      "path": "app-server-transport/src/transport/unix_socket.rs",
+      "before": "a2ff08a28cb52c8a11895bb4cff41401180fb0efd0491984b77af381e7efafe3",
+      "after": "eff797aa302d1d99e5ffae604c950d335ec3a5a12a2ecc43bb1acebd7e74ecc2"
+    },
+    {
+      "path": "app-server-transport/src/transport/unix_socket_tests.rs",
+      "before": "7665be7cadd9a6f309620674fd2f39a61c6c4fc22d6fbfe719c575dc5af89ec5",
+      "after": "56214cc1ebdcb402c5d42a631cc8603f59b9da5329ae685e6f8585e557a7a9c2"
+    },
+    {
+      "path": "app-server-transport/src/transport/websocket.rs",
+      "before": "c9d2b13f46e34e3cabb8783f6d50073015ce388d748fdf5e9af57f323a24a860",
+      "after": "149a93b81f736e1f4d04571975dab1bb00f4c08e59f590c80888c4b56585daa0"
+    },
+    {
+      "path": "app-server-transport/src/transport/remote_control/client_tracker.rs",
+      "before": "eb962402dfa0dcd44de5f433ecb91db44ae2f07077e6680c38bb077e24ae874e",
+      "after": "cae24e806b94480ee1f720ad6ca2738afb97192de1f99330cce7e132cf9e43ab"
+    },
+    {
+      "path": "tui/src/app/session_lifecycle.rs",
+      "before": "7b706ce2f7e2096c122f1e6dd35078019f342c6c617dc4509acfd37dfaa19ce9",
+      "after": "ee7d5439c468d8987e01aa68eeacfd8140f24dd4147c9d752269b62c2ed46867"
+    },
+    {
+      "path": "tui/src/app/tests.rs",
+      "before": "325b26803cc7864a281e83db3c758202e7b20f7577cd72369340cb419dbc5d6d",
+      "after": "4145a6cf6b6728e9c9e6648218b2cc9d547c5b9e0d6e26db65d3d10f963977a4"
+    },
+    {
+      "path": "app-server-client/src/remote.rs",
+      "before": "60e1c05e70e4e4085ca3cd596980c24a08b4028757c0dc26a61ce87dd205e214",
+      "after": "9314a53a9525197f08f56b2a0c8af382877deb245f001d355990d3a39185f4a0"
+    },
+    {
+      "path": "tui/src/app_server_session.rs",
+      "before": "5a62e29f5b20a81194a24c796a233194478b6a2a7af27c15168233054f7e3e4b",
+      "after": "78f473ec159dc300bab4dc3258e80771a094eacb32c401c94ac2e55e736df4ad"
+    },
+    {
+      "path": "tui/src/app/backend_sessions.rs",
+      "before": "c181f816ca1de2292b87ca1fcb6bdaf8d9436762c43580903d517e6ac134d5fb",
+      "after": "3eb9975198ddec3e237c8e8295e27efb0003e0523bd6136e54d873fa5e648e42"
+    },
+    {
+      "path": "tui/src/native_input_hold.rs",
+      "before": null,
+      "after": "75057d3193d8c789b0a9cbb8779824cb9359587e5c648a31a189d3f4c7608ec8"
+    }
+  ],
+  "patchSHA256": "c10271e0ad004073a0995d86b7e553841206e0defe1b41e1e273b5e0e5a7ddbb",
+  "verification": {
+    "selectedAppServerAndAdjacentUnitTests": 23,
+    "coreInputPreservationUnitTests": 2,
+    "twoHomeLiveAdmission": true,
+    "liveQueueAndPausedGoal": true,
+    "liveV2ChildGoalSelectedAdmission": true,
+    "tuiObservationCompileAndTests": "Initial15passed including4native; newly applied peer extension test pending",
+    "verifiedBinaryBeforeTuiObservationSHA256": "96e2e20db4f42394be5f568c00e8fabab541c77826154bdc0cb975a6ad428748",
+    "serverPeerObservation": "server14,transport1,TUI23filters and selected21regression passed; counts include adjacent tests",
+    "tuiParkedDraftResume": "Targeted resume regression and actual two-peer PTY direct /resume at120x36 and80x24 passed",
+    "standaloneNativeObservation": "Real kernel-peer/subscriber correlation, offscreen draft, return repaint and original4session preservation passed; full census/admission/migration false",
+    "connectionNonceObservation": "Both shutdown pattern and debug test constructor fields fixed; native test94023 still compiling",
+    "native40": {
+      "status": "2 retention tests passed",
+      "handle": null
+    },
+    "native41": {
+      "status": "31 native TUI tests passed including7 hold; actual dualTUI direct bothsizes and proxy-negative passed",
+      "liveVerified": true,
+      "terminalSizes": [
+        "120x36",
+        "80x24"
+      ],
+      "actualSwiftControl": true,
+      "bufferedInputAndUnfinishedPasteNotReplayed": true,
+      "originalActiveSessionsPreserved": 4,
+      "completeCensus": false,
+      "migrationVerified": false
+    }
+  },
+  "remaining": [
+    "complete retained-thread ownership and stable client/cohort census",
+    "production private endpoint discovery and scoped native migration control",
+    "cross-home execution integration with child/Goal/history preservation and original-home return",
+    "group and destination app-server picker with actual move actions",
+    "final full CLI/app packaging, source commit, published release assets/checksums, download and installed-version verification"
+  ]
+}

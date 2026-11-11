@@ -8,7 +8,7 @@ import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const cli=process.env.AUTOAPPROVE_CODEX_BIN;
 assert.ok(cli&&path.isAbsolute(cli),'Set AUTOAPPROVE_CODEX_BIN to a native installed CLI');
-const probeVersion=process.argv.includes('--probe-0.167')?'0.167.0':'0.166.0';
+const probeVersion=process.argv.includes('--probe-0.167.1')?'0.167.1':process.argv.includes('--probe-0.167')?'0.167.0':'0.166.0';
 const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.equal(version,'codex-cli '+probeVersion,'The owned probe must match its explicit native version');
 const restoreGoal=process.argv.includes('--restore-goal');
 const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
@@ -18,7 +18,7 @@ const checkSettings=process.argv.includes('--check-settings');
 const checkRetirement=process.argv.includes('--check-retirement');
 const returnCleared=process.argv.includes('--return-cleared-goal');
 const crashNativeAcks=process.argv.includes('--crash-native-acks');
-assert.ok(probeVersion==='0.166.0'||!returnOriginal,'The native return coordinator is still pinned to 0.166.0; the 0.167 probe does not bypass its version contract');
+assert.ok(['0.166.0','0.167.1'].includes(probeVersion)||!returnOriginal,'The native return coordinator requires an explicitly supported exact version');
 assert.ok(!crashNativeAcks || returnOriginal&&checkRetirement);
 assert.ok(!returnCleared || returnOriginal&&checkRetirement);
 assert.ok(!checkClearedSlot || restoreGoal);
@@ -188,7 +188,7 @@ try{
        const thread=(await c.request('thread/read',{threadId:id,includeTurns:true})).thread;
        const loadedIDs=(await c.request('thread/loaded/list',{limit:100})).data;
        assert.equal(c.alive(),true);
-       result={serverID:c.identity,thread,loadedIDs,ownedCompleteScope:true,settingsAcknowledgment:nativeResumeResult??null};
+       result={serverID:c.identity,cliVersion:probeVersion,thread,loadedIDs,ownedCompleteScope:true,settingsAcknowledgment:nativeResumeResult??null};
       }else{
        assert.ok(['thread/unarchive','thread/resume'].includes(message.method));
        nativeCounts[message.method]++;
@@ -205,7 +205,7 @@ try{
     const timer=setTimeout(()=>helper.kill('SIGTERM'),90000);
     helper.once('error',problem=>{clearTimeout(timer);reject(problem);});
     helper.once('exit',code=>{clearTimeout(timer);if(error)return reject(error);if(code===52&&crashNativeAcks)return resolve({restart:true});if(code!==0||!final)return reject(Error(stderr||'Owned native restoration bridge failed'));resolve(final);});
-    send({serverID:c.identity,sessionRelativePath:relative,history:expectedReturnTurns,settings:resumed});
+    send({serverID:c.identity,cliVersion:probeVersion,sessionRelativePath:relative,history:expectedReturnTurns,settings:resumed});
    });
    for(let attempt=0;attempt<3;attempt++){
     nativeRestoreResult=await nativeAttempt();

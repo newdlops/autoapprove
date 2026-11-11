@@ -15,8 +15,9 @@ let package = Package(
         .target(name: "CPTY", exclude: ["vendor/libvterm/LICENSE", "vendor/libvterm/UPSTREAM.md"], cSettings: [.headerSearchPath("vendor/libvterm/include"), .headerSearchPath("vendor/libvterm/src")]),
         .target(name: "CTTYInput"),
         .target(name: "CLocalDashboard"),
+        .target(name: "CNativePeer", linkerSettings: [.linkedLibrary("bsm")]),
         .target(name: "TerminalInputSupport", dependencies: ["CTTYInput"]),
-        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "TerminalInputSupport"], resources: [.copy("Resources/RemoteWeb"), .copy("Resources/CloudflareRelay")]),
+        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "CNativePeer", "TerminalInputSupport"], resources: [.copy("Resources/RemoteWeb"), .copy("Resources/CloudflareRelay")]),
         .executableTarget(name: "AutoApproveApp", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveCLI", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveChecks", dependencies: ["AutoApproveCore"], path: "Tests/AutoApproveCoreTests", swiftSettings: [.unsafeFlags(["-parse-as-library"]), .unsafeFlags(["-Onone"], .when(configuration: .release))])

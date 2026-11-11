@@ -44,7 +44,8 @@ enum NativeReturnBridge {
     static func run(_ args:[String])throws {
         guard args.count==5,args[2].hasPrefix("/private/tmp/aa-cross-home-"),args[3].hasPrefix("/private/tmp/aa-cross-home-") else{throw AppError.message("Owned native restoration homes required")}
         let lines=Lines(),context=try lines.read(),sourceHome=args[2],destinationHome=args[3],threadID=args[4]
-        guard let serverID=context["serverID"] as? String,let relative=context["sessionRelativePath"] as? String,
+        guard let serverID=context["serverID"] as? String,let cliVersion=context["cliVersion"] as? String,
+              ["0.166.0","0.167.1"].contains(cliVersion),let relative=context["sessionRelativePath"] as? String,
               let history=context["history"] as? [Any],let sourceSettings=context["settings"] as? JSONObject else{throw AppError.message("Owned native context missing")}
         let store=try AuditStore(path:URL(fileURLWithPath:sourceHome).deletingLastPathComponent().appendingPathComponent("retirement-audit.sqlite").path)
         let journal=try CodexMigrationJournal(store:store)
@@ -55,20 +56,20 @@ enum NativeReturnBridge {
         let old=goal.backup.retirement
         let plan:CodexNativeReturnPlan
         if let saved=goal.nativeRestore?.plan {
-            guard saved.server.serverID==serverID,saved.rootID==threadID,saved.server.home==destinationHome,
+            guard saved.server.serverID==serverID,saved.server.cliVersion==cliVersion,saved.rootID==threadID,saved.server.home==destinationHome,
                   saved.threads.count==1,saved.threads[0].source==source,saved.threads[0].sessionRelativePath==relative,
                   saved.threads[0].historyDigest == (try digest(history)),saved.threads[0].settingsDigest == (try settings(sourceSettings)) else{throw AppError.message("Owned restart context changed")}
             plan=saved
         }else{
             let archive=try CodexMigrationRolloutWitness.capture(home:destinationHome,homeIdentity:old.goal.homeIdentity,relative:old.rollout.relativePath)
-            let identity=CodexNativeReturnServer(home:destinationHome,homeIdentity:old.goal.homeIdentity,serverID:serverID,cliVersion:"0.166.0")
+            let identity=CodexNativeReturnServer(home:destinationHome,homeIdentity:old.goal.homeIdentity,serverID:serverID,cliVersion:cliVersion)
             let entry=CodexNativeReturnThread(source:source,archive:archive,sessionRelativePath:relative,historyDigest:try digest(history),settingsDigest:try settings(sourceSettings),previousOwner:goal.backup.currentOwner)
             plan = .init(rootID:threadID,server:identity,threads:[entry])
         }
         var acknowledgedSettings:[String:String]=[:],unarchives=0,resumes=0
         let services=CodexNativeReturnServices(observe:{plan in
             let raw=try lines.rpc("owned/observe",["threadId":threadID])
-            guard let actualServer=raw["serverID"] as? String,let thread=raw["thread"] as? JSONObject,
+            guard let actualServer=raw["serverID"] as? String,raw["cliVersion"] as? String==cliVersion,let thread=raw["thread"] as? JSONObject,
                   let path=thread["path"] as? String,path.hasPrefix(destinationHome+"/"),
                   let loaded=raw["loadedIDs"] as? [String] else{throw AppError.message("Owned native observation missing")}
             let relative=String(path.dropFirst(destinationHome.count+1)),isLoaded=loaded.contains(threadID)

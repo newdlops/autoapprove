@@ -33,21 +33,40 @@ parser.add_argument('--tui', required=True)
 parser.add_argument('--expected-node', required=True)
 parser.add_argument('--output', required=True)
 parser.add_argument('--server', help='Optional exact-version CLI for an owned shared Unix app-server')
+parser.add_argument('--app-server-binary', action='store_true', help='Use a standalone app-server for --server')
+parser.add_argument('--expected-version', choices=['0.166.0', '0.167.1'], default='0.166.0')
+parser.add_argument('--terminal-size', choices=['120x36', '80x24'], default='120x36')
 parser.add_argument('--navigation', action='store_true', help='Exercise owned offscreen unsubscribe and draft return')
 parser.add_argument('--return-via-resume', action='store_true', help='Regression check for the distinct direct /resume path')
 parser.add_argument('--peer-cli', help='Optional patched full CLI for a second owned TUI on the same root')
+parser.add_argument('--peer-is-tui', action='store_true', help='Use a standalone TUI for --peer-cli and resume through its UI')
 parser.add_argument('--server-inventory', action='store_true', help='Require the patched server native observation socket')
+parser.add_argument('--connection-binding', action='store_true', help='Correlate displayed native transport with its exact server connection')
+parser.add_argument('--swift-binding-helper', help='Run the application connection collector against each owned TUI/server pair')
+parser.add_argument('--retained-backends', action='store_true', help='Require event-loop backend and offscreen channel observations')
+parser.add_argument('--terminal-input-hold', action='store_true', help='Verify the owned TUI blocks physical input without changing drafts or its peer')
+parser.add_argument('--swift-input-hold-helper', help='Run the real application input-hold transport against the owned TUI')
 parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
 parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
 parser.add_argument('--admission', action='store_true', help='Verify separately enabled whole-server runtime-start lease')
 args = parser.parse_args()
+terminal_cols, terminal_rows = map(int, args.terminal_size.split('x'))
 assert not args.navigation or args.server, 'Navigation requires the owned shared server'
 assert not args.return_via_resume or args.navigation, 'Direct return requires navigation'
 assert not args.peer_cli or args.navigation, 'A shared peer requires the owned navigation test'
+assert not args.peer_is_tui or args.peer_cli, 'Standalone peer mode requires --peer-cli'
 assert not args.server_inventory or args.server, 'Server observation requires the owned server'
 assert not args.direct_server or args.server_inventory, 'Direct peer validation requires server inventory'
+assert not args.connection_binding or ((args.direct_server or args.expect_proxy_peer) and args.expected_version == '0.167.1'), 'Connection binding requires the direct or explicit proxy-negative 0.167.1 native server'
+assert not args.swift_binding_helper or args.connection_binding, 'Application collector requires connection binding checks'
+assert not args.retained_backends or args.connection_binding, 'Retained backend checks require connection binding'
+assert not args.terminal_input_hold or (args.retained_backends and args.direct_server and args.navigation), 'Terminal input hold requires the direct owned retained-backend navigation fixture'
+assert not args.swift_input_hold_helper or args.terminal_input_hold, 'Application input-hold transport requires terminal hold tests'
 assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
 assert not args.admission or (args.direct_server and args.navigation), 'Admission test requires direct native server binding and navigation'
+assert not args.app_server_binary or args.server, 'Standalone server mode requires --server'
+assert not args.admission or args.expected_version == '0.166.0', 'The old whole-server lease probe is only verified for 0.166.0'
+server_prefix = [] if args.app_server_binary else ['app-server']
 tui = pathlib.Path(args.tui).resolve(strict=True)
 assert tui.name == 'codex-tui', 'Only the explicitly built standalone test TUI is allowed'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -73,6 +92,7 @@ work.mkdir(mode=0o700)
 endpoint = fixture/'inventory.sock'
 server_endpoint = fixture/'server-inventory.sock'
 transition_endpoint = fixture/'transition.sock'
+input_hold_endpoint = fixture/'input-hold.sock'
 counts = {'inference': 0, 'externalBlocked': 0}
 admission_stream_stop = threading.Event()
 
@@ -169,6 +189,8 @@ env = {'HOME': str(fixture_home), 'CODEX_HOME': str(fixture_home), 'PATH': '/usr
        'AUTOAPPROVE_NATIVE_INVENTORY_SOCKET': str(endpoint),
        'HTTP_PROXY': f'http://127.0.0.1:{port}', 'HTTPS_PROXY': f'http://127.0.0.1:{port}',
        'NO_PROXY': '127.0.0.1,localhost'}
+if args.terminal_input_hold:
+    env['AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET'] = str(input_hold_endpoint)
 server = None
 server_log = None
 other_server = None
@@ -335,7 +357,8 @@ if args.server:
     server_path.chmod(0o700)
     version = subprocess.run([str(server_path), '--version'], env=env, cwd=work,
                              capture_output=True, timeout=10, check=True)
-    assert version.stdout.strip() == b'codex-cli 0.166.0'
+    expected_server_name = 'codex-app-server' if args.app_server_binary else 'codex-cli'
+    assert version.stdout.strip() == (expected_server_name+' '+args.expected_version).encode(), version.stdout
     control_socket.parent.mkdir(mode=0o700)
     server_log = (output/'owned-server-private.log').open('wb')
     server_env = dict(env)
@@ -343,7 +366,7 @@ if args.server:
         server_env['AUTOAPPROVE_NATIVE_SERVER_INVENTORY_SOCKET'] = str(server_endpoint)
     if args.admission:
         server_env['AUTOAPPROVE_NATIVE_TRANSITION_SOCKET'] = str(transition_endpoint)
-    server = subprocess.Popen([str(server_path), 'app-server', '--listen', 'unix://'+str(backend_socket)],
+    server = subprocess.Popen([str(server_path), *server_prefix, '--listen', 'unix://'+str(backend_socket)],
                               env=server_env, cwd=work, stdin=subprocess.DEVNULL,
                               stdout=server_log, stderr=server_log, start_new_session=True)
     deadline = time.monotonic()+15
@@ -371,7 +394,7 @@ if pid == 0:
     mode = [] if server else ['--no-daemon']
     os.execve(str(tui), [str(tui), *mode, '--no-alt-screen', '--sandbox', 'read-only',
                         '--ask-for-approval', 'never', '-C', str(work)], env)
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols, 0, 0))
 os.set_blocking(fd, False)
 done = threading.Event()
 captured = bytearray()
@@ -437,7 +460,7 @@ def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-t
     with socket.socket(socket.AF_UNIX) as stream:
         stream.settimeout(3)
         stream.connect(str(own_endpoint))
-        if args.direct_server:
+        if args.direct_server or args.connection_binding:
             kernel = kernel_socket_identity(stream)
             assert kernel['pid'] == own_pid, 'Private endpoint belongs to a different native process'
             if own_pid in kernel_identities:
@@ -453,9 +476,21 @@ def inventory(own_endpoint=endpoint, own_pid=pid, producer='autoapprove-native-t
     value = json.loads(data)
     assert value['nonce'] == nonce and value['pid'] == own_pid and value['schemaVersion'] == 1
     assert value['producer'] == producer
+    assert value['cliVersion'] == args.expected_version, 'Unexpected native observation version'
     assert value['membershipComplete'] is False and value['admissionGranted'] is False
-    if args.direct_server and producer == 'autoapprove-native-tui-prototype':
+    if (args.direct_server or args.connection_binding) and producer == 'autoapprove-native-tui-prototype':
         assert value['processIdentity'] == kernel, 'TUI self identity does not match its actual socket peer'
+    if args.retained_backends and producer == 'autoapprove-native-tui-prototype':
+        backends = value['retainedBackends']
+        assert len(backends) == 1, 'This owned fixture registers exactly one backend per TUI'
+        assert backends[0]['displayed'] is True and backends[0]['listening'] is True
+        assert backends[0]['ownershipVerified'] is False
+        assert backends[0]['connection'] == value['displayedBackend']
+        assert backends[0]['logicalBackendId'] == value['displayedBackend']['logicalBackendId']
+        channels = value['channelStates']
+        assert set(channels) == set(value['stores']['channels'])
+        assert all(type(row['readable']) is bool for row in channels.values())
+        assert all('input' not in row for row in channels.values() if not row['readable'])
     return value
 
 def original_sessions_unchanged():
@@ -514,6 +549,39 @@ def server_subscribers(root_id, expected_count):
                 actual_pids = {row['nativePeer']['pid'] for row in value['connections'] if row['connectionID'] in ids}
                 expected_pids = {pid, peer['pid']} if peer and expected_count == 2 else ({peer['pid']} if peer and expected_count == 1 else ({pid} if expected_count == 1 else set()))
                 assert actual_pids == expected_pids, 'Native subscriber peers did not match the owned clients'
+            if args.connection_binding:
+                expected_owners = {pid, peer['pid']} if peer and expected_count == 2 else ({peer['pid']} if peer and expected_count == 1 else ({pid} if expected_count == 1 else set()))
+                for owner in expected_owners:
+                    observed = inventory() if owner == pid else peer_inventory()
+                    assert observed['backendBindingComplete'] is False
+                    backend = observed['displayedBackend']
+                    assert backend and backend['logicalBackendId'] and backend['ownershipVerified'] is False
+                    transport = backend['transport']
+                    matches = [row for row in value['connections']
+                               if row['connectionID'] in ids
+                               and row['nativeConnectionNonce'] == transport['connectionNonce']]
+                    assert len(matches) == 1, 'Handshake nonce did not match exactly one real subscriber connection'
+                    matched = matches[0]
+                    if args.expect_proxy_peer:
+                        assert matched['nativePeer']['pid'] == os.getpid()
+                        assert transport['serverPeer'] == matched['nativePeer'], 'Client did not identify the actual owned proxy'
+                        assert matched['nativePeer'] != kernel_identities[owner], 'Proxy was falsely attributed to the TUI process'
+                        assert transport['serverPeer'] != kernel_identities[server.pid], 'Proxy was falsely attributed to the real backend'
+                    else:
+                        assert transport['serverPeer'] == kernel_identities[server.pid], 'Displayed backend belongs to another server process'
+                        assert matched['nativePeer'] == kernel_identities[owner], 'Displayed transport belongs to another client process'
+                    if args.swift_binding_helper:
+                        owner_endpoint = endpoint if owner == pid else peer['endpoint']
+                        checked = subprocess.run([args.swift_binding_helper, '--native-binding-observe',
+                                                  str(owner_endpoint), str(server_endpoint)],
+                                                 capture_output=True, text=True, timeout=5)
+                        check = json.loads(checked.stdout)
+                        assert checked.returncode == (1 if args.expect_proxy_peer else 0), checked.stderr
+                        assert check['verified'] is (not args.expect_proxy_peer)
+                        assert check['migrationAuthorized'] is False
+                        if not args.expect_proxy_peer:
+                            assert check['connectionID'] == matched['connectionID']
+                            assert check['tuiPID'] == owner and check['serverPID'] == server.pid
             return set(ids)
         time.sleep(.05)
     (output/'owned-server-inventory-mismatch.json').write_text(json.dumps(value, indent=2)+'\n')
@@ -523,17 +591,21 @@ def launch_peer(primary):
     peer_binary = fixture/'owned-inventory-cli'
     shutil.copyfile(pathlib.Path(args.peer_cli).resolve(strict=True), peer_binary)
     peer_binary.chmod(0o700)
-    version = subprocess.run([str(peer_binary), '--version'], env=env, cwd=work,
-                             capture_output=True, timeout=10, check=True)
-    assert version.stdout.strip() == b'codex-cli 0.166.0'
+    if not args.peer_is_tui:
+        version = subprocess.run([str(peer_binary), '--version'], env=env, cwd=work,
+                                 capture_output=True, timeout=10, check=True)
+        assert version.stdout.strip() == ('codex-cli '+args.expected_version).encode(), version.stdout
     peer_endpoint = fixture/'peer.sock'
     peer_env = dict(env, AUTOAPPROVE_NATIVE_INVENTORY_SOCKET=str(peer_endpoint))
+    if args.terminal_input_hold:
+        peer_env['AUTOAPPROVE_TUI_INPUT_HOLD_SOCKET'] = str(fixture/'peer-input-hold.sock')
     peer_pid, peer_fd = pty.fork()
     if peer_pid == 0:
         os.chdir(work)
+        resume_args = [] if args.peer_is_tui else ['resume', primary]
         os.execve(str(peer_binary), [str(peer_binary), '--no-alt-screen', '--sandbox', 'read-only',
-                                    '--ask-for-approval', 'never', '-C', str(work), 'resume', primary], peer_env)
-    fcntl.ioctl(peer_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
+                                    '--ask-for-approval', 'never', '-C', str(work), *resume_args], peer_env)
+    fcntl.ioctl(peer_fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols, 0, 0))
     os.set_blocking(peer_fd, False)
     value = {'pid': peer_pid, 'fd': peer_fd, 'endpoint': peer_endpoint, 'captured': bytearray(),
              'done': threading.Event(), 'lock': threading.Lock(), 'reaped': False}
@@ -565,6 +637,55 @@ def stop_owned_tui(own_pid, own_fd, own_done, own_reader, already_reaped):
     own_done.set()
     own_reader.join(timeout=1)
     os.close(own_fd)
+
+class TerminalInputHold:
+    def __init__(self):
+        self.stream = socket.socket(socket.AF_UNIX)
+        self.stream.settimeout(4)
+        self.stream.connect(str(input_hold_endpoint))
+        assert kernel_socket_identity(self.stream) == kernel_identities[pid]
+        self.generation = None
+        self.lease = None
+        self.generation = self.call('inspect')['generation']
+
+    def call(self, op):
+        nonce = secrets.token_hex(16)
+        request = {'op': op, 'nonce': nonce}
+        if self.generation:
+            request['generation'] = self.generation
+        if self.lease:
+            request['leaseId'] = self.lease
+        self.stream.sendall(json.dumps(request).encode()+b'\n')
+        data = bytearray()
+        while not data.endswith(b'\n'):
+            chunk = self.stream.recv(4096)
+            assert chunk, 'Terminal input hold closed before its acknowledgment'
+            data.extend(chunk)
+            assert len(data) <= 65536
+        value = json.loads(data)
+        assert value['nonce'] == nonce and value['pid'] == pid
+        assert value['producer'] == 'autoapprove-native-tui-input-hold'
+        assert value['migrationAuthorized'] is False and value['membershipComplete'] is False
+        assert value['acceptedWorkStopped'] is False
+        assert value['terminalInputBlocked'] is (op not in ('inspect', 'release'))
+        assert value['leaseActive'] is (op not in ('inspect', 'release'))
+        if self.generation:
+            assert value['generation'] == self.generation
+        if self.lease:
+            assert value['leaseId'] == self.lease
+        self.lease = value['leaseId']
+        return value
+
+    def close(self):
+        self.stream.close()
+
+def wait_terminal_input_ready():
+    deadline = time.monotonic()+4
+    while time.monotonic() < deadline:
+        if inventory()['terminalInputBlocked'] is False:
+            return
+        time.sleep(.05)
+    raise RuntimeError('Owned terminal input hold did not release')
 
 class AdmissionLease:
     def __init__(self):
@@ -619,7 +740,7 @@ def admission_probe():
     other_env.pop('AUTOAPPROVE_NATIVE_INVENTORY_SOCKET', None)
     other_socket = fixture/'other.sock'
     other_server_log = (output/'owned-other-server-private.log').open('wb')
-    other_server = subprocess.Popen([str(server_path), 'app-server', '--listen', 'unix://'+str(other_socket)],
+    other_server = subprocess.Popen([str(server_path), *server_prefix, '--listen', 'unix://'+str(other_socket)],
                                     env=other_env, cwd=work, stdin=subprocess.DEVNULL,
                                     stdout=other_server_log, stderr=other_server_log, start_new_session=True)
     deadline = time.monotonic()+15
@@ -775,6 +896,11 @@ try:
             original_sessions_unchanged()
             try:
                 peer_state = peer_inventory()
+                if args.peer_is_tui and not peer.get('resume_sent') and peer_state['stores']['primary'] and not peer_state['currentWidget']['hasActiveView']:
+                    os.write(peer['fd'], ('/resume '+first['stores']['primary'][0]).encode())
+                    time.sleep(.35)
+                    os.write(peer['fd'], b'\r')
+                    peer['resume_sent'] = True
                 if peer_state['stores']['primary'] == first['stores']['primary'] and not peer_state['currentWidget']['hasActiveView']:
                     break
             except OSError:
@@ -803,9 +929,129 @@ try:
         shared_identity(value['stores']['primary'])
         if peer:
             assert peer_inventory()['stores']['primary'] == first['stores']['primary']
+    if args.terminal_input_hold:
+        inference_before_hold = counts['inference']
+        for release_route in ('release', 'escape', 'disconnect'):
+            hold = TerminalInputHold()
+            try:
+                hold.call('pause')
+                assert inventory()['terminalInputBlocked'] is True
+                blocked = b'OWNED_BLOCKED_INPUT_NEVER_REPLAY'
+                os.write(fd, blocked+b'\r')
+                os.write(fd, b'\x1b[200~OWNED_BLOCKED_PASTE_NEVER_REPLAY\x1b[201~\r')
+                os.write(fd, b'\x1b[24~')
+                time.sleep(.3)
+                held = inventory()
+                assert held['terminalInputBlocked'] is True
+                assert held['stores']['primary'] == first['stores']['primary']
+                assert held['currentWidget']['hasDraft'] and not held['currentWidget']['hasActiveView']
+                assert counts['inference'] == inference_before_hold, 'Held terminal input reached inference'
+                if release_route == 'release':
+                    hold.call('renew')
+                    if peer:
+                        assert not peer_inventory()['currentWidget']['hasDraft']
+                        os.write(peer['fd'], b'OWNED_UNHELD_PEER_DRAFT')
+                        deadline = time.monotonic()+4
+                        while time.monotonic() < deadline:
+                            if peer_inventory()['currentWidget']['hasDraft']:
+                                break
+                            time.sleep(.05)
+                        else:
+                            raise RuntimeError('A held terminal incorrectly blocked the other owned TUI')
+                    with capture_lock:
+                        offset = len(captured)
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols-3, 0, 0))
+                    os.kill(pid, signal.SIGWINCH)
+                    time.sleep(.3)
+                    with capture_lock:
+                        held_frame = bytes(captured[offset:])
+                        (output/'owned-input-held-private.ansi').write_bytes(bytes(captured))
+                    visible = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', held_frame)
+                    assert draft in visible and blocked not in visible
+                    # No settling sleep: release must also discard raw/parsed typeahead.
+                    os.write(fd, b'OWNED_BLOCKED_TYPEAHEAD_AT_RELEASE\r')
+                    hold.call('release')
+                elif release_route == 'escape':
+                    os.write(fd, b'\x1b')
+                else:
+                    hold.close()
+                wait_terminal_input_ready()
+                time.sleep(.2)
+                assert counts['inference'] == inference_before_hold, 'Blocked input replayed after release'
+                ready = inventory()
+                assert ready['currentWidget']['hasDraft'] and not ready['currentWidget']['hasActiveView']
+            finally:
+                hold.close()
+        hold = TerminalInputHold()
+        try:
+            hold.call('pause')
+            os.write(fd, b'\x1b[200~OWNED_BLOCKED_UNFINISHED_PASTE')
+            release_result = []
+            def release_with_partial_paste():
+                try:
+                    release_result.append(hold.call('release'))
+                except BaseException as error:
+                    release_result.append(error)
+            release_worker = threading.Thread(target=release_with_partial_paste, daemon=True)
+            release_worker.start()
+            time.sleep(.2)
+            assert release_worker.is_alive(), 'Release acknowledged before the unfinished paste boundary was cleared'
+            os.write(fd, b'\x1b[201~\r')
+            release_worker.join(timeout=4)
+            assert not release_worker.is_alive() and len(release_result) == 1
+            assert not isinstance(release_result[0], BaseException), str(release_result[0])
+            wait_terminal_input_ready()
+            assert counts['inference'] == inference_before_hold, 'Unfinished held paste replayed after release'
+        finally:
+            hold.close()
+        if args.swift_input_hold_helper:
+            helper = subprocess.Popen([args.swift_input_hold_helper, '--native-terminal-input-hold',
+                                       str(endpoint), str(server_endpoint), str(input_hold_endpoint)],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            try:
+                assert select.select([helper.stdout], [], [], 5)[0], 'Application hold acknowledgment timed out'
+                paused = json.loads(helper.stdout.readline())
+                assert paused['paused'] is True and paused['migrationAuthorized'] is False
+                assert inventory()['terminalInputBlocked'] is True
+                os.write(fd, b'OWNED_BLOCKED_SWIFT_HOLD\r')
+                time.sleep(.15)
+                assert counts['inference'] == inference_before_hold
+                os.write(fd, b'OWNED_BLOCKED_SWIFT_RELEASE_TYPEAHEAD\r')
+                helper.stdin.write(b'release\n'); helper.stdin.flush()
+                assert select.select([helper.stdout], [], [], 5)[0], 'Application drained release acknowledgment timed out'
+                released = json.loads(helper.stdout.readline())
+                assert released['released'] is True and released['migrationAuthorized'] is False
+                assert helper.wait(timeout=5) == 0, helper.stderr.read(4096)
+                wait_terminal_input_ready()
+                assert counts['inference'] == inference_before_hold
+            finally:
+                if helper.poll() is None:
+                    helper.terminate()
+                    try:
+                        helper.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        helper.kill(); helper.wait()
+        # New explicit input must work after release; the ignored input remains gone.
+        os.write(fd, b'z')
+        time.sleep(.2)
+        with capture_lock:
+            offset = len(captured)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols-4, 0, 0))
+        os.kill(pid, signal.SIGWINCH)
+        time.sleep(.3)
+        with capture_lock:
+            fresh = bytes(captured[offset:])
+        visible = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', fresh)
+        assert draft+b'z' in visible, 'Explicit input did not return after releasing the hold'
+        assert b'OWNED_BLOCKED_' not in visible
+        os.write(fd, b'\x7f')
+        time.sleep(.2)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols, 0, 0))
+        os.kill(pid, signal.SIGWINCH)
+        original_sessions_unchanged()
     with capture_lock:
         offset = len(captured)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 119, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols-1, 0, 0))
     os.kill(pid, signal.SIGWINCH)
     time.sleep(.5)
     with capture_lock:
@@ -882,7 +1128,7 @@ try:
             raise RuntimeError('Owned original thread and draft did not return')
         with capture_lock:
             offset = len(captured)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 118, 0, 0))
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows, terminal_cols-2, 0, 0))
         os.kill(pid, signal.SIGWINCH)
         time.sleep(.5)
         with capture_lock:
@@ -903,7 +1149,7 @@ try:
         # before it: a draft-presence flag cannot prove exact input retention.
         with capture_lock:
             offset = len(captured)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 37, 119, 0, 0))
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', terminal_rows+1, terminal_cols-1, 0, 0))
         os.kill(pid, signal.SIGWINCH)
         time.sleep(.5)
         with capture_lock:
@@ -911,7 +1157,13 @@ try:
         repaint = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', repaint)
         assert draft in repaint, 'Native transition lost the exact owned unsent draft'
         admission_result['exactDraftPreservedAfterLease'] = True
+    with capture_lock:
+        (output/'owned-main-private.ansi').write_bytes(captured)
+    if peer:
+        with peer['lock']:
+            (output/'owned-peer-private.ansi').write_bytes(peer['captured'])
     result = {'verified': True, 'nativeTUIProducer': True, 'fixturePID': pid,
+              'terminalSize': args.terminal_size,
               'runtimeAdmissionProbe': admission_result,
               'originalSessions': len(before), 'preserved': len(before), 'fixtureExcludedFromController': True,
               'primaryIdentityPreserved': True, 'exactDraftPreservedOnFreshRepaint': True,
@@ -927,6 +1179,12 @@ try:
                   if args.server_inventory and args.navigation else None,
               'nativeServerPeerAttestationVerified': False,
               'ownedKernelPeerProcessBindingVerified': args.direct_server,
+              'displayedConnectionBindingVerified': args.connection_binding and args.direct_server,
+              'displayedConnectionBindingMismatchVerified': args.connection_binding and args.expect_proxy_peer,
+              'retainedBackendAndChannelObservationVerified': args.retained_backends,
+              'terminalInputHoldVerified': args.terminal_input_hold,
+              'applicationTerminalInputHoldVerified': bool(args.swift_input_hold_helper),
+              'applicationConnectionCollectorVerified': bool(args.swift_binding_helper),
               'proxyPeerMismatchVerified': args.expect_proxy_peer,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,
               'externalRequestsBlocked': counts['externalBlocked'], 'membershipComplete': False,
