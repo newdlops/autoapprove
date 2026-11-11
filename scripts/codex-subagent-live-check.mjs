@@ -12,7 +12,7 @@ const option=name=>process.argv.find(v=>v.startsWith('--'+name+'='))?.slice(name
 assert.ok(option('codex'),'Provide --codex=/absolute/native/codex');
 const require=createRequire(import.meta.url);
 const {ws:WS}=require(path.join(path.dirname(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright')),'../playwright-core/lib/utilsBundle.js'));
-const {Terminal}=require('../extensions/vscode/node_modules/@xterm/headless');
+const {Terminal}=require(process.env.AUTOAPPROVE_XTERM_HEADLESS_MODULE||'../extensions/vscode/node_modules/@xterm/headless');
 const root=await mkdtemp('/private/tmp/aa-live-approval-'),home=root+'/home',sock=home+'/app-server-control/app-server-control.sock';
 const terminal=new Terminal({cols:120,rows:40,allowProposedApi:true});
 let serverProcess,tui,ws,stderr='',sequence=0,posts=0,approval,completed=false,commandOutput='',releaseChild,childHeld=false;
@@ -23,7 +23,7 @@ const running=p=>p&&p.exitCode===null&&p.signalCode===null;
 const screen=()=>Array.from({length:terminal.rows},(_,i)=>terminal.buffer.active.getLine(terminal.buffer.active.viewportY+i)?.translateToString(true)||'').join('\n');
 const keys=value=>tui.stdin.write(JSON.stringify({keys:value})+'\n');
 terminal.onData(value=>{if(running(tui))keys(value);});
-async function until(check,label){for(let i=0;i<600;i++){if(await check())return;await delay(100);}throw Error('Timed out '+label+' '+stderr.slice(-600));}
+async function until(check,label){for(let i=0;i<600;i++){if(await check())return;await delay(100);}if(withTUI&&option('screen'))await writeFile(option('screen'),screen());throw Error('Timed out '+label+' '+stderr.slice(-600));}
 async function stop(p){if(!running(p))return;const closed=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');const timer=setTimeout(()=>p.kill('SIGKILL'),3000);await closed;clearTimeout(timer);}
 function rpc(method,params){return new Promise((resolve,reject)=>{const id=++sequence;pending.set(id,{resolve,reject});ws.send(JSON.stringify({id,method,params}));});}
 const api=http.createServer(async(req,res)=>{
@@ -67,7 +67,20 @@ try {
  }
  await rpc('turn/start',{threadId:thread,input:[{type:'text',text:'Perform the owned harmless fixture command.'}]});
  if(withTUI){
-  await until(()=>childHeld,'child model hold');await delay(1000);keys('\u001b[1;3C');
+  await until(()=>childHeld,'child model hold');
+  const children=[];
+  for(const id of (await rpc('thread/loaded/list',{})).data){if(id!==thread){const row=(await rpc('thread/read',{threadId:id,includeTurns:false})).thread;if(row.parentThreadId===thread)children.push(id);}}
+  assert.equal(children.length,1,'Fixture must own exactly one child');
+  // The explicit picker refreshes remote child metadata. An Alt+Right press
+  // can otherwise consult the empty navigation cache established at startup.
+  await until(()=>screen().includes('Ask Codex'),'parent ready for picker');
+  keys('/subagents');await delay(350);keys('\r');await until(()=>screen().includes('Subagents'),'child picker');
+  await until(()=>screen().includes(children[0])&&screen().includes(thread),'picker thread identities');
+  const pickerRows=screen().split('\n'),childRow=pickerRows.findIndex(line=>line.includes(children[0])),parentRow=pickerRows.findIndex(line=>line.includes(thread));
+  assert.notEqual(childRow,parentRow);
+  // This native picker is not searchable; select the adjacent child row from
+  // the initially selected parent instead of typing an ID into the terminal.
+  keys(childRow>parentRow?'\u001b[B':'\u001b[A');await delay(300);keys('\r');
   await until(()=>screen().includes('Viewing sub-agent'),'child navigation');keys('\u001b[1;3D');
   await until(()=>screen().includes('Main [default]'),'parent navigation');releaseChild();
  }

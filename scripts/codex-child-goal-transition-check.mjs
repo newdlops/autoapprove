@@ -3,15 +3,27 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
-import {mkdtemp,mkdir,writeFile,copyFile,chmod,stat,rm} from 'node:fs/promises';
-import {spawn,execFileSync} from 'node:child_process';
+import {mkdtemp,mkdir,writeFile,readFile,copyFile,chmod,stat,rm,realpath,cp} from 'node:fs/promises';
+import {spawn,execFileSync,execFile} from 'node:child_process';
+import {createHash} from 'node:crypto';
+import {promisify} from 'node:util';
 import {createRequire} from 'node:module';
 const option=n=>process.argv.find(v=>v.startsWith('--'+n+'='))?.slice(n.length+3);
 const managedControl=process.argv.includes('--managed-control');
+const daemonPackage=option('daemon-package'),execFileAsync=promisify(execFile);
+assert.ok(!daemonPackage||!process.argv.includes('--app-server-binary'),'Daemon test requires the complete CLI');
+const completePackage=process.argv.includes('--complete-package');
+assert.ok(!completePackage||daemonPackage,'Complete package check requires --daemon-package');
 assert.ok(option('codex'),'Provide --codex=/absolute/native/codex');
 const require=createRequire(import.meta.url),{ws:WS}=require(path.join(path.dirname(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright')),'../playwright-core/lib/utilsBundle.js'));
 const root=await mkdtemp('/private/tmp/aa-child-goal-'),home=root+'/home',socket=home+'/app-server-control/app-server-control.sock';
 const pending=new Map(),streams=new Set();let processChild,ws,seq=0,childID,rootID,childTurnID,posts=0,stderr='';
+let daemonBinary,daemonEnvironment,daemonAttempted=false,daemonVerified=false;
+const sha256=bytes=>createHash('sha256').update(bytes).digest('hex');
+async function daemonCommand(action){
+ const {stdout}=await execFileAsync(daemonBinary,['app-server','daemon',action],{cwd:root,env:daemonEnvironment,timeout:30000,maxBuffer:1024*1024});
+ return JSON.parse(stdout);
+}
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(test,label){for(let i=0;i<200;i++){if(await test())return;await wait(100);}throw Error('Owned fixture timeout: '+label+' '+stderr.slice(-300));}
 function rpc(method,params){return new Promise((resolve,reject)=>{
@@ -47,7 +59,39 @@ try {
  await writeFile(home+'/config.toml',`model="fixture-model"\nmodel_provider="fixture"\napproval_policy="never"\nsandbox_mode="read-only"\ncheck_for_update_on_startup=false\ncli_auth_credentials_store="file"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:${api.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n[features]\nmulti_agent_v2=true\ngoals=true\n[analytics]\nenabled=false\n`);
  const binary=root+'/owned-goal-server';await copyFile(option('codex'),binary);await chmod(binary,0o700);
  const env={HOME:root,CODEX_HOME:home,PATH:'/usr/bin:/bin',NO_COLOR:'1',HTTP_PROXY:'http://127.0.0.1:9',HTTPS_PROXY:'http://127.0.0.1:9',NO_PROXY:'127.0.0.1,localhost'};
- processChild=spawn(binary,[...(process.argv.includes('--app-server-binary')?[]:['app-server']),'--listen','unix://'+socket],{cwd:root,env,stdio:['ignore','ignore','pipe']});processChild.stderr.on('data',c=>stderr=(stderr+c).slice(-2000));
+ if(daemonPackage){
+  // Assemble only fixture package files. Never use or change the source home,
+  // daemon settings, auth, or selected release. The real installer copies this
+  // package into the owned home, just as it does for a fresh login group.
+  const metadata=JSON.parse(await readFile(path.join(daemonPackage,'codex-package.json'),'utf8'));
+  assert.equal(metadata.version,'0.167.1');assert.equal(metadata.target,'aarch64-apple-darwin');
+  const fixturePackage=root+'/fixture-package';
+  if(completePackage){
+   assert.equal(sha256(await readFile(path.join(daemonPackage,'bin/codex'))),sha256(await readFile(binary)),'Complete package must contain the tested CLI');
+   await cp(daemonPackage,fixturePackage,{recursive:true,errorOnExist:true,force:false,verbatimSymlinks:true});
+   daemonBinary=fixturePackage+'/bin/codex';
+  }else{
+   await mkdir(fixturePackage+'/bin',{recursive:true});await mkdir(fixturePackage+'/codex-path');
+   for(const file of ['bin/codex-code-mode-host','codex-path/rg']){
+    await copyFile(path.join(daemonPackage,file),path.join(fixturePackage,file));await chmod(path.join(fixturePackage,file),0o700);
+   }
+   daemonBinary=fixturePackage+'/bin/codex';await copyFile(binary,daemonBinary);await chmod(daemonBinary,0o700);
+   await writeFile(fixturePackage+'/codex-package.json',JSON.stringify({layoutVersion:1,version:metadata.version,target:metadata.target,entrypoint:'bin/codex',pathDir:'codex-path'}));
+  }
+  await mkdir(home+'/app-server-daemon',{recursive:true});
+  await writeFile(home+'/app-server-daemon/settings.json',JSON.stringify({shutdownGraceSeconds:0,updater:{autoUpdateEnabled:false}}));
+  daemonEnvironment=env;daemonAttempted=true;
+  assert.equal((await daemonCommand('start')).status,'started');
+  const version=await daemonCommand('version');
+  assert.equal(version.status,'running');assert.equal(version.cliVersion,'0.167.1');assert.equal(version.appServerVersion,'0.167.1');
+  assert.equal(version.managedCodexVersion,'0.167.1');
+  const installed=await realpath(version.managedCodexPath);
+  assert.ok(installed.startsWith(home+'/packages/app-server-daemon/releases/'));
+  assert.equal(sha256(await readFile(installed)),sha256(await readFile(binary)),'Daemon must use the modified executable');
+  daemonVerified=true;
+ }else{
+  processChild=spawn(binary,[...(process.argv.includes('--app-server-binary')?[]:['app-server']),'--listen','unix://'+socket],{cwd:root,env,stdio:['ignore','ignore','pipe']});processChild.stderr.on('data',c=>stderr=(stderr+c).slice(-2000));
+ }
  await until(async()=>{try{return(await stat(socket)).isSocket();}catch{return false;}},'socket');
  ws=new WS('ws://localhost/',{createConnection:()=>net.connect(socket)});await new Promise((r,j)=>{ws.once('open',r);ws.once('error',j);});
  ws.on('message',bytes=>{const m=JSON.parse(bytes);if(m.id!==undefined&&!m.method){const p=pending.get(m.id);pending.delete(m.id);if(p)m.error?p.reject(Object.assign(Error(m.error.message),m.error)):p.resolve(m.result);return;}if(m.method==='thread/started'&&m.params.thread.parentThreadId){childID=m.params.thread.id;}if(m.method==='turn/started'&&m.params.threadId===childID)childTurnID=m.params.turn.id;});
@@ -103,13 +147,16 @@ try {
   const after=await inspect();assert.equal(after.identity.goalId,originalGoalID);assert.equal(after.goal.objective,before.objective);assert.equal(after.goal.tokenBudget,before.tokenBudget);
   assert.ok(after.goal.tokensUsed>=atRest.goal.tokensUsed);assert.ok(after.goal.timeUsedSeconds>=atRest.goal.timeUsedSeconds);
   assert.deepEqual((await rpc('thread/turns/list',{threadId:rootID,limit:10,itemsView:'notLoaded',sortDirection:'desc'})).data.map(t=>t.id),parentBefore);
-  console.log(JSON.stringify({verified:true,realV2Child:true,pausedAndResumed:true,swiftTransportVerified:Boolean(swiftInitial),goalIdentityAndBudgetRetained:true,accountingMonotonic:true,parentTurnsUnchanged:true,staleIdentityRejected:true,ordinaryDirectInputStillRejected:true,existingSessionsTouched:false}));
+  console.log(JSON.stringify({verified:true,realV2Child:true,pausedAndResumed:true,swiftTransportVerified:Boolean(swiftInitial),managedDaemonVerified:daemonVerified,completePackageVerified:completePackage&&daemonVerified,goalIdentityAndBudgetRetained:true,accountingMonotonic:true,parentTurnsUnchanged:true,staleIdentityRejected:true,ordinaryDirectInputStillRejected:true,existingSessionsTouched:false}));
  }
- else if(process.argv.includes('--expect-rejection')){assert.equal(rejected?.code,-32600);assert.match(rejected.message,/direct app-server input is not allowed/);console.log(JSON.stringify({verified:true,originalDefectReproduced:true,realV2Child:true,activeGoal:true,existingSessionsTouched:false}));}
+ else if(process.argv.includes('--expect-rejection')){assert.equal(rejected?.code,-32600);assert.match(rejected.message,/direct app-server input is not allowed/);console.log(JSON.stringify({verified:true,originalDefectReproduced:true,realV2Child:true,activeGoal:true,managedDaemonVerified:daemonVerified,existingSessionsTouched:false}));}
  else {assert.equal(rejected,undefined,rejected?.message);assert.equal(goalIdentity(),originalGoalID);console.log(JSON.stringify({verified:true,realV2Child:true,pausedWithoutDirectTurnInput:true,goalIdentityAndBudgetRetained:true,existingSessionsTouched:false}));}
 } finally {
  for(const request of pending.values())request.reject(Error('Owned fixture closed'));pending.clear();
  for(const res of streams)res.destroy();ws?.terminate();
  if(processChild&&processChild.exitCode===null){const done=new Promise(r=>processChild.once('exit',r));processChild.kill('SIGTERM');const timer=setTimeout(()=>processChild.kill('SIGKILL'),3000);await done;clearTimeout(timer);}
- api.closeAllConnections();api.close();await rm(root,{recursive:true,force:true});
+ api.closeAllConnections();api.close();
+ // Keep the owned home available for recovery if stopping its daemon fails.
+ if(daemonAttempted){const stopped=await daemonCommand('stop');assert.ok(['stopped','notRunning'].includes(stopped.status),JSON.stringify(stopped));}
+ await rm(root,{recursive:true,force:true});
 }

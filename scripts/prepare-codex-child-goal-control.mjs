@@ -23,6 +23,19 @@ for(const f of manifest.files){
 execFileSync('/usr/bin/git',['apply','--check',patch],{cwd:source});
 execFileSync('/usr/bin/git',['apply',patch],{cwd:source});
 for(const f of manifest.files)assert.equal(hash(await readFile(path.join(source,f.path))),f.after,'Changed postimage: '+f.path);
+// The approval dialog fix has identical preimages in the pinned 0.167.1 tree.
+// Verify those bytes independently; never assume a patch from another version fits.
+let approvalFiles=0;
+if(process.argv.includes('--with-approval-fix')){
+ const approval=JSON.parse(await readFile(assets+'0.167.0-subagent-approval.manifest.json','utf8'));
+ const approvalPatch=assets+'0.167.0-subagent-approval.patch';
+ assert.equal(hash(await readFile(approvalPatch)),approval.patchSHA256,'Changed approval patch');
+ for(const f of approval.files)assert.equal(hash(await readFile(path.join(source,f.path))),f.before,'Changed approval preimage: '+f.path);
+ execFileSync('/usr/bin/git',['apply','--check',approvalPatch],{cwd:source});
+ execFileSync('/usr/bin/git',['apply',approvalPatch],{cwd:source});
+ for(const f of approval.files)assert.equal(hash(await readFile(path.join(source,f.path))),f.after,'Changed approval postimage: '+f.path);
+ approvalFiles=approval.files.length;
+}
 let count=0;
 const lock=(await readFile(path.join(source,'Cargo.lock'),'utf8')).split('[[package]]').map(block=>{
  if(!/^source = /m.test(block)&&/^version = "0.0.0"$/m.test(block)){
@@ -31,4 +44,4 @@ const lock=(await readFile(path.join(source,'Cargo.lock'),'utf8')).split('[[pack
 }).join('[[package]]');
 assert.equal(count,171,'Changed upstream workspace lock layout');
 await writeFile(path.join(source,'Cargo.lock'),lock);
-console.log(JSON.stringify({prepared:source,verifiedSourceFiles:manifest.files.length,feature:manifest.feature,enabledByDefault:false,installed:false}));
+console.log(JSON.stringify({prepared:source,verifiedSourceFiles:manifest.files.length+approvalFiles,approvalFixIncluded:approvalFiles>0,feature:manifest.feature,enabledByDefault:false,installed:false}));
