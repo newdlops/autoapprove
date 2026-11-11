@@ -1,0 +1,39 @@
+{
+  "upstreamCommit": "0a94398fa60c4fac0e7659e4213a0a36e613dd46",
+  "upstreamVersion": "0.167.1",
+  "sourceArchiveSHA256": "f8ad03960fef47f4d5ebf80266cdfef65e4e46c03f5de9e97ed975617daefc96",
+  "patchSHA256": "aa1f88cb11b542e4a4fce817f5d8f78207960860dee660d658c4b047e8c64b2a",
+  "feature": "autoapprove-goal-control",
+  "files": [
+    {
+      "path": "app-server/Cargo.toml",
+      "before": "cceb3af7ee41633a33b14f55f1193b32fc75afb830c0dfa22393cf24af3d6f3d",
+      "after": "31330479d6efb279fe2f5a1d5a195651a5cb1d941138a0940ab18c3b081b96fc"
+    },
+    {
+      "path": "app-server-protocol/src/protocol/common.rs",
+      "before": "4c449f1da399848c714c780fc1304ba566d0089aeaef8c33c3a9c7eb986e4272",
+      "after": "bc9952fbbe0444c7277566b27d6bc89be885489b690bc373841da7712fc39b95"
+    },
+    {
+      "path": "app-server-protocol/src/protocol/v2/thread.rs",
+      "before": "f5a99bd250950ddaa3a07a8cae84e434c77d645650c11ec037e140945fa2c500",
+      "after": "5f3c829940196aa0369a4be2ee2388cf8ffc49c1487ecd10745cf68e6580c318"
+    },
+    {
+      "path": "app-server/src/message_processor.rs",
+      "before": "de79b843e440610da5b0b6abb31a97f9d6c6e30bc60e6d5f7a45d4f69cf6fedc",
+      "after": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f"
+    },
+    {
+      "path": "app-server/src/request_processors/thread_goal_processor.rs",
+      "before": "28a3c515685b68cd986a9de616de91fa84d4fbb4e0d5d0a035c6fbe068e32c39",
+      "after": "70e42492922edbee61da4bef8514e71188e7aa13da086b87774f5c8720919714"
+    },
+    {
+      "path": "app-server/src/request_processors/thread_goal_control.rs",
+      "before": null,
+      "after": "35875dc457b3ebbda8afe05333da36d9d6f49e038764fe2df15fbbabb1b094ff"
+    }
+  ]
+}

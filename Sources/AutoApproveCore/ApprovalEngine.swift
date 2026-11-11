@@ -188,6 +188,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var codexApprovalEpochs:[String:UUID]=[:]
     private let codexConversation:CodexConversationTransport
     private let codexGoals:CodexGoalTransport
+    private let codexSubagentGoals:CodexSubagentGoalServices
     private var changingGoals=Set<String>()
     private var changingGoalThreads=Set<String>()
     private var manualGoalHoldCache:[String:String]=[:]
@@ -497,6 +498,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
                 osPermissionServices:OSPermissionServices? = nil,codexGoals:CodexGoalTransport = .live,codexConversation:CodexConversationTransport = .live,
+                codexSubagentGoals:CodexSubagentGoalServices = .live,
                 codexAccountTransitions:CodexAccountTransitionServices? = nil,
                 codexAccountTargets:(@Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget])? = nil,
                 codexManagedServers:CodexManagedServerServices = .live,diagnosticServices:CodexDiagnosticServices = .live,
@@ -544,6 +546,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.questionTransport = questionTransport
         self.codexQueue = codexQueue
         self.codexGoals = codexGoals
+        self.codexSubagentGoals = codexSubagentGoals
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
         // Native window checks need one original process, not a system-wide
@@ -7801,6 +7804,70 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         try await connectCodexApprovals(sessionID: sessionID, threadID: thread)
     }
+    private func subagentGoalTarget(_ session:AgentSession,root:String) async throws ->CodexReplyTarget {
+        guard session.agent == .codex,session.phase != .ended,session.codexApprovalBinding?.threadID==root else {throw AppError.message("연결된 부모 대화를 다시 확인해주세요.")}
+        let target=try await questionTransport.prepareQueue(session,root)
+        try validateCodexQueueSession(session,threadID:root)
+        guard target.threadID==root,target.queueAvailable,sessions[session.id]?.codexApprovalBinding?.threadID==root else {throw AppError.message("서브에이전트의 연결 서버가 바뀌었습니다.")}
+        return target
+    }
+
+    public func readCodexSubagentGoal(sessionID:String,childID:String) async throws ->CodexSubagentGoal {
+        guard let session=sessions[sessionID],let root=session.codexApprovalBinding?.threadID else {throw AppError.message("부모 대화에 연결한 뒤 Goal을 확인해주세요.")}
+        let target=try await subagentGoalTarget(session,root:root)
+        let result:CodexSubagentGoal
+        do {result=try await codexSubagentGoals.read(target,session.cwd,childID)}
+        catch let error as RemoteHTTPError where error.diagnostics?["rpcCode"]=="-32601" {throw AppError.message("이 연결 서버는 서브에이전트 Goal 관리를 지원하지 않습니다. 지원하는 관리형 서버 연결이 필요합니다.")}
+        catch let error as CodexControlRPCError where error.reason=="managed child goal control is unavailable" {throw AppError.message("이 연결 서버에서 서브에이전트 Goal 관리가 활성화되지 않았습니다.")}
+        let fresh=try await subagentGoalTarget(session,root:root)
+        guard fresh.home==target.home,result.rootThreadID==root,result.threadID==childID else {throw AppError.message("서브에이전트의 연결이 바뀌었습니다. 다시 확인해주세요.")}
+        return result
+    }
+
+    private final class SubagentGoalDispatch {var started=false}
+    public func changeCodexSubagentGoal(sessionID:String,expected:CodexSubagentGoal,action:CodexSubagentGoalAction,requestID:UUID) async throws ->CodexSubagentGoalReceipt {
+        guard let session=sessions[sessionID],let goal=expected.goal,
+              UUID(uuidString:expected.threadID) != nil,UUID(uuidString:goal.instanceID ?? "") != nil,
+              expected.threadID != expected.rootThreadID else {throw AppError.message("현재 서브에이전트 Goal을 다시 확인해주세요.")}
+        let target=try await subagentGoalTarget(session,root:expected.rootThreadID)
+        let binding=PromptDetector.fingerprint([sessionID,target.home,expected.rootThreadID,expected.threadID,expected.parentThreadID,goal.revision,expected.turnID ?? "",action.rawValue].joined(separator:"\u{0}"))
+        let ledger=try CodexSubagentGoalActionStore(path:paths.directory.appendingPathComponent("subagent-goal-actions.sqlite").path)
+        if let existing=try ledger.read(requestID) {
+            guard existing.binding==binding else {throw AppError.message("다른 Goal 요청에 사용한 식별자입니다.")}
+            return existing
+        }
+        let key=target.home+"\u{0}"+expected.threadID
+        guard !changingGoalThreads.contains(key),!changingGoals.contains(sessionID),!automaticInputBusy(sessionID),
+              !remoteInputSessions.contains(sessionID),!codexAccountInputHeld(sessionID),!codexAccountContinuationHeld(sessionID),
+              action == .pause ? goal.status == .active:goal.status == .paused else {throw AppError.message("진행 중인 입력·계정 전환 또는 Goal 상태를 먼저 확인해주세요.")}
+        changingGoalThreads.insert(key);changingGoals.insert(sessionID)
+        defer {changingGoalThreads.remove(key);changingGoals.remove(sessionID)}
+        var receipt=CodexSubagentGoalReceipt(requestID:requestID,binding:binding,phase:.reserved,result:nil,detail:"요청 결과를 확인 중입니다. 같은 요청은 다시 보내지 않습니다.")
+        try ledger.reserve(receipt)
+        let dispatch=SubagentGoalDispatch()
+        do {
+            let result=try await codexSubagentGoals.change(target,session.cwd,expected,action,{[self] in
+                let fresh=try await self.subagentGoalTarget(session,root:expected.rootThreadID)
+                try await MainActor.run {
+                    guard fresh.home==target.home,!self.codexAccountInputHeld(sessionID),!self.codexAccountContinuationHeld(sessionID),
+                          !self.automaticInputBusy(sessionID),self.changingGoalThreads.contains(key) else {throw AppError.message("Goal 변경 직전에 연결이나 입력 상태가 바뀌었습니다.")}
+                    dispatch.started=true
+                }
+            })
+            let fresh=try await subagentGoalTarget(session,root:expected.rootThreadID)
+            guard dispatch.started,fresh.home==target.home,result.rootThreadID==expected.rootThreadID,result.threadID==expected.threadID,
+                  result.goal?.instanceID==goal.instanceID,result.goal?.status==(action == .pause ? .paused:.active) else {throw AppError.message("Goal 변경 결과가 예상 상태와 다릅니다.")}
+            receipt.phase = .confirmed;receipt.result=result
+            receipt.detail=action == .resume ? "Goal을 재개했습니다.":result.executionState=="idle" ? "Goal과 현재 작업을 일시정지했습니다.":"Goal을 일시정지했습니다. 현재 작업의 종료는 아직 확인되지 않았습니다."
+        } catch {
+            receipt.phase=dispatch.started ? .unknown:.notStarted
+            receipt.detail=dispatch.started ? "요청 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 현재 상태를 새로 확인해주세요.":error.localizedDescription
+        }
+        try ledger.finish(receipt)
+        _ = log(AuditEvent(sessionID:sessionID,summary:action == .pause ? "서브에이전트 Goal 일시정지":"서브에이전트 Goal 재개",outcome:receipt.detail,source:"서브에이전트 관리",context:AuditContext(session:session)))
+        return receipt
+    }
+
     public func codexApprovalSubagents(sessionID: String) async throws -> [CodexSubagentRow] {
         guard let session = sessions[sessionID], let binding = session.codexApprovalBinding,
               session.agent == .codex, session.phase != .ended else { throw AppError.message("연결된 Codex 부모 대화를 선택해주세요.") }

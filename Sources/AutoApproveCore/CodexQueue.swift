@@ -254,7 +254,7 @@ final class CodexQueueConnection {
             if object["method"] as? String == "serverRequest/resolved", let params = object["params"] as? JSONObject, let requestID = params["requestId"], let key = Self.requestKey(requestID) { resolvedRequests.insert(key) }
             guard object["id"] as? Int == id else { continue }
             if let error = object["error"] as? JSONObject {
-                if error["code"] as? Int == -32601 { throw RemoteHTTPError(409,"이 Codex 버전은 요청한 제어 기능을 지원하지 않습니다. Codex를 업데이트해주세요.",diagnostics:["delivery":"not_started"]) }
+                if error["code"] as? Int == -32601 { throw RemoteHTTPError(409,"이 Codex 버전은 요청한 제어 기능을 지원하지 않습니다. Codex를 업데이트해주세요.",diagnostics:["delivery":"not_started","rpcCode":"-32601"]) }
                 let failure = CodexControlRPCError(method: method, code: error["code"] as? Int ?? 0, reason: error["message"] as? String ?? "")
                 if classifyError { throw failure }
                 throw RemoteHTTPError(409, failure.localizedDescription, diagnostics: ["delivery": "not_started"])

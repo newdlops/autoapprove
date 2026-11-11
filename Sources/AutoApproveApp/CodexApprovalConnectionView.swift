@@ -42,6 +42,10 @@ struct CodexApprovalConnectionView: View {
                     Text(child.phase.title).font(.caption).foregroundStyle(.secondary)
                     Text(child.id).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                    CodexSubagentGoalView(
+                        read:{try await engine.readCodexSubagentGoal(sessionID:session.id,childID:child.id)},
+                        change:{try await engine.changeCodexSubagentGoal(sessionID:session.id,expected:$0,action:$1,requestID:$2)})
+                        .id(session.id+"/"+(session.codexApprovalBinding?.threadID ?? "")+"/"+child.id)
                 }
             }
             if let error {

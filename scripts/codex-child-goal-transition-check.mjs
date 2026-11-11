@@ -7,13 +7,26 @@ import {mkdtemp,mkdir,writeFile,copyFile,chmod,stat,rm} from 'node:fs/promises';
 import {spawn,execFileSync} from 'node:child_process';
 import {createRequire} from 'node:module';
 const option=n=>process.argv.find(v=>v.startsWith('--'+n+'='))?.slice(n.length+3);
+const managedControl=process.argv.includes('--managed-control');
 assert.ok(option('codex'),'Provide --codex=/absolute/native/codex');
 const require=createRequire(import.meta.url),{ws:WS}=require(path.join(path.dirname(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright')),'../playwright-core/lib/utilsBundle.js'));
 const root=await mkdtemp('/private/tmp/aa-child-goal-'),home=root+'/home',socket=home+'/app-server-control/app-server-control.sock';
 const pending=new Map(),streams=new Set();let processChild,ws,seq=0,childID,rootID,childTurnID,posts=0,stderr='';
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(test,label){for(let i=0;i<200;i++){if(await test())return;await wait(100);}throw Error('Owned fixture timeout: '+label+' '+stderr.slice(-300));}
-function rpc(method,params){return new Promise((resolve,reject)=>{const id=++seq;pending.set(id,{resolve,reject});ws.send(JSON.stringify({id,method,params}));});}
+function rpc(method,params){return new Promise((resolve,reject)=>{
+ const id=++seq,timer=setTimeout(()=>{pending.delete(id);reject(Error('Owned fixture RPC timeout: '+method));},20000);
+ pending.set(id,{resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
+ ws.send(JSON.stringify({id,method,params}),error=>{if(error){const request=pending.get(id);pending.delete(id);request?.reject(error);}});
+});}
+async function swiftGoal(action,expected){
+ const args=[home,rootID,root,childID,action,...(expected?[JSON.stringify(expected)]:[])];
+ const child=spawn(option('swift-helper'),args,{stdio:['ignore','pipe','pipe']});let out='',err='';
+ child.stdout.on('data',bytes=>out+=bytes);child.stderr.on('data',bytes=>err=(err+bytes).slice(-2000));
+ const timer=setTimeout(()=>child.kill('SIGKILL'),25000);
+ let code;try{code=await new Promise((resolve,reject)=>{child.once('exit',resolve);child.once('error',reject);});}finally{clearTimeout(timer);}
+ assert.equal(code,0,err);return JSON.parse(out);
+}
 const api=http.createServer(async(req,res)=>{
  let raw='';for await(const chunk of req)raw+=chunk;
  const data=JSON.parse(raw),input=JSON.stringify(data.input),isChild=input.includes('OWNED_GOAL_CHILD')&&!input.includes('owned-spawn-call');
@@ -30,11 +43,11 @@ const api=http.createServer(async(req,res)=>{
  emit({type:'response.output_item.added',output_index:0,item});emit({type:'response.output_item.done',output_index:0,item});emit({type:'response.completed',response:{id:rid,status:'completed',output:[item],usage:{input_tokens:1,output_tokens:1,total_tokens:2}}});res.end();
 });
 try {
- await mkdir(home+'/app-server-control',{recursive:true});await new Promise(r=>api.listen(0,'127.0.0.1',r));
+ await mkdir(home+'/app-server-control',{recursive:true});await new Promise((resolve,reject)=>{api.once('error',reject);api.listen(0,'127.0.0.1',resolve);});
  await writeFile(home+'/config.toml',`model="fixture-model"\nmodel_provider="fixture"\napproval_policy="never"\nsandbox_mode="read-only"\ncheck_for_update_on_startup=false\ncli_auth_credentials_store="file"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:${api.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n[features]\nmulti_agent_v2=true\ngoals=true\n[analytics]\nenabled=false\n`);
  const binary=root+'/owned-goal-server';await copyFile(option('codex'),binary);await chmod(binary,0o700);
  const env={HOME:root,CODEX_HOME:home,PATH:'/usr/bin:/bin',NO_COLOR:'1',HTTP_PROXY:'http://127.0.0.1:9',HTTPS_PROXY:'http://127.0.0.1:9',NO_PROXY:'127.0.0.1,localhost'};
- processChild=spawn(binary,['app-server','--listen','unix://'+socket],{cwd:root,env,stdio:['ignore','ignore','pipe']});processChild.stderr.on('data',c=>stderr=(stderr+c).slice(-2000));
+ processChild=spawn(binary,[...(process.argv.includes('--app-server-binary')?[]:['app-server']),'--listen','unix://'+socket],{cwd:root,env,stdio:['ignore','ignore','pipe']});processChild.stderr.on('data',c=>stderr=(stderr+c).slice(-2000));
  await until(async()=>{try{return(await stat(socket)).isSocket();}catch{return false;}},'socket');
  ws=new WS('ws://localhost/',{createConnection:()=>net.connect(socket)});await new Promise((r,j)=>{ws.once('open',r);ws.once('error',j);});
  ws.on('message',bytes=>{const m=JSON.parse(bytes);if(m.id!==undefined&&!m.method){const p=pending.get(m.id);pending.delete(m.id);if(p)m.error?p.reject(Object.assign(Error(m.error.message),m.error)):p.resolve(m.result);return;}if(m.method==='thread/started'&&m.params.thread.parentThreadId){childID=m.params.thread.id;}if(m.method==='turn/started'&&m.params.threadId===childID)childTurnID=m.params.turn.id;});
@@ -54,9 +67,48 @@ try {
  let rejected;
  try{const paused=(await rpc('thread/goal/set',{threadId:childID,status:'paused',origin:'automatic'})).goal;assert.equal(paused.status,'paused');assert.equal(paused.objective,before.objective);assert.equal(paused.tokenBudget,before.tokenBudget);assert.ok(paused.tokensUsed>=before.tokensUsed);}
  catch(error){rejected=error;}
- if(process.argv.includes('--expect-rejection')){assert.equal(rejected?.code,-32600);assert.match(rejected.message,/direct app-server input is not allowed/);console.log(JSON.stringify({verified:true,originalDefectReproduced:true,realV2Child:true,activeGoal:true,existingSessionsTouched:false}));}
+ if(managedControl){
+  // The ordinary direct-input restriction must remain intact in the managed build.
+  assert.equal(rejected?.code,-32600);assert.match(rejected.message,/direct app-server input is not allowed/);
+  const address={threadId:childID,parentThreadId:rootID};
+  const inspect=()=>rpc('autoapprove/thread/goal/read',address);
+  const control=(expected,action)=>rpc('autoapprove/thread/goal/control',{...address,expected,action});
+  const initial=await inspect();assert.equal(initial.identity.goalId,originalGoalID);
+  const swiftInitial=option('swift-helper')?await swiftGoal('read'):undefined;
+  if(swiftInitial){assert.equal(swiftInitial.goal.instanceID,originalGoalID);assert.ok(swiftInitial.turnID,'Swift must observe the active child turn');}
+  const assertRejected=async(action)=>{await assert.rejects(action,e=>e.code===-32600);assert.equal(goalIdentity(),originalGoalID);assert.equal((await inspect()).goal.status,'active');};
+  await assertRejected(()=>rpc('autoapprove/thread/goal/read',{...address,parentThreadId:childID}));
+  await assertRejected(()=>control({...initial.identity,goalId:'replaced-goal'},'pause'));
+  await assertRejected(()=>control({...initial.identity,objective:'different objective'},'pause'));
+  await assertRejected(()=>control({...initial.identity,tokenBudget:1235},'pause'));
+  const parentBefore=(await rpc('thread/turns/list',{threadId:rootID,limit:10,itemsView:'notLoaded',sortDirection:'desc'})).data.map(t=>t.id);
+  const swiftPaused=swiftInitial?await swiftGoal('pause',swiftInitial):undefined;
+  const paused=swiftPaused?{goal:swiftPaused.goal,goalId:swiftPaused.goal.instanceID}:await control(initial.identity,'pause');assert.equal(paused.goal.status,'paused');assert.equal(paused.goalId,originalGoalID);
+  assert.equal(paused.goal.objective,before.objective);assert.equal(paused.goal.tokenBudget,before.tokenBudget);
+  assert.ok(paused.goal.tokensUsed>=before.tokensUsed);assert.ok(paused.goal.timeUsedSeconds>=before.timeUsedSeconds);
+  await assert.rejects(()=>control(initial.identity,'pause'),e=>e.code===-32600);
+  // Goal continuation is paused first; the existing exact-turn interrupt then
+  // stops in-flight work. No new user turn is injected into the child.
+  const pausedTurnID=childTurnID;
+  if(swiftPaused)assert.equal(swiftPaused.executionState,'idle','Swift pause must interrupt and confirm the observed turn');
+  else await rpc('turn/interrupt',{threadId:childID,turnId:pausedTurnID});
+  await until(async()=> (await rpc('thread/read',{threadId:childID,includeTurns:false})).thread.status.type==='idle','paused child idle');
+  const atRest=await inspect(),postsAtRest=posts;
+  assert.equal(atRest.goal.status,'paused');await wait(1200);assert.equal(posts,postsAtRest,'Paused Goal must not autonomously start another turn');
+  const swiftRest=swiftInitial?await swiftGoal('read'):undefined;
+  const swiftResumed=swiftRest?await swiftGoal('resume',swiftRest):undefined;
+  const resumed=swiftResumed?{goal:swiftResumed.goal,goalId:swiftResumed.goal.instanceID}:await control(atRest.identity,'resume');assert.equal(resumed.goal.status,'active');
+  assert.equal(resumed.goalId,originalGoalID);assert.equal(goalIdentity(),originalGoalID);
+  await until(async()=>{const turns=(await rpc('thread/turns/list',{threadId:childID,limit:1,itemsView:'notLoaded',sortDirection:'desc'})).data;return Boolean(turns[0]?.id&&turns[0].id!==pausedTurnID&&posts>postsAtRest);},'same child Goal resumed');
+  const after=await inspect();assert.equal(after.identity.goalId,originalGoalID);assert.equal(after.goal.objective,before.objective);assert.equal(after.goal.tokenBudget,before.tokenBudget);
+  assert.ok(after.goal.tokensUsed>=atRest.goal.tokensUsed);assert.ok(after.goal.timeUsedSeconds>=atRest.goal.timeUsedSeconds);
+  assert.deepEqual((await rpc('thread/turns/list',{threadId:rootID,limit:10,itemsView:'notLoaded',sortDirection:'desc'})).data.map(t=>t.id),parentBefore);
+  console.log(JSON.stringify({verified:true,realV2Child:true,pausedAndResumed:true,swiftTransportVerified:Boolean(swiftInitial),goalIdentityAndBudgetRetained:true,accountingMonotonic:true,parentTurnsUnchanged:true,staleIdentityRejected:true,ordinaryDirectInputStillRejected:true,existingSessionsTouched:false}));
+ }
+ else if(process.argv.includes('--expect-rejection')){assert.equal(rejected?.code,-32600);assert.match(rejected.message,/direct app-server input is not allowed/);console.log(JSON.stringify({verified:true,originalDefectReproduced:true,realV2Child:true,activeGoal:true,existingSessionsTouched:false}));}
  else {assert.equal(rejected,undefined,rejected?.message);assert.equal(goalIdentity(),originalGoalID);console.log(JSON.stringify({verified:true,realV2Child:true,pausedWithoutDirectTurnInput:true,goalIdentityAndBudgetRetained:true,existingSessionsTouched:false}));}
 } finally {
+ for(const request of pending.values())request.reject(Error('Owned fixture closed'));pending.clear();
  for(const res of streams)res.destroy();ws?.terminate();
  if(processChild&&processChild.exitCode===null){const done=new Promise(r=>processChild.once('exit',r));processChild.kill('SIGTERM');const timer=setTimeout(()=>processChild.kill('SIGKILL'),3000);await done;clearTimeout(timer);}
  api.closeAllConnections();api.close();await rm(root,{recursive:true,force:true});

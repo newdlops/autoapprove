@@ -1,0 +1,357 @@
+--- a/app-server/Cargo.toml
++++ b/app-server/Cargo.toml
+@@ -20,6 +20,9 @@
+ name = "codex_app_server"
+ path = "src/lib.rs"
+ doctest = false
++
++[features]
++autoapprove-goal-control = []
+ 
+ [lints]
+ workspace = true
+--- a/app-server-protocol/src/protocol/common.rs
++++ b/app-server-protocol/src/protocol/common.rs
+@@ -627,6 +627,18 @@
+         params: v2::ThreadPredictionRequestParams,
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadPredictionRequestResponse,
++    },
++    #[experimental("autoapprove/thread/goal/read")]
++    AutoapproveGoalRead => "autoapprove/thread/goal/read" {
++        params: v2::AutoapproveGoalReadParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::AutoapproveGoalReadResponse,
++    },
++    #[experimental("autoapprove/thread/goal/control")]
++    AutoapproveGoalControl => "autoapprove/thread/goal/control" {
++        params: v2::AutoapproveGoalControlParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::AutoapproveGoalControlResponse,
+     },
+     ThreadGoalSet => "thread/goal/set" {
+         params: v2::ThreadGoalSetParams,
+--- a/app-server-protocol/src/protocol/v2/thread.rs
++++ b/app-server-protocol/src/protocol/v2/thread.rs
+@@ -915,6 +915,61 @@
+     pub goal: Option<ThreadGoal>,
+ }
+ 
++/// Opt-in managed-server lifecycle control. Ordinary v2 child input remains forbidden.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct AutoapproveGoalReadParams {
++    pub thread_id: String,
++    pub parent_thread_id: String,
++}
++
++/// Compare semantic goal identity under the native mutation permit. Accounting
++/// is deliberately excluded: progress between observation and pause is retained.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct AutoapproveGoalIdentity {
++    pub goal_id: String,
++    pub objective: String,
++    pub status: ThreadGoalStatus,
++    pub token_budget: Option<i64>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct AutoapproveGoalReadResponse {
++    pub identity: Option<AutoapproveGoalIdentity>,
++    pub goal: Option<ThreadGoal>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum AutoapproveGoalAction {
++    Pause,
++    Resume,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct AutoapproveGoalControlParams {
++    pub thread_id: String,
++    pub parent_thread_id: String,
++    pub expected: AutoapproveGoalIdentity,
++    pub action: AutoapproveGoalAction,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct AutoapproveGoalControlResponse {
++    pub goal_id: String,
++    pub goal: ThreadGoal,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -1405,6 +1405,12 @@
+                     .thread_set_name(request_id.clone(), params)
+                     .await
+             }
++            ClientRequest::AutoapproveGoalRead { params, .. } => {
++                self.thread_goal_processor.autoapprove_goal_read(params).await
++            }
++            ClientRequest::AutoapproveGoalControl { params, .. } => {
++                self.thread_goal_processor.autoapprove_goal_control(params).await
++            }
+             ClientRequest::ThreadGoalSet { params, .. } => {
+                 self.thread_goal_processor
+                     .thread_goal_set(request_id.clone(), params)
+--- a/app-server/src/request_processors/thread_goal_processor.rs
++++ b/app-server/src/request_processors/thread_goal_processor.rs
+@@ -16,6 +16,9 @@
+ 
+ #[path = "thread_goal_user_context.rs"]
+ mod user_context;
++
++#[path = "thread_goal_control.rs"]
++mod autoapprove_control;
+ 
+ enum GoalAccess {
+     Read,
+--- /dev/null
++++ b/app-server/src/request_processors/thread_goal_control.rs
+@@ -0,0 +1,230 @@
++//! Deliberately separate from direct input: no objective/budget edits, new goal,
++//! turn input, cold loading, model override or parent mutation is accepted here.
++use super::*;
++use codex_app_server_protocol::{
++    AutoapproveGoalAction, AutoapproveGoalControlParams, AutoapproveGoalControlResponse,
++    AutoapproveGoalIdentity, AutoapproveGoalReadParams, AutoapproveGoalReadResponse,
++};
++use codex_protocol::protocol::MultiAgentVersion;
++
++fn identity(goal: &codex_state::ThreadGoal) -> AutoapproveGoalIdentity {
++    AutoapproveGoalIdentity {
++        goal_id: goal.goal_id.clone(),
++        objective: goal.objective.clone(),
++        status: match goal.status {
++            codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
++            codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
++            codex_state::ThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
++            codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
++            codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
++            codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
++        },
++        token_budget: goal.token_budget,
++    }
++}
++
++fn requested_status(
++    params: &AutoapproveGoalControlParams,
++) -> Result<ThreadGoalStatus, JSONRPCErrorError> {
++    match (params.action, params.expected.status) {
++        (AutoapproveGoalAction::Pause, ThreadGoalStatus::Active) => Ok(ThreadGoalStatus::Paused),
++        (AutoapproveGoalAction::Resume, ThreadGoalStatus::Paused) => Ok(ThreadGoalStatus::Active),
++        _ => Err(invalid_request(
++            "goal control requires active-to-paused or paused-to-active transition",
++        )),
++    }
++}
++
++impl ThreadGoalRequestProcessor {
++    async fn controlled_child(
++        &self,
++        thread_id: ThreadId,
++        parent: &str,
++    ) -> Result<Arc<CodexThread>, JSONRPCErrorError> {
++        if !cfg!(feature = "autoapprove-goal-control")
++            || !self.config.features.enabled(Feature::Goals)
++        {
++            return Err(invalid_request("managed child goal control is unavailable"));
++        }
++        let parent_id = parse_thread_id_for_request(parent)?;
++        let thread = self
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|_| invalid_request("child must already be loaded"))?;
++        let source = thread.config_snapshot().await.session_source;
++        if thread.multi_agent_version() != Some(MultiAgentVersion::V2)
++            || !matches!(source, SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, .. }) if parent_thread_id == parent_id)
++            || self.thread_manager.get_thread(parent_id).await.is_err()
++        {
++            return Err(invalid_request(
++                "loaded parent-child ownership does not match",
++            ));
++        }
++        Ok(thread)
++    }
++
++    pub(crate) async fn autoapprove_goal_read(
++        &self,
++        params: AutoapproveGoalReadParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let thread_id = parse_thread_id_for_request(&params.thread_id)?;
++        self.controlled_child(thread_id, &params.parent_thread_id)
++            .await?;
++        let state_db = self
++            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
++            .await?;
++        let stored = state_db
++            .thread_goals()
++            .get_thread_goal(thread_id)
++            .await
++            .map_err(|err| internal_error(format!("failed to read child goal: {err}")))?;
++        // Construct identity and public counters from a single database row.
++        let goal = stored.as_ref().map(|row| ThreadGoal {
++            thread_id: thread_id.to_string(),
++            objective: row.objective.clone(),
++            status: identity(row).status,
++            token_budget: row.token_budget,
++            tokens_used: row.tokens_used,
++            time_used_seconds: row.time_used_seconds,
++            created_at: row.created_at.timestamp(),
++            updated_at: row.updated_at.timestamp(),
++        });
++        Ok(Some(
++            AutoapproveGoalReadResponse {
++                identity: stored.as_ref().map(identity),
++                goal,
++            }
++            .into(),
++        ))
++    }
++
++    pub(crate) async fn autoapprove_goal_control(
++        &self,
++        params: AutoapproveGoalControlParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let status = requested_status(&params)?;
++        let thread_id = parse_thread_id_for_request(&params.thread_id)?;
++        let _resume_guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
++        let thread = self
++            .controlled_child(thread_id, &params.parent_thread_id)
++            .await?;
++        let state_db = self
++            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
++            .await?;
++        self.reconcile_thread_goal_rollout(thread_id, &state_db)
++            .await?;
++        if status == ThreadGoalStatus::Active {
++            self.config_manager
++                .check_thread_model_provider_for_input(thread.config().await.as_ref())
++                .await
++                .map_err(|error| config_load_error(&error))?;
++        }
++        let outcome = self
++            .goal_service
++            .set_thread_goal(
++                &state_db,
++                GoalSetRequest {
++                    thread_id,
++                    objective: GoalObjectiveUpdate::Keep,
++                    status: Some(status.to_core()),
++                    token_budget: GoalTokenBudgetUpdate::Keep,
++                    max_goal_token_budget: thread.config().await.max_goal_token_budget,
++                },
++                async {
++                    // GoalService holds the native mutation permit through this check
++                    // and the update, after flushing the current accounting segment.
++                    let current = state_db
++                        .thread_goals()
++                        .get_thread_goal(thread_id)
++                        .await
++                        .map_err(|err| GoalServiceError::Internal(err.to_string()))?;
++                    if current.as_ref().map(identity).as_ref() != Some(&params.expected) {
++                        return Err(GoalServiceError::InvalidRequest(
++                            "child Goal changed; read it again before another action".into(),
++                        ));
++                    }
++                    let fresh_thread = self
++                        .controlled_child(thread_id, &params.parent_thread_id)
++                        .await
++                        .map_err(|err| GoalServiceError::InvalidRequest(err.message))?;
++                    if !Arc::ptr_eq(&thread, &fresh_thread) {
++                        return Err(GoalServiceError::InvalidRequest(
++                            "child runtime changed; inspect again".into(),
++                        ));
++                    }
++                    self.record_user_goal_update(
++                        thread_id,
++                        UserGoalUpdate::Set {
++                            objective: None,
++                            status: Some(status.to_core()),
++                        },
++                    )
++                    .await?;
++                    Ok(())
++                },
++            )
++            .await
++            .map_err(goal_service_error)?;
++        let persist = thread
++            .append_rollout_items(&[outcome.thread_goal_updated_item()])
++            .await;
++        let goal = ThreadGoal::from(outcome.goal.clone());
++        let listener = self
++            .thread_state_manager
++            .thread_state(thread_id)
++            .await
++            .lock()
++            .await
++            .listener_command_tx();
++        self.emit_thread_goal_updated_ordered(thread_id, goal.clone(), listener)
++            .await;
++        outcome.apply_runtime_effects(&self.goal_service).await;
++        persist.map_err(|err| internal_error(format!("Goal changed, but rollout persistence was not confirmed; inspect before retrying: {err}")))?;
++        Ok(Some(
++            AutoapproveGoalControlResponse {
++                goal_id: params.expected.goal_id,
++                goal,
++            }
++            .into(),
++        ))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn managed_goal_control_accepts_only_pause_and_resume() {
++        for state in [
++            ThreadGoalStatus::Active,
++            ThreadGoalStatus::Paused,
++            ThreadGoalStatus::Blocked,
++            ThreadGoalStatus::UsageLimited,
++            ThreadGoalStatus::BudgetLimited,
++            ThreadGoalStatus::Complete,
++        ] {
++            for action in [AutoapproveGoalAction::Pause, AutoapproveGoalAction::Resume] {
++                let params = AutoapproveGoalControlParams {
++                    thread_id: "child".into(),
++                    parent_thread_id: "parent".into(),
++                    expected: AutoapproveGoalIdentity {
++                        goal_id: "original".into(),
++                        objective: "keep".into(),
++                        status: state,
++                        token_budget: Some(1234),
++                    },
++                    action,
++                };
++                assert_eq!(
++                    requested_status(&params).is_ok(),
++                    matches!(
++                        (action, state),
++                        (AutoapproveGoalAction::Pause, ThreadGoalStatus::Active)
++                            | (AutoapproveGoalAction::Resume, ThreadGoalStatus::Paused)
++                    )
++                );
++            }
++        }
++    }
++}
