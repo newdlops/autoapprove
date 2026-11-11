@@ -1247,6 +1247,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Native runtime: malformed foreign and linked records reject",tests.testNativeRuntimeRegistryRejectsMalformedOrForeignDiscoveryHints),
             ("Native runtime: registry cannot forge a kernel process instance",tests.testNativeRuntimeRegistryFileCannotForgeKernelProcessInstance),
             ("Bundled Codex runtime: digest markers and launch identity",tests.testBundledCodexRuntimeChecksDigestMarkersAndLaunchIdentity),
+            ("Session migration: only matching reviewed versions prepare",tests.testSessionMigrationSupportsOnlyMatchingReviewedVersions),
             ("Bundled Codex runtime: profile requires matching server and literal command",tests.testBundledCodexProfileLaunchRequiresMatchingServerAndLiteralCommand),
             ("Bundled Codex runtime: unsupported capabilities links and missing code reject",tests.testBundledCodexRuntimeRejectsWrongCapabilitiesLinksAndMissingCode),
             ("Native connection: kernel witness and exact displayed association",tests.testNativeConnectionReadsKernelWitnessAndExactAssociation),

@@ -76,9 +76,10 @@ struct CodexSessionMigrationState:Codable,Equatable {
             try physicalHome(endpoint)
             guard [endpoint.serverID,endpoint.socketID,endpoint.credentialStoreID,endpoint.cliIdentity,
                    endpoint.account.subjectID,endpoint.account.sessionID,endpoint.account.workspaceID].allSatisfy({text($0)}),
-                  endpoint.cliVersion=="0.166.0" else{throw failure}
+                  ["0.166.0","0.167.1"].contains(endpoint.cliVersion) else{throw failure}
         }
-        guard source.home != destination.home,source.physicalHomeID != destination.physicalHomeID,
+        guard source.cliVersion==destination.cliVersion,
+              source.home != destination.home,source.physicalHomeID != destination.physicalHomeID,
               source.serverID != destination.serverID,source.socketID != destination.socketID,
               source.credentialStoreID != destination.credentialStoreID else{throw failure}
     }

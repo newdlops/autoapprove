@@ -34,6 +34,23 @@ import Darwin
     func journal(_ name:String="audit")throws->CodexMigrationJournal {try .init(store:AuditStore(path:root.appendingPathComponent(name+".sqlite").path))}
 }
 extension ApprovalTests {
+    @MainActor func testSessionMigrationSupportsOnlyMatchingReviewedVersions() async throws {
+        for (source,destination,accepted) in [("0.166.0","0.166.0",true),("0.167.1","0.167.1",true),
+                                            ("0.166.0","0.167.1",false),("0.167.1","0.166.0",false),
+                                            ("0.167.0","0.167.0",false),("0.167.2","0.167.2",false),("0.168.0","0.168.0",false)] {
+            let f=try SessionMigrationFixture(),journal=try f.journal()
+            f.scene.source.cliVersion=source;f.scene.destination.cliVersion=destination
+            let c=CodexSessionMigrationCoordinator(journal:journal,services:f.services),request=f.request
+            var state:CodexSessionMigrationState?
+            do {state=try await c.prepare(request)}catch {if accepted{throw error}}
+            try expectEqual(state != nil,accepted)
+            if let state {
+                try expectEqual(state.currentOwners,[f.a:f.scene.source.home,f.b:f.scene.source.home])
+                try c.cancel(id:state.request.id)
+            }else{try expectEqual(f.reads,0,"Reject incompatible versions before observing or reserving")}
+            try expect(try journal.activeRecords().isEmpty)
+        }
+    }
     @MainActor func testSessionMigrationPreparesExactCohortWithoutChangingOwnership() async throws {
         let f=try SessionMigrationFixture(),journal=try f.journal(),c=CodexSessionMigrationCoordinator(journal:journal,services:f.services),request=f.request
         var reservedStage:String?
