@@ -1249,6 +1249,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Bundled Codex runtime: digest markers and launch identity",tests.testBundledCodexRuntimeChecksDigestMarkersAndLaunchIdentity),
             ("Session migration: only matching reviewed versions prepare",tests.testSessionMigrationSupportsOnlyMatchingReviewedVersions),
             ("Native selected lease: changed scope and authority claims reject",tests.testNativeSelectedInputLeaseRejectsChangedScopeAndAuthorityClaims),
+            ("Native selected cohort: incomplete scope and forged readiness reject",tests.testNativeSelectedCohortRejectsIncompleteOrForgedReadiness),
             ("Bundled Codex runtime: profile requires matching server and literal command",tests.testBundledCodexProfileLaunchRequiresMatchingServerAndLiteralCommand),
             ("Bundled Codex runtime: unsupported capabilities links and missing code reject",tests.testBundledCodexRuntimeRejectsWrongCapabilitiesLinksAndMissingCode),
             ("Native connection: kernel witness and exact displayed association",tests.testNativeConnectionReadsKernelWitnessAndExactAssociation),

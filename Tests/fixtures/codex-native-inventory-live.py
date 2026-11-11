@@ -49,6 +49,7 @@ parser.add_argument('--terminal-input-hold', action='store_true', help='Verify t
 parser.add_argument('--swift-input-hold-helper', help='Run the real application input-hold transport against the owned TUI')
 parser.add_argument('--runtime-registration', action='store_true', help='Discover native endpoints using only the shared private registration root')
 parser.add_argument('--swift-selected-input-helper', help='Check real application selected input lease against the discovered server')
+parser.add_argument('--swift-selected-cohort', action='store_true', help='Read the actual native runtime cohort through that application lease')
 parser.add_argument('--direct-server', action='store_true', help='Bypass the wire proxy and verify actual kernel TUI peers')
 parser.add_argument('--expect-proxy-peer', action='store_true', help='Verify the proxy kernel peer is not mistaken for a TUI')
 parser.add_argument('--admission', action='store_true', help='Verify separately enabled whole-server runtime-start lease')
@@ -67,6 +68,7 @@ assert not args.terminal_input_hold or (args.retained_backends and args.direct_s
 assert not args.swift_input_hold_helper or args.terminal_input_hold, 'Application input-hold transport requires terminal hold tests'
 assert not args.runtime_registration or (args.terminal_input_hold and args.swift_input_hold_helper), 'Runtime registration requires real application input-hold checks'
 assert not args.swift_selected_input_helper or args.runtime_registration, 'Selected application lease requires runtime registration'
+assert not args.swift_selected_cohort or args.swift_selected_input_helper, 'Application cohort requires its selected input helper'
 assert not args.expect_proxy_peer or (args.server_inventory and not args.direct_server), 'Proxy identity check requires the owned proxy'
 assert not args.admission or (args.direct_server and args.navigation), 'Admission test requires direct native server binding and navigation'
 assert not args.app_server_binary or args.server, 'Standalone server mode requires --server'
@@ -966,13 +968,17 @@ try:
     if args.swift_selected_input_helper:
         root_id = first['stores']['primary'][0]
         wire = Wire()
-        helper = subprocess.Popen([args.swift_selected_input_helper, '--native-runtime-selected-input-lease',
+        operation = '--native-runtime-selected-input-cohort' if args.swift_selected_cohort else '--native-runtime-selected-input-lease'
+        helper = subprocess.Popen([args.swift_selected_input_helper, operation,
                                    str(runtime_root), str(fixture_home), str(pid), str(server.pid), root_id],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             assert select.select([helper.stdout], [], [], 5)[0], 'Application selected lease did not acknowledge'
             held = json.loads(helper.stdout.readline())
-            assert held == {'paused': True, 'threadIds': [root_id], 'migrationAuthorized': False}, held
+            expected_held = {'paused': True, 'threadIds': [root_id], 'migrationAuthorized': False}
+            if args.swift_selected_cohort:
+                expected_held.update(runtimeCohortVerified=True, runtimeCohortReady=True)
+            assert held == expected_held, held
             before_inference = counts['inference']
             denied = wire.call('turn/start', {'threadId': root_id,
                               'input': [{'type': 'text', 'text': 'OWNED_SELECTED_MUST_NOT_DISPATCH'}]}, expect_error=True)
@@ -1265,6 +1271,7 @@ try:
               'applicationTerminalInputHoldVerified': bool(args.swift_input_hold_helper),
               'runtimeRegistrationDiscoveryVerified': args.runtime_registration,
               'applicationSelectedInputLeaseVerified': bool(args.swift_selected_input_helper),
+              'applicationSelectedRuntimeCohortVerified': args.swift_selected_cohort,
               'applicationConnectionCollectorVerified': bool(args.swift_binding_helper),
               'proxyPeerMismatchVerified': args.expect_proxy_peer,
               'returnRoute': ('direct-resume' if args.return_via_resume else 'overview') if args.navigation else None,

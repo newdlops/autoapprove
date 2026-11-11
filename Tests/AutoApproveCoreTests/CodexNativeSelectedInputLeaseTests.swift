@@ -3,6 +3,46 @@ import Foundation
 @testable import AutoApproveCore
 
 extension ApprovalTests {
+    func testNativeSelectedCohortRejectsIncompleteOrForgedReadiness()throws {
+        let id=UUID().uuidString.lowercased(),other=UUID().uuidString.lowercased()
+        let nonce=String(repeating:"a",count:32),generation=UUID().uuidString.lowercased(),lease=UUID().uuidString.lowercased()
+        let peer=CodexNativePeerIdentity(source:"macos-audit-token",pid:123,effectiveUid:501,effectiveGid:20,auditPidVersion:7)
+        let row:[String:Any]=["threadId":id,"status":"pending-init","loaded":true,"persistent":true,
+            "hasActiveTurn":false,"hasBackgroundTerminal":false,"hasProtectedRequest":false,"hasQueuedInput":false,
+            "goal":NSNull(),"goalId":NSNull(),"readyForWriterShutdown":true]
+        let cohort:[String:Any]=["schemaVersion":1,"producer":"autoapprove-selected-runtime-cohort","threads":[row],
+            "missingThreadIds":[],"knownSubtreeCovered":true,"readyForWriterShutdown":true,"inputScopeVerified":true,
+            "membershipComplete":false,"writersStopped":false,"migrationAuthorized":false]
+        func check(_ snapshot:[String:Any])throws {
+            let value:[String:Any]=["schemaVersion":1,"producer":"autoapprove-selected-input-lease","pid":peer.pid,
+                "nonce":nonce,"serverGeneration":generation,"scope":"selected-thread-input","threadIds":[id],"leaseId":lease,
+                "inputAdmissionPaused":true,"leaseTTLMillis":29_000,"membershipComplete":false,"existingWorkStopped":false,
+                "goalLifecycleManaged":false,"credentialsTouched":false,"migrationAuthorized":false,"runtimeCohort":snapshot]
+            _ = try CodexNativeSelectedInputLease.validate(JSONSerialization.data(withJSONObject:value),operation:.cohort,
+                nonce:nonce,peer:peer,generation:generation,leaseID:lease,threadIDs:[id])
+        }
+        try check(cohort)
+        for (field,value) in [("membershipComplete",true),("writersStopped",true),("migrationAuthorized",true),
+                              ("inputScopeVerified",false),("missingThreadIds",[other]),("threads",[])] as [(String,Any)] {
+            var bad=cohort;bad[field]=value;try expectThrows(check(bad))
+        }
+        for field in ["hasActiveTurn","hasBackgroundTerminal","hasProtectedRequest","hasQueuedInput"] {
+            var badRow=row;badRow[field]=true
+            var bad=cohort;bad["threads"]=[badRow];try expectThrows(check(bad))
+        }
+        var changed=row;changed["threadId"]=other
+        var bad=cohort;bad["threads"]=[changed];try expectThrows(check(bad))
+        var active=row
+        active["goal"]=["threadId":id,"objective":"Existing Goal","status":"active","createdAt":1,"updatedAt":2,
+                        "tokensUsed":37,"timeUsedSeconds":4,"tokenBudget":1234]
+        active["goalId"]=UUID().uuidString.lowercased()
+        bad["threads"]=[active];try expectThrows(check(bad))
+        active["readyForWriterShutdown"]=false;bad["threads"]=[active];bad["readyForWriterShutdown"]=false
+        try check(bad) // A valid blocked observation is not a protocol failure.
+        var missing=cohort;missing["missingThreadIds"]=[other];missing["knownSubtreeCovered"]=false;missing["readyForWriterShutdown"]=false
+        try check(missing)
+    }
+
     func testNativeSelectedInputLeaseRejectsChangedScopeAndAuthorityClaims()throws {
         let nonce=String(repeating:"a",count:32),generation=UUID().uuidString.lowercased(),lease=UUID().uuidString.lowercased()
         let ids=["a0000000-0000-4000-8000-000000000001","a0000000-0000-4000-8000-000000000002"]

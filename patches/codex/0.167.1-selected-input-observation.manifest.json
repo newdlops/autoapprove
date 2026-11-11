@@ -14,27 +14,27 @@
     {
       "path": "app-server/src/lib.rs",
       "before": "a44b0266619d6adda0c1e7135d5be18e6581cff44307e78097efecc5195f8b6c",
-      "after": "9ed8142845c35bd7c929e6eec3b17f1ade97555f60de9f536baf10afae65e3f1"
+      "after": "b4a8127aa2fc5f5e3f5e2b9a82b404caa0ae91c6ab1a1f3d24ef40c4f4706264"
     },
     {
       "path": "app-server/src/turn_admission.rs",
       "before": "b6549e17e25a56c1768d6bfd77e7e6df18838261e50a5c70e95b46d215e0c5ec",
-      "after": "8e80d1eee3a63577ccbc16723d1c72f00e454a244471ab0fe3986f5908dc9a24"
+      "after": "a816655b94f20ffb87edbdc688549c090e793b47aa8f7eb655c3415380a50536"
     },
     {
       "path": "app-server/src/selected_admission_tests.rs",
       "before": null,
-      "after": "cc7434aafc59170127a51c1374f13aa22da27ead655fd483aa82816fe7a48b27"
+      "after": "3898b6b0dcb37e9329b9b630579a0a4aa041ca054cfe1ce58b9aaa15307661eb"
     },
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "8844dce031beba4d94e5d774fa15afee69a0fd7f5f95699f67f0951086de5ac8"
+      "after": "162bb7defa876239096dcec20d841abe3eacbecbfc9bcc86301745e5fba18389"
     },
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "ec6a2dd1b4a5f34d8ba373db62bc955b0955156f5da8b69332d3862bdd56d919"
+      "after": "5958b72021e1468b0363da6783420d6519a908bd91151059a122eb7689027675"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -254,10 +254,40 @@
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "7519c0213a94e3a2210443de1d8798b1506fad1d4aa9a4e53bb1245045e20134"
+      "after": "2a9217a5ea735817f4aa40562f148bf78775ec0addf0ff7452b126a170e7508a"
+    },
+    {
+      "path": "core/src/codex_thread.rs",
+      "before": "4049c4cf401d90720a0dd336337f6a85dd9630914d052778dc65852076ce26d6",
+      "after": "20be2834685b89ce40b3acd4add2e85afa3c6787d334e73f9fabb10b77d27873"
+    },
+    {
+      "path": "app-server/src/request_processors/selected_cohort.rs",
+      "before": null,
+      "after": "467791cc3315fc3411c6c7ed51ea840d39fdd5b18d7c7c27c19b2e8c1ed2f8e2"
+    },
+    {
+      "path": "app-server/src/request_processors/thread_goal_processor.rs",
+      "before": "70e42492922edbee61da4bef8514e71188e7aa13da086b87774f5c8720919714",
+      "after": "db92c3447575caad7dc4a24d21c8f2e1df4f4cf38860d9a406a8b085936bca5d"
+    },
+    {
+      "path": "app-server/src/request_processors/thread_goal_control.rs",
+      "before": "35875dc457b3ebbda8afe05333da36d9d6f49e038764fe2df15fbbabb1b094ff",
+      "after": "28da3b57470907d4afdb39931b7e34ad484ac6ceb964033d85155ef05f79eb18"
+    },
+    {
+      "path": "app-server/src/request_processors/thread_queue_processor.rs",
+      "before": "2e2aa119a090fc4da2e7858a06af55be5d2e181679d101c8fd50521d8f584581",
+      "after": "2963daba620a6b8c0a3728ede850ae3cfb965409c409dec58a0a789ddeb3ff9d"
+    },
+    {
+      "path": "app-server/src/outgoing_message.rs",
+      "before": "c6a200bbced4757e7337a9eeb6e729d124c14dab62eb01baf65833b4742643dd",
+      "after": "6ff752f525ac5ca1f6ba53c1ca8ba411d38876cd08fbe3a3cdc74f3bec23b12e"
     }
   ],
-  "patchSHA256": "f996a8ce73fc9801bab673f073ecc00925760826bd940fbe73a9670dd01fc0f5",
+  "patchSHA256": "395d35f226f3204e571d0150a687519d14ecb68ad6ffdb65ee428ea0c6ac41e2",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -477,6 +507,122 @@
       },
       "next": "Complete native move adapter and actual destination server selection/transaction. Movement button intentionally disabled. Render and exercise real600x660 sheet including stale-target and login/server preparation isolation before claiming UI complete.",
       "currentVersionInstalled": "unchanged0.2.280-build307"
+    },
+    "native45SelectedCohort": {
+      "sourceFiles": 56,
+      "status": "source56b-sealed-cohort-actual-native-and-swift-verified",
+      "codeCheck": {
+        "session": 75959,
+        "terminal": true,
+        "passed": true,
+        "elapsed": "25.13s"
+      },
+      "swiftTests": {
+        "passed": 2,
+        "session": 38951,
+        "terminal": true,
+        "filter": "Native selected"
+      },
+      "build": {
+        "session": 9252,
+        "status": "terminal-success",
+        "profile": "release debug0, app-server opt0, normal Rust thinLTO; SAME successful stage50 command",
+        "exit": 0,
+        "elapsed": "12m03s",
+        "binarySHA256": "c5de62d36ab195c195d27204dec71715ee03cff2ec6e5d8b63f0c0c4dbd9d14e",
+        "preserved": "/private/tmp/aa-native56-cohort-bcn3pnw8/codex-app-server"
+      },
+      "features": [
+        "native owned selected guard exact gate/scope and drained-state verification",
+        "cohort opcode on the same lease/peer/generation",
+        "actual Core active-turn owner instead of presentation status",
+        "known live+persistent subtree missing-ID report",
+        "paused Goal UUID and counters from one database row, including archived threads",
+        "queue, protected request (including verification-owned) and background terminal blockers",
+        "client recomputes readiness and rejects scope/authority inconsistencies"
+      ],
+      "knownFollowupsBeforeFinalUse": [
+        "New Rust exact-guard unit test is added but not yet executed in full native unit binary; lib code-check and actual socket paths passed",
+        "No native retirement/ownership transaction IPC or complete client census yet; no migration authority",
+        "No actual production cross-home move or native client rebind yet"
+      ],
+      "next": "No builds or tests live. Do not repeat the cohort preflight work: actual source56b server and real Swift/native two-client path pass. Wire journal-bound source retirement using strict closure plus existing exact per-thread WriterLockCoordinator lifetime guards; inspect nativeSelectedWriterLockFinding. Then Incoming/Activate policy IPC, complete all-client/backend cohort observer and native TUI rebind. Proposed post-commit normal destination resume avoids a raw journal-EX startup bypass. Move UI remains preparation-only and requires actual sheet QA and final end-to-end A-B-A before required release/install.",
+      "liveActiveQueue": {
+        "passed": true,
+        "fixture": "/private/tmp/aa-queue-gtpprvmq",
+        "session": 16759,
+        "terminal": true,
+        "provider": "owned loopback only",
+        "providerRequests": 2,
+        "checks": [
+          "actual active-turn owner blocks readiness",
+          "queued input blocks readiness after turn finishes",
+          "Goal UUID/counters readable",
+          "queue is preserved during held admission and dispatches exactly once after release"
+        ]
+      },
+      "sourceLabel": "source56b-sealed-native-cohort",
+      "compatibleBuild": {
+        "session": 77275,
+        "terminal": true,
+        "passed": true,
+        "elapsed": "4m06s",
+        "binary": "/private/tmp/aa-codex-approval-release/release/codex-app-server",
+        "binarySHA256": "4b5b9c9da25525d2d53a688913bbf73a4d2d7a1859d27f5591a03e02c385d134"
+      },
+      "liveCohort": {
+        "passed": true,
+        "session": 56784,
+        "terminal": true,
+        "fixture": "/private/tmp/aa-cohort-live-bi_pcwaw",
+        "checks": [
+          "exact held scope and actual stored Goal UUID/counters",
+          "stable read-only snapshot",
+          "unrelated settings write allowed and selected mutation denied",
+          "archived cold Goal and queue read without unarchive or runtime spawn",
+          "invented thread ID rejected"
+        ],
+        "modelTurnsSubmitted": 0
+      },
+      "liveActiveQueueFinal": {
+        "passed": true,
+        "session": 29359,
+        "terminal": true,
+        "fixture": "/private/tmp/aa-queue-bmz8xqma",
+        "ownedProviderRequests": 2,
+        "externalModelRequests": 0,
+        "checks": [
+          "actual active turn blocks readiness",
+          "queued input continues to block readiness after turn completes",
+          "Goal preserved",
+          "queued item dispatches exactly once after lease release"
+        ]
+      },
+      "liveSwiftRuntimeCohort": {
+        "passed": true,
+        "session": 52675,
+        "terminal": true,
+        "report": "/private/tmp/aa-native-cohort-swift-live-20261112/report.json",
+        "serverSource": "source56b",
+        "clientSource": "packaged managed2 fullCLI source42",
+        "checks": [
+          "real Swift lease cohort query",
+          "kernel peer and displayed connection binding",
+          "private runtime discovery",
+          "two shared TUI clients and native subscriber2-1-2",
+          "native and Swift input holds",
+          "exact draft and identity preserved across direct resume",
+          "selected writes and unscoped start denied without inference"
+        ],
+        "originalSessions": 4,
+        "preservedAfterCleanup": 4,
+        "completeClientCensusVerified": false,
+        "migrationVerified": false
+      },
+      "closedFollowups": [
+        "NativeSelectedRuntime is privately constructed only inside MessageProcessor and carries its own admission; native cohort cannot be paired with an independently supplied gate",
+        "Native queue preflight reads service storage directly for already-verified threads, including archived cold descendants; no unarchive or resume side effects"
+      ]
     }
   },
   "remaining": [

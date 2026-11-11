@@ -64,6 +64,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True)
     parser.add_argument('--app-server-binary', action='store_true')
+    parser.add_argument('--native-cohort', action='store_true')
     args = parser.parse_args()
     api = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     worker = threading.Thread(target=api.serve_forever, daemon=True)
@@ -99,6 +100,13 @@ enabled=false
         queued = call('thread/queue/add', {'threadId': tid, 'input': [{'type': 'text', 'text': 'OWNED_QUEUED_INPUT'}],
                                           'clientUserMessageId': 'owned-queued-id'})['queuedSubmission']
         lease = fixture.Lease(server.endpoint, [tid])
+        if args.native_cohort:
+            cohort = lease.call('cohort')['runtimeCohort']
+            assert cohort['knownSubtreeCovered'] and not cohort['readyForWriterShutdown'], cohort
+            assert not cohort['membershipComplete'] and not cohort['migrationAuthorized'], cohort
+            row = cohort['threads'][0]
+            assert row['threadId'] == tid and row['hasActiveTurn'] and row['hasQueuedInput'], row
+            assert row['goal'] == goal and row['goalId'], row
         denied = call('thread/queue/start', {'threadId': tid, 'queuedSubmissionId': queued['id']}, error=True)
         assert denied['code'] == -32600 and 'input was not accepted' in denied['message'], denied
         finish_first.set()
@@ -110,6 +118,12 @@ enabled=false
             assert len(requests) == 1, 'Queued input or paused Goal ran while held'
             time.sleep(1)
         resting = call('thread/goal/get', {'threadId': tid})['goal']
+        if args.native_cohort:
+            cohort = lease.call('cohort')['runtimeCohort']
+            row = cohort['threads'][0]
+            assert not row['hasActiveTurn'] and row['hasQueuedInput'], row
+            assert not row['readyForWriterShutdown'] and not cohort['readyForWriterShutdown'], cohort
+            assert row['goal'] == resting, row
         assert resting['status'] == 'paused' and resting['tokenBudget'] == goal['tokenBudget']
         assert resting['objective'] == goal['objective']
         lease.call('release')
@@ -122,7 +136,8 @@ enabled=false
         assert call('thread/goal/get', {'threadId': tid})['goal']['status'] == 'paused'
         print(json.dumps({'passed': True, 'fixture': str(root), 'queuedItemRetainedDuringHold': True,
                           'automaticDispatchAfterRelease': True, 'noDuplicateSubmission': True,
-                          'pausedGoalPreserved': True, 'providerRequests': len(requests)}))
+                          'pausedGoalPreserved': True, 'providerRequests': len(requests),
+                          'nativeCohortVerified': args.native_cohort}))
     finally:
         if lease:
             lease.close()

@@ -136,12 +136,17 @@ extension ApprovalTests {
 }
 
 enum NativeConnectionProbe {
-    private static func selected(_ pair:CodexNativeRuntimePair,threadID:String)async throws {
+    private static func selected(_ pair:CodexNativeRuntimePair,threadID:String,cohort:Bool=false)async throws {
         try await Task.detached {
             let lease=try CodexNativeSelectedInputLease(path:pair.serverControlSocket,expected:pair.connection,threadIDs:[threadID])
             defer{lease.close()}
             try lease.status();try lease.renew()
-            let reply:[String:Any]=["paused":true,"threadIds":[threadID],"migrationAuthorized":false]
+            var reply:[String:Any]=["paused":true,"threadIds":[threadID],"migrationAuthorized":false]
+            if cohort {
+                let observed=try lease.cohort()
+                reply["runtimeCohortVerified"]=true
+                reply["runtimeCohortReady"]=observed.readyForWriterShutdown
+            }
             try FileHandle.standardOutput.write(contentsOf:JSONSerialization.data(withJSONObject:reply)+Data([10]))
             var input=pollfd(fd:STDIN_FILENO,events:Int16(POLLIN),revents:0)
             guard poll(&input,1,5000)>0,readLine()=="release" else{throw AppError.message("Owned selected release command missing")}
@@ -164,7 +169,8 @@ enum NativeConnectionProbe {
     @MainActor static func runIfRequested() async -> Bool {
         let inputHold = CommandLine.arguments.firstIndex(of: "--native-terminal-input-hold")
         let runtimeHold=CommandLine.arguments.firstIndex(of:"--native-runtime-input-hold")
-        let runtimeSelected=CommandLine.arguments.firstIndex(of:"--native-runtime-selected-input-lease")
+        let runtimeCohort=CommandLine.arguments.firstIndex(of:"--native-runtime-selected-input-cohort")
+        let runtimeSelected=runtimeCohort ?? CommandLine.arguments.firstIndex(of:"--native-runtime-selected-input-lease")
         let runtime=runtimeSelected ?? runtimeHold ?? CommandLine.arguments.firstIndex(of:"--native-runtime-resolve")
         guard let index = runtime ?? inputHold ?? CommandLine.arguments.firstIndex(of: "--native-binding-observe") else { return false }
         do {
@@ -174,7 +180,7 @@ enum NativeConnectionProbe {
                 let pair=try await CodexNativeRuntimePair.resolve(root:CommandLine.arguments[index+1],home:CommandLine.arguments[index+2],tuiPID:tuiPID,serverPID:serverPID)
                 if runtimeSelected != nil {
                     guard index+5<CommandLine.arguments.count else{throw AppError.message("Owned selected thread ID required")}
-                    try await selected(pair,threadID:CommandLine.arguments[index+5])
+                    try await selected(pair,threadID:CommandLine.arguments[index+5],cohort:runtimeCohort != nil)
                 }else if runtimeHold != nil {try await operate(pair.connection,path:pair.tuiControlSocket)}
                 else {
                     let result:[String:Any]=["verified":true,"connectionID":pair.connection.connectionID,
