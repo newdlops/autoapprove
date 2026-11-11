@@ -34,6 +34,20 @@ import Darwin
     func journal(_ name:String="audit")throws->CodexMigrationJournal {try .init(store:AuditStore(path:root.appendingPathComponent(name+".sqlite").path))}
 }
 extension ApprovalTests {
+    @MainActor func testSessionMigrationExecutionCannotUsePreparationOnlyCancellation() async throws {
+        for phase in [CodexSessionMigrationState.Execution.Phase.shutdownAttempted,.retireAttempted] {
+            let f=try SessionMigrationFixture(),journal=try f.journal(),request=f.request
+            let coordinator=CodexSessionMigrationCoordinator(journal:journal,services:f.services)
+            var state=try await coordinator.prepare(request)
+            state.execution = .init(phase:phase,ownershipRevision:phase == .retireAttempted ? 0:nil)
+            let before=try journal.load(id:request.id)!.record
+            let attempted=try journal.save(id:request.id,payload:JSONEncoder().encode(state),expectedRevision:before.revision)
+            try expectEqual(try coordinator.state(id:request.id),state)
+            try expectThrows(coordinator.cancel(id:request.id))
+            try expectEqual(try journal.load(id:request.id)!.record,attempted)
+            try expectEqual(try journal.activeRecords().count,1,"Uncertain native effects require recovery, not cancellation")
+        }
+    }
     @MainActor func testSessionMigrationSupportsOnlyMatchingReviewedVersions() async throws {
         for (source,destination,accepted) in [("0.166.0","0.166.0",true),("0.167.1","0.167.1",true),
                                             ("0.166.0","0.167.1",false),("0.167.1","0.166.0",false),

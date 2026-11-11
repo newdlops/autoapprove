@@ -778,7 +778,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,755 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::message_processor::NativeSelectedRuntime;
@@ -975,8 +975,10 @@
 +    inspected["journalLockSupported"] = json!(runtime.is_some());
 +    send(&mut writer, inspected).await?;
 +    let first = read_request(&mut reader, Duration::from_secs(2)).await?;
-+    if !matches!(first.op.as_str(), "pause" | "shutdown-observe")
-+        || first.server_generation.as_deref() != Some(&generation)
++    if !matches!(
++        first.op.as_str(),
++        "pause" | "shutdown-observe" | "ownership-observe"
++    ) || first.server_generation.as_deref() != Some(&generation)
 +        || first.lease_id.is_some()
 +        || (first.op == "pause" && first.journal.is_some())
 +    {
@@ -997,6 +999,23 @@
 +        }
 +    }
 +    names.sort();
++    if first.op == "ownership-observe" {
++        if first.journal.is_some() {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
++        let value = runtime
++            .as_ref()
++            .ok_or(io::ErrorKind::Unsupported)?
++            .observe_ownership(&threads)?;
++        send(
++            &mut writer,
++            json!({"schemaVersion":1,"producer":"autoapprove-selected-ownership-observation",
++            "nonce":first.nonce,"serverGeneration":generation,"pid":std::process::id(),
++            "threadIds":names,"ownership":value,"migrationAuthorized":false}),
++        )
++        .await?;
++        return Ok(());
++    }
 +    if first.op == "shutdown-observe" {
 +        let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
 +        let stamp = first.journal.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
@@ -1036,6 +1055,7 @@
 +    let lease = uuid::Uuid::now_v7().to_string();
 +    let mut shutdown: Option<crate::message_processor::NativeSelectedShutdown> = None;
 +    let mut journal_lock = None;
++    let mut retirement: Option<crate::request_processors::NativeSelectedRetirement> = None;
 +    let mut deadline = Instant::now() + ttl;
 +    tokio::time::timeout_at(
 +        deadline,
@@ -1070,6 +1090,7 @@
 +        let mut cohort = None;
 +        let mut journal_reply = None;
 +        let mut shutdown_reply = None;
++        let mut retirement_reply = None;
 +        if let Some(lock) = &journal_lock {
 +            crate::selected_journal_lock::NativeJournalLock::verify_kernel(lock)?;
 +        }
@@ -1107,6 +1128,9 @@
 +                journal_lock = Some(lock);
 +            }
 +            "journal-sync" => {
++                if retirement.is_some() {
++                    return Err(io::ErrorKind::InvalidInput.into());
++                }
 +                let lock = journal_lock.as_mut().ok_or(io::ErrorKind::InvalidInput)?;
 +                lock.refresh(
 +                    request.journal.clone().ok_or(io::ErrorKind::InvalidInput)?,
@@ -1143,6 +1167,33 @@
 +                shutdown_reply = Some(job.snapshot());
 +                shutdown = Some(job);
 +            }
++            "retire-prepare" => {
++                if retirement.is_some() {
++                    return Err(io::ErrorKind::AlreadyExists.into());
++                }
++                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                // Do not detach archive work. A lost connection cannot publish
++                // policy: publication needs a new connected commit command.
++                let proof = runtime.prepare_retirement(&pause, &threads, lock).await?;
++                retirement_reply = Some(proof.snapshot());
++                retirement = Some(proof);
++            }
++            "retire-commit" => {
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                let proof = retirement.as_mut().ok_or(io::ErrorKind::InvalidInput)?;
++                if Instant::now() >= deadline || !reader.buffer().is_empty() {
++                    return Err(io::ErrorKind::ConnectionAborted.into());
++                }
++                let mut byte = [0u8; 1];
++                match reader.get_ref().as_ref().try_read(&mut byte) {
++                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
++                    _ => return Err(io::ErrorKind::ConnectionAborted.into()),
++                }
++                // No await separates final peer/lease checks, guard validation,
++                // and atomic policy publication. A lost reply is observed.
++                retirement_reply = Some(proof.commit(lock, &admission, &pause, &threads)?);
++            }
 +            "shutdown-status" => {
 +                shutdown_reply = Some(shutdown.as_ref().ok_or(io::ErrorKind::NotFound)?.snapshot());
 +            }
@@ -1157,6 +1208,7 @@
 +                if shutdown.as_ref().is_some_and(|job| job.pending()) {
 +                    return Err(io::ErrorKind::WouldBlock.into());
 +                }
++                drop(retirement);
 +                drop(journal_lock);
 +                drop(pause);
 +                send(
@@ -1178,6 +1230,9 @@
 +        );
 +        if let Some(cohort) = cohort {
 +            reply["runtimeCohort"] = cohort;
++        }
++        if let Some(value) = retirement_reply {
++            reply["retirement"] = value;
 +        }
 +        if let Some(status) = shutdown_reply {
 +            reply["shutdown"] = status;
@@ -1489,7 +1544,7 @@
      user_verification: Arc<crate::user_verification::Service>,
      outgoing: Arc<OutgoingMessageSender>,
      startup_warnings: StartupWarnings,
-@@ -177,6 +178,145 @@
+@@ -177,6 +178,184 @@
      turn_processor: TurnRequestProcessor,
      windows_sandbox_processor: WindowsSandboxRequestProcessor,
      request_serialization_queues: RequestSerializationQueues,
@@ -1632,10 +1687,49 @@
 +            .native_move_cohort(&self.admission, pause, ids, &self.queues)
 +            .await
 +    }
++    pub(crate) fn observe_ownership(
++        &self,
++        ids: &std::collections::HashSet<codex_protocol::ThreadId>,
++    ) -> std::io::Result<serde_json::Value> {
++        let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
++        let observed =
++            codex_core::native_ownership::store::observe(&self.threads.native_move_home(), &ids)?;
++        let rows = observed.threads.into_iter().map(|row| serde_json::json!({
++            "threadId":row.thread_id,"requestId":row.request_id,"ownerHomeIdentity":row.owner_home_identity,"phase":row.phase,
++        })).collect::<Vec<_>>();
++        Ok(
++            serde_json::json!({"homeIdentity":observed.home_identity,"ownershipRevision":observed.revision,
++            "threads":rows,"observationOnly":true,"migrationAuthorized":false}),
++        )
++    }
++    pub(crate) async fn prepare_retirement(
++        &self,
++        pause: &crate::turn_admission::SelectedAdmissionPause,
++        ids: &std::collections::HashSet<codex_protocol::ThreadId>,
++        journal: &crate::selected_journal_lock::NativeJournalLock,
++    ) -> std::io::Result<crate::request_processors::NativeSelectedRetirement> {
++        let cohort = self
++            .cohort(pause, ids)
++            .await
++            .map_err(|error| std::io::Error::other(error.message))?;
++        if cohort["readyForWriterShutdown"] != true
++            || cohort["knownSubtreeCovered"] != true
++            || !cohort["threads"]
++                .as_array()
++                .is_some_and(|rows| rows.iter().all(|row| row["loaded"] == false))
++        {
++            return Err(std::io::Error::other(
++                "Every selected runtime must stop before retirement",
++            ));
++        }
++        self.threads
++            .native_prepare_retirement(&self.admission, pause, ids, journal)
++            .await
++    }
  }
  
  #[derive(Debug)]
-@@ -336,7 +476,7 @@
+@@ -336,7 +515,7 @@
              ),
          );
          let goal_service = Arc::new(GoalService::new());
@@ -1644,7 +1738,7 @@
          let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
          let extension_event_sink =
              app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
-@@ -543,6 +683,7 @@
+@@ -543,6 +722,7 @@
              config_warnings.clone(),
              sample_responses,
          );
@@ -1652,7 +1746,7 @@
          let turn_processor = TurnRequestProcessor::new(
              auth_manager,
              Arc::clone(&thread_manager),
-@@ -612,6 +753,7 @@
+@@ -612,6 +792,7 @@
  
          Self {
              turn_admission,
@@ -1660,7 +1754,7 @@
              user_verification,
              outgoing,
              startup_warnings: StartupWarnings {
-@@ -644,6 +786,22 @@
+@@ -644,6 +825,22 @@
              turn_processor,
              windows_sandbox_processor,
              request_serialization_queues,
@@ -1683,7 +1777,7 @@
          }
      }
  
-@@ -1018,6 +1176,9 @@
+@@ -1018,6 +1215,9 @@
          {
              return Err(invalid_request(experimental_required_message(reason)));
          }
@@ -1693,7 +1787,7 @@
          let connection_id = connection_request_id.connection_id;
          self.initialize_processor.track_initialized_request(
              connection_id,
-@@ -1065,6 +1226,7 @@
+@@ -1065,6 +1265,7 @@
          let request = QueuedInitializedRequest::new(
              rpc_gate,
              async move {
@@ -1701,7 +1795,7 @@
                  let _turn_admission = turn_admission;
                  // Runtime changes already admitted before drain finish normally. Turn work
                  // still waiting in serialization must observe the newly closed gate.
-@@ -1406,10 +1568,14 @@
+@@ -1406,10 +1607,14 @@
                      .await
              }
              ClientRequest::AutoapproveGoalRead { params, .. } => {
@@ -5563,7 +5657,7 @@
  codex-utils-process = { workspace = true }
 --- /dev/null
 +++ b/core/src/native_ownership/store.rs
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,773 @@
 +//! Policy storage only. The native caller must independently verify its live
 +//! admission lease, journal, complete scope, writer closure and imported data.
 +use super::*;
@@ -5590,6 +5684,69 @@
 +    pub request_id: String,
 +    pub thread_ids: Vec<String>,
 +    pub phase: &'static str,
++}
++#[derive(Debug, PartialEq, Eq)]
++pub struct ThreadObservation {
++    pub thread_id: String,
++    pub request_id: Option<String>,
++    pub owner_home_identity: Option<String>,
++    pub phase: Option<&'static str>,
++}
++#[derive(Debug, PartialEq, Eq)]
++pub struct Observation {
++    pub home_identity: String,
++    pub revision: u64,
++    pub threads: Vec<ThreadObservation>,
++}
++/// A validated point-in-time read for recovery after a lost publication reply.
++/// This grants no permission to mutate or replay an ownership transition.
++pub fn observe(home: &Path, thread_ids: &[String]) -> io::Result<Observation> {
++    let ids: std::collections::BTreeSet<_> = thread_ids.iter().cloned().collect();
++    if ids.is_empty()
++        || ids.len() > 512
++        || ids.len() != thread_ids.len()
++        || ids.iter().any(|id| !canonical_uuid(id))
++    {
++        return Err(unavailable());
++    }
++    let (_, root, home_identity) = open_home(home)?;
++    let loaded = load(home)?;
++    let revision = loaded.as_ref().map_or(0, |value| value.state.revision);
++    let mut threads = Vec::new();
++    for thread_id in ids {
++        let row = loaded.as_ref().and_then(|value| {
++            value
++                .state
++                .threads
++                .iter()
++                .find(|row| row.thread_id == thread_id)
++        });
++        threads.push(ThreadObservation {
++            thread_id,
++            request_id: row.map(|row| row.request_id.clone()),
++            owner_home_identity: row.map(|row| row.owner_home_identity.clone()),
++            phase: row.map(|row| match row.phase {
++                Phase::Incoming => "incoming",
++                Phase::Retired => "retired",
++                Phase::Active => "active",
++            }),
++        });
++    }
++    if let Some(loaded) = &loaded {
++        same_current(home, Some(loaded))?;
++    } else if present(&home.join(POLICY_DIRECTORY))? {
++        return Err(conflict());
++    }
++    let pinned = root.metadata()?;
++    let current = std::fs::symlink_metadata(home)?;
++    if !current.is_dir() || (pinned.dev(), pinned.ino()) != (current.dev(), current.ino()) {
++        return Err(unavailable());
++    }
++    Ok(Observation {
++        home_identity,
++        revision,
++        threads,
++    })
 +}
 +pub fn revision(home: &Path) -> io::Result<u64> {
 +    Ok(load(home)?.map_or(0, |loaded| loaded.state.revision))
@@ -6041,6 +6198,51 @@
 +        uuid::Uuid::new_v4().to_string()
 +    }
 +    #[test]
++    fn recovery_observes_exact_rows_without_replaying_or_accepting_corruption() -> io::Result<()> {
++        let source = Fixture::new()?;
++        let destination = Fixture::new()?;
++        let selected = id();
++        let other = id();
++        let ids = vec![selected.clone(), other.clone()];
++        let empty = observe(&source.home, &ids)?;
++        assert_eq!(empty.revision, 0);
++        assert!(empty.threads.iter().all(|row| row.phase.is_none()));
++        let mut change = request(Transition::Retire, 0, vec![selected.clone()]);
++        change.destination_home_identity = Some(destination.id.clone());
++        apply(&source.home, &change, || Ok(()))?;
++        let bytes = source.bytes()?;
++        let snapshot = observe(&source.home, &ids)?;
++        assert_eq!(snapshot.revision, 1);
++        let row = snapshot
++            .threads
++            .iter()
++            .find(|row| row.thread_id == selected)
++            .unwrap();
++        assert_eq!(row.phase, Some("retired"));
++        assert_eq!(row.request_id.as_deref(), Some(change.request_id.as_str()));
++        assert_eq!(
++            row.owner_home_identity.as_deref(),
++            Some(destination.id.as_str())
++        );
++        assert_eq!(
++            snapshot
++                .threads
++                .iter()
++                .find(|row| row.thread_id == other)
++                .unwrap()
++                .phase,
++            None
++        );
++        assert_eq!(source.bytes()?, bytes);
++        assert!(observe(&source.home, &[selected.clone(), selected.clone()]).is_err());
++        std::fs::write(
++            source.home.join(POLICY_DIRECTORY).join(STATE_FILE),
++            b"broken",
++        )?;
++        assert!(observe(&source.home, &[selected]).is_err());
++        Ok(())
++    }
++    #[test]
 +    fn first_publication_is_complete_and_activation_is_single_use() -> io::Result<()> {
 +        let f = Fixture::new()?;
 +        let thread = id();
@@ -6451,9 +6653,18 @@
  use tracing::info;
  use tracing::warn;
  use uuid::Uuid;
+@@ -599,6 +598,8 @@
+ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++pub(crate) use thread_processor::NativeSelectedRetirement;
+ pub(crate) use thread_processor::ThreadRequestProcessor;
+ pub(crate) use thread_processor::ThreadResumeTarget;
+ pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 --- a/app-server/src/request_processors/thread_processor.rs
 +++ b/app-server/src/request_processors/thread_processor.rs
-@@ -5,6 +5,16 @@
+@@ -5,6 +5,21 @@
  mod daemon_snapshot;
  
  mod workspace_switching;
@@ -6465,20 +6676,26 @@
 +#[path = "selected_cohort.rs"]
 +mod selected_cohort;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++#[path = "selected_retirement.rs"]
++mod selected_retirement;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +#[path = "selected_shutdown.rs"]
 +mod selected_shutdown;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++pub(crate) use selected_retirement::NativeSelectedRetirement;
  
  use super::persisted_resume_settings::PersistedResumeSettings;
  use super::persisted_resume_settings::latest_owned_thread_settings;
-@@ -510,6 +520,7 @@
+@@ -510,6 +525,8 @@
      pub(super) state_db: Option<StateDbHandle>,
      pub(super) log_db: Option<LogDbLayer>,
      pub(super) background_tasks: TaskTracker,
-+    retained_removal_shutdowns: Arc<retained_shutdown::RetainedShutdowns<ThreadId, codex_core::CodexThread>>,
++    retained_removal_shutdowns:
++        Arc<retained_shutdown::RetainedShutdowns<ThreadId, codex_core::CodexThread>>,
      pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
      pub(super) skills_watcher: Arc<SkillsWatcher>,
      pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-@@ -534,6 +545,10 @@
+@@ -534,6 +551,10 @@
  }
  
  impl ThreadRequestProcessor {
@@ -6489,7 +6706,7 @@
      #[allow(clippy::too_many_arguments)]
      pub(crate) fn new(
          auth_manager: Arc<AuthManager>,
-@@ -571,6 +586,7 @@
+@@ -571,6 +592,7 @@
              state_db,
              log_db,
              background_tasks: TaskTracker::new(),
@@ -6497,7 +6714,7 @@
              sample_responses,
              skills_watcher,
              turn_cost_worker,
-@@ -1175,24 +1191,38 @@
+@@ -1175,24 +1197,58 @@
          thread_id: ThreadId,
          operation: &str,
      ) -> Result<(), JSONRPCErrorError> {
@@ -6519,34 +6736,51 @@
 -                    error!(
 -                        "failed to submit Shutdown to thread {thread_id}; proceeding with {operation}"
 -                    );
--                }
++        if let Some(conversation) = conversation {
++            match self
++                .retained_removal_shutdowns
++                .observe(
++                    thread_id,
++                    Arc::clone(&conversation),
++                    Duration::from_secs(10),
++                    |thread| async move {
++                        thread
++                            .shutdown_and_wait()
++                            .await
++                            .map_err(|error| error.to_string())
++                    },
++                )
++                .await
++            {
++                retained_shutdown::Observation::Stopped => {}
++                retained_shutdown::Observation::Pending => {
++                    return Err(internal_error(format!(
++                        "Thread {thread_id} is still shutting down; {operation} has not been performed"
++                    )));
+                 }
 -                ThreadShutdownResult::TimedOut => {
 -                    warn!("thread {thread_id} shutdown timed out; proceeding with {operation}");
--                }
--            }
-+        if let Some(conversation) = conversation {
-+            match self.retained_removal_shutdowns.observe(
-+                thread_id,
-+                Arc::clone(&conversation),
-+                Duration::from_secs(10),
-+                |thread| async move { thread.shutdown_and_wait().await.map_err(|error| error.to_string()) },
-+            ).await {
-+                retained_shutdown::Observation::Stopped => {}
-+                retained_shutdown::Observation::Pending => return Err(internal_error(format!(
-+                    "Thread {thread_id} is still shutting down; {operation} has not been performed"
-+                ))),
-+                retained_shutdown::Observation::Failed(error) => return Err(internal_error(format!(
-+                    "Thread {thread_id} shutdown was not confirmed; {operation} has not been performed: {error}"
-+                ))),
-+            }
++                retained_shutdown::Observation::Failed(error) => {
++                    return Err(internal_error(format!(
++                        "Thread {thread_id} shutdown was not confirmed; {operation} has not been performed: {error}"
++                    )));
+                 }
+             }
 +            // A late shutdown must never unregister or tear down a replacement.
-+            if self.thread_manager.remove_thread_if_matches(&thread_id, &conversation).await.is_none() {
++            if self
++                .thread_manager
++                .remove_thread_if_matches(&thread_id, &conversation)
++                .await
++                .is_none()
++            {
 +                return Err(internal_error(format!(
 +                    "Thread {thread_id} registration changed during shutdown; inspect its current state before {operation}"
 +                )));
 +            }
 +            self.finalize_thread_teardown(thread_id).await;
-+            self.retained_removal_shutdowns.forget_if_matches(&thread_id, &conversation).await;
++            self.retained_removal_shutdowns
++                .forget_if_matches(&thread_id, &conversation)
++                .await;
 +            return Ok(());
          }
          self.finalize_thread_teardown(thread_id).await;
@@ -6749,7 +6983,7 @@
      pub(crate) async fn cancel_requests_for_thread(
 --- /dev/null
 +++ b/app-server/src/selected_journal_lock.rs
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,392 @@
 +//! Kernel-backed journal coordination. Holding this is not a migration grant.
 +use base64::Engine;
 +use codex_core::native_ownership::{BorrowedMigrationLock, borrow_migration_lock};
@@ -7030,6 +7264,37 @@
 +        }
 +        Ok(())
 +    }
++    pub(crate) fn retirement_request(
++        &self,
++    ) -> io::Result<codex_core::native_ownership::store::Request> {
++        self.require_source()?;
++        self.require_phase("retireAttempted")?;
++        let expected_revision = self
++            .payload
++            .pointer("/execution/ownershipRevision")
++            .and_then(Value::as_u64)
++            .ok_or_else(invalid)?;
++        let thread_ids = self
++            .payload
++            .pointer("/request/threads")
++            .and_then(Value::as_array)
++            .ok_or_else(invalid)?
++            .iter()
++            .map(|row| string(row, "/id").map(str::to_owned))
++            .collect::<io::Result<Vec<_>>>()?;
++        Ok(codex_core::native_ownership::store::Request {
++            expected_revision,
++            request_id: self.stamp.request_id.clone(),
++            thread_ids,
++            transition: codex_core::native_ownership::store::Transition::Retire,
++            destination_home_identity: Some(
++                string(&self.payload, "/request/destination/physicalHomeID")?.to_owned(),
++            ),
++        })
++    }
++    pub(crate) fn home(&self) -> &Path {
++        self.lock.home()
++    }
 +    pub(crate) fn retain_kernel(&self) -> Arc<BorrowedMigrationLock> {
 +        Arc::clone(&self.lock)
 +    }
@@ -7220,3 +7485,295 @@
 +        Ok(())
 +    }
 +}
+--- /dev/null
++++ b/app-server/src/request_processors/selected_retirement.rs
+@@ -0,0 +1,183 @@
++//! Connected source retirement. Preparation may archive only observed active
++//! members; publication is a separate synchronous command under all live guards.
++use super::*;
++use crate::selected_journal_lock::{JournalLockRequest, NativeJournalLock};
++use crate::turn_admission::{SelectedAdmissionPause, TurnAdmission};
++use codex_core::native_ownership::store;
++use codex_rollout::{WriterLockCoordinator, WriterLockGuard};
++use serde_json::{Value, json};
++use std::io;
++
++pub(crate) struct NativeSelectedRetirement {
++    home: PathBuf,
++    stamp: JournalLockRequest,
++    request: store::Request,
++    guards: Vec<(ThreadId, WriterLockGuard)>,
++    attempted: bool,
++}
++impl NativeSelectedRetirement {
++    fn verify(
++        &self,
++        journal: &NativeJournalLock,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++    ) -> io::Result<()> {
++        let stamp = journal.stamp();
++        if journal.home() != self.home
++            || stamp.request_id != self.stamp.request_id
++            || stamp.revision != self.stamp.revision
++            || stamp.digest != self.stamp.digest
++            || self.guards.len() != ids.len()
++            || self.guards.iter().any(|(id, _)| !ids.contains(id))
++        {
++            return Err(io::Error::other(
++                "Retirement guards no longer match the prepared move",
++            ));
++        }
++        journal.require_source()?;
++        journal.require_phase("retireAttempted")?;
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++        for (id, guard) in &self.guards {
++            guard.verify_for(&self.home, *id)?;
++        }
++        Ok(())
++    }
++    pub(crate) fn snapshot(&self) -> Value {
++        let mut ids = self.request.thread_ids.clone();
++        ids.sort();
++        json!({"requestId":self.request.request_id,"threadIds":ids,"phase":"writers-held",
++            "ownershipRevision":self.request.expected_revision,"writersStopped":true,
++            "membershipComplete":false,"migrationAuthorized":false})
++    }
++    pub(crate) fn commit(
++        &mut self,
++        journal: &NativeJournalLock,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++    ) -> io::Result<Value> {
++        if self.attempted {
++            return Err(io::Error::other(
++                "Retirement was already attempted; observe ownership instead",
++            ));
++        }
++        self.verify(journal, admission, pause, ids)?;
++        self.attempted = true;
++        let receipt = store::apply(&self.home, &self.request, || {
++            self.verify(journal, admission, pause, ids)
++        })?;
++        Ok(
++            json!({"requestId":receipt.request_id,"threadIds":receipt.thread_ids,"phase":receipt.phase,
++            "ownershipRevision":receipt.revision,"homeIdentity":receipt.home_identity,
++            "writersStopped":true,"membershipComplete":false,"migrationAuthorized":false}),
++        )
++    }
++}
++
++impl ThreadRequestProcessor {
++    pub(crate) async fn native_prepare_retirement(
++        &self,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++        journal: &NativeJournalLock,
++    ) -> io::Result<NativeSelectedRetirement> {
++        let request = journal.retirement_request()?;
++        let home = self.native_move_home();
++        if journal.home() != home {
++            return Err(io::Error::other("Wrong retirement home"));
++        }
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++        let observed = store::observe(&home, &request.thread_ids)?;
++        if observed.revision != request.expected_revision
++            || observed.threads.iter().any(|row| {
++                row.request_id.as_deref() == Some(request.request_id.as_str())
++                    || row.phase.is_some_and(|phase| phase != "active")
++            })
++        {
++            return Err(io::Error::other(
++                "Ownership already changed; observe instead of replaying retirement",
++            ));
++        }
++        let mut sorted: Vec<_> = ids.iter().copied().collect();
++        sorted.sort_by_key(ToString::to_string);
++        let mut active = Vec::new();
++        for id in &sorted {
++            if self
++                .thread_manager
++                .capture_thread_for_client_removal(id)
++                .await
++                .map_err(|error| io::Error::other(error.to_string()))?
++                .is_some()
++            {
++                return Err(io::Error::other(
++                    "Selected runtime must stop before retirement",
++                ));
++            }
++            let row = self
++                .thread_store
++                .read_thread(StoreReadThreadParams {
++                    thread_id: *id,
++                    include_archived: true,
++                    include_history: false,
++                })
++                .await
++                .map_err(|error| io::Error::other(error.to_string()))?;
++            if row.archived_at.is_none() {
++                active.push(*id);
++            }
++        }
++        if !active.is_empty() {
++            let archived = self
++                .thread_store
++                .archive_threads(StoreArchiveThreadsParams {
++                    thread_ids: active.clone(),
++                    writer_lock_thread_ids: sorted.clone(),
++                })
++                .await
++                .map_err(|error| io::Error::other(error.to_string()))?;
++            if archived.into_iter().collect::<HashSet<_>>() != active.into_iter().collect() {
++                return Err(io::Error::other(
++                    "Only part of the selected scope was archived; inspect before continuing",
++                ));
++            }
++        }
++        for id in &sorted {
++            let row = self
++                .thread_store
++                .read_thread(StoreReadThreadParams {
++                    thread_id: *id,
++                    include_archived: true,
++                    include_history: false,
++                })
++                .await
++                .map_err(|error| io::Error::other(error.to_string()))?;
++            if row.archived_at.is_none() || row.thread_id != *id {
++                return Err(io::Error::other("Selected archive state was not confirmed"));
++            }
++        }
++        // Direct cross-process acquisition deliberately does not use the local
++        // store helper, which can skip a lock owned by its own live recorder.
++        let coordinator = Arc::new(WriterLockCoordinator::new(&home));
++        let mut guards = Vec::new();
++        for id in sorted {
++            let guard = coordinator.acquire(id)?;
++            guard.verify_for(&home, id)?;
++            guards.push((id, guard));
++        }
++        let result = NativeSelectedRetirement {
++            home,
++            stamp: journal.stamp(),
++            request,
++            guards,
++            attempted: false,
++        };
++        result.verify(journal, admission, pause, ids)?;
++        Ok(result)
++    }
++}
+--- a/rollout/src/writer_lock.rs
++++ b/rollout/src/writer_lock.rs
+@@ -30,6 +30,44 @@
+     coordinator: Arc<WriterLockCoordinator>,
+     path: PathBuf,
+     file: Option<File>,
++}
++
++impl WriterLockGuard {
++    /// Revalidate a held lock against the current, non-link namespace. Native
++    /// ownership publication uses this in addition to its pinned home lock.
++    #[cfg(unix)]
++    pub fn verify_for(&self, codex_home: &Path, thread_id: ThreadId) -> io::Result<()> {
++        use std::os::unix::fs::MetadataExt;
++        let invalid = || {
++            io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "Thread writer lock namespace changed",
++            )
++        };
++        let directory = codex_home.join(WRITER_LOCK_DIR);
++        if self.coordinator.directory != directory
++            || self.path != directory.join(format!("{thread_id}.lock"))
++        {
++            return Err(invalid());
++        }
++        let namespace = fs::symlink_metadata(&directory)?;
++        let current = fs::symlink_metadata(&self.path)?;
++        let pinned = self.file.as_ref().ok_or_else(invalid)?.metadata()?;
++        let uid = unsafe { libc::geteuid() };
++        if !namespace.is_dir()
++            || namespace.uid() != uid
++            || namespace.mode() & 0o022 != 0
++            || !current.is_file()
++            || current.uid() != uid
++            || current.mode() & 0o022 != 0
++            || current.nlink() != 1
++            || pinned.nlink() != 1
++            || (current.dev(), current.ino()) != (pinned.dev(), pinned.ino())
++        {
++            return Err(invalid());
++        }
++        Ok(())
++    }
+ }
+ 
+ impl WriterLockCoordinator {
+@@ -194,9 +232,25 @@
+             }
+         };
+ 
+-        // Close the writer lock before deleting it so cleanup works on Windows too.
++        // A failed native namespace check can leave another entry at this
++        // pathname. Cleanup must never remove a replacement's lock file.
++        #[cfg(unix)]
++        let remove_current = {
++            use std::os::unix::fs::MetadataExt;
++            self.file
++                .as_ref()
++                .and_then(|file| file.metadata().ok())
++                .zip(fs::symlink_metadata(&self.path).ok())
++                .is_some_and(|(held, current)| {
++                    current.is_file() && (held.dev(), held.ino()) == (current.dev(), current.ino())
++                })
++        };
++        #[cfg(not(unix))]
++        let remove_current = true;
++        // Close before deletion so ordinary cleanup also works on Windows.
+         drop(self.file.take());
+-        if let Err(err) = fs::remove_file(&self.path)
++        if remove_current
++            && let Err(err) = fs::remove_file(&self.path)
+             && err.kind() != io::ErrorKind::NotFound
+         {
+             warn!(
+--- a/rollout/src/writer_lock_tests.rs
++++ b/rollout/src/writer_lock_tests.rs
+@@ -9,6 +9,28 @@
+ use super::WriterLockCoordinator;
+ use pretty_assertions::assert_eq;
+ use std::io::ErrorKind;
++
++#[cfg(unix)]
++#[test]
++fn ownership_witness_rejects_wrong_scope_and_replaced_or_linked_lock() {
++    let home = TempDir::new().unwrap();
++    let coordinator = Arc::new(WriterLockCoordinator::new(home.path()));
++    let id = ThreadId::default();
++    let guard = coordinator.acquire(id).unwrap();
++    guard.verify_for(home.path(), id).unwrap();
++    assert!(guard.verify_for(home.path(), ThreadId::default()).is_err());
++    let path = home.path().join(WRITER_LOCK_DIR).join(format!("{id}.lock"));
++    let linked = home.path().join("linked-lock");
++    fs::hard_link(&path, &linked).unwrap();
++    assert!(guard.verify_for(home.path(), id).is_err());
++    fs::remove_file(&linked).unwrap();
++    guard.verify_for(home.path(), id).unwrap();
++    fs::rename(&path, &linked).unwrap();
++    fs::write(&path, b"replacement").unwrap();
++    assert!(guard.verify_for(home.path(), id).is_err());
++    drop(guard);
++    assert_eq!(fs::read(&path).unwrap(), b"replacement");
++}
+ 
+ #[test]
+ fn writer_locks_reject_competing_owners_and_release_their_files() {

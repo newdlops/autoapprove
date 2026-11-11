@@ -57,10 +57,47 @@ struct CodexNativeSelectedShutdown:Decodable,Sendable {
     }
 }
 
+struct CodexNativeRetirementReceipt:Decodable,Sendable {
+    let requestId:String,threadIds:[String],phase:String,ownershipRevision:Int
+    let homeIdentity:String?
+    let writersStopped:Bool,membershipComplete:Bool,migrationAuthorized:Bool
+    func validate(requestID:String,threadIDs:[String],phase:String,revision:Int,homeIdentity:String)throws {
+        guard requestId==requestID,threadIds==(try CodexNativeSelectedInputLease.checkedScope(threadIDs)),
+              ["writers-held","retired"].contains(phase),self.phase==phase,ownershipRevision==revision,revision>=0,writersStopped,!membershipComplete,!migrationAuthorized,
+              phase=="retired" ? self.homeIdentity==homeIdentity:self.homeIdentity==nil else {
+            throw AppError.message("원본 대화의 소유권 해제 결과를 확인하지 못했습니다.")
+        }
+    }
+}
+
+/// Current durable rows for recovery. They are not a grant to repeat a command.
+struct CodexNativeOwnershipObservation:Decodable,Sendable {
+    struct Thread:Decodable,Sendable {let threadId:String,requestId:String?,ownerHomeIdentity:String?,phase:String?}
+    let homeIdentity:String,ownershipRevision:Int,threads:[Thread]
+    let observationOnly:Bool,migrationAuthorized:Bool
+    private static func identity(_ value:String)->Bool {
+        let pieces=value.split(separator:":",omittingEmptySubsequences:false)
+        return pieces.count==2 && pieces.allSatisfy{!$0.isEmpty && $0.utf8.allSatisfy{(48...57).contains($0)} && UInt64($0) != nil}
+    }
+    func validate(threadIDs:[String])throws {
+        let failure=AppError.message("대화의 현재 소유권 기록을 확인하지 못했습니다.")
+        guard Self.identity(homeIdentity),ownershipRevision>=0,observationOnly,!migrationAuthorized,
+              threads.map(\.threadId)==(try CodexNativeSelectedInputLease.checkedScope(threadIDs)) else{throw failure}
+        for row in threads {
+            if let phase=row.phase {
+                guard ownershipRevision>0,["active","incoming","retired"].contains(phase),
+                      let requestID=row.requestId,UUID(uuidString:requestID)?.uuidString.lowercased()==requestID,
+                      let owner=row.ownerHomeIdentity,Self.identity(owner),
+                      (phase=="retired") == (owner != homeIdentity) else{throw failure}
+            }else {guard row.requestId==nil,row.ownerHomeIdentity==nil else{throw failure}}
+        }
+    }
+}
+
 /// One utility-task owner. The lease drains and pauses input admission for an
 /// exact scope. It does not stop accepted work or establish migration ownership.
 final class CodexNativeSelectedInputLease {
-    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status"}
+    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status",retirePrepare="retire-prepare",retireCommit="retire-commit"}
     struct JournalLockReceipt:Decodable {
         let requestId:String,revision:Int,digest:String,homeIdentity:String,role:String,phase:String
         let migrationAuthorized:Bool
@@ -74,6 +111,7 @@ final class CodexNativeSelectedInputLease {
         let journalLockSupported:Bool?,journalDescriptorReady:Bool?
         let journalLock:JournalLockReceipt?
         let shutdown:CodexNativeSelectedShutdown?
+        let retirement:CodexNativeRetirementReceipt?
     }
     private struct Request:Encodable {
         let op:String,nonce:String,serverGeneration:String?,leaseId:String?,threadIds:[String]?
@@ -90,6 +128,8 @@ final class CodexNativeSelectedInputLease {
     private var journalHeld=false
     private var journalWitness:JournalLockReceipt?
     private var shutdownRequestID:String?
+    private var retirementRevision:Int?
+    private var retirementCommitAttempted=false
     private static var failure:AppError {.message("선택한 대화의 서버 입력 차단을 확인하지 못했습니다. 이동을 진행하지 않습니다.")}
     static func checkedScope(_ ids:[String])throws->[String] {
         guard (1...512).contains(ids.count),Set(ids).count==ids.count,
@@ -166,6 +206,50 @@ final class CodexNativeSelectedInputLease {
             return status
         }catch{close();throw error}
     }
+    func prepareRetirement(expectedOwnershipRevision:Int)throws->CodexNativeRetirementReceipt {
+        do {
+            guard held,retirementRevision==nil,let witness=journalWitness,witness.role=="source",
+                  expectedOwnershipRevision>=0,let receipt=try call(.retirePrepare).retirement else{throw Self.failure}
+            try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"writers-held",
+                revision:expectedOwnershipRevision,homeIdentity:witness.homeIdentity)
+            retirementRevision=expectedOwnershipRevision
+            return receipt
+        }catch{close();throw error}
+    }
+    func commitRetirement()throws->CodexNativeRetirementReceipt {
+        do {
+            guard held,!retirementCommitAttempted,let revision=retirementRevision,revision<Int.max,
+                  let witness=journalWitness else{throw Self.failure}
+            retirementCommitAttempted=true
+            guard let receipt=try call(.retireCommit).retirement else{throw Self.failure}
+            try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"retired",revision:revision+1,
+                homeIdentity:witness.homeIdentity)
+            return receipt
+        }catch{close();throw error}
+    }
+    static func observeOwnership(path:String,expected:CodexNativeDisplayedConnection,threadIDs:[String])throws->CodexNativeOwnershipObservation {
+        let scope=try checkedScope(threadIDs),connection=try CodexNativeLineConnection(path:path)
+        defer{connection.close()}
+        guard connection.peer.identity==expected.serverPeer else{throw failure}
+        let inspectNonce=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
+        let inspect=Request(op:"inspect",nonce:inspectNonce,serverGeneration:nil,leaseId:nil,threadIds:nil)
+        let inspected=try validate(connection.exchange(JSONEncoder().encode(inspect)),operation:.inspect,nonce:inspectNonce,
+            peer:connection.peer.identity,generation:nil,leaseID:nil,threadIDs:scope)
+        let nonce=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
+        let request=Request(op:"ownership-observe",nonce:nonce,serverGeneration:inspected.serverGeneration,leaseId:nil,threadIds:scope)
+        let data=try connection.exchange(JSONEncoder().encode(request))
+        struct Envelope:Decodable {
+            let schemaVersion:Int,producer:String,nonce:String,serverGeneration:String,pid:UInt32,threadIds:[String]
+            let ownership:CodexNativeOwnershipObservation,migrationAuthorized:Bool
+        }
+        guard data.count<=1_048_576 else{throw failure}
+        let reply=try JSONDecoder().decode(Envelope.self,from:data)
+        guard reply.schemaVersion==1,reply.producer=="autoapprove-selected-ownership-observation",reply.nonce==nonce,
+              reply.serverGeneration==inspected.serverGeneration,reply.pid==connection.peer.identity.pid,
+              reply.threadIds==scope,!reply.migrationAuthorized else{throw failure}
+        try reply.ownership.validate(threadIDs:scope)
+        return reply.ownership
+    }
     func release()throws {
         guard held else{throw Self.failure}
         defer{close()}
@@ -212,6 +296,9 @@ final class CodexNativeSelectedInputLease {
             if operation == .shutdownBegin || operation == .shutdownStatus {
                 guard let status=reply.shutdown else{throw failure};try status.validate()
             }else {guard reply.shutdown==nil else{throw failure}}
+            if operation == .retirePrepare || operation == .retireCommit {
+                guard reply.retirement != nil else{throw failure}
+            }else {guard reply.retirement==nil else{throw failure}}
             return reply
         }catch{throw failure}
     }

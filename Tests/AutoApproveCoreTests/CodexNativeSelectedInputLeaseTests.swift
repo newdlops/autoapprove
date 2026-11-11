@@ -3,6 +3,45 @@ import Foundation
 @testable import AutoApproveCore
 
 extension ApprovalTests {
+    func testNativeSelectedRetirementRejectsChangedRequestScopeAndRevision()throws {
+        let requestID=UUID().uuidString.lowercased(),id=UUID().uuidString.lowercased(),home="16777234:12345"
+        func check(_ changes:[String:Any]=[:],phase:String="retired")throws {
+            var value:[String:Any]=["requestId":requestID,"threadIds":[id],"phase":"retired","ownershipRevision":7,
+                "homeIdentity":home,"writersStopped":true,"membershipComplete":false,"migrationAuthorized":false]
+            value.merge(changes,uniquingKeysWith:{$1})
+            let receipt=try JSONDecoder().decode(CodexNativeRetirementReceipt.self,from:JSONSerialization.data(withJSONObject:value))
+            try receipt.validate(requestID:requestID,threadIDs:[id],phase:phase,revision:7,homeIdentity:home)
+        }
+        try check()
+        try check(["phase":"writers-held","homeIdentity":NSNull()],phase:"writers-held")
+        for changes in [["requestId":UUID().uuidString.lowercased()],["threadIds":[]],["threadIds":[id,id]],
+                        ["ownershipRevision":6],["homeIdentity":"16777234:12346"],["writersStopped":false],
+                        ["membershipComplete":true],["migrationAuthorized":true],["phase":"active"]] as [[String:Any]] {
+            try expectThrows(check(changes))
+        }
+    }
+    func testNativeSelectedOwnershipObservationRequiresCompleteRequestedRows()throws {
+        let id=UUID().uuidString.lowercased(),requestID=UUID().uuidString.lowercased()
+        let row:[String:Any]=["threadId":id,"requestId":requestID,"ownerHomeIdentity":"16777234:54321","phase":"retired"]
+        func check(_ changes:[String:Any]=[:],row changedRow:[String:Any]?=nil)throws {
+            var value:[String:Any]=["homeIdentity":"16777234:12345","ownershipRevision":1,"threads":[changedRow ?? row],
+                "observationOnly":true,"migrationAuthorized":false]
+            value.merge(changes,uniquingKeysWith:{$1})
+            let snapshot=try JSONDecoder().decode(CodexNativeOwnershipObservation.self,from:JSONSerialization.data(withJSONObject:value))
+            try snapshot.validate(threadIDs:[id])
+        }
+        try check()
+        try check(["ownershipRevision":0],row:["threadId":id])
+        for changes in [["threads":[]],["threads":[row,row]],["ownershipRevision":0],["homeIdentity":"bad"],
+                        ["observationOnly":false],["migrationAuthorized":true]] as [[String:Any]] {
+            try expectThrows(check(changes))
+        }
+        for changes in [["threadId":UUID().uuidString.lowercased()],["requestId":"bad"],
+                        ["ownerHomeIdentity":"16777234:12345"],["phase":"active"],["phase":"ready"]] as [[String:Any]] {
+            var bad=row;bad.merge(changes,uniquingKeysWith:{$1});try expectThrows(check(row:bad))
+        }
+        var active=row;active["phase"]="active";active["ownerHomeIdentity"]="16777234:12345";try check(row:active)
+    }
     func testNativeSelectedShutdownRejectsOwnershipClaimsAndInconsistentResults()throws {
         let id=UUID().uuidString.lowercased()
         func check(_ changes:[String:Any]=[:],requestID:String?=nil)throws {

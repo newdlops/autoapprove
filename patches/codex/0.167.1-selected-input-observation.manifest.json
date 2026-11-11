@@ -29,12 +29,12 @@
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "474bb2c4bbbafe6c6b70f24d2f65275d72bc978746c64b70aa273e45db59c23c"
+      "after": "664653c1442be7f6b466f2fa3c87fdc93fe0eef29900b350bc257672b00266be"
     },
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "21ca18aa75263b31ff9d23e96a7b7a9d91d1d06803ae656fe9941b4086a2b22a"
+      "after": "50a9e122951122823b07133ffdba25ba6f99cc524803c5b6b60c1ef6dd598f9b"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -239,7 +239,7 @@
     {
       "path": "core/src/native_ownership/store.rs",
       "before": null,
-      "after": "bbfcc3d3c7d396cdfe13fdeb06d3f167b68a99f466cea435e658a3a6601c5eec"
+      "after": "d1bd1906a03d457437c9bf47c6995d1b703aa90e23365aa67a99b2bb6b360638"
     },
     {
       "path": "app-server/src/request_processors/retained_shutdown.rs",
@@ -249,12 +249,12 @@
     {
       "path": "app-server/src/request_processors.rs",
       "before": "9bdbcd07e08001c72125e202565cf7537d5fc09702939138d58704084ed8d9fd",
-      "after": "cadeb07659b8225751d9b621c5cdc42ef47b0b8117a6fc4c092b0f1e999ee83e"
+      "after": "a4d029d234194462be16a1567196102df501bc65f1808a274aee311dd6ce6176"
     },
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "1350218a176b05f20b2bf8dea21c9aa9c096f4ee5976afd17b75a0b7d0085c5e"
+      "after": "fc46cc207aeae4f210c61a09df878bb8bfd81ec1ef9adbe0f6bbe36419880576"
     },
     {
       "path": "core/src/codex_thread.rs",
@@ -289,15 +289,30 @@
     {
       "path": "app-server/src/selected_journal_lock.rs",
       "before": null,
-      "after": "e024d5a7eee5238303184946089627492f0d074ffb43ea5400d8a248b891abc9"
+      "after": "3fa6fb18bfdb1e7f9147ebf4f569c685985740efa59b3d32a86e8b3985ba07ae"
     },
     {
       "path": "app-server/src/request_processors/selected_shutdown.rs",
       "before": null,
       "after": "892e95b751f69303aca5e7b4c0ab2fc2386634e6423e0d95eb9e257965860994"
+    },
+    {
+      "path": "app-server/src/request_processors/selected_retirement.rs",
+      "before": null,
+      "after": "4c29b05decc875c0da2a458822886a5ca1122a87df26a62deeb366547c669c08"
+    },
+    {
+      "path": "rollout/src/writer_lock.rs",
+      "before": "c3e93ffcd45e19935ddf86e7b7a92b4263eccf048954277827e16af2c5f006a5",
+      "after": "a860ae149b5380966f4b563d5d5e78af5b4dcbe079d68c946f2ada52f0fc7000"
+    },
+    {
+      "path": "rollout/src/writer_lock_tests.rs",
+      "before": "ec35c4614cce8831e872e7452f30acf7b8ad5889b0227284bbfc683bf7f0d99d",
+      "after": "a6a961601badb0dc24a06d2161d1bd808ab7b403ef649f8520e581c199cd78a1"
     }
   ],
-  "patchSHA256": "699c2423c31642e50fc0e2edbecd81792fbec66818de3df4c20f03a8f1783000",
+  "patchSHA256": "6e7508a844a3d76a13ef6bd0ab4b4260a0e4a945f0e8610d46e5a0def4486a1d",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,

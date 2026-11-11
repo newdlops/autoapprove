@@ -41,12 +41,19 @@ struct CodexSessionMigrationRequest:Codable,Equatable,Sendable {
 struct CodexSessionMigrationState:Codable,Equatable {
     enum Stage:String,Codable {case reserved,prepared,cancelled}
     enum Cancellation:String,Codable {case requested,changedBeforeEffects}
+    struct Execution:Codable,Equatable {
+        enum Phase:String,Codable {case shutdownAttempted,retireAttempted}
+        var phase:Phase
+        var ownershipRevision:Int?=nil
+    }
     var formatVersion=1
     var request:CodexSessionMigrationRequest
     var stage:Stage = .prepared
     var cancellation:Cancellation?=nil
-    // These are the actual owners, not the requested future destinations.
+    // Verified owners at preparation. Once execution exists, recovery must
+    // consult native durable policy rather than treating this as current fact.
     var currentOwners:[String:String]
+    var execution:Execution?=nil
 }
 @MainActor struct CodexSessionMigrationServices {
     var observe:(CodexSessionMigrationRequest) async throws ->CodexSessionMigrationObservation
@@ -147,6 +154,10 @@ struct CodexSessionMigrationState:Codable,Equatable {
               state.currentOwners==Dictionary(uniqueKeysWithValues:state.request.threads.map{($0.id,state.request.source.home)}),
               record.terminal==(state.stage == .cancelled),
               (state.stage == .cancelled)==(state.cancellation != nil) else{throw failure}
+        if let execution=state.execution {
+            guard state.stage == .prepared,
+                  execution.phase == .retireAttempted ? (execution.ownershipRevision.map{$0>=0} ?? false):execution.ownershipRevision==nil else{throw failure}
+        }
         return state
     }
     func prepare(_ proposed:CodexSessionMigrationRequest) async throws ->CodexSessionMigrationState {
@@ -197,6 +208,9 @@ struct CodexSessionMigrationState:Codable,Equatable {
     private func cancel(id:String,reason:CodexSessionMigrationState.Cancellation)throws {
         let record=try journal.repair(id:id)
         var state=try Self.decode(record)
+        // A lost native reply can hide a completed shutdown or publication.
+        // Preparation-only cancellation cannot safely release such a move.
+        guard state.execution==nil else{throw Self.failure}
         if state.stage == .cancelled {try journal.release(id:id);return}
         state.stage = .cancelled;state.cancellation=reason
         _ = try journal.save(id:id,payload:Self.encode(state),expectedRevision:record.revision,terminal:true)
