@@ -19,7 +19,7 @@
     {
       "path": "app-server/src/turn_admission.rs",
       "before": "b6549e17e25a56c1768d6bfd77e7e6df18838261e50a5c70e95b46d215e0c5ec",
-      "after": "383be48518a4c911bdfdf4a7d1f576799c58084dd23cf3c7ed0af48be6cae4c3"
+      "after": "8e80d1eee3a63577ccbc16723d1c72f00e454a244471ab0fe3986f5908dc9a24"
     },
     {
       "path": "app-server/src/selected_admission_tests.rs",
@@ -34,7 +34,7 @@
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "a6a63df25d5cbffdfa326c61881a4b92a3cd4edf1922d2e7eb10109f00c3895d"
+      "after": "ec6a2dd1b4a5f34d8ba373db62bc955b0955156f5da8b69332d3862bdd56d919"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -49,7 +49,7 @@
     {
       "path": "core/src/session/turn_input.rs",
       "before": "ca92430590dff971718ae9d9d6220e904e0695e0f7e41ff04508dfd898fcb92f",
-      "after": "0875e760762fe2d38e8d1a604685eba32c16b31a768c3025f04f256106629c49"
+      "after": "d1ce7e7341ebf75d487fd9edba632bb02d39d4cbf1005cae19b2094e93a6a0de"
     },
     {
       "path": "core/src/session/turn_input_tests.rs",
@@ -215,9 +215,24 @@
       "path": "app-server-transport/src/native_runtime.rs",
       "before": null,
       "after": "e2cc6638696d8e87039e0536e6a3b08900848a9ac5a6502ac9096f7bebe643a5"
+    },
+    {
+      "path": "core/src/lib.rs",
+      "before": "03e6a93a787b8f3537e6780cc74245cb2b88e96e170a8ed587e73fbd446be600",
+      "after": "d356f263a6ae7c268b5a97414cdda62f1dd89ef19fec8698bcf799667625e504"
+    },
+    {
+      "path": "core/src/thread_manager.rs",
+      "before": "a694695f3d17d0ed5044a328109c2f6607dc5c809fa463def022439ef7042bd5",
+      "after": "55dfd2e086d85268edb7acf72f6380615958bac0d155b07341d30e154576cea7"
+    },
+    {
+      "path": "core/src/native_ownership.rs",
+      "before": null,
+      "after": "aa85f91bcdac99f73546e9c147bd0fe6b9901d2396b6ece1afd01d7a8156eaad"
     }
   ],
-  "patchSHA256": "a94c71074fa92ab8d00b499fe780e02c8b22881ad1dc5501c88010319de51f16",
+  "patchSHA256": "4d6d66b9e0b2c58a4905c947f59482fb5c6f2a1c5a4d5b4c3a192a18580593c8",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -260,14 +275,41 @@
       "terminalSizes": [
         "120x36",
         "80x24"
-      ]
+      ],
+      "sourceStage": 42
+    },
+    "managed2PackageStage42": {
+      "binarySHA256": "f91ecc67dc373c9725afafeaca8edf27ef6645646a803c9956a338a558d553e2",
+      "signedPackageAndVoiceVerified": true,
+      "actualFullCLILiveVerified": true,
+      "freshHomeAppServerPrepareVerified": true,
+      "repeatedPreparePreservesKernelPIDVersion": true,
+      "qaAppDeepSignatureVerified": true,
+      "embeddedRuntimeInspectorVerified": true,
+      "installed": false,
+      "currentOwnershipSourceIncluded": false
+    },
+    "native43": {
+      "persistentReaderApplied": true,
+      "coreResumeTurnSteerRecoveryHooksApplied": true,
+      "knownThreadMutationHookApplied": true,
+      "focusedTestsPending": false,
+      "fullCodeCheckRunning": false,
+      "retirementAndActivationMutationAPIsReady": false,
+      "packaged": false,
+      "migrationVerified": false,
+      "focusedReaderTestsPassed": 4,
+      "resumeRaceBarrierStillRequired": true,
+      "fullCoreAndServerCodeCheckPassed": true,
+      "fullCodeCheckDuration": "10m44s",
+      "nativeRuntimePolicyEnforcementVerified": false
     }
   },
   "remaining": [
-    "complete retained-thread ownership and stable client/cohort census",
-    "production private endpoint discovery and scoped native migration control",
-    "cross-home execution integration with child/Goal/history preservation and original-home return",
+    "complete retained client/thread cohort census under stable native admission",
+    "persistent source retirement and destination activation transactions with concurrent writer-start barrier",
+    "cross-home execution using Goal/history/settings preservation and original-home return",
     "group and destination app-server picker with actual move actions",
-    "final full CLI/app packaging, source commit, published release assets/checksums, download and installed-version verification"
+    "functional and visual UI verification, final matching CLI/app package, source commit, published release/checksums/download and installed-version verification"
   ]
 }

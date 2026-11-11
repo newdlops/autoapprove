@@ -5,17 +5,25 @@ import Darwin
 @testable import AutoApproveCore
 
 enum BundledRuntimeProbe {
-    static func runIfRequested()->Bool {
+    static func runIfRequested()async->Bool {
         let args=Array(CommandLine.arguments.dropFirst())
-        guard args.first=="--bundled-runtime-inspect" else{return false}
+        let prepare=args.first=="--bundled-runtime-prepare"
+        guard prepare || args.first=="--bundled-runtime-inspect" else{return false}
         do {
-            guard args.count==2 else{throw AppError.message("Expected one runtime directory")}
+            guard args.count==(prepare ? 3:2) else{throw AppError.message("Expected runtime directory and optional owned home")}
             let runtime=try CodexBundledRuntime.inspect(root:args[1]);try runtime.verifyUnchanged()
             let version=try CommandRunner.run(runtime.executable,["--version"],timeout:10,
                 environment:["PATH":"/usr/bin:/bin"],inheritEnvironment:false)
             guard version.status==0,version.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli 0.167.1" else{throw AppError.message("Unexpected bundled CLI version")}
+            if prepare {
+                let home=args[2]
+                guard home.hasPrefix("/private/tmp/aa-managed2-daemon-"),home.hasSuffix("/home") else{throw AppError.message("Owned daemon fixture home required")}
+                let entry=TerminalProfileEntry(title:"Owned daemon fixture",agent:"codex",cwd:home,conversationID:"",providerHome:home)
+                try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,
+                    server:.local(userHome:URL(fileURLWithPath:home).deletingLastPathComponent().path,executable:runtime.executable))
+            }
             try runtime.verifyUnchanged()
-            let output:[String:Any]=["verified":true,"version":runtime.version,"executable":runtime.executable,"migrationVerified":false]
+            let output:[String:Any]=["verified":true,"version":runtime.version,"executable":runtime.executable,"serverPrepared":prepare,"migrationVerified":false]
             print(String(decoding:try JSONSerialization.data(withJSONObject:output,options:[.sortedKeys]),as:UTF8.self))
         }catch{fputs(error.localizedDescription+"\n",stderr);exit(1)}
         return true

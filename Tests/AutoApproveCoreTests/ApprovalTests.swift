@@ -502,7 +502,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     @MainActor static func main() async {
         if WorkingDirectoryFixture.runIfRequested() { return }
 #if DEBUG
-        if BundledRuntimeProbe.runIfRequested() { return }
+        if await BundledRuntimeProbe.runIfRequested() { return }
         if await NativeConnectionProbe.runIfRequested() { return }
 #endif
         let tests = ApprovalTests()
