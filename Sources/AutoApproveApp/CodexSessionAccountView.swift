@@ -13,6 +13,7 @@ private struct CodexAccountLoginPresentation:Identifiable {
     @State private var loading=false
     @State private var error:String?
     @State private var loginPresentation:CodexAccountLoginPresentation?
+    @State private var movePresentation:CodexAccountLoginPresentation?
     @State private var busy=false
     @State private var held=false
     var body:some View {
@@ -23,7 +24,7 @@ private struct CodexAccountLoginPresentation:Identifiable {
                     do {_ = try await verifiedTargets(account);try await engine.reconnectCodexLogin(home:account.target.home)}
                     catch {self.error=error.localizedDescription}
                 }
-            })
+            },changeGroup:{if let account {movePresentation = .init(account:account)}})
             .padding(.horizontal,24).padding(.vertical,12)
             .task(id:sessionID) {
                 account=nil;error=nil
@@ -34,6 +35,9 @@ private struct CodexAccountLoginPresentation:Identifiable {
             }
             .onReceive(engine.$codexAccountTransitionBusy){busy=$0}
             .onReceive(engine.$codexAccountTransitionStates){held=$0.values.contains(where:\.held)}
+            .sheet(item:$movePresentation) {presentation in
+                CodexSessionMoveView(engine:engine,source:presentation.account,close:{movePresentation=nil})
+            }
             .sheet(item:$loginPresentation) {presentation in
                     let account=presentation.account
                     VStack(alignment:.leading,spacing:16) {
@@ -80,6 +84,7 @@ struct CodexSessionAccountContent:View {
     let refresh:()->Void
     let login:()->Void
     let reconnect:()->Void
+    var changeGroup:(()->Void)?=nil
     var body:some View {
         VStack(alignment:.leading,spacing:8) {
             HStack {
@@ -120,5 +125,9 @@ struct CodexSessionAccountContent:View {
             .disabled(loading).help("연결된 계정의 로그인과 전환 진행 상태를 확인합니다.")
         Button("현재 로그인으로 재연결",action:reconnect).disabled(disabled || loading)
             .help("같은 서버의 연결된 Codex를 순차 중단하고 저장된 로그인으로 다시 연결합니다.")
+        if let changeGroup {
+            Button("로그인 그룹 변경…",action:changeGroup).disabled(disabled || loading)
+                .help("옮길 로그인 그룹의 계정과 연결 서버를 확인합니다.")
+        }
     }
 }

@@ -342,7 +342,7 @@
     },
     "native44RetainedShutdown": {
       "sourceStage": 50,
-      "status": "source-tests-passed-standalone-server-build-running",
+      "status": "stage50-built-and-actual-owned-runtime-regressions-passed",
       "module": "app-server/src/request_processors/retained_shutdown.rs",
       "moduleSHA256": "032f13c2801840fe9a235535c850ffc81247acf61b2b310f797281d2f285ebf7",
       "sourceTests": {
@@ -365,10 +365,13 @@
       },
       "build": {
         "session": 62511,
-        "status": "running",
+        "status": "terminal-failed-linker-bitcode-format",
         "binary": "/private/tmp/aa-codex-approval-release/release/codex-app-server",
         "profile": "release dependencies debug0; app-server opt0; final bin LTO off",
-        "command": "env MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 RUST_MIN_STACK=33554432 CARGO_TARGET_DIR=/private/tmp/aa-codex-approval-release STABLE_GIT_COMMIT=0a94398fa60c4fac0e7659e4213a0a36e613dd46 CODEX_BUILD_COMMIT=autoapprove-selected-transition-experiment /opt/homebrew/bin/cargo rustc -p codex-app-server --bin codex-app-server --release --features autoapprove-goal-control,autoapprove-native-inventory,autoapprove-selected-transition --config profile.release.package.codex-app-server.opt-level=0 --locked --offline --jobs 2 -- -C lto=off -C debuginfo=0"
+        "command": "env MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 RUST_MIN_STACK=33554432 CARGO_TARGET_DIR=/private/tmp/aa-codex-approval-release STABLE_GIT_COMMIT=0a94398fa60c4fac0e7659e4213a0a36e613dd46 CODEX_BUILD_COMMIT=autoapprove-selected-transition-experiment /opt/homebrew/bin/cargo rustc -p codex-app-server --bin codex-app-server --release --features autoapprove-goal-control,autoapprove-native-inventory,autoapprove-selected-transition --config profile.release.package.codex-app-server.opt-level=0 --locked --offline --jobs 2 -- -C lto=off -C debuginfo=0",
+        "lastObservation": "still running: codex-thread-store, core dependencies; no error",
+        "exit": 101,
+        "failure": "Final-bin lto=off cannot link thin-LTO dependency archives: Apple LLVM21 reader rejects RustLLVM22 bitcode."
       },
       "supersededBuild": {
         "session": 73181,
@@ -389,7 +392,91 @@
         "no journal EX controlled restore",
         "not a cross-home move or release"
       ],
-      "next": "Poll exact build session62511 to terminal. Never restart for observation timeout. Then run Tests/fixtures/codex-retained-shutdown-live.py --app-server-binary --binary=/private/tmp/aa-codex-approval-release/release/codex-app-server outside sandbox for Unix sockets, and selected-server-live regression against same binary. Update verification and checkpoint. Then wire strict method into validated native retirement, journal/ownership transaction and controlled restore; full census and actual move UI remain."
+      "next": "No builds live. Stage50 standalone real server and source tests pass. Wire exact selected guard + strict writer closure + journal-bound private source retirement and destination ownership transaction into production service. Full client/backend cohort census and TUI rebind still required. New destination preparation UI exists but move remains disabled; actual600x660 sheet visual/interaction QA remains. Review proposed post-commit ordinary resume ordering instead of a raw Core EX-lock bypass. Finish actual A-B-A move, all Goal/group/server UI behavior, and required release/install.",
+      "checkpoint": "182cb24",
+      "compatibleBuild": {
+        "session": 26097,
+        "status": "terminal-success",
+        "binary": "/private/tmp/aa-codex-approval-release/release/codex-app-server",
+        "profile": "same cached dependencies, app-server opt0, normal Rust thinLTO link",
+        "command": "env MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 RUST_MIN_STACK=33554432 CARGO_TARGET_DIR=/private/tmp/aa-codex-approval-release STABLE_GIT_COMMIT=0a94398fa60c4fac0e7659e4213a0a36e613dd46 CODEX_BUILD_COMMIT=autoapprove-selected-transition-experiment /opt/homebrew/bin/cargo build -p codex-app-server --bin codex-app-server --release --features autoapprove-goal-control,autoapprove-native-inventory,autoapprove-selected-transition --config profile.release.package.codex-app-server.opt-level=0 --locked --offline --jobs 2",
+        "exit": 0,
+        "elapsed": "3m36s",
+        "binarySHA256": "9a40731179807ce2a71ab1c9c6bd8f97015f7a9358e35aaf130c7f733c429afd"
+      },
+      "liveShutdown": {
+        "passed": true,
+        "session": 61684,
+        "terminal": true,
+        "fixture": "/private/tmp/aa-retire-live-ocd15s0d",
+        "checks": [
+          "strict archive removes captured runtime",
+          "exact UUID and paused Goal preserved after unarchive/resume",
+          "replacement instance archive succeeds",
+          "unrelated runtime stays writable"
+        ],
+        "modelTurnsSubmitted": 0
+      },
+      "liveSelectedAdmission": {
+        "passed": true,
+        "session": 30701,
+        "terminal": true,
+        "fixture": "/private/tmp/aa-sel-gzjc57ef",
+        "checks": [
+          "selected input denied",
+          "unrelated and independent server writes preserved",
+          "read status preserved",
+          "explicit and EOF release"
+        ]
+      },
+      "liveSourcePolicy": {
+        "passed": true,
+        "session": 91953,
+        "terminal": true,
+        "fixture": "/private/tmp/aa-policy-live-e7kxogxe",
+        "checks": [
+          "Core resolves actual rollout ID and denies Incoming despite different supplied threadId",
+          "live Retired writer input denied",
+          "read-only query and unrelated writes preserved",
+          "Active permits exact UUID and paused Goal restoration",
+          "corrupt installed policy fails closed"
+        ],
+        "modelTurnsAccepted": 0,
+        "policyInstallation": "fixture writes private policy files, NOT production transaction IPC",
+        "productionPolicyIPCVerified": false,
+        "migrationVerified": false
+      }
+    },
+    "sessionMoveDestinationUI": {
+      "status": "implemented-preparation-only-native-move-still-disabled",
+      "files": [
+        "Sources/AutoApproveApp/CodexSessionMoveView.swift",
+        "Sources/AutoApproveApp/CodexSessionAccountView.swift"
+      ],
+      "features": [
+        "session account entry opens destination sheet",
+        "read named groups plus default and detected homes",
+        "selecting destination keeps source binding unchanged",
+        "reuse scoped account/login/server inspection and explicit server preparation",
+        "verify original actual account/server and destination registration before target actions",
+        "show loading, empty, error, busy, long path and explicit unavailable move state"
+      ],
+      "checks": {
+        "previewCompile": true,
+        "renderedAccountPanelStates": 28,
+        "viewed": [
+          "shared-light-350.png",
+          "shared-dark-600.png",
+          "long-light-350.png"
+        ],
+        "sheetRenderVerified": false,
+        "sheetInteractionsVerified": false,
+        "appBuildSession": 75473,
+        "appBuildStatus": "terminal-success",
+        "appBuildElapsed": "26.86s"
+      },
+      "next": "Complete native move adapter and actual destination server selection/transaction. Movement button intentionally disabled. Render and exercise real600x660 sheet including stale-target and login/server preparation isolation before claiming UI complete.",
+      "currentVersionInstalled": "unchanged0.2.280-build307"
     }
   },
   "remaining": [
