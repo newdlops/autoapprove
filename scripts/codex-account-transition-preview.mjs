@@ -8,7 +8,7 @@ await mkdir(output,{recursive:true});
 const binary=output+'/AccountTransitionPreview';
 execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/AccountPreview'),
  '-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),
- 'Sources/AutoApproveApp/CodexAccountTransitionSettings.swift','Tests/fixtures/codex-account-transition-preview.swift','-o',binary],{stdio:'inherit',timeout:120000});
+ 'Sources/AutoApproveApp/CodexAccountTransitionSettings.swift','Sources/AutoApproveApp/CodexAutomationHoldView.swift','Tests/fixtures/codex-account-transition-preview.swift','-o',binary],{stdio:'inherit',timeout:120000});
 if(!process.argv.includes('--build-only'))execFileSync(binary,[output],{stdio:'inherit',timeout:30000});
 const app=output+'/AccountTransitionPreview.app';
 await mkdir(app+'/Contents/MacOS',{recursive:true});

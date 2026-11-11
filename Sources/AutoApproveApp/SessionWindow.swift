@@ -544,6 +544,9 @@ private struct SessionDetail: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
                 if session.agent == .codex, let approvalEngine, session.phase != .ended {
+                    CodexAutomationHoldView(engine:approvalEngine,sessionID:session.id)
+                }
+                if session.agent == .codex, let approvalEngine, session.phase != .ended {
                     CodexApprovalConnectionView(session:session,engine:approvalEngine)
                     Divider()
                 }

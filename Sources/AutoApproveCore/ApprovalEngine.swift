@@ -417,6 +417,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             [.needsPause,.pauseReserved,.waitingPause,.needsTab,.tabReserved,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase) && ($0.context.session.tty==session.tty || ($0.replacesTab && "/dev/"+$0.context.shell.tty==session.tty))
         }
     }
+    /// The native session view uses the same barrier as the input transports,
+    /// including clients whose server membership is not yet verified.
+    public func codexApprovalHoldReason(sessionID:String)->String? {
+        guard let session=sessions[sessionID],session.phase != .ended,codexAccountInputHeld(sessionID) else{return nil}
+        return "계정 전환·세션 연결을 확인하는 동안 자동 승인을 보류합니다. 계정·로그인에서 진행 상태를 확인하거나 남은 전환을 중지해주세요."
+    }
     private func codexAccountTransitionInputHeld(_ session:AgentSession,home:String?=nil)->Bool {
         let held=codexAccountTransitionStates.filter {key,state in state.held && (home==nil || home==key)}
         guard !held.isEmpty else{return false}
@@ -7849,7 +7855,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         guard let current = self.sessions[id], current.phase != .ended,
                               current.codexApprovalBinding?.threadID == binding.threadID else { break }
                         do {
-                            let approvalsEnabled = current.automatic && !self.snapshot.paused
+                            let holdReason=self.codexApprovalHoldReason(sessionID:id)
+                            let approvalsEnabled = current.automatic && !self.snapshot.paused && holdReason == nil
                             let target = try await transport.prepareQueue(current, binding.threadID)
                             let reader = self.processReader
                             let engine = self
@@ -7863,7 +7870,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 })
                             }.value
                             guard self.codexApprovalEpochs[id] == epoch else { break }
-                            self.setCodexApprovalStatus(id, threadID: binding.threadID, message: !approvalsEnabled ? (self.snapshot.paused ? "전체 일시정지 중 · 상태 확인 중" : "자동 승인 꺼짐 · 상태 확인 중") : count.review > 0 ? "직접 확인할 요청 \(count.review)건 · 해당 서브에이전트에서 확인해주세요" : count.responded > 0 ? "승인 응답 \(count.responded)건 처리 · 자식 요청 감시 중" : "부모·서브에이전트 승인 요청 감시 중")
+                            self.setCodexApprovalStatus(id, threadID: binding.threadID, message: self.codexApprovalHoldReason(sessionID:id) ?? (!approvalsEnabled ? (self.snapshot.paused ? "전체 일시정지 중 · 상태 확인 중" : holdReason != nil ? "보류 해제 · 승인 연결 확인 중" : "자동 승인 꺼짐 · 상태 확인 중") : count.review > 0 ? "직접 확인할 요청 \(count.review)건 · 해당 서브에이전트에서 확인해주세요" : count.responded > 0 ? "승인 응답 \(count.responded)건 처리 · 자식 요청 감시 중" : "부모·서브에이전트 승인 요청 감시 중"))
                         }
                     } catch {
                         guard self.codexApprovalEpochs[id] == epoch else { break }

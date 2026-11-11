@@ -141,6 +141,9 @@ extension ApprovalTests {
             try expect(held(0),"The exact original cohort must retain its transition barrier")
             try expectFalse(held(1),"A verified independent home must not inherit another home's transition hold")
             try expect(held(2),"An unknown home must remain conservative until its independence is proved")
+            try expect(engine.codexApprovalHoldReason(sessionID:sessions[0].id) != nil,"Native UI must explain the actual cohort hold")
+            try expectEqual(engine.codexApprovalHoldReason(sessionID:sessions[1].id),nil,"An independent server must not show another group's hold")
+            try expect(engine.codexApprovalHoldReason(sessionID:sessions[2].id) != nil,"An unverified server must explain why automatic approval is held")
         }
         let prior=probe.writes
         engine.receiveScreen(sessionID:sessions[1].id,raw:AccountInputProbe.prompt,generation:"independent-server-approval")
@@ -159,6 +162,14 @@ extension ApprovalTests {
         try expectFalse(engine.remoteSessionViews().first{$0.session.id==sessions[1].id}?.inputReason?.contains("계정 전환") == true,
                         "The independent read-only refresh must restore approval without advancing another home's transition")
         try expectEqual(r.effects,priorEffects,"Membership refresh must never interrupt or restart native work")
+        try engine.cancelCodexAccountTransition(home:target.home)
+        for session in sessions {try expectEqual(engine.codexApprovalHoldReason(sessionID:session.id),nil,"Cancelling the remaining transition must clear the native hold notice")}
+        let beforeRelease=probe.writes
+        engine.receiveScreen(sessionID:sessions[2].id,raw:AccountInputProbe.prompt,generation:"released-unknown-server")
+        let releaseDeadline=Date().addingTimeInterval(3)
+        while probe.writes==beforeRelease,Date()<releaseDeadline {try await Task.sleep(for:.milliseconds(20))}
+        try expect(probe.writes>beforeRelease,"The unverified client's existing screen approval must recover after cancellation")
+        try expectEqual(r.effects,priorEffects,"Cancelling must not restart a server or resume paused work")
     }
     func testAccountReconnectRecoversSharedServerWhileIndependentWorkStaysRunning() async throws {
         try await exerciseSharedLoginRecovery(native:false)

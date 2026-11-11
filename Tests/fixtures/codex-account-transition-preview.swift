@@ -3,15 +3,20 @@ import AppKit
 import AutoApproveCore
 
 private struct AccountTransitionPreview: View {
-    @State private var enabled = false
-    @State private var phase = CodexAccountTransitionState.Phase.ready
+    @State private var enabled = true
+    @State private var phase = CodexAccountTransitionState.Phase.review
     @State private var calls = 0
+    @State private var dark = false
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack { Text("연결 설정 · Codex").font(.title2.weight(.semibold)); Spacer(); Text("합성 검사").foregroundStyle(.secondary) }.padding(24)
+            HStack { Text("연결 설정 · Codex").font(.title2.weight(.semibold)); Spacer(); Toggle("어두운 화면",isOn:$dark) }.padding(24)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if enabled,Self.state(phase).held {
+                        CodexAutomationHoldNotice(reason:"계정 전환·세션 연결을 확인하는 동안 자동 승인을 보류합니다. 계정·로그인에서 진행 상태를 확인하거나 남은 전환을 중지해주세요.",openAccounts:{calls += 1})
+                        Divider()
+                    }
                     Picker("검사 상태", selection: $phase) {
                         ForEach([CodexAccountTransitionState.Phase.ready, .stopping, .waiting, .restarting, .reconnecting, .resuming, .complete, .review, .unsupported], id: \.self) { Text($0.rawValue).tag($0) }
                     }
@@ -22,7 +27,7 @@ private struct AccountTransitionPreview: View {
                     Text("검사 버튼 동작 \(calls)회").font(.caption).accessibilityIdentifier("check-count")
                 }.font(.callout).foregroundStyle(.secondary).padding(24)
             }
-        }.frame(width: 600, height: 660).background(Color(nsColor: .windowBackgroundColor))
+        }.frame(width: 600, height: 660).background(Color(nsColor: .windowBackgroundColor)).preferredColorScheme(dark ? .dark:.light)
     }
     static func state(_ phase: CodexAccountTransitionState.Phase) -> CodexAccountTransitionState {
         var state = CodexAccountTransitionState(); state.phase = phase
@@ -68,6 +73,8 @@ private struct AccountTransitionPreview: View {
             }
         }
         if CommandLine.arguments.contains("--interactive") || CommandLine.arguments.count == 1 {
+            let menu=NSMenu(),item=NSMenuItem();menu.addItem(item)
+            let submenu=NSMenu();submenu.addItem(withTitle:"Quit",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"q");item.submenu=submenu;NSApp.mainMenu=menu
             let window = NSWindow(contentRect: NSRect(x: 120, y: 100, width: 600, height: 660), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             window.title = "AutoApprove 계정 전환 합성 검사"
             window.contentView = NSHostingView(rootView: AccountTransitionPreview())
