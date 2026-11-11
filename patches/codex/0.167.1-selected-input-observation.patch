@@ -4453,7 +4453,29 @@
  pub use turn_extension_data::WithTurnExtensionData;
 --- a/core/src/thread_manager.rs
 +++ b/core/src/thread_manager.rs
-@@ -2265,6 +2265,11 @@
+@@ -1552,6 +1552,21 @@
+         }))
+     }
+ 
++    /// Capture a client-removable runtime without unregistering a live writer.
++    /// The caller must confirm shutdown before removing this exact instance.
++    pub async fn capture_thread_for_client_removal(
++        &self,
++        thread_id: &ThreadId,
++    ) -> CodexResult<Option<Arc<CodexThread>>> {
++        let threads = self.state.threads.read().await;
++        if threads.get(thread_id).is_some_and(|thread| thread.session_source.is_internal()) {
++            return Err(CodexErr::InvalidRequest(
++                "live internal threads can only be removed by their owner".to_owned(),
++            ));
++        }
++        Ok(threads.get(thread_id).cloned())
++    }
++
+     /// Removes a thread only if `thread_id` still maps to `expected`.
+     ///
+     /// Delayed cleanup uses this to avoid removing a replacement runtime registered under the
+@@ -2265,6 +2280,11 @@
  
      /// Spawn a new thread with optional history and register it with the manager.
      async fn spawn_thread(&self, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
@@ -4465,7 +4487,7 @@
          let cancellation = request
              .options
              .config
-@@ -2389,7 +2394,15 @@
+@@ -2389,7 +2409,15 @@
                  "reserved thread ID cannot be used when resuming a thread".to_string(),
              ));
          }
@@ -4481,7 +4503,7 @@
              let mut threads = self.threads.write().await;
              if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                  if thread.is_running() {
-@@ -2584,6 +2597,10 @@
+@@ -2584,6 +2612,10 @@
          } else {
              codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
          };
@@ -5729,3 +5751,307 @@
 +        Ok(())
 +    }
 +}
+--- /dev/null
++++ b/app-server/src/request_processors/retained_shutdown.rs
+@@ -0,0 +1,209 @@
++//! Retain one shutdown submission per captured runtime. Observation deadlines
++//! and disconnected callers never cancel or resubmit that shutdown.
++use std::collections::HashMap;
++use std::future::Future;
++use std::hash::Hash;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::sync::{Mutex, watch};
++
++type Outcome = Result<(), String>;
++struct Entry<T> {
++    runtime: Arc<T>,
++    result: watch::Receiver<Option<Outcome>>,
++}
++
++pub(super) struct RetainedShutdowns<K, T> {
++    entries: Mutex<HashMap<K, Entry<T>>>,
++}
++
++impl<K, T> Default for RetainedShutdowns<K, T> {
++    fn default() -> Self {
++        Self {
++            entries: Mutex::new(HashMap::new()),
++        }
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) enum Observation {
++    Stopped,
++    Pending,
++    Failed(String),
++}
++
++impl<K: Eq + Hash, T: Send + Sync + 'static> RetainedShutdowns<K, T> {
++    pub(super) async fn observe<F, Fut>(
++        &self,
++        id: K,
++        runtime: Arc<T>,
++        deadline: Duration,
++        shutdown: F,
++    ) -> Observation
++    where
++        F: FnOnce(Arc<T>) -> Fut + Send + 'static,
++        Fut: Future<Output = Outcome> + Send + 'static,
++    {
++        let mut result = {
++            let mut entries = self.entries.lock().await;
++            match entries.get(&id) {
++                Some(entry) if Arc::ptr_eq(&entry.runtime, &runtime) => entry.result.clone(),
++                _ => {
++                    let (sender, receiver) = watch::channel(None);
++                    entries.insert(
++                        id,
++                        Entry {
++                            runtime: Arc::clone(&runtime),
++                            result: receiver.clone(),
++                        },
++                    );
++                    // No await after publication: cancellation cannot leave an
++                    // entry without a task, or a task without its entry.
++                    tokio::spawn(async move {
++                        sender.send_replace(Some(shutdown(runtime).await));
++                    });
++                    receiver
++                }
++            }
++        };
++        let terminal = async {
++            loop {
++                if let Some(result) = result.borrow_and_update().clone() {
++                    return match result {
++                        Ok(()) => Observation::Stopped,
++                        Err(error) => Observation::Failed(error),
++                    };
++                }
++                if result.changed().await.is_err() {
++                    return Observation::Failed(
++                        "Shutdown task ended without a confirmed result".into(),
++                    );
++                }
++            }
++        };
++        tokio::time::timeout(deadline, terminal)
++            .await
++            .unwrap_or(Observation::Pending)
++    }
++
++    pub(super) async fn forget_if_matches(&self, id: &K, runtime: &Arc<T>) {
++        let mut entries = self.entries.lock().await;
++        if entries
++            .get(id)
++            .is_some_and(|entry| Arc::ptr_eq(&entry.runtime, runtime))
++        {
++            entries.remove(id);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use tokio::sync::Notify;
++
++    #[tokio::test]
++    async fn timeout_and_cancelled_observer_keep_one_live_submission() {
++        let registry = Arc::new(RetainedShutdowns::default());
++        let runtime = Arc::new(());
++        let started = Arc::new(AtomicUsize::new(0));
++        let finished = Arc::new(Notify::new());
++        let (r, t, s, f) = (
++            registry.clone(),
++            runtime.clone(),
++            started.clone(),
++            finished.clone(),
++        );
++        let observer = tokio::spawn(async move {
++            r.observe(1, t, Duration::from_secs(60), move |_| async move {
++                s.fetch_add(1, Ordering::SeqCst);
++                f.notified().await;
++                Ok(())
++            })
++            .await
++        });
++        while started.load(Ordering::SeqCst) == 0 {
++            tokio::task::yield_now().await;
++        }
++        observer.abort();
++        let _ = observer.await;
++        assert_eq!(
++            registry
++                .observe(1, runtime.clone(), Duration::from_millis(1), |_| async {
++                    panic!("a reconnect must observe, not submit shutdown again")
++                })
++                .await,
++            Observation::Pending
++        );
++        assert_eq!(started.load(Ordering::SeqCst), 1);
++        finished.notify_one();
++        assert_eq!(
++            registry
++                .observe(1, runtime, Duration::from_secs(1), |_| async {
++                    panic!("late completion must reuse the captured shutdown")
++                })
++                .await,
++            Observation::Stopped
++        );
++    }
++
++    #[tokio::test]
++    async fn submission_failure_is_terminal_and_never_replayed() {
++        let registry = RetainedShutdowns::default();
++        let runtime = Arc::new(());
++        assert_eq!(
++            registry
++                .observe(1, runtime.clone(), Duration::from_secs(1), |_| async {
++                    Err("submission rejected".into())
++                })
++                .await,
++            Observation::Failed("submission rejected".into())
++        );
++        assert_eq!(
++            registry
++                .observe(1, runtime, Duration::from_secs(1), |_| async {
++                    panic!("an unknown submission must not be replayed")
++                })
++                .await,
++            Observation::Failed("submission rejected".into())
++        );
++    }
++
++    #[tokio::test]
++    async fn old_cleanup_cannot_forget_replacement_runtime() {
++        let registry = RetainedShutdowns::default();
++        let old = Arc::new(());
++        let replacement = Arc::new(());
++        assert_eq!(
++            registry
++                .observe(1, old.clone(), Duration::from_secs(1), |_| async { Ok(()) })
++                .await,
++            Observation::Stopped
++        );
++        assert_eq!(
++            registry
++                .observe(1, replacement.clone(), Duration::from_secs(1), |_| async {
++                    Err("replacement failed".into())
++                })
++                .await,
++            Observation::Failed("replacement failed".into())
++        );
++        registry.forget_if_matches(&1, &old).await;
++        assert_eq!(
++            registry
++                .observe(1, replacement.clone(), Duration::from_secs(1), |_| async {
++                    panic!("old cleanup removed the replacement outcome")
++                })
++                .await,
++            Observation::Failed("replacement failed".into())
++        );
++        registry.forget_if_matches(&1, &replacement).await;
++        assert_eq!(
++            registry
++                .observe(1, replacement, Duration::from_secs(1), |_| async { Ok(()) })
++                .await,
++            Observation::Stopped
++        );
++    }
++}
+--- a/app-server/src/request_processors.rs
++++ b/app-server/src/request_processors.rs
+@@ -528,7 +528,6 @@
+ use tokio_util::task::TaskTracker;
+ use toml::Value as TomlValue;
+ use tracing::Instrument;
+-use tracing::error;
+ use tracing::info;
+ use tracing::warn;
+ use uuid::Uuid;
+--- a/app-server/src/request_processors/thread_processor.rs
++++ b/app-server/src/request_processors/thread_processor.rs
+@@ -5,6 +5,9 @@
+ mod daemon_snapshot;
+ 
+ mod workspace_switching;
++
++#[path = "retained_shutdown.rs"]
++mod retained_shutdown;
+ 
+ use super::persisted_resume_settings::PersistedResumeSettings;
+ use super::persisted_resume_settings::latest_owned_thread_settings;
+@@ -510,6 +513,7 @@
+     pub(super) state_db: Option<StateDbHandle>,
+     pub(super) log_db: Option<LogDbLayer>,
+     pub(super) background_tasks: TaskTracker,
++    retained_removal_shutdowns: Arc<retained_shutdown::RetainedShutdowns<ThreadId, codex_core::CodexThread>>,
+     pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
+     pub(super) skills_watcher: Arc<SkillsWatcher>,
+     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
+@@ -571,6 +575,7 @@
+             state_db,
+             log_db,
+             background_tasks: TaskTracker::new(),
++            retained_removal_shutdowns: Arc::new(retained_shutdown::RetainedShutdowns::default()),
+             sample_responses,
+             skills_watcher,
+             turn_cost_worker,
+@@ -1175,24 +1180,38 @@
+         thread_id: ThreadId,
+         operation: &str,
+     ) -> Result<(), JSONRPCErrorError> {
+-        let removed_conversation = self
++        // Keep cold resume from publishing a replacement between the confirmed
++        // shutdown and removal of the captured instance.
++        let _resume_guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
++        let conversation = self
+             .thread_manager
+-            .remove_thread_for_client(&thread_id)
++            .capture_thread_for_client_removal(&thread_id)
+             .await
+             .map_err(|err| core_thread_write_error(operation, err))?;
+-        if let Some(conversation) = removed_conversation {
+-            info!("thread {thread_id} was active; shutting down");
+-            match wait_for_thread_shutdown(&conversation).await {
+-                ThreadShutdownResult::Complete => {}
+-                ThreadShutdownResult::SubmitFailed => {
+-                    error!(
+-                        "failed to submit Shutdown to thread {thread_id}; proceeding with {operation}"
+-                    );
+-                }
+-                ThreadShutdownResult::TimedOut => {
+-                    warn!("thread {thread_id} shutdown timed out; proceeding with {operation}");
+-                }
+-            }
++        if let Some(conversation) = conversation {
++            match self.retained_removal_shutdowns.observe(
++                thread_id,
++                Arc::clone(&conversation),
++                Duration::from_secs(10),
++                |thread| async move { thread.shutdown_and_wait().await.map_err(|error| error.to_string()) },
++            ).await {
++                retained_shutdown::Observation::Stopped => {}
++                retained_shutdown::Observation::Pending => return Err(internal_error(format!(
++                    "Thread {thread_id} is still shutting down; {operation} has not been performed"
++                ))),
++                retained_shutdown::Observation::Failed(error) => return Err(internal_error(format!(
++                    "Thread {thread_id} shutdown was not confirmed; {operation} has not been performed: {error}"
++                ))),
++            }
++            // A late shutdown must never unregister or tear down a replacement.
++            if self.thread_manager.remove_thread_if_matches(&thread_id, &conversation).await.is_none() {
++                return Err(internal_error(format!(
++                    "Thread {thread_id} registration changed during shutdown; inspect its current state before {operation}"
++                )));
++            }
++            self.finalize_thread_teardown(thread_id).await;
++            self.retained_removal_shutdowns.forget_if_matches(&thread_id, &conversation).await;
++            return Ok(());
+         }
+         self.finalize_thread_teardown(thread_id).await;
+         Ok(())

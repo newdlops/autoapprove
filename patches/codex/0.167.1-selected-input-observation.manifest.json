@@ -224,7 +224,7 @@
     {
       "path": "core/src/thread_manager.rs",
       "before": "a694695f3d17d0ed5044a328109c2f6607dc5c809fa463def022439ef7042bd5",
-      "after": "7cb76df1afb5bfebb828bc7a5425af6d9b565d5619fc939fd9f241080fc2a831"
+      "after": "6cb8b23501e64d014a778af42cad45f1fbe6fff4d6c06663f65789e9f8ca2c9a"
     },
     {
       "path": "core/src/native_ownership.rs",
@@ -240,9 +240,24 @@
       "path": "core/src/native_ownership/store.rs",
       "before": null,
       "after": "bbfcc3d3c7d396cdfe13fdeb06d3f167b68a99f466cea435e658a3a6601c5eec"
+    },
+    {
+      "path": "app-server/src/request_processors/retained_shutdown.rs",
+      "before": null,
+      "after": "032f13c2801840fe9a235535c850ffc81247acf61b2b310f797281d2f285ebf7"
+    },
+    {
+      "path": "app-server/src/request_processors.rs",
+      "before": "9bdbcd07e08001c72125e202565cf7537d5fc09702939138d58704084ed8d9fd",
+      "after": "cadeb07659b8225751d9b621c5cdc42ef47b0b8117a6fc4c092b0f1e999ee83e"
+    },
+    {
+      "path": "app-server/src/request_processors/thread_processor.rs",
+      "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
+      "after": "7519c0213a94e3a2210443de1d8798b1506fad1d4aa9a4e53bb1245045e20134"
     }
   ],
-  "patchSHA256": "558b8adb43cbd97f610e82d0a19621b7177e2d6ccee7e0d932108206923c620c",
+  "patchSHA256": "f996a8ce73fc9801bab673f073ecc00925760826bd940fbe73a9670dd01fc0f5",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -324,6 +339,57 @@
       "policyStorageTransactionsApplied": true,
       "focusedReaderLockAndStorageTestsPassed": 12,
       "nativeQuiescenceVerified": false
+    },
+    "native44RetainedShutdown": {
+      "sourceStage": 50,
+      "status": "source-tests-passed-standalone-server-build-running",
+      "module": "app-server/src/request_processors/retained_shutdown.rs",
+      "moduleSHA256": "032f13c2801840fe9a235535c850ffc81247acf61b2b310f797281d2f285ebf7",
+      "sourceTests": {
+        "passed": 3,
+        "root": "/private/tmp/aa-retained-shutdown-source-check/check-jKTGUH",
+        "session": 30467,
+        "terminal": true
+      },
+      "fullCodeCheck": {
+        "passed": true,
+        "session": 14789,
+        "elapsed": "46.88s",
+        "afterwardChanges": "added per-thread resume guard and removed unused import; standalone build verifies final source"
+      },
+      "baselineFixture": {
+        "passed": true,
+        "root": "/private/tmp/aa-retire-live-pz83jyfg",
+        "binarySourceStage": 42,
+        "newShutdownImplementationVerified": false
+      },
+      "build": {
+        "session": 62511,
+        "status": "running",
+        "binary": "/private/tmp/aa-codex-approval-release/release/codex-app-server",
+        "profile": "release dependencies debug0; app-server opt0; final bin LTO off",
+        "command": "env MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 RUST_MIN_STACK=33554432 CARGO_TARGET_DIR=/private/tmp/aa-codex-approval-release STABLE_GIT_COMMIT=0a94398fa60c4fac0e7659e4213a0a36e613dd46 CODEX_BUILD_COMMIT=autoapprove-selected-transition-experiment /opt/homebrew/bin/cargo rustc -p codex-app-server --bin codex-app-server --release --features autoapprove-goal-control,autoapprove-native-inventory,autoapprove-selected-transition --config profile.release.package.codex-app-server.opt-level=0 --locked --offline --jobs 2 -- -C lto=off -C debuginfo=0"
+      },
+      "supersededBuild": {
+        "session": 73181,
+        "terminal": true,
+        "exit": 130,
+        "reason": "Stopped incorrect debug-info profile cold rebuild; corrected env to existing debug0 cache"
+      },
+      "behavior": [
+        "capture runtime without unregistering live writer",
+        "retain exactly one shutdown per runtime across timeout and observer disconnect",
+        "failed or pending closure never authorizes archive/delete",
+        "remove only the exact stopped runtime while holding resume lock",
+        "replacement cleanup cannot remove new runtime or its shutdown outcome"
+      ],
+      "limitations": [
+        "not complete client/subtree census",
+        "no private native retirement or policy transaction IPC",
+        "no journal EX controlled restore",
+        "not a cross-home move or release"
+      ],
+      "next": "Poll exact build session62511 to terminal. Never restart for observation timeout. Then run Tests/fixtures/codex-retained-shutdown-live.py --app-server-binary --binary=/private/tmp/aa-codex-approval-release/release/codex-app-server outside sandbox for Unix sockets, and selected-server-live regression against same binary. Update verification and checkpoint. Then wire strict method into validated native retirement, journal/ownership transaction and controlled restore; full census and actual move UI remain."
     }
   },
   "remaining": [
