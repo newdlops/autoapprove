@@ -13,6 +13,15 @@ extension ApprovalTests {
             try receipt.validate(requestID:requestID,threadIDs:[id],phase:phase,revision:7,homeIdentity:home)
         }
         try check()
+        let file:[String:Any]=["threadId":id,"relativePath":"archived_sessions/rollout-\(id).jsonl",
+            "fileIdentity":"16777234:45678","size":123,"modifiedSeconds":1,"modifiedNanoseconds":2,"sha256":String(repeating:"a",count:64)]
+        try check(["files":[file]])
+        for files in [[],[file,file]] as [[[String:Any]]] {try expectThrows(check(["files":files]))}
+        for change in [["threadId":UUID().uuidString.lowercased()],["relativePath":"archived_sessions/../outside-\(id).jsonl"],
+                       ["relativePath":"sessions/rollout-\(id).jsonl"],["size":0],["modifiedNanoseconds":1_000_000_000],
+                       ["fileIdentity":"linked"],["sha256":String(repeating:"A",count:64)]] as [[String:Any]] {
+            var bad=file;bad.merge(change,uniquingKeysWith:{$1});try expectThrows(check(["files":[bad]]))
+        }
         try check(["phase":"writers-held","homeIdentity":NSNull()],phase:"writers-held")
         for changes in [["requestId":UUID().uuidString.lowercased()],["threadIds":[]],["threadIds":[id,id]],
                         ["ownershipRevision":6],["homeIdentity":"16777234:12346"],["writersStopped":false],

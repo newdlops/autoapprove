@@ -778,7 +778,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,755 @@
+@@ -0,0 +1,765 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::message_processor::NativeSelectedRuntime;
@@ -1192,7 +1192,17 @@
 +                }
 +                // No await separates final peer/lease checks, guard validation,
 +                // and atomic policy publication. A lost reply is observed.
-+                retirement_reply = Some(proof.commit(lock, &admission, &pause, &threads)?);
++                retirement_reply =
++                    Some(proof.commit(lock, &admission, &pause, &threads, || {
++                        if Instant::now() >= deadline || !reader.buffer().is_empty() {
++                            return Err(io::ErrorKind::ConnectionAborted.into());
++                        }
++                        let mut byte = [0u8; 1];
++                        match reader.get_ref().as_ref().try_read(&mut byte) {
++                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
++                            _ => Err(io::ErrorKind::ConnectionAborted.into()),
++                        }
++                    })?);
 +            }
 +            "shutdown-status" => {
 +                shutdown_reply = Some(shutdown.as_ref().ok_or(io::ErrorKind::NotFound)?.snapshot());
@@ -6664,7 +6674,7 @@
  pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 --- a/app-server/src/request_processors/thread_processor.rs
 +++ b/app-server/src/request_processors/thread_processor.rs
-@@ -5,6 +5,21 @@
+@@ -5,6 +5,24 @@
  mod daemon_snapshot;
  
  mod workspace_switching;
@@ -6672,6 +6682,9 @@
 +#[path = "retained_shutdown.rs"]
 +mod retained_shutdown;
 +
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++#[path = "selected_archive.rs"]
++mod selected_archive;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +#[path = "selected_cohort.rs"]
 +mod selected_cohort;
@@ -6686,7 +6699,7 @@
  
  use super::persisted_resume_settings::PersistedResumeSettings;
  use super::persisted_resume_settings::latest_owned_thread_settings;
-@@ -510,6 +525,8 @@
+@@ -510,6 +528,8 @@
      pub(super) state_db: Option<StateDbHandle>,
      pub(super) log_db: Option<LogDbLayer>,
      pub(super) background_tasks: TaskTracker,
@@ -6695,7 +6708,7 @@
      pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
      pub(super) skills_watcher: Arc<SkillsWatcher>,
      pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-@@ -534,6 +551,10 @@
+@@ -534,6 +554,10 @@
  }
  
  impl ThreadRequestProcessor {
@@ -6706,7 +6719,7 @@
      #[allow(clippy::too_many_arguments)]
      pub(crate) fn new(
          auth_manager: Arc<AuthManager>,
-@@ -571,6 +592,7 @@
+@@ -571,6 +595,7 @@
              state_db,
              log_db,
              background_tasks: TaskTracker::new(),
@@ -6714,7 +6727,7 @@
              sample_responses,
              skills_watcher,
              turn_cost_worker,
-@@ -1175,24 +1197,58 @@
+@@ -1175,24 +1200,58 @@
          thread_id: ThreadId,
          operation: &str,
      ) -> Result<(), JSONRPCErrorError> {
@@ -7487,9 +7500,10 @@
 +}
 --- /dev/null
 +++ b/app-server/src/request_processors/selected_retirement.rs
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,198 @@
 +//! Connected source retirement. Preparation may archive only observed active
 +//! members; publication is a separate synchronous command under all live guards.
++use super::selected_archive::SelectedArchivePlan;
 +use super::*;
 +use crate::selected_journal_lock::{JournalLockRequest, NativeJournalLock};
 +use crate::turn_admission::{SelectedAdmissionPause, TurnAdmission};
@@ -7504,6 +7518,7 @@
 +    request: store::Request,
 +    guards: Vec<(ThreadId, WriterLockGuard)>,
 +    attempted: bool,
++    archive: SelectedArchivePlan,
 +}
 +impl NativeSelectedRetirement {
 +    fn verify(
@@ -7533,6 +7548,7 @@
 +        for (id, guard) in &self.guards {
 +            guard.verify_for(&self.home, *id)?;
 +        }
++        self.archive.verify_archived()?;
 +        Ok(())
 +    }
 +    pub(crate) fn snapshot(&self) -> Value {
@@ -7540,7 +7556,7 @@
 +        ids.sort();
 +        json!({"requestId":self.request.request_id,"threadIds":ids,"phase":"writers-held",
 +            "ownershipRevision":self.request.expected_revision,"writersStopped":true,
-+            "membershipComplete":false,"migrationAuthorized":false})
++            "membershipComplete":false,"migrationAuthorized":false,"files":self.archive.snapshot()})
 +    }
 +    pub(crate) fn commit(
 +        &mut self,
@@ -7548,6 +7564,7 @@
 +        admission: &TurnAdmission,
 +        pause: &SelectedAdmissionPause,
 +        ids: &HashSet<ThreadId>,
++        mut peer_live: impl FnMut() -> io::Result<()>,
 +    ) -> io::Result<Value> {
 +        if self.attempted {
 +            return Err(io::Error::other(
@@ -7555,14 +7572,16 @@
 +            ));
 +        }
 +        self.verify(journal, admission, pause, ids)?;
++        peer_live()?;
 +        self.attempted = true;
 +        let receipt = store::apply(&self.home, &self.request, || {
-+            self.verify(journal, admission, pause, ids)
++            self.verify(journal, admission, pause, ids)?;
++            peer_live()
 +        })?;
 +        Ok(
 +            json!({"requestId":receipt.request_id,"threadIds":receipt.thread_ids,"phase":receipt.phase,
 +            "ownershipRevision":receipt.revision,"homeIdentity":receipt.home_identity,
-+            "writersStopped":true,"membershipComplete":false,"migrationAuthorized":false}),
++            "writersStopped":true,"membershipComplete":false,"migrationAuthorized":false,"files":self.archive.snapshot()}),
 +        )
 +    }
 +}
@@ -7597,6 +7616,7 @@
 +        let mut sorted: Vec<_> = ids.iter().copied().collect();
 +        sorted.sort_by_key(ToString::to_string);
 +        let mut active = Vec::new();
++        let mut paths = Vec::new();
 +        for id in &sorted {
 +            if self
 +                .thread_manager
@@ -7621,7 +7641,14 @@
 +            if row.archived_at.is_none() {
 +                active.push(*id);
 +            }
++            paths.push((
++                *id,
++                row.rollout_path
++                    .ok_or_else(|| io::Error::other("Missing selected rollout path"))?,
++                row.archived_at.is_some(),
++            ));
 +        }
++        let archive = SelectedArchivePlan::capture(&home, &paths).await?;
 +        if !active.is_empty() {
 +            let archived = self
 +                .thread_store
@@ -7666,6 +7693,7 @@
 +            request,
 +            guards,
 +            attempted: false,
++            archive,
 +        };
 +        result.verify(journal, admission, pause, ids)?;
 +        Ok(result)
@@ -7777,3 +7805,270 @@
  
  #[test]
  fn writer_locks_reject_competing_owners_and_release_their_files() {
+--- /dev/null
++++ b/app-server/src/request_processors/selected_archive.rs
+@@ -0,0 +1,264 @@
++//! Complete selected archive file evidence, held through source publication.
++use codex_protocol::ThreadId;
++use codex_rollout::{ARCHIVED_SESSIONS_SUBDIR, RolloutReferenceIndex, SESSIONS_SUBDIR};
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::collections::{BTreeMap, HashSet};
++use std::ffi::CString;
++use std::fs::{File, OpenOptions};
++use std::io::{self, Read};
++use std::os::fd::{AsRawFd, FromRawFd};
++use std::os::unix::ffi::OsStrExt;
++use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++use std::path::{Component, Path, PathBuf};
++
++fn invalid() -> io::Error {
++    io::Error::other("Selected archive history or its destination changed")
++}
++#[derive(PartialEq, Eq)]
++struct Content {
++    identity: String,
++    size: u64,
++    seconds: i64,
++    nanos: i64,
++    hash: String,
++}
++struct Entry {
++    id: ThreadId,
++    before: PathBuf,
++    after: PathBuf,
++    content: Content,
++}
++pub(crate) struct SelectedArchivePlan {
++    home: PathBuf,
++    root: File,
++    files: Vec<Entry>,
++}
++impl SelectedArchivePlan {
++    fn verify_root(&self) -> io::Result<()> {
++        let a = self.root.metadata()?;
++        let b = std::fs::symlink_metadata(&self.home)?;
++        if !b.is_dir() || (a.dev(), a.ino()) != (b.dev(), b.ino()) {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++    fn open(&self, relative: &Path) -> io::Result<File> {
++        let parts = relative
++            .components()
++            .map(|part| match part {
++                Component::Normal(name) => Ok(name),
++                _ => Err(invalid()),
++            })
++            .collect::<io::Result<Vec<_>>>()?;
++        if parts.is_empty() || parts.len() > 64 {
++            return Err(invalid());
++        }
++        let mut parent = self.root.try_clone()?;
++        for (offset, name) in parts.iter().enumerate() {
++            let name = CString::new(name.as_bytes()).map_err(|_| invalid())?;
++            let flags = libc::O_RDONLY
++                | libc::O_NOFOLLOW
++                | libc::O_CLOEXEC
++                | libc::O_NONBLOCK
++                | if offset + 1 == parts.len() {
++                    0
++                } else {
++                    libc::O_DIRECTORY
++                };
++            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
++            if fd < 0 {
++                return Err(io::Error::last_os_error());
++            }
++            parent = unsafe { File::from_raw_fd(fd) };
++            if offset + 1 != parts.len() {
++                let info = parent.metadata()?;
++                if !info.is_dir()
++                    || info.uid() != unsafe { libc::geteuid() }
++                    || info.mode() & 0o022 != 0
++                {
++                    return Err(invalid());
++                }
++            }
++        }
++        Ok(parent)
++    }
++    fn absent(&self, relative: &Path) -> io::Result<bool> {
++        match self.open(relative) {
++            Ok(_) => Ok(false),
++            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
++            Err(error) => Err(error),
++        }
++    }
++    fn content(&self, relative: &Path) -> io::Result<Content> {
++        self.verify_root()?;
++        let mut file = self.open(relative)?;
++        let a = file.metadata()?;
++        if !a.is_file()
++            || a.uid() != unsafe { libc::geteuid() }
++            || a.mode() & 0o022 != 0
++            || a.nlink() != 1
++            || a.len() == 0
++            || a.len() > 256 * 1024 * 1024
++        {
++            return Err(invalid());
++        }
++        let mut hash = Sha256::new();
++        let mut total = 0u64;
++        let mut buffer = [0u8; 65536];
++        loop {
++            let n = file.read(&mut buffer)?;
++            if n == 0 {
++                break;
++            }
++            total += n as u64;
++            if total > a.len() {
++                return Err(invalid());
++            }
++            hash.update(&buffer[..n]);
++        }
++        let b = file.metadata()?;
++        let current = self.open(relative)?.metadata()?;
++        if total != a.len()
++            || (
++                a.dev(),
++                a.ino(),
++                a.len(),
++                a.mtime(),
++                a.mtime_nsec(),
++                a.ctime(),
++                a.ctime_nsec(),
++            ) != (
++                b.dev(),
++                b.ino(),
++                b.len(),
++                b.mtime(),
++                b.mtime_nsec(),
++                b.ctime(),
++                b.ctime_nsec(),
++            )
++            || (a.dev(), a.ino()) != (current.dev(), current.ino())
++        {
++            return Err(invalid());
++        }
++        self.verify_root()?;
++        Ok(Content {
++            identity: format!("{}:{}", a.dev(), a.ino()),
++            size: total,
++            seconds: a.mtime(),
++            nanos: a.mtime_nsec(),
++            hash: format!("{:x}", hash.finalize()),
++        })
++    }
++    pub(crate) async fn capture(
++        home: &Path,
++        selected: &[(ThreadId, PathBuf, bool)],
++    ) -> io::Result<Self> {
++        if home.canonicalize()? != home {
++            return Err(invalid());
++        }
++        let root = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(home)?;
++        if root.metadata()?.uid() != unsafe { libc::geteuid() }
++            || root.metadata()?.mode() & 0o022 != 0
++        {
++            return Err(invalid());
++        }
++        let mut result = Self {
++            home: home.to_owned(),
++            root,
++            files: Vec::new(),
++        };
++        result.verify_root()?;
++        let ids = selected.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
++        let active = RolloutReferenceIndex::scan_unarchived_threads(home, &ids).await?;
++        let archived = RolloutReferenceIndex::scan_archived_threads(home, &ids).await?;
++        let mut candidates = BTreeMap::new();
++        let mut active_ids = HashSet::new();
++        for (id, path, is_archived) in selected {
++            let relative = path.strip_prefix(home).map_err(|_| invalid())?;
++            if *is_archived != relative.starts_with(ARCHIVED_SESSIONS_SUBDIR)
++                || (!*is_archived && !relative.starts_with(SESSIONS_SUBDIR))
++            {
++                return Err(invalid());
++            }
++            if !*is_archived {
++                active_ids.insert(*id);
++            }
++            candidates.insert(path.clone(), *id);
++            for (_, path) in active
++                .rollouts_for_thread(*id)
++                .chain(archived.rollouts_for_thread(*id))
++            {
++                if candidates
++                    .insert(path.to_owned(), *id)
++                    .is_some_and(|old| old != *id)
++                {
++                    return Err(invalid());
++                }
++            }
++        }
++        if candidates.len() > 4096 {
++            return Err(invalid());
++        }
++        let mut destinations = HashSet::new();
++        let mut bytes = 0u64;
++        for (path, id) in candidates {
++            let before = path.strip_prefix(home).map_err(|_| invalid())?.to_owned();
++            if before.to_str().is_none_or(|path| path.len() > 4096) {
++                return Err(invalid());
++            }
++            let is_active = before.starts_with(SESSIONS_SUBDIR);
++            if (!is_active && !before.starts_with(ARCHIVED_SESSIONS_SUBDIR))
++                || (is_active && !active_ids.contains(&id))
++            {
++                return Err(invalid());
++            }
++            let after = if is_active {
++                Path::new(ARCHIVED_SESSIONS_SUBDIR).join(before.file_name().ok_or_else(invalid)?)
++            } else {
++                before.clone()
++            };
++            if !destinations.insert(after.clone()) || (is_active && !result.absent(&after)?) {
++                return Err(invalid());
++            }
++            let content = result.content(&before)?;
++            let meta = codex_rollout::read_session_meta_line(&path).await?;
++            if meta.meta.id != id || result.content(&before)? != content {
++                return Err(invalid());
++            }
++            bytes = bytes.checked_add(content.size).ok_or_else(invalid)?;
++            if bytes > 1024 * 1024 * 1024 {
++                return Err(invalid());
++            }
++            result.files.push(Entry {
++                id,
++                before,
++                after,
++                content,
++            });
++        }
++        if result.files.is_empty() || serde_json::to_vec(&result.snapshot())?.len() > 768 * 1024 {
++            return Err(invalid());
++        }
++        Ok(result)
++    }
++    pub(crate) fn verify_archived(&self) -> io::Result<()> {
++        self.verify_root()?;
++        for entry in &self.files {
++            if self.content(&entry.after)? != entry.content
++                || (entry.before != entry.after && !self.absent(&entry.before)?)
++            {
++                return Err(invalid());
++            }
++        }
++        self.verify_root()
++    }
++    pub(crate) fn snapshot(&self) -> Value {
++        json!(self.files.iter().map(|entry|json!({"threadId":entry.id.to_string(),"relativePath":entry.after,
++            "fileIdentity":entry.content.identity,"size":entry.content.size,"modifiedSeconds":entry.content.seconds,
++            "modifiedNanoseconds":entry.content.nanos,"sha256":entry.content.hash})).collect::<Vec<_>>())
++    }
++}

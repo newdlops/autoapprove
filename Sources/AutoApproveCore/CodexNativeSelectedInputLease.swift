@@ -57,15 +57,45 @@ struct CodexNativeSelectedShutdown:Decodable,Sendable {
     }
 }
 
+struct CodexNativeArchivedFile:Decodable,Equatable,Sendable {
+    let threadId:String,relativePath:String,fileIdentity:String,sha256:String
+    let size:Int64,modifiedSeconds:Int64,modifiedNanoseconds:Int64
+    var witness:CodexMigrationRolloutWitness {.init(relativePath:relativePath,fileIdentity:fileIdentity,size:size,
+        modifiedSeconds:modifiedSeconds,modifiedNanoseconds:modifiedNanoseconds,sha256:sha256)}
+    func validate(scope:Set<String>)throws {
+        try witness.validate()
+        let identity=fileIdentity.split(separator:":",omittingEmptySubsequences:false)
+        guard scope.contains(threadId),relativePath.hasPrefix("archived_sessions/"),
+              URL(fileURLWithPath:relativePath).lastPathComponent.contains(threadId),
+              (0..<1_000_000_000).contains(modifiedNanoseconds),
+              identity.count==2,identity.allSatisfy({!$0.isEmpty && $0.utf8.allSatisfy{(48...57).contains($0)} && UInt64($0) != nil}),
+              sha256.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}) else {
+            throw AppError.message("원본 이력 파일의 범위와 신원을 확인하지 못했습니다.")
+        }
+    }
+}
 struct CodexNativeRetirementReceipt:Decodable,Sendable {
     let requestId:String,threadIds:[String],phase:String,ownershipRevision:Int
     let homeIdentity:String?
     let writersStopped:Bool,membershipComplete:Bool,migrationAuthorized:Bool
+    let files:[CodexNativeArchivedFile]?
     func validate(requestID:String,threadIDs:[String],phase:String,revision:Int,homeIdentity:String)throws {
         guard requestId==requestID,threadIds==(try CodexNativeSelectedInputLease.checkedScope(threadIDs)),
               ["writers-held","retired"].contains(phase),self.phase==phase,ownershipRevision==revision,revision>=0,writersStopped,!membershipComplete,!migrationAuthorized,
               phase=="retired" ? self.homeIdentity==homeIdentity:self.homeIdentity==nil else {
             throw AppError.message("원본 대화의 소유권 해제 결과를 확인하지 못했습니다.")
+        }
+        if let files {
+            let scope=Set(threadIDs)
+            guard (1...4096).contains(files.count),Set(files.map(\.relativePath)).count==files.count,
+                  Set(files.map(\.threadId))==scope else{throw AppError.message("원본 이력 파일 목록이 대화 범위와 다릅니다.")}
+            var total:Int64=0
+            for file in files {
+                try file.validate(scope:scope)
+                let next=total.addingReportingOverflow(file.size)
+                guard !next.overflow,next.partialValue<=1_073_741_824 else{throw AppError.message("이동할 이력이 허용 범위를 넘었습니다.")}
+                total=next.partialValue
+            }
         }
     }
 }
@@ -130,6 +160,7 @@ final class CodexNativeSelectedInputLease {
     private var shutdownRequestID:String?
     private var retirementRevision:Int?
     private var retirementCommitAttempted=false
+    private var retirementFiles:[CodexNativeArchivedFile]?
     private static var failure:AppError {.message("선택한 대화의 서버 입력 차단을 확인하지 못했습니다. 이동을 진행하지 않습니다.")}
     static func checkedScope(_ ids:[String])throws->[String] {
         guard (1...512).contains(ids.count),Set(ids).count==ids.count,
@@ -213,6 +244,7 @@ final class CodexNativeSelectedInputLease {
             try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"writers-held",
                 revision:expectedOwnershipRevision,homeIdentity:witness.homeIdentity)
             retirementRevision=expectedOwnershipRevision
+            retirementFiles=receipt.files
             return receipt
         }catch{close();throw error}
     }
@@ -224,6 +256,7 @@ final class CodexNativeSelectedInputLease {
             guard let receipt=try call(.retireCommit).retirement else{throw Self.failure}
             try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"retired",revision:revision+1,
                 homeIdentity:witness.homeIdentity)
+            guard receipt.files==retirementFiles else{throw Self.failure}
             return receipt
         }catch{close();throw error}
     }
@@ -269,7 +302,7 @@ final class CodexNativeSelectedInputLease {
                          generation:String?,leaseID:String?,threadIDs:[String])throws->Reply {
         do {
             let scope=try checkedScope(threadIDs)
-            guard (1...(operation == .cohort ? 1_048_576:65_536)).contains(data.count),nonce.utf8.count==32,
+            guard (1...([Operation.cohort,.retirePrepare,.retireCommit].contains(operation) ? 1_048_576:65_536)).contains(data.count),nonce.utf8.count==32,
                   nonce.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}) else{throw failure}
             let reply=try JSONDecoder().decode(Reply.self,from:data)
             let paused=operation != .inspect && operation != .release

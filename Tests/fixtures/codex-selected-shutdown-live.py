@@ -25,6 +25,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True)
     parser.add_argument('--retirement', action='store_true')
+    parser.add_argument('--case')
     args = parser.parse_args()
     binary = pathlib.Path(args.binary).resolve(strict=True)
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -34,7 +35,10 @@ def main():
     root = pathlib.Path(tempfile.mkdtemp(prefix='aa-selected-shutdown-', dir='/private/tmp'))
     root.chmod(0o700)
     checks = []
-    modes = ['retire', 'retire-cohort', 'disconnected-prepare', 'lost-reply', 'external-writer', 'stale-policy', 'replaced-writer'] if args.retirement else ['wrong-phase', 'skipped-revision', 'changed-request', 'connected', 'disconnect']
+    modes = ['retire', 'retire-cohort', 'disconnected-prepare', 'lost-reply', 'external-writer', 'stale-policy', 'replaced-writer', 'archive-collision', 'history-changed'] if args.retirement else ['wrong-phase', 'skipped-revision', 'changed-request', 'connected', 'disconnect']
+    if args.case:
+        assert args.case in modes, args.case
+        modes = [args.case]
     for mode in modes:
         folder = root / mode
         folder.mkdir(mode=0o700)
@@ -168,7 +172,16 @@ def main():
                         stamp = publish(3, stamp['digest'])
                         assert lease.call('journal-sync', journal=stamp)['journalLock']['revision'] == 3
                         writer_path = source / 'thread-writer-locks' / (selected + '.lock')
-                        if mode == 'external-writer':
+                        if mode == 'archive-collision':
+                            existing = server.call('thread/read', {'threadId': selected, 'includeTurns': False})['thread']['path']
+                            collision = source / 'archived_sessions' / pathlib.Path(existing).name
+                            collision.parent.mkdir(mode=0o700, exist_ok=True)
+                            collision.write_bytes(b'preserve-existing-archive')
+                            collision.chmod(0o600)
+                            rejected('retire-prepare')
+                            assert collision.read_bytes() == b'preserve-existing-archive'
+                            assert pathlib.Path(existing).exists(), 'Failed preparation moved the original history'
+                        elif mode == 'external-writer':
                             writer = os.open(writer_path, os.O_RDWR | os.O_CREAT, 0o600)
                             try:
                                 fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -181,6 +194,15 @@ def main():
                             proof = lease.call('retire-prepare')['retirement']
                             assert proof['phase'] == 'writers-held' and proof['writersStopped'], proof
                             assert proof['threadIds'] == sorted(scope) and not proof['membershipComplete'] and not proof['migrationAuthorized'], proof
+                            files = proof['files']
+                            assert set(row['threadId'] for row in files) == set(scope) and len(set(row['relativePath'] for row in files)) == len(files), files
+                            for row in files:
+                                path = source / row['relativePath']
+                                assert row['relativePath'].startswith('archived_sessions/') and path.resolve().is_relative_to(source.resolve()), row
+                                info = path.stat()
+                                assert hashlib.sha256(path.read_bytes()).hexdigest() == row['sha256'], row
+                                assert info.st_size == row['size'] and identity(path) == row['fileIdentity'], row
+                                assert info.st_mtime_ns == row['modifiedSeconds'] * 1_000_000_000 + row['modifiedNanoseconds'], row
                             thread = server.call('thread/read', {'threadId': selected, 'includeTurns': False})['thread']
                             assert '/archived_sessions/' in thread['path'], thread
                             assert not (source / '.autoapprove-ownership').exists()
@@ -203,7 +225,14 @@ def main():
                                             pass
                                     finally:
                                         os.close(second)
-                                if mode == 'replaced-writer':
+                                if mode == 'history-changed':
+                                    changed = source / files[0]['relativePath']
+                                    with changed.open('ab') as output:
+                                        output.write(b'\n')
+                                    rejected('retire-commit')
+                                    lease.close()
+                                    lease = None
+                                elif mode == 'replaced-writer':
                                     os.rename(writer_path, writer_path.with_suffix('.original'))
                                     fd = os.open(writer_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                                     with os.fdopen(fd, 'wb') as output:
@@ -221,7 +250,7 @@ def main():
                                     else:
                                         receipt = lease.call('retire-commit')['retirement']
                                         assert receipt['phase'] == 'retired' and receipt['ownershipRevision'] == 1, receipt
-                                        assert receipt['homeIdentity'] == identity(source) and receipt['writersStopped'], receipt
+                                        assert receipt['homeIdentity'] == identity(source) and receipt['writersStopped'] and receipt['files'] == files, receipt
                                     end = time.monotonic() + 10
                                     while True:
                                         owned = observe()
@@ -251,7 +280,7 @@ def main():
                                 os.close(probe)
                             if mode == 'replaced-writer':
                                 assert writer_path.read_bytes() == b'preserve-replaced-entry', 'Native cleanup removed a replaced lock entry'
-                        if mode in ['disconnected-prepare', 'external-writer', 'stale-policy', 'replaced-writer']:
+                        if mode in ['disconnected-prepare', 'external-writer', 'stale-policy', 'replaced-writer', 'archive-collision', 'history-changed']:
                             assert not (source / '.autoapprove-ownership').exists()
                     else:
                         if lease:
@@ -266,7 +295,7 @@ def main():
                 lease = None
             os.close(original)
             original = None
-            if mode in ['connected', 'disconnect', 'disconnected-prepare', 'external-writer', 'stale-policy', 'replaced-writer']:
+            if mode in ['connected', 'disconnect', 'disconnected-prepare', 'external-writer', 'stale-policy', 'replaced-writer', 'archive-collision', 'history-changed']:
                 current = server.call('thread/read', {'threadId': selected, 'includeTurns': False})['thread']
                 if '/archived_sessions/' in current['path']:
                     server.call('thread/unarchive', {'threadId': selected})
@@ -298,7 +327,7 @@ def main():
                 server.close()
     assert hashlib.sha256(binary.read_bytes()).hexdigest() == binary_sha256, 'Binary changed during fixture execution'
     report = {'passed': True, 'fixture': str(root), 'binarySHA256': binary_sha256, 'checks': checks, 'modelTurnsSubmitted': 0,
-              'policyWrites': 3 if args.retirement else 0, 'retirementVerified': args.retirement, 'migrationVerified': False}
+              'policyWrites': sum(case in ['retire', 'retire-cohort', 'lost-reply'] for case in checks), 'retirementVerified': args.retirement and {'retire', 'retire-cohort', 'lost-reply'}.issubset(checks), 'migrationVerified': False}
     (root / 'report.json').write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
 

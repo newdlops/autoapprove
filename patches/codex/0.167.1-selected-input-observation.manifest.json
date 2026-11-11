@@ -29,7 +29,7 @@
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "664653c1442be7f6b466f2fa3c87fdc93fe0eef29900b350bc257672b00266be"
+      "after": "503e3f628ab747e267c8c36042f9b077c484bac5f3c722aa6b53deca629c20bb"
     },
     {
       "path": "app-server/src/message_processor.rs",
@@ -254,7 +254,7 @@
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "fc46cc207aeae4f210c61a09df878bb8bfd81ec1ef9adbe0f6bbe36419880576"
+      "after": "6d2b4c475e02dec59eb304d382b2bc029a0cfa7e11b4acf0ca07de97dba9be58"
     },
     {
       "path": "core/src/codex_thread.rs",
@@ -299,7 +299,7 @@
     {
       "path": "app-server/src/request_processors/selected_retirement.rs",
       "before": null,
-      "after": "4c29b05decc875c0da2a458822886a5ca1122a87df26a62deeb366547c669c08"
+      "after": "46593b9565698fe96813d2faf18bee3894f0aef922b5b8177c464d3416594370"
     },
     {
       "path": "rollout/src/writer_lock.rs",
@@ -310,9 +310,14 @@
       "path": "rollout/src/writer_lock_tests.rs",
       "before": "ec35c4614cce8831e872e7452f30acf7b8ad5889b0227284bbfc683bf7f0d99d",
       "after": "a6a961601badb0dc24a06d2161d1bd808ab7b403ef649f8520e581c199cd78a1"
+    },
+    {
+      "path": "app-server/src/request_processors/selected_archive.rs",
+      "before": null,
+      "after": "8f3c8eac8a2a5721f6bf47ed6a5f69af6139fb4a34991c9b1e826fc19a9d2131"
     }
   ],
-  "patchSHA256": "6e7508a844a3d76a13ef6bd0ab4b4260a0e4a945f0e8610d46e5a0def4486a1d",
+  "patchSHA256": "980650bf5575c1326d966d7d83c3d2f9a7694727982bc41650b803ab8181d968",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
