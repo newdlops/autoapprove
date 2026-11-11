@@ -5,6 +5,7 @@ import AutoApproveCore
 struct Preview: View {
     @ObservedObject var engine: ApprovalEngine
     let id: String
+    let home:String
     var body: some View {
         HSplitView {
             VStack(alignment: .leading) {
@@ -21,11 +22,18 @@ struct Preview: View {
                         Text("Fixture Lab").font(.title)
                         Toggle("자동 승인", isOn: Binding(get: { session.automatic }, set: { try? engine.setAutomatic(id, enabled: $0) }))
                         Toggle("전체 일시정지", isOn: Binding(get: { engine.snapshot.paused }, set: { try? engine.setPaused($0) }))
+                        HStack {
+                            Button("부모 오류"){mode("parent-error")}
+                            Button("모두 대기"){mode("all-idle")}
+                            Button("자식 작업 중"){mode("child-working")}
+                            Button("연결 오류"){mode("error")}
+                        }
                     }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.frame(minWidth: 350)
         }
     }
+    private func mode(_ value:String) {try? Data(value.utf8).write(to:URL(fileURLWithPath:home).appendingPathComponent("activity-mode"))}
 }
 @main struct PreviewApp {
     @MainActor static func main() throws {
@@ -39,7 +47,7 @@ struct Preview: View {
         let app = NSApplication.shared; app.setActivationPolicy(.regular)
         let window = NSWindow(contentRect: NSRect(x: 50, y: 100, width: 1040, height: 700), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = "AutoApprove · 서브에이전트 연결 검사"
-        window.contentView = NSHostingView(rootView: Preview(engine: engine, id: session.id))
+        window.contentView = NSHostingView(rootView: Preview(engine: engine, id: session.id,home:home))
         window.minSize = NSSize(width: 784, height: 612)
         window.makeKeyAndOrderFront(nil); app.activate(ignoringOtherApps: true)
         app.run(); engine.stop()

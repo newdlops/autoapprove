@@ -26,6 +26,22 @@ import Foundation
         idleRows[0]["status"] = ["type": "idle"]
         let unknownActivity = try CodexSubagentApprovals.activity(root: root, rows: idleRows)
         precondition(unknownActivity.phase == .unknown)
+        idleRows[0]["status"] = ["type":"systemError"]
+        precondition(CodexSubagentApprovals.rootConversations(rows:idleRows,cwd:"/fixture").map(\.id)==[root])
+        idleRows[0]["status"] = ["type":"notLoaded"]
+        precondition(CodexSubagentApprovals.rootConversations(rows:idleRows,cwd:"/fixture").isEmpty)
+        let mode=URL(fileURLWithPath:home).appendingPathComponent("activity-mode")
+        try Data("parent-error".utf8).write(to:mode)
+        let failedParentObservations=Counter()
+        let noEffects=try await CodexSubagentApprovals.poll(target:target,cwd:"/fixture",
+            observed:{activity in
+                precondition(activity.parent.phase == .unknown && activity.children.count==1)
+                await failedParentObservations.add()
+            },authorize:{_ in fatalError("Failed parent cannot authorize approvals")},
+            completed:{_,_ in fatalError("Status refresh cannot send responses")})
+        let observedFailedParent=await failedParentObservations.value
+        precondition(observedFailedParent==1 && noEffects.responded==0 && noEffects.review==0)
+        try FileManager.default.removeItem(at:mode)
         let readOnly = Counter()
         _ = try await CodexSubagentApprovals.poll(target: target, cwd: "/fixture", approvalsEnabled: false,
             observed: { activity in
@@ -72,8 +88,14 @@ import Foundation
         engine.updateDiscovery([session], records: [record])
         try engine.setPaused(true)
         try engine.setAutomatic(session.id, enabled: true)
+        try Data("parent-error".utf8).write(to:mode)
         try await engine.connectCurrentCodexApprovals(sessionID: session.id)
         try await Task.sleep(for: .milliseconds(200))
+        precondition(engine.snapshot.sessions[0].codexApprovalBinding?.threadID==root)
+        precondition(engine.snapshot.sessions[0].codexActivity?.children.count==1)
+        precondition(engine.snapshot.sessions[0].codexActivity?.parent.phase == .unknown)
+        try FileManager.default.removeItem(at:mode)
+        _ = try await engine.codexApprovalSubagents(sessionID:session.id)
         precondition(engine.snapshot.sessions[0].codexActivity?.children.first?.phase == .approval)
         precondition(engine.snapshot.sessions[0].phase == .approval)
         let before = engine.snapshot.events.filter { $0.source == "Codex 부모·서브에이전트" }.count

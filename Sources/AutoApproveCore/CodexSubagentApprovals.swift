@@ -194,10 +194,13 @@ enum CodexSubagentApprovals {
 
     static func roots(target: CodexReplyTarget, cwd: String) throws -> [CodexQueueConversation] {
         let connection = try CodexQueueConnection(home: target.home, captureApprovals: true)
-        return try loadedThreads(connection).compactMap { row in
+        return rootConversations(rows:try loadedThreads(connection),cwd:cwd)
+    }
+    static func rootConversations(rows:[JSONObject],cwd:String)->[CodexQueueConversation] {
+        return rows.compactMap { row in
             guard row["cwd"] as? String == cwd, row["parentThreadId"] == nil || row["parentThreadId"] is NSNull,
                   let id = row["id"] as? String,
-                  ["active", "idle"].contains((row["status"] as? JSONObject)?["type"] as? String ?? "") else { return nil }
+                  ["active", "idle", "systemError"].contains((row["status"] as? JSONObject)?["type"] as? String ?? "") else { return nil }
             return CodexQueueConversation(id: id, title: String((row["name"] as? String ?? row["preview"] as? String ?? id).prefix(180)))
         }
     }
@@ -218,7 +221,9 @@ enum CodexSubagentApprovals {
         await observed(try activity(root: target.threadID, rows: rows))
         guard approvalsEnabled else { return (0, 0) }
         let owned = ownedThreads(root: target.threadID, rows: rows)
-        guard owned[target.threadID] != nil else { throw AppError.message("부모 대화가 실행 중이 아닙니다.") }
+        // Observation above remains valid when a loaded parent is stopped by
+        // a provider/system error. It does not authorize approval mutations.
+        guard owned[target.threadID] != nil else { return (0,0) }
         let waiting = owned.filter {
             (($0.value["status"] as? JSONObject)?["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
         }

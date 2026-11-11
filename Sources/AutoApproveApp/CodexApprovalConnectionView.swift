@@ -31,6 +31,10 @@ struct CodexApprovalConnectionView: View {
             } else if subagents.isEmpty {
                 Text("현재 실행 중인 서브에이전트가 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
+            if let activity=session.codexActivity {
+                Text("마지막 갱신 · "+activity.observedAt.formatted(date:.omitted,time:.standard))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             ForEach(subagents) { child in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(child.title).font(.callout.weight(.medium)).textSelection(.enabled)
@@ -78,7 +82,18 @@ struct CodexApprovalConnectionView: View {
                 }.padding(.top, 6)
             }
         }
-        .task(id: session.id) { await load() }
+        .task(id: session.id) {
+            // Initial attachment can race server recovery. Retry observation
+            // until a binding exists; its engine worker then owns polling.
+            while !Task.isCancelled {
+                await load()
+                if engine.snapshot.sessions.first(where:{$0.id==session.id})?.codexApprovalBinding != nil {return}
+                do {try await Task.sleep(for:.seconds(3))} catch {return}
+            }
+        }
+        .onChange(of:session.codexActivity?.observedAt) {_,date in
+            if date != nil {loaded=true;error=nil}
+        }
     }
     private func refresh() { Task { await load() } }
     @MainActor private func load() async {
@@ -88,8 +103,9 @@ struct CodexApprovalConnectionView: View {
         do {
             try await engine.connectCurrentCodexApprovals(sessionID: session.id)
             _ = try await engine.codexApprovalSubagents(sessionID: session.id)
+            try Task.checkCancellation()
             loaded = true
-        } catch { self.error = error.localizedDescription }
+        } catch is CancellationError {} catch { self.error = error.localizedDescription }
     }
     private func perform(_ action: @escaping @MainActor () async throws -> Void) {
         loading = true; error = nil

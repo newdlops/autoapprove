@@ -43,7 +43,7 @@ try {
         assert.equal(m.params.includeTurns,false);
         let mode='';try{mode=readFileSync(path.join(dir,'activity-mode'),'utf8');}catch{}
         if(mode==='error'){socket.send(JSON.stringify({id:m.id,error:{code:-32000,message:'fixture disconnected'}}));return;}
-        const p=mode?{...parent,status:{type:mode==='parent-working'?'active':'idle',activeFlags:[]}}:parent;
+        const p=mode?{...parent,status:{type:mode==='parent-error'?'systemError':mode==='parent-working'?'active':'idle',activeFlags:[]}}:parent;
         const w=mode?{...worker,status:{type:mode==='child-working'?'active':'idle',activeFlags:[]}}:worker;
         reply({thread:m.params.threadId===root?p:m.params.threadId===child?w:{...worker,id:other,parentThreadId:other}});return;
       }
@@ -66,6 +66,7 @@ try {
   });
   await new Promise(resolve=>server.listen(path.join(dir,'app-server-control/app-server-control.sock'),resolve));
   async function run(...args){process=spawn(binary,[dir,root,...args],{stdio:'inherit'});const code=await new Promise(resolve=>process.on('exit',resolve));assert.equal(code,0);}
+  if(preview&&globalThis.process.argv.includes('--start-offline'))await writeFile(path.join(dir,'activity-mode'),'error');
   await run();
   if(!preview)assert.deepEqual(responses.sort(),['hidden-command','hidden-command','hidden-file','hidden-file','hidden-mcp','hidden-mcp'].sort());
   if(!preview){acknowledge=false;const before=responses.length;await run('--uncertain');assert.equal(responses.length,before+3);await run('--uncertain');assert.equal(responses.length,before+3,'Restart cannot replay an uncertain response');}
