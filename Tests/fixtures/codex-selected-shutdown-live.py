@@ -26,6 +26,8 @@ def main():
     parser.add_argument('--binary', required=True)
     parser.add_argument('--retirement', action='store_true')
     args = parser.parse_args()
+    binary = pathlib.Path(args.binary).resolve(strict=True)
+    binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     spec = importlib.util.spec_from_file_location('selected_fixture', pathlib.Path(__file__).with_name('codex-selected-server-live.py'))
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
@@ -39,7 +41,7 @@ def main():
         server = lease = None
         original = None
         try:
-            server = fixture.Server(pathlib.Path(args.binary).resolve(strict=True), folder, standalone=True)
+            server = fixture.Server(binary, folder, standalone=True)
             selected = server.call('thread/start', {'cwd': str(folder)})['thread']['id']
             scope = [selected]
             if mode == 'retire-cohort':
@@ -52,6 +54,12 @@ def main():
                 with sqlite3.connect((server.home / 'goals_1.sqlite').as_uri() + '?mode=ro', uri=True) as db:
                     return db.execute('SELECT goal_id FROM thread_goals WHERE thread_id=?', (selected,)).fetchone()[0]
             initial_goal_id = goal_id()
+            # Seed real stored accounting without submitting a model turn.
+            # Zero-only checks would miss lost accounting during shutdown.
+            with sqlite3.connect((server.home / 'goals_1.sqlite').as_uri() + '?mode=rw', uri=True) as db:
+                assert db.execute('UPDATE thread_goals SET tokens_used=37,time_used_seconds=11 WHERE thread_id=?', (selected,)).rowcount == 1
+            goal = server.call('thread/goal/get', {'threadId': selected})['goal']
+            assert goal['tokensUsed'] == 37 and goal['timeUsedSeconds'] == 11, goal
             source = server.home
             destination = folder / 'destination-검증'
             destination.mkdir(mode=0o700)
@@ -288,7 +296,8 @@ def main():
                 os.close(original)
             if server:
                 server.close()
-    report = {'passed': True, 'fixture': str(root), 'checks': checks, 'modelTurnsSubmitted': 0,
+    assert hashlib.sha256(binary.read_bytes()).hexdigest() == binary_sha256, 'Binary changed during fixture execution'
+    report = {'passed': True, 'fixture': str(root), 'binarySHA256': binary_sha256, 'checks': checks, 'modelTurnsSubmitted': 0,
               'policyWrites': 3 if args.retirement else 0, 'retirementVerified': args.retirement, 'migrationVerified': False}
     (root / 'report.json').write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
