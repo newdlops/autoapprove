@@ -229,15 +229,20 @@
     {
       "path": "core/src/native_ownership.rs",
       "before": null,
-      "after": "391a685ee137bcb14343352ad7f328fbd8f0b1b5531365dcb4d8e3a7df48ac33"
+      "after": "f000b55efdd589337f80636ce7503f85e2544bd451faa223e42e58967971d3dc"
     },
     {
       "path": "core/Cargo.toml",
       "before": "48b3e7817b9b9391a4e05d08859f2ec460d4bcfa709885fa8577a6edd58bb393",
       "after": "00d847a8bc1428425ad408b9e6a35e43386e5e403dddd5ccb97dc290e1416432"
+    },
+    {
+      "path": "core/src/native_ownership/store.rs",
+      "before": null,
+      "after": "bbfcc3d3c7d396cdfe13fdeb06d3f167b68a99f466cea435e658a3a6601c5eec"
     }
   ],
-  "patchSHA256": "8f0da8f102148b1f2467db20ccd64f3eade4971a32cc34338157915162ab796c",
+  "patchSHA256": "558b8adb43cbd97f610e82d0a19621b7177e2d6ccee7e0d932108206923c620c",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,
@@ -306,7 +311,7 @@
       "focusedReaderTestsPassed": 4,
       "resumeRaceBarrierStillRequired": true,
       "fullCoreAndServerCodeCheckPassed": true,
-      "fullCodeCheckDuration": "3m06s",
+      "fullCodeCheckDuration": "2m35s",
       "nativeRuntimePolicyEnforcementVerified": false,
       "sharedStartupGuardApplied": true,
       "controlledRestoreUnderExclusiveReservationStillPending": true,
@@ -314,7 +319,11 @@
       "startupGuardPhysicalLockReplacementRejected": true,
       "sharedVsExclusiveOSLockTestsPassed": true,
       "sameLockPathAsSwiftJournalVerified": true,
-      "actualSwiftToCoreStartupIntegrationVerified": false
+      "actualSwiftToCoreStartupIntegrationVerified": false,
+      "atomicPolicyDirectoryApplied": true,
+      "policyStorageTransactionsApplied": true,
+      "focusedReaderLockAndStorageTestsPassed": 12,
+      "nativeQuiescenceVerified": false
     }
   },
   "remaining": [

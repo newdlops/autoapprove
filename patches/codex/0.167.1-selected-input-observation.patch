@@ -4494,11 +4494,11 @@
              startup,
 --- /dev/null
 +++ b/core/src/native_ownership.rs
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,554 @@
 +//! Durable denial of writes to conversations retired from a login home.
-+//! Absence of both files preserves ordinary Codex behavior. Once installed,
-+//! missing, linked or inconsistent records fail closed; unrelated IDs remain usable.
-+use serde::Deserialize;
++//! An absent policy directory preserves ordinary Codex behavior. A published
++//! directory with missing, linked or inconsistent contents fails closed.
++use serde::{Deserialize, Serialize};
 +use std::collections::HashSet;
 +use std::fs::{File, OpenOptions};
 +use std::io::{self, Read};
@@ -4506,8 +4506,10 @@
 +use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 +use std::path::Path;
 +
-+pub const REQUIRED_FILE: &str = ".autoapprove-ownership-required.json";
-+pub const STATE_FILE: &str = ".autoapprove-ownership.json";
++pub const POLICY_DIRECTORY: &str = ".autoapprove-ownership";
++pub const REQUIRED_FILE: &str = "required.json";
++pub const STATE_FILE: &str = "state.json";
++pub mod store;
 +
 +/// Shares the exact home lock used by AutoApprove's migration journal. Holding
 +/// this through manager publication prevents a new writer crossing reservation.
@@ -4573,7 +4575,7 @@
 +    startup_guard_enabled(home, cfg!(feature = "autoapprove-native-ownership"))
 +}
 +fn startup_guard_enabled(home: &Path, enabled: bool) -> io::Result<Option<StartupGuard>> {
-+    if !enabled && !present(&home.join(REQUIRED_FILE))? && !present(&home.join(STATE_FILE))? {
++    if !enabled && !present(&home.join(POLICY_DIRECTORY))? {
 +        return Ok(None);
 +    }
 +    let home = home.canonicalize().map_err(|_| unavailable())?;
@@ -4621,13 +4623,13 @@
 +    Ok(Some(guard))
 +}
 +
-+#[derive(Deserialize)]
++#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 +#[serde(rename_all = "camelCase", deny_unknown_fields)]
 +struct Required {
 +    schema_version: u32,
 +    home_identity: String,
 +}
-+#[derive(Deserialize)]
++#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 +#[serde(rename_all = "camelCase", deny_unknown_fields)]
 +struct State {
 +    schema_version: u32,
@@ -4635,7 +4637,7 @@
 +    revision: u64,
 +    threads: Vec<Thread>,
 +}
-+#[derive(Deserialize)]
++#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 +#[serde(rename_all = "camelCase", deny_unknown_fields)]
 +struct Thread {
 +    thread_id: String,
@@ -4643,7 +4645,7 @@
 +    owner_home_identity: String,
 +    phase: Phase,
 +}
-+#[derive(Deserialize, PartialEq)]
++#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 +#[serde(rename_all = "kebab-case")]
 +enum Phase {
 +    Active,
@@ -4718,13 +4720,13 @@
 +
 +/// Checks both resume and turn submission. This is not a retirement witness or
 +/// migration grant: native quiescence and the transition journal are still required.
-+pub fn check_writer(home: &Path, thread_id: &str) -> io::Result<()> {
-+    if !canonical_uuid(thread_id) {
-+        return Err(unavailable());
-+    }
-+    if !present(&home.join(REQUIRED_FILE))? && !present(&home.join(STATE_FILE))? {
-+        return Ok(());
-+    }
++struct Loaded {
++    physical: std::path::PathBuf,
++    root: File,
++    policy: File,
++    state: State,
++}
++fn open_home(home: &Path) -> io::Result<(std::path::PathBuf, File, String)> {
 +    let physical = home.canonicalize().map_err(|_| unavailable())?;
 +    let root = OpenOptions::new()
 +        .read(true)
@@ -4736,8 +4738,24 @@
 +        return Err(unavailable());
 +    }
 +    let home_identity = format!("{}:{}", info.dev(), info.ino());
-+    let required: Required = read(&root, REQUIRED_FILE, 4096)?;
-+    let state: State = read(&root, STATE_FILE, 16 * 1024 * 1024)?;
++    Ok((physical, root, home_identity))
++}
++fn load(home: &Path) -> io::Result<Option<Loaded>> {
++    if !present(&home.join(POLICY_DIRECTORY))? {
++        return Ok(None);
++    }
++    let (physical, root, home_identity) = open_home(home)?;
++    let policy = open_at(
++        &root,
++        POLICY_DIRECTORY,
++        libc::O_RDONLY | libc::O_DIRECTORY,
++        0,
++    )?;
++    if !private(&policy.metadata().map_err(|_| unavailable())?, true) {
++        return Err(unavailable());
++    }
++    let required: Required = read(&policy, REQUIRED_FILE, 4096)?;
++    let state: State = read(&policy, STATE_FILE, 16 * 1024 * 1024)?;
 +    if required.schema_version != 1
 +        || state.schema_version != 1
 +        || state.revision == 0
@@ -4748,8 +4766,7 @@
 +        return Err(unavailable());
 +    }
 +    let mut seen = HashSet::new();
-+    let mut allowed = true;
-+    for row in state.threads {
++    for row in &state.threads {
 +        if !canonical_uuid(&row.thread_id)
 +            || !canonical_uuid(&row.request_id)
 +            || !seen.insert(row.thread_id.clone())
@@ -4758,14 +4775,52 @@
 +        {
 +            return Err(unavailable());
 +        }
-+        if row.thread_id == thread_id {
-+            allowed = row.phase == Phase::Active;
-+        }
 +    }
-+    let current = std::fs::symlink_metadata(&physical).map_err(|_| unavailable())?;
-+    if !current.is_dir() || current.dev() != info.dev() || current.ino() != info.ino() {
++    let loaded = Loaded {
++        physical,
++        root,
++        policy,
++        state,
++    };
++    loaded.verify()?;
++    Ok(Some(loaded))
++}
++impl Loaded {
++    fn verify(&self) -> io::Result<()> {
++        let before = self.root.metadata().map_err(|_| unavailable())?;
++        let current = std::fs::symlink_metadata(&self.physical).map_err(|_| unavailable())?;
++        if !current.is_dir() || (current.dev(), current.ino()) != (before.dev(), before.ino()) {
++            return Err(unavailable());
++        }
++        let actual = open_at(
++            &self.root,
++            POLICY_DIRECTORY,
++            libc::O_RDONLY | libc::O_DIRECTORY,
++            0,
++        )?;
++        let before = self.policy.metadata().map_err(|_| unavailable())?;
++        let current = actual.metadata().map_err(|_| unavailable())?;
++        if !private(&current, true)
++            || (current.dev(), current.ino()) != (before.dev(), before.ino())
++        {
++            return Err(unavailable());
++        }
++        Ok(())
++    }
++}
++pub fn check_writer(home: &Path, thread_id: &str) -> io::Result<()> {
++    if !canonical_uuid(thread_id) {
 +        return Err(unavailable());
 +    }
++    let Some(loaded) = load(home)? else {
++        return Ok(());
++    };
++    let allowed = loaded
++        .state
++        .threads
++        .iter()
++        .find(|row| row.thread_id == thread_id)
++        .is_none_or(|row| row.phase == Phase::Active);
 +    if allowed {
 +        Ok(())
 +    } else {
@@ -4811,9 +4866,16 @@
 +            json!({"schemaVersion":1,"homeIdentity":self.id,"revision":1,"threads":rows})
 +        }
 +        fn write(&self, name: &str, value: Value) -> io::Result<()> {
-+            let path = self.home.join(name);
++            if !self.policy().exists() {
++                std::fs::create_dir(&self.policy())?;
++                std::fs::set_permissions(self.policy(), std::fs::Permissions::from_mode(0o700))?;
++            }
++            let path = self.policy().join(name);
 +            std::fs::write(&path, serde_json::to_vec(&value)?)?;
 +            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
++        }
++        fn policy(&self) -> std::path::PathBuf {
++            self.home.join(POLICY_DIRECTORY)
 +        }
 +        fn install(&self, rows: Vec<Value>) -> io::Result<()> {
 +            self.write(
@@ -4888,7 +4950,10 @@
 +        assert_eq!(std::fs::read_dir(&f.home)?.count(), 0);
 +        f.write(STATE_FILE, f.state(vec![]))?;
 +        assert!(check_writer(&f.home, &f.thread).is_err());
-+        std::fs::remove_file(f.home.join(STATE_FILE))?;
++        std::fs::remove_file(f.policy().join(STATE_FILE))?;
++        // A surviving policy directory is evidence that ownership was
++        // installed; deleting both contents cannot revert it to legacy mode.
++        assert!(check_writer(&f.home, &f.thread).is_err());
 +        f.write(
 +            REQUIRED_FILE,
 +            json!({"schemaVersion":1,"homeIdentity":f.id}),
@@ -4902,14 +4967,14 @@
 +        let f = Fixture::new()?;
 +        for phase in ["active", "incoming", "retired"] {
 +            f.install(vec![f.row(phase)])?;
-+            let before = std::fs::read(f.home.join(STATE_FILE))?;
++            let before = std::fs::read(f.policy().join(STATE_FILE))?;
 +            let result = check_writer(&f.home, &f.thread);
 +            assert_eq!(result.is_ok(), phase == "active");
 +            if phase != "active" {
 +                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
 +            }
 +            check_writer(&f.home, &uuid::Uuid::new_v4().to_string())?;
-+            assert_eq!(std::fs::read(f.home.join(STATE_FILE))?, before);
++            assert_eq!(std::fs::read(f.policy().join(STATE_FILE))?, before);
 +        }
 +        Ok(())
 +    }
@@ -4952,7 +5017,7 @@
 +    fn removed_replaced_linked_and_public_state_cannot_authorize_writes() -> io::Result<()> {
 +        let f = Fixture::new()?;
 +        f.install(vec![f.row("active")])?;
-+        let state = f.home.join(STATE_FILE);
++        let state = f.policy().join(STATE_FILE);
 +        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644))?;
 +        assert!(check_writer(&f.home, &f.thread).is_err());
 +        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600))?;
@@ -4967,13 +5032,18 @@
 +        std::fs::remove_file(&state)?;
 +        let replacement = f._root.path().join("replacement");
 +        std::fs::create_dir(&replacement)?;
++        std::fs::create_dir(replacement.join(POLICY_DIRECTORY))?;
++        std::fs::set_permissions(
++            replacement.join(POLICY_DIRECTORY),
++            std::fs::Permissions::from_mode(0o700),
++        )?;
 +        for file in [STATE_FILE, REQUIRED_FILE] {
 +            let from = if file == STATE_FILE {
 +                saved.clone()
 +            } else {
-+                f.home.join(file)
++                f.policy().join(file)
 +            };
-+            std::fs::copy(from, replacement.join(file))?;
++            std::fs::copy(from, replacement.join(POLICY_DIRECTORY).join(file))?;
 +        }
 +        assert!(check_writer(&replacement, &f.thread).is_err());
 +        Ok(())
@@ -4991,3 +5061,671 @@
  
  [dependencies]
  codex-utils-process = { workspace = true }
+--- /dev/null
++++ b/core/src/native_ownership/store.rs
+@@ -0,0 +1,665 @@
++//! Policy storage only. The native caller must independently verify its live
++//! admission lease, journal, complete scope, writer closure and imported data.
++use super::*;
++use std::collections::BTreeMap;
++use std::io::Write;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Transition {
++    Incoming,
++    Retire,
++    Activate,
++}
++pub struct Request {
++    pub expected_revision: u64,
++    pub request_id: String,
++    pub thread_ids: Vec<String>,
++    pub transition: Transition,
++    pub destination_home_identity: Option<String>,
++}
++#[derive(Debug, PartialEq, Eq)]
++pub struct Receipt {
++    pub home_identity: String,
++    pub revision: u64,
++    pub request_id: String,
++    pub thread_ids: Vec<String>,
++    pub phase: &'static str,
++}
++pub fn revision(home: &Path) -> io::Result<u64> {
++    Ok(load(home)?.map_or(0, |loaded| loaded.state.revision))
++}
++fn conflict() -> io::Error {
++    io::Error::new(
++        io::ErrorKind::AlreadyExists,
++        "Conversation ownership changed; inspect the current move instead of replaying it",
++    )
++}
++struct PolicyLock {
++    home: std::path::PathBuf,
++    root: File,
++    directory: File,
++    lock: File,
++}
++impl PolicyLock {
++    fn acquire(home: &Path) -> io::Result<(Self, String)> {
++        let (home, root, identity) = open_home(home)?;
++        if unsafe { libc::mkdirat(root.as_raw_fd(), c".autoapprove-migrations".as_ptr(), 0o700) }
++            != 0
++            && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
++        {
++            return Err(unavailable());
++        }
++        let directory = open_at(
++            &root,
++            ".autoapprove-migrations",
++            libc::O_RDONLY | libc::O_DIRECTORY,
++            0,
++        )?;
++        if !private(&directory.metadata()?, true) {
++            return Err(unavailable());
++        }
++        let lock = open_at(
++            &directory,
++            "ownership-lock",
++            libc::O_RDWR | libc::O_CREAT,
++            0o600,
++        )?;
++        if !private(&lock.metadata()?, false) {
++            return Err(unavailable());
++        }
++        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::WouldBlock,
++                "Ownership update is already in progress",
++            ));
++        }
++        let result = Self {
++            home,
++            root,
++            directory,
++            lock,
++        };
++        result.verify()?;
++        Ok((result, identity))
++    }
++    fn verify(&self) -> io::Result<()> {
++        let root = self.root.metadata()?;
++        let current = std::fs::symlink_metadata(&self.home)?;
++        if !current.is_dir() || (root.dev(), root.ino()) != (current.dev(), current.ino()) {
++            return Err(unavailable());
++        }
++        let actual = open_at(
++            &self.root,
++            ".autoapprove-migrations",
++            libc::O_RDONLY | libc::O_DIRECTORY,
++            0,
++        )?;
++        let current = actual.metadata()?;
++        let pinned = self.directory.metadata()?;
++        if !private(&current, true)
++            || (current.dev(), current.ino()) != (pinned.dev(), pinned.ino())
++        {
++            return Err(unavailable());
++        }
++        let actual = open_at(&actual, "ownership-lock", libc::O_RDONLY, 0)?;
++        let current = actual.metadata()?;
++        let pinned = self.lock.metadata()?;
++        if !private(&current, false)
++            || (current.dev(), current.ino()) != (pinned.dev(), pinned.ino())
++        {
++            return Err(unavailable());
++        }
++        Ok(())
++    }
++}
++struct Temporary<'a> {
++    parent: &'a File,
++    name: String,
++    directory: bool,
++    published: bool,
++    entry: Option<File>,
++    children: Vec<(&'static str, File)>,
++}
++impl Drop for Temporary<'_> {
++    fn drop(&mut self) {
++        if self.published {
++            return;
++        }
++        let Some(pinned) = &self.entry else {
++            return;
++        };
++        let Ok(current) = open_at(
++            self.parent,
++            &self.name,
++            libc::O_RDONLY | if self.directory { libc::O_DIRECTORY } else { 0 },
++            0,
++        ) else {
++            return;
++        };
++        let (Ok(a), Ok(b)) = (pinned.metadata(), current.metadata()) else {
++            return;
++        };
++        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
++            return;
++        }
++        let Ok(name) = std::ffi::CString::new(self.name.as_str()) else {
++            return;
++        };
++        if self.directory {
++            if let Ok(dir) = open_at(
++                self.parent,
++                &self.name,
++                libc::O_RDONLY | libc::O_DIRECTORY,
++                0,
++            ) {
++                for (name, pinned) in &self.children {
++                    let Ok(current) = open_at(&dir, name, libc::O_RDONLY, 0) else {
++                        continue;
++                    };
++                    let (Ok(a), Ok(b)) = (pinned.metadata(), current.metadata()) else {
++                        continue;
++                    };
++                    if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
++                        continue;
++                    }
++                    let Ok(name) = std::ffi::CString::new(*name) else {
++                        continue;
++                    };
++                    unsafe {
++                        libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
++                    }
++                }
++            }
++        }
++        unsafe {
++            libc::unlinkat(
++                self.parent.as_raw_fd(),
++                name.as_ptr(),
++                if self.directory {
++                    libc::AT_REMOVEDIR
++                } else {
++                    0
++                },
++            );
++        }
++    }
++}
++fn write_new(parent: &File, name: &str, data: &[u8]) -> io::Result<File> {
++    let mut file = open_at(
++        parent,
++        name,
++        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
++        0o600,
++    )?;
++    if !private(&file.metadata()?, false) {
++        return Err(unavailable());
++    }
++    file.write_all(data)?;
++    file.sync_all()?;
++    Ok(file)
++}
++fn same_current(home: &Path, before: Option<&Loaded>) -> io::Result<()> {
++    if let Some(before) = before {
++        before.verify()?;
++        let current = load(home)?.ok_or_else(conflict)?;
++        let a = before.policy.metadata()?;
++        let b = current.policy.metadata()?;
++        if before.state != current.state || (a.dev(), a.ino()) != (b.dev(), b.ino()) {
++            return Err(conflict());
++        }
++    } else if present(&home.join(POLICY_DIRECTORY))? {
++        return Err(conflict());
++    }
++    Ok(())
++}
++fn rename_new_directory(root: &File, from: &str) -> io::Result<()> {
++    let from = std::ffi::CString::new(from).map_err(|_| unavailable())?;
++    let result;
++    #[cfg(target_os = "macos")]
++    {
++        result = unsafe {
++            libc::renameatx_np(
++                root.as_raw_fd(),
++                from.as_ptr(),
++                root.as_raw_fd(),
++                c".autoapprove-ownership".as_ptr(),
++                libc::RENAME_EXCL,
++            )
++        };
++    }
++    #[cfg(target_os = "linux")]
++    {
++        result = unsafe {
++            libc::renameat2(
++                root.as_raw_fd(),
++                from.as_ptr(),
++                root.as_raw_fd(),
++                c".autoapprove-ownership".as_ptr(),
++                libc::RENAME_NOREPLACE,
++            )
++        };
++    }
++    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
++    {
++        return Err(io::Error::new(
++            io::ErrorKind::Unsupported,
++            "Atomic policy installation is unavailable",
++        ));
++    }
++    if result == 0 { Ok(()) } else { Err(conflict()) }
++}
++
++/// Compare-and-swap storage; authorize must be read-only and revalidate native
++/// authority. Any error after publication is an unknown outcome to observe,
++/// never permission to replay the same operation.
++pub fn apply(
++    home: &Path,
++    request: &Request,
++    mut authorize: impl FnMut() -> io::Result<()>,
++) -> io::Result<Receipt> {
++    if !canonical_uuid(&request.request_id)
++        || request.thread_ids.is_empty()
++        || request.thread_ids.len() > 512
++        || request.thread_ids.iter().any(|id| !canonical_uuid(id))
++    {
++        return Err(unavailable());
++    }
++    let ids: HashSet<_> = request.thread_ids.iter().cloned().collect();
++    if ids.len() != request.thread_ids.len() {
++        return Err(unavailable());
++    }
++    let (lock, home_identity) = PolicyLock::acquire(home)?;
++    let before = load(home)?;
++    let mut state = before
++        .as_ref()
++        .map(|value| value.state.clone())
++        .unwrap_or_else(|| State {
++            schema_version: 1,
++            home_identity: home_identity.clone(),
++            revision: 0,
++            threads: vec![],
++        });
++    if state.revision != request.expected_revision {
++        return Err(conflict());
++    }
++    let (phase, owner) = match request.transition {
++        Transition::Retire => {
++            let owner = request
++                .destination_home_identity
++                .as_ref()
++                .ok_or_else(unavailable)?;
++            if !identity(owner) || owner == &home_identity {
++                return Err(unavailable());
++            }
++            (Phase::Retired, owner.clone())
++        }
++        Transition::Incoming | Transition::Activate => {
++            if request.destination_home_identity.is_some() {
++                return Err(unavailable());
++            }
++            (
++                if request.transition == Transition::Incoming {
++                    Phase::Incoming
++                } else {
++                    Phase::Active
++                },
++                home_identity.clone(),
++            )
++        }
++    };
++    let current_request: HashSet<_> = state
++        .threads
++        .iter()
++        .filter(|row| row.request_id == request.request_id)
++        .map(|row| row.thread_id.clone())
++        .collect();
++    if request.transition == Transition::Activate {
++        if current_request != ids {
++            return Err(conflict());
++        }
++    } else if !current_request.is_empty() {
++        return Err(conflict());
++    }
++    let mut rows: BTreeMap<_, _> = state
++        .threads
++        .into_iter()
++        .map(|row| (row.thread_id.clone(), row))
++        .collect();
++    for id in &ids {
++        let old = rows.get(id);
++        let valid = match request.transition {
++            Transition::Incoming => old.is_none_or(|row| row.phase == Phase::Retired),
++            Transition::Retire => old.is_none_or(|row| row.phase == Phase::Active),
++            Transition::Activate => old.is_some_and(|row| {
++                row.phase == Phase::Incoming && row.request_id == request.request_id
++            }),
++        };
++        if !valid {
++            return Err(conflict());
++        }
++        rows.insert(
++            id.clone(),
++            Thread {
++                thread_id: id.clone(),
++                request_id: request.request_id.clone(),
++                owner_home_identity: owner.clone(),
++                phase: phase.clone(),
++            },
++        );
++    }
++    state.threads = rows.into_values().collect();
++    state.revision = state.revision.checked_add(1).ok_or_else(unavailable)?;
++    let bytes = serde_json::to_vec(&state)?;
++    if state.threads.len() > 65_536 || bytes.len() > 16 * 1024 * 1024 {
++        return Err(unavailable());
++    }
++    authorize()?;
++    if let Some(before) = &before {
++        let mut temporary = Temporary {
++            parent: &before.policy,
++            name: format!(".state-{}", uuid::Uuid::new_v4()),
++            directory: false,
++            published: false,
++            entry: None,
++            children: vec![],
++        };
++        temporary.entry = Some(write_new(&before.policy, &temporary.name, &bytes)?);
++        authorize()?;
++        lock.verify()?;
++        same_current(home, Some(before))?;
++        let from = std::ffi::CString::new(temporary.name.as_str()).map_err(|_| unavailable())?;
++        if unsafe {
++            libc::renameat(
++                before.policy.as_raw_fd(),
++                from.as_ptr(),
++                before.policy.as_raw_fd(),
++                c"state.json".as_ptr(),
++            )
++        } != 0
++        {
++            return Err(unavailable());
++        }
++        temporary.published = true;
++        before.policy.sync_all()?;
++    } else {
++        let mut temporary = Temporary {
++            parent: &lock.root,
++            name: format!(".autoapprove-ownership-stage-{}", uuid::Uuid::new_v4()),
++            directory: true,
++            published: false,
++            entry: None,
++            children: vec![],
++        };
++        let name = std::ffi::CString::new(temporary.name.as_str()).map_err(|_| unavailable())?;
++        if unsafe { libc::mkdirat(lock.root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
++            return Err(unavailable());
++        }
++        let directory = open_at(
++            &lock.root,
++            &temporary.name,
++            libc::O_RDONLY | libc::O_DIRECTORY,
++            0,
++        )?;
++        temporary.entry = Some(directory.try_clone()?);
++        temporary.children.push((
++            REQUIRED_FILE,
++            write_new(
++                &directory,
++                REQUIRED_FILE,
++                &serde_json::to_vec(&Required {
++                    schema_version: 1,
++                    home_identity: home_identity.clone(),
++                })?,
++            )?,
++        ));
++        temporary
++            .children
++            .push((STATE_FILE, write_new(&directory, STATE_FILE, &bytes)?));
++        directory.sync_all()?;
++        authorize()?;
++        lock.verify()?;
++        same_current(home, before.as_ref())?;
++        rename_new_directory(&lock.root, &temporary.name)?;
++        temporary.published = true;
++        lock.root.sync_all()?;
++    }
++    let mut thread_ids: Vec<_> = ids.into_iter().collect();
++    thread_ids.sort();
++    Ok(Receipt {
++        home_identity,
++        revision: state.revision,
++        request_id: request.request_id.clone(),
++        thread_ids,
++        phase: match phase {
++            Phase::Incoming => "incoming",
++            Phase::Retired => "retired",
++            Phase::Active => "active",
++        },
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    struct Fixture {
++        _root: tempfile::TempDir,
++        home: std::path::PathBuf,
++        id: String,
++    }
++    impl Fixture {
++        fn new() -> io::Result<Self> {
++            let root = tempfile::tempdir_in("/private/tmp")?;
++            let home = root.path().join("home");
++            std::fs::create_dir(&home)?;
++            let info = std::fs::metadata(&home)?;
++            Ok(Self {
++                _root: root,
++                home,
++                id: format!("{}:{}", info.dev(), info.ino()),
++            })
++        }
++        fn bytes(&self) -> io::Result<Vec<u8>> {
++            std::fs::read(self.home.join(POLICY_DIRECTORY).join(STATE_FILE))
++        }
++    }
++    fn request(transition: Transition, revision: u64, ids: Vec<String>) -> Request {
++        Request {
++            transition,
++            expected_revision: revision,
++            request_id: uuid::Uuid::new_v4().to_string(),
++            thread_ids: ids,
++            destination_home_identity: None,
++        }
++    }
++    fn id() -> String {
++        uuid::Uuid::new_v4().to_string()
++    }
++    #[test]
++    fn first_publication_is_complete_and_activation_is_single_use() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let thread = id();
++        let mut change = request(Transition::Incoming, 0, vec![thread.clone()]);
++        let mut checks = 0;
++        let incoming = apply(&f.home, &change, || {
++            checks += 1;
++            assert_eq!(revision(&f.home)?, 0);
++            check_writer(&f.home, &thread)
++        })?;
++        assert_eq!(checks, 2);
++        assert_eq!(incoming.revision, 1);
++        assert_eq!(
++            check_writer(&f.home, &thread).unwrap_err().kind(),
++            io::ErrorKind::PermissionDenied
++        );
++        check_writer(&f.home, &id())?;
++        change.transition = Transition::Activate;
++        change.expected_revision = 1;
++        assert_eq!(apply(&f.home, &change, || Ok(()))?.revision, 2);
++        check_writer(&f.home, &thread)?;
++        let before = f.bytes()?;
++        assert!(apply(&f.home, &change, || Ok(())).is_err());
++        change.expected_revision = 2;
++        assert!(apply(&f.home, &change, || Ok(())).is_err());
++        assert_eq!(f.bytes()?, before);
++        Ok(())
++    }
++    #[test]
++    fn retirement_and_return_preserve_other_conversations() -> io::Result<()> {
++        let a = Fixture::new()?;
++        let b = Fixture::new()?;
++        let selected = id();
++        let other = id();
++        let mut old = request(Transition::Incoming, 0, vec![other.clone()]);
++        apply(&a.home, &old, || Ok(()))?;
++        old.transition = Transition::Activate;
++        old.expected_revision = 1;
++        apply(&a.home, &old, || Ok(()))?;
++        let before_other = load(&a.home)?.unwrap().state.threads[0].clone();
++        let mut retire = request(Transition::Retire, 2, vec![selected.clone()]);
++        retire.destination_home_identity = Some(b.id.clone());
++        apply(&a.home, &retire, || Ok(()))?;
++        assert!(check_writer(&a.home, &selected).is_err());
++        check_writer(&a.home, &other)?;
++        let mut back = request(Transition::Incoming, 3, vec![selected.clone()]);
++        apply(&a.home, &back, || Ok(()))?;
++        back.transition = Transition::Activate;
++        back.expected_revision = 4;
++        apply(&a.home, &back, || Ok(()))?;
++        check_writer(&a.home, &selected)?;
++        assert_eq!(
++            load(&a.home)?
++                .unwrap()
++                .state
++                .threads
++                .iter()
++                .find(|row| row.thread_id == other),
++            Some(&before_other)
++        );
++        Ok(())
++    }
++    #[test]
++    fn stale_scope_and_revoked_authority_leave_policy_unchanged() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let thread = id();
++        let mut change = request(Transition::Incoming, 99, vec![thread.clone()]);
++        let mut checks = 0;
++        assert!(
++            apply(&f.home, &change, || {
++                checks += 1;
++                Ok(())
++            })
++            .is_err()
++        );
++        assert_eq!(checks, 0);
++        change.expected_revision = 0;
++        assert!(
++            apply(&f.home, &change, || {
++                checks += 1;
++                if checks == 2 {
++                    Err(unavailable())
++                } else {
++                    Ok(())
++                }
++            })
++            .is_err()
++        );
++        assert_eq!(revision(&f.home)?, 0);
++        assert!(!f.home.join(POLICY_DIRECTORY).exists());
++        assert!(!std::fs::read_dir(&f.home)?.any(|entry| {
++            entry
++                .unwrap()
++                .file_name()
++                .to_string_lossy()
++                .starts_with(".autoapprove-ownership-stage-")
++        }));
++        apply(&f.home, &change, || Ok(()))?;
++        let before = f.bytes()?;
++        change.transition = Transition::Activate;
++        change.expected_revision = 1;
++        let mut calls = 0;
++        assert!(
++            apply(&f.home, &change, || {
++                calls += 1;
++                if calls == 2 {
++                    Err(unavailable())
++                } else {
++                    Ok(())
++                }
++            })
++            .is_err()
++        );
++        assert_eq!(f.bytes()?, before);
++        Ok(())
++    }
++    #[test]
++    fn whole_request_scope_must_activate_together() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let mut change = request(Transition::Incoming, 0, vec![id(), id()]);
++        apply(&f.home, &change, || Ok(()))?;
++        let before = f.bytes()?;
++        let second = change.thread_ids.pop().unwrap();
++        change.transition = Transition::Activate;
++        change.expected_revision = 1;
++        assert!(apply(&f.home, &change, || Ok(())).is_err());
++        change.transition = Transition::Incoming;
++        change.thread_ids = vec![id()];
++        assert!(apply(&f.home, &change, || Ok(())).is_err());
++        assert_eq!(f.bytes()?, before);
++        change.transition = Transition::Activate;
++        change.thread_ids = load(&f.home)?
++            .unwrap()
++            .state
++            .threads
++            .into_iter()
++            .map(|row| row.thread_id)
++            .collect();
++        assert!(change.thread_ids.contains(&second));
++        apply(&f.home, &change, || Ok(()))?;
++        Ok(())
++    }
++    #[test]
++    fn publication_never_adopts_an_existing_empty_policy_directory() -> io::Result<()> {
++        use std::os::unix::fs::PermissionsExt;
++        let f = Fixture::new()?;
++        let change = request(Transition::Incoming, 0, vec![id()]);
++        let mut checks = 0;
++        let mut retained = None;
++        assert!(
++            apply(&f.home, &change, || {
++                checks += 1;
++                if checks == 2 {
++                    let path = f.home.join(POLICY_DIRECTORY);
++                    std::fs::create_dir(&path)?;
++                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
++                    retained = Some(File::open(path)?);
++                }
++                Ok(())
++            })
++            .is_err()
++        );
++        let original = retained.unwrap().metadata()?;
++        let current = std::fs::metadata(f.home.join(POLICY_DIRECTORY))?;
++        assert_eq!(
++            (original.dev(), original.ino()),
++            (current.dev(), current.ino())
++        );
++        assert!(check_writer(&f.home, &change.thread_ids[0]).is_err());
++        Ok(())
++    }
++    #[test]
++    fn policy_lock_serializes_updates_and_same_home_retirement_is_rejected() -> io::Result<()> {
++        let f = Fixture::new()?;
++        let held = PolicyLock::acquire(&f.home)?.0;
++        let mut change = request(Transition::Incoming, 0, vec![id()]);
++        assert_eq!(
++            apply(&f.home, &change, || Ok(())).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++        drop(held);
++        change.transition = Transition::Retire;
++        change.destination_home_identity = Some(f.id.clone());
++        assert!(apply(&f.home, &change, || Ok(())).is_err());
++        assert_eq!(revision(&f.home)?, 0);
++        Ok(())
++    }
++}
