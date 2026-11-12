@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Owned native shutdown IPC; no migration, credentials, or model turns."""
 import argparse
+import subprocess
 import array
 import base64
 import fcntl
@@ -26,7 +27,13 @@ def main():
     parser.add_argument('--binary', required=True)
     parser.add_argument('--retirement', action='store_true')
     parser.add_argument('--case')
+    parser.add_argument('--incoming', action='store_true')
+    parser.add_argument('--import-helper')
+    parser.add_argument('--coordinator-helper')
     args = parser.parse_args()
+    assert not args.coordinator_helper or args.case == 'retire', 'Coordinator probe requires --case retire'
+    assert not args.incoming or (args.retirement and args.case == 'retire'), 'Incoming probe requires --retirement --case retire'
+    assert not args.import_helper or args.incoming, 'Import helper requires --incoming'
     binary = pathlib.Path(args.binary).resolve(strict=True)
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     spec = importlib.util.spec_from_file_location('selected_fixture', pathlib.Path(__file__).with_name('codex-selected-server-live.py'))
@@ -67,6 +74,27 @@ def main():
             source = server.home
             destination = folder / 'destination-검증'
             destination.mkdir(mode=0o700)
+            if args.coordinator_helper:
+                target_root = folder / 'coordinator-target'
+                target_root.mkdir(mode=0o700)
+                target_server = fixture.Server(binary, target_root, standalone=True, home=destination)
+                try:
+                    result = subprocess.run([str(pathlib.Path(args.coordinator_helper).resolve(strict=True)),
+                        str(source), str(destination), str(server.endpoint), str(target_server.endpoint), selected, str(binary)],
+                        capture_output=True, text=True, timeout=30)
+                    assert result.returncode == 0, {'stdout': result.stdout, 'stderr': result.stderr}
+                    assert 'coordinator-completed ' in result.stdout, result.stdout
+                    target_server.call('thread/unarchive', {'threadId': selected})
+                    assert target_server.call('thread/resume', {'threadId': selected})['thread']['id'] == selected
+                    assert target_server.call('thread/goal/get', {'threadId': selected})['goal'] == goal
+                    with sqlite3.connect((destination / 'goals_1.sqlite').as_uri() + '?mode=ro', uri=True) as db:
+                        assert db.execute('SELECT goal_id FROM thread_goals WHERE thread_id=?', (selected,)).fetchone()[0] == initial_goal_id
+                    denied = server.call('thread/resume', {'threadId': selected}, error=True)
+                    assert 'another login group' in denied['message'], denied
+                    checks.append('swift-coordinator-complete-resume')
+                finally:
+                    target_server.close()
+                continue
             identity = lambda p: f'{p.stat().st_dev}:{p.stat().st_ino}'
             request_id = str(uuid.uuid4())
             payload = {'formatVersion': 1, 'stage': 'prepared',
@@ -315,6 +343,72 @@ def main():
                 lease.close()
                 lease = None
                 assert goal_id() == initial_goal_id
+                if args.incoming:
+                    target_root = folder / 'target-server'
+                    target_root.mkdir(mode=0o700)
+                    target_server = fixture.Server(binary, target_root, standalone=True, home=destination)
+                    target_lease = None
+                    target_lock = None
+                    try:
+                        payload['sourceRetirement'] = {'ownershipRevision': 1, 'homeIdentity': identity(source), 'files': files}
+                        payload['execution'] = {'phase': 'incomingAttempted', 'ownershipRevision': 0, 'sourceRetirementRevision': 1}
+                        stamp = publish(stamp['revision'] + 1, stamp['digest'])
+                        target_lock = os.open(destination / '.autoapprove-migrations/lock', os.O_RDWR | os.O_CREAT, 0o600)
+                        fcntl.flock(target_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        target_lease = fixture.Lease(target_server.endpoint, scope)
+                        assert target_lease.call('journal-lock', journal=stamp)['journalDescriptorReady']
+                        target_lease.socket.sendmsg([b'F'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [target_lock]))])
+                        assert json.loads(target_lease.file.readline())['journalLock']['role'] == 'destination'
+                        prepared = target_lease.call('incoming-prepare')['incoming']
+                        assert prepared['phase'] == 'writers-held' and prepared['ownershipRevision'] == 0, prepared
+                        incoming = target_lease.call('incoming-commit')['incoming']
+                        assert incoming['phase'] == 'incoming' and incoming['ownershipRevision'] == 1, incoming
+                        assert incoming['sourceRetirementRevision'] == 1 and incoming['homeIdentity'] == identity(destination), incoming
+                        checks.append('destination-incoming')
+                        if args.import_helper:
+                            manifest = folder / 'source-archive.json'
+                            manifest.write_text(json.dumps(files))
+                            imported = subprocess.run([str(pathlib.Path(args.import_helper).resolve(strict=True)),
+                                str(source), str(destination), request_id, str(manifest)],
+                                check=True, capture_output=True, text=True, timeout=20)
+                            payload['goalSlots'] = json.loads(imported.stdout)
+                            stamp = publish(stamp['revision'] + 1, stamp['digest'])
+                            target_lease.call('journal-sync', journal=stamp)
+                            observation = target_lease.call('incoming-verify')['importObservation']
+                            assert observation['ownershipRevision'] == 1, observation
+                            observation_path = folder / 'import-observation.json'
+                            observation_path.write_text(json.dumps(observation))
+                            subprocess.run([str(pathlib.Path(args.import_helper).resolve(strict=True)),
+                                str(source), str(destination), request_id, str(manifest), str(observation_path)],
+                                check=True, capture_output=True, text=True, timeout=20)
+                            checks.append('swift-import-observation')
+                            payload['destinationImportObservation'] = observation
+                            stamp = publish(stamp['revision'] + 1, stamp['digest'])
+                            target_lease.call('journal-sync', journal=stamp)
+                            payload['execution'] = {'phase': 'activationAttempted', 'ownershipRevision': 1, 'sourceRetirementRevision': 1}
+                            stamp = publish(stamp['revision'] + 1, stamp['digest'])
+                            target_lease.call('journal-sync', journal=stamp)
+                            activation = target_lease.call('incoming-activate')['activation']
+                            assert activation['phase'] == 'active' and activation['ownershipRevision'] == 2, activation
+                            assert activation['homeIdentity'] == identity(destination), activation
+                            target_lease.call('release')
+                            target_lease.close()
+                            target_lease = None
+                            os.close(target_lock)
+                            target_lock = None
+                            target_server.call('thread/unarchive', {'threadId': selected})
+                            resumed = target_server.call('thread/resume', {'threadId': selected})['thread']
+                            assert resumed['id'] == selected, resumed
+                            assert target_server.call('thread/goal/get', {'threadId': selected})['goal'] == goal
+                            with sqlite3.connect((destination / 'goals_1.sqlite').as_uri() + '?mode=ro', uri=True) as db:
+                                assert db.execute('SELECT goal_id FROM thread_goals WHERE thread_id=?', (selected,)).fetchone()[0] == initial_goal_id
+                            checks.append('destination-active-resume')
+                    finally:
+                        if target_lease:
+                            target_lease.close()
+                        if target_lock is not None:
+                            os.close(target_lock)
+                        target_server.close()
             else:
                 assert not (source / '.autoapprove-ownership').exists()
             checks.append(mode)
@@ -327,7 +421,10 @@ def main():
                 server.close()
     assert hashlib.sha256(binary.read_bytes()).hexdigest() == binary_sha256, 'Binary changed during fixture execution'
     report = {'passed': True, 'fixture': str(root), 'binarySHA256': binary_sha256, 'checks': checks, 'modelTurnsSubmitted': 0,
-              'policyWrites': sum(case in ['retire', 'retire-cohort', 'lost-reply'] for case in checks), 'retirementVerified': args.retirement and {'retire', 'retire-cohort', 'lost-reply'}.issubset(checks), 'migrationVerified': False}
+              'policyWrites': sum(3 if case == 'swift-coordinator-complete-resume' else int(case in ['retire', 'retire-cohort', 'lost-reply', 'destination-incoming', 'destination-active-resume']) for case in checks),
+              'coordinatorVerified': 'swift-coordinator-complete-resume' in checks,
+              'destinationActivationVerified': bool({'destination-active-resume', 'swift-coordinator-complete-resume'}.intersection(checks)),
+              'retirementVerified': args.retirement and {'retire', 'retire-cohort', 'lost-reply'}.issubset(checks), 'migrationVerified': False}
     (root / 'report.json').write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
 

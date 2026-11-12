@@ -188,7 +188,7 @@
  }
  
  impl Default for TurnAdmission {
-@@ -27,14 +40,104 @@
+@@ -27,14 +40,105 @@
          Self {
              state: Arc::new(Mutex::new(AdmissionState::default())),
              active_tx: watch::channel(0).0,
@@ -224,6 +224,7 @@
 +        request: &ClientRequest,
 +    ) -> Result<Option<SelectedAdmissionPermit>, JSONRPCErrorError> {
 +        match request {
++            ClientRequest::GetAccount { params, .. } if !params.refresh_token => return Ok(None),
 +            ClientRequest::ThreadRead { .. }
 +            | ClientRequest::ThreadList { .. }
 +            | ClientRequest::ThreadLoadedList { .. }
@@ -293,7 +294,7 @@
      pub(crate) async fn pause(&self) -> Result<TurnAdmissionPause, JSONRPCErrorError> {
          let mut active = self.subscribe_active();
          {
-@@ -42,7 +145,7 @@
+@@ -42,7 +146,7 @@
                  .state
                  .lock()
                  .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -302,7 +303,7 @@
                  return Err(invalid_request("Runtime changes are already paused"));
              }
              state.paused = true;
-@@ -58,11 +161,136 @@
+@@ -58,11 +162,136 @@
          Ok(pause)
      }
  
@@ -439,7 +440,7 @@
      }
  
      pub(crate) fn subscribe_active(&self) -> watch::Receiver<usize> {
-@@ -106,6 +334,85 @@
+@@ -106,6 +335,85 @@
              .ok()
              .map(|permit| Box::new(permit) as Box<dyn Send>)
      }
@@ -525,7 +526,7 @@
  }
  
  impl Drop for TurnPermit {
-@@ -123,3 +430,7 @@
+@@ -123,3 +431,7 @@
  #[cfg(test)]
  #[path = "turn_admission_tests.rs"]
  mod tests;
@@ -535,7 +536,7 @@
 +mod selected_tests;
 --- /dev/null
 +++ b/app-server/src/selected_admission_tests.rs
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,246 @@
 +use super::*;
 +use codex_app_server_protocol::RequestId;
 +use codex_app_server_protocol::ThreadArchiveParams;
@@ -685,6 +686,12 @@
 +        },
 +    };
 +    assert!(gate.admit_selected_request(&read).unwrap().is_none());
++    let account = |refresh_token| ClientRequest::GetAccount {
++        request_id: RequestId::Integer(4),
++        params: codex_app_server_protocol::GetAccountParams { refresh_token },
++    };
++    assert!(gate.admit_selected_request(&account(false)).unwrap().is_none());
++    assert!(gate.admit_selected_request(&account(true)).is_err());
 +    let set = |id: ThreadId| ClientRequest::ThreadGoalSet {
 +        request_id: RequestId::Integer(2),
 +        params: ThreadGoalSetParams {
@@ -778,7 +785,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,802 @@
+@@ -0,0 +1,842 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::message_processor::NativeSelectedRuntime;
@@ -889,7 +896,9 @@
 +                    let recovery = recovery.clone();
 +                    let runtime = runtime.clone();
 +                    connections.spawn(async move {
-+                        let _ = session(stream, admission, generation, ttl, recovery, runtime).await;
++                        if let Err(error) = session(stream, admission, generation, ttl, recovery, runtime).await {
++                            tracing::debug!(%error, "selected transition control session ended");
++                        }
 +                    });
 +                }
 +                _ = connections.join_next(), if !connections.is_empty() => {}
@@ -1093,6 +1102,8 @@
 +        let mut shutdown_reply = None;
 +        let mut retirement_reply = None;
 +        let mut incoming_reply = None;
++        let mut import_observation = None;
++        let mut activation_reply = None;
 +        if let Some(lock) = &journal_lock {
 +            crate::selected_journal_lock::NativeJournalLock::verify_kernel(lock)?;
 +        }
@@ -1238,6 +1249,36 @@
 +                    }
 +                })?);
 +            }
++            "incoming-verify" => {
++                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                let observation = tokio::time::timeout_at(
++                    deadline,
++                    runtime.observe_incoming_import(&pause, &threads, lock, incoming.as_ref().ok_or(io::ErrorKind::InvalidInput)?),
++                )
++                .await
++                .map_err(|_| io::ErrorKind::TimedOut)??;
++                incoming
++                    .as_mut()
++                    .ok_or(io::ErrorKind::InvalidInput)?
++                    .mark_import_verified();
++                import_observation = Some(observation);
++            }
++            "incoming-activate" => {
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                let proof = incoming.as_mut().ok_or(io::ErrorKind::InvalidInput)?;
++                activation_reply =
++                    Some(proof.activate(lock, &admission, &pause, &threads, || {
++                        if Instant::now() >= deadline || !reader.buffer().is_empty() {
++                            return Err(io::ErrorKind::ConnectionAborted.into());
++                        }
++                        let mut byte = [0u8; 1];
++                        match reader.get_ref().as_ref().try_read(&mut byte) {
++                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
++                            _ => Err(io::ErrorKind::ConnectionAborted.into()),
++                        }
++                    })?);
++            }
 +            "shutdown-status" => {
 +                shutdown_reply = Some(shutdown.as_ref().ok_or(io::ErrorKind::NotFound)?.snapshot());
 +            }
@@ -1280,6 +1321,12 @@
 +        }
 +        if let Some(value) = incoming_reply {
 +            reply["incoming"] = value;
++        }
++        if let Some(value) = import_observation {
++            reply["importObservation"] = value;
++        }
++        if let Some(value) = activation_reply {
++            reply["activation"] = value;
 +        }
 +        if let Some(status) = shutdown_reply {
 +            reply["shutdown"] = status;
@@ -1591,7 +1638,7 @@
      user_verification: Arc<crate::user_verification::Service>,
      outgoing: Arc<OutgoingMessageSender>,
      startup_warnings: StartupWarnings,
-@@ -177,6 +178,194 @@
+@@ -177,6 +178,205 @@
      turn_processor: TurnRequestProcessor,
      windows_sandbox_processor: WindowsSandboxRequestProcessor,
      request_serialization_queues: RequestSerializationQueues,
@@ -1783,10 +1830,21 @@
 +            .native_prepare_incoming(&self.admission, pause, ids, &self.queues, journal)
 +            .await
 +    }
++    pub(crate) async fn observe_incoming_import(
++        &self,
++        pause: &crate::turn_admission::SelectedAdmissionPause,
++        ids: &std::collections::HashSet<codex_protocol::ThreadId>,
++        journal: &crate::selected_journal_lock::NativeJournalLock,
++        incoming: &crate::request_processors::NativeSelectedIncoming,
++    ) -> std::io::Result<serde_json::Value> {
++        self.threads
++            .native_observe_imported_session(&self.admission, pause, ids, &self.queues, journal, incoming)
++            .await
++    }
  }
  
  #[derive(Debug)]
-@@ -336,7 +525,7 @@
+@@ -336,7 +536,7 @@
              ),
          );
          let goal_service = Arc::new(GoalService::new());
@@ -1795,7 +1853,7 @@
          let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
          let extension_event_sink =
              app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
-@@ -543,6 +732,7 @@
+@@ -543,6 +743,7 @@
              config_warnings.clone(),
              sample_responses,
          );
@@ -1803,7 +1861,7 @@
          let turn_processor = TurnRequestProcessor::new(
              auth_manager,
              Arc::clone(&thread_manager),
-@@ -612,6 +802,7 @@
+@@ -612,6 +813,7 @@
  
          Self {
              turn_admission,
@@ -1811,7 +1869,7 @@
              user_verification,
              outgoing,
              startup_warnings: StartupWarnings {
-@@ -644,6 +835,22 @@
+@@ -644,6 +846,22 @@
              turn_processor,
              windows_sandbox_processor,
              request_serialization_queues,
@@ -1834,7 +1892,7 @@
          }
      }
  
-@@ -1018,6 +1225,9 @@
+@@ -1018,6 +1236,9 @@
          {
              return Err(invalid_request(experimental_required_message(reason)));
          }
@@ -1844,7 +1902,7 @@
          let connection_id = connection_request_id.connection_id;
          self.initialize_processor.track_initialized_request(
              connection_id,
-@@ -1065,6 +1275,7 @@
+@@ -1065,6 +1286,7 @@
          let request = QueuedInitializedRequest::new(
              rpc_gate,
              async move {
@@ -1852,7 +1910,7 @@
                  let _turn_admission = turn_admission;
                  // Runtime changes already admitted before drain finish normally. Turn work
                  // still waiting in serialization must observe the newly closed gate.
-@@ -1406,10 +1617,14 @@
+@@ -1406,10 +1628,14 @@
                      .await
              }
              ClientRequest::AutoapproveGoalRead { params, .. } => {
@@ -2248,7 +2306,7 @@
  
          let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
              Ok(exit_reason)
-@@ -1443,6 +1473,31 @@
+@@ -1443,6 +1473,34 @@
                          AppRunControl::Continue
                      }
                      Some(event) = app_event_rx.recv() => {
@@ -2272,7 +2330,10 @@
 +                        if let AppEvent::AutoapproveInventoryRead { nonce, reply } = event {
 +                            let mut value = app.autoapprove_inventory_for_backend(
 +                                nonce, backends.session_at(displayed_session));
-+                            value["retainedBackends"] = serde_json::json!(backends.autoapprove_observations());
++                            let retained = backends.autoapprove_observations();
++                            value["backendBindingComplete"] =
++                                serde_json::json!(backends.autoapprove_binding_complete());
++                            value["retainedBackends"] = serde_json::json!(retained);
 +                            value["terminalInputBlocked"] = serde_json::json!(native_input_hold.is_some());
 +                            let _ = reply.send(value);
 +                            continue;
@@ -2280,7 +2341,7 @@
                          if let AppEvent::ResumeBackendSession(target) = event {
                              match app.resume_backend_session(tui, &mut backends, target).await {
                                  Ok(AppRunControl::Continue) => continue,
-@@ -1499,9 +1554,52 @@
+@@ -1499,9 +1557,52 @@
                          }
                          AppRunControl::Continue
                      }
@@ -2898,12 +2959,20 @@
 +}
 --- a/app-server/src/thread_state.rs
 +++ b/app-server/src/thread_state.rs
-@@ -422,6 +422,27 @@
+@@ -388,6 +388,7 @@
+ 
+ #[derive(Default)]
+ struct ThreadStateManagerInner {
++    revision: u64,
+     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
+     threads: HashMap<ThreadId, ThreadEntry>,
+     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
+@@ -422,6 +423,27 @@
  }
  
  impl ThreadStateManager {
-+    /// One read of the actual initialized-client and subscription stores. This
-+    /// does not establish transport-peer identity, revision stability or admission.
++    /// Copies the actual client and subscription stores under one lock. The
++    /// revision changes whenever those membership stores change.
 +    pub(crate) async fn native_inventory_snapshot(&self) -> serde_json::Value {
 +        let state = self.state.lock().await;
 +        let mut live: Vec<_> = state.live_connections.keys().map(|id| id.0).collect();
@@ -2920,12 +2989,209 @@
 +            ids.sort_unstable();
 +            subscribers.insert(id.to_string(), ids);
 +        }
-+        serde_json::json!({"initializedConnectionIDs":live,"byConnection":by_connection,"subscribers":subscribers})
++        serde_json::json!({"revision":state.revision,"initializedConnectionIDs":live,"byConnection":by_connection,"subscribers":subscribers})
 +    }
 +
      /// Coordinates goal edits with cold/path-based resume for just this thread.
      pub(crate) async fn lock_goal_resume(
          &self,
+@@ -453,11 +475,12 @@
+         connection_id: ConnectionId,
+         capabilities: ConnectionCapabilities,
+     ) {
+-        self.state
+-            .lock()
+-            .await
+-            .live_connections
+-            .insert(connection_id, capabilities);
++        let mut state = self.state.lock().await;
++        state.live_connections.insert(connection_id, capabilities);
++        state.revision = state
++            .revision
++            .checked_add(1)
++            .expect("native inventory revision exhausted");
+     }
+ 
+     pub(crate) async fn first_attestation_capable_connection_for_thread(
+@@ -483,12 +506,20 @@
+     pub(crate) async fn wait_for_thread_subscriber(&self, thread_id: ThreadId) {
+         let mut has_connections = {
+             let mut state = self.state.lock().await;
+-            state
++            let absent = !state.threads.contains_key(&thread_id);
++            let receiver = state
+                 .threads
+                 .entry(thread_id)
+                 .or_default()
+                 .has_connections_watcher
+-                .subscribe()
++                .subscribe();
++            if absent {
++                state.revision = state
++                    .revision
++                    .checked_add(1)
++                    .expect("native inventory revision exhausted");
++            }
++            receiver
+         };
+         while !*has_connections.borrow_and_update() {
+             if has_connections.changed().await.is_err() {
+@@ -508,7 +539,15 @@
+ 
+     pub(crate) async fn thread_state(&self, thread_id: ThreadId) -> Arc<Mutex<ThreadState>> {
+         let mut state = self.state.lock().await;
+-        state.threads.entry(thread_id).or_default().state.clone()
++        let absent = !state.threads.contains_key(&thread_id);
++        let thread_state = state.threads.entry(thread_id).or_default().state.clone();
++        if absent {
++            state.revision = state
++                .revision
++                .checked_add(1)
++                .expect("native inventory revision exhausted");
++        }
++        thread_state
+     }
+ 
+     pub(crate) async fn created_listener_state(
+@@ -560,10 +599,17 @@
+                 .threads
+                 .remove(&thread_id)
+                 .map(|thread_entry| thread_entry.state);
++            let mut changed = thread_state.is_some();
+             state.thread_ids_by_connection.retain(|_, thread_ids| {
+-                thread_ids.remove(&thread_id);
++                changed |= thread_ids.remove(&thread_id);
+                 !thread_ids.is_empty()
+             });
++            if changed {
++                state.revision = state
++                    .revision
++                    .checked_add(1)
++                    .expect("native inventory revision exhausted");
++            }
+             thread_state
+         };
+ 
+@@ -601,6 +647,10 @@
+             return false;
+         }
+         state.threads.remove(&thread_id);
++        state.revision = state
++            .revision
++            .checked_add(1)
++            .expect("native inventory revision exhausted");
+         self.unregister_listener_command_tx(thread_id);
+         thread_state.clear_listener();
+         true
+@@ -655,6 +705,10 @@
+                 thread_entry.connection_ids.remove(&connection_id);
+                 thread_entry.update_has_connections();
+             }
++            state.revision = state
++                .revision
++                .checked_add(1)
++                .expect("native inventory revision exhausted");
+         };
+ 
+         true
+@@ -680,10 +734,12 @@
+     ) -> Result<Option<(T, watch::Receiver<bool>, bool)>, E> {
+         let mut state = self.state.lock().await;
+         let ThreadStateManagerInner {
++            revision,
+             live_connections,
+             threads,
+             thread_ids_by_connection,
+         } = &mut *state;
++        let absent = !threads.contains_key(&thread_id);
+         let slot = threads.entry(thread_id);
+         match (&slot, candidate) {
+             (Entry::Occupied(entry), _) if Arc::ptr_eq(&entry.get().state, candidate.state()) => {}
+@@ -695,14 +751,20 @@
+             .any(|connection_id| live_connections.contains_key(connection_id));
+         let installed = install(attached)?;
+         let entry = slot.or_insert_with(|| ThreadEntry::new(Arc::clone(candidate.state())));
++        let mut changed = absent;
+         for &connection_id in connection_ids {
+             if live_connections.contains_key(&connection_id) {
+-                thread_ids_by_connection
++                changed |= thread_ids_by_connection
+                     .entry(connection_id)
+                     .or_default()
+                     .insert(thread_id);
+-                entry.connection_ids.insert(connection_id);
+-            }
++                changed |= entry.connection_ids.insert(connection_id);
++            }
++        }
++        if changed {
++            *revision = revision
++                .checked_add(1)
++                .expect("native inventory revision exhausted");
+         }
+         entry.update_has_connections();
+         Ok(Some((
+@@ -721,32 +783,40 @@
+         if !state.live_connections.contains_key(&connection_id) {
+             return false;
+         }
+-        state
++        let absent = !state.threads.contains_key(&thread_id);
++        let mapping_changed = state
+             .thread_ids_by_connection
+             .entry(connection_id)
+             .or_default()
+             .insert(thread_id);
+         let thread_entry = state.threads.entry(thread_id).or_default();
+-        thread_entry.connection_ids.insert(connection_id);
++        let subscriber_changed = thread_entry.connection_ids.insert(connection_id);
+         thread_entry.update_has_connections();
++        if absent || mapping_changed || subscriber_changed {
++            state.revision = state
++                .revision
++                .checked_add(1)
++                .expect("native inventory revision exhausted");
++        }
+         true
+     }
+ 
+     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
+         {
+             let mut state = self.state.lock().await;
+-            state.live_connections.remove(&connection_id);
++            let removed = state.live_connections.remove(&connection_id).is_some();
+             let thread_ids = state
+                 .thread_ids_by_connection
+                 .remove(&connection_id)
+                 .unwrap_or_default();
++            let changed = removed || !thread_ids.is_empty();
+             for thread_id in &thread_ids {
+                 if let Some(thread_entry) = state.threads.get_mut(thread_id) {
+                     thread_entry.connection_ids.remove(&connection_id);
+                     thread_entry.update_has_connections();
+                 }
+             }
+-            thread_ids
++            let removed_threads = thread_ids
+                 .into_iter()
+                 .filter(|thread_id| {
+                     state
+@@ -754,7 +824,14 @@
+                         .get(thread_id)
+                         .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
+                 })
+-                .collect::<Vec<_>>()
++                .collect::<Vec<_>>();
++            if changed {
++                state.revision = state
++                    .revision
++                    .checked_add(1)
++                    .expect("native inventory revision exhausted");
++            }
++            removed_threads
+         }
+     }
+ 
 --- /dev/null
 +++ b/app-server/src/native_inventory.rs
 @@ -0,0 +1,160 @@
@@ -4028,7 +4294,7 @@
      }
 --- a/tui/src/app/backend_sessions.rs
 +++ b/tui/src/app/backend_sessions.rs
-@@ -107,6 +107,24 @@
+@@ -107,6 +107,30 @@
  
      pub(super) fn displayed_owner(&self) -> BackendId {
          self.session_at(self.displayed).backend_id()
@@ -4050,9 +4316,140 @@
 +                })
 +            })
 +            .collect()
++    }
++
++    #[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++    pub(super) fn autoapprove_binding_complete(&self) -> bool {
++        let observations = self.autoapprove_observations();
++        autoapprove_binding_complete(&observations)
      }
  
      pub(super) fn picker_views(&self) -> Vec<AppServerSession> {
+@@ -238,3 +262,124 @@
+         first_error.map_or(Ok(()), Err)
+     }
+ }
++
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++fn autoapprove_binding_complete(observations: &[serde_json::Value]) -> bool {
++    use std::collections::HashSet;
++
++    if observations.is_empty()
++        || observations
++            .iter()
++            .filter(|row| row["displayed"] == true)
++            .count()
++            != 1
++    {
++        return false;
++    }
++
++    let mut logical_ids = HashSet::new();
++    let mut nonces = HashSet::new();
++    observations.iter().all(|row| {
++        let Some(logical_id) = row["logicalBackendId"].as_str() else {
++            return false;
++        };
++        let Some(connection) = row["connection"].as_object() else {
++            return false;
++        };
++        if connection["logicalBackendId"].as_str() != Some(logical_id) {
++            return false;
++        }
++        let Some(transport) = connection["transport"].as_object() else {
++            return false;
++        };
++        let Some(nonce) = transport["connectionNonce"].as_str() else {
++            return false;
++        };
++        let Some(peer) = transport["serverPeer"].as_object() else {
++            return false;
++        };
++        let Some(pid) = peer["pid"].as_u64() else {
++            return false;
++        };
++        let Some(uid) = peer["effectiveUid"].as_u64() else {
++            return false;
++        };
++        let Some(version) = peer["auditPidVersion"].as_u64() else {
++            return false;
++        };
++        peer["source"] == "macos-audit-token"
++            && logical_id.len() <= 128
++            && !logical_id.is_empty()
++            && pid > 0
++            && uid == unsafe { libc::geteuid() } as u64
++            && version > 0
++            && valid_native_nonce(nonce)
++            && logical_ids.insert(logical_id)
++            && nonces.insert(nonce)
++    })
++}
++
++#[cfg(all(unix, feature = "autoapprove-native-inventory"))]
++fn valid_native_nonce(value: &str) -> bool {
++    let bytes = value.as_bytes();
++    bytes.len() == 24
++        && &bytes[22..] == b"=="
++        && matches!(bytes[21], b'A' | b'Q' | b'g' | b'w')
++        && bytes[..22]
++            .iter()
++            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
++}
++
++#[cfg(all(test, unix, feature = "autoapprove-native-inventory"))]
++mod autoapprove_binding_tests {
++    use super::autoapprove_binding_complete;
++    use serde_json::json;
++
++    fn row(id: &str, displayed: bool, nonce: &str, pid: u64) -> serde_json::Value {
++        json!({
++            "logicalBackendId": id,
++            "displayed": displayed,
++            "connection": {
++                "logicalBackendId": id,
++                "transport": {
++                    "connectionNonce": nonce,
++                    "serverPeer": {
++                        "source": "macos-audit-token",
++                        "pid": pid,
++                        "effectiveUid": unsafe { libc::geteuid() },
++                        "auditPidVersion": 7
++                    }
++                }
++            }
++        })
++    }
++
++    #[test]
++    fn binding_requires_every_live_backend_and_one_displayed_backend() {
++        let complete = vec![
++            row("backend-a", true, "AAAAAAAAAAAAAAAAAAAAAA==", 11),
++            row("backend-b", false, "AAAAAAAAAAAAAAAAAAAAAQ==", 12),
++        ];
++        assert!(autoapprove_binding_complete(&complete));
++        assert!(!autoapprove_binding_complete(&complete[..1]));
++
++        let missing = vec![row("backend-a", true, "AAAAAAAAAAAAAAAAAAAAAA==", 11), {
++            let mut value = row("backend-b", false, "AAAAAAAAAAAAAAAAAAAAAQ==", 12);
++            value["connection"] = serde_json::Value::Null;
++            value
++        }];
++        assert!(!autoapprove_binding_complete(&missing));
++
++        let duplicate_nonce = vec![
++            row("backend-a", true, "AAAAAAAAAAAAAAAAAAAAAA==", 11),
++            row("backend-b", false, "AAAAAAAAAAAAAAAAAAAAAA==", 12),
++        ];
++        assert!(!autoapprove_binding_complete(&duplicate_nonce));
++
++        let duplicate_backend = vec![
++            row("backend-a", true, "AAAAAAAAAAAAAAAAAAAAAA==", 11),
++            row("backend-a", false, "AAAAAAAAAAAAAAAAAAAAAQ==", 12),
++        ];
++        assert!(!autoapprove_binding_complete(&duplicate_backend));
++    }
++}
 --- /dev/null
 +++ b/tui/src/native_input_hold.rs
 @@ -0,0 +1,528 @@
@@ -4586,7 +4983,7 @@
 +}
 --- /dev/null
 +++ b/app-server-transport/src/native_runtime.rs
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,340 @@
 +//! Private discovery hints for explicitly enabled maintained native clients.
 +//! A registration is never proof of live ownership or migration authorization.
 +use crate::native_current_process_identity;
@@ -4759,11 +5156,12 @@
 +                .push((path, (info.dev(), info.ino()), libc::S_IFSOCK as u32));
 +        }
 +        let identity = native_current_process_identity().ok_or(io::ErrorKind::Unsupported)?;
++        let executable = std::env::current_exe()?.canonicalize()?;
 +        let data = serde_json::to_vec(&json!({
 +            "schemaVersion":1,"producer":"autoapprove-native-runtime-registration",
 +            "cliVersion":env!("CARGO_PKG_VERSION"),"registrationId":self.id,
 +            "role":self.role.name(),"controlKind":self.role.control(),"pid":std::process::id(),
-+            "processIdentity":identity,"home":self.home,
++            "processIdentity":identity,"executable":executable,"home":self.home,
 +            "inventorySocket":"i.sock","controlSocket":"c.sock",
 +            "membershipComplete":false,"migrationAuthorized":false
 +        }))?;
@@ -6974,7 +7372,7 @@
 +}
 --- a/app-server/src/request_processors/thread_goal_processor.rs
 +++ b/app-server/src/request_processors/thread_goal_processor.rs
-@@ -77,6 +77,26 @@
+@@ -77,6 +77,76 @@
          self.thread_goal_get_inner(params)
              .await
              .map(|response| Some(response.into()))
@@ -6987,17 +7385,67 @@
 +        // The native cohort reader already checked the actual loaded runtime
 +        // or stored thread, including archived descendants. Ordinary goal/get
 +        // intentionally searches only the active rollout namespace.
-+        let state_db = self.state_db.clone().ok_or_else(|| internal_error("sqlite state db unavailable for move goals"))?;
-+        let stored = state_db.thread_goals().get_thread_goal(thread_id).await
++        let state_db = self
++            .state_db
++            .clone()
++            .ok_or_else(|| internal_error("sqlite state db unavailable for move goals"))?;
++        let stored = state_db
++            .thread_goals()
++            .get_thread_goal(thread_id)
++            .await
 +            .map_err(|error| internal_error(format!("failed to read move goal: {error}")))?;
 +        let identity = stored.as_ref().map(|goal| goal.goal_id.clone());
 +        let goal = stored.map(|row| ThreadGoal {
-+            thread_id: thread_id.to_string(), objective: row.objective.clone(),
++            thread_id: thread_id.to_string(),
++            objective: row.objective.clone(),
 +            status: autoapprove_control::identity(&row).status,
-+            token_budget: row.token_budget, tokens_used: row.tokens_used, time_used_seconds: row.time_used_seconds,
-+            created_at: row.created_at.timestamp(), updated_at: row.updated_at.timestamp(),
++            token_budget: row.token_budget,
++            tokens_used: row.tokens_used,
++            time_used_seconds: row.time_used_seconds,
++            created_at: row.created_at.timestamp(),
++            updated_at: row.updated_at.timestamp(),
 +        });
 +        Ok((goal, identity))
++    }
++
++    pub(crate) async fn native_move_goal_slot(
++        &self,
++        thread_id: ThreadId,
++    ) -> Result<serde_json::Value, JSONRPCErrorError> {
++        let state_db = self
++            .state_db
++            .clone()
++            .ok_or_else(|| internal_error("sqlite state db unavailable for move goals"))?;
++        let stored = state_db
++            .thread_goals()
++            .get_thread_goal(thread_id)
++            .await
++            .map_err(|error| internal_error(format!("failed to read move goal slot: {error}")))?;
++        let deferred = state_db
++            .thread_goals()
++            .has_thread_goal_continuation_deferral(thread_id)
++            .await
++            .map_err(|error| {
++                internal_error(format!(
++                    "failed to read move Goal continuation state: {error}"
++                ))
++            })?;
++        if let Some(row) = stored {
++            Ok(
++                serde_json::json!({"threadId":thread_id.to_string(),"goalId":row.goal_id,
++                "objective":row.objective,"status":row.status.as_str(),"tokenBudget":row.token_budget,
++                "tokensUsed":row.tokens_used,"timeUsedSeconds":row.time_used_seconds,
++                "createdAtMs":row.created_at.timestamp_millis(),"updatedAtMs":row.updated_at.timestamp_millis(),
++                "continuationDeferred":deferred}),
++            )
++        } else {
++            if deferred {
++                return Err(internal_error(
++                    "Goal deferral exists without a move Goal row",
++                ));
++            }
++            Ok(serde_json::Value::Null)
++        }
      }
  
      pub(crate) async fn thread_goal_clear(
@@ -7054,7 +7502,7 @@
      pub(crate) async fn cancel_requests_for_thread(
 --- /dev/null
 +++ b/app-server/src/selected_journal_lock.rs
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,484 @@
 +//! Kernel-backed journal coordination. Holding this is not a migration grant.
 +use base64::Engine;
 +use codex_core::native_ownership::{BorrowedMigrationLock, borrow_migration_lock};
@@ -7284,8 +7732,27 @@
 +                client_scope.insert(id.as_str().ok_or_else(invalid)?.to_owned());
 +            }
 +        }
-+        if client_scope != names {
++        if client_scope.is_empty() || !client_scope.is_subset(&names) {
 +            return Err(invalid());
++        }
++        // Stored descendants belong to the move even when the TUI only holds
++        // their root. Every additional member must reach a referenced root.
++        let by_id: std::collections::HashMap<_, _> = threads
++            .iter()
++            .map(|thread| Ok((string(thread, "/id")?, thread)))
++            .collect::<io::Result<_>>()?;
++        for id in names.difference(&client_scope) {
++            let mut cursor = id.as_str();
++            let mut seen = HashSet::new();
++            while !client_scope.contains(cursor) {
++                if !seen.insert(cursor) {
++                    return Err(invalid());
++                }
++                cursor = string(by_id.get(cursor).ok_or_else(invalid)?, "/parentID")?;
++                if !by_id.contains_key(cursor) {
++                    return Err(invalid());
++                }
++            }
 +        }
 +        lock.verify()?;
 +        Ok(Self {
@@ -7938,7 +8405,7 @@
  fn writer_locks_reject_competing_owners_and_release_their_files() {
 --- /dev/null
 +++ b/app-server/src/request_processors/selected_archive.rs
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,479 @@
 +//! Complete selected archive file evidence, held through source publication.
 +use codex_protocol::ThreadId;
 +use codex_rollout::{ARCHIVED_SESSIONS_SUBDIR, RolloutReferenceIndex, SESSIONS_SUBDIR};
@@ -8314,6 +8781,93 @@
 +        plan.verify_root()?;
 +        Ok(plan)
 +    }
++    pub(crate) async fn verify_imported_manifest(
++        home: &Path,
++        thread_ids: &HashSet<ThreadId>,
++        manifest: &[NativeArchiveFile],
++    ) -> io::Result<()> {
++        if home.canonicalize()? != home || thread_ids.is_empty() || manifest.is_empty() {
++            return Err(invalid());
++        }
++        let mut expected = BTreeMap::<String, String>::new();
++        for file in manifest {
++            let id = ThreadId::try_from(file.thread_id.as_str()).map_err(|_| invalid())?;
++            if id.to_string() != file.thread_id
++                || !thread_ids.contains(&id)
++                || !file.relative_path.starts_with("archived_sessions/")
++                || Path::new(&file.relative_path)
++                    .components()
++                    .any(|part| !matches!(part, Component::Normal(_)))
++                || file.size == 0
++                || file.size > 256 * 1024 * 1024
++                || file.sha256.len() != 64
++                || !file
++                    .sha256
++                    .bytes()
++                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++                || expected
++                    .insert(file.relative_path.clone(), file.thread_id.clone())
++                    .is_some()
++            {
++                return Err(invalid());
++            }
++        }
++        if thread_ids
++            .iter()
++            .any(|id| !manifest.iter().any(|file| file.thread_id == id.to_string()))
++        {
++            return Err(invalid());
++        }
++        let ids = thread_ids.iter().copied().collect::<Vec<_>>();
++        let index = RolloutReferenceIndex::scan_archived_threads(home, &ids).await?;
++        let mut indexed = BTreeMap::<String, String>::new();
++        for id in thread_ids {
++            for (_, path) in index.rollouts_for_thread(*id) {
++                let relative = path
++                    .strip_prefix(home)
++                    .map_err(|_| invalid())?
++                    .to_str()
++                    .ok_or_else(invalid)?
++                    .to_owned();
++                if indexed.insert(relative, id.to_string()).is_some() {
++                    return Err(invalid());
++                }
++            }
++        }
++        if indexed != expected {
++            return Err(invalid());
++        }
++        let root = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(home)?;
++        let mut plan = Self {
++            home: home.to_owned(),
++            root,
++            files: Vec::new(),
++        };
++        plan.verify_root()?;
++        for file in manifest {
++            let relative = PathBuf::from(&file.relative_path);
++            let content = plan.content(&relative)?;
++            if content.size != file.size || content.hash != file.sha256 {
++                return Err(invalid());
++            }
++            let metadata = codex_rollout::read_session_meta_line(&home.join(&relative)).await?;
++            let id = ThreadId::try_from(file.thread_id.as_str()).map_err(|_| invalid())?;
++            if metadata.meta.id != id || plan.content(&relative)? != content {
++                return Err(invalid());
++            }
++            plan.files.push(Entry {
++                id,
++                before: relative.clone(),
++                after: relative,
++                content,
++            });
++        }
++        plan.verify_root()?;
++        Ok(())
++    }
 +    pub(crate) fn verify_archived(&self) -> io::Result<()> {
 +        self.verify_root()?;
 +        for entry in &self.files {
@@ -8333,7 +8887,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/request_processors/selected_incoming.rs
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,529 @@
 +//! Destination-side Incoming reservation. This blocks resume while native
 +//! archive import and verification are still pending.
 +use super::selected_archive::SelectedArchivePlan;
@@ -8343,6 +8897,7 @@
 +use codex_core::native_ownership::store;
 +use codex_rollout::{WriterLockCoordinator, WriterLockGuard};
 +use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
 +use std::io;
 +
 +pub(crate) struct NativeSelectedIncoming {
@@ -8355,9 +8910,21 @@
 +    source_revision: u64,
 +    source_archive: SelectedArchivePlan,
 +    attempted: bool,
++    import_verified: bool,
++    activation_attempted: bool,
 +}
 +
 +impl NativeSelectedIncoming {
++    pub(crate) fn verify_import_guards(&self, journal: &NativeJournalLock, ids: &HashSet<ThreadId>) -> io::Result<()> {
++        journal.require_destination()?;
++        journal.require_phase("incomingAttempted")?;
++        if !self.attempted || self.home != journal.home() || self.request.request_id != journal.stamp().request_id
++            || self.guards.len() != ids.len() || self.guards.iter().any(|(id, _)| !ids.contains(id)) {
++            return Err(invalid());
++        }
++        for (id, guard) in &self.guards { guard.verify_for(&self.home, *id)?; }
++        Ok(())
++    }
 +    fn verify(
 +        &self,
 +        journal: &NativeJournalLock,
@@ -8420,6 +8987,75 @@
 +        json!({"requestId":self.request.request_id,"threadIds":ids,"phase":"writers-held",
 +            "ownershipRevision":self.request.expected_revision,"sourceRetirementRevision":self.source_revision,
 +            "writersStopped":true,"migrationAuthorized":false})
++    }
++
++    pub(crate) fn mark_import_verified(&mut self) {
++        self.import_verified = true;
++    }
++
++    pub(crate) fn activate(
++        &mut self,
++        journal: &NativeJournalLock,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++        mut peer_live: impl FnMut() -> io::Result<()>,
++    ) -> io::Result<Value> {
++        if !self.import_verified || self.activation_attempted || !self.attempted {
++            return Err(io::Error::other("Imported session has not been verified"));
++        }
++        journal.require_destination()?;
++        journal.require_phase("activationAttempted")?;
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++        let destination = store::observe(&self.home, &self.request.thread_ids)?;
++        let expected = self
++            .request
++            .expected_revision
++            .checked_add(1)
++            .ok_or_else(invalid)?;
++        let home_identity = journal.destination_identity()?;
++        if destination.home_identity != home_identity
++            || destination.revision != expected
++            || destination.threads.iter().any(|row| {
++                row.request_id.as_deref() != Some(self.request.request_id.as_str())
++                    || row.owner_home_identity.as_deref() != Some(home_identity)
++                    || row.phase != Some("incoming")
++            })
++        {
++            return Err(io::Error::other(
++                "Incoming ownership changed before activation",
++            ));
++        }
++        self.source_archive.verify_archived()?;
++        for (id, guard) in &self.guards {
++            guard.verify_for(&self.home, *id)?;
++        }
++        peer_live()?;
++        self.activation_attempted = true;
++        let request = store::Request {
++            expected_revision: expected,
++            request_id: self.request.request_id.clone(),
++            thread_ids: self.request.thread_ids.clone(),
++            transition: store::Transition::Activate,
++            destination_home_identity: None,
++        };
++        let receipt = store::apply(&self.home, &request, || {
++            journal.require_phase("activationAttempted")?;
++            pause
++                .verify_scope(admission, ids)
++                .map_err(|error| io::Error::other(error.message))?;
++            for (id, guard) in &self.guards {
++                guard.verify_for(&self.home, *id)?;
++            }
++            peer_live()
++        })?;
++        Ok(
++            json!({"requestId":receipt.request_id,"threadIds":receipt.thread_ids,"phase":receipt.phase,
++            "ownershipRevision":receipt.revision,"homeIdentity":receipt.home_identity,
++            "writersStopped":true,"migrationAuthorized":false}),
++        )
 +    }
 +
 +    pub(crate) fn commit(
@@ -8522,6 +9158,8 @@
 +            {
 +                Err(codex_thread_store::ThreadStoreError::ThreadNotFound { thread_id })
 +                    if thread_id == *id => {}
++                Err(codex_thread_store::ThreadStoreError::InvalidRequest { message })
++                    if message == format!("no rollout found for thread id {id}") => {}
 +                Err(error) => {
 +                    return Err(io::Error::other(format!(
 +                        "Destination thread lookup failed: {error}"
@@ -8572,8 +9210,210 @@
 +            source_revision,
 +            source_archive,
 +            attempted: false,
++            import_verified: false,
++            activation_attempted: false,
 +        };
 +        result.verify(journal, admission, pause, ids)?;
 +        Ok(result)
++    }
++
++    pub(crate) async fn native_observe_imported_session(
++        &self,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++        queues: &crate::request_processors::ThreadQueueRequestProcessor,
++        journal: &NativeJournalLock,
++        incoming: &NativeSelectedIncoming,
++    ) -> io::Result<Value> {
++        let (request, source_home, source_identity, source_revision, source_manifest) =
++            journal.incoming_request()?;
++        let home = self.native_move_home();
++        let destination_identity = journal.destination_identity()?;
++        if journal.home() != home || request.thread_ids.len() != ids.len() {
++            return Err(io::Error::other("Wrong import verification home or scope"));
++        }
++        journal.require_destination()?;
++        journal.require_phase("incomingAttempted")?;
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++        let source = store::observe(&source_home, &request.thread_ids)?;
++        if source.home_identity != source_identity
++            || source.revision != source_revision
++            || source.threads.iter().any(|row| {
++                row.request_id.as_deref() != Some(request.request_id.as_str())
++                    || row.owner_home_identity.as_deref() != Some(destination_identity)
++                    || row.phase != Some("retired")
++            })
++        {
++            return Err(io::Error::other(
++                "Source retirement changed during import verification",
++            ));
++        }
++        let source_archive =
++            SelectedArchivePlan::capture_import_manifest(&source_home, ids, &source_manifest)
++                .await?;
++        source_archive.verify_archived()?;
++        let destination = store::observe(&home, &request.thread_ids)?;
++        if destination.home_identity != destination_identity
++            || destination.revision
++                != request
++                    .expected_revision
++                    .checked_add(1)
++                    .ok_or_else(invalid)?
++            || destination.threads.iter().any(|row| {
++                row.request_id.as_deref() != Some(request.request_id.as_str())
++                    || row.owner_home_identity.as_deref() != Some(destination_identity)
++                    || row.phase != Some("incoming")
++            })
++        {
++            return Err(io::Error::other(
++                "Destination Incoming reservation is not confirmed",
++            ));
++        }
++        SelectedArchivePlan::verify_imported_manifest(&home, ids, &source_manifest).await?;
++
++        incoming.verify_import_guards(journal, ids)?;
++        let mut sorted = ids.iter().copied().collect::<Vec<_>>();
++        sorted.sort_by_key(ToString::to_string);
++        let mut observations = Vec::with_capacity(sorted.len());
++        for id in &sorted {
++            if self
++                .thread_manager
++                .capture_thread_for_client_removal(id)
++                .await
++                .map_err(|error| io::Error::other(error.to_string()))?
++                .is_some()
++                || queues
++                    .native_move_has_queued_input(*id)
++                    .await
++                    .map_err(|error| io::Error::other(error.message))?
++                || self.outgoing.native_move_has_pending_request(*id).await
++            {
++                return Err(io::Error::other(
++                    "Destination session has a runtime or pending input",
++                ));
++            }
++            let mut stored = self
++                .thread_store
++                .read_thread(StoreReadThreadParams {
++                    thread_id: *id,
++                    include_archived: true,
++                    include_history: false,
++                })
++                .await
++                .map_err(|error| {
++                    io::Error::other(format!(
++                        "Could not resolve imported thread history: {error}"
++                    ))
++                })?;
++            let path = stored.rollout_path.as_ref()
++                .ok_or_else(|| io::Error::other("Imported thread has no rollout path"))?;
++            let (items, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(path).await?;
++            let history = codex_thread_store::StoredThreadHistory {
++                thread_id: *id, items, revision: None,
++            };
++            if stored.thread_id != *id
++                || stored.archived_at.is_none()
++                || history.thread_id != *id
++                || history.items.is_empty()
++            {
++                return Err(io::Error::other(
++                    "Imported thread metadata/history did not match its UUID",
++                ));
++            }
++            let rollout = stored
++                .rollout_path
++                .as_ref()
++                .and_then(|path| path.strip_prefix(&home).ok())
++                .and_then(|path| path.to_str())
++                .ok_or_else(invalid)?
++                .to_owned();
++            if !source_manifest
++                .iter()
++                .any(|file| file.thread_id == id.to_string() && file.relative_path == rollout)
++            {
++                return Err(io::Error::other(
++                    "Resolved thread rollout is absent from the committed source manifest",
++                ));
++            }
++            if !history.items.iter().any(|item|matches!(item,codex_rollout::RolloutItem::SessionMeta(meta) if meta.meta.id==*id)) {
++                return Err(io::Error::other("Resolved history has no matching session metadata"));
++            }
++            let mut history_hash = Sha256::new();
++            for item in &history.items {
++                let bytes = serde_json::to_vec(item)?;
++                history_hash.update((bytes.len() as u64).to_be_bytes());
++                history_hash.update(bytes);
++            }
++            let history_digest = format!("{:x}", history_hash.finalize());
++            let setting_items = history.items.iter().filter(|item| {
++                matches!(
++                    item,
++                    codex_rollout::RolloutItem::EventMsg(
++                        codex_protocol::protocol::EventMsg::ThreadSettingsApplied(_)
++                    )
++                )
++            });
++            let mut settings_hash = Sha256::new();
++            let mut settings_count = 0u64;
++            for item in setting_items {
++                let bytes = serde_json::to_vec(item)?;
++                settings_hash.update((bytes.len() as u64).to_be_bytes());
++                settings_hash.update(bytes);
++                settings_count += 1;
++            }
++            let settings_digest = format!("{:x}", settings_hash.finalize());
++            let history_item_count = history.items.len();
++            stored.history = None;
++            let mut metadata_hash = Sha256::new();
++            serde_json::to_writer(&mut HashWriter(&mut metadata_hash), &stored)?;
++            let metadata_digest = format!("{:x}", metadata_hash.finalize());
++            let goal_slot = self
++                .thread_goal_processor
++                .native_move_goal_slot(*id)
++                .await
++                .map_err(|error| io::Error::other(error.message))?;
++            observations.push(json!({"threadId":id.to_string(),"rolloutPath":rollout,
++                "archived":true,"historyItemCount":history_item_count,"historyDigest":history_digest,
++                "settingsEventCount":settings_count,"settingsDigest":settings_digest,
++                "storedMetadataDigest":metadata_digest,"goalSlot":goal_slot}));
++        }
++        incoming.verify_import_guards(journal, ids)?;
++        source_archive.verify_archived()?;
++        let latest = store::observe(&home, &request.thread_ids)?;
++        if latest.home_identity != destination_identity
++            || latest.revision != destination.revision
++            || latest.threads != destination.threads
++        {
++            return Err(io::Error::other(
++                "Incoming ownership changed while verifying imported data",
++            ));
++        }
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++        Ok(
++            json!({"producer":"autoapprove-selected-import-observation","schemaVersion":1,
++            "requestId":request.request_id,"homeIdentity":destination_identity,
++            "ownershipRevision":destination.revision,"sourceRetirementRevision":source_revision,
++            "threadIds":sorted.iter().map(ToString::to_string).collect::<Vec<_>>(),"threads":observations,
++            "observationOnly":true,"migrationAuthorized":false}),
++        )
++    }
++}
++
++struct HashWriter<'a>(&'a mut Sha256);
++fn invalid() -> io::Error {
++    io::Error::other("Invalid imported session state")
++}
++impl io::Write for HashWriter<'_> {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        self.0.update(bytes);
++        Ok(bytes.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
 +    }
 +}

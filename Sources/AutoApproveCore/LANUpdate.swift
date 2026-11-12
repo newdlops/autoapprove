@@ -27,7 +27,8 @@ public struct LANUpdateManifest: Codable, Equatable, Sendable {
         self.protocolVersion = protocolVersion; self.nodeID = nodeID; self.release = release
         self.architecture = architecture; self.size = size; self.sha256 = sha256
     }
-    public static let maximumSize = 32 * 1_024 * 1_024
+    // The signed app also carries its matching managed Codex runtime.
+    public static let maximumSize = 256 * 1_024 * 1_024
     public static let chunkSize = 256 * 1_024
     public static var architecture: String {
         #if arch(arm64)
@@ -163,7 +164,7 @@ public enum LANUpdateInstallation {
         guard let end, try uint(end + 4, 2) == 0, try uint(end + 6, 2) == 0,
               try uint(end + 8, 2) == uint(end + 10, 2) else { throw invalid() }
         let count = Int(try uint(end + 10, 2)), size = Int(try uint(end + 12, 4)), start = Int(try uint(end + 16, 4))
-        guard count > 0, count <= 4_096, start >= 0, size > 0, start + size == end else { throw invalid() }
+        guard count > 0, count <= 32_768, start >= 0, size > 0, start + size == end else { throw invalid() }
         var cursor = start, output: UInt64 = 0, names = Set<String>(), localRanges: [Range<Int>] = []
         for _ in 0..<count {
             guard try uint(cursor, 4) == 0x02014b50 else { throw invalid() }
@@ -180,7 +181,15 @@ public enum LANUpdateInstallation {
                   name == "AutoApprove.app/" || name.hasPrefix("AutoApprove.app/"),
                   names.insert(name.precomposedStringWithCanonicalMapping.lowercased()).inserted else { throw invalid() }
             output += unpacked
-            guard output <= 128 * 1_024 * 1_024, unpacked <= 64 * 1_024 * 1_024 else { throw invalid() }
+            let fileLimit:UInt64
+            switch name {
+            case "AutoApprove.app/Contents/Resources/CodexRuntime/bin/codex":
+                fileLimit=768 * 1_024 * 1_024
+            case "AutoApprove.app/Contents/Resources/CodexRuntime/bin/codex-code-mode-host":
+                fileLimit=128 * 1_024 * 1_024
+            default:fileLimit=64 * 1_024 * 1_024
+            }
+            guard output <= 1_024 * 1_024 * 1_024, unpacked <= fileLimit else { throw invalid() }
             var extraCursor = cursor + 46 + length
             while extraCursor < cursor + 46 + length + extra {
                 let id = try uint(extraCursor, 2), bytes = Int(try uint(extraCursor + 2, 2))

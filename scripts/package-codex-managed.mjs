@@ -19,7 +19,7 @@ const inputBinary=await readFile(option('binary'));
 assert.ok(inputBinary.includes(Buffer.from(buildLabel)),'Maintained-build diagnostic stamp is missing');
 if(nativeRuntime)for(const marker of ['autoapprove-native-runtime-registration','autoapprove-native-tui-input-hold'])assert.ok(inputBinary.includes(Buffer.from(marker)),'Native runtime capability marker is missing: '+marker);
 assert.ok(inputBinary.includes(Buffer.from(pins.upstreamCommit)),'Runtime compatibility stamp is missing');
-const name=`Codex-0.167.1-AutoApprove-managed${nativeRuntime?'2':'1'}-macOS-arm64`,bundle=path.resolve('dist',name);
+const name=`Codex-0.167.1-AutoApprove-managed${nativeRuntime?'2':'1'}-macOS-arm64`,bundle=path.resolve(option('staging')||'dist',name);
 await mkdir(path.dirname(bundle),{recursive:true});
 // Refuse to reuse an old staging folder so unrelated files cannot enter a release.
 assert.equal(hash(await readFile(option('runtime-archive'))),runtimeArchiveSHA256,'Wrong official runtime archive');

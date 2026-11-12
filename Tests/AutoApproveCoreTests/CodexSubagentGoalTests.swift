@@ -5,7 +5,7 @@ private final class ChildGoalFixture:@unchecked Sendable {
     let records=ProcessDiscovery.parse("101801 1 ttys801 101801 101801 Wed Nov 11 08:00:00 2026 /fixture/codex")
     let parent="00000000-0000-4000-8000-000000001801",child="00000000-0000-4000-8000-000000001802"
     private let lock=NSLock()
-    private var alive=true,count=0,lost=false
+    private var alive=true,count=0,lost=false,waitCount=0
     private var value:CodexSubagentGoal
     init() {
         value=CodexSubagentGoal(rootThreadID:parent,threadID:child,parentThreadID:parent,
@@ -16,13 +16,17 @@ private final class ChildGoalFixture:@unchecked Sendable {
     func exit(){lock.lock();alive=false;lock.unlock()}
     func loseReply(){lock.lock();lost=true;lock.unlock()}
     var writes:Int {lock.lock();defer{lock.unlock()};return count}
+    var waits:Int {lock.lock();defer{lock.unlock()};return waitCount}
+    func pauseWhileWorking(){lock.lock();defer{lock.unlock()};value.goal?.status = .paused}
     func check(_ expected:CodexSubagentGoal) throws {
         guard read().goal?.revision==expected.goal?.revision else {throw AppError.message("Stale child Goal")}
     }
     func change(_ action:CodexSubagentGoalAction) throws ->CodexSubagentGoal {
-        lock.lock();defer{lock.unlock()};count+=1
-        value.goal?.status=action == .pause ? .paused:.active
-        value.executionState=action == .pause ? "idle":"active";value.turnID=action == .pause ? nil:"resumed-turn"
+        lock.lock();defer{lock.unlock()}
+        if action == .wait {waitCount+=1}else{count+=1}
+        value.goal?.status=action == .resume ? .active:.paused
+        value.executionState=action == .pause || action == .wait ? "idle":"active"
+        value.turnID=action == .pause || action == .wait ? nil:"resumed-turn"
         if lost {throw AppError.message("Lost acknowledgement after mutation")};return value
     }
 }
@@ -43,6 +47,25 @@ private final class ChildGoalFixture:@unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testChildGoalWaitPreservesPausedGoalAndDeduplicates() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-child-wait-"+UUID().uuidString),fixture=ChildGoalFixture()
+        defer{try? FileManager.default.removeItem(at:directory)}
+        fixture.pauseWhileWorking()
+        let engine=try childGoalEngine(fixture,directory);defer{engine.stop()}
+        let id=fixture.records[0].key,request=UUID()
+        let before=try await engine.readCodexSubagentGoal(sessionID:id,childID:fixture.child)
+        let result=try await engine.changeCodexSubagentGoal(sessionID:id,expected:before,action:.wait,requestID:request)
+        try expectEqual(result.phase,.confirmed)
+        try expectEqual(result.result?.executionState,"idle")
+        try expectEqual(result.result?.goal,before.goal)
+        try expectEqual(fixture.writes,0)
+        try expectEqual(fixture.waits,1)
+        let duplicate=try await engine.changeCodexSubagentGoal(sessionID:id,expected:before,action:.wait,requestID:request)
+        try expectEqual(duplicate.phase,result.phase)
+        try expectEqual(duplicate.result,result.result)
+        try expectEqual(fixture.waits,1)
+        try expectEqual(fixture.writes,0)
+    }
     func testChildGoalActionsPreserveIdentityAndDeduplicate() async throws {
         let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-child-actions-"+UUID().uuidString),fixture=ChildGoalFixture()
         defer{try? FileManager.default.removeItem(at:directory)}

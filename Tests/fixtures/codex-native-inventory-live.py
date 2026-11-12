@@ -31,6 +31,7 @@ import uuid
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--tui', required=True)
+parser.add_argument('--isolated-cli', action='store_true', help='Use a full CLI with owned PTYs only; do not query the production controller')
 parser.add_argument('--expected-node', required=True)
 parser.add_argument('--output', required=True)
 parser.add_argument('--server', help='Optional exact-version CLI for an owned shared Unix app-server')
@@ -77,10 +78,12 @@ assert not args.app_server_binary or args.server, 'Standalone server mode requir
 assert not args.admission or args.expected_version == '0.166.0', 'The old whole-server lease probe is only verified for 0.166.0'
 server_prefix = [] if args.app_server_binary else ['app-server']
 tui = pathlib.Path(args.tui).resolve(strict=True)
-assert tui.name == 'codex-tui', 'Only the explicitly built standalone test TUI is allowed'
+assert tui.name == ('codex' if args.isolated_cli else 'codex-tui'), 'Unexpected explicitly built test executable'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def controller():
+    if args.isolated_cli:
+        return {'id': args.expected_node, 'sessions': []}
     with opener.open('http://127.0.0.1:8765/api/state', timeout=4) as response:
         value = json.load(response)
     assert value['id'] == args.expected_node, 'Wrong local controller'
@@ -591,7 +594,7 @@ def server_subscribers(root_id, expected_count):
                 expected_owners = {pid, peer['pid']} if peer and expected_count == 2 else ({peer['pid']} if peer and expected_count == 1 else ({pid} if expected_count == 1 else set()))
                 for owner in expected_owners:
                     observed = inventory() if owner == pid else peer_inventory()
-                    assert observed['backendBindingComplete'] is False
+                    assert observed['backendBindingComplete'] is True
                     backend = observed['displayedBackend']
                     assert backend and backend['logicalBackendId'] and backend['ownershipVerified'] is False
                     transport = backend['transport']
@@ -615,7 +618,7 @@ def server_subscribers(root_id, expected_count):
                         checked = subprocess.run([args.swift_binding_helper, *helper_args],
                                                  capture_output=True, text=True, timeout=5)
                         check = json.loads(checked.stdout)
-                        assert checked.returncode == (1 if args.expect_proxy_peer else 0), checked.stderr
+                        assert checked.returncode == (1 if args.expect_proxy_peer else 0), {'observation': check, 'stderr': checked.stderr}
                         assert check['verified'] is (not args.expect_proxy_peer)
                         assert check['migrationAuthorized'] is False
                         if not args.expect_proxy_peer:
@@ -1256,7 +1259,8 @@ try:
     result = {'verified': True, 'nativeTUIProducer': True, 'fixturePID': pid,
               'terminalSize': args.terminal_size,
               'runtimeAdmissionProbe': admission_result,
-              'originalSessions': len(before), 'preserved': len(before), 'fixtureExcludedFromController': True,
+              'originalSessions': None if args.isolated_cli else len(before), 'preserved': None if args.isolated_cli else len(before),
+              'controllerChecked': not args.isolated_cli, 'fixtureExcludedFromController': None if args.isolated_cli else True,
               'primaryIdentityPreserved': True, 'exactDraftPreservedOnFreshRepaint': True,
               'draftContentNotExported': True, 'inferenceRequests': counts['inference'],
               'offscreenUnsubscribedDraftObserved': offscreen, 'exactDraftReturnedAfterNavigation': returned,
@@ -1335,6 +1339,6 @@ finally:
 # Verify again after terminating only owned children and removing only the owned
 # fixture. A successful snapshot before cleanup is insufficient for this claim.
 assert before <= identities(controller()), 'Original controller identities changed after fixture cleanup'
-result['originalSessionsPreservedAfterCleanup'] = True
+result['originalSessionsPreservedAfterCleanup'] = None if args.isolated_cli else True
 (output/'report.json').write_text(json.dumps(result, indent=2)+'\n')
 print(json.dumps(result))

@@ -16,6 +16,9 @@ private struct CodexAccountLoginPresentation:Identifiable {
     @State private var movePresentation:CodexAccountLoginPresentation?
     @State private var busy=false
     @State private var held=false
+    @State private var serverLink:CodexSessionServerLink?
+    @State private var linkingServer=false
+    @State private var serverLinkError:String?
     var body:some View {
         CodexSessionAccountContent(account:account,loading:loading,error:error,disabled:busy || held,
             refresh:{Task{await load()}},login:{if let account {loginPresentation = .init(account:account)}},reconnect:{
@@ -24,7 +27,9 @@ private struct CodexAccountLoginPresentation:Identifiable {
                     do {_ = try await verifiedTargets(account);try await engine.reconnectCodexLogin(home:account.target.home)}
                     catch {self.error=error.localizedDescription}
                 }
-            },changeGroup:{if let account {movePresentation = .init(account:account)}})
+            },changeGroup:{if let account {movePresentation = .init(account:account)}},
+            serverLink:serverLink,serverLinkError:serverLinkError,linkingServer:linkingServer,
+            verifyServerLink:{verifyServerLink()})
             .padding(.horizontal,24).padding(.vertical,12)
             .task(id:sessionID) {
                 account=nil;error=nil
@@ -61,11 +66,23 @@ private struct CodexAccountLoginPresentation:Identifiable {
     }
     private func load() async {
         guard !loading else{return}
-        loading=true;defer{loading=false}
+        loading=true;serverLink=nil;serverLinkError=nil;defer{loading=false}
         do {
             let value=try await engine.codexSessionAccount(sessionID:sessionID)
             try Task.checkCancellation();account=value;error=nil
+            if serverLink?.sessionID != value.sessionID || serverLink?.serverPID != value.serverPID {serverLink=nil}
         } catch is CancellationError {} catch {account=nil;self.error=error.localizedDescription}
+    }
+    private func verifyServerLink() {
+        guard !linkingServer else{return}
+        linkingServer=true;serverLinkError=nil
+        Task { @MainActor in
+            defer{linkingServer=false}
+            do {
+                let value=try await engine.codexSessionServerLink(sessionID:sessionID)
+                try Task.checkCancellation();serverLink=value
+            } catch is CancellationError {} catch {serverLink=nil;serverLinkError=error.localizedDescription}
+        }
     }
     private func verifiedTargets(_ expected:CodexSessionAccount) async throws -> [CodexAccountTransitionTarget] {
         let fresh=try await engine.codexSessionAccount(sessionID:sessionID)
@@ -85,6 +102,10 @@ struct CodexSessionAccountContent:View {
     let login:()->Void
     let reconnect:()->Void
     var changeGroup:(()->Void)?=nil
+    var serverLink:CodexSessionServerLink?=nil
+    var serverLinkError:String?=nil
+    var linkingServer=false
+    var verifyServerLink:(()->Void)?=nil
     var body:some View {
         VStack(alignment:.leading,spacing:8) {
             HStack {
@@ -108,6 +129,19 @@ struct CodexSessionAccountContent:View {
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         .fixedSize(horizontal:false,vertical:true)
                 }
+                if let serverLink,serverLink.sessionID==account.sessionID {
+                    Label("서버 전체 연결 확인됨 · Codex 창 \(serverLink.clientCount)개 / 접속 \(serverLink.serverConnectionCount)개",systemImage:"checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    Text("이 세션의 접속 ID #\(serverLink.connectionID)")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("서버 세대 \(serverLink.serverGeneration) · 백엔드 \(serverLink.logicalBackendID)")
+                        .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                        .fixedSize(horizontal:false,vertical:true)
+                }
+                if let serverLinkError {
+                    Label("세션 서버 연결 상세를 확인하지 못했습니다: \(serverLinkError)",systemImage:"exclamationmark.circle")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
                 ViewThatFits(in:.horizontal) {
                     HStack {buttons(account)}
                     VStack(alignment:.leading,spacing:8){buttons(account)}
@@ -123,6 +157,11 @@ struct CodexSessionAccountContent:View {
     @ViewBuilder private func buttons(_ account:CodexSessionAccount) -> some View {
         Button(account.individual ? "이 세션 계정 로그인":"공유 계정 로그인 (\(account.sharedSessions)개 세션)",action:login)
             .disabled(loading).help("연결된 계정의 로그인과 전환 진행 상태를 확인합니다.")
+        if let verifyServerLink {
+            Button(linkingServer ? "연결 확인 중…":"전체 서버 연결 확인",systemImage:"point.3.connected.trianglepath.dotted",action:verifyServerLink)
+                .disabled(disabled || loading || linkingServer)
+                .help("이 세션 창과 app-server 사이의 실제 로컬 연결 및 같은 서버의 전체 창 목록을 대조합니다.")
+        }
         Button("현재 로그인으로 재연결",action:reconnect).disabled(disabled || loading)
             .help("같은 서버의 연결된 Codex를 순차 중단하고 저장된 로그인으로 다시 연결합니다.")
         if let changeGroup {

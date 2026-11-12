@@ -26,13 +26,17 @@ struct CodexSubagentGoalView:View {
                     Text("사용 \(goal.tokensUsed.formatted()) 토큰"+(goal.tokenBudget.map{" / 예산 \($0.formatted()) 토큰"} ?? "")+" · \(goal.timeUsedSeconds.formatted())초")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                     if goal.status == .paused && value.executionState != "idle" {
-                        Text("Goal은 대기 중입니다. 현재 작업의 종료는 아직 확인되지 않았습니다.")
+                        Text("Goal은 일시정지됐지만 현재 작업은 계속 실행 중입니다. 종료를 기다리거나 Goal을 재개할 수 있습니다.")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                     }
                     if goal.status == .active || goal.status == .paused {
                         HStack {
                             Button(goal.status == .active ? "Goal 일시정지":"Goal 재개") {act(value,goal.status == .active ? .pause:.resume)}
                                 .disabled(busy || !fresh)
+                            if goal.status == .paused,value.executionState != "idle",value.turnID != nil {
+                                Button("작업 종료 대기") {act(value,.wait)}
+                                    .disabled(busy || !fresh)
+                            }
                             if busy {ProgressView().controlSize(.small).accessibilityLabel("Goal 처리 중")}
                         }
                     } else {
@@ -45,7 +49,7 @@ struct CodexSubagentGoalView:View {
                 if let error {Label(error,systemImage:"exclamationmark.triangle").font(.caption).foregroundStyle(.orange).fixedSize(horizontal:false,vertical:true)}
                 if let notice {Text(notice).font(.caption).fixedSize(horizontal:false,vertical:true).textSelection(.enabled)}
                 Button("현재 Goal 다시 확인") {Task {await load()}}.disabled(busy)
-                Text("일시정지는 Goal의 자동 진행을 멈춥니다. 확인한 현재 작업도 중단하며, 목표·예산·누적 사용량은 유지합니다.")
+                Text("일시정지는 Goal의 자동 진행과 확인된 현재 작업을 멈춥니다. 작업이 바로 끝나지 않으면 종료 대기를 이어갈 수 있습니다. 목표·예산·누적 사용량은 유지합니다.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             }.padding(.top,6).frame(maxWidth:.infinity,alignment:.leading)
         }.font(.caption)

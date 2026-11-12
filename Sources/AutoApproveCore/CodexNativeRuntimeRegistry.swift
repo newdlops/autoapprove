@@ -11,17 +11,39 @@ enum CodexNativeRuntimeRole: String, Codable, Sendable {
 struct CodexNativeRuntimeHint: Sendable {
     let inventorySocket: String, controlSocket: String
     let claimedPeer: CodexNativePeerIdentity
+    let cliVersion:String,executable:String?,serverGeneration:String?
+}
+struct CodexNativeServerRuntime:Sendable {
+    let inventorySocket:String,controlSocket:String
+    let peer:CodexNativePeerIdentity
+    let cliVersion:String,executable:String,serverGeneration:String
+    private init(_ hint:CodexNativeRuntimeHint,generation:String,executable:String) {
+        inventorySocket=hint.inventorySocket;controlSocket=hint.controlSocket;peer=hint.claimedPeer
+        cliVersion=hint.cliVersion;self.executable=executable
+        serverGeneration=generation
+    }
+    static func resolve(root:String=CodexNativeRuntimeRoot.path,home:String,serverPID:Int32)async throws->Self {
+        guard serverPID>0 else{throw AppError.message("대상 Codex 연결 서버를 확인하지 못했습니다.")}
+        let hints=try await Task.detached(priority:.utility){
+            try CodexNativeRuntimeRegistry.candidates(root:root,pid:serverPID,role:.server,home:home)
+        }.value
+        let hint=try await CodexNativeRuntimeRegistry.live(hints,role:.server)
+        guard let generation=hint.serverGeneration else{throw AppError.message("대상 Codex 서버 세대를 확인하지 못했습니다.")}
+        guard let executable=hint.executable else{throw AppError.message("대상 Codex 실행 파일 등록 정보를 확인하지 못했습니다.")}
+        return Self(hint,generation:generation,executable:executable)
+    }
 }
 enum CodexNativeRuntimeRegistry {
     private struct Record: Decodable {
         let schemaVersion: Int, producer: String, cliVersion: String, registrationId: String
         let role: CodexNativeRuntimeRole, controlKind: String, pid: UInt32
         let processIdentity: CodexNativePeerIdentity
-        let home: String, inventorySocket: String, controlSocket: String
+        let home: String, inventorySocket: String, controlSocket: String, executable:String?
         let membershipComplete: Bool, migrationAuthorized: Bool
     }
     private struct Header: Decodable {
         let schemaVersion: Int, producer: String, cliVersion: String, pid: UInt32, nonce: String
+        let serverGeneration:String?
         let membershipComplete: Bool, admissionGranted: Bool
     }
     private static var failure: AppError {
@@ -86,6 +108,8 @@ enum CodexNativeRuntimeRegistry {
               value.role==role,value.controlKind==role.control,value.pid==UInt32(pid),value.home==home,
               value.processIdentity.source=="macos-audit-token",value.processIdentity.pid==UInt32(pid),
               value.processIdentity.effectiveUid==getuid(),value.processIdentity.auditPidVersion>0,
+              value.executable.map({$0.hasPrefix("/") && $0.utf8.count<=4096
+                  && !$0.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)}) ?? true,
               value.inventorySocket=="i.sock",value.controlSocket=="c.sock",!value.membershipComplete,!value.migrationAuthorized
         else{throw failure}
         for socket in [value.inventorySocket,value.controlSocket] {
@@ -95,7 +119,8 @@ enum CodexNativeRuntimeRegistry {
         }
         let path=root+"/"+name
         guard sameDirectory(path,directory) else{throw failure}
-        return .init(inventorySocket:path+"/i.sock",controlSocket:path+"/c.sock",claimedPeer:value.processIdentity)
+        return .init(inventorySocket:path+"/i.sock",controlSocket:path+"/c.sock",claimedPeer:value.processIdentity,
+                     cliVersion:value.cliVersion,executable:value.executable,serverGeneration:nil)
     }
     static func live(_ hints:[CodexNativeRuntimeHint],role:CodexNativeRuntimeRole)async throws->CodexNativeRuntimeHint {
         let values=await withTaskGroup(of:CodexNativeRuntimeHint?.self,returning:[CodexNativeRuntimeHint].self){group in
@@ -105,8 +130,12 @@ enum CodexNativeRuntimeRegistry {
                     let head=try JSONDecoder().decode(Header.self,from:read.data)
                     guard read.peer.identity==hint.claimedPeer,head.schemaVersion==1,head.producer==role.producer,
                           head.cliVersion=="0.167.1",head.pid==hint.claimedPeer.pid,head.nonce==read.nonce,
+                          role == .tui ? head.serverGeneration == nil:
+                            (head.serverGeneration.map({UUID(uuidString:$0)?.uuidString.lowercased()==$0}) ?? false),
                           !head.membershipComplete,!head.admissionGranted else{return nil}
-                    return hint
+                    return .init(inventorySocket:hint.inventorySocket,controlSocket:hint.controlSocket,
+                        claimedPeer:hint.claimedPeer,cliVersion:hint.cliVersion,executable:hint.executable,
+                        serverGeneration:head.serverGeneration)
                 }catch{return nil}
             }}
             var values:[CodexNativeRuntimeHint]=[]
@@ -141,5 +170,44 @@ struct CodexNativeRuntimePair:Sendable {
             throw AppError.message("제어 등록을 확인하는 중 Codex 프로세스가 바뀌었습니다.")
         }
         return Self(connection,client,host)
+    }
+
+    /// Confirms that the server's complete live connection list consists only
+    /// of the supplied TUI processes, each paired to this same server instance.
+    /// This remains a connection census; it does not prove thread ownership.
+    static func resolveCensus(root:String=CodexNativeRuntimeRoot.path,home:String,serverPID:Int32,clientPIDs:[Int32])async throws->[Self] {
+        guard serverPID>0,!clientPIDs.isEmpty,clientPIDs.count<=64,
+              Set(clientPIDs).count==clientPIDs.count,clientPIDs.allSatisfy({$0>0}) else {
+            throw AppError.message("Codex 연결 서버의 전체 창 목록을 확인하지 못했습니다.")
+        }
+        let values=await withTaskGroup(of:Self?.self,returning:[Self].self){group in
+            for pid in clientPIDs { group.addTask {
+                do{return try await resolve(root:root,home:home,tuiPID:pid,serverPID:serverPID)}catch{return nil}
+            }}
+            var result:[Self]=[]
+            for await value in group {if let value{result.append(value)}}
+            return result
+        }
+        try Task.checkCancellation()
+        let byConnection=Dictionary(uniqueKeysWithValues:values.map{($0.connection.connectionID,$0)})
+        guard values.count==clientPIDs.count,
+              Set(values.map{$0.connection.tuiPeer.pid}).count==values.count,
+              let first=values.first,
+              values.allSatisfy({$0.connection.serverPeer==first.connection.serverPeer
+                  && $0.connection.serverGeneration==first.connection.serverGeneration
+                  && $0.connection.serverConnectionIDs==first.connection.serverConnectionIDs
+                  && $0.connection.serverThreadIDsByConnection==first.connection.serverThreadIDsByConnection
+                  && $0.connection.serverSubscriptionRevision==first.connection.serverSubscriptionRevision}),
+              Set(values.map{$0.connection.connectionID})==first.connection.serverConnectionIDs,
+              first.connection.serverThreadIDsByConnection.allSatisfy({id,threadIDs in
+                  guard let pair=byConnection[id] else{return false}
+                  let active=pair.connection.tuiActiveThreadIDs
+                  let channels=pair.connection.tuiChannelThreadIDsByBackend[pair.connection.logicalBackendID] ?? []
+                  return threadIDs.isSubset(of:pair.connection.tuiReferencedThreadIDs)
+                      && active.isSubset(of:threadIDs) && channels.isSubset(of:threadIDs)
+              }) else {
+            throw AppError.message("Codex 서버에 알 수 없는 창, 초기화 중 연결 또는 누락된 접속이 있어 전체 연결을 확인하지 못했습니다.")
+        }
+        return values.sorted{$0.connection.tuiPeer.pid<$1.connection.tuiPeer.pid}
     }
 }

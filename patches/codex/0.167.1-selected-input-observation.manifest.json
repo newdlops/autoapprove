@@ -1,9 +1,9 @@
 {
   "format": 1,
-  "kind": "source-only-experiment",
+  "kind": "maintained-native-runtime",
   "baselineRelease": "codex-0.167.1-autoapprove-managed1",
   "upstreamCommit": "0a94398fa60c4fac0e7659e4213a0a36e613dd46",
-  "releaseReady": false,
+  "releaseReady": true,
   "migrationAuthorized": false,
   "files": [
     {
@@ -19,22 +19,22 @@
     {
       "path": "app-server/src/turn_admission.rs",
       "before": "b6549e17e25a56c1768d6bfd77e7e6df18838261e50a5c70e95b46d215e0c5ec",
-      "after": "a816655b94f20ffb87edbdc688549c090e793b47aa8f7eb655c3415380a50536"
+      "after": "560269f47ab63329a7afa601f186a124a8b002f178951ec998998f968ffbdcd5"
     },
     {
       "path": "app-server/src/selected_admission_tests.rs",
       "before": null,
-      "after": "3898b6b0dcb37e9329b9b630579a0a4aa041ca054cfe1ce58b9aaa15307661eb"
+      "after": "084238440a396203bd290f757efc874f1c3158ee7835c7a421d202828ccbf627"
     },
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "4867def60aeb796f54ff92c529ed394f115e9d61eea9b61930c7fc96060ab7cb"
+      "after": "dd661f5c7e9c6ef2c68603248e85202fdc3859a3471e253b43bc57c210d9afdf"
     },
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "4e9fec2189ea2f3a7005d1d3cc02816b95574fbfb7b4a0730dd0143070caf094"
+      "after": "461aa5e467d35988713f5e69111dc2461c51c05afaaafc0aff673304a1d738a3"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -79,7 +79,7 @@
     {
       "path": "tui/src/app/startup.rs",
       "before": "fbbedd6664ddb1df28fa49ac055bac130b1c7996815ead701fecddcbd41565cf",
-      "after": "bd5b6b0ba9355b22a5438e3643dc86c5e93cd22048f5f56a436bb133eac189ab"
+      "after": "066c952b728006d4428f2ec5c4367c7a72dcdef13f08168e1825e20b6ce5cbf9"
     },
     {
       "path": "tui/src/app/event_dispatch.rs",
@@ -109,7 +109,7 @@
     {
       "path": "app-server/src/thread_state.rs",
       "before": "f9f51519080faba0be7cd6a1fe39f3818a5326db0fe77ee360f23f225c6a7111",
-      "after": "8f006e9b1e9135f9f771aea8acec8bf5df4da3f0f367bae2af4e5d54ded885bc"
+      "after": "8e49e42b0c0228f8cb62c66ed1e9a9a32d750112fa7e2318c1f2c402ce2b70ee"
     },
     {
       "path": "app-server/src/native_inventory.rs",
@@ -204,7 +204,7 @@
     {
       "path": "tui/src/app/backend_sessions.rs",
       "before": "c181f816ca1de2292b87ca1fcb6bdaf8d9436762c43580903d517e6ac134d5fb",
-      "after": "3eb9975198ddec3e237c8e8295e27efb0003e0523bd6136e54d873fa5e648e42"
+      "after": "831b01d8de67ba5cb4e4b99bd3bffb4267b81303e877141e876a187a5e2a9067"
     },
     {
       "path": "tui/src/native_input_hold.rs",
@@ -214,7 +214,7 @@
     {
       "path": "app-server-transport/src/native_runtime.rs",
       "before": null,
-      "after": "e2cc6638696d8e87039e0536e6a3b08900848a9ac5a6502ac9096f7bebe643a5"
+      "after": "b445a700e830394a87272a14eeeb40e5bc25d15b27b3f2543150905ae55446ca"
     },
     {
       "path": "core/src/lib.rs",
@@ -269,7 +269,7 @@
     {
       "path": "app-server/src/request_processors/thread_goal_processor.rs",
       "before": "70e42492922edbee61da4bef8514e71188e7aa13da086b87774f5c8720919714",
-      "after": "db92c3447575caad7dc4a24d21c8f2e1df4f4cf38860d9a406a8b085936bca5d"
+      "after": "af0477bab186d7c8ece0f3013c3aa09a55773987f016e7a098b5c540367db152"
     },
     {
       "path": "app-server/src/request_processors/thread_goal_control.rs",
@@ -289,7 +289,7 @@
     {
       "path": "app-server/src/selected_journal_lock.rs",
       "before": null,
-      "after": "9a682bc064bd880c5122bc21b1e6ddc1cff9468c3a3faf45dd2331ba48b02b49"
+      "after": "a6d80cf88dbaf0e067e6f0d0009e00c77ece573e5ee48e6952086c0795b2dcf4"
     },
     {
       "path": "app-server/src/request_processors/selected_shutdown.rs",
@@ -314,15 +314,15 @@
     {
       "path": "app-server/src/request_processors/selected_archive.rs",
       "before": null,
-      "after": "060b4d4216fe3e101847f143ad962321c96409b9e5382ea070dbc05009f47b90"
+      "after": "03dc415eb170d5e77c7b02d0d8bde9898cbf31216a6bf5bc6614f6a8a1c96795"
     },
     {
       "path": "app-server/src/request_processors/selected_incoming.rs",
       "before": null,
-      "after": "487735354de7b3edcfbdc31ee5d79be855586beaca44f1d48f6870dd7a626ad6"
+      "after": "a786ca8ddde9dd1394fcf5f91057fa39da7994a6cc49b0266321bbfd1afbc8e3"
     }
   ],
-  "patchSHA256": "61fd748f3595fc21a976913ef1b196375a36421b1f012973a5650e1f0f03b3f4",
+  "patchSHA256": "c5d0702c7471273b85b42f85bf40a075ee50945c37eecedb1dc956ae23fb4d12",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,

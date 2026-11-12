@@ -152,8 +152,8 @@ enum NativeConnectionProbe {
             let physical=String(cString:pointer);free(pointer)
             var info=stat();guard lstat(physical,&info)==0,info.st_mode&S_IFMT==S_IFDIR else{throw AppError.message("Owned home missing")}
             return .init(home:physical,physicalHomeID:"\(info.st_dev):\(info.st_ino)",serverID:"owned-"+label,socketID:"owned-socket-"+label,
-                credentialStoreID:"owned-credentials-"+label,cliIdentity:"owned-native-fixture",cliVersion:"0.167.1",
-                account:.init(subjectID:"owned-subject-"+label,sessionID:"owned-login-"+label,workspaceID:"owned-workspace-"+label))
+                cliIdentity:"owned-native-fixture",cliVersion:"0.167.1",
+                account:.init(provider:"ChatGPT",email:label+"@example.test",authenticated:true))
         }
         let source=try endpoint(home,"source"),target=try endpoint(destination.path,"destination"),id=UUID().uuidString.lowercased()
         let client=CodexMigrationClient(identity:.init(pid:Int32(pair.connection.tuiPeer.pid),started:"owned-fixture",tty:"/dev/owned-fixture"),home:source.home,threadIDs:[threadID])
@@ -262,7 +262,8 @@ enum NativeConnectionProbe {
                 "membershipComplete": false, "migrationAuthorized": false]
             print(String(decoding: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), as: UTF8.self))
         } catch {
-            print("{\"verified\":false,\"migrationAuthorized\":false}")
+            let result:[String:Any] = ["verified":false,"migrationAuthorized":false,"error":String(describing:error)]
+            print(String(decoding:(try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data(),as:UTF8.self))
             exit(1)
         }
         return true

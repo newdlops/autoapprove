@@ -13,16 +13,17 @@ import time
 
 
 class Server:
-    def __init__(self, binary, root, config=None, standalone=False):
+    def __init__(self, binary, root, config=None, standalone=False, home=None):
         self.root = root
-        self.home = root / 'home'
-        self.home.mkdir(mode=0o700)
+        self.home = home if home is not None else root / 'home'
+        self.home.mkdir(mode=0o700, exist_ok=home is not None)
         if config:
             (self.home / 'config.toml').write_text(config)
         self.endpoint = root / 'lease.sock'
         env = {k: v for k, v in os.environ.items()
                if not any(s in k.upper() for s in ('TOKEN', 'API_KEY', 'CODEX', 'OPENAI'))}
         env.update(HOME=str(root), CODEX_HOME=str(self.home), AUTOAPPROVE_SELECTED_TRANSITION_SOCKET=str(self.endpoint),
+                   RUST_LOG='codex_app_server=debug',
                    HTTP_PROXY='http://127.0.0.1:9', HTTPS_PROXY='http://127.0.0.1:9', NO_PROXY='127.0.0.1,localhost')
         self.log = (root / 'server.log').open('wb')
         self.process = subprocess.Popen([str(binary)] + ([] if standalone else ['app-server']), env=env, cwd=root,

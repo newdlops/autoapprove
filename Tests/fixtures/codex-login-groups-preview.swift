@@ -27,6 +27,10 @@ private final class GroupProbe:@unchecked Sendable {
 @MainActor private final class GroupFixture:ObservableObject {
     let root:URL,engine:ApprovalEngine
     @Published var dark=false
+    var source:CodexSessionAccount {
+        .init(sessionID:"synthetic-move-session",target:.init(home:root.appendingPathComponent("source-home").path,executable:"/fixture/codex"),
+            identity:.init(provider:"ChatGPT",email:"source-account@example.test"),sharedSessions:1,loginGroupName:"개별 로그인",serverPID:12345)
+    }
     init()throws {
         root=Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("fixture",isDirectory:true)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
@@ -71,6 +75,7 @@ private final class GroupProbe:@unchecked Sendable {
         Form {
             Text("실제 계정 화면과 저장소 · 모든 로그인/서버 동작은 합성 대역입니다.")
             Button("계정 창 열기"){openWindow(id:"accounts")}
+            Button("그룹 이동 창 열기"){openWindow(id:"move")}
             Toggle("어두운 화면",isOn:$fixture.dark)
             Button("합성 로그인 완료"){try? Data().write(to:fixture.root.appendingPathComponent("signed-codex"))}
             Button("조회 지연 시작"){try? Data().write(to:fixture.root.appendingPathComponent("hold-inspection"))}
@@ -87,5 +92,9 @@ private final class GroupProbe:@unchecked Sendable {
             .windowResizability(.contentSize)
         Window("계정·로그인 · 합성 검사",id:"accounts"){CodexAccountsWindow(engine:fixture.engine).preferredColorScheme(fixture.dark ? .dark:.light)}
             .windowResizability(.contentSize)
+        Window("그룹 이동 · 합성 검사",id:"move"){
+            CodexSessionMoveView(engine:fixture.engine,source:fixture.source,close:{})
+                .preferredColorScheme(fixture.dark ? .dark:.light)
+        }.windowResizability(.contentSize)
     }
 }

@@ -162,6 +162,9 @@ import AutoApproveCore
             }
         }
         do{
+            // Keep a session/group-scoped view on its requested home even when
+            // live target discovery fails. Never fall back to the default login.
+            if let preferredHome{selected=try CodexAccountTransitionTarget.canonicalHome(preferredHome)}
             var found=try await targets();try Task.checkCancellation()
             guard targetsRequest==request,visible else{return}
             liveHomes=Set(found.map(\.home))

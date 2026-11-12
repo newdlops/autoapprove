@@ -28,6 +28,22 @@ public struct CodexSessionAttachment:Codable {
     public var canRetryUnsentGoalPause:Bool {
         phase == .review && goalBeforePause != nil && pausedGoal==nil && (pauseNotStarted == true || detail=="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다." || detail=="자동 연결 보류: "+TerminalDeviceInput.unavailableBeforeInputMessage)
     }
+    static func migrated(context:SessionExitRecovery,state:CodexSessionMigrationState)throws->Self {
+        guard state.stage == .completed,state.destinationActivation != nil,
+              let thread=context.conversationID,
+              state.currentOwners[thread]==state.request.destination.home,
+              state.request.clients.contains(where:{$0.identity.pid==context.session.pid
+                  && $0.identity.started==context.session.started && $0.identity.tty==context.session.tty
+                  && $0.threadIDs.contains(thread)}) else {
+            throw AppError.message("완료된 그룹 이동과 원래 세션의 대화 연결을 확인하지 못했습니다.")
+        }
+        var destination=context
+        destination.executable=state.request.destination.cliIdentity
+        var attachment=Self(context:destination,home:state.request.destination.home)
+        guard attachment.command != nil else{throw AppError.message("목적지 그룹에서 이어갈 대화의 실행 명령을 준비하지 못했습니다.")}
+        attachment.detail="그룹 이동을 확인했습니다. 원래 터미널에서 같은 대화를 목적지 서버에 연결합니다."
+        return attachment
+    }
     public var replacesTab:Bool {originalLogin != nil}
     /// Separate jobs remain live work. Only an explicit reconnect's exact
     /// recorded tool-host cohort may be cleaned up by Codex's graceful exit.

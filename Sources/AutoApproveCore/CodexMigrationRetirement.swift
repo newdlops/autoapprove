@@ -47,18 +47,19 @@ struct CodexMigrationRolloutWitness:Codable,Equatable {
               !fileIdentity.isEmpty,fileIdentity.count<=128 else{throw retirementFailure}
         _=try RetirementFiles.components(relativePath)
     }
-    static func capture(home:String,homeIdentity:String,relative:String)throws->Self {
+    static func capture(home:String,homeIdentity:String,relative:String,checkpoint:()throws->Void={})throws->Self {
         let root=try RetirementFiles.home(home,identity:homeIdentity);defer{close(root)}
         let fd=try RetirementFiles.file(root,relative);defer{close(fd)}
-        return try read(fd,relative:relative)
+        return try read(fd,relative:relative,checkpoint:checkpoint)
     }
-    static func read(_ fd:Int32,relative:String,copyTo:Int32?=nil)throws->Self {
+    static func read(_ fd:Int32,relative:String,copyTo:Int32?=nil,checkpoint:()throws->Void={})throws->Self {
         var before=stat()
         guard fstat(fd,&before)==0,before.st_mode&S_IFMT==S_IFREG,before.st_uid==getuid(),before.st_mode&0o022==0,
               before.st_nlink==1,before.st_size>0,before.st_size<=256*1024*1024 else{throw retirementFailure}
         var hash=SHA256(),total:Int64=0,buffer=[UInt8](repeating:0,count:65536)
         while true {
             try Task.checkCancellation()
+            try checkpoint()
             let count=Darwin.read(fd,&buffer,buffer.count)
             if count<0,errno==EINTR{continue};guard count>=0 else{throw retirementFailure};if count==0{break}
             total+=Int64(count);guard total<=before.st_size else{throw retirementFailure}

@@ -28,6 +28,55 @@ private final class GoalTransferFixture {
 }
 
 extension ApprovalTests {
+    func testSelectedArchiveImportPreservesSourceAndGoalAcrossCancellation() throws {
+        let f=try GoalTransferFixture()
+        let slot=try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id)
+        let target=try CodexGoalTransferStore.captureSlot(home:f.home("b"),threadID:f.id)
+        let requestID=UUID().uuidString.lowercased()
+        let journal=try CodexMigrationJournal(store:AuditStore(path:f.root.appendingPathComponent("import-audit.sqlite").path))
+        _=try journal.create(id:requestID,homes:[slot.sourceHome,target.sourceHome],payload:Data("owned-import".utf8))
+        let refs=try CodexGoalTransferSlotStore.capture(home:slot.sourceHome,homeIdentity:slot.homeIdentity,
+            requestID:requestID,threadIDs:[f.id])
+        let relative="archived_sessions/rollout-"+f.id+".jsonl"
+        let source=URL(fileURLWithPath:slot.sourceHome).appendingPathComponent(relative)
+        try FileManager.default.createDirectory(at:source.deletingLastPathComponent(),withIntermediateDirectories:true)
+        let bytes=Data((String(repeating:"owned conversation history\n",count:6000)).utf8)
+        try bytes.write(to:source)
+        let witness=try CodexMigrationRolloutWitness.capture(home:slot.sourceHome,homeIdentity:slot.homeIdentity,relative:relative)
+        let file=CodexNativeArchivedFile(threadId:f.id,relativePath:relative,fileIdentity:witness.fileIdentity,
+            sha256:witness.sha256,size:witness.size,modifiedSeconds:witness.modifiedSeconds,modifiedNanoseconds:witness.modifiedNanoseconds)
+        let destination=URL(fileURLWithPath:target.sourceHome).appendingPathComponent(relative)
+        var cancelled=false
+        var copyingCheckpoints=0
+        do {
+            _=try CodexNativeSelectedArchiveImport.install(requestID:requestID,sourceHome:slot.sourceHome,sourceHomeIdentity:slot.homeIdentity,
+                destinationHome:target.sourceHome,destinationHomeIdentity:target.homeIdentity,files:[file],goalSlots:refs,threadIDs:[f.id],
+                checkpoint:{copyingCheckpoints+=1;if copyingCheckpoints==12{throw CancellationError()}})
+        }catch is CancellationError{cancelled=true}
+        try expect(cancelled)
+        let partial=URL(fileURLWithPath:target.sourceHome)
+            .appendingPathComponent(".autoapprove-migrations/imports/\(requestID)/files/00000000.stage")
+        let partialSize=try Data(contentsOf:partial).count
+        try expect(partialSize>0 && partialSize<bytes.count,"Cancellation must leave a real partial copy")
+        try expectFalse(FileManager.default.fileExists(atPath:destination.path))
+        try expectEqual(try Data(contentsOf:source),bytes)
+        var checkpoints=0
+        do {_=try CodexNativeSelectedArchiveImport.install(requestID:requestID,sourceHome:slot.sourceHome,sourceHomeIdentity:slot.homeIdentity,
+            destinationHome:target.sourceHome,destinationHomeIdentity:target.homeIdentity,files:[file],goalSlots:refs,threadIDs:[f.id],
+            checkpoint:{checkpoints+=1})}
+        catch {throw AppError.message("Archive import failed after \(checkpoints) checkpoints; destination exists=\(FileManager.default.fileExists(atPath:destination.path)): "+error.localizedDescription)}
+        try expect(checkpoints>1)
+        try expectEqual(try Data(contentsOf:destination),bytes)
+        try expectEqual(try Data(contentsOf:source),bytes)
+        let imported=try CodexGoalTransferStore.captureSlot(home:target.sourceHome,threadID:f.id)
+        try expectEqual(imported.row,slot.row)
+        try expectEqual(imported.continuationDeferred,slot.continuationDeferred)
+        try CodexGoalTransferStore.verifyCurrent(slot)
+        _=try CodexNativeSelectedArchiveImport.install(requestID:requestID,sourceHome:slot.sourceHome,sourceHomeIdentity:slot.homeIdentity,
+            destinationHome:target.sourceHome,destinationHomeIdentity:target.homeIdentity,files:[file],goalSlots:refs,threadIDs:[f.id])
+        try expectEqual(try Data(contentsOf:destination),bytes)
+        try expectEqual(try CodexGoalTransferStore.captureSlot(home:target.sourceHome,threadID:f.id).row,slot.row)
+    }
     func testGoalTransferSlotWitnessesClearedState() throws {
         let f=try GoalTransferFixture()
         let old=try CodexGoalTransferStore.captureSlot(home:f.home("a"),threadID:f.id)

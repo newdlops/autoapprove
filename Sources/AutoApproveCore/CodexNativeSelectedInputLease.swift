@@ -115,6 +115,54 @@ struct CodexNativeIncomingReceipt:Decodable,Sendable {
     }
 }
 
+struct CodexNativeImportObservation:Codable,Equatable,Sendable {
+    struct Goal:Codable,Equatable,Sendable {
+        let threadId:String,goalId:String,objective:String,status:String
+        let tokenBudget:Int64?
+        let tokensUsed:Int64,timeUsedSeconds:Int64,createdAtMs:Int64,updatedAtMs:Int64
+        let continuationDeferred:Bool
+        func matches(_ slot:CodexGoalTransferSlot)->Bool {
+            guard let row=slot.row else{return false}
+            return threadId==row.threadID && goalId==row.goalID && objective==row.objective && status==row.status
+                && tokenBudget==row.tokenBudget && tokensUsed==row.tokensUsed && timeUsedSeconds==row.timeUsedSeconds
+                && createdAtMs==row.createdAtMs && updatedAtMs==row.updatedAtMs && continuationDeferred==slot.continuationDeferred
+        }
+    }
+    struct Thread:Codable,Equatable,Sendable {
+        let threadId:String,rolloutPath:String,historyDigest:String,settingsDigest:String,storedMetadataDigest:String
+        let archived:Bool,historyItemCount:Int,settingsEventCount:Int
+        let goalSlot:Goal?
+    }
+    let producer:String,schemaVersion:Int,requestId:String,homeIdentity:String
+    let ownershipRevision:Int,sourceRetirementRevision:Int,threadIds:[String],threads:[Thread]
+    let observationOnly:Bool,migrationAuthorized:Bool
+    func validate(requestID:String,home:String,revision:Int,sourceRevision:Int,slots:[CodexGoalTransferSlot])throws {
+        let failure=AppError.message("가져온 대화와 Goal 상태를 확인하지 못했습니다.")
+        let scope=try CodexNativeSelectedInputLease.checkedScope(slots.map(\.threadID))
+        guard producer=="autoapprove-selected-import-observation",schemaVersion==1,requestId==requestID,
+              homeIdentity==home,ownershipRevision==revision,sourceRetirementRevision==sourceRevision,
+              threadIds==scope,threads.map(\.threadId)==scope,observationOnly,!migrationAuthorized else{throw failure}
+        let byID=Dictionary(uniqueKeysWithValues:slots.map{($0.threadID,$0)})
+        for thread in threads {
+            guard let slot=byID[thread.threadId],thread.archived,thread.historyItemCount>0,thread.settingsEventCount>=0,
+                  thread.rolloutPath.hasPrefix("archived_sessions/"),
+                  [thread.historyDigest,thread.settingsDigest,thread.storedMetadataDigest].allSatisfy({$0.utf8.count==64 && $0.utf8.allSatisfy{(48...57).contains($0)||(97...102).contains($0)}}),
+                  thread.goalSlot.map({$0.matches(slot)}) ?? (slot.row==nil && !slot.continuationDeferred) else{throw failure}
+        }
+    }
+}
+
+struct CodexNativeActivationReceipt:Codable,Equatable,Sendable {
+    let requestId:String,threadIds:[String],phase:String,ownershipRevision:Int,homeIdentity:String
+    let writersStopped:Bool,migrationAuthorized:Bool
+    func validate(requestID:String,threadIDs:[String],revision:Int,home:String)throws {
+        guard requestId==requestID,threadIds==(try CodexNativeSelectedInputLease.checkedScope(threadIDs)),
+              phase=="active",ownershipRevision==revision,homeIdentity==home,writersStopped,!migrationAuthorized else {
+            throw AppError.message("대상 세션 활성화 결과를 확인하지 못했습니다.")
+        }
+    }
+}
+
 /// Current durable rows for recovery. They are not a grant to repeat a command.
 struct CodexNativeOwnershipObservation:Decodable,Sendable {
     struct Thread:Decodable,Sendable {let threadId:String,requestId:String?,ownerHomeIdentity:String?,phase:String?}
@@ -142,7 +190,7 @@ struct CodexNativeOwnershipObservation:Decodable,Sendable {
 /// One utility-task owner. The lease drains and pauses input admission for an
 /// exact scope. It does not stop accepted work or establish migration ownership.
 final class CodexNativeSelectedInputLease {
-    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status",retirePrepare="retire-prepare",retireCommit="retire-commit",incomingPrepare="incoming-prepare",incomingCommit="incoming-commit"}
+    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status",retirePrepare="retire-prepare",retireCommit="retire-commit",incomingPrepare="incoming-prepare",incomingCommit="incoming-commit",incomingVerify="incoming-verify",incomingActivate="incoming-activate"}
     struct JournalLockReceipt:Decodable {
         let requestId:String,revision:Int,digest:String,homeIdentity:String,role:String,phase:String
         let migrationAuthorized:Bool
@@ -158,6 +206,8 @@ final class CodexNativeSelectedInputLease {
         let shutdown:CodexNativeSelectedShutdown?
         let retirement:CodexNativeRetirementReceipt?
         let incoming:CodexNativeIncomingReceipt?
+        let importObservation:CodexNativeImportObservation?
+        let activation:CodexNativeActivationReceipt?
     }
     private struct Request:Encodable {
         let op:String,nonce:String,serverGeneration:String?,leaseId:String?,threadIds:[String]?
@@ -180,17 +230,23 @@ final class CodexNativeSelectedInputLease {
     private var incomingRevision:Int?
     private var incomingSourceRevision:Int?
     private var incomingCommitAttempted=false
+    private var incomingOwnershipRevision:Int?
+    private var incomingActivationAttempted=false
+    private var incomingImportVerified=false
     private static var failure:AppError {.message("선택한 대화의 서버 입력 차단을 확인하지 못했습니다. 이동을 진행하지 않습니다.")}
     static func checkedScope(_ ids:[String])throws->[String] {
         guard (1...512).contains(ids.count),Set(ids).count==ids.count,
               ids.allSatisfy({UUID(uuidString:$0)?.uuidString.lowercased()==$0}) else{throw failure}
         return ids.sorted()
     }
-    init(path:String,expected:CodexNativeDisplayedConnection,threadIDs:[String])throws {
+    convenience init(path:String,expected:CodexNativeDisplayedConnection,threadIDs:[String])throws {
+        try self.init(path:path,expectedServerPeer:expected.serverPeer,threadIDs:threadIDs)
+    }
+    init(path:String,expectedServerPeer:CodexNativePeerIdentity,threadIDs:[String])throws {
         self.threadIDs=try Self.checkedScope(threadIDs)
         connection=try CodexNativeLineConnection(path:path)
         do {
-            guard connection.peer.identity==expected.serverPeer else{throw Self.failure}
+            guard connection.peer.identity==expectedServerPeer else{throw Self.failure}
             let inspected=try call(.inspect)
             generation=inspected.serverGeneration
             cohortSupported=inspected.runtimeCohortSupported==true
@@ -301,13 +357,47 @@ final class CodexNativeSelectedInputLease {
             try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"incoming",
                 revision:revision+1,homeIdentity:witness.homeIdentity,
                 sourceRetirementRevision:sourceRevision)
+            incomingOwnershipRevision=revision+1
             return receipt
         }catch{close();throw error}
     }
+    func verifyIncoming(slots:[CodexGoalTransferSlot],ownershipRevision:Int,sourceRetirementRevision:Int)throws->CodexNativeImportObservation {
+        do {
+            guard held,let witness=journalWitness,witness.role=="destination",ownershipRevision>0,sourceRetirementRevision>0,
+                  let observation=try call(.incomingVerify).importObservation else{throw Self.failure}
+            try observation.validate(requestID:witness.requestId,home:witness.homeIdentity,revision:ownershipRevision,
+                                     sourceRevision:sourceRetirementRevision,slots:slots)
+            guard observation.threadIds==threadIDs else{throw Self.failure}
+            incomingImportVerified=true
+            return observation
+        }catch{close();throw error}
+    }
+    func activateIncoming()throws->CodexNativeActivationReceipt {
+        do {
+            guard held,incomingImportVerified,!incomingActivationAttempted,let revision=incomingOwnershipRevision,revision<Int.max,
+                  let witness=journalWitness,witness.role=="destination" else{throw Self.failure}
+            // The server may accept activation and lose its reply. Record the
+            // attempt before dispatch so this lease can never issue it twice.
+            incomingActivationAttempted=true
+            guard let receipt=try call(.incomingActivate).activation else{throw Self.failure}
+            try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,revision:revision+1,home:witness.homeIdentity)
+            return receipt
+        }catch{close();throw error}
+    }
+    func verifyAndActivateIncoming(slots:[CodexGoalTransferSlot],ownershipRevision:Int,
+                                   sourceRetirementRevision:Int)throws->(CodexNativeImportObservation,CodexNativeActivationReceipt) {
+        let observation=try verifyIncoming(slots:slots,ownershipRevision:ownershipRevision,
+                                           sourceRetirementRevision:sourceRetirementRevision)
+        let activation=try activateIncoming()
+        return(observation,activation)
+    }
     static func observeOwnership(path:String,expected:CodexNativeDisplayedConnection,threadIDs:[String])throws->CodexNativeOwnershipObservation {
+        try observeOwnership(path:path,expectedServerPeer:expected.serverPeer,threadIDs:threadIDs)
+    }
+    static func observeOwnership(path:String,expectedServerPeer:CodexNativePeerIdentity,threadIDs:[String])throws->CodexNativeOwnershipObservation {
         let scope=try checkedScope(threadIDs),connection=try CodexNativeLineConnection(path:path)
         defer{connection.close()}
-        guard connection.peer.identity==expected.serverPeer else{throw failure}
+        guard connection.peer.identity==expectedServerPeer else{throw failure}
         let inspectNonce=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
         let inspect=Request(op:"inspect",nonce:inspectNonce,serverGeneration:nil,leaseId:nil,threadIds:nil)
         let inspected=try validate(connection.exchange(JSONEncoder().encode(inspect)),operation:.inspect,nonce:inspectNonce,
@@ -346,7 +436,7 @@ final class CodexNativeSelectedInputLease {
                          generation:String?,leaseID:String?,threadIDs:[String])throws->Reply {
         do {
             let scope=try checkedScope(threadIDs)
-            guard (1...([Operation.cohort,.retirePrepare,.retireCommit,.incomingPrepare,.incomingCommit].contains(operation) ? 1_048_576:65_536)).contains(data.count),nonce.utf8.count==32,
+            guard (1...([Operation.cohort,.retirePrepare,.retireCommit,.incomingPrepare,.incomingCommit,.incomingVerify,.incomingActivate].contains(operation) ? 1_048_576:65_536)).contains(data.count),nonce.utf8.count==32,
                   nonce.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}) else{throw failure}
             let reply=try JSONDecoder().decode(Reply.self,from:data)
             let paused=operation != .inspect && operation != .release
@@ -379,6 +469,8 @@ final class CodexNativeSelectedInputLease {
             if operation == .incomingPrepare || operation == .incomingCommit {
                 guard reply.incoming != nil else{throw failure}
             }else {guard reply.incoming==nil else{throw failure}}
+            guard (operation == .incomingVerify) == (reply.importObservation != nil) else{throw failure}
+            guard (operation == .incomingActivate) == (reply.activation != nil) else{throw failure}
             return reply
         }catch{throw failure}
     }

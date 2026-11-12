@@ -21,6 +21,7 @@ private final class NativeRegistryFixture {
         record=["schemaVersion":1,"producer":"autoapprove-native-runtime-registration","cliVersion":"0.167.1",
                 "registrationId":id,"role":"tui","controlKind":"terminal-input-hold","pid":getpid(),
                 "processIdentity":try JSONSerialization.jsonObject(with:JSONEncoder().encode(peer)),
+                "executable":"/Applications/Codex.app/Contents/MacOS/codex",
                 "home":home,"inventorySocket":"i.sock","controlSocket":"c.sock","membershipComplete":false,"migrationAuthorized":false]
         for name in ["i.sock","c.sock"] {
             let fd=socket(AF_UNIX,SOCK_STREAM,0);guard fd>=0 else{throw AppError.message("Owned registry socket failed")}

@@ -263,7 +263,7 @@ enum CodexAccountTransitionLocal {
             }
         }
     }
-    static func thread(_ connection: CodexQueueConnection, id: String,metadata:JSONObject?=nil,home:String?=nil) throws -> CodexAccountTransitionThread {
+    static func thread(_ connection: CodexQueueConnection, id: String,metadata:JSONObject?=nil,home:String?=nil,allowSubagent:Bool=false) throws -> CodexAccountTransitionThread {
         let result = try metadata ?? connection.request("thread/read", ["threadId": id, "includeTurns": false])
         guard let row = result["thread"] as? JSONObject, row["id"] as? String == id,
               let status = (row["status"] as? JSONObject)?["type"] as? String, ["active", "idle", "systemError"].contains(status) else {
@@ -311,17 +311,31 @@ enum CodexAccountTransitionLocal {
             guard !data.isEmpty || next == nil else { throw AppError.message("대기 작업 목록이 불완전합니다.") }
             if !data.isEmpty { blocker = reason == "백그라운드 작업" ? reason : blocker ?? reason }
         }
-        let goalResult = try connection.request("thread/goal/get", ["threadId": id])
+        let parent=row["parentThreadId"] as? String
+        let child=allowSubagent && parent.map({UUID(uuidString:$0) != nil && $0 != id}) == true
+        let goalResult = try child
+            ? connection.request("autoapprove/thread/goal/read",["threadId":id,"parentThreadId":parent!])
+            : connection.request("thread/goal/get", ["threadId": id])
         if let goal = goalResult["goal"], !(goal is NSNull) {
             guard let object = goal as? JSONObject, let value = object["status"] as? String,
                   CodexGoal.Status(rawValue: value) != nil else { throw AppError.message("Goal 실행 상태를 확인하지 못했습니다.") }
             if value == "active" { blocker = "활성 Goal" }
         }
         let cwd=row["cwd"] as? String,provider=row["modelProvider"] as? String
-        let continuable=row["source"] is String && row["threadSource"] as? String=="user" && row["ephemeral"] as? Bool==false &&
-            (row["parentThreadId"]==nil || row["parentThreadId"] is NSNull) && cwd?.hasPrefix("/")==true && provider?.isEmpty==false
+        let root=row["source"] is String && row["threadSource"] as? String=="user" &&
+            (row["parentThreadId"]==nil || row["parentThreadId"] is NSNull)
+        let continuable=(root || child) && row["ephemeral"] as? Bool==false && cwd?.hasPrefix("/")==true && provider?.isEmpty==false
         var goal=continuable ? try CodexGoalTransport.decode(goalResult,threadID:id):nil
-        if let home,let current=goal,let stored=try? CodexGoalTransport.readDatabase(home:home,threadID:id),
+        if child,let current=goal {
+            guard let identity=goalResult["identity"] as? JSONObject,let instance=identity["goalId"] as? String,
+                  UUID(uuidString:instance) != nil,identity["objective"] as? String==current.objective,
+                  identity["status"] as? String==current.status.rawValue,
+                  (identity["tokenBudget"] as? NSNumber)?.int64Value==current.tokenBudget else {
+                throw AppError.message("이동할 서브에이전트 Goal의 식별자를 확인하지 못했습니다.")
+            }
+            goal?.instanceID=instance
+        }
+        if !child,let home,let current=goal,let stored=try? CodexGoalTransport.readDatabase(home:home,threadID:id),
            stored.createdAt==current.createdAt,stored.objective==current.objective,stored.tokenBudget==current.tokenBudget {goal?.instanceID=stored.instanceID}
         return .init(id: id, turnID: turnID, active: status == "active", blocker: blocker,continuable:continuable,cwd:cwd,modelProvider:provider,goal:goal,turnStatus:latest.first?["status"] as? String)
     }

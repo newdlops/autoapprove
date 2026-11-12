@@ -400,6 +400,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var codexManagedServerStartTask:Task<CodexManagedServerStatus,Error>?
     private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
     private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
+    private var codexMigrationCoordinator:CodexSessionMigrationCoordinator?
+    private var codexMigrationHeldClients:Set<CodexMigrationClientID>=[]
+    private var codexMigrationRecoveryError:String?
+    private var codexMigrationReconnectContexts:[String:SessionExitRecovery]=[:]
+    private var codexMigrationReconnectRecoveryError:String?
+    private var codexMigrationRunningIDs:Set<String>=[]
     private var codexAccountObservedTargets: [CodexAccountTransitionTarget] = []
     private var codexAccountMembershipVerifiedAt:Date?
     private var codexAccountMembershipRefreshTask:Task<Void,Never>?
@@ -414,7 +420,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var recordedNativeCodexLoginIDs:Set<String>=[]
     private func codexAccountInputHeld(_ id: String) -> Bool {
         guard let session=sessions[id],session.agent == .codex else{return false}
-        return codexAccountTransitionInputHeld(session) || codexAttachmentActiveIDs.contains(id) || codexSessionAttachments.values.contains {
+        return codexMigrationRecoveryError != nil || codexMigrationReconnectRecoveryError != nil
+            || codexMigrationReconnectContexts.values.contains(where:{$0.session.tty==session.tty})
+            || codexMigrationHeldClients.contains(.init(pid:session.pid,started:session.started,tty:session.tty))
+            || codexAccountTransitionInputHeld(session) || codexAttachmentActiveIDs.contains(id) || codexSessionAttachments.values.contains {
             [.needsPause,.pauseReserved,.waitingPause,.needsTab,.tabReserved,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase) && ($0.context.session.tty==session.tty || ($0.replacesTab && "/dev/"+$0.context.shell.tty==session.tty))
         }
     }
@@ -422,6 +431,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// including clients whose server membership is not yet verified.
     public func codexApprovalHoldReason(sessionID:String)->String? {
         guard let session=sessions[sessionID],session.phase != .ended,codexAccountInputHeld(sessionID) else{return nil}
+        if let error=codexMigrationRecoveryError ?? codexMigrationReconnectRecoveryError {
+            return "로그인 그룹 이동 기록을 확인하지 못해 자동 입력을 보류합니다. "+error
+        }
+        if codexMigrationHeldClients.contains(.init(pid:session.pid,started:session.started,tty:session.tty)) {
+            return "로그인 그룹 이동 준비·실행 중입니다. 이동을 완료하거나 실행 전 준비를 취소하면 자동 승인을 다시 확인합니다."
+        }
         return "계정 전환·세션 연결을 확인하는 동안 자동 승인을 보류합니다. 계정·로그인에서 진행 상태를 확인하거나 남은 전환을 중지해주세요."
     }
     private func codexAccountTransitionInputHeld(_ session:AgentSession,home:String?=nil)->Bool {
@@ -657,6 +672,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         configureNativeCodexLogin()
         if let saved=store.value("codexSessionAttachments"),let data=saved.data(using:.utf8),let states=try? JSONDecoder().decode([String:CodexSessionAttachment].self,from:data) {codexSessionAttachments=states.mapValues {var restored=$0;restored.authorizedToolHosts=nil;return restored}}
         if let saved=store.value("codexNativeAttachmentFailures.v1"),let data=saved.data(using:.utf8),let homes=try? JSONDecoder().decode([String].self,from:data) {codexNativeAttachmentFailures=Set(homes)}
+        refreshCodexMigrationHolds()
+        if let saved=store.value("codexMigrationReconnectContexts.v1"),!saved.isEmpty {
+            do {codexMigrationReconnectContexts=try JSONDecoder().decode([String:SessionExitRecovery].self,from:Data(saved.utf8))}
+            catch {codexMigrationReconnectRecoveryError=error.localizedDescription}
+        }
     }
     private func configureNativeCodexLogin() {
         codexNativeAttachmentTask?.cancel();codexNativeAttachmentTask=nil;codexNativeAttachmentPending.removeAll()
@@ -6024,6 +6044,342 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let store=codexLoginGroupStore
         return try await Task.detached(priority:.utility){try store.list()}.value
     }
+    private func sessionMigrationCoordinator()throws->CodexSessionMigrationCoordinator {
+        if let existing=codexMigrationCoordinator{return existing}
+        let coordinator=CodexSessionMigrationCoordinator(journal:try CodexMigrationJournal(store:store),
+            services:.init(observe:{[weak self] request in
+                guard let self else{throw CancellationError()}
+                return try await self.codexMigrationObservation(request)
+            }))
+        codexMigrationCoordinator=coordinator
+        return coordinator
+    }
+    private func refreshCodexMigrationHolds() {
+        do {
+            let states=try sessionMigrationCoordinator().activeStates()
+            codexMigrationHeldClients=Set(states.flatMap{$0.request.clients.map(\.identity)})
+            codexMigrationRecoveryError=nil
+        }catch {codexMigrationRecoveryError=error.localizedDescription}
+    }
+    private func saveCodexMigrationReconnectContext(_ context:SessionExitRecovery?,id:String)throws {
+        var values=codexMigrationReconnectContexts
+        values[id]=context
+        try store.set("codexMigrationReconnectContexts.v1",String(decoding:JSONEncoder().encode(values),as:UTF8.self))
+        codexMigrationReconnectContexts=values
+    }
+    func prepareCodexSessionMigration(sessionID:String,destinationHome:String) async throws->CodexSessionMigrationState {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+            throw AppError.message("진행 중인 로그인·계정 전환을 마친 뒤 이동해주세요.")
+        }
+        let epoch=codexAccountTransitionEpoch
+        codexAccountTransitionBusy=true
+        defer{refreshCodexMigrationHolds();if epoch==codexAccountTransitionEpoch{codexAccountTransitionBusy=false}}
+        let request=try await codexMigrationRequest(sessionID:sessionID,destinationHome:destinationHome)
+        let context=try await codexMigrationReconnectContext(sessionID:sessionID,request:request)
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+        try saveCodexMigrationReconnectContext(context,id:request.id)
+        do {return try await sessionMigrationCoordinator().prepare(request)}
+        catch {
+            let original=error
+            do {
+                let state=try sessionMigrationCoordinator().state(id:request.id)
+                if state==nil || state?.stage == .cancelled {try saveCodexMigrationReconnectContext(nil,id:request.id)}
+            }catch { /* Retain the context when reservation outcome is unknown. */ }
+            throw original
+        }
+    }
+    func cancelCodexSessionMigration(id:String)throws {
+        defer{refreshCodexMigrationHolds()}
+        try sessionMigrationCoordinator().cancel(id:id)
+        try saveCodexMigrationReconnectContext(nil,id:id)
+    }
+    public func prepareCodexSessionMove(sessionID:String,destinationHome:String) async throws->CodexSessionMovePlan {
+        .init(try await prepareCodexSessionMigration(sessionID:sessionID,destinationHome:destinationHome))
+    }
+    public func cancelCodexSessionMove(id:String)throws {
+        try cancelCodexSessionMigration(id:id)
+    }
+    public func codexSessionMoveRecoveries()throws->[CodexSessionMoveRecovery] {
+        let coordinator=try sessionMigrationCoordinator()
+        let ids=Set(try coordinator.activeStates().map{$0.request.id}).union(codexMigrationReconnectContexts.keys)
+        return try ids.sorted().compactMap { id in
+            guard let state=try coordinator.state(id:id) else {
+                throw AppError.message("재연결 정보에 대응하는 이동 기록을 찾지 못했습니다: "+id)
+            }
+            if state.stage == .cancelled{return nil}
+            let canCancel=state.execution==nil
+            let canReconnect=state.stage == .completed && codexMigrationReconnectContexts[id] != nil
+            let detail:String
+            if canReconnect {detail="대화 이전 완료 · 원래 터미널의 목적지 연결 확인이 남아 있습니다."}
+            else if canCancel {detail="이동 범위 준비됨 · 아직 대화 이전을 실행하지 않았습니다."}
+            else {detail="이전 실행 결과 확인 필요 · 종료·소유권 이전 명령을 반복하지 않습니다."}
+            return .init(id:id,destinationHome:state.request.destination.home,conversationCount:state.request.threads.count,
+                detail:detail,canCancel:canCancel,canReconnect:canReconnect)
+        }
+    }
+    public func performCodexSessionMove(id:String) async throws->CodexSessionAttachment {
+        guard codexMigrationRunningIDs.insert(id).inserted else {
+            throw AppError.message("이 이동의 실행·재연결 확인이 이미 진행 중입니다.")
+        }
+        defer{codexMigrationRunningIDs.remove(id)}
+        guard codexMigrationReconnectContexts[id] != nil else {
+            throw AppError.message("원래 터미널로 돌아올 이동 준비 정보를 확인하지 못했습니다.")
+        }
+        let coordinator=try sessionMigrationCoordinator()
+        guard let state=try coordinator.state(id:id) else{throw AppError.message("준비한 이동을 찾지 못했습니다.")}
+        if state.stage != .completed {_ = try await executeCodexSessionMigration(id:id)}
+        return try await reconnectMigratedCodexSession(id:id)
+    }
+    func codexMigrationReconnectContext(sessionID:String,request:CodexSessionMigrationRequest) async throws->SessionExitRecovery {
+        guard let session=sessions[sessionID],session.phase != .ended,session.agent == .codex,
+              let host=ScreenHost(kind:session.terminal),screenConnections[host]?.enabled==true,
+              screenAdapters[host]?.restart != nil,
+              request.clients.contains(where:{$0.identity.pid==session.pid && $0.identity.started==session.started
+                  && $0.identity.tty==session.tty}) else {
+            throw AppError.message("이동 후 돌아올 원래 세션과 터미널 연결을 확인해주세요.")
+        }
+        let runtime=try await codexNativeRuntime(sessionID:sessionID)
+        let active=runtime.connection.tuiActiveThreadIDs
+        guard active.count==1,let thread=active.first,request.threads.contains(where:{$0.id==thread && $0.parentID==nil}) else {
+            throw AppError.message("이동 후 재개할 현재 부모 대화를 확인하지 못했습니다.")
+        }
+        let reader=processReader
+        let records=try await Task.detached(priority:.utility){try reader()}.value
+        guard let process=records.first(where:{$0.pid==session.pid && $0.started==session.started}),process.isForeground,
+              let shell=ProcessDiscovery.ancestors(of:process.parent,byPID:ProcessDiscovery.index(records))
+                .first(where:{$0.tty==process.tty && SessionExitRecovery.isShell($0)}),
+              !CodexSessionAttachment.hasIndependentChildWork(process:process,records:records),
+              let current=sessions[sessionID],current.pid==session.pid,current.started==session.started,current.phase != .ended else {
+            throw AppError.message("원래 Codex의 셸이나 실행 중인 하위 작업을 확인해주세요.")
+        }
+        var context=SessionExitRecovery(session:session,process:process,shell:shell,conversationID:thread)
+        context.executable=request.source.cliIdentity
+        return context
+    }
+    /// Internal until the caller also owns the terminal reconnection lifecycle.
+    func reconnectMigratedCodexSession(id:String) async throws->CodexSessionAttachment {
+        guard let context=codexMigrationReconnectContexts[id],let moved=try sessionMigrationCoordinator().state(id:id),
+              moved.stage == .completed,let host=ScreenHost(kind:context.session.terminal),
+              screenConnections[host]?.enabled==true,let adapter=screenAdapters[host],let restart=adapter.restart else {
+            throw AppError.message("완료된 이동과 원래 터미널의 재연결 정보를 확인해주세요.")
+        }
+        let key="codexMigrationReconnectPlan:"+id
+        let destinationHome=moved.request.destination.home,threadIDs=moved.request.threads.map(\.id)
+        let sourceConnectionHome=try CodexAccountTransitionTarget.canonicalHome(moved.request.source.home)
+        let destinationConnectionHome=try CodexAccountTransitionTarget.canonicalHome(destinationHome)
+        try await Task.detached(priority:.utility) {
+            let connection=try CodexQueueConnection(home:destinationHome)
+            for thread in threadIDs {
+                try Task.checkCancellation()
+                let response=try connection.request("thread/read",["threadId":thread,"includeTurns":false])
+                guard let row=response["thread"] as? JSONObject,row["id"] as? String==thread,let path=row["path"] as? String else {
+                    throw AppError.message("목적지 대화의 보관 상태를 확인하지 못했습니다.")
+                }
+                if path.contains("/archived_sessions/") {
+                    _=try connection.request("thread/unarchive",["threadId":thread],classifyError:true)
+                }
+            }
+        }.value
+        var plan:CodexSessionAttachment
+        if let saved=store.value(key),!saved.isEmpty {plan=try JSONDecoder().decode(CodexSessionAttachment.self,from:Data(saved.utf8))}
+        else {plan=try CodexSessionAttachment.migrated(context:context,state:moved)}
+        let original=context.session,reader=processReader,epoch=codexAccountTransitionEpoch
+        func authorized()throws {
+            try Task.checkCancellation()
+            guard !remoteInputStopped,!snapshot.paused,epoch==codexAccountTransitionEpoch else{throw CancellationError()}
+        }
+        func screen(_ target:ScreenTarget) async throws->String {
+            try authorized()
+            let result=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+            guard result.failures.isEmpty,result.screens.count==1,let raw=result.screens.first?.contents else {
+                throw AppError.message("재연결할 터미널 화면을 확인하지 못했습니다.")
+            }
+            try authorized();return raw
+        }
+        let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
+        let services=CodexSessionAttachmentServices(exit:{
+            try authorized()
+            let rows=try await Task.detached(priority:.utility){try reader()}.value
+            guard let process=rows.first(where:{$0.pid==original.pid && $0.started==original.started}),process.isForeground,
+                  !CodexSessionAttachment.hasIndependentChildWork(process:process,records:rows),
+                  CodexServerLocation.connectedHome(pid:process.pid,hints:[sourceConnectionHome])==sourceConnectionHome else {
+                throw AppError.message("이동한 원본 Codex의 실행·서버 연결이 바뀌었습니다.")
+            }
+            let before=try await screen(target)
+            guard CodexGoalScreen.ready(before) else{throw AppError.message("원본 Codex의 작업·질문·작성 중 입력을 확인해주세요.")}
+            // Explicit paste avoids Codex treating a fast text+Enter burst as
+            // multiline draft input and leaving /exit unsubmitted.
+            return try await Task.detached(priority:.utility){try adapter.input(target,before,.codex,.init(kind:.message,text:"/exit")) == .sent}.value
+        },shellReady:{
+            let rows=try await Task.detached(priority:.utility){try reader()}.value
+            guard let shell=context.verifiedShell(in:rows) else{return false}
+            let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
+            return SessionExitRecovery.emptyShellPrompt(try await screen(target))
+        },launch:{
+            let rows=try await Task.detached(priority:.utility){try reader()}.value
+            guard let shell=context.verifiedShell(in:rows) else{throw AppError.message("원래 빈 셸을 확인하지 못했습니다.")}
+            let root=try CodexNativeRuntimeRoot.prepare()
+            let attachment=try CodexSessionAttachment.migrated(context:context,state:moved)
+            guard let command=attachment.command(nativeRuntimeRoot:root) else{throw AppError.message("목적지 재개 명령을 확인하지 못했습니다.")}
+            let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
+            let before=try await screen(target)
+            guard SessionExitRecovery.emptyShellPrompt(before) else{throw AppError.message("셸 입력창이 비어 있지 않습니다.")}
+            return try await Task.detached(priority:.utility){try restart(target,before,command) == .sent}.value
+        },verify:{
+            try authorized()
+            let rows=try await Task.detached(priority:.utility){try reader()}.value
+            let candidates=rows.filter{$0.agent == .codex && $0.tty==context.shell.tty && $0.key != original.id
+                && ProcessDiscovery.ancestors(of:$0.parent,byPID:ProcessDiscovery.index(rows)).contains(where:{$0.key==context.shell.key})}
+            guard candidates.count==1,let next=candidates.first,let thread=context.conversationID,
+                  CodexServerLocation.connectedHome(pid:next.pid,hints:[destinationConnectionHome])==destinationConnectionHome else{return false}
+            let loaded=try await Task.detached(priority:.utility){
+                let response=try CodexQueueConnection(home:moved.request.destination.home).request("thread/read",["threadId":thread,"includeTurns":false])
+                guard let row=response["thread"] as? JSONObject else{return false}
+                return row["id"] as? String==thread && CodexQueueTransport.isLoadedRoot(row,cwd:original.cwd)
+            }.value
+            guard loaded else{return false}
+            try self.store.set("automatic:"+next.key,original.automatic ? "true":"false")
+            self.sessions[next.key]?.automatic=original.automatic
+            return true
+        })
+        if [.review,.launchReserved,.verifying,.connected].contains(plan.phase),try await services.verify() {
+            plan.phase = .connected
+            plan.detail="실행 명령을 반복하지 않고 목적지의 같은 대화 연결을 확인했습니다."
+            try store.set(key,String(decoding:JSONEncoder().encode(plan),as:UTF8.self))
+            try saveCodexMigrationReconnectContext(nil,id:id)
+            return plan
+        }
+        repeat {
+            plan=try await services.advance(plan,save:{value in
+                try self.store.set(key,String(decoding:JSONEncoder().encode(value),as:UTF8.self))
+            })
+            if plan.phase == .connected {try saveCodexMigrationReconnectContext(nil,id:id);return plan}
+            if plan.phase == .review {return plan}
+            try await Task.sleep(for:.seconds(1))
+        }while true
+    }
+    func executeCodexSessionMigration(id:String) async throws->CodexSessionMigrationState {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+            throw AppError.message("진행 중인 로그인·계정 전환을 마친 뒤 이동해주세요.")
+        }
+        let coordinator=try sessionMigrationCoordinator()
+        guard let state=try coordinator.state(id:id),state.stage == .prepared,state.execution==nil else {
+            throw AppError.message("준비된 이동을 확인하지 못했습니다. 이전 실행을 반복하지 않습니다.")
+        }
+        let epoch=codexAccountTransitionEpoch
+        codexAccountTransitionBusy=true
+        defer{refreshCodexMigrationHolds();if epoch==codexAccountTransitionEpoch{codexAccountTransitionBusy=false}}
+        @Sendable func runtime(_ endpoint:CodexMigrationEndpoint) async throws->CodexNativeServerRuntime {
+            guard let component=endpoint.serverID.split(separator:":").first,let pid=Int32(component),pid>0 else {
+                throw AppError.message("이동 서버의 프로세스를 확인하지 못했습니다.")
+            }
+            return try await CodexNativeServerRuntime.resolve(home:endpoint.home,serverPID:pid)
+        }
+        async let sourceRuntime=runtime(state.request.source)
+        async let destinationRuntime=runtime(state.request.destination)
+        let (source,destination)=try await (sourceRuntime,destinationRuntime)
+        guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
+        var clientHolds:[CodexNativeTerminalInputHold]=[]
+        defer{for hold in clientHolds{try? hold.release();hold.close()}}
+        for client in state.request.clients {
+            let pair=try await CodexNativeRuntimePair.resolve(home:client.home,tuiPID:client.identity.pid,serverPID:Int32(source.peer.pid))
+            let hold=try CodexNativeTerminalInputHold(path:pair.tuiControlSocket,expected:pair.connection)
+            try hold.pause()
+            clientHolds.append(hold)
+        }
+        let ids=state.request.threads.map(\.id)
+        let sourceLease=try CodexNativeSelectedInputLease(path:source.controlSocket,expectedServerPeer:source.peer,threadIDs:ids)
+        defer{sourceLease.close()}
+        let destinationLease=try CodexNativeSelectedInputLease(path:destination.controlSocket,expectedServerPeer:destination.peer,threadIDs:ids)
+        defer{destinationLease.close()}
+        return try await coordinator.executePrepared(id:id,source:source,destination:destination,
+            sourceLease:sourceLease,destinationLease:destinationLease,clientHolds:clientHolds)
+    }
+    func codexNativeDestinationServer(home:String) async throws->CodexNativeServerRuntime {
+        let canonical=try CodexAccountTransitionTarget.canonicalHome(home)
+        let standard=try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")
+        let groups=try await codexLoginGroups()
+        guard canonical==standard || groups.contains(where:{(try? CodexAccountTransitionTarget.canonicalHome($0.home))==canonical}) else {
+            throw AppError.message("대상 로그인 그룹을 다시 선택해주세요.")
+        }
+        let (identity,server)=try await CodexServerAccountIdentity.read(home:canonical)
+        guard identity.authenticated,server>0,!remoteInputStopped else {
+            throw AppError.message("대상 로그인 그룹의 실행 서버와 계정을 확인해주세요.")
+        }
+        _ = try await Task.detached(priority:.utility){try CodexNativeRuntimeRoot.prepare()}.value
+        let runtime=try await CodexNativeServerRuntime.resolve(home:canonical,serverPID:server)
+        guard runtime.peer.pid==UInt32(server),runtime.peer.effectiveUid==getuid(),runtime.peer.auditPidVersion>0 else {
+            throw AppError.message("대상 그룹의 네이티브 서버 연결을 확인하지 못했습니다.")
+        }
+        return runtime
+    }
+    func codexMigrationRequest(sessionID:String,destinationHome:String) async throws->CodexSessionMigrationRequest {
+        guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {
+            throw AppError.message("이동할 Codex 세션을 선택해주세요.")
+        }
+        let account=try await codexSessionAccount(sessionID:sessionID)
+        let pair=try await codexNativeRuntime(sessionID:sessionID)
+        let source=try await CodexNativeServerRuntime.resolve(home:account.target.home,serverPID:Int32(pair.connection.serverPeer.pid))
+        let destination=try await codexNativeDestinationServer(home:destinationHome)
+        let (destinationAccount,_)=try await CodexServerAccountIdentity.read(home:destinationHome)
+        let reader=processReader
+        let records=try await Task.detached(priority:.utility){try reader()}.value
+        guard let process=records.first(where:{$0.pid==session.pid && $0.started==session.started}) else {
+            throw AppError.message("이동할 세션의 프로세스가 바뀌었습니다.")
+        }
+        let sourceEndpoint=try CodexMigrationEndpoint.capture(home:account.target.home,runtime:source,account:account.identity)
+        let home=sourceEndpoint.home
+        let client=try pair.connection.migrationClient(process:process,home:home)
+        let roots=client.threadIDs
+        let threads=try await Task.detached(priority:.utility) {
+            try CodexMigrationThread.captureScope(connection:CodexQueueConnection(home:home),home:home,rootIDs:roots)
+        }.value
+        guard !remoteInputStopped,let current=sessions[sessionID],current.pid==session.pid,
+              current.started==session.started,current.phase != .ended else{throw CancellationError()}
+        return .init(id:UUID().uuidString.lowercased(),
+            source:sourceEndpoint,
+            destination:try CodexMigrationEndpoint.capture(home:destinationHome,runtime:destination,account:destinationAccount),
+            clients:[client],threads:threads)
+    }
+    func codexMigrationObservation(_ request:CodexSessionMigrationRequest) async throws->CodexSessionMigrationObservation {
+        let reader=processReader
+        let records=try await Task.detached(priority:.utility){try reader()}.value
+        let targets=try await codexAccountTargetReader(records)
+        var endpoints:[CodexMigrationEndpoint]=[],clients:[CodexMigrationClient]=[]
+        for home in [request.source.home,request.destination.home] {
+            try codexLoginGroupStore.validate(home:home)
+            let (account,pid)=try await CodexServerAccountIdentity.read(home:home)
+            let runtime=try await CodexNativeServerRuntime.resolve(home:home,serverPID:pid)
+            endpoints.append(try CodexMigrationEndpoint.capture(home:home,runtime:runtime,account:account))
+            let canonical=try CodexAccountTransitionTarget.canonicalHome(home)
+            let witnesses=targets.first(where:{$0.home==canonical})?.witnesses ?? []
+            if !witnesses.isEmpty {
+                let census=try await CodexNativeRuntimePair.resolveCensus(home:home,serverPID:pid,clientPIDs:witnesses.map(\.pid))
+                for pair in census {
+                    guard let process=records.first(where:{UInt32($0.pid)==pair.connection.tuiPeer.pid}),
+                          witnesses.contains(where:{$0.pid==process.pid && $0.started==process.started}) else {
+                        throw AppError.message("이동 준비 중 Codex 세션 연결이 바뀌었습니다.")
+                    }
+                    clients.append(try pair.connection.migrationClient(process:process,home:home))
+                }
+            }else {
+                let inventory=try await CodexNativeObservation.query(path:runtime.inventorySocket)
+                let body=try JSONSerialization.jsonObject(with:inventory.data) as? JSONObject
+                guard inventory.peer.identity==runtime.peer,let connections=body?["connections"] as? [JSONObject],connections.isEmpty else {
+                    throw AppError.message("로그인 그룹 서버에 식별되지 않은 세션 연결이 있습니다.")
+                }
+            }
+        }
+        let home=request.source.home,roots=request.clients.flatMap(\.threadIDs)
+        let threads=try await Task.detached(priority:.utility) {
+            let connection=try CodexQueueConnection(home:home)
+            return try CodexMigrationThread.captureScope(connection:connection,home:home,rootIDs:Array(Set(roots)))
+        }.value
+        try Task.checkCancellation()
+        guard !remoteInputStopped else{throw CancellationError()}
+        return .init(source:endpoints[0],destination:endpoints[1],clients:clients,threads:threads,
+            completeClients:true,completeThreads:true)
+    }
     public func createCodexLoginGroup(name:String) async throws->CodexLoginGroup {
         guard !remoteInputStopped else{throw CancellationError()}
         let store=codexLoginGroupStore
@@ -6247,7 +6603,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     _ = try await Task.detached(priority:.utility){try CodexQueueConnection(home:home).peerProcessID()}.value
                     guard try await screen(target)==before else{throw AppError.message("서버 확인 중 화면이 바뀌어 종료하지 않았습니다.")}
                     guard self.log(AuditEvent(sessionID:id,summary:"기존 Codex 서버 연결",outcome:state.authorizedToolHosts?.isEmpty == false ? "사용자 재연결 요청 · 확인한 도구 호스트 정리를 포함한 정상 종료 예약":"같은 창·대화 연결을 위한 종료 요청 예약",source:host.title,context:AuditContext(session:original))) else{throw AppError.message("연결 기록을 저장하지 못했습니다.")}
-                    return try await Task.detached(priority:.utility){try adapter.input(target,before,.codex,.init(kind:.submit,text:"/exit")) == .sent}.value
+                    return try await Task.detached(priority:.utility){try adapter.input(target,before,.codex,.init(kind:.message,text:"/exit")) == .sent}.value
                 },shellReady:{
                     let current=try await Task.detached(priority:.utility){try reader()}.value
                     guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current) else{return false}
@@ -6544,7 +6900,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let session=sessions[sessionID],session.agent == .codex,session.phase != .ended else {throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")}
         let targets=try await codexLoginTargets()
         guard let target=targets.first(where:{$0.witnesses.contains(where:{$0.pid==session.pid && $0.started==session.started && $0.tty==session.tty})}) else {throw AppError.message(codexAttachmentWaitReasons[sessionID].map{"이 세션은 아직 독립 실행 중입니다. "+$0} ?? "이 세션의 실제 연결 서버를 확인하지 못했습니다.")}
-        let groupName=try await codexLoginGroups().first(where:{$0.home==target.home})?.name
+        let groupName=try await codexLoginGroups().first(where:{(try? CodexAccountTransitionTarget.canonicalHome($0.home))==target.home})?.name
         let (identity,server)=try await CodexServerAccountIdentity.read(home:target.home)
         let connected=await Task.detached(priority:.utility) {
             target.witnesses.filter{CodexServerLocation.connectedHome(pid:$0.pid,hints:[target.home],peerPID:server)==target.home}
@@ -6562,13 +6918,37 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let account=try await codexSessionAccount(sessionID:sessionID)
         guard let server=account.serverPID,server>0 else{throw AppError.message("실제 연결 서버를 확인하지 못했습니다.")}
-        let runtime=try await CodexNativeRuntimePair.resolve(home:account.target.home,tuiPID:original.pid,serverPID:server)
+        let clientPIDs=account.target.witnesses.map(\.pid)
+        let census=try await CodexNativeRuntimePair.resolveCensus(home:account.target.home,serverPID:server,clientPIDs:clientPIDs)
+        guard let runtime=census.first(where:{$0.connection.tuiPeer.pid==UInt32(original.pid)}),
+              census.count==clientPIDs.count else{throw AppError.message("이 세션의 창을 전체 app-server 연결 목록에 연결하지 못했습니다.")}
         guard !Task.isCancelled,!remoteInputStopped,let current=sessions[sessionID],
               current.pid==original.pid,current.started==original.started,current.tty==original.tty,current.phase != .ended,
               runtime.connection.tuiPeer.pid==UInt32(original.pid),runtime.connection.serverPeer.pid==UInt32(server) else {
             throw AppError.message("제어 연결을 확인하는 중 원래 세션이나 서버가 바뀌었습니다.")
         }
         return runtime
+    }
+    public func codexSessionServerLink(sessionID:String) async throws ->CodexSessionServerLink {
+        guard let original=sessions[sessionID],original.agent == .codex,original.phase != .ended else {
+            throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")
+        }
+        let account=try await codexSessionAccount(sessionID:sessionID)
+        guard let server=account.serverPID,server>0 else{throw AppError.message("세션의 app-server 프로세스를 확인하지 못했습니다.")}
+        let clientPIDs=account.target.witnesses.map(\.pid)
+        let census=try await CodexNativeRuntimePair.resolveCensus(home:account.target.home,serverPID:server,clientPIDs:clientPIDs)
+        guard let runtime=census.first(where:{$0.connection.tuiPeer.pid==UInt32(original.pid)}),
+              census.count==clientPIDs.count else{throw AppError.message("이 세션의 창을 전체 app-server 연결 목록에 연결하지 못했습니다.")}
+        guard !Task.isCancelled,!remoteInputStopped,let current=sessions[sessionID],
+              current.pid==original.pid,current.started==original.started,current.tty==original.tty,
+              current.cwd==original.cwd,current.phase != .ended,
+              runtime.connection.tuiPeer.pid==UInt32(original.pid),runtime.connection.serverPeer.pid==UInt32(server) else {
+            throw AppError.message("연결을 확인하는 동안 세션이나 서버가 바뀌었습니다. 다시 확인해주세요.")
+        }
+        return .init(sessionID:sessionID,sessionPID:original.pid,serverPID:server,
+            serverGeneration:runtime.connection.serverGeneration,connectionID:runtime.connection.connectionID,
+            logicalBackendID:runtime.connection.logicalBackendID,clientCount:census.count,
+            serverConnectionCount:runtime.connection.serverConnectionIDs.count)
     }
     public func checkCodexAccountTransitions() async {
         guard codexAccountCheckTask==nil,!codexAccountTransitionBusy else{return}
@@ -7855,9 +8235,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return existing
         }
         let key=target.home+"\u{0}"+expected.threadID
+        let validGoalAction = action == .pause ? goal.status == .active:
+            action == .resume ? goal.status == .paused:
+                goal.status == .paused && expected.executionState != "idle" && expected.turnID != nil
         guard !changingGoalThreads.contains(key),!changingGoals.contains(sessionID),!automaticInputBusy(sessionID),
               !remoteInputSessions.contains(sessionID),!codexAccountInputHeld(sessionID),!codexAccountContinuationHeld(sessionID),
-              action == .pause ? goal.status == .active:goal.status == .paused else {throw AppError.message("진행 중인 입력·계정 전환 또는 Goal 상태를 먼저 확인해주세요.")}
+              validGoalAction else {throw AppError.message("진행 중인 입력·계정 전환 또는 Goal 상태를 먼저 확인해주세요.")}
         changingGoalThreads.insert(key);changingGoals.insert(sessionID)
         defer {changingGoalThreads.remove(key);changingGoals.remove(sessionID)}
         var receipt=CodexSubagentGoalReceipt(requestID:requestID,binding:binding,phase:.reserved,result:nil,detail:"요청 결과를 확인 중입니다. 같은 요청은 다시 보내지 않습니다.")
@@ -7873,16 +8256,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             })
             let fresh=try await subagentGoalTarget(session,root:expected.rootThreadID)
+            let expectedStatus:CodexGoal.Status = action == .resume ? .active:.paused
             guard dispatch.started,fresh.home==target.home,result.rootThreadID==expected.rootThreadID,result.threadID==expected.threadID,
-                  result.goal?.instanceID==goal.instanceID,result.goal?.status==(action == .pause ? .paused:.active) else {throw AppError.message("Goal 변경 결과가 예상 상태와 다릅니다.")}
+                  result.goal?.instanceID==goal.instanceID,result.goal?.status==expectedStatus else {throw AppError.message("Goal 변경 결과가 예상 상태와 다릅니다.")}
             receipt.phase = .confirmed;receipt.result=result
-            receipt.detail=action == .resume ? "Goal을 재개했습니다.":result.executionState=="idle" ? "Goal과 현재 작업을 일시정지했습니다.":"Goal을 일시정지했습니다. 현재 작업의 종료는 아직 확인되지 않았습니다."
+            switch action {
+            case .resume: receipt.detail="Goal을 재개했습니다."
+            case .pause: receipt.detail=result.executionState=="idle" ? "Goal을 일시정지하고 현재 작업이 끝난 것을 확인했습니다.":"Goal은 일시정지했습니다. 현재 작업은 계속 실행 중입니다. ‘작업 종료 대기’로 기다릴 수 있습니다."
+            case .wait: receipt.detail=result.executionState=="idle" ? "일시정지된 Goal의 현재 작업이 끝난 것을 확인했습니다.":"Goal은 일시정지 상태입니다. 작업 종료를 아직 확인하지 못했습니다. 다시 기다릴 수 있습니다."
+            }
         } catch {
             receipt.phase=dispatch.started ? .unknown:.notStarted
             receipt.detail=dispatch.started ? "요청 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 현재 상태를 새로 확인해주세요.":error.localizedDescription
         }
         try ledger.finish(receipt)
-        _ = log(AuditEvent(sessionID:sessionID,summary:action == .pause ? "서브에이전트 Goal 일시정지":"서브에이전트 Goal 재개",outcome:receipt.detail,source:"서브에이전트 관리",context:AuditContext(session:session)))
+        let summary:String
+        switch action {case .pause:summary="서브에이전트 Goal 일시정지";case .resume:summary="서브에이전트 Goal 재개";case .wait:summary="서브에이전트 작업 종료 대기"}
+        _ = log(AuditEvent(sessionID:sessionID,summary:summary,outcome:receipt.detail,source:"서브에이전트 관리",context:AuditContext(session:session)))
         return receipt
     }
 

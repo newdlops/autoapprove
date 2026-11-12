@@ -43,6 +43,10 @@ struct CodexAccountsLayout<Content:View>:View {
     @State private var requestedHome:String?
     @State private var focusHome:String?
     @State private var groupsRequest=UUID()
+    @State private var moves:[CodexSessionMoveRecovery]=[]
+    @State private var moveError:String?
+    @State private var moveNotice:String?
+    @State private var reconnectingMove:String?
     private var homeNames:[String:String] {
         var names=Dictionary(groups.map{((try? CodexAccountTransitionTarget.canonicalHome($0.home)) ?? $0.home,$0.name)},uniquingKeysWith:{first,_ in first})
         if let home=try? CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex"){names[home]="기본 로그인"}
@@ -83,6 +87,36 @@ struct CodexAccountsLayout<Content:View>:View {
             if let notice=engine.codexSessionAttachmentNotice {
                 CodexSessionAttachmentStatus(detail:notice)
             }
+            if !moves.isEmpty || moveError != nil || moveNotice != nil {
+                Divider()
+                VStack(alignment:.leading,spacing:10) {
+                    HStack {
+                        Text("남은 로그인 그룹 이동").font(.callout.weight(.semibold))
+                        Spacer()
+                        Button("다시 확인"){reloadMoves()}.disabled(reconnectingMove != nil)
+                    }
+                    ForEach(moves){move in
+                        VStack(alignment:.leading,spacing:6) {
+                            Text("대화 \(move.conversationCount)개 · "+move.detail).fixedSize(horizontal:false,vertical:true)
+                            Text(move.destinationHome).font(.caption).foregroundStyle(.secondary)
+                                .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+                            if move.canCancel {
+                                Button("이동 준비 취소") {
+                                    do {try engine.cancelCodexSessionMove(id:move.id);moveError=nil;reloadMoves()}
+                                    catch {moveError=error.localizedDescription}
+                                }.disabled(reconnectingMove != nil || engine.codexAccountTransitionBusy)
+                            }
+                            if move.canReconnect {
+                                Button(reconnectingMove==move.id ? "재연결 확인 중…":"목적지로 재연결"){reconnect(move)}
+                                    .disabled(reconnectingMove != nil || engine.codexAccountTransitionBusy || loginBusy)
+                            }
+                        }
+                    }
+                    if reconnectingMove != nil {ProgressView().controlSize(.small).accessibilityLabel("그룹 이동 재연결 중")}
+                    if let moveError {Label(moveError,systemImage:"exclamationmark.circle").foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)}
+                    if let moveNotice {Text(moveNotice).font(.caption).fixedSize(horizontal:false,vertical:true)}
+                }
+            }
             Divider()
             CodexAccountTransitionSettings(enabled:engine.codexAccountTransitionEnabled,busy:engine.codexAccountTransitionBusy,
                 states:engine.codexAccountTransitionStates,notice:engine.codexAccountTransitionNotice,error:error,
@@ -96,7 +130,7 @@ struct CodexAccountsLayout<Content:View>:View {
                     catch {self.error=error.localizedDescription}
                 })
         }.windowUpdates(viewUpdates,sources:[engine.objectWillChange])
-        .task{await reloadGroups()}
+        .task{await reloadGroups();reloadMoves()}
         .onDisappear{groupsRequest=UUID();loadingGroups=false}
         .sheet(isPresented:$newGroup,onDismiss:{focusHome=requestedHome}) {
             CodexNewLoginGroupSheet(create:{name in
@@ -104,6 +138,21 @@ struct CodexAccountsLayout<Content:View>:View {
                 let group=try await engine.createCodexLoginGroup(name:name)
                 await reloadGroups();requestedHome=group.home;newGroup=false
             },cancel:{newGroup=false})
+        }
+    }
+    private func reloadMoves() {
+        do {moves=try engine.codexSessionMoveRecoveries();moveError=nil}
+        catch {moveError=error.localizedDescription}
+    }
+    private func reconnect(_ move:CodexSessionMoveRecovery) {
+        guard reconnectingMove==nil else{return}
+        reconnectingMove=move.id;moveError=nil;moveNotice=nil
+        Task { @MainActor in
+            defer{reconnectingMove=nil}
+            do {
+                let result=try await engine.performCodexSessionMove(id:move.id)
+                moveNotice=result.detail;reloadMoves()
+            }catch {moveError=error.localizedDescription}
         }
     }
     private func reloadGroups() async {

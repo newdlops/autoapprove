@@ -12,7 +12,7 @@ await mkdir(out,{recursive:true});
 for(const arch of arches) {
  const name=`AutoApprove-${release.version}-build${release.build}-macOS-${arch}.zip`,file=path.join(out,name);
  execFileSync('/usr/bin/ditto',['-c','-k','--norsrc','--keepParent',app,file],{stdio:'inherit'});
- const bytes=await readFile(file);if(!bytes.length||bytes.length>32*1024*1024)throw Error('Update archive exceeds its size limit');
+ const bytes=await readFile(file);if(!bytes.length||bytes.length>256*1024*1024)throw Error('Update archive exceeds its size limit');
  const sha256=createHash('sha256').update(bytes).digest('hex');await writeFile(file+'.sha256',`${sha256}  ${name}\n`);
  console.log(JSON.stringify({name,bytes:bytes.length,sha256}));
 }

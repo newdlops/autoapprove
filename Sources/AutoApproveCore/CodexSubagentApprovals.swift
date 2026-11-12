@@ -148,7 +148,8 @@ enum CodexSubagentApprovals {
               root["parentThreadId"] == nil || root["parentThreadId"] is NSNull else {
             throw AppError.message("연결한 부모 대화가 바뀌었습니다.")
         }
-        return try activity(root: target.threadID, rows: loadedThreads(connection))
+        let loaded=Set(try loadedThreadIDs(connection))
+        return try activity(root: target.threadID, rows: currentSubtree(connection,root:root,loaded:loaded))
     }
     static func children(target: CodexReplyTarget, cwd: String) throws -> [CodexSubagentRow] {
         try readActivity(target: target, cwd: cwd).children.map { CodexSubagentRow(id: $0.id, title: $0.title, status: $0.phase.title) }
@@ -174,6 +175,14 @@ enum CodexSubagentApprovals {
     }
 
     static func loadedThreads(_ connection: CodexQueueConnection) throws -> [JSONObject] {
+        try loadedThreadIDs(connection).map { id in
+            let response = try connection.request("thread/read", ["threadId": id, "includeTurns": false])
+            guard let row = response["thread"] as? JSONObject, row["id"] as? String == id else { throw AppError.message("대화 식별자가 바뀌었습니다.") }
+            return row
+        }
+    }
+
+    static func loadedThreadIDs(_ connection:CodexQueueConnection)throws->[String] {
         var ids: [String] = [], cursor: String?, cursors = Set<String>()
         repeat {
             var params: JSONObject = ["limit": 100]
@@ -185,10 +194,57 @@ enum CodexSubagentApprovals {
             guard ids.count <= 500, Set(ids).count == ids.count,
                   cursor == nil || cursors.insert(cursor!).inserted else { throw AppError.message("실행 중인 대화 목록 한도를 초과했습니다.") }
         } while cursor != nil
-        return try ids.map { id in
-            let response = try connection.request("thread/read", ["threadId": id, "includeTurns": false])
-            guard let row = response["thread"] as? JSONObject, row["id"] as? String == id else { throw AppError.message("대화 식별자가 바뀌었습니다.") }
-            return row
+        return ids
+    }
+
+    /// Read just the root and its stored descendants. The previous status path
+    /// read every loaded thread one RPC at a time, which delayed updates on
+    /// servers containing many unrelated conversations.
+    static func subtree(_ connection:CodexQueueConnection,root:JSONObject)throws->[JSONObject] {
+        guard let rootID=root["id"] as? String,UUID(uuidString:rootID) != nil else{throw AppError.message("부모 대화를 확인하지 못했습니다.")}
+        var rows=[root],ids:Set<String>=[rootID],cursor:String?,cursors=Set<String>()
+        repeat {
+            var params:JSONObject=["ancestorThreadId":rootID,"archived":false,"limit":100,"useStateDbOnly":true]
+            if let cursor{params["cursor"]=cursor}
+            let page:JSONObject
+            do {page=try connection.request("thread/list",params,classifyError:true)}
+            catch let error as CodexControlRPCError where [-32601,-32602].contains(error.code) {
+                // Older compatible servers may not expose the experimental
+                // relation filter; retain their previous complete loaded scan.
+                var legacy=try loadedThreads(connection)
+                if !legacy.contains(where:{$0["id"] as? String==rootID}){legacy.append(root)}
+                return legacy
+            }
+            guard let data=page["data"] as? [JSONObject],data.count<=100 else{throw AppError.message("서브에이전트 목록을 확인하지 못했습니다.")}
+            for row in data {
+                guard let id=row["id"] as? String,UUID(uuidString:id)?.uuidString.lowercased()==id,ids.insert(id).inserted,
+                      let parent=row["parentThreadId"] as? String,UUID(uuidString:parent) != nil,parent != id,
+                      (row["status"] as? JSONObject)?["type"] as? String != nil else {
+                    throw AppError.message("서브에이전트의 부모·실행 상태를 확인하지 못했습니다.")
+                }
+                rows.append(row)
+                guard rows.count<=4097 else{throw AppError.message("서브에이전트가 너무 많아 상태를 갱신하지 못했습니다.")}
+            }
+            cursor=page["nextCursor"] as? String
+            guard cursor==nil || cursors.insert(cursor!).inserted else{throw AppError.message("서브에이전트 페이지 연결이 잘못되었습니다.")}
+        }while cursor != nil
+        return rows
+    }
+
+    /// `thread/list` with the state DB enabled is a fast source of ancestry,
+    /// but its status can lag a live subagent turn. Refresh only loaded rows in
+    /// this root's subtree; unrelated conversations stay out of the poll.
+    static func currentSubtree(_ connection:CodexQueueConnection,root:JSONObject,loaded:Set<String>)throws->[JSONObject] {
+        let rows=try subtree(connection,root:root)
+        return try rows.map { stored in
+            guard let id=stored["id"] as? String,loaded.contains(id) else{return stored}
+            let response=try connection.request("thread/read",["threadId":id,"includeTurns":false])
+            guard let live=response["thread"] as? JSONObject,live["id"] as? String==id,
+                  live["cwd"] as? String==stored["cwd"] as? String,
+                  live["parentThreadId"] as? String==stored["parentThreadId"] as? String else {
+                throw AppError.message("서브에이전트의 최신 상태를 확인하는 동안 부모 연결이 바뀌었습니다.")
+            }
+            return live
         }
     }
 
@@ -217,7 +273,8 @@ enum CodexSubagentApprovals {
         let root = try connection.request("thread/read", ["threadId": target.threadID, "includeTurns": false])["thread"] as? JSONObject
         guard let root, root["id"] as? String == target.threadID, root["cwd"] as? String == cwd,
               root["parentThreadId"] == nil || root["parentThreadId"] is NSNull else { throw AppError.message("연결한 부모 대화가 바뀌었습니다. 다시 연결해주세요.") }
-        let rows = try loadedThreads(connection)
+        let loaded=Set(try loadedThreadIDs(connection))
+        let rows = try currentSubtree(connection,root:root,loaded:loaded)
         await observed(try activity(root: target.threadID, rows: rows))
         guard approvalsEnabled else { return (0, 0) }
         let owned = ownedThreads(root: target.threadID, rows: rows)
@@ -225,7 +282,7 @@ enum CodexSubagentApprovals {
         // a provider/system error. It does not authorize approval mutations.
         guard owned[target.threadID] != nil else { return (0,0) }
         let waiting = owned.filter {
-            (($0.value["status"] as? JSONObject)?["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
+            loaded.contains($0.key) && (($0.value["status"] as? JSONObject)?["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
         }
         var attached: [String: JSONObject] = [:]
         for (id, metadata) in waiting {

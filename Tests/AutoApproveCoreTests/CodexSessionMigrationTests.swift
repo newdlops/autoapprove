@@ -1,6 +1,7 @@
 #if DEBUG
 import Foundation
 import Darwin
+import CSQLite
 @testable import AutoApproveCore
 
 @MainActor private final class SessionMigrationFixture {
@@ -11,7 +12,22 @@ import Darwin
     var reads=0
     var mutate:((Int)->Void)?
     init() throws {
-        for name in ["a","b"] {try FileManager.default.createDirectory(at:root.appendingPathComponent(name),withIntermediateDirectories:true)}
+        let fixture=URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("fixtures/codex-goals-0.166.sql")
+        let schema=try String(contentsOf:fixture,encoding:.utf8)
+        for name in ["a","b"] {
+            let home=root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at:home,withIntermediateDirectories:true)
+            var db:OpaquePointer?
+            guard sqlite3_open(home.appendingPathComponent("goals_1.sqlite").path,&db)==SQLITE_OK else {
+                if let db{sqlite3_close(db)}
+                throw AppError.message("Migration fixture Goal database open failed")
+            }
+            defer{sqlite3_close(db)}
+            guard sqlite3_exec(db,schema,nil,nil,nil)==SQLITE_OK else {
+                throw AppError.message("Migration fixture Goal schema setup failed")
+            }
+        }
         let source=try endpoint("a"),destination=try endpoint("b")
         let selected=CodexMigrationClient(identity:.init(pid:41,started:"owned-41",tty:"/dev/ttys971"),home:source.home,threadIDs:[a,b])
         let other=CodexMigrationClient(identity:.init(pid:42,started:"owned-42",tty:"/dev/ttys972"),home:source.home,threadIDs:[d])
@@ -26,8 +42,8 @@ import Darwin
     func endpoint(_ name:String)throws->CodexMigrationEndpoint {
         let home=root.appendingPathComponent(name).path;var info=stat();try expectEqual(lstat(home,&info),0)
         return .init(home:home,physicalHomeID:"\(info.st_dev):\(info.st_ino)",serverID:"daemon-"+name,socketID:"socket-"+name,
-                     credentialStoreID:"file-backend-"+name,cliIdentity:"owned-cli-"+name,cliVersion:"0.166.0",
-                     account:.init(subjectID:"user-"+name,sessionID:"login-"+name,workspaceID:"workspace-"+name))
+                     cliIdentity:"owned-cli-"+name,cliVersion:"0.166.0",
+                     account:.init(provider:"ChatGPT",email:name+"@example.test",authenticated:true))
     }
     var request:CodexSessionMigrationRequest {.init(id:UUID().uuidString.lowercased(),source:scene.source,destination:scene.destination,clients:[scene.clients[0]],threads:Array(scene.threads.prefix(2)))}
     var services:CodexSessionMigrationServices {.init(observe:{[unowned self] _ in self.reads+=1;self.mutate?(self.reads);return self.scene})}
@@ -81,6 +97,13 @@ extension ApprovalTests {
         try c.cancel(id:state.request.id)
         try expectEqual(try c.state(id:state.request.id)?.stage,.cancelled)
         try expect(try journal.activeRecords().isEmpty)
+        // A TUI can reference only the root while its stored child belongs to
+        // the same migration. Do not invent a direct TUI reference to that child.
+        f.scene.clients[0].threadIDs=[f.a]
+        let withDescendant=try await c.prepare(f.request)
+        try expectEqual(withDescendant.request.clients[0].threadIDs,[f.a])
+        try expectEqual(Set(withDescendant.request.threads.map(\.id)),Set([f.a,f.b]))
+        try c.cancel(id:withDescendant.request.id)
     }
     @MainActor func testSessionMigrationRejectsSharedWritersAndIncompleteChildren() async throws {
         for scenario in ["source-writer","destination-writer","missing-child","unowned-child","incomplete-clients","incomplete-threads","duplicate-client","duplicate-thread","missing-selected","cyclic-family"] {
@@ -123,15 +146,13 @@ extension ApprovalTests {
         }
     }
     @MainActor func testSessionMigrationRejectsChangedIdentityAndSharedBackends() async throws {
-        for scenario in ["daemon","socket","credentials","account","signed-out","version","home-id","client-id","goal"] {
+        for scenario in ["daemon","socket","signed-out","version","home-id","client-id","goal"] {
             let f=try SessionMigrationFixture(),journal=try f.journal()
             var request=f.request
             switch scenario {
             case "daemon":f.scene.destination.serverID=f.scene.source.serverID
             case "socket":f.scene.destination.socketID=f.scene.source.socketID
-            case "credentials":f.scene.destination.credentialStoreID=f.scene.source.credentialStoreID
-            case "account":f.scene.destination.account.workspaceID="different-workspace"
-            case "signed-out":f.scene.destination.account.sessionID=""
+            case "signed-out":f.scene.destination.account.authenticated=false
             case "version":f.scene.destination.cliVersion="0.167.0"
             case "home-id":f.scene.source.physicalHomeID="replaced-home"
             case "client-id":f.scene.clients[0].identity.started="reused-pid"
@@ -139,7 +160,7 @@ extension ApprovalTests {
             }
             // Also reject when the caller itself proposes these invalid
             // backends; a mere request/observation equality check is insufficient.
-            if ["daemon","socket","credentials","signed-out","version","home-id"].contains(scenario) {request=f.request}
+            if ["daemon","socket","signed-out","version","home-id"].contains(scenario) {request=f.request}
             let c=CodexSessionMigrationCoordinator(journal:journal,services:f.services)
             var rejected=false;do{_ = try await c.prepare(request)}catch{rejected=true}
             try expect(rejected,"Identity changed before reservation: "+scenario)
@@ -147,7 +168,7 @@ extension ApprovalTests {
         }
     }
     @MainActor func testSessionMigrationRechecksAfterDurableReservationAndReleasesOnChange() async throws {
-        for scenario in ["draft","membership","goal","account"] {
+        for scenario in ["draft","membership","goal","signed-out"] {
             let f=try SessionMigrationFixture(),journal=try f.journal(),request=f.request
             let original=f.scene!
             f.mutate={read in if read==2 {
@@ -155,7 +176,7 @@ extension ApprovalTests {
                 case "draft":f.scene.clients[0].hasDraft=true
                 case "membership":f.scene.clients[0].threadIDs.append(f.d)
                 case "goal":f.scene.threads[0].goalRevision="replacement-goal"
-                default:f.scene.destination.account.sessionID="replacement-login"
+                default:f.scene.destination.account.authenticated=false
                 }
             }}
             let c=CodexSessionMigrationCoordinator(journal:journal,services:f.services)

@@ -13,7 +13,7 @@ public struct CodexSubagentGoal:Codable,Equatable,Sendable {
     }
 }
 
-public enum CodexSubagentGoalAction:String,Codable,Sendable {case pause,resume}
+public enum CodexSubagentGoalAction:String,Codable,Sendable {case pause,resume,wait}
 
 /// Only the opt-in managed native API can mutate a v2 child Goal. There is no
 /// ordinary goal/set fallback, terminal injection, new Goal or cold resume.
@@ -31,7 +31,9 @@ public enum CodexSubagentGoalTransport {
         try await Task.detached(priority:.utility) {
             guard expected.rootThreadID==target.threadID,let goal=expected.goal,let instance=goal.instanceID,
                   goal.threadId==expected.threadID,
-                  action == .pause ? goal.status == .active:goal.status == .paused else {
+                  action == .pause ? goal.status == .active:
+                    action == .resume ? goal.status == .paused:
+                      goal.status == .paused && expected.executionState != "idle" && expected.turnID != nil else {
                 throw RemoteHTTPError(409,"현재 서브에이전트 Goal의 일시정지·재개 상태를 다시 확인해주세요.",diagnostics:["delivery":"not_started"])
             }
             let connection=try CodexQueueConnection(home:target.home,captureApprovals:true)
@@ -42,16 +44,23 @@ public enum CodexSubagentGoalTransport {
             }
             try await authorize()
             try Task.checkCancellation()
+            if action == .wait {
+                guard try await waitUntilIdle(connection,childID:expected.threadID,turnID:expected.turnID!,attempts:60) else {
+                    throw RemoteHTTPError(408,"서브에이전트 작업이 아직 끝나지 않았습니다. 상태를 새로 고친 뒤 다시 확인해주세요.",diagnostics:["delivery":"not_started"])
+                }
+                return try read(connection,target:target,childID:expected.threadID,parentID:parent)
+            }
             let identity:JSONObject=["goalId":instance,"objective":goal.objective,"status":goal.status.rawValue,
                                      "tokenBudget":goal.tokenBudget.map{$0 as Any} ?? NSNull()]
             let result=try connection.request("autoapprove/thread/goal/control",[
                 "threadId":expected.threadID,"parentThreadId":parent,"expected":identity,"action":action.rawValue
             ],classifyError:true)
+            let expectedStatus:CodexGoal.Status = action == .resume ? .active:.paused
             guard result["goalId"] as? String==instance,
                   var changed=try CodexGoalTransport.decode(result,threadID:expected.threadID),
                   changed.objective==goal.objective,changed.tokenBudget==goal.tokenBudget,changed.createdAt==goal.createdAt,
                   changed.tokensUsed>=goal.tokensUsed,changed.timeUsedSeconds>=goal.timeUsedSeconds,
-                  changed.status==(action == .pause ? .paused:.active) else {
+                  changed.status==expectedStatus else {
                 throw RemoteHTTPError(409,"Goal 변경 결과를 확인하지 못했습니다. 같은 요청을 다시 보내지 말고 상태를 새로 확인해주세요.",diagnostics:["delivery":"unknown"])
             }
             changed.instanceID=instance
@@ -61,21 +70,35 @@ public enum CodexSubagentGoalTransport {
                 let current=try execution(connection,childID:expected.threadID)
                 if current.turn==observedTurn {
                     _ = try connection.request("turn/interrupt",["threadId":expected.threadID,"turnId":observedTurn],classifyError:true)
-                    for _ in 0..<20 {
-                        if try execution(connection,childID:expected.threadID).state=="idle" {break}
-                        try await Task.sleep(for:.milliseconds(100))
-                    }
+                    _ = try await waitUntilIdle(connection,childID:expected.threadID,turnID:observedTurn,attempts:30)
                 }
             }
             return try read(connection,target:target,childID:expected.threadID,parentID:parent)
         }.value
     }
 
+    @discardableResult private static func waitUntilIdle(_ connection:CodexQueueConnection,childID:String,
+                                                           turnID:String,attempts:Int) async throws -> Bool {
+        for attempt in 0..<attempts {
+            try Task.checkCancellation()
+            let current=try execution(connection,childID:childID)
+            if current.state=="idle" {return true}
+            if current.turn != turnID {return false}
+            if attempt+1<attempts {try await Task.sleep(for:.seconds(1))}
+        }
+        return false
+    }
+
     private static func validate(_ connection:CodexQueueConnection,target:CodexReplyTarget,cwd:String,childID:String) throws ->String {
         guard target.queueAvailable,UUID(uuidString:target.threadID) != nil,UUID(uuidString:childID) != nil,childID != target.threadID else {
             throw RemoteHTTPError(409,"연결된 부모 대화의 서브에이전트를 선택해주세요.",diagnostics:["delivery":"not_started"])
         }
-        let rows=try CodexSubagentApprovals.loadedThreads(connection)
+        let root=try connection.request("thread/read",["threadId":target.threadID,"includeTurns":false])["thread"] as? JSONObject
+        guard let root,root["id"] as? String==target.threadID,root["cwd"] as? String==cwd,
+              root["parentThreadId"]==nil || root["parentThreadId"] is NSNull else{
+            throw RemoteHTTPError(409,"부모 대화의 경로와 연결이 바뀌었습니다.",diagnostics:["delivery":"not_started"])
+        }
+        let rows=try CodexSubagentApprovals.subtree(connection,root:root)
         let owned=CodexSubagentApprovals.ownedThreads(root:target.threadID,rows:rows,includeInactive:true)
         guard owned[target.threadID]?["cwd"] as? String==cwd,let child=owned[childID],
               let parent=child["parentThreadId"] as? String,owned[parent] != nil,

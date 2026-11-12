@@ -21,10 +21,13 @@ import AutoApproveCore
     }
     func change(_ expected:CodexSubagentGoal,_ action:CodexSubagentGoalAction,_ request:UUID) async throws ->CodexSubagentGoalReceipt {
         writes+=1;try await Task.sleep(for:.milliseconds(1000))
-        value.goal?.status=action == .pause ? .paused:.active;value.executionState=action == .pause ? "idle":"active"
-        value.turnID=action == .pause ? nil:"resumed"
+        value.goal?.status=action == .resume ? .active:.paused
+        value.executionState=action == .pause || action == .wait ? "idle":"active"
+        value.turnID=action == .pause || action == .wait ? nil:"resumed"
         if mode=="응답 유실" {return .init(requestID:request,binding:"preview",phase:.unknown,detail:"요청 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 현재 상태를 새로 확인해주세요.")}
-        return .init(requestID:request,binding:"preview",phase:.confirmed,result:value,detail:action == .pause ? "Goal과 현재 작업을 일시정지했습니다.":"Goal을 재개했습니다.")
+        let detail:String
+        switch action {case .pause:detail="Goal과 현재 작업을 일시정지했습니다.";case .resume:detail="Goal을 재개했습니다.";case .wait:detail="현재 작업 종료를 확인했습니다."}
+        return .init(requestID:request,binding:"preview",phase:.confirmed,result:value,detail:detail)
     }
 }
 

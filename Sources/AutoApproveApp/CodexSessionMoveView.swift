@@ -7,8 +7,8 @@ private struct CodexMoveDestination:Identifiable {
     var id:String {target.home}
 }
 
-/// Destination preparation only until the verified native move adapter is
-/// connected. Selecting a group never changes the session's current binding.
+/// Prepares the destination, reviews the stored conversation scope, and runs
+/// the engine's journaled move plus original-terminal reconnection.
 @MainActor struct CodexSessionMoveView:View {
     let engine:ApprovalEngine
     let source:CodexSessionAccount
@@ -20,6 +20,10 @@ private struct CodexMoveDestination:Identifiable {
     @State private var busy=false
     @State private var held=false
     @State private var loginBusy=false
+    @State private var plan:CodexSessionMovePlan?
+    @State private var moving=false
+    @State private var attempted=false
+    @State private var notice:String?
     private var destination:CodexMoveDestination? {destinations.first{$0.id==selected}}
     var body:some View {
         VStack(alignment:.leading,spacing:0) {
@@ -27,6 +31,7 @@ private struct CodexMoveDestination:Identifiable {
                 Text("로그인 그룹 변경").font(.title2.weight(.semibold))
                 Spacer()
                 Button("닫기",action:close).keyboardShortcut(.cancelAction)
+                    .disabled(moving || plan != nil && !attempted)
             }.padding(24)
             Divider()
             ScrollView {
@@ -48,7 +53,7 @@ private struct CodexMoveDestination:Identifiable {
                             Text("옮길 로그인 그룹").font(.callout.weight(.semibold))
                             Spacer()
                             Button("새로 확인"){Task{await load()}}
-                                .disabled(loading || loginBusy || busy || held)
+                                .disabled(loading || loginBusy || busy || held || plan != nil || moving)
                         }
                         if loading {ProgressView("로그인 그룹 확인 중…").controlSize(.small)}
                         if let error {
@@ -64,7 +69,7 @@ private struct CodexMoveDestination:Identifiable {
                                 ForEach(destinations){value in
                                     Text(value.name).lineLimit(1).help(value.target.home).tag(Optional(value.id))
                                 }
-                            }.disabled(loading || busy || held || loginBusy)
+                            }.disabled(loading || busy || held || loginBusy || plan != nil || moving)
                         }
                     }
                     if let destination {
@@ -84,24 +89,68 @@ private struct CodexMoveDestination:Identifiable {
                                 homeNames:[destination.target.home:destination.name],
                                 onLoginActivityChanged:{loginBusy=$0})
                                 .id(destination.id)
+                                .disabled(plan != nil || moving)
                         }
                     }
                     Divider()
                     VStack(alignment:.leading,spacing:8) {
-                        Label("대화 이동 준비 중",systemImage:"info.circle").font(.callout.weight(.semibold))
-                        Text("현재 버전에서는 대상 그룹의 로그인과 서버를 준비할 수 있습니다. 기존 대화 이동은 아직 사용할 수 없습니다.")
+                        Label("기존 대화 이동",systemImage:"arrow.right.arrow.left").font(.callout.weight(.semibold))
+                        Text("이 세션의 대화와 하위 서브에이전트를 선택한 로그인 그룹으로 옮긴 뒤, 원래 터미널에서 같은 대화를 다시 연결합니다. 진행 중인 Goal·작업·작성 중 입력은 먼저 정리해주세요.")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-                        Button("이 그룹으로 대화 이동"){}.disabled(true)
-                            .help("기존 대화 이동 기능을 준비 중입니다.")
+                        if let plan {
+                            Text("이동할 대화 \(plan.conversationCount)개 · 서브에이전트 포함")
+                                .font(.callout.weight(.medium)).fixedSize(horizontal:false,vertical:true)
+                            if !attempted {
+                                HStack {
+                                    Button("이 그룹으로 이동하고 재연결"){performMove(plan)}
+                                        .disabled(moving || busy || held || loginBusy)
+                                    Button("준비 취소"){
+                                        do {try engine.cancelCodexSessionMove(id:plan.id);self.plan=nil;error=nil}
+                                        catch {self.error=error.localizedDescription}
+                                    }.disabled(moving)
+                                }
+                            }
+                        }else if notice == nil {
+                            Button("이동 범위 확인"){prepareMove()}
+                                .disabled(destination == nil || loading || loginBusy || busy || held || moving)
+                        }
+                        if moving {ProgressView(attempted ? "대화 이동·재연결 중…":"이동할 대화 확인 중…").controlSize(.small)}
+                        if let notice {Text(notice).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
                     }
                 }.padding(24).frame(maxWidth:.infinity,alignment:.leading)
             }
         }.font(.callout).frame(width:600,height:660)
+            .interactiveDismissDisabled(moving || plan != nil && !attempted)
             .task{await load()}
             .onReceive(engine.$codexAccountTransitionBusy){busy=$0}
             .onReceive(engine.$codexAccountTransitionStates){states in
                 held=states.values.contains(where:\.held)
             }
+    }
+    private func prepareMove() {
+        guard let destination,!moving else{return}
+        moving=true;error=nil;notice=nil
+        Task { @MainActor in
+            defer{moving=false}
+            do {plan=try await engine.prepareCodexSessionMove(sessionID:source.sessionID,destinationHome:destination.id)}
+            catch {self.error=error.localizedDescription}
+        }
+    }
+    private func performMove(_ plan:CodexSessionMovePlan) {
+        guard !moving,!attempted else{return}
+        moving=true;attempted=true;error=nil
+        Task { @MainActor in
+            defer{moving=false}
+            do {
+                let result=try await engine.performCodexSessionMove(id:plan.id)
+                notice=result.detail
+                if result.phase == .connected {self.plan=nil}
+                else {error="이동 후 연결 확인이 필요합니다. "+result.detail}
+            }catch {
+                self.error=error.localizedDescription
+                notice="이동 결과를 확인해야 합니다. 같은 요청을 자동으로 반복하지 않습니다."
+            }
+        }
     }
     private func load() async {
         guard !loginBusy else{return}

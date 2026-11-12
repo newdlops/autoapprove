@@ -1,5 +1,24 @@
 import Foundation
 
+public struct CodexSessionMovePlan:Identifiable,Equatable,Sendable {
+    public let id:String
+    public let sourceHome:String
+    public let destinationHome:String
+    public let conversationCount:Int
+    init(_ state:CodexSessionMigrationState) {
+        id=state.request.id;sourceHome=state.request.source.home
+        destinationHome=state.request.destination.home;conversationCount=state.request.threads.count
+    }
+}
+public struct CodexSessionMoveRecovery:Identifiable,Equatable,Sendable {
+    public let id:String
+    public let destinationHome:String
+    public let conversationCount:Int
+    public let detail:String
+    public let canCancel:Bool
+    public let canReconnect:Bool
+}
+
 public struct CodexServerAccountIdentity: Equatable, Sendable {
     public var provider: String
     public var email: String?
@@ -47,4 +66,21 @@ public struct CodexSessionAccount: Equatable, Sendable {
         self.loginGroupName=loginGroupName;self.serverPID=serverPID
     }
     public var individual:Bool {sharedSessions==1}
+}
+
+/// A kernel-witnessed TUI-to-app-server connection for one live Codex session.
+public struct CodexSessionServerLink:Equatable,Sendable {
+    public let sessionID:String
+    public let sessionPID:Int32
+    public let serverPID:Int32
+    public let serverGeneration:String
+    public let connectionID:UInt64
+    public let logicalBackendID:String
+    public let clientCount:Int
+    public let serverConnectionCount:Int
+    public init(sessionID:String,sessionPID:Int32,serverPID:Int32,serverGeneration:String,connectionID:UInt64,logicalBackendID:String,clientCount:Int,serverConnectionCount:Int) {
+        self.sessionID=sessionID;self.sessionPID=sessionPID;self.serverPID=serverPID
+        self.serverGeneration=serverGeneration;self.connectionID=connectionID;self.logicalBackendID=logicalBackendID
+        self.clientCount=clientCount;self.serverConnectionCount=serverConnectionCount
+    }
 }
