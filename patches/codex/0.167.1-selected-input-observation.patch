@@ -778,7 +778,7 @@
 +}
 --- /dev/null
 +++ b/app-server/src/selected_transition.rs
-@@ -0,0 +1,765 @@
+@@ -0,0 +1,802 @@
 +//! Optional local selected-input lease. Does not attest client ownership or
 +//! authorize migration. Enabled only by an explicit feature and local socket path.
 +use crate::message_processor::NativeSelectedRuntime;
@@ -1056,6 +1056,7 @@
 +    let mut shutdown: Option<crate::message_processor::NativeSelectedShutdown> = None;
 +    let mut journal_lock = None;
 +    let mut retirement: Option<crate::request_processors::NativeSelectedRetirement> = None;
++    let mut incoming: Option<crate::request_processors::NativeSelectedIncoming> = None;
 +    let mut deadline = Instant::now() + ttl;
 +    tokio::time::timeout_at(
 +        deadline,
@@ -1091,6 +1092,7 @@
 +        let mut journal_reply = None;
 +        let mut shutdown_reply = None;
 +        let mut retirement_reply = None;
++        let mut incoming_reply = None;
 +        if let Some(lock) = &journal_lock {
 +            crate::selected_journal_lock::NativeJournalLock::verify_kernel(lock)?;
 +        }
@@ -1204,6 +1206,38 @@
 +                        }
 +                    })?);
 +            }
++            "incoming-prepare" => {
++                if incoming.is_some() || retirement.is_some() {
++                    return Err(io::ErrorKind::AlreadyExists.into());
++                }
++                let runtime = runtime.as_ref().ok_or(io::ErrorKind::Unsupported)?;
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                let proof = runtime.prepare_incoming(&pause, &threads, lock).await?;
++                incoming_reply = Some(proof.snapshot());
++                incoming = Some(proof);
++            }
++            "incoming-commit" => {
++                let lock = journal_lock.as_ref().ok_or(io::ErrorKind::InvalidInput)?;
++                let proof = incoming.as_mut().ok_or(io::ErrorKind::InvalidInput)?;
++                if Instant::now() >= deadline || !reader.buffer().is_empty() {
++                    return Err(io::ErrorKind::ConnectionAborted.into());
++                }
++                let mut byte = [0u8; 1];
++                match reader.get_ref().as_ref().try_read(&mut byte) {
++                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
++                    _ => return Err(io::ErrorKind::ConnectionAborted.into()),
++                }
++                incoming_reply = Some(proof.commit(lock, &admission, &pause, &threads, || {
++                    if Instant::now() >= deadline || !reader.buffer().is_empty() {
++                        return Err(io::ErrorKind::ConnectionAborted.into());
++                    }
++                    let mut byte = [0u8; 1];
++                    match reader.get_ref().as_ref().try_read(&mut byte) {
++                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
++                        _ => Err(io::ErrorKind::ConnectionAborted.into()),
++                    }
++                })?);
++            }
 +            "shutdown-status" => {
 +                shutdown_reply = Some(shutdown.as_ref().ok_or(io::ErrorKind::NotFound)?.snapshot());
 +            }
@@ -1243,6 +1277,9 @@
 +        }
 +        if let Some(value) = retirement_reply {
 +            reply["retirement"] = value;
++        }
++        if let Some(value) = incoming_reply {
++            reply["incoming"] = value;
 +        }
 +        if let Some(status) = shutdown_reply {
 +            reply["shutdown"] = status;
@@ -1554,7 +1591,7 @@
      user_verification: Arc<crate::user_verification::Service>,
      outgoing: Arc<OutgoingMessageSender>,
      startup_warnings: StartupWarnings,
-@@ -177,6 +178,184 @@
+@@ -177,6 +178,194 @@
      turn_processor: TurnRequestProcessor,
      windows_sandbox_processor: WindowsSandboxRequestProcessor,
      request_serialization_queues: RequestSerializationQueues,
@@ -1736,10 +1773,20 @@
 +            .native_prepare_retirement(&self.admission, pause, ids, journal)
 +            .await
 +    }
++    pub(crate) async fn prepare_incoming(
++        &self,
++        pause: &crate::turn_admission::SelectedAdmissionPause,
++        ids: &std::collections::HashSet<codex_protocol::ThreadId>,
++        journal: &crate::selected_journal_lock::NativeJournalLock,
++    ) -> std::io::Result<crate::request_processors::NativeSelectedIncoming> {
++        self.threads
++            .native_prepare_incoming(&self.admission, pause, ids, &self.queues, journal)
++            .await
++    }
  }
  
  #[derive(Debug)]
-@@ -336,7 +515,7 @@
+@@ -336,7 +525,7 @@
              ),
          );
          let goal_service = Arc::new(GoalService::new());
@@ -1748,7 +1795,7 @@
          let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
          let extension_event_sink =
              app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
-@@ -543,6 +722,7 @@
+@@ -543,6 +732,7 @@
              config_warnings.clone(),
              sample_responses,
          );
@@ -1756,7 +1803,7 @@
          let turn_processor = TurnRequestProcessor::new(
              auth_manager,
              Arc::clone(&thread_manager),
-@@ -612,6 +792,7 @@
+@@ -612,6 +802,7 @@
  
          Self {
              turn_admission,
@@ -1764,7 +1811,7 @@
              user_verification,
              outgoing,
              startup_warnings: StartupWarnings {
-@@ -644,6 +825,22 @@
+@@ -644,6 +835,22 @@
              turn_processor,
              windows_sandbox_processor,
              request_serialization_queues,
@@ -1787,7 +1834,7 @@
          }
      }
  
-@@ -1018,6 +1215,9 @@
+@@ -1018,6 +1225,9 @@
          {
              return Err(invalid_request(experimental_required_message(reason)));
          }
@@ -1797,7 +1844,7 @@
          let connection_id = connection_request_id.connection_id;
          self.initialize_processor.track_initialized_request(
              connection_id,
-@@ -1065,6 +1265,7 @@
+@@ -1065,6 +1275,7 @@
          let request = QueuedInitializedRequest::new(
              rpc_gate,
              async move {
@@ -1805,7 +1852,7 @@
                  let _turn_admission = turn_admission;
                  // Runtime changes already admitted before drain finish normally. Turn work
                  // still waiting in serialization must observe the newly closed gate.
-@@ -1406,10 +1607,14 @@
+@@ -1406,10 +1617,14 @@
                      .await
              }
              ClientRequest::AutoapproveGoalRead { params, .. } => {
@@ -6663,10 +6710,12 @@
  use tracing::info;
  use tracing::warn;
  use uuid::Uuid;
-@@ -599,6 +598,8 @@
+@@ -599,6 +598,10 @@
  pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
  pub(crate) use search::SearchRequestProcessor;
  pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++pub(crate) use thread_processor::NativeSelectedIncoming;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +pub(crate) use thread_processor::NativeSelectedRetirement;
  pub(crate) use thread_processor::ThreadRequestProcessor;
@@ -6674,7 +6723,7 @@
  pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 --- a/app-server/src/request_processors/thread_processor.rs
 +++ b/app-server/src/request_processors/thread_processor.rs
-@@ -5,6 +5,24 @@
+@@ -5,6 +5,29 @@
  mod daemon_snapshot;
  
  mod workspace_switching;
@@ -6689,17 +6738,22 @@
 +#[path = "selected_cohort.rs"]
 +mod selected_cohort;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++#[path = "selected_incoming.rs"]
++mod selected_incoming;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +#[path = "selected_retirement.rs"]
 +mod selected_retirement;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +#[path = "selected_shutdown.rs"]
 +mod selected_shutdown;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++pub(crate) use selected_incoming::NativeSelectedIncoming;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +pub(crate) use selected_retirement::NativeSelectedRetirement;
  
  use super::persisted_resume_settings::PersistedResumeSettings;
  use super::persisted_resume_settings::latest_owned_thread_settings;
-@@ -510,6 +528,8 @@
+@@ -510,6 +533,8 @@
      pub(super) state_db: Option<StateDbHandle>,
      pub(super) log_db: Option<LogDbLayer>,
      pub(super) background_tasks: TaskTracker,
@@ -6708,7 +6762,7 @@
      pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
      pub(super) skills_watcher: Arc<SkillsWatcher>,
      pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-@@ -534,6 +554,10 @@
+@@ -534,6 +559,10 @@
  }
  
  impl ThreadRequestProcessor {
@@ -6719,7 +6773,7 @@
      #[allow(clippy::too_many_arguments)]
      pub(crate) fn new(
          auth_manager: Arc<AuthManager>,
-@@ -571,6 +595,7 @@
+@@ -571,6 +600,7 @@
              state_db,
              log_db,
              background_tasks: TaskTracker::new(),
@@ -6727,7 +6781,7 @@
              sample_responses,
              skills_watcher,
              turn_cost_worker,
-@@ -1175,24 +1200,58 @@
+@@ -1175,24 +1205,58 @@
          thread_id: ThreadId,
          operation: &str,
      ) -> Result<(), JSONRPCErrorError> {
@@ -6996,7 +7050,7 @@
      pub(crate) async fn cancel_requests_for_thread(
 --- /dev/null
 +++ b/app-server/src/selected_journal_lock.rs
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,447 @@
 +//! Kernel-backed journal coordination. Holding this is not a migration grant.
 +use base64::Engine;
 +use codex_core::native_ownership::{BorrowedMigrationLock, borrow_migration_lock};
@@ -7304,6 +7358,61 @@
 +                string(&self.payload, "/request/destination/physicalHomeID")?.to_owned(),
 +            ),
 +        })
++    }
++    pub(crate) fn require_destination(&self) -> io::Result<()> {
++        if self.role != "destination" {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++    pub(crate) fn destination_identity(&self) -> io::Result<&str> {
++        string(&self.payload, "/request/destination/physicalHomeID")
++    }
++    pub(crate) fn incoming_request(
++        &self,
++    ) -> io::Result<(
++        codex_core::native_ownership::store::Request,
++        std::path::PathBuf,
++        String,
++        u64,
++    )> {
++        self.require_destination()?;
++        self.require_phase("incomingAttempted")?;
++        let expected_revision = self
++            .payload
++            .pointer("/execution/ownershipRevision")
++            .and_then(Value::as_u64)
++            .ok_or_else(invalid)?;
++        let source_revision = self
++            .payload
++            .pointer("/execution/sourceRetirementRevision")
++            .and_then(Value::as_u64)
++            .ok_or_else(invalid)?;
++        if source_revision == 0 {
++            return Err(invalid());
++        }
++        let source_home = string(&self.payload, "/request/source/home")?;
++        let source_identity = string(&self.payload, "/request/source/physicalHomeID")?.to_owned();
++        let thread_ids = self
++            .payload
++            .pointer("/request/threads")
++            .and_then(Value::as_array)
++            .ok_or_else(invalid)?
++            .iter()
++            .map(|row| string(row, "/id").map(str::to_owned))
++            .collect::<io::Result<Vec<_>>>()?;
++        Ok((
++            codex_core::native_ownership::store::Request {
++                expected_revision,
++                request_id: self.stamp.request_id.clone(),
++                thread_ids,
++                transition: codex_core::native_ownership::store::Transition::Incoming,
++                destination_home_identity: None,
++            },
++            std::path::PathBuf::from(source_home),
++            source_identity,
++            source_revision,
++        ))
 +    }
 +    pub(crate) fn home(&self) -> &Path {
 +        self.lock.home()
@@ -8070,5 +8179,244 @@
 +        json!(self.files.iter().map(|entry|json!({"threadId":entry.id.to_string(),"relativePath":entry.after,
 +            "fileIdentity":entry.content.identity,"size":entry.content.size,"modifiedSeconds":entry.content.seconds,
 +            "modifiedNanoseconds":entry.content.nanos,"sha256":entry.content.hash})).collect::<Vec<_>>())
++    }
++}
+--- /dev/null
++++ b/app-server/src/request_processors/selected_incoming.rs
+@@ -0,0 +1,236 @@
++//! Destination-side Incoming reservation. This blocks resume while native
++//! archive import and verification are still pending.
++use super::*;
++use crate::selected_journal_lock::{JournalLockRequest, NativeJournalLock};
++use crate::turn_admission::{SelectedAdmissionPause, TurnAdmission};
++use codex_core::native_ownership::store;
++use codex_rollout::{WriterLockCoordinator, WriterLockGuard};
++use serde_json::{Value, json};
++use std::io;
++
++pub(crate) struct NativeSelectedIncoming {
++    home: PathBuf,
++    stamp: JournalLockRequest,
++    request: store::Request,
++    guards: Vec<(ThreadId, WriterLockGuard)>,
++    source_home: PathBuf,
++    source_identity: String,
++    source_revision: u64,
++    attempted: bool,
++}
++
++impl NativeSelectedIncoming {
++    fn verify(
++        &self,
++        journal: &NativeJournalLock,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++    ) -> io::Result<()> {
++        let stamp = journal.stamp();
++        if journal.home() != self.home
++            || stamp.request_id != self.stamp.request_id
++            || stamp.revision != self.stamp.revision
++            || stamp.digest != self.stamp.digest
++            || self.guards.len() != ids.len()
++            || self.guards.iter().any(|(id, _)| !ids.contains(id))
++        {
++            return Err(io::Error::other("Incoming reservation scope changed"));
++        }
++        journal.require_destination()?;
++        journal.require_phase("incomingAttempted")?;
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++
++        let source = store::observe(&self.source_home, &self.request.thread_ids)?;
++        let destination_identity = journal.destination_identity()?;
++        if source.home_identity != self.source_identity
++            || source.revision != self.source_revision
++            || source.threads.iter().any(|row| {
++                row.request_id.as_deref() != Some(self.request.request_id.as_str())
++                    || row.owner_home_identity.as_deref() != Some(destination_identity)
++                    || row.phase != Some("retired")
++            })
++        {
++            return Err(io::Error::other(
++                "Source retirement changed; inspect before importing",
++            ));
++        }
++        let destination = store::observe(&self.home, &self.request.thread_ids)?;
++        if destination.home_identity != destination_identity
++            || destination.revision != self.request.expected_revision
++            || destination.threads.iter().any(|row| {
++                row.request_id.as_deref() == Some(self.request.request_id.as_str())
++                    || row.phase.is_some_and(|phase| phase != "retired")
++            })
++        {
++            return Err(io::Error::other(
++                "Destination ownership changed; observe instead of replaying",
++            ));
++        }
++        for (id, guard) in &self.guards {
++            guard.verify_for(&self.home, *id)?;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn snapshot(&self) -> Value {
++        let mut ids = self.request.thread_ids.clone();
++        ids.sort();
++        json!({"requestId":self.request.request_id,"threadIds":ids,"phase":"writers-held",
++            "ownershipRevision":self.request.expected_revision,"sourceRetirementRevision":self.source_revision,
++            "writersStopped":true,"migrationAuthorized":false})
++    }
++
++    pub(crate) fn commit(
++        &mut self,
++        journal: &NativeJournalLock,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++        mut peer_live: impl FnMut() -> io::Result<()>,
++    ) -> io::Result<Value> {
++        if self.attempted {
++            return Err(io::Error::other(
++                "Incoming was already attempted; observe ownership instead",
++            ));
++        }
++        self.verify(journal, admission, pause, ids)?;
++        peer_live()?;
++        self.attempted = true;
++        let receipt = store::apply(&self.home, &self.request, || {
++            self.verify(journal, admission, pause, ids)?;
++            peer_live()
++        })?;
++        Ok(
++            json!({"requestId":receipt.request_id,"threadIds":receipt.thread_ids,
++            "phase":receipt.phase,"ownershipRevision":receipt.revision,
++            "homeIdentity":receipt.home_identity,"sourceRetirementRevision":self.source_revision,
++            "writersStopped":true,"migrationAuthorized":false}),
++        )
++    }
++}
++
++impl ThreadRequestProcessor {
++    pub(crate) async fn native_prepare_incoming(
++        &self,
++        admission: &TurnAdmission,
++        pause: &SelectedAdmissionPause,
++        ids: &HashSet<ThreadId>,
++        queues: &crate::request_processors::ThreadQueueRequestProcessor,
++        journal: &NativeJournalLock,
++    ) -> io::Result<NativeSelectedIncoming> {
++        let (request, source_home, source_identity, source_revision) =
++            journal.incoming_request()?;
++        let home = self.native_move_home();
++        if journal.home() != home || request.thread_ids.len() != ids.len() {
++            return Err(io::Error::other("Wrong incoming destination or scope"));
++        }
++        pause
++            .verify_scope(admission, ids)
++            .map_err(|error| io::Error::other(error.message))?;
++        let source = store::observe(&source_home, &request.thread_ids)?;
++        let destination_identity = journal.destination_identity()?;
++        if source.home_identity != source_identity
++            || source.revision != source_revision
++            || source.threads.iter().any(|row| {
++                row.request_id.as_deref() != Some(request.request_id.as_str())
++                    || row.owner_home_identity.as_deref() != Some(destination_identity)
++                    || row.phase != Some("retired")
++            })
++        {
++            return Err(io::Error::other("Source retirement is not confirmed"));
++        }
++        let destination = store::observe(&home, &request.thread_ids)?;
++        if destination.home_identity != destination_identity
++            || destination.revision != request.expected_revision
++            || destination.threads.iter().any(|row| {
++                row.request_id.as_deref() == Some(request.request_id.as_str())
++                    || row.phase.is_some_and(|phase| phase != "retired")
++            })
++        {
++            return Err(io::Error::other(
++                "Destination ownership changed; observe instead of replaying",
++            ));
++        }
++
++        let mut sorted = ids.iter().copied().collect::<Vec<_>>();
++        sorted.sort_by_key(ToString::to_string);
++        for id in &sorted {
++            if self
++                .thread_manager
++                .capture_thread_for_client_removal(id)
++                .await
++                .map_err(|error| io::Error::other(error.to_string()))?
++                .is_some()
++            {
++                return Err(io::Error::other(
++                    "Destination runtime must be absent before import",
++                ));
++            }
++            match self
++                .thread_store
++                .read_thread(StoreReadThreadParams {
++                    thread_id: *id,
++                    include_archived: true,
++                    include_history: false,
++                })
++                .await
++            {
++                Err(codex_thread_store::ThreadStoreError::ThreadNotFound { thread_id })
++                    if thread_id == *id => {}
++                Err(error) => {
++                    return Err(io::Error::other(format!(
++                        "Destination thread lookup failed: {error}"
++                    )));
++                }
++                Ok(_) => {
++                    return Err(io::Error::other(
++                        "Destination already contains this conversation",
++                    ));
++                }
++            }
++            let (goal, raw_goal_id) = self
++                .thread_goal_processor
++                .native_move_goal(*id)
++                .await
++                .map_err(|error| io::Error::other(error.message))?;
++            if goal.is_some() || raw_goal_id.is_some() {
++                return Err(io::Error::other(
++                    "Destination already contains a stored Goal",
++                ));
++            }
++            if queues
++                .native_move_has_queued_input(*id)
++                .await
++                .map_err(|error| io::Error::other(error.message))?
++                || self.outgoing.native_move_has_pending_request(*id).await
++            {
++                return Err(io::Error::other(
++                    "Destination has queued or protected input",
++                ));
++            }
++        }
++
++        let coordinator = Arc::new(WriterLockCoordinator::new(&home));
++        let mut guards = Vec::with_capacity(sorted.len());
++        for id in sorted {
++            let guard = coordinator.acquire(id)?;
++            guard.verify_for(&home, id)?;
++            guards.push((id, guard));
++        }
++        let result = NativeSelectedIncoming {
++            home,
++            stamp: journal.stamp(),
++            request,
++            guards,
++            source_home,
++            source_identity,
++            source_revision,
++            attempted: false,
++        };
++        result.verify(journal, admission, pause, ids)?;
++        Ok(result)
 +    }
 +}

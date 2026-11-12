@@ -29,12 +29,12 @@
     {
       "path": "app-server/src/selected_transition.rs",
       "before": null,
-      "after": "503e3f628ab747e267c8c36042f9b077c484bac5f3c722aa6b53deca629c20bb"
+      "after": "4867def60aeb796f54ff92c529ed394f115e9d61eea9b61930c7fc96060ab7cb"
     },
     {
       "path": "app-server/src/message_processor.rs",
       "before": "e8dbc6203f89010631f755fa1b99f9b54c4da4e0835a51ae1a503dda2ba1ce2f",
-      "after": "50a9e122951122823b07133ffdba25ba6f99cc524803c5b6b60c1ef6dd598f9b"
+      "after": "4e9fec2189ea2f3a7005d1d3cc02816b95574fbfb7b4a0730dd0143070caf094"
     },
     {
       "path": "ext/extension-api/src/turn_admission.rs",
@@ -249,12 +249,12 @@
     {
       "path": "app-server/src/request_processors.rs",
       "before": "9bdbcd07e08001c72125e202565cf7537d5fc09702939138d58704084ed8d9fd",
-      "after": "a4d029d234194462be16a1567196102df501bc65f1808a274aee311dd6ce6176"
+      "after": "0e4fb59c41f42d048b955554cd1dbd00ed00c5525f05d13fb6b7c0580b2d995f"
     },
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "6d2b4c475e02dec59eb304d382b2bc029a0cfa7e11b4acf0ca07de97dba9be58"
+      "after": "c5321b1ba876b757115ed2fab400a3cad642b25b57fe04cc8466b0ed5403eec1"
     },
     {
       "path": "core/src/codex_thread.rs",
@@ -289,7 +289,7 @@
     {
       "path": "app-server/src/selected_journal_lock.rs",
       "before": null,
-      "after": "3fa6fb18bfdb1e7f9147ebf4f569c685985740efa59b3d32a86e8b3985ba07ae"
+      "after": "13a42372e664c12d82905cadb5c6a9e04b3cbbf9fa0809d1147693aafb63dec4"
     },
     {
       "path": "app-server/src/request_processors/selected_shutdown.rs",
@@ -315,9 +315,14 @@
       "path": "app-server/src/request_processors/selected_archive.rs",
       "before": null,
       "after": "8f3c8eac8a2a5721f6bf47ed6a5f69af6139fb4a34991c9b1e826fc19a9d2131"
+    },
+    {
+      "path": "app-server/src/request_processors/selected_incoming.rs",
+      "before": null,
+      "after": "6a7a00ea440e6b916868480e5cee17c0a1d25a5bc99acf22b3c1951633ce0e99"
     }
   ],
-  "patchSHA256": "980650bf5575c1326d966d7d83c3d2f9a7694727982bc41650b803ab8181d968",
+  "patchSHA256": "fe33774817679f47284bdc834c0f61a8885c6445ff3ca994f125ea44be00518f",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,

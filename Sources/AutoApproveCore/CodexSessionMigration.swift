@@ -42,9 +42,10 @@ struct CodexSessionMigrationState:Codable,Equatable {
     enum Stage:String,Codable {case reserved,prepared,cancelled}
     enum Cancellation:String,Codable {case requested,changedBeforeEffects}
     struct Execution:Codable,Equatable {
-        enum Phase:String,Codable {case shutdownAttempted,retireAttempted}
+        enum Phase:String,Codable {case shutdownAttempted,retireAttempted,incomingAttempted}
         var phase:Phase
         var ownershipRevision:Int?=nil
+        var sourceRetirementRevision:Int?=nil
     }
     var formatVersion=1
     var request:CodexSessionMigrationRequest
@@ -156,7 +157,9 @@ struct CodexSessionMigrationState:Codable,Equatable {
               (state.stage == .cancelled)==(state.cancellation != nil) else{throw failure}
         if let execution=state.execution {
             guard state.stage == .prepared,
-                  execution.phase == .retireAttempted ? (execution.ownershipRevision.map{$0>=0} ?? false):execution.ownershipRevision==nil else{throw failure}
+                  execution.phase == .retireAttempted ? ((execution.ownershipRevision.map{$0>=0} ?? false) && execution.sourceRetirementRevision==nil):
+                    execution.phase == .incomingAttempted ? ((execution.ownershipRevision.map{$0>=0} ?? false) && (execution.sourceRetirementRevision.map{$0>0} ?? false)):
+                    (execution.ownershipRevision==nil && execution.sourceRetirementRevision==nil) else{throw failure}
         }
         return state
     }
@@ -192,6 +195,39 @@ struct CodexSessionMigrationState:Codable,Equatable {
     func state(id:String)throws->CodexSessionMigrationState? {
         guard let loaded=try journal.load(id:id) else{return nil}
         guard loaded.consistent else{throw Self.failure};return try Self.decode(loaded.record)
+    }
+    /// Persist each irreversible native step before issuing it. A lost save
+    /// reply is resolved by reading the journal; the same transition is never
+    /// resubmitted from this API.
+    @discardableResult func recordExecutionAttempt(
+        id:String,
+        phase:CodexSessionMigrationState.Execution.Phase,
+        ownershipRevision:Int?=nil,
+        sourceRetirementRevision:Int?=nil
+    )throws->CodexSessionMigrationState {
+        guard let parsed=UUID(uuidString:id) else{throw Self.failure}
+        let canonical=parsed.uuidString.lowercased()
+        guard canonical==id,let loaded=try journal.load(id:canonical),loaded.consistent else{throw Self.failure}
+        var state=try Self.decode(loaded.record)
+        guard state.stage == .prepared else{throw Self.failure}
+        let next=CodexSessionMigrationState.Execution(phase:phase,ownershipRevision:ownershipRevision,
+            sourceRetirementRevision:sourceRetirementRevision)
+        let allowed:Bool
+        switch (state.execution?.phase,phase) {
+        case (nil,.shutdownAttempted):allowed=true
+        case (.shutdownAttempted?,.retireAttempted):allowed=true
+        case (.retireAttempted?,.incomingAttempted):allowed=true
+        default:allowed=false
+        }
+        guard allowed,
+              phase == .shutdownAttempted ? (ownershipRevision==nil && sourceRetirementRevision==nil):
+                phase == .retireAttempted ? ((ownershipRevision.map{$0>=0} ?? false) && sourceRetirementRevision==nil):
+                ((ownershipRevision.map{$0>=0} ?? false) && (sourceRetirementRevision.map{$0>0} ?? false)) else{throw Self.failure}
+        state.execution=next
+        let saved=try journal.save(id:canonical,payload:Self.encode(state),expectedRevision:loaded.record.revision)
+        guard let confirmed=try journal.load(id:canonical),confirmed.consistent,
+              confirmed.record==saved else{throw Self.failure}
+        return try Self.decode(confirmed.record)
     }
     func cancel(id:String)throws {
         guard let parsed=UUID(uuidString:id) else{throw Self.failure}

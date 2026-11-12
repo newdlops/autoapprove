@@ -99,6 +99,21 @@ struct CodexNativeRetirementReceipt:Decodable,Sendable {
         }
     }
 }
+struct CodexNativeIncomingReceipt:Decodable,Sendable {
+    let requestId:String,threadIds:[String],phase:String,ownershipRevision:Int
+    let homeIdentity:String?,sourceRetirementRevision:Int
+    let writersStopped:Bool,migrationAuthorized:Bool
+    func validate(requestID:String,threadIDs:[String],phase:String,revision:Int,
+                  homeIdentity:String,sourceRetirementRevision:Int)throws {
+        guard requestId==requestID,threadIds==(try CodexNativeSelectedInputLease.checkedScope(threadIDs)),
+              self.phase==phase,ownershipRevision==revision,revision>=0,
+              phase == "writers-held" ? self.homeIdentity==nil:self.homeIdentity==homeIdentity,
+              self.sourceRetirementRevision==sourceRetirementRevision,
+              writersStopped,!migrationAuthorized else {
+            throw AppError.message("대상 대화의 가져오기 예약 상태를 확인하지 못했습니다.")
+        }
+    }
+}
 
 /// Current durable rows for recovery. They are not a grant to repeat a command.
 struct CodexNativeOwnershipObservation:Decodable,Sendable {
@@ -127,7 +142,7 @@ struct CodexNativeOwnershipObservation:Decodable,Sendable {
 /// One utility-task owner. The lease drains and pauses input admission for an
 /// exact scope. It does not stop accepted work or establish migration ownership.
 final class CodexNativeSelectedInputLease {
-    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status",retirePrepare="retire-prepare",retireCommit="retire-commit"}
+    enum Operation:String {case inspect,pause,status,renew,release,cohort;case journalLock="journal-lock",journalSync="journal-sync",shutdownBegin="shutdown-begin",shutdownStatus="shutdown-status",retirePrepare="retire-prepare",retireCommit="retire-commit",incomingPrepare="incoming-prepare",incomingCommit="incoming-commit"}
     struct JournalLockReceipt:Decodable {
         let requestId:String,revision:Int,digest:String,homeIdentity:String,role:String,phase:String
         let migrationAuthorized:Bool
@@ -142,6 +157,7 @@ final class CodexNativeSelectedInputLease {
         let journalLock:JournalLockReceipt?
         let shutdown:CodexNativeSelectedShutdown?
         let retirement:CodexNativeRetirementReceipt?
+        let incoming:CodexNativeIncomingReceipt?
     }
     private struct Request:Encodable {
         let op:String,nonce:String,serverGeneration:String?,leaseId:String?,threadIds:[String]?
@@ -161,6 +177,9 @@ final class CodexNativeSelectedInputLease {
     private var retirementRevision:Int?
     private var retirementCommitAttempted=false
     private var retirementFiles:[CodexNativeArchivedFile]?
+    private var incomingRevision:Int?
+    private var incomingSourceRevision:Int?
+    private var incomingCommitAttempted=false
     private static var failure:AppError {.message("선택한 대화의 서버 입력 차단을 확인하지 못했습니다. 이동을 진행하지 않습니다.")}
     static func checkedScope(_ ids:[String])throws->[String] {
         guard (1...512).contains(ids.count),Set(ids).count==ids.count,
@@ -260,6 +279,31 @@ final class CodexNativeSelectedInputLease {
             return receipt
         }catch{close();throw error}
     }
+    func prepareIncoming(expectedOwnershipRevision:Int,sourceRetirementRevision:Int)throws->CodexNativeIncomingReceipt {
+        do {
+            guard held,incomingRevision==nil,let witness=journalWitness,witness.role=="destination",
+                  expectedOwnershipRevision>=0,sourceRetirementRevision>=1,
+                  let receipt=try call(.incomingPrepare).incoming else{throw Self.failure}
+            try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"writers-held",
+                revision:expectedOwnershipRevision,homeIdentity:witness.homeIdentity,
+                sourceRetirementRevision:sourceRetirementRevision)
+            incomingRevision=expectedOwnershipRevision
+            incomingSourceRevision=sourceRetirementRevision
+            return receipt
+        }catch{close();throw error}
+    }
+    func commitIncoming()throws->CodexNativeIncomingReceipt {
+        do {
+            guard held,!incomingCommitAttempted,let revision=incomingRevision,revision<Int.max,
+                  let sourceRevision=incomingSourceRevision,let witness=journalWitness else{throw Self.failure}
+            incomingCommitAttempted=true
+            guard let receipt=try call(.incomingCommit).incoming else{throw Self.failure}
+            try receipt.validate(requestID:witness.requestId,threadIDs:threadIDs,phase:"incoming",
+                revision:revision+1,homeIdentity:witness.homeIdentity,
+                sourceRetirementRevision:sourceRevision)
+            return receipt
+        }catch{close();throw error}
+    }
     static func observeOwnership(path:String,expected:CodexNativeDisplayedConnection,threadIDs:[String])throws->CodexNativeOwnershipObservation {
         let scope=try checkedScope(threadIDs),connection=try CodexNativeLineConnection(path:path)
         defer{connection.close()}
@@ -302,7 +346,7 @@ final class CodexNativeSelectedInputLease {
                          generation:String?,leaseID:String?,threadIDs:[String])throws->Reply {
         do {
             let scope=try checkedScope(threadIDs)
-            guard (1...([Operation.cohort,.retirePrepare,.retireCommit].contains(operation) ? 1_048_576:65_536)).contains(data.count),nonce.utf8.count==32,
+            guard (1...([Operation.cohort,.retirePrepare,.retireCommit,.incomingPrepare,.incomingCommit].contains(operation) ? 1_048_576:65_536)).contains(data.count),nonce.utf8.count==32,
                   nonce.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}) else{throw failure}
             let reply=try JSONDecoder().decode(Reply.self,from:data)
             let paused=operation != .inspect && operation != .release
@@ -332,6 +376,9 @@ final class CodexNativeSelectedInputLease {
             if operation == .retirePrepare || operation == .retireCommit {
                 guard reply.retirement != nil else{throw failure}
             }else {guard reply.retirement==nil else{throw failure}}
+            if operation == .incomingPrepare || operation == .incomingCommit {
+                guard reply.incoming != nil else{throw failure}
+            }else {guard reply.incoming==nil else{throw failure}}
             return reply
         }catch{throw failure}
     }
