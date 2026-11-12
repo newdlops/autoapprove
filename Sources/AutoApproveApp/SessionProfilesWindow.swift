@@ -116,6 +116,13 @@ struct SessionProfilesWindow: View {
                     Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal")+" · "+SessionProfileEntryFilter.windowPosition(entry))
                         .font(.caption).foregroundStyle(.secondary)
                     Text(entry.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(entry.cwd)
+                    Label {
+                        Text(entry.resumesConversation ? "저장한 대화 이어가기":"새 CLI 실행 · 이전 대화는 복원하지 않음")
+                            .foregroundStyle(entry.resumesConversation ? Color.secondary:Color.primary)
+                    } icon: {
+                        Image(systemName:entry.resumesConversation ? "bubble.left":"terminal")
+                            .foregroundStyle(entry.resumesConversation ? Color.secondary:Color.orange)
+                    }.font(.caption)
                     DisclosureGroup("대화·창 정보") {
                         VStack(alignment:.leading,spacing:4) {
                             if !entry.terminalTabSummary.isEmpty {Text(entry.terminalTabSummary).help(entry.terminalTabSummary)}
@@ -199,6 +206,7 @@ private struct ProfileDraftRow:Identifiable {
     var entry:TerminalProfileEntry
     var choices:[CodexProfileConversation]
     var detail:String?
+    var startsNewCLI=false
 }
 
 struct SessionProfileEditor:View {
@@ -215,14 +223,18 @@ struct SessionProfileEditor:View {
         _name=State(initialValue:draft.name)
         _rows=State(initialValue:draft.candidates.map {.init(id:$0.id,entry:$0.entry,choices:$0.conversations,detail:$0.detail)})
     }
-    private var profile:TerminalSessionProfile {.init(id:draft.profileID,name:name,entries:rows.filter(\.included).map(\.entry))}
+    private var profile:TerminalSessionProfile {get throws {
+        let included=rows.filter(\.included)
+        return try TerminalSessionProfile(id:draft.profileID,name:name,entries:included.map(\.entry))
+            .validatedForSaving(newCLIIDs:Set(included.filter(\.startsNewCLI).map { $0.entry.id }))
+    }}
     private var validationError:String? {
-        do {_ = try profile.validated();return nil} catch {return error.localizedDescription}
+        do {_ = try profile;return nil} catch {return error.localizedDescription}
     }
     var body:some View {
         VStack(alignment:.leading,spacing:16) {
             Text("세션 프로필 저장").font(.title2.weight(.semibold))
-            Text("대화 ID는 선택 사항입니다. 비워 두면 저장한 폴더에서 새 CLI를 열고, 입력하면 해당 대화를 이어갑니다.")
+            Text("기존 작업을 복원하려면 이어갈 대화를 저장하세요. 새 대화를 시작하려는 항목만 ‘새 CLI 실행’을 선택하세요.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             HStack {
                 Text("프로필 이름")
@@ -251,16 +263,30 @@ struct SessionProfileEditor:View {
                                 TextField("작업 폴더",text:$row.entry.cwd).textFieldStyle(.roundedBorder)
                                     .accessibilityLabel("\(row.entry.title) 작업 폴더").help("이 대화를 다시 열 작업 폴더의 전체 경로")
                                 if let home=row.entry.providerHome {Text("CLI 설정 폴더: "+home).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)}
+                                Picker("복원 방식",selection:$row.startsNewCLI) {
+                                    Text("대화 이어가기").tag(false)
+                                    Text("새 CLI 실행").tag(true)
+                                }.accessibilityLabel("\(row.entry.title) 복원 방식")
+                                if row.startsNewCLI {
+                                    Text("저장한 폴더에서 새 CLI를 엽니다. 이전 대화는 복원하지 않습니다.")
+                                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                                } else {
                                 if !row.choices.isEmpty {
                                     Picker("복원할 대화",selection:$row.entry.conversationID) {
-                                        Text("새 CLI 실행").tag("")
+                                        Text("이어갈 대화 선택").tag("")
                                         ForEach(row.choices) {choice in Text(choice.title).tag(choice.id)}
                                     }.frame(maxWidth:.infinity,alignment:.leading)
                                 }
-                                TextField("대화 ID (선택 사항)",text:$row.entry.conversationID).textFieldStyle(.roundedBorder)
-                                    .font(.system(.callout,design:.monospaced)).accessibilityLabel("\(row.entry.title) 대화 ID · 선택 사항")
-                                    .help("비워 두면 새 CLI를 실행합니다. 대화를 이어가려면 해당 UUID를 입력하세요.")
+                                TextField("대화 ID",text:$row.entry.conversationID).textFieldStyle(.roundedBorder)
+                                    .font(.system(.callout,design:.monospaced)).accessibilityLabel("\(row.entry.title) 대화 ID")
+                                    .help("자동 확인한 대화를 저장하거나 이어갈 대화의 UUID를 입력하세요.")
+                                if !row.entry.resumesConversation {
+                                    Label {Text("이어갈 대화를 확인해주세요").foregroundStyle(.primary)}
+                                        icon: {Image(systemName:"exclamationmark.triangle").foregroundStyle(.orange)}
+                                        .font(.caption)
+                                }
                                 if let detail=row.detail {Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
+                                }
                             }.padding(.leading,20).disabled(!row.included)
                             Divider()
                         }
@@ -271,7 +297,7 @@ struct SessionProfileEditor:View {
                 Label(message,systemImage:"exclamationmark.circle").font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)
             }
             HStack(spacing:10) {
-                Text("\(rows.filter(\.included).count)개 세션 포함").font(.caption).foregroundStyle(.secondary)
+                Text("대화 \(rows.filter {$0.included && !$0.startsNewCLI}.count)개 · 새 CLI \(rows.filter {$0.included && $0.startsNewCLI}.count)개").font(.caption).foregroundStyle(.secondary)
                 if saving {ProgressView().controlSize(.small)}
                 Spacer()
                 Button("취소",action:cancel).keyboardShortcut(.cancelAction).disabled(saving)

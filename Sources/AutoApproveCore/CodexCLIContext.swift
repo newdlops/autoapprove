@@ -71,6 +71,9 @@ struct CodexCLIContext {
         guard Identity(executable)==identity else{throw AppError.message("Codex 조회 중 실행 파일이 바뀌었습니다.")}
         return result
     }
+    func verifyUnchanged() throws {
+        guard Identity(executable)==identity else {throw AppError.message("Codex 실행 파일이 바뀌었습니다. 상태를 다시 확인해주세요.")}
+    }
     private static func validPath(_ value:String)->Bool {
         value.hasPrefix("/") && value.utf8.count<=4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
     }

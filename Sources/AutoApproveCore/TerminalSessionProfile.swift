@@ -61,11 +61,15 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     public func resumeCommand(nativeRuntimeRoot:String?=nil) throws -> String {
         try resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
     }
-    func resumeCommand(nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?) throws -> String {
+    func resumeCommand(nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil) throws -> String {
         let entry=try validated()
         if let bundledRuntime {
             guard entry.agent == "codex",nativeRuntimeRoot != nil else {throw AppError.message("Codex 실행 환경을 확인해주세요.")}
             try bundledRuntime.verifyUnchanged()
+        }
+        if let compatibleCLI {
+            guard entry.agent == "codex",nativeRuntimeRoot != nil,bundledRuntime==nil else {throw AppError.message("Codex 복원 실행 환경을 확인해주세요.")}
+            try compatibleCLI.verifyUnchanged()
         }
         var arguments=["env"]
         if let root=nativeRuntimeRoot {
@@ -73,8 +77,9 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
             arguments.append("AUTOAPPROVE_NATIVE_RUNTIME_ROOT="+root)
         }
         if let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
-        arguments.append(bundledRuntime?.executable ?? agent)
-        if bundledRuntime != nil {arguments += ["--remote","unix://"]}
+        if let searchPath=compatibleCLI?.environment["PATH"] {arguments.append("PATH="+searchPath)}
+        arguments.append(compatibleCLI?.executable ?? bundledRuntime?.executable ?? agent)
+        if bundledRuntime != nil || compatibleCLI != nil {arguments += ["--remote","unix://"]}
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
         return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+(entry.agent == "codex" ? "":"exec ")+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
@@ -88,6 +93,19 @@ public struct TerminalSessionProfile: Codable, Equatable, Identifiable, Sendable
     public var entries: [TerminalProfileEntry]
     public init(id: UUID = UUID(), name: String, savedAt: Date = Date(), entries: [TerminalProfileEntry]) {
         self.id=id;self.name=name;self.savedAt=savedAt;self.entries=entries
+    }
+    /// Editing/capture requires an explicit choice before an unresolved
+    /// conversation becomes a new CLI. Legacy files remain readable unchanged.
+    public func validatedForSaving(newCLIIDs:Set<UUID>) throws -> Self {
+        guard newCLIIDs.isSubset(of:Set(entries.map(\.id))) else {throw AppError.message("새 CLI로 저장할 항목을 다시 확인해주세요.")}
+        var profile=self
+        for index in profile.entries.indices {
+            if newCLIIDs.contains(profile.entries[index].id) {profile.entries[index].conversationID=""}
+            else if !profile.entries[index].resumesConversation {
+                throw AppError.message("이어갈 대화를 확인하지 못한 항목이 있습니다. 대화를 선택하거나 ‘새 CLI 실행’을 선택해주세요.")
+            }
+        }
+        return try profile.validated()
     }
     public func validated() throws -> Self {
         var result=self; result.name=name.trimmingCharacters(in:.whitespacesAndNewlines).precomposedStringWithCanonicalMapping
@@ -225,8 +243,9 @@ public enum CodexProfileConversationBinding {
         if let first=title.unicodeScalars.first,(0x2800...0x28ff).contains(first.value),title.dropFirst().first==" " {
             title=String(title.dropFirst(2))
         }
-        let attention="[ . ] Action Required | "
-        if title.hasPrefix(attention) {title=String(title.dropFirst(attention.count))}
+        for attention in ["[ . ] Action Required | ","[ ! ] Action Required | "] where title.hasPrefix(attention) {
+            title=String(title.dropFirst(attention.count));break
+        }
         let suffix=" | "+URL(fileURLWithPath:cwd).lastPathComponent.precomposedStringWithCanonicalMapping
         guard title.hasSuffix(suffix) else {return nil}
         let name=String(title.dropLast(suffix.count))
@@ -358,8 +377,8 @@ public enum TerminalProfileLauncher {
     public static func script(_ entry: TerminalProfileEntry,targetTTY:String?=nil,nativeRuntimeRoot:String?=nil) throws -> String {
         try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
     }
-    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?) throws ->String {
-        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:bundledRuntime))
+    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil) throws ->String {
+        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:bundledRuntime,compatibleCLI:compatibleCLI))
         if entry.host == .iterm {
             return "const app=Application('com.googlecode.iterm2'); app.activate(); const window=app.createWindowWithDefaultProfile({command:\(command)}); JSON.stringify({tty:window.currentSession().tty()});"
         }
@@ -390,16 +409,22 @@ public enum TerminalProfileLauncher {
     public static func launch(_ entry: TerminalProfileEntry,anchorTTY:String?=nil) async throws -> String {
         let entry=try entry.validated()
         return try await Task.detached(priority:.userInitiated) {
-            let nativeRoot=entry.agent == "codex" ? try CodexNativeRuntimeRoot.prepare():nil
-            let runtime=entry.agent == "codex" ? try CodexBundledRuntime.bundled():nil
-            if let runtime {
-                try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,server:.local(executable:runtime.executable))
+            let nativeRoot:String?
+            let launchRuntime:CodexProfileLaunchRuntime?
+            do {
+                nativeRoot=entry.agent == "codex" ? try CodexNativeRuntimeRoot.prepare():nil
+                if let runtime=entry.agent == "codex" ? try CodexBundledRuntime.bundled():nil {
+                    launchRuntime=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:.local(executable:runtime.executable))
+                } else {launchRuntime=nil}
+            } catch {
+                throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
             }
             var targetTTY:String?
             if entry.host == .terminal,let anchorTTY {
                 targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY,settingsName:entry.terminalTab?.settingsName)
             }
-            let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRoot,bundledRuntime:runtime)
+            try launchRuntime?.verifyUnchanged()
+            let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRoot,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed)
             let text:String
             do {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
             catch let error as TerminalAdapterError {

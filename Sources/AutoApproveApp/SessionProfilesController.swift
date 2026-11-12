@@ -181,7 +181,8 @@ struct SessionProfileEntryFilter:Equatable {
         guard !busy else {throw AppError.message("다른 프로필 작업을 마친 뒤 저장해주세요.")}
         busy=true;defer {busy=false};let store=store
         _ = try await Task.detached(priority:.utility) {try store.save(profile)}.value
-        selectedID=profile.id;draft=nil;message="‘\(profile.name)’의 세션 \(profile.entries.count)개를 파일로 저장했습니다.";error=nil
+        let conversations=profile.entries.filter(\.resumesConversation).count
+        selectedID=profile.id;draft=nil;message="‘\(profile.name)’ 저장 완료 · 대화 \(conversations)개 · 새 CLI \(profile.entries.count-conversations)개";error=nil
         await reload()
     }
     func restore(_ profile:TerminalSessionProfile,selected:Set<UUID>) async {

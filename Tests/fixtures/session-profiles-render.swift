@@ -51,11 +51,11 @@ import AutoApproveCore
         await empty.reload()
         try await render(SessionProfilesWindow(controller:empty),name:"empty-light",width:700,height:480,scheme:.light,root:root)
         var missing=entries[1];missing.conversationID=""
-        let draft=SessionProfileDraft(profileID:UUID(),name:"대화 ID 없이 폴더에서 CLI 열기",candidates:[.init(id:"known",entry:entries[0]),.init(id:"choose",entry:missing,conversations:[.init(id:"00000000-0000-4000-8000-000000000002",title:"선택할 기존 대화")],detail:"대화 ID는 선택 사항입니다. 비워 두면 새 CLI를 엽니다.")])
+        let draft=SessionProfileDraft(profileID:UUID(),name:"대화 확인과 명시적 새 CLI 선택",candidates:[.init(id:"known",entry:entries[0]),.init(id:"choose",entry:missing,conversations:[.init(id:"00000000-0000-4000-8000-000000000002",title:"선택할 기존 대화")],detail:"대화를 선택하거나 새 CLI 실행을 명시적으로 선택해주세요.")])
         for scheme in [ColorScheme.light,.dark] {
             try await render(SessionProfileEditor(draft:draft,save:{_ in},cancel:{}),name:scheme == .dark ? "editor-dark":"editor-light",width:700,height:620,scheme:scheme,root:root)
         }
-        var invalid=draft;invalid.candidates[0].entry.conversationID="bad-id"
+        var invalid=draft;invalid.candidates[0].entry.conversationID="bad-id";invalid.candidates[1].entry.conversationID="00000000-0000-4000-8000-000000000002"
         try await render(SessionProfileEditor(draft:invalid,save:{_ in},cancel:{}),name:"editor-invalid-light",width:700,height:620,scheme:.light,root:root)
         print("PASS native profile views: 700×480 / 860×640 / 1100×800 light/dark, access denied, Terminal closed, empty, long error and optional/invalid conversation editor; synthetic data only")
     }

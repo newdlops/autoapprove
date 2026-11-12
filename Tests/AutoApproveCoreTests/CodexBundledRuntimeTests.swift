@@ -66,6 +66,45 @@ private final class BundledRuntimeFixture {
     func record(_ home:String){homes.append(home)}
 }
 extension ApprovalTests {
+    func testProfileLaunchReusesMatchingInstalledCLIWithoutPreparingLiveServer() async throws {
+        let f=try BundledRuntimeFixture(),runtime=try CodexBundledRuntime.inspect(root:f.root.path)
+        let home=f.root.appendingPathComponent("home"),cliPath=f.root.appendingPathComponent("installed codex '$literal")
+        try FileManager.default.createDirectory(at:home,withIntermediateDirectories:false)
+        try Data("#!/bin/sh\nprintf 'codex-cli 0.167.2\\n'\n".utf8).write(to:cliPath)
+        try FileManager.default.setAttributes([.posixPermissions:0o755],ofItemAtPath:cliPath.path)
+        guard let cli=try CodexCLIContext.resolve(home:home.path,userHome:f.root.path,executable:cliPath.path) else {throw AppError.message("Missing owned fixture CLI")}
+        let entry=TerminalProfileEntry(title:"Synthetic",agent:"codex",cwd:home.path,conversationID:UUID().uuidString,providerHome:home.path)
+        let services=CodexManagedServerServices(inspect:{_,_ in .init(phase:.unavailable,version:"0.167.1",detail:"Existing server 0.167.2")},prepare:{_,_ in throw AppError.message("Never prepare or replace a live mismatching server")})
+        let choice=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{selected in
+            try expectEqual(selected,home.path)
+            return (cli,.init(phase:.running,version:"0.167.2",detail:"Matching installed CLI and existing socket"))
+        })
+        try expectNil(choice.bundled);try expectEqual(choice.installed?.executable,cliPath.path)
+        try choice.verifyUnchanged()
+        let command=try entry.resumeCommand(nativeRuntimeRoot:"/private/tmp/aa-codex-501",bundledRuntime:choice.bundled,compatibleCLI:choice.installed)
+        try expect(command.contains([cliPath.path,"--remote","unix://","resume",entry.conversationID.lowercased()].map(HookInstaller.quote).joined(separator:" ")))
+        try expect(command.contains(HookInstaller.quote("CODEX_HOME="+home.path)))
+        try expect(!command.contains(runtime.executable))
+        var rejected=false
+        do {_ = try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in nil})}
+        catch {rejected=error.localizedDescription.contains("기존 서버는 유지했습니다")}
+        try expect(rejected,"An incompatible live server cannot trigger a new daemon")
+        rejected=false
+        do {_ = try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in (cli,.init(phase:.running,version:"0.168.0",detail:"Changed CLI"))})}
+        catch {rejected=true}
+        try expect(rejected,"Reported server and CLI versions must match")
+        try Data("#!/bin/sh\nexit 1\n".utf8).write(to:cliPath)
+        try expectThrows(try choice.verifyUnchanged())
+    }
+
+    func testProfileLaunchUsesMatchingBundledServerWithoutChangingAutoStart() async throws {
+        let f=try BundledRuntimeFixture(),runtime=try CodexBundledRuntime.inspect(root:f.root.path)
+        let entry=TerminalProfileEntry(title:"Synthetic",agent:"codex",cwd:f.root.path,conversationID:"",providerHome:f.root.path)
+        let services=CodexManagedServerServices(inspect:{_,_ in .init(phase:.running,version:"0.167.1",detail:"Existing server",autoStartEnabled:false)},prepare:{_,_ in throw AppError.message("Do not change existing server settings")})
+        let choice=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in throw AppError.message("No fallback needed")})
+        try expectEqual(choice.bundled?.executable,runtime.executable);try expectNil(choice.installed)
+    }
+
     func testBundledCodexProfileLaunchRequiresMatchingServerAndLiteralCommand() async throws {
         let f=try BundledRuntimeFixture(),runtime=try CodexBundledRuntime.inspect(root:f.root.path)
         let calls=BundledLaunchCalls(),home=f.root.appendingPathComponent("login group '$value")

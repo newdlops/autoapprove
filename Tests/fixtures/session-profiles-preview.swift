@@ -54,7 +54,7 @@ private actor FixtureLaunches {
             var freshClaude=try entry(402,"대화 ID 없이 새 Claude","claude","current-claude");freshClaude.conversationID=""
             let candidates=[TerminalProfileCandidate(id:"fixture-current-a",entry:try entry(300,"현재 API 창","codex","current-api")),
                             TerminalProfileCandidate(id:"fixture-current-b",entry:try entry(301,"현재 Claude 창","claude","current-web")),
-                            TerminalProfileCandidate(id:"fixture-current-choice",entry:ambiguous,conversations:[.init(id:id(400),title:"도구 승인 안정화 작업"),.init(id:id(401),title:"프로필 복원 구현 작업")],detail:"대화 ID는 선택 사항입니다. 비워 두면 새 Codex를 엽니다."),
+                            TerminalProfileCandidate(id:"fixture-current-choice",entry:ambiguous,conversations:[.init(id:id(400),title:"도구 승인 안정화 작업"),.init(id:id(401),title:"프로필 복원 구현 작업")],detail:"대화를 선택하거나 새 CLI 실행을 명시적으로 선택해주세요."),
                             TerminalProfileCandidate(id:"fixture-current-claude",entry:freshClaude)]
             let current:@MainActor () async throws -> [TerminalProfileCandidate] = {
                 try await Task.sleep(for:.milliseconds(250))
