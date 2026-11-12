@@ -57,7 +57,7 @@ struct CodexNativeSelectedShutdown:Decodable,Sendable {
     }
 }
 
-struct CodexNativeArchivedFile:Decodable,Equatable,Sendable {
+struct CodexNativeArchivedFile:Codable,Equatable,Sendable {
     let threadId:String,relativePath:String,fileIdentity:String,sha256:String
     let size:Int64,modifiedSeconds:Int64,modifiedNanoseconds:Int64
     var witness:CodexMigrationRolloutWitness {.init(relativePath:relativePath,fileIdentity:fileIdentity,size:size,

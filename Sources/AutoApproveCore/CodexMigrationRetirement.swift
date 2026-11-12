@@ -187,7 +187,7 @@ enum CodexMigrationRolloutStaging {
     }
 }
 
-private enum RetirementFiles {
+enum RetirementFiles {
     static func components(_ value:String)throws->[String] {
         let parts=value.split(separator:"/",omittingEmptySubsequences:false).map(String.init)
         guard value.utf8.count<=4096,!value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains),
