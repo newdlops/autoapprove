@@ -10,6 +10,7 @@ struct CodexNativeSelectedArchiveImport:Codable,Equatable,Sendable {
     struct Marker:Codable,Equatable {
         let formatVersion:Int,requestID:String,sourceHomeIdentity:String,destinationHomeIdentity:String
         let files:[CodexNativeArchivedFile]
+        let goalSlots:[CodexGoalTransferSlotReference]
     }
     let marker:Marker
     let importedFiles:[CodexNativeArchivedFile]
@@ -140,7 +141,8 @@ struct CodexNativeSelectedArchiveImport:Codable,Equatable,Sendable {
     }
     static func install(requestID:String,sourceHome:String,sourceHomeIdentity:String,
                         destinationHome:String,destinationHomeIdentity:String,
-                        files:[CodexNativeArchivedFile],threadIDs:[String])throws->Self {
+                        files:[CodexNativeArchivedFile],goalSlots:[CodexGoalTransferSlotReference],
+                        threadIDs:[String])throws->Self {
         guard UUID(uuidString:requestID)?.uuidString.lowercased()==requestID,
               try identity(sourceHome)==sourceHomeIdentity,try identity(destinationHome)==destinationHomeIdentity,
               sourceHome != destinationHome,sourceHomeIdentity != destinationHomeIdentity,
@@ -153,6 +155,18 @@ struct CodexNativeSelectedArchiveImport:Codable,Equatable,Sendable {
             guard !next.overflow,next.partialValue<=1_073_741_824 else{throw failure};total=next.partialValue
             try verifySource(file,home:sourceHome,homeIdentity:sourceHomeIdentity,scope:scope)
         }
+        guard goalSlots.count==scope.count,Set(goalSlots.map(\.threadID))==scope,
+              goalSlots.map(\.threadID)==goalSlots.map(\.threadID).sorted() else{throw failure}
+        var goalBytes=0
+        var slots:[CodexGoalTransferSlot]=[]
+        for reference in goalSlots {
+            try reference.validate(requestID:requestID,sourceHome:sourceHome,threadIDs:scope)
+            let slot=try CodexGoalTransferSlotStore.load(reference,home:sourceHome,homeIdentity:sourceHomeIdentity,
+                requestID:requestID,threadIDs:scope)
+            let (sum,overflow)=goalBytes.addingReportingOverflow(reference.size)
+            guard !overflow,sum<=536_870_912 else{throw failure};goalBytes=sum
+            slots.append(slot)
+        }
         let sourceRoot=try RetirementFiles.home(sourceHome,identity:sourceHomeIdentity);defer{close(sourceRoot)}
         let destinationRoot=try RetirementFiles.home(destinationHome,identity:destinationHomeIdentity);defer{close(destinationRoot)}
         let migration=try openPrivateDirectory(destinationRoot,".autoapprove-migrations",create:true);defer{close(migration)}
@@ -160,7 +174,7 @@ struct CodexNativeSelectedArchiveImport:Codable,Equatable,Sendable {
         let request=try openPrivateDirectory(imports,requestID,create:true);defer{close(request)}
         let stage=try openPrivateDirectory(request,"files",create:true);defer{close(stage)}
         let expected=Marker(formatVersion:1,requestID:requestID,sourceHomeIdentity:sourceHomeIdentity,
-            destinationHomeIdentity:destinationHomeIdentity,files:files)
+            destinationHomeIdentity:destinationHomeIdentity,files:files,goalSlots:goalSlots)
         let existing=try readMarker(request)
         let resume=existing != nil
         if let existing {guard existing==expected else{throw failure}}
@@ -168,6 +182,11 @@ struct CodexNativeSelectedArchiveImport:Codable,Equatable,Sendable {
             // An existing path without this exact request marker is prior data,
             // including a retired destination slot; never adopt or overwrite it.
             for file in files {guard try pathAbsent(destinationRoot,file.relativePath) else{throw failure}}
+            for slot in slots {
+                let target=try CodexGoalTransferStore.captureSlot(home:destinationHome,threadID:slot.threadID)
+                guard target.row==nil,!target.continuationDeferred,
+                      target.schemaFingerprint==slot.schemaFingerprint else{throw failure}
+            }
             let encoder=JSONEncoder();encoder.outputFormatting=[.sortedKeys,.withoutEscapingSlashes]
             let data=try encoder.encode(expected)
             guard data.count<=768*1024 else{throw failure}
@@ -190,6 +209,13 @@ struct CodexNativeSelectedArchiveImport:Codable,Equatable,Sendable {
         for (index,file) in files.enumerated() {
             try installOne(file,destinationHome:destinationHome,destinationIdentity:destinationHomeIdentity,
                 destinationRoot:destinationRoot,stageRoot:request,stageName:String(format:"%08d.stage",index),resume:resume)
+        }
+        for slot in slots {
+            try CodexGoalTransferStore.restore(slot,toHome:destinationHome,allowExactExisting:resume)
+            let target=try CodexGoalTransferStore.captureSlot(home:destinationHome,threadID:slot.threadID)
+            guard target.row==slot.row,target.continuationDeferred==slot.continuationDeferred,
+                  target.schemaFingerprint==slot.schemaFingerprint else{throw failure}
+            try CodexGoalTransferStore.verifyCurrent(slot)
         }
         var imported:[CodexNativeArchivedFile]=[]
         for file in files {

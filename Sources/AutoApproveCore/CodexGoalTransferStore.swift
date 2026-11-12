@@ -239,6 +239,38 @@ enum CodexGoalTransferStore {
               try capture(home:snapshot.sourceHome,threadID:v.threadID)==snapshot else{throw failure}
         try Task.checkCancellation();try connection.check();try connection.exec("COMMIT");committed=true
     }
+    /// Restore an exact per-session slot, including an explicitly absent Goal.
+    /// Exact existing rows are accepted only while recovering a request whose
+    /// private import marker was already validated by the caller.
+    static func restore(_ slot:CodexGoalTransferSlot,toHome:String,allowExactExisting:Bool=false)throws {
+        try Task.checkCancellation();try slot.validate()
+        let home=try physicalHome(toHome)
+        guard home != slot.sourceHome,
+              try captureSlot(home:slot.sourceHome,threadID:slot.threadID)==slot else{throw failure}
+        let connection=try Connection(home:home,writable:true)
+        try connection.exec("BEGIN IMMEDIATE");var committed=false;defer{if !committed{try? connection.exec("ROLLBACK")}}
+        guard try schema(connection)==slot.schemaFingerprint else{throw failure}
+        let current=try row(connection,slot.threadID)
+        if current.0 != nil || current.1 {
+            guard allowExactExisting,current.0==slot.row,current.1==slot.continuationDeferred else{throw failure}
+            try connection.check();try verifyCurrent(slot)
+            try connection.exec("COMMIT");committed=true
+            return
+        }
+        if let value=slot.row {
+            try connection.exec("INSERT INTO thread_goals (\(columns)) VALUES (?,?,?,?,?,?,?,?,?)",
+                [.text(value.threadID),.text(value.goalID),.text(value.objective),.text(value.status),
+                 value.tokenBudget.map(Cell.integer) ?? .null,.integer(value.tokensUsed),.integer(value.timeUsedSeconds),
+                 .integer(value.createdAtMs),.integer(value.updatedAtMs)])
+            if slot.continuationDeferred {
+                try connection.exec("INSERT INTO thread_goal_continuation_deferrals(thread_id) VALUES (?)",[.text(value.threadID)])
+            }
+        }
+        let inserted=try row(connection,slot.threadID)
+        guard inserted.0==slot.row,inserted.1==slot.continuationDeferred else{throw failure}
+        try verifyCurrent(slot);try connection.check();try Task.checkCancellation()
+        try connection.exec("COMMIT");committed=true
+    }
     // The return coordinator must durably reserve/attempt the exact backed-up
     // retirement before calling this. BEGIN IMMEDIATE protects the exact-row
     // comparison and replacement as one transaction; arbitrary upsert is absent.

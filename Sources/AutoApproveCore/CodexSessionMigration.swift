@@ -47,6 +47,9 @@ struct CodexSessionMigrationState:Codable,Equatable {
         var ownershipRevision:Int?=nil
         var sourceRetirementRevision:Int?=nil
     }
+    struct SourceRetirement:Codable,Equatable {
+        let ownershipRevision:Int,homeIdentity:String,files:[CodexNativeArchivedFile]
+    }
     var formatVersion=1
     var request:CodexSessionMigrationRequest
     var stage:Stage = .prepared
@@ -55,6 +58,8 @@ struct CodexSessionMigrationState:Codable,Equatable {
     // consult native durable policy rather than treating this as current fact.
     var currentOwners:[String:String]
     var execution:Execution?=nil
+    var goalSlots:[CodexGoalTransferSlotReference]?=nil
+    var sourceRetirement:SourceRetirement?=nil
 }
 @MainActor struct CodexSessionMigrationServices {
     var observe:(CodexSessionMigrationRequest) async throws ->CodexSessionMigrationObservation
@@ -155,8 +160,28 @@ struct CodexSessionMigrationState:Codable,Equatable {
               state.currentOwners==Dictionary(uniqueKeysWithValues:state.request.threads.map{($0.id,state.request.source.home)}),
               record.terminal==(state.stage == .cancelled),
               (state.stage == .cancelled)==(state.cancellation != nil) else{throw failure}
+        if let references=state.goalSlots {
+            let ids=Set(state.request.threads.map(\.id))
+            guard references.count==ids.count,Set(references.map(\.threadID))==ids,
+                  references.map(\.threadID)==references.map(\.threadID).sorted() else{throw failure}
+            for reference in references {
+                try reference.validate(requestID:state.request.id,sourceHome:state.request.source.home,threadIDs:ids)
+            }
+        }
+        if let retirement=state.sourceRetirement {
+            let ids=Set(state.request.threads.map(\.id))
+            guard let execution=state.execution,execution.phase != .shutdownAttempted,
+                  retirement.ownershipRevision>0,retirement.homeIdentity==state.request.source.physicalHomeID,
+                  (1...4096).contains(retirement.files.count),
+                  Set(retirement.files.map(\.threadId))==ids,
+                  Set(retirement.files.map(\.relativePath)).count==retirement.files.count else{throw failure}
+            for file in retirement.files {try file.validate(scope:ids)}
+            if execution.phase == .incomingAttempted {
+                guard execution.sourceRetirementRevision==retirement.ownershipRevision else{throw failure}
+            }
+        }
         if let execution=state.execution {
-            guard state.stage == .prepared,
+            guard state.stage == .prepared,state.goalSlots != nil,
                   execution.phase == .retireAttempted ? ((execution.ownershipRevision.map{$0>=0} ?? false) && execution.sourceRetirementRevision==nil):
                     execution.phase == .incomingAttempted ? ((execution.ownershipRevision.map{$0>=0} ?? false) && (execution.sourceRetirementRevision.map{$0>0} ?? false)):
                     (execution.ownershipRevision==nil && execution.sourceRetirementRevision==nil) else{throw failure}
@@ -182,6 +207,8 @@ struct CodexSessionMigrationState:Codable,Equatable {
             guard !preparationCancelled else{throw CancellationError()}
             try Task.checkCancellation()
             guard let fresh=try journal.load(id:value.id),fresh.consistent,fresh.record==reserved else{throw Self.failure}
+            state.goalSlots=try CodexGoalTransferSlotStore.capture(home:value.source.home,
+                homeIdentity:value.source.physicalHomeID,requestID:value.id,threadIDs:value.threads.map(\.id))
             state.stage = .prepared
             _ = try journal.save(id:value.id,payload:Self.encode(state),expectedRevision:reserved.revision)
             return state
@@ -216,17 +243,41 @@ struct CodexSessionMigrationState:Codable,Equatable {
         switch (state.execution?.phase,phase) {
         case (nil,.shutdownAttempted):allowed=true
         case (.shutdownAttempted?,.retireAttempted):allowed=true
-        case (.retireAttempted?,.incomingAttempted):allowed=true
+        case (.retireAttempted?,.incomingAttempted):
+            allowed=state.sourceRetirement?.ownershipRevision==sourceRetirementRevision
         default:allowed=false
         }
         guard allowed,
               phase == .shutdownAttempted ? (ownershipRevision==nil && sourceRetirementRevision==nil):
                 phase == .retireAttempted ? ((ownershipRevision.map{$0>=0} ?? false) && sourceRetirementRevision==nil):
                 ((ownershipRevision.map{$0>=0} ?? false) && (sourceRetirementRevision.map{$0>0} ?? false)) else{throw Self.failure}
+        guard let references=state.goalSlots else{throw Self.failure}
+        let ids=Set(state.request.threads.map(\.id))
+        for reference in references {
+            _=try CodexGoalTransferSlotStore.load(reference,home:state.request.source.home,
+                homeIdentity:state.request.source.physicalHomeID,requestID:state.request.id,threadIDs:ids)
+        }
         state.execution=next
         let saved=try journal.save(id:canonical,payload:Self.encode(state),expectedRevision:loaded.record.revision)
         guard let confirmed=try journal.load(id:canonical),confirmed.consistent,
               confirmed.record==saved else{throw Self.failure}
+        return try Self.decode(confirmed.record)
+    }
+    @discardableResult func recordSourceRetirement(_ receipt:CodexNativeRetirementReceipt,id:String)throws->CodexSessionMigrationState {
+        guard let parsed=UUID(uuidString:id) else{throw Self.failure}
+        let canonical=parsed.uuidString.lowercased()
+        guard canonical==id,let loaded=try journal.load(id:canonical),loaded.consistent else{throw Self.failure}
+        var state=try Self.decode(loaded.record)
+        guard state.stage == .prepared,state.sourceRetirement==nil,
+              let execution=state.execution,execution.phase == .retireAttempted,
+              let expected=execution.ownershipRevision,expected<Int.max,let files=receipt.files else{throw Self.failure}
+        try receipt.validate(requestID:canonical,threadIDs:state.request.threads.map(\.id),phase:"retired",
+            revision:expected+1,homeIdentity:state.request.source.physicalHomeID)
+        guard !files.isEmpty else{throw Self.failure}
+        state.sourceRetirement = .init(ownershipRevision:receipt.ownershipRevision,
+            homeIdentity:state.request.source.physicalHomeID,files:files)
+        let saved=try journal.save(id:canonical,payload:Self.encode(state),expectedRevision:loaded.record.revision)
+        guard let confirmed=try journal.load(id:canonical),confirmed.consistent,confirmed.record==saved else{throw Self.failure}
         return try Self.decode(confirmed.record)
     }
     func cancel(id:String)throws {
