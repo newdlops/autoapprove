@@ -72,4 +72,62 @@ struct CodexCredentialFile:Codable,Equatable {
         if let a=source.entry,let b=destination.entry {guard a.identity != b.identity else{throw failure}}
         try source.verifyCurrent();try destination.verifyCurrent()
     }
+    /// Called only by an explicit request to reuse this account in a newly
+    /// created independent home. Credential bytes never leave this function.
+    func copyForIndependentLogin(to home:String)throws {
+        let destination=try Self.capture(home:home)
+        try Self.requireIndependent(self,destination)
+        guard let expected=entry,expected.size>0,expected.size<=1_048_576,destination.entry==nil else {
+            throw AppError.message("복사할 파일 기반 로그인이나 비어 있는 독립 홈을 확인하지 못했습니다. 독립 홈에서 브라우저 로그인을 사용해주세요.")
+        }
+        let source=open(physicalHome+"/auth.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)
+        guard source>=0 else{throw Self.failure};defer{close(source)}
+        var before=stat(),after=stat()
+        guard fstat(source,&before)==0,try Self.file(before)==expected else{throw Self.failure}
+        let bytes=try FileHandle(fileDescriptor:source,closeOnDealloc:false).read(upToCount:1_048_577) ?? Data()
+        guard bytes.count==expected.size,fstat(source,&after)==0,try Self.file(after)==expected,
+              (try? JSONSerialization.jsonObject(with:bytes)) is [String:Any] else{throw Self.failure}
+        try verifyCurrent();try destination.verifyCurrent()
+        let root=open(destination.physicalHome,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)
+        guard root>=0 else{throw Self.failure};defer{close(root)}
+        var info=stat()
+        guard fstat(root,&info)==0,Self.identity(info)==destination.homeIdentity else{throw Self.failure}
+        let temporary=".auth-independent-"+UUID().uuidString.lowercased()
+        let output=openat(root,temporary,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0o600)
+        guard output>=0 else{throw Self.failure}
+        defer{close(output);unlinkat(root,temporary,0)}
+        try FileHandle(fileDescriptor:output,closeOnDealloc:false).write(contentsOf:bytes)
+        guard fsync(output)==0 else{throw Self.failure}
+        try verifyCurrent();try destination.verifyCurrent()
+        guard renameatx_np(root,temporary,root,"auth.json",UInt32(RENAME_EXCL))==0,fsync(root)==0 else{throw Self.failure}
+        try Self.requireIndependent(self,Self.capture(home:home))
+    }
+    func copyConfigurationForIndependentLogin(to home:String)throws {
+        let destination=try Self.capture(home:home)
+        try Self.requireIndependent(self,destination)
+        guard destination.entry==nil else{throw Self.failure}
+        let input=open(physicalHome+"/config.toml",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)
+        if input<0 {guard errno==ENOENT else{throw Self.failure};return}
+        defer{close(input)}
+        var before=stat(),after=stat()
+        guard fstat(input,&before)==0,before.st_mode&S_IFMT==S_IFREG,before.st_uid==getuid(),
+              before.st_nlink==1,(0...1_048_576).contains(before.st_size) else{throw Self.failure}
+        let bytes=try FileHandle(fileDescriptor:input,closeOnDealloc:false).read(upToCount:1_048_577) ?? Data()
+        guard bytes.count==before.st_size,fstat(input,&after)==0,
+              before.st_ino==after.st_ino,before.st_dev==after.st_dev,before.st_size==after.st_size,
+              before.st_mtimespec.tv_sec==after.st_mtimespec.tv_sec,before.st_mtimespec.tv_nsec==after.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec==after.st_ctimespec.tv_sec,before.st_ctimespec.tv_nsec==after.st_ctimespec.tv_nsec else{throw Self.failure}
+        try verifyCurrent();try destination.verifyCurrent()
+        let root=open(destination.physicalHome,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)
+        guard root>=0 else{throw Self.failure};defer{close(root)}
+        var info=stat()
+        guard fstat(root,&info)==0,Self.identity(info)==destination.homeIdentity else{throw Self.failure}
+        let temporary=".config-independent-"+UUID().uuidString.lowercased()
+        let output=openat(root,temporary,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0o600)
+        guard output>=0 else{throw Self.failure};defer{close(output);unlinkat(root,temporary,0)}
+        try FileHandle(fileDescriptor:output,closeOnDealloc:false).write(contentsOf:bytes)
+        guard fsync(output)==0 else{throw Self.failure}
+        try destination.verifyCurrent()
+        guard renameat(root,temporary,root,"config.toml")==0,fsync(root)==0 else{throw Self.failure}
+    }
 }

@@ -10,6 +10,9 @@ private struct CodexAccountLoginPresentation:Identifiable {
     let engine:ApprovalEngine
     let sessionID:String
     @State private var account:CodexSessionAccount?
+    @State private var standalone:CodexStandaloneSession?
+    @State private var standaloneMove:CodexStandaloneSession?
+    @State private var detachPresentation:CodexAccountLoginPresentation?
     @State private var loading=false
     @State private var error:String?
     @State private var loginPresentation:CodexAccountLoginPresentation?
@@ -27,12 +30,15 @@ private struct CodexAccountLoginPresentation:Identifiable {
                     do {_ = try await verifiedTargets(account);try await engine.reconnectCodexLogin(home:account.target.home)}
                     catch {self.error=error.localizedDescription}
                 }
-            },changeGroup:{if let account {movePresentation = .init(account:account)}},
+            },changeGroup:{
+                if let account {movePresentation = .init(account:account)}
+                else if let standalone {standaloneMove=standalone}
+            },standalone:standalone,makeIndependent:{if let account {detachPresentation = .init(account:account)}},
             serverLink:serverLink,serverLinkError:serverLinkError,linkingServer:linkingServer,
             verifyServerLink:{verifyServerLink()})
             .padding(.horizontal,24).padding(.vertical,12)
             .task(id:sessionID) {
-                account=nil;error=nil
+                account=nil;standalone=nil;error=nil
                 while !Task.isCancelled {
                     await load()
                     do {try await Task.sleep(for:.seconds(30))} catch {return}
@@ -42,6 +48,12 @@ private struct CodexAccountLoginPresentation:Identifiable {
             .onReceive(engine.$codexAccountTransitionStates){held=$0.values.contains(where:\.held)}
             .sheet(item:$movePresentation) {presentation in
                 CodexSessionMoveView(engine:engine,source:presentation.account,close:{movePresentation=nil})
+            }
+            .sheet(item:$standaloneMove) {source in
+                CodexSessionMoveView(engine:engine,standalone:source,close:{standaloneMove=nil})
+            }
+            .sheet(item:$detachPresentation) {presentation in
+                CodexSessionDetachView(engine:engine,source:presentation.account,close:{detachPresentation=nil})
             }
             .sheet(item:$loginPresentation) {presentation in
                     let account=presentation.account
@@ -69,9 +81,16 @@ private struct CodexAccountLoginPresentation:Identifiable {
         loading=true;serverLink=nil;serverLinkError=nil;defer{loading=false}
         do {
             let value=try await engine.codexSessionAccount(sessionID:sessionID)
-            try Task.checkCancellation();account=value;error=nil
+            try Task.checkCancellation();account=value;standalone=nil;error=nil
             if serverLink?.sessionID != value.sessionID || serverLink?.serverPID != value.serverPID {serverLink=nil}
-        } catch is CancellationError {} catch {account=nil;self.error=error.localizedDescription}
+        } catch is CancellationError {} catch {
+            let accountError=error
+            account=nil
+            do {
+                let value=try await engine.codexStandaloneSession(sessionID:sessionID)
+                try Task.checkCancellation();standalone=value;self.error=nil
+            }catch is CancellationError {}catch {standalone=nil;self.error=accountError.localizedDescription}
+        }
     }
     private func verifyServerLink() {
         guard !linkingServer else{return}
@@ -102,6 +121,8 @@ struct CodexSessionAccountContent:View {
     let login:()->Void
     let reconnect:()->Void
     var changeGroup:(()->Void)?=nil
+    var standalone:CodexStandaloneSession?=nil
+    var makeIndependent:(()->Void)?=nil
     var serverLink:CodexSessionServerLink?=nil
     var serverLinkError:String?=nil
     var linkingServer=false
@@ -150,6 +171,16 @@ struct CodexSessionAccountContent:View {
                     Text("개별 계정으로 쓰려면 Codex 홈·서버를 분리해야 합니다. 이 서버의 로그인 변경은 공유 세션 전체에 적용됩니다.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
+            }else if let standalone {
+                Label("독립 실행",systemImage:"person.crop.circle").font(.callout.weight(.medium))
+                Text("공유 app-server 없이 실행 중입니다. 로그인 그룹에 연결하면 해당 그룹의 계정을 사용합니다.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                Text(standalone.home).font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+                if let changeGroup {
+                    Button("로그인 그룹에 연결…",action:changeGroup).disabled(disabled || loading)
+                        .help("선택한 독립 세션의 대화를 로그인 그룹으로 옮깁니다. 다른 세션은 그대로 유지합니다.")
+                }
             } else if error==nil {Text("이 세션이 연결된 서버에서 계정을 확인합니다…").font(.caption).foregroundStyle(.secondary)}
             if let error {Label(error,systemImage:"exclamationmark.circle").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
         }.frame(maxWidth:.infinity,alignment:.leading)
@@ -167,6 +198,10 @@ struct CodexSessionAccountContent:View {
         if let changeGroup {
             Button("로그인 그룹 변경…",action:changeGroup).disabled(disabled || loading)
                 .help("옮길 로그인 그룹의 계정과 연결 서버를 확인합니다.")
+        }
+        if let makeIndependent {
+            Button("독립 실행으로 분리…",action:makeIndependent).disabled(disabled || loading)
+                .help("이 세션만 전용 로그인 홈으로 옮기고 공유 서버 없이 실행합니다.")
         }
     }
 }

@@ -123,7 +123,7 @@ public struct CodexLoginGroupStore:Sendable {
         document.groups[index]=updated;try Self.save(document,root)
         return updated
     }
-    @discardableResult public func create(name raw:String)throws->CodexLoginGroup {
+    @discardableResult public func create(name raw:String,daemonAutoStart:Bool?=nil)throws->CodexLoginGroup {
         let name=try Self.name(raw),root=try Root(directory,create:true,lock:true)
         var document=try Self.load(root)
         guard document.groups.count<32 else{throw AppError.message("로그인 그룹은 최대 32개까지 만들 수 있습니다.")}
@@ -142,7 +142,9 @@ public struct CodexLoginGroupStore:Sendable {
         guard fstat(home,&info)==0 else{throw Self.failure}
         let identity=Self.identity(info),config=openat(home,"config.toml",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0o600)
         guard config>=0 else{throw Self.failure};defer{close(config)}
-        try FileHandle(fileDescriptor:config,closeOnDealloc:false).write(contentsOf:Data("cli_auth_credentials_store = \"file\"\n".utf8))
+        var settings="cli_auth_credentials_store = \"file\"\n"
+        if let daemonAutoStart {settings += "[features]\ndaemon_auto_start = \(daemonAutoStart ? "true":"false")\n"}
+        try FileHandle(fileDescriptor:config,closeOnDealloc:false).write(contentsOf:Data(settings.utf8))
         guard fsync(config)==0,fsync(home)==0,fsync(homes)==0 else{throw Self.failure}
         let group=CodexLoginGroup(id:id,name:name,home:path,homeIdentity:identity,createdAt:Date())
         try Self.home(group,root);document.groups.append(group);try Self.save(document,root)

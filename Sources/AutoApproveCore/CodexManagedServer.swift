@@ -20,7 +20,15 @@ public struct CodexManagedServerServices:Sendable {
                 prepare:@escaping @Sendable(String,[ProcessRecord]) async throws -> CodexManagedServerStatus) {
         self.inspect=inspect;self.prepare=prepare
     }
-    public static var live:Self {local()}
+    public static var live:Self {
+        Self(inspect:{home,records in
+            let runtime=try CodexBundledRuntime.bundled()
+            return try await local(executable:runtime?.executable).inspect(home,records)
+        },prepare:{home,records in
+            let runtime=try CodexBundledRuntime.bundled()
+            return try await local(executable:runtime?.executable).prepare(home,records)
+        })
+    }
     public static func local(userHome:String=NSHomeDirectory(),executable:String?=nil)->Self {
         Self(inspect:{home,records in try await background {
             let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records)

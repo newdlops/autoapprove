@@ -4,6 +4,7 @@ import Darwin
 /// Delivery reservations survive application restarts. Unknown exit/launch
 /// outcomes require review rather than replaying terminal input.
 public struct CodexSessionAttachment:Codable {
+    public enum ExecutionMode:String,Codable,Sendable {case server,standalone}
     public enum Phase:String,Codable {case needsPause,pauseReserved,waitingPause,needsTab,tabReserved,ready,exitReserved,waitingShell,launchReserved,verifying,connected,review}
     public var context:SessionExitRecovery
     public var home:String
@@ -16,6 +17,7 @@ public struct CodexSessionAttachment:Codable {
     public var stoppedThread:CodexAccountTransitionThread?
     public var continuationLoginRequestID:String?
     public var originalLogin:ProcessRecord?
+    public var executionMode:ExecutionMode?
     public var preparationNotStarted:Bool?
     /// Only the exact cohort captured by an explicit reconnect may be stopped.
     public var authorizedToolHosts:[ProcessRecord]?
@@ -28,7 +30,7 @@ public struct CodexSessionAttachment:Codable {
     public var canRetryUnsentGoalPause:Bool {
         phase == .review && goalBeforePause != nil && pausedGoal==nil && (pauseNotStarted == true || detail=="자동 연결 보류: Goal 중단 요청의 전달 결과를 확인하지 못했습니다." || detail=="자동 연결 보류: "+TerminalDeviceInput.unavailableBeforeInputMessage)
     }
-    static func migrated(context:SessionExitRecovery,state:CodexSessionMigrationState)throws->Self {
+    static func migrated(context:SessionExitRecovery,state:CodexSessionMigrationState,executionMode:ExecutionMode = .server)throws->Self {
         guard state.stage == .completed,state.destinationActivation != nil,
               let thread=context.conversationID,
               state.currentOwners[thread]==state.request.destination.home,
@@ -40,6 +42,7 @@ public struct CodexSessionAttachment:Codable {
         var destination=context
         destination.executable=state.request.destination.cliIdentity
         var attachment=Self(context:destination,home:state.request.destination.home)
+        attachment.executionMode=executionMode
         guard attachment.command != nil else{throw AppError.message("목적지 그룹에서 이어갈 대화의 실행 명령을 준비하지 못했습니다.")}
         attachment.detail="그룹 이동을 확인했습니다. 원래 터미널에서 같은 대화를 목적지 서버에 연결합니다."
         return attachment
@@ -82,7 +85,9 @@ public struct CodexSessionAttachment:Codable {
             guard CodexNativeRuntimeRoot.validPath(root) else{return nil}
             arguments.append("AUTOAPPROVE_NATIVE_RUNTIME_ROOT="+root)
         }
-        arguments += [context.executable,"--remote","unix://","resume",id]
+        arguments.append(context.executable)
+        arguments += executionMode == .standalone ? ["--no-daemon"]:["--remote","unix://"]
+        arguments += ["resume",id]
         return "cd -- "+HookInstaller.quote(context.session.cwd)+" && "+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
 }
@@ -102,6 +107,7 @@ public struct CodexSessionAttachment:Codable {
         var state=original
         func persist(_ phase:CodexSessionAttachment.Phase,_ detail:String)throws {
             state.phase=phase;state.detail=detail
+            if phase == .connected,state.executionMode == .standalone {state.detail="원래 터미널에서 같은 대화의 독립 실행을 확인했습니다."}
             if phase == .review || phase == .connected {state.authorizedToolHosts=nil}
             if phase == .connected {state.toolHostShutdownWitnesses=nil}
             if phase == .exitReserved {

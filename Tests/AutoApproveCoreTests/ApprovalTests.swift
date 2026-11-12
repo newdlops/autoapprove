@@ -1284,6 +1284,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Credential file: independent present and absent slots",tests.testCredentialFileIndependentPresentAndAbsentSlots),
             ("Login groups: rename preserves home identity credentials and unrelated groups",tests.testLoginGroupRenamePreservesHomeIdentityAndAuthentication),
             ("Login groups: private homes persist without credentials",tests.testLoginGroupsCreatePrivateHomesAndRestoreWithoutCredentials),
+            ("Independent login: persists outside groups with daemon auto-start disabled",tests.testIndependentLoginDoesNotEnrollOrStartServer),
+            ("Independent login: copied account has a distinct credential file",tests.testIndependentLoginCopiesAccountWithoutSharingCredentialFile),
             ("Login groups: invalid names duplicates and corruption preserve state",tests.testLoginGroupsRejectNamesDuplicatesAndCorruptionWithoutReset),
             ("Login groups: changed linked and missing homes reject",tests.testLoginGroupsRejectChangedLinkedAndMissingHomes),
             ("Login groups: linked public and special index files reject",tests.testLoginGroupsRejectLinkedPublicAndSpecialIndexFiles),
