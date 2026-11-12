@@ -36,6 +36,34 @@ extension ApprovalTests {
             try f.store.validate(home:group.home)
         }
     }
+    func testLegacyLoginGroupsMigrateToStableVolumeIdentity()throws {
+        let f=try LoginGroupFixture(),group=try f.store.create(name:"Legacy")
+        let index=f.store.directory.appendingPathComponent("groups.json")
+        var document=try JSONSerialization.jsonObject(with:Data(contentsOf:index)) as! [String:Any]
+        var rootInfo=stat(),homeInfo=stat()
+        try expectEqual(lstat(f.store.directory.path,&rootInfo),0);try expectEqual(lstat(group.home,&homeInfo),0)
+        document["identity"]="\(rootInfo.st_dev):\(rootInfo.st_ino)"
+        var groups=document["groups"] as! [[String:Any]]
+        groups[0]["homeIdentity"]="\(homeInfo.st_dev):\(homeInfo.st_ino)";document["groups"]=groups
+        try JSONSerialization.data(withJSONObject:document).write(to:index)
+        let migrated=try f.store.list()
+        try expectEqual(migrated.first?.id,group.id)
+        let volume=try URL(fileURLWithPath:group.home).resourceValues(forKeys:[.volumeUUIDStringKey]).volumeUUIDString!.lowercased()
+        try expectEqual(migrated[0].homeIdentity,"volume:\(volume):\(homeInfo.st_ino)")
+        try expectEqual(try f.store.list(),migrated)
+    }
+    func testLoginGroupsRejectDifferentVolumeIdentity()throws {
+        let f=try LoginGroupFixture(),group=try f.store.create(name:"Owned")
+        let index=f.store.directory.appendingPathComponent("groups.json")
+        var document=try JSONSerialization.jsonObject(with:Data(contentsOf:index)) as! [String:Any]
+        let original=document["identity"] as! String
+        let parts=original.split(separator:":")
+        document["identity"]="volume:00000000-0000-0000-0000-000000000000:\(parts.last!)"
+        let bytes=try JSONSerialization.data(withJSONObject:document);try bytes.write(to:index)
+        try f.rejects{_ = try f.store.list()}
+        try expectEqual(try Data(contentsOf:index),bytes)
+        try expect(FileManager.default.fileExists(atPath:group.home))
+    }
     func testLoginGroupRenamePreservesHomeIdentityAndAuthentication()throws {
         let f=try LoginGroupFixture(),a=try f.store.create(name:"Personal"),b=try f.store.create(name:"Work")
         let auth=Data("synthetic-private-fixture".utf8)

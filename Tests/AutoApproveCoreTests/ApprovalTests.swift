@@ -1288,6 +1288,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Rollout return: exact atomic archive replacement and backup",tests.testRolloutReturnAtomicallyReplacesExactArchiveAndPreservesBackup),
             ("Credential file: independent present and absent slots",tests.testCredentialFileIndependentPresentAndAbsentSlots),
             ("Login groups: rename preserves home identity credentials and unrelated groups",tests.testLoginGroupRenamePreservesHomeIdentityAndAuthentication),
+            ("Login groups: legacy identity migration",tests.testLegacyLoginGroupsMigrateToStableVolumeIdentity),
+            ("Login groups: reject different volume identity",tests.testLoginGroupsRejectDifferentVolumeIdentity),
             ("Login groups: private homes persist without credentials",tests.testLoginGroupsCreatePrivateHomesAndRestoreWithoutCredentials),
             ("Independent login: persists outside groups with daemon auto-start disabled",tests.testIndependentLoginDoesNotEnrollOrStartServer),
             ("Independent login: copied account has a distinct credential file",tests.testIndependentLoginCopiesAccountWithoutSharingCredentialFile),

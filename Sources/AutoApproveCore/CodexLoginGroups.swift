@@ -11,13 +11,22 @@ public struct CodexLoginGroupStore:Sendable {
     public init(directory:URL){self.directory=directory}
     private struct Document:Codable,Equatable {
         var version=1
-        let root:String,identity:String
+        let root:String
+        var identity:String
         var groups:[CodexLoginGroup]=[]
     }
     private static var failure:AppError {.message("로그인 그룹 저장소나 홈이 바뀌었습니다. 기존 그룹을 유지했습니다. 경로와 접근 권한을 확인해주세요.")}
-    private static func identity(_ info:stat)->String {"\(info.st_dev):\(info.st_ino)"}
+    private static func legacyIdentity(_ info:stat)->String {"\(info.st_dev):\(info.st_ino)"}
+    private static func identity(_ info:stat, path:String)throws->String {
+        guard let volume = try URL(fileURLWithPath:path).resourceValues(forKeys:[.volumeUUIDStringKey]).volumeUUIDString else {throw failure}
+        return "volume:\(volume.lowercased()):\(info.st_ino)"
+    }
+    private static func matches(_ stored:String,_ info:stat,path:String)throws->Bool {
+        if stored == legacyIdentity(info) {return true}
+        return stored == (try identity(info,path:path))
+    }
     private final class Root {
-        let path:String,identity:String,fd:Int32
+        let path:String,identity:String,legacy:String,fd:Int32
         var lockFD:Int32 = -1
         init(_ directory:URL,create:Bool,lock:Bool)throws {
             if create {try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])}
@@ -30,7 +39,8 @@ public struct CodexLoginGroupStore:Sendable {
             guard fd>=0,fstat(fd,&info)==0,info.st_dev==selected.st_dev,info.st_ino==selected.st_ino else {
                 if fd>=0{close(fd)};throw failure
             }
-            identity=CodexLoginGroupStore.identity(info)
+            do {identity=try CodexLoginGroupStore.identity(info,path:path)} catch {close(fd);throw error}
+            legacy=CodexLoginGroupStore.legacyIdentity(info)
             if lock {
                 lockFD=openat(fd,"lock",O_RDWR|O_CREAT|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0o600)
                 guard lockFD>=0,fstat(lockFD,&info)==0,info.st_mode&S_IFMT==S_IFREG,info.st_uid==getuid(),
@@ -43,7 +53,7 @@ public struct CodexLoginGroupStore:Sendable {
         func verify()throws {
             var info=stat()
             guard lstat(path,&info)==0,info.st_mode&S_IFMT==S_IFDIR,info.st_uid==getuid(),info.st_mode&0o077==0,
-                  CodexLoginGroupStore.identity(info)==identity else{throw failure}
+                  CodexLoginGroupStore.legacyIdentity(info)==legacy else{throw failure}
         }
     }
     private static func name(_ raw:String)throws->String {
@@ -59,7 +69,7 @@ public struct CodexLoginGroupStore:Sendable {
         var parent=stat(),info=stat()
         guard lstat(root.path+"/homes",&parent)==0,parent.st_mode&S_IFMT==S_IFDIR,parent.st_uid==getuid(),parent.st_mode&0o077==0,
               lstat(group.home,&info)==0,info.st_mode&S_IFMT==S_IFDIR,info.st_uid==getuid(),info.st_mode&0o077==0,
-              identity(info)==group.homeIdentity else{throw failure}
+              try matches(group.homeIdentity,info,path:group.home) else{throw failure}
     }
     private static func load(_ root:Root)throws->Document {
         let fd=openat(root.fd,"groups.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)
@@ -80,7 +90,7 @@ public struct CodexLoginGroupStore:Sendable {
         guard data.count==info.st_size else{throw failure}
         let document:Document
         do{document=try JSONDecoder().decode(Document.self,from:data)}catch{throw failure}
-        guard document.version==1,document.root==root.path,document.identity==root.identity,document.groups.count<=32,
+        guard document.version==1,document.root==root.path,(document.identity==root.identity || document.identity==root.legacy),document.groups.count<=32,
               Set(document.groups.map(\.id)).count==document.groups.count,
               Set(document.groups.map{ nameKey($0.name) }).count==document.groups.count else{throw failure}
         for group in document.groups {try home(group,root)}
@@ -101,7 +111,17 @@ public struct CodexLoginGroupStore:Sendable {
     public func list()throws->[CodexLoginGroup] {
         var info=stat()
         if lstat(directory.path,&info)<0 {guard errno==ENOENT else{throw Self.failure};return []}
-        return try Self.load(Root(directory,create:false,lock:false)).groups
+        let root=try Root(directory,create:false,lock:true)
+        var document=try Self.load(root)
+        if document.identity != root.identity || document.groups.contains(where:{!$0.homeIdentity.hasPrefix("volume:")}) {
+            document.identity=root.identity
+            document.groups=try document.groups.map { group in
+                var info=stat();guard lstat(group.home,&info)==0 else {throw Self.failure}
+                return CodexLoginGroup(id:group.id,name:group.name,home:group.home,homeIdentity:try Self.identity(info,path:group.home),createdAt:group.createdAt)
+            }
+            try Self.save(document,root)
+        }
+        return document.groups
     }
     public func validate(home:String)throws {
         // Other detected user homes retain their existing behavior. An app-owned
@@ -140,7 +160,7 @@ public struct CodexLoginGroupStore:Sendable {
         let home=openat(homes,folder,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)
         guard home>=0 else{throw Self.failure};defer{close(home)}
         guard fstat(home,&info)==0 else{throw Self.failure}
-        let identity=Self.identity(info),config=openat(home,"config.toml",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0o600)
+        let identity=try Self.identity(info,path:path),config=openat(home,"config.toml",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0o600)
         guard config>=0 else{throw Self.failure};defer{close(config)}
         var settings="cli_auth_credentials_store = \"file\"\n"
         if let daemonAutoStart {settings += "[features]\ndaemon_auto_start = \(daemonAutoStart ? "true":"false")\n"}
