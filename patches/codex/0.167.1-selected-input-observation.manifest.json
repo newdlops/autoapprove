@@ -249,12 +249,12 @@
     {
       "path": "app-server/src/request_processors.rs",
       "before": "9bdbcd07e08001c72125e202565cf7537d5fc09702939138d58704084ed8d9fd",
-      "after": "0e4fb59c41f42d048b955554cd1dbd00ed00c5525f05d13fb6b7c0580b2d995f"
+      "after": "f7b1197124fa428c7923a5449110597cd3a6c93a45a49a5dfe19d1ac10480249"
     },
     {
       "path": "app-server/src/request_processors/thread_processor.rs",
       "before": "a1e9934e1c7f3084f12b52e5cdbd56419b9a0261b9668dd8469078d8c3822ce2",
-      "after": "c5321b1ba876b757115ed2fab400a3cad642b25b57fe04cc8466b0ed5403eec1"
+      "after": "a5fc0e90761b4a3c945b26e630ef3e81b01a2477afb6c7c30b8c207eb1a9bbb3"
     },
     {
       "path": "core/src/codex_thread.rs",
@@ -289,7 +289,7 @@
     {
       "path": "app-server/src/selected_journal_lock.rs",
       "before": null,
-      "after": "13a42372e664c12d82905cadb5c6a9e04b3cbbf9fa0809d1147693aafb63dec4"
+      "after": "9a682bc064bd880c5122bc21b1e6ddc1cff9468c3a3faf45dd2331ba48b02b49"
     },
     {
       "path": "app-server/src/request_processors/selected_shutdown.rs",
@@ -314,15 +314,15 @@
     {
       "path": "app-server/src/request_processors/selected_archive.rs",
       "before": null,
-      "after": "8f3c8eac8a2a5721f6bf47ed6a5f69af6139fb4a34991c9b1e826fc19a9d2131"
+      "after": "060b4d4216fe3e101847f143ad962321c96409b9e5382ea070dbc05009f47b90"
     },
     {
       "path": "app-server/src/request_processors/selected_incoming.rs",
       "before": null,
-      "after": "6a7a00ea440e6b916868480e5cee17c0a1d25a5bc99acf22b3c1951633ce0e99"
+      "after": "487735354de7b3edcfbdc31ee5d79be855586beaca44f1d48f6870dd7a626ad6"
     }
   ],
-  "patchSHA256": "fe33774817679f47284bdc834c0f61a8885c6445ff3ca994f125ea44be00518f",
+  "patchSHA256": "61fd748f3595fc21a976913ef1b196375a36421b1f012973a5650e1f0f03b3f4",
   "verification": {
     "selectedAppServerAndAdjacentUnitTests": 23,
     "coreInputPreservationUnitTests": 2,

@@ -6710,10 +6710,12 @@
  use tracing::info;
  use tracing::warn;
  use uuid::Uuid;
-@@ -599,6 +598,10 @@
+@@ -599,6 +598,12 @@
  pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
  pub(crate) use search::SearchRequestProcessor;
  pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++pub(crate) use thread_processor::NativeArchiveFile;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +pub(crate) use thread_processor::NativeSelectedIncoming;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
@@ -6723,7 +6725,7 @@
  pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 --- a/app-server/src/request_processors/thread_processor.rs
 +++ b/app-server/src/request_processors/thread_processor.rs
-@@ -5,6 +5,29 @@
+@@ -5,6 +5,31 @@
  mod daemon_snapshot;
  
  mod workspace_switching;
@@ -6747,13 +6749,15 @@
 +#[path = "selected_shutdown.rs"]
 +mod selected_shutdown;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
++pub(crate) use selected_archive::NativeArchiveFile;
++#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +pub(crate) use selected_incoming::NativeSelectedIncoming;
 +#[cfg(all(feature = "autoapprove-selected-transition", unix))]
 +pub(crate) use selected_retirement::NativeSelectedRetirement;
  
  use super::persisted_resume_settings::PersistedResumeSettings;
  use super::persisted_resume_settings::latest_owned_thread_settings;
-@@ -510,6 +533,8 @@
+@@ -510,6 +535,8 @@
      pub(super) state_db: Option<StateDbHandle>,
      pub(super) log_db: Option<LogDbLayer>,
      pub(super) background_tasks: TaskTracker,
@@ -6762,7 +6766,7 @@
      pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
      pub(super) skills_watcher: Arc<SkillsWatcher>,
      pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-@@ -534,6 +559,10 @@
+@@ -534,6 +561,10 @@
  }
  
  impl ThreadRequestProcessor {
@@ -6773,7 +6777,7 @@
      #[allow(clippy::too_many_arguments)]
      pub(crate) fn new(
          auth_manager: Arc<AuthManager>,
-@@ -571,6 +600,7 @@
+@@ -571,6 +602,7 @@
              state_db,
              log_db,
              background_tasks: TaskTracker::new(),
@@ -6781,7 +6785,7 @@
              sample_responses,
              skills_watcher,
              turn_cost_worker,
-@@ -1175,24 +1205,58 @@
+@@ -1175,24 +1207,58 @@
          thread_id: ThreadId,
          operation: &str,
      ) -> Result<(), JSONRPCErrorError> {
@@ -7050,7 +7054,7 @@
      pub(crate) async fn cancel_requests_for_thread(
 --- /dev/null
 +++ b/app-server/src/selected_journal_lock.rs
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,465 @@
 +//! Kernel-backed journal coordination. Holding this is not a migration grant.
 +use base64::Engine;
 +use codex_core::native_ownership::{BorrowedMigrationLock, borrow_migration_lock};
@@ -7375,6 +7379,7 @@
 +        std::path::PathBuf,
 +        String,
 +        u64,
++        Vec<crate::request_processors::NativeArchiveFile>,
 +    )> {
 +        self.require_destination()?;
 +        self.require_phase("incomingAttempted")?;
@@ -7393,6 +7398,22 @@
 +        }
 +        let source_home = string(&self.payload, "/request/source/home")?;
 +        let source_identity = string(&self.payload, "/request/source/physicalHomeID")?.to_owned();
++        if self
++            .payload
++            .pointer("/sourceRetirement/ownershipRevision")
++            .and_then(Value::as_u64)
++            != Some(source_revision)
++            || string(&self.payload, "/sourceRetirement/homeIdentity")? != source_identity
++        {
++            return Err(invalid());
++        }
++        let files: Vec<crate::request_processors::NativeArchiveFile> = serde_json::from_value(
++            self.payload
++                .pointer("/sourceRetirement/files")
++                .cloned()
++                .ok_or_else(invalid)?,
++        )
++        .map_err(|_| invalid())?;
 +        let thread_ids = self
 +            .payload
 +            .pointer("/request/threads")
@@ -7412,6 +7433,7 @@
 +            std::path::PathBuf::from(source_home),
 +            source_identity,
 +            source_revision,
++            files,
 +        ))
 +    }
 +    pub(crate) fn home(&self) -> &Path {
@@ -7916,10 +7938,11 @@
  fn writer_locks_reject_competing_owners_and_release_their_files() {
 --- /dev/null
 +++ b/app-server/src/request_processors/selected_archive.rs
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,392 @@
 +//! Complete selected archive file evidence, held through source publication.
 +use codex_protocol::ThreadId;
 +use codex_rollout::{ARCHIVED_SESSIONS_SUBDIR, RolloutReferenceIndex, SESSIONS_SUBDIR};
++use serde::Deserialize;
 +use serde_json::{Value, json};
 +use sha2::{Digest, Sha256};
 +use std::collections::{BTreeMap, HashSet};
@@ -7933,6 +7956,17 @@
 +
 +fn invalid() -> io::Error {
 +    io::Error::other("Selected archive history or its destination changed")
++}
++#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub(crate) struct NativeArchiveFile {
++    pub(crate) thread_id: String,
++    pub(crate) relative_path: String,
++    pub(crate) file_identity: String,
++    pub(crate) size: u64,
++    pub(crate) modified_seconds: i64,
++    pub(crate) modified_nanoseconds: i64,
++    pub(crate) sha256: String,
 +}
 +#[derive(PartialEq, Eq)]
 +struct Content {
@@ -8164,6 +8198,122 @@
 +        }
 +        Ok(result)
 +    }
++    /// Revalidate a committed source manifest against the source server's
++    /// current native archive index and physical rollout bytes. This prevents
++    /// a journal list from omitting a fork/reference file or substituting a
++    /// stale manifest after source retirement.
++    pub(crate) async fn capture_import_manifest(
++        home: &Path,
++        thread_ids: &HashSet<ThreadId>,
++        manifest: &[NativeArchiveFile],
++    ) -> io::Result<Self> {
++        if home.canonicalize()? != home
++            || thread_ids.is_empty()
++            || manifest.is_empty()
++            || manifest.len() > 4096
++        {
++            return Err(invalid());
++        }
++        let mut names = HashSet::new();
++        let mut expected = BTreeMap::<String, String>::new();
++        let mut total = 0u64;
++        for file in manifest {
++            let id = ThreadId::try_from(file.thread_id.as_str()).map_err(|_| invalid())?;
++            if id.to_string() != file.thread_id
++                || !thread_ids.contains(&id)
++                || !file.relative_path.starts_with("archived_sessions/")
++                || Path::new(&file.relative_path)
++                    .components()
++                    .any(|part| !matches!(part, Component::Normal(_)))
++                || !Path::new(&file.relative_path)
++                    .file_name()
++                    .and_then(|name| name.to_str())
++                    .is_some_and(|name| name.contains(&file.thread_id))
++                || file.size == 0
++                || file.size > 256 * 1024 * 1024
++                || !(0..1_000_000_000).contains(&file.modified_nanoseconds)
++                || file.sha256.len() != 64
++                || !file
++                    .sha256
++                    .bytes()
++                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++                || file.file_identity.split(':').count() != 2
++                || !file
++                    .file_identity
++                    .split(':')
++                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
++                || !names.insert(file.relative_path.clone())
++            {
++                return Err(invalid());
++            }
++            total = total.checked_add(file.size).ok_or_else(invalid)?;
++            if total > 1024 * 1024 * 1024 {
++                return Err(invalid());
++            }
++            expected.insert(file.relative_path.clone(), file.thread_id.clone());
++        }
++        if thread_ids
++            .iter()
++            .any(|id| !manifest.iter().any(|file| file.thread_id == id.to_string()))
++        {
++            return Err(invalid());
++        }
++        let ids = thread_ids.iter().copied().collect::<Vec<_>>();
++        let index = RolloutReferenceIndex::scan_archived_threads(home, &ids).await?;
++        let mut indexed = BTreeMap::<String, String>::new();
++        for id in thread_ids {
++            for (_, path) in index.rollouts_for_thread(*id) {
++                let relative = path
++                    .strip_prefix(home)
++                    .map_err(|_| invalid())?
++                    .to_str()
++                    .ok_or_else(invalid)?
++                    .to_owned();
++                if indexed.insert(relative, id.to_string()).is_some() {
++                    return Err(invalid());
++                }
++            }
++        }
++        if indexed != expected {
++            return Err(invalid());
++        }
++        let root = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(home)?;
++        let mut plan = Self {
++            home: home.to_owned(),
++            root,
++            files: Vec::new(),
++        };
++        plan.verify_root()?;
++        for file in manifest {
++            let before = PathBuf::from(&file.relative_path);
++            let content = Content {
++                identity: file.file_identity.clone(),
++                size: file.size,
++                seconds: file.modified_seconds,
++                nanos: file.modified_nanoseconds,
++                hash: file.sha256.clone(),
++            };
++            if plan.content(&before)? != content {
++                return Err(invalid());
++            }
++            let metadata = codex_rollout::read_session_meta_line(&home.join(&before)).await?;
++            let id = ThreadId::try_from(file.thread_id.as_str()).map_err(|_| invalid())?;
++            if metadata.meta.id != id || plan.content(&before)? != content {
++                return Err(invalid());
++            }
++            plan.files.push(Entry {
++                id,
++                before: before.clone(),
++                after: before,
++                content,
++            });
++        }
++        plan.verify_root()?;
++        Ok(plan)
++    }
 +    pub(crate) fn verify_archived(&self) -> io::Result<()> {
 +        self.verify_root()?;
 +        for entry in &self.files {
@@ -8183,9 +8333,10 @@
 +}
 --- /dev/null
 +++ b/app-server/src/request_processors/selected_incoming.rs
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,243 @@
 +//! Destination-side Incoming reservation. This blocks resume while native
 +//! archive import and verification are still pending.
++use super::selected_archive::SelectedArchivePlan;
 +use super::*;
 +use crate::selected_journal_lock::{JournalLockRequest, NativeJournalLock};
 +use crate::turn_admission::{SelectedAdmissionPause, TurnAdmission};
@@ -8202,6 +8353,7 @@
 +    source_home: PathBuf,
 +    source_identity: String,
 +    source_revision: u64,
++    source_archive: SelectedArchivePlan,
 +    attempted: bool,
 +}
 +
@@ -8243,6 +8395,7 @@
 +                "Source retirement changed; inspect before importing",
 +            ));
 +        }
++        self.source_archive.verify_archived()?;
 +        let destination = store::observe(&self.home, &self.request.thread_ids)?;
 +        if destination.home_identity != destination_identity
 +            || destination.revision != self.request.expected_revision
@@ -8307,7 +8460,7 @@
 +        queues: &crate::request_processors::ThreadQueueRequestProcessor,
 +        journal: &NativeJournalLock,
 +    ) -> io::Result<NativeSelectedIncoming> {
-+        let (request, source_home, source_identity, source_revision) =
++        let (request, source_home, source_identity, source_revision, source_manifest) =
 +            journal.incoming_request()?;
 +        let home = self.native_move_home();
 +        if journal.home() != home || request.thread_ids.len() != ids.len() {
@@ -8328,6 +8481,9 @@
 +        {
 +            return Err(io::Error::other("Source retirement is not confirmed"));
 +        }
++        let source_archive =
++            SelectedArchivePlan::capture_import_manifest(&source_home, ids, &source_manifest)
++                .await?;
 +        let destination = store::observe(&home, &request.thread_ids)?;
 +        if destination.home_identity != destination_identity
 +            || destination.revision != request.expected_revision
@@ -8414,6 +8570,7 @@
 +            source_home,
 +            source_identity,
 +            source_revision,
++            source_archive,
 +            attempted: false,
 +        };
 +        result.verify(journal, admission, pause, ids)?;
