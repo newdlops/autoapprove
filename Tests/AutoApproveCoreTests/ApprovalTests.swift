@@ -1256,7 +1256,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Native selected cohort: incomplete scope and forged readiness reject",tests.testNativeSelectedCohortRejectsIncompleteOrForgedReadiness),
             ("Native selected shutdown: retained results never grant writer ownership",tests.testNativeSelectedShutdownRejectsOwnershipClaimsAndInconsistentResults),
             ("Bundled Codex runtime: profile requires matching server and literal command",tests.testBundledCodexProfileLaunchRequiresMatchingServerAndLiteralCommand),
-            ("Session profiles: newer live server uses its matching CLI without replacement",tests.testProfileLaunchReusesMatchingInstalledCLIWithoutPreparingLiveServer),
+            ("Session profiles: compatible newer server preserves the bundled client",tests.testProfileLaunchKeepsBundledClientWithCompatibleNewerServer),
             ("Session profiles: matching bundled server preserves auto-start settings",tests.testProfileLaunchUsesMatchingBundledServerWithoutChangingAutoStart),
             ("Bundled Codex runtime: unsupported capabilities links and missing code reject",tests.testBundledCodexRuntimeRejectsWrongCapabilitiesLinksAndMissingCode),
             ("Native connection: kernel witness and exact displayed association",tests.testNativeConnectionReadsKernelWitnessAndExactAssociation),
