@@ -6,6 +6,7 @@ import Darwin
 enum NativeProcessReader {
     private static let codexName = Array("codex".utf8)
     private static let claudeName = Array("claude".utf8)
+    private static let claudeExeName = Array("claude.exe".utf8)
     private static let nodeName = Array("node".utf8)
     static func read(pid: Int32? = nil) throws -> [ProcessRecord] {
         try autoreleasepool { try records(pid: pid, sessionsOnly: false) }
@@ -145,7 +146,7 @@ enum NativeProcessReader {
         // Inspect the fixed-size kernel name directly. Building a Swift String
         // (and lowercased copy) for every process on every discovery pass is
         // unnecessary; detailed argv/path data is fetched only for matches.
-        if shortNameMatches(process, codexName) || shortNameMatches(process, claudeName) { return true }
+        if shortNameMatches(process, codexName) || shortNameMatches(process, claudeName) || shortNameMatches(process, claudeExeName) { return true }
         // Claude's versioned CLI can appear under its Node runtime name. Limit
         // this fallback to TTY processes; unrelated background Node services
         // do not need argv reads or ancestry enrichment.

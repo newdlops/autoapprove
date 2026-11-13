@@ -8,11 +8,13 @@ public struct ClaudeSessionRegistration: Equatable {
     public var jobID: String?
     public var parkedJobID: String?
     public var activity: ClaudeSessionActivity?
+    /// Name advertised by the current Claude process; not a conversation UUID.
+    public var peerName: String?
 
-    public init(processID: String, kind: String, jobID: String? = nil, parkedJobID: String? = nil, activity: ClaudeSessionActivity? = nil) {
+    public init(processID: String, kind: String, jobID: String? = nil, parkedJobID: String? = nil, activity: ClaudeSessionActivity? = nil, peerName: String? = nil) {
         self.processID = processID; self.kind = kind
         self.jobID = jobID; self.parkedJobID = parkedJobID
-        self.activity = activity
+        self.activity = activity; self.peerName = peerName
     }
 }
 
@@ -134,7 +136,11 @@ public enum ClaudeSessionRegistry {
             activity = .init(providerID: provider, status: status, waitingFor: json["waitingFor"] as? String,
                 changedAt: Date(timeIntervalSince1970: milliseconds / 1000))
         }
-        return .init(processID: process.key, kind: kind, jobID: identifier("jobId"), parkedJobID: identifier("parkedJobId"), activity: activity)
+        let peerName = (json["name"] as? String).flatMap { name -> String? in
+            guard !name.isEmpty, name.count <= 256, !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+            return name
+        }
+        return .init(processID: process.key, kind: kind, jobID: identifier("jobId"), parkedJobID: identifier("parkedJobId"), activity: activity, peerName: peerName)
     }
 
     /// Jobs are not a stable Claude API. Use their optional structured question only

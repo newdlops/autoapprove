@@ -238,6 +238,8 @@ import AutoApproveCore
                     .help(AppHelp.connections)
                 Button {openWindow(id:"profiles")} label: {Label("세션 프로필",systemImage:"rectangle.stack")}
                     .help("창별 대화를 이름 있는 여러 프로필 파일로 저장하고 재부팅 후 복원합니다.")
+                Button {openWindow(id:"session-groups")} label: {Label("세션 그룹",systemImage:"person.2")}
+                    .help("Codex와 Claude Code 세션을 그룹으로 묶고 구성원을 관리합니다.")
                 Button {
                     do { allAutomationResetMessage = try engine.resetAllAutomation().message }
                     catch { self.error = error.localizedDescription }

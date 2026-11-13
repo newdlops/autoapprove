@@ -52,6 +52,10 @@ import AutoApproveCore
             if let controller=container.sessionProfiles {SessionProfilesWindow(controller:controller)}
         }.defaultSize(width:860,height:640).windowResizability(.contentMinSize).commandsRemoved()
 
+        Window("세션 그룹", id: "session-groups") {
+            if let engine = container.engine { SessionGroupsWindow(engine: engine) }
+        }.defaultSize(width:860,height:640).windowResizability(.contentMinSize).commandsRemoved()
+
         Window("계정·로그인", id: "accounts") {
             if let engine=container.engine {CodexAccountsWindow(engine:engine)}
         }.windowResizability(.contentSize).commandsRemoved()

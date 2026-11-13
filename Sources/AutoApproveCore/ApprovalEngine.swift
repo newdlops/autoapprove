@@ -2144,6 +2144,70 @@ private struct ScreenAnalysisStorageKey: Hashable {
         remoteUserInputHasPriority(id) || automaticInputBusy(id)
     }
 
+    /// Resolve only each already-discovered process. This never uses thread/list.
+    public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
+        let originals = sessions.values.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
+        guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
+        let reader = processReader, registry = claudeRegistryReader
+        let records = try await Task.detached(priority: .utility) { try reader() }.value
+        var result: [SessionGroupLiveSession] = []
+        for original in originals {
+            try Task.checkCancellation()
+            guard let record = records.first(where: { $0.key == original.id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else { continue }
+            let environment = await Task.detached(priority: .utility) { ProcessEnvironment.read(record) }.value
+            var home: String?, conversation: String?, messagingName: String?
+            if original.agent == .codex {
+                let location = try? await Task.detached(priority: .utility) {
+                    try CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: record.pid, expectedStart: record.started))
+                }.value
+                if let location, UUID(uuidString: location.threadID) != nil {
+                    conversation = location.threadID
+                    home = URL(fileURLWithPath: location.database).deletingLastPathComponent().resolvingSymlinksInPath().path
+                } else if let thread = original.codexApprovalBinding?.threadID, UUID(uuidString: thread) != nil,
+                          var target = try? await questionTransport.queueHome(original) {
+                    target.threadID = thread
+                    if (try? await codexQueue.validate(target, original.cwd)) != nil {
+                        conversation = thread; home = URL(fileURLWithPath: target.home).resolvingSymlinksInPath().path
+                    }
+                }
+            } else {
+                if let environment {
+                    let path = environment["CLAUDE_CONFIG_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path
+                    home = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+                    let directory = URL(fileURLWithPath: path)
+                    let rows = await Task.detached(priority: .utility) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
+                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap { $0.activity?.providerID })
+                    if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
+                    let matching = rows.filter { $0.processID == original.id && $0.activity?.providerID == conversation }
+                    if conversation != nil, matching.count == 1 { messagingName = matching[0].peerName }
+                } else {
+                    // Injected registry readers are also useful for isolated tests; do not infer a home.
+                    let rows = await Task.detached(priority: .utility) { registry([record]) }.value
+                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap { $0.activity?.providerID })
+                    if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
+                    let matching = rows.filter { $0.processID == original.id && $0.activity?.providerID == conversation }
+                    if conversation != nil, matching.count == 1 { messagingName = matching[0].peerName }
+                }
+            }
+            guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
+                  current.tty == original.tty, current.agent == original.agent, current.cwd == original.cwd,
+                  current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
+                  current.phase != .ended else { continue }
+            result.append(SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName))
+        }
+        // Discovery can lag while a process exits or a PID is reused. Re-read
+        // the process list after the async work, and never publish a stale match.
+        let latest = try await Task.detached(priority: .utility) { try reader() }.value
+        return result.filter { observation in
+            guard let current = sessions[observation.id], current.phase != .ended,
+                  current.pid == observation.session.pid, current.started == observation.session.started,
+                  current.tty == observation.session.tty, current.cwd == observation.session.cwd,
+                  current.agent == observation.session.agent,
+                  current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID else { return false }
+            return latest.contains { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }
+        }.sorted { $0.session.displayedTerminalTitle.localizedStandardCompare($1.session.displayedTerminalTitle) == .orderedAscending }
+    }
+
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
         guard let owner = object["owner"] as? String, UUID(uuidString: owner) != nil,
               let tool = object["tool"] as? String else { throw RemoteHTTPError(400, "MCP 연결 정보가 필요합니다.") }
@@ -2153,6 +2217,44 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
         switch tool {
+        case "get_session_groups":
+            let observed = try await sessionGroupSessions()
+            let claimed = object["conversationID"] as? String
+            guard claimed == nil || UUID(uuidString: claimed!) != nil else { throw RemoteHTTPError(400, "현재 대화의 UUID를 확인해주세요.") }
+            let direct = (object["sessionID"] as? String).flatMap { id in observed.first { $0.id == id } }
+            let caller: SessionGroupLiveSession
+            let attribution: String
+            if let direct {
+                if let claimed, UUID(uuidString: claimed) != direct.conversationID.flatMap(UUID.init(uuidString:)) {
+                    throw RemoteHTTPError(409, "지정한 대화 ID가 현재 세션과 다릅니다.")
+                }
+                caller = direct; attribution = "process"
+            } else {
+                guard let claimed, let uuid = UUID(uuidString: claimed),
+                      let kindText = object["agentKind"] as? String, let kind = AgentKind(rawValue: kindText), kind != .shell else {
+                    throw RemoteHTTPError(409, "공유 서버에서 현재 세션을 자동 확인하지 못했습니다. 현재 대화 UUID를 지정해주세요.")
+                }
+                let matches = observed.filter { $0.session.agent == kind && $0.providerHome != nil && $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }
+                guard matches.count == 1, let found = matches.first else {
+                    throw RemoteHTTPError(409, "지정한 대화에 일치하는 실행 세션을 유일하게 확인하지 못했습니다.")
+                }
+                caller = found; attribution = "provided_conversation_id"
+            }
+            let groups = try SessionGroupStore(directory: paths.directory).load()
+            let matching = groups.filter { group in group.members.contains { SessionGroupMatching.match($0, in: observed)?.id == caller.id } }
+            let output: [JSONObject] = matching.map { group in
+                let members: [JSONObject] = group.members.map { member in
+                    let live = SessionGroupMatching.match(member, in: observed)
+                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title,
+                            "cwd": member.cwd, "conversationID": member.conversationID,
+                            "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
+                            "messagingName": live?.messagingName as Any? ?? NSNull(),
+                            "isCaller": live?.id == caller.id, "sameAgent": member.agent == caller.session.agent]
+                }
+                return ["id": group.id.uuidString, "name": group.name, "members": members]
+            }
+            return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
+                    "message": "다른 도구의 구성원은 표시만 합니다. 같은 도구의 메시지 수신 가능 여부와 실제 주소는 각 도구에서 확인하세요."]
         case "ask_user":
             guard webStatus.ready else { throw RemoteHTTPError(409, "Mac에서 AutoApprove 웹 접속을 켠 뒤 질문을 게시해주세요.") }
             var params = object

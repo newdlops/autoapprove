@@ -102,7 +102,7 @@ public struct ProcessRecord: Codable, Equatable, Sendable {
             let name = component.isEmpty || component == "." || component == ".."
                 ? URL(fileURLWithPath: executable).lastPathComponent : component
             if name == "codex" { candidate = .codex }
-            else if name == "claude" || (name.first?.isNumber == true && executable.contains("/claude/versions/")) { candidate = .claude }
+            else if name == "claude" || (name == "claude.exe" && executable.hasSuffix("/node_modules/@anthropic-ai/claude-code/bin/claude.exe")) || (name.first?.isNumber == true && executable.contains("/claude/versions/")) { candidate = .claude }
             else { return nil }
         }
         return executable.contains("/Applications/ChatGPT.app/") ? nil : candidate

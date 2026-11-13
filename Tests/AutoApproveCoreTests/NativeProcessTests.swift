@@ -144,6 +144,10 @@ extension ApprovalTests {
             return (reads[pid, default: 0] > 1 ? changed[pid] : graph[pid]).map { [$0] } ?? []
         }
         try expect(rejected == nil, "A nonmatching intermediate agent is still part of the original ownership proof")
+        let npm = ProcessDiscovery.parse("31 20 ttys901 31 20 Tue Oct 20 01:58:00 2026 /fixture/node_modules/@anthropic-ai/claude-code/bin/claude.exe")[0]
+        let unrelated = ProcessDiscovery.parse("32 20 ttys901 32 20 Tue Oct 20 01:58:00 2026 /fixture/other/claude.exe")[0]
+        try expectEqual(npm.agent, .claude)
+        try expectNil(unrelated.agent)
     }
 
     func testNativeProcessMetadataAndOriginalHostParity() throws {

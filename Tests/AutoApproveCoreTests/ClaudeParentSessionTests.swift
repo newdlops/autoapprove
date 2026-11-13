@@ -124,14 +124,17 @@ extension ApprovalTests {
         let start = Date(timeIntervalSince1970: 1_792_000_000), changed = start.addingTimeInterval(30)
         let process = ProcessDiscovery.parse("900000 1 ttys901 900000 900000 \(local.string(from: start)) claude")[0]
         let file = sessions.appendingPathComponent("900000.json", isDirectory: false)
-        var row: JSONObject = ["pid": 900000, "pidDomain": "darwin", "procStart": utc.string(from: start), "kind": "interactive", "sessionId": "fixture-path", "status": "idle", "statusUpdatedAt": changed.timeIntervalSince1970 * 1000]
+        var row: JSONObject = ["pid": 900000, "pidDomain": "darwin", "procStart": utc.string(from: start), "kind": "interactive", "sessionId": "fixture-path", "status": "idle", "statusUpdatedAt": changed.timeIntervalSince1970 * 1000, "name": "fixture-peer"]
         func read() -> [ClaudeSessionRegistration] { ClaudeSessionRegistry.read(records: [process], directory: directory) }
         try expect(read().isEmpty)
         try JSONSerialization.data(withJSONObject: row).write(to: file, options: .atomic)
         try expectEqual(read().first?.activity?.status, "idle")
+        try expectEqual(read().first?.peerName, "fixture-peer")
+        row["name"] = "bad\nname"
         row["status"] = "busy"
         try JSONSerialization.data(withJSONObject: row).write(to: file, options: .atomic)
         try expectEqual(read().first?.activity?.status, "busy", "Atomic replacement must invalidate a warm registration")
+        try expectNil(read().first?.peerName)
         try FileManager.default.removeItem(at: file)
         try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
         try expect(read().isEmpty, "A directory named like metadata is never a registration")
