@@ -4570,6 +4570,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return ["autoapproveBridge": ["waiting": true, "waitSupported": true]]
     }
 
+    /// Hold Claude's hook only for an answer AutoApprove sends within its confirmation delay.
+    /// Every other request returns at once, so Claude's own terminal dialog and choices appear.
+    private func holdsClaudeHook(_ request: ClaudeHookRequest, questionEditing: Bool) -> Bool {
+        guard effectiveAutomatic(request.sessionID), !snapshot.paused else { return false }
+        if request.safetyResponse != nil { return true }
+        return request.response != nil && !questionEditing
+    }
+
+    /// Return a held hook to Claude once AutoApprove can no longer answer it, for example after automatic approval is turned off.
+    private func releaseLiveClaudeHook(_ id: String) throws -> JSONObject {
+        guard var pending = liveClaudeHooks[id] else { return bridgeResponse([:]) }
+        let response = handleHook(pending.request.payload, deferApproval: false, prepared: pending.request)
+        pending.receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+        try saveClaudeReceipt(pending.receipt)
+        removeLiveClaudeHook(id, terminal: true)
+        publish()
+        return bridgeResponse(response)
+    }
+
     private func saveClaudeReceipt(_ receipt: ClaudeHookReceipt) throws {
         do {
             try store.saveClaudeHook(receipt)
@@ -4614,6 +4633,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     _ = handleHook(envelope.payload, deferApproval: true, prepared: pending.request)
                 }
             }
+            if !holdsClaudeHook(pending.request, questionEditing: pending.questionEditing) {
+                liveClaudeHooks[envelope.id] = pending
+                return try releaseLiveClaudeHook(envelope.id)
+            }
             pending.lastContact = now
             liveClaudeHooks[envelope.id] = pending
             try answerClaudeHookIfEligible(pending, at: now)
@@ -4653,7 +4676,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return bridgeResponse([:])
             }
         }
-        if request.response == nil && request.questions == nil && request.safetyResponse == nil {
+        if !holdsClaudeHook(request, questionEditing: false) {
             invalidateClaudeHooks(for: payload, sessionID: request.sessionID)
             let response = handleHook(request.payload, deferApproval: false, prepared: request)
             receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
@@ -5231,8 +5254,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         if session.channel == .hook {
             // A hook that already allowed the request must never be followed by a screen approval.
-            guard session.phase == .approval, session.pendingInTerminal, prompt != nil,
-                  let source, source.isScreen else { return }
+            // A released hook returns `{}` and leaves its request pending in the terminal, so the screen may answer it.
+            // Ownership stays with the kind of request that was released: a question takes only a choice screen,
+            // and a permission request takes only a permission dialog.
+            let matchesReleasedRequest = session.phase == .input
+                ? prompt == nil && analysis.request?.phase == .input
+                : session.phase == .approval && prompt != nil
+            guard matchesReleasedRequest, session.pendingInTerminal, let source, source.isScreen else { return }
             sessions[sessionID]?.channel = source
         } else if !session.channel.isScreen { return }
         screenObservedAt[sessionID] = now

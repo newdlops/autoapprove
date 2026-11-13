@@ -217,14 +217,14 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try safetyHookEngine(paths, probe: SafetyProbe()), now = Date(); defer { engine.stop() }
         let request = safetyHook(now)
-        try expectEqual((try engine.handleClaudeHook(request, at: now)["autoapproveBridge"] as! JSONObject)["waiting"] as? Bool, true)
+        // A manual system change is released to Claude's terminal at once, with its risk shown in the session.
+        try expectEqual(((try engine.handleClaudeHook(request, at: now)["autoapproveBridge"] as! JSONObject)["response"] as? JSONObject)?.isEmpty, true)
         try engine.setAutomatic(safetyClaude.key, enabled: true); try engine.setPaused(true)
-        try expectEqual((try engine.handleClaudeHook(request, at: now)["autoapproveBridge"] as! JSONObject)["waiting"] as? Bool, true)
-        let approval = engine.snapshot.sessions.first { $0.id == safetyClaude.key }!.claudeApprovals!.first!
-        try expectEqual(approval.buttonTitle, "안전한 방법으로 계속"); try expectNil(approval.automaticAt)
-        try engine.answerClaudeApproval(sessionID: safetyClaude.key, requestID: request["requestID"] as! String, at: now)
-        let response = (try engine.handleClaudeHook(request, at: now)["autoapproveBridge"] as! JSONObject)["response"] as! JSONObject
-        try expectEqual(((response["hookSpecificOutput"] as! JSONObject)["decision"] as! JSONObject)["interrupt"] as? Bool, false)
+        try expectEqual(((try engine.handleClaudeHook(request, at: now)["autoapproveBridge"] as! JSONObject)["response"] as? JSONObject)?.isEmpty, true, "A released system change is never decided by the hook after the fact")
+        let released = engine.snapshot.sessions.first { $0.id == safetyClaude.key }!
+        try expect(released.pendingInTerminal, "The released system change is pending in the terminal")
+        try expectNotNil(released.systemCommandRisk)
+        try expect(engine.snapshot.events.allSatisfy { !["승인 전달", "질문 응답 전달"].contains($0.outcome) })
         try engine.setPaused(false)
         let read = safetyHook(now, command: "launchctl print gui/501/com.fixture")
         _ = try engine.handleClaudeHook(read, at: now)

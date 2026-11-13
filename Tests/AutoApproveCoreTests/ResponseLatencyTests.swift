@@ -252,23 +252,18 @@ extension ApprovalTests {
              "tty": "/dev/ttys980", "cwd": "/fixture", "tool_name": "Bash", "tool_use_id": "synthetic-tool-\(number)", "tool_input": ["command": "echo synthetic-\(number)"]]
         }
         let socket = engine.paths.socket
-        let calls = payloads.map { payload in Task.detached { try SocketClient.request(path: socket, message: ["method": "hookWait", "params": payload], timeout: 20) } }
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
-        while engine.snapshot.sessions.first?.claudeApprovals?.count != 2, ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        try expectEqual(engine.snapshot.sessions[0].claudeApprovals?.count, 2)
         let start = ProcessInfo.processInfo.systemUptime
-        try engine.answerClaudeApproval(sessionID: record.key, requestID: payloads[0]["requestID"] as! String)
-        let first = try await calls[0].value
-        try expect((first["autoapproveBridge"] as? JSONObject)?["response"] is JSONObject)
-        try expect(ProcessInfo.processInfo.systemUptime - start < 0.3, "A stored decision must wake its helper without the 400ms polling interval")
-        try expect(engine.snapshot.sessions[0].claudeApprovals?.contains(where: { $0.id == payloads[1]["requestID"] as? String && !$0.sending }) == true)
-        try engine.acknowledgeClaudeHook(payloads[0])
-        try engine.answerClaudeApproval(sessionID: record.key, requestID: payloads[1]["requestID"] as! String)
-        _ = try await calls[1].value; try engine.acknowledgeClaudeHook(payloads[1])
+        let calls = payloads.map { payload in Task.detached { try SocketClient.request(path: socket, message: ["method": "hookWait", "params": payload], timeout: 20) } }
+        // Manual requests are released to Claude's terminal at once; no helper waits on the app.
+        for call in calls {
+            let result = try await call.value
+            try expectEqual((result["autoapproveBridge"] as? JSONObject)?["response"].map { ($0 as? JSONObject)?.isEmpty == true }, true)
+        }
+        try expect(ProcessInfo.processInfo.systemUptime - start < 0.3, "A released request must wake its helper without the 400ms polling interval")
+        try expect(engine.snapshot.sessions[0].claudeApprovals?.isEmpty ?? true, "A released request leaves no app card")
         let replay = try await Task.detached { try SocketClient.request(path: socket, message: ["method": "hookWait", "params": payloads[0]], timeout: 2) }.value
-        try expect((replay["autoapproveBridge"] as? JSONObject)?["response"] is JSONObject)
-        try expectEqual(engine.snapshot.events.count, 2)
-        try expect(engine.snapshot.events.allSatisfy { $0.outcome == "승인 전달" })
+        try expectEqual((replay["autoapproveBridge"] as? JSONObject)?["response"].map { ($0 as? JSONObject)?.isEmpty == true }, true, "A saved release replays exactly")
+        try expect(engine.snapshot.events.allSatisfy { $0.outcome != "승인 전달" })
     }
     func testResponseFastDefaultConfirmationAndCancellationWindow() async throws {
         let root = URL(fileURLWithPath: "/private/tmp/aa-confirm-fast-" + UUID().uuidString), probe = PreparationProbe(0)

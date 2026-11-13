@@ -879,6 +879,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Claude decision and audit rollback together before retry", tests.testClaudeHookDurableSaveFailureAndRetry),
             ("Claude general permission and unsupported question fallback", tests.testClaudeHookGeneralPermissionAndUnsupportedQuestion),
             ("Live Claude hook excludes screen input and rechecks parent exit", tests.testClaudeLiveHookOwnsScreenAndRechecksParent),
+            ("Released Claude question takes only its choice screen", tests.testReleasedClaudeQuestionTakesOnlyItsChoiceScreen),
             ("Claude registry verifies process identity and exact background parent", tests.testClaudeRegistryIdentityAndExactParent),
             ("Claude restores existing background questions without replaying old hooks", tests.testClaudeRestoresWaitingBackgroundWithoutAHook),
             ("Claude recovered waiting transitions and unavailable metadata", tests.testClaudeRecoveredWaitingTransitionsAndUnavailableMetadata),
