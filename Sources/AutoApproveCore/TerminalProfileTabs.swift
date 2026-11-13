@@ -340,7 +340,12 @@ public enum TerminalProfileTabOpener {
             }
             return tty
         }catch {
-            throw RemoteHTTPError(409,error.localizedDescription,diagnostics:posted ? nil:["delivery":"not_started"])
+            // This routine can create a tab, but never submits a CLI command.
+            // Preserve the separate uncertainty about the tab itself.
+            var diagnostics=["command_delivery":"not_started"]
+            if !posted {diagnostics["delivery"]="not_started"}
+            else {diagnostics["tab_creation"]="unknown"}
+            throw RemoteHTTPError(409,error.localizedDescription,diagnostics:diagnostics)
         }
     }
 }

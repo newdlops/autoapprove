@@ -5304,7 +5304,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return
         }
         activityTrackers.removeValue(forKey: sessionID)
-        let risk = SystemCommandRisk.detect(prompt.summary, cwd: session.cwd)
+        let risk = Self.screenApprovalRisk(prompt,agent:session.agent,cwd:session.cwd)
         sessions[sessionID]?.systemCommandRisk = risk
         if let risk { observeSystemSafety(sessionID, risk: risk, prompt: prompt, generation: generation, at: now) }
         if let existing = screens[sessionID], existing.isCurrent, existing.generation == generation, existing.prompt.identity == prompt.identity {
@@ -8640,15 +8640,28 @@ private struct ScreenAnalysisStorageKey: Hashable {
         publish()
     }
 
+    private static func isCodexFileEdit(_ prompt:ApprovalPrompt,agent:AgentKind)->Bool {
+        agent == .codex && prompt.summary.filter{!$0.isWhitespace}.hasPrefix("Wouldyouliketomakethefollowingedits?")
+    }
+    private static func screenApprovalRisk(_ prompt:ApprovalPrompt,agent:AgentKind,cwd:String)->SystemCommandRisk? {
+        let operation=isCodexFileEdit(prompt,agent:agent) ? "write_text ":""
+        return SystemCommandRisk.detect(operation+prompt.summary,cwd:cwd)
+    }
     private func scheduleScreenApproval(_ id: String) {
-        guard sessions[id]?.codexApprovalBinding == nil else { return }
+        // Codex file edits use the visible terminal as their sole approval
+        // transport, even when this session also observes server activity.
+        func screenOwnsApproval(_ session:AgentSession,_ prompt:ApprovalPrompt)->Bool {
+            guard session.codexApprovalBinding != nil else {return true}
+            return Self.isCodexFileEdit(prompt,agent:session.agent)
+        }
         guard !hasOSPermissionWait(id) else {return}
         if systemSafetyStates[id]?.notice.isPending == true { scheduleSystemSafety(id); return }
         guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
-              SystemCommandRisk.detect(state.prompt.summary, cwd: session.cwd) == nil else { return }
+              screenOwnsApproval(session,state.prompt),
+              Self.screenApprovalRisk(state.prompt,agent:session.agent,cwd:session.cwd) == nil else { return }
         let scheduledRevision = revision
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
@@ -8663,7 +8676,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let self else { return }
             guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
                   !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
-                  self.sessions[id]?.codexApprovalBinding == nil,
+                  let latestSession=self.sessions[id], screenOwnsApproval(latestSession,state.prompt),
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,
@@ -8672,7 +8685,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.scheduledID == scheduledID,
                   current.generation == state.generation,
                   current.prompt.requestIdentity == state.prompt.requestIdentity,
-                  SystemCommandRisk.detect(current.prompt.summary, cwd: session.cwd) == nil,
+                  Self.screenApprovalRisk(current.prompt,agent:session.agent,cwd:session.cwd) == nil,
                   live?.contains(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent
                       && "/dev/" + $0.tty == session.tty && $0.isForeground }) == true else {
                 if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }

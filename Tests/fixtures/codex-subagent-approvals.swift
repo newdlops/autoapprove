@@ -73,9 +73,9 @@ import Foundation
                 await confirmed.add()
             })
         }.value
-        precondition(count.responded == 3 && count.review == 2)
+        precondition(count.responded == 2 && count.review == 3)
         let a = await authorized.value, c = await confirmed.value
-        precondition(a == 3 && c == 3)
+        precondition(a == 2 && c == 2)
         }
 
         let paths = AppPaths(directory: URL(fileURLWithPath: home).appendingPathComponent(uncertain ? "engine-uncertain" : "engine"))
@@ -84,7 +84,9 @@ import Foundation
         session.channel = .itermScreen
         let transport = CodexReplyTransport(prepare: { _, _ in target }, send: { _, _ in fatalError("No user message") },
             prepareMessage: { _ in target }, queueHome: { _ in target }, prepareQueue: { _, _ in target })
-        let engine = try ApprovalEngine(paths: paths, questionTransport: transport, processReader: { [record] })
+        let screenProbe=ScreenProbe()
+        let screenAdapter=ScreenHostAdapter(screens:{_ in .init(screens:[])},approve:{target,_,_ in screenProbe.record(target.tty);return .sent},reveal:{_ in nil})
+        let engine = try ApprovalEngine(paths: paths, questionTransport: transport, processReader: { [record] },screenAdapters:[.iterm:screenAdapter])
         engine.updateDiscovery([session], records: [record])
         try engine.setPaused(true)
         try engine.setAutomatic(session.id, enabled: true)
@@ -133,8 +135,16 @@ import Foundation
         precondition(engine.snapshot.events.contains(where: { $0.outcome == "서버 승인 확인" }))
         try await Task.sleep(for: .seconds(4)) // The same replay must not be sent twice.
         let attempts = engine.snapshot.events.filter { $0.outcome == "서버 승인 응답 시도 · 결과 미확인" }.count
-        precondition(attempts == 3)
+        precondition(attempts == 2)
         if uncertain { precondition(engine.snapshot.events.contains { $0.outcome == "서버 응답 결과 미확인 · 중복 전송하지 않음" }) }
+        if !uncertain {
+            let raw="Would you like to make the following edits?\n\nDestination: /fixture/source.swift\n\n› 1. Yes, proceed (y)\n  2. No (esc)\n\nPress enter to confirm or esc to cancel"
+            engine.receiveScreen(sessionID:session.id,raw:raw,generation:"fixture-screen")
+            for _ in 0..<80 {if screenProbe.count>0 {break};try await Task.sleep(for:.milliseconds(50))}
+            precondition(screenProbe.count==1 && screenProbe.tty==session.tty,"Visible file edit must use the original screen once while the server poll is active")
+            engine.receiveScreen(sessionID:session.id,raw:raw,generation:"fixture-screen")
+            try await Task.sleep(for:.milliseconds(200));precondition(screenProbe.count==1,"The repeated screen must not replay the file edit")
+        }
         try await engine.connectCodexApprovals(sessionID: session.id, threadID: nil)
         precondition(engine.snapshot.sessions[0].codexApprovalBinding == nil && engine.snapshot.sessions[0].codexActivity == nil)
         engine.stop()
@@ -142,3 +152,9 @@ import Foundation
     }
 }
 actor Counter { var value = 0; func add() { value += 1 } }
+final class ScreenProbe:@unchecked Sendable {
+    private let lock=NSLock();private var values:[String]=[]
+    func record(_ tty:String) {lock.lock();defer{lock.unlock()};values.append(tty)}
+    var count:Int {lock.lock();defer{lock.unlock()};return values.count}
+    var tty:String? {lock.lock();defer{lock.unlock()};return values.first}
+}

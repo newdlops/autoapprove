@@ -71,6 +71,90 @@ private final class DeliveredFrameProbe:@unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testBoundCodexFileEditsUseOneVisibleScreenApproval() async throws {
+        let probe=ApprovalRecoveryProbe()
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,boundCodex:true)
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id=sessions[0].id
+        let raw="""
+        Would you like to make the following edits?
+
+        Description: Apply proposed file edits
+        Destination: /tmp/approval-fixture/first.py
+        Destination: /tmp/approval-fixture/second.py
+
+        › 1. Yes, proceed (y)
+          2. Yes, and don't ask again for these files (a)
+          3. No, and tell Codex what to do differently (esc)
+
+        Press enter to confirm or esc to cancel
+        """
+        try expectNotNil(PromptDetector.detect(raw,agent:.codex))
+        let context=JSContext()!
+        context.setObject(raw,forKeyedSubscript:"current" as NSString)
+        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/fixture',contents:()=>current,processes:()=>['codex']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+        let script=try TerminalAdapter.approvalScript(tty:"/dev/fixture",expectedScreen:raw,agent:.codex)
+        try expectEqual(context.evaluateScript(script)?.toString(),"sent")
+        try expectEqual(context.evaluateScript("writes.join(',')")?.toString(),"1")
+        context.setObject(raw.replacingOccurrences(of:"› 1.",with:"  1.").replacingOccurrences(of:"  3.",with:"› 3."),forKeyedSubscript:"current" as NSString)
+        try expectEqual(context.evaluateScript(script)?.toString(),"screenChanged")
+        try expectEqual(context.evaluateScript("writes.length")?.toInt32(),1,"Changed selection cannot receive another input")
+        engine.receiveScreen(sessionID:id,raw:raw,generation:"same-tty")
+        try await waitForRecovery({probe.inputs.count==1},"A visible file-edit permission must be answered even when Codex is connected")
+        for _ in 0..<3 {engine.receiveScreen(sessionID:id,raw:raw,generation:"same-tty")}
+        func wrap(_ input:String,width:Int)->String {
+            input.components(separatedBy:"\n").flatMap {row -> [String] in
+                var rest=row,result:[String]=[]
+                while rest.count>width {result.append(String(rest.prefix(width)));rest=String(rest.dropFirst(width))}
+                result.append(rest);return result
+            }.joined(separator:"\n")
+        }
+        let identity=PromptDetector.detect(raw,agent:.codex)?.requestIdentity
+        for width in [30,60,120] {
+            let resized=wrap(raw,width:width)
+            try expectEqual(PromptDetector.detect(resized,agent:.codex)?.requestIdentity,identity,"The same file edit must remain identifiable after reflow")
+            engine.receiveScreen(sessionID:id,raw:resized,generation:"same-tty")
+        }
+        try await Task.sleep(for:.milliseconds(120))
+        try expectEqual(probe.inputs.count,1,"The same visible request must not be sent twice, including after resize")
+        try expectEqual(probe.inputs.first?.0.tty,sessions[0].tty)
+        for width in [30,60,120] {
+            let resizedProbe=ApprovalRecoveryProbe()
+            let (resizedEngine,resizedSessions,resizedDirectory)=try recoveryEngine(resizedProbe,host:.terminal,boundCodex:true)
+            defer {resizedEngine.stop();try? FileManager.default.removeItem(at:resizedDirectory)}
+            resizedEngine.receiveScreen(sessionID:resizedSessions[0].id,raw:wrap(raw,width:width),generation:"resized-tty")
+            try await waitForRecovery({resizedProbe.inputs.count==1},"A complete resized file-edit screen must be approved at width \(width)")
+        }
+    }
+    func testBoundCodexScreenApprovalRejectsOtherAndUncertainRequests() async throws {
+        let probe=ApprovalRecoveryProbe();probe.throwFirst=true
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,boundCodex:true)
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id=sessions[0].id
+        engine.receiveScreen(sessionID:id,raw:recoveryPrompt("echo command"),generation:"bound")
+        try await Task.sleep(for:.milliseconds(150));try expectEqual(probe.inputs.count,0,"Bound command permissions keep their existing transport")
+        let raw="Would you like to make the following edits?\n\nDestination: /tmp/approval-fixture/first.py\n\n› 1. Yes, proceed (y)\n  2. No (esc)\n\nPress enter to confirm or esc to cancel"
+        engine.receiveScreen(sessionID:id,raw:raw,generation:"bound")
+        try await waitForRecovery({engine.snapshot.sessions.first?.pendingInTerminal == true},"An uncertain terminal delivery must require review")
+        for _ in 0..<3 {engine.receiveScreen(sessionID:id,raw:raw,generation:"bound")}
+        try await Task.sleep(for:.milliseconds(120));try expectEqual(probe.inputs.count,1,"An uncertain file-edit input is never repeated")
+    }
+    func testBoundCodexFileEditScreenRespectsPauseSelectionAndSafety() async throws {
+        for mode in ["paused","disabled","selection","protected","protected_settings","protected_etc"] {
+            let probe=ApprovalRecoveryProbe(),(engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,boundCodex:true)
+            defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+            let id=sessions[0].id
+            var raw="Would you like to make the following edits?\n\nDescription: Apply proposed file edits\nDestination: /tmp/approval-fixture/file.py\n\n› 1. Yes, proceed (y)\n  2. No (esc)\n\nPress enter to confirm or esc to cancel"
+            if mode=="paused" {try engine.setPaused(true)}
+            if mode=="disabled" {try engine.setAutomatic(id,enabled:false)}
+            if mode=="selection" {raw=raw.replacingOccurrences(of:"› 1.",with:"  1.").replacingOccurrences(of:"  2.",with:"› 2.")}
+            if mode=="protected" {raw=raw.replacingOccurrences(of:"/tmp/approval-fixture/file.py",with:"/Library/LaunchAgents/test.plist")}
+            if mode=="protected_settings" {raw=raw.replacingOccurrences(of:"/tmp/approval-fixture/file.py",with:"/Library/Preferences/test.plist")}
+            if mode=="protected_etc" {raw=raw.replacingOccurrences(of:"/tmp/approval-fixture/file.py",with:"/etc/ssh/test.conf")}
+            engine.receiveScreen(sessionID:id,raw:raw,generation:"guarded")
+            try await Task.sleep(for:.milliseconds(160));try expectEqual(probe.inputs.count,0,"Screen approval must remain blocked for \(mode)")
+        }
+    }
     func testApprovalReflowLateValidationCannotOverridePauseDisableOrNewQuestion() async throws {
         for mode in ["pause","disable","new-question"] {
             let stale=recoveryPrompt("echo stale-read"),fresh=recoveryPrompt("echo fresh-read"),gate=NativeTypingValidationGate()
@@ -286,7 +370,7 @@ extension ApprovalTests {
       }
     }
     private func recoveryEngine(_ probe: ApprovalRecoveryProbe, agents: [AgentKind] = [.codex],nativeKeyboardActivity:NativeKeyboardActivity? = nil,
-                                host:ScreenHost = .iterm,validation:(@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil) throws -> (ApprovalEngine, [AgentSession], URL) {
+                                host:ScreenHost = .iterm,validation:(@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)? = nil,boundCodex:Bool = false) throws -> (ApprovalEngine, [AgentSession], URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-approval-recovery-" + UUID().uuidString)
         let records = ProcessDiscovery.parse(agents.enumerated().map { index, agent in
             "\(82001 + index) 1 ttys\(891 + index) \(82001 + index) \(82001 + index) Mon Sep 21 09:00:0\(index) 2026 /usr/local/bin/\(agent.rawValue)"
@@ -297,7 +381,14 @@ extension ApprovalTests {
             session.channel = host.channel; return session
         }
         let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { target, raw, _ in try probe.approve(target, raw) }, reveal: { _ in nil },validationScreens:validation)
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [host: adapter],nativeKeyboardActivity:nativeKeyboardActivity)
+        let paths=AppPaths(directory:directory)
+        if boundCodex {
+            try paths.prepare()
+            let binding=CodexApprovalBinding(threadID:"00000000-0000-4000-8000-000000000001",title:"fixture")
+            try AuditStore(path:paths.database).set("codexApprovalBinding:"+sessions[0].id,String(decoding:try JSONEncoder().encode(binding),as:UTF8.self))
+        }
+        let offline=CodexReplyTransport(prepare:{_,_ in throw AppError.message("fixture offline")},send:{_,_ in throw AppError.message("fixture offline")},prepareMessage:{_ in throw AppError.message("fixture offline")})
+        let engine = try ApprovalEngine(paths: paths, questionTransport:boundCodex ? offline:.live,processReader: { records }, screenAdapters: [host: adapter],nativeKeyboardActivity:nativeKeyboardActivity)
         engine.updateDiscovery(sessions, records: records)
         for session in sessions { try engine.setAutomatic(session.id, enabled: true) }
         return (engine, sessions, directory)

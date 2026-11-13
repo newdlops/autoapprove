@@ -301,13 +301,10 @@ enum CodexSubagentApprovals {
             guard let id = object["id"], let rpcKey = CodexQueueConnection.requestKey(id), seen.insert(rpcKey).inserted,
                   !connection.resolvedRequests.contains(rpcKey), let params = object["params"] as? JSONObject,
                   let thread = params["threadId"] as? String, attached[thread] != nil else { continue }
-            var fileItem: JSONObject?
-            if object["method"] as? String == "item/fileChange/requestApproval",
-               let turn = params["turnId"] as? String, let item = params["itemId"] as? String {
-                let result = try connection.request("thread/items/read", ["threadId": thread, "turnId": turn, "itemIds": [item]])
-                fileItem = (result["data"] as? [JSONObject])?.first(where: { $0["turnId"] as? String == turn })?["item"] as? JSONObject
-            }
-            guard let approval = CodexServerApproval.parse(object, threads: attached, fileItem: fileItem),
+            // File edits are decided by the visible, validated terminal dialog.
+            // Never race that single input against a server-side approval.
+            if object["method"] as? String == "item/fileChange/requestApproval" { review += 1; continue }
+            guard let approval = CodexServerApproval.parse(object, threads: attached),
                   !connection.resolvedRequests.contains(rpcKey), await authorize(approval) else { review += 1; continue }
             do {
                 try connection.respond(id: id, result: approval.result)

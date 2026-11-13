@@ -353,11 +353,13 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     result = .init(id:entry.id,phase:.opened,detail:detail)
                 }
                 catch {
-                    let notStarted=(error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started"
+                    let diagnostics=(error as? RemoteHTTPError)?.diagnostics
+                    let notStarted=diagnostics?["delivery"] == "not_started" || diagnostics?["command_delivery"] == "not_started"
                     if notStarted {dispatched.removeValue(forKey:entry.key)}
                     else {dispatched[entry.key]?.failure=error.localizedDescription}
                     if let key {blocked.insert(key)}
-                    result = .init(id:entry.id,phase:notStarted ? .failed:.needsReview,detail:notStarted ? error.localizedDescription:"복원 결과를 확인하지 못했습니다. 중복 실행 전에 터미널을 확인해주세요. "+error.localizedDescription)
+                    let detail=notStarted ? error.localizedDescription+(diagnostics?["tab_creation"] == "unknown" ? " 대화 명령은 보내지 않았습니다. 빈 탭이 생겼을 수 있으니 확인한 뒤 다시 시도해주세요.":"") : "복원 결과를 확인하지 못했습니다. 중복 실행 전에 터미널을 확인해주세요. "+error.localizedDescription
+                    result = .init(id:entry.id,phase:notStarted ? .failed:.needsReview,detail:detail)
                 }
             }
             results.append(result);progress(result)

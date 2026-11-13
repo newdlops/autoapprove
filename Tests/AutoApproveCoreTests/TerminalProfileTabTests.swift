@@ -205,6 +205,14 @@ extension ApprovalTests {
         let allowed=try await denied.restore(profile,selected:[a.id,b.id],active:[],directoryExists:{_ in true},launch:{await log.launch($0,$1)})
         try expectEqual(allowed.map(\.phase),[.opened,.opened]);try expectEqual(await log.entries.count,3)
         try expectEqual(await log.entries.last?.1,"/dev/ttys702")
+        let tabFailure=TerminalProfileRestorer(),tabLog=TabLaunchLog()
+        let incomplete=try await tabFailure.restore(profile,selected:[a.id,b.id],active:[],directoryExists:{_ in true},launch:{entry,anchor in
+            if entry.id==b.id {throw RemoteHTTPError(409,"focus",diagnostics:["command_delivery":"not_started","tab_creation":"unknown"])}
+            return await tabLog.launch(entry,anchor)
+        })
+        try expectEqual(incomplete.map(\.phase),[.opened,.failed]);try expect(incomplete[1].detail.contains("빈 탭"))
+        let recovered=try await tabFailure.restore(profile,selected:[b.id],active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{await tabLog.launch($0,$1)})
+        try expectEqual(recovered.first?.phase,.opened);try expectEqual(await tabLog.entries.last?.1,"/dev/ttys701")
     }
 
     func testTerminalTabKeyboardPinsOwnerWindowAndUncertainResult() throws {
@@ -221,7 +229,7 @@ extension ApprovalTests {
         for afterPost in [true,false] {
             let uncertain=TabKeyFixture();uncertain.throwAfterPost=afterPost;uncertain.failConfirmation = !afterPost
             do {_ = try TerminalProfileTabOpener.open(anchorTTY:"/dev/ttys700",environment:uncertain.environment,nativeGroupReader:{nil});try expect(false)}
-            catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started")}
+            catch let error as RemoteHTTPError {try expect(error.diagnostics?["delivery"] != "not_started");try expectEqual(error.diagnostics?["command_delivery"],"not_started");try expectEqual(error.diagnostics?["tab_creation"],"unknown")}
             try expectEqual(uncertain.posts,1)
         }
     }

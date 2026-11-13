@@ -19,6 +19,17 @@ import AutoApproveCore
         let profile=try store.save(.init(name:"여러 창 작업 프로필 · 재부팅 뒤 이어가기",entries:entries))
         let controller=SessionProfilesController(store:store,capture:{[]},launch:{_,_ in "/dev/fixture-render"})
         await controller.reload();controller.selectedID=profile.id;await controller.waitForRepositories()
+        let failureStore=TerminalProfileStore(directory:root.appendingPathComponent("failure-data"))
+        let failureEntry=TerminalProfileEntry(title:"복원할 대화",agent:"codex",cwd:"/tmp",conversationID:"00000000-0000-4000-8000-000000000001")
+        let failureProfile=try failureStore.save(.init(name:"복원 확인",entries:[failureEntry]))
+        let failure=SessionProfilesController(store:failureStore,capture:{[]},launch:{_,_ in throw RemoteHTTPError(409,"새 Terminal 탭의 화면 반영을 확인하지 못했습니다.",diagnostics:["command_delivery":"not_started","tab_creation":"unknown"])})
+        await failure.reload();failure.selectedID=failureProfile.id;await failure.waitForRepositories()
+        await failure.restore(failureProfile,selected:[failureEntry.id])
+        for (name,width,height) in [("failure-minimum",700,480),("failure-default",860,640),("failure-wide",1100,800)] {
+            for (theme,scheme) in [("light",ColorScheme.light),("dark",ColorScheme.dark)] {
+                try await render(SessionProfilesWindow(controller:failure),name:name+"-"+theme,width:width,height:height,scheme:scheme,root:root)
+            }
+        }
         for (name,width,height) in [("minimum",700,480),("default",860,640),("wide",1100,800)] {
             for (theme,scheme) in [("light",ColorScheme.light),("dark",ColorScheme.dark)] {
                 try await render(SessionProfilesWindow(controller:controller),name:name+"-"+theme,width:width,height:height,scheme:scheme,root:root)
