@@ -312,10 +312,15 @@ extension ApprovalTests {
              "tty": "/dev/" + record.tty, "cwd": "/fixture", "tool_name": "AskUserQuestion", "tool_use_id": UUID().uuidString,
              "tool_input": ["questions": [["question": "계속 진행할까요?", "options": [["label": "아니오"], ["label": "예"]]]]]]
         }
+        // Both sessions are automatic, so each question is held only for its confirmation window.
+        for payload in payloads {
+            var start = payload; start["hook_event_name"] = "SessionStart"; start["requestID"] = UUID().uuidString
+            _ = try engine.handleClaudeHook(start, at: Date())
+        }
+        try engine.setAutomatic(records[0].key, enabled: true); try engine.setAutomatic(records[1].key, enabled: true)
         let socket = engine.paths.socket
         let calls = payloads.map { payload in Task.detached { try SocketClient.request(path: socket, message: ["method":"hookWait", "params":payload], timeout: 4) } }
         try await waitReset { engine.snapshot.sessions.filter { $0.claudeApprovals?.count == 1 }.count == 2 }
-        try engine.setAutomatic(records[0].key, enabled: true)
         if all { _ = try engine.resetAllAutomation() }
         else { _ = try engine.resetAutomation(records[0].key) }
         let response = try await calls[0].value
@@ -325,17 +330,13 @@ extension ApprovalTests {
             try expect((second["autoapproveBridge"] as? JSONObject)?["response"] == nil)
             try expect(engine.snapshot.sessions.allSatisfy { ($0.claudeApprovals ?? []).isEmpty })
         } else { try expectEqual(engine.snapshot.sessions.first { $0.id == records[1].key }?.claudeApprovals?.count, 1) }
+        // Paused, the rebuilt request is manual: it is released to Claude's terminal at once.
         try engine.setPaused(true)
-        let fresh = Task.detached { try SocketClient.request(path: socket, message: ["method":"hookWait", "params":payloads[0]], timeout: 4) }
-        try await waitReset { engine.snapshot.sessions.first { $0.id == records[0].key }?.claudeApprovals?.count == 1 }
-        try engine.answerClaudeApproval(sessionID: records[0].key, requestID: payloads[0]["requestID"] as! String)
-        let rebuilt = try await fresh.value
-        try expect((rebuilt["autoapproveBridge"] as? JSONObject)?["response"] is JSONObject)
+        let rebuilt = try await Task.detached { try SocketClient.request(path: socket, message: ["method":"hookWait", "params":payloads[0]], timeout: 4) }.value
+        try expect((rebuilt["autoapproveBridge"] as? JSONObject)?["response"] is JSONObject, "A rebuilt request is released while paused")
         if all {
-            let other = Task.detached { try SocketClient.request(path: socket, message: ["method":"hookWait", "params":payloads[1]], timeout: 4) }
-            try await waitReset { engine.snapshot.sessions.first { $0.id == records[1].key }?.claudeApprovals?.count == 1 }
-            try engine.answerClaudeApproval(sessionID: records[1].key, requestID: payloads[1]["requestID"] as! String)
-            _ = try await other.value
+            let other = try await Task.detached { try SocketClient.request(path: socket, message: ["method":"hookWait", "params":payloads[1]], timeout: 4) }.value
+            try expect((other["autoapproveBridge"] as? JSONObject)?["response"] is JSONObject)
         } else {
             try engine.answerClaudeApproval(sessionID: records[1].key, requestID: payloads[1]["requestID"] as! String)
             _ = try await calls[1].value

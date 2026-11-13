@@ -53,29 +53,15 @@ extension ApprovalTests {
                 let input: JSONObject = ["questions": [["question": title, "multiSelect": multiSelect,
                     "options": labels.map { ["label": $0, "description": "선택한 항목으로 진행합니다."] }]]]
                 payload["tool_input"] = input
-                try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now)))
-                try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(6))))
-                try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(60))), "An automatic session never expires a task choice into a default answer")
+                // AutoApprove cannot answer a task choice, so the hook returns at once and Claude's terminal shows it.
+                try expectEqual(bridgeAnswer(try engine.handleClaudeHook(payload, at: now))?.isEmpty, true, "A task choice is released to Claude's terminal at once")
+                try expectEqual(bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(60)))?.isEmpty, true, "A repeated task choice gets the same release, never a default answer")
                 let requestID = payload["requestID"] as! String
-                let approval = engine.snapshot.sessions.first { $0.id == hookSession(12) }?.backgroundChildren
-                    .first { $0.id == hookSession(21) }?.claudeApprovals?.first { $0.id == requestID }
-                try expectNotNil(approval)
-                try expectEqual(approval?.isQuestion, true)
-                try expectNil(approval?.automaticAt)
-                try expectEqual(approval?.answer, "")
-                try expectEqual(approval?.questions?.first?.options.map(\.label), labels)
-                try expect(approval?.systemCommandRisk == nil, "Question text is not an attempted system operation")
-                let events = engine.snapshot.events.count
-                try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: requestID,
-                    answers: ["0": ["choices": [labels.last!], "text": ""]], at: now.addingTimeInterval(61))
-                let output = bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(62)))!["hookSpecificOutput"] as! JSONObject
-                let decision = event == "PreToolUse" ? output : output["decision"] as! JSONObject
-                let updated = decision["updatedInput"] as! JSONObject
-                try expectEqual(updated["answers"] as? [String: String], [title: labels.last!])
-                try expectEqual(try JSONSerialization.data(withJSONObject: updated["questions"]!, options: [.sortedKeys]),
-                    try JSONSerialization.data(withJSONObject: input["questions"]!, options: [.sortedKeys]))
-                try expectEqual(engine.snapshot.events.count, events + 1, "Only an explicit web answer creates a reply")
-                try engine.acknowledgeClaudeHook(payload, at: now.addingTimeInterval(62))
+                let child = engine.snapshot.sessions.first { $0.id == hookSession(12) }?.backgroundChildren.first { $0.id == hookSession(21) }
+                try expect(child?.pendingInTerminal == true, "The released choice is pending in the terminal")
+                try expect(child?.claudeApprovals?.contains { $0.id == requestID } != true, "A released choice leaves no app-held card")
+                try expect(child?.pendingSummary?.isEmpty == false, "The terminal request keeps a summary for the app")
+                try engine.acknowledgeClaudeHook(payload, at: now.addingTimeInterval(60))
             }
             var confirmation = hookPayload(now, pid: 22)
             confirmation["hook_event_name"] = event
@@ -102,18 +88,15 @@ extension ApprovalTests {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date(), first = hookPayload(now)
         var tracker = AttentionTracker()
-        try expect(bridgeWaiting(try engine.handleClaudeHook(first, at: now)))
-        try expectEqual(tracker.update(engine.snapshot).count, 1, "An OFF session still needs manual attention")
+        // A manual session cannot answer, so the question returns to Claude's terminal at once.
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(first, at: now))?.isEmpty, true, "A manual question is released to the terminal at once")
+        try expectEqual(tracker.update(engine.snapshot).count, 1, "An OFF session still needs manual attention in the terminal")
         let parent = engine.snapshot.sessions.first { $0.id == hookSession(12) }!
-        try expectEqual(parent.backgroundChildren.first { $0.id == hookSession(21) }?.claudeApprovals?.count, 1)
+        try expect(parent.backgroundChildren.first { $0.id == hookSession(21) }?.claudeApprovals?.isEmpty ?? true, "A released question is not held in the app")
         try expect(!parent.automatic)
-        try engine.answerClaudeApproval(sessionID: hookSession(21), requestID: first["requestID"] as! String, enableAutomatic: true, at: now)
-        try expect(tracker.update(engine.snapshot).isEmpty, "A sending answer must withdraw the manual alert")
+        try engine.setAutomatic(hookSession(12), enabled: true)
         try expect(engine.snapshot.sessions.first { $0.id == hookSession(12) }!.automatic)
-        try expectEqual(engine.snapshot.events.first?.outcome, "답변 대기열 등록")
-        try expect(!bridgeAnswer(try engine.handleClaudeHook(first, at: now))!.isEmpty)
-        try engine.acknowledgeClaudeHook(first, at: now)
-        try expectEqual(engine.snapshot.events.first?.outcome, "질문 응답 전달")
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(first, at: now))?.isEmpty, true, "A released question is never answered after the fact")
         for index in 1...30 {
             let date = now.addingTimeInterval(Double(index) * 6), payload = hookPayload(date, number: index)
             try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: date)))
@@ -125,8 +108,9 @@ extension ApprovalTests {
             try expectEqual(updated?["answers"] as? [String: String], ["[\(index)] 이 작업을 허용할까요?": "허용"])
             try engine.acknowledgeClaudeHook(payload, at: date.addingTimeInterval(5))
         }
-        try expectEqual(engine.snapshot.events.count, 31)
-        try expect(engine.snapshot.events.allSatisfy { $0.sessionID == hookSession(12) && $0.originSessionID == hookSession(21) && $0.outcome == "질문 응답 전달" })
+        let automaticAnswers = engine.snapshot.events.filter { $0.outcome == "질문 응답 전달" }
+        try expectEqual(automaticAnswers.count, 30, "Only the thirty automatic questions were answered by AutoApprove")
+        try expect(automaticAnswers.allSatisfy { $0.sessionID == hookSession(12) && $0.originSessionID == hookSession(21) })
         try expectNil(engine.snapshot.sessions.first { $0.id == hookSession(12) }?.backgroundChildren.first { $0.id == hookSession(21) }?.pendingSummary)
     }
 
@@ -179,17 +163,17 @@ extension ApprovalTests {
         let now = Date(), payload = hookPayload(now), first = try hookEngine(paths)
         _ = try first.handleClaudeHook(payload, at: now)
         let restarted = try hookEngine(paths)
-        try expect(bridgeWaiting(try restarted.handleClaudeHook(payload, at: now.addingTimeInterval(1))))
-        try restarted.answerClaudeApproval(sessionID: hookSession(21), requestID: payload["requestID"] as! String, at: now.addingTimeInterval(1))
+        // The manual question is released to the terminal, so the restarted app has no answer to replay.
+        let released = bridgeAnswer(try restarted.handleClaudeHook(payload, at: now.addingTimeInterval(1)))
+        try expectEqual(released?.isEmpty, true, "A restarted manual question is released without an app answer")
         let afterLostResponse = try hookEngine(paths)
         let response = bridgeAnswer(try afterLostResponse.handleClaudeHook(payload, at: now.addingTimeInterval(2)))!
-        try expect(!response.isEmpty)
         let repeated = bridgeAnswer(try afterLostResponse.handleClaudeHook(payload, at: now.addingTimeInterval(3)))!
         try expectEqual(try JSONSerialization.data(withJSONObject: response, options: .sortedKeys), try JSONSerialization.data(withJSONObject: repeated, options: .sortedKeys))
-        try expectEqual(afterLostResponse.snapshot.events.count, 1, "Retry must not produce another approval audit")
+        try expect(afterLostResponse.snapshot.events.allSatisfy { $0.outcome != "질문 응답 전달" }, "Retry must not produce an automatic answer audit")
         try afterLostResponse.acknowledgeClaudeHook(payload, at: now.addingTimeInterval(3))
         try afterLostResponse.acknowledgeClaudeHook(payload, at: now.addingTimeInterval(3))
-        try expectEqual(afterLostResponse.snapshot.events.count, 1)
+        try expect(afterLostResponse.snapshot.events.allSatisfy { $0.outcome != "질문 응답 전달" })
         var altered = payload; altered["tool_input"] = ["questions": []]
         try expectThrows(try afterLostResponse.handleClaudeHook(altered, at: now.addingTimeInterval(4)))
         var permission = payload; permission["requestID"] = UUID().uuidString; permission["hook_event_name"] = "PermissionRequest"
@@ -200,8 +184,7 @@ extension ApprovalTests {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date(), payload = hookPayload(now)
         defer { engine.stop() }
-        _ = try engine.handleClaudeHook(payload, at: now)
-        try engine.answerClaudeApproval(sessionID: hookSession(21), requestID: payload["requestID"] as! String, at: now)
+        // The released response is the exact `{}` Claude receives; every replay must match it.
         let answer = bridgeAnswer(try engine.handleClaudeHook(payload, at: now))!
         let mutations: [(inout JSONObject) -> Void] = [
             { $0["tool_input"] = ["questions": []] },
@@ -220,7 +203,7 @@ extension ApprovalTests {
             var changed = payload; mutate(&changed)
             try expectThrows(try engine.handleClaudeHook(changed, at: now))
             try engine.acknowledgeClaudeHook(changed, at: now)
-            try expectEqual(engine.snapshot.events.first?.outcome, "답변 대기열 등록", "A changed envelope cannot acknowledge the saved answer")
+            try expect(engine.snapshot.events.allSatisfy { $0.outcome != "질문 응답 전달" }, "A changed envelope cannot create an answer from the saved release")
         }
         let invalid: [(inout JSONObject) -> Void] = [
             { $0["autoapproveProtocol"] = 2 },
@@ -237,12 +220,11 @@ extension ApprovalTests {
             var changed = payload; mutate(&changed)
             try expect(bridgeAnswer(try engine.handleClaudeHook(changed, at: now))!.isEmpty)
             try engine.acknowledgeClaudeHook(changed, at: now)
-            try expectEqual(engine.snapshot.events.first?.outcome, "답변 대기열 등록")
+            try expect(engine.snapshot.events.allSatisfy { $0.outcome != "질문 응답 전달" })
         }
         try engine.acknowledgeClaudeHook(payload, at: now)
         try engine.acknowledgeClaudeHook(payload, at: now)
-        try expectEqual(engine.snapshot.events.count, 1)
-        try expectEqual(engine.snapshot.events.first?.outcome, "질문 응답 전달")
+        try expect(engine.snapshot.events.allSatisfy { $0.outcome != "질문 응답 전달" }, "A released question never creates an automatic answer")
         let repeated = bridgeAnswer(try engine.handleClaudeHook(payload, at: now))!
         try expectEqual(try JSONSerialization.data(withJSONObject: repeated, options: .sortedKeys),
                         try JSONSerialization.data(withJSONObject: answer, options: .sortedKeys))
@@ -260,18 +242,22 @@ extension ApprovalTests {
         request["hook_event_name"] = "PermissionRequest"; request["tool_name"] = "Bash"
         request["cwd"] = paths.directory.path
         request["tool_input"] = ["command": "python3 tools/install_fixture.py --install"]
-        try expect(bridgeWaiting(try engine.handleClaudeHook(request, at: now)))
+        // A manual installer request is released to Claude's terminal dialog at once.
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(request, at: now))?.isEmpty, true)
         func risk() -> SystemCommandRisk? {
             engine.snapshot.sessions.first { $0.id == hookSession(12) }?.backgroundChildren
-                .first { $0.id == hookSession(21) }?.claudeApprovals?.first?.systemCommandRisk
+                .first { $0.id == hookSession(21) }?.systemCommandRisk
         }
         try expectNil(risk())
         // Write text only: this synthetic installer is never executed.
         try "Path.home().joinpath('Library/LaunchAgents/com.fixture.test.plist').write_text('fixture')"
             .write(to: script, atomically: true, encoding: .utf8)
-        try expect(bridgeWaiting(try engine.handleClaudeHook(request, at: now.addingTimeInterval(1))))
-        try expectEqual(risk()?.kind, .persistence, "An undecided request must inspect current installer source again")
-        try expect(engine.snapshot.events.isEmpty)
+        // A new request inspects the current installer source; the released one is never answered again.
+        // A new tool call has a new identity; a retry of the same tool call returns the saved release.
+        var retry = request; retry["requestID"] = UUID().uuidString; retry["tool_use_id"] = UUID().uuidString
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(retry, at: now.addingTimeInterval(1)))?.isEmpty, true)
+        try expectEqual(risk()?.kind, .persistence, "A new request must inspect current installer source again")
+        try expect(engine.snapshot.events.allSatisfy { !["승인 전달", "질문 응답 전달"].contains($0.outcome) }, "Releasing an installer request never approves it")
     }
 
     func testClaudeHookPreparationRespectsEffectiveSessionDirectory() throws {
@@ -300,18 +286,21 @@ extension ApprovalTests {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date()
         let a = hookPayload(now), b = hookPayload(now, pid: 22), c = hookPayload(now, number: 2)
-        for payload in [a, b, c] { _ = try engine.handleClaudeHook(payload, at: now) }
-        try expectEqual(AttentionRequest.candidates(engine.snapshot.sessions.first { $0.id == hookSession(12) }!, paused: false).count, 3)
+        // Each manual request is released to its own terminal; none waits for an app answer.
+        for payload in [a, b, c] { try expectEqual(bridgeAnswer(try engine.handleClaudeHook(payload, at: now))?.isEmpty, true) }
+        // Attention is one item per waiting session: child 21 holds two released requests, child 22 one.
+        try expectEqual(AttentionRequest.candidates(engine.snapshot.sessions.first { $0.id == hookSession(12) }!, paused: false).count, 2)
         try engine.setAutomatic(hookSession(12), enabled: true); try engine.setPaused(true)
-        try expect(bridgeWaiting(try engine.handleClaudeHook(a, at: now.addingTimeInterval(6))))
-        try engine.answerClaudeApproval(sessionID: hookSession(21), requestID: a["requestID"] as! String, at: now.addingTimeInterval(6))
-        _ = try engine.handleClaudeHook(a, at: now.addingTimeInterval(6))
-        try expectThrows(try engine.answerClaudeApproval(sessionID: hookSession(22), requestID: c["requestID"] as! String))
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(a, at: now.addingTimeInterval(6)))?.isEmpty, true, "A released request is never answered after pause or automatic approval changes")
         var unrelated = hookPayload(now); unrelated["hook_event_name"] = "PostToolUse"
         _ = try engine.handleClaudeHook(unrelated, at: now.addingTimeInterval(6))
-        try expectEqual(AttentionRequest.candidates(engine.snapshot.sessions.first { $0.id == hookSession(12) }!, paused: true).count, 2)
+        // Claude's PostToolUse for child 21 ends its released requests; child 22's request is still waiting in its terminal.
+        let parentAfterPause = engine.snapshot.sessions.first { $0.id == hookSession(12) }!
+        let stillWaiting = AttentionRequest.candidates(parentAfterPause, paused: true).map(\.sourceSessionID)
+        try expect(stillWaiting.contains(hookSession(22)))
         try engine.setPaused(false)
-        for payload in [b, c] { try expect(!bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(7)))!.isEmpty) }
+        for payload in [b, c] { try expectEqual(bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(7)))?.isEmpty, true) }
+        try expect(engine.snapshot.events.allSatisfy { !["승인 전달", "질문 응답 전달"].contains($0.outcome) }, "Released requests never create an automatic answer")
     }
 
     func testClaudeHookHandoffExpiryAndPIDReuse() throws {
@@ -319,7 +308,8 @@ extension ApprovalTests {
         let processes = HookProcesses(), engine = try hookEngine(paths, processes: processes), now = Date()
         let payload = hookPayload(now), id = payload["requestID"] as! String
         _ = try engine.handleClaudeHook(payload, at: now)
-        try engine.releaseClaudeApproval(sessionID: hookSession(21), requestID: id)
+        // A released request is already in Claude's terminal, so the app has nothing to hand back.
+        try expectThrows(try engine.releaseClaudeApproval(sessionID: hookSession(21), requestID: id))
         try expect(bridgeAnswer(try engine.handleClaudeHook(payload, at: now))!.isEmpty)
         var permission = payload; permission["requestID"] = UUID().uuidString; permission["hook_event_name"] = "PermissionRequest"
         try expect(bridgeAnswer(try engine.handleClaudeHook(permission, at: now))!.isEmpty, "Handoff must not trap the same question again")
@@ -340,31 +330,30 @@ extension ApprovalTests {
 
     func testClaudeHookDurableSaveFailureAndRetry() throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
-        let engine = try hookEngine(paths), now = Date(), payload = hookPayload(now), id = payload["requestID"] as! String
-        _ = try engine.handleClaudeHook(payload, at: now)
-        _ = try CommandRunner.run("/usr/bin/sqlite3", [paths.database, "CREATE TRIGGER fail_hook_audit BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'fixture'); END;"])
-        try expectThrows(try engine.answerClaudeApproval(sessionID: hookSession(21), requestID: id, at: now))
-        try expect(engine.snapshot.events.isEmpty)
+        let engine = try hookEngine(paths), now = Date(), payload = hookPayload(now)
+        _ = try CommandRunner.run("/usr/bin/sqlite3", [paths.database, "CREATE TRIGGER fail_hook_receipt BEFORE INSERT ON claude_hooks BEGIN SELECT RAISE(ABORT, 'fixture'); END;"])
+        // A release whose receipt cannot be saved must fail, so the helper retries instead of Claude receiving an unsaved answer.
+        try expectThrows(try engine.handleClaudeHook(payload, at: now))
+        try expect(engine.snapshot.events.allSatisfy { !["승인 전달", "질문 응답 전달"].contains($0.outcome) }, "A failed release never records an approval")
         let restarted = try hookEngine(paths)
-        try expect(bridgeWaiting(try restarted.handleClaudeHook(payload, at: now)), "A rolled back response cannot approve after restart")
-        _ = try CommandRunner.run("/usr/bin/sqlite3", [paths.database, "DROP TRIGGER fail_hook_audit"])
-        try restarted.answerClaudeApproval(sessionID: hookSession(21), requestID: id, at: now)
-        try expect(!bridgeAnswer(try restarted.handleClaudeHook(payload, at: now))!.isEmpty)
-        try expectEqual(restarted.snapshot.events.count, 1)
+        _ = try CommandRunner.run("/usr/bin/sqlite3", [paths.database, "DROP TRIGGER fail_hook_receipt"])
+        try expectEqual(bridgeAnswer(try restarted.handleClaudeHook(payload, at: now))?.isEmpty, true, "After the fault clears, the retry releases the request once")
+        try expectEqual(bridgeAnswer(try restarted.handleClaudeHook(payload, at: now))?.isEmpty, true, "The saved release is replayed exactly")
+        try expect(restarted.snapshot.events.allSatisfy { !["승인 전달", "질문 응답 전달"].contains($0.outcome) })
     }
 
     func testClaudeHookGeneralPermissionAndUnsupportedQuestion() throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date()
         var permission = hookPayload(now); permission["hook_event_name"] = "PermissionRequest"; permission["tool_name"] = "Bash"; permission["tool_input"] = ["command": "echo fixture"]
-        _ = try engine.handleClaudeHook(permission, at: now)
-        try engine.answerClaudeApproval(sessionID: hookSession(21), requestID: permission["requestID"] as! String, at: now)
-        let output = bridgeAnswer(try engine.handleClaudeHook(permission, at: now))?["hookSpecificOutput"] as? JSONObject
-        try expectEqual((output?["decision"] as? JSONObject)?["behavior"] as? String, "allow")
+        // A manual general permission is released to Claude's terminal dialog instead of waiting for an app answer.
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(permission, at: now))?.isEmpty, true)
         var question = hookPayload(now)
         question["tool_input"] = ["questions": [["question": "어떤 환경?", "options": [["label": "개발"], ["label": "운영"]]]]]
-        try expect(bridgeWaiting(try engine.handleClaudeHook(question, at: now)))
-        try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(12) }!.backgroundChildren.first { $0.id == hookSession(21) }!.claudeApprovals?.first?.questions?.count, 1)
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(question, at: now))?.isEmpty, true, "A manual question is released to the terminal")
+        let child = engine.snapshot.sessions.first { $0.id == hookSession(12) }!.backgroundChildren.first { $0.id == hookSession(21) }
+        try expectEqual(child?.pendingInTerminal, true, "The released question is pending in the terminal")
+        try expect(child?.claudeApprovals?.isEmpty ?? true, "The released question leaves no app card")
         var invalid = hookPayload(now); invalid["tool_input"] = ["questions": []]
         try expect(bridgeAnswer(try engine.handleClaudeHook(invalid, at: now))!.isEmpty, "Malformed question preserves the original terminal flow")
     }
@@ -374,10 +363,13 @@ extension ApprovalTests {
         let processes = HookProcesses(), now = Date()
         processes.records = hookProcesses.filter { $0.pid < 20 }
         let engine = try hookEngine(paths, processes: processes)
+        // Only a request AutoApprove can answer within its confirmation window keeps the hook open.
+        var start = hookPayload(now, pid: 12); start["hook_event_name"] = "SessionStart"
+        _ = try engine.handleClaudeHook(start, at: now)
+        try engine.setAutomatic(hookSession(12), enabled: true)
         var permission = hookPayload(now, pid: 12)
         permission["hook_event_name"] = "PermissionRequest"; permission["tool_name"] = "Bash"; permission["tool_input"] = ["command": "echo fixture"]
-        _ = try engine.handleClaudeHook(permission, at: now)
-        try engine.setAutomatic(hookSession(12), enabled: true)
+        try expect(bridgeWaiting(try engine.handleClaudeHook(permission, at: now)))
         engine.receiveScreen(sessionID: hookSession(12), raw: "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel", generation: "mirror", source: .terminalScreen)
         try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(12) }?.channel, .hook)
         try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(12) }?.claudeApprovals?.count, 1)
@@ -394,6 +386,27 @@ extension ApprovalTests {
         try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(21) }?.automatic, false)
     }
 
+    func testReleasedClaudeQuestionTakesOnlyItsChoiceScreen() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let processes = HookProcesses(), now = Date()
+        processes.records = hookProcesses.filter { $0.pid < 20 }
+        let engine = try hookEngine(paths, processes: processes)
+        var start = hookPayload(now, pid: 12); start["hook_event_name"] = "SessionStart"
+        _ = try engine.handleClaudeHook(start, at: now)
+        var question = hookPayload(now, pid: 12)
+        question["tool_input"] = ["questions": [["question": "어느 환경을 쓸까요?", "options": [["label": "개발"], ["label": "운영"]]]]]
+        // The manual question is released; no app card keeps the hook open.
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(question, at: now))?.isEmpty, true)
+        // A permission dialog must not take ownership of a released question.
+        engine.receiveScreen(sessionID: hookSession(12), raw: "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel", generation: "mirror", source: .terminalScreen)
+        try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(12) }?.channel, .hook)
+        // Its own choice menu may take the released question.
+        engine.receiveScreen(sessionID: hookSession(12), raw: "어느 환경을 쓸까요?\n❯ 1. 개발\n  2. 운영\nEnter to select", generation: "mirror-choice", source: .terminalScreen)
+        let released = engine.snapshot.sessions.first { $0.id == hookSession(12) }
+        try expectEqual(released?.channel, .terminalScreen, "The released question is answered only through its choice screen")
+        try expect(released?.pendingInTerminal == true)
+    }
+
     func testClaudeWebAnswersMultipleQuestionsAndEditingHold() async throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date()
@@ -402,21 +415,18 @@ extension ApprovalTests {
             ["question": "환경?", "options": [["label": "개발"], ["label": "운영"]]],
             ["question": "확인 항목?", "multiSelect": true, "options": [["label": "화면"], ["label": "입력"]]]]]
         payload["tool_input"] = input
-        try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now)))
+        // A manual multi-question form is released to Claude's terminal; the app form has nothing to answer.
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(payload, at: now))?.isEmpty, true)
         try engine.setAutomatic(hookSession(12), enabled: true)
-        try expect(bridgeWaiting(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(6))), "General questions never auto-select a default")
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(6)))?.isEmpty, true, "General questions never auto-select a default")
         try expectThrows(try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String, answers: [:], at: now.addingTimeInterval(6)))
-        try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String,
-            answers: ["0": ["choices": ["개발"], "text": ""], "1": ["choices": ["화면", "입력"], "text": "한글🧪"]], at: now.addingTimeInterval(6))
-        let output = bridgeAnswer(try engine.handleClaudeHook(payload, at: now.addingTimeInterval(7)))!["hookSpecificOutput"] as! JSONObject
-        let updated = output["updatedInput"] as! JSONObject
-        try expectEqual(updated["answers"] as? [String: String], ["환경?": "개발", "확인 항목?": "화면, 입력\n한글🧪"])
-        try expectEqual(try JSONSerialization.data(withJSONObject: updated["questions"]!, options: .sortedKeys), try JSONSerialization.data(withJSONObject: input["questions"]!, options: .sortedKeys))
-        try expectThrows(try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String, answers: [:]))
+        try expectThrows(try engine.replyClaudeQuestions(sessionID: hookSession(21), requestID: payload["requestID"] as! String,
+            answers: ["0": ["choices": ["개발"], "text": ""], "1": ["choices": ["화면", "입력"], "text": "한글🧪"]], at: now.addingTimeInterval(6)))
         let yes = hookPayload(now)
         _ = try engine.handleClaudeHook(yes, at: now)
         _ = try await engine.remoteAction(["action": "beginClaudeQuestion", "sessionID": hookSession(21), "requestIDForApproval": yes["requestID"]!])
-        try expect(bridgeWaiting(try engine.handleClaudeHook(yes, at: now.addingTimeInterval(6))), "Editing stops the five-second automatic answer")
+        // Editing turns the automatic answer off, so the hook is handed to Claude's terminal instead of waiting in the app.
+        try expectEqual(bridgeAnswer(try engine.handleClaudeHook(yes, at: now.addingTimeInterval(6)))?.isEmpty, true, "Editing stops the five-second automatic answer")
         try expect(engine.snapshot.sessions.first { $0.id == hookSession(12) }!.automatic)
     }
 }
