@@ -13,7 +13,8 @@ export async function coreLinkArguments(build) {
     ...await objects(path.join(build, 'CPTY.build')), ...await objects(path.join(build, 'CTTYInput.build')),
     ...await objects(path.join(build, 'CNativePeer.build')),
     ...await objects(path.join(build, 'CLocalDashboard.build')),
-    ...await objects(path.join(build, 'TerminalInputSupport.build'))];
+    ...Object.values(JSON.parse(await readFile(path.join(build, 'TerminalInputSupport.build/output-file-map.json'), 'utf8')))
+      .filter(value => typeof value.object === 'string').map(value => path.join(build, 'TerminalInputSupport.build', path.basename(value.object)))];
 }
 
 // A retained build may live at a different path than its original SwiftPM

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
-import {mkdtemp,mkdir,writeFile,readdir,rm,copyFile,chmod,stat} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,copyFile,chmod,stat} from 'node:fs/promises';
 import {spawn,execFileSync} from 'node:child_process';
 import {createRequire} from 'node:module';
 import {coreLinkArguments} from './swift-core-link.mjs';
@@ -43,8 +43,9 @@ const api=http.createServer(async(req,res)=>{
 try {
  await mkdir(home+'/app-server-control',{recursive:true});await new Promise(r=>api.listen(0,'127.0.0.1',r));
  await writeFile(home+'/config.toml',`model="fixture-model"\nmodel_provider="fixture"\napproval_policy="on-request"\nsandbox_mode="read-only"\ncheck_for_update_on_startup=false\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:${api.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n[features]\nmulti_agent_v2=true\n[analytics]\nenabled=false\n`);
- const build=path.resolve('.build/debug'),objects=(await readdir(build+'/AutoApproveCore.build')).filter(n=>n.endsWith('.swift.o')).map(n=>build+'/AutoApproveCore.build/'+n);
- execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/SubagentApprovals'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,'Tests/fixtures/codex-subagent-live-approval.swift','-o',root+'/observer'],{stdio:'inherit'});
+ const build=path.resolve('.build/debug'),map=JSON.parse(await readFile(build+'/AutoApproveCore.build/output-file-map.json','utf8'));
+ const objects=Object.values(map).filter(v=>typeof v.object==='string').map(v=>path.join(build,'AutoApproveCore.build',path.basename(v.object)));
+ execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/SubagentApprovals'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),...objects,'Tests/fixtures/codex-subagent-live-approval.swift',...await coreLinkArguments(build),'-lsqlite3','-o',root+'/observer'],{stdio:'inherit'});
  await copyFile(option('codex'),root+'/owned-approval-server');await chmod(root+'/owned-approval-server',0o700);
  serverProcess=spawn(root+'/owned-approval-server',['app-server','--listen','unix://'+sock],{cwd:root,env:{...process.env,CODEX_HOME:home},stdio:['ignore','ignore','pipe']});serverProcess.stderr.on('data',c=>stderr=(stderr+c).slice(-5000));
  await until(async()=>{try{return(await stat(sock)).isSocket();}catch{return false;}},'socket');

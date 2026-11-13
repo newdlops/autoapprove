@@ -99,6 +99,10 @@ extension ApprovalTests {
         do {_ = try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in (future,.init(phase:.running,version:"0.168.0",detail:"Future server"))})}
         catch {rejected=error.localizedDescription.contains("AutoApprove 업데이트")}
         try expect(rejected,"Unverified future servers must not silently replace the app client")
+        try Data("#!/bin/sh\nprintf 'codex-cli 0.169.0\\n'\n".utf8).write(to:cliPath)
+        let current=try CodexCLIContext.resolve(home:home.path,userHome:f.root.path,executable:cliPath.path)!
+        let currentChoice=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in (current,.init(phase:.running,version:"0.169.0",detail:"Verified server"))})
+        try expectEqual(currentChoice.bundled?.executable,runtime.executable);try expectNil(currentChoice.installed)
         try choice.verifyUnchanged()
     }
 

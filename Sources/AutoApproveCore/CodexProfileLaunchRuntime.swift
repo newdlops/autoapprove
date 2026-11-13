@@ -34,9 +34,9 @@ struct CodexProfileLaunchRuntime:Sendable {
             try verify(cli,version:version)
             // The installed CLI attests the existing server, not the client
             // to launch. The bundled 0.167.1 client has been exercised against
-            // 0.167.2, including child approvals displayed on the parent.
+            // 0.167.2 and 0.169.0, including child approvals displayed on the parent.
             // Do not silently discard its behavior after an external update.
-            guard runtime.version == "0.167.1",version == "0.167.2" else {
+            guard runtime.version == "0.167.1",["0.167.2","0.169.0"].contains(version) else {
                 throw AppError.message("실행 중인 Codex 서버와 앱 내장 클라이언트의 호환성을 확인하지 못했습니다. AutoApprove 업데이트가 필요합니다. 기존 서버는 유지했습니다.")
             }
             try runtime.verifyUnchanged()
