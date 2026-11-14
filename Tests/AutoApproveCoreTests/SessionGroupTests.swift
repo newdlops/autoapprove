@@ -45,6 +45,18 @@ private final class GroupTerminalWriter: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testSessionGroupTerminalStatusRequiresFreshCard() throws {
+        let old = UUID().uuidString.lowercased(), next = UUID().uuidString.lowercased()
+        func card(_ id: String) -> String {
+            ">_ OpenAI Codex (v0.167.1)\nModel: fixture\nDirectory: /tmp/project\nPermissions: Read Only\nAgents.md: none\nSession: " + id + "\n› Ask anything"
+        }
+        try expectNil(SessionGroupTerminalStatus.freshConversationID(before: card(old), after: card(old) + "\n› /status", agent: .codex))
+        try expectEqual(SessionGroupTerminalStatus.freshConversationID(before: card(old), after: card(old) + "\n" + card(next), agent: .codex), next)
+        try expectNil(SessionGroupTerminalStatus.freshConversationID(before: "", after: "Session: " + next, agent: .codex))
+        let claude = "Version: 2.1.0\nSession ID: " + next
+        try expectEqual(SessionGroupTerminalStatus.freshConversationID(before: "", after: claude, agent: .claude), next)
+        try expectNil(SessionGroupTerminalStatus.freshConversationID(before: claude, after: claude, agent: .claude))
+    }
     func testSessionGroupIdentityValidation() throws {
         let conversation = UUID()
         let member = SessionGroupMember(agent: .codex, title: "Codex", cwd: "/tmp/project",

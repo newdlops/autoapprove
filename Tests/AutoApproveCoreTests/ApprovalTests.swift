@@ -512,6 +512,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Computer Use: no replay from unchanged, blank or draft frames",tests.testComputerUseFollowupNeverReplaysWithoutResolution),
             ("Computer Use: late confirmation respects pause and OFF",tests.testComputerUseFollowupDiscardsPausedOrDisabledRead),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
+            ("Session groups: terminal status refresh rejects historical IDs",tests.testSessionGroupTerminalStatusRequiresFreshCard),
             ("Session groups: storage and malformed data preservation",tests.testSessionGroupStoragePreservesInvalidData),
             ("Session groups: live conversation identity and ambiguity",tests.testSessionGroupMatchingRejectsAmbiguousAndChangedConversations),
             ("Session groups: MCP caller isolation and same-agent members",tests.testSessionGroupMCPOnlyReturnsCallersGroupsAndSameAgent),

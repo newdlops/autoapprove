@@ -1,6 +1,26 @@
 import Foundation
 import Darwin
 
+public enum SessionGroupTerminalStatus {
+    public static func freshConversationID(before: String, after: String, agent: AgentKind) -> String? {
+        if agent == .codex { return CodexStatusIdentity(screen: before).freshThread(in: after) }
+        guard agent == .claude, after.contains("Version:"), after.contains("Session ID:") else { return nil }
+        let previous = conversationIDs(before), current = conversationIDs(after)
+        guard let id = current.last, current.count > previous.count || id != previous.last else { return nil }
+        return id
+    }
+    /// Read only the labelled ID in a CLI status card, never arbitrary UUIDs in chat.
+    private static func conversationIDs(_ screen: String) -> [String] {
+        let text = PromptDetector.normalizedLines(screen).joined(separator: "\n")
+        let pattern = #"(?im)^\s*[│┃|]?\s*Session(?:\s+ID)?\s*:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+            guard let range = Range(match.range(at: 1), in: text), let uuid = UUID(uuidString: String(text[range])) else { return nil }
+            return uuid.uuidString.lowercased()
+        }
+    }
+}
+
 /// A saved collaboration group identifies conversations, not processes or projects.
 public struct SessionGroupMember: Codable, Equatable, Identifiable {
     public var id: UUID

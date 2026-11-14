@@ -2153,6 +2153,44 @@ private struct ScreenAnalysisStorageKey: Hashable {
         remoteUserInputHasPriority(id) || automaticInputBusy(id)
     }
 
+    private var groupStatusIdentities: [String: (session: AgentSession, conversationID: String, home: String?)] = [:]
+
+    /// Explicitly query the original terminal without opening another CLI or selecting a thread.
+    public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID) async throws {
+        let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
+        guard let group = saved.first(where: { $0.id == groupID }),
+              let member = group.members.first(where: { $0.id == memberID }),
+              let runtime = member.runtimeID, let original = sessions[runtime],
+              original.agent == member.agent, original.cwd == member.cwd, original.phase == .idle,
+              !original.pendingInTerminal, !automaticInputBusy(runtime), !userInputHasPriority(runtime) else {
+            throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 또는 연결 상태를 확인해주세요.")
+        }
+        let before = try await remoteTerminal(sessionID: runtime, realtime: true)
+        guard SystemSafetyComposer.capture(before.screen, agent: original.agent, text: "/status") != nil,
+              original.agent == .codex ? CodexProgressScreen.emptyComposer(before.screen) :
+                PromptDetector.normalizedLines(before.screen).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })?.trimmingCharacters(in: .whitespaces) == "❯" else {
+            throw AppError.message("터미널 입력창을 비우고 질문이나 메뉴를 닫은 뒤 다시 갱신해주세요.")
+        }
+        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision])
+        sendingMessages.insert(runtime); defer { sendingMessages.remove(runtime) }
+        for _ in 0..<60 {
+            try await Task.sleep(for: .milliseconds(200))
+            guard let current = sessions[runtime], current.pid == original.pid, current.started == original.started,
+                  current.cwd == original.cwd, current.tty == original.tty, current.phase != .ended else {
+                throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 저장하지 않았습니다.")
+            }
+            let frame = try await remoteTerminal(sessionID: runtime, realtime: true)
+            guard let id = SessionGroupTerminalStatus.freshConversationID(before: before.screen, after: frame.screen, agent: original.agent) else { continue }
+            var next = saved
+            let gi = next.firstIndex(where: { $0.id == groupID })!, mi = next[gi].members.firstIndex(where: { $0.id == memberID })!
+            next[gi].members[mi].conversationID = id
+            try store.save(next, expected: saved)
+            groupStatusIdentities[runtime] = (original, id, member.providerHome)
+            return
+        }
+        throw AppError.message("터미널의 /status 화면에서 세션 ID를 확인하지 못했습니다. 기존 ID를 유지합니다.")
+    }
+
     /// Resolve only each already-discovered process. This never uses thread/list.
     public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
         let originals = sessions.values.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
@@ -2202,6 +2240,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.tty == original.tty, current.agent == original.agent, current.cwd == original.cwd,
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
+            if let status = groupStatusIdentities[current.id], status.session.started == current.started,
+               status.session.tty == current.tty, status.session.cwd == current.cwd, status.session.agent == current.agent {
+                conversation = status.conversationID
+                home = home ?? status.home
+            }
             result.append(SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName))
         }
         // Discovery can lag while a process exits or a PID is reused. Re-read

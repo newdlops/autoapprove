@@ -145,8 +145,14 @@ import AutoApproveCore
                                 .lineLimit(2).help(task.deliveryError ?? task.question?.text ?? task.task)
                         }
                         Text(member.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
-                        Text(member.conversationID.isEmpty ? "대화 ID 확인 필요" : member.conversationID)
-                            .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                        HStack(alignment: .top) {
+                            Text(member.conversationID.isEmpty ? "대화 ID 확인 필요" : member.conversationID)
+                                .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                            Spacer(minLength: 8)
+                            Button("세션 ID 갱신") { Task { await refreshIdentity(member, in: group) } }
+                                .fixedSize().disabled(loading)
+                                .help("원래 터미널에 /status를 입력하고 화면에서 현재 세션 ID를 읽어 저장합니다. 입력창이 빈 대기 상태에서만 실행합니다.")
+                        }
                         if (member.conversationID.isEmpty || member.providerHome == nil), let match, match.conversationID != nil, match.providerHome != nil {
                             Button("현재 대화 연결") { Task { await bind(member, to: match, in: group) } }.disabled(loading)
                                 .help("같은 실행 세션의 확인된 대화 ID를 그룹에 저장합니다.")
@@ -227,6 +233,16 @@ import AutoApproveCore
 
     private func setParent(_ parent: SessionGroupMember, for member: SessionGroupMember, in group: SessionGroup) {
         _ = persist(groups.map { $0.id == group.id ? group.settingParent(parent.id, for: member.id) : $0 }, message: "상위 구성원을 변경했습니다.")
+    }
+
+    private func refreshIdentity(_ member: SessionGroupMember, in group: SessionGroup) async {
+        guard !loading else { return }; loading = true; defer { loading = false }
+        do {
+            notice = "터미널에서 세션 ID를 조회하고 있습니다…"
+            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+            groups = try store.load(); live = try await engine.sessionGroupSessions()
+            error = nil; notice = "터미널에서 확인한 현재 세션 ID를 저장했습니다."
+        } catch { notice = nil; self.error = error.localizedDescription }
     }
 
     private func refresh() async {
