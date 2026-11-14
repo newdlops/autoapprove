@@ -24,6 +24,8 @@ import AutoApproveCore
     @State private var openingTerminal = false
     @State private var editingSession: AgentSession?
     @State private var showing = false
+    /// Collapsed group and member rows, kept across launches. Everything starts expanded.
+    @AppStorage("sessionListCollapsed") private var collapsedRows = ""
     private var liveQuestionIDs: Set<QuestionReplyKey> {
         Set(engine.snapshot.sessions.filter { $0.phase != .ended }.flatMap { session in
             session.questions.map { QuestionReplyKey(sessionID: session.id, questionID: $0.id) }
@@ -164,17 +166,20 @@ import AutoApproveCore
                                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        let displayed = visible
+                        let tree = SessionListTree.build(visible)
+                        let displayed = tree.ungrouped
                         List(selection: $selection) {
-                            ForEach(displayed) { session in
-                                SessionRow(session: session, paused: engine.snapshot.paused, selected: selection.contains(session.id),
-                                    setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
-                                    reveal: { reveal(session) })
-                                    .tag(session.id)
-                                    .padding(.vertical, 6)
-                                    .help("드래그하면 목록 순서를 바꿉니다.\n" + (session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false)))
-                            }.onMove { offsets, destination in
-                                perform { try engine.moveSessions(fromOffsets: offsets, toOffset: destination, visibleIDs: displayed.map(\.id)) }
+                            if tree.groups.isEmpty {
+                                ungroupedRows(displayed)
+                            } else {
+                                Section("세션 그룹") {
+                                    ForEach(tree.groups) { group in
+                                        DisclosureGroup(isExpanded: expansion(group.id)) { treeRows(group.roots) } label: {
+                                            SessionGroupHeader(group: group, expanded: !collapsed.contains(group.id))
+                                        }
+                                    }
+                                }
+                                if !displayed.isEmpty { Section("그룹 밖 세션") { ungroupedRows(displayed) } }
                             }
                         }.listStyle(.inset)
                         .contextMenu(forSelectionType: String.self) { ids in
@@ -217,6 +222,39 @@ import AutoApproveCore
                 detail.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+    private var collapsed: Set<String> { Set(collapsedRows.split(separator: "\n").map(String.init)) }
+    private func expansion(_ key: String) -> Binding<Bool> {
+        Binding(get: { !collapsed.contains(key) }, set: { open in
+            var next = collapsed
+            if open { next.remove(key) } else { next.insert(key) }
+            collapsedRows = next.sorted().joined(separator: "\n")
+        })
+    }
+    private func sessionRow(_ session: AgentSession, grouped: Bool) -> some View {
+        SessionRow(session: session, paused: engine.snapshot.paused, selected: selection.contains(session.id),
+            setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
+            reveal: { reveal(session) })
+            .tag(session.id)
+            .padding(.vertical, 6)
+            .help((grouped ? "그룹 안의 순서는 상위 구성원 관계를 따릅니다. 세션 그룹 창에서 바꿀 수 있습니다.\n" : "드래그하면 목록 순서를 바꿉니다.\n")
+                + (session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false)))
+    }
+    private func ungroupedRows(_ displayed: [AgentSession]) -> some View {
+        ForEach(displayed) { session in sessionRow(session, grouped: false) }
+            .onMove { offsets, destination in
+                perform { try engine.moveSessions(fromOffsets: offsets, toOffset: destination, visibleIDs: displayed.map(\.id)) }
+            }
+    }
+    /// A member with members of its own can be collapsed like its group.
+    private func treeRows(_ nodes: [SessionListTree.Node]) -> AnyView {
+        AnyView(ForEach(nodes) { node in
+            if node.children.isEmpty {
+                sessionRow(node.session, grouped: true)
+            } else {
+                DisclosureGroup(isExpanded: expansion(node.key)) { treeRows(node.children) } label: { sessionRow(node.session, grouped: true) }
+            }
+        })
     }
     private var windowContent: some View {
         content.frame(minWidth: 780, minHeight: 560)
@@ -477,6 +515,27 @@ private struct SessionRowDisplay: View, Equatable {
             }
         }.accessibilityElement(children: .contain)
             .accessibilityAction(named: Text("터미널 열기")) { actions.reveal() }
+    }
+}
+
+/// The collapsible row of one session group. A collapsed group still shows members that need attention.
+private struct SessionGroupHeader: View {
+    let group: SessionListTree.Group
+    let expanded: Bool
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(group.name, systemImage: group.hasLeader ? "person.3.sequence" : "person.2")
+                .font(.callout.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+            Text("\(group.sessionCount)개").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            if group.attentionCount > 0 {
+                Label("확인 필요 \(group.attentionCount)", systemImage: "hand.raised").font(.caption.weight(.medium)).foregroundStyle(.orange).fixedSize()
+            }
+            Spacer(minLength: 0)
+        }.padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityHint(expanded ? "접으면 구성원 행을 숨깁니다." : "펼치면 구성원 행을 보여 줍니다.")
+            .help((group.hasLeader ? "그룹장 아래에 지시를 받는 구성원을 들여 써서 보여 줍니다." : "그룹장이 없는 그룹입니다.")
+                + " 접어도 확인이 필요한 구성원 수는 계속 보입니다.")
     }
 }
 

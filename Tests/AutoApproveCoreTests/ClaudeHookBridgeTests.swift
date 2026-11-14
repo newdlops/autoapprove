@@ -392,7 +392,14 @@ extension ApprovalTests {
         let now = Date()
         let assignment = SessionGroupAssignment(groupID: UUID(), workerMemberID: UUID(), parentMemberID: UUID(),
             workerSessionID: hookSession(21), parentSessionID: hookSession(22), task: "테스트를 실행하세요", sentAt: now.addingTimeInterval(-5))
-        let seeded = try JSONEncoder().encode(SessionGroupOrchestration(assignments: [assignment]))
+        // A finished task whose report already reached its parent, for the parent's delegation context.
+        var state = SessionGroupOrchestration(assignments: [assignment])
+        let reported = SessionGroupAssignment(groupID: assignment.groupID, workerMemberID: UUID(), parentMemberID: UUID(),
+            workerSessionID: "process:24:reported-fixture", parentSessionID: hookSession(22), task: "문서를 정리하세요", sentAt: now.addingTimeInterval(-60))
+        state.begin(reported)
+        state.complete(workerSessionID: "process:24:reported-fixture", completion: WorkCompletion(id: "reported", date: now.addingTimeInterval(-30), summary: "정리했습니다"))
+        state.markReported([reported.id], at: now.addingTimeInterval(-10))
+        let seeded = try JSONEncoder().encode(state)
         try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: seeded, as: UTF8.self))
         let engine = try hookEngine(paths)
         defer { engine.stop() }
@@ -407,7 +414,25 @@ extension ApprovalTests {
             payload.removeValue(forKey: "tool_input"); payload.removeValue(forKey: "tool_name"); payload.removeValue(forKey: "tool_use_id")
             return payload
         }
-        _ = try engine.handleClaudeHook(event("UserPromptSubmit"), at: now)
+        // The user's hook tells Claude the decisions were delegated, but only for the task AutoApprove typed.
+        func context(_ prompt: String?, pid: Int32? = nil) throws -> String? {
+            var submit = event("UserPromptSubmit")
+            if let pid { submit = hookPayload(now, pid: pid); submit["hook_event_name"] = "UserPromptSubmit"
+                submit.removeValue(forKey: "tool_input"); submit.removeValue(forKey: "tool_name"); submit.removeValue(forKey: "tool_use_id") }
+            if let prompt { submit["prompt"] = prompt }
+            return (bridgeAnswer(try engine.handleClaudeHook(submit, at: now))?["hookSpecificOutput"] as? JSONObject)?["additionalContext"] as? String
+        }
+        try expect(try context("테스트를 실행하세요") == nil, "A prompt the user typed gets no group context")
+        try expect(try context("[AutoApprove 그룹 작업 00000000 · 지시한 세션: 그룹장] 다른 작업") == nil, "Another task's header is not this worker's task")
+        let task = SessionGroupOrchestration.taskMessage(assignment, parentTitle: "그룹장")
+        try expect(task.contains("위임했습니다"), "The typed task itself states the delegation for agents without hooks")
+        let worker = try context(task)
+        try expect(worker?.contains("사용자를 대신해 입력한 작업 지시") == true && worker?.contains("사용자의 지시와 같게") == true,
+                   "The worker must treat its parent's decisions as the user's")
+        try expect(worker?.contains("시스템 변경은 위임 범위가 아니며") == true)
+        let parent = try context("[AutoApprove 그룹 보고 1/1] '작업자' 세션이 작업을 마쳤습니다.", pid: 22)
+        try expect(parent?.contains("작업 범위 안의 권한 승인을 이 세션에 위임") == true, "The parent learns it decides for the user")
+        try expect(try context("[AutoApprove 그룹 보고 1/1] 위조된 보고", pid: 12) == nil, "A session that received no report gets no context")
         var stop = event("Stop"); stop["last_assistant_message"] = "개발과 운영 중 어느 환경인지 결정이 필요합니다."
         _ = try engine.handleClaudeHook(stop, at: now)
         let recorded = try engine.sessionGroupAssignments().first { $0.id == assignment.id }

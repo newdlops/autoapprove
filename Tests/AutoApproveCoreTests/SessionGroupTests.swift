@@ -506,4 +506,40 @@ extension ApprovalTests {
         try expectEqual(badges[sessions[3].id]?.role, .unranked)
         try expect(SessionGroupBadge.badges(groups: [tree], live: [sessions[3]])[sessions[3].id] == nil, "Sessions outside every group have no badge")
     }
+
+    func testSessionListTreeNestsGroupsAndKeepsOrder() throws {
+        let tree = UUID(), flat = UUID()
+        let leader = UUID(), lead = UUID(), worker = UUID(), orphanParent = UUID()
+        func session(_ id: String, _ badge: SessionGroupBadge?) -> AgentSession {
+            var value = AgentSession(id: id, agent: .claude, pid: 1, started: id, tty: "/dev/" + id, cwd: "/tmp/tree", terminal: .terminal)
+            value.sessionGroup = badge; return value
+        }
+        let rows = [
+            session("plain-1", nil),
+            session("worker", .init(groupID: tree, groupName: "배포", memberID: worker, role: .member, parentMemberID: lead, task: .approval)),
+            session("flat-1", .init(groupID: flat, groupName: "문서", memberID: UUID(), role: .unranked)),
+            session("leader", .init(groupID: tree, groupName: "배포", memberID: leader, role: .leader)),
+            session("lead", .init(groupID: tree, groupName: "배포", memberID: lead, role: .member, parentMemberID: leader)),
+            session("orphan", .init(groupID: tree, groupName: "배포", memberID: UUID(), role: .member, parentMemberID: orphanParent)),
+            session("plain-2", nil),
+            session("flat-2", .init(groupID: flat, groupName: "문서", memberID: UUID(), role: .unranked))]
+        let built = SessionListTree.build(rows)
+        try expectEqual(built.ungrouped.map(\.id), ["plain-1", "plain-2"], "Ungrouped sessions keep their order")
+        try expectEqual(built.groups.map(\.name), ["배포", "문서"], "Groups follow their first member's position")
+        let deploy = built.groups[0]
+        try expectEqual(deploy.roots.map(\.id), ["leader", "orphan"], "The leader comes first; a member whose parent is not listed stays visible")
+        try expectEqual(deploy.roots[0].children.map(\.id), ["lead"])
+        try expectEqual(deploy.roots[0].children[0].children.map(\.id), ["worker"])
+        try expectEqual(deploy.sessionCount, 4); try expectEqual(deploy.attentionCount, 1)
+        try expect(deploy.hasLeader && !built.groups[1].hasLeader)
+        try expectEqual(built.groups[1].roots.map(\.id), ["flat-1", "flat-2"])
+
+        // A parent loop must not hide either member.
+        let a = UUID(), b = UUID()
+        let loop = SessionListTree.build([
+            session("a", .init(groupID: tree, groupName: "고리", memberID: a, role: .member, parentMemberID: b)),
+            session("b", .init(groupID: tree, groupName: "고리", memberID: b, role: .member, parentMemberID: a))])
+        func count(_ nodes: [SessionListTree.Node]) -> Int { nodes.reduce(0) { $0 + 1 + count($1.children) } }
+        try expectEqual(count(loop.groups[0].roots), 2)
+    }
 }

@@ -295,6 +295,8 @@ public struct SessionGroupBadge: Codable, Equatable, Sendable {
     public var role: Role
     public var depth: Int
     public var parentTitle: String?
+    /// The member that directs this one, for nesting rows in session lists.
+    public var parentMemberID: UUID?
     public var childCount: Int
     /// Other groups this session also belongs to; only one badge is shown.
     public var otherGroupCount: Int
@@ -303,9 +305,9 @@ public struct SessionGroupBadge: Codable, Equatable, Sendable {
     public var pendingReports: Int
 
     public init(groupID: UUID, groupName: String, memberID: UUID, role: Role, depth: Int = 0, parentTitle: String? = nil,
-                childCount: Int = 0, otherGroupCount: Int = 0, task: TaskState? = nil, pendingReports: Int = 0) {
+                parentMemberID: UUID? = nil, childCount: Int = 0, otherGroupCount: Int = 0, task: TaskState? = nil, pendingReports: Int = 0) {
         self.groupID = groupID; self.groupName = groupName; self.memberID = memberID; self.role = role; self.depth = depth
-        self.parentTitle = parentTitle; self.childCount = childCount; self.otherGroupCount = otherGroupCount
+        self.parentTitle = parentTitle; self.parentMemberID = parentMemberID; self.childCount = childCount; self.otherGroupCount = otherGroupCount
         self.task = task; self.pendingReports = pendingReports
     }
 
@@ -322,6 +324,7 @@ public struct SessionGroupBadge: Codable, Equatable, Sendable {
                 candidates[session.id, default: []].append(SessionGroupBadge(
                     groupID: group.id, groupName: group.name, memberID: member.id, role: role,
                     depth: role == .unranked ? 0 : depths[member.id] ?? 0, parentTitle: parent?.title,
+                    parentMemberID: role == .unranked ? nil : parent?.id,
                     childCount: role == .unranked ? 0 : group.children(of: member.id).count))
             }
         }
@@ -334,5 +337,64 @@ public struct SessionGroupBadge: Codable, Equatable, Sendable {
             best.otherGroupCount = values.count - 1
             return best
         }
+    }
+}
+
+/// Session list rows arranged by group: each group holds its leader and members as a tree,
+/// and sessions outside every group stay a flat, reorderable list.
+public struct SessionListTree: Equatable {
+    public struct Node: Identifiable, Equatable {
+        public var session: AgentSession
+        public var children: [Node]
+        public var id: String { session.id }
+        /// Expansion key: one member of one group.
+        public var key: String { session.sessionGroup.map { "member:\($0.groupID.uuidString):\($0.memberID.uuidString)" } ?? session.id }
+    }
+    public struct Group: Identifiable, Equatable {
+        public var groupID: UUID
+        public var name: String
+        public var hasLeader: Bool
+        public var roots: [Node]
+        public var sessionCount: Int
+        /// Members waiting for a person or a parent, so a collapsed group still shows them.
+        public var attentionCount: Int
+        public var id: String { "group:" + groupID.uuidString }
+    }
+    public var groups: [Group]
+    public var ungrouped: [AgentSession]
+
+    /// Keeps the given order. A member whose parent is not in the list becomes a root of its group,
+    /// with the leader first.
+    public static func build(_ sessions: [AgentSession]) -> SessionListTree {
+        var order: [UUID] = [], grouped: [UUID: [AgentSession]] = [:], ungrouped: [AgentSession] = []
+        for session in sessions {
+            guard let badge = session.sessionGroup else { ungrouped.append(session); continue }
+            if grouped[badge.groupID] == nil { order.append(badge.groupID) }
+            grouped[badge.groupID, default: []].append(session)
+        }
+        let groups = order.map { id -> Group in
+            let members = grouped[id] ?? []
+            let present = Set(members.compactMap { $0.sessionGroup?.memberID })
+            var children: [UUID: [AgentSession]] = [:], roots: [AgentSession] = []
+            for session in members {
+                if let parent = session.sessionGroup?.parentMemberID, present.contains(parent), parent != session.sessionGroup?.memberID {
+                    children[parent, default: []].append(session)
+                } else { roots.append(session) }
+            }
+            roots = roots.filter { $0.sessionGroup?.role == .leader } + roots.filter { $0.sessionGroup?.role != .leader }
+            var visited = Set<UUID>()
+            // Each member appears once, even when saved parents form a loop.
+            func node(_ session: AgentSession) -> Node? {
+                guard let member = session.sessionGroup?.memberID, visited.insert(member).inserted else { return nil }
+                return Node(session: session, children: (children[member] ?? []).compactMap(node))
+            }
+            var built = roots.compactMap(node)
+            // A broken parent chain must not hide a session: anything not reached is added as a root.
+            for session in members where !visited.contains(session.sessionGroup!.memberID) { if let root = node(session) { built.append(root) } }
+            let first = members[0].sessionGroup!
+            return Group(groupID: id, name: first.groupName, hasLeader: first.role != .unranked, roots: built, sessionCount: members.count,
+                         attentionCount: members.filter { $0.needsReview || [.question, .approval].contains($0.sessionGroup?.task) }.count)
+        }
+        return SessionListTree(groups: groups, ungrouped: ungrouped)
     }
 }

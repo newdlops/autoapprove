@@ -524,6 +524,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: a task turns on worker automatic approval",tests.testGroupTaskTurnsOnWorkerAutomaticApproval),
             ("Session groups: a worker choice question reaches the parent and is answered",tests.testGroupWorkerChoiceQuestionReachesParentAndIsAnswered),
             ("Session groups: list badges tell leaders from members",tests.testSessionGroupBadgesForSessionLists),
+            ("Session groups: session list tree nests members and keeps order",tests.testSessionListTreeNestsGroupsAndKeepsOrder),
             ("Session profiles: multiple private files, explicit update, import and restart",tests.testTerminalProfilesMultiplePrivateFilesAndRestart),
             ("Session profiles: fresh native titles repair startup capture and active duplicate detection",tests.testTerminalProfileFreshTabTitleRepairsStartupCaptureAndActiveDeduplication),
             ("Session profiles: unresolved conversations require an explicit new CLI choice",tests.testTerminalProfileSavingRequiresExplicitNewCLISelection),

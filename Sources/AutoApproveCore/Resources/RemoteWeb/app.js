@@ -1501,33 +1501,106 @@ function renderGroupBadge(element, badge) {
   taskElement.dataset.task = badge.task || '';
   show(taskElement, !!(task || reports));
 }
+// Collapsed group and member rows of the session list, kept per browser.
+const collapsedListRows = new Set((() => {
+  try { const saved = JSON.parse(localStorage.getItem('session-list-collapsed') || '[]'); return Array.isArray(saved) ? saved.filter(value => typeof value === 'string').slice(0, 500) : []; }
+  catch (_) { return []; }
+})());
+function toggleListRow(key) {
+  if (collapsedListRows.has(key)) collapsedListRows.delete(key); else collapsedListRows.add(key);
+  try { localStorage.setItem('session-list-collapsed', JSON.stringify([...collapsedListRows])); } catch (_) {}
+  renderList();
+}
+// Groups come first, each as a tree under its leader. Sessions outside every group keep their order.
+// A member whose parent is not listed stays visible as a root, and a saved parent loop shows each member once.
+function sessionListEntries(visible) {
+  const groups = new Map(), ungrouped = [];
+  for (const item of visible) {
+    const badge = item.session.sessionGroup;
+    if (!badge) { ungrouped.push(item); continue; }
+    const key = `group:${item.node.id}:${badge.groupID}`;
+    if (!groups.has(key)) groups.set(key, {key, name: badge.groupName, hasLeader: badge.role !== 'unranked', items: []});
+    groups.get(key).items.push(item);
+  }
+  const entries = [];
+  for (const group of groups.values()) {
+    const present = new Set(group.items.map(item => item.session.sessionGroup.memberID)), children = new Map(), roots = [];
+    for (const item of group.items) {
+      const badge = item.session.sessionGroup;
+      if (badge.parentMemberID && badge.parentMemberID !== badge.memberID && present.has(badge.parentMemberID)) {
+        if (!children.has(badge.parentMemberID)) children.set(badge.parentMemberID, []);
+        children.get(badge.parentMemberID).push(item);
+      } else roots.push(item);
+    }
+    roots.sort((a, b) => (b.session.sessionGroup.role === 'leader') - (a.session.sessionGroup.role === 'leader'));
+    const attention = group.items.filter(item => needsReview(item.session) || ['question', 'approval'].includes(item.session.sessionGroup.task)).length;
+    const groupCollapsed = collapsedListRows.has(group.key), visited = new Set();
+    entries.push({kind: 'group', key: group.key, group, attention, collapsed: groupCollapsed, hidden: false});
+    const walk = (item, depth, hidden) => {
+      const member = item.session.sessionGroup.memberID; if (visited.has(member)) return; visited.add(member);
+      const toggleKey = `member:${group.key}:${member}`, kids = children.get(member) || [], collapsed = collapsedListRows.has(toggleKey);
+      entries.push({kind: 'session', key: item.key, item, depth, hidden, toggleKey: kids.length ? toggleKey : '', collapsed: kids.length > 0 && collapsed});
+      for (const child of kids) walk(child, depth + 1, hidden || collapsed);
+    };
+    for (const root of roots) walk(root, 1, groupCollapsed);
+    for (const item of group.items) walk(item, 1, groupCollapsed);
+  }
+  for (const item of ungrouped) entries.push({kind: 'session', key: item.key, item, depth: 0, hidden: false, toggleKey: '', collapsed: false});
+  return entries;
+}
 function renderList() {
   const query = $('search').value.trim().toLocaleLowerCase();
   const available = allSessions.filter(item => !retainedError(item));
   const visible = available.filter(({ node, view, session }) => ($('node-filter').value === 'all' || node.id === $('node-filter').value)
     && (filter !== 'review' || needsReview(session)) && (filter !== 'automatic' || session.automatic)
     && [view.title, session.cwd, session.terminalTitle, session.customization?.note, session.gitBranch?.name, session.sessionGroup?.groupName, node.name, agents[session.agent]].filter(Boolean).join(' ').toLocaleLowerCase().includes(query));
-  const visibleKeys = new Set(visible.map(item => item.key));
+  const entries = sessionListEntries(visible);
+  const visibleKeys = new Set(entries.map(entry => entry.key));
   for (const [key, row] of rows) if (!visibleKeys.has(key)) { row.remove(); rows.delete(key); }
-  for (const [index, item] of visible.entries()) {
-    let row = rows.get(item.key);
-    if (!row) {
-      row = make('li'); const button = make('button', 'session-row');
-      const group = make('span', 'row-group'); group.append(make('span', 'row-group-name'), make('span', 'row-group-task'));
-      button.append(make('span', 'row-project'), make('span', 'row-title'), group, make('span', 'row-meta'));
-      const state = make('span', 'row-state'); state.append(make('span', 'phase'), make('span', 'row-auto')); button.append(state); row.append(button);
-      button.addEventListener('click', () => selectSession(item.key, true)); rows.set(item.key, row);
+  for (const [index, entry] of entries.entries()) {
+    let row = rows.get(entry.key);
+    if (entry.kind === 'group') {
+      if (!row) {
+        row = make('li', 'group-row'); const header = make('button', 'group-header');
+        header.append(make('span', 'group-caret'), make('span', 'group-name'), make('span', 'group-count'), make('span', 'group-attention'));
+        header.addEventListener('click', () => toggleListRow(entry.key)); row.append(header); rows.set(entry.key, row);
+      }
+      const header = row.querySelector('.group-header'), attention = row.querySelector('.group-attention');
+      header.setAttribute('aria-expanded', String(!entry.collapsed));
+      header.title = entry.group.hasLeader ? '그룹장 아래에 지시를 받는 구성원을 들여 써서 보여 줍니다.' : '그룹장이 없는 그룹입니다.';
+      text(row.querySelector('.group-caret'), entry.collapsed ? '▸' : '▾');
+      text(row.querySelector('.group-name'), entry.group.name);
+      text(row.querySelector('.group-count'), `${entry.group.items.length}개`);
+      text(attention, `확인 필요 ${entry.attention}`); show(attention, entry.attention > 0);
+    } else {
+      const item = entry.item;
+      if (!row) {
+        row = make('li'); const toggle = make('button', 'tree-toggle'), button = make('button', 'session-row');
+        toggle.addEventListener('click', () => { if (toggle.dataset.key) toggleListRow(toggle.dataset.key); });
+        const group = make('span', 'row-group'); group.append(make('span', 'row-group-name'), make('span', 'row-group-task'));
+        button.append(make('span', 'row-project'), make('span', 'row-title'), group, make('span', 'row-meta'));
+        const state = make('span', 'row-state'); state.append(make('span', 'phase'), make('span', 'row-auto')); button.append(state); row.append(toggle, button);
+        button.addEventListener('click', () => selectSession(item.key, true)); rows.set(item.key, row);
+      }
+      const button = row.querySelector('.session-row'); button.setAttribute('aria-pressed', String(item.key === selectedKey));
+      row.classList.toggle('tree-row', entry.depth > 0); row.style.setProperty('--depth', String(entry.depth));
+      const toggle = row.querySelector('.tree-toggle');
+      show(toggle, entry.depth > 0); toggle.dataset.key = entry.toggleKey; toggle.style.visibility = entry.toggleKey ? '' : 'hidden';
+      toggle.tabIndex = entry.toggleKey ? 0 : -1; text(toggle, entry.collapsed ? '▸' : '▾');
+      if (entry.toggleKey) { toggle.setAttribute('aria-expanded', String(!entry.collapsed)); toggle.setAttribute('aria-label', entry.collapsed ? '하위 구성원 펼치기' : '하위 구성원 접기'); }
+      else { toggle.removeAttribute('aria-expanded'); toggle.setAttribute('aria-hidden', 'true'); }
+      if (entry.toggleKey) toggle.removeAttribute('aria-hidden');
+      const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
+      text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
+      renderGroupBadge(row.querySelector('.row-group'), item.session.sessionGroup);
+      text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
+      const phase = row.querySelector('.phase'), unavailable = !connected || !item.node.online;
+      text(phase, unavailable ? item.node.loading ? '갱신 중…' : '연결 끊김' : item.view.phaseTitle);
+      phase.dataset.phase = unavailable ? 'unknown' : item.session.interruption && item.session.interruption.recoveredAt == null ? 'error' : item.session.phase;
+      phase.title = unavailable ? '마지막 확인: '+item.view.phaseTitle : '';
+      text(row.querySelector('.row-auto'), item.session.automatic ? item.node.state.snapshot.paused ? '자동 승인 · 정지' : '자동 승인 켜짐' : '자동 승인 꺼짐');
     }
-    const button = row.firstChild; button.setAttribute('aria-pressed', String(item.key === selectedKey));
-    const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
-    text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
-    renderGroupBadge(row.querySelector('.row-group'), item.session.sessionGroup);
-    text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
-    const phase = row.querySelector('.phase'), unavailable = !connected || !item.node.online;
-    text(phase, unavailable ? item.node.loading ? '갱신 중…' : '연결 끊김' : item.view.phaseTitle);
-    phase.dataset.phase = unavailable ? 'unknown' : item.session.interruption && item.session.interruption.recoveredAt == null ? 'error' : item.session.phase;
-    phase.title = unavailable ? '마지막 확인: '+item.view.phaseTitle : '';
-    text(row.querySelector('.row-auto'), item.session.automatic ? item.node.state.snapshot.paused ? '자동 승인 · 정지' : '자동 승인 켜짐' : '자동 승인 꺼짐');
+    show(row, !entry.hidden);
     const atPosition = $('session-list').children[index];
     if (atPosition !== row) $('session-list').insertBefore(row, atPosition || null);
   }
@@ -3146,7 +3219,7 @@ $('back').addEventListener('click', () => {
   stopPTY(); stopTerminalStream(true);
   nativeSessionKey = ''; clearNativeImage();
   stopDirect(); composing = false;
-  drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.firstChild;
+  drafts.set(selectedKey, $('terminal-input').value); const previous = rows.get(selectedKey)?.querySelector('.session-row');
   selectedKey = ''; selectedItem = null; latestFrame = null; detailGeneration++; frameController?.abort(); clearTimeout(frameTimer);
   terminalFocus(false);
   document.body.classList.remove('detail-open'); history.replaceState(null, '', location.pathname); show($('detail-content'), false); show($('detail-empty'), true); renderList(); previous?.focus();

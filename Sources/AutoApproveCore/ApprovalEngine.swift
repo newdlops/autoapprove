@@ -2334,6 +2334,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
+#if DEBUG
+    /// Native previews show group rows without live conversation identities. Not in release builds.
+    public func setSessionGroupBadgesForPreview(_ badges: [String: SessionGroupBadge]) {
+        groupBadgeTask?.cancel(); groupBadgeTask = nil
+        sessionGroupBadges = badges; groupBadgeRefreshedAt = Date(); publish()
+    }
+#endif
+
     /// Adds the cached group badge and the member's current task to a published row.
     private func projectSessionGroup(_ session: AgentSession) -> AgentSession {
         guard var badge = sessionGroupBadges[session.id] else {
@@ -2545,7 +2553,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull()]
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "다른 도구의 구성원은 표시만 합니다. 같은 도구의 메시지 수신 가능 여부와 실제 주소는 각 도구에서 확인하세요. 그룹장이 있는 그룹은 get_group_status와 assign_group_task로 작업을 지시하세요."]
+                    "message": "그룹장이 있는 그룹에서는 작업 지시와 답변을 각 도구의 메시지 기능으로 보내지 말고 get_group_status, assign_group_task, answer_group_question을 사용하세요. AutoApprove가 사용자의 위임 사실을 함께 전달합니다. 그룹장이 없는 그룹에서 다른 도구의 구성원은 표시만 하며, 같은 도구의 메시지 수신 가능 여부와 실제 주소는 각 도구에서 확인하세요."]
         case "get_group_status":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
@@ -5077,7 +5085,36 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[key] = session
         if session.interruption != nil { persistInterruption(key) }
         snapshot.health.claude = "연결됨 · 세션 이벤트 수신 중"; publish()
+        if event == "UserPromptSubmit", let context = groupDelegationContext(sessionID: key, prompt: payload["prompt"] as? String) {
+            response["hookSpecificOutput"] = ["hookEventName": "UserPromptSubmit", "additionalContext": context]
+        }
         return response
+    }
+
+    /// The user's own hook tells Claude that the group's decisions were delegated to the assigning session.
+    /// It is added only to prompts AutoApprove itself just typed: the worker's current task, or the reports
+    /// and requests it just delivered to the assigning session. Other prompts get nothing.
+    private func groupDelegationContext(sessionID: String, prompt: String?, at now: Date = Date()) -> String? {
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines), prompt.hasPrefix("[AutoApprove 그룹 "),
+              let state = try? groupOrchestration() else { return nil }
+        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
+        func title(_ group: UUID, _ member: UUID) -> String {
+            let value = SessionGroupOrchestration.oneLine(groups.first { $0.id == group }?.members.first { $0.id == member }?.title ?? "")
+            return value.isEmpty ? "그룹장" : value
+        }
+        func groupName(_ id: UUID) -> String { groups.first { $0.id == id }?.name ?? "세션 그룹" }
+        if let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working }),
+           prompt.hasPrefix("[AutoApprove 그룹 작업 \(task.shortID)"), now.timeIntervalSince(task.sentAt) < 600 {
+            return SessionGroupOrchestration.workerDelegation(group: groupName(task.groupID), parent: title(task.groupID, task.parentMemberID))
+        }
+        let delivered = state.assignments.filter { item in
+            item.parentSessionID == sessionID && [item.reportedAt, item.question?.reportedAt].contains { $0.map { now.timeIntervalSince($0) < 600 } == true }
+        }
+        if prompt.hasPrefix("[AutoApprove 그룹 보고") || prompt.hasPrefix("[AutoApprove 그룹 질문") || prompt.hasPrefix("[AutoApprove 그룹 승인 요청"),
+           let item = delivered.first {
+            return SessionGroupOrchestration.parentDelegation(group: groupName(item.groupID))
+        }
+        return nil
     }
 
     private func rememberHook(_ fingerprint: String) -> Bool {
