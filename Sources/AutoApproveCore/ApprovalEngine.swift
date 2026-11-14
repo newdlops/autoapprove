@@ -1097,7 +1097,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let rows=await Task.detached(priority:.utility) {
                     home.map {ClaudeSessionRegistry.read(records:[record],directory:URL(fileURLWithPath:$0))} ?? registry([record])
                 }.value
-                let identities=Set(rows.filter {$0.processID == session.id}.compactMap { $0.activity?.providerID })
+                let identities=Set(rows.filter {$0.processID == session.id}.compactMap(\.conversationID))
                 if identities.count == 1,let id=identities.first,UUID(uuidString:id) != nil {entry.conversationID=id}
                 else if let id=session.providerID,UUID(uuidString:id) != nil {entry.conversationID=id}
                 else {detail="대화 ID는 선택 사항입니다. 비워 두면 이 폴더에서 새 Claude Code를 엽니다."}
@@ -1204,7 +1204,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let registryReader = claudeRegistryReader, key = session.id
         let registrations = await Task.detached { registryReader(records).filter { $0.processID == key } }.value
-        return registrations.count == 1 ? registrations.first?.activity?.providerID : nil
+        return registrations.count == 1 ? registrations.first?.conversationID : nil
     }
     private func spawnPTY(_ object: JSONObject) async throws -> ManagedPTYDescriptor {
         guard !remoteInputStopped else { throw RemoteHTTPError(503, "앱이 종료 중입니다.") }
@@ -2252,16 +2252,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     home = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
                     let directory = URL(fileURLWithPath: path)
                     let rows = await Task.detached(priority: .utility) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
-                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap { $0.activity?.providerID })
+                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
                     if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
-                    let matching = rows.filter { $0.processID == original.id && $0.activity?.providerID == conversation }
+                    let matching = rows.filter { $0.processID == original.id && $0.conversationID == conversation }
                     if conversation != nil, matching.count == 1 { messagingName = matching[0].peerName }
                 } else {
                     // Injected registry readers are also useful for isolated tests; do not infer a home.
                     let rows = await Task.detached(priority: .utility) { registry([record]) }.value
-                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap { $0.activity?.providerID })
+                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
                     if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
-                    let matching = rows.filter { $0.processID == original.id && $0.activity?.providerID == conversation }
+                    let matching = rows.filter { $0.processID == original.id && $0.conversationID == conversation }
                     if conversation != nil, matching.count == 1 { messagingName = matching[0].peerName }
                 }
             }

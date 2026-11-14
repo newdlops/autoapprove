@@ -521,6 +521,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: session list tree nests members and keeps order",tests.testSessionListTreeNestsGroupsAndKeepsOrder),
             ("Session restart: command keeps known options only",tests.testSessionRestartCommandKeepsKnownOptionsOnly),
             ("Session restart: process arguments parse only argv",tests.testProcessArgumentsParseOnlyArgv),
+            ("Claude registry keeps the conversation for an unknown status",tests.testClaudeRegistryKeepsConversationForUnknownStatus),
             ("Session restart: exits and reopens the same conversation",tests.testSessionRestartExitsAndReopensTheSameConversation),
             ("Session restart: a shell-less CLI is left untouched",tests.testSessionRestartLeavesShelllessCLIUntouched),
             ("Session restart: unsupported terminals are refused",tests.testSessionRestartRefusesUnsupportedTerminals),

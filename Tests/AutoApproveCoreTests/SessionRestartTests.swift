@@ -54,6 +54,23 @@ extension ApprovalTests {
         try expectThrows(try SessionRestartCommand.plan(agent: .claude, executable: "claude", argv: [], conversationID: id))
     }
 
+    func testClaudeRegistryKeepsConversationForUnknownStatus() throws {
+        // Claude reports statuses this app does not know, such as "shell". The conversation must still be read,
+        // or saving a session profile and restarting the session both report that no conversation was found.
+        let process = ProcessDiscovery.parse("6244 1 ttys006 6244 6244 Tue Nov 10 20:25:14 2026 /fixture/claude")[0]
+        let conversation = "046adb89-3665-413a-996a-dc90a7a65862"
+        func registration(_ status: String) -> ClaudeSessionRegistration? {
+            let json: JSONObject = ["pid": 6244, "pidDomain": "darwin", "procStart": "Tue Nov 10 20:25:14 2026", "kind": "interactive",
+                                    "sessionId": conversation, "status": status, "statusUpdatedAt": Date().timeIntervalSince1970 * 1000]
+            return ClaudeSessionRegistry.decode(try! JSONSerialization.data(withJSONObject: json), process: process, processTimeZone: TimeZone(secondsFromGMT: 0)!)
+        }
+        let shell = try unwrapRestart(registration("shell"))
+        try expectEqual(shell.conversationID, conversation)
+        try expect(shell.activity == nil, "An unknown status is not reported as activity")
+        let idle = try unwrapRestart(registration("idle"))
+        try expectEqual(idle.conversationID, conversation); try expectEqual(idle.activity?.status, "idle")
+    }
+
     func testProcessArgumentsParseOnlyArgv() throws {
         var bytes = withUnsafeBytes(of: Int32(3)) { Array($0) }
         for part in ["/opt/claude", "", "", "/opt/claude", "--model", "opus", "HOME=/Users/fixture", "TERM=xterm", ""] {

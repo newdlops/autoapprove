@@ -10,11 +10,17 @@ public struct ClaudeSessionRegistration: Equatable {
     public var activity: ClaudeSessionActivity?
     /// Name advertised by the current Claude process; not a conversation UUID.
     public var peerName: String?
+    /// The conversation Claude registered for this process. Unlike `activity`, it does not depend on the status
+    /// value, so a status this app does not know (for example "shell") still identifies the conversation.
+    public var sessionID: String?
+    /// The conversation to use for identity: the registered one, or the one reported with a known activity.
+    public var conversationID: String? { sessionID ?? activity?.providerID }
 
-    public init(processID: String, kind: String, jobID: String? = nil, parkedJobID: String? = nil, activity: ClaudeSessionActivity? = nil, peerName: String? = nil) {
+    public init(processID: String, kind: String, jobID: String? = nil, parkedJobID: String? = nil, activity: ClaudeSessionActivity? = nil,
+                peerName: String? = nil, sessionID: String? = nil) {
         self.processID = processID; self.kind = kind
         self.jobID = jobID; self.parkedJobID = parkedJobID
-        self.activity = activity; self.peerName = peerName
+        self.activity = activity; self.peerName = peerName; self.sessionID = sessionID
     }
 }
 
@@ -140,7 +146,8 @@ public enum ClaudeSessionRegistry {
             guard !name.isEmpty, name.count <= 256, !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
             return name
         }
-        return .init(processID: process.key, kind: kind, jobID: identifier("jobId"), parkedJobID: identifier("parkedJobId"), activity: activity, peerName: peerName)
+        return .init(processID: process.key, kind: kind, jobID: identifier("jobId"), parkedJobID: identifier("parkedJobId"), activity: activity,
+                     peerName: peerName, sessionID: identifier("sessionId"))
     }
 
     /// Jobs are not a stable Claude API. Use their optional structured question only
