@@ -157,6 +157,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
+    private let codexGroupReader: @Sendable (ProcessRecord) throws -> CodexThreadLocation?
+    private let codexGroupEnvironment: @Sendable (ProcessRecord) -> [String: String]?
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
     private let discoveryReader: @Sendable () throws -> [ProcessRecord]
     private var workingDirectoriesBySession: [String: String] = [:]
@@ -539,6 +541,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public init(paths: AppPaths = AppPaths(), terminalReader: (@Sendable ([String]) throws -> TerminalSnapshot)? = nil, questionTransport: CodexReplyTransport = .live, claudeRegistryReader: @escaping @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { ClaudeSessionRegistry.read(records: $0) }, processReader: (@Sendable () throws -> [ProcessRecord])? = nil, screenAdapters: [ScreenHost: ScreenHostAdapter] = [:], powerControl: PowerControl = .live, managedPTY: ManagedPTYManager = ManagedPTYManager(), terminalWindowCapture: TerminalWindowCapture? = nil, itermWindowCapture: TerminalWindowCapture? = nil, orcaSnapshotReader: (@Sendable (String) async throws -> OrcaTerminalSnapshot)? = nil, requestTerminalKeyboardPermission: (@MainActor @Sendable () -> Void)? = nil, bridgeOwnerBundle: (@MainActor @Sendable (Int32) -> String?)? = nil, terminalInputAvailable: (@Sendable () -> Bool)? = nil,
                 terminalInputIdentity: (@Sendable (Int32) -> TTYInputIdentity?)? = nil, testScreenSharing: TestScreenSharing? = nil,
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
+                codexGroupReader: (@Sendable (ProcessRecord) throws -> CodexThreadLocation?)? = nil,
+                codexGroupEnvironment: (@Sendable (ProcessRecord) -> [String: String]?)? = nil,
                 webLoopbackOnly: Bool = false, isolateByDefault: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
@@ -594,6 +598,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.codexSubagentGoals = codexSubagentGoals
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
+        self.codexGroupReader = codexGroupReader ?? { record in
+            try CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: record.pid, expectedStart: record.started))
+        }
+        self.codexGroupEnvironment = codexGroupEnvironment ?? { ProcessEnvironment.read($0) }
         // Native window checks need one original process, not a system-wide
         // snapshot. Keep injected readers authoritative and every check fresh.
         if let singleProcessReader { self.singleProcessReader = singleProcessReader }
@@ -823,6 +831,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        codexGroupDiscoveryTask?.cancel(); codexGroupDiscoveryTask = nil
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
@@ -2183,6 +2192,35 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private var groupStatusIdentities: [String: (session: AgentSession, conversationID: String, home: String?)] = [:]
+    private var codexGroupStatusDates: [String: Date] = [:]
+    private var codexGroupDiscoveryTask: Task<Void, Never>?
+    private var codexGroupDiscoveryAttempts: [String: Date] = [:]
+
+    /// A shared Codex daemon owns the rollout. Ask the original idle terminal for its identity.
+    /// Queries are serialized and use the same draft, question and input-collision guards as manual refresh.
+    private func discoverCodexGroupIdentities(_ live: [SessionGroupLiveSession]) {
+        guard codexGroupDiscoveryTask == nil, !snapshot.paused, !remoteInputStopped else { return }
+        let candidates = live.filter { $0.session.agent == .codex && $0.conversationID == nil &&
+            ![.ended, .approval, .input].contains($0.session.phase) && $0.providerHome != nil &&
+            Date().timeIntervalSince(codexGroupDiscoveryAttempts[$0.id] ?? .distantPast) >= 30 }
+        guard !candidates.isEmpty else { return }
+        codexGroupDiscoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.codexGroupDiscoveryTask = nil }
+            for candidate in candidates {
+                guard !Task.isCancelled, !self.snapshot.paused, !self.remoteInputStopped else { return }
+                guard let current = self.sessions[candidate.id], current.started == candidate.session.started,
+                      current.tty == candidate.session.tty, current.cwd == candidate.session.cwd,
+                      ![.ended, .approval, .input].contains(current.phase), !current.pendingInTerminal,
+                      !self.automaticInputBusy(current.id), !self.userInputHasPriority(current.id) else { continue }
+                self.codexGroupDiscoveryAttempts[current.id] = Date()
+                guard let id = try? await self.statusConversationID(current), !Task.isCancelled else { continue }
+                self.groupStatusIdentities[current.id] = (current, id, candidate.providerHome)
+                self.codexGroupStatusDates[current.id] = Date()
+            }
+            if !Task.isCancelled { self.refreshSessionGroupBadges() }
+        }
+    }
 
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
     public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID) async throws {
@@ -2190,7 +2228,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let group = saved.first(where: { $0.id == groupID }),
               let member = group.members.first(where: { $0.id == memberID }),
               let runtime = member.runtimeID, let original = sessions[runtime],
-              original.agent == member.agent, original.cwd == member.cwd, original.phase == .idle,
+              original.agent == member.agent, original.cwd == member.cwd,
+              original.phase == .idle || (original.agent == .codex && ![.ended, .approval, .input].contains(original.phase)),
               !original.pendingInTerminal, !automaticInputBusy(runtime), !userInputHasPriority(runtime) else {
             throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 또는 연결 상태를 확인해주세요.")
         }
@@ -2198,20 +2237,34 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var next = saved
         let gi = next.firstIndex(where: { $0.id == groupID })!, mi = next[gi].members.firstIndex(where: { $0.id == memberID })!
         next[gi].members[mi].conversationID = id
+        if original.agent == .codex,
+           let record = try? processReader().first(where: { $0.key == original.id }),
+           let home = CodexGroupIdentity.home(environment: ProcessEnvironment.read(record)) {
+            next[gi].members[mi].providerHome = home
+        }
         try store.save(next, expected: saved)
-        groupStatusIdentities[runtime] = (original, id, member.providerHome)
+        groupStatusIdentities[runtime] = (original, id, next[gi].members[mi].providerHome)
+        if original.agent == .codex { codexGroupStatusDates[runtime] = Date() }
     }
 
     /// Types /status into an idle CLI and reads the conversation ID from the fresh status screen.
     private func statusConversationID(_ original: AgentSession) async throws -> String {
         let runtime = original.id
+        if original.agent == .codex, sendingMessages.contains(runtime) { throw AppError.message("이미 이 터미널에 입력을 전달하고 있습니다.") }
         let before = try await remoteTerminal(sessionID: runtime, realtime: true)
         guard SystemSafetyComposer.capture(before.screen, agent: original.agent, text: "/status") != nil,
               original.agent == .codex ? CodexProgressScreen.emptyComposer(before.screen) :
                 PromptDetector.normalizedLines(before.screen).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })?.trimmingCharacters(in: .whitespaces) == "❯" else {
             throw AppError.message("터미널 입력창을 비우고 질문이나 메뉴를 닫은 뒤 다시 갱신해주세요.")
         }
-        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision])
+        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], preflight: {
+            guard original.agent == .codex else { return }
+            let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true)
+            guard !self.snapshot.paused, !self.userInputHasPriority(runtime),
+                  self.sessions[runtime]?.pendingInTerminal == false, CodexProgressScreen.ready(latest.screen) else {
+                throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
+            }
+        })
         sendingMessages.insert(runtime); defer { sendingMessages.remove(runtime) }
         for _ in 0..<60 {
             try await Task.sleep(for: .milliseconds(200))
@@ -2230,27 +2283,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
         let originals = sessions.values.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
         guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
-        let reader = processReader, registry = claudeRegistryReader
+        let reader = processReader, registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
         let records = try await Task.detached(priority: .utility) { try reader() }.value
         var result: [SessionGroupLiveSession] = []
         for original in originals {
             try Task.checkCancellation()
             guard let record = records.first(where: { $0.key == original.id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else { continue }
-            let environment = await Task.detached(priority: .utility) { ProcessEnvironment.read(record) }.value
+            let environment = await Task.detached(priority: .utility) {
+                original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
+            }.value
             var home: String?, conversation: String?, messagingName: String?
             if original.agent == .codex {
+                home = CodexGroupIdentity.home(environment: environment)
                 let location = try? await Task.detached(priority: .utility) {
-                    try CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: record.pid, expectedStart: record.started))
+                    try codexReader(record)
                 }.value
                 if let location, UUID(uuidString: location.threadID) != nil {
                     conversation = location.threadID
                     home = URL(fileURLWithPath: location.database).deletingLastPathComponent().resolvingSymlinksInPath().path
-                } else if let thread = original.codexApprovalBinding?.threadID, UUID(uuidString: thread) != nil,
-                          var target = try? await questionTransport.queueHome(original) {
-                    target.threadID = thread
-                    if (try? await codexQueue.validate(target, original.cwd)) != nil {
-                        conversation = thread; home = URL(fileURLWithPath: target.home).resolvingSymlinksInPath().path
-                    }
                 }
             } else {
                 if let environment {
@@ -2276,7 +2326,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
             if let status = groupStatusIdentities[current.id], status.session.started == current.started,
-               status.session.tty == current.tty, status.session.cwd == current.cwd, status.session.agent == current.agent {
+               status.session.tty == current.tty, status.session.cwd == current.cwd, status.session.agent == current.agent,
+               current.agent != .codex || (conversation == nil && Date().timeIntervalSince(codexGroupStatusDates[current.id] ?? .distantPast) < 120) {
                 conversation = status.conversationID
                 home = home ?? status.home
             }
@@ -2285,7 +2336,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // Discovery can lag while a process exits or a PID is reused. Re-read
         // the process list after the async work, and never publish a stale match.
         let latest = try await Task.detached(priority: .utility) { try reader() }.value
-        return result.filter { observation in
+        let observed = result.filter { observation in
             guard let current = sessions[observation.id], current.phase != .ended,
                   current.pid == observation.session.pid, current.started == observation.session.started,
                   current.tty == observation.session.tty, current.cwd == observation.session.cwd,
@@ -2293,6 +2344,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID else { return false }
             return latest.contains { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }
         }.sorted { $0.session.displayedTerminalTitle.localizedStandardCompare($1.session.displayedTerminalTitle) == .orderedAscending }
+        let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
+        let refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
+        if refreshed != saved { try groupStore.save(refreshed, expected: saved) }
+        discoverCodexGroupIdentities(observed)
+        return observed
     }
 
     /// The MCP caller is its enclosing process, or on a shared server the one live conversation it names.
@@ -2309,11 +2365,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let kindText = object["agentKind"] as? String, let kind = AgentKind(rawValue: kindText), kind != .shell else {
             throw RemoteHTTPError(409, "공유 서버에서 현재 세션을 자동 확인하지 못했습니다. 현재 대화 UUID를 지정해주세요.")
         }
-        let matches = observed.filter { $0.session.agent == kind && $0.providerHome != nil && $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }
+        let claimedHome = kind == .codex ? object["codexCallerHome"] as? String : nil
+        let matches = observed.filter { $0.session.agent == kind && $0.providerHome != nil &&
+            (claimedHome == nil || claimedHome == $0.providerHome) && $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }
+        if matches.isEmpty, kind == .codex, let home = object["codexCallerHome"] as? String,
+           home.hasPrefix("/"), (object["codexCallerConversationID"] as? String).flatMap(UUID.init(uuidString:)) == uuid {
+            let caller = AgentSession(id: "codex-mcp:" + home + ":" + uuid.uuidString, agent: .codex, pid: 0,
+                                      started: "", tty: "", cwd: "", terminal: .unknown)
+            return (.init(session: caller, conversationID: uuid.uuidString, providerHome: home), "codex_mcp_metadata")
+        }
         guard matches.count == 1, let found = matches.first else {
             throw RemoteHTTPError(409, "지정한 대화에 일치하는 실행 세션을 유일하게 확인하지 못했습니다.")
         }
         return (found, "provided_conversation_id")
+    }
+
+    private func groupMemberIsCaller(_ member: SessionGroupMember, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> Bool {
+        if caller.session.pid == 0, caller.session.agent == .codex {
+            return member.agent == .codex && member.providerHome == caller.providerHome &&
+                UUID(uuidString: member.conversationID) == caller.conversationID.flatMap(UUID.init(uuidString:))
+        }
+        return SessionGroupMatching.match(member, in: observed)?.id == caller.id
     }
 
     private func groupOrchestration() throws -> SessionGroupOrchestration {
@@ -2603,7 +2675,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let groups = (try? SessionGroupStore(directory: self.paths.directory).load()) ?? []
                 var next: [String: SessionGroupBadge] = [:]
                 if !groups.isEmpty, let live = try? await self.sessionGroupSessions() {
-                    next = SessionGroupBadge.badges(groups: groups, live: live)
+                    let refreshed = (try? SessionGroupStore(directory: self.paths.directory).load()) ?? groups
+                    next = SessionGroupBadge.badges(groups: refreshed, live: live)
                 }
                 guard !Task.isCancelled else { return }
                 self.groupBadgeRefreshedAt = Date()
@@ -2719,11 +2792,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw RemoteHTTPError(404, "그룹을 찾지 못했습니다. get_group_status로 현재 그룹을 확인해주세요.")
         }
         guard group.leaderMemberID != nil else { throw RemoteHTTPError(409, "이 그룹에는 그룹장이 없습니다. 관리 창의 세션 그룹에서 그룹장을 지정해주세요.") }
-        guard let callerMember = group.members.first(where: { SessionGroupMatching.match($0, in: observed)?.id == caller.id }) else {
+        guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else {
             throw RemoteHTTPError(403, "현재 세션은 이 그룹의 구성원으로 확인되지 않았습니다.")
         }
         guard let target = group.members.first(where: { $0.id == memberID }), group.parentID(of: memberID) == callerMember.id else {
             throw RemoteHTTPError(403, "직속 하위 구성원에게만 지시하거나 답할 수 있습니다. get_group_status의 canAssign을 확인해주세요.")
+        }
+        if caller.session.pid == 0, target.agent != .codex {
+            throw RemoteHTTPError(409, "이 Codex 호출에서는 Codex 구성원에게만 작업을 지시할 수 있습니다.")
         }
         guard let worker = SessionGroupMatching.match(target, in: observed), let current = sessions[worker.id] else {
             throw RemoteHTTPError(409, "작업자 세션의 연결을 확인하지 못했습니다. 관리 창에서 구성원 연결을 확인해주세요.")
@@ -2872,7 +2948,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
             let groups = try SessionGroupStore(directory: paths.directory).load()
-            let matching = groups.filter { group in group.members.contains { SessionGroupMatching.match($0, in: observed)?.id == caller.id } }
+            let matching = groups.filter { group in group.members.contains { groupMemberIsCaller($0, caller: caller, observed: observed) } }
             let output: [JSONObject] = matching.map { group in
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
@@ -2880,7 +2956,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
-                            "isCaller": live?.id == caller.id, "sameAgent": member.agent == caller.session.agent,
+                            "isCaller": groupMemberIsCaller(member, caller: caller, observed: observed), "sameAgent": member.agent == caller.session.agent,
                             "isLeader": group.leaderMemberID == member.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull()]
                 }
@@ -2897,7 +2973,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             var received: [UUID] = [], receivedQuestions: [UUID] = []
             let memberStatuses = await claudeStatuses(observed.map(\.session))
             let output: [JSONObject] = groups.compactMap { group in
-                guard let callerMember = group.members.first(where: { SessionGroupMatching.match($0, in: observed)?.id == caller.id }) else { return nil }
+                guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { return nil }
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
                     let phase = live.flatMap { sessions[$0.id]?.phase }
@@ -2906,7 +2982,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "depth": entry.depth, "isLeader": group.leaderMemberID == member.id, "isCaller": member.id == callerMember.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull(),
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
-                            "canAssign": group.parentID(of: member.id) == callerMember.id,
+                            "canAssign": group.parentID(of: member.id) == callerMember.id && (caller.session.pid != 0 || member.agent == .codex),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
                 }
                 // Reading reports here counts as receiving them, so they are not typed into the terminal again.
@@ -6098,6 +6174,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
         automationNeedsFreshScreen.remove(sessionID)
         let previousFrame = remoteObservedScreens[sessionID]
+        if session.agent == .codex, groupStatusIdentities[sessionID] != nil,
+           !screenContentsUnchanged, raw.contains(">_ OpenAI Codex (v"),
+           CodexProgressScreen.ready(raw), CodexStatusIdentity.cards(raw).isEmpty {
+            // /new clears the status card while retaining the same TUI process.
+            codexGroupStatusDates.removeValue(forKey: sessionID)
+        }
         // Registration and frame updates share this actor. A new observer starts
         // pending and reads the latest frame; an empty signal has no callback.
         // Avoid comparing a long Cocoa screen when nobody can use its notice.

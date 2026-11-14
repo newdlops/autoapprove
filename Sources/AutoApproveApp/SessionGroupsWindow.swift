@@ -300,8 +300,8 @@ import AutoApproveCore
     private func refresh() async {
         guard !loading else { return }; loading = true; defer { loading = false }
         do {
-            let saved = try store.load()
             let sessions = try await engine.sessionGroupSessions()
+            let saved = try store.load()
             groups = saved; live = sessions; assignments = try engine.sessionGroupAssignments(); error = nil
             if let id = selectedID, !groups.contains(where: { $0.id == id }) { selectedID = nil }
             if let id = selectedID, name.isEmpty { name = groups.first { $0.id == id }?.name ?? "" }

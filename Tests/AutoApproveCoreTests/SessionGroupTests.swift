@@ -218,7 +218,8 @@ extension ApprovalTests {
                 }
             })
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
-                                        processReader: { [record] }, codexQueue: queue)
+                                        processReader: { [record] }, codexQueue: queue,
+                                        codexGroupReader: { _ in .init(threadID: thread, database: "/tmp/group-home/thread_history_1.sqlite") })
         defer { engine.stop() }; engine.updateDiscovery([session], records: [record])
         let observation = try unwrapGroup(try await engine.sessionGroupSessions().first)
         try expectEqual(observation.conversationID, thread)

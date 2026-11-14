@@ -506,6 +506,13 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
+            ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
+            ("Session groups: Codex idle terminal status discovery and persistence",tests.testCodexGroupDiscoversIdleTerminalFromStatus),
+            ("Session groups: Codex discovery preserves work and unfinished input",tests.testCodexGroupDiscoveryPreservesBusyScreensAndDrafts),
+            ("Session groups: Codex refresh preserves Claude and rejects ambiguity",tests.testCodexGroupRefreshIsolatedFromClaude),
+            ("Session groups: Codex shared MCP identifies group without inventing terminal",tests.testCodexSharedMCPFindsSavedGroupWithoutTerminalGuess),
+            ("Session groups: Codex metadata parent directs only its confirmed worker",tests.testCodexMetadataParentCanDirectConfirmedWorker),
+            ("Session groups: Codex rejects stale approval binding",tests.testCodexGroupRejectsStaleApprovalBinding),
             ("Session groups: terminal status refresh rejects historical IDs",tests.testSessionGroupTerminalStatusRequiresFreshCard),
             ("Session groups: storage and malformed data preservation",tests.testSessionGroupStoragePreservesInvalidData),
             ("Session groups: live conversation identity and ambiguity",tests.testSessionGroupMatchingRejectsAmbiguousAndChangedConversations),
