@@ -27,6 +27,9 @@ private actor AutomaticReplyProbe {
     var count: Int { deliveries.count }
 }
 
+/// The production delay is longer; tests scale every wait to this value so they check the same ordering faster.
+private let replyDelay: TimeInterval = 1
+
 @MainActor private struct AutomaticReplyFixture {
     var engine: ApprovalEngine
     var session: AgentSession
@@ -35,7 +38,7 @@ private actor AutomaticReplyProbe {
     init(root: URL, name: String, transport: CodexReplyTransport, enabled: Bool = true, restored: Bool = false) throws {
         paths = AppPaths(directory: root.appendingPathComponent(name))
         engine = try ApprovalEngine(paths: paths, questionTransport: transport,nativeKeyboardActivity:.inactive)
-        engine.automaticConfirmationDelay = 5
+        engine.automaticConfirmationDelay = replyDelay
         session = AgentSession(id: "process:\(name):first", agent: .codex, pid: 42, started: name,
             tty: "/dev/fixture-\(name)", cwd: "/tmp/reply", terminal: .terminal)
         session.phase = .working; session.channel = .terminalScreen
@@ -87,7 +90,7 @@ extension ApprovalTests {
         for (fixture, observed, answer) in fixtures {
             let delivery = deliveries.first { $0.thread == fixture.question.threadID }
             try expectNotNil(delivery)
-            try expect((delivery?.date.timeIntervalSince(observed) ?? 0) >= 5)
+            try expect((delivery?.date.timeIntervalSince(observed) ?? 0) >= replyDelay)
             try expect(delivery?.message.hasSuffix("\n\n" + answer) == true)
             try expectEqual(fixture.reply?.phase, .queued)
             try expectEqual(fixture.engine.snapshot.events.first?.answer, answer)
@@ -139,14 +142,14 @@ extension ApprovalTests {
         try expectEqual(fixture.automation?.phase, .scheduled)
         var tracker = AttentionTracker()
         try expect(tracker.update(fixture.engine.snapshot).isEmpty, "A scheduled Codex reply needs no manual alert")
-        try expect((originalDeadline?.timeIntervalSince(firstObserved) ?? 0) >= 5)
+        try expect((originalDeadline?.timeIntervalSince(firstObserved) ?? 0) >= replyDelay)
         do {
             try await fixture.engine.replyToQuestion(sessionID: "unrelated", questionID: fixture.question.id, answer: "No")
             throw AppError.message("An unrelated session must not answer this question")
         } catch {
             try expectEqual(error.localizedDescription, "이미 전송 중이거나 처리한 질문입니다. 현재 상태를 확인해주세요.")
         }
-        try await Task.sleep(nanoseconds: 2_000_000_000)
+        try await Task.sleep(for: .seconds(replyDelay * 0.4))
         try expectEqual(await probe.count, 0, "The response must wait five seconds")
         fixture.engine.refreshNotices()
         try expectEqual(fixture.engine.snapshot.sessions[0].unreadNoticeCount, 0, "A scheduled Codex reply must not create a badge")
@@ -165,13 +168,13 @@ extension ApprovalTests {
         try expectEqual(fixture.automation?.deadline, originalDeadline, "Repeated reads keep the displayed deadline")
         try await waitForAutomaticReply(timeout: 4) { await probe.count == 1 }
         let first = await probe.deliveries[0]
-        try expect(first.date.timeIntervalSince(firstObserved) >= 5)
+        try expect(first.date.timeIntervalSince(firstObserved) >= replyDelay)
         try expectEqual(first.message, "> delay 작업을 진행할까요?\n\nYes (Recommended)")
         try expectNil(fixture.engine.snapshot.sessions[0].questions[1].reply)
         fixture.engine.updateCodexQuestions([update])
         try await waitForAutomaticReply(timeout: 4) { await probe.count == 2 }
         let next = await probe.deliveries[1]
-        try expect(next.date.timeIntervalSince(secondObserved) >= 5, "Each question owns its wait interval")
+        try expect(next.date.timeIntervalSince(secondObserved) >= replyDelay, "Each question owns its wait interval")
         try expectEqual(next.message, "> 다음 질문도 진행할까요?\n\nYes, proceed (y)")
         try expectEqual(fixture.engine.snapshot.sessions[0].phase, .working)
         try expect(fixture.engine.snapshot.sessions[0].unansweredQuestions.isEmpty)
@@ -179,7 +182,7 @@ extension ApprovalTests {
         let reopened = try ApprovalEngine(paths: fixture.paths, questionTransport: transport,nativeKeyboardActivity:.inactive)
         defer { reopened.stop() }
         reopened.updateDiscovery([fixture.session], records: []); reopened.updateCodexQuestions([update])
-        try await Task.sleep(nanoseconds: 5_100_000_000)
+        try await Task.sleep(for: .seconds(replyDelay + 0.4))
         try expectEqual(await probe.count, 2, "Repeated reads and app restart cannot resubmit queued answers")
         try expectEqual(try AuditStore(path: fixture.paths.database).history(result: .queued).total, 2)
     }
@@ -226,19 +229,19 @@ extension ApprovalTests {
         try expectEqual(disabled.engine.debugQuestionConfirmationDetections, detectionsWhileDisabled,
             "Disabled automatic approval must skip question parsing entirely")
 #endif
-        try await Task.sleep(nanoseconds: 2_000_000_000)
+        try await Task.sleep(for: .seconds(replyDelay * 0.4))
         let resumedAt = Date()
         try fixtures["resumed"]!.engine.setPaused(false)
         fixtures["changed"]!.question.title = "변경된 질문을 진행할까요?"
         fixtures["changed"]!.observe()
         fixtures["changed-options"]!.question.options = ["Allow once", "Don’t allow"]
         fixtures["changed-options"]!.observe()
-        try await Task.sleep(nanoseconds: 3_200_000_000)
+        try await Task.sleep(for: .seconds(replyDelay * 0.9))
         try expectEqual(await probe.count, 1, "Cancelled waits cannot send Yes; manual No remains available while paused")
         try await waitForAutomaticReply(timeout: 4) { await probe.count == 4 }
         let deliveries = await probe.deliveries
         try expectEqual(Set(deliveries.map(\.thread)), Set(["manual", "resumed", "changed", "changed-options"]))
-        try expect(deliveries.filter { $0.thread != "manual" }.allSatisfy { $0.date.timeIntervalSince(resumedAt) >= 5 })
+        try expect(deliveries.filter { $0.thread != "manual" }.allSatisfy { $0.date.timeIntervalSince(resumedAt) >= replyDelay })
         try expect(deliveries.first(where: { $0.thread == "changed" })?.message.contains("변경된 질문") == true)
         try expect(deliveries.first(where: { $0.thread == "changed-options" })?.message.hasSuffix("\n\nAllow once") == true,
             "Changed options with the same question title must not reuse the previous reservation's answer")
@@ -281,12 +284,12 @@ extension ApprovalTests {
         try expect(fixtures["dismiss"]!.engine.snapshot.sessions[0].questions.isEmpty)
         for name in ["pause", "disable"] {
             try expectEqual(fixtures[name]!.automation?.phase, .scheduled)
-            try expect((fixtures[name]!.automation?.deadline?.timeIntervalSince(resumedAt) ?? 0) >= 5)
+            try expect((fixtures[name]!.automation?.deadline?.timeIntervalSince(resumedAt) ?? 0) >= replyDelay)
         }
         try await waitForAutomaticReply { await probe.count == 3 }
         let resumed = await probe.deliveries.filter { $0.thread != "stable" }
         try expectEqual(Set(resumed.map(\.thread)), Set(["pause", "disable"]))
-        try expect(resumed.allSatisfy { $0.date.timeIntervalSince(resumedAt) >= 5 })
+        try expect(resumed.allSatisfy { $0.date.timeIntervalSince(resumedAt) >= replyDelay })
     }
 
     func testAutomaticQuestionReplyFailuresAreNotRetried() async throws {
@@ -327,7 +330,7 @@ extension ApprovalTests {
             engine.updateCodexQuestions([CodexQuestionUpdate(sessionID: fixture.session.id, questions: [fixture.question])])
             reopened.append(engine)
         }
-        try await Task.sleep(nanoseconds: 5_100_000_000)
+        try await Task.sleep(for: .seconds(replyDelay + 0.4))
         try expectEqual(await probe.preparations, 3, "Failed or uncertain answers require manual review, also after restart")
         try expectEqual(await probe.count, 1)
     }
@@ -440,7 +443,7 @@ extension ApprovalTests {
         try expectEqual(discovered.snapshot.sessions.first { $0.id == reviewRow.id }?.questions.first?.options, ["Development", "Production"])
         discovered.updateDiscovery([], records: [])
         try expect(discovered.snapshot.sessions.allSatisfy { $0.questions.isEmpty }, "Ended discovery queues must clear")
-        try await Task.sleep(nanoseconds: 5_300_000_000)
+        try await Task.sleep(for: .seconds(replyDelay + 0.5))
         try expectEqual(await probe.count, 0)
         let decoded = try JSONDecoder().decode(EngineSnapshot.self, from: JSONEncoder().encode(duplicate.engine.snapshot))
         try expectEqual(decoded.sessions[0].questions[0].automation?.phase, .duplicate)

@@ -134,22 +134,6 @@ extension ApprovalTests {
         try expectFalse(FileManager.default.fileExists(atPath: missing), "Read-only access must never create a Codex database")
         try sql("DROP TABLE thread_items;")
         try expectThrows(try reader.read(location))
-#if DEBUG
-        try testCodexHistoryConnectionsAreReusedAndBounded()
-        try testUnchangedDatabaseVersionSkipsSessionHistoryQueriesAndExternalCommitInvalidatesIt()
-        try testCodexHistoryConnectionCacheReopensReplacedDatabase()
-        try testSessionHistoryProjectionRebuildsWhenDatabaseFileIsReplaced()
-        try testHistoryStatementsArePreparedOncePerReusedConnection()
-        try testSessionHistoryReaderReleasesStatementsForInactiveDatabase()
-        try testIncrementalHistoryQueryUsesAppendAndRewriteIndexes()
-        try testUnchangedHistoryQueryCostDoesNotScaleWithThreadRows()
-        try await testCodexCollectorRebuildsProjectionAfterHistoryFileReplacement()
-        try testIncrementalHistoryQueryOmitsSynchronousAgentBodies()
-        try testHistoryCacheRetainsQuestionsNotOrdinaryMessagesAndReplaysOldEdits()
-        try testRewriteFromAsyncQuestionToSynchronousAgentMessageClearsPendingQuestion()
-        try testCodexOpenFileReadersAllocateOnlyRequiredPaths()
-        try testDescriptorPathReaderSkipsOnlyTransientFDPathErrors()
-#endif
     }
 
     func testCodexThreadBinding() throws {

@@ -406,7 +406,7 @@ extension ApprovalTests {
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter])
         defer { engine.stop() }
-        engine.groupQuestionGrace = 0.2
+        engine.groupQuestionGrace = 0.2; engine.groupDeliveryInterval = 0.2
         engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
         let observed = try await engine.sessionGroupSessions()
         let leader = try unwrapGroup(observed.first { $0.id == records[0].key })
@@ -446,7 +446,7 @@ extension ApprovalTests {
         let approved = try await call("answer_group_question", from: leader.id, ["choice": 1])
         try expectEqual(approved["permission"] as? Bool, true)
         try expectEqual(writer.writes(to: workerTTY).count, beforeApproval + 1)
-        try await Task.sleep(for: .seconds(4.5))
+        try await Task.sleep(for: .seconds(1.2))
         try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "An answered request is not reported again")
 
         writer.show("어느 환경에 배포할까요?\n\n❯ 1. 개발\n  2. 운영\n  3. 둘 다\n\nEnter to select", on: workerTTY)
@@ -479,7 +479,7 @@ extension ApprovalTests {
             await engine.refreshScreens()
             return phase(worker.id) == .approval
         }, "The worker must be waiting on the permission prompt")
-        try await Task.sleep(for: .seconds(4.5))
+        try await Task.sleep(for: .seconds(1.2))
         try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "A system change must stay with the user")
     }
 

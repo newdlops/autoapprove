@@ -129,6 +129,19 @@ public enum ProcessEnvironment {
         return result
     }
 
+    /// The absolute executable path of the exact process, or nil if the PID now belongs to another process.
+    public static func executablePath(_ record: ProcessRecord) -> String? {
+        guard record.pid > 0, let started = startDate(record.started) else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(record.pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+              abs(Double(info.pbi_start_tvsec) - started.timeIntervalSince1970) < 2 else { return nil }
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(record.pid, &path, UInt32(path.count)) > 0 else { return nil }
+        let value = String(cString: path)
+        return value.hasPrefix("/") ? value : nil
+    }
+
     /// The exact process's argv, or nil if the PID now belongs to another process.
     public static func arguments(_ record: ProcessRecord) -> [String]? {
         procArgs(record).map(parseArguments)
