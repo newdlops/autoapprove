@@ -109,6 +109,20 @@ extension ApprovalTests {
             try expectEqual(calls.filter {($0 as? String)==command}.count,1)
             try expect(calls.contains(host == .terminal ? "com.apple.Terminal":"com.googlecode.iterm2"))
         }
+        entry.host = .terminal
+        for afterDispatch in [false,true] {
+            let context=JSContext()!
+            context.evaluateScript("""
+                const fixtureApp={activate:()=>{},doScript:()=>{throw Error('Error');},settingsSets:{byName:()=>{throw Error('Error');}}};
+                function Application(){return fixtureApp;}
+                """)
+            var failing=entry
+            if !afterDispatch {failing.terminalTab = .init(window:UUID(),windowOrder:0,tabOrder:0,settingsName:"Missing")}
+            let result=context.evaluateScript(try TerminalProfileLauncher.script(failing))!.toString()!
+            let receipt=try JSONSerialization.jsonObject(with:Data(result.utf8)) as! [String:Any]
+            try expectEqual(receipt["commandAttempted"] as? Bool,afterDispatch)
+            try expect((receipt["error"] as? String)?.contains(afterDispatch ? "명령 전달":"연결 준비") == true)
+        }
         entry.agent="claude";try expect(try entry.resumeCommand().contains("'claude' '--resume'"))
         try expect(try entry.resumeCommand().contains("'CLAUDE_CONFIG_DIR="))
     }
@@ -178,6 +192,25 @@ extension ApprovalTests {
         try expectEqual(failed.first?.phase,.needsReview)
         let retry=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
         try expectEqual(retry.first?.phase,.needsReview);try expect(retry.first?.detail.contains("lost acknowledgement") == true,"Keep the original failure visible after retrying");try expectEqual(await opened.keys.count,1)
+        // A failed entry in the same saved window must not strand its siblings.
+        for knownNotSent in [true,false] {
+            let batchRestorer=TerminalProfileRestorer(),recorder=FreshProfileLaunchRecorder(),window=UUID()
+            var batch=(0..<3).map {_ in profileEntry()}
+            for index in batch.indices {batch[index].terminalTab = .init(window:window,windowOrder:0,tabOrder:index)}
+            let failedID=batch[1].id
+            let batchProfile=TerminalSessionProfile(name:"partial",entries:batch)
+            let partial=try await batchRestorer.restore(batchProfile,selected:Set(batch.map(\.id)),active:[],directoryExists:{_ in true},launch:{entry,anchor in
+                if entry.id==failedID {
+                    throw RemoteHTTPError(409,"Terminal connection failed",diagnostics:knownNotSent ? ["command_delivery":"not_started"]:nil)
+                }
+                return try await recorder.launch(entry,anchor)
+            })
+            try expectEqual(partial.map(\.phase),[.opened,knownNotSent ? .failed:.needsReview,.opened])
+            let targets=await recorder.anchors
+            try expectEqual(targets.count,2);try expectNil(targets[1])
+            let retry=try await batchRestorer.restore(batchProfile,selected:Set(batch.map(\.id)),active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
+            try expectEqual(retry.map(\.phase),[.alreadyOpen,knownNotSent ? .opened:.needsReview,.alreadyOpen])
+        }
         let closed=try await restorer.restore(profile,selected:[next.id],active:[],directoryExists:{_ in true},terminalIsOpen:{_ in false},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile-new"})
         try expectEqual(closed.first?.phase,.opened);try expectEqual(await opened.keys.count,2)
         let beforeStart=profileEntry(),beforeProfile=TerminalSessionProfile(name:"권한",entries:[beforeStart])

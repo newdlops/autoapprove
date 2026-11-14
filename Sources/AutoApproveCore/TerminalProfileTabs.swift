@@ -235,6 +235,7 @@ public enum TerminalProfileTabOpener {
             environment.run={try AutomationScript.run($0,app:"Terminal",denied:.permissionDenied,timeout:8)}
         }
         var posted=false
+        var stage="Terminal 연결 준비"
         guard lock.lock(before:Date().addingTimeInterval(3)) else {throw RemoteHTTPError(409,"다른 Terminal 탭 복원을 마친 뒤 다시 시도해주세요.",diagnostics:["delivery":"not_started"])}
         defer {lock.unlock()}
         let deadline=environment.clock()+8
@@ -261,6 +262,7 @@ public enum TerminalProfileTabOpener {
                 else if suppliedEnvironment==nil,let nativeReader {try nativeReader.select(state,expected:expected)}
                 else {_ = try environment.run(TerminalProfileLauncher.selectionScript(tty))}
             }
+            stage="기존 창·탭 연결 확인"
             let initial=try JSONDecoder().decode(Prepared.self,from:Data(environment.run(prepareScript(anchorTTY:anchorTTY,settingsName:settingsName)).utf8))
             guard initial.tty==anchorTTY,initial.windowID>0,initial.ttys.contains(anchorTTY),initial.ttys.count<4096,
                   Set(initial.ttys).count==initial.ttys.count,
@@ -282,7 +284,9 @@ public enum TerminalProfileTabOpener {
                   try environment.processes().contains(where:{$0.pid==owner.pid && $0.started==owner.started}) else {
                 throw AppError.message("선택한 Terminal 창이 바뀌어 탭을 열지 않았습니다.")
             }
+            stage="새 탭 생성"
             try check();posted=true;try environment.postPair(owner.pid,down,up)
+            stage="새 탭 연결 확인"
             let text=try environment.run(confirmationScript(anchorTTY:anchorTTY,windowID:initial.windowID,previousTTYs:initial.ttys))
             guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject,let tty=object["tty"] as? String,
                   let returnedWindow=object["windowID"] as? NSNumber,
@@ -296,6 +300,7 @@ public enum TerminalProfileTabOpener {
             // Compare insertion positions and any surviving identities, then
             // bind the current bar through both exact TTYs below. Old AX
             // identities are never a prerequisite for the Nth addition.
+            stage="새 탭의 창 묶음 확인"
             let anchorIndex=before.flatMap {$0.tabs.firstIndex(of:$0.selected)} ?? 0
             func matchesAddition(_ value:TerminalNativeTabGroup)->Bool {
                 guard value.isValid,value.tabs.count==(before?.tabs.count ?? 1)+1,
@@ -345,7 +350,7 @@ public enum TerminalProfileTabOpener {
             var diagnostics=["command_delivery":"not_started"]
             if !posted {diagnostics["delivery"]="not_started"}
             else {diagnostics["tab_creation"]="unknown"}
-            throw RemoteHTTPError(409,error.localizedDescription,diagnostics:diagnostics)
+            throw RemoteHTTPError(409,stage+": "+error.localizedDescription,diagnostics:diagnostics)
         }
     }
 }

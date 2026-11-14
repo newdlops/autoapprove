@@ -295,9 +295,9 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             return left==right ? a.offset<b.offset:left<right
         }.map(\.element)
         let activeKeys=Set(active.map(\.key))
-        var anchors:[String:String]=[:],knownTTYs:[String:String]=[:],blocked=Set<String>(),openedGroups=Set<String>()
+        var anchors:[String:String]=[:],knownTTYs:[String:String]=[:],openedGroups=Set<String>()
         // Reuse only the exact saved conversation's verified current Terminal.
-        // A receipt that cannot be resolved blocks its group, including later retries.
+        // Uncertain receipts protect only their own entry; other entries can use a new window.
         for entry in entries {
             if let tty=activeTerminalTTYs[entry.key],activeKeys.contains(entry.key),TerminalProfileLauncher.validTTY(tty) {
                 knownTTYs[entry.key]=tty
@@ -311,12 +311,9 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     else if open==true {
                         knownTTYs[entry.key]=tty
                         if let key=group(entry),anchors[key]==nil {anchors[key]=tty}
-                    } else if let key=group(entry) {blocked.insert(key)}
-                } else if !activeKeys.contains(entry.key),let key=group(entry) {blocked.insert(key)}
+                    }
+                }
             }
-        }
-        for entry in entries where activeKeys.contains(entry.key) {
-            if let key=group(entry),anchors[key]==nil {blocked.insert(key)}
         }
         func finishGroup(_ key:String) async {
             guard openedGroups.contains(key),!Task.isCancelled else {return}
@@ -338,8 +335,6 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 항목을 다시 열기 전에 터미널을 확인해주세요."+(receipt.failure.map {" 원인: "+$0} ?? ""))
             } else if active.contains(where:{$0.key == entry.key}) || dispatched[entry.key] != nil {
                 result = .init(id:entry.id,phase:.alreadyOpen,detail:"이미 열려 있거나 복원 명령을 전달한 세션입니다.")
-            } else if key.map({blocked.contains($0)}) == true {
-                result = .init(id:entry.id,phase:.needsReview,detail:"같은 창의 앞선 탭 복원을 확인하지 못했습니다. 창이 나뉘지 않도록 후속 탭을 열지 않았습니다. 터미널을 확인한 뒤 다시 시도해주세요.")
             } else if entry.resumesConversation && active.contains(where:{$0.agent == entry.agent && $0.cwd == entry.cwd && $0.providerHome == entry.providerHome && UUID(uuidString:$0.conversationID)==nil}) {
                 result = .init(id:entry.id,phase:.needsReview,detail:"같은 폴더의 CLI가 실행 중입니다. 원래 대화를 확인한 뒤 복원해주세요.")
             } else if !directoryExists(entry.cwd) {
@@ -351,7 +346,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 do {
                     let tty=try await launch(entry,key.flatMap {anchors[$0]});dispatched[entry.key]=Receipt(tty:tty);knownTTYs[entry.key]=tty
                     if let key {anchors[key]=tty;openedGroups.insert(key)}
-                    let detail=entry.resumesConversation ? (entry.host == .terminal ? "저장한 창의 탭으로 대화 이어하기 명령을 전달했습니다.":"새 터미널에 저장한 대화의 이어하기 명령을 전달했습니다."):"저장한 폴더에서 새 CLI 실행 명령을 전달했습니다."
+                    let detail=entry.resumesConversation ? (entry.host == .terminal ? "Terminal에 대화 이어하기 명령을 전달했습니다.":"새 터미널에 저장한 대화의 이어하기 명령을 전달했습니다."):"저장한 폴더에서 새 CLI 실행 명령을 전달했습니다."
                     result = .init(id:entry.id,phase:.opened,detail:detail)
                 }
                 catch {
@@ -359,7 +354,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     let notStarted=diagnostics?["delivery"] == "not_started" || diagnostics?["command_delivery"] == "not_started"
                     if notStarted {dispatched.removeValue(forKey:entry.key)}
                     else {dispatched[entry.key]?.failure=error.localizedDescription}
-                    if let key {blocked.insert(key)}
+                    if let key {anchors.removeValue(forKey:key)}
                     let detail=notStarted ? error.localizedDescription+(diagnostics?["tab_creation"] == "unknown" ? " 대화 명령은 보내지 않았습니다. 빈 탭이 생겼을 수 있으니 확인한 뒤 다시 시도해주세요.":"") : "복원 결과를 확인하지 못했습니다. 중복 실행 전에 터미널을 확인해주세요. "+error.localizedDescription
                     result = .init(id:entry.id,phase:notStarted ? .failed:.needsReview,detail:detail)
                 }
@@ -390,23 +385,28 @@ public enum TerminalProfileLauncher {
         return """
         (()=>{
           const app=Application('com.apple.Terminal'),target=\(target),settings=\(settings),title=\(title);
+          let stage='Terminal 연결 준비',commandAttempted=false;
+          try {
           const profile=settings===null ? null:app.settingsSets.byName(settings);
           if(profile!==null && !profile.exists())throw Error('저장한 Terminal 설정 프로필이 없습니다: '+settings);
           \(TerminalProfileScriptQueries.matchingTab)
           let tab;
           if(target!==null){
-            tab=matchingTab(target);
+            stage='복원 대상 탭 연결 확인';tab=matchingTab(target);
             const processes=tab.processes();
             if(tab.busy() || !processes.length || !processes.every(p=>/^(?:-?(?:zsh|bash|sh|fish|tcsh|csh|dash|ksh)|login)$/.test(String(p).trim().split(/\\s+/)[0].split('/').pop())))throw Error('새 탭에서 다른 작업이 실행 중이어서 대화 명령을 보내지 않았습니다.');
             if(profile!==null)tab.currentSettings=profile;
             if(title!==null)tab.customTitle=title;
+            stage='대화 명령 전달';commandAttempted=true;
             app.doScript(\(command),{in:tab});
           }else{
+            stage='새 창에 대화 명령 전달';commandAttempted=true;
             tab=app.doScript(\(command));
             if(profile!==null)tab.currentSettings=profile;
             if(title!==null)tab.customTitle=title;
           }
-          app.activate();return JSON.stringify({tty:tab.tty()});
+          stage='복원된 터미널 확인';app.activate();return JSON.stringify({tty:tab.tty()});
+          }catch(error){return JSON.stringify({error:stage+': '+String(error.message||error),commandAttempted});}
         })();
         """
     }
@@ -425,7 +425,14 @@ public enum TerminalProfileLauncher {
             }
             var targetTTY:String?
             if entry.host == .terminal,let anchorTTY {
-                targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY,settingsName:entry.terminalTab?.settingsName)
+                do {targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY,settingsName:entry.terminalTab?.settingsName)}
+                catch {
+                    // The tab opener never sends a conversation command. Only
+                    // its explicit no-command receipt permits a new-window fallback.
+                    guard (error as? RemoteHTTPError)?.diagnostics?["command_delivery"] == "not_started",
+                          !Task.isCancelled else {throw error}
+                    targetTTY=nil
+                }
             }
             try launchRuntime?.verifyUnchanged()
             let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRoot,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed)
@@ -434,8 +441,11 @@ public enum TerminalProfileLauncher {
             catch let error as TerminalAdapterError {
                 throw RemoteHTTPError(403,error.localizedDescription,diagnostics:targetTTY==nil ? ["delivery":"not_started"]:nil)
             }
-            guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject,
-                  let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
+            guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
+            if let failure=object["error"] as? String {
+                throw RemoteHTTPError(409,failure,diagnostics:object["commandAttempted"] as? Bool == false ? ["command_delivery":"not_started"]:nil)
+            }
+            guard let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
             return tty
         }.value
     }
