@@ -760,6 +760,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func start(poll: Bool = true, webByDefault: Bool = false) throws {
         remoteInputStopped = false
+        if var state = try? groupOrchestration(), state.removeUndelivered() > 0 { try? saveGroupOrchestration(state) }
         if let state = try? groupOrchestration(), state.needsWatching { scheduleGroupDelivery() }
         refreshSessionGroupBadges()
         let socket = SocketServer(path: paths.socket, handler: { [weak self] message, peer in
@@ -2651,14 +2652,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 uniquingKeysWith: { first, _ in first })
         let questions = Dictionary(grouping: state.undeliveredQuestions, by: \.parentSessionID)
         let reports = Dictionary(grouping: state.undelivered, by: \.parentSessionID)
+        let parentStatuses = await claudeStatuses(Set(questions.keys).union(reports.keys).compactMap { sessions[$0] })
         for parentID in Set(questions.keys).union(reports.keys) {
-            guard let parent = sessions[parentID], parent.phase == .idle, !parent.pendingInTerminal,
+            guard let parent = sessions[parentID], parentStatuses[parentID].map({ $0 == "idle" }) ?? (parent.phase == .idle), !parent.pendingInTerminal,
                   !automaticInputBusy(parentID), !userInputHasPriority(parentID) else { continue }
             let items = reports[parentID] ?? [], asked = questions[parentID] ?? []
             let ids = items.map(\.id) + asked.map(\.id)
             do {
-                _ = try await sendOriginalTerminalMessage(parent, object: ["text": SessionGroupOrchestration.report(for: items, questions: asked, titles: titles),
-                                                                           "revision": "session-group"])
+                try await sendGroupLine(parent, text: SessionGroupOrchestration.report(for: items, questions: asked, titles: titles))
                 state = (try? groupOrchestration()) ?? state
                 state.markReported(items.map(\.id)); state.markQuestionsReported(asked.map(\.id))
                 log(AuditEvent(sessionID: parentID, summary: "세션 그룹 보고 \(items.count)건, 질문 \(asked.count)건", outcome: "그룹 보고 전달", source: "세션 그룹", tool: "group_report"))
@@ -2740,6 +2741,62 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return TerminalChoiceQuestion.detectPermission(raw, agent: session.agent)
     }
 
+    /// The status each Claude session registered for itself ("idle", "busy", "waiting", "shell", …).
+    /// Sessions that are not Claude, or whose registration cannot be read, are left out.
+    private func claudeStatuses(_ targets: [AgentSession]) async -> [String: String] {
+        let claude = targets.filter { $0.agent == .claude && $0.phase != .ended }
+        guard !claude.isEmpty else { return [:] }
+        let reader = processReader, registry = claudeRegistryReader
+        return await Task.detached(priority: .utility) {
+            guard let records = try? reader() else { return [:] }
+            var result: [String: String] = [:]
+            for session in claude {
+                guard let record = records.first(where: { $0.key == session.id && $0.agent == .claude }) else { continue }
+                let directory = ProcessEnvironment.read(record)?["CLAUDE_CONFIG_DIR"]
+                let rows = directory.map { ClaudeSessionRegistry.read(records: [record], directory: URL(fileURLWithPath: $0)) } ?? registry([record])
+                if let status = rows.first(where: { $0.processID == record.key })?.status { result[session.id] = status }
+            }
+            return result
+        }.value
+    }
+
+    /// Types one line of group traffic (a task, a report or a request) into a session and submits it.
+    /// For Claude in a host that can type without focus, the line also reaches a background tab, and the
+    /// change of Claude's status away from "idle" proves that it was submitted.
+    private func sendGroupLine(_ session: AgentSession, text: String) async throws {
+        if session.agent == .claude, let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
+           let type = screenAdapters[host]?.typeLine, let before = await claudeStatuses([session])[session.id] {
+            guard before == "idle" else {
+                throw RemoteHTTPError(409, "대상 Claude가 대기 상태가 아니어서 입력하지 않았습니다. (상태: \(before))", diagnostics: ["delivery": "not_started"])
+            }
+            let reader = processReader
+            guard let records = try? await Task.detached(operation: { try reader() }).value,
+                  let process = records.first(where: { $0.key == session.id && $0.agent == .claude && "/dev/" + $0.tty == session.tty && $0.isForeground }),
+                  sendingMessages.insert(session.id).inserted else {
+                throw RemoteHTTPError(409, "대상 CLI를 확인하지 못해 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
+            }
+            defer { sendingMessages.remove(session.id) }
+            let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [process.pid], sourcePID: process.pid, sourceStarted: process.started)
+            guard try await Task.detached(operation: { try type(target, text) }).value == .sent else {
+                throw RemoteHTTPError(409, "대상 터미널 탭을 찾지 못해 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
+            }
+            func submitted(within seconds: Double) async -> Bool {
+                let until = Date().addingTimeInterval(seconds)
+                while Date() < until {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    if let status = await claudeStatuses([session])[session.id], status != "idle" { return true }
+                }
+                return false
+            }
+            if await submitted(within: 1.5) { return }
+            // A long line arrives as a paste, and Claude does not take the newline at its end as Enter.
+            _ = try? await Task.detached(operation: { try type(target, "") }).value
+            if await submitted(within: 6) { return }
+            throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
+        }
+        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"])
+    }
+
     /// Turns on automatic approval for a group worker. The global pause stays
     /// the user's decision and is reported rather than overridden.
     private func enableGroupWorkerApproval(_ id: String) -> GroupWorkerApproval {
@@ -2755,7 +2812,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let assignment else { return NSNull() }
         let formatter = ISO8601DateFormatter()
         return ["id": assignment.id.uuidString, "status": assignment.status.rawValue, "task": assignment.task,
-                "sentAt": formatter.string(from: assignment.sentAt),
+                "sentAt": formatter.string(from: assignment.sentAt), "delivered": assignment.isDelivered,
                 "completedAt": assignment.completedAt.map(formatter.string(from:)) as Any? ?? NSNull(),
                 "summary": assignment.summary as Any? ?? NSNull(),
                 "question": assignment.question.map { question -> JSONObject in
@@ -2801,12 +2858,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let groups = try SessionGroupStore(directory: paths.directory).load()
             var state = try groupOrchestration()
             var received: [UUID] = [], receivedQuestions: [UUID] = []
+            let memberStatuses = await claudeStatuses(observed.map(\.session))
             let output: [JSONObject] = groups.compactMap { group in
                 guard let callerMember = group.members.first(where: { SessionGroupMatching.match($0, in: observed)?.id == caller.id }) else { return nil }
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
                     let phase = live.flatMap { sessions[$0.id]?.phase }
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "cwd": member.cwd,
+                            "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
                             "depth": entry.depth, "isLeader": group.leaderMemberID == member.id, "isCaller": member.id == callerMember.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull(),
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
@@ -2830,7 +2889,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 state.markReported(received); state.markQuestionsReported(receivedQuestions); try saveGroupOrchestration(state)
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
+                    "message": "canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
         case "assign_group_task":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
@@ -2840,8 +2899,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(400, "작업 내용은 1~\(SessionGroupOrchestration.maximumTaskLength)자로 지정해주세요.")
             }
             let (group, caller, callerMember, target, worker, current) = try await groupDirectWorker(object, groupID: groupID, memberID: memberID)
-            guard ![.working, .approval, .input, .ended].contains(current.phase) else {
-                throw RemoteHTTPError(409, "작업자가 아직 작업 중이거나 응답을 기다리고 있습니다. 완료 보고를 받은 뒤 다시 지시하세요.")
+            // Claude registers its own status; the screen reading reports "unknown" when Claude shows a status line.
+            if let status = await claudeStatuses([current])[worker.id] {
+                guard status == "idle" else {
+                    throw RemoteHTTPError(409, "작업자가 대기 상태가 아닙니다. (Claude 상태: \(status)) 완료 보고를 받은 뒤 다시 지시하세요.")
+                }
+            } else {
+                guard ![.working, .approval, .input, .ended].contains(current.phase) else {
+                    throw RemoteHTTPError(409, "작업자가 아직 작업 중이거나 응답을 기다리고 있습니다. 완료 보고를 받은 뒤 다시 지시하세요.")
+                }
             }
             let assignment = SessionGroupAssignment(groupID: group.id, workerMemberID: target.id, parentMemberID: callerMember.id,
                                                     workerSessionID: worker.id, parentSessionID: caller.id, task: task)
@@ -2851,8 +2917,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             // prompt, so a group task turns it on before the task is typed.
             let approval = enableGroupWorkerApproval(worker.id)
             do {
-                _ = try await sendOriginalTerminalMessage(current, object: ["text": SessionGroupOrchestration.taskMessage(assignment, parentTitle: callerMember.title),
-                                                                            "revision": "session-group"])
+                try await sendGroupLine(current, text: SessionGroupOrchestration.taskMessage(assignment, parentTitle: callerMember.title))
+                if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
             } catch {
                 if var latest = try? groupOrchestration() { latest.cancel(assignment.id); try? saveGroupOrchestration(latest) }
                 // Only a task that never reached the terminal restores the previous choice.

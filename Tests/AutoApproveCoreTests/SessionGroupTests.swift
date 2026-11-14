@@ -35,6 +35,26 @@ private final class GroupTerminalWriter: @unchecked Sendable {
     }
 }
 
+/// Terminal typing without focus, and the status Claude registers for itself.
+private final class GroupLineTerminal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [(tty: String, text: String)] = []
+    private var statuses: [Int32: String] = [:]
+    /// When set, Claude becomes busy only after a separate Enter, as it does for a long pasted line.
+    var needsEnter = true
+    /// When set, Claude never becomes busy, as when the line was not accepted.
+    var ignoresInput = false
+    var typed: [String] { lock.lock(); defer { lock.unlock() }; return lines.map(\.text) }
+    func status(_ pid: Int32) -> String { lock.lock(); defer { lock.unlock() }; return statuses[pid] ?? "idle" }
+    func setStatus(_ pid: Int32, _ value: String) { lock.lock(); defer { lock.unlock() }; statuses[pid] = value }
+    func type(_ target: ScreenTarget, _ text: String, pid: Int32) -> TerminalDelivery {
+        lock.lock(); defer { lock.unlock() }
+        lines.append((target.tty, text))
+        if !ignoresInput, text.isEmpty || !needsEnter { statuses[pid] = "busy" }
+        return .sent
+    }
+}
+
 @MainActor private func waitForGroup(_ seconds: Double, _ condition: () async -> Bool) async throws -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
@@ -319,6 +339,17 @@ extension ApprovalTests {
         asking.clearQuestion(open.id)
         try expectNil(asking.assignments[0].question)
 
+        // A task is pending until it has been typed; one that never was is dropped when the app starts.
+        var typing = SessionGroupOrchestration()
+        let typed = assignment(now, "입력된 작업"), lost = SessionGroupAssignment(groupID: group, workerMemberID: UUID(), parentMemberID: parent,
+            workerSessionID: "process:9:z", parentSessionID: "process:2:b", task: "입력되지 않은 작업", sentAt: now)
+        typing.begin(typed); typing.begin(lost)
+        try expect(!typing.assignments[0].isDelivered)
+        typing.markDelivered(typed.id)
+        try expectEqual(typing.removeUndelivered(), 1)
+        try expectEqual(typing.assignments.map(\.id), [typed.id], "Only the task that never reached its worker is removed")
+        try expect(typing.assignments[0].isDelivered)
+
         var crowded = SessionGroupOrchestration()
         for index in 0..<(SessionGroupOrchestration.limit + 5) {
             crowded.begin(SessionGroupAssignment(groupID: group, workerMemberID: UUID(), parentMemberID: parent,
@@ -541,5 +572,61 @@ extension ApprovalTests {
             session("b", .init(groupID: tree, groupName: "고리", memberID: b, role: .member, parentMemberID: a))])
         func count(_ nodes: [SessionListTree.Node]) -> Int { nodes.reduce(0) { $0 + 1 + count($1.children) } }
         try expectEqual(count(loop.groups[0].roots), 2)
+    }
+
+    @MainActor func testGroupTaskReachesBackgroundClaudeWithoutFocus() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-line-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        100801 1 ttys081 100801 100801 Wed Oct 28 12:00:00 2026 /fixture/claude
+        100802 1 ttys082 100802 100802 Wed Oct 28 12:00:00 2026 /fixture/claude
+        """)
+        var sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/tmp/group-fixture", terminal: .terminal) }
+        for index in sessions.indices { sessions[index].channel = .terminalScreen }
+        let terminal = GroupLineTerminal()
+        let ids = [records[0].pid: UUID().uuidString, records[1].pid: UUID().uuidString]
+        // The screen reading stays "unknown" here, as it does when Claude shows a status line; Claude's own status decides.
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.compactMap { row in ids[row.pid].map { .init(processID: row.key, kind: "interactive", sessionID: $0, status: terminal.status(row.pid)) } }
+        }
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "상태 줄이 있는 화면") }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, _ in .missingTarget })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.terminal: adapter])
+        defer { engine.stop() }
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.terminal)
+        let observed = try await engine.sessionGroupSessions()
+        let leader = try unwrapGroup(observed.first { $0.id == records[0].key }), worker = try unwrapGroup(observed.first { $0.id == records[1].key })
+        let leaderMember = leader.member, workerMember = worker.member
+        let group = SessionGroup(name: "백그라운드 전달", members: [leaderMember, workerMember], leaderMemberID: leaderMember.id)
+        try SessionGroupStore(directory: directory).save([group])
+        func assign(_ task: String) async throws -> JSONObject {
+            try await engine.mcpAction(["owner": UUID().uuidString, "tool": "assign_group_task", "sessionID": leader.id,
+                                        "groupID": group.id.uuidString, "memberID": workerMember.id.uuidString, "task": task])
+        }
+        func working() throws -> [SessionGroupAssignment] { try engine.sessionGroupAssignments().filter { $0.status == .working } }
+
+        // A busy worker is refused before anything is recorded or typed.
+        terminal.setStatus(records[1].pid, "busy")
+        do { _ = try await assign("바쁠 때 지시"); throw AppError.message("A busy worker accepted a task") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        try expect(terminal.typed.isEmpty); try expect(try working().isEmpty)
+
+        // A line that Claude never accepts leaves no task behind, so the leader can assign again.
+        terminal.setStatus(records[1].pid, "idle"); terminal.ignoresInput = true
+        do { _ = try await assign("제출되지 않는 지시"); throw AppError.message("An unsubmitted line was reported as delivered") }
+        catch let error as RemoteHTTPError { try expectEqual(error.diagnostics?["delivery"], "unknown") }
+        try expect(try working().isEmpty, "A task that was not submitted must not stay working")
+
+        // A long line arrives as a paste: the text is typed, then a separate Enter submits it.
+        terminal.ignoresInput = false
+        let before = terminal.typed.count
+        _ = try await assign("배포 상태를 확인하세요")
+        let lines = Array(terminal.typed[before...])
+        try expectEqual(lines.count, 2); try expect(lines[0].contains("배포 상태를 확인하세요")); try expectEqual(lines[1], "", "The second line is only Enter")
+        try expectEqual(try working().count, 1); try expect(try working()[0].isDelivered)
+        let status = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_group_status", "sessionID": leader.id])
+        let members = (status["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject]
+        try expectEqual(members?.first { $0["id"] as? String == workerMember.id.uuidString }?["claudeStatus"] as? String, "busy")
     }
 }

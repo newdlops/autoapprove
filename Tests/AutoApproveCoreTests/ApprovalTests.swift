@@ -519,6 +519,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: a worker choice question reaches the parent and is answered",tests.testGroupWorkerChoiceQuestionReachesParentAndIsAnswered),
             ("Session groups: list badges tell leaders from members",tests.testSessionGroupBadgesForSessionLists),
             ("Session groups: session list tree nests members and keeps order",tests.testSessionListTreeNestsGroupsAndKeepsOrder),
+            ("Session groups: a task reaches a background Claude without focus and proves submission",tests.testGroupTaskReachesBackgroundClaudeWithoutFocus),
             ("Session restart: command keeps known options only",tests.testSessionRestartCommandKeepsKnownOptionsOnly),
             ("Session restart: process arguments parse only argv",tests.testProcessArgumentsParseOnlyArgv),
             ("Claude registry keeps the conversation for an unknown status",tests.testClaudeRegistryKeepsConversationForUnknownStatus),

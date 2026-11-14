@@ -28,13 +28,17 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     public var deliveryError: String?
     /// A choice question the worker is waiting on during this task. Only its parent may answer it.
     public var question: GroupWorkerQuestion?
+    /// True from the moment the task is recorded until it has been typed into the worker's terminal.
+    /// A record that still says so when the app starts never reached the worker and is dropped.
+    public var pendingDelivery: Bool?
 
     public init(id: UUID = UUID(), groupID: UUID, workerMemberID: UUID, parentMemberID: UUID,
                 workerSessionID: String, parentSessionID: String, task: String, sentAt: Date = Date()) {
         self.id = id; self.groupID = groupID; self.workerMemberID = workerMemberID; self.parentMemberID = parentMemberID
         self.workerSessionID = workerSessionID; self.parentSessionID = parentSessionID
-        self.task = task; self.sentAt = sentAt; status = .working
+        self.task = task; self.sentAt = sentAt; status = .working; pendingDelivery = true
     }
+    public var isDelivered: Bool { pendingDelivery != true }
 
     public var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
 }
@@ -95,6 +99,19 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     /// Used when the task never reached the worker's terminal.
     public mutating func cancel(_ id: UUID) {
         assignments.removeAll { $0.id == id }
+    }
+
+    public mutating func markDelivered(_ id: UUID) {
+        for index in assignments.indices where assignments[index].id == id { assignments[index].pendingDelivery = nil }
+    }
+
+    /// Drops tasks that were recorded but never typed, for example when the app stopped in between.
+    /// Returns how many were removed.
+    @discardableResult
+    public mutating func removeUndelivered() -> Int {
+        let before = assignments.count
+        assignments.removeAll { $0.status == .working && $0.pendingDelivery == true }
+        return before - assignments.count
     }
 
     /// The first completion after the task reached the worker is its result. Older turns are not.
