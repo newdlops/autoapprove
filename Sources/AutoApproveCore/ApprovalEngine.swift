@@ -201,6 +201,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var sessionRestartTasks: [String: Task<Void, Never>] = [:]
     /// Conversation IDs read the way session groups read them, once per restart request.
     private var restartIdentityTask: Task<[String: String], Never>?
+    /// Exiting a CLI, opening a tab and typing the resume command happen for one session at a time:
+    /// Terminal opens one tab at a time, and parallel typing missed its input deadlines.
+    private var restartTerminalBusy = false
     /// Reads a CLI's original arguments for a restart. Tests replace it; it never runs for other processes.
     public var processArgumentsReader: @Sendable (ProcessRecord) -> [String]? = { ProcessEnvironment.arguments($0) }
     public var processPathReader: @Sendable (ProcessRecord) -> String? = { ProcessEnvironment.executablePath($0) }
@@ -2333,7 +2336,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     @discardableResult
     public func restartSessions(_ ids: [String]) -> SessionRestartProgress {
         let now = Date()
-        var items = (snapshot.sessionRestart?.items ?? []).filter { !$0.phase.isFinished && !ids.contains($0.id) }
+        // Retrying keeps earlier results visible; only the retried sessions start over.
+        var items = (snapshot.sessionRestart?.items ?? []).filter { !ids.contains($0.id) && ($0.phase == .done || !$0.phase.isFinished) }
         for id in ids {
             guard let session = sessions[id], session.phase != .ended, session.agent == .claude || session.agent == .codex else { continue }
             items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대기 상태가 되면 다시 시작합니다.", at: now))
@@ -2355,6 +2359,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessionRestartTasks.removeValue(forKey: item.id)?.cancel()
             updateRestart(item.id, .cancelled, "다시 시작을 취소했습니다.")
         }
+    }
+
+    /// Retries only the sessions whose restart failed and whose original CLI is still running.
+    public func retryFailedSessionRestarts() {
+        let failed = snapshot.sessionRestart?.items.filter { $0.phase == .failed && sessions[$0.id]?.phase != .ended && sessions[$0.id] != nil }.map(\.id) ?? []
+        guard !failed.isEmpty else { return }
+        restartSessions(failed)
     }
 
     public func dismissSessionRestarts() {
@@ -2415,7 +2426,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         while true {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
-            if current.phase == .idle, !current.pendingInTerminal, !automaticInputBusy(id), !userInputHasPriority(id),
+            var idle = current.phase == .idle
+            if current.phase == .unknown, let frame = try? await remoteTerminal(sessionID: id, realtime: true), frame.question == nil,
+               ActivityDetector.detect(frame.screen, agent: current.agent).phase == .idle { idle = true }
+            if idle, !current.pendingInTerminal, !automaticInputBusy(id), !userInputHasPriority(id),
                !sendingMessages.contains(id), !liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { break }
             guard Date() < waitUntil else { return fail("30분 동안 대기 상태가 되지 않아 다시 시작하지 않았습니다.") }
             updateRestart(id, .waiting, "작업이 끝나고 입력창이 비면 다시 시작합니다. (현재: \(current.phaseTitle))")
@@ -2444,11 +2458,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
         catch { return fail(error.localizedDescription) }
         // The status query may leave the CLI briefly busy; wait for it to settle again.
         let settleUntil = Date().addingTimeInterval(20)
-        while sessions[id]?.phase != .idle || sendingMessages.contains(id) || automaticInputBusy(id) {
+        while (sessions[id]?.phase != .idle && sessions[id]?.phase != .unknown) || sendingMessages.contains(id) || automaticInputBusy(id) {
             guard Date() < settleUntil, !Task.isCancelled else { return fail("대화 ID를 확인한 뒤 CLI가 대기 상태로 돌아오지 않았습니다.") }
             try? await Task.sleep(for: .milliseconds(300))
         }
-        guard let current = sessions[id] else { return }
+        while restartTerminalBusy {
+            guard !Task.isCancelled else { return }
+            updateRestart(id, .waiting, "다른 세션의 다시 시작이 끝나기를 기다리고 있습니다.")
+            try? await Task.sleep(for: .milliseconds(300))
+        }
+        restartTerminalBusy = true
+        var terminalReleased = false
+        func releaseTerminal() { if !terminalReleased { terminalReleased = true; restartTerminalBusy = false } }
+        defer { releaseTerminal() }
+        guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
         let wasAutomatic = current.automatic
         let cliTarget = ScreenTarget(tty: current.tty, handle: current.screenHandle, jobPIDs: [process.pid], sourcePID: process.pid, sourceStarted: process.started)
 
@@ -2491,6 +2514,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)") }
         guard delivery == .sent else { return fail("셸 화면이 바뀌어 다시 시작 명령을 입력하지 않았습니다. 터미널에서 직접 실행해주세요: \(command)") }
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
+        releaseTerminal()
 
         // Find the new CLI under that shell and carry the automatic approval choice over.
         updateRestart(id, .confirming, "새 CLI 실행을 확인하고 있습니다.")

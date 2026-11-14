@@ -261,6 +261,7 @@ import AutoApproveCore
                 Spacer(minLength: 8)
                 Button(showingRestartDetails ? "접기" : "자세히") { showingRestartDetails.toggle() }.buttonStyle(.borderless)
                 if waiting > 0 { Button("대기 취소") { engine.cancelSessionRestarts() }.help("아직 종료하지 않은 세션의 다시 시작을 취소합니다.") }
+                if failed > 0 { Button("실패한 세션 다시 시도") { engine.retryFailedSessionRestarts() }.help("실패한 세션 가운데 원래 CLI가 아직 실행 중인 세션만 다시 시작합니다. 이미 다시 시작한 세션은 건드리지 않습니다.") }
                 if !progress.isActive { Button("닫기") { engine.dismissSessionRestarts(); showingRestartDetails = false } }
             }
             if showingRestartDetails {
