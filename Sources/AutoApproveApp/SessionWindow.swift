@@ -26,6 +26,8 @@ import AutoApproveCore
     @State private var showing = false
     /// Collapsed group and member rows, kept across launches. Everything starts expanded.
     @AppStorage("sessionListCollapsed") private var collapsedRows = ""
+    @State private var confirmingRestart: [String]?
+    @State private var showingRestartDetails = false
     private var liveQuestionIDs: Set<QuestionReplyKey> {
         Set(engine.snapshot.sessions.filter { $0.phase != .ended }.flatMap { session in
             session.questions.map { QuestionReplyKey(sessionID: session.id, questionID: $0.id) }
@@ -106,6 +108,7 @@ import AutoApproveCore
                         .help(AppHelp.connections)
                 }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10).background(Color.orange.opacity(0.10))
             }
+            if let progress = engine.snapshot.sessionRestart { restartBanner(progress) }
             if engine.snapshot.paused {
                 HStack(spacing: 8) {
                     Image(systemName: "pause.circle.fill")
@@ -187,6 +190,9 @@ import AutoApproveCore
                                 Button("터미널 열기") { reveal(session) }
                                     .disabled(!session.canReveal || openingTerminal)
                                     .help(AppHelp.reveal(session, opening: openingTerminal))
+                                Button("이 세션 다시 시작", systemImage: "arrow.triangle.2.circlepath") { confirmingRestart = [session.id] }
+                                    .disabled(restartableIDs([session]).isEmpty)
+                                    .help("원래 터미널에서 CLI를 종료하고 같은 대화를 다시 엽니다. 작업 중이면 작업이 끝난 뒤 다시 시작합니다.")
                                 Button("표시 이름·메모·색상 편집", systemImage: "pencil") { editingSession = session }
                                     .help("이 세션의 표시 이름, 메모와 식별 색상을 편집합니다.")
                                 Button("알림 읽음으로 표시", systemImage: "checkmark.circle") {
@@ -222,6 +228,52 @@ import AutoApproveCore
                 detail.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+    private func restartableIDs(_ sessions: [AgentSession]) -> [String] {
+        let running = Set(engine.snapshot.sessionRestart?.items.filter { !$0.phase.isFinished }.map(\.id) ?? [])
+        return sessions.filter { ($0.agent == .claude || $0.agent == .codex) && $0.phase != .ended && !running.contains($0.id) }.map(\.id)
+    }
+    private var restartTitle: String { (confirmingRestart?.count ?? 0) == 1 ? "이 세션을 다시 시작할까요?" : "세션 \(confirmingRestart?.count ?? 0)개를 다시 시작할까요?" }
+    private var restartMessage: String {
+        let chosen = engine.snapshot.sessions.filter { confirmingRestart?.contains($0.id) == true }
+        let supported: Set<TerminalKind> = [.terminal, .iterm, .pty]
+        let now = chosen.filter { supported.contains($0.terminal) && $0.phase == .idle }.count
+        let later = chosen.filter { supported.contains($0.terminal) && $0.phase != .idle }.count
+        let unsupported = chosen.count - now - later
+        var lines = ["원래 터미널에서 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다."]
+        if now > 0 { lines.append("지금 다시 시작: \(now)개") }
+        if later > 0 { lines.append("작업이 끝나고 입력창이 비면 다시 시작: \(later)개 (최대 30분 대기)") }
+        if unsupported > 0 { lines.append("지원하지 않는 터미널이라 건너뜀: \(unsupported)개 (tmux, Orca, VS Code)") }
+        return lines.joined(separator: "\n")
+    }
+    @ViewBuilder private func restartBanner(_ progress: SessionRestartProgress) -> some View {
+        let done = progress.count(.done), failed = progress.count(.failed), cancelled = progress.count(.cancelled)
+        let waiting = progress.count(.waiting), working = progress.items.count - done - failed - cancelled - waiting
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if progress.isActive { ProgressView().controlSize(.small) } else {
+                    Image(systemName: failed > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle.fill").foregroundStyle(failed > 0 ? .orange : .green)
+                }
+                Text(progress.isActive ? "세션 다시 시작 중" : failed == 0 ? "세션 다시 시작 완료" : "세션 다시 시작 결과").font(.callout.weight(.semibold))
+                Text(["완료 \(done)", working > 0 ? "진행 \(working)" : nil, waiting > 0 ? "작업 끝나길 기다림 \(waiting)" : nil,
+                      failed > 0 ? "실패 \(failed)" : nil, cancelled > 0 ? "취소 \(cancelled)" : nil].compactMap { $0 }.joined(separator: " · "))
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button(showingRestartDetails ? "접기" : "자세히") { showingRestartDetails.toggle() }.buttonStyle(.borderless)
+                if waiting > 0 { Button("대기 취소") { engine.cancelSessionRestarts() }.help("아직 종료하지 않은 세션의 다시 시작을 취소합니다.") }
+                if !progress.isActive { Button("닫기") { engine.dismissSessionRestarts(); showingRestartDetails = false } }
+            }
+            if showingRestartDetails {
+                ForEach(progress.items) { item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: item.phase == .done ? "checkmark.circle" : item.phase == .failed ? "exclamationmark.triangle"
+                              : item.phase == .cancelled ? "xmark.circle" : "clock").foregroundStyle(item.phase == .failed ? .orange : .secondary)
+                        Text(item.title).font(.caption.weight(.medium)).lineLimit(1).frame(maxWidth: 200, alignment: .leading)
+                        Text(item.message).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    }
+                }
+            }
+        }.padding(.horizontal, 20).padding(.vertical, 10).background((failed > 0 ? Color.orange : Color.accentColor).opacity(0.08))
     }
     private var collapsed: Set<String> { Set(collapsedRows.split(separator: "\n").map(String.init)) }
     private func expansion(_ key: String) -> Binding<Bool> {
@@ -278,6 +330,10 @@ import AutoApproveCore
                     .help("창별 대화를 이름 있는 여러 프로필 파일로 저장하고 재부팅 후 복원합니다.")
                 Button {openWindow(id:"session-groups")} label: {Label("세션 그룹",systemImage:"person.2")}
                     .help("Codex와 Claude Code 세션을 그룹으로 묶고 구성원을 관리합니다.")
+                Button { confirmingRestart = restartableIDs(engine.snapshot.sessions) } label: {
+                    Label("세션 다시 시작", systemImage: "arrow.triangle.2.circlepath")
+                }.disabled(restartableIDs(engine.snapshot.sessions).isEmpty)
+                    .help("모든 Claude Code·Codex 세션을 원래 터미널에서 종료하고 같은 대화로 다시 엽니다. 새 MCP 도구와 설정을 적용할 때 씁니다. 작업 중인 세션은 작업이 끝난 뒤 다시 시작합니다.")
                 Button {
                     do { allAutomationResetMessage = try engine.resetAllAutomation().message }
                     catch { self.error = error.localizedDescription }
@@ -295,6 +351,11 @@ import AutoApproveCore
                 }.help(AppHelp.pause(engine.snapshot.paused))
             }
         }
+        .confirmationDialog(restartTitle, isPresented: Binding(get: { confirmingRestart != nil }, set: { if !$0 { confirmingRestart = nil } }),
+                            titleVisibility: .visible) {
+            Button("다시 시작") { if let ids = confirmingRestart { engine.restartSessions(ids) }; confirmingRestart = nil }
+            Button("취소", role: .cancel) { confirmingRestart = nil }
+        } message: { Text(restartMessage) }
         .alert("요청을 처리하지 못했습니다", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("확인") { error = nil }
                 .help("오류 안내를 닫고 세션 목록으로 돌아갑니다.")

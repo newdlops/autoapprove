@@ -323,6 +323,8 @@ public struct EngineSnapshot: Codable {
     /// Optional for compatibility with clients predating the independent mouse signal setting.
     public var mouseActivity: MouseActivityStatus?
     public var codexProgressRecoveryEnabled:Bool?
+    /// The latest "restart sessions" request, until the user dismisses it.
+    public var sessionRestart: SessionRestartProgress?
     public var osPermissions:OSPermissionMonitorStatus?
     public var questionNotificationDelay: Int {
         guard let value = questionNotificationDelaySeconds, Self.questionNotificationDelayRange.contains(value) else { return 10 }

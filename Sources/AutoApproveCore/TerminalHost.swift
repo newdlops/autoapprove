@@ -111,12 +111,38 @@ public enum ProcessEnvironment {
         return result
     }
 
+    /// The argv strings after the executable path, without the environment.
+    public static func parseArguments(_ bytes: [UInt8]) -> [String] {
+        guard bytes.count > MemoryLayout<Int32>.size else { return [] }
+        let argc = bytes.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        guard argc > 0, argc < 4096 else { return [] }
+        var index = MemoryLayout<Int32>.size
+        while index < bytes.count, bytes[index] != 0 { index += 1 }
+        while index < bytes.count, bytes[index] == 0 { index += 1 }
+        var result: [String] = []
+        while index < bytes.count, result.count < Int(argc) {
+            let start = index
+            while index < bytes.count, bytes[index] != 0 { index += 1 }
+            result.append(String(decoding: bytes[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return result
+    }
+
+    /// The exact process's argv, or nil if the PID now belongs to another process.
+    public static func arguments(_ record: ProcessRecord) -> [String]? {
+        procArgs(record).map(parseArguments)
+    }
+
     /// Returns nil unless the PID still belongs to the scanned process. Test records and reused
     /// PIDs therefore never borrow another process's terminal identity.
     public static func read(_ record: ProcessRecord) -> [String: String]? {
         read(record,names:names)
     }
     static func read(_ record:ProcessRecord,names:Set<String>)->[String:String]? {
+        procArgs(record).map { parse($0, names: names) }
+    }
+    private static func procArgs(_ record: ProcessRecord) -> [UInt8]? {
         guard record.pid > 0, let started = startDate(record.started) else { return nil }
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
@@ -127,7 +153,7 @@ public enum ProcessEnvironment {
         var bytes = [UInt8](repeating: 0, count: Int(limit)), count = Int(limit)
         mib = [CTL_KERN, KERN_PROCARGS2, record.pid]
         guard sysctl(&mib, 3, &bytes, &count, nil, 0) == 0 else { return nil }
-        return parse(Array(bytes.prefix(count)),names:names)
+        return Array(bytes.prefix(count))
     }
     private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
