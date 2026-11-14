@@ -101,7 +101,13 @@ import AutoApproveCore
                     .help("현재 세션과 저장된 구성원의 연결을 다시 확인합니다.")
             }
         }
-        .task { await refresh() }
+        .task {
+            await refresh()
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                await refreshObservation()
+            }
+        }
         .onChange(of: selectedID) { _, id in name = groups.first { $0.id == id }?.name ?? ""; notice = nil; bulkFailures = [] }
         .confirmationDialog("이 그룹을 삭제할까요?", isPresented: $deleteConfirm) {
             Button("그룹 삭제", role: .destructive) { deleteSelected() }
@@ -153,6 +159,7 @@ import AutoApproveCore
                 List(group.treeOrder) { entry in
                     let member = entry.member
                     let match = SessionGroupMatching.match(member, in: live)
+                    let connection = SessionGroupMatching.connection(member, in: live)
                     VStack(alignment: .leading, spacing: 5) {
                         HStack(alignment: .top) {
                             if group.leaderMemberID == member.id {
@@ -163,7 +170,7 @@ import AutoApproveCore
                             roleMenu(member, in: group)
                             Button("제거") { remove(member, from: group) }.disabled(loading)
                         }
-                        Text("\(member.agent.title) · \(match == nil ? "연결 확인 필요" : "실행 중") · \(roleText(member, in: group))")
+                        Text("\(member.agent.title) · \(connection == nil ? "연결 확인 필요" : "실행 중") · \(roleText(member, in: group))")
                             .font(.caption).foregroundStyle(.secondary)
                         if let task = currentTask(member, in: group) {
                             Label(taskText(task), systemImage: task.question?.isPermission == true ? "hand.raised" : task.question != nil ? "questionmark.bubble" : task.status == .working ? "hourglass" : "checkmark.circle")
@@ -177,7 +184,7 @@ import AutoApproveCore
                             Spacer(minLength: 8)
                             Button("세션 ID 갱신") { Task { await refreshIdentity(member, in: group) } }
                                 .fixedSize().disabled(loading)
-                                .help("원래 터미널에 /status를 입력하고 화면에서 현재 세션 ID를 읽어 저장합니다. 입력창이 빈 대기 상태에서만 실행합니다.")
+                                .help("확인된 현재 대화 ID를 저장합니다. ID를 알 수 없을 때만 빈 대기 터미널에 /status를 한 번 입력합니다.")
                         }
                         if (member.conversationID.isEmpty || member.providerHome == nil), let match, match.conversationID != nil, match.providerHome != nil {
                             Button("현재 대화 연결") { Task { await bind(member, to: match, in: group) } }.disabled(loading)
@@ -270,7 +277,7 @@ import AutoApproveCore
         do {
             notice = "터미널에서 세션 ID를 조회하고 있습니다…"
             try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
-            groups = try store.load(); live = try await engine.sessionGroupSessions()
+            live = try await engine.sessionGroupSessions(); groups = try store.load()
             error = nil; notice = "터미널에서 확인한 현재 세션 ID를 저장했습니다."
         } catch { notice = nil; self.error = error.localizedDescription }
     }
@@ -291,10 +298,21 @@ import AutoApproveCore
             }
             attempted += 1
         }
-        do { groups = try store.load(); live = try await engine.sessionGroupSessions() }
+        do { live = try await engine.sessionGroupSessions(); groups = try store.load() }
         catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
         let remaining = group.members.count - attempted
         notice = "\(group.name) · 갱신 \(succeeded)개 · 보류·실패 \(attempted - succeeded)개" + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : " · 전체 조회 완료")
+    }
+
+    private func refreshObservation() async {
+        guard !loading else { return }
+        do {
+            let observed = try await engine.sessionGroupSessions()
+            guard !loading, !Task.isCancelled else { return }
+            let saved = try store.load()
+            let tasks = try engine.sessionGroupAssignments()
+            live = observed; groups = saved; assignments = tasks
+        } catch { /* Keep the last observation; explicit refresh reports errors. */ }
     }
 
     private func refresh() async {

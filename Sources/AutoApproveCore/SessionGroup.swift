@@ -208,6 +208,19 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
 }
 
 public enum SessionGroupMatching {
+    /// Process connectivity is separate from conversation identity. This is only
+    /// for presentation and explicit identity refresh, never task delivery.
+    public static func connection(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
+        let candidates = live.filter {
+            $0.id == member.runtimeID && $0.session.agent == member.agent &&
+            $0.session.phase != .ended && $0.session.cwd == member.cwd &&
+            (member.providerHome == nil || $0.providerHome == nil || member.providerHome == $0.providerHome)
+        }
+        if candidates.count == 1 { return candidates[0] }
+        guard candidates.isEmpty else { return nil }
+        return match(member, in: live)
+    }
+
     /// A conversation can be attached only when one exact live observation matches.
     public static func match(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
         let matches = live.filter { observation in

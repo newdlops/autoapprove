@@ -146,8 +146,14 @@ extension ApprovalTests {
         try expectEqual(SessionGroupMatching.match(member, in: [live])?.id, session.id)
         var changed = live; changed.conversationID = other
         try expectNil(SessionGroupMatching.match(member, in: [changed]))
+        try expectEqual(SessionGroupMatching.connection(member, in: [changed])?.id, session.id)
+        changed.conversationID = nil
+        try expectEqual(SessionGroupMatching.connection(member, in: [changed])?.id, session.id)
+        try expectNil(SessionGroupMatching.match(member, in: [changed]))
+        try expectNil(SessionGroupMatching.connection(member, in: [changed, changed]))
         changed = live; changed.providerHome = "/tmp/other-home"
         try expectNil(SessionGroupMatching.match(member, in: [changed]))
+        try expectNil(SessionGroupMatching.connection(member, in: [changed]))
         changed = live; changed.session.id = "process:43:start"
         try expectNil(SessionGroupMatching.match(member, in: [live, changed]))
         var unresolved = member; unresolved.conversationID = ""

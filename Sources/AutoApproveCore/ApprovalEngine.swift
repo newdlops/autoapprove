@@ -831,7 +831,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
-        codexGroupDiscoveryTask?.cancel(); codexGroupDiscoveryTask = nil
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
@@ -1916,9 +1915,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return try await remoteInput(object, automaticAuthorization: nil)
     }
 
-    private func remoteInput(_ object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)?) async throws -> JSONObject {
+    private func remoteInput(_ object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)?, codexStatusQuery: Bool = false) async throws -> JSONObject {
         var deliveryStarted = false
-        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted, automaticAuthorization: automaticAuthorization) }
+        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted, automaticAuthorization: automaticAuthorization, codexStatusQuery: codexStatusQuery) }
         catch {
             var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
             if diagnostics["delivery"] == nil { diagnostics["delivery"] = deliveryStarted ? "unknown" : "not_started" }
@@ -1926,7 +1925,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool, automaticAuthorization: (@MainActor () throws -> Void)?) async throws -> JSONObject {
+    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool, automaticAuthorization: (@MainActor () throws -> Void)?, codexStatusQuery: Bool = false) async throws -> JSONObject {
         try automaticAuthorization?()
         let relay = object["relay"] as? Bool == true
         guard !remoteInputStopped, let id = object["sessionID"] as? String, let token = object["revision"] as? String,
@@ -1964,8 +1963,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !remoteInputSessions.contains(id), observed.frame.keys.contains(kind.rawValue) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
         if !relay && automaticInputBusy(id) { throw RemoteHTTPError(409, "Mac에서 승인 또는 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요.") }
         let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? "", relay: relay); try input.validate()
+        // This capability is private; callers cannot enable it through JSON. It
+        // permits only the read-only slash command in a visibly empty Codex composer.
+        if codexStatusQuery {
+            guard [.message, .submit].contains(kind), input.text == "/status",
+                  codexGroupStatusEligible(session), CodexProgressScreen.ready(observed.raw) else {
+                throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
+            }
+        }
         if kind == .message {
-            guard relay, !session.pendingInTerminal, session.phase != .approval, !RemoteMessageReadiness.hasMenu(observed.raw, agent: session.agent),
+            guard relay, codexStatusQuery || !session.pendingInTerminal, session.phase != .approval, !RemoteMessageReadiness.hasMenu(observed.raw, agent: session.agent),
                   [.terminal, .tmux].contains(session.terminal) else {
                 throw RemoteHTTPError(409, "현재 원본 터미널의 질문에 먼저 답변해주세요.")
             }
@@ -2033,7 +2040,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               current.tmuxHandle == session.tmuxHandle,
               current.bridgeID == session.bridgeID, current.terminalID == session.terminalID,
               !nativeInput || nativeBridgeBinding(current) == nativeBinding,
-              kind != .message || !current.pendingInTerminal && current.phase != .approval,
+              kind != .message || (codexStatusQuery ? codexGroupStatusEligible(current) : !current.pendingInTerminal && current.phase != .approval),
               !orcaInput || remoteOrcaBindings[id]?.binding == observed.orcaBinding && remoteFrames[id]?.orcaBinding == observed.orcaBinding,
               (relay ? remoteStreams[id]?.token == (object["streamID"] as? String) : remoteFrames[id]?.frame.revision == token) else { throw RemoteHTTPError(409, "대상 CLI나 화면 상태가 바뀌었습니다. 최신 화면을 확인해주세요.") }
         if session.terminal == .terminal, relay || ![.text, .submit, .enter].contains(kind) {
@@ -2045,6 +2052,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // Pause, opt-out and a replaced model question can cancel during the
         // asynchronous process check. Web callers cannot supply this callback.
         try automaticAuthorization?()
+        if codexStatusQuery {
+            guard !snapshot.paused, !nativeUserInputHasPriority(id), !automaticInputBusy(id),
+                  codexGroupStatusEligible(current) else {
+                throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
+            }
+        }
         // Reserve this exact frame before writing. Neither a timeout nor a second click replays it.
         if !relay { remoteFrames.removeValue(forKey: id) }
         invalidateRemoteRead(id)
@@ -2052,6 +2065,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var event = AuditEvent(sessionID: id, summary: textual ? String(input.text.prefix(200)) : kind.rawValue,
             outcome: "웹 입력 전달 확인 중", source: "같은 네트워크 웹", context: AuditContext(session: session), request: kind.rawValue, answer: textual ? input.text : kind.rawValue)
         if automaticAuthorization != nil { event.source = "현재 모델 자동 유지" }
+        if codexStatusQuery { event.source = "Codex 세션 ID 조회" }
         if kind == .choice, let question = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent), let selected = question.targetIndex(command: input.text) {
             event.summary = question.question; event.request = question.question + "\n" + question.options.joined(separator: "\n"); event.answer = question.options[selected]
         }
@@ -2097,6 +2111,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
+                                            codexStatusQuery: Bool = false,
                                             preflight: (() async throws -> Void)? = nil) async throws -> JSONObject {
         var outcome = "not_started"
         do {
@@ -2112,7 +2127,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
                       current.tty == original.tty, current.terminal == original.terminal,
                       current.bridgeID == original.bridgeID, current.terminalID == original.terminalID,
-                      !current.pendingInTerminal, current.phase != .approval, frame.inputReason == nil,
+                      (codexStatusQuery ? codexGroupStatusEligible(current) : !current.pendingInTerminal && current.phase != .approval), frame.inputReason == nil,
                       !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
                     throw RemoteHTTPError(409, "원본 터미널의 연결이나 질문 상태가 바뀌었습니다. 현재 화면을 확인해주세요.")
                 }
@@ -2121,7 +2136,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 var input: JSONObject = ["sessionID": original.id, "revision": frame.revision, "text": text]
                 var submitSeparately = false
-                if frame.keys.contains("message"), let stream = frame.streamID {
+                if codexStatusQuery, frame.keys.contains("submit") {
+                    // Status queries require the exact empty-composer frame at dispatch.
+                    input["kind"] = "submit"
+                } else if frame.keys.contains("message"), let stream = frame.streamID {
                     input["kind"] = "message"; input["relay"] = true; input["streamID"] = stream
                 } else if frame.keys.contains("submit") { input["kind"] = "submit" }
                 else if frame.keys.contains("characters"), frame.keys.contains("enter"), let stream = frame.streamID {
@@ -2132,14 +2150,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 var textWasSent = false
                 do {
                     try await preflight?()
-                    _ = try await remoteInput(input)
+                    if codexStatusQuery, !submitSeparately {
+                        _ = try await remoteInput(input, automaticAuthorization: nil, codexStatusQuery: true)
+                    } else { _ = try await remoteInput(input) }
                     if submitSeparately {
                         textWasSent = true; outcome = "unknown"
                         let next = try await remoteTerminal(sessionID: original.id, realtime: true)
                         guard next.streamID == frame.streamID, next.inputReason == nil,
                               !RemoteMessageReadiness.hasMenu(next.screen, agent: original.agent),
-                              sessions[original.id]?.pendingInTerminal == false, sessions[original.id]?.phase != .approval else {
+                              let current = sessions[original.id],
+                              (codexStatusQuery ? codexGroupStatusEligible(current) : !current.pendingInTerminal && current.phase != .approval) else {
                             throw RemoteHTTPError(409, "문자는 전달했지만 원본의 입력 상태가 바뀌어 Enter를 보내지 않았습니다. 원본 화면을 확인해주세요.")
+                        }
+                        if codexStatusQuery {
+                            guard !snapshot.paused, !nativeUserInputHasPriority(original.id),
+                                  ActivityDetector.detect(next.screen, agent: .codex).phase != .working,
+                                  PromptDetector.normalizedLines(next.screen).last(where: { $0.hasPrefix("›") || $0.hasPrefix("»") })?.dropFirst().trimmingCharacters(in: .whitespaces) == "/status" else {
+                                throw RemoteHTTPError(409, "Codex 조회 명령의 입력을 확인하지 못해 Enter를 보내지 않았습니다.")
+                            }
                         }
                         _ = try await remoteInput(["sessionID": original.id, "revision": next.revision, "streamID": next.streamID!, "relay": true, "kind": "enter"])
                     }
@@ -2192,76 +2220,81 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private var groupStatusIdentities: [String: (session: AgentSession, conversationID: String, home: String?)] = [:]
-    private var codexGroupStatusDates: [String: Date] = [:]
-    private var codexGroupDiscoveryTask: Task<Void, Never>?
-    private var codexGroupDiscoveryAttempts: [String: Date] = [:]
+    private var groupStatusQueries: Set<String> = []
 
-    /// A shared Codex daemon owns the rollout. Ask the original idle terminal for its identity.
-    /// Queries are serialized and use the same draft, question and input-collision guards as manual refresh.
-    private func discoverCodexGroupIdentities(_ live: [SessionGroupLiveSession]) {
-        guard codexGroupDiscoveryTask == nil, !snapshot.paused, !remoteInputStopped else { return }
-        let candidates = live.filter { $0.session.agent == .codex && $0.conversationID == nil &&
-            ![.ended, .approval, .input].contains($0.session.phase) && $0.providerHome != nil &&
-            Date().timeIntervalSince(codexGroupDiscoveryAttempts[$0.id] ?? .distantPast) >= 30 }
-        guard !candidates.isEmpty else { return }
-        codexGroupDiscoveryTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.codexGroupDiscoveryTask = nil }
-            for candidate in candidates {
-                guard !Task.isCancelled, !self.snapshot.paused, !self.remoteInputStopped else { return }
-                guard let current = self.sessions[candidate.id], current.started == candidate.session.started,
-                      current.tty == candidate.session.tty, current.cwd == candidate.session.cwd,
-                      ![.ended, .approval, .input].contains(current.phase), !current.pendingInTerminal,
-                      !self.automaticInputBusy(current.id), !self.userInputHasPriority(current.id) else { continue }
-                self.codexGroupDiscoveryAttempts[current.id] = Date()
-                guard let id = try? await self.statusConversationID(current), !Task.isCancelled else { continue }
-                self.groupStatusIdentities[current.id] = (current, id, candidate.providerHome)
-                self.codexGroupStatusDates[current.id] = Date()
-            }
-            if !Task.isCancelled { self.refreshSessionGroupBadges() }
+    /// A recovery receipt is not a CLI question. The caller must still prove an
+    /// idle, empty composer from a fresh screen before sending exactly /status.
+    private func codexGroupStatusEligible(_ session: AgentSession) -> Bool {
+        guard session.agent == .codex, ![.ended, .approval].contains(session.phase) else { return false }
+        if session.pendingInTerminal {
+            return session.pendingRequestID?.hasPrefix("capacity:review:") == true
         }
+        return true // The fresh screen, not a lagging phase, proves an empty composer.
     }
 
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
     public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID) async throws {
+        // Prefer current process evidence or an already verified status result.
+        // Opening a group and refreshing its display must never type into a CLI.
+        let observed = try await sessionGroupSessions()
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         guard let group = saved.first(where: { $0.id == groupID }),
               let member = group.members.first(where: { $0.id == memberID }),
-              let runtime = member.runtimeID, let original = sessions[runtime],
-              original.agent == member.agent, original.cwd == member.cwd,
-              original.phase == .idle || (original.agent == .codex && ![.ended, .approval, .input].contains(original.phase)),
-              !original.pendingInTerminal, !automaticInputBusy(runtime), !userInputHasPriority(runtime) else {
-            throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 또는 연결 상태를 확인해주세요.")
+              let connection = SessionGroupMatching.connection(member, in: observed),
+              let original = sessions[connection.id] else {
+            throw AppError.message("원래 터미널 연결을 확인해주세요. 다시 실행한 세션은 실행 중인 세션에 연결한 뒤 갱신할 수 있습니다.")
         }
-        let id = try await statusConversationID(original)
+        let runtime = original.id
+        let id: String
+        if let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
+            id = confirmed
+        } else {
+            guard (original.agent == .codex ? codexGroupStatusEligible(original) : original.phase == .idle && !original.pendingInTerminal),
+                  !automaticInputBusy(runtime), !userInputHasPriority(runtime) else {
+                throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
+            }
+            id = try await statusConversationID(original)
+        }
         var next = saved
         let gi = next.firstIndex(where: { $0.id == groupID })!, mi = next[gi].members.firstIndex(where: { $0.id == memberID })!
         next[gi].members[mi].conversationID = id
-        if original.agent == .codex,
+        next[gi].members[mi].runtimeID = runtime
+        next[gi].members[mi].providerHome = connection.providerHome ?? member.providerHome
+        if original.agent == .codex, next[gi].members[mi].providerHome == nil,
            let record = try? processReader().first(where: { $0.key == original.id }),
            let home = CodexGroupIdentity.home(environment: ProcessEnvironment.read(record)) {
             next[gi].members[mi].providerHome = home
         }
         try store.save(next, expected: saved)
-        groupStatusIdentities[runtime] = (original, id, next[gi].members[mi].providerHome)
-        if original.agent == .codex { codexGroupStatusDates[runtime] = Date() }
+        if connection.conversationID == nil {
+            groupStatusIdentities[runtime] = (original, id, next[gi].members[mi].providerHome)
+        }
     }
 
     /// Types /status into an idle CLI and reads the conversation ID from the fresh status screen.
     private func statusConversationID(_ original: AgentSession) async throws -> String {
         let runtime = original.id
-        if original.agent == .codex, sendingMessages.contains(runtime) { throw AppError.message("이미 이 터미널에 입력을 전달하고 있습니다.") }
-        let before = try await remoteTerminal(sessionID: runtime, realtime: true)
-        guard SystemSafetyComposer.capture(before.screen, agent: original.agent, text: "/status") != nil,
-              original.agent == .codex ? CodexProgressScreen.emptyComposer(before.screen) :
-                PromptDetector.normalizedLines(before.screen).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })?.trimmingCharacters(in: .whitespaces) == "❯" else {
-            throw AppError.message("터미널 입력창을 비우고 질문이나 메뉴를 닫은 뒤 다시 갱신해주세요.")
+        guard !sendingMessages.contains(runtime), groupStatusQueries.insert(runtime).inserted else {
+            throw AppError.message("이미 이 터미널의 세션 ID를 조회하고 있습니다.")
         }
-        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], preflight: {
+        defer { groupStatusQueries.remove(runtime) }
+        let before = try await remoteTerminal(sessionID: runtime, realtime: true)
+        let ready = original.agent == .codex ? CodexProgressScreen.ready(before.screen) :
+            SystemSafetyComposer.capture(before.screen, agent: original.agent, text: "/status") != nil &&
+                PromptDetector.normalizedLines(before.screen).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })?.trimmingCharacters(in: .whitespaces) == "❯"
+        guard ready else {
+            let phase = ActivityDetector.detect(before.screen, agent: original.agent).phase
+            let reason = phase == .working ? "작업 중인 터미널에는 조회 명령을 추가하지 않습니다. 작업이 끝난 뒤 갱신해주세요." :
+                phase == .input ? "터미널 입력창에 작성 중인 내용이 있습니다. 비운 뒤 다시 갱신해주세요." :
+                "빈 입력창의 대기 상태를 확인하지 못했습니다. 질문·메뉴를 닫고 현재 터미널 화면을 확인해주세요."
+            throw AppError.message(reason)
+        }
+        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, preflight: {
             guard original.agent == .codex else { return }
             let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true)
             guard !self.snapshot.paused, !self.userInputHasPriority(runtime),
-                  self.sessions[runtime]?.pendingInTerminal == false, CodexProgressScreen.ready(latest.screen) else {
+                  !self.automaticInputBusy(runtime), let current = self.sessions[runtime],
+                  self.codexGroupStatusEligible(current), CodexProgressScreen.ready(latest.screen) else {
                 throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
             }
         })
@@ -2327,9 +2360,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.phase != .ended else { continue }
             if let status = groupStatusIdentities[current.id], status.session.started == current.started,
                status.session.tty == current.tty, status.session.cwd == current.cwd, status.session.agent == current.agent,
-               current.agent != .codex || (conversation == nil && Date().timeIntervalSince(codexGroupStatusDates[current.id] ?? .distantPast) < 120) {
+               conversation == nil {
                 conversation = status.conversationID
                 home = home ?? status.home
+            }
+            if let cached = groupStatusIdentities[current.id], let conversation,
+               UUID(uuidString: cached.conversationID) != UUID(uuidString: conversation) {
+                groupStatusIdentities.removeValue(forKey: current.id)
             }
             result.append(SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName))
         }
@@ -2347,7 +2384,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
         let refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
         if refreshed != saved { try groupStore.save(refreshed, expected: saved) }
-        discoverCodexGroupIdentities(observed)
         return observed
     }
 
@@ -6178,7 +6214,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
            !screenContentsUnchanged, raw.contains(">_ OpenAI Codex (v"),
            CodexProgressScreen.ready(raw), CodexStatusIdentity.cards(raw).isEmpty {
             // /new clears the status card while retaining the same TUI process.
-            codexGroupStatusDates.removeValue(forKey: sessionID)
+            groupStatusIdentities.removeValue(forKey: sessionID)
         }
         // Registration and frame updates share this actor. A new observer starts
         // pending and reads the latest frame; an empty signal has no callback.
