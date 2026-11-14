@@ -85,8 +85,12 @@ extension ApprovalTests {
         try expectEqual((initialize?["result"] as? JSONObject)?["protocolVersion"] as? String, "2025-11-25")
         let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": "list", "method": "tools/list"]) { _, _ in [:] }
         let tools=(list?["result"] as? JSONObject)?["tools"] as? [JSONObject] ?? []
-        try expectEqual(Set(tools.compactMap{$0["name"] as? String}),Set(["ask_user","get_user_answers","get_session_groups","get_diagnostics","list_screens","start_screen_share","stop_screen_share"]))
+        try expectEqual(Set(tools.compactMap{$0["name"] as? String}),Set(["ask_user","get_user_answers","get_session_groups","get_group_status","assign_group_task","answer_group_question","get_diagnostics","list_screens","start_screen_share","stop_screen_share"]))
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_session_groups"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
+        // Reading reports marks them received, and assigning types into a terminal; neither is read-only.
+        for name in ["get_group_status","assign_group_task","answer_group_question"] {
+            try expectEqual((tools.first(where:{$0["name"] as? String==name})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,false)
+        }
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_diagnostics"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
         var modifiedSchema = AutoApproveMCPServer.tools
         modifiedSchema[0]["name"] = "changed"

@@ -386,6 +386,38 @@ extension ApprovalTests {
         try expectEqual(engine.snapshot.sessions.first { $0.id == hookSession(21) }?.automatic, false)
     }
 
+    func testGroupWorkerQuestionReturnsAndCompletionBecomesReport() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        try FileManager.default.createDirectory(at: paths.directory, withIntermediateDirectories: true)
+        let now = Date()
+        let assignment = SessionGroupAssignment(groupID: UUID(), workerMemberID: UUID(), parentMemberID: UUID(),
+            workerSessionID: hookSession(21), parentSessionID: hookSession(22), task: "테스트를 실행하세요", sentAt: now.addingTimeInterval(-5))
+        let seeded = try JSONEncoder().encode(SessionGroupOrchestration(assignments: [assignment]))
+        try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: seeded, as: UTF8.self))
+        let engine = try hookEngine(paths)
+        defer { engine.stop() }
+        let choices: JSONObject = ["questions": [["question": "어느 환경을 쓸까요?", "options": [["label": "개발"], ["label": "운영"]]]]]
+        var question = hookPayload(now); question["tool_input"] = choices
+        let output = bridgeAnswer(try engine.handleClaudeHook(question, at: now))?["hookSpecificOutput"] as? JSONObject
+        try expectEqual(output?["permissionDecision"] as? String, "deny", "A group worker never waits for a person")
+        try expectEqual(output?["permissionDecisionReason"] as? String, SessionGroupOrchestration.questionRedirect)
+        // The worker ends its turn with the question, and that completion becomes the assigning member's report.
+        func event(_ name: String) -> JSONObject {
+            var payload = hookPayload(now); payload["hook_event_name"] = name
+            payload.removeValue(forKey: "tool_input"); payload.removeValue(forKey: "tool_name"); payload.removeValue(forKey: "tool_use_id")
+            return payload
+        }
+        _ = try engine.handleClaudeHook(event("UserPromptSubmit"), at: now)
+        var stop = event("Stop"); stop["last_assistant_message"] = "개발과 운영 중 어느 환경인지 결정이 필요합니다."
+        _ = try engine.handleClaudeHook(stop, at: now)
+        let recorded = try engine.sessionGroupAssignments().first { $0.id == assignment.id }
+        try expectEqual(recorded?.status, .completed)
+        try expectEqual(recorded?.summary, "개발과 운영 중 어느 환경인지 결정이 필요합니다.")
+        // A session without a group task keeps its normal question flow.
+        var other = hookPayload(now, pid: 22); other["tool_input"] = choices
+        try expectNil(bridgeAnswer(try engine.handleClaudeHook(other, at: now))?["hookSpecificOutput"])
+    }
+
     func testReleasedClaudeQuestionTakesOnlyItsChoiceScreen() throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let processes = HookProcesses(), now = Date()
