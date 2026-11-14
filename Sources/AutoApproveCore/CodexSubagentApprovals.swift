@@ -282,7 +282,7 @@ enum CodexSubagentApprovals {
         // a provider/system error. It does not authorize approval mutations.
         guard owned[target.threadID] != nil else { return (0,0) }
         let waiting = owned.filter {
-            loaded.contains($0.key) && (($0.value["status"] as? JSONObject)?["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
+            $0.key != target.threadID && loaded.contains($0.key) && (($0.value["status"] as? JSONObject)?["activeFlags"] as? [String])?.contains("waitingOnApproval") == true
         }
         var attached: [String: JSONObject] = [:]
         for (id, metadata) in waiting {

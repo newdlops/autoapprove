@@ -10,7 +10,7 @@ import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const require=createRequire(import.meta.url),ws=require(path.join(path.dirname(globalThis.process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright')),'../playwright-core/lib/utilsBundle.js'));
 const dir=await mkdtemp('/private/tmp/aa-subagent-'),build=path.resolve(globalThis.process.argv.find(v=>v.startsWith('--build='))?.slice(8)||'.build/debug');
 const root='00000000-0000-4000-8000-000000000001',child='00000000-0000-4000-8000-000000000002',other='00000000-0000-4000-8000-000000000003';
-const parent={id:root,cwd:'/fixture',name:'parent',source:'cli',parentThreadId:null,status:{type:'active',activeFlags:[]}};
+const parent={id:root,cwd:'/fixture',name:'parent',source:'cli',parentThreadId:null,status:{type:'active',activeFlags:['waitingOnApproval']}};
 const worker={id:child,cwd:'/fixture',agentNickname:'worker',source:{subAgent:{thread_spawn:{parent_thread_id:root,depth:1,agent_path:'/root/worker',agent_nickname:'worker',agent_role:null}}},parentThreadId:root,status:{type:'active',activeFlags:['waitingOnApproval']}};
 const server=http.createServer(),wss=new ws.wsServer({noServer:true}),connections=new Set(),responses=[];
 let process, acknowledge=true;

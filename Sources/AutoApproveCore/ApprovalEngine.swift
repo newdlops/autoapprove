@@ -5855,7 +5855,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleSystemSafety(_ id: String) {
-        guard sessions[id]?.codexApprovalBinding == nil else { return }
         guard !hasOSPermissionWait(id),let state = systemSafetyStates[id], state.generation != nil,
               state.notice.phase != .guided, state.notice.phase != .uncertain,
               state.retryAfter.map({ $0 > Date() }) != true,
@@ -5878,7 +5877,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func safetyInputAllowed(_ original: AgentSession, noticeID: String, automationEpoch: UInt64) -> Bool {
-        guard sessions[original.id]?.codexApprovalBinding == nil else { return false }
         guard !hasOSPermissionWait(original.id),!Task.isCancelled, automationRuntime.epoch(original.id) == automationEpoch,
               !automationNeedsFreshScreen.contains(original.id),
               !remoteInputStopped, !snapshot.paused, effectiveAutomatic(original.id), !userInputHasPriority(original.id),
@@ -9053,19 +9051,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return SystemCommandRisk.detect(operation+prompt.summary,cwd:cwd)
     }
     private func scheduleScreenApproval(_ id: String) {
-        // Codex file edits use the visible terminal as their sole approval
-        // transport, even when this session also observes server activity.
-        func screenOwnsApproval(_ session:AgentSession,_ prompt:ApprovalPrompt)->Bool {
-            guard session.codexApprovalBinding != nil else {return true}
-            return Self.isCodexFileEdit(prompt,agent:session.agent)
-        }
+        // The visible parent terminal owns its approvals; the server monitor
+        // handles only child threads and must never race the terminal input.
         guard !hasOSPermissionWait(id) else {return}
         if systemSafetyStates[id]?.notice.isPending == true { scheduleSystemSafety(id); return }
         guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
-              screenOwnsApproval(session,state.prompt),
               Self.screenApprovalRisk(state.prompt,agent:session.agent,cwd:session.cwd) == nil else { return }
         let scheduledRevision = revision
         let scheduledID = UUID()
@@ -9081,7 +9074,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let self else { return }
             guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
                   !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
-                  let latestSession=self.sessions[id], screenOwnsApproval(latestSession,state.prompt),
+                  self.sessions[id] != nil,
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
                   self.sessions[id]?.terminalID == session.terminalID,

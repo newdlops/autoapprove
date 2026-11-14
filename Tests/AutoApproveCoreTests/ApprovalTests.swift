@@ -625,6 +625,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Account transition: native login starts all sessions without a settings view",tests.testNativeCodexLoginStartsAllSessionTransitionWithoutAnySettingsView),
             ("Codex approval reflow: late validation respects pause, OFF and newer question",tests.testApprovalReflowLateValidationCannotOverridePauseDisableOrNewQuestion),
             ("Codex file edits: connected session uses one visible approval",tests.testBoundCodexFileEditsUseOneVisibleScreenApproval),
+            ("Codex commands: connected session uses visible approval",tests.testBoundCodexCommandUsesVisibleScreenApproval),
             ("Codex file edits: other and uncertain inputs remain guarded",tests.testBoundCodexScreenApprovalRejectsOtherAndUncertainRequests),
             ("Codex file edits: pause, disabled, selection and system guard",tests.testBoundCodexFileEditScreenRespectsPauseSelectionAndSafety),
             ("Codex approval reflow: unknown delivery never refreshes or retries",tests.testApprovalReflowUnknownDeliveryNeverStartsRefreshOrRetry),

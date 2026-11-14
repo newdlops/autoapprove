@@ -131,13 +131,22 @@ extension ApprovalTests {
         let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,boundCodex:true)
         defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
         let id=sessions[0].id
-        engine.receiveScreen(sessionID:id,raw:recoveryPrompt("echo command"),generation:"bound")
-        try await Task.sleep(for:.milliseconds(150));try expectEqual(probe.inputs.count,0,"Bound command permissions keep their existing transport")
         let raw="Would you like to make the following edits?\n\nDestination: /tmp/approval-fixture/first.py\n\n› 1. Yes, proceed (y)\n  2. No (esc)\n\nPress enter to confirm or esc to cancel"
         engine.receiveScreen(sessionID:id,raw:raw,generation:"bound")
         try await waitForRecovery({engine.snapshot.sessions.first?.pendingInTerminal == true},"An uncertain terminal delivery must require review")
         for _ in 0..<3 {engine.receiveScreen(sessionID:id,raw:raw,generation:"bound")}
         try await Task.sleep(for:.milliseconds(120));try expectEqual(probe.inputs.count,1,"An uncertain file-edit input is never repeated")
+    }
+    func testBoundCodexCommandUsesVisibleScreenApproval() async throws {
+        let probe=ApprovalRecoveryProbe()
+        let (engine,sessions,directory)=try recoveryEngine(probe,host:.terminal,boundCodex:true)
+        defer {engine.stop();try? FileManager.default.removeItem(at:directory)}
+        let id=sessions[0].id, raw=recoveryPrompt("echo command")
+        engine.receiveScreen(sessionID:id,raw:raw,generation:"bound")
+        try await waitForRecovery({probe.inputs.count==1},"A bound Codex command must be approved through its visible terminal")
+        engine.receiveScreen(sessionID:id,raw:raw,generation:"bound")
+        try await Task.sleep(for:.milliseconds(120))
+        try expectEqual(probe.inputs.count,1,"The same request must not be approved twice")
     }
     func testBoundCodexFileEditScreenRespectsPauseSelectionAndSafety() async throws {
         for mode in ["paused","disabled","selection","protected","protected_settings","protected_etc"] {
