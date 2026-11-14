@@ -81,7 +81,9 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         arguments.append(compatibleCLI?.executable ?? bundledRuntime?.executable ?? agent)
         if bundledRuntime != nil || compatibleCLI != nil {arguments += ["--remote","unix://"]}
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
-        return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+(entry.agent == "codex" ? "":"exec ")+arguments.map(HookInstaller.quote).joined(separator:" ")
+        // Keep the tab's interactive shell for both agents. A CLI that replaces its shell leaves a tab that cannot
+        // run anything after the CLI exits, so the session could never be restarted in the same tab.
+        return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
 }
 

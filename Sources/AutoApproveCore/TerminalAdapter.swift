@@ -76,11 +76,6 @@ public struct ScreenHostAdapter: Sendable {
     public var completeResume: (@Sendable (ScreenTarget, CodexCapacityStop) throws -> ResumeDelivery)?
     /// The source is an already verified, idle original shell after an observed CLI error.
     public var restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
-    /// Runs a command in a new window of this host and returns the new TTY. Needs no focus or key presses.
-    /// Used to reopen a CLI that replaced its shell, because a finished tab cannot run anything again.
-    public var launchWindow: (@Sendable (String) throws -> String)?
-    /// Closes the tab at this TTY only when its process has ended. Returns whether a tab was closed.
-    public var closeFinishedTab: (@Sendable (String) throws -> Bool)?
     public var replacementShell: (@Sendable (ScreenTarget) throws -> ProcessRecord)?
     public var replacementShellValid: (@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)?
     public var goalInterrupt: (@Sendable (ScreenTarget,String) throws -> TerminalDelivery)?
@@ -127,8 +122,6 @@ public struct ScreenHostAdapter: Sendable {
                 history:{try TerminalAppleEvents.history(tty:$0.tty)},
                 replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)},
                 goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)})
-            adapter.launchWindow = { try TerminalAdapter.launchWindow(command: $0) }
-            adapter.closeFinishedTab = { try TerminalAdapter.closeFinishedTab(tty: $0) }
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
                 adapter.validationScreens = nil
@@ -272,60 +265,6 @@ public enum TerminalAdapter {
         let output = try AutomationScript.run(restartScript(target:target,expected:expected,command:command),app:"Terminal",denied:.permissionDenied)
         guard let result = TerminalDelivery(rawValue:output) else { throw AppError.message("같은 대화 복구 명령의 전달 결과를 확인하지 못했습니다.") }
         return result
-    }
-    /// `do script` without a target tab opens a new window and runs the command in its login shell.
-    public static func launchWindow(command: String) throws -> String {
-        let literal = try AutomationScript.literal(["command": command] as JSONObject)
-        let output = try AutomationScript.run("""
-        (() => {
-          const app = Application('com.apple.Terminal'), target = \(literal);
-          ObjC.import('Foundation');
-          if (!app.running()) return '';
-          const known = new Set();
-          for (const window of app.windows()) { try { for (const tab of window.tabs() || []) known.add(String(tab.tty())); } catch (error) {} }
-          const tab = app.doScript(String(target.command).normalize('NFC'));
-          // A tab reference is not resolvable for a moment after the window appears (-1728).
-          for (let attempt = 0; attempt < 60; attempt++) {
-            try { const tty = String(tab.tty()); if (tty.startsWith('/dev/')) return tty; } catch (error) {}
-            for (const window of app.windows()) {
-              try { for (const other of window.tabs() || []) { const tty = String(other.tty()); if (!known.has(tty) && tty.startsWith('/dev/')) return tty; } } catch (error) {}
-            }
-            $.NSThread.sleepForTimeInterval(0.05);
-          }
-          return '';
-        })();
-        """, app: "Terminal", denied: .permissionDenied)
-        let tty = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard tty.hasPrefix("/dev/ttys"), tty.dropFirst("/dev/ttys".count).allSatisfy(\.isNumber) else {
-            throw AppError.message("새 Terminal 창을 열지 못했습니다.")
-        }
-        return tty
-    }
-    /// In Terminal's scripting model every tab is its own window, so closing that window closes only the tab.
-    /// A tab that still runs anything is left alone.
-    public static func closeFinishedTab(tty: String) throws -> Bool {
-        let literal = try AutomationScript.literal(["tty": tty] as JSONObject)
-        let output = try AutomationScript.run("""
-        (() => {
-          const app = Application('com.apple.Terminal'), target = \(literal);
-          if (!app.running()) return 'missing';
-          // Windows that are appearing or closing can be listed as unresolvable entries; skip them.
-          for (const window of app.windows()) {
-            let tabs = [];
-            try { tabs = window.tabs() || []; } catch (error) { continue; }
-            for (const tab of tabs) {
-              let tty = '';
-              try { tty = String(tab.tty()); } catch (error) { continue; }
-              if (tty !== target.tty) continue;
-              if (tab.busy() || tab.processes().length !== 0) return 'busy';
-              window.close();
-              return 'closed';
-            }
-          }
-          return 'missing';
-        })();
-        """, app: "Terminal", denied: .permissionDenied)
-        return output.trimmingCharacters(in: .whitespacesAndNewlines) == "closed"
     }
     public static func restartScript(target: ScreenTarget, expected: String, command: String) throws -> String {
         let literal = try AutomationScript.literal(["tty":target.tty,"screen":expected,"command":command] as JSONObject)

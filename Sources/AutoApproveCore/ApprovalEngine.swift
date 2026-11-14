@@ -2401,17 +2401,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return fail("CLI 프로세스를 확인하지 못했습니다.")
         }
         // npm launchers put a node process between the shell and the CLI, so use the nearest shell on the same terminal.
-        // A CLI that replaced its shell with exec (as restored session profiles do) has nothing to return to, and a
-        // finished Terminal tab cannot run anything again. It reopens in a new window and the finished tab is closed.
+        // A CLI that replaced its shell with exec has nothing to return to: a finished Terminal tab cannot run anything
+        // again, and a new tab always lands at the end of the tab bar. Such a session is left untouched so its tab and
+        // position stay as they are.
         let chain = ProcessDiscovery.ancestors(of: process.parent, records: records)
-        var originalShell: ProcessRecord?
-        if let index = chain.firstIndex(where: { $0.tty == process.tty && SessionExitRecovery.isShell($0) }),
-           chain[..<index].allSatisfy({ $0.tty == process.tty }) {
-            originalShell = chain[index]
-        } else if !(chain.first.map({ $0.tty == process.tty && ($0.executable as NSString).lastPathComponent == "login" }) == true
-                    && adapter.launchWindow != nil) {
-            return fail("CLI를 실행한 셸을 확인하지 못했습니다. 셸에서 실행했거나 Terminal에서 셸 없이 실행한 세션만 다시 시작합니다.")
+        guard let index = chain.firstIndex(where: { $0.tty == process.tty && SessionExitRecovery.isShell($0) }),
+              chain[..<index].allSatisfy({ $0.tty == process.tty }) else {
+            let shellless = chain.first.map { $0.tty == process.tty && ($0.executable as NSString).lastPathComponent == "login" } == true
+            return fail(shellless
+                ? "셸 없이 실행된 세션이라 같은 탭에서 다시 열 수 없어 건드리지 않았습니다. 세션 프로필로 다시 복원하면 다음부터 같은 탭에서 다시 시작합니다."
+                : "CLI를 실행한 셸을 확인하지 못해 다시 시작하지 않았습니다.")
         }
+        let shell = chain[index]
         let argumentsReader = processArgumentsReader, pathReader = processPathReader
         let resolved: String? = process.executable.hasPrefix("/") ? process.executable : await Task.detached(operation: { pathReader(process) }).value
         guard let executable = resolved else { return fail("CLI 실행 파일 경로를 확인하지 못했습니다.") }
@@ -2478,40 +2479,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
         do {
             _ = try await sendOriginalTerminalMessage(current, object: ["text": "/exit", "revision": "session-restart"])
         } catch { return fail("종료 명령을 입력하지 못했습니다: \(error.localizedDescription)") }
-        let command = plan.command(cwd: originalShell == nil ? current.cwd : nil, environment: environment)
+        let command = plan.command(cwd: nil, environment: environment)
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "종료 명령 입력", source: host.title, context: AuditContext(session: current), request: command))
         let manual = " 터미널에서 직접 실행해주세요: \(command)"
 
-        var launchedTTY = process.tty
-        if let shell = originalShell {
-            // In place: the original shell must be back in the foreground with an empty prompt. The screen can
-            // still be settling right after the CLI exits, so a changed screen is read again instead of failing.
-            let context = SessionExitRecovery(session: current, process: process, shell: shell, conversationID: conversation)
-            let target = ScreenTarget(tty: current.tty, handle: current.screenHandle, jobPIDs: [shell.pid], sourcePID: shell.pid, sourceStarted: shell.started)
-            let until = Date().addingTimeInterval(45)
-            var sent = false
-            while !sent {
-                guard Date() < until else { return fail("CLI가 종료된 뒤 셸 입력창을 확인하지 못했습니다." + manual) }
-                try? await Task.sleep(for: .milliseconds(500))
-                guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else { continue }
-                let screen = try? await Task.detached(operation: { try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents }).value
-                guard let prompt = screen ?? nil, SessionExitRecovery.emptyShellPrompt(prompt) else { continue }
-                updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
-                do { sent = try await Task.detached(operation: { try restart(target, prompt, command) }).value == .sent }
-                catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
-            }
-        } else {
-            guard let launch = adapter.launchWindow else { return }
-            let until = Date().addingTimeInterval(30)
-            while true {
-                guard Date() < until else { return fail("CLI가 종료되지 않았습니다. 터미널을 확인해주세요.") }
-                try? await Task.sleep(for: .milliseconds(500))
-                if let live = try? await Task.detached(operation: { try reader() }).value,
-                   !live.contains(where: { $0.pid == process.pid && $0.started == process.started }) { break }
-            }
-            updateRestart(id, .launching, "새 창에서 같은 대화를 다시 열고 있습니다.")
-            do { launchedTTY = String(try await Task.detached(operation: { try launch(command) }).value.dropFirst("/dev/".count)) }
-            catch { return fail("새 창을 열지 못했습니다: \(error.localizedDescription)." + manual) }
+        // In place: the original shell must be back in the foreground with an empty prompt. The screen can
+        // still be settling right after the CLI exits, so a changed screen is read again instead of failing.
+        let context = SessionExitRecovery(session: current, process: process, shell: shell, conversationID: conversation)
+        let target = ScreenTarget(tty: current.tty, handle: current.screenHandle, jobPIDs: [shell.pid], sourcePID: shell.pid, sourceStarted: shell.started)
+        let until = Date().addingTimeInterval(45)
+        var sent = false
+        while !sent {
+            guard Date() < until else { return fail("CLI가 종료된 뒤 셸 입력창을 확인하지 못했습니다." + manual) }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else { continue }
+            let screen = try? await Task.detached(operation: { try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents }).value
+            guard let prompt = screen ?? nil, SessionExitRecovery.emptyShellPrompt(prompt) else { continue }
+            updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
+            do { sent = try await Task.detached(operation: { try restart(target, prompt, command) }).value == .sent }
+            catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
         }
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
         releaseTerminal()
@@ -2524,9 +2510,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let live = try? await Task.detached(operation: { try reader() }).value else { continue }
             let index = ProcessDiscovery.index(live)
             let next = live.first { candidate in
-                guard candidate.agent == original.agent, candidate.tty == launchedTTY, candidate.key != id else { return false }
-                guard let shell = originalShell else { return true }
-                return ProcessDiscovery.ancestors(of: candidate.parent, byPID: index).contains { $0.pid == shell.pid && $0.started == shell.started }
+                candidate.agent == original.agent && candidate.tty == process.tty && candidate.key != id &&
+                ProcessDiscovery.ancestors(of: candidate.parent, byPID: index).contains { $0.pid == shell.pid && $0.started == shell.started }
             }
             guard let next, sessions[next.key] != nil else { continue }
             if wasAutomatic {
@@ -2537,17 +2522,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sessionOrder[slot] = next.key
                 if let json = try? JSONEncoder().encode(sessionOrder) { try? store.set("sessionOrder", String(decoding: json, as: UTF8.self)) }
             }
-            // The original tab only shows a finished process now; close it so no extra terminal is left behind.
-            var place = "같은 터미널에서"
-            if originalShell == nil {
-                let closed = await Task.detached(operation: { (try? adapter.closeFinishedTab?(current.tty)) ?? false }).value
-                place = closed ? "새 창에서(종료된 원래 탭은 닫음)" : "새 창에서(종료된 원래 탭은 직접 닫아주세요)"
-            }
             refreshSessionGroupBadges()
             publish()
             let note = plan.dropped.isEmpty ? "" : " 다시 적용하지 않은 실행 인자: \(plan.dropped.joined(separator: " "))"
             let source = launchedConversation ? " 현재 대화 ID를 찾지 못해 처음 실행할 때의 대화 ID(\(conversation.prefix(8)))로 열었습니다." : ""
-            return updateRestart(id, .done, "\(place) 같은 대화로 다시 시작했습니다." + source + note, newSessionID: next.key)
+            return updateRestart(id, .done, "같은 탭에서 같은 대화로 다시 시작했습니다." + source + note, newSessionID: next.key)
         }
         fail("다시 시작 명령은 입력했지만 새 CLI를 확인하지 못했습니다. 터미널을 확인해주세요.")
     }

@@ -121,7 +121,8 @@ extension ApprovalTests {
         try expectEqual(normalized.conversationID,"");try expect(!normalized.resumesConversation)
         try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' 'codex'")
         var claude=normalized;claude.id=UUID();claude.agent="claude";claude.providerHome="/tmp/provider with space"
-        try expectEqual(try claude.resumeCommand(),"cd -- '/tmp/fresh-workspace' && exec 'env' 'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'claude'")
+        try expectEqual(try claude.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' 'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'claude'",
+                        "Claude restoration must retain the interactive shell so the session can restart in its own tab")
         var another=normalized;another.id=UUID()
         try expect(normalized.key != another.key,"Separate tabs in one folder have distinct launch receipts")
         var moved=normalized;moved.cwd="/tmp/other-workspace";try expect(moved.key != normalized.key)
