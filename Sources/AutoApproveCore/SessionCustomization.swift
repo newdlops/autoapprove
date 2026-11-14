@@ -55,6 +55,6 @@ extension AgentSession {
     }
 
     public func matchesSearch(_ query: String) -> Bool {
-        query.isEmpty || "\(project) \(terminalTitle ?? "") \(customization?.title ?? "") \(customization?.note ?? "") \(gitBranch?.name ?? "") \(cwd) \(agent.title) \(pid) \(tty)".localizedCaseInsensitiveContains(query) || backgroundChildren.contains { $0.matchesSearch(query) }
+        query.isEmpty || "\(project) \(terminalTitle ?? "") \(customization?.title ?? "") \(customization?.note ?? "") \(gitBranch?.name ?? "") \(sessionGroup?.groupName ?? "") \(cwd) \(agent.title) \(pid) \(tty)".localizedCaseInsensitiveContains(query) || backgroundChildren.contains { $0.matchesSearch(query) }
     }
 }

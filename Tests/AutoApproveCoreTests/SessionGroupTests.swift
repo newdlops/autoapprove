@@ -375,6 +375,12 @@ extension ApprovalTests {
         try expect(writer.writes[0].contains("빌드를 확인하세요"))
         let again = try await assign("다시 확인하세요")
         try expectEqual(again["automaticApproval"] as? String, "already")
+        engine.refreshSessionGroupBadges()
+        func badge(_ id: String) -> SessionGroupBadge? { engine.snapshot.sessions.first { $0.id == id }?.sessionGroup }
+        try expect(try await waitForGroup(5) { badge(leader.id) != nil && badge(worker.id) != nil }, "Session list rows must show group roles")
+        try expectEqual(badge(leader.id)?.role, .leader); try expectEqual(badge(leader.id)?.childCount, 1)
+        try expectEqual(badge(worker.id)?.role, .member); try expectEqual(badge(worker.id)?.task, .working)
+        try expectEqual(badge(worker.id)?.parentTitle, leaderMember.title)
 
         try engine.setPaused(true); defer { try? engine.setPaused(false) }
         let paused = try await assign("일시정지 중 작업")
@@ -427,15 +433,21 @@ extension ApprovalTests {
         writer.show("결과 정리\n\n❯ Try “다음 작업”\n? for shortcuts", on: leaderTTY)
         try expect(try await waitForGroup(10) { await engine.refreshScreens(); return phase(leader.id) == .idle }, "The parent must be idle to receive reports")
 
-        // A permission prompt is never sent to the parent, even after the grace period.
+        // Any other permission prompt is delegated: the parent's choice counts as the user's approval.
         writer.show("Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
-        try expect(try await waitForGroup(10) {
+        let delegated = try await waitForGroup(20) {
             await engine.refreshScreens()
-            return phase(worker.id) == .approval
-        }, "The worker must be waiting on the permission prompt")
+            return writer.writes(to: leaderTTY).contains { $0.contains("[AutoApprove 그룹 승인 요청") }
+        }
+        try expect(delegated, "The worker's permission prompt must reach the parent")
+        let request = try unwrapGroup(writer.writes(to: leaderTTY).first { $0.contains("[AutoApprove 그룹 승인 요청") })
+        try expect(request.contains("echo fixture") && request.contains("1) Yes") && request.contains("사용자 승인으로 처리"))
+        let beforeApproval = writer.writes(to: workerTTY).count
+        let approved = try await call("answer_group_question", from: leader.id, ["choice": 1])
+        try expectEqual(approved["permission"] as? Bool, true)
+        try expectEqual(writer.writes(to: workerTTY).count, beforeApproval + 1)
         try await Task.sleep(for: .seconds(4.5))
-        try expect(writer.writes(to: leaderTTY).isEmpty, "A permission prompt must not reach the parent")
-        try expect(try await question() == nil)
+        try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "An answered request is not reported again")
 
         writer.show("어느 환경에 배포할까요?\n\n❯ 1. 개발\n  2. 운영\n  3. 둘 다\n\nEnter to select", on: workerTTY)
         let reported = try await waitForGroup(20) {
@@ -458,5 +470,40 @@ extension ApprovalTests {
         try expect(try await question() == nil)
         do { _ = try await call("answer_group_question", from: leader.id, ["choice": 2]); throw AppError.message("An answered question accepted a second answer") }
         catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+
+        // A system change that AutoApprove never approves in the app is not delegated to the parent.
+        // The command is assembled so that this source text is not itself a system change request.
+        let persistence = "launch" + "ctl bootstrap gui/501 /fixture/test.plist"
+        writer.show("Do you want to proceed?\n$ \(persistence)\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
+        try expect(try await waitForGroup(10) {
+            await engine.refreshScreens()
+            return phase(worker.id) == .approval
+        }, "The worker must be waiting on the permission prompt")
+        try await Task.sleep(for: .seconds(4.5))
+        try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "A system change must stay with the user")
+    }
+
+    func testSessionGroupBadgesForSessionLists() throws {
+        func live(_ pid: Int32, _ agent: AgentKind = .claude) -> SessionGroupLiveSession {
+            let session = AgentSession(id: "process:\(pid):start", agent: agent, pid: pid, started: "start", tty: "/dev/ttys\(pid)", cwd: "/tmp/badge", terminal: .terminal)
+            return SessionGroupLiveSession(session: session, conversationID: UUID().uuidString, providerHome: "/tmp/home")
+        }
+        let sessions = [live(1), live(2), live(3), live(4)]
+        let members = sessions.map(\.member)
+        var tree = SessionGroup(name: "배포", members: Array(members[0..<3]), leaderMemberID: members[0].id)
+        tree = tree.settingParent(members[1].id, for: members[2].id)
+        let flat = SessionGroup(name: "가나다 평면", members: [members[2], members[3]])
+        let other = SessionGroup(name: "하위 트리", members: [members[1], members[2]], leaderMemberID: members[1].id)
+        let badges = SessionGroupBadge.badges(groups: [flat, tree, other], live: sessions)
+        try expectEqual(badges[sessions[0].id]?.role, .leader)
+        try expectEqual(badges[sessions[0].id]?.childCount, 1)
+        try expectEqual(badges[sessions[2].id]?.role, .member, "A member of a tree wins over a group without a leader")
+        try expectEqual(badges[sessions[2].id]?.depth, 2)
+        try expectEqual(badges[sessions[2].id]?.parentTitle, members[1].title)
+        try expectEqual(badges[sessions[2].id]?.otherGroupCount, 2)
+        try expectEqual(badges[sessions[1].id]?.role, .leader, "Leading a group wins over working in another")
+        try expectEqual(badges[sessions[1].id]?.groupName, "하위 트리")
+        try expectEqual(badges[sessions[3].id]?.role, .unranked)
+        try expect(SessionGroupBadge.badges(groups: [tree], live: [sessions[3]])[sessions[3].id] == nil, "Sessions outside every group have no badge")
     }
 }

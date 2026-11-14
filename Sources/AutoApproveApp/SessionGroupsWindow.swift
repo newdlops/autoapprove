@@ -166,7 +166,7 @@ import AutoApproveCore
                         Text("\(member.agent.title) · \(match == nil ? "연결 확인 필요" : "실행 중") · \(roleText(member, in: group))")
                             .font(.caption).foregroundStyle(.secondary)
                         if let task = currentTask(member, in: group) {
-                            Label(taskText(task), systemImage: task.question != nil ? "questionmark.bubble" : task.status == .working ? "hourglass" : "checkmark.circle")
+                            Label(taskText(task), systemImage: task.question?.isPermission == true ? "hand.raised" : task.question != nil ? "questionmark.bubble" : task.status == .working ? "hourglass" : "checkmark.circle")
                                 .font(.caption).foregroundStyle(task.deliveryError == nil && task.question == nil ? Color.secondary : Color.orange)
                                 .lineLimit(2).help(task.deliveryError ?? task.question?.text ?? task.task)
                         }
@@ -240,6 +240,9 @@ import AutoApproveCore
         switch task.status {
         case .working:
             guard let question = task.question else { return "작업 중 · " + task.task }
+            if question.isPermission {
+                return (question.reportedAt == nil ? "승인 요청 보고 대기 · " : "지시한 세션의 위임 승인을 기다림 · ") + question.text
+            }
             return (question.reportedAt == nil ? "질문 보고 대기 · " : "지시한 세션의 답을 기다림 · ") + question.text
         case .completed: return task.deliveryError == nil ? "완료 · 보고 전달 대기" : "완료 · 보고 전달 재시도 중"
         case .reported: return "완료 · 보고 전달됨"
@@ -306,7 +309,11 @@ import AutoApproveCore
         } catch { self.error = error.localizedDescription }
     }
     private func persist(_ next: [SessionGroup], message: String) -> Bool {
-        do { try store.save(next, expected: groups); groups = try store.load(); error = nil; notice = message; return true }
+        do {
+            try store.save(next, expected: groups); groups = try store.load(); error = nil; notice = message
+            engine.refreshSessionGroupBadges()
+            return true
+        }
         catch { self.error = error.localizedDescription; return false }
     }
     private func create() {

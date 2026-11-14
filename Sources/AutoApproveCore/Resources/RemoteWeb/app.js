@@ -1485,25 +1485,43 @@ function renderNodeFilter() {
   }
   select.value = value;
 }
+// Tells the group leader apart from the members it directs, matching the Mac session list.
+function renderGroupBadge(element, badge) {
+  show(element, !!badge);
+  if (!badge) { delete element.dataset.role; return; }
+  const others = badge.otherGroupCount > 0 ? ` 외 ${badge.otherGroupCount}개 그룹` : '';
+  const name = badge.role === 'leader' ? `그룹장 · ${badge.groupName}${badge.childCount > 0 ? ` · 하위 ${badge.childCount}개` : ''}`
+    : badge.role === 'member' ? `↳ ${badge.groupName} · 지시: ${badge.parentTitle || '그룹장'}` : badge.groupName;
+  const task = {working: '그룹 작업 중', question: '질문 대기', approval: '승인 대기', reporting: '보고 전달 대기'}[badge.task] || '';
+  const reports = badge.pendingReports > 0 ? `보고 ${badge.pendingReports}건` : '';
+  element.dataset.role = badge.role;
+  text(element.querySelector('.row-group-name'), name + others);
+  const taskElement = element.querySelector('.row-group-task');
+  text(taskElement, [task, reports].filter(Boolean).join(' · '));
+  taskElement.dataset.task = badge.task || '';
+  show(taskElement, !!(task || reports));
+}
 function renderList() {
   const query = $('search').value.trim().toLocaleLowerCase();
   const available = allSessions.filter(item => !retainedError(item));
   const visible = available.filter(({ node, view, session }) => ($('node-filter').value === 'all' || node.id === $('node-filter').value)
     && (filter !== 'review' || needsReview(session)) && (filter !== 'automatic' || session.automatic)
-    && [view.title, session.cwd, session.terminalTitle, session.customization?.note, session.gitBranch?.name, node.name, agents[session.agent]].filter(Boolean).join(' ').toLocaleLowerCase().includes(query));
+    && [view.title, session.cwd, session.terminalTitle, session.customization?.note, session.gitBranch?.name, session.sessionGroup?.groupName, node.name, agents[session.agent]].filter(Boolean).join(' ').toLocaleLowerCase().includes(query));
   const visibleKeys = new Set(visible.map(item => item.key));
   for (const [key, row] of rows) if (!visibleKeys.has(key)) { row.remove(); rows.delete(key); }
   for (const [index, item] of visible.entries()) {
     let row = rows.get(item.key);
     if (!row) {
       row = make('li'); const button = make('button', 'session-row');
-      button.append(make('span', 'row-project'), make('span', 'row-title'), make('span', 'row-meta'));
+      const group = make('span', 'row-group'); group.append(make('span', 'row-group-name'), make('span', 'row-group-task'));
+      button.append(make('span', 'row-project'), make('span', 'row-title'), group, make('span', 'row-meta'));
       const state = make('span', 'row-state'); state.append(make('span', 'phase'), make('span', 'row-auto')); button.append(state); row.append(button);
       button.addEventListener('click', () => selectSession(item.key, true)); rows.set(item.key, row);
     }
     const button = row.firstChild; button.setAttribute('aria-pressed', String(item.key === selectedKey));
     const project = item.session.cwd ? item.session.cwd.split('/').filter(Boolean).pop() : '프로젝트 확인 중';
     text(row.querySelector('.row-project'), project); text(row.querySelector('.row-title'), item.view.title);
+    renderGroupBadge(row.querySelector('.row-group'), item.session.sessionGroup);
     text(row.querySelector('.row-meta'), `${item.node.name} · ${agents[item.session.agent]} · ${item.session.hostName || hosts[item.session.terminal]}`);
     const phase = row.querySelector('.phase'), unavailable = !connected || !item.node.online;
     text(phase, unavailable ? item.node.loading ? '갱신 중…' : '연결 끊김' : item.view.phaseTitle);

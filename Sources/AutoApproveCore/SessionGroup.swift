@@ -270,3 +270,69 @@ public struct SessionGroupStore {
         try TerminalProfileStore.write(data, to: file)
     }
 }
+
+/// How a live session takes part in a session group, shown in session lists.
+public struct SessionGroupBadge: Codable, Equatable, Sendable {
+    public enum Role: String, Codable, Sendable {
+        case leader
+        case member
+        /// The group has no leader, so its members are not ranked.
+        case unranked
+    }
+    public enum TaskState: String, Codable, Sendable {
+        case working
+        /// The worker stopped on a choice question its parent has to answer.
+        case question
+        /// The worker stopped on a permission prompt delegated to its parent.
+        case approval
+        /// The worker finished and its report has not reached the parent yet.
+        case reporting
+    }
+
+    public var groupID: UUID
+    public var groupName: String
+    public var memberID: UUID
+    public var role: Role
+    public var depth: Int
+    public var parentTitle: String?
+    public var childCount: Int
+    /// Other groups this session also belongs to; only one badge is shown.
+    public var otherGroupCount: Int
+    public var task: TaskState?
+    /// Reports and questions from this member's workers that have not reached it yet.
+    public var pendingReports: Int
+
+    public init(groupID: UUID, groupName: String, memberID: UUID, role: Role, depth: Int = 0, parentTitle: String? = nil,
+                childCount: Int = 0, otherGroupCount: Int = 0, task: TaskState? = nil, pendingReports: Int = 0) {
+        self.groupID = groupID; self.groupName = groupName; self.memberID = memberID; self.role = role; self.depth = depth
+        self.parentTitle = parentTitle; self.childCount = childCount; self.otherGroupCount = otherGroupCount
+        self.task = task; self.pendingReports = pendingReports
+    }
+
+    /// One badge per live session. A session in several groups shows the group where it leads,
+    /// then where it works for a parent, then a group without a leader.
+    public static func badges(groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [String: SessionGroupBadge] {
+        var candidates: [String: [SessionGroupBadge]] = [:]
+        for group in groups {
+            let depths = Dictionary(group.treeOrder.map { ($0.member.id, $0.depth) }, uniquingKeysWith: { first, _ in first })
+            for member in group.members {
+                guard let session = SessionGroupMatching.match(member, in: live) else { continue }
+                let role: Role = group.leaderMemberID == nil ? .unranked : group.leaderMemberID == member.id ? .leader : .member
+                let parent = group.parentID(of: member.id).flatMap { id in group.members.first { $0.id == id } }
+                candidates[session.id, default: []].append(SessionGroupBadge(
+                    groupID: group.id, groupName: group.name, memberID: member.id, role: role,
+                    depth: role == .unranked ? 0 : depths[member.id] ?? 0, parentTitle: parent?.title,
+                    childCount: role == .unranked ? 0 : group.children(of: member.id).count))
+            }
+        }
+        let rank: [Role: Int] = [.leader: 0, .member: 1, .unranked: 2]
+        return candidates.compactMapValues { values in
+            guard var best = values.sorted(by: {
+                rank[$0.role]! != rank[$1.role]! ? rank[$0.role]! < rank[$1.role]!
+                    : $0.groupName.localizedStandardCompare($1.groupName) == .orderedAscending
+            }).first else { return nil }
+            best.otherGroupCount = values.count - 1
+            return best
+        }
+    }
+}

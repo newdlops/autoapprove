@@ -440,6 +440,7 @@ private struct SessionRowDisplay: View, Equatable {
                         .lineLimit(1)
                 }.foregroundStyle(.secondary)
                     .help(session.displayedTerminalTitle)
+                if let badge = session.sessionGroup { SessionGroupBadgeLabel(badge: badge, selected: selected) }
                 if let note = session.customization?.note, !note.isEmpty {
                     Label(note, systemImage: "note.text").font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).help(note)
@@ -476,6 +477,65 @@ private struct SessionRowDisplay: View, Equatable {
             }
         }.accessibilityElement(children: .contain)
             .accessibilityAction(named: Text("터미널 열기")) { actions.reveal() }
+    }
+}
+
+/// Tells the group leader apart from the members it directs, and shows a member's group task.
+struct SessionGroupBadgeLabel: View {
+    let badge: SessionGroupBadge
+    var selected = false
+    private var title: String {
+        var text: String
+        switch badge.role {
+        case .leader: text = "그룹장 · \(badge.groupName)" + (badge.childCount > 0 ? " · 하위 \(badge.childCount)개" : "")
+        case .member: text = "\(badge.groupName) · 지시: \(badge.parentTitle ?? "그룹장")"
+        case .unranked: text = badge.groupName
+        }
+        if badge.otherGroupCount > 0 { text += " 외 \(badge.otherGroupCount)개 그룹" }
+        return text
+    }
+    private var symbol: String {
+        switch badge.role { case .leader: "crown.fill"; case .member: "arrow.turn.down.right"; case .unranked: "person.2" }
+    }
+    private var task: (title: String, symbol: String, attention: Bool)? {
+        switch badge.task {
+        case .working: ("그룹 작업 중", "hourglass", false)
+        case .question: ("질문 대기", "questionmark.bubble", true)
+        case .approval: ("승인 대기", "hand.raised", true)
+        case .reporting: ("보고 전달 대기", "paperplane", false)
+        case nil: nil
+        }
+    }
+    private var help: String {
+        var lines: [String]
+        switch badge.role {
+        case .leader: lines = ["‘\(badge.groupName)’ 그룹의 그룹장입니다. 직속 구성원 \(badge.childCount)개에게 작업을 지시합니다."]
+        case .member: lines = ["‘\(badge.groupName)’ 그룹의 구성원입니다. ‘\(badge.parentTitle ?? "그룹장")’ 세션이 작업을 지시합니다."]
+        case .unranked: lines = ["‘\(badge.groupName)’ 그룹의 구성원입니다. 이 그룹에는 그룹장이 없습니다."]
+        }
+        if let task {
+            lines.append(task.title + (badge.task == .question ? ": 지시한 세션이 선택지를 골라 답해야 합니다."
+                : badge.task == .approval ? ": 사용자가 위임한 승인입니다. 지시한 세션이 선택하면 사용자 승인으로 처리합니다." : ""))
+        }
+        if badge.pendingReports > 0 { lines.append("하위 구성원의 보고와 질문 \(badge.pendingReports)건이 이 세션의 터미널 입력을 기다립니다.") }
+        if badge.otherGroupCount > 0 { lines.append("다른 그룹 \(badge.otherGroupCount)개에도 속해 있습니다. 세션 그룹 창에서 확인하세요.") }
+        return lines.joined(separator: "\n")
+    }
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: symbol)
+                .font(.caption.weight(badge.role == .leader ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : badge.role == .leader ? Color.orange : Color.secondary)
+                .lineLimit(1).truncationMode(.middle)
+            if let task {
+                Label(task.title, systemImage: task.symbol).font(.caption).fixedSize()
+                    .foregroundStyle(selected ? Color.primary : task.attention ? Color.orange : Color.secondary)
+            }
+            if badge.pendingReports > 0 {
+                Label("보고 \(badge.pendingReports)건", systemImage: "tray.and.arrow.down").font(.caption.monospacedDigit()).fixedSize()
+                    .foregroundStyle(selected ? Color.primary : Color.secondary)
+            }
+        }.help(help).accessibilityElement(children: .combine)
     }
 }
 

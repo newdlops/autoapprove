@@ -52,10 +52,20 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
         return detect(screen, agent: agent, prepared: prepared, permissionPrompt: prompt, request: request)
     }
 
+    /// A permission dialog read as numbered choices. Only a parent answering for its group worker
+    /// uses this; ordinary choice answers never select a permission option.
+    public static func detectPermission(_ screen: String, agent: AgentKind) -> Self? {
+        let prepared = DetectionLines(screen)
+        let prompt = PromptDetector.detect(screen, agent: agent, prepared: prepared)
+        let request = QuestionDetector.detect(agent: agent, prepared: prepared)
+        guard prompt != nil || request?.phase == .approval else { return nil }
+        return detect(screen, agent: agent, prepared: prepared, permissionPrompt: nil, request: request, allowPermission: true)
+    }
+
     static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines,
-                       permissionPrompt: ApprovalPrompt?, request: PendingScreenRequest?) -> Self? {
-        guard agent != .shell, permissionPrompt == nil else { return nil }
-        guard request?.phase != .approval else { return nil }
+                       permissionPrompt: ApprovalPrompt?, request: PendingScreenRequest?, allowPermission: Bool = false) -> Self? {
+        guard agent != .shell, allowPermission || permissionPrompt == nil else { return nil }
+        guard allowPermission || request?.phase != .approval else { return nil }
         let suffix = prepared.normalizedSuffix(300), raw = suffix.rows
         let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
         let header = agent == .codex ? codexHeader(lines) : nil
@@ -97,7 +107,7 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
         guard options.count >= 2, let selected, options.allSatisfy({ !$0.isEmpty }),
               !numericSubmission || options.count <= 9,
               lines[start...].joined(separator: "\n").count < 4000,
-              !permissionLabels || AutomaticQuestionDecision.currentModelIndex(question: question, options: options) != nil else { return nil }
+              allowPermission || !permissionLabels || AutomaticQuestionDecision.currentModelIndex(question: question, options: options) != nil else { return nil }
         // Include visible conversation context to distinguish identical labels
         // in successive questions. Selection movement and line wrapping are cosmetic.
         let all = prepared.raw

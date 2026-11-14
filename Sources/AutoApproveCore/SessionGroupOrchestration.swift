@@ -47,10 +47,14 @@ public struct GroupWorkerQuestion: Codable, Equatable {
     public var options: [String]
     public var seenAt: Date
     public var reportedAt: Date?
+    /// A permission prompt the user delegated to the parent: its choice counts as the user's approval.
+    public var permission: Bool?
 
-    public init(id: String, text: String, options: [String], seenAt: Date = Date()) {
+    public init(id: String, text: String, options: [String], seenAt: Date = Date(), permission: Bool = false) {
         self.id = id; self.text = String(text.prefix(1200)); self.options = Array(options.prefix(9).map { String($0.prefix(200)) }); self.seenAt = seenAt
+        self.permission = permission ? true : nil
     }
+    public var isPermission: Bool { permission == true }
 }
 
 /// Assignment history for every group. AutoApprove keeps only the reports a parent has not received yet;
@@ -189,11 +193,19 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         parts += questions.enumerated().compactMap { offset, item in
             guard let question = item.question else { return nil }
             let options = question.options.enumerated().map { "\($0.offset + 1)) \(oneLine($0.element))" }.joined(separator: " ")
+            if question.isPermission {
+                return "[AutoApprove 그룹 승인 요청 \(items.count + offset + 1)/\(total)] '\(title(item))' 세션이 작업 \(item.shortID) 중에 권한 승인을 기다립니다. " +
+                    "요청: \(oneLine(question.text)) 선택지: \(options) 사용자가 승인을 위임했으므로 이 세션의 선택이 사용자 승인으로 처리됩니다."
+            }
             return "[AutoApprove 그룹 질문 \(items.count + offset + 1)/\(total)] '\(title(item))' 세션이 작업 \(item.shortID) 중에 답을 기다립니다. " +
                 "질문: \(oneLine(question.text)) 선택지: \(options)"
         }
         var guide: [String] = []
-        if !questions.isEmpty { guide.append("질문은 answer_group_question에 구성원 ID와 선택지 번호(choice)를 지정해 답하세요.") }
+        if !questions.isEmpty {
+            let kinds = questions.contains { $0.question?.isPermission == true }
+                ? (questions.contains { $0.question?.isPermission == false } ? "질문과 승인 요청은" : "승인 요청은") : "질문은"
+            guide.append("\(kinds) answer_group_question에 구성원 ID와 선택지 번호(choice)를 지정해 답하세요.")
+        }
         if !items.isEmpty { guide.append("get_group_status로 전체 상태를 확인하고 assign_group_task로 다음 작업을 지시하세요.") }
         return (parts + guide).joined(separator: " ")
     }

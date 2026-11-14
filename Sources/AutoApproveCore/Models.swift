@@ -149,6 +149,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var codexProgressRecovery:CodexProgressRecovery?
     public var osPermissionPolicy:OSPermissionPolicy?
     public var osPermissionWaiting:Bool?
+    /// Set only on published rows; the engine keeps group membership separately.
+    public var sessionGroup: SessionGroupBadge?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
