@@ -204,6 +204,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Exiting a CLI, opening a tab and typing the resume command happen for one session at a time:
     /// Terminal opens one tab at a time, and parallel typing missed its input deadlines.
     private var restartTerminalBusy = false
+    private var restartResumesWork = true
+    /// How long a restarted CLI may take to accept input, and how long it must stay idle before the resume line is typed.
+    public var restartResumeWait: TimeInterval = 90, restartResumeSettle: TimeInterval = 2
     /// Reads a CLI's original arguments for a restart. Tests replace it; it never runs for other processes.
     public var processArgumentsReader: @Sendable (ProcessRecord) -> [String]? = { ProcessEnvironment.arguments($0) }
     public var processPathReader: @Sendable (ProcessRecord) -> String? = { ProcessEnvironment.executablePath($0) }
@@ -2336,16 +2339,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// Restarts each session in its own terminal and reopens the same conversation, so a CLI picks up
     /// new MCP tools and settings. Busy sessions restart once they are idle with an empty input box.
+    /// With `resume`, each restarted session is then told to go on with the work it had in progress.
     @discardableResult
-    public func restartSessions(_ ids: [String]) -> SessionRestartProgress {
+    public func restartSessions(_ ids: [String], resume: Bool = true) -> SessionRestartProgress {
         let now = Date()
+        restartResumesWork = resume
         // Retrying keeps earlier results visible; only the retried sessions start over.
         var items = (snapshot.sessionRestart?.items ?? []).filter { !ids.contains($0.id) && ($0.phase == .done || !$0.phase.isFinished) }
         for id in ids {
             guard let session = sessions[id], session.phase != .ended, session.agent == .claude || session.agent == .codex else { continue }
             items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대기 상태가 되면 다시 시작합니다.", at: now))
             sessionRestartTasks[id]?.cancel()
-            sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id) }
+            sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id, resume: resume) }
         }
         restartIdentityTask = Task { [weak self] in
             guard let self, let live = try? await self.sessionGroupSessions() else { return [:] }
@@ -2368,7 +2373,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func retryFailedSessionRestarts() {
         let failed = snapshot.sessionRestart?.items.filter { $0.phase == .failed && sessions[$0.id]?.phase != .ended && sessions[$0.id] != nil }.map(\.id) ?? []
         guard !failed.isEmpty else { return }
-        restartSessions(failed)
+        restartSessions(failed, resume: restartResumesWork)
     }
 
     public func dismissSessionRestarts() {
@@ -2384,7 +2389,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         snapshot.sessionRestart = progress
     }
 
-    private func runSessionRestart(_ id: String) async {
+    private func runSessionRestart(_ id: String, resume: Bool) async {
         defer { sessionRestartTasks.removeValue(forKey: id) }
         func fail(_ message: String) { updateRestart(id, .failed, message) }
         guard let original = sessions[id] else { return fail("세션을 찾지 못했습니다.") }
@@ -2550,9 +2555,41 @@ private struct ScreenAnalysisStorageKey: Hashable {
             publish()
             let note = plan.dropped.isEmpty ? "" : " 다시 적용하지 않은 실행 인자: \(plan.dropped.joined(separator: " "))"
             let source = launchedConversation ? " 현재 대화 ID를 찾지 못해 처음 실행할 때의 대화 ID(\(conversation.prefix(8)))로 열었습니다." : ""
-            return updateRestart(id, .done, "같은 탭에서 같은 대화로 다시 시작했습니다." + source + note, newSessionID: next.key)
+            var resumed = ""
+            if resume {
+                updateRestart(id, .confirming, "진행하던 작업을 이어가도록 입력하고 있습니다.", newSessionID: next.key)
+                resumed = await resumeWorkAfterRestart(next.key, host: host)
+                    ? " 진행하던 작업을 이어가도록 입력했습니다."
+                    : " 진행하던 작업을 이어가라는 입력은 전달하지 못했습니다. 필요하면 터미널에서 직접 입력해주세요."
+            }
+            return updateRestart(id, .done, "같은 탭에서 같은 대화로 다시 시작했습니다." + resumed + source + note, newSessionID: next.key)
         }
         fail("다시 시작 명령은 입력했지만 새 CLI를 확인하지 못했습니다. 터미널을 확인해주세요.")
+    }
+
+    /// Types the resume line into a restarted session once its CLI accepts input. A dialog on the new screen
+    /// (for example a choice about how to reopen a long conversation) is left for the user.
+    private func resumeWorkAfterRestart(_ id: String, host: ScreenHost) async -> Bool {
+        let until = Date().addingTimeInterval(restartResumeWait)
+        var readySince: Date?
+        while Date() < until, !Task.isCancelled, !remoteInputStopped {
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let session = sessions[id], session.phase != .ended else { return false }
+            var ready = session.phase == .idle
+            if session.agent == .claude, let status = await claudeStatuses([session])[id] { ready = status == "idle" }
+            if ready, session.pendingInTerminal || liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { ready = false }
+            guard ready else { readySince = nil; continue }
+            // The registration appears before the input box does, so the idle state must hold for a moment.
+            guard let since = readySince else { readySince = Date(); continue }
+            guard Date().timeIntervalSince(since) >= restartResumeSettle else { continue }
+            if let frame = try? await remoteTerminal(sessionID: id, realtime: true), frame.question != nil { return false }
+            guard let current = sessions[id], current.phase != .ended else { return false }
+            do { try await sendGroupLine(current, text: SessionRestartCommand.resumePrompt) } catch { return false }
+            log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "진행하던 작업 이어가기 입력", source: host.title,
+                           context: AuditContext(session: current), request: SessionRestartCommand.resumePrompt))
+            return true
+        }
+        return false
     }
 
     /// Recomputes which live sessions belong to saved groups. Reading conversation identities
@@ -2898,6 +2935,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !task.isEmpty, task.count <= SessionGroupOrchestration.maximumTaskLength, !task.contains("\0") else {
                 throw RemoteHTTPError(400, "작업 내용은 1~\(SessionGroupOrchestration.maximumTaskLength)자로 지정해주세요.")
             }
+            if let prefix = SessionGroupOrchestration.commandPrefix(task) {
+                throw RemoteHTTPError(400, "작업 내용은 작업자 터미널에 그대로 입력되므로 '\(prefix)'로 시작할 수 없습니다. 문장으로 시작하도록 고쳐 다시 지시하세요.")
+            }
             let (group, caller, callerMember, target, worker, current) = try await groupDirectWorker(object, groupID: groupID, memberID: memberID)
             // Claude registers its own status; the screen reading reports "unknown" when Claude shows a status line.
             if let status = await claudeStatuses([current])[worker.id] {
@@ -2917,7 +2957,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             // prompt, so a group task turns it on before the task is typed.
             let approval = enableGroupWorkerApproval(worker.id)
             do {
-                try await sendGroupLine(current, text: SessionGroupOrchestration.taskMessage(assignment, parentTitle: callerMember.title))
+                try await sendGroupLine(current, text: SessionGroupOrchestration.taskMessage(assignment))
                 if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
             } catch {
                 if var latest = try? groupOrchestration() { latest.cancel(assignment.id); try? saveGroupOrchestration(latest) }
@@ -2935,7 +2975,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                            source: "세션 그룹", tool: "assign_group_task", request: task))
             scheduleGroupDelivery()
             return ["taskID": assignment.id.uuidString, "workerMemberID": target.id.uuidString, "automaticApproval": approval.rawValue,
-                    "message": "작업자 터미널에 작업을 전달했습니다. " + approval.message + "작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
+                    "message": "작업 내용을 작업자 터미널에 사용자가 직접 입력한 것처럼 그대로 입력했습니다. " + approval.message + "작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
         case "answer_group_question":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
@@ -5398,30 +5438,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return response
     }
 
-    /// The user's own hook tells Claude that the group's decisions were delegated to the assigning session.
-    /// It is added only to prompts AutoApprove itself just typed: the worker's current task, or the reports
-    /// and requests it just delivered to the assigning session. Other prompts get nothing.
+    /// The user's own hook tells the assigning Claude that the group's decisions were delegated to it.
+    /// It is added only to the reports and requests AutoApprove just delivered to that session. A worker's
+    /// task gets nothing: it is typed as plain input, exactly as if the user had typed it.
     private func groupDelegationContext(sessionID: String, prompt: String?, at now: Date = Date()) -> String? {
-        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines), prompt.hasPrefix("[AutoApprove 그룹 "),
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+              prompt.hasPrefix("[AutoApprove 그룹 보고") || prompt.hasPrefix("[AutoApprove 그룹 질문") || prompt.hasPrefix("[AutoApprove 그룹 승인 요청"),
               let state = try? groupOrchestration() else { return nil }
-        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
-        func title(_ group: UUID, _ member: UUID) -> String {
-            let value = SessionGroupOrchestration.oneLine(groups.first { $0.id == group }?.members.first { $0.id == member }?.title ?? "")
-            return value.isEmpty ? "그룹장" : value
-        }
-        func groupName(_ id: UUID) -> String { groups.first { $0.id == id }?.name ?? "세션 그룹" }
-        if let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working }),
-           prompt.hasPrefix("[AutoApprove 그룹 작업 \(task.shortID)"), now.timeIntervalSince(task.sentAt) < 600 {
-            return SessionGroupOrchestration.workerDelegation(group: groupName(task.groupID), parent: title(task.groupID, task.parentMemberID))
-        }
-        let delivered = state.assignments.filter { item in
+        let delivered = state.assignments.first { item in
             item.parentSessionID == sessionID && [item.reportedAt, item.question?.reportedAt].contains { $0.map { now.timeIntervalSince($0) < 600 } == true }
         }
-        if prompt.hasPrefix("[AutoApprove 그룹 보고") || prompt.hasPrefix("[AutoApprove 그룹 질문") || prompt.hasPrefix("[AutoApprove 그룹 승인 요청"),
-           let item = delivered.first {
-            return SessionGroupOrchestration.parentDelegation(group: groupName(item.groupID))
-        }
-        return nil
+        guard let delivered else { return nil }
+        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
+        return SessionGroupOrchestration.parentDelegation(group: groups.first { $0.id == delivered.groupID }?.name ?? "세션 그룹")
     }
 
     private func rememberHook(_ fingerprint: String) -> Bool {
@@ -5862,7 +5891,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 // The same request as the session window's context menu, for one named session.
                 guard let id = params["sessionID"] as? String, let session = sessions[id], session.phase != .ended,
                       session.agent == .claude || session.agent == .codex else { throw AppError.message("실행 중인 Claude Code 또는 Codex 세션 ID가 필요합니다.") }
-                let progress = restartSessions([id])
+                let progress = restartSessions([id], resume: params["resume"] as? Bool ?? true)
                 result = try JSONSerialization.jsonObject(with: JSONEncoder().encode(progress)) as? JSONObject ?? [:]
             case "web":
                 if let enabled = params["enabled"] as? Bool {

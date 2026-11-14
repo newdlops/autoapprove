@@ -312,8 +312,10 @@ extension ApprovalTests {
         let report = SessionGroupOrchestration.report(for: state.undelivered, titles: [worker: "빌드\n작업자"])
         try expect(!report.contains("\n"), "Reports are one line so every terminal connection can submit them")
         try expect(report.contains("'빌드 작업자'") && report.contains(second.shortID) && report.contains("완료 세부 내용"))
-        let task = SessionGroupOrchestration.taskMessage(first, parentTitle: "그룹장")
-        try expect(!task.contains("\n") && task.contains("1. 빌드 2. 테스트") && task.contains("사용자에게 확인을 구하지 말고"))
+        try expectEqual(SessionGroupOrchestration.taskMessage(first), "1. 빌드 2. 테스트",
+                        "The worker receives the instruction alone on one line, as if the user had typed it")
+        try expectEqual(SessionGroupOrchestration.commandPrefix("  !rm -rf build"), "!")
+        try expect(SessionGroupOrchestration.commandPrefix("/clear") == "/" && SessionGroupOrchestration.commandPrefix("빌드하세요") == nil)
 
         state.noteDeliveryFailure([second.id], "busy")
         try expectEqual(state.undelivered.first?.deliveryError, "busy")
@@ -623,7 +625,10 @@ extension ApprovalTests {
         let before = terminal.typed.count
         _ = try await assign("배포 상태를 확인하세요")
         let lines = Array(terminal.typed[before...])
-        try expectEqual(lines.count, 2); try expect(lines[0].contains("배포 상태를 확인하세요")); try expectEqual(lines[1], "", "The second line is only Enter")
+        try expectEqual(lines, ["배포 상태를 확인하세요", ""], "The instruction is typed alone, as the user would type it; the second line is only Enter")
+        do { _ = try await assign("!rm -rf build"); throw AppError.message("A shell command line was typed into the worker") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 400) }
+        try expectEqual(terminal.typed.count, before + 2, "A command line is refused before anything is typed")
         try expectEqual(try working().count, 1); try expect(try working()[0].isDelivered)
         let status = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_group_status", "sessionID": leader.id])
         let members = (status["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject]

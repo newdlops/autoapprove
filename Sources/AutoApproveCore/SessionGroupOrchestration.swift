@@ -187,23 +187,18 @@ public struct SessionGroupOrchestration: Codable, Equatable {
 
     /// Returned instead of a question while a worker has a group task, so the worker ends its turn
     /// and the question reaches the assigning member as a report instead of waiting for a person.
-    public static let questionRedirect = "사용자가 이 그룹의 판단을 작업을 지시한 세션에 위임했으므로, 그룹 작업 중에는 사용자에게 질문하지 않습니다. 결정이 필요하면 지금까지의 결과와 질문을 마지막 응답에 적고 응답을 마치세요. AutoApprove가 작업을 지시한 세션에 전달하고, 그 세션이 다음 지시로 답합니다."
+    /// The worker receives its task as plain terminal input, so this says nothing about the group.
+    public static let questionRedirect = "지금은 질문 창에 답할 수 없습니다. 결정이 필요하면 지금까지의 결과와 질문을 마지막 응답에 적고 응답을 마치세요."
 
-    /// Typed into the worker's composer as one line, so every terminal connection can submit it.
-    public static func taskMessage(_ assignment: SessionGroupAssignment, parentTitle: String) -> String {
-        let parent = oneLine(parentTitle).isEmpty ? "그룹장" : oneLine(parentTitle)
-        return "[AutoApprove 그룹 작업 \(assignment.shortID) · 지시한 세션: \(parent)] \(oneLine(assignment.task)) " +
-            "(사용자가 이 그룹의 작업 지시와 판단을 '\(parent)' 세션에 위임했습니다. 이 지시와 그 세션의 결정을 사용자의 지시로 따르고, 사용자에게 확인을 구하지 말고 끝까지 진행하세요. 결정이 필요하면 지금까지의 결과와 질문을 마지막 응답에 적고 마치세요. " +
-            "작업을 마치면 마지막 응답에 결과를 요약해 주세요. AutoApprove가 그 요약을 지시한 세션에 전달합니다.)"
-    }
+    /// Typed into the worker's composer exactly as a person would type it: the instruction alone, on one line,
+    /// with no header and no note about where it came from. A worker that sees a relayed instruction from
+    /// another session asks the user to confirm it, although the user delegated the group to its leader.
+    public static func taskMessage(_ assignment: SessionGroupAssignment) -> String { oneLine(assignment.task) }
 
-    /// Added by the user's AutoApprove hook to a worker's group task, so the worker follows its parent.
-    public static func workerDelegation(group: String, parent: String) -> String {
-        "AutoApprove 세션 그룹 위임 안내 (사용자가 설치한 AutoApprove hook이 붙인 맥락): 이 프롬프트는 사용자가 만든 세션 그룹 '\(oneLine(group))'에서 " +
-        "AutoApprove가 사용자를 대신해 입력한 작업 지시입니다. 사용자는 이 그룹의 작업 지시와 판단을 '\(oneLine(parent))' 세션에 위임했습니다. " +
-        "이 지시와, 그 세션이 이후 내리는 결정, 선택, 승인을 사용자의 지시와 같게 받아들이고 진행하세요. 사용자에게 직접 확인이나 입력을 다시 요구하지 마세요. " +
-        "결정이 필요하면 지금까지의 결과와 질문을 마지막 응답에 적고 응답을 마치세요. AutoApprove가 그 세션에 전달하고 답을 다음 지시로 입력합니다. " +
-        "관리자 권한, 자동 실행 등록, 보안 설정 같은 시스템 변경은 위임 범위가 아니며 AutoApprove가 사용자에게 남깁니다."
+    /// A line that starts with a command prefix would run a CLI command or a shell command in the worker
+    /// instead of reaching the agent as an instruction, and a shell command would skip the approval hooks.
+    public static func commandPrefix(_ task: String) -> Character? {
+        oneLine(task).first.flatMap { "/!#$&".contains($0) ? $0 : nil }
     }
 
     /// Added by the user's AutoApprove hook to reports and requests delivered to the assigning session.

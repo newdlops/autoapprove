@@ -240,7 +240,7 @@ import AutoApproveCore
         let now = chosen.filter { supported.contains($0.terminal) && $0.phase == .idle }.count
         let later = chosen.filter { supported.contains($0.terminal) && $0.phase != .idle }.count
         let unsupported = chosen.count - now - later
-        var lines = ["원래 터미널에서 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다."]
+        var lines = ["원래 터미널에서 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다. '작업 이어가기'를 고르면 다시 열린 세션에 진행하던 작업을 이어가라고 입력합니다."]
         if now > 0 { lines.append("지금 다시 시작: \(now)개") }
         if later > 0 { lines.append("작업이 끝나고 입력창이 비면 다시 시작: \(later)개 (최대 30분 대기)") }
         if unsupported > 0 { lines.append("지원하지 않는 터미널이라 건너뜀: \(unsupported)개 (tmux, Orca, VS Code)") }
@@ -354,7 +354,8 @@ import AutoApproveCore
         }
         .confirmationDialog(restartTitle, isPresented: Binding(get: { confirmingRestart != nil }, set: { if !$0 { confirmingRestart = nil } }),
                             titleVisibility: .visible) {
-            Button("다시 시작") { if let ids = confirmingRestart { engine.restartSessions(ids) }; confirmingRestart = nil }
+            Button("다시 시작하고 작업 이어가기") { if let ids = confirmingRestart { engine.restartSessions(ids) }; confirmingRestart = nil }
+            Button("다시 시작만 하기") { if let ids = confirmingRestart { engine.restartSessions(ids, resume: false) }; confirmingRestart = nil }
             Button("취소", role: .cancel) { confirmingRestart = nil }
         } message: { Text(restartMessage) }
         .alert("요청을 처리하지 못했습니다", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {

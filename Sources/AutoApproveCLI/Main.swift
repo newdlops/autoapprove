@@ -73,8 +73,11 @@ import AutoApproveCore
                 guard arguments.count == 2 else { throw AppError.message("세션 ID를 지정해주세요. autoapprove status로 확인할 수 있습니다.") }
                 try printJSON(SocketClient.request(path: paths.socket, message: ["method": "automatic", "params": ["sessionID": arguments[1], "enabled": command == "enable"]]))
             case "restart":
-                guard arguments.count == 2 else { throw AppError.message("세션 ID를 지정해주세요. autoapprove status로 확인할 수 있습니다.") }
-                try printJSON(SocketClient.request(path: paths.socket, message: ["method": "restart", "params": ["sessionID": arguments[1]]]))
+                // --no-resume restarts only; by default the session is then told to go on with its work.
+                let ids = arguments.dropFirst().filter { $0 != "--no-resume" }
+                guard ids.count == 1 else { throw AppError.message("세션 ID를 지정해주세요. autoapprove status로 확인할 수 있습니다.") }
+                try printJSON(SocketClient.request(path: paths.socket, message: ["method": "restart",
+                    "params": ["sessionID": ids[0], "resume": !arguments.contains("--no-resume")]]))
             case "serve":
                 let engine = try ApprovalEngine(paths: paths, webLoopbackOnly: arguments.contains("--loopback"))
                 try engine.start(webByDefault: true)
@@ -140,7 +143,8 @@ import AutoApproveCore
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
                   autoapprove enable ID     연결된 세션 자동 승인 켜기
                   autoapprove disable ID    자동 승인 끄기
-                  autoapprove restart ID    세션을 같은 탭에서 같은 대화로 다시 시작
+                  autoapprove restart ID [--no-resume]
+                                            세션을 같은 탭에서 같은 대화로 다시 시작하고 진행하던 작업을 이어가도록 입력
                   autoapprove pause         전체 자동 승인 일시정지
                   autoapprove resume        전체 자동 승인 재개
                   autoapprove install-claude Claude 훅 설치 (기존 설정 백업)

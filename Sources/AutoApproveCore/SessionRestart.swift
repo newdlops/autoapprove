@@ -4,6 +4,11 @@ import Foundation
 /// Only options whose meaning is known are carried over; prompts and conversation selectors are dropped,
 /// and an unknown option stops the restart instead of being guessed.
 public enum SessionRestartCommand {
+    /// Typed into a restarted session, so work the restart interrupted goes on without the user visiting every tab.
+    /// A question that was waiting for the user stays a question: this line is never an approval.
+    public static let resumePrompt = "세션을 다시 시작했습니다. 다시 시작하기 전에 진행하던 작업이 있으면 이어서 진행하세요. " +
+        "제 답이나 승인을 기다리던 일은 이 입력을 승인으로 보지 말고 다시 물어보세요. 이어갈 작업이 없으면 다른 작업을 하지 말고 '이어갈 작업 없음'이라고만 답하세요."
+
     public struct Plan: Equatable {
         public var arguments: [String]
         /// Original arguments that are not passed again, such as an initial prompt.

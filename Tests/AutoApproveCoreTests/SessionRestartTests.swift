@@ -21,6 +21,14 @@ private final class RestartTerminal: @unchecked Sendable {
         inputs.append(input.bytes)
         return .sent
     }
+    private var resumeLines: [String] = []
+    var lines: [String] { lock.lock(); defer { lock.unlock() }; return resumeLines }
+    /// A line typed into the running CLI; Claude starts working on it.
+    func type(_ text: String) -> TerminalDelivery {
+        lock.lock(); defer { lock.unlock() }
+        resumeLines.append(text); claudeStatus = "busy"
+        return .sent
+    }
     private var signals = 0, claudeStatus = "idle"
     var terminated: Int { lock.lock(); defer { lock.unlock() }; return signals }
     var status: String {
@@ -108,19 +116,21 @@ extension ApprovalTests {
         let terminal = RestartTerminal(stages: [running, exited, reopened])
         let tty = "/dev/ttys060"
         terminal.show("❯ Try “다음 작업”\n? for shortcuts", on: tty)
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: terminal.screen($0.tty)) }) },
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: terminal.screen($0.tty)) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil },
             restart: { target, expected, command in terminal.restart(target, expected: expected, command: command) },
             input: { target, _, _, input in terminal.send(target, input) })
+        adapter.typeLine = { _, text in terminal.type(text) }
         let conversation = UUID().uuidString.lowercased()
         // Claude's own registered status decides when the session is idle; the screen is not consulted.
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
-            rows.filter { $0.pid == 100601 }.map { .init(processID: $0.key, kind: "interactive", sessionID: conversation, status: terminal.status) }
+            rows.filter { $0.pid == 100601 || $0.pid == 100602 }.map { .init(processID: $0.key, kind: "interactive", sessionID: conversation, status: terminal.status) }
         }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { terminal.records },
                                         screenAdapters: [.iterm: adapter])
         defer { engine.stop() }
         engine.processTerminator = { terminal.terminate($0) }
+        engine.restartResumeSettle = 0.5
         engine.processArgumentsReader = { record in record.pid == 100601 ? ["/fixture/claude", "--model", "opus", "처음 프롬프트"] : nil }
         var session = ProcessDiscovery.sessions(running).first { $0.agent == .claude }!
         session.terminal = .iterm; session.channel = .itermScreen; session.providerID = conversation
@@ -150,6 +160,8 @@ extension ApprovalTests {
         let item = try unwrapRestart(engine.snapshot.sessionRestart?.items.first)
         try expectEqual(item.newSessionID, next.id)
         try expect(item.message.contains("처음 프롬프트"), "Dropped arguments are reported")
+        try expectEqual(terminal.lines, [SessionRestartCommand.resumePrompt], "The restarted session is told once to go on with its work")
+        try expect(item.message.contains("이어가도록 입력했습니다"), item.message)
         try expectEqual(engine.snapshot.sessions.first { $0.id == next.id }?.automatic, true, "Automatic approval carries over")
         engine.dismissSessionRestarts()
         try expect(engine.snapshot.sessionRestart == nil)
