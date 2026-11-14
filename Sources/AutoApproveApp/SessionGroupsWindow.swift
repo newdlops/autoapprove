@@ -14,6 +14,9 @@ import AutoApproveCore
     @State private var error: String?
     @State private var notice: String?
     @State private var deleteConfirm = false
+    @State private var bulkRunning = false
+    @State private var bulkStopRequested = false
+    @State private var bulkFailures: [String] = []
     init(engine: ApprovalEngine, initialSelection: UUID? = nil) {
         self.engine = engine
         _selectedID = State(initialValue: initialSelection)
@@ -51,7 +54,7 @@ import AutoApproveCore
                                     Text("세션 \(group.members.count)개").font(.caption).foregroundStyle(.secondary)
                                 }.padding(.vertical, 5).tag(group.id)
                             }
-                        }.listStyle(.inset)
+                        }.listStyle(.inset).disabled(loading)
                     }
                 }.frame(minWidth: 210, idealWidth: 245, maxWidth: 300)
                 Group {
@@ -67,10 +70,27 @@ import AutoApproveCore
                     }
                 }.frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
             }
+            if !bulkFailures.isEmpty {
+                Divider()
+                DisclosureGroup("갱신하지 못한 세션 \(bulkFailures.count)개") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(bulkFailures.enumerated()), id: \.offset) { _, text in
+                                Text(text).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }.padding(.vertical, 8)
+                    }.frame(maxHeight: 130)
+                }.padding(.horizontal, 12).padding(.vertical, 6)
+            }
             if let notice {
                 Divider()
-                Text(notice).font(.callout).foregroundStyle(.secondary).padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    Text(notice).font(.callout).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                    if bulkRunning {
+                        Button(bulkStopRequested ? "중단 요청됨" : "중단") { bulkStopRequested = true }
+                            .disabled(bulkStopRequested).help("현재 세션의 조회가 끝나면 다음 세션부터 중단합니다.")
+                    }
+                }.padding(12)
             }
         }
         .frame(minWidth: 700, minHeight: 480)
@@ -82,7 +102,7 @@ import AutoApproveCore
             }
         }
         .task { await refresh() }
-        .onChange(of: selectedID) { _, id in name = groups.first { $0.id == id }?.name ?? ""; notice = nil }
+        .onChange(of: selectedID) { _, id in name = groups.first { $0.id == id }?.name ?? ""; notice = nil; bulkFailures = [] }
         .confirmationDialog("이 그룹을 삭제할까요?", isPresented: $deleteConfirm) {
             Button("그룹 삭제", role: .destructive) { deleteSelected() }
         } message: { Text("그룹만 삭제하며 원본 세션과 대화는 유지됩니다.") }
@@ -111,6 +131,12 @@ import AutoApproveCore
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Text("구성원 \(group.members.count)개").font(.headline)
+                Spacer()
+                Button("전체 세션 ID 갱신") { Task { await refreshAllIdentities(in: group) } }
+                    .disabled(loading || group.members.isEmpty)
+                    .help("이 그룹의 구성원을 순서대로 조회합니다. 보류·실패한 세션은 기존 ID를 유지하며 다음 구성원을 계속 처리합니다.")
+            }
+            HStack {
                 Spacer()
                 Menu("세션 추가", systemImage: "plus") {
                     if live.isEmpty { Text(loading ? "확인 중…" : "추가할 실행 세션이 없습니다") }
@@ -237,12 +263,35 @@ import AutoApproveCore
 
     private func refreshIdentity(_ member: SessionGroupMember, in group: SessionGroup) async {
         guard !loading else { return }; loading = true; defer { loading = false }
+        bulkFailures = []
         do {
             notice = "터미널에서 세션 ID를 조회하고 있습니다…"
             try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
             groups = try store.load(); live = try await engine.sessionGroupSessions()
             error = nil; notice = "터미널에서 확인한 현재 세션 ID를 저장했습니다."
         } catch { notice = nil; self.error = error.localizedDescription }
+    }
+
+    private func refreshAllIdentities(in group: SessionGroup) async {
+        guard !loading else { return }
+        loading = true; bulkRunning = true; bulkStopRequested = false; bulkFailures = []; error = nil
+        defer { loading = false; bulkRunning = false }
+        var succeeded = 0, attempted = 0
+        for (index, member) in group.members.enumerated() {
+            if bulkStopRequested || Task.isCancelled { break }
+            notice = "\(group.name) · \(index + 1)/\(group.members.count) 조회 중 · \(member.title.isEmpty ? member.agent.title : member.title)"
+            do {
+                try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+                succeeded += 1
+            } catch {
+                bulkFailures.append("\(member.title.isEmpty ? member.agent.title : member.title): \(error.localizedDescription)")
+            }
+            attempted += 1
+        }
+        do { groups = try store.load(); live = try await engine.sessionGroupSessions() }
+        catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
+        let remaining = group.members.count - attempted
+        notice = "\(group.name) · 갱신 \(succeeded)개 · 보류·실패 \(attempted - succeeded)개" + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : " · 전체 조회 완료")
     }
 
     private func refresh() async {
