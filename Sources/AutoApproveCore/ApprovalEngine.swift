@@ -198,6 +198,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Session group task history, read from the store on first use.
     private var groupOrchestrationCache: SessionGroupOrchestration?
     private var groupDeliveryTask: Task<Void, Never>?
+    private var sessionRestartTasks: [String: Task<Void, Never>] = [:]
+    /// Reads a CLI's original arguments for a restart. Tests replace it; it never runs for other processes.
+    public var processArgumentsReader: @Sendable (ProcessRecord) -> [String]? = { ProcessEnvironment.arguments($0) }
+    private var sessionGroupBadges: [String: SessionGroupBadge] = [:]
+    private var groupBadgeTask: Task<Void, Never>?
+    private var groupBadgeRefreshPending = false
+    private var groupBadgeSessionIDs: Set<String> = []
+    private var groupBadgeRefreshedAt = Date.distantPast
+    /// Sessions whose next choice input is a parent's delegated permission answer.
+    private var delegatedPermissionInputs: Set<String> = []
     private var groupQuestionSeen: [UUID: (id: String, since: Date)] = [:]
     /// How long a worker must stay on the same choice question before its parent is asked.
     public var groupQuestionGrace: TimeInterval = 8
@@ -741,6 +751,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func start(poll: Bool = true, webByDefault: Bool = false) throws {
         remoteInputStopped = false
         if let state = try? groupOrchestration(), state.needsWatching { scheduleGroupDelivery() }
+        refreshSessionGroupBadges()
         let socket = SocketServer(path: paths.socket, handler: { [weak self] message, peer in
             Task { @MainActor in self?.receive(message, from: peer) }
         }, disconnected: { [weak self] id in
@@ -799,6 +810,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     public func stop() {
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
+        groupBadgeTask?.cancel(); groupBadgeTask = nil
+        sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
         for task in codexApprovalTasks.values { task.cancel() };codexApprovalTasks.removeAll();codexApprovalEpochs.removeAll()
         codexAccountTransitionEpoch = UUID()
         for entry in codexAccountInspectionTasks.values {entry.task.cancel()};codexAccountInspectionTasks.removeAll()
@@ -1935,7 +1948,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         if kind == .choice {
-            guard let currentQuestion = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent),
+            let delegated = delegatedPermissionInputs.contains(id)
+            guard let currentQuestion = delegated ? TerminalChoiceQuestion.detectPermission(observed.raw, agent: session.agent)
+                                                  : TerminalChoiceQuestion.detect(observed.raw, agent: session.agent),
                   let questionID = object["questionID"] as? String, questionID == currentQuestion.id,
                   replyingQuestions.contains("terminalChoice:\(id):\(questionID)"),
                   let target = currentQuestion.targetIndex(command: input.text), currentQuestion.options.indices.contains(target),
@@ -2299,6 +2314,189 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let data = try JSONEncoder().encode(state)
         try store.set(SessionGroupOrchestration.storeKey, String(decoding: data, as: UTF8.self))
         groupOrchestrationCache = state
+        if !sessionGroupBadges.isEmpty { publish() }
+    }
+
+    /// Restarts each session in its own terminal and reopens the same conversation, so a CLI picks up
+    /// new MCP tools and settings. Busy sessions restart once they are idle with an empty input box.
+    @discardableResult
+    public func restartSessions(_ ids: [String]) -> SessionRestartProgress {
+        let now = Date()
+        var items = (snapshot.sessionRestart?.items ?? []).filter { !$0.phase.isFinished && !ids.contains($0.id) }
+        for id in ids {
+            guard let session = sessions[id], session.phase != .ended, session.agent == .claude || session.agent == .codex else { continue }
+            items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대기 상태가 되면 다시 시작합니다.", at: now))
+            sessionRestartTasks[id]?.cancel()
+            sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id) }
+        }
+        let progress = SessionRestartProgress(items: items, startedAt: now)
+        snapshot.sessionRestart = progress
+        return progress
+    }
+
+    /// Stops restarts that have not exited their CLI yet. A CLI that already exited still gets its resume command.
+    public func cancelSessionRestarts() {
+        for item in snapshot.sessionRestart?.items ?? [] where item.phase == .waiting {
+            sessionRestartTasks.removeValue(forKey: item.id)?.cancel()
+            updateRestart(item.id, .cancelled, "다시 시작을 취소했습니다.")
+        }
+    }
+
+    public func dismissSessionRestarts() {
+        guard snapshot.sessionRestart?.isActive != true else { return }
+        snapshot.sessionRestart = nil
+    }
+
+    private func updateRestart(_ id: String, _ phase: SessionRestartItem.Phase, _ message: String, newSessionID: String? = nil) {
+        guard var progress = snapshot.sessionRestart, let index = progress.items.firstIndex(where: { $0.id == id }),
+              !progress.items[index].phase.isFinished else { return }
+        progress.items[index].phase = phase; progress.items[index].message = message; progress.items[index].updatedAt = Date()
+        if let newSessionID { progress.items[index].newSessionID = newSessionID }
+        snapshot.sessionRestart = progress
+    }
+
+    private func runSessionRestart(_ id: String) async {
+        defer { sessionRestartTasks.removeValue(forKey: id) }
+        func fail(_ message: String) { updateRestart(id, .failed, message) }
+        guard let original = sessions[id] else { return fail("세션을 찾지 못했습니다.") }
+        guard let host = ScreenHost(kind: original.terminal), host == .terminal || host == .iterm || host == .pty,
+              screenConnections[host]?.enabled == true, let adapter = screenAdapters[host], let restart = adapter.restart else {
+            return fail("이 터미널(\(original.hostTitle))은 다시 시작 입력을 지원하지 않습니다. Terminal, iTerm2, AutoApprove PTY에서만 다시 시작합니다.")
+        }
+        let conversation = original.agent == .claude ? original.providerID : questionThreadBySession[id] ?? original.codexApprovalBinding?.threadID
+        guard let conversation, UUID(uuidString: conversation) != nil else {
+            return fail("대화 ID를 확인하지 못해 같은 대화로 다시 열 수 없습니다.")
+        }
+        let reader = processReader
+        guard let records = try? await Task.detached(operation: { try reader() }).value,
+              let process = records.first(where: { $0.key == id && $0.agent == original.agent }),
+              let shell = records.first(where: { $0.pid == process.parent && $0.tty == process.tty }), SessionExitRecovery.isShell(shell) else {
+            return fail("CLI를 실행한 셸을 확인하지 못했습니다. 셸에서 직접 실행한 세션만 다시 시작합니다.")
+        }
+        let plan: SessionRestartCommand.Plan
+        do {
+            let argumentsReader = processArgumentsReader
+            guard let argv = await Task.detached(operation: { argumentsReader(process) }).value, !argv.isEmpty else {
+                return fail("CLI의 실행 옵션을 읽지 못했습니다.")
+            }
+            plan = try SessionRestartCommand.plan(agent: original.agent, executable: process.executable, argv: Array(argv.dropFirst()), conversationID: conversation)
+        } catch { return fail(error.localizedDescription) }
+
+        // Never cut off work: wait for an idle CLI with an empty input box and no pending request.
+        let waitUntil = Date().addingTimeInterval(1800)
+        while true {
+            guard !Task.isCancelled, !remoteInputStopped else { return }
+            guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
+            if current.phase == .idle, !current.pendingInTerminal, !automaticInputBusy(id), !userInputHasPriority(id),
+               !sendingMessages.contains(id), !liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { break }
+            guard Date() < waitUntil else { return fail("30분 동안 대기 상태가 되지 않아 다시 시작하지 않았습니다.") }
+            updateRestart(id, .waiting, "작업이 끝나고 입력창이 비면 다시 시작합니다. (현재: \(current.phaseTitle))")
+            try? await Task.sleep(for: .seconds(2))
+        }
+        guard !Task.isCancelled, let current = sessions[id] else { return }
+        let wasAutomatic = current.automatic
+        updateRestart(id, .exiting, "CLI를 종료하고 있습니다.")
+        do {
+            _ = try await sendOriginalTerminalMessage(current, object: ["text": "/exit", "revision": "session-restart"])
+        } catch { return fail("종료 명령을 입력하지 못했습니다: \(error.localizedDescription)") }
+        log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "종료 명령 입력", source: host.title, context: AuditContext(session: current), request: plan.command))
+
+        // The original shell must be back in the foreground with an empty prompt before anything is typed.
+        let context = SessionExitRecovery(session: current, process: process, shell: shell, conversationID: conversation)
+        let target = ScreenTarget(tty: current.tty, handle: current.screenHandle, jobPIDs: [shell.pid], sourcePID: shell.pid, sourceStarted: shell.started)
+        var prompt: String?
+        let exitUntil = Date().addingTimeInterval(30)
+        while prompt == nil {
+            guard Date() < exitUntil else { return fail("CLI가 종료되지 않았거나 셸 입력창을 확인하지 못했습니다. 터미널을 확인해주세요.") }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else { continue }
+            let screen = try? await Task.detached(operation: { try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents }).value
+            if let screen = screen ?? nil, SessionExitRecovery.emptyShellPrompt(screen) { prompt = screen }
+        }
+        guard let prompt else { return }
+        updateRestart(id, .launching, "같은 대화를 다시 열고 있습니다.")
+        let command = plan.command
+        let delivery: TerminalDelivery
+        do { delivery = try await Task.detached(operation: { try restart(target, prompt, command) }).value }
+        catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)") }
+        guard delivery == .sent else { return fail("셸 화면이 바뀌어 다시 시작 명령을 입력하지 않았습니다. 터미널에서 직접 실행해주세요: \(command)") }
+        log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
+
+        // Find the new CLI under the same shell and carry the automatic approval choice over.
+        updateRestart(id, .confirming, "새 CLI 실행을 확인하고 있습니다.")
+        let confirmUntil = Date().addingTimeInterval(60)
+        while Date() < confirmUntil, !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(1))
+            guard let live = try? await Task.detached(operation: { try reader() }).value else { continue }
+            let index = ProcessDiscovery.index(live)
+            let next = live.first { candidate in
+                candidate.agent == original.agent && candidate.tty == process.tty && candidate.key != id &&
+                ProcessDiscovery.ancestors(of: candidate.parent, byPID: index).contains { $0.pid == shell.pid && $0.started == shell.started }
+            }
+            guard let next, sessions[next.key] != nil else { continue }
+            if wasAutomatic {
+                try? store.set("automatic:\(next.key)", "true")
+                sessions[next.key]?.automatic = true
+            }
+            if let slot = sessionOrder.firstIndex(of: id), !sessionOrder.contains(next.key) {
+                sessionOrder[slot] = next.key
+                if let json = try? JSONEncoder().encode(sessionOrder) { try? store.set("sessionOrder", String(decoding: json, as: UTF8.self)) }
+            }
+            refreshSessionGroupBadges()
+            publish()
+            let note = plan.dropped.isEmpty ? "" : " 다시 적용하지 않은 실행 인자: \(plan.dropped.joined(separator: " "))"
+            return updateRestart(id, .done, "같은 대화로 다시 시작했습니다." + note, newSessionID: next.key)
+        }
+        fail("다시 시작 명령은 입력했지만 새 CLI를 확인하지 못했습니다. 터미널을 확인해주세요.")
+    }
+
+    /// Recomputes which live sessions belong to saved groups. Reading conversation identities
+    /// is too costly for every publication, so the result is cached until the next refresh.
+    public func refreshSessionGroupBadges() {
+        if groupBadgeTask != nil { groupBadgeRefreshPending = true; return }
+        groupBadgeTask = Task { @MainActor [weak self] in
+            repeat {
+                guard let self, !Task.isCancelled else { return }
+                self.groupBadgeRefreshPending = false
+                let groups = (try? SessionGroupStore(directory: self.paths.directory).load()) ?? []
+                var next: [String: SessionGroupBadge] = [:]
+                if !groups.isEmpty, let live = try? await self.sessionGroupSessions() {
+                    next = SessionGroupBadge.badges(groups: groups, live: live)
+                }
+                guard !Task.isCancelled else { return }
+                self.groupBadgeRefreshedAt = Date()
+                if next != self.sessionGroupBadges { self.sessionGroupBadges = next; self.publish() }
+                if !self.groupBadgeRefreshPending { self.groupBadgeTask = nil; return }
+            } while true
+        }
+    }
+
+#if DEBUG
+    /// Native previews show group rows without live conversation identities. Not in release builds.
+    public func setSessionGroupBadgesForPreview(_ badges: [String: SessionGroupBadge]) {
+        groupBadgeTask?.cancel(); groupBadgeTask = nil
+        sessionGroupBadges = badges; groupBadgeRefreshedAt = Date(); publish()
+    }
+#endif
+
+    /// Adds the cached group badge and the member's current task to a published row.
+    private func projectSessionGroup(_ session: AgentSession) -> AgentSession {
+        guard var badge = sessionGroupBadges[session.id] else {
+            guard session.sessionGroup != nil else { return session }
+            var value = session; value.sessionGroup = nil; return value
+        }
+        if let state = try? groupOrchestration() {
+            switch state.current(groupID: badge.groupID, workerMemberID: badge.memberID) {
+            case let item? where item.status == .working:
+                badge.task = item.question.map { $0.isPermission ? .approval : .question } ?? .working
+            case let item? where item.status == .completed: badge.task = .reporting
+            default: badge.task = nil
+            }
+            badge.pendingReports = (state.undelivered + state.undeliveredQuestions)
+                .filter { $0.groupID == badge.groupID && $0.parentMemberID == badge.memberID }.count
+        }
+        var value = session; value.sessionGroup = badge
+        return value
     }
 
     /// A worker's first completion after its task becomes a report for the member that assigned it.
@@ -2399,29 +2597,43 @@ private struct ScreenAnalysisStorageKey: Hashable {
         groupQuestionSeen = groupQuestionSeen.filter { id, _ in working.contains { $0.id == id } }
         var noted: [(UUID, GroupWorkerQuestion)] = [], cleared: [UUID] = []
         for item in working {
-            guard let worker = sessions[item.workerSessionID], worker.phase == .input, !remoteInputStopped else {
+            guard let worker = sessions[item.workerSessionID], worker.phase == .input || worker.phase == .approval, !remoteInputStopped else {
                 groupQuestionSeen[item.id] = nil
                 if item.question != nil { cleared.append(item.id) }
                 continue
             }
-            guard let frame = try? await remoteTerminal(sessionID: worker.id, realtime: true),
-                  let question = frame.question, question.reply == nil, !question.options.isEmpty else { continue }
+            guard let frame = try? await remoteTerminal(sessionID: worker.id, realtime: true) else { continue }
+            let permission = worker.phase == .approval
+            guard let question = permission ? delegablePermission(sessions[worker.id] ?? worker) : frame.question,
+                  question.reply == nil, savedReply("terminalChoice:\(worker.id):\(question.id)") == nil,
+                  !question.options.isEmpty else { continue }
             guard let seen = groupQuestionSeen[item.id], seen.id == question.id else {
                 groupQuestionSeen[item.id] = (question.id, Date())
                 continue
             }
             guard Date().timeIntervalSince(seen.since) >= groupQuestionGrace, item.question?.id != question.id else { continue }
-            noted.append((item.id, GroupWorkerQuestion(id: question.id, text: question.question, options: question.options)))
+            noted.append((item.id, GroupWorkerQuestion(id: question.id, text: question.question, options: question.options, permission: permission)))
         }
         guard !noted.isEmpty || !cleared.isEmpty, var state = try? groupOrchestration() else { return }
         cleared.forEach { state.clearQuestion($0) }
         for (id, question) in noted where state.noteQuestion(id, question) {
             if let item = state.assignments.first(where: { $0.id == id }) {
-                log(AuditEvent(sessionID: item.workerSessionID, summary: "세션 그룹 작업 \(item.shortID)", outcome: "그룹 작업 질문 보고 대기",
+                log(AuditEvent(sessionID: item.workerSessionID, summary: "세션 그룹 작업 \(item.shortID)",
+                               outcome: question.isPermission ? "그룹장 위임 승인 요청 대기" : "그룹 작업 질문 보고 대기",
                                source: "세션 그룹", tool: "group_question", request: question.text))
             }
         }
         try? saveGroupOrchestration(state)
+    }
+
+    /// A permission prompt the user delegated to the worker's parent. The global pause, macOS permission
+    /// dialogs and system changes that AutoApprove never approves in the app stay with the user.
+    private func delegablePermission(_ session: AgentSession) -> TerminalChoiceQuestion? {
+        guard !snapshot.paused, !hasOSPermissionWait(session.id), systemSafetyStates[session.id]?.notice.isPending != true,
+              let raw = remoteFrames[session.id]?.raw else { return nil }
+        if let prompt = PromptDetector.detect(raw, agent: session.agent),
+           Self.screenApprovalRisk(prompt, agent: session.agent, cwd: session.cwd) != nil { return nil }
+        return TerminalChoiceQuestion.detectPermission(raw, agent: session.agent)
     }
 
     /// Turns on automatic approval for a group worker. The global pause stays
@@ -2478,7 +2690,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull()]
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "다른 도구의 구성원은 표시만 합니다. 같은 도구의 메시지 수신 가능 여부와 실제 주소는 각 도구에서 확인하세요. 그룹장이 있는 그룹은 get_group_status와 assign_group_task로 작업을 지시하세요."]
+                    "message": "그룹장이 있는 그룹에서는 작업 지시와 답변을 각 도구의 메시지 기능으로 보내지 말고 get_group_status, assign_group_task, answer_group_question을 사용하세요. AutoApprove가 사용자의 위임 사실을 함께 전달합니다. 그룹장이 없는 그룹에서 다른 도구의 구성원은 표시만 하며, 같은 도구의 메시지 수신 가능 여부와 실제 주소는 각 도구에서 확인하세요."]
         case "get_group_status":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
@@ -2568,24 +2780,31 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard question.options.indices.contains(choice - 1) else {
                 throw RemoteHTTPError(400, "선택지 번호는 1~\(question.options.count) 중에서 지정해주세요.")
             }
-            // Permission prompts never reach this path: they are not choice questions, and the worker must still be asking.
-            guard current.phase == .input else {
+            // The worker must still be asking. A permission answer is the user's delegated approval.
+            guard current.phase == (question.isPermission ? .approval : .input) else {
                 var state = try groupOrchestration(); state.clearQuestion(item.id); try saveGroupOrchestration(state)
-                throw RemoteHTTPError(409, "작업자가 더 이상 질문을 기다리지 않습니다. get_group_status로 현재 상태를 확인해주세요.")
+                throw RemoteHTTPError(409, "작업자가 더 이상 답을 기다리지 않습니다. get_group_status로 현재 상태를 확인해주세요.")
+            }
+            if question.isPermission, snapshot.paused {
+                throw RemoteHTTPError(409, "자동 승인이 전체 일시정지 중이라 위임 승인을 하지 않습니다. 사용자가 재개한 뒤 다시 답하세요.")
             }
             let frame = try await remoteTerminal(sessionID: worker.id, realtime: true)
-            guard let live = frame.question, live.id == question.id, live.options == question.options else {
+            let fresh = question.isPermission ? delegablePermission(sessions[worker.id] ?? current) : frame.question
+            guard let live = fresh, live.id == question.id, live.options == question.options else {
                 var state = try groupOrchestration(); state.clearQuestion(item.id); try saveGroupOrchestration(state)
                 throw RemoteHTTPError(409, "작업자의 질문이 바뀌어 답하지 않았습니다. 새 질문은 다시 보고됩니다.")
             }
             let answer = question.options[choice - 1]
-            _ = try await replyTerminalQuestion(current, object: ["questionID": question.id, "revision": frame.revision, "choice": choice - 1])
+            _ = try await replyTerminalQuestion(current, object: ["questionID": question.id, "revision": frame.revision, "choice": choice - 1],
+                                                permission: question.isPermission)
             var state = try groupOrchestration(); state.clearQuestion(item.id); try saveGroupOrchestration(state)
             groupQuestionSeen[item.id] = nil
-            log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(item.shortID)", outcome: "그룹 질문 답변",
+            log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(item.shortID)",
+                           outcome: question.isPermission ? "그룹장 위임 승인" : "그룹 질문 답변",
                            source: "세션 그룹", tool: "answer_group_question", request: question.text, answer: answer))
-            return ["taskID": item.id.uuidString, "answer": answer,
-                    "message": "작업자의 질문에서 ‘\(answer)’를 선택했습니다. 작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
+            return ["taskID": item.id.uuidString, "answer": answer, "permission": question.isPermission,
+                    "message": (question.isPermission ? "사용자가 위임한 권한 승인에서" : "작업자의 질문에서") +
+                        " ‘\(answer)’를 선택했습니다. 작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
         case "ask_user":
             guard webStatus.ready else { throw RemoteHTTPError(409, "Mac에서 AutoApprove 웹 접속을 켠 뒤 질문을 게시해주세요.") }
             var params = object
@@ -3262,7 +3481,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var ranks: [String: Int] = [:]
         ranks.reserveCapacity(sessionOrder.count)
         for (rank, id) in sessionOrder.enumerated() { ranks[id] = rank }
-        let rows = presentedSessions().map(projectCodexActivity)
+        let rows = presentedSessions().map(projectCodexActivity).map(projectSessionGroup)
         var projects: [String: String] = [:]
         for row in rows where ranks[row.id] == nil { projects[row.id] = row.project }
         let precedes: (AgentSession, AgentSession) -> Bool = {
@@ -3823,11 +4042,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return ["ok":true,"count":ids.count,"message":restore ? "지난 질문을 다시 표시합니다. 다음 질문 조회에 반영됩니다.":"지난 질문을 정리했습니다. 원본 대화와 대기 입력은 유지됩니다."]
     }
 
-    private func replyTerminalQuestion(_ session: AgentSession, object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)? = nil) async throws -> JSONObject {
+    private func replyTerminalQuestion(_ session: AgentSession, object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)? = nil,
+                                       permission: Bool = false) async throws -> JSONObject {
+        func detect(_ raw: String) -> TerminalChoiceQuestion? {
+            permission ? TerminalChoiceQuestion.detectPermission(raw, agent: session.agent) : TerminalChoiceQuestion.detect(raw, agent: session.agent)
+        }
         guard let questionID = object["questionID"] as? String, let revision = object["revision"] as? String,
               let index = object["choice"] as? Int,
               let observed = remoteFrames[session.id], observed.frame.revision == revision,
-              let question = TerminalChoiceQuestion.detect(observed.raw, agent: session.agent),
+              let question = detect(observed.raw),
               question.id == questionID, question.options.indices.contains(index) else {
             throw RemoteHTTPError(409, "질문이나 선택지가 바뀌었습니다. 현재 질문을 확인해주세요.", diagnostics: ["delivery": "not_started"])
         }
@@ -3844,7 +4067,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         do {
             let frame = try await remoteTerminal(sessionID: session.id, realtime: true)
-            guard frame.revision == revision, let current = frame.question, current.id == questionID,
+            let live = permission ? remoteFrames[session.id].flatMap { detect($0.raw) } : frame.question
+            guard frame.revision == revision, let current = live, current.id == questionID,
                   frame.keys.contains("choice"), frame.inputReason == nil else {
                 throw RemoteHTTPError(409, "질문이나 입력 연결이 바뀌었습니다. 현재 질문을 확인해주세요.", diagnostics: ["delivery": "not_started"])
             }
@@ -3853,6 +4077,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                      "kind": "choice", "text": current.command(for: index)]
             if session.terminal == .orca, let stream = frame.streamID { input["relay"] = true; input["streamID"] = stream }
             attempted = true
+            if permission { delegatedPermissionInputs.insert(session.id) }
+            defer { delegatedPermissionInputs.remove(session.id) }
             if let automaticAuthorization { _ = try await remoteInput(input, automaticAuthorization: automaticAuthorization) }
             else { _ = try await remoteInput(input) }
             let message = "같은 원본 터미널에서 ‘\(question.options[index])’를 선택했습니다."
@@ -4274,6 +4500,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         for id in Array(exitRecoveries.keys) where sessions[id]?.phase == .ended {
             advanceExitRecovery(id, records: records, byPID: &recoveryProcesses)
+        }
+        // Conversation identities can change without a new process, so also recheck every minute.
+        let groupCandidates = Set(sessions.values.lazy.filter { $0.phase != .ended }.map(\.id))
+        if groupCandidates != groupBadgeSessionIDs || Date().timeIntervalSince(groupBadgeRefreshedAt) >= 60 {
+            groupBadgeSessionIDs = groupCandidates
+            refreshSessionGroupBadges()
         }
         publish()
     }
@@ -4990,7 +5222,36 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[key] = session
         if session.interruption != nil { persistInterruption(key) }
         snapshot.health.claude = "연결됨 · 세션 이벤트 수신 중"; publish()
+        if event == "UserPromptSubmit", let context = groupDelegationContext(sessionID: key, prompt: payload["prompt"] as? String) {
+            response["hookSpecificOutput"] = ["hookEventName": "UserPromptSubmit", "additionalContext": context]
+        }
         return response
+    }
+
+    /// The user's own hook tells Claude that the group's decisions were delegated to the assigning session.
+    /// It is added only to prompts AutoApprove itself just typed: the worker's current task, or the reports
+    /// and requests it just delivered to the assigning session. Other prompts get nothing.
+    private func groupDelegationContext(sessionID: String, prompt: String?, at now: Date = Date()) -> String? {
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines), prompt.hasPrefix("[AutoApprove 그룹 "),
+              let state = try? groupOrchestration() else { return nil }
+        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
+        func title(_ group: UUID, _ member: UUID) -> String {
+            let value = SessionGroupOrchestration.oneLine(groups.first { $0.id == group }?.members.first { $0.id == member }?.title ?? "")
+            return value.isEmpty ? "그룹장" : value
+        }
+        func groupName(_ id: UUID) -> String { groups.first { $0.id == id }?.name ?? "세션 그룹" }
+        if let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working }),
+           prompt.hasPrefix("[AutoApprove 그룹 작업 \(task.shortID)"), now.timeIntervalSince(task.sentAt) < 600 {
+            return SessionGroupOrchestration.workerDelegation(group: groupName(task.groupID), parent: title(task.groupID, task.parentMemberID))
+        }
+        let delivered = state.assignments.filter { item in
+            item.parentSessionID == sessionID && [item.reportedAt, item.question?.reportedAt].contains { $0.map { now.timeIntervalSince($0) < 600 } == true }
+        }
+        if prompt.hasPrefix("[AutoApprove 그룹 보고") || prompt.hasPrefix("[AutoApprove 그룹 질문") || prompt.hasPrefix("[AutoApprove 그룹 승인 요청"),
+           let item = delivered.first {
+            return SessionGroupOrchestration.parentDelegation(group: groupName(item.groupID))
+        }
+        return nil
     }
 
     private func rememberHook(_ fingerprint: String) -> Bool {

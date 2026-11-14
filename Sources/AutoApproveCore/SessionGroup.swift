@@ -270,3 +270,131 @@ public struct SessionGroupStore {
         try TerminalProfileStore.write(data, to: file)
     }
 }
+
+/// How a live session takes part in a session group, shown in session lists.
+public struct SessionGroupBadge: Codable, Equatable, Sendable {
+    public enum Role: String, Codable, Sendable {
+        case leader
+        case member
+        /// The group has no leader, so its members are not ranked.
+        case unranked
+    }
+    public enum TaskState: String, Codable, Sendable {
+        case working
+        /// The worker stopped on a choice question its parent has to answer.
+        case question
+        /// The worker stopped on a permission prompt delegated to its parent.
+        case approval
+        /// The worker finished and its report has not reached the parent yet.
+        case reporting
+    }
+
+    public var groupID: UUID
+    public var groupName: String
+    public var memberID: UUID
+    public var role: Role
+    public var depth: Int
+    public var parentTitle: String?
+    /// The member that directs this one, for nesting rows in session lists.
+    public var parentMemberID: UUID?
+    public var childCount: Int
+    /// Other groups this session also belongs to; only one badge is shown.
+    public var otherGroupCount: Int
+    public var task: TaskState?
+    /// Reports and questions from this member's workers that have not reached it yet.
+    public var pendingReports: Int
+
+    public init(groupID: UUID, groupName: String, memberID: UUID, role: Role, depth: Int = 0, parentTitle: String? = nil,
+                parentMemberID: UUID? = nil, childCount: Int = 0, otherGroupCount: Int = 0, task: TaskState? = nil, pendingReports: Int = 0) {
+        self.groupID = groupID; self.groupName = groupName; self.memberID = memberID; self.role = role; self.depth = depth
+        self.parentTitle = parentTitle; self.parentMemberID = parentMemberID; self.childCount = childCount; self.otherGroupCount = otherGroupCount
+        self.task = task; self.pendingReports = pendingReports
+    }
+
+    /// One badge per live session. A session in several groups shows the group where it leads,
+    /// then where it works for a parent, then a group without a leader.
+    public static func badges(groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [String: SessionGroupBadge] {
+        var candidates: [String: [SessionGroupBadge]] = [:]
+        for group in groups {
+            let depths = Dictionary(group.treeOrder.map { ($0.member.id, $0.depth) }, uniquingKeysWith: { first, _ in first })
+            for member in group.members {
+                guard let session = SessionGroupMatching.match(member, in: live) else { continue }
+                let role: Role = group.leaderMemberID == nil ? .unranked : group.leaderMemberID == member.id ? .leader : .member
+                let parent = group.parentID(of: member.id).flatMap { id in group.members.first { $0.id == id } }
+                candidates[session.id, default: []].append(SessionGroupBadge(
+                    groupID: group.id, groupName: group.name, memberID: member.id, role: role,
+                    depth: role == .unranked ? 0 : depths[member.id] ?? 0, parentTitle: parent?.title,
+                    parentMemberID: role == .unranked ? nil : parent?.id,
+                    childCount: role == .unranked ? 0 : group.children(of: member.id).count))
+            }
+        }
+        let rank: [Role: Int] = [.leader: 0, .member: 1, .unranked: 2]
+        return candidates.compactMapValues { values in
+            guard var best = values.sorted(by: {
+                rank[$0.role]! != rank[$1.role]! ? rank[$0.role]! < rank[$1.role]!
+                    : $0.groupName.localizedStandardCompare($1.groupName) == .orderedAscending
+            }).first else { return nil }
+            best.otherGroupCount = values.count - 1
+            return best
+        }
+    }
+}
+
+/// Session list rows arranged by group: each group holds its leader and members as a tree,
+/// and sessions outside every group stay a flat, reorderable list.
+public struct SessionListTree: Equatable {
+    public struct Node: Identifiable, Equatable {
+        public var session: AgentSession
+        public var children: [Node]
+        public var id: String { session.id }
+        /// Expansion key: one member of one group.
+        public var key: String { session.sessionGroup.map { "member:\($0.groupID.uuidString):\($0.memberID.uuidString)" } ?? session.id }
+    }
+    public struct Group: Identifiable, Equatable {
+        public var groupID: UUID
+        public var name: String
+        public var hasLeader: Bool
+        public var roots: [Node]
+        public var sessionCount: Int
+        /// Members waiting for a person or a parent, so a collapsed group still shows them.
+        public var attentionCount: Int
+        public var id: String { "group:" + groupID.uuidString }
+    }
+    public var groups: [Group]
+    public var ungrouped: [AgentSession]
+
+    /// Keeps the given order. A member whose parent is not in the list becomes a root of its group,
+    /// with the leader first.
+    public static func build(_ sessions: [AgentSession]) -> SessionListTree {
+        var order: [UUID] = [], grouped: [UUID: [AgentSession]] = [:], ungrouped: [AgentSession] = []
+        for session in sessions {
+            guard let badge = session.sessionGroup else { ungrouped.append(session); continue }
+            if grouped[badge.groupID] == nil { order.append(badge.groupID) }
+            grouped[badge.groupID, default: []].append(session)
+        }
+        let groups = order.map { id -> Group in
+            let members = grouped[id] ?? []
+            let present = Set(members.compactMap { $0.sessionGroup?.memberID })
+            var children: [UUID: [AgentSession]] = [:], roots: [AgentSession] = []
+            for session in members {
+                if let parent = session.sessionGroup?.parentMemberID, present.contains(parent), parent != session.sessionGroup?.memberID {
+                    children[parent, default: []].append(session)
+                } else { roots.append(session) }
+            }
+            roots = roots.filter { $0.sessionGroup?.role == .leader } + roots.filter { $0.sessionGroup?.role != .leader }
+            var visited = Set<UUID>()
+            // Each member appears once, even when saved parents form a loop.
+            func node(_ session: AgentSession) -> Node? {
+                guard let member = session.sessionGroup?.memberID, visited.insert(member).inserted else { return nil }
+                return Node(session: session, children: (children[member] ?? []).compactMap(node))
+            }
+            var built = roots.compactMap(node)
+            // A broken parent chain must not hide a session: anything not reached is added as a root.
+            for session in members where !visited.contains(session.sessionGroup!.memberID) { if let root = node(session) { built.append(root) } }
+            let first = members[0].sessionGroup!
+            return Group(groupID: id, name: first.groupName, hasLeader: first.role != .unranked, roots: built, sessionCount: members.count,
+                         attentionCount: members.filter { $0.needsReview || [.question, .approval].contains($0.sessionGroup?.task) }.count)
+        }
+        return SessionListTree(groups: groups, ungrouped: ungrouped)
+    }
+}

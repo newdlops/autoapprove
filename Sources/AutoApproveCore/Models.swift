@@ -149,6 +149,8 @@ public struct AgentSession: Identifiable, Codable, Equatable {
     public var codexProgressRecovery:CodexProgressRecovery?
     public var osPermissionPolicy:OSPermissionPolicy?
     public var osPermissionWaiting:Bool?
+    /// Set only on published rows; the engine keeps group membership separately.
+    public var sessionGroup: SessionGroupBadge?
     public var questions: [QueuedQuestion] { queuedQuestions ?? [] }
     public var unansweredQuestions: [QueuedQuestion] { questions.filter(\.needsAnswer) }
     public var isMonitoring: Bool { phase == .idle && backgroundMonitoring == true }
@@ -321,6 +323,8 @@ public struct EngineSnapshot: Codable {
     /// Optional for compatibility with clients predating the independent mouse signal setting.
     public var mouseActivity: MouseActivityStatus?
     public var codexProgressRecoveryEnabled:Bool?
+    /// The latest "restart sessions" request, until the user dismisses it.
+    public var sessionRestart: SessionRestartProgress?
     public var osPermissions:OSPermissionMonitorStatus?
     public var questionNotificationDelay: Int {
         guard let value = questionNotificationDelaySeconds, Self.questionNotificationDelayRange.contains(value) else { return 10 }

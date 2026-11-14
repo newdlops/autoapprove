@@ -128,6 +128,20 @@ main { max-width: 1440px; margin: auto; padding: 24px max(24px, env(safe-area-in
 .session-row[aria-pressed=true] { background: var(--selected); border-color: var(--blue); }
 .row-project { display: block; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
 .row-title { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
+.group-header { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: transparent; color: var(--fg); padding: 10px 12px; margin-top: 6px; font-size: 14px; font-weight: 600; }
+.group-header:hover { background: var(--subtle); filter: none; }
+.group-caret { flex: none; width: 16px; color: var(--muted); font-size: 16px; }
+.group-name { min-width: 0; overflow-wrap: anywhere; }
+.group-count { flex: none; color: var(--muted); font-size: 12px; font-weight: 400; }
+.group-attention { flex: none; color: var(--orange); font-size: 12px; font-weight: 500; }
+.tree-row { display: flex; align-items: flex-start; padding-left: calc((var(--depth) - 1) * 16px); }
+.tree-row .session-row { flex: 1; min-width: 0; }
+.tree-toggle { flex: none; width: 28px; min-height: 44px; margin-top: 3px; padding: 0; background: transparent; color: var(--muted); font-size: 16px; }
+.tree-toggle:hover { background: var(--subtle); filter: none; }
+.row-group { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 12px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
+.row-group > span { min-width: 0; overflow-wrap: anywhere; }
+.row-group[data-role=leader] .row-group-name { color: var(--orange); font-weight: 600; }
+.row-group-task[data-task=question], .row-group-task[data-task=approval] { color: var(--orange); }
 .row-meta { display: block; font-size: 12px; color: var(--muted); margin-top: 8px; overflow-wrap: anywhere; }
 .row-state { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; margin-top: 6px; }
 .row-auto { color: var(--muted); }

@@ -24,6 +24,10 @@ import AutoApproveCore
     @State private var openingTerminal = false
     @State private var editingSession: AgentSession?
     @State private var showing = false
+    /// Collapsed group and member rows, kept across launches. Everything starts expanded.
+    @AppStorage("sessionListCollapsed") private var collapsedRows = ""
+    @State private var confirmingRestart: [String]?
+    @State private var showingRestartDetails = false
     private var liveQuestionIDs: Set<QuestionReplyKey> {
         Set(engine.snapshot.sessions.filter { $0.phase != .ended }.flatMap { session in
             session.questions.map { QuestionReplyKey(sessionID: session.id, questionID: $0.id) }
@@ -104,6 +108,7 @@ import AutoApproveCore
                         .help(AppHelp.connections)
                 }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10).background(Color.orange.opacity(0.10))
             }
+            if let progress = engine.snapshot.sessionRestart { restartBanner(progress) }
             if engine.snapshot.paused {
                 HStack(spacing: 8) {
                     Image(systemName: "pause.circle.fill")
@@ -164,17 +169,20 @@ import AutoApproveCore
                                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        let displayed = visible
+                        let tree = SessionListTree.build(visible)
+                        let displayed = tree.ungrouped
                         List(selection: $selection) {
-                            ForEach(displayed) { session in
-                                SessionRow(session: session, paused: engine.snapshot.paused, selected: selection.contains(session.id),
-                                    setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
-                                    reveal: { reveal(session) })
-                                    .tag(session.id)
-                                    .padding(.vertical, 6)
-                                    .help("드래그하면 목록 순서를 바꿉니다.\n" + (session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false)))
-                            }.onMove { offsets, destination in
-                                perform { try engine.moveSessions(fromOffsets: offsets, toOffset: destination, visibleIDs: displayed.map(\.id)) }
+                            if tree.groups.isEmpty {
+                                ungroupedRows(displayed)
+                            } else {
+                                Section("세션 그룹") {
+                                    ForEach(tree.groups) { group in
+                                        DisclosureGroup(isExpanded: expansion(group.id)) { treeRows(group.roots) } label: {
+                                            SessionGroupHeader(group: group, expanded: !collapsed.contains(group.id))
+                                        }
+                                    }
+                                }
+                                if !displayed.isEmpty { Section("그룹 밖 세션") { ungroupedRows(displayed) } }
                             }
                         }.listStyle(.inset)
                         .contextMenu(forSelectionType: String.self) { ids in
@@ -182,6 +190,9 @@ import AutoApproveCore
                                 Button("터미널 열기") { reveal(session) }
                                     .disabled(!session.canReveal || openingTerminal)
                                     .help(AppHelp.reveal(session, opening: openingTerminal))
+                                Button("이 세션 다시 시작", systemImage: "arrow.triangle.2.circlepath") { confirmingRestart = [session.id] }
+                                    .disabled(restartableIDs([session]).isEmpty)
+                                    .help("원래 터미널에서 CLI를 종료하고 같은 대화를 다시 엽니다. 작업 중이면 작업이 끝난 뒤 다시 시작합니다.")
                                 Button("표시 이름·메모·색상 편집", systemImage: "pencil") { editingSession = session }
                                     .help("이 세션의 표시 이름, 메모와 식별 색상을 편집합니다.")
                                 Button("알림 읽음으로 표시", systemImage: "checkmark.circle") {
@@ -218,6 +229,85 @@ import AutoApproveCore
             }
         }
     }
+    private func restartableIDs(_ sessions: [AgentSession]) -> [String] {
+        let running = Set(engine.snapshot.sessionRestart?.items.filter { !$0.phase.isFinished }.map(\.id) ?? [])
+        return sessions.filter { ($0.agent == .claude || $0.agent == .codex) && $0.phase != .ended && !running.contains($0.id) }.map(\.id)
+    }
+    private var restartTitle: String { (confirmingRestart?.count ?? 0) == 1 ? "이 세션을 다시 시작할까요?" : "세션 \(confirmingRestart?.count ?? 0)개를 다시 시작할까요?" }
+    private var restartMessage: String {
+        let chosen = engine.snapshot.sessions.filter { confirmingRestart?.contains($0.id) == true }
+        let supported: Set<TerminalKind> = [.terminal, .iterm, .pty]
+        let now = chosen.filter { supported.contains($0.terminal) && $0.phase == .idle }.count
+        let later = chosen.filter { supported.contains($0.terminal) && $0.phase != .idle }.count
+        let unsupported = chosen.count - now - later
+        var lines = ["원래 터미널에서 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다."]
+        if now > 0 { lines.append("지금 다시 시작: \(now)개") }
+        if later > 0 { lines.append("작업이 끝나고 입력창이 비면 다시 시작: \(later)개 (최대 30분 대기)") }
+        if unsupported > 0 { lines.append("지원하지 않는 터미널이라 건너뜀: \(unsupported)개 (tmux, Orca, VS Code)") }
+        return lines.joined(separator: "\n")
+    }
+    @ViewBuilder private func restartBanner(_ progress: SessionRestartProgress) -> some View {
+        let done = progress.count(.done), failed = progress.count(.failed), cancelled = progress.count(.cancelled)
+        let waiting = progress.count(.waiting), working = progress.items.count - done - failed - cancelled - waiting
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if progress.isActive { ProgressView().controlSize(.small) } else {
+                    Image(systemName: failed > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle.fill").foregroundStyle(failed > 0 ? .orange : .green)
+                }
+                Text(progress.isActive ? "세션 다시 시작 중" : failed == 0 ? "세션 다시 시작 완료" : "세션 다시 시작 결과").font(.callout.weight(.semibold))
+                Text(["완료 \(done)", working > 0 ? "진행 \(working)" : nil, waiting > 0 ? "작업 끝나길 기다림 \(waiting)" : nil,
+                      failed > 0 ? "실패 \(failed)" : nil, cancelled > 0 ? "취소 \(cancelled)" : nil].compactMap { $0 }.joined(separator: " · "))
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button(showingRestartDetails ? "접기" : "자세히") { showingRestartDetails.toggle() }.buttonStyle(.borderless)
+                if waiting > 0 { Button("대기 취소") { engine.cancelSessionRestarts() }.help("아직 종료하지 않은 세션의 다시 시작을 취소합니다.") }
+                if !progress.isActive { Button("닫기") { engine.dismissSessionRestarts(); showingRestartDetails = false } }
+            }
+            if showingRestartDetails {
+                ForEach(progress.items) { item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: item.phase == .done ? "checkmark.circle" : item.phase == .failed ? "exclamationmark.triangle"
+                              : item.phase == .cancelled ? "xmark.circle" : "clock").foregroundStyle(item.phase == .failed ? .orange : .secondary)
+                        Text(item.title).font(.caption.weight(.medium)).lineLimit(1).frame(maxWidth: 200, alignment: .leading)
+                        Text(item.message).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    }
+                }
+            }
+        }.padding(.horizontal, 20).padding(.vertical, 10).background((failed > 0 ? Color.orange : Color.accentColor).opacity(0.08))
+    }
+    private var collapsed: Set<String> { Set(collapsedRows.split(separator: "\n").map(String.init)) }
+    private func expansion(_ key: String) -> Binding<Bool> {
+        Binding(get: { !collapsed.contains(key) }, set: { open in
+            var next = collapsed
+            if open { next.remove(key) } else { next.insert(key) }
+            collapsedRows = next.sorted().joined(separator: "\n")
+        })
+    }
+    private func sessionRow(_ session: AgentSession, grouped: Bool) -> some View {
+        SessionRow(session: session, paused: engine.snapshot.paused, selected: selection.contains(session.id),
+            setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
+            reveal: { reveal(session) })
+            .tag(session.id)
+            .padding(.vertical, 6)
+            .help((grouped ? "그룹 안의 순서는 상위 구성원 관계를 따릅니다. 세션 그룹 창에서 바꿀 수 있습니다.\n" : "드래그하면 목록 순서를 바꿉니다.\n")
+                + (session.canReveal ? "더블클릭하면 이 터미널을 열고 강조합니다." : AppHelp.reveal(session, opening: false)))
+    }
+    private func ungroupedRows(_ displayed: [AgentSession]) -> some View {
+        ForEach(displayed) { session in sessionRow(session, grouped: false) }
+            .onMove { offsets, destination in
+                perform { try engine.moveSessions(fromOffsets: offsets, toOffset: destination, visibleIDs: displayed.map(\.id)) }
+            }
+    }
+    /// A member with members of its own can be collapsed like its group.
+    private func treeRows(_ nodes: [SessionListTree.Node]) -> AnyView {
+        AnyView(ForEach(nodes) { node in
+            if node.children.isEmpty {
+                sessionRow(node.session, grouped: true)
+            } else {
+                DisclosureGroup(isExpanded: expansion(node.key)) { treeRows(node.children) } label: { sessionRow(node.session, grouped: true) }
+            }
+        })
+    }
     private var windowContent: some View {
         content.frame(minWidth: 780, minHeight: 560)
         .windowUpdates(viewUpdates, sources: [
@@ -240,6 +330,10 @@ import AutoApproveCore
                     .help("창별 대화를 이름 있는 여러 프로필 파일로 저장하고 재부팅 후 복원합니다.")
                 Button {openWindow(id:"session-groups")} label: {Label("세션 그룹",systemImage:"person.2")}
                     .help("Codex와 Claude Code 세션을 그룹으로 묶고 구성원을 관리합니다.")
+                Button { confirmingRestart = restartableIDs(engine.snapshot.sessions) } label: {
+                    Label("세션 다시 시작", systemImage: "arrow.triangle.2.circlepath")
+                }.disabled(restartableIDs(engine.snapshot.sessions).isEmpty)
+                    .help("모든 Claude Code·Codex 세션을 원래 터미널에서 종료하고 같은 대화로 다시 엽니다. 새 MCP 도구와 설정을 적용할 때 씁니다. 작업 중인 세션은 작업이 끝난 뒤 다시 시작합니다.")
                 Button {
                     do { allAutomationResetMessage = try engine.resetAllAutomation().message }
                     catch { self.error = error.localizedDescription }
@@ -257,6 +351,11 @@ import AutoApproveCore
                 }.help(AppHelp.pause(engine.snapshot.paused))
             }
         }
+        .confirmationDialog(restartTitle, isPresented: Binding(get: { confirmingRestart != nil }, set: { if !$0 { confirmingRestart = nil } }),
+                            titleVisibility: .visible) {
+            Button("다시 시작") { if let ids = confirmingRestart { engine.restartSessions(ids) }; confirmingRestart = nil }
+            Button("취소", role: .cancel) { confirmingRestart = nil }
+        } message: { Text(restartMessage) }
         .alert("요청을 처리하지 못했습니다", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("확인") { error = nil }
                 .help("오류 안내를 닫고 세션 목록으로 돌아갑니다.")
@@ -440,6 +539,7 @@ private struct SessionRowDisplay: View, Equatable {
                         .lineLimit(1)
                 }.foregroundStyle(.secondary)
                     .help(session.displayedTerminalTitle)
+                if let badge = session.sessionGroup { SessionGroupBadgeLabel(badge: badge, selected: selected) }
                 if let note = session.customization?.note, !note.isEmpty {
                     Label(note, systemImage: "note.text").font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).help(note)
@@ -476,6 +576,86 @@ private struct SessionRowDisplay: View, Equatable {
             }
         }.accessibilityElement(children: .contain)
             .accessibilityAction(named: Text("터미널 열기")) { actions.reveal() }
+    }
+}
+
+/// The collapsible row of one session group. A collapsed group still shows members that need attention.
+private struct SessionGroupHeader: View {
+    let group: SessionListTree.Group
+    let expanded: Bool
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(group.name, systemImage: group.hasLeader ? "person.3.sequence" : "person.2")
+                .font(.callout.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+            Text("\(group.sessionCount)개").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            if group.attentionCount > 0 {
+                Label("확인 필요 \(group.attentionCount)", systemImage: "hand.raised").font(.caption.weight(.medium)).foregroundStyle(.orange).fixedSize()
+            }
+            Spacer(minLength: 0)
+        }.padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityHint(expanded ? "접으면 구성원 행을 숨깁니다." : "펼치면 구성원 행을 보여 줍니다.")
+            .help((group.hasLeader ? "그룹장 아래에 지시를 받는 구성원을 들여 써서 보여 줍니다." : "그룹장이 없는 그룹입니다.")
+                + " 접어도 확인이 필요한 구성원 수는 계속 보입니다.")
+    }
+}
+
+/// Tells the group leader apart from the members it directs, and shows a member's group task.
+struct SessionGroupBadgeLabel: View {
+    let badge: SessionGroupBadge
+    var selected = false
+    private var title: String {
+        var text: String
+        switch badge.role {
+        case .leader: text = "그룹장 · \(badge.groupName)" + (badge.childCount > 0 ? " · 하위 \(badge.childCount)개" : "")
+        case .member: text = "\(badge.groupName) · 지시: \(badge.parentTitle ?? "그룹장")"
+        case .unranked: text = badge.groupName
+        }
+        if badge.otherGroupCount > 0 { text += " 외 \(badge.otherGroupCount)개 그룹" }
+        return text
+    }
+    private var symbol: String {
+        switch badge.role { case .leader: "crown.fill"; case .member: "arrow.turn.down.right"; case .unranked: "person.2" }
+    }
+    private var task: (title: String, symbol: String, attention: Bool)? {
+        switch badge.task {
+        case .working: ("그룹 작업 중", "hourglass", false)
+        case .question: ("질문 대기", "questionmark.bubble", true)
+        case .approval: ("승인 대기", "hand.raised", true)
+        case .reporting: ("보고 전달 대기", "paperplane", false)
+        case nil: nil
+        }
+    }
+    private var help: String {
+        var lines: [String]
+        switch badge.role {
+        case .leader: lines = ["‘\(badge.groupName)’ 그룹의 그룹장입니다. 직속 구성원 \(badge.childCount)개에게 작업을 지시합니다."]
+        case .member: lines = ["‘\(badge.groupName)’ 그룹의 구성원입니다. ‘\(badge.parentTitle ?? "그룹장")’ 세션이 작업을 지시합니다."]
+        case .unranked: lines = ["‘\(badge.groupName)’ 그룹의 구성원입니다. 이 그룹에는 그룹장이 없습니다."]
+        }
+        if let task {
+            lines.append(task.title + (badge.task == .question ? ": 지시한 세션이 선택지를 골라 답해야 합니다."
+                : badge.task == .approval ? ": 사용자가 위임한 승인입니다. 지시한 세션이 선택하면 사용자 승인으로 처리합니다." : ""))
+        }
+        if badge.pendingReports > 0 { lines.append("하위 구성원의 보고와 질문 \(badge.pendingReports)건이 이 세션의 터미널 입력을 기다립니다.") }
+        if badge.otherGroupCount > 0 { lines.append("다른 그룹 \(badge.otherGroupCount)개에도 속해 있습니다. 세션 그룹 창에서 확인하세요.") }
+        return lines.joined(separator: "\n")
+    }
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: symbol)
+                .font(.caption.weight(badge.role == .leader ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : badge.role == .leader ? Color.orange : Color.secondary)
+                .lineLimit(1).truncationMode(.middle)
+            if let task {
+                Label(task.title, systemImage: task.symbol).font(.caption).fixedSize()
+                    .foregroundStyle(selected ? Color.primary : task.attention ? Color.orange : Color.secondary)
+            }
+            if badge.pendingReports > 0 {
+                Label("보고 \(badge.pendingReports)건", systemImage: "tray.and.arrow.down").font(.caption.monospacedDigit()).fixedSize()
+                    .foregroundStyle(selected ? Color.primary : Color.secondary)
+            }
+        }.help(help).accessibilityElement(children: .combine)
     }
 }
 

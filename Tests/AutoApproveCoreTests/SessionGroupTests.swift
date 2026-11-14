@@ -375,6 +375,12 @@ extension ApprovalTests {
         try expect(writer.writes[0].contains("빌드를 확인하세요"))
         let again = try await assign("다시 확인하세요")
         try expectEqual(again["automaticApproval"] as? String, "already")
+        engine.refreshSessionGroupBadges()
+        func badge(_ id: String) -> SessionGroupBadge? { engine.snapshot.sessions.first { $0.id == id }?.sessionGroup }
+        try expect(try await waitForGroup(5) { badge(leader.id) != nil && badge(worker.id) != nil }, "Session list rows must show group roles")
+        try expectEqual(badge(leader.id)?.role, .leader); try expectEqual(badge(leader.id)?.childCount, 1)
+        try expectEqual(badge(worker.id)?.role, .member); try expectEqual(badge(worker.id)?.task, .working)
+        try expectEqual(badge(worker.id)?.parentTitle, leaderMember.title)
 
         try engine.setPaused(true); defer { try? engine.setPaused(false) }
         let paused = try await assign("일시정지 중 작업")
@@ -427,15 +433,21 @@ extension ApprovalTests {
         writer.show("결과 정리\n\n❯ Try “다음 작업”\n? for shortcuts", on: leaderTTY)
         try expect(try await waitForGroup(10) { await engine.refreshScreens(); return phase(leader.id) == .idle }, "The parent must be idle to receive reports")
 
-        // A permission prompt is never sent to the parent, even after the grace period.
+        // Any other permission prompt is delegated: the parent's choice counts as the user's approval.
         writer.show("Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
-        try expect(try await waitForGroup(10) {
+        let delegated = try await waitForGroup(20) {
             await engine.refreshScreens()
-            return phase(worker.id) == .approval
-        }, "The worker must be waiting on the permission prompt")
+            return writer.writes(to: leaderTTY).contains { $0.contains("[AutoApprove 그룹 승인 요청") }
+        }
+        try expect(delegated, "The worker's permission prompt must reach the parent")
+        let request = try unwrapGroup(writer.writes(to: leaderTTY).first { $0.contains("[AutoApprove 그룹 승인 요청") })
+        try expect(request.contains("echo fixture") && request.contains("1) Yes") && request.contains("사용자 승인으로 처리"))
+        let beforeApproval = writer.writes(to: workerTTY).count
+        let approved = try await call("answer_group_question", from: leader.id, ["choice": 1])
+        try expectEqual(approved["permission"] as? Bool, true)
+        try expectEqual(writer.writes(to: workerTTY).count, beforeApproval + 1)
         try await Task.sleep(for: .seconds(4.5))
-        try expect(writer.writes(to: leaderTTY).isEmpty, "A permission prompt must not reach the parent")
-        try expect(try await question() == nil)
+        try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "An answered request is not reported again")
 
         writer.show("어느 환경에 배포할까요?\n\n❯ 1. 개발\n  2. 운영\n  3. 둘 다\n\nEnter to select", on: workerTTY)
         let reported = try await waitForGroup(20) {
@@ -458,5 +470,76 @@ extension ApprovalTests {
         try expect(try await question() == nil)
         do { _ = try await call("answer_group_question", from: leader.id, ["choice": 2]); throw AppError.message("An answered question accepted a second answer") }
         catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+
+        // A system change that AutoApprove never approves in the app is not delegated to the parent.
+        // The command is assembled so that this source text is not itself a system change request.
+        let persistence = "launch" + "ctl bootstrap gui/501 /fixture/test.plist"
+        writer.show("Do you want to proceed?\n$ \(persistence)\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
+        try expect(try await waitForGroup(10) {
+            await engine.refreshScreens()
+            return phase(worker.id) == .approval
+        }, "The worker must be waiting on the permission prompt")
+        try await Task.sleep(for: .seconds(4.5))
+        try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "A system change must stay with the user")
+    }
+
+    func testSessionGroupBadgesForSessionLists() throws {
+        func live(_ pid: Int32, _ agent: AgentKind = .claude) -> SessionGroupLiveSession {
+            let session = AgentSession(id: "process:\(pid):start", agent: agent, pid: pid, started: "start", tty: "/dev/ttys\(pid)", cwd: "/tmp/badge", terminal: .terminal)
+            return SessionGroupLiveSession(session: session, conversationID: UUID().uuidString, providerHome: "/tmp/home")
+        }
+        let sessions = [live(1), live(2), live(3), live(4)]
+        let members = sessions.map(\.member)
+        var tree = SessionGroup(name: "배포", members: Array(members[0..<3]), leaderMemberID: members[0].id)
+        tree = tree.settingParent(members[1].id, for: members[2].id)
+        let flat = SessionGroup(name: "가나다 평면", members: [members[2], members[3]])
+        let other = SessionGroup(name: "하위 트리", members: [members[1], members[2]], leaderMemberID: members[1].id)
+        let badges = SessionGroupBadge.badges(groups: [flat, tree, other], live: sessions)
+        try expectEqual(badges[sessions[0].id]?.role, .leader)
+        try expectEqual(badges[sessions[0].id]?.childCount, 1)
+        try expectEqual(badges[sessions[2].id]?.role, .member, "A member of a tree wins over a group without a leader")
+        try expectEqual(badges[sessions[2].id]?.depth, 2)
+        try expectEqual(badges[sessions[2].id]?.parentTitle, members[1].title)
+        try expectEqual(badges[sessions[2].id]?.otherGroupCount, 2)
+        try expectEqual(badges[sessions[1].id]?.role, .leader, "Leading a group wins over working in another")
+        try expectEqual(badges[sessions[1].id]?.groupName, "하위 트리")
+        try expectEqual(badges[sessions[3].id]?.role, .unranked)
+        try expect(SessionGroupBadge.badges(groups: [tree], live: [sessions[3]])[sessions[3].id] == nil, "Sessions outside every group have no badge")
+    }
+
+    func testSessionListTreeNestsGroupsAndKeepsOrder() throws {
+        let tree = UUID(), flat = UUID()
+        let leader = UUID(), lead = UUID(), worker = UUID(), orphanParent = UUID()
+        func session(_ id: String, _ badge: SessionGroupBadge?) -> AgentSession {
+            var value = AgentSession(id: id, agent: .claude, pid: 1, started: id, tty: "/dev/" + id, cwd: "/tmp/tree", terminal: .terminal)
+            value.sessionGroup = badge; return value
+        }
+        let rows = [
+            session("plain-1", nil),
+            session("worker", .init(groupID: tree, groupName: "배포", memberID: worker, role: .member, parentMemberID: lead, task: .approval)),
+            session("flat-1", .init(groupID: flat, groupName: "문서", memberID: UUID(), role: .unranked)),
+            session("leader", .init(groupID: tree, groupName: "배포", memberID: leader, role: .leader)),
+            session("lead", .init(groupID: tree, groupName: "배포", memberID: lead, role: .member, parentMemberID: leader)),
+            session("orphan", .init(groupID: tree, groupName: "배포", memberID: UUID(), role: .member, parentMemberID: orphanParent)),
+            session("plain-2", nil),
+            session("flat-2", .init(groupID: flat, groupName: "문서", memberID: UUID(), role: .unranked))]
+        let built = SessionListTree.build(rows)
+        try expectEqual(built.ungrouped.map(\.id), ["plain-1", "plain-2"], "Ungrouped sessions keep their order")
+        try expectEqual(built.groups.map(\.name), ["배포", "문서"], "Groups follow their first member's position")
+        let deploy = built.groups[0]
+        try expectEqual(deploy.roots.map(\.id), ["leader", "orphan"], "The leader comes first; a member whose parent is not listed stays visible")
+        try expectEqual(deploy.roots[0].children.map(\.id), ["lead"])
+        try expectEqual(deploy.roots[0].children[0].children.map(\.id), ["worker"])
+        try expectEqual(deploy.sessionCount, 4); try expectEqual(deploy.attentionCount, 1)
+        try expect(deploy.hasLeader && !built.groups[1].hasLeader)
+        try expectEqual(built.groups[1].roots.map(\.id), ["flat-1", "flat-2"])
+
+        // A parent loop must not hide either member.
+        let a = UUID(), b = UUID()
+        let loop = SessionListTree.build([
+            session("a", .init(groupID: tree, groupName: "고리", memberID: a, role: .member, parentMemberID: b)),
+            session("b", .init(groupID: tree, groupName: "고리", memberID: b, role: .member, parentMemberID: a))])
+        func count(_ nodes: [SessionListTree.Node]) -> Int { nodes.reduce(0) { $0 + 1 + count($1.children) } }
+        try expectEqual(count(loop.groups[0].roots), 2)
     }
 }
