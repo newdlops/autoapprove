@@ -224,6 +224,7 @@ extension ApprovalTests {
     }
 
     @MainActor func testCodexMetadataParentCanDirectConfirmedWorker() async throws {
+        for textUnavailable in [false, true] {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-parent-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let parentID = UUID().uuidString, workerID = UUID().uuidString, home = "/fixture/home"
@@ -232,7 +233,12 @@ extension ApprovalTests {
         let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .iterm)
         let screen = CodexGroupScreen()
         let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
-            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) })
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) },
+            presentationScreens: { _ in throw AppError.message("Cursor/window lookup timed out") },
+            validationScreens: { targets in
+                if textUnavailable { throw AppError.message("Text channel unavailable") }
+                return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) })
+            })
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.iterm: adapter],
             codexGroupReader: { _ in .init(threadID: workerID, database: home + "/thread_history_1.sqlite") })
         defer { engine.stop() }
@@ -243,12 +249,23 @@ extension ApprovalTests {
         let params: JSONObject = ["owner": UUID().uuidString, "tool": "assign_group_task", "agentKind": "codex",
             "sessionID": "shared-daemon", "conversationID": parentID, "codexCallerConversationID": parentID, "codexCallerHome": home,
             "groupID": group.id.uuidString, "memberID": worker.id.uuidString, "task": "Inspect the fixture"]
+        if textUnavailable {
+            do { _ = try await engine.mcpAction(params); throw AppError.message("Unreadable text accepted a task") }
+            catch let error as RemoteHTTPError {
+                try expectEqual(error.diagnostics?["delivery"], "not_started")
+                try expect(error.localizedDescription.contains("Text channel unavailable"))
+            }
+            try expectEqual(screen.inputs.count, 0)
+            try expect(try engine.sessionGroupAssignments().isEmpty)
+            continue
+        }
         _ = try await engine.mcpAction(params)
         try expectEqual(screen.inputs.count, 1)
         try expect(screen.inputs[0].contains("Inspect the fixture"))
         let task = try engine.sessionGroupAssignments().first
         try expectEqual(task?.workerSessionID, session.id)
         try expect(task?.parentSessionID.hasPrefix("codex-mcp:") == true, "Never route reports to an unverified parent terminal")
+        }
     }
 
     @MainActor func testCodexGroupRejectsStaleApprovalBinding() async throws {

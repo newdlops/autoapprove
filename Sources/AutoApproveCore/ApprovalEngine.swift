@@ -1359,9 +1359,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func readRemoteScreen(_ session: AgentSession, host: ScreenHost, adapter: ScreenHostAdapter,
-                                  realtime: Bool = false, initial: Bool = false) async throws -> RemoteObservedScreen {
+                                  realtime: Bool = false, initial: Bool = false, textOnly: Bool = false) async throws -> RemoteObservedScreen {
         let target = ScreenTarget(tty: session.tty, handle: session.screenHandle)
         let generation = remoteGeneration(session, host: host)
+        if textOnly {
+            // Group delivery validates fresh text from this exact TTY. Cursor,
+            // title and selected-window decoration must not gate a message.
+            // Keep it out of the viewer cache so neither read can replace the other.
+            let snapshot = try await Task.detached(priority: .userInitiated) {
+                try RemoteTerminalPerformance.shared.measure(.textRead) {
+                    try adapter.readForValidation([target])
+                }
+            }.value
+            try Task.checkCancellation()
+            guard let screen = snapshot.screens.first(where: { $0.tty == target.tty }) else {
+                throw RemoteHTTPError(503, snapshot.failures.first?.message ?? "원본 터미널의 입력 확인용 텍스트를 읽지 못했습니다.")
+            }
+            return RemoteObservedScreen(raw: screen.contents, generation: generation, observedAt: Date(),
+                                        appearance: nil, cursor: nil, display: nil)
+        }
         // A new subscriber still checks permission and the original process.
         // Reuse only a completed live observation within the live cache's own
         // freshness window; never join a slow pending presentation read here.
@@ -1707,7 +1723,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     public func remoteTerminal(sessionID: String, realtime: Bool = false, renderWindow: Bool = false,
-                               initial: Bool = false) async throws -> RemoteTerminalFrame {
+                               initial: Bool = false, textOnly: Bool = false) async throws -> RemoteTerminalFrame {
         let frameStart = RemoteTerminalPerformance.now; var frameSucceeded = false
         defer { RemoteTerminalPerformance.shared.observe(initial ? .firstFrame : .liveFrame,
             elapsed:RemoteTerminalPerformance.now-frameStart,succeeded:frameSucceeded) }
@@ -1795,7 +1811,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             raw = ""; generation = remoteGeneration(session, host: host); observedAt = Date(); appearance = nil; cursor = nil
             outputReason = "연결 버튼을 눌러 원래 터미널의 출력과 입력을 연결해주세요. 새 터미널은 만들지 않습니다."
         } else if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
-            let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime, initial: initial && !renderWindow)
+            let observed = try await readRemoteScreen(session, host: host, adapter: adapter, realtime: realtime, initial: initial && !renderWindow, textOnly: textOnly)
             raw = observed.raw; generation = observed.generation; observedAt = observed.observedAt
             appearance = observed.appearance; cursor = observed.cursor
             display = observed.display
@@ -2111,7 +2127,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
-                                            codexStatusQuery: Bool = false,
+                                            codexStatusQuery: Bool = false, textOnly: Bool = false,
                                             preflight: (() async throws -> Void)? = nil) async throws -> JSONObject {
         var outcome = "not_started"
         do {
@@ -2123,7 +2139,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !sendingMessages.contains(original.id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 잠시 후 다시 확인해주세요.") }
             sendingMessages.insert(original.id); defer { sendingMessages.remove(original.id) }
             for attempt in 0..<3 {
-                let frame = try await remoteTerminal(sessionID: original.id, realtime: true)
+                let frame = try await remoteTerminal(sessionID: original.id, realtime: true, textOnly: textOnly)
                 guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
                       current.tty == original.tty, current.terminal == original.terminal,
                       current.bridgeID == original.bridgeID, current.terminalID == original.terminalID,
@@ -2155,7 +2171,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     } else { _ = try await remoteInput(input) }
                     if submitSeparately {
                         textWasSent = true; outcome = "unknown"
-                        let next = try await remoteTerminal(sessionID: original.id, realtime: true)
+                        let next = try await remoteTerminal(sessionID: original.id, realtime: true, textOnly: textOnly)
                         guard next.streamID == frame.streamID, next.inputReason == nil,
                               !RemoteMessageReadiness.hasMenu(next.screen, agent: original.agent),
                               let current = sessions[original.id],
@@ -2943,7 +2959,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if await submitted(within: 6) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
-        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"])
+        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true)
     }
 
     /// Turns on automatic approval for a group worker. The global pause stays
@@ -3072,6 +3088,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 try await sendGroupLine(current, text: SessionGroupOrchestration.taskMessage(assignment))
                 if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
             } catch {
+                log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(assignment.shortID)",
+                               outcome: "그룹 작업 전달 실패: " + error.localizedDescription,
+                               source: "세션 그룹", tool: "assign_group_task"))
                 if var latest = try? groupOrchestration() { latest.cancel(assignment.id); try? saveGroupOrchestration(latest) }
                 // Only a task that never reached the terminal restores the previous choice.
                 if approval.changed, (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" {
