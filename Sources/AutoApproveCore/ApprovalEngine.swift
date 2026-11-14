@@ -207,6 +207,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Reads a CLI's original arguments for a restart. Tests replace it; it never runs for other processes.
     public var processArgumentsReader: @Sendable (ProcessRecord) -> [String]? = { ProcessEnvironment.arguments($0) }
     public var processPathReader: @Sendable (ProcessRecord) -> String? = { ProcessEnvironment.executablePath($0) }
+    /// Ends a CLI for a restart. A signal needs no terminal input, which a changing screen can reject.
+    public var processTerminator: @Sendable (ProcessRecord) -> Bool = { kill($0.pid, SIGTERM) == 0 }
     private var sessionGroupBadges: [String: SessionGroupBadge] = [:]
     private var groupBadgeTask: Task<Void, Never>?
     private var groupBadgeRefreshPending = false
@@ -2423,18 +2425,32 @@ private struct ScreenAnalysisStorageKey: Hashable {
         catch { return fail(error.localizedDescription) }
         let environment = await Task.detached(operation: { ProcessEnvironment.read(process) ?? [:] }).value
 
-        // Never cut off work: wait for an idle CLI with an empty input box and no pending request.
+        // Never cut off work. Claude registers its own status, which does not depend on reading the screen;
+        // a status line at the bottom of Claude's screen makes the screen reading report "unknown".
+        let registryReader = claudeRegistryReader, configDirectory = environment["CLAUDE_CONFIG_DIR"]
+        func claudeStatus() async -> String? {
+            await Task.detached(operation: {
+                let rows = configDirectory.map { ClaudeSessionRegistry.read(records: [process], directory: URL(fileURLWithPath: $0)) } ?? registryReader([process])
+                return rows.first { $0.processID == process.key }?.status
+            }).value
+        }
         let waitUntil = Date().addingTimeInterval(1800)
         while true {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
-            var idle = current.phase == .idle
-            if current.phase == .unknown, let frame = try? await remoteTerminal(sessionID: id, realtime: true), frame.question == nil,
-               ActivityDetector.detect(frame.screen, agent: current.agent).phase == .idle { idle = true }
-            if idle, !current.pendingInTerminal, !automaticInputBusy(id), !userInputHasPriority(id),
-               !sendingMessages.contains(id), !liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { break }
-            guard Date() < waitUntil else { return fail("30분 동안 대기 상태가 되지 않아 다시 시작하지 않았습니다.") }
-            updateRestart(id, .waiting, "작업이 끝나고 입력창이 비면 다시 시작합니다. (현재: \(current.phaseTitle))")
+            var idle = current.phase == .idle, reason = "현재: \(current.phaseTitle)"
+            if current.agent == .claude, let status = await claudeStatus() {
+                idle = status == "idle"
+                reason = ["busy": "Claude가 작업 중", "waiting": "Claude가 응답을 기다리는 중", "shell": "Claude의 백그라운드 셸 작업이 실행 중"][status] ?? "Claude 상태: \(status)"
+            } else if current.phase == .unknown, let frame = try? await remoteTerminal(sessionID: id, realtime: true), frame.question == nil,
+                      ActivityDetector.detect(frame.screen, agent: current.agent).phase == .idle { idle = true }
+            if idle {
+                if current.pendingInTerminal || liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { reason = "답을 기다리는 요청이 있음" }
+                else if automaticInputBusy(id) { reason = "승인 입력을 전달하는 중" }
+                else { break }
+            }
+            guard Date() < waitUntil else { return fail("30분 동안 대기 상태가 되지 않아 다시 시작하지 않았습니다. (\(reason))") }
+            updateRestart(id, .waiting, "대기 상태가 되면 다시 시작합니다. (\(reason))")
             try? await Task.sleep(for: .seconds(2))
         }
         guard !Task.isCancelled, let current = sessions[id] else { return }
@@ -2460,7 +2476,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         catch { return fail(error.localizedDescription) }
         // The status query may leave the CLI briefly busy; wait for it to settle again.
         let settleUntil = Date().addingTimeInterval(20)
-        while (sessions[id]?.phase != .idle && sessions[id]?.phase != .unknown) || sendingMessages.contains(id) || automaticInputBusy(id) {
+        while sendingMessages.contains(id) || automaticInputBusy(id) {
             guard Date() < settleUntil, !Task.isCancelled else { return fail("대화 ID를 확인한 뒤 CLI가 대기 상태로 돌아오지 않았습니다.") }
             try? await Task.sleep(for: .milliseconds(300))
         }
@@ -2476,11 +2492,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
         let wasAutomatic = current.automatic
         updateRestart(id, .exiting, "CLI를 종료하고 있습니다.")
-        do {
-            _ = try await sendOriginalTerminalMessage(current, object: ["text": "/exit", "revision": "session-restart"])
-        } catch { return fail("종료 명령을 입력하지 못했습니다: \(error.localizedDescription)") }
         let command = plan.command(cwd: nil, environment: environment)
-        log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "종료 명령 입력", source: host.title, context: AuditContext(session: current), request: command))
+        // The PID must still be the same CLI and its shell must still be its ancestor before a signal is sent.
+        let terminate = processTerminator
+        guard let fresh = try? await Task.detached(operation: { try reader() }).value,
+              fresh.contains(where: { $0.pid == process.pid && $0.started == process.started && $0.agent == original.agent && $0.tty == process.tty }),
+              fresh.contains(where: { $0.pid == shell.pid && $0.started == shell.started && $0.tty == shell.tty }) else {
+            return fail("CLI나 셸이 바뀌어 종료하지 않았습니다.")
+        }
+        guard log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "CLI 종료 신호 전달", source: host.title, context: AuditContext(session: current), request: command)) else {
+            return fail("승인 내역을 저장하지 못해 종료하지 않았습니다.")
+        }
+        guard await Task.detached(operation: { terminate(process) }).value else { return fail("CLI에 종료 신호를 보내지 못했습니다.") }
         let manual = " 터미널에서 직접 실행해주세요: \(command)"
 
         // In place: the original shell must be back in the foreground with an empty prompt. The screen can
@@ -5769,6 +5792,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             case "automatic":
                 guard let id = params["sessionID"] as? String, let enabled = params["enabled"] as? Bool else { throw AppError.message("세션 ID와 설정값이 필요합니다.") }
                 try setAutomatic(id, enabled: enabled); result = ["enabled": enabled]
+            case "restart":
+                // The same request as the session window's context menu, for one named session.
+                guard let id = params["sessionID"] as? String, let session = sessions[id], session.phase != .ended,
+                      session.agent == .claude || session.agent == .codex else { throw AppError.message("실행 중인 Claude Code 또는 Codex 세션 ID가 필요합니다.") }
+                let progress = restartSessions([id])
+                result = try JSONSerialization.jsonObject(with: JSONEncoder().encode(progress)) as? JSONObject ?? [:]
             case "web":
                 if let enabled = params["enabled"] as? Bool {
                     let port = (params["port"] as? Int).flatMap(UInt16.init(exactly:))

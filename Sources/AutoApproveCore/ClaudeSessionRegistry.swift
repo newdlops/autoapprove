@@ -13,14 +13,17 @@ public struct ClaudeSessionRegistration: Equatable {
     /// The conversation Claude registered for this process. Unlike `activity`, it does not depend on the status
     /// value, so a status this app does not know (for example "shell") still identifies the conversation.
     public var sessionID: String?
+    /// The status exactly as Claude registered it ("idle", "busy", "waiting", "shell", …).
+    public var status: String?
     /// The conversation to use for identity: the registered one, or the one reported with a known activity.
     public var conversationID: String? { sessionID ?? activity?.providerID }
 
     public init(processID: String, kind: String, jobID: String? = nil, parkedJobID: String? = nil, activity: ClaudeSessionActivity? = nil,
-                peerName: String? = nil, sessionID: String? = nil) {
+                peerName: String? = nil, sessionID: String? = nil, status: String? = nil) {
         self.processID = processID; self.kind = kind
         self.jobID = jobID; self.parkedJobID = parkedJobID
         self.activity = activity; self.peerName = peerName; self.sessionID = sessionID
+        self.status = status ?? activity?.status
     }
 }
 
@@ -147,7 +150,7 @@ public enum ClaudeSessionRegistry {
             return name
         }
         return .init(processID: process.key, kind: kind, jobID: identifier("jobId"), parkedJobID: identifier("parkedJobId"), activity: activity,
-                     peerName: peerName, sessionID: identifier("sessionId"))
+                     peerName: peerName, sessionID: identifier("sessionId"), status: identifier("status"))
     }
 
     /// Jobs are not a stable Claude API. Use their optional structured question only

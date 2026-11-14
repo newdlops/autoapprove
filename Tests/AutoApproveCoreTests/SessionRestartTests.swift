@@ -19,8 +19,19 @@ private final class RestartTerminal: @unchecked Sendable {
     func send(_ target: ScreenTarget, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         inputs.append(input.bytes)
-        if input.bytes.contains("/exit") { stage = 1; screens[target.tty] = "Resume this session later.\nuser@mac project %" }
         return .sent
+    }
+    private var signals = 0, claudeStatus = "idle"
+    var terminated: Int { lock.lock(); defer { lock.unlock() }; return signals }
+    var status: String {
+        get { lock.lock(); defer { lock.unlock() }; return claudeStatus }
+        set { lock.lock(); defer { lock.unlock() }; claudeStatus = newValue }
+    }
+    /// The CLI ends on a signal and its shell prompt returns; nothing is typed into the terminal.
+    func terminate(_ process: ProcessRecord) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        signals += 1; stage = 1; screens["/dev/" + process.tty] = "Resume this session later.\nuser@mac project %"
+        return true
     }
     private var rejections = 1
     func restart(_ target: ScreenTarget, expected: String, command: String) -> TerminalDelivery {
@@ -101,9 +112,15 @@ extension ApprovalTests {
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil },
             restart: { target, expected, command in terminal.restart(target, expected: expected, command: command) },
             input: { target, _, _, input in terminal.send(target, input) })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { terminal.records }, screenAdapters: [.iterm: adapter])
-        defer { engine.stop() }
         let conversation = UUID().uuidString.lowercased()
+        // Claude's own registered status decides when the session is idle; the screen is not consulted.
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.filter { $0.pid == 100601 }.map { .init(processID: $0.key, kind: "interactive", sessionID: conversation, status: terminal.status) }
+        }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { terminal.records },
+                                        screenAdapters: [.iterm: adapter])
+        defer { engine.stop() }
+        engine.processTerminator = { terminal.terminate($0) }
         engine.processArgumentsReader = { record in record.pid == 100601 ? ["/fixture/claude", "--model", "opus", "처음 프롬프트"] : nil }
         var session = ProcessDiscovery.sessions(running).first { $0.agent == .claude }!
         session.terminal = .iterm; session.channel = .itermScreen; session.providerID = conversation
@@ -112,10 +129,17 @@ extension ApprovalTests {
         func phase() -> SessionPhase? { engine.snapshot.sessions.first { $0.id == session.id }?.phase }
         _ = try await waitForRestart(10) { await engine.refreshScreens(); return phase() == .idle }
 
+        terminal.status = "busy"
         engine.restartSessions([session.id])
+        try await Task.sleep(for: .seconds(3))
+        try expectEqual(terminal.terminated, 0, "A busy Claude is never ended")
+        try expect(engine.snapshot.sessionRestart?.items.first?.message.contains("Claude가 작업 중") == true,
+                   engine.snapshot.sessionRestart?.items.first?.message ?? "no progress")
+        terminal.status = "idle"
         let launched = try await waitForRestart(30) { !terminal.launched.isEmpty }
         try expect(launched, "The resume command must be typed into the original shell: \(engine.snapshot.sessionRestart?.items.first?.message ?? "")")
-        try expect(terminal.typed.contains { $0.contains("/exit") }, "The CLI must be asked to exit first")
+        try expectEqual(terminal.terminated, 1, "The CLI is ended with one signal")
+        try expect(terminal.typed.isEmpty, "Ending the CLI types nothing into the terminal")
         try expectEqual(terminal.launched, [["/fixture/claude", "--model", "opus", "--resume", conversation].map(HookInstaller.quote).joined(separator: " ")])
         // The app's discovery loop reports the new CLI.
         var next = ProcessDiscovery.sessions(reopened).first { $0.agent == .claude }!
@@ -151,11 +175,12 @@ extension ApprovalTests {
         var session = ProcessDiscovery.sessions(records).first { $0.agent == .claude }!
         session.terminal = .iterm; session.channel = .itermScreen; session.providerID = UUID().uuidString.lowercased(); session.phase = .idle
         engine.updateDiscovery([session], records: records); await engine.connectScreenHost(.iterm)
+        engine.processTerminator = { typed.terminate($0) }
         engine.restartSessions([session.id])
         let failed = try await waitForRestart(10) { engine.snapshot.sessionRestart?.items.first?.phase == .failed }
         try expect(failed, engine.snapshot.sessionRestart?.items.first?.message ?? "no progress")
         try expect(engine.snapshot.sessionRestart?.items.first?.message.contains("셸 없이 실행된 세션") == true)
-        try expect(typed.typed.isEmpty && typed.launched.isEmpty, "A session that cannot restart in its own tab is never exited")
+        try expect(typed.typed.isEmpty && typed.launched.isEmpty && typed.terminated == 0, "A session that cannot restart in its own tab is never exited")
     }
 
     @MainActor func testSessionRestartRefusesUnsupportedTerminals() async throws {
