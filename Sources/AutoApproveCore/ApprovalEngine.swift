@@ -2428,6 +2428,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
             conversation = valid(try? await statusConversationID(current))
             if let conversation { groupStatusIdentities[id] = (current, conversation, nil) }
         }
+        // Last resort: the conversation the CLI was launched with. A later /clear may have started another one,
+        // so the result says which ID was used.
+        var launchedConversation = false
+        if conversation == nil {
+            let tokens = Array(argv.dropFirst())
+            let flags: Set<String> = current.agent == .claude ? ["--resume", "-r", "--session-id"] : ["resume"]
+            if let index = tokens.firstIndex(where: { flags.contains($0) }), index + 1 < tokens.count, let id = valid(tokens[index + 1]) {
+                conversation = id; launchedConversation = true
+            }
+        }
         guard let conversation else { return fail("대화 ID를 확인하지 못해 같은 대화로 다시 열 수 없습니다.") }
         let plan: SessionRestartCommand.Plan
         do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
@@ -2506,7 +2516,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             publish()
             let place = originalShell == nil ? "같은 창의 새 탭에서" : "같은 터미널에서"
             let note = plan.dropped.isEmpty ? "" : " 다시 적용하지 않은 실행 인자: \(plan.dropped.joined(separator: " "))"
-            return updateRestart(id, .done, "\(place) 같은 대화로 다시 시작했습니다." + note, newSessionID: next.key)
+            let source = launchedConversation ? " 현재 대화 ID를 찾지 못해 처음 실행할 때의 대화 ID(\(conversation.prefix(8)))로 열었습니다." : ""
+            return updateRestart(id, .done, "\(place) 같은 대화로 다시 시작했습니다." + source + note, newSessionID: next.key)
         }
         fail("다시 시작 명령은 입력했지만 새 CLI를 확인하지 못했습니다. 터미널을 확인해주세요.")
     }
