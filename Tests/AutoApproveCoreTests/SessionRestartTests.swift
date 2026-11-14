@@ -22,43 +22,47 @@ private final class RestartTerminal: @unchecked Sendable {
         if input.bytes.contains("/exit") { stage = 1; screens[target.tty] = "Resume this session later.\nuser@mac project %" }
         return .sent
     }
+    private var rejections = 1
     func restart(_ target: ScreenTarget, expected: String, command: String) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         guard screens[target.tty] == expected else { return .screenChanged }
+        // Right after the CLI exits its helper processes can still be listed; the first try is refused.
+        if rejections > 0 { rejections -= 1; return .agentMissing }
         commands.append(command); stage = 2; screens[target.tty] = "❯ Try “다음 작업”\n? for shortcuts"
         return .sent
     }
 }
 
-/// A Terminal window whose CLI replaced its shell: restarting opens a new tab in the same window.
+/// A Terminal tab whose CLI replaced its shell: it reopens in a new window and the finished tab is closed.
 private final class ShelllessTerminal: @unchecked Sendable {
     private let lock = NSLock()
     private var screens: [String: String] = [:]
     private var stage = 0
     private var commands: [String] = []
-    private var opened = false
+    private var closedTabs: [String] = []
     let stages: [[ProcessRecord]]
     init(stages: [[ProcessRecord]]) { self.stages = stages }
     var records: [ProcessRecord] { lock.lock(); defer { lock.unlock() }; return stages[stage] }
     var launched: [String] { lock.lock(); defer { lock.unlock() }; return commands }
-    var tabOpened: Bool { lock.lock(); defer { lock.unlock() }; return opened }
+    var closed: [String] { lock.lock(); defer { lock.unlock() }; return closedTabs }
     func screen(_ tty: String) -> String { lock.lock(); defer { lock.unlock() }; return screens[tty] ?? "" }
     func show(_ text: String, on tty: String) { lock.lock(); defer { lock.unlock() }; screens[tty] = text }
-    func openTab() -> ProcessRecord {
-        lock.lock(); defer { lock.unlock() }
-        opened = true; stage = 1; screens["/dev/ttys071"] = "user@mac ~ %"
-        return stages[1].first { $0.tty == "ttys071" && SessionExitRecovery.isShell($0) }!
-    }
     func send(_ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
-        if input.bytes.contains("/exit") { stage = 2; screens["/dev/ttys070"] = "[프로세스 완료됨]" }
+        if input.bytes.contains("/exit") { stage = 1; screens["/dev/ttys070"] = "[프로세스 완료됨]" }
         return .sent
     }
-    func restart(_ target: ScreenTarget, expected: String, command: String) -> TerminalDelivery {
+    /// A new window can only be opened after the CLI has ended.
+    func launchWindow(_ command: String) throws -> String {
         lock.lock(); defer { lock.unlock() }
-        guard target.tty == "/dev/ttys071", screens[target.tty] == expected else { return .screenChanged }
-        commands.append(command); stage = 3; screens[target.tty] = "❯ Try “다음 작업”\n? for shortcuts"
-        return .sent
+        guard stage == 1 else { throw AppError.message("The CLI was still running when a window was opened") }
+        commands.append(command); stage = 2; screens["/dev/ttys071"] = "❯ Try “다음 작업”\n? for shortcuts"
+        return "/dev/ttys071"
+    }
+    func closeFinishedTab(_ tty: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard stage == 2, tty == "/dev/ttys070" else { return false }
+        closedTabs.append(tty); return true
     }
 }
 
@@ -143,8 +147,8 @@ extension ApprovalTests {
         try expect(engine.snapshot.sessionRestart == nil)
     }
 
-    @MainActor func testSessionRestartOpensNewTabForShelllessCLI() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-restart-tab-" + UUID().uuidString)
+    @MainActor func testSessionRestartReopensShelllessCLIInNewWindow() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-restart-window-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let started = "Wed Oct 28 12:00:00 2026"
         func records(_ text: String) -> [ProcessRecord] { ProcessDiscovery.parse(text) }
@@ -153,28 +157,19 @@ extension ApprovalTests {
         100700 1 ttys070 100700 100701 \(started) /usr/bin/login
         100701 100700 ttys070 100701 100701 \(started) claude
         """)
-        let tab = records("""
-        100700 1 ttys070 100700 100701 \(started) /usr/bin/login
-        100701 100700 ttys070 100701 100701 \(started) claude
-        100710 1 ttys071 100710 100711 \(started) /usr/bin/login
-        100711 100710 ttys071 100711 100711 \(started) -zsh
-        """)
-        let exited = records("""
-        100710 1 ttys071 100710 100711 \(started) /usr/bin/login
-        100711 100710 ttys071 100711 100711 \(started) -zsh
-        """)
+        let exited = records("100799 1 ttys079 100799 100799 \(started) /bin/zsh")
         let reopened = records("""
         100710 1 ttys071 100710 100720 \(started) /usr/bin/login
         100711 100710 ttys071 100711 100720 \(started) -zsh
         100720 100711 ttys071 100720 100720 \(started) claude
         """)
-        let terminal = ShelllessTerminal(stages: [running, tab, exited, reopened])
+        let terminal = ShelllessTerminal(stages: [running, exited, reopened])
         terminal.show("❯ Try “다음 작업”\n? for shortcuts", on: "/dev/ttys070")
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: terminal.screen($0.tty)) }) },
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: terminal.screen($0.tty)) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil },
-            restart: { target, expected, command in terminal.restart(target, expected: expected, command: command) },
-            input: { _, _, _, input in terminal.send(input) },
-            replacementShell: { _ in terminal.openTab() }, replacementShellValid: { _, shell in shell.tty == "ttys071" })
+            restart: { _, _, _ in .missingTarget }, input: { _, _, _, input in terminal.send(input) })
+        adapter.launchWindow = { try terminal.launchWindow($0) }
+        adapter.closeFinishedTab = { terminal.closeFinishedTab($0) }
         let conversation = UUID().uuidString.lowercased()
         // The conversation comes only from Claude's session registry.
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
@@ -198,16 +193,17 @@ extension ApprovalTests {
 
         engine.restartSessions([session.id])
         let launched = try await waitForRestart(45) { !terminal.launched.isEmpty }
-        try expect(launched, "The resume command must reach the new tab: \(engine.snapshot.sessionRestart?.items.first?.message ?? "") stage records \(terminal.records.map(\.pid))")
-        try expect(terminal.tabOpened, "A tab must be opened before the CLI exits")
+        try expect(launched, "The resume command must open in a new window: \(engine.snapshot.sessionRestart?.items.first?.message ?? "")")
         try expectEqual(terminal.launched, ["cd -- '/tmp/복원 프로젝트' && '/Users/fixture/.local/bin/claude' '--resume' '\(conversation)'"],
-                        "The new tab returns to the CLI's folder and reopens the current conversation, not the one in the old arguments")
+                        "The new window returns to the CLI's folder and reopens the current conversation, not the one in the old arguments")
+        try expect(terminal.closed.isEmpty, "The original tab is closed only after the new CLI is confirmed")
         var next = ProcessDiscovery.sessions(reopened).first { $0.agent == .claude }!
         next.terminal = .terminal; next.channel = .terminalScreen
         engine.updateDiscovery([next], records: reopened)
         let finished = try await waitForRestart(10) { engine.snapshot.sessionRestart?.items.first?.phase == .done }
         try expect(finished, engine.snapshot.sessionRestart?.items.first?.message ?? "no progress")
-        try expect(engine.snapshot.sessionRestart?.items.first?.message.contains("새 탭") == true)
+        try expectEqual(terminal.closed, ["/dev/ttys070"], "The finished original tab is closed so no extra terminal remains")
+        try expect(engine.snapshot.sessionRestart?.items.first?.message.contains("새 창") == true)
         try expectEqual(engine.snapshot.sessions.first { $0.id == next.id }?.automatic, true)
     }
 

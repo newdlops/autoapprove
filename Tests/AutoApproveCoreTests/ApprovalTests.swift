@@ -522,7 +522,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session restart: command keeps known options only",tests.testSessionRestartCommandKeepsKnownOptionsOnly),
             ("Session restart: process arguments parse only argv",tests.testProcessArgumentsParseOnlyArgv),
             ("Session restart: exits and reopens the same conversation",tests.testSessionRestartExitsAndReopensTheSameConversation),
-            ("Session restart: a shell-less CLI reopens in a new tab of the same window",tests.testSessionRestartOpensNewTabForShelllessCLI),
+            ("Session restart: a shell-less CLI reopens in a new window and its finished tab is closed",tests.testSessionRestartReopensShelllessCLIInNewWindow),
             ("Session restart: unsupported terminals are refused",tests.testSessionRestartRefusesUnsupportedTerminals),
             ("Session profiles: multiple private files, explicit update, import and restart",tests.testTerminalProfilesMultiplePrivateFilesAndRestart),
             ("Session profiles: fresh native titles repair startup capture and active duplicate detection",tests.testTerminalProfileFreshTabTitleRepairsStartupCaptureAndActiveDeduplication),
