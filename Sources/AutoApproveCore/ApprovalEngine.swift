@@ -2727,7 +2727,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try await sendGroupLine(current, text: line, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
-                : ActivityDetector.detect(frame.screen, agent: .claude).phase == .idle
+                : ClaudeComposerReadiness.isEmpty(frame.screen)
             guard empty, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
                 throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
             }

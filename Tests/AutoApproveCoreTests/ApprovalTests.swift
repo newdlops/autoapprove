@@ -515,6 +515,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: mailbox persistence, deduplication and atomic receipts",tests.testGroupMailboxDurabilityReceiptsAndOrdering),
             ("Session groups: completion reports require recipient ACK",tests.testGroupReportRequiresRecipientAcknowledgement),
             ("Session groups: corrupt mailbox never accepts or deletes messages",tests.testGroupMailboxRefusesCorruptStorage),
+            ("Session groups: Claude composer separates custom status from drafts",tests.testClaudeMailboxComposerSeparatesCustomStatusFromDrafts),
+            ("Session groups: Claude mailbox retries after busy with custom status",tests.testGroupClaudeMailboxCustomStatus),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
             ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
             ("Session groups: clipped and repeated Codex status requires fresh history",tests.testCodexGroupStatusUsesFreshHistoryWhenFrameClips),

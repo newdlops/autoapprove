@@ -65,6 +65,73 @@ private final class GroupLineTerminal: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    @MainActor func testGroupClaudeMailboxCustomStatus() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-claude-mailbox-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        104401 1 fixture401 104401 104401 Wed Oct 28 12:00:00 2026 /fixture/claude
+        104402 1 fixture402 104402 104402 Wed Oct 28 12:00:00 2026 /fixture/claude
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: .claude, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/fixture", terminal: .iterm) }
+        let ids = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString) })
+        let writer = GroupTerminalWriter(), terminal = GroupLineTerminal()
+        terminal.needsEnter = false
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.map { .init(processID: $0.key, kind: "interactive", sessionID: ids[$0.pid], status: terminal.status($0.pid)) }
+        }
+        let rule = String(repeating: "─", count: 30)
+        let custom = "answer\n\(rule)\n❯ \n\(rule)\nuser@host project (main) | Opus 4.7 | ctx 32% | 5h 12% (resets 23:00)"
+        for session in sessions { writer.show(custom, on: session.tty) }
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,_,_,_ in .missingTarget })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter], isolateByDefault: true)
+        defer { engine.stop() }
+        engine.groupMailboxPollInterval = 0.05; engine.groupMailboxReminderInterval = 60
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        let live = try await engine.sessionGroupSessions()
+        let members = try sessions.map { session in try unwrapGroup(live.first { $0.id == session.id }).member }
+        let group = SessionGroup(name: "Claude inbox", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: directory).save([group])
+        let box = try SessionGroupMailbox(directory: directory)
+        func send(_ text: String) async throws -> UUID {
+            let receipt = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "ask_group_question", "sessionID": sessions[0].id,
+                "groupID": group.id.uuidString, "memberID": members[1].id.uuidString, "text": text])
+            try expectEqual(receipt["accepted"] as? Bool, true)
+            return try unwrapGroup((receipt["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+        }
+        func ack(_ id: UUID) async throws {
+            _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "ack_group_messages", "sessionID": sessions[1].id,
+                "groupID": group.id.uuidString, "messageIDs": [id.uuidString]])
+        }
+        terminal.setStatus(records[1].pid, "busy")
+        let waiting = try await send("busy then idle")
+        try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "not_started" })
+        try expect(terminal.typed.isEmpty); try expectEqual(try box.pendingCount, 1)
+        terminal.setStatus(records[1].pid, "idle")
+        try box.noteAttempt(waiting, result: "not_started", retryAt: .distantPast)
+        try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "submitted" })
+        try expectEqual(terminal.typed.count, 1)
+        try expect(terminal.typed[0].contains("[AutoApprove 그룹 수신함]"))
+        try expectEqual(try box.pendingCount, 1, "Terminal submission is not an ACK")
+        try await ack(waiting)
+        // A subsequent draft, continuation, question or approval must remain untouched.
+        for (index, screen) in [custom.replacingOccurrences(of: "❯ ", with: "❯ user draft"),
+                               custom.replacingOccurrences(of: "❯ ", with: "❯ \ncontinued draft"),
+                               "Choose environment\n❯ 1. Development\n  2. Production\nEnter to select",
+                               "Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. No\nEsc to cancel"].enumerated() {
+            terminal.setStatus(records[1].pid, "idle"); writer.show(screen, on: sessions[1].tty)
+            await engine.refreshScreens()
+            let held = try await send("held \(index)")
+            try expect(try await waitForGroup(5) { (try? box.message(held)?.lastResult) == "not_started" })
+            try expectEqual(terminal.typed.count, 1); try expectNil(try box.message(held)?.acknowledgedAt)
+            try await ack(held)
+        }
+        try expect(try engine.sessionGroupAssignments().isEmpty)
+        try expect(engine.snapshot.sessions.allSatisfy { !$0.automatic })
+        try expect(engine.networkIsolated); try expectEqual(try box.pendingCount, 0)
+    }
+
     func testSessionGroupTerminalStatusRequiresFreshCard() throws {
         let old = UUID().uuidString.lowercased(), next = UUID().uuidString.lowercased()
         func card(_ id: String) -> String {
