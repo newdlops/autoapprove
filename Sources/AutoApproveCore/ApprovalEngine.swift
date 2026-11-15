@@ -1995,7 +1995,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // permits only the read-only slash command in a visibly empty Codex composer.
         if codexStatusQuery {
             guard [.message, .submit].contains(kind), input.text == "/status",
-                  codexGroupStatusEligible(session), CodexProgressScreen.ready(observed.raw) else {
+                  codexGroupStatusEligible(session), CodexStatusIdentity.canQuery(observed.raw) else {
                 throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
             }
         }
@@ -2201,7 +2201,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         }
                         if codexStatusQuery {
                             guard !snapshot.paused, !nativeUserInputHasPriority(original.id),
-                                  ActivityDetector.detect(next.screen, agent: .codex).phase != .working,
                                   PromptDetector.normalizedLines(next.screen).last(where: { $0.hasPrefix("›") || $0.hasPrefix("»") })?.dropFirst().trimmingCharacters(in: .whitespaces) == "/status" else {
                                 throw RemoteHTTPError(409, "Codex 조회 명령의 입력을 확인하지 못해 Enter를 보내지 않았습니다.")
                             }
@@ -2300,13 +2299,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// A recovery receipt is not a CLI question. The caller must still prove an
-    /// idle, empty composer from a fresh screen before sending exactly /status.
+    /// empty composer from a fresh screen before sending exactly /status.
     private func codexGroupStatusEligible(_ session: AgentSession) -> Bool {
         guard session.agent == .codex, ![.ended, .approval].contains(session.phase) else { return false }
         if session.pendingInTerminal {
             return session.pendingRequestID?.hasPrefix("capacity:review:") == true
         }
-        return true // The fresh screen, not a lagging phase, proves an empty composer.
+        return true // Work can continue while /status reads the current session.
     }
 
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
@@ -2328,7 +2327,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } else {
             guard (original.agent == .codex ? codexGroupStatusEligible(original) : original.phase == .idle && !original.pendingInTerminal),
                   !automaticInputBusy(runtime), !userInputHasPriority(runtime) else {
-                throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
+                throw AppError.message(original.agent == .codex
+                    ? "터미널의 질문·승인 또는 다른 입력과 겹쳐 조회를 보류했습니다. 해당 입력을 마친 뒤 다시 갱신해주세요."
+                    : "원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
             id = try await statusConversationID(original)
         }
@@ -2349,7 +2350,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         refreshSessionGroupBadges()
     }
 
-    /// Types /status into an idle CLI and reads the conversation ID from the fresh status screen.
+    /// Types /status into an empty composer and reads the fresh status card, including during Codex work.
     private func statusConversationID(_ original: AgentSession) async throws -> String {
         let runtime = original.id
         guard !sendingMessages.contains(runtime), groupStatusQueries.insert(runtime).inserted else {
@@ -2357,12 +2358,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         defer { groupStatusQueries.remove(runtime) }
         let before = try await remoteTerminal(sessionID: runtime, realtime: true)
-        let ready = original.agent == .codex ? CodexProgressScreen.ready(before.screen) :
+        let ready = original.agent == .codex ? CodexStatusIdentity.canQuery(before.screen) :
             SystemSafetyComposer.capture(before.screen, agent: original.agent, text: "/status") != nil &&
                 PromptDetector.normalizedLines(before.screen).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })?.trimmingCharacters(in: .whitespaces) == "❯"
         guard ready else {
             let phase = ActivityDetector.detect(before.screen, agent: original.agent).phase
-            let reason = phase == .working ? "작업 중인 터미널에는 조회 명령을 추가하지 않습니다. 작업이 끝난 뒤 갱신해주세요." :
+            let reason = phase == .working && original.agent != .codex ? "작업 중인 터미널에는 조회 명령을 추가하지 않습니다. 작업이 끝난 뒤 갱신해주세요." :
                 phase == .input ? "터미널 입력창에 작성 중인 내용이 있습니다. 비운 뒤 다시 갱신해주세요." :
                 "빈 입력창의 대기 상태를 확인하지 못했습니다. 질문·메뉴를 닫고 현재 터미널 화면을 확인해주세요."
             throw AppError.message(reason)
@@ -2372,7 +2373,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true)
             guard !self.snapshot.paused, !self.userInputHasPriority(runtime),
                   !self.automaticInputBusy(runtime), let current = self.sessions[runtime],
-                  self.codexGroupStatusEligible(current), CodexProgressScreen.ready(latest.screen) else {
+                  self.codexGroupStatusEligible(current), CodexStatusIdentity.canQuery(latest.screen) else {
                 throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
             }
         })

@@ -88,7 +88,6 @@ extension ApprovalTests {
 
     @MainActor func testCodexGroupStatusReviewDoesNotBypassRealInput() async throws {
         let screens = [
-            "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts",
             "Codex\n› my unfinished draft\n ? for shortcuts · Goal stalled (/goal resume)",
             "Would you like to make the following edits?\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel"
         ]
@@ -114,18 +113,25 @@ extension ApprovalTests {
     }
 
     @MainActor func testCodexGroupDiscoversIdleTerminalFromStatus() async throws {
+        for useTerminal in [false,true] {
+        for working in [false,true] {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-screen-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let record = ProcessDiscovery.parse("100591 1 fixture40 100591 100591 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
-        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .iterm)
-        session.phase = .idle; session.channel = .itermScreen
-        let screen = CodexGroupScreen()
+        let host:ScreenHost=useTerminal ? .terminal:.iterm
+        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: useTerminal ? .terminal:.iterm)
+        session.phase = working ? .working:.idle; session.channel = host.channel
+        let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.timeZone = .current;formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
+        let identity=TTYInputIdentity(pid:record.pid,processGroup:record.pid,uid:getuid(),effectiveUID:geteuid(),device:42,
+            startSeconds:UInt64(formatter.date(from:record.started)!.timeIntervalSince1970),startMicroseconds:71)
+        let screen = CodexGroupScreen(working ? "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts":nil)
         let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.iterm: adapter],
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
+            terminalInputAvailable:{true},terminalInputIdentity:{_ in identity},
             codexGroupReader: { _ in screen.location() }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
         defer { engine.stop() }
-        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.iterm)
+        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(host)
         let unresolved = SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home")
         try SessionGroupStore(directory: directory).save([SessionGroup(name: "fixture", members: [unresolved.member])])
         for _ in 0..<3 { _ = try await engine.sessionGroupSessions() }
@@ -150,6 +156,8 @@ extension ApprovalTests {
         try expectEqual(screen.inputs, ["/status\r"], "Known process identity needs no terminal input")
         screen.clearRollout()
         try expectNil(try await engine.sessionGroupSessions().first?.conversationID)
+        }
+        }
     }
 
     @MainActor func testCodexGroupDiscoveryPreservesBusyScreensAndDrafts() async throws {

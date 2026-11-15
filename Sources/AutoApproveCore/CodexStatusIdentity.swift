@@ -3,6 +3,13 @@ import Foundation
 /// A status card is accepted only after this app requested a fresh /status.
 /// No account text or terminal contents are persisted in the reservation.
 public struct CodexStatusIdentity: Codable {
+    /// /status is available while a Codex task runs. Only the composer and
+    /// modal/input conflicts matter; generic idle-only recovery rules do not.
+    public static func canQuery(_ screen:String)->Bool {
+        let phase=ActivityDetector.detect(screen,agent:.codex).phase
+        return [.idle,.working].contains(phase) && CodexProgressScreen.emptyComposer(screen) &&
+            !RemoteMessageReadiness.hasMenu(screen,agent:.codex)
+    }
     public var counts:[String:Int]
     public var requested:Date
     public var threadID:String?
