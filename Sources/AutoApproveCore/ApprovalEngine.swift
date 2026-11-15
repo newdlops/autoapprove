@@ -2260,6 +2260,44 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private var groupStatusIdentities: [String: (session: AgentSession, conversationID: String, home: String?)] = [:]
     private var groupStatusQueries: Set<String> = []
+    private var profileGroupAttachments:[TerminalProfileGroupAttachment]=[]
+
+    public func terminalProfileGroups(candidates:[TerminalProfileCandidate]) throws -> [TerminalProfileGroup] {
+        TerminalProfileGroup.capture(try SessionGroupStore(directory:paths.directory).load(),candidates:candidates)
+    }
+
+    public func restoreTerminalProfileGroups(_ profile:TerminalSessionProfile,results:[TerminalProfileRestoreResult],
+                                            previous:[TerminalProfileCandidate]) async throws {
+        let profile=try profile.validated(),store=SessionGroupStore(directory:paths.directory),saved=try store.load()
+        // Old files have no group snapshot. Recover only exact known conversations
+        // from the still-persisted groups; never use a project/title guess.
+        let snapshots=profile.groups ?? TerminalProfileGroup.capture(saved,candidates:profile.entries.map {.init(id:$0.id.uuidString,entry:$0)})
+        let successful=results.filter {$0.phase == .opened || $0.phase == .alreadyOpen}
+        var next=try TerminalProfileGroupRestore.merge(snapshots,into:saved,restored:Set(successful.map(\.id)))
+        var pending:[TerminalProfileGroupAttachment]=[]
+        for snapshot in snapshots {
+            guard let gi=next.firstIndex(where:{$0.id==snapshot.group.id}) else{continue}
+            for link in snapshot.links {
+                guard let result=successful.first(where:{$0.id==link.entryID}),let entry=profile.entries.first(where:{$0.id==link.entryID}),
+                      let mi=next[gi].members.firstIndex(where:{$0.id==link.memberID}) else{continue}
+                let active=previous.filter {$0.entry.key==entry.key}
+                if result.phase == .alreadyOpen,active.count==1,let original=active.first,
+                   let current=sessions[original.id],current.phase != .ended,current.agent.rawValue==entry.agent,current.cwd==entry.cwd {
+                    next[gi].members[mi].runtimeID=current.id
+                } else if let tty=result.tty,TerminalProfileLauncher.validTTY(tty) {
+                    pending.append(.init(groupID:snapshot.group.id,memberID:link.memberID,entry:entry,tty:tty,
+                                         excludedRuntimes:Set(previous.map(\.id)),expires:Date().addingTimeInterval(120)))
+                }
+            }
+        }
+        if next != saved {try store.save(next,expected:saved)}
+        for attachment in pending {
+            profileGroupAttachments.removeAll {$0.groupID==attachment.groupID && $0.memberID==attachment.memberID}
+            profileGroupAttachments.append(attachment)
+        }
+        _ = try await sessionGroupSessions()
+        refreshSessionGroupBadges()
+    }
 
     /// A recovery receipt is not a CLI question. The caller must still prove an
     /// idle, empty composer from a fresh screen before sending exactly /status.
@@ -2422,8 +2460,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return latest.contains { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }
         }.sorted { $0.session.displayedTerminalTitle.localizedStandardCompare($1.session.displayedTerminalTitle) == .orderedAscending }
         let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
-        let refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
+        var refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
+        var remaining:[TerminalProfileGroupAttachment]=[]
+        for attachment in profileGroupAttachments where attachment.expires > Date() {
+            guard let gi=refreshed.firstIndex(where:{$0.id==attachment.groupID}),
+                  let mi=refreshed[gi].members.firstIndex(where:{$0.id==attachment.memberID}) else{continue}
+            // A user's intervening identity edit invalidates this receipt.
+            let member=refreshed[gi].members[mi]
+            guard member.agent.rawValue==attachment.entry.agent,member.cwd==attachment.entry.cwd,
+                  member.conversationID==attachment.entry.conversationID else{continue}
+            guard let live=attachment.match(observed) else{remaining.append(attachment);continue}
+            guard !refreshed[gi].members.contains(where:{$0.id != member.id && $0.runtimeID==live.id}) else{continue}
+            refreshed[gi].members[mi].runtimeID=live.id
+            refreshed[gi].members[mi].providerHome=live.providerHome ?? TerminalProfileGroup.normalizedHome(attachment.entry.providerHome,agent:attachment.entry.agent)
+        }
         if refreshed != saved { try groupStore.save(refreshed, expected: saved) }
+        profileGroupAttachments=remaining
         return observed
     }
 

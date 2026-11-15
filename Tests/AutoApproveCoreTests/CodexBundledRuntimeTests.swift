@@ -66,6 +66,28 @@ private final class BundledRuntimeFixture {
     func record(_ home:String){homes.append(home)}
 }
 extension ApprovalTests {
+    func testProfileLaunchAttestsNewerServerAfterStart() async throws {
+        let f=try BundledRuntimeFixture(),runtime=try CodexBundledRuntime.inspect(root:f.root.path),calls=BundledLaunchCalls()
+        let cliPath=f.root.appendingPathComponent("managed-codex")
+        try Data("#!/bin/sh\nprintf 'codex-cli 0.169.0\\n'\n".utf8).write(to:cliPath)
+        try FileManager.default.setAttributes([.posixPermissions:0o755],ofItemAtPath:cliPath.path)
+        let cli=try CodexCLIContext.resolve(home:f.root.path,userHome:f.root.path,executable:cliPath.path)!
+        let entry=TerminalProfileEntry(title:"Restore",agent:"codex",cwd:f.root.path,conversationID:UUID().uuidString,providerHome:f.root.path)
+        let services=CodexManagedServerServices(inspect:{_,_ in .init(phase:.stopped,version:"0.167.1",detail:"Stopped")},prepare:{home,_ in
+            await calls.record(home)
+            return .init(phase:.unavailable,version:"0.167.1",detail:"서버 시작 명령은 끝났지만 실행 상태를 확인하지 못했습니다.")
+        })
+        let result=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{home in
+            try expectEqual(home,f.root.path)
+            return (cli,.init(phase:.running,version:"0.169.0",detail:"Attested managed CLI and socket"))
+        })
+        try expectEqual(result.bundled?.executable,runtime.executable);try expectNil(result.installed)
+        try expectEqual(calls.homes,[f.root.path])
+        var rejected=false
+        do {_ = try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in nil})}
+        catch {rejected=error.localizedDescription.contains("서버를 준비하지 못했습니다")}
+        try expect(rejected,"A successful start alone is never proof of a usable server")
+    }
     func testProfileLaunchKeepsBundledClientWithCompatibleNewerServer() async throws {
         let f=try BundledRuntimeFixture(),runtime=try CodexBundledRuntime.inspect(root:f.root.path)
         let home=f.root.appendingPathComponent("home"),cliPath=f.root.appendingPathComponent("installed codex '$literal")
@@ -133,7 +155,7 @@ extension ApprovalTests {
         try expectFalse(try entry.resumeCommand().contains(runtime.executable))
         for status in [CodexManagedServerStatus(phase:.running,version:"0.168.0",detail:"Synthetic mismatch"),.init(phase:.unavailable,version:"0.167.1",detail:"Synthetic unknown")] {
             let wrong=CodexManagedServerServices(inspect:{_,_ in status},prepare:{_,_ in status})
-            do {try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,server:wrong);throw AppError.message("Unexpected preparation success")}
+            do {try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,server:wrong,installed:{_ in nil});throw AppError.message("Unexpected preparation success")}
             catch {try expect(error.localizedDescription.contains("서버를 준비하지 못했습니다"))}
         }
         f.bytes.append(1);try f.saveBinary()

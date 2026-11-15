@@ -16,12 +16,20 @@ struct CodexProfileLaunchRuntime:Sendable {
         let home=try CodexAccountTransitionTarget.canonicalHome(entry.providerHome ?? NSHomeDirectory()+"/.codex")
         let status=try await server.inspect(home,[])
         try Task.checkCancellation()
-        if status.phase == .running,status.version==runtime.version {
-            try runtime.verifyUnchanged()
+        if status.phase == .stopped {
+            try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,server:server,installed:installed)
             return .init(bundled:runtime,installed:nil,version:runtime.version)
         }
-        if status.phase == .stopped {
-            try await CodexBundledProfileLaunch.prepare(entry:entry,runtime:runtime,server:server)
+        return try await verifiedServer(home:home,runtime:runtime,status:status,installed:installed)
+    }
+
+    /// Official daemon start can select an already-installed newer managed binary.
+    /// Apply the same attestation after start as when attaching to an existing server.
+    static func verifiedServer(home:String,runtime:CodexBundledRuntime.Installation,status:CodexManagedServerStatus,
+                               installed:(@Sendable (String) async throws -> (CodexCLIContext,CodexManagedServerStatus)?)? = nil) async throws -> Self {
+        try Task.checkCancellation()
+        if status.phase == .running,status.version==runtime.version {
+            try runtime.verifyUnchanged()
             return .init(bundled:runtime,installed:nil,version:runtime.version)
         }
         // Inspection never updates/restarts a daemon, enables a feature or

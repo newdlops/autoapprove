@@ -537,6 +537,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session restart: a shell-less CLI is left untouched",tests.testSessionRestartLeavesShelllessCLIUntouched),
             ("Session restart: unsupported terminals are refused",tests.testSessionRestartRefusesUnsupportedTerminals),
             ("Session profiles: multiple private files, explicit update, import and restart",tests.testTerminalProfilesMultiplePrivateFilesAndRestart),
+            ("Session profiles: portable group hierarchy, selection and legacy files",tests.testTerminalProfileGroupsSavePortableHierarchyAndSelection),
+            ("Session profiles: group receipts reconnect without claiming conversation identity",tests.testTerminalProfileGroupsReconnectReceiptsWithoutClaimingConversation),
             ("Session profiles: fresh native titles repair startup capture and active duplicate detection",tests.testTerminalProfileFreshTabTitleRepairsStartupCaptureAndActiveDeduplication),
             ("Session profiles: unresolved conversations require an explicit new CLI choice",tests.testTerminalProfileSavingRequiresExplicitNewCLISelection),
             ("Session profiles: validated explicit binding and preserved identity failures",tests.testTerminalProfileCaptureUsesValidatedExplicitBindingAndPreservesFailures),
@@ -765,6 +767,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
 #if DEBUG
         cases.insert(contentsOf: [
             ("Session profiles: compatible newer server preserves the bundled client",tests.testProfileLaunchKeepsBundledClientWithCompatibleNewerServer),
+            ("Session profiles: newly started newer server uses the same attestation",tests.testProfileLaunchAttestsNewerServerAfterStart),
             ("Session profiles: matching bundled server preserves auto-start settings",tests.testProfileLaunchUsesMatchingBundledServerWithoutChangingAutoStart),
             ("Screen parsing: ordinary scrollback stays on its bounded suffix", tests.testOrdinaryScrollbackDoesNotMaterializeTrimmedRows),
             ("Screen parsing: source byte counting reuses bridged line normalization", tests.testScreenAnalysisPreservesSourceUTF8ByteCountAcrossLinePreparation),

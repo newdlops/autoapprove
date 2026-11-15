@@ -70,7 +70,7 @@ extension ApprovalTests {
         let store=TerminalProfileStore(directory:directory),entry=profileEntry(),valid=try store.save(.init(name:"기존",entries:[entry]))
         let original=try TerminalProfileStore.read(store.file(valid.id))
         for bad in ["",String(repeating:"가",count:81),"잘못된\n이름"] {var value=valid;value.name=bad;try expectThrows(try store.save(value))}
-        var future=valid;future.schema=3;try expectThrows(try store.save(future))
+        var future=valid;future.schema=4;try expectThrows(try store.save(future))
         var duplicate=valid;duplicate.entries += [entry];try expectThrows(try store.save(duplicate))
         var unknown=entry;unknown.agent="shell";try expectThrows(try unknown.resumeCommand())
         unknown=entry;unknown.conversationID="--last";try expectThrows(try unknown.resumeCommand())

@@ -88,13 +88,14 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
 }
 
 public struct TerminalSessionProfile: Codable, Equatable, Identifiable, Sendable {
-    public var schema: Int = 2
+    public var schema: Int = 3
     public var id: UUID
     public var name: String
     public var savedAt: Date
     public var entries: [TerminalProfileEntry]
-    public init(id: UUID = UUID(), name: String, savedAt: Date = Date(), entries: [TerminalProfileEntry]) {
-        self.id=id;self.name=name;self.savedAt=savedAt;self.entries=entries
+    public var groups: [TerminalProfileGroup]?
+    public init(id: UUID = UUID(), name: String, savedAt: Date = Date(), entries: [TerminalProfileEntry], groups:[TerminalProfileGroup]?=nil) {
+        self.id=id;self.name=name;self.savedAt=savedAt;self.entries=entries;self.groups=groups
     }
     /// Editing/capture requires an explicit choice before an unresolved
     /// conversation becomes a new CLI. Legacy files remain readable unchanged.
@@ -111,12 +112,16 @@ public struct TerminalSessionProfile: Codable, Equatable, Identifiable, Sendable
     }
     public func validated() throws -> Self {
         var result=self; result.name=name.trimmingCharacters(in:.whitespacesAndNewlines).precomposedStringWithCanonicalMapping
-        guard (1...2).contains(schema),schema == 2 || entries.allSatisfy({$0.terminalTab==nil}) else {throw AppError.message("이 프로필 파일 형식은 지원하지 않습니다. AutoApprove 버전을 확인해주세요.")}
+        guard (1...3).contains(schema),schema >= 2 || entries.allSatisfy({$0.terminalTab==nil}),schema == 3 || groups == nil else {throw AppError.message("이 프로필 파일 형식은 지원하지 않습니다. AutoApprove 버전을 확인해주세요.")}
         guard !result.name.isEmpty, result.name.count <= 80, !result.name.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains),
               savedAt.timeIntervalSince1970.isFinite, (1...128).contains(entries.count) else {
             throw AppError.message("프로필 이름은 1~80자, 세션은 1~128개로 저장해주세요.")
         }
         result.entries=try entries.map {try $0.validated()}
+        if let groups {
+            guard groups.count<=200,Set(groups.map { $0.group.id }).count==groups.count else {throw AppError.message("프로필의 그룹 목록이 중복되거나 너무 많습니다.")}
+            result.groups=try groups.map {try $0.validated(entries:result.entries)}
+        }
         guard Set(result.entries.map(\.id)).count == entries.count,Set(result.entries.map(\.key)).count == entries.count else {
             throw AppError.message("같은 대화가 프로필에 두 번 포함되어 있습니다.")
         }
@@ -268,6 +273,9 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
     public var id: UUID
     public var phase: Phase
     public var detail: String
+    /// This restore attempt's tab receipt, never part of the saved profile.
+    public var tty: String?
+    public init(id:UUID,phase:Phase,detail:String,tty:String?=nil) {self.id=id;self.phase=phase;self.detail=detail;self.tty=tty}
 }
 
 @MainActor public final class TerminalProfileRestorer {
@@ -337,7 +345,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             if !active.contains(where:{$0.key == entry.key}),let receipt=dispatched[entry.key],receipt.tty == nil {
                 result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 항목을 다시 열기 전에 터미널을 확인해주세요."+(receipt.failure.map {" 원인: "+$0} ?? ""))
             } else if active.contains(where:{$0.key == entry.key}) || dispatched[entry.key] != nil {
-                result = .init(id:entry.id,phase:.alreadyOpen,detail:"이미 열려 있거나 복원 명령을 전달한 세션입니다.")
+                result = .init(id:entry.id,phase:.alreadyOpen,detail:"이미 열려 있거나 복원 명령을 전달한 세션입니다.",tty:knownTTYs[entry.key])
             } else if entry.resumesConversation && active.contains(where:{$0.agent == entry.agent && $0.cwd == entry.cwd && $0.providerHome == entry.providerHome && UUID(uuidString:$0.conversationID)==nil}) {
                 result = .init(id:entry.id,phase:.needsReview,detail:"같은 폴더의 CLI가 실행 중입니다. 원래 대화를 확인한 뒤 복원해주세요.")
             } else if !directoryExists(entry.cwd) {
@@ -352,7 +360,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     let tty=try await launch(entry,key.flatMap {anchors[$0]});dispatched[entry.key]=Receipt(tty:tty);knownTTYs[entry.key]=tty
                     if let key {anchors[key]=tty;openedGroups.insert(key)}
                     let detail=entry.resumesConversation ? (entry.host == .terminal ? "Terminal에 대화 이어하기 명령을 전달했습니다.":"새 터미널에 저장한 대화의 이어하기 명령을 전달했습니다."):"저장한 폴더에서 새 CLI 실행 명령을 전달했습니다."
-                    result = .init(id:entry.id,phase:.opened,detail:detail)
+                    result = .init(id:entry.id,phase:.opened,detail:detail,tty:tty)
                 }
                 catch {
                     let diagnostics=(error as? RemoteHTTPError)?.diagnostics

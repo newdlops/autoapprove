@@ -22,7 +22,7 @@ public enum SessionGroupTerminalStatus {
 }
 
 /// A saved collaboration group identifies conversations, not processes or projects.
-public struct SessionGroupMember: Codable, Equatable, Identifiable {
+public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var agent: AgentKind
     public var title: String
@@ -47,7 +47,7 @@ public struct SessionGroupTreeEntry: Identifiable, Equatable {
     public var id: UUID { member.id }
 }
 
-public struct SessionGroup: Codable, Equatable, Identifiable {
+public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
     public var members: [SessionGroupMember]
