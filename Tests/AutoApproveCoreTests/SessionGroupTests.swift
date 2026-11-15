@@ -110,6 +110,19 @@ extension ApprovalTests {
         }
     }
 
+    func testSessionGroupRebindingPreservesHierarchy() throws {
+        let session = AgentSession(id: "new-process", agent: .codex, pid: 123, started: "start", tty: "/dev/fixture", cwd: "/project", terminal: .terminal)
+        let live = SessionGroupLiveSession(session: session, conversationID: UUID().uuidString, providerHome: "/fixture/home")
+        let root = live.member, parent = live.member
+        var child = live.member; child.parentMemberID = parent.id; child.runtimeID = "old-process"
+        var group = SessionGroup(name: "tree", members: [root, parent, child], leaderMemberID: root.id)
+        group.members[2] = child.updatingConnection(from: live)
+        try expectEqual(group.leaderMemberID, root.id)
+        try expectEqual(group.parentID(of: child.id), parent.id)
+        try expectEqual(group.members[2].runtimeID, live.id)
+        try expectEqual(group.treeOrder.map(\.depth), [0, 1, 2])
+    }
+
     func testSessionGroupStoragePreservesInvalidData() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-groups-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

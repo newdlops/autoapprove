@@ -381,7 +381,7 @@ import AutoApproveCore
                   fresh.conversationID == candidate.conversationID, fresh.providerHome == candidate.providerHome else {
                 throw AppError.message("현재 대화 연결이 변경되었습니다. 새로고침 후 다시 확인해주세요.")
             }
-            var updated = fresh.member; updated.id = member.id
+            let updated = member.updatingConnection(from: fresh)
             var changed = latest; changed.members = latest.members.map { $0.id == member.id ? updated : $0 }
             _ = persist(groups.map { $0.id == latest.id ? changed : $0 }, message: "현재 대화 연결을 저장했습니다.")
         } catch { self.error = error.localizedDescription }
@@ -402,7 +402,7 @@ import AutoApproveCore
                     throw AppError.message("선택한 세션은 저장된 대화와 다릅니다. 원래 대화를 선택해주세요.")
                 }
             }
-            var updated = fresh.member; updated.id = member.id
+            let updated = member.updatingConnection(from: fresh)
             var changed = latest; changed.members = latest.members.map { $0.id == member.id ? updated : $0 }
             _ = persist(groups.map { $0.id == latest.id ? changed : $0 }, message: "선택한 현재 대화에 연결했습니다.")
         } catch { self.error = error.localizedDescription }

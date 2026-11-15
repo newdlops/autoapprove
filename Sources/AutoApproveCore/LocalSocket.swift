@@ -227,7 +227,14 @@ public enum SocketClient {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw AppError.message("연결을 생성하지 못했습니다.") }
         let result = withUnsafePointer(to: &address) { p in p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
-        guard result == 0 else { Darwin.close(fd); throw AppError.message("AutoApprove 앱을 먼저 실행해주세요.") }
+        guard result == 0 else {
+            let failure = errno
+            Darwin.close(fd)
+            if failure == EPERM || failure == EACCES {
+                throw AppError.message("AutoApprove의 로컬 소켓 접근이 권한 또는 샌드박스에 의해 차단됐습니다. 현재 실행 환경의 로컬 연결 권한을 확인해주세요.")
+            }
+            throw AppError.message("AutoApprove 앱을 먼저 실행해주세요.")
+        }
         let connection = SocketConnection(fd: fd)
         configureSocket(fd, timeout: timeout)
         defer { connection.close() }

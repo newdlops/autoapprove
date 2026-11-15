@@ -3,12 +3,14 @@ import Foundation
 /// Codex supplies these fields outside the model's tool arguments on every MCP call.
 /// Do not use the shared daemon's PID as the identity of an attached terminal.
 public enum CodexGroupIdentity {
-    public static func conversationID(in message: JSONObject) throws -> String? {
-        guard let params = message["params"] as? JSONObject,
-              let meta = params["_meta"] as? JSONObject else { return nil }
+    public static func conversationID(in message: JSONObject, environment: [String: String] = [:]) throws -> String? {
+        let params = message["params"] as? JSONObject ?? [:]
+        let meta = params["_meta"] as? JSONObject ?? [:]
         let turn = meta["x-codex-turn-metadata"] as? JSONObject ?? [:]
         let values = [meta["threadId"], turn["thread_id"], turn["session_id"]].compactMap { $0 }
-        guard !values.isEmpty else { return nil }
+        // A helper launched by Codex exec receives its thread in the inherited
+        // execution context. Per-call metadata always wins on shared helpers.
+        guard !values.isEmpty else { return environment["CODEX_THREAD_ID"].flatMap(UUID.init(uuidString:))?.uuidString.lowercased() }
         let ids = values.compactMap { ($0 as? String).flatMap(UUID.init(uuidString:)) }
         guard ids.count == values.count, Set(ids).count == 1, let id = ids.first else {
             throw AppError.message("Codex 호출의 대화 식별 정보가 서로 다릅니다. MCP 연결을 다시 확인해주세요.")

@@ -513,6 +513,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: offline bidirectional peer messages stay local",tests.testGroupOfflinePeerMessagesUseLocalTerminals),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
             ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
+            ("Session groups: clipped and repeated Codex status requires fresh history",tests.testCodexGroupStatusUsesFreshHistoryWhenFrameClips),
+            ("Session groups: rebinding preserves hierarchy",tests.testSessionGroupRebindingPreservesHierarchy),
             ("Session groups: Codex read-only discovery and explicit status reuse",tests.testCodexGroupDiscoversIdleTerminalFromStatus),
             ("Session groups: Codex status refresh preserves uncertain recovery",tests.testCodexGroupStatusRefreshDuringRecoveryReview),
             ("Session groups: Codex recovery review never bypasses real input",tests.testCodexGroupStatusReviewDoesNotBypassRealInput),

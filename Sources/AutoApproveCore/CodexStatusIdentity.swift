@@ -40,7 +40,10 @@ public struct CodexStatusIdentity: Codable {
         accept();return result
     }
     public func freshThread(in screen:String)->String? {
-        let now=Self.cards(screen),fresh=now.keys.filter{now[$0,default:0]>counts[$0,default:0]}
+        freshThread(in: Self.cards(screen))
+    }
+    public func freshThread(in now:[String:Int])->String? {
+        let fresh=now.keys.filter{now[$0,default:0]>counts[$0,default:0]}
         return fresh.count==1 ? fresh[0]:nil
     }
     public mutating func identify(_ screen:String)->Bool {

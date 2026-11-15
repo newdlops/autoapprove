@@ -39,6 +39,13 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
         self.id = id; self.agent = agent; self.title = title; self.cwd = cwd
         self.conversationID = conversationID; self.providerHome = providerHome
     }
+
+    /// Updating a terminal binding never changes the member's place in its group.
+    public func updatingConnection(from live: SessionGroupLiveSession) -> SessionGroupMember {
+        var result = live.member
+        result.id = id; result.parentMemberID = parentMemberID
+        return result
+    }
 }
 
 public struct SessionGroupTreeEntry: Identifiable, Equatable {

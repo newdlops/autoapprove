@@ -29,7 +29,56 @@ private final class CodexGroupScreen: @unchecked Sendable {
     }
 }
 
+private final class ClippedGroupStatus: @unchecked Sendable {
+    let lock = NSLock(), id = UUID().uuidString.lowercased()
+    let repeated: Bool, append: Bool
+    private var sent = false, reads = 0
+    init(repeated: Bool, append: Bool = true) { self.repeated = repeated; self.append = append }
+    private var card: String { ">_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(id)\n› \n ? for shortcuts" }
+    var screen: String {
+        lock.lock(); defer { lock.unlock() }
+        return repeated ? card : sent ? "Session: \(id)\n› \n ? for shortcuts" : "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts"
+    }
+    var history: String {
+        lock.lock(); defer { lock.unlock() }; reads += 1
+        return card + (sent && append ? "\n" + card : "")
+    }
+    var historyReads: Int { lock.lock(); defer { lock.unlock() }; return reads }
+    func send(_ input: RemoteTerminalInput) -> TerminalDelivery {
+        lock.lock(); defer { lock.unlock() }
+        if input.bytes == "/status\r" { sent = true }
+        return .sent
+    }
+}
+
 extension ApprovalTests {
+    @MainActor func testCodexGroupStatusUsesFreshHistoryWhenFrameClips() async throws {
+        for (repeated, append) in [(false, true), (true, true), (false, false)] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-status-history-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let record = ProcessDiscovery.parse("100596 1 fixture45 100596 100596 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+            let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .terminal)
+            let screen = ClippedGroupStatus(repeated: repeated, append: append)
+            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+                approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) },
+                history: { target in try expectEqual(target.tty, session.tty); return screen.history })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter],
+                codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
+            defer { engine.stop() }
+            engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.terminal)
+            let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home").member])
+            try SessionGroupStore(directory: directory).save([group])
+            _ = try await engine.sessionGroupSessions()
+            try expectEqual(screen.historyReads, 0, "Discovery never reads scrollback")
+            var refreshed = false
+            do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id); refreshed = true }
+            catch { if append { throw error } }
+            try expectEqual(refreshed, append, "An unchanged historical card must never establish freshness")
+            let saved = try SessionGroupStore(directory: directory).load()[0]
+            try expectEqual(saved.members[0].conversationID, append ? screen.id : "")
+            try expect(screen.historyReads <= 4, "History fallback is bounded per explicit query")
+        }
+    }
     @MainActor func testCodexGroupStatusRefreshDuringRecoveryReview() async throws {
         for useITerm in [false, true] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-review-" + UUID().uuidString)
@@ -184,6 +233,10 @@ extension ApprovalTests {
         let message: JSONObject = ["params": ["arguments": ["conversationID": other], "_meta": [
             "threadId": id, "x-codex-turn-metadata": ["thread_id": id.lowercased(), "session_id": id]]]]
         try expectEqual(try CodexGroupIdentity.conversationID(in: message), id.lowercased())
+        try expectEqual(try CodexGroupIdentity.conversationID(in: message, environment: ["CODEX_THREAD_ID": other]), id.lowercased(), "Per-call metadata wins over inherited context")
+        try expectEqual(try CodexGroupIdentity.conversationID(in: [:], environment: ["CODEX_THREAD_ID": id]), id.lowercased())
+        try expectNil(try CodexGroupIdentity.conversationID(in: [:], environment: ["CODEX_THREAD_ID": "invalid"]))
+        try expectNil(try CodexGroupIdentity.conversationID(in: ["params": ["arguments": ["CODEX_THREAD_ID": id]]]))
         try expectNil(try CodexGroupIdentity.conversationID(in: ["params": ["arguments": ["_meta": ["threadId": id]]]]))
         for meta: JSONObject in [["threadId": "bad"], ["threadId": id, "x-codex-turn-metadata": ["thread_id": other]]] {
             do { _ = try CodexGroupIdentity.conversationID(in: ["params": ["_meta": meta]]); throw AppError.message("Accepted ambiguous metadata") }
@@ -227,6 +280,7 @@ extension ApprovalTests {
         let peer = (groups?.first?["members"] as? [JSONObject])?.first
         try expectEqual(peer?["isCaller"] as? Bool, true)
         try expectEqual(peer?["connected"] as? Bool, false, "MCP identity must not invent a terminal connection")
+        try expectEqual(peer?["connectionState"] as? String, "disconnected")
         params["codexCallerHome"] = "/fixture/other"
         try expectEqual((try await engine.mcpAction(params)["groups"] as? [JSONObject])?.count, 0)
     }

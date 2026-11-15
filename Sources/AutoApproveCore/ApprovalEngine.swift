@@ -2353,6 +2353,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
         refreshSessionGroupBadges()
     }
 
+    /// A status card can extend above Terminal's visible frame. Capture only
+    /// counts, on explicit refresh, without retaining or recording scrollback.
+    private func groupStatusHistory(_ original: AgentSession) async throws -> CodexStatusIdentity? {
+        guard original.agent == .codex, original.terminal == .terminal,
+              remoteCanRead(original), let history = screenAdapters[.terminal]?.history else { return nil }
+        let verify = remoteProcessVerifier
+        let target = ScreenTarget(tty: original.tty, handle: original.screenHandle,
+                                  sourcePID: original.pid, sourceStarted: original.started)
+        let proof = try await Task.detached(priority: .utility) {
+            guard try verify(original) else { throw AppError.message("원래 터미널 연결이 바뀌었습니다.") }
+            let text = try history(target)
+            guard try verify(original) else { throw AppError.message("기록을 읽는 동안 터미널 연결이 바뀌었습니다.") }
+            return CodexStatusIdentity(screen: String(text.suffix(160_000)))
+        }.value
+        try Task.checkCancellation()
+        guard !remoteInputStopped, let current = sessions[original.id], current.pid == original.pid,
+              current.started == original.started, current.tty == original.tty, current.cwd == original.cwd,
+              current.terminal == original.terminal, current.phase != .ended, remoteCanRead(current) else {
+            throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 저장하지 않았습니다.")
+        }
+        return proof
+    }
+
     /// Types /status into an empty composer and reads the fresh status card, including during Codex work.
     private func statusConversationID(_ original: AgentSession) async throws -> String {
         let runtime = original.id
@@ -2360,7 +2383,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("이미 이 터미널의 세션 ID를 조회하고 있습니다.")
         }
         defer { groupStatusQueries.remove(runtime) }
-        let before = try await remoteTerminal(sessionID: runtime, realtime: true)
+        let before = try await remoteTerminal(sessionID: runtime, realtime: true, textOnly: original.agent == .codex)
         let ready = original.agent == .codex ? CodexStatusIdentity.canQuery(before.screen) :
             SystemSafetyComposer.capture(before.screen, agent: original.agent, text: "/status") != nil &&
                 PromptDetector.normalizedLines(before.screen).last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })?.trimmingCharacters(in: .whitespaces) == "❯"
@@ -2371,9 +2394,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 "빈 입력창의 대기 상태를 확인하지 못했습니다. 질문·메뉴를 닫고 현재 터미널 화면을 확인해주세요."
             throw AppError.message(reason)
         }
+        let historyBefore = try? await groupStatusHistory(original)
         _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, preflight: {
             guard original.agent == .codex else { return }
-            let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true)
+            let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true, textOnly: true)
             guard !self.snapshot.paused, !self.userInputHasPriority(runtime),
                   !self.automaticInputBusy(runtime), let current = self.sessions[runtime],
                   self.codexGroupStatusEligible(current), CodexStatusIdentity.canQuery(latest.screen) else {
@@ -2381,15 +2405,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         })
         sendingMessages.insert(runtime); defer { sendingMessages.remove(runtime) }
-        for _ in 0..<60 {
+        for attempt in 0..<60 {
             try await Task.sleep(for: .milliseconds(200))
             guard let current = sessions[runtime], current.pid == original.pid, current.started == original.started,
                   current.cwd == original.cwd, current.tty == original.tty, current.phase != .ended else {
                 throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 저장하지 않았습니다.")
             }
-            let frame = try await remoteTerminal(sessionID: runtime, realtime: true)
-            guard let id = SessionGroupTerminalStatus.freshConversationID(before: before.screen, after: frame.screen, agent: original.agent) else { continue }
-            return id
+            let frame = try await remoteTerminal(sessionID: runtime, realtime: true, textOnly: original.agent == .codex)
+            if let id = SessionGroupTerminalStatus.freshConversationID(before: before.screen, after: frame.screen, agent: original.agent) { return id }
+            // Never infer freshness from a UUID merely becoming visible after
+            // scrolling. Both snapshots must show a newly appended full card.
+            // At most three fallback reads per explicit query, never per poll.
+            if [4, 29, 59].contains(attempt), let historyBefore,
+               let after = try? await groupStatusHistory(original), let id = historyBefore.freshThread(in: after.counts) { return id }
         }
         throw AppError.message("터미널의 /status 화면에서 세션 ID를 확인하지 못했습니다. 기존 ID를 유지합니다.")
     }
@@ -2504,7 +2532,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
            home.hasPrefix("/"), (object["codexCallerConversationID"] as? String).flatMap(UUID.init(uuidString:)) == uuid {
             let caller = AgentSession(id: "codex-mcp:" + home + ":" + uuid.uuidString, agent: .codex, pid: 0,
                                       started: "", tty: "", cwd: "", terminal: .unknown)
-            return (.init(session: caller, conversationID: uuid.uuidString, providerHome: home), "codex_mcp_metadata")
+            let attribution = object["codexCallerSource"] as? String == "codex_exec_context" ? "codex_exec_context" : "codex_mcp_metadata"
+            return (.init(session: caller, conversationID: uuid.uuidString, providerHome: home), attribution)
         }
         guard matches.count == 1, let found = matches.first else {
             throw RemoteHTTPError(409, "지정한 대화에 일치하는 실행 세션을 유일하게 확인하지 못했습니다.")
@@ -3164,6 +3193,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title,
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
+                            "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
                             "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
@@ -3193,6 +3223,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "depth": entry.depth, "isLeader": group.leaderMemberID == member.id, "isCaller": member.id == callerMember.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull(),
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
+                            "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "canAssign": group.parentID(of: member.id) == callerMember.id && (caller.session.pid != 0 || member.agent == .codex),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
