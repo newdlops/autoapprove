@@ -467,6 +467,8 @@ extension ApprovalTests {
         let leaderMember = leader.member, workerMember = worker.member
         let group = SessionGroup(name: "질문 전달", members: [leaderMember, workerMember], leaderMemberID: leaderMember.id)
         try SessionGroupStore(directory: directory).save([group])
+        let mailbox = try SessionGroupMailbox(directory: directory)
+        func messages() -> [SessionGroupMessage] { (try? mailbox.list(groupID: group.id, memberID: leaderMember.id, includeAcknowledged: true)) ?? [] }
         func call(_ tool: String, from caller: String, _ extra: JSONObject = [:]) async throws -> JSONObject {
             var params: JSONObject = ["owner": UUID().uuidString, "tool": tool, "sessionID": caller,
                                       "groupID": group.id.uuidString, "memberID": workerMember.id.uuidString]
@@ -490,25 +492,29 @@ extension ApprovalTests {
         writer.show("Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
         let delegated = try await waitForGroup(20) {
             await engine.refreshScreens()
-            return writer.writes(to: leaderTTY).contains { $0.contains("[AutoApprove 그룹 승인 요청") }
+            return messages().contains { $0.text.contains("[AutoApprove 그룹 승인 요청") }
         }
         try expect(delegated, "The worker's permission prompt must reach the parent")
-        let request = try unwrapGroup(writer.writes(to: leaderTTY).first { $0.contains("[AutoApprove 그룹 승인 요청") })
+        let permissionMessage = try unwrapGroup(messages().first { $0.text.contains("[AutoApprove 그룹 승인 요청") })
+        let request = permissionMessage.text
+        _ = try await call("ack_group_messages", from: leader.id, ["messageIDs": [permissionMessage.id.uuidString]])
         try expect(request.contains("echo fixture") && request.contains("1) Yes") && request.contains("사용자 승인으로 처리"))
         let beforeApproval = writer.writes(to: workerTTY).count
         let approved = try await call("answer_group_question", from: leader.id, ["choice": 1])
         try expectEqual(approved["permission"] as? Bool, true)
         try expectEqual(writer.writes(to: workerTTY).count, beforeApproval + 1)
         try await Task.sleep(for: .seconds(1.2))
-        try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "An answered request is not reported again")
+        try expectEqual(messages().filter { $0.text.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "An answered request is not reported again")
 
         writer.show("어느 환경에 배포할까요?\n\n❯ 1. 개발\n  2. 운영\n  3. 둘 다\n\nEnter to select", on: workerTTY)
         let reported = try await waitForGroup(20) {
             await engine.refreshScreens()
-            return writer.writes(to: leaderTTY).contains { $0.contains("[AutoApprove 그룹 질문") }
+            return messages().contains { $0.text.contains("[AutoApprove 그룹 질문") }
         }
-        try expect(reported, "The worker's choice question must reach the parent's terminal")
-        let typed = try unwrapGroup(writer.writes(to: leaderTTY).first { $0.contains("[AutoApprove 그룹 질문") })
+        try expect(reported, "The worker's choice question must reach the parent's durable inbox")
+        let choiceMessage = try unwrapGroup(messages().first { $0.text.contains("[AutoApprove 그룹 질문") })
+        let typed = choiceMessage.text
+        _ = try await call("ack_group_messages", from: leader.id, ["messageIDs": [choiceMessage.id.uuidString]])
         try expect(typed.contains("어느 환경에 배포할까요?") && typed.contains("2) 운영"))
         try expectEqual(try await question()?["options"] as? [String], ["개발", "운영", "둘 다"])
 
@@ -533,7 +539,7 @@ extension ApprovalTests {
             return phase(worker.id) == .approval
         }, "The worker must be waiting on the permission prompt")
         try await Task.sleep(for: .seconds(1.2))
-        try expectEqual(writer.writes(to: leaderTTY).filter { $0.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "A system change must stay with the user")
+        try expectEqual(messages().filter { $0.text.contains("[AutoApprove 그룹 승인 요청") }.count, 1, "A system change must stay with the user")
     }
 
     func testSessionGroupBadgesForSessionLists() throws {
@@ -668,7 +674,7 @@ extension ApprovalTests {
 
 extension ApprovalTests {
     @MainActor func testGroupDialogueAcrossAgentsAndHierarchy() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-dialogue-" + UUID().uuidString)
+        let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("group-dialogue-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let records = ProcessDiscovery.parse("""
         101011 1 fixture201 101011 101011 Wed Oct 28 12:00:00 2026 /fixture/codex
@@ -685,49 +691,71 @@ extension ApprovalTests {
         var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
         adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records },
-            screenAdapters: [.iterm: adapter], codexGroupReader: { record in ids[record.pid].map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") } }, isolateByDefault: true)
+        func makeEngine() throws -> ApprovalEngine {
+            let value = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records },
+                screenAdapters: [.iterm: adapter], codexGroupReader: { record in ids[record.pid].map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") } }, isolateByDefault: true)
+            value.groupMailboxPollInterval = 0.05; value.groupMailboxReminderInterval = 0.25
+            return value
+        }
+        var engine = try makeEngine()
         defer { engine.stop() }
-        func showReady(_ index: Int, working: Bool = false) {
+        func showReady(_ index: Int) {
             let glyph = sessions[index].agent == .claude ? "❯" : "›"
-            writer.show("fixture\n" + (working ? "• Working (esc to interrupt)\n" : "") + glyph + " \n ? for shortcuts", on: sessions[index].tty)
+            writer.show("fixture\n" + (sessions[index].agent == .codex ? "• Working (esc to interrupt)\n" : "") + glyph + " \n ? for shortcuts", on: sessions[index].tty)
             terminal.setStatus(records[index].pid, "idle")
         }
         for index in sessions.indices { showReady(index) }
         engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
         let observed = try await engine.sessionGroupSessions()
         let members = try sessions.map { session in try unwrapGroup(observed.first { $0.id == session.id }).member }
-        var group = SessionGroup(name: "local dialogue", members: Array(members.prefix(3)), leaderMemberID: members[0].id)
+        let group = SessionGroup(name: "local dialogue", members: Array(members.prefix(3)), leaderMemberID: members[0].id)
         let store = SessionGroupStore(directory: directory); try store.save([group])
-        func call(_ tool: String = "ask_group_question", _ text: String = "검증 결과가 어떤가요?", caller: Int = 1, target: Int = 0) async throws -> JSONObject {
-            try await engine.mcpAction(["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[caller].id,
-                "groupID": group.id.uuidString, "memberID": members[target].id.uuidString, "text": text])
+        let box = try SessionGroupMailbox(directory: directory)
+        func call(_ tool: String = "ask_group_question", _ text: String = "검증 결과가 어떤가요?", caller: Int = 1, target: Int = 0, extra: JSONObject = [:]) async throws -> JSONObject {
+            var args: JSONObject = ["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[caller].id,
+                "groupID": group.id.uuidString, "memberID": members[target].id.uuidString, "text": text]
+            args.merge(extra) { _, new in new }
+            return try await engine.mcpAction(args)
+        }
+        func acknowledge(_ ids: [UUID], caller: Int) async throws {
+            _ = try await call("ack_group_messages", caller: caller, extra: ["messageIDs": ids.map(\.uuidString)])
         }
         func count() -> Int { writer.writes.count + terminal.typed.count }
         func rejects(line: Int = #line, _ operation: () async throws -> JSONObject) async throws {
-            let before = count()
-            do { _ = try await operation(); throw AppError.message("Invalid group dialogue was delivered at line \(line)") }
+            let before = try box.pendingCount
+            do { _ = try await operation(); throw AppError.message("Invalid group dialogue accepted at line \(line)") }
             catch is RemoteHTTPError { }
-            try expectEqual(count(), before)
+            try expectEqual(try box.pendingCount, before)
         }
         let originalAutomatic = engine.snapshot.sessions.map(\.automatic)
-        // Worker -> leader, leader -> worker, peer -> peer; both Codex/Claude directions.
-        for (caller, target, reply) in [(1, 0, false), (0, 1, true), (2, 1, false), (1, 2, true), (2, 0, false), (0, 2, true)] {
-            try await Task.sleep(for: .milliseconds(900))
-            showReady(target, working: sessions[target].agent == .codex)
-            let text = "/status 형식에 대해\n확인해주세요"
-            let response = try await call(reply ? "reply_group_question" : "ask_group_question", text, caller: caller, target: target)
-            try expectEqual(response["delivered"] as? Bool, true)
-            try expectEqual(response["networkRequired"] as? Bool, false)
-            let sent = sessions[target].agent == .claude ? terminal.typed.last(where: { !$0.isEmpty })! : writer.writes(to: sessions[target].tty).last!
-            try expect(sent.contains(members[caller].id.uuidString)); try expect(sent.contains(group.id.uuidString))
-            try expect(sent.hasPrefix("[AutoApprove 그룹 " + (reply ? "답변" : "질문") + "]"))
-            try expect(sent.contains("/status 형식에 대해 확인해주세요")); try expect(!sent.contains("\n"))
-            if !reply { try expect(sent.contains("reply_group_question")) }
+        try engine.setPaused(true)
+        // Two senders overlap while no terminal input is possible: both requests are durably accepted.
+        let concurrentEngine = engine
+        @Sendable @MainActor func simultaneous(_ caller: Int, _ text: String) async throws -> Bool {
+            let receipt = try await concurrentEngine.mcpAction(["owner": UUID().uuidString, "tool": "ask_group_question", "sessionID": sessions[caller].id,
+                "groupID": group.id.uuidString, "memberID": members[0].id.uuidString, "text": text])
+            return receipt["accepted"] as? Bool == true && receipt["delivered"] as? Bool == false
         }
-        try expectEqual(engine.snapshot.sessions.map(\.automatic), originalAutomatic)
-        try expect(try engine.sessionGroupAssignments().isEmpty)
-        try expectEqual(try store.load(), [group])
+        async let left = simultaneous(1, "first")
+        async let right = simultaneous(2, "second")
+        let accepted = try await [left, right]
+        try expect(accepted.allSatisfy { $0 })
+        for index in 0..<10 { _ = try await call("ask_group_question", "queued \(index)", caller: index % 2 + 1) }
+        try expectEqual(try box.pendingCount, 12); try expectEqual(count(), 0)
+        let all = try box.list(groupID: group.id, memberID: members[0].id)
+        try expectEqual(Set(all.map(\.id)).count, 12)
+        try expectEqual(all.map(\.sequence), all.map(\.sequence).sorted())
+        let first = all[0]
+        _ = try await call("ask_group_question", first.text, caller: first.senderID == members[1].id ? 1 : 2, extra: ["messageID": first.id.uuidString])
+        try expectEqual(try box.pendingCount, 12)
+        // Reads, including a lost response, never consume the inbox. Pagination retains acceptance order.
+        let page = try await call("get_group_messages", caller: 0, extra: ["limit": 3])
+        try expectEqual(page["hasMore"] as? Bool, true)
+        let next = try await call("get_group_messages", caller: 0, extra: ["afterSequence": all[2].sequence])
+        try expectEqual((next["messages"] as? [JSONObject])?.count, 9)
+        _ = try await call("get_group_status", caller: 0)
+        try expectEqual(try box.pendingCount, 12)
+        try await rejects { try await call("ack_group_messages", caller: 1, extra: ["messageIDs": [first.id.uuidString]]) }
         for tool in ["ask_group_question", "reply_group_question"] {
             try await rejects { try await call(tool, caller: 3) }
             try await rejects { try await call(tool, target: 3) }
@@ -736,41 +764,63 @@ extension ApprovalTests {
             try await rejects { try await call(tool, "bad\0text") }
             try await rejects { try await call(tool, String(repeating: "x", count: 4001)) }
         }
-        try engine.setPaused(true)
-        try await rejects { try await call() }
+        try await rejects { try await call("get_group_messages", caller: 3) }
+        // A busy Codex with an empty composer receives a hint, not duplicate executable message bodies.
         try engine.setPaused(false)
-        try await Task.sleep(for: .milliseconds(900))
-        for target in [0, 1] {
-            let glyph = sessions[target].agent == .claude ? "❯" : "›"
-            terminal.setStatus(records[target].pid, "idle")
-            writer.show("fixture\n\(glyph) unfinished draft\n ? for shortcuts", on: sessions[target].tty)
-            try await rejects { try await call(caller: 2, target: target) }
-            writer.show("Which option?\n\(glyph) 1. First\n  2. Second\nPress enter to confirm", on: sessions[target].tty)
-            try await rejects { try await call(caller: 2, target: target) }
-            showReady(target)
-        }
+        try expect(try await waitForGroup(5) { writer.writes(to: sessions[0].tty).contains { $0.contains("그룹 수신함") } })
+        try expect(writer.writes.allSatisfy { !$0.contains("queued 0") && !$0.contains("first") })
+        try expectEqual(try box.pendingCount, 12)
+        try await acknowledge(all.map(\.id), caller: 0)
+        try await acknowledge(all.map(\.id), caller: 0)
+        try expectEqual(try box.pendingCount, 0)
+        // Codex -> Claude peer and leader replies are accepted during Claude work; pull receipt works without input.
         terminal.setStatus(records[1].pid, "busy")
-        try await rejects { try await call(caller: 2, target: 1) }
-        showReady(1)
-        // Disconnected saved member: neither its conversation nor original process is present.
-        // A stale ID on the same verified live process is legitimately refreshed by discovery.
-        group.members[0].conversationID = UUID().uuidString; group.members[0].runtimeID = "process:missing"
-        try store.save([group])
-        try await rejects { try await call() }
-        group.members[0] = members[0]; group.leaderMemberID = nil; try store.save([group])
-        _ = try await call(caller: 1, target: 0)
-        // Questions never authorize a worker to assign upward or answer a peer's permission prompt.
-        group.leaderMemberID = members[0].id; try store.save([group])
-        for tool in ["assign_group_task", "answer_group_question"] {
-            try await rejects { try await engine.mcpAction(["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[1].id,
-                "groupID": group.id.uuidString, "memberID": members[0].id.uuidString, "task": "invalid", "choice": 1]) }
+        let peer = try await call("ask_group_question", "peer question", caller: 2, target: 1)
+        let reply = try await call("reply_group_question", "answer", caller: 0, target: 1)
+        try expectEqual(peer["accepted"] as? Bool, true); try expectEqual(reply["accepted"] as? Bool, true)
+        let inbox = try await call("get_group_messages", caller: 1)
+        let received = (inbox["messages"] as? [JSONObject] ?? []).compactMap { ($0["messageID"] as? String).flatMap(UUID.init(uuidString:)) }
+        try expectEqual(received.count, 2); try await acknowledge(received, caller: 1)
+        // Drafts and choice screens defer notification while retaining the message.
+        for screen in ["fixture\n› unfinished draft\n ? for shortcuts", "Which option?\n› 1. First\n  2. Second\nPress enter to confirm"] {
+            writer.show(screen, on: sessions[0].tty)
+            let before = count()
+            let pending = try await call("ask_group_question", "while blocked " + UUID().uuidString)
+            try await Task.sleep(for: .milliseconds(350))
+            try expectEqual(count(), before)
+            let id = try unwrapGroup((pending["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+            try expectNil(try box.message(id)?.acknowledgedAt)
+            try await acknowledge([id], caller: 0)
         }
-        terminal.ignoresInput = true
-        do { _ = try await call(caller: 2, target: 1); throw AppError.message("Uncertain submission became success") }
-        catch let error as RemoteHTTPError { try expectEqual(error.diagnostics?["delivery"], "unknown") }
-        try expect(try engine.sessionGroupAssignments().isEmpty, "Dialogue must not create a task or delivery queue")
+        showReady(0)
+        // A disconnected recipient is retained, without rerouting to another member.
+        var disconnected = group; disconnected.members[0].conversationID = UUID().uuidString; disconnected.members[0].runtimeID = "missing"
+        try store.save([disconnected])
+        let disconnectedMessage = try await call("ask_group_question", "while disconnected")
+        let disconnectedID = try unwrapGroup((disconnectedMessage["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+        try await Task.sleep(for: .milliseconds(350)); try expectNil(try box.message(disconnectedID)?.acknowledgedAt)
+        try store.save([group]); try await acknowledge([disconnectedID], caller: 0)
+        // Submission uncertainty survives app restart; repeating a hint never duplicates the message record.
+        showReady(1); terminal.ignoresInput = true; engine.groupMailboxReminderInterval = 30
+        let uncertain = try await call("reply_group_question", "retained after restart", caller: 2, target: 1)
+        let uncertainID = try unwrapGroup((uncertain["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+        try expect(try await waitForGroup(12) { (try? box.message(uncertainID)?.lastResult) == "unknown" })
+        engine.stop(); terminal.ignoresInput = false; showReady(1)
+        try box.noteAttempt(uncertainID, result: "unknown", retryAt: .distantPast)
+        engine = try makeEngine(); engine.groupMailboxReminderInterval = 30
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        try engine.start(poll: false)
+        try expect(try await waitForGroup(6) { (try? box.message(uncertainID)?.lastResult) == "submitted" })
+        try expectEqual(try box.message(uncertainID)?.text, "retained after restart")
+        try expectEqual(try box.pendingCount, 1)
+        try await acknowledge([uncertainID], caller: 1)
+        try expectEqual(try box.pendingCount, 0)
+        for tool in ["assign_group_task", "answer_group_question"] {
+            try await rejects { try await call(tool, caller: 1, target: 0, extra: ["task": "invalid", "choice": 1]) }
+        }
         try expectEqual(engine.snapshot.sessions.map(\.automatic), originalAutomatic)
-        try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
+        try expect(try engine.sessionGroupAssignments().isEmpty)
+        try expectEqual(try store.load(), [group]); try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
     }
 
     @MainActor func testGroupOfflinePeerMessagesUseLocalTerminals() async throws {
@@ -806,21 +856,23 @@ extension ApprovalTests {
             }
             try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
             let result = try await send("첫 번째 줄\n두 번째 줄")
-            try expectEqual(result["transport"] as? String, "local_terminal"); try expectEqual(result["delivered"] as? Bool, true)
-            try expectEqual(writer.writes(to: sessions[1].tty), ["첫 번째 줄 두 번째 줄\r"])
+            try expectEqual(result["transport"] as? String, "local_mailbox"); try expectEqual(result["accepted"] as? Bool, true)
+            let box = try SessionGroupMailbox(directory: directory)
+            try expectEqual(try box.list(groupID: group.id, memberID: members[1].id).map(\.text), ["첫 번째 줄 두 번째 줄"])
             _ = try await send("확인했습니다", caller: 1, target: 0)
-            try expectEqual(writer.writes(to: sessions[0].tty), ["확인했습니다\r"])
-            try expect(try engine.sessionGroupAssignments().isEmpty, "Peer messages must not create an orchestration queue")
+            try expectEqual(try box.list(groupID: group.id, memberID: members[0].id).map(\.text), ["확인했습니다"])
+            try expect(try engine.sessionGroupAssignments().isEmpty, "Peer messages must not create worker assignments")
             for (text, caller, target) in [("/status", 0, 1), ("hello", 2, 1), ("hello", 0, 0)] {
                 do { _ = try await send(text, caller: caller, target: target); throw AppError.message("Invalid message was delivered") }
                 catch is RemoteHTTPError { }
             }
             try engine.setPaused(true)
-            do { _ = try await send("paused"); throw AppError.message("Global pause was bypassed") } catch is RemoteHTTPError { }
+            _ = try await send("paused")
+            try expectEqual(try box.pendingCount, 3)
             try engine.setPaused(false)
             group.leaderMemberID = members[0].id; try store.save([group])
             do { _ = try await send("must use assign"); throw AppError.message("Tree authorization was bypassed") } catch is RemoteHTTPError { }
-            try expectEqual(writer.writes.count, 2)
+            try expectEqual(try box.pendingCount, 3)
             try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
         }
     }

@@ -7,7 +7,7 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
         case working
         /// The worker finished; the parent has not received the report yet.
         case completed
-        /// The parent received the report in its terminal or through get_group_status.
+        /// The parent explicitly acknowledged its durable inbox report.
         case reported
         /// A newer task for the same worker replaced this one before it finished.
         case superseded
@@ -196,7 +196,7 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     public static func taskMessage(_ assignment: SessionGroupAssignment) -> String { oneLine(assignment.task) }
 
     /// Sender attribution and return address for free-form dialogue, across either agent kind.
-    /// This path never grants task/approval authority and does not create a delivery queue.
+    /// Formatting alone never grants task/approval authority.
     public static func dialogueMessage(groupID: UUID, sender: SessionGroupMember, text: String, reply: Bool) -> String {
         let heading = "[AutoApprove 그룹 \(reply ? "답변" : "질문")] 보낸 구성원: \(oneLine(sender.title)) (\(sender.agent.rawValue), \(sender.id.uuidString)). "
         let route = reply ? "추가 질문이 필요할 때만 ask_group_question" : "답변은 reply_group_question"
