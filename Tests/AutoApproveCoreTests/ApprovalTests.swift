@@ -511,6 +511,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: offline reconnect uses original terminal",tests.testGroupOfflineReconnectUsesOriginalTerminal),
             ("Session groups: offline self reconnect preserves drafts",tests.testGroupOfflineSelfReconnectProtectsDrafts),
             ("Session groups: offline bidirectional peer messages stay local",tests.testGroupOfflinePeerMessagesUseLocalTerminals),
+            ("Session groups: cross-agent questions and replies preserve authority and input",tests.testGroupDialogueAcrossAgentsAndHierarchy),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
             ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
             ("Session groups: clipped and repeated Codex status requires fresh history",tests.testCodexGroupStatusUsesFreshHistoryWhenFrameClips),

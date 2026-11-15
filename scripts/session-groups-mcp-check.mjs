@@ -49,7 +49,7 @@ try {
   const response=JSON.parse(line.value);assert.equal(response.id,id);assert.equal(response.result.isError,isError);
  };
  await request(1,'ask_user',{questions:[{question:'fixture'}]});
- const groupTools=['get_session_groups','get_group_status','reconnect_group_member','send_group_message','assign_group_task','answer_group_question'];
+ const groupTools=['get_session_groups','get_group_status','reconnect_group_member','send_group_message','assign_group_task','answer_group_question','ask_group_question','reply_group_question'];
  for(const [index,tool] of groupTools.entries()) {
   await request(index+2,tool,{groupID:'fixture',memberID:'fixture',text:'fixture',task:'fixture',choice:1,
    sessionID:'spoofed-session',agentKind:'spoofed-agent',codexCallerHome:'/spoofed',codexCallerConversationID:'spoofed',codexCallerSource:'spoofed'});

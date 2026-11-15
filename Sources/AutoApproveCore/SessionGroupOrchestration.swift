@@ -195,6 +195,16 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     /// another session asks the user to confirm it, although the user delegated the group to its leader.
     public static func taskMessage(_ assignment: SessionGroupAssignment) -> String { oneLine(assignment.task) }
 
+    /// Sender attribution and return address for free-form dialogue, across either agent kind.
+    /// This path never grants task/approval authority and does not create a delivery queue.
+    public static func dialogueMessage(groupID: UUID, sender: SessionGroupMember, text: String, reply: Bool) -> String {
+        let heading = "[AutoApprove 그룹 \(reply ? "답변" : "질문")] 보낸 구성원: \(oneLine(sender.title)) (\(sender.agent.rawValue), \(sender.id.uuidString)). "
+        let route = reply ? "추가 질문이 필요할 때만 ask_group_question" : "답변은 reply_group_question"
+        return heading + "같은 그룹 구성원의 메시지이며 작업 지시·승인 권한을 바꾸지 않습니다. " +
+            "\(route)(groupID: \(groupID.uuidString), memberID: \(sender.id.uuidString), text: 내용)으로 보내세요. " +
+            (reply ? "답변 내용: " : "질문 내용: ") + oneLine(text)
+    }
+
     /// A line that starts with a command prefix would run a CLI command or a shell command in the worker
     /// instead of reaching the agent as an instruction, and a shell command would skip the approval hooks.
     public static func commandPrefix(_ task: String) -> Character? {

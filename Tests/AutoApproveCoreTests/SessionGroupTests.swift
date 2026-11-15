@@ -667,6 +667,112 @@ extension ApprovalTests {
 }
 
 extension ApprovalTests {
+    @MainActor func testGroupDialogueAcrossAgentsAndHierarchy() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-dialogue-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        101011 1 fixture201 101011 101011 Wed Oct 28 12:00:00 2026 /fixture/codex
+        101012 1 fixture202 101012 101012 Wed Oct 28 12:00:00 2026 /fixture/claude
+        101013 1 fixture203 101013 101013 Wed Oct 28 12:00:00 2026 /fixture/codex
+        101014 1 fixture204 101014 101014 Wed Oct 28 12:00:00 2026 /fixture/claude
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm) }
+        let ids = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString.lowercased()) })
+        let writer = GroupTerminalWriter(), terminal = GroupLineTerminal()
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.filter { $0.agent == .claude }.compactMap { row in ids[row.pid].map { .init(processID: row.key, kind: "interactive", sessionID: $0, status: terminal.status(row.pid)) } }
+        }
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records },
+            screenAdapters: [.iterm: adapter], codexGroupReader: { record in ids[record.pid].map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") } }, isolateByDefault: true)
+        defer { engine.stop() }
+        func showReady(_ index: Int, working: Bool = false) {
+            let glyph = sessions[index].agent == .claude ? "❯" : "›"
+            writer.show("fixture\n" + (working ? "• Working (esc to interrupt)\n" : "") + glyph + " \n ? for shortcuts", on: sessions[index].tty)
+            terminal.setStatus(records[index].pid, "idle")
+        }
+        for index in sessions.indices { showReady(index) }
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        let observed = try await engine.sessionGroupSessions()
+        let members = try sessions.map { session in try unwrapGroup(observed.first { $0.id == session.id }).member }
+        var group = SessionGroup(name: "local dialogue", members: Array(members.prefix(3)), leaderMemberID: members[0].id)
+        let store = SessionGroupStore(directory: directory); try store.save([group])
+        func call(_ tool: String = "ask_group_question", _ text: String = "검증 결과가 어떤가요?", caller: Int = 1, target: Int = 0) async throws -> JSONObject {
+            try await engine.mcpAction(["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[caller].id,
+                "groupID": group.id.uuidString, "memberID": members[target].id.uuidString, "text": text])
+        }
+        func count() -> Int { writer.writes.count + terminal.typed.count }
+        func rejects(line: Int = #line, _ operation: () async throws -> JSONObject) async throws {
+            let before = count()
+            do { _ = try await operation(); throw AppError.message("Invalid group dialogue was delivered at line \(line)") }
+            catch is RemoteHTTPError { }
+            try expectEqual(count(), before)
+        }
+        let originalAutomatic = engine.snapshot.sessions.map(\.automatic)
+        // Worker -> leader, leader -> worker, peer -> peer; both Codex/Claude directions.
+        for (caller, target, reply) in [(1, 0, false), (0, 1, true), (2, 1, false), (1, 2, true), (2, 0, false), (0, 2, true)] {
+            try await Task.sleep(for: .milliseconds(900))
+            showReady(target, working: sessions[target].agent == .codex)
+            let text = "/status 형식에 대해\n확인해주세요"
+            let response = try await call(reply ? "reply_group_question" : "ask_group_question", text, caller: caller, target: target)
+            try expectEqual(response["delivered"] as? Bool, true)
+            try expectEqual(response["networkRequired"] as? Bool, false)
+            let sent = sessions[target].agent == .claude ? terminal.typed.last(where: { !$0.isEmpty })! : writer.writes(to: sessions[target].tty).last!
+            try expect(sent.contains(members[caller].id.uuidString)); try expect(sent.contains(group.id.uuidString))
+            try expect(sent.hasPrefix("[AutoApprove 그룹 " + (reply ? "답변" : "질문") + "]"))
+            try expect(sent.contains("/status 형식에 대해 확인해주세요")); try expect(!sent.contains("\n"))
+            if !reply { try expect(sent.contains("reply_group_question")) }
+        }
+        try expectEqual(engine.snapshot.sessions.map(\.automatic), originalAutomatic)
+        try expect(try engine.sessionGroupAssignments().isEmpty)
+        try expectEqual(try store.load(), [group])
+        for tool in ["ask_group_question", "reply_group_question"] {
+            try await rejects { try await call(tool, caller: 3) }
+            try await rejects { try await call(tool, target: 3) }
+            try await rejects { try await call(tool, caller: 0) }
+            try await rejects { try await call(tool, "\n\t") }
+            try await rejects { try await call(tool, "bad\0text") }
+            try await rejects { try await call(tool, String(repeating: "x", count: 4001)) }
+        }
+        try engine.setPaused(true)
+        try await rejects { try await call() }
+        try engine.setPaused(false)
+        try await Task.sleep(for: .milliseconds(900))
+        for target in [0, 1] {
+            let glyph = sessions[target].agent == .claude ? "❯" : "›"
+            terminal.setStatus(records[target].pid, "idle")
+            writer.show("fixture\n\(glyph) unfinished draft\n ? for shortcuts", on: sessions[target].tty)
+            try await rejects { try await call(caller: 2, target: target) }
+            writer.show("Which option?\n\(glyph) 1. First\n  2. Second\nPress enter to confirm", on: sessions[target].tty)
+            try await rejects { try await call(caller: 2, target: target) }
+            showReady(target)
+        }
+        terminal.setStatus(records[1].pid, "busy")
+        try await rejects { try await call(caller: 2, target: 1) }
+        showReady(1)
+        // Disconnected saved member: neither its conversation nor original process is present.
+        // A stale ID on the same verified live process is legitimately refreshed by discovery.
+        group.members[0].conversationID = UUID().uuidString; group.members[0].runtimeID = "process:missing"
+        try store.save([group])
+        try await rejects { try await call() }
+        group.members[0] = members[0]; group.leaderMemberID = nil; try store.save([group])
+        _ = try await call(caller: 1, target: 0)
+        // Questions never authorize a worker to assign upward or answer a peer's permission prompt.
+        group.leaderMemberID = members[0].id; try store.save([group])
+        for tool in ["assign_group_task", "answer_group_question"] {
+            try await rejects { try await engine.mcpAction(["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[1].id,
+                "groupID": group.id.uuidString, "memberID": members[0].id.uuidString, "task": "invalid", "choice": 1]) }
+        }
+        terminal.ignoresInput = true
+        do { _ = try await call(caller: 2, target: 1); throw AppError.message("Uncertain submission became success") }
+        catch let error as RemoteHTTPError { try expectEqual(error.diagnostics?["delivery"], "unknown") }
+        try expect(try engine.sessionGroupAssignments().isEmpty, "Dialogue must not create a task or delivery queue")
+        try expectEqual(engine.snapshot.sessions.map(\.automatic), originalAutomatic)
+        try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
+    }
+
     @MainActor func testGroupOfflinePeerMessagesUseLocalTerminals() async throws {
         for agent in [AgentKind.codex, .claude] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-message-" + UUID().uuidString)

@@ -2640,6 +2640,53 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 "transport": "local_terminal", "message": "같은 Mac의 원래 터미널에 메시지를 입력했습니다."]
     }
 
+    /// Free-form questions/replies are local terminal messages, not assignments or approval answers.
+    /// No queue or watcher: a failed/uncertain submission must be inspected by the caller.
+    private func sendGroupDialogue(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String, reply: Bool) async throws -> JSONObject {
+        let line = SessionGroupOrchestration.oneLine(text)
+        guard !line.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0") else {
+            throw RemoteHTTPError(400, "질문·답변은 1~\(SessionGroupOrchestration.maximumTaskLength)자로 지정해주세요.")
+        }
+        let observed = try await sessionGroupSessions()
+        let (caller, _) = try sessionGroupCaller(object, observed: observed)
+        guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+              let sender = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }),
+              let recipient = group.members.first(where: { $0.id == memberID }), recipient.id != sender.id else {
+            throw RemoteHTTPError(403, "같은 그룹의 다른 구성원에게만 질문·답변을 보낼 수 있습니다.")
+        }
+        guard UUID(uuidString: sender.conversationID) != nil, caller.conversationID.flatMap(UUID.init(uuidString:)) != nil,
+              UUID(uuidString: recipient.conversationID) != nil,
+              let live = SessionGroupMatching.match(recipient, in: observed), live.conversationID.flatMap(UUID.init(uuidString:)) != nil,
+              let current = sessions[live.id] else {
+            throw RemoteHTTPError(409, "대상 구성원의 현재 대화와 원래 터미널을 확인하지 못했습니다. 그룹 연결을 먼저 갱신해주세요.")
+        }
+        func ready() throws {
+            // Awaiting screen/process reads can let a group edit or input begin. Recheck before typing.
+            guard try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) == group else {
+                throw RemoteHTTPError(409, "그룹 구성이 바뀌어 전달하지 않았습니다. get_session_groups로 다시 확인해주세요.", diagnostics: ["delivery": "not_started"])
+            }
+            guard let now = sessions[current.id], !snapshot.paused, !remoteInputStopped,
+                  !automaticInputBusy(current.id), !userInputHasPriority(current.id),
+                  ![.approval, .input, .ended].contains(now.phase), !now.pendingInTerminal else {
+                throw RemoteHTTPError(409, "질문·승인·다른 입력 또는 일시정지와 겹쳐 전달하지 않았습니다. 입력 가능할 때 다시 확인해주세요.", diagnostics: ["delivery": "not_started"])
+            }
+        }
+        try ready()
+        let message = SessionGroupOrchestration.dialogueMessage(groupID: group.id, sender: sender, text: line, reply: reply)
+        try await sendGroupLine(current, text: message, preflight: {
+            let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
+            let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
+                : ActivityDetector.detect(frame.screen, agent: .claude).phase == .idle
+            guard empty, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
+                throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 전달하지 않았습니다. 작성 중인 내용이나 질문을 먼저 확인해주세요.", diagnostics: ["delivery": "not_started"])
+            }
+            try ready()
+        })
+        return ["groupID": group.id.uuidString, "senderMemberID": sender.id.uuidString, "memberID": recipient.id.uuidString,
+                "kind": reply ? "reply" : "question", "delivered": true, "transport": "local_terminal", "networkRequired": false,
+                "message": "같은 Mac의 원래 터미널에 \(reply ? "답변" : "질문")을 입력했습니다. 대상 에이전트가 읽거나 답변했다는 의미는 아닙니다."]
+    }
+
     private func groupOrchestration() throws -> SessionGroupOrchestration {
         if let cached = groupOrchestrationCache { return cached }
         var loaded = SessionGroupOrchestration()
@@ -3128,7 +3175,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Types one line of group traffic (a task, a report or a request) into a session and submits it.
     /// For Claude in a host that can type without focus, the line also reaches a background tab, and the
     /// change of Claude's status away from "idle" proves that it was submitted.
-    private func sendGroupLine(_ session: AgentSession, text: String) async throws {
+    private func sendGroupLine(_ session: AgentSession, text: String, preflight: (() async throws -> Void)? = nil) async throws {
         if session.agent == .claude, let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
            let type = screenAdapters[host]?.typeLine, let before = await claudeStatuses([session])[session.id] {
             guard before == "idle" else {
@@ -3142,6 +3189,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             defer { sendingMessages.remove(session.id) }
             let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [process.pid], sourcePID: process.pid, sourceStarted: process.started)
+            try await preflight?()
             guard try await Task.detached(operation: { try type(target, text) }).value == .sent else {
                 throw RemoteHTTPError(409, "대상 터미널 탭을 찾지 못해 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
             }
@@ -3159,7 +3207,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if await submitted(within: 6) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
-        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true)
+        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true, preflight: preflight)
     }
 
     /// Turns on automatic approval for a group worker. The global pause stays
@@ -3196,13 +3244,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
         switch tool {
-        case "reconnect_group_member", "send_group_message":
+        case "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)) else {
                 throw RemoteHTTPError(400, "그룹 ID와 구성원 ID를 지정해주세요.")
             }
             if tool == "reconnect_group_member" { return try await reconnectGroupMember(object, groupID: groupID, memberID: memberID) }
             guard let text = object["text"] as? String else { throw RemoteHTTPError(400, "메시지 내용을 지정해주세요.") }
+            if tool == "ask_group_question" || tool == "reply_group_question" {
+                return try await sendGroupDialogue(object, groupID: groupID, memberID: memberID, text: text, reply: tool == "reply_group_question")
+            }
             return try await sendGroupMessage(object, groupID: groupID, memberID: memberID, text: text)
         case "get_session_groups":
             let observed = try await sessionGroupSessions()
@@ -3221,6 +3272,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? groupStatusBlockReason($0.session)?.message : nil } as Any? ?? NSNull(),
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
                             "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
+                            "canAskQuestion": member.id != callerMember.id && live?.conversationID.flatMap(UUID.init(uuidString:)) != nil && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, caller: caller, observed: observed),
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "isLeader": group.leaderMemberID == member.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull()]
@@ -3230,7 +3282,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "transport": "local_terminal", "networkRequired": false,
-                    "message": "그룹 통신은 같은 Mac의 Unix 소켓과 원래 터미널만 사용합니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 재연결하세요. 그룹장이 있는 그룹은 get_group_status, assign_group_task, answer_group_question을 사용하고, 없는 그룹은 send_group_message로 같은 도구의 구성원에게 전달하세요. 외부 서버나 각 도구의 별도 메시지 경로로 우회하지 마세요."]
+                    "message": "그룹 통신은 같은 Mac의 Unix 소켓과 원래 터미널만 사용합니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 재연결하세요. 자유 형식 질문·답변은 ask_group_question과 reply_group_question으로 Codex↔Claude를 포함한 같은 그룹 구성원에게 전달하세요. 그룹장이 있는 그룹은 get_group_status, assign_group_task, answer_group_question을 사용하고, 없는 그룹은 send_group_message로 같은 도구의 구성원에게 전달하세요. 외부 서버나 각 도구의 별도 메시지 경로로 우회하지 마세요."]
         case "get_group_status":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
@@ -3250,6 +3302,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
+                            "canAskQuestion": member.id != callerMember.id && live?.conversationID.flatMap(UUID.init(uuidString:)) != nil && UUID(uuidString: callerMember.conversationID) != nil,
                             "canAssign": group.parentID(of: member.id) == callerMember.id && (caller.session.pid != 0 || member.agent == .codex),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
                 }
@@ -3270,7 +3323,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 state.markReported(received); state.markQuestionsReported(receivedQuestions); try saveGroupOrchestration(state)
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
+                    "message": "자유 형식 질문·답변은 ask_group_question과 reply_group_question을 사용하세요. 그룹장·동료와 Codex↔Claude 모두 지원합니다. canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업자가 응답을 마치면 결과 요약이 이 세션의 터미널에 전달됩니다."]
         case "assign_group_task":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
