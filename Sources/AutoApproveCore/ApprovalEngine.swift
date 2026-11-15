@@ -2308,6 +2308,33 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return true // Work can continue while /status reads the current session.
     }
 
+    private func groupStatusBlockReason(_ session: AgentSession) -> (message: String, transient: Bool)? {
+        let id = session.id
+        if !codexGroupStatusEligible(session) { return ("터미널의 질문·승인 상태를 먼저 확인해주세요.", false) }
+        if snapshot.paused || remoteInputStopped { return ("AutoApprove가 일시정지되어 세션 ID 조회를 보류했습니다.", false) }
+        if codexAccountInputHeld(id) { return (codexApprovalHoldReason(sessionID: id) ?? Self.codexAccountHoldMessage, false) }
+        if changingGoals.contains(id) { return ("이 세션의 Goal 설정을 변경하고 있어 ID 조회를 보류했습니다.", false) }
+        if automaticInputBusy(id) { return ("자동 승인 또는 복구 입력을 전달하고 있어 ID 조회를 보류했습니다. 입력 완료 후 다시 갱신해주세요.", true) }
+        if remoteUserInputHasPriority(id) { return ("이 세션에 전달 중인 입력의 보호 시간이 끝나지 않아 ID 조회를 보류했습니다.", true) }
+        if nativeUserInputHasPriority(id) { return ("터미널 앱의 키보드·원격 조작 우선권이 유지되어 ID 조회를 보류했습니다. 입력과 보조키를 놓은 뒤 다시 갱신해주세요.", true) }
+        return nil
+    }
+
+    /// Explicit queries may wait for a short input cooldown, but never bypass it.
+    /// A new question, draft or process replacement is checked again at dispatch.
+    private func waitForGroupStatusInput(_ original: AgentSession) async throws {
+        let deadline = Date().addingTimeInterval(3)
+        while true {
+            try Task.checkCancellation()
+            guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
+                  current.tty == original.tty, current.cwd == original.cwd, current.terminal == original.terminal,
+                  current.phase != .ended else { throw AppError.message("원래 터미널 연결이 바뀌어 ID 조회를 보류했습니다.") }
+            guard let reason = groupStatusBlockReason(current) else { return }
+            guard reason.transient, Date() < deadline else { throw AppError.message(reason.message) }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
     public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws {
         // Prefer current process evidence or an already verified status result.
@@ -2328,11 +2355,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
             id = confirmed
         } else {
-            guard (original.agent == .codex ? codexGroupStatusEligible(original) : original.phase == .idle && !original.pendingInTerminal),
-                  !automaticInputBusy(runtime), !userInputHasPriority(runtime) else {
-                throw AppError.message(original.agent == .codex
-                    ? "터미널의 질문·승인 또는 다른 입력과 겹쳐 조회를 보류했습니다. 해당 입력을 마친 뒤 다시 갱신해주세요."
-                    : "원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
+            if original.agent == .codex { try await waitForGroupStatusInput(original) }
+            else if original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime) {
+                throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
             id = try await statusConversationID(original)
         }
@@ -2395,14 +2420,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message(reason)
         }
         let historyBefore = try? await groupStatusHistory(original)
-        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, preflight: {
+        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, textOnly: original.agent == .codex, preflight: {
             guard original.agent == .codex else { return }
             let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true, textOnly: true)
-            guard !self.snapshot.paused, !self.userInputHasPriority(runtime),
-                  !self.automaticInputBusy(runtime), let current = self.sessions[runtime],
-                  self.codexGroupStatusEligible(current), CodexStatusIdentity.canQuery(latest.screen) else {
-                throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
-            }
+            guard let current = self.sessions[runtime] else { throw RemoteHTTPError(409, "원래 터미널 연결이 바뀌었습니다.") }
+            if let reason = self.groupStatusBlockReason(current) { throw RemoteHTTPError(409, reason.message) }
+            guard CodexStatusIdentity.canQuery(latest.screen) else { throw RemoteHTTPError(409, "최신 Codex 화면에서 빈 입력창을 확인하지 못했습니다. 작성 중인 입력이나 열린 메뉴를 확인해주세요.") }
         })
         sendingMessages.insert(runtime); defer { sendingMessages.remove(runtime) }
         for attempt in 0..<60 {
@@ -3190,10 +3213,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let callerMember = group.members.first { groupRecoveryCaller($0, caller: caller, observed: observed) }!
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
+                    let unresolved = live == nil ? SessionGroupMatching.connection(member, in: observed) : nil
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title,
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
+                            "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? groupStatusBlockReason($0.session)?.message : nil } as Any? ?? NSNull(),
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
                             "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),

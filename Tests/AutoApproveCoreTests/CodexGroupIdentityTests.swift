@@ -51,7 +51,54 @@ private final class ClippedGroupStatus: @unchecked Sendable {
     }
 }
 
+private final class GroupInputCooldown: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started: Date?
+    let continuous: Bool
+    init(continuous: Bool) { self.continuous = continuous }
+    func activate() { lock.lock(); defer { lock.unlock() }; started = Date() }
+    var idleSeconds: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        guard let started else { return .infinity }
+        return continuous ? 0 : Date().timeIntervalSince(started)
+    }
+}
+
 extension ApprovalTests {
+    @MainActor func testCodexGroupStatusWaitsForInputCooldownWithoutBypass() async throws {
+        for continuous in [false, true] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-status-cooldown-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let record = ProcessDiscovery.parse("100597 1 fixture46 100597 100597 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+            let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .terminal)
+            let screen = CodexGroupScreen(), priority = GroupInputCooldown(continuous: continuous)
+            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+                approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in
+                    try expect(priority.idleSeconds >= 1.5, "Never input during keyboard priority")
+                    return screen.send(input)
+                })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter],
+                codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] },
+                nativeKeyboardActivity: .init(idleSeconds: { priority.idleSeconds }, frontmostBundle: { "com.apple.Terminal" }))
+            defer { engine.stop() }
+            engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.terminal)
+            let previousID = UUID().uuidString.lowercased()
+            let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: previousID, providerHome: "/fixture/home").member])
+            try SessionGroupStore(directory: directory).save([group]); priority.activate()
+            let result = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_session_groups", "sessionID": session.id])
+            let member = ((result["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])?.first
+            try expect((member?["reconnectBlockedReason"] as? String)?.contains("키보드") == true)
+            var succeeded = false
+            do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id); succeeded = true }
+            catch {
+                if !continuous { throw error }
+                try expect(error.localizedDescription.contains("키보드"), "Explain real input priority, not an invented terminal question")
+            }
+            try expectEqual(succeeded, !continuous)
+            try expectEqual(screen.inputs, continuous ? [] : ["/status\r"])
+            try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, continuous ? previousID : screen.id)
+        }
+    }
     @MainActor func testCodexGroupStatusUsesFreshHistoryWhenFrameClips() async throws {
         for (repeated, append) in [(false, true), (true, true), (false, false)] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-status-history-" + UUID().uuidString)

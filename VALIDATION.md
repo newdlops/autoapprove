@@ -1,3 +1,12 @@
+## 0.2.306 · Codex ID 갱신 입력 보호 대기와 진단
+
+- 릴리스 빌드 성공. 전체 회귀 검사 **266/266** 통과. Debug·Release 모두 IP 통신 차단 그룹 검사 **30/30** 및 실제 MCP stdio 재연결 검사 통과.
+- 합성 Terminal 검사에서 실제 키보드 우선권을 1.5초 동안 유지했다가 해제하면 `/status`가 정확히 한 번 전달되고 새 ID가 저장됐다. 우선권이 계속 유지되면 제한 시간 뒤 키보드 원인으로 거절하고 기존 ID와 입력 내용을 보존했다. 기존 그룹 조회 도구의 `reconnectBlockedReason`에도 같은 원인이 표시됐다.
+- `get_session_groups`의 `canReconnect`는 원래 프로세스와 재연결 권한의 존재이고 즉시 입력 가능 여부와는 별개다. 실제 질문, 계정 전환, Goal 변경, 자동 입력, 원격 입력 및 키보드 보호를 구분하며 어떤 보호 조건도 우회하지 않는다.
+- 332 설치 이후 실제 사용자 그룹의 A/B/C가 새 MCP stdio 연결에서 원래 UUID로 재연결됐고 기존 `assign_group_task`로 실제 새 작업을 시작했다는 별도 실기 보고를 받았다. 같은 보고에서 UI 전체 갱신은 1개 성공·5개 보류였으며, 앱 읽기 전용 상태에서는 A/B/C가 idle이고 pendingInTerminal은 false였다. 보류 당시 내부 입력 우선권의 세부 원인까지 확인한 것으로 기록하지 않는다.
+- 별도의 실제 Codex app-server·가짜 로컬 모델에서 MCP 설정이 바뀌지 않은 `config/mcpServer/reload`는 도구 10개를 유지했다. 격리된 MCP 설정에 비기능 버전 환경값을 추가한 뒤 공식 reload를 호출하면 같은 thread의 도구가 12개로 바뀌고 다음 모델 turn에 reconnect 도구가 제공됐다. 실제 사용자 설정·서버·CLI는 변경하지 않았다. 0.167.1의 `/mcp`는 목록 조회이며 reload 명령이 아니다. [공식 slash 명령 구현](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/tui/src/chatwidget/slash_dispatch.rs), [공식 MCP reload 문서](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server/README.md#mcp-configuration-reload).
+- 기존 발행자 서명과 내장 Codex 런타임을 유지해 DMG·업데이트 ZIP을 만들고 DMG 마운트·서명·내용을 검증했다. DMG SHA-256 `f17ae0c3ae648b96dcb65eb599b202d9fb125cc86acff4bbf144e8e47cb77ed7`, ZIP SHA-256 `9d1efbde24e9145914acd617d9438d16868cac1376cacd07e3bc6fc8207a8e80`.
+
 ## 0.2.305 · Codex 상태 카드와 그룹 재연결 보존
 
 - 릴리스 빌드 성공. `.build/release/autoapprove-checks` **265/265 통과**. Debug와 Release 모두 `session-groups-offline-check.mjs`로 IP 통신을 차단한 그룹 **29/29** 및 실제 MCP stdio 재연결 검사를 통과했다.
