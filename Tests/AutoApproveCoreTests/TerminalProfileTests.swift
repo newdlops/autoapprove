@@ -24,6 +24,12 @@ private actor FreshProfileLaunchRecorder {
         return "/dev/ttys\(980+commands.count-1)"
     }
 }
+private final class ProfileLaunchEffects: @unchecked Sendable {
+    private let lock=NSLock()
+    private var values:[String]=[]
+    func record(_ value:String) {lock.lock();defer {lock.unlock()};values.append(value)}
+    var calls:[String] {lock.lock();defer {lock.unlock()};return values}
+}
 private final class ProfileReadFixture: @unchecked Sendable {
     let records:[ProcessRecord]
     private let lock=NSLock()
@@ -192,7 +198,7 @@ extension ApprovalTests {
         try expectEqual(failed.first?.phase,.needsReview)
         let retry=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
         try expectEqual(retry.first?.phase,.needsReview);try expect(retry.first?.detail.contains("lost acknowledgement") == true,"Keep the original failure visible after retrying");try expectEqual(await opened.keys.count,1)
-        // A failed entry in the same saved window must not strand its siblings.
+        // A failed entry must not move its siblings into a different window.
         for knownNotSent in [true,false] {
             let batchRestorer=TerminalProfileRestorer(),recorder=FreshProfileLaunchRecorder(),window=UUID()
             var batch=(0..<3).map {_ in profileEntry()}
@@ -207,7 +213,7 @@ extension ApprovalTests {
             })
             try expectEqual(partial.map(\.phase),[.opened,knownNotSent ? .failed:.needsReview,.opened])
             let targets=await recorder.anchors
-            try expectEqual(targets.count,2);try expectNil(targets[1])
+            try expectEqual(targets.count,2);try expectEqual(targets[1],"/dev/ttys980")
             let retry=try await batchRestorer.restore(batchProfile,selected:Set(batch.map(\.id)),active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
             try expectEqual(retry.map(\.phase),[.alreadyOpen,knownNotSent ? .opened:.needsReview,.alreadyOpen])
         }
@@ -218,6 +224,69 @@ extension ApprovalTests {
         try expectEqual(denied.first?.phase,.failed)
         let allowed=try await restorer.restore(beforeProfile,selected:[beforeStart.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile-allowed"})
         try expectEqual(allowed.first?.phase,.opened);try expectEqual(await opened.keys.count,3)
+    }
+
+    func testTerminalProfileTabFailureNeverCreatesWindow() async throws {
+        for diagnostics in [["delivery":"not_started","command_delivery":"not_started"],
+                            ["command_delivery":"not_started","tab_creation":"unknown"]] {
+            let calls=ProfileLaunchEffects(),entry=profileEntry("claude")
+            var failed=false
+            do {
+                _ = try await TerminalProfileLauncher.launch(entry,anchorTTY:"/dev/ttys980",openTab:{anchor,_ in
+                    calls.record("tab:"+anchor)
+                    throw RemoteHTTPError(409,"fixture tab confirmation failed",diagnostics:diagnostics)
+                },execute:{_,_ in
+                    calls.record("conversation command")
+                    return #"{"tty":"/dev/ttys981"}"#
+                })
+            } catch let error as RemoteHTTPError {
+                failed=true;try expectEqual(error.diagnostics,diagnostics)
+            }
+            try expect(failed,"An unconfirmed tab must not be reported as a successful new window")
+            try expectEqual(calls.calls,["tab:/dev/ttys980"],"Never run the conversation command through a new-window fallback")
+        }
+    }
+
+    func testTerminalProfileUncertainWindowDoesNotSplitSiblings() async throws {
+        let restorer=TerminalProfileRestorer(),recorder=FreshProfileLaunchRecorder()
+        let windows=[UUID(),UUID()]
+        var entries=(0..<4).map {_ in profileEntry()}
+        for index in entries.indices {entries[index].terminalTab = .init(window:windows[index/2],windowOrder:index/2,tabOrder:index%2)}
+        let profile=TerminalSessionProfile(name:"two windows",entries:entries),selected=Set(entries.map(\.id)),first=entries[0]
+        let result=try await restorer.restore(profile,selected:selected,active:[],directoryExists:{_ in true},launch:{entry,anchor in
+            if entry.id==first.id {throw AppError.message("first window acknowledgement lost")}
+            return try await recorder.launch(entry,anchor)
+        })
+        try expectEqual(result.map(\.phase),[.needsReview,.needsReview,.opened,.opened])
+        var anchors=await recorder.anchors
+        try expectEqual(anchors.count,2);try expectNil(anchors[0]);try expectEqual(anchors[1],"/dev/ttys980")
+        let again=try await restorer.restore(profile,selected:selected,active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
+        try expectEqual(again.map(\.phase),[.needsReview,.needsReview,.alreadyOpen,.alreadyOpen])
+        try expectEqual(await recorder.anchors.count,2,"Retry cannot multiply an unconfirmed first window")
+        // A fresh exact live binding resolves the unknown first window without
+        // relaunching its conversation; only its remaining tab is added there.
+        let connected=try await restorer.restore(profile,selected:selected,active:[first],activeTerminalTTYs:[first.key:"/dev/ttys979"],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
+        try expectEqual(connected.map(\.phase),[.alreadyOpen,.opened,.alreadyOpen,.alreadyOpen])
+        anchors=await recorder.anchors;try expectEqual(anchors.last!,"/dev/ttys979")
+    }
+
+    func testTerminalProfileUnconfirmedTabStopsOnlyItsWindow() async throws {
+        let restorer=TerminalProfileRestorer(),recorder=FreshProfileLaunchRecorder()
+        let window=UUID(),otherWindow=UUID()
+        var entries=(0..<4).map {_ in profileEntry()}
+        for index in entries.indices {entries[index].terminalTab = .init(window:index<3 ? window:otherWindow,windowOrder:index<3 ? 0:1,tabOrder:index<3 ? index:0)}
+        let profile=TerminalSessionProfile(name:"tabs",entries:entries),failed=entries[1].id
+        let results=try await restorer.restore(profile,selected:Set(entries.map(\.id)),active:[],directoryExists:{_ in true},launch:{entry,anchor in
+            if entry.id==failed {throw RemoteHTTPError(409,"tab location unknown",diagnostics:["command_delivery":"not_started","tab_creation":"unknown"])}
+            return try await recorder.launch(entry,anchor)
+        })
+        try expectEqual(results.map(\.phase),[.opened,.failed,.needsReview,.opened])
+        try expectEqual(await recorder.anchors.count,2,"An unknown tab must not create more tabs or windows in that saved window")
+        // Once the user explicitly retries, retain the known window anchor.
+        let retry=try await restorer.restore(profile,selected:Set(entries.map(\.id)),active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
+        try expectEqual(retry.map(\.phase),[.alreadyOpen,.opened,.opened,.alreadyOpen])
+        let anchors=await recorder.anchors
+        try expectEqual(anchors[2],"/dev/ttys980");try expectEqual(anchors[3],"/dev/ttys982")
     }
 
     func testTerminalProfileCaptureBindsExactConversationsAndRejectsStalePID() async throws {

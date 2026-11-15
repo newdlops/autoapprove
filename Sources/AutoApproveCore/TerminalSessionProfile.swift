@@ -296,14 +296,17 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
         }.map(\.element)
         let activeKeys=Set(active.map(\.key))
         var anchors:[String:String]=[:],knownTTYs:[String:String]=[:],openedGroups=Set<String>()
+        var unresolvedGroups=Set<String>(),unconfirmedTabs=Set<String>()
         // Reuse only the exact saved conversation's verified current Terminal.
-        // Uncertain receipts protect only their own entry; other entries can use a new window.
+        // Without an anchor, an uncertain first launch cannot authorize another
+        // window for the remaining tabs of that same saved window.
         for entry in entries {
             if let tty=activeTerminalTTYs[entry.key],activeKeys.contains(entry.key),TerminalProfileLauncher.validTTY(tty) {
                 knownTTYs[entry.key]=tty
                 if let key=group(entry),anchors[key]==nil {anchors[key]=tty}
                 continue
             }
+            if activeKeys.contains(entry.key),let key=group(entry) {unresolvedGroups.insert(key)}
             if let receipt=dispatched[entry.key] {
                 if let tty=receipt.tty {
                     let open=try? await terminalIsOpen(tty)
@@ -311,8 +314,8 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     else if open==true {
                         knownTTYs[entry.key]=tty
                         if let key=group(entry),anchors[key]==nil {anchors[key]=tty}
-                    }
-                }
+                    } else if open==nil,let key=group(entry) {unresolvedGroups.insert(key)}
+                } else if let key=group(entry) {unresolvedGroups.insert(key)}
             }
         }
         func finishGroup(_ key:String) async {
@@ -341,6 +344,8 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 result = .init(id:entry.id,phase:.failed,detail:"작업 폴더가 없습니다. 프로필의 폴더 경로를 확인해주세요.")
             } else if Task.isCancelled {
                 result = .init(id:entry.id,phase:.needsReview,detail:"복원이 중단되었습니다. 이 항목은 실행하지 않았습니다.")
+            } else if let key,unconfirmedTabs.contains(key) || (anchors[key]==nil && unresolvedGroups.contains(key)) {
+                result = .init(id:entry.id,phase:.needsReview,detail:"같은 창의 이전 복원 위치를 확인하지 못해 이 탭은 열지 않았습니다. 원래 Terminal 창을 확인해주세요.")
             } else {
                 dispatched[entry.key]=Receipt(tty:nil)
                 do {
@@ -354,7 +359,12 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     let notStarted=diagnostics?["delivery"] == "not_started" || diagnostics?["command_delivery"] == "not_started"
                     if notStarted {dispatched.removeValue(forKey:entry.key)}
                     else {dispatched[entry.key]?.failure=error.localizedDescription}
-                    if let key {anchors.removeValue(forKey:key)}
+                    // A failed sibling must not discard the last verified tab
+                    // and turn every subsequent launch into a separate window.
+                    if let key {
+                        if !notStarted {unresolvedGroups.insert(key)}
+                        if diagnostics?["tab_creation"] == "unknown" {unconfirmedTabs.insert(key)}
+                    }
                     let detail=notStarted ? error.localizedDescription+(diagnostics?["tab_creation"] == "unknown" ? " 대화 명령은 보내지 않았습니다. 빈 탭이 생겼을 수 있으니 확인한 뒤 다시 시도해주세요.":"") : "복원 결과를 확인하지 못했습니다. 중복 실행 전에 터미널을 확인해주세요. "+error.localizedDescription
                     result = .init(id:entry.id,phase:notStarted ? .failed:.needsReview,detail:detail)
                 }
@@ -410,7 +420,9 @@ public enum TerminalProfileLauncher {
         })();
         """
     }
-    public static func launch(_ entry: TerminalProfileEntry,anchorTTY:String?=nil) async throws -> String {
+    public static func launch(_ entry: TerminalProfileEntry,anchorTTY:String?=nil,
+                              openTab:@escaping @Sendable (String,String?) throws -> String = {try TerminalProfileTabOpener.open(anchorTTY:$0,settingsName:$1)},
+                              execute:(@Sendable (String,TerminalProfileEntry.Host) throws -> String)? = nil) async throws -> String {
         let entry=try entry.validated()
         return try await Task.detached(priority:.userInitiated) {
             let nativeRoot:String?
@@ -425,19 +437,17 @@ public enum TerminalProfileLauncher {
             }
             var targetTTY:String?
             if entry.host == .terminal,let anchorTTY {
-                do {targetTTY=try TerminalProfileTabOpener.open(anchorTTY:anchorTTY,settingsName:entry.terminalTab?.settingsName)}
-                catch {
-                    // The tab opener never sends a conversation command. Only
-                    // its explicit no-command receipt permits a new-window fallback.
-                    guard (error as? RemoteHTTPError)?.diagnostics?["command_delivery"] == "not_started",
-                          !Task.isCancelled else {throw error}
-                    targetTTY=nil
-                }
+                // Failure to confirm a tab is never permission to change the
+                // saved window layout. Preserve the opener's delivery diagnostics.
+                targetTTY=try openTab(anchorTTY,entry.terminalTab?.settingsName)
             }
             try launchRuntime?.verifyUnchanged()
             let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRoot,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed)
             let text:String
-            do {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
+            do {
+                if let execute {text=try execute(body,entry.host)}
+                else {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
+            }
             catch let error as TerminalAdapterError {
                 throw RemoteHTTPError(403,error.localizedDescription,diagnostics:targetTTY==nil ? ["delivery":"not_started"]:nil)
             }
