@@ -21,6 +21,8 @@ import AutoApproveCore
     private var deliveryTokens: [String: UUID] = [:]
     private var deliveryStartedAt: [String: Date] = [:]
     private var deliveryDeadlines: [String: Date] = [:]
+    private var completionExpiry: Task<Void, Never>?
+    private var completionExpiryDeadline: Date?
     private static let category = "MANUAL_ANSWER"
     private static let completionCategory = "WORK_COMPLETED"
     private static let openAction = "OPEN_TERMINAL"
@@ -49,7 +51,7 @@ import AutoApproveCore
         center.setNotificationCategories(Set([Self.category, Self.completionCategory].map {
             UNNotificationCategory(identifier: $0, actions: [action], intentIdentifiers: [])
         }))
-        subscription = engine.$snapshot.sink { [weak self] snapshot in self?.update(snapshot) }
+        subscription = engine.presentationUpdates.sink { [weak self] snapshot in self?.update(snapshot) }
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
             guard (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == Bundle.main.bundleIdentifier else { return }
             Task { @MainActor in await self?.refreshAuthorization() }
@@ -88,6 +90,7 @@ import AutoApproveCore
     }
 
     private func update(_ snapshot: EngineSnapshot) {
+        scheduleCompletionExpiry(snapshot)
         var requests = tracker.update(snapshot)
         requests.append(contentsOf: AttentionRequest.completions(snapshot))
         var next: [String: AttentionRequest] = [:]
@@ -168,6 +171,21 @@ import AutoApproveCore
                     self.deliveryDeadlines.removeValue(forKey: request.id)
                 }
             }
+        }
+    }
+
+    private func scheduleCompletionExpiry(_ snapshot: EngineSnapshot) {
+        let deadline = AttentionRequest.nextCompletionExpiration(snapshot)
+        guard deadline != completionExpiryDeadline else { return }
+        completionExpiry?.cancel(); completionExpiry = nil
+        completionExpiryDeadline = deadline
+        guard let deadline else { return }
+        completionExpiry = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
+            catch { return }
+            guard let self, self.completionExpiryDeadline == deadline else { return }
+            self.completionExpiryDeadline = nil; self.completionExpiry = nil
+            self.update(self.engine.snapshot)
         }
     }
 

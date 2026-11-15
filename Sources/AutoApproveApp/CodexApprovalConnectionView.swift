@@ -31,9 +31,12 @@ struct CodexApprovalConnectionView: View {
             } else if subagents.isEmpty {
                 Text("현재 실행 중인 서브에이전트가 없습니다.").font(.callout).foregroundStyle(.secondary)
             }
-            if let activity=session.codexActivity {
-                Text("마지막 갱신 · "+activity.observedAt.formatted(date:.omitted,time:.standard))
-                    .font(.caption).foregroundStyle(.secondary)
+            if session.codexActivity != nil {
+                CodexActivityObservationView(sessionID: session.id, engine: engine) {
+                    if !loaded { loaded = true }
+                    if error != nil { error = nil }
+                }
+                .id(session.id)
             }
             ForEach(subagents) { child in
                 VStack(alignment: .leading, spacing: 3) {
@@ -95,9 +98,6 @@ struct CodexApprovalConnectionView: View {
                 do {try await Task.sleep(for:.seconds(3))} catch {return}
             }
         }
-        .onChange(of:session.codexActivity?.observedAt) {_,date in
-            if date != nil {loaded=true;error=nil}
-        }
     }
     private func refresh() { Task { await load() } }
     @MainActor private func load() async {
@@ -116,6 +116,32 @@ struct CodexApprovalConnectionView: View {
         Task { @MainActor in
             defer { loading = false }
             do { try await action() } catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
+/// Keep the live timestamp (and recovery feedback) without invalidating the
+/// session list, child goal controls or notification tracker on each heartbeat.
+private struct CodexActivityObservationView: View {
+    let sessionID: String
+    let engine: ApprovalEngine
+    let didObserve: () -> Void
+    @State private var observedAt: Date?
+
+    var body: some View {
+        Group {
+            if let observedAt {
+                Text("마지막 갱신 · " + observedAt.formatted(date: .omitted, time: .standard))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .onReceive(engine.$snapshot.map { snapshot in
+            snapshot.sessions.first { $0.id == sessionID }?.codexActivity?.observedAt
+        }.removeDuplicates()) { date in
+            if observedAt != date {
+                observedAt = date
+                if date != nil { didObserve() }
+            }
         }
     }
 }

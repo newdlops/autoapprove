@@ -2,7 +2,7 @@ import { coreLinkArguments } from './swift-core-link.mjs';
 // Real Swift HTTP servers and Chromium, isolated profiles and synthetic terminals only.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, readdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:http';
@@ -12,7 +12,13 @@ const { chromium } = await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE || '
 const build = path.resolve('.build', process.argv.includes('--release') ? 'release' : 'debug');
 const binary = path.resolve('.build/qa/WebVersionPreview');
 await mkdir(path.dirname(binary), { recursive: true });
-execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/WebVersionPreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build), ...(await readdir(path.join(build, 'AutoApproveCore.build'))).filter(name => name.endsWith('.swift.o')).map(name => path.join(build, 'AutoApproveCore.build', name)), 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
+const core = path.join(build, 'AutoApproveCore.build');
+const outputs = JSON.parse(await readFile(path.join(core, 'output-file-map.json'), 'utf8'));
+// Retained build directories can contain retired sources. Link this build's
+// manifest, as SwiftPM does, rather than every old object in the directory.
+const objects = Object.entries(outputs).filter(([source, value]) => source.endsWith('.swift') && typeof value.object === 'string')
+  .map(([, value]) => path.join(core, path.basename(value.object)));
+execFileSync('/usr/bin/xcrun', ['swiftc', '-parse-as-library', '-module-cache-path', path.resolve('.build/cache/WebVersionPreview'), '-I', path.join(build, 'Modules'), '-I', path.resolve('Sources/CSQLite'), '-lsqlite3', ...await coreLinkArguments(build), ...objects, 'Tests/fixtures/network-preview.swift', '-o', binary], { stdio: 'inherit' });
 const root = await mkdtemp(path.join(tmpdir(), 'autoapprove-web-version-'));
 const output = path.resolve('dist/qa/web-version'); await mkdir(output, { recursive: true });
 const children = [], probes = [], checks = [], errors = [], views = [];

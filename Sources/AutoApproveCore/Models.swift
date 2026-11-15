@@ -266,7 +266,7 @@ public struct AuditPage {
     public var total: Int
 }
 
-public struct ConnectionHealth: Codable {
+public struct ConnectionHealth: Codable, Equatable {
     public var terminal = "아직 연결하지 않음"
     public var terminalRequested = false
     public var terminalConnected = false
@@ -310,7 +310,7 @@ extension ConnectionHealth {
     }
 }
 
-public struct EngineSnapshot: Codable {
+public struct EngineSnapshot: Codable, Equatable {
     public static let questionNotificationDelayRange = 1...3600
     public var sessions: [AgentSession]
     public var events: [AuditEvent]

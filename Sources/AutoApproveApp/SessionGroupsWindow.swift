@@ -1,10 +1,13 @@
 import SwiftUI
+import Combine
 import AutoApproveCore
 
 /// Group membership and the active terminal are intentionally separate: a
 /// stored conversation may be offline or its live identity may be unknown.
 @MainActor struct SessionGroupsWindow: View {
-    @ObservedObject var engine: ApprovalEngine
+    let engine: ApprovalEngine
+    @StateObject private var viewUpdates = WindowViewUpdates()
+    @State private var observed = false
     @State private var groups: [SessionGroup] = []
     @State private var live: [SessionGroupLiveSession] = []
     @State private var assignments: [SessionGroupAssignment] = []
@@ -94,6 +97,7 @@ import AutoApproveCore
             }
         }
         .frame(minWidth: 700, minHeight: 480)
+        .windowUpdates(viewUpdates, sources: [AnyPublisher<Void, Never>]())
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("새 그룹", systemImage: "plus") { create() }.disabled(loading)
@@ -101,8 +105,10 @@ import AutoApproveCore
                     .help("현재 세션과 저장된 구성원의 연결을 다시 확인합니다.")
             }
         }
-        .task {
-            await refresh()
+        .task(id: viewUpdates.isVisible) {
+            guard viewUpdates.isVisible else { return }
+            if !observed { await refresh() }
+            else { await refreshObservation() }
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(3)) } catch { return }
                 await refreshObservation()
@@ -311,7 +317,9 @@ import AutoApproveCore
             guard !loading, !Task.isCancelled else { return }
             let saved = try store.load()
             let tasks = try engine.sessionGroupAssignments()
-            live = observed; groups = saved; assignments = tasks
+            if !live.elementsEqual(observed, by: { $0.hasSamePresentation(as: $1) }) { live = observed }
+            if groups != saved { groups = saved }
+            if assignments != tasks { assignments = tasks }
         } catch { /* Keep the last observation; explicit refresh reports errors. */ }
     }
 
@@ -319,12 +327,14 @@ import AutoApproveCore
         guard !loading else { return }; loading = true; defer { loading = false }
         do {
             let sessions = try await engine.sessionGroupSessions()
+            try Task.checkCancellation()
             let saved = try store.load()
             groups = saved; live = sessions; assignments = try engine.sessionGroupAssignments(); error = nil
+            observed = true
             if let id = selectedID, !groups.contains(where: { $0.id == id }) { selectedID = nil }
             if let id = selectedID, name.isEmpty { name = groups.first { $0.id == id }?.name ?? "" }
             notice = "현재 세션과 저장된 그룹을 확인했습니다."
-        } catch { self.error = error.localizedDescription }
+        } catch is CancellationError {} catch { self.error = error.localizedDescription }
     }
     private func persist(_ next: [SessionGroup], message: String) -> Bool {
         do {

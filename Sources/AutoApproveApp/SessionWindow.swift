@@ -312,7 +312,7 @@ import AutoApproveCore
     private var windowContent: some View {
         content.frame(minWidth: 780, minHeight: 560)
         .windowUpdates(viewUpdates, sources: [
-            engine.$snapshot.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            engine.presentationUpdates.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             engine.$initialDiscoveryComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             notifications.objectWillChange.eraseToAnyPublisher()
         ])

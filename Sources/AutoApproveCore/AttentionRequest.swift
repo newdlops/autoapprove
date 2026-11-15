@@ -38,6 +38,18 @@ public struct AttentionRequest: Equatable, Identifiable {
         return requests
     }
 
+    /// Presentation subscribers do not receive observation-only heartbeats.
+    /// Schedule the next expiry explicitly so delivered completion notices still
+    /// disappear after their existing five-minute lifetime on a quiet engine.
+    public static func nextCompletionExpiration(_ snapshot: EngineSnapshot, at now: Date = Date()) -> Date? {
+        snapshot.sessions.flatMap { [$0] + $0.backgroundChildren }.compactMap { session -> Date? in
+            guard session.agent != .shell, session.phase != .ended, let completion = session.completion else { return nil }
+            // completions() includes the exact boundary; wake just after it.
+            let deadline = completion.date.addingTimeInterval(300.001)
+            return deadline > now ? deadline : nil
+        }.min()
+    }
+
     public static func needsAttention(_ session: AgentSession, paused: Bool) -> Bool {
         var collector = CandidateCollector(includeDetails: false, stopAfterFirst: true)
         collectCandidates(session, paused: paused, prefix: "", into: &collector)

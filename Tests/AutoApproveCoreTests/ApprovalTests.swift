@@ -505,6 +505,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
 #endif
         let tests = ApprovalTests()
         var cases: [(String, () async throws -> Void)] = [
+            ("Presentation heartbeat: raw freshness, real changes and question lifecycle", tests.testPresentationHeartbeatPreservesStateAndNotificationTransitions),
+            ("Presentation heartbeat: group identity and connection changes", tests.testGroupPresentationKeepsFreshIdentitiesAndConnectionChanges),
             ("App updates: GitHub checks, persisted opt-out and isolation", tests.testGitHubAppUpdatePreferencesAndChecks),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
             ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
