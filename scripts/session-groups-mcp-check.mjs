@@ -1,7 +1,7 @@
 // Isolated bridge: exercise the real MCP stdio process without using any user's session.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {createServer} from 'node:net';
+import {createServer,connect} from 'node:net';
 import {mkdtemp,realpath,rm} from 'node:fs/promises';
 import {once} from 'node:events';
 import readline from 'node:readline';
@@ -10,6 +10,17 @@ import path from 'node:path';
 const binary=await realpath(process.argv[2]||'.build/debug/autoapprove');
 const home=await mkdtemp('/private/tmp/aa-group-mcp-');
 const calls=[];
+if(process.argv.includes('--offline')) {
+ for(const host of ['127.0.0.1','::1','192.0.2.1']) {
+  await new Promise((resolve,reject)=>{
+   const socket=connect({host,port:9});
+   socket.once('connect',()=>{socket.destroy();reject(new Error('IP networking was not blocked'));});
+   socket.once('error',error=>{try {assert.ok(['EPERM','EACCES'].includes(error.code),String(error));resolve();}catch(failure){reject(failure);}});
+   socket.setTimeout(2000,()=>{socket.destroy();reject(new Error('Expected immediate sandbox denial'));});
+  });
+ }
+}
+
 const server=createServer(socket=>{
  let buffer='';socket.setEncoding('utf8');socket.on('data',chunk=>{
   buffer+=chunk;const end=buffer.indexOf('\n');if(end<0)return;
@@ -29,15 +40,26 @@ try {
   const response=JSON.parse(line.value);assert.equal(response.id,id);assert.equal(response.result.isError,false);
  };
  await request(1,'ask_user',{questions:[{question:'fixture'}]});
- await request(2,'get_session_groups',{sessionID:'spoofed-session',agentKind:'spoofed-agent'});
+ const groupTools=['get_session_groups','get_group_status','reconnect_group_member','send_group_message','assign_group_task','answer_group_question'];
+ for(const [index,tool] of groupTools.entries()) {
+  await request(index+2,tool,{groupID:'fixture',memberID:'fixture',text:'fixture',task:'fixture',choice:1,
+   sessionID:'spoofed-session',agentKind:'spoofed-agent',codexCallerHome:'/spoofed',codexCallerConversationID:'spoofed'});
+ }
+ // The stdio connection remains usable after the GUI's Unix listener restarts.
+ await new Promise(resolve=>server.close(resolve));
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(path.join(home,'bridge.sock'),resolve);});
+ await request(20,'get_session_groups',{});
  child.stdin.end();const [code]=await closed;assert.equal(code,0);child=null;reader.close();
- assert.deepEqual(calls.map(value=>value.tool),['ask_user','get_session_groups','disconnect']);
+ assert.deepEqual(calls.map(value=>value.tool),['ask_user',...groupTools,'get_session_groups','disconnect']);
  assert.equal(calls[1].sessionID??null,calls[0].sessionID??null);
  assert.notEqual(calls[1].sessionID,'spoofed-session');
- assert.notEqual(calls[1].agentKind,'spoofed-agent');
+ for(const call of calls.slice(1,-1)) {
+  assert.notEqual(call.sessionID,'spoofed-session');assert.notEqual(call.agentKind,'spoofed-agent');
+  assert.notEqual(call.codexCallerHome,'/spoofed');assert.notEqual(call.codexCallerConversationID,'spoofed');
+ }
  if(process.env.AA_EXPECT_AGENT==='1') assert.match(calls[1].sessionID??'',/^process:\d+:/);
  assert.ok(calls.every(value=>value.owner===calls[0].owner));
- console.log('PASS MCP stdio: session attribution is shared with existing attribution and caller override is discarded');
+ console.log('PASS MCP stdio: all group tools stay on Unix sockets, discard spoofed attribution and reconnect after listener restart');
 } finally {
  if(child&&child.exitCode===null&&child.signalCode===null){child.kill();await closed;}
  await new Promise(resolve=>server.close(resolve));await rm(home,{recursive:true,force:true});

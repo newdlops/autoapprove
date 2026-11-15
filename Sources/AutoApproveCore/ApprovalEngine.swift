@@ -2309,11 +2309,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
-    public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID) async throws {
+    public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws {
         // Prefer current process evidence or an already verified status result.
         // Opening a group and refreshing its display must never type into a CLI.
         let observed = try await sessionGroupSessions()
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
+        if let expectedGroup, saved.first(where: { $0.id == groupID }) != expectedGroup {
+            throw RemoteHTTPError(409, "그룹 구성이 바뀌어 갱신하지 않았습니다. get_session_groups로 다시 확인해주세요.")
+        }
         guard let group = saved.first(where: { $0.id == groupID }),
               let member = group.members.first(where: { $0.id == memberID }),
               let connection = SessionGroupMatching.connection(member, in: observed),
@@ -2481,11 +2484,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// The MCP caller is its enclosing process, or on a shared server the one live conversation it names.
-    private func sessionGroupCaller(_ object: JSONObject, observed: [SessionGroupLiveSession]) throws -> (session: SessionGroupLiveSession, attribution: String) {
+    private func sessionGroupCaller(_ object: JSONObject, observed: [SessionGroupLiveSession], recovery: Bool = false) throws -> (session: SessionGroupLiveSession, attribution: String) {
         let claimed = object["conversationID"] as? String
         guard claimed == nil || UUID(uuidString: claimed!) != nil else { throw RemoteHTTPError(400, "현재 대화의 UUID를 확인해주세요.") }
         if let direct = (object["sessionID"] as? String).flatMap({ id in observed.first { $0.id == id } }) {
-            if let claimed, UUID(uuidString: claimed) != direct.conversationID.flatMap(UUID.init(uuidString:)) {
+            if let claimed, !(recovery && direct.conversationID == nil), UUID(uuidString: claimed) != direct.conversationID.flatMap(UUID.init(uuidString:)) {
                 throw RemoteHTTPError(409, "지정한 대화 ID가 현재 세션과 다릅니다.")
             }
             return (direct, "process")
@@ -2515,6 +2518,74 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 UUID(uuidString: member.conversationID) == caller.conversationID.flatMap(UUID.init(uuidString:))
         }
         return SessionGroupMatching.match(member, in: observed)?.id == caller.id
+    }
+
+    /// Reading membership and repairing an ID may use the exact saved process.
+    /// This does not authorize messages, tasks or consuming reports until the conversation is verified.
+    private func groupRecoveryCaller(_ member: SessionGroupMember, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> Bool {
+        groupMemberIsCaller(member, caller: caller, observed: observed) ||
+            (caller.conversationID == nil && member.runtimeID == caller.id &&
+             SessionGroupMatching.connection(member, in: observed)?.id == caller.id)
+    }
+
+    private func canReconnectGroupMember(_ member: SessionGroupMember, group: SessionGroup, caller: SessionGroupLiveSession,
+                                         callerMember: SessionGroupMember, observed: [SessionGroupLiveSession]) -> Bool {
+        guard caller.session.pid != 0 || member.agent == .codex,
+              SessionGroupMatching.connection(member, in: observed) != nil else { return false }
+        return member.id == callerMember.id || group.parentID(of: member.id) == callerMember.id ||
+            (group.leaderMemberID == nil && member.agent == caller.session.agent)
+    }
+
+    private func reconnectGroupMember(_ object: JSONObject, groupID: UUID, memberID: UUID) async throws -> JSONObject {
+        let observed = try await sessionGroupSessions()
+        let (caller, _) = try sessionGroupCaller(object, observed: observed, recovery: true)
+        guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+              let callerMember = group.members.first(where: { groupRecoveryCaller($0, caller: caller, observed: observed) }),
+              let member = group.members.first(where: { $0.id == memberID }) else {
+            throw RemoteHTTPError(403, "현재 세션의 그룹과 구성원을 확인해주세요. get_session_groups로 다시 조회할 수 있습니다.")
+        }
+        guard canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed) else {
+            throw RemoteHTTPError(409, "재연결할 수 있는 원래 터미널을 확인하지 못했거나 재연결 권한이 없습니다. canReconnect가 true인 구성원만 재연결할 수 있습니다. 종료된 터미널은 자동으로 다시 실행하지 않습니다.")
+        }
+        try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group)
+        let fresh = try await sessionGroupSessions()
+        guard let updated = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID })?.members.first(where: { $0.id == memberID }),
+              let live = SessionGroupMatching.match(updated, in: fresh),
+              let id = live.conversationID, UUID(uuidString: id) != nil else {
+            throw RemoteHTTPError(409, "갱신 후 연결이 바뀌어 재연결을 확인하지 못했습니다. get_session_groups로 다시 확인해주세요.")
+        }
+        return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "connected": true,
+                "conversationID": id, "transport": "local_terminal", "message": "같은 Mac의 원래 터미널에서 현재 세션 ID와 연결을 확인했습니다."]
+    }
+
+    /// Peer messages use the same local terminal path as group tasks. No provider messaging or network fallback.
+    private func sendGroupMessage(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String) async throws -> JSONObject {
+        let line = SessionGroupOrchestration.oneLine(text)
+        guard !line.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
+              SessionGroupOrchestration.commandPrefix(line) == nil else {
+            throw RemoteHTTPError(400, "메시지는 명령 접두사(/, !, #, $, &)가 아닌 문장으로 시작하고 1~\(SessionGroupOrchestration.maximumTaskLength)자로 지정해주세요.")
+        }
+        let observed = try await sessionGroupSessions()
+        let (caller, _) = try sessionGroupCaller(object, observed: observed)
+        guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+              let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }),
+              let member = group.members.first(where: { $0.id == memberID }), member.id != callerMember.id,
+              member.agent == caller.session.agent else {
+            throw RemoteHTTPError(403, "같은 그룹의 확인된 같은 도구 구성원에게만 메시지를 보낼 수 있습니다.")
+        }
+        guard group.leaderMemberID == nil else {
+            throw RemoteHTTPError(409, "그룹장이 있는 그룹은 assign_group_task와 answer_group_question을 사용해주세요.")
+        }
+        guard let live = SessionGroupMatching.match(member, in: observed), let current = sessions[live.id] else {
+            throw RemoteHTTPError(409, "구성원 연결을 확인하지 못했습니다. reconnect_group_member로 재연결한 뒤 다시 확인해주세요.")
+        }
+        guard !snapshot.paused, !remoteInputStopped, !automaticInputBusy(current.id), !userInputHasPriority(current.id),
+              ![.working, .approval, .input, .ended].contains(current.phase), !current.pendingInTerminal else {
+            throw RemoteHTTPError(409, "대상 세션의 작업·질문·작성 중인 입력 또는 일시정지와 겹쳐 전달하지 않았습니다. 대기 상태에서 다시 보내주세요.")
+        }
+        try await sendGroupLine(current, text: line)
+        return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "delivered": true,
+                "transport": "local_terminal", "message": "같은 Mac의 원래 터미널에 메시지를 입력했습니다."]
     }
 
     private func groupOrchestration() throws -> SessionGroupOrchestration {
@@ -2931,7 +3002,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw RemoteHTTPError(409, "이 Codex 호출에서는 Codex 구성원에게만 작업을 지시할 수 있습니다.")
         }
         guard let worker = SessionGroupMatching.match(target, in: observed), let current = sessions[worker.id] else {
-            throw RemoteHTTPError(409, "작업자 세션의 연결을 확인하지 못했습니다. 관리 창에서 구성원 연결을 확인해주세요.")
+            throw RemoteHTTPError(409, "작업자 세션의 연결을 확인하지 못했습니다. get_session_groups의 canReconnect를 확인하고 reconnect_group_member로 재연결해주세요.")
         }
         return (group, caller, callerMember, target, worker, current)
     }
@@ -3073,19 +3144,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
         switch tool {
+        case "reconnect_group_member", "send_group_message":
+            guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
+                  let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)) else {
+                throw RemoteHTTPError(400, "그룹 ID와 구성원 ID를 지정해주세요.")
+            }
+            if tool == "reconnect_group_member" { return try await reconnectGroupMember(object, groupID: groupID, memberID: memberID) }
+            guard let text = object["text"] as? String else { throw RemoteHTTPError(400, "메시지 내용을 지정해주세요.") }
+            return try await sendGroupMessage(object, groupID: groupID, memberID: memberID, text: text)
         case "get_session_groups":
             let observed = try await sessionGroupSessions()
-            let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+            let (caller, attribution) = try sessionGroupCaller(object, observed: observed, recovery: true)
             let groups = try SessionGroupStore(directory: paths.directory).load()
-            let matching = groups.filter { group in group.members.contains { groupMemberIsCaller($0, caller: caller, observed: observed) } }
+            let matching = groups.filter { group in group.members.contains { groupRecoveryCaller($0, caller: caller, observed: observed) } }
             let output: [JSONObject] = matching.map { group in
+                let callerMember = group.members.first { groupRecoveryCaller($0, caller: caller, observed: observed) }!
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title,
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
-                            "isCaller": groupMemberIsCaller(member, caller: caller, observed: observed), "sameAgent": member.agent == caller.session.agent,
+                            "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
+                            "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "isLeader": group.leaderMemberID == member.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull()]
                 }
@@ -3093,7 +3174,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull()]
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "그룹장이 있는 그룹에서는 작업 지시와 답변을 각 도구의 메시지 기능으로 보내지 말고 get_group_status, assign_group_task, answer_group_question을 사용하세요. AutoApprove가 사용자의 위임 사실을 함께 전달합니다. 그룹장이 없는 그룹에서 다른 도구의 구성원은 표시만 하며, 같은 도구의 메시지 수신 가능 여부와 실제 주소는 각 도구에서 확인하세요."]
+                    "transport": "local_terminal", "networkRequired": false,
+                    "message": "그룹 통신은 같은 Mac의 Unix 소켓과 원래 터미널만 사용합니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 재연결하세요. 그룹장이 있는 그룹은 get_group_status, assign_group_task, answer_group_question을 사용하고, 없는 그룹은 send_group_message로 같은 도구의 구성원에게 전달하세요. 외부 서버나 각 도구의 별도 메시지 경로로 우회하지 마세요."]
         case "get_group_status":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
@@ -3111,6 +3193,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "depth": entry.depth, "isLeader": group.leaderMemberID == member.id, "isCaller": member.id == callerMember.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull(),
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
+                            "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "canAssign": group.parentID(of: member.id) == callerMember.id && (caller.session.pid != 0 || member.agent == .codex),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
                 }

@@ -1,3 +1,13 @@
+## 0.2.304 · 네트워크 격리 중 그룹 재연결과 로컬 전달
+
+- 릴리스 빌드 성공. `.build/release/autoapprove-checks` **263/263 통과**. `node scripts/session-groups-offline-check.mjs`로 릴리스의 그룹 **27/27**과 MCP stdio 검사도 IP 차단 상태에서 통과했다. 실제 엔진을 격리 모드로 시작하고 Unix 소켓을 통해 조회·재연결을 호출했으며, `webByDefault: true`여도 웹 서버는 켜지지 않았다.
+- `node scripts/session-groups-offline-check.mjs --debug` 통과. 별도 macOS sandbox 프로세스에서 모든 IP 통신을 차단하고 Unix 소켓만 허용했다. IPv4 루프백·IPv6 루프백·외부 IPv4 주소 연결이 실제로 `EPERM`/`EACCES`로 거절되는 것을 확인했다. 이 조건에서 그룹 검사 **27/27**과 실제 MCP stdio 검사가 통과했다. 사용자 Mac의 네트워크 설정은 바꾸지 않았다.
+- 합성 엔진에서 네트워크 격리 모드를 켜고 웹 서버 없이 그룹 저장·조회, ID 미확인 구성원의 재연결, Codex 작업 중 `/status`, 자기 세션 복구, 기존 ID 재사용, Codex·Claude 각각의 같은 도구 간 양방향 메시지를 확인했다. 그룹 메시지는 원래 터미널에만 기록됐고 별도 작업 큐는 생성하지 않았다.
+- 다른 그룹·직속 관계가 아닌 구성원, 종료된 원래 세션, 작성 중인 초안, 미확인 ID의 작업 전달과 보고 수신, 명령 접두사, 자기 자신에게 메시지 전송, 전체 일시정지 및 그룹장 구조를 우회하는 메시지를 거절했다. 기존 그룹 작업·질문·자동 승인·Claude 전달 검사도 IP 차단 상태에서 통과했다.
+- 실제 CLI의 MCP stdio에서 모든 그룹 도구의 위조된 호출자 필드를 제거했다. 같은 stdio 프로세스를 유지한 채 Unix 소켓 서버를 재시작한 뒤 다음 조회가 성공했다. 새 도구 목록은 새 MCP 연결에 적용되며 기존 사용자 CLI/MCP를 강제 재시작하지 않는다.
+- 기존 발행자 서명과 내장 Codex 런타임을 보존해 DMG와 업데이트 ZIP을 만들었다. DMG 마운트·서명·내용 검증 통과. DMG SHA-256 `f29acc4918af2025708eebc45208fc42b6c0027a294b4e6a67ff899dcb3a566c`, ZIP SHA-256 `c4b4e41aaff7bff3631b5c1f8711fcfce0b579b3cdc61e4fcc22237fbca21a37`.
+- 검증은 합성 터미널·로컬 소켓에서 수행했다. 실제 사용자 세션으로 메시지를 보내거나 `/status`를 입력하지 않았으며, Codex·Claude 모델 API의 오프라인 응답 생성을 검증한 것은 아니다. 사용자 화면 배치는 변경하지 않았다.
+
 ## 0.2.303 · 반복 UI 갱신 감소와 기능 보존
 
 - `swift build --disable-sandbox --cache-path .build/cache -c release` 성공. `.build/release/autoapprove-checks` **260/260 통과**. 관찰 시각만 바뀐 100회 이벤트는 원본 구독자에 전부 전달되고, 표시·알림 구독자에는 추가 전달되지 않았다. 부모·자식 상태, 연결·세션 ID, 질문 해소와 재등장, 읽음 처리, 완료 만료, 자동 승인·일시정지와 그룹 작업 변경은 모두 전달됐다.

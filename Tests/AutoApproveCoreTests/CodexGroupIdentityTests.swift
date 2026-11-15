@@ -307,3 +307,98 @@ extension ApprovalTests {
         try expectNil(try await engine.sessionGroupSessions().first?.conversationID)
     }
 }
+
+extension ApprovalTests {
+    @MainActor func testGroupOfflineReconnectUsesOriginalTerminal() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("aa-group-offline-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        100901 1 fixture91 100901 100901 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100902 1 fixture92 100902 100902 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100903 1 fixture93 100903 100903 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let ids = records.map { _ in UUID().uuidString.lowercased() }
+        let sessions = records.map { AgentSession(id: $0.key, agent: .codex, pid: $0.pid, started: $0.started,
+            tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm) }
+        let screen = CodexGroupScreen("Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts")
+        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in
+                try expectEqual(target.tty, sessions[1].tty, "Only the saved worker terminal may be queried")
+                return screen.send(input)
+            })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { records }, screenAdapters: [.iterm: adapter],
+            codexGroupReader: { record in
+                guard record.pid != records[1].pid, let index = records.firstIndex(where: { $0.key == record.key }) else { return nil }
+                return .init(threadID: ids[index], database: "/fixture/home/thread_history_1.sqlite")
+            }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] }, isolateByDefault: true)
+        defer { engine.stop() }
+        try engine.start(poll: false, webByDefault: true)
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        let members = sessions.enumerated().map { SessionGroupLiveSession(session: $0.element, conversationID: ids[$0.offset], providerHome: "/fixture/home").member }
+        let group = SessionGroup(name: "offline", members: Array(members.prefix(2)), leaderMemberID: members[0].id)
+        let store = SessionGroupStore(directory: directory); try store.save([group])
+        func call(_ tool: String, caller: Int = 0, target: Int = 1) async throws -> JSONObject {
+            let params: JSONObject = ["tool": tool, "owner": UUID().uuidString, "sessionID": sessions[caller].id,
+                "conversationID": ids[caller], "groupID": group.id.uuidString, "memberID": members[target].id.uuidString, "task": "Check fixture"]
+            return try await Task.detached {
+                try SocketClient.request(path: AppPaths(directory: directory).socket, message: ["method": "mcp", "params": params], timeout: 20)
+            }.value
+        }
+        try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
+        let listed = try await call("get_session_groups", caller: 1)
+        let rows = (listed["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject]
+        try expectEqual(rows?.first { $0["id"] as? String == members[1].id.uuidString }?["connected"] as? Bool, false)
+        try expectEqual(rows?.first { $0["id"] as? String == members[1].id.uuidString }?["canReconnect"] as? Bool, true)
+        try expectEqual(screen.inputs, [], "Read-only membership must not type /status")
+        for (tool, caller, target) in [("reconnect_group_member", 2, 1), ("reconnect_group_member", 1, 0), ("assign_group_task", 0, 1), ("get_group_status", 1, 1)] {
+            var rejected = false
+            do { _ = try await call(tool, caller: caller, target: target) } catch { rejected = true }
+            try expect(rejected, "Unverified or unauthorized operation succeeded")
+        }
+        try expectEqual(screen.inputs, [])
+        let repaired = try await call("reconnect_group_member")
+        try expectEqual(repaired["connected"] as? Bool, true)
+        try expectEqual(repaired["conversationID"] as? String, screen.id)
+        try expectEqual(repaired["transport"] as? String, "local_terminal")
+        try expectEqual(screen.inputs, ["/status\r"])
+        try expectEqual(try store.load()[0].members[1].conversationID, screen.id)
+        _ = try await call("reconnect_group_member")
+        try expectEqual(screen.inputs, ["/status\r"], "A verified ID is reused without adding terminal input")
+        try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
+        // An exited member may not be replaced with an unrelated process in the same project.
+        engine.updateDiscovery([sessions[0], sessions[2]], records: [records[0], records[2]])
+        var rejected = false
+        do { _ = try await call("reconnect_group_member") } catch { rejected = true }
+        try expect(rejected, "An exited terminal was guessed")
+        try expectEqual(screen.inputs, ["/status\r"])
+    }
+
+    @MainActor func testGroupOfflineSelfReconnectProtectsDrafts() async throws {
+        for text in ["Codex\n› unfinished draft\n ? for shortcuts", "Codex\n› Ask Codex to do anything\n ? for shortcuts"] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-self-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let record = ProcessDiscovery.parse("100904 1 fixture94 100904 100904 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+            let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .iterm)
+            let screen = CodexGroupScreen(text)
+            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+                approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.iterm: adapter],
+                codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] }, isolateByDefault: true)
+            defer { engine.stop() }
+            engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.iterm)
+            let member = SessionGroupLiveSession(session: session, conversationID: UUID().uuidString, providerHome: "/fixture/home").member
+            let group = SessionGroup(name: "self", members: [member]); let store = SessionGroupStore(directory: directory); try store.save([group])
+            let params: JSONObject = ["tool": "reconnect_group_member", "owner": UUID().uuidString, "sessionID": session.id,
+                "conversationID": screen.id, "groupID": group.id.uuidString, "memberID": member.id.uuidString]
+            if text.contains("unfinished") {
+                var failed = false
+                do { _ = try await engine.mcpAction(params) } catch { failed = true }
+                try expect(failed); try expectEqual(screen.inputs, [])
+                try expectEqual(try store.load()[0].members[0].conversationID, member.conversationID.lowercased())
+            } else {
+                let result = try await engine.mcpAction(params)
+                try expectEqual(result["connected"] as? Bool, true); try expectEqual(screen.inputs, ["/status\r"])
+            }
+        }
+    }
+}

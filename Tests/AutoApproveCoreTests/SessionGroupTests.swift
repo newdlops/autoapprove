@@ -652,3 +652,57 @@ extension ApprovalTests {
         try expectEqual(members?.first { $0["id"] as? String == workerMember.id.uuidString }?["claudeStatus"] as? String, "busy")
     }
 }
+
+extension ApprovalTests {
+    @MainActor func testGroupOfflinePeerMessagesUseLocalTerminals() async throws {
+        for agent in [AgentKind.codex, .claude] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-message-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let records = ProcessDiscovery.parse("""
+            100911 1 fixture101 100911 100911 Wed Oct 28 12:00:00 2026 /fixture/\(agent.rawValue)
+            100912 1 fixture102 100912 100912 Wed Oct 28 12:00:00 2026 /fixture/\(agent.rawValue)
+            100913 1 fixture103 100913 100913 Wed Oct 28 12:00:00 2026 /fixture/\(agent.rawValue)
+            """)
+            let sessions = records.map { AgentSession(id: $0.key, agent: agent, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm) }
+            let ids = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString.lowercased()) })
+            let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+                rows.compactMap { row in ids[row.pid].map { .init(processID: row.key, kind: "interactive", sessionID: $0, status: "idle") } }
+            }
+            let writer = GroupTerminalWriter()
+            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+                approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
+            let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records },
+                screenAdapters: [.iterm: adapter], codexGroupReader: { record in
+                    ids[record.pid].map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") }
+                }, isolateByDefault: true)
+            defer { engine.stop() }
+            engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+            let observed = try await engine.sessionGroupSessions()
+            let members = try sessions.map { session in try unwrapGroup(observed.first { $0.id == session.id }).member }
+            var group = SessionGroup(name: "local peers", members: Array(members.prefix(2)))
+            let store = SessionGroupStore(directory: directory); try store.save([group])
+            func send(_ text: String, caller: Int = 0, target: Int = 1) async throws -> JSONObject {
+                try await engine.mcpAction(["tool": "send_group_message", "owner": UUID().uuidString, "sessionID": sessions[caller].id,
+                    "groupID": group.id.uuidString, "memberID": members[target].id.uuidString, "text": text])
+            }
+            try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
+            let result = try await send("첫 번째 줄\n두 번째 줄")
+            try expectEqual(result["transport"] as? String, "local_terminal"); try expectEqual(result["delivered"] as? Bool, true)
+            try expectEqual(writer.writes(to: sessions[1].tty), ["첫 번째 줄 두 번째 줄\r"])
+            _ = try await send("확인했습니다", caller: 1, target: 0)
+            try expectEqual(writer.writes(to: sessions[0].tty), ["확인했습니다\r"])
+            try expect(try engine.sessionGroupAssignments().isEmpty, "Peer messages must not create an orchestration queue")
+            for (text, caller, target) in [("/status", 0, 1), ("hello", 2, 1), ("hello", 0, 0)] {
+                do { _ = try await send(text, caller: caller, target: target); throw AppError.message("Invalid message was delivered") }
+                catch is RemoteHTTPError { }
+            }
+            try engine.setPaused(true)
+            do { _ = try await send("paused"); throw AppError.message("Global pause was bypassed") } catch is RemoteHTTPError { }
+            try engine.setPaused(false)
+            group.leaderMemberID = members[0].id; try store.save([group])
+            do { _ = try await send("must use assign"); throw AppError.message("Tree authorization was bypassed") } catch is RemoteHTTPError { }
+            try expectEqual(writer.writes.count, 2)
+            try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
+        }
+    }
+}
