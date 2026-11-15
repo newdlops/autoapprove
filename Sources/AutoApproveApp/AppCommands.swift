@@ -58,6 +58,7 @@ struct AppCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
             Button("AutoApprove 정보") { AppInformation.showAbout() }
+            Button("업데이트…") { show("updates") }.disabled(!connectionsAvailable)
         }
         CommandGroup(replacing: .appSettings) {
             Button("연결 설정…") { show("settings") }

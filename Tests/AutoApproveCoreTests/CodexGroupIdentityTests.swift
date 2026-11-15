@@ -224,36 +224,56 @@ extension ApprovalTests {
     }
 
     @MainActor func testCodexMetadataParentCanDirectConfirmedWorker() async throws {
-        for textUnavailable in [false, true] {
+        for (useTerminal, textUnavailable, backgroundAvailable) in [(false, false, true), (false, true, true), (true, false, true), (true, false, false)] {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-parent-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let parentID = UUID().uuidString, workerID = UUID().uuidString, home = "/fixture/home"
         let parent = SessionGroupMember(agent: .codex, title: "parent", cwd: "/project", conversationID: parentID, providerHome: home)
         let record = ProcessDiscovery.parse("100593 1 fixture42 100593 100593 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
-        let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .iterm)
+        let host: ScreenHost = useTerminal ? .terminal : .iterm
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current; formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        let identity = TTYInputIdentity(pid: record.pid, processGroup: record.pid, uid: getuid(), effectiveUID: geteuid(), device: 42,
+            startSeconds: UInt64(formatter.date(from: record.started)!.timeIntervalSince1970), startMicroseconds: 71)
+        let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: useTerminal ? .terminal : .iterm)
         let screen = CodexGroupScreen()
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
-            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) },
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in
+                if useTerminal { throw AppError.message("Focus-dependent input must never be used for group traffic") }
+                return screen.send(input)
+            },
             presentationScreens: { _ in throw AppError.message("Cursor/window lookup timed out") },
             validationScreens: { targets in
                 if textUnavailable { throw AppError.message("Text channel unavailable") }
                 return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) })
             })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.iterm: adapter],
+        if useTerminal, backgroundAvailable {
+            adapter.backgroundInput = { target, raw, agent, input in
+                try TerminalDeviceInput.deliverBackground(target: target, screen: raw, agent: agent, input: input,
+                    captureIdentity: { _ in identity }, run: { script in
+                        try expect(!script.contains("activate") && !script.contains("selectedTab") && !script.contains("System Events"), "Group delivery must not select or focus any window")
+                        try expect(script.contains("app.doScript(target.text, {in: tab})"))
+                        _ = screen.send(input)
+                        return "sent"
+                    })
+            }
+        }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
+            terminalInputAvailable: { true }, terminalInputIdentity: { _ in identity },
             codexGroupReader: { _ in .init(threadID: workerID, database: home + "/thread_history_1.sqlite") })
         defer { engine.stop() }
-        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.iterm)
+        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(host)
         let worker = SessionGroupLiveSession(session: session, conversationID: workerID, providerHome: home).member
         let group = SessionGroup(name: "fixture", members: [parent, worker], leaderMemberID: parent.id)
         try SessionGroupStore(directory: directory).save([group])
         let params: JSONObject = ["owner": UUID().uuidString, "tool": "assign_group_task", "agentKind": "codex",
             "sessionID": "shared-daemon", "conversationID": parentID, "codexCallerConversationID": parentID, "codexCallerHome": home,
             "groupID": group.id.uuidString, "memberID": worker.id.uuidString, "task": "Inspect the fixture"]
-        if textUnavailable {
+        if textUnavailable || !backgroundAvailable {
             do { _ = try await engine.mcpAction(params); throw AppError.message("Unreadable text accepted a task") }
             catch let error as RemoteHTTPError {
                 try expectEqual(error.diagnostics?["delivery"], "not_started")
-                try expect(error.localizedDescription.contains("Text channel unavailable"))
+                try expect(error.localizedDescription.contains(textUnavailable ? "Text channel unavailable" : "포커스 없는"), "Unexpected rejection (Terminal: \(useTerminal)): \(error.localizedDescription)")
             }
             try expectEqual(screen.inputs.count, 0)
             try expect(try engine.sessionGroupAssignments().isEmpty)

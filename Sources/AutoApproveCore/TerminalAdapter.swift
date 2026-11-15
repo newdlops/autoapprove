@@ -79,6 +79,8 @@ public struct ScreenHostAdapter: Sendable {
     /// Types one line into the tab's terminal and submits it, without focus or key events, so it also reaches
     /// a tab in the background. The caller verifies that the CLI is idle at its prompt.
     public var typeLine: (@Sendable (ScreenTarget, String) throws -> TerminalDelivery)?
+    /// A direct terminal write. Must never activate a window or fall back to keyboard events.
+    public var backgroundInput: (@Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery)?
     public var replacementShell: (@Sendable (ScreenTarget) throws -> ProcessRecord)?
     public var replacementShellValid: (@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)?
     public var goalInterrupt: (@Sendable (ScreenTarget,String) throws -> TerminalDelivery)?
@@ -126,6 +128,7 @@ public struct ScreenHostAdapter: Sendable {
                 replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)},
                 goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)})
             adapter.typeLine = { try TerminalAdapter.typeLine(target: $0, text: $1) }
+            adapter.backgroundInput = { try TerminalDeviceInput.deliverBackground(target: $0, screen: $1, agent: $2, input: $3) }
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
                 adapter.validationScreens = nil

@@ -35,6 +35,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private(set) var remoteDashboardRevision: UInt64 = 0
     let remoteInventoryChanges = RemoteTerminalChangeSignal()
+    public lazy var appUpdates = AppUpdates(engine: self, services: publishedUpdateServices)
+    lazy var updateReceiver = LANUpdateReceiver(engine: self)
+    func installationNodeID() throws -> String {
+        if let id = store.value("webNodeID"), UUID(uuidString: id) != nil { return id }
+        let id = UUID().uuidString; try store.set("webNodeID", id); return id
+    }
     public var finishLANUpdate: @MainActor () -> Void = {}
     private var lanUpdateSleepTransferred = false
 
@@ -800,6 +806,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         if poll {
+            appUpdates.start()
             startCodexAccountTransitionPolling()
             startCodexManagedServerPolling()
             if osPermissionMonitoringEnabled {osPermissionTask=Task { [weak self] in
@@ -831,6 +838,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        appUpdates.stop(); updateReceiver.stop()
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
@@ -969,6 +977,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         networkIsolated = enabled
         lanUpdate = Self.idleLANUpdate(enabled: store.value("lanUpdateEnabled") != "false" && !enabled, isolated: enabled)
         if enabled {
+            appUpdates.stop()
             try? stopTunnel()
             testScreens.stopAll()
             webService?.cancelLANUpdate()
@@ -977,9 +986,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } else {
             webStatus = RemoteNetworkStatus()
             if store.value("webEnabled") != "false" { try setWebEnabled(true) }
+            appUpdates.start()
         }
     }
-    func updateLANUpdateStatus(_ value: LANUpdateStatus) { if lanUpdate != value { lanUpdate = value } }
+    func updateLANUpdateStatus(_ value: LANUpdateStatus) {
+        if lanUpdate != value { lanUpdate = value }; appUpdates.receive(value)
+    }
     var lanUpdateWaitReason: String? {
         updateWaitReason(allowTunnelRestart:false)
     }
@@ -1931,9 +1943,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return try await remoteInput(object, automaticAuthorization: nil)
     }
 
-    private func remoteInput(_ object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)?, codexStatusQuery: Bool = false) async throws -> JSONObject {
+    private func remoteInput(_ object: JSONObject, automaticAuthorization: (@MainActor () throws -> Void)?, codexStatusQuery: Bool = false, backgroundOnly: Bool = false) async throws -> JSONObject {
         var deliveryStarted = false
-        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted, automaticAuthorization: automaticAuthorization, codexStatusQuery: codexStatusQuery) }
+        do { return try await performRemoteInput(object, deliveryStarted: &deliveryStarted, automaticAuthorization: automaticAuthorization, codexStatusQuery: codexStatusQuery, backgroundOnly: backgroundOnly) }
         catch {
             var diagnostics = (error as? RemoteHTTPError)?.diagnostics ?? [:]
             if diagnostics["delivery"] == nil { diagnostics["delivery"] = deliveryStarted ? "unknown" : "not_started" }
@@ -1941,7 +1953,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool, automaticAuthorization: (@MainActor () throws -> Void)?, codexStatusQuery: Bool = false) async throws -> JSONObject {
+    private func performRemoteInput(_ object: JSONObject, deliveryStarted: inout Bool, automaticAuthorization: (@MainActor () throws -> Void)?, codexStatusQuery: Bool = false, backgroundOnly: Bool = false) async throws -> JSONObject {
         try automaticAuthorization?()
         let relay = object["relay"] as? Bool == true
         guard !remoteInputStopped, let id = object["sessionID"] as? String, let token = object["revision"] as? String,
@@ -2092,7 +2104,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let host = ScreenHost(kind: session.terminal), let adapter = screenAdapters[host] {
                 let job = currentRecords.filter { $0.tty == tty && $0.processGroup == process.processGroup }.map(\.pid)
                 let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
-                    sourcePID: session.pid, sourceStarted: session.started, sourceIdentity: remoteStreams[id]?.identity), write = adapter.input
+                    sourcePID: session.pid, sourceStarted: session.started, sourceIdentity: remoteStreams[id]?.identity)
+                let write: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
+                if backgroundOnly, host == .terminal {
+                    guard let background = adapter.backgroundInput else {
+                        throw RemoteHTTPError(409, "포커스 없는 터미널 전달을 사용할 수 없습니다.", diagnostics: ["delivery": "not_started"])
+                    }
+                    write = background
+                } else { write = adapter.input }
                 let result = try await Task.detached { try write(target, observed.raw, session.agent, input) }.value
                 sent = result == .sent
             } else if let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID {
@@ -2127,7 +2146,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
-                                            codexStatusQuery: Bool = false, textOnly: Bool = false,
+                                            codexStatusQuery: Bool = false, textOnly: Bool = false, backgroundOnly: Bool = false,
                                             preflight: (() async throws -> Void)? = nil) async throws -> JSONObject {
         var outcome = "not_started"
         do {
@@ -2167,7 +2186,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 do {
                     try await preflight?()
                     if codexStatusQuery, !submitSeparately {
-                        _ = try await remoteInput(input, automaticAuthorization: nil, codexStatusQuery: true)
+                        _ = try await remoteInput(input, automaticAuthorization: nil, codexStatusQuery: true, backgroundOnly: backgroundOnly)
+                    } else if backgroundOnly {
+                        _ = try await remoteInput(input, automaticAuthorization: nil, backgroundOnly: true)
                     } else { _ = try await remoteInput(input) }
                     if submitSeparately {
                         textWasSent = true; outcome = "unknown"
@@ -2185,7 +2206,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 throw RemoteHTTPError(409, "Codex 조회 명령의 입력을 확인하지 못해 Enter를 보내지 않았습니다.")
                             }
                         }
-                        _ = try await remoteInput(["sessionID": original.id, "revision": next.revision, "streamID": next.streamID!, "relay": true, "kind": "enter"])
+                        let enter: JSONObject = ["sessionID": original.id, "revision": next.revision, "streamID": next.streamID!, "relay": true, "kind": "enter"]
+                        if backgroundOnly { _ = try await remoteInput(enter, automaticAuthorization: nil, backgroundOnly: true) }
+                        else { _ = try await remoteInput(enter) }
                     }
                     return ["ok": true, "transport": "terminal", "message": "같은 원본 터미널에 메시지를 전달했습니다."]
                 } catch let error as RemoteHTTPError {
@@ -2285,6 +2308,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if connection.conversationID == nil {
             groupStatusIdentities[runtime] = (original, id, next[gi].members[mi].providerHome)
         }
+        refreshSessionGroupBadges()
     }
 
     /// Types /status into an idle CLI and reads the conversation ID from the fresh status screen.
@@ -2959,7 +2983,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if await submitted(within: 6) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
-        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true)
+        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true)
     }
 
     /// Turns on automatic approval for a group worker. The global pause stays
@@ -6013,6 +6037,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         do {
             switch method {
             case "status": result = try JSONSerialization.jsonObject(with: JSONEncoder().encode(snapshot)) as? JSONObject ?? [:]
+            case "updateHealth":
+                result = ["nodeID": try installationNodeID(), "pid": Int(getpid())]
+                if let release = RemoteWebVersion.current { result["release"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(release)) }
             case "terminalTimings": result = try JSONSerialization.jsonObject(with:JSONEncoder().encode(RemoteTerminalPerformance.shared.snapshot())) as? JSONObject ?? [:]
             case "pause": try setPaused(params["paused"] as? Bool ?? true); result = ["paused": snapshot.paused]
             case "automatic":

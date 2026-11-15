@@ -66,6 +66,10 @@ import AutoApproveCore
             }
         }.windowResizability(.contentSize).commandsRemoved()
 
+        Window("AutoApprove 업데이트", id: "updates") {
+            if let engine = container.engine { AppUpdatesView(model: engine.appUpdates) }
+        }.windowResizability(.contentSize).commandsRemoved()
+
         Window("AutoApprove 도움말", id: "help") {
             HelpWindow(connectionsAvailable: container.engine != nil)
         }.defaultSize(width: 620, height: 660).windowResizability(.contentMinSize).commandsRemoved()
@@ -132,6 +136,8 @@ private struct StatusMenu: View {
             .help(AppHelp.history)
         Button("연결 설정…") { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
             .help(AppHelp.connections)
+        Button("업데이트…") { openWindow(id: "updates"); NSApp.activate(ignoringOtherApps: true) }
+            .help("GitHub 새 버전 확인과 자동 업데이트를 설정합니다.")
         Button("계정·로그인…") {openWindow(id:"accounts");NSApp.activate(ignoringOtherApps:true)}
             .help("이 Mac의 Codex 로그인과 서버·세션 연결을 확인합니다. ⌘⇧L")
         Button("세션 프로필…") {openWindow(id:"profiles");NSApp.activate(ignoringOtherApps:true)}

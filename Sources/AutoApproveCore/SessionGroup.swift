@@ -331,7 +331,9 @@ public struct SessionGroupBadge: Codable, Equatable, Sendable {
         for group in groups {
             let depths = Dictionary(group.treeOrder.map { ($0.member.id, $0.depth) }, uniquingKeysWith: { first, _ in first })
             for member in group.members {
-                guard let session = SessionGroupMatching.match(member, in: live) else { continue }
+                // List membership follows the original process while its conversation
+                // identity is being refreshed. Task delivery still uses strict matching.
+                guard let session = SessionGroupMatching.connection(member, in: live) else { continue }
                 let role: Role = group.leaderMemberID == nil ? .unranked : group.leaderMemberID == member.id ? .leader : .member
                 let parent = group.parentID(of: member.id).flatMap { id in group.members.first { $0.id == id } }
                 candidates[session.id, default: []].append(SessionGroupBadge(

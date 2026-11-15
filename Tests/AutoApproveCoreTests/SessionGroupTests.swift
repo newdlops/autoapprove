@@ -545,6 +545,16 @@ extension ApprovalTests {
         try expectEqual(badges[sessions[1].id]?.groupName, "하위 트리")
         try expectEqual(badges[sessions[3].id]?.role, .unranked)
         try expect(SessionGroupBadge.badges(groups: [tree], live: [sessions[3]])[sessions[3].id] == nil, "Sessions outside every group have no badge")
+        var refreshing = sessions
+        refreshing[1].conversationID = nil
+        refreshing[2].conversationID = UUID().uuidString
+        try expectEqual(SessionGroupBadge.badges(groups: [flat, tree, other], live: refreshing), badges,
+                        "Refreshing conversation identities must preserve the original processes' group rows")
+        try expect(SessionGroupMatching.match(members[1], in: refreshing) == nil, "Unknown identity still prevents task delivery")
+        try expect(SessionGroupMatching.match(members[2], in: refreshing) == nil, "Changed identity still prevents task delivery")
+        refreshing[1].session.id = "process:2:restarted"
+        try expect(SessionGroupBadge.badges(groups: [tree], live: refreshing)[refreshing[1].id] == nil,
+                      "A replacement process with no confirmed identity must not inherit membership")
     }
 
     func testSessionListTreeNestsGroupsAndKeepsOrder() throws {

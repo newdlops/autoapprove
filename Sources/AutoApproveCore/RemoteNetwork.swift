@@ -353,7 +353,7 @@ struct RemoteTerminalUpdate: Encodable {
         engineInventorySignal = engine.remoteInventoryChanges
         self.engine = engine; self.nodeID = nodeID
         updateArchive = LANUpdateArchive(directory: engine.paths.directory.appendingPathComponent("updates/offer"), nodeID: nodeID)
-        updateReceiver = LANUpdateReceiver(engine: engine)
+        updateReceiver = engine.updateReceiver
         publishedUpdates=PublishedUpdates(services:engine.publishedUpdateServices)
         self.loopbackOnly = loopbackOnly
         self.bonjourEnabled = bonjourEnabled && !loopbackOnly
@@ -719,7 +719,8 @@ struct RemoteTerminalUpdate: Encodable {
         status = RemoteNetworkStatus(); emitStatus()
     }
     public func cancelLANUpdate() {
-        updateReceiver.stop();pendingPublishedOffer=nil;publishedUpdates.stop()
+        if engine?.appUpdates.hasPendingInstallation != true { updateReceiver.stop() }
+        pendingPublishedOffer=nil;publishedUpdates.stop()
         publishedUpdateMaintenance?.cancel();publishedUpdateMaintenance=nil
     }
     private func beginPublishedUpdate(_ offer:PublishedReleaseOffer) {
@@ -749,7 +750,7 @@ struct RemoteTerminalUpdate: Encodable {
         return value
     }
     private func checkLANUpdate() {
-        guard running, let webVersion else { return }
+        guard running, let webVersion, engine?.appUpdates.hasPendingInstallation != true else { return }
         if let offer=pendingPublishedOffer {
             if offer.manifest.release>webVersion {
                 let epoch=generation
