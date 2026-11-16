@@ -10,30 +10,37 @@ public struct AgentAccountServices:Sendable {
     public var check:@Sendable(String) async throws -> AgentAccountState
     public var launch:@Sendable(String) throws -> ManagedPTY
     public init(home:String,check:@escaping @Sendable(String) async throws -> AgentAccountState,launch:@escaping @Sendable(String) throws -> ManagedPTY) {self.home=home;self.check=check;self.launch=launch}
-    public static var live:Self { live(codexHome:nil,executable:nil) }
+    public static var live:Self { local(codexHome:nil,executable:nil) }
     public static func codex(_ target:CodexAccountTransitionTarget) throws -> Self {
         guard target.home.hasPrefix("/"), !target.home.contains("\0"),
               target.executable == "codex" || target.executable.hasPrefix("/") && !target.executable.contains("\0") else {throw AppError.message("로그인할 Codex 위치를 확인해주세요.")}
-        return live(codexHome:target.home,executable:target.executable,browser:true,witnesses:target.witnesses)
+        return local(codexHome:target.home,executable:target.executable,browser:true,witnesses:target.witnesses)
     }
-    private static func live(codexHome:String?,executable:String?,browser:Bool=false,witnesses:[CodexAccountTransitionWitness]=[]) -> Self {
-        let home=NSHomeDirectory()
+    // The verifier is an internal fixture seam; public factories always attest
+    // original OpenAI code. Claude's command and shell environment are unchanged.
+    static func local(userHome:String=NSHomeDirectory(),codexHome:String?,executable:String?,browser:Bool=false,
+                      witnesses:[CodexAccountTransitionWitness]=[],
+                      verifyExecutable:@escaping @Sendable (String)throws->Void = {try CodexOfficialExecutable.verify($0)}) -> Self {
+        let home=userHome
         var environment=ProcessInfo.processInfo.environment
         environment["HOME"]=home;environment["BROWSER"]="true";environment["NO_COLOR"]="1"
         if let codexHome {environment["CODEX_HOME"]=codexHome}
         // Match the login-shell environment used by AutoApprove's normal PTYs.
         // Never read/copy auth.json, API keys or credential-store entries here.
         let env=environment
+        let resolve:@Sendable ()throws->CodexCLIContext? = {
+            let selectedHome=codexHome ?? env["CODEX_HOME"] ?? home+"/.codex"
+            let records=witnesses.prefix(50).flatMap {witness in
+                ((try? ProcessDiscovery.read(pid:witness.pid)) ?? []).filter{$0.pid==witness.pid && $0.started==witness.started && "/dev/"+$0.tty==witness.tty}
+            }
+            return try CodexOfficialExecutable.resolve(home:selectedHome,userHome:home,
+                executable:executable=="codex" ? nil:executable,records:records,environment:env,verifyExecutable:verifyExecutable)
+        }
         return Self(home:home,check:{agent in
             try await Task.detached(priority:.utility) {
                 let result:CommandResult
                 if agent=="codex" {
-                    let selectedHome=codexHome ?? env["CODEX_HOME"] ?? home+"/.codex"
-                    let records=witnesses.prefix(50).flatMap {witness in
-                        ((try? ProcessDiscovery.read(pid:witness.pid)) ?? []).filter{$0.pid==witness.pid && $0.started==witness.started && "/dev/"+$0.tty==witness.tty}
-                    }
-                    guard let cli=try CodexCLIContext.resolve(home:selectedHome,userHome:home,
-                        executable:executable=="codex" ? nil:executable,records:records,environment:env) else{return .init(agent:agent,phase:"missing")}
+                    guard let cli=try resolve() else{return .init(agent:agent,phase:"missing")}
                     result=try cli.run(["login","status"])
                 } else {
                     let script="command -v -- \"$1\" >/dev/null 2>&1 || exit 127; exec \"$1\" auth status --json"
@@ -54,9 +61,18 @@ public struct AgentAccountServices:Sendable {
             // A native Mac login uses the CLI's standard browser + loopback
             // flow. Clear overrides after the login shell has run as well.
             let nativeBrowser=browser && agent=="codex"
-            let prefix=nativeBrowser ? ["/usr/bin/env","-u","SSH_CONNECTION","-u","SSH_TTY","-u","SSH_CLIENT","-u","BROWSER","NO_COLOR=1"] : ["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]
-            let command=agent=="codex" ? (codexHome.map{["CODEX_HOME="+$0]} ?? [])+[executable ?? "codex","login"]+(nativeBrowser ? []:["--device-auth"]) : ["claude","auth","login","--claudeai"]
-            return try ManagedPTY(cwd:home,program:"shell",command:prefix+command,columns:240,rows:40,environment:env)
+            var prefix=nativeBrowser ? ["/usr/bin/env","-u","SSH_CONNECTION","-u","SSH_TTY","-u","SSH_CLIENT","-u","BROWSER","NO_COLOR=1"] : ["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]
+            let command:[String],launchEnvironment:[String:String]
+            if agent=="codex" {
+                guard let cli=try resolve() else {throw AppError.message("공식 Codex CLI를 찾지 못했습니다.")}
+                try cli.verifyUnchanged()
+                // The login shell must not reintroduce private fork protocols
+                // or redirect this exact selected home to another account.
+                prefix.insert(contentsOf:["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"],at:1)
+                command=["HOME="+home,"CODEX_HOME="+cli.environment["CODEX_HOME"]!,"PATH="+cli.environment["PATH",default:"/usr/bin:/bin"],cli.executable,"login"]+(nativeBrowser ? []:["--device-auth"])
+                launchEnvironment=cli.environment
+            } else {command=["claude","auth","login","--claudeai"];launchEnvironment=env}
+            return try ManagedPTY(cwd:home,program:"shell",command:prefix+command,columns:240,rows:40,environment:launchEnvironment)
         })
     }
 }

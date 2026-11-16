@@ -112,6 +112,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var ptyContinuations: [String: (source: String, conversation: String?, ptyID: String)] = [:]
     private var ptyContinuationTasks: [String: Task<ManagedPTYDescriptor, Error>] = [:]
     private var automaticInputSessions = Set<String>()
+    // API responses and terminal navigation share the same session reservation.
+    // An old completion must never release a newer request's reservation.
+    private var codexServerInputReservations: [String: String] = [:]
     private let automationRuntime = AutomationRuntime()
     private var automationNeedsFreshScreen = Set<String>()
     private struct ResetApprovalReceipt {
@@ -163,6 +166,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     let store: AuditStore
     private let claudeRegistryReader: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration]
     private let processReader: @Sendable () throws -> [ProcessRecord]
+    // Explicit internal seam for owned native CLI fixtures. Production always
+    // resolves the original OpenAI executable and the connected daemon.
+    var codexAttachmentRuntime: @Sendable (CodexSessionLaunch,String,CodexSessionAttachment.ExecutionMode) async throws ->CodexCLIContext = {
+        try await $0.reconnectionContext(home:$1,mode:$2)
+    }
     private let codexGroupReader: @Sendable (ProcessRecord) throws -> CodexThreadLocation?
     private let codexGroupEnvironment: @Sendable (ProcessRecord) -> [String: String]?
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
@@ -392,6 +400,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var projectedCapacityResumeIDs = Set<String>()
     private var legacyResumeDraftReceipts: [String: [CodexCapacityStop]] = [:]
     private var exitRecoveries: [String: SessionExitRecovery] = [:]
+    // Capture once per original process, off the main actor. Completed tasks also
+    // cache failed reads, so ordinary screen polling cannot repeatedly probe it.
+    private var exitLaunchReads: [String: Task<CodexSessionLaunch?,Never>] = [:]
+#if DEBUG
+    func observedExitLaunch(_ id:String) async ->CodexSessionLaunch? {await exitLaunchReads[id]?.value}
+#endif
     private var exitRecoveryTasks: [String: UUID] = [:]
     private var conversationReads = Set<String>()
     /// Retained for source compatibility. Enabled keep-awake now lasts for the app lifetime.
@@ -854,6 +868,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         groupMailboxTask?.cancel(); groupMailboxTask = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
+        exitLaunchReads.values.forEach { $0.cancel() }; exitLaunchReads.removeAll()
         for task in codexApprovalTasks.values { task.cancel() };codexApprovalTasks.removeAll();codexApprovalEpochs.removeAll()
         codexAccountTransitionEpoch = UUID()
         for entry in codexAccountInspectionTasks.values {entry.task.cancel()};codexAccountInspectionTasks.removeAll()
@@ -1249,6 +1264,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var cwd = object["cwd"] as? String ?? NSHomeDirectory()
         var program = object["program"] as? String ?? "shell"
         var command: [String]?
+        var codexContext:CodexCLIContext?
         if let id = object["sessionID"] as? String {
             guard let session = sessions[id], session.phase != .ended, session.agent != .shell else { throw RemoteHTTPError(409, "이어갈 CLI 세션을 다시 선택해주세요.") }
             let reader = processReader
@@ -1259,15 +1275,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
             var conversation = supplied ?? (session.agent == .codex ? questionThreadBySession[id] : session.providerID)
             if supplied == nil { conversation = await currentPTYConversation(session, records: live) }
             if let conversation, UUID(uuidString: conversation) == nil { throw RemoteHTTPError(400, "올바른 대화 ID를 입력해주세요.") }
-            let fresh = try await Task.detached { try reader() }.value
-            guard !remoteInputStopped, fresh.contains(where: { $0.key == record.key && $0.agent == session.agent && "/dev/" + $0.tty == session.tty }), sessions[id]?.pid == session.pid else { throw RemoteHTTPError(409, "원래 CLI가 종료되었거나 바뀌었습니다.") }
             // Fork the recorded conversation, preserving the original running TUI.
             // Without an exact ID, open the provider's picker; never choose --last.
-            command = session.agent == .codex ? [record.executable, "fork"] + (conversation.map { [$0] } ?? [])
-                : [record.executable, "--resume"] + (conversation.map { [$0] } ?? []) + ["--fork-session"]
+            if session.agent == .codex {
+                let context=try await Task.detached(priority:.utility) {try CodexOfficialExecutable.forSession(record)}.value
+                codexContext=context
+                command=try context.terminalInvocation(["fork"]+(conversation.map{[$0]} ?? []))
+            } else {
+                command=[record.executable,"--resume"]+(conversation.map{[$0]} ?? [])+["--fork-session"]
+            }
+            let fresh = try await Task.detached { try reader() }.value
+            guard !remoteInputStopped, fresh.contains(where: { $0.key == record.key && $0.agent == session.agent && "/dev/" + $0.tty == session.tty }), sessions[id]?.pid == session.pid else { throw RemoteHTTPError(409, "원래 CLI가 종료되었거나 바뀌었습니다.") }
         }
         try Task.checkCancellation()
-        let terminal = try managedPTY.create(cwd: cwd, program: program, command: command, columns: object["columns"] as? Int ?? 80, rows: object["rows"] as? Int ?? 24)
+        let manager=managedPTY,launchCwd=cwd,launchProgram=program,launchCommand=command,launchContext=codexContext
+        let columns=object["columns"] as? Int ?? 80,rows=object["rows"] as? Int ?? 24
+        let creation=Task.detached(priority:.userInitiated) {
+            try launchContext?.verifyUnchanged()
+            return try manager.create(cwd:launchCwd,program:launchProgram,command:launchCommand,columns:columns,rows:rows,environment:launchContext?.environment)
+        }
+        let terminal=try await withTaskCancellationHandler(operation:{try await creation.value},onCancel:{creation.cancel()})
+        guard !remoteInputStopped,!Task.isCancelled else {
+            (try? manager.terminal(terminal.ptyID))?.close();throw CancellationError()
+        }
         ptyAutomatic[terminal.ptyID] = object["automatic"] as? Bool == true
         let owned = try managedPTY.terminal(terminal.ptyID), id = terminal.ptyID
         let observer = owned.observeOutput { [weak self, weak owned] in
@@ -2909,8 +2939,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         guard let conversation else { return fail("대화 ID를 확인하지 못해 같은 대화로 다시 열 수 없습니다.") }
+        let codexContext:CodexCLIContext?
+        do {
+            codexContext=original.agent == .codex
+                ? try await Task.detached(priority:.utility) {try CodexOfficialExecutable.forSession(process)}.value:nil
+            try Task.checkCancellation()
+        } catch is CancellationError {return}
+        catch {return fail(error.localizedDescription)}
         let plan: SessionRestartCommand.Plan
-        do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
+        do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
         catch { return fail(error.localizedDescription) }
         // The status query may leave the CLI briefly busy; wait for it to settle again.
         let settleUntil = Date().addingTimeInterval(20)
@@ -2927,10 +2964,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var terminalReleased = false
         func releaseTerminal() { if !terminalReleased { terminalReleased = true; restartTerminalBusy = false } }
         defer { releaseTerminal() }
+        guard !Task.isCancelled,!remoteInputStopped else {return}
         guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
         let wasAutomatic = current.automatic
         updateRestart(id, .exiting, "CLI를 종료하고 있습니다.")
-        let command = plan.command(cwd: nil, environment: environment)
+        let command:String
+        do {command=try codexContext.map{try $0.terminalInvocation(Array(plan.arguments.dropFirst())).map(HookInstaller.quote).joined(separator:" ")}
+            ?? plan.command(cwd:nil,environment:environment)}
+        catch {return fail(error.localizedDescription)}
         // The PID must still be the same CLI and its shell must still be its ancestor before a signal is sent.
         let terminate = processTerminator
         guard let fresh = try? await Task.detached(operation: { try reader() }).value,
@@ -2957,7 +2998,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let screen = try? await Task.detached(operation: { try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents }).value
             guard let prompt = screen ?? nil, SessionExitRecovery.emptyShellPrompt(prompt) else { continue }
             updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
-            do { sent = try await Task.detached(operation: { try restart(target, prompt, command) }).value == .sent }
+            do {
+                let delivery:TerminalDelivery=try await Task.detached {
+                    try codexContext?.verifyUnchanged()
+                    return try restart(target,prompt,command)
+                }.value
+                sent=delivery == .sent
+            }
             catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
         }
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
@@ -5306,6 +5353,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             capacityStates.removeValue(forKey: member)
             exitRecoveryTasks.removeValue(forKey: member)
             exitRecoveries.removeValue(forKey: member)
+            exitLaunchReads.removeValue(forKey: member)?.cancel()
             remoteInputUntil.removeValue(forKey: member)
             retainedModelMenus.removeValue(forKey: member)
             // An interrupted safety write cannot become another Escape or paste.
@@ -5339,6 +5387,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             remoteObservedScreens.removeAll(); remoteFrames.removeAll()
             remoteScreenReads.removeAll(); remoteInitialReads.removeAll()
             capacityStates.removeAll(); exitRecoveries.removeAll(); exitRecoveryTasks.removeAll()
+            exitLaunchReads.values.forEach { $0.cancel() }; exitLaunchReads.removeAll()
             modelRetentionTasks.removeAll(); systemSafetyTasks.removeAll()
             automaticQuestionReplies.removeAll(); retainedModelMenus.removeAll()
             remoteInputUntil.removeAll(); readableQuestionSessions.removeAll()
@@ -7610,7 +7659,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private func disableIndependentDaemonAutoStart(home:String,executable:String) async throws {
         try await Task.detached(priority:.utility) {
-            guard let cli=try CodexCLIContext.resolve(home:home,userHome:NSHomeDirectory(),executable:executable),
+            guard let cli=try CodexOfficialExecutable.resolve(home:home,userHome:NSHomeDirectory(),executable:executable),
                   try cli.run(["features","disable","daemon_auto_start"]).status==0 else {
                 throw AppError.message("독립 홈의 자동 서버 연결을 끄지 못했습니다. 실행하지 않고 설정을 유지합니다.")
             }
@@ -7657,6 +7706,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Enroll just this standalone TUI in its own home's server first. The
     /// existing migration coordinator then moves it to the selected group.
     public func prepareStandaloneCodexSessionMove(sessionID:String,destinationHome:String) async throws->CodexSessionMovePlan {
+        try CodexFeatureSupport.requireSessionMove()
         let source=try await codexStandaloneSession(sessionID:sessionID)
         guard source.home != (try CodexAccountTransitionTarget.canonicalHome(destinationHome)) else {
             throw AppError.message("다른 로그인 그룹을 선택해주세요.")
@@ -7751,6 +7801,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexMigrationReconnectContexts=values
     }
     func prepareCodexSessionMigration(sessionID:String,destinationHome:String) async throws->CodexSessionMigrationState {
+        try CodexFeatureSupport.requireSessionMove()
         guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
             throw AppError.message("진행 중인 로그인·계정 전환을 마친 뒤 이동해주세요.")
         }
@@ -7791,9 +7842,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             if state.stage == .cancelled{return nil}
             let canCancel=state.execution==nil
-            let canReconnect=state.stage == .completed && codexMigrationReconnectContexts[id] != nil
+            let canReconnect=CodexFeatureSupport.canMoveOpenSessions && state.stage == .completed && codexMigrationReconnectContexts[id] != nil
             let detail:String
-            if canReconnect {detail="대화 이전 완료 · 원래 터미널의 목적지 연결 확인이 남아 있습니다."}
+            if !CodexFeatureSupport.canMoveOpenSessions {detail=canCancel
+                ? "공식 Codex에서 기존 대화 이동 미지원 · 이전에 준비한 이동을 취소할 수 있습니다."
+                : "이전 이동 기록의 상태 확인 필요 · 공식 Codex에서 자동 이동·재연결은 지원하지 않습니다."}
+            else if canReconnect {detail="대화 이전 완료 · 원래 터미널의 목적지 연결 확인이 남아 있습니다."}
             else if canCancel {detail="이동 범위 준비됨 · 아직 대화 이전을 실행하지 않았습니다."}
             else {detail="이전 실행 결과 확인 필요 · 종료·소유권 이전 명령을 반복하지 않습니다."}
             return .init(id:id,destinationHome:state.request.destination.home,conversationCount:state.request.threads.count,
@@ -7801,6 +7855,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func performCodexSessionMove(id:String) async throws->CodexSessionAttachment {
+        try CodexFeatureSupport.requireSessionMove()
         guard codexMigrationRunningIDs.insert(id).inserted else {
             throw AppError.message("이 이동의 실행·재연결 확인이 이미 진행 중입니다.")
         }
@@ -7837,6 +7892,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         var context=SessionExitRecovery(session:session,process:process,shell:shell,conversationID:thread)
         context.executable=request.source.cliIdentity
+        context.codexLaunch=try await Task.detached(priority:.utility){try CodexSessionLaunch.capture(process)}.value
         return context
     }
     /// Internal until the caller also owns the terminal reconnection lifecycle.
@@ -7853,6 +7909,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let destinationConnectionHome=try CodexAccountTransitionTarget.canonicalHome(destinationHome)
         try await Task.detached(priority:.utility) {
             let connection=try CodexQueueConnection(home:destinationHome)
+            _ = try CodexOfficialExecutable.verifyServer(connection)
             for thread in threadIDs {
                 try Task.checkCancellation()
                 let response=try connection.request("thread/read",["threadId":thread,"includeTurns":false])
@@ -7871,6 +7928,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("저장한 재연결 방식과 목적지 홈이 다릅니다. 실행 명령을 반복하지 않았습니다.")
         }
         let original=context.session,reader=processReader,epoch=codexAccountTransitionEpoch
+        if plan.context.codexLaunch==nil,![.launchReserved,.verifying,.connected,.review].contains(plan.phase) {
+            let savedContext=context
+            plan.context.codexLaunch=try await Task.detached(priority:.utility) {
+                try CodexSessionLaunch.forAttachment(savedContext,home:destinationHome,records:reader())
+            }.value
+            try store.set(key,String(decoding:JSONEncoder().encode(plan),as:UTF8.self))
+        }
+        let launchAttachment=plan
+        let resolveRuntime=codexAttachmentRuntime
+        // Attest before sending /exit. A failed replacement leaves the original
+        // session open and the durable delivery receipt unchanged.
+        let preflight:CodexCLIContext?
+        if [.ready,.needsTab,.needsPause].contains(plan.phase) {
+            guard let launchIdentity=launchAttachment.context.codexLaunch else{throw AppError.message("원래 Codex 실행 환경을 확인하지 못했습니다.")}
+            preflight=try await resolveRuntime(launchIdentity,destinationHome,executionMode)
+        }else{preflight=nil}
         func authorized()throws {
             try Task.checkCancellation()
             guard !remoteInputStopped,!snapshot.paused,epoch==codexAccountTransitionEpoch else{throw CancellationError()}
@@ -7886,6 +7959,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
         let services=CodexSessionAttachmentServices(exit:{
             try authorized()
+            try preflight?.verifyUnchanged()
             let rows=try await Task.detached(priority:.utility){try reader()}.value
             guard let process=rows.first(where:{$0.pid==original.pid && $0.started==original.started}),process.isForeground,
                   !CodexSessionAttachment.hasIndependentChildWork(process:process,records:rows),
@@ -7905,15 +7979,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         },launch:{
             let rows=try await Task.detached(priority:.utility){try reader()}.value
             guard let shell=context.verifiedShell(in:rows) else{throw AppError.message("원래 빈 셸을 확인하지 못했습니다.")}
-            let root=try CodexNativeRuntimeRoot.prepare()
-            let attachment=try CodexSessionAttachment.migrated(context:context,state:moved,executionMode:executionMode)
+            guard let launchIdentity=launchAttachment.context.codexLaunch else{throw AppError.message("원래 Codex 실행 환경을 확인하지 못했습니다.")}
+            let cli=try await resolveRuntime(launchIdentity,destinationHome,executionMode)
             if executionMode == .standalone {
-                try await self.disableIndependentDaemonAutoStart(home:destinationHome,executable:attachment.context.executable)
+                try await self.disableIndependentDaemonAutoStart(home:destinationHome,executable:cli.executable)
             }
-            guard let command=attachment.command(nativeRuntimeRoot:root) else{throw AppError.message("목적지 재개 명령을 확인하지 못했습니다.")}
+            let command=try launchAttachment.command(using:cli)
             let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
             let before=try await screen(target)
             guard SessionExitRecovery.emptyShellPrompt(before) else{throw AppError.message("셸 입력창이 비어 있지 않습니다.")}
+            try cli.verifyUnchanged()
             return try await Task.detached(priority:.utility){try restart(target,before,command) == .sent}.value
         },verify:{
             try authorized()
@@ -7925,7 +8000,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let loaded:Bool
             if executionMode == .standalone {
                 guard connected==nil else{return false}
-                loaded=(try? await CodexStandaloneObservation.displays(home:destinationHome,pid:next.pid,threadID:thread))==true
+                loaded=await Task.detached(priority:.utility){
+                    guard let location=try? CodexThreadLocation.locate(paths:ProcessOpenFiles.codexRolloutPaths(pid:next.pid,expectedStart:next.started)) else{return false}
+                    return location.threadID==thread && (try? CodexAccountTransitionTarget.canonicalHome(URL(fileURLWithPath:location.database).deletingLastPathComponent().path))==destinationConnectionHome
+                }.value
             }else {
                 guard connected==destinationConnectionHome else{return false}
                 loaded=try await Task.detached(priority:.utility){
@@ -7956,6 +8034,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }while true
     }
     func executeCodexSessionMigration(id:String) async throws->CodexSessionMigrationState {
+        try CodexFeatureSupport.requireSessionMove()
         guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
             throw AppError.message("진행 중인 로그인·계정 전환을 마친 뒤 이동해주세요.")
         }
@@ -8179,6 +8258,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Idle standalone conversations move sequentially through their own shell.
     /// Active work, Goals, questions and drafts wait without being discarded.
     private func attachStandaloneCodexSessions(home:String,sessionIDs:Set<String>?=nil) async {
+        guard CodexFeatureSupport.canAttachOpenStandaloneSessions else {
+            codexAttachmentHomes.remove(home)
+            codexSessionAttachmentNotice=CodexFeatureSupport.standaloneAttachmentUnavailable
+            return
+        }
         guard !Task.isCancelled,!snapshot.paused,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
         if sessionIDs==nil,(try? codexIndependentLoginStore.contains(home:home))==true {return}
         let epoch=codexAccountTransitionEpoch,reader=processReader
@@ -8238,16 +8322,32 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard original.phase == .idle || selectedIdle || goal?.status == .active || explicit && goal?.status == .paused else{wait(original,"실행 중 작업 유지 · Goal 확인 필요");continue}
                 var context=SessionExitRecovery(session:original,process:process,shell:shell,conversationID:threadID)
                 context.executable=executable
+                context.codexLaunch=try await Task.detached(priority:.utility){try CodexSessionLaunch.capture(process)}.value
                 var attachment=CodexSessionAttachment(context:context,home:home,originalLogin:login,authorizedToolHosts:approvedToolHosts)
                 if goal?.status == .paused {attachment.pausedGoal=goal}
                 if goal?.status == .active {attachment.goalBeforePause=goal;attachment.phase = .needsPause}
                 try saveCodexSessionAttachment(attachment)
             }
-            for state in codexSessionAttachments.values.filter({$0.home==home && ![.connected,.review].contains($0.phase)
+            for savedState in codexSessionAttachments.values.filter({$0.home==home && ![.connected,.review].contains($0.phase)
                 && (sessionIDs?.contains($0.context.session.id) ?? true)}).sorted(by:{$0.context.session.pid<$1.context.session.pid}) {
+                var updatedState=savedState
+                if updatedState.context.codexLaunch==nil,![.launchReserved,.verifying].contains(updatedState.phase) {
+                    let savedContext=updatedState.context
+                    updatedState.context.codexLaunch=try await Task.detached(priority:.utility) {
+                        try CodexSessionLaunch.forAttachment(savedContext,home:home,records:reader())
+                    }.value
+                    try saveCodexSessionAttachment(updatedState)
+                }
+                let state=updatedState
                 let context=state.context,original=context.session,id=original.id
                 if state.phase == .needsPause,codexAttachmentToolHostGrants[home]?[id]==nil {wait(original,"Goal 일시정지·재연결 직접 요청 대기");continue}
                 guard authorized(id),let host=ScreenHost(kind:original.terminal),screenConnections[host]?.enabled==true,let adapter=screenAdapters[host],let restart=adapter.restart else{return}
+                let resolveRuntime=codexAttachmentRuntime
+                let preflight:[CodexSessionAttachment.Phase] = [.needsPause,.needsTab,.ready]
+                if preflight.contains(state.phase) {
+                    guard let launchIdentity=context.codexLaunch else{throw AppError.message("원래 Codex 실행 환경을 확인하지 못했습니다.")}
+                    _ = try await resolveRuntime(launchIdentity,home,.server)
+                }
                 codexAttachmentActiveIDs.insert(id)
                 let frozenIdentity=state.phase == .needsPause && host == .terminal ? try? TTYInputIdentity.capture(pid:original.pid):nil
                 let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started,sourceIdentity:frozenIdentity)
@@ -8325,12 +8425,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let source=ScreenTarget(tty:"/dev/"+shell.tty,handle:state.replacesTab ? nil:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
                     return SessionExitRecovery.emptyShellPrompt(try await screen(source))
                 },launch:{
-                    let nativeRoot=try await Task.detached(priority:.utility){try CodexNativeRuntimeRoot.prepare()}.value
+                    guard let launchIdentity=context.codexLaunch else{throw AppError.message("원래 Codex 실행 환경을 확인하지 못했습니다.")}
+                    let cli=try await resolveRuntime(launchIdentity,home,.server)
+                    let command=try state.command(using:cli)
                     let current=try await Task.detached(priority:.utility){try reader()}.value
-                    guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current),let command=state.command(nativeRuntimeRoot:nativeRoot),FileManager.default.isExecutableFile(atPath:context.executable) else{throw AppError.message("원래 셸·실행 파일·대화를 확인하지 못했습니다.")}
+                    guard authorized(id),cleanupFinished(current),let shell=context.verifiedShell(in:current) else{throw AppError.message("원래 셸·실행 파일·대화를 확인하지 못했습니다.")}
                     let source=ScreenTarget(tty:"/dev/"+shell.tty,handle:state.replacesTab ? nil:original.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
                     let before=try await screen(source)
                     guard SessionExitRecovery.emptyShellPrompt(before) else{throw AppError.message("셸 입력창이 비어 있지 않습니다.")}
+                    try cli.verifyUnchanged()
                     return try await Task.detached(priority:.utility){try restart(source,before,command) == .sent}.value
                 },verify:{
                     let current=try await Task.detached(priority:.utility){try reader()}.value
@@ -8646,6 +8749,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return runtime
     }
     public func codexSessionServerLink(sessionID:String) async throws ->CodexSessionServerLink {
+        try CodexFeatureSupport.requireConnectionInventory()
         guard let original=sessions[sessionID],original.agent == .codex,original.phase != .ended else {
             throw AppError.message("실행 중인 Codex 세션을 선택해주세요.")
         }
@@ -8744,6 +8848,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // Account refresh must wait until an exit/launch has been verified.
         let attachmentHome=try CodexAccountTransitionTarget.canonicalHome(home)
         if try await joinCodexAccountControl(home:attachmentHome) {return}
+        if !CodexFeatureSupport.canAttachOpenStandaloneSessions {
+            try await reconnectCodexManagedLogin(home:attachmentHome,loginRequestID:loginRequestID)
+            return
+        }
         // A signed-out shared server can recover its saved login independently
         // of standalone TUIs. Never stop/migrate unrelated work just to restore
         // the already connected cohort, or bypass a partly executed attachment.
@@ -9354,7 +9462,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let conversation = session.agent == .codex ? questionThreadBySession[session.id] : session.providerID
         var context = SessionExitRecovery(session:session,process:process,shell:shell,conversationID:conversation)
         context.conversationID = context.conversationID ?? exitRecoveries[session.id]?.conversationID
+        context.codexLaunch = exitRecoveries[session.id]?.codexLaunch
         exitRecoveries[session.id] = context
+        if session.agent == .codex,context.codexLaunch == nil,exitLaunchReads[session.id] == nil {
+            let id=session.id,pid=session.pid,started=session.started
+            let read=Task.detached(priority:.utility) {try? CodexSessionLaunch.capture(process)}
+            exitLaunchReads[id]=read
+            Task { [weak self] in
+                let captured=await read.value
+                guard let self,!read.isCancelled,!remoteInputStopped,
+                      exitRecoveries[id]?.session.pid==pid,exitRecoveries[id]?.session.started==started else{return}
+                exitRecoveries[id]?.codexLaunch=captured
+                if sessions[id]?.phase == .ended {saveExitRecoveries()}
+            }
+        }
     }
 
     private func readRecoveryConversation(_ id: String) {
@@ -9453,7 +9574,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     sessions[next.id]?.automatic = true
                     try? store.set("automatic:\(next.id)","true")
                 }
-                persistInterruption(id); exitRecoveries.removeValue(forKey:id); saveExitRecoveries(); publish()
+                persistInterruption(id); exitRecoveries.removeValue(forKey:id)
+                exitLaunchReads.removeValue(forKey:id)?.cancel();saveExitRecoveries(); publish()
             }
             return
         }
@@ -9502,11 +9624,32 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sessions[id]?.interruption?.recoveryDetail = "원본 셸의 빈 입력창을 기다리고 있습니다."; publish(); return
             }
             context.conversationID = context.conversationID ?? SessionExitRecovery.conversation(in:first)
-            guard let command = context.command else {
+            guard let conversation=context.conversationID,UUID(uuidString:conversation) != nil,
+                  context.session.agent == .codex || context.command != nil else {
                 exitRecoveries[id]?.state = "unavailable"
                 sessions[id]?.interruption?.recoveryStatus = "unavailable"
                 sessions[id]?.interruption?.recoveryDetail = "정확한 대화 ID를 확인하지 못했습니다. Mac에서 원래 대화를 선택해주세요."
                 persistInterruption(id); saveExitRecoveries(); publish(); return
+            }
+            let command:String,launchContext:CodexCLIContext?
+            if context.session.agent == .codex {
+                if context.codexLaunch == nil,let pending=exitLaunchReads[id] {
+                    context.codexLaunch=await pending.value
+                    guard mayLaunch() else{return}
+                }
+                guard let saved=context.codexLaunch else {
+                    exitRecoveries[id]?.state="review"
+                    sessions[id]?.interruption?.recoveryStatus="review"
+                    sessions[id]?.interruption?.recoveryDetail="원래 Codex의 로그인 홈을 확인하지 못했습니다. 원본 로그인 홈에서 같은 대화를 다시 열어주세요."
+                    persistInterruption(id);saveExitRecoveries();publish();return
+                }
+                let official=try await Task.detached(priority:.utility) {try saved.officialContext()}.value
+                guard mayLaunch() else{return}
+                command=try official.terminalInvocation(["resume",conversation,CodexCapacityStop.resumeText]).map(HookInstaller.quote).joined(separator:" ")
+                launchContext=official
+            } else {
+                guard let planned=context.command else {throw AppError.message("복구 명령을 확인하지 못했습니다.")}
+                command=planned;launchContext=nil
             }
             try await Task.sleep(for:.seconds(1))
             guard mayLaunch() else { return }
@@ -9524,7 +9667,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard log(event) else { exitRecoveries[id]?.state = "review"; return }
             publish()
             launched = true
-            let delivery = try await Task.detached { try restart(target,first,command) }.value
+            let delivery = try await Task.detached {
+                try launchContext?.verifyUnchanged()
+                return try restart(target,first,command)
+            }.value
             guard owns("launching") else { return }
             if delivery == .sent {
                 exitRecoveries[id]?.state = "awaiting"; exitRecoveries[id]?.conversationID = context.conversationID
@@ -9963,14 +10109,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try ledger.reserve(receipt)
         let dispatch=SubagentGoalDispatch()
         do {
-            let result=try await codexSubagentGoals.change(target,session.cwd,expected,action,{[self] in
+            let authorize:@Sendable () async throws ->Void = {[self] in
                 let fresh=try await self.subagentGoalTarget(session,root:expected.rootThreadID)
                 try await MainActor.run {
                     guard fresh.home==target.home,!self.codexAccountInputHeld(sessionID),!self.codexAccountContinuationHeld(sessionID),
                           !self.automaticInputBusy(sessionID),self.changingGoalThreads.contains(key) else {throw AppError.message("Goal 변경 직전에 연결이나 입력 상태가 바뀌었습니다.")}
                     dispatch.started=true
                 }
-            })
+            }
+            let result:CodexSubagentGoal
+            if let requested=codexSubagentGoals.requestedChange {
+                result=try await requested(target,session.cwd,expected,action,requestID,paths.directory,authorize)
+            }else {result=try await codexSubagentGoals.change(target,session.cwd,expected,action,authorize)}
             let fresh=try await subagentGoalTarget(session,root:expected.rootThreadID)
             let expectedStatus:CodexGoal.Status = action == .resume ? .active:.paused
             guard dispatch.started,fresh.home==target.home,result.rootThreadID==expected.rootThreadID,result.threadID==expected.threadID,
@@ -10088,6 +10238,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func reserveCodexApproval(_ original: AgentSession, threadID: String, epoch: UUID, approval: CodexServerApproval) -> Bool {
         guard !remoteInputStopped, !snapshot.paused, let current = sessions[original.id], current.automatic,
               !userInputHasPriority(original.id), !automaticInputBusy(original.id),
+              codexApprovalHoldReason(sessionID: original.id) == nil,
               current.phase != .ended, current.pid == original.pid, current.started == original.started,
               current.tty == original.tty, current.cwd == original.cwd,
               current.codexApprovalBinding?.threadID == threadID,
@@ -10097,9 +10248,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             source: "Codex 부모·서브에이전트", context: AuditContext(session: original), request: approval.request,
             answer: approval.risk == nil ? "accept (이번 요청)" : "decline · " + approval.risk!.title)
         guard log(event) else { return false }
-        do { try store.set("codexApprovalAttempt:" + approval.key, "attempted"); return true } catch { return false }
+        do {
+            try store.set("codexApprovalAttempt:" + approval.key, "attempted")
+            codexServerInputReservations[original.id] = approval.key
+            automaticInputSessions.insert(original.id)
+            return true
+        } catch { return false }
     }
     private func finishCodexApproval(_ session: AgentSession, approval: CodexServerApproval, confirmed: Bool) {
+        defer {
+            if codexServerInputReservations[session.id] == approval.key {
+                codexServerInputReservations.removeValue(forKey: session.id)
+                automaticInputSessions.remove(session.id)
+                scheduleScreenApproval(session.id)
+            }
+        }
         _ = log(AuditEvent(sessionID: session.id, summary: approval.summary,
             outcome: confirmed ? (approval.risk == nil ? "서버 승인 확인" : "시스템 변경 거절 확인") : "서버 응답 결과 미확인 · 중복 전송하지 않음",
             source: "Codex 부모·서브에이전트", context: AuditContext(session: session), request: approval.request))
@@ -10175,7 +10338,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     sourcePID: session.pid, sourceStarted: session.started)
                 let approve = adapter.approve, raw = current.raw, kind = session.agent
                 do {
-                    let delivery = try await Task.detached { try approve(target, raw, kind) }.value
+                    let delivery: TerminalDelivery
+                    var navigatedChild: CodexChildApprovalNavigation.Outcome?
+                    if kind == .codex && CodexChildApprovalNavigation.requiresNavigation(raw) {
+                        let navigation = try await CodexChildApprovalNavigation.approve(target: target, initial: raw,
+                            parentThreadID: session.codexApprovalBinding?.threadID, adapter: adapter, valid: { [weak self] in
+                                guard let self else { return false }
+                                let records = try? await Task.detached { try reader() }.value
+                                return await self.codexChildNavigationValid(session, epoch: epoch, records: records)
+                            })
+                        delivery = navigation.delivery; navigatedChild = navigation
+                    } else {
+                        delivery = try await Task.detached { try approve(target, raw, kind) }.value
+                    }
                     if Task.isCancelled || self.automationRuntime.epoch(id) != epoch {
                         event.outcome = delivery == .sent ? "초기화 전 승인 입력 전달" : "초기화 전 입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                         self.log(event); return
@@ -10186,9 +10361,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             requestIdentity:current.prompt.requestIdentity,epoch:epoch,read:adapter.validationScreens ?? adapter.screens)
                     }
                     if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
-                    event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
+                    event.outcome = delivery == .sent
+                        ? navigatedChild.map { $0.approved ? "하위 요청 승인 입력 전달 · 부모 화면 복귀 확인" : "처리된 하위 요청 화면 정리 · 부모 화면 복귀 확인" } ?? "승인 입력 전달"
+                        : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     self.log(event)
                 } catch {
+                    if error is CodexChildApprovalNavigation.Interrupted,
+                       self.sessions[id]?.pid == session.pid, self.sessions[id]?.started == session.started {
+                        // Navigation changes the visible request identity. A later child
+                        // frame must not bypass the original uncertain-write reservation.
+                        // Persist OFF so restart/resize cannot replay the possible approval.
+                        do { try self.setAutomatic(id, enabled: false) }
+                        catch { self.sessions[id]?.automatic = false }
+                        self.sessions[id]?.pendingInTerminal = true
+                        self.sessions[id]?.activityDetail = "하위 화면 조작 결과를 확인하지 못해 자동 승인을 껐습니다. 터미널을 확인한 뒤 다시 켜주세요."
+                    }
                     if Task.isCancelled || self.automationRuntime.epoch(id) != epoch {
                         event.outcome = "초기화 전 입력 확인 필요: \(error.localizedDescription)"
                         self.log(event); return
@@ -10212,6 +10399,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             self.publish()
         }
+    }
+
+    private func codexChildNavigationValid(_ original: AgentSession, epoch: UInt64, records: [ProcessRecord]?) -> Bool {
+        guard !remoteInputStopped, !snapshot.paused, !userInputHasPriority(original.id),
+              !hasOSPermissionWait(original.id), !codexAccountInputHeld(original.id),
+              automationRuntime.epoch(original.id) == epoch,
+              let current = sessions[original.id], current.automatic, current.phase != .ended,
+              current.pid == original.pid, current.started == original.started, current.tty == original.tty,
+              current.channel == original.channel, current.screenHandle == original.screenHandle,
+              current.cwd == original.cwd, current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID else { return false }
+        return records?.contains { $0.pid == original.pid && $0.started == original.started && $0.agent == .codex
+            && "/dev/" + $0.tty == original.tty && $0.isForeground } == true
     }
 
     /// A proven non-write may mean a bulk monitor frame has lagged behind the

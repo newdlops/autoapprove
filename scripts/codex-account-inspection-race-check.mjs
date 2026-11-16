@@ -4,8 +4,8 @@ import {execFileSync,spawn} from 'node:child_process';
 import {mkdtemp,mkdir,writeFile,chmod,rm} from 'node:fs/promises';
 import http from 'node:http';import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
-const require=createRequire(import.meta.url),module=process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright');
-const ws=require(path.join(path.dirname(module),'../playwright-core/lib/utilsBundle.js'));
+const require=createRequire(import.meta.url),module=process.env.AUTOAPPROVE_WEBSOCKET_MODULE ? null:process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright');
+const ws=module ? require(path.join(path.dirname(module),'../playwright-core/lib/utilsBundle.js')):{wsServer:require(process.env.AUTOAPPROVE_WEBSOCKET_MODULE).WebSocketServer};
 const root=await mkdtemp('/private/tmp/aa-inspection-race-'),build=path.resolve(process.env.AUTOAPPROVE_CHECK_BUILD||'.build/debug'),clients=new Set();
 const server=http.createServer(),websocket=new ws.wsServer({noServer:true});let mode='race',account='a',calls=[];
 const session=account=>({activeSessionId:'session-'+account,sessions:[{sessionId:'session-'+account,isActive:true,userId:'user-'+account,selectedWorkspaceAccountId:'workspace'}]});
@@ -23,7 +23,7 @@ try {
   socket.send(JSON.stringify({id:m.id,result}));
  });});
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(root+'/app-server-control/app-server-control.sock',resolve)});
- async function run(expected){const child=spawn(root+'/check',[root,cli,expected],{stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>error+=b);const status=await new Promise(r=>child.once('exit',r));assert.equal(status,0,error);return JSON.parse(output);}
+ async function run(expected){const child=spawn(root+'/check',[root,cli,expected],{env:{HOME:root,ZDOTDIR:root,PATH:'/usr/bin:/bin'},stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>error+=b);const status=await new Promise(r=>child.once('exit',r));assert.equal(status,0,error);return JSON.parse(output);}
  await run('unverified');mode='stable';account='b';await run('same');
  assert.ok(calls.every(m=>['initialize','account/read','accountSession/list'].includes(m)));
  console.log(JSON.stringify({verified:true,racingIdentityRejected:true,stableIdentityAccepted:true,mutationCalls:0}));

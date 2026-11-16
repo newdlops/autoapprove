@@ -5,9 +5,14 @@ import Darwin
 // Storage evidence only. The native producer still must prove the writer has
 // closed and flushed; an archived path or a stable hash alone cannot prove it.
 struct CodexMigrationRetirement:Codable,Equatable {
+    struct Official:Codable,Equatable {
+        let requestID:String,intentDigest:String,originalArchivePath:String
+    }
     let formatVersion:Int
     let goal:CodexGoalTransferSlot
     let rollout:CodexMigrationRolloutWitness
+    var official:Official?=nil
+    var originalArchivePath:String {official?.originalArchivePath ?? rollout.relativePath}
     static func capture(home:String,threadID:String,rolloutPath:String)throws->Self {
         let goal=try CodexGoalTransferStore.captureSlot(home:home,threadID:threadID)
         // Canonicalize the selected home once, while still rejecting links in
@@ -27,13 +32,23 @@ struct CodexMigrationRetirement:Codable,Equatable {
         return .init(formatVersion:1,goal:goal,rollout:witness)
     }
     func validate()throws {
-        guard formatVersion==1,rollout.relativePath.hasPrefix("archived_sessions/"),
-              rollout.relativePath.hasSuffix(".jsonl"),
-              URL(fileURLWithPath:rollout.relativePath).lastPathComponent.contains(goal.threadID) else{throw retirementFailure}
+        if let official {
+            guard formatVersion==2,UUID(uuidString:official.requestID)?.uuidString.lowercased()==official.requestID,
+                  official.intentDigest.utf8.count==64,official.intentDigest.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}),
+                  rollout.relativePath==".autoapprove-migrations/official-retired/"+official.requestID+"-"+goal.threadID+"/rollout.jsonl",
+                  official.originalArchivePath.hasPrefix("archived_sessions/"),official.originalArchivePath.hasSuffix(".jsonl"),
+                  URL(fileURLWithPath:official.originalArchivePath).lastPathComponent.contains(goal.threadID) else{throw retirementFailure}
+            _=try RetirementFiles.components(official.originalArchivePath)
+        }else{
+            guard formatVersion==1,rollout.relativePath.hasPrefix("archived_sessions/"),
+                  rollout.relativePath.hasSuffix(".jsonl"),
+                  URL(fileURLWithPath:rollout.relativePath).lastPathComponent.contains(goal.threadID) else{throw retirementFailure}
+        }
         try rollout.validate()
     }
     func verifyCurrent()throws {
         try validate();try CodexGoalTransferStore.verifyCurrent(goal)
+        if official != nil {try CodexOfficialRetirement.verifyStorageFact(self);return}
         guard try CodexMigrationRolloutWitness.capture(home:goal.sourceHome,homeIdentity:goal.homeIdentity,relative:rollout.relativePath)==rollout else{throw retirementFailure}
         try CodexGoalTransferStore.verifyCurrent(goal)
     }
@@ -88,6 +103,7 @@ struct CodexMigrationRetiredBackup:Codable,Equatable {
     var rolloutPath:String {retirement.goal.sourceHome+"/"+relativeDirectory+"/rollout.jsonl"}
     var recordPath:String {retirement.goal.sourceHome+"/"+relativeDirectory+"/retired.json"}
     func verify()throws {
+        try retirement.validate()
         guard UUID(uuidString:requestID)?.uuidString.lowercased()==requestID,requestDigest.count==64,
               currentOwner.threadID==retirement.goal.threadID,
               relativeDirectory==".autoapprove-migrations/backups/"+requestID+"-"+retirement.goal.threadID else{throw retirementFailure}

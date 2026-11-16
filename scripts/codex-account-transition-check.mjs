@@ -7,8 +7,8 @@ import http from 'node:http';
 import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const require=createRequire(import.meta.url);
-const module=process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright');
-const ws=require(path.join(path.dirname(module),'../playwright-core/lib/utilsBundle.js'));
+const module=process.env.AUTOAPPROVE_WEBSOCKET_MODULE ? null:process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright');
+const ws=module ? require(path.join(path.dirname(module),'../playwright-core/lib/utilsBundle.js')):{wsServer:require(process.env.AUTOAPPROVE_WEBSOCKET_MODULE).WebSocketServer};
 const build=path.resolve(process.env.AUTOAPPROVE_CHECK_BUILD||'.build/debug');
 const directory=await mkdtemp('/private/tmp/aa-account-rpc-'),cli=directory+'/codex';
 const server=http.createServer(),websocket=new ws.wsServer({noServer:true}),clients=new Set(),methods=[];
@@ -70,7 +70,7 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  });
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(directory+'/daemon.sock',resolve);});
  await symlink(directory+'/daemon.sock',directory+'/app-server-control/app-server-control.sock');
- async function run(action){child=spawn(directory+'/check',[directory,cli,action],{stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',c=>output+=c);child.stderr.on('data',c=>error+=c);const status=await new Promise(resolve=>child.once('exit',resolve));assert.equal(status,0,error);return JSON.parse(output);}
+ async function run(action){child=spawn(directory+'/check',[directory,cli,action],{env:{HOME:directory,ZDOTDIR:directory,PATH:'/usr/bin:/bin'},stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',c=>output+=c);child.stderr.on('data',c=>error+=c);const status=await new Promise(resolve=>child.once('exit',resolve));assert.equal(status,0,error);return JSON.parse(output);}
  assert.equal((await run('interrupt')).verified,true);assert.equal(interrupts,1);
  for(const value of ['queue','background','goal']){mode=value;assert.equal((await run('block')).blocked,true);}
  mode='goal';assert.equal((await run('quiesce')).verified,true);assert.equal(goalPauses,1);

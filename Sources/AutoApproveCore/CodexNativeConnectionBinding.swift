@@ -13,10 +13,13 @@ struct CodexNativePeerIdentity: Codable, Equatable, Sendable {
 /// A kernel witness cannot be constructed by decoding an observation response.
 struct CodexNativeKernelPeer: Equatable, Sendable {
     let identity: CodexNativePeerIdentity
+    let auditToken: Data
     private init(_ value: aa_native_peer_identity) {
         identity = .init(source: "macos-audit-token", pid: value.pid,
             effectiveUid: value.effective_uid, effectiveGid: value.effective_gid,
             auditPidVersion: value.audit_pid_version)
+        var token=value.audit_token
+        auditToken=withUnsafeBytes(of:&token){Data($0)}
     }
     static func connectedSocket(_ fd: Int32) throws -> Self {
         var value = aa_native_peer_identity()

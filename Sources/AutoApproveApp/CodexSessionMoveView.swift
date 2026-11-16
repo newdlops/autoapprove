@@ -32,6 +32,10 @@ private struct CodexMoveDestination:Identifiable {
     private var sourceHome:String {source?.target.home ?? standalone?.home ?? ""}
     private var sourceExecutable:String {source?.target.executable ?? standalone?.executable ?? "codex"}
     var body:some View {
+        if CodexFeatureSupport.canMoveOpenSessions {supportedContent}
+        else {CodexSessionMoveUnavailableView(close:close)}
+    }
+    private var supportedContent:some View {
         VStack(alignment:.leading,spacing:0) {
             HStack {
                 Text(independentDestination != nil ? "독립 실행으로 분리":standalone == nil ? "로그인 그룹 변경":"독립 세션을 그룹에 연결").font(.title2.weight(.semibold))
@@ -238,5 +242,20 @@ private struct CodexMoveDestination:Identifiable {
             throw AppError.message("대상 로그인 그룹이 바뀌었습니다. 그룹을 다시 확인해주세요.")
         }
         return [expected.target]
+    }
+}
+
+struct CodexSessionMoveUnavailableView:View {
+    let close:()->Void
+    var body:some View {
+        VStack(alignment:.leading,spacing:16) {
+            HStack {
+                Text("기존 대화 이동 미지원").font(.title2.weight(.semibold))
+                Spacer()
+                Button("닫기",action:close).keyboardShortcut(.cancelAction)
+            }
+            Label(CodexFeatureSupport.sessionMoveUnavailable,systemImage:"info.circle")
+                .foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+        }.padding(24).font(.callout).frame(width:600,alignment:.leading)
     }
 }

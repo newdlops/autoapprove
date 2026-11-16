@@ -77,6 +77,19 @@ public struct CodexSessionAttachment:Codable {
     public var command:String? {
         command(nativeRuntimeRoot:nil)
     }
+    /// Production launch uses an attested official context; context.executable
+    /// remains the original process witness for the pre-exit identity checks.
+    func command(using cli:CodexCLIContext) throws ->String {
+        guard let id=context.conversationID,UUID(uuidString:id) != nil,
+              context.session.cwd.hasPrefix("/"),
+              !context.session.cwd.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains),
+              try CodexAccountTransitionTarget.canonicalHome(cli.environment["CODEX_HOME"] ?? "")==CodexAccountTransitionTarget.canonicalHome(home) else {
+            throw AppError.message("재연결할 대화·홈·작업 폴더를 확인하지 못했습니다.")
+        }
+        let mode=executionMode == .standalone ? ["--no-daemon"]:["--remote","unix://"]
+        let arguments=try cli.terminalInvocation(mode+["resume",id])
+        return "cd -- "+HookInstaller.quote(context.session.cwd)+" && "+arguments.map(HookInstaller.quote).joined(separator:" ")
+    }
     func command(nativeRuntimeRoot:String?) ->String? {
         guard let id=context.conversationID,UUID(uuidString:id) != nil,context.executable.hasPrefix("/"),home.hasPrefix("/"),context.session.cwd.hasPrefix("/"),
               [home,context.executable,context.session.cwd].allSatisfy({!$0.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)}) else{return nil}

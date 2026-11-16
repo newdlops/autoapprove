@@ -5,7 +5,7 @@ import AutoApproveCore
     static func main() async throws {
         let args=CommandLine.arguments
         guard args.count==7 else{throw AppError.message("Owned fixture arguments required")}
-        let service=CodexManagedServerServices.local(userHome:args[1],executable:args[2]=="PATH" ? nil:args[2])
+        let service=CodexManagedServerServices.local(userHome:args[1],executable:args[2]=="PATH" ? nil:args[2],verifyExecutable:{_ in})
         let before=try await service.inspect(args[3],[])
         guard before.phase.rawValue==args[4] else{throw AppError.message("Before: "+before.phase.rawValue+" "+before.detail)}
         if args[6]=="feature-denied" {

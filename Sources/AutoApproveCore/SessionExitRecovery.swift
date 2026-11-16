@@ -7,6 +7,8 @@ public struct SessionExitRecovery: Codable {
     public var shell: ProcessRecord
     public var executable: String
     public var conversationID: String?
+    /// Older saved plans have no home evidence. Never substitute another login.
+    public var codexLaunch: CodexSessionLaunch?
     public var state: String = "ready"
     public var deadline: Date?
     public var attempts: Int = 0

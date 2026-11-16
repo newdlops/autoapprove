@@ -173,15 +173,21 @@ struct CodexSessionAccountContent:View {
                 }
             }else if let standalone {
                 Label("독립 실행",systemImage:"person.crop.circle").font(.callout.weight(.medium))
-                Text("공유 app-server 없이 실행 중입니다. 로그인 그룹에 연결하면 해당 그룹의 계정을 사용합니다.")
+                Text("공유 app-server 없이 실행 중입니다. 새 세션의 로그인 그룹은 프로필에서 선택할 수 있습니다.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 Text(standalone.home).font(.caption).foregroundStyle(.secondary)
                     .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+                Text(CodexFeatureSupport.standaloneAttachmentUnavailable)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 if let changeGroup {
-                    Button("로그인 그룹에 연결…",action:changeGroup).disabled(disabled || loading)
-                        .help("선택한 독립 세션의 대화를 로그인 그룹으로 옮깁니다. 다른 세션은 그대로 유지합니다.")
+                    Button("로그인 그룹에 연결…",action:changeGroup).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
+                        .help(CodexFeatureSupport.sessionMoveUnavailable)
                 }
             } else if error==nil {Text("이 세션이 연결된 서버에서 계정을 확인합니다…").font(.caption).foregroundStyle(.secondary)}
+            if account != nil {
+                Text(CodexFeatureSupport.sessionMoveUnavailable)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            }
             if let error {Label(error,systemImage:"exclamationmark.circle").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
         }.frame(maxWidth:.infinity,alignment:.leading)
     }
@@ -189,19 +195,19 @@ struct CodexSessionAccountContent:View {
         Button(account.individual ? "이 세션 계정 로그인":"공유 계정 로그인 (\(account.sharedSessions)개 세션)",action:login)
             .disabled(loading).help("연결된 계정의 로그인과 전환 진행 상태를 확인합니다.")
         if let verifyServerLink {
-            Button(linkingServer ? "연결 확인 중…":"전체 서버 연결 확인",systemImage:"point.3.connected.trianglepath.dotted",action:verifyServerLink)
-                .disabled(disabled || loading || linkingServer)
-                .help("이 세션 창과 app-server 사이의 실제 로컬 연결 및 같은 서버의 전체 창 목록을 대조합니다.")
+            Button(linkingServer ? "연결 확인 중…":CodexFeatureSupport.canInspectAllClientConnections ? "전체 서버 연결 확인":"전체 접속 목록 (미지원)",systemImage:"point.3.connected.trianglepath.dotted",action:verifyServerLink)
+                .disabled(disabled || loading || linkingServer || !CodexFeatureSupport.canInspectAllClientConnections)
+                .help(CodexFeatureSupport.connectionInventoryUnavailable)
         }
         Button("현재 로그인으로 재연결",action:reconnect).disabled(disabled || loading)
             .help("같은 서버의 연결된 Codex를 순차 중단하고 저장된 로그인으로 다시 연결합니다.")
         if let changeGroup {
-            Button("로그인 그룹 변경…",action:changeGroup).disabled(disabled || loading)
-                .help("옮길 로그인 그룹의 계정과 연결 서버를 확인합니다.")
+            Button("로그인 그룹 변경…",action:changeGroup).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
+                .help(CodexFeatureSupport.sessionMoveUnavailable)
         }
         if let makeIndependent {
-            Button("독립 실행으로 분리…",action:makeIndependent).disabled(disabled || loading)
-                .help("이 세션만 전용 로그인 홈으로 옮기고 공유 서버 없이 실행합니다.")
+            Button("독립 실행으로 분리…",action:makeIndependent).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
+                .help(CodexFeatureSupport.sessionMoveUnavailable)
         }
     }
 }

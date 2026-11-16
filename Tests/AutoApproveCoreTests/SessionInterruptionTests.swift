@@ -275,6 +275,38 @@ extension ApprovalTests {
         try expect(script.contains("jobs.length !== 1")); try expect(script.contains("if (tab.tty() !== target.tty)"))
     }
 
+    @MainActor func testExitedCodexWithoutHomeDoesNotBorrowAnotherLogin() async throws {
+        let directory=URL(fileURLWithPath:"/private/tmp/aa-exit-home-"+UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let records=ProcessDiscovery.parse("""
+        41 1 ttys901 41 42 Mon Sep 21 09:00:00 2026 /bin/zsh
+        42 41 ttys901 42 42 Mon Sep 21 09:00:01 2026 /owned/missing/codex
+        """)
+        let probe=ExitProbe();probe.records=records
+        let adapter=ScreenHostAdapter(screens:{ targets in TerminalSnapshot(screens:targets.map{TerminalScreen(tty:$0.tty,contents:probe.screen)}) },
+            approve:{_,_,_ in .sent},reveal:{_ in nil},restart:{_,_,command in try probe.launch(command)})
+        let paths=AppPaths(directory:directory)
+        let engine=try ApprovalEngine(paths:paths,processReader:{probe.read()},screenAdapters:[.terminal:adapter])
+        defer {engine.stop()}
+        await engine.connectScreenHost(.terminal);engine.interruptionResumeDelays=[0.01]
+        var session=AgentSession(id:records[1].key,agent:.codex,pid:42,started:records[1].started,tty:"/dev/ttys901",cwd:"/owned",terminal:.terminal)
+        session.channel = .terminalScreen
+        engine.updateDiscovery([session],records:records);try engine.setAutomatic(session.id,enabled:true)
+        engine.receiveScreen(sessionID:session.id,raw:interruptionFrame("■ stream disconnected before completion: network error",agent:.codex),generation:"QA")
+        var shell=records[0];shell.foregroundGroup=shell.processGroup;probe.records=[shell]
+        engine.updateDiscovery([],records:[shell]);try await Task.sleep(for:.milliseconds(30));engine.updateDiscovery([],records:[shell])
+        let deadline=Date().addingTimeInterval(3)
+        while engine.snapshot.sessions.first?.interruption?.recoveryStatus != "review",Date()<deadline {try await Task.sleep(for:.milliseconds(25))}
+        try expectEqual(probe.commands.count,0)
+        try expectEqual(engine.snapshot.sessions.first?.interruption?.recoveryStatus,"review")
+        try expect(engine.snapshot.sessions.first?.interruption?.recoveryDetail?.contains("로그인 홈") == true)
+        engine.stop()
+        let restored=try ApprovalEngine(paths:paths,processReader:{probe.read()},screenAdapters:[.terminal:adapter])
+        defer {restored.stop()};restored.updateDiscovery([],records:[shell])
+        try expectEqual(restored.snapshot.sessions.first?.interruption?.recoveryStatus,"review")
+        try expectEqual(probe.commands.count,0)
+    }
+
     @MainActor func testExitedRecoveryRestoresExactConversationAndNeverReplays() async throws {
         for uncertain in [false,true] {
             let directory = URL(fileURLWithPath:"/private/tmp/aa-exit-"+UUID().uuidString)

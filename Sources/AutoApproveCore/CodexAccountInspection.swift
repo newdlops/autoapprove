@@ -39,22 +39,16 @@ public struct CodexAccountInspectionServices:Sendable {
     public var read:@Sendable(CodexAccountTransitionTarget) async throws ->CodexAccountInspection
     public init(read:@escaping @Sendable(CodexAccountTransitionTarget) async throws ->CodexAccountInspection){self.read=read}
     public static var inactive:Self {.init(read:{_ in throw AppError.message("이 실행의 읽기 전용 계정 조회 연결을 확인해주세요.")})}
-    public static var live:Self {.init(read:{target in
-        let task=Task.detached(priority:.utility){try localRead(target)}
+    public static var live:Self {local()}
+    static func local(verifyExecutable:(@Sendable (String)throws->Void)?=nil) ->Self {.init(read:{target in
+        let task=Task.detached(priority:.utility){try localRead(target,verifyExecutable:verifyExecutable)}
         return try await withTaskCancellationHandler(operation:{let result=try await task.value;try Task.checkCancellation();return result},onCancel:{task.cancel()})
     })}
-    private static func localRead(_ target:CodexAccountTransitionTarget) throws ->CodexAccountInspection {
+    private static func localRead(_ target:CodexAccountTransitionTarget,verifyExecutable:(@Sendable (String)throws->Void)?) throws ->CodexAccountInspection {
         try Task.checkCancellation()
-        let rows:[ProcessRecord]
-        if target.executable=="codex" {rows=try ProcessDiscovery.read()}
-        else {rows=target.witnesses.prefix(50).flatMap{(try? ProcessDiscovery.read(pid:$0.pid)) ?? []}}
-        guard let context=try CodexCLIContext.resolve(home:target.home,userHome:NSHomeDirectory(),
-            executable:target.executable=="codex" ? nil:target.executable,records:rows) else{
-            return .init(home:target.home,comparison:.unverified,connectedSessions:target.witnesses.count,detail:"Codex CLI를 찾지 못했습니다. 로그인 확인은 기존 작업을 변경하지 않았습니다.")
-        }
-        var current=target;current.executable=context.executable
+        let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
         let saved:String?,savedRead:Bool
-        do {saved=try CodexAccountMetadataProcess.read(current,environment:context.environment);savedRead=true}
+        do {saved=try CodexAccountMetadataProcess.read(target,runtime:runtime);savedRead=true}
         catch is CancellationError {throw CancellationError()}
         catch {saved=nil;savedRead=false}
         try Task.checkCancellation()

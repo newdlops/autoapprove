@@ -11,6 +11,32 @@ struct CodexGoalTransferRow:Codable,Equatable,Sendable {
     let tokenBudget:Int64?
     let tokensUsed:Int64,timeUsedSeconds:Int64,createdAtMs:Int64,updatedAtMs:Int64
 }
+/// Separate from transfer slots: observing an active Goal here must never make
+/// that Goal eligible for the migration store's paused-only import contract.
+struct CodexOfficialGoalStateSnapshot:Codable,Equatable,Sendable {
+    let home:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String
+    let row:CodexGoalTransferRow
+    let continuationDeferred:Bool
+    let digest:String
+    private struct Payload:Codable {
+        let home:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String
+        let row:CodexGoalTransferRow
+        let continuationDeferred:Bool
+    }
+    private var payload:Payload {.init(home:home,homeIdentity:homeIdentity,databaseIdentity:databaseIdentity,
+        schemaFingerprint:schemaFingerprint,row:row,continuationDeferred:continuationDeferred)}
+    fileprivate init(home:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String,
+                     row:CodexGoalTransferRow,continuationDeferred:Bool)throws {
+        self.home=home;self.homeIdentity=homeIdentity;self.databaseIdentity=databaseIdentity
+        self.schemaFingerprint=schemaFingerprint;self.row=row;self.continuationDeferred=continuationDeferred
+        digest=try CodexGoalTransferSnapshot.hash(Payload(home:home,homeIdentity:homeIdentity,databaseIdentity:databaseIdentity,
+            schemaFingerprint:schemaFingerprint,row:row,continuationDeferred:continuationDeferred))
+    }
+    func validate()throws {
+        guard UUID(uuidString:row.threadID)?.uuidString.lowercased()==row.threadID,UUID(uuidString:row.goalID) != nil,
+              digest == (try CodexGoalTransferSnapshot.hash(payload)) else{throw AppError.message("원래 Goal 상태의 신원을 확인하지 못했습니다.")}
+    }
+}
 struct CodexGoalTransferSnapshot:Codable,Equatable,Sendable {
     let formatVersion:Int
     let sourceHome:String,homeIdentity:String,databaseIdentity:String,schemaFingerprint:String
@@ -186,7 +212,7 @@ enum CodexGoalTransferStore {
         guard actual==migrations else{throw AppError.message("Goal transfer: schema migration mismatch")}
         return try CodexGoalTransferSnapshot.hash(normalizedRows+actual)
     }
-    private static func row(_ connection:Connection,_ threadID:String) throws ->(CodexGoalTransferRow?,Bool) {
+    private static func row(_ connection:Connection,_ threadID:String,allowActive:Bool=false) throws ->(CodexGoalTransferRow?,Bool) {
         let rows=try connection.rows("SELECT \(columns) FROM thread_goals WHERE thread_id=? LIMIT 2",[.text(threadID)])
         let deferred=try connection.rows("SELECT thread_id FROM thread_goal_continuation_deferrals WHERE thread_id=? LIMIT 2",[.text(threadID)])
         guard rows.count<=1,deferred.count<=1 else{throw failure}
@@ -195,10 +221,84 @@ enum CodexGoalTransferStore {
         let budget:Int64?=values[4] == .null ? nil:try integer(values[4])
         let value=try CodexGoalTransferRow(threadID:text(values[0]),goalID:text(values[1]),objective:text(values[2]),status:text(values[3]),tokenBudget:budget,tokensUsed:integer(values[5]),timeUsedSeconds:integer(values[6]),createdAtMs:integer(values[7]),updatedAtMs:integer(values[8]))
         guard value.threadID==threadID,!value.goalID.isEmpty,value.goalID.utf8.count<=256,
-              ["paused","blocked","usage_limited","budget_limited","complete"].contains(value.status),
+              ["paused","blocked","usage_limited","budget_limited","complete"].contains(value.status) || allowActive && value.status=="active",
               value.tokensUsed>=0,value.timeUsedSeconds>=0,value.tokenBudget.map({$0>=0}) ?? true,
               value.createdAtMs>=0,value.updatedAtMs>=value.createdAtMs else{throw failure}
         return(value,!deferred.isEmpty)
+    }
+    fileprivate static func officialSnapshot(home:String,threadID:String)throws->CodexOfficialGoalStateSnapshot {
+        guard let uuid=UUID(uuidString:threadID) else{throw failure}
+        let home=try physicalHome(home),homeID=try homeIdentity(home)
+        let connection=try Connection(home:home,writable:false)
+        try connection.exec("BEGIN");defer{try? connection.exec("ROLLBACK")}
+        let fingerprint=try schema(connection),entry=try row(connection,uuid.uuidString.lowercased(),allowActive:true)
+        guard let row=entry.0,try homeIdentity(home)==homeID else{throw failure}
+        try connection.check()
+        let snapshot=try CodexOfficialGoalStateSnapshot(home:home,homeIdentity:homeID,databaseIdentity:connection.identity,
+            schemaFingerprint:fingerprint,row:row,continuationDeferred:entry.1)
+        try snapshot.validate();return snapshot
+    }
+    /// Compare the complete paused row while holding SQLite write ownership.
+    /// This is persistence only; it neither owns the runtime Goal permit nor
+    /// delivers a parent followup. The lifecycle adapter is still separate.
+    fileprivate static func resumeOfficialState(_ expected:CodexOfficialGoalStateSnapshot,updatedAtMs:Int64,
+                                                 check:()throws->Void)throws->CodexOfficialGoalStateSnapshot {
+        try changeOfficialState(expected,from:"paused",to:"active",deferred:false,updatedAtMs:updatedAtMs,check:check)
+    }
+    fileprivate static func pauseOfficialState(_ expected:CodexOfficialGoalStateSnapshot,updatedAtMs:Int64,
+                                                check:()throws->Void)throws->CodexOfficialGoalStateSnapshot {
+        guard expected.continuationDeferred else{throw failure}
+        return try changeOfficialState(expected,from:"active",to:"paused",deferred:false,updatedAtMs:updatedAtMs,check:check)
+    }
+    private static func changeOfficialState(_ expected:CodexOfficialGoalStateSnapshot,from:String,to:String,deferred:Bool,
+                                            updatedAtMs:Int64,check:()throws->Void)throws->CodexOfficialGoalStateSnapshot {
+        try expected.validate();try Task.checkCancellation();try check()
+        guard expected.row.status==from,updatedAtMs>expected.row.updatedAtMs,
+              try physicalHome(expected.home)==expected.home,try homeIdentity(expected.home)==expected.homeIdentity else{throw failure}
+        let connection=try Connection(home:expected.home,writable:true)
+        guard connection.identity==expected.databaseIdentity else{throw failure}
+        try connection.exec("BEGIN IMMEDIATE");var committed=false
+        defer{if !committed{try? connection.exec("ROLLBACK")}}
+        guard try schema(connection)==expected.schemaFingerprint else{throw failure}
+        let current=try row(connection,expected.row.threadID,allowActive:true)
+        guard current.0==expected.row,current.1==expected.continuationDeferred else{throw failure}
+        try check();try Task.checkCancellation()
+        try connection.exec("UPDATE thread_goals SET status=?,updated_at_ms=? WHERE thread_id=? AND goal_id=? AND status=?",
+            [.text(to),.integer(updatedAtMs),.text(expected.row.threadID),.text(expected.row.goalID),.text(from)])
+        guard sqlite3_changes(connection.db)==1 else{throw failure}
+        if deferred {try connection.exec("INSERT OR IGNORE INTO thread_goal_continuation_deferrals(thread_id) VALUES (?)",[.text(expected.row.threadID)])}
+        else {try connection.exec("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id=?",[.text(expected.row.threadID)])}
+        let changed=try row(connection,expected.row.threadID,allowActive:true)
+        guard let row=changed.0,row==CodexGoalTransferRow(threadID:expected.row.threadID,goalID:expected.row.goalID,
+            objective:expected.row.objective,status:to,tokenBudget:expected.row.tokenBudget,tokensUsed:expected.row.tokensUsed,
+            timeUsedSeconds:expected.row.timeUsedSeconds,createdAtMs:expected.row.createdAtMs,updatedAtMs:updatedAtMs),changed.1==deferred,
+              try schema(connection)==expected.schemaFingerprint,try homeIdentity(expected.home)==expected.homeIdentity else{throw failure}
+        try connection.check();try check();try Task.checkCancellation()
+        let receipt=try CodexOfficialGoalStateSnapshot(home:expected.home,homeIdentity:expected.homeIdentity,
+            databaseIdentity:expected.databaseIdentity,schemaFingerprint:expected.schemaFingerprint,row:row,continuationDeferred:deferred)
+        try connection.exec("COMMIT");committed=true
+        return receipt
+    }
+    /// Defer native automatic continuation without changing Goal status or
+    /// accounting. An exact-turn interrupt can then flush progress normally.
+    fileprivate static func deferOfficialContinuation(_ expected:CodexOfficialGoalStateSnapshot,
+                                                       check:()throws->Void)throws->CodexOfficialGoalStateSnapshot {
+        try expected.validate();try Task.checkCancellation();try check()
+        guard expected.row.status=="active",try physicalHome(expected.home)==expected.home,
+              try homeIdentity(expected.home)==expected.homeIdentity else{throw failure}
+        let connection=try Connection(home:expected.home,writable:true)
+        guard connection.identity==expected.databaseIdentity else{throw failure}
+        try connection.exec("BEGIN IMMEDIATE");var committed=false
+        defer{if !committed{try? connection.exec("ROLLBACK")}}
+        let current=try row(connection,expected.row.threadID,allowActive:true)
+        guard try schema(connection)==expected.schemaFingerprint,current.0==expected.row,current.1==expected.continuationDeferred else{throw failure}
+        try connection.exec("INSERT OR IGNORE INTO thread_goal_continuation_deferrals(thread_id) VALUES (?)",[.text(expected.row.threadID)])
+        let after=try row(connection,expected.row.threadID,allowActive:true)
+        guard after.0==expected.row,after.1,try homeIdentity(expected.home)==expected.homeIdentity else{throw failure}
+        try connection.check();try check();try Task.checkCancellation()
+        let result=try CodexOfficialGoalStateSnapshot(home:expected.home,homeIdentity:expected.homeIdentity,
+            databaseIdentity:expected.databaseIdentity,schemaFingerprint:expected.schemaFingerprint,row:expected.row,continuationDeferred:true)
+        try connection.exec("COMMIT");committed=true;return result
     }
     static func capture(home:String,threadID:String) throws ->CodexGoalTransferSnapshot? {
         let slot=try captureSlot(home:home,threadID:threadID)
@@ -297,5 +397,60 @@ enum CodexGoalTransferStore {
         try verifyAuthority();try verifyCurrent(source);try connection.check()
         guard try homeIdentity(expected.sourceHome)==expected.homeIdentity else{throw failure}
         try Task.checkCancellation();try connection.exec("COMMIT");committed=true
+    }
+}
+
+/// Version-bound local persistence primitive for the official Goal alternative.
+/// It is not wired to UI actions until runtime coordination and followup delivery
+/// have their own verified lifecycle. Existing private control remains intact.
+final class CodexOfficialGoalStateAccess {
+    private let home:String,cli:CodexCLIContext,serverCLI:CodexCLIContext,connection:CodexQueueConnection
+    private let peer:CodexNativePeerIdentity,socket:String,device:dev_t,inode:ino_t
+    init(home:String,userHome:String,executable:String)throws {
+        self.home=try CodexAccountTransitionTarget.canonicalHome(home)
+        guard let cli=try CodexOfficialExecutable.resolve(home:self.home,userHome:userHome,executable:executable),
+              let socket=CodexQueueConnection.socketPath(home:self.home) else{throw AppError.message("Goal 상태를 보존할 공식 Codex 버전을 확인하지 못했습니다.")}
+        let version=try cli.run(["--version"])
+        guard version.status==0,version.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli 0.169.0" else{throw AppError.message("Goal 상태를 보존할 공식 Codex 버전을 확인하지 못했습니다.")}
+        self.cli=cli;self.socket=socket
+        var info=stat()
+        guard lstat(socket,&info)==0,info.st_uid==getuid(),info.st_mode&S_IFMT==S_IFSOCK else{throw AppError.message("원래 Goal 서버의 연결 경로가 바뀌었습니다.")}
+        device=info.st_dev;inode=info.st_ino
+        connection=try CodexQueueConnection(home:self.home)
+        peer=try CodexOfficialExecutable.verifyServer(connection)
+        guard let process=try ProcessDiscovery.read(pid:Int32(peer.pid)).first,
+              let path=ProcessEnvironment.executablePath(process),
+              let environment=ProcessEnvironment.read(process,names:["HOME","CODEX_HOME"]),
+              let actualHome=environment["CODEX_HOME"] ?? environment["HOME"].map({$0+"/.codex"}),
+              try CodexAccountTransitionTarget.canonicalHome(actualHome)==self.home,
+              let serverCLI=try CodexOfficialExecutable.resolve(home:self.home,userHome:userHome,executable:path) else{throw AppError.message("원래 Goal 서버의 실행 환경을 확인하지 못했습니다.")}
+        let serverVersion=try serverCLI.run(["--version"])
+        guard serverVersion.status==0,serverVersion.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli 0.169.0" else{throw AppError.message("원래 Goal 서버의 공식 버전을 확인하지 못했습니다.")}
+        self.serverCLI=serverCLI
+        try verify()
+    }
+    private func verify()throws {
+        try cli.verifyUnchanged()
+        try serverCLI.verifyUnchanged()
+        var info=stat()
+        guard CodexQueueConnection.socketPath(home:home)==socket,lstat(socket,&info)==0,
+              info.st_uid==getuid(),info.st_mode&S_IFMT==S_IFSOCK,info.st_dev==device,info.st_ino==inode,
+              try CodexOfficialExecutable.verifyServer(connection)==peer else{throw AppError.message("Goal 변경 전 원래 공식 서버의 신원이 바뀌었습니다.")}
+    }
+    func snapshot(threadID:String)throws->CodexOfficialGoalStateSnapshot {
+        try verify();let snapshot=try CodexGoalTransferStore.officialSnapshot(home:home,threadID:threadID)
+        try verify();return snapshot
+    }
+    func resume(_ expected:CodexOfficialGoalStateSnapshot,updatedAtMs:Int64,check:()throws->Void={})throws->CodexOfficialGoalStateSnapshot {
+        guard (try? CodexAccountTransitionTarget.canonicalHome(expected.home))==home else{throw AppError.message("선택한 Goal의 로그인 홈이 다릅니다.")}
+        return try CodexGoalTransferStore.resumeOfficialState(expected,updatedAtMs:updatedAtMs,check:{try self.verify();try check();try self.verify()})
+    }
+    func deferContinuation(_ expected:CodexOfficialGoalStateSnapshot,check:()throws->Void={})throws->CodexOfficialGoalStateSnapshot {
+        guard (try? CodexAccountTransitionTarget.canonicalHome(expected.home))==home else{throw AppError.message("선택한 Goal의 로그인 홈이 다릅니다.")}
+        return try CodexGoalTransferStore.deferOfficialContinuation(expected,check:{try self.verify();try check();try self.verify()})
+    }
+    func pause(_ expected:CodexOfficialGoalStateSnapshot,updatedAtMs:Int64,check:()throws->Void={})throws->CodexOfficialGoalStateSnapshot {
+        guard (try? CodexAccountTransitionTarget.canonicalHome(expected.home))==home else{throw AppError.message("선택한 Goal의 로그인 홈이 다릅니다.")}
+        return try CodexGoalTransferStore.pauseOfficialState(expected,updatedAtMs:updatedAtMs,check:{try self.verify();try check();try self.verify()})
     }
 }

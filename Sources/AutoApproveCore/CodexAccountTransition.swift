@@ -21,6 +21,11 @@ public struct CodexAccountTransitionWitness: Codable, Equatable, Sendable {
         self.pid = pid; self.started = started; self.tty = tty; self.threadID = threadID
     }
 }
+public struct CodexAccountTransitionSubagent:Codable,Equatable,Sendable {
+    public var rootThreadID:String
+    public var parentThreadID:String
+    public var rootCwd:String
+}
 public struct CodexAccountTransitionThread: Codable, Equatable, Sendable {
     public var id: String
     public var turnID: String?
@@ -31,18 +36,20 @@ public struct CodexAccountTransitionThread: Codable, Equatable, Sendable {
     public var cwd:String?
     public var modelProvider:String?
     public var goal:CodexGoal?
+    public var subagent:CodexAccountTransitionSubagent?
     var needsQuiescence:Bool {active || blocker == "활성 Goal" || blocker == "백그라운드 작업"}
     var stopToken:String {turnID ?? "__autoapprove_idle__"}
-    public init(id: String, turnID: String? = nil, active: Bool = false, blocker: String? = nil,continuable:Bool?=nil,cwd:String?=nil,modelProvider:String?=nil,goal:CodexGoal?=nil,turnStatus:String?=nil) {
+    public init(id: String, turnID: String? = nil, active: Bool = false, blocker: String? = nil,continuable:Bool?=nil,cwd:String?=nil,modelProvider:String?=nil,goal:CodexGoal?=nil,turnStatus:String?=nil,subagent:CodexAccountTransitionSubagent?=nil) {
         self.id = id; self.turnID = turnID; self.active = active; self.blocker = blocker
         self.continuable=continuable;self.cwd=cwd;self.modelProvider=modelProvider;self.goal=goal
         self.turnStatus=turnStatus
+        self.subagent=subagent
     }
     public static func ==(lhs:Self,rhs:Self)->Bool {
         // Usage can flush after a Goal pauses. Its identity/lifecycle/budget
         // revision remains the authority for the restart barrier.
         lhs.id==rhs.id && lhs.turnID==rhs.turnID && lhs.turnStatus==rhs.turnStatus && lhs.active==rhs.active && lhs.blocker==rhs.blocker &&
-        lhs.continuable==rhs.continuable && lhs.cwd==rhs.cwd && lhs.modelProvider==rhs.modelProvider && lhs.goal?.revision==rhs.goal?.revision
+        lhs.continuable==rhs.continuable && lhs.cwd==rhs.cwd && lhs.modelProvider==rhs.modelProvider && lhs.goal?.revision==rhs.goal?.revision && lhs.subagent==rhs.subagent
     }
 }
 public struct CodexAccountTransitionObservation: Sendable {

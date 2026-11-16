@@ -4,7 +4,7 @@ public struct CodexStandaloneSession:Equatable,Identifiable,Sendable {
     public let sessionID:String,home:String,executable:String,project:String,started:String,tty:String
     public let pid:Int32
     public var id:String {sessionID}
-    init(session:AgentSession,home:String,executable:String) {
+    public init(session:AgentSession,home:String,executable:String) {
         sessionID=session.id;self.home=home;self.executable=executable;project=session.project
         started=session.started;tty=session.tty;pid=session.pid
     }

@@ -1,5 +1,5 @@
 import Foundation
-import AutoApproveCore
+@testable import AutoApproveCore
 
 @main struct AccountContinuationCheck {
     @MainActor static func main() async throws {
@@ -17,7 +17,7 @@ import AutoApproveCore
             guard discovered.count==1,discovered[0].home==canonical,discovered[0].witnesses.count==3 else {throw AppError.message("Owned common server missing: processes \(records.count), targets \(discovered.count), witnesses \(discovered.map{$0.witnesses.count}), canonicalHome \(discovered.first?.home==canonical), fixtureHomes \(discovered.map{$0.home.hasPrefix("/private/tmp/aa-account-real-cli-") ? $0.home:"outside-owned-fixture"})")}
             target=discovered[0]
         }
-        var services=CodexAccountTransitionServices.live
+        var services=official ? CodexAccountTransitionServices.live:CodexAccountTransitionServices.local(verifyExecutable:{_ in})
         let liveRestart=services.restart
         let liveResume=services.resume
         var continuationCalls:[String:Int]=[:]

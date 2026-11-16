@@ -163,6 +163,7 @@ final class CodexQueueConnection {
     private var deadline = Date().addingTimeInterval(8)
     private var sequence = 0
     private let captureApprovals: Bool
+    private let requestScopedDeadline:Bool
     var pendingRequests: [JSONObject] = []
     var resolvedRequests = Set<String>()
     static func socketPath(home: String) -> String? {
@@ -180,8 +181,9 @@ final class CodexQueueConnection {
         }
         return path
     }
-    init(home: String, captureApprovals: Bool = false) throws {
+    init(home: String, captureApprovals: Bool = false,requestScopedDeadline:Bool=false) throws {
         self.captureApprovals = captureApprovals
+        self.requestScopedDeadline=captureApprovals || requestScopedDeadline
         deadline = Date().addingTimeInterval(8)
         guard let path = Self.socketPath(home: home) else {
             throw RemoteHTTPError(409, CodexQueueTransport.unavailableMessage, diagnostics: ["delivery": "not_started"])
@@ -242,7 +244,7 @@ final class CodexQueueConnection {
         return pid
     }
     func request(_ method: String, _ params: JSONObject, classifyError: Bool = false) throws -> JSONObject {
-        if captureApprovals { deadline = Date().addingTimeInterval(8) }
+        if requestScopedDeadline { deadline = Date().addingTimeInterval(8) }
         sequence += 1; let id = sequence
         try send(["id": id, "method": method, "params": params])
         while true {

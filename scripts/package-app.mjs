@@ -31,9 +31,10 @@ if (configuration === 'release') {
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
 await copyFile('dist/AppIcon.icns', path.join(resources, 'AppIcon.icns'));
 await cp(path.join(build,'AutoApprove_AutoApproveCore.bundle'), path.join(resources, 'AutoApprove_AutoApproveCore.bundle'), { recursive: true });
-const codexRuntime=process.argv.find(value=>value.startsWith('--codex-runtime='))?.slice('--codex-runtime='.length);
-if(codexRuntime)await (await import('./codex-runtime-resource.mjs')).copyCodexRuntime(codexRuntime,path.join(resources,'CodexRuntime'),{allowExperimental:configuration==='debug'});
-else await rm(path.join(resources,'CodexRuntime'),{recursive:true,force:true});
+const codexRuntime=process.argv.find(value=>value.startsWith('--codex-runtime='))?.slice('--codex-runtime='.length)
+  || process.env.AUTOAPPROVE_CODEX_RUNTIME
+  || await (await import('./fetch-official-codex.mjs')).ensureOfficialCodexRuntime();
+await (await import('./codex-runtime-resource.mjs')).copyCodexRuntime(codexRuntime,path.join(resources,'CodexRuntime'));
 // Remove retired payloads when reusing a bundle from an older build.
 for (const relative of ['Contents/MacOS/AutoApproveTTYService',
   'Contents/Library/LaunchDaemons/local.autoapprove.tty-input.plist',

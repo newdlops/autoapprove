@@ -1,8 +1,16 @@
 import Foundation
 import CoreGraphics
-import AutoApproveCore
+@testable import AutoApproveCore
 import TerminalInputSupport
 import CSQLite
+
+// Only the owned Mach-O fixture bypasses OpenAI provenance. The production
+// resolver has separate real-official and counterfeit-server coverage.
+func ownedAttachmentRuntime(_ saved:CodexSessionLaunch,_ home:String,_ mode:CodexSessionAttachment.ExecutionMode) async throws ->CodexCLIContext {
+    guard let cli=try CodexCLIContext.resolve(home:home,userHome:saved.userHome,executable:saved.executable,
+        environment:["PATH":saved.path ?? "/usr/bin:/bin"]) else{throw AppError.message("Missing owned native fixture")}
+    return try cli.selectingNativeExecutable(cli.executable)
+}
 
 final class OwnedEnginePTY:@unchecked Sendable {
     let terminal:ManagedPTY,descriptor:ManagedPTYDescriptor
@@ -34,11 +42,15 @@ final class OwnedEnginePTY:@unchecked Sendable {
     }
     func directInterrupt(_ target:ScreenTarget,_ expected:String)throws->TerminalDelivery {
         self.interruptCalls+=1
-        return try TerminalDeviceInput.deliver(target:target,agent:.codex,input:.init(kind:.escape),screen:expected,environment:.init(available:{true},capture:{try TTYInputIdentity.capture(pid:$0)},send:{request in
-            guard request.tty==self.descriptor.tty,request.identity.pid==target.sourcePID else{throw AppError.message("Wrong owned transport target")}
-            self.interruptWrites+=1;self.event("pause")
-            try self.write(String(decoding:request.bytes,as:UTF8.self));if self.losePauseAck {throw AppError.message("Owned interrupt acknowledgement lost")};return .init(error:0,written:request.bytes.count)
-        }))
+        let environment=TerminalKeyboard.Environment(trusted:{true},postingAllowed:{true},run:{_ in "ready:77"},
+            metadata:{_ in .init(tty:self.descriptor.tty,windowID:77,ownerPID:990001,ownerBundleID:"com.apple.Terminal",selected:true,minimized:false)},
+            ownerBundle:{_ in "com.apple.Terminal"},focused:{_ in !self.wrongWindow},processes:{self.read()},postPair:{pid,down,up in
+                guard pid==990001,down.getIntegerValueField(.keyboardEventKeycode)==53,down.flags.isEmpty,up.flags.isEmpty else{throw AppError.message("Wrong owned transport target")}
+                self.interruptWrites+=1;self.event("pause")
+                try self.write("\u{1b}")
+                if self.losePauseAck {throw AppError.message("Owned interrupt acknowledgement lost")}
+            })
+        return try TerminalDeviceInput.deliver(target:target,agent:.codex,input:.init(kind:.escape),screen:expected,environment:environment)
     }
     func keyboardInterrupt(_ target:ScreenTarget,_ expected:String)throws->TerminalDelivery {
         self.interruptCalls+=1
@@ -145,12 +157,21 @@ final class OwnedEnginePTY:@unchecked Sendable {
             guard manualGoal,verifiedAccount,restarts==1,original.goal?.status == .active,try CodexGoalTransport.readDatabase(home:home,threadID:thread)?.status == .paused else{throw AppError.message("Goal resumed before account verification")}
             resumes+=1;try goal("active");return .goal
         })
-        @MainActor func createEngine() throws -> ApprovalEngine {try ApprovalEngine(paths:.init(directory:URL(fileURLWithPath:root+"/state")),processReader:{probe.read()},screenAdapters:[.terminal:probe.adapter()],terminalInputAvailable:{probe.nativeAvailable},codexAccountTransitions:accountServices,codexAccountTargets:{rows in
+        @MainActor func createEngine() throws -> ApprovalEngine {let engine=try ApprovalEngine(paths:.init(directory:URL(fileURLWithPath:root+"/state")),processReader:{probe.read()},screenAdapters:[.terminal:probe.adapter()],terminalInputAvailable:{probe.nativeAvailable},codexAccountTransitions:accountServices,codexAccountTargets:{rows in
             var targets=try await CodexAccountTransitionTarget.discover(rows)
             if existingManaged,targets.isEmpty {targets=[.init(home:home,executable:root+"/codex",witnesses:[.init(pid:990099,started:"owned-existing",tty:"/dev/owned-existing",threadID:nil)])]}
             return targets
-        },codexManagedServers:setup)}
+        },codexManagedServers:setup)
+            engine.codexAttachmentRuntime={try await ownedAttachmentRuntime($0,$1,$2)}
+            return engine
+        }
         let engine=try createEngine()
+        func attachmentConnected() throws ->Bool {
+            guard let json=engine.store.value("codexSessionAttachments") else{return false}
+            let states=try JSONDecoder().decode([String:CodexSessionAttachment].self,from:Data(json.utf8))
+            guard let state=states[original.key] else{return false}
+            return state.phase == .connected && state.context.conversationID==thread && state.home==home
+        }
         if CommandLine.arguments.contains("--keyboard-goal") || CommandLine.arguments.contains("--keyboard-focus") {probe.nativeAvailable=false;probe.keyboardAvailable=true}
         defer{engine.stop()}
         func beginOwnedLogin() throws {
@@ -170,6 +191,16 @@ final class OwnedEnginePTY:@unchecked Sendable {
         try await Task.sleep(for:.seconds(2))
         engine.receiveScreen(sessionID:original.key,raw:terminal.screen(),generation:"owned",source:.terminalScreen)
         guard engine.snapshot.sessions.contains(where:{$0.id==original.key && $0.terminal == .terminal && $0.phase == (pausedGoal ? .unknown:manualGoal && !idleGoal ? .working:.idle)}) else{throw AppError.message("Owned engine inventory: "+engine.snapshot.sessions.map{"pid=\($0.pid) host=\($0.terminal.rawValue) phase=\($0.phase.rawValue)"}.joined(separator:",")+" screen="+terminal.screen())}
+        if CommandLine.arguments.contains("--reject-runtime") {
+            engine.codexAttachmentRuntime={_,_,_ in throw AppError.message("Owned official runtime rejection")}
+            await engine.ensureCodexManagedServers()
+            guard probe.exitCalls==0,probe.launchCalls==0,probe.prepareCalls==0,
+                  probe.read().contains(where:{$0.key==original.key}),
+                  engine.codexSessionAttachmentNotice?.contains("Owned official runtime rejection")==true else {
+                throw AppError.message("Runtime rejection must preserve the original session before any exit or tab: exit=\(probe.exitCalls) launch=\(probe.launchCalls) prepare=\(probe.prepareCalls) original=\(probe.read().contains(where:{$0.key==original.key})) notice=\(engine.codexSessionAttachmentNotice ?? "none")")
+            }
+            print("{\"verified\":true,\"runtimeRejectedBeforeExit\":true,\"originalSessionPreserved\":true}");return
+        }
         if CommandLine.arguments.contains("--keyboard-focus") {
             probe.wrongWindow=true
             var rejected=false
@@ -307,7 +338,7 @@ final class OwnedEnginePTY:@unchecked Sendable {
             engine.receiveScreen(sessionID:original.key,raw:terminal.screen(),generation:"owned",source:.terminalScreen)
             await engine.ensureCodexManagedServers()
             attached=try await engine.codexLoginTargets().contains(where:{$0.home==home && $0.witnesses.contains(where:{$0.pid != original.pid})})
-            if attached,engine.codexSessionAttachmentNotice?.contains("기존 창·같은 대화의 관리형 서버 연결을 확인했습니다.") == true {break};try await Task.sleep(for:.milliseconds(150))
+            if attached,try attachmentConnected() {break};try await Task.sleep(for:.milliseconds(150))
         }while Date()<deadline
         if red {
             guard !attached,probe.statusCalls==0,probe.exitCalls==0,engine.codexSessionAttachmentNotice?.contains(loginShell || noShell ? "원본 셸":"대화 ID") == true else{throw AppError.message("Expected SQLite-only discovery failure not reproduced: \(engine.codexSessionAttachmentNotice ?? "none") inventory=\(engine.snapshot.sessions.map{"\($0.phase.rawValue) pending=\($0.pendingInTerminal) review=\($0.needsReview)"})")}
@@ -316,7 +347,7 @@ final class OwnedEnginePTY:@unchecked Sendable {
         } else if wrong {
             guard !attached,probe.statusCalls==1,probe.exitCalls==0,probe.launchCalls==0,probe.read().contains(where:{$0.key==original.key}) else{throw AppError.message("Mismatched thread must retain the original process")}
         } else {
-            guard attached,engine.codexSessionAttachmentNotice?.contains("기존 창·같은 대화의 관리형 서버 연결을 확인했습니다.") == true,probe.statusCalls==(goalWait ? 2:1),probe.exitCalls==1,probe.launchCalls==1 else{throw AppError.message("Engine attachment failed: "+(engine.codexSessionAttachmentNotice ?? "none")+" status=\(probe.statusCalls) exit=\(probe.exitCalls) launch=\(probe.launchCalls)")}
+            guard attached,try attachmentConnected(),probe.statusCalls==(goalWait ? 2:1),probe.exitCalls==1,probe.launchCalls==1 else{throw AppError.message("Engine attachment failed: "+(engine.codexSessionAttachmentNotice ?? "none")+" status=\(probe.statusCalls) exit=\(probe.exitCalls) launch=\(probe.launchCalls)")}
         }
         print("{\"verified\":true,\"productionEngine\":true,\"sqliteOnly\":true,\"expectedUnresolved\":\(red),\"mismatchedThread\":\(wrong),\"goalWait\":\(goalWait),\"loginShell\":\(loginShell),\"noShell\":\(noShell),\"profileCommand\":\(profileCommand),\"preparationAttempts\":\(probe.prepareCalls),\"preparedTabs\":\(probe.replacement == nil ? 0:1),\"definiteRetry\":\(definiteRetry),\"toolHosts\":\(toolHosts),\"waitedForToolHostExit\":\(lingerToolHost),\"replacementRejected\":\(wrongWindow || busyReplacement || prepareFails),\"manualReconnect\":\(manual),\"accountObservations\":\(accountObservations),\"statusRequests\":\(probe.statusCalls),\"exitRequests\":\(probe.exitCalls),\"launchRequests\":\(probe.launchCalls),\"userTerminalActions\":0}")
     }

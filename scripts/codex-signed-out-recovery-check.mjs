@@ -6,7 +6,7 @@ import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const cli=await realpath(process.env.AUTOAPPROVE_CODEX_BIN);
 const pack=path.dirname(path.dirname(cli));
 const metadata=JSON.parse(await readFile(pack+'/codex-package.json','utf8'));
-assert.match(metadata.version,/^0\.16[67]\./);assert.equal(metadata.entrypoint,'bin/codex');
+assert.match(metadata.version,/^0\.16[679]\./);assert.equal(metadata.entrypoint,'bin/codex');
 const root=await mkdtemp('/private/tmp/aa-signed-out-'),build=path.resolve(process.env.AUTOAPPROVE_CHECK_BUILD||'.build/debug');
 // No TUI/TTY is created. The production controller has no discoverable session
 // in this unregistered random home. Authentication is synthetic and invalid.

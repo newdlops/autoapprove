@@ -61,25 +61,28 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     public func resumeCommand(nativeRuntimeRoot:String?=nil) throws -> String {
         try resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
     }
-    func resumeCommand(nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil) throws -> String {
+    func resumeCommand(nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil,standalone:Bool=false) throws -> String {
         let entry=try validated()
+        guard !standalone || (entry.agent == "codex" && !entry.resumesConversation && (bundledRuntime != nil || compatibleCLI != nil)) else {
+            throw AppError.message("독립 실행은 검증된 공식 Codex의 새 대화에만 사용할 수 있습니다.")
+        }
         if let bundledRuntime {
-            guard entry.agent == "codex",nativeRuntimeRoot != nil else {throw AppError.message("Codex 실행 환경을 확인해주세요.")}
+            guard entry.agent == "codex" else {throw AppError.message("Codex 실행 환경을 확인해주세요.")}
             try bundledRuntime.verifyUnchanged()
         }
         if let compatibleCLI {
-            guard entry.agent == "codex",nativeRuntimeRoot != nil,bundledRuntime==nil else {throw AppError.message("Codex 복원 실행 환경을 확인해주세요.")}
+            guard entry.agent == "codex",bundledRuntime==nil else {throw AppError.message("Codex 복원 실행 환경을 확인해주세요.")}
             try compatibleCLI.verifyUnchanged()
         }
         var arguments=["env"]
-        if let root=nativeRuntimeRoot {
-            guard entry.agent == "codex",CodexNativeRuntimeRoot.validPath(root) else {throw AppError.message("Codex 제어 등록 경로를 확인해주세요.")}
-            arguments.append("AUTOAPPROVE_NATIVE_RUNTIME_ROOT="+root)
-        }
+        guard nativeRuntimeRoot==nil else {throw AppError.message("공식 Codex는 전용 제어 등록 경로를 사용하지 않습니다.")}
+        if entry.agent == "codex" {arguments += ["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"]}
         if let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
         if let searchPath=compatibleCLI?.environment["PATH"] {arguments.append("PATH="+searchPath)}
         arguments.append(compatibleCLI?.executable ?? bundledRuntime?.executable ?? agent)
-        if bundledRuntime != nil || compatibleCLI != nil {arguments += ["--remote","unix://"]}
+        if bundledRuntime != nil || compatibleCLI != nil {
+            arguments += standalone ? ["-c","features.daemon_auto_start=false"]:["--remote","unix://"]
+        }
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
         // Keep the tab's interactive shell for both agents. A CLI that replaces its shell leaves a tab that cannot
         // run anything after the CLI exits, so the session could never be restarted in the same tab.
@@ -394,8 +397,8 @@ public enum TerminalProfileLauncher {
     public static func script(_ entry: TerminalProfileEntry,targetTTY:String?=nil,nativeRuntimeRoot:String?=nil) throws -> String {
         try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
     }
-    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil) throws ->String {
-        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:bundledRuntime,compatibleCLI:compatibleCLI))
+    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil,standalone:Bool=false) throws ->String {
+        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:bundledRuntime,compatibleCLI:compatibleCLI,standalone:standalone))
         if entry.host == .iterm {
             return "const app=Application('com.googlecode.iterm2'); app.activate(); const window=app.createWindowWithDefaultProfile({command:\(command)}); JSON.stringify({tty:window.currentSession().tty()});"
         }
@@ -433,12 +436,18 @@ public enum TerminalProfileLauncher {
                               execute:(@Sendable (String,TerminalProfileEntry.Host) throws -> String)? = nil) async throws -> String {
         let entry=try entry.validated()
         return try await Task.detached(priority:.userInitiated) {
-            let nativeRoot:String?
             let launchRuntime:CodexProfileLaunchRuntime?
             do {
-                nativeRoot=entry.agent == "codex" ? try CodexNativeRuntimeRoot.prepare():nil
-                if let runtime=entry.agent == "codex" ? try CodexBundledRuntime.bundled():nil {
-                    launchRuntime=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:.local(executable:runtime.executable))
+                if entry.agent == "codex" {
+                    if let runtime=try CodexBundledRuntime.bundled() {
+                        launchRuntime=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:.local(executable:runtime.executable))
+                    } else {
+                        guard let candidate=try CodexCLIContext.resolve(home:entry.providerHome ?? NSHomeDirectory()+"/.codex",userHome:NSHomeDirectory(),executable:nil) else {
+                            throw AppError.message("공식 Codex CLI를 찾지 못했습니다. Codex를 설치한 뒤 다시 복원해주세요.")
+                        }
+                        let cli=try CodexOfficialExecutable.context(candidate)
+                        launchRuntime=try await CodexProfileLaunchRuntime.resolveInstalled(entry:entry,cli:cli,server:.local(executable:cli.executable))
+                    }
                 } else {launchRuntime=nil}
             } catch {
                 throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
@@ -450,7 +459,7 @@ public enum TerminalProfileLauncher {
                 targetTTY=try openTab(anchorTTY,entry.terminalTab?.settingsName)
             }
             try launchRuntime?.verifyUnchanged()
-            let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRoot,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed)
+            let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
             let text:String
             do {
                 if let execute {text=try execute(body,entry.host)}

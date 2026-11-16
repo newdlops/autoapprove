@@ -1,10 +1,15 @@
 import Foundation
-import AutoApproveCore
+@testable import AutoApproveCore
 
 @main struct SubagentGoalFixture {
     static func main() async throws {
         let args=CommandLine.arguments
         guard args.count>=6 else {throw AppError.message("Expected owned home, root thread, cwd, child thread and action")}
+        if args[5]=="read-transition" {
+            let connection=try CodexQueueConnection(home:args[1])
+            let result=try CodexAccountTransitionLocal.thread(connection,id:args[4],home:args[1],allowSubagent:true)
+            print(String(decoding:try JSONEncoder().encode(result),as:UTF8.self));return
+        }
         let target=CodexReplyTarget(executable:"",home:args[1],threadID:args[2])
         let result:CodexSubagentGoal
         if args[5]=="read" {

@@ -25,19 +25,28 @@ extension CodexAccountTransitionTarget {
 }
 
 extension CodexAccountTransitionServices {
-    public static var live: Self {
+    public static var live: Self {local()}
+    static func local(verifyExecutable:(@Sendable (String)throws->Void)?=nil) ->Self {
         Self(observe: { target in
-            try await CodexAccountBackground.run { try CodexAccountTransitionLocal.observe(target) }
-        }, interrupt: { target, server, thread, turn in
             try await CodexAccountBackground.run {
-                guard try CodexAccountTransitionLocal.identity(target) == server else { throw AppError.message("중단 직전 Codex 서버가 바뀌었습니다.") }
+                let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
+                return try CodexAccountTransitionLocal.observe(target,runtime:runtime)
+            }
+        }, interrupt: { target, server, thread, turn in
+            try await CodexAccountBackground.runAsync {
+                let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
+                guard try CodexAccountTransitionLocal.identity(target,runtime:runtime) == server else { throw AppError.message("중단 직전 Codex 서버가 바뀌었습니다.") }
                 try Task.checkCancellation()
-                let connection = try CodexQueueConnection(home: target.home)
-                try CodexAccountTransitionLocal.quiesce(connection,target:target,server:server,id:thread,token:turn)
+                // Quiescence includes awaiting the native abort/accounting
+                // lifecycle. Bound each RPC without expiring the idle socket
+                // during that wait or taking over approval callbacks.
+                let connection = try CodexQueueConnection(home: target.home,requestScopedDeadline:true)
+                try await CodexAccountTransitionLocal.quiesce(connection,target:target,runtime:runtime,server:server,id:thread,token:turn)
             }
         }, restart: { target, expected in
             try await CodexAccountBackground.run {
-                let fresh = try CodexAccountTransitionLocal.observe(target)
+                let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
+                let fresh = try CodexAccountTransitionLocal.observe(target,runtime:runtime)
                 guard fresh.serverID == expected.serverID, fresh.savedAccount == expected.savedAccount,
                       fresh.serverAccount == expected.serverAccount,
                       fresh.savedAccount != nil, fresh.serverAccount != fresh.savedAccount || expected.loginRefreshRequested,
@@ -50,18 +59,18 @@ extension CodexAccountTransitionServices {
                         throw AppError.message("기존 Codex 창의 서버 연결이 바뀌었습니다. 서버 전환을 보류했습니다.")
                     }
                 }
-                guard try CodexAccountTransitionLocal.identity(target) == expected.serverID else { throw AppError.message("전환할 서버가 바뀌었습니다.") }
+                guard try CodexAccountTransitionLocal.identity(target,runtime:runtime) == expected.serverID else { throw AppError.message("전환할 서버가 바뀌었습니다.") }
                 try Task.checkCancellation()
                 // Official 0.166 defaults to a 60s graceful stop, permits
                 // 300s, then allows forced-exit and readiness checks. A 30s
                 // wrapper kills a valid restart before its drain completes.
-                let result = try CommandRunner.run(target.executable, ["app-server", "daemon", "restart"], timeout: 375,
-                    environment: CodexAccountTransitionLocal.environment(target), inheritEnvironment: false, outputLimit: 32_768, errorLimit: 32_768)
+                let result = try runtime.context.run(["app-server", "daemon", "restart"], timeout: 375)
                 guard result.status == 0 else { throw AppError.message("공통 서버 전환 결과를 확인하지 못했습니다. 같은 요청을 반복하지 말고 Mac에서 연결을 확인해주세요.") }
             }
         }, verify: { target, witnesses, threads in
             try await CodexAccountBackground.run {
-                let before = try CodexAccountTransitionLocal.identity(target)
+                let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
+                let before = try CodexAccountTransitionLocal.identity(target,runtime:runtime)
                 let connection=try CodexQueueConnection(home:target.home)
                 let serverPID=try connection.peerProcessID()
                 // Background conversations are reattached by the official
@@ -78,16 +87,26 @@ extension CodexAccountTransitionServices {
                           CodexServerLocation.connectedHome(pid: witness.pid, hints: [target.home],peerPID:serverPID) == target.home else { continue }
                     verified += 1
                 }
-                guard try CodexAccountTransitionLocal.identity(target) == before else {throw AppError.message("창 재연결 확인 중 Codex 서버가 바뀌었습니다.")}
+                guard try CodexAccountTransitionLocal.identity(target,runtime:runtime) == before else {throw AppError.message("창 재연결 확인 중 Codex 서버가 바뀌었습니다.")}
                 return verified
             }
         },resume:{target,expected,original,receipt in
-            try await CodexAccountBackground.run {try CodexAccountContinuationLocal.resume(target,expected:expected,original:original,receipt:receipt)}
+            try await CodexAccountBackground.runAsync {
+                let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
+                return try await CodexAccountContinuationLocal.resume(target,runtime:runtime,expected:expected,original:original,receipt:receipt)
+            }
         })
     }
 }
 
 private enum CodexAccountBackground {
+    static func runAsync<Value:Sendable>(_ operation:@escaping @Sendable () async throws ->Value) async throws ->Value {
+        let child=Task.detached(priority:.utility,operation:operation)
+        return try await withTaskCancellationHandler(operation:{
+            do {let result=try await child.value;try Task.checkCancellation();return result}
+            catch {try Task.checkCancellation();throw error}
+        },onCancel:{child.cancel()})
+    }
     static func run<Value: Sendable>(_ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
         let child = Task.detached(priority: .utility, operation: operation)
         return try await withTaskCancellationHandler(operation: {
@@ -106,20 +125,16 @@ private enum CodexAccountBackground {
 /// All inspection is local metadata. This adapter never reads credentials,
 /// resumes a conversation, creates a turn, edits a queue or types into a TUI.
 enum CodexAccountTransitionLocal {
-    static func environment(_ target: CodexAccountTransitionTarget) -> [String: String] {
-        ["HOME": NSHomeDirectory(), "CODEX_HOME": target.home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "NO_COLOR": "1"]
-    }
     static func sameProcess(_ witness: CodexAccountTransitionWitness) -> Bool {
         (try? ProcessDiscovery.read(pid: witness.pid))?.contains {
             $0.pid == witness.pid && $0.started == witness.started && "/dev/" + $0.tty == witness.tty && $0.agent == .codex
         } == true
     }
-    static func identity(_ target: CodexAccountTransitionTarget) throws -> String {
-        guard target.executable.hasPrefix("/"), target.home.hasPrefix("/"),
-              FileManager.default.isExecutableFile(atPath: target.executable),
+    static func identity(_ target: CodexAccountTransitionTarget,runtime:CodexAccountRuntime) throws -> String {
+        try runtime.validate(target)
+        guard target.home.hasPrefix("/"),
               let socket = CodexQueueConnection.socketPath(home: target.home) else { throw AppError.message("이 Codex의 관리형 로컬 서버를 찾지 못했습니다.") }
-        let result = try CommandRunner.run(target.executable, ["app-server", "daemon", "version"], timeout: 8,
-            environment: environment(target), inheritEnvironment: false, outputLimit: 32_768, errorLimit: 32_768)
+        let result = try runtime.context.run(["app-server", "daemon", "version"])
         guard result.status == 0, let data = result.output.data(using: .utf8),
               let version = try JSONSerialization.jsonObject(with: data) as? JSONObject,
               version["status"] as? String == "running", ["pid", "launchd"].contains(version["backend"] as? String ?? ""),
@@ -129,13 +144,21 @@ enum CodexAccountTransitionLocal {
               let control = version["socketPath"] as? String, URL(fileURLWithPath: control).resolvingSymlinksInPath().path == socket else {
             throw AppError.message("공식 관리형 Codex 0.166.0 이상과 같은 버전의 CLI가 필요합니다. 현재 실행 방식은 자동 전환을 지원하지 않습니다.")
         }
+        try runtime.verifyExecutable(managed)
+        try runtime.validate(target)
         var info = stat(), binary = stat(), managedInfo = stat()
         guard lstat(socket, &info) == 0, info.st_uid == getuid(), info.st_mode & S_IFMT == S_IFSOCK,
-              stat(target.executable, &binary) == 0, stat(managed, &managedInfo) == 0,
+              stat(runtime.context.executable, &binary) == 0, stat(managed, &managedInfo) == 0,
               [getuid(), 0].contains(binary.st_uid), [getuid(), 0].contains(managedInfo.st_uid) else {
             throw AppError.message("Codex 서버·실행 파일의 소유권을 확인하지 못했습니다.")
         }
-        return digest([socket, String(info.st_dev), String(info.st_ino), current, String(binary.st_dev), String(binary.st_ino), String(managedInfo.st_ino)])
+        let peer=try runtime.connectedServerIdentity(home:target.home)
+        var currentSocket=stat()
+        guard CodexQueueConnection.socketPath(home:target.home)==socket,lstat(socket,&currentSocket)==0,
+              currentSocket.st_dev==info.st_dev,currentSocket.st_ino==info.st_ino else {
+            throw AppError.message("공식 서버 확인 중 연결이 바뀌었습니다. 기존 세션은 유지했습니다.")
+        }
+        return digest([socket, String(info.st_dev), String(info.st_ino), current, String(binary.st_dev), String(binary.st_ino), String(managedInfo.st_ino)]+peer)
     }
     static func supported(_ version: String) -> Bool {
         let pieces = version.split(separator: ".")
@@ -157,9 +180,9 @@ enum CodexAccountTransitionLocal {
         }
         return digest([user, workspace])
     }
-    static func observe(_ target: CodexAccountTransitionTarget) throws -> CodexAccountTransitionObservation {
-        let before = try identity(target)
-        let saved = try CodexAccountMetadataProcess.read(target)
+    static func observe(_ target: CodexAccountTransitionTarget,runtime:CodexAccountRuntime) throws -> CodexAccountTransitionObservation {
+        let before = try identity(target,runtime:runtime)
+        let saved = try CodexAccountMetadataProcess.read(target,runtime:runtime)
         let connection = try CodexQueueConnection(home: target.home)
         // A validated empty session list is a signed-out server, not a failed
         // observation. It must be recoverable using the saved login. Malformed
@@ -183,12 +206,12 @@ enum CodexAccountTransitionLocal {
                     // Unknown/user ephemeral threads still fail closed below.
                     continue
                 }
-                threads.append(try thread(connection, id: id,metadata:metadata,home:target.home))
+                threads.append(try thread(connection, id: id,metadata:metadata,home:target.home,allowSubagent:true))
             }
             cursor = try nextCursor(page)
             guard cursor == nil || seen.insert(cursor!).inserted, seen.count < 100 else { throw AppError.message("실행 대화 목록 조회가 반복됐습니다.") }
         } while cursor != nil
-        guard try identity(target) == before else { throw AppError.message("계정 확인 중 공통 서버가 바뀌었습니다.") }
+        guard try identity(target,runtime:runtime) == before else { throw AppError.message("계정 확인 중 공통 서버가 바뀌었습니다.") }
         return .init(savedAccount: saved, serverAccount: current, serverID: before, threads: threads.sorted { $0.id < $1.id })
     }
     static func nextCursor(_ page: JSONObject) throws -> String? {
@@ -196,11 +219,11 @@ enum CodexAccountTransitionLocal {
         guard let cursor = value as? String, !cursor.isEmpty, cursor.utf8.count <= 8192 else { throw AppError.message("목록의 다음 위치를 확인하지 못했습니다.") }
         return cursor
     }
-    static func quiesce(_ connection:CodexQueueConnection,target:CodexAccountTransitionTarget,server:String,id:String,token:String) throws {
+    static func quiesce(_ connection:CodexQueueConnection,target:CodexAccountTransitionTarget,runtime:CodexAccountRuntime,server:String,id:String,token:String) async throws {
         func current() throws -> CodexAccountTransitionThread {
             try Task.checkCancellation()
-            guard try identity(target)==server else {throw AppError.message("작업 정리 중 Codex 서버가 바뀌었습니다.")}
-            let value=try thread(connection,id:id,home:target.home)
+            guard try identity(target,runtime:runtime)==server else {throw AppError.message("작업 정리 중 Codex 서버가 바뀌었습니다.")}
+            let value=try thread(connection,id:id,home:target.home,allowSubagent:true)
             guard value.stopToken==token else {throw AppError.message("작업 정리 중 새 실행 차례가 시작됐습니다. 새 작업은 중단하지 않았습니다.")}
             return value
         }
@@ -209,8 +232,33 @@ enum CodexAccountTransitionLocal {
         if (goal["goal"] as? JSONObject)?["status"] as? String == "active" {
             let latest=try current();try Task.checkCancellation()
             if latest.blocker == "활성 Goal" {
+                if let owner=latest.subagent,let goal=latest.goal {
+                    let selected=CodexReplyTarget(executable:runtime.context.executable,home:target.home,threadID:owner.rootThreadID)
+                    let expected=CodexSubagentGoal(rootThreadID:owner.rootThreadID,threadID:id,parentThreadID:owner.parentThreadID,
+                        goal:goal,executionState:latest.active ? "active":"idle",turnID:latest.turnID)
+                    let pausedRevision:String = {var paused=goal;paused.status = .paused;return paused.revision}()
+                    _ = try await CodexSubagentGoalTransport.pauseOfficial(target:selected,cwd:owner.rootCwd,expected:expected,authorize:{
+                        try Task.checkCancellation()
+                        guard try identity(target,runtime:runtime)==server else {throw AppError.message("하위 Goal 중단 직전 Codex 서버가 바뀌었습니다.")}
+                        let value=try thread(CodexQueueConnection(home:target.home),id:id,home:target.home,allowSubagent:true)
+                        guard value.stopToken==token,value.subagent==owner,value.goal?.revision==goal.revision else {
+                            throw AppError.message("하위 Goal·부모·실행 차례가 바뀌었습니다. 새 작업은 중단하지 않았습니다.")
+                        }
+                    },authorizePaused:{
+                        try Task.checkCancellation()
+                        guard try identity(target,runtime:runtime)==server else {throw AppError.message("하위 Goal 저장 뒤 Codex 서버가 바뀌었습니다.")}
+                        let value=try thread(CodexQueueConnection(home:target.home),id:id,home:target.home,allowSubagent:true)
+                        guard value.stopToken==token,!value.active,value.subagent==owner,
+                              value.goal?.revision==pausedRevision,
+                              value.goal?.tokensUsed ?? -1 >= goal.tokensUsed,
+                              value.goal?.timeUsedSeconds ?? -1 >= goal.timeUsedSeconds else {
+                            throw AppError.message("저장한 하위 Goal·부모·실행 차례가 바뀌었습니다. 재연결하지 않았습니다.")
+                        }
+                    })
+                }else{
                 let paused=try connection.request("thread/goal/set",["threadId":id,"status":"paused","origin":"automatic"])
                 guard (paused["goal"] as? JSONObject)?["status"] as? String == "paused" else {throw AppError.message("Goal 일시정지 결과를 확인하지 못했습니다. 같은 요청은 반복하지 않습니다.")}
+                }
             }
         }
         var cursor:String?,seen=Set<String>(),processes=Set<String>()
@@ -254,10 +302,10 @@ enum CodexAccountTransitionLocal {
                         let fresh=try connection.request("thread/read",["threadId":id,"includeTurns":false])
                         guard let latest=fresh["thread"] as? JSONObject,latest["id"] as? String==id,
                               (latest["status"] as? JSONObject)?["type"] as? String == "idle",
-                              try identity(target)==server else {throw error}
+                              try identity(target,runtime:runtime)==server else {throw error}
                         return
                     }
-                    if attempt < 4 {Thread.sleep(forTimeInterval:0.05)}
+                    if attempt < 4 {try await Task.sleep(for:.milliseconds(50))}
                 }
                 throw error
             }
@@ -313,9 +361,12 @@ enum CodexAccountTransitionLocal {
         }
         let parent=row["parentThreadId"] as? String
         let child=allowSubagent && parent.map({UUID(uuidString:$0) != nil && $0 != id}) == true
-        let goalResult = try child
-            ? connection.request("autoapprove/thread/goal/read",["threadId":id,"parentThreadId":parent!])
-            : connection.request("thread/goal/get", ["threadId": id])
+        let owner=child && row["canAcceptDirectInput"] as? Bool==false ? try subagentOwner(connection,row:row):nil
+        let beforeGoal:Result<CodexGoal?,Error>? = child ? Result {
+            guard let home else{throw AppError.message("이동할 서브에이전트의 원래 Codex 홈을 확인해주세요.")}
+            return try CodexGoalTransport.readDatabase(home:home,threadID:id)
+        }:nil
+        let goalResult = try connection.request("thread/goal/get", ["threadId": id])
         if let goal = goalResult["goal"], !(goal is NSNull) {
             guard let object = goal as? JSONObject, let value = object["status"] as? String,
                   CodexGoal.Status(rawValue: value) != nil else { throw AppError.message("Goal 실행 상태를 확인하지 못했습니다.") }
@@ -327,28 +378,56 @@ enum CodexAccountTransitionLocal {
         let continuable=(root || child) && row["ephemeral"] as? Bool==false && cwd?.hasPrefix("/")==true && provider?.isEmpty==false
         var goal=continuable ? try CodexGoalTransport.decode(goalResult,threadID:id):nil
         if child,let current=goal {
-            guard let identity=goalResult["identity"] as? JSONObject,let instance=identity["goalId"] as? String,
-                  UUID(uuidString:instance) != nil,identity["objective"] as? String==current.objective,
-                  identity["status"] as? String==current.status.rawValue,
-                  (identity["tokenBudget"] as? NSNumber)?.int64Value==current.tokenBudget else {
+            guard let home,let beforeGoal else {
                 throw AppError.message("이동할 서브에이전트 Goal의 식별자를 확인하지 못했습니다.")
             }
-            goal?.instanceID=instance
+            goal=try CodexGoalTransport.identify(current,before:beforeGoal.get(),after:CodexGoalTransport.readDatabase(home:home,threadID:id))
         }
         if !child,let home,let current=goal,let stored=try? CodexGoalTransport.readDatabase(home:home,threadID:id),
            stored.createdAt==current.createdAt,stored.objective==current.objective,stored.tokenBudget==current.tokenBudget {goal?.instanceID=stored.instanceID}
-        return .init(id: id, turnID: turnID, active: status == "active", blocker: blocker,continuable:continuable,cwd:cwd,modelProvider:provider,goal:goal,turnStatus:latest.first?["status"] as? String)
+        return .init(id: id, turnID: turnID, active: status == "active", blocker: blocker,continuable:continuable,cwd:cwd,modelProvider:provider,goal:goal,turnStatus:latest.first?["status"] as? String,subagent:owner)
+    }
+
+    static func subagentOwner(_ connection:CodexQueueConnection,row:JSONObject) throws ->CodexAccountTransitionSubagent {
+        // The official history summary omits this live-only capability for an
+        // unloaded child. A saved V2 owner may be checked before attaching its
+        // paused Goal; loaded children must still explicitly disallow input.
+        let dormant=(row["status"] as? JSONObject)?["type"] as? String=="notLoaded"
+        let absent=row["canAcceptDirectInput"]==nil || row["canAcceptDirectInput"] is NSNull
+        guard let id=row["id"] as? String,UUID(uuidString:id) != nil,
+              let parent=row["parentThreadId"] as? String,UUID(uuidString:parent) != nil,parent != id,
+              row["canAcceptDirectInput"] as? Bool==false || dormant && absent else {throw AppError.message("하위 대화의 원래 부모를 확인하지 못했습니다.")}
+        var seen:Set<String>=[id],next=parent
+        while seen.count<=100 {
+            try Task.checkCancellation()
+            guard UUID(uuidString:next) != nil,seen.insert(next).inserted,
+                  let ancestor=try connection.request("thread/read",["threadId":next,"includeTurns":false])["thread"] as? JSONObject,
+                  ancestor["id"] as? String==next,ancestor["ephemeral"] as? Bool==false else {
+                throw AppError.message("하위 대화의 부모 연결이 불명확합니다. 계정 전환을 보류했습니다.")
+            }
+            if ancestor["parentThreadId"]==nil || ancestor["parentThreadId"] is NSNull {
+                guard ancestor["source"] is String,ancestor["threadSource"] as? String=="user",
+                      let cwd=ancestor["cwd"] as? String,cwd.hasPrefix("/") else {
+                    throw AppError.message("원래 부모 대화의 경로·종류를 확인하지 못했습니다.")
+                }
+                return .init(rootThreadID:next,parentThreadID:parent,rootCwd:cwd)
+            }
+            guard let value=ancestor["parentThreadId"] as? String else {break}
+            next=value
+        }
+        throw AppError.message("하위 대화의 부모 연결이 반복되거나 너무 깊습니다.")
     }
 }
 
 /// A short-lived, non-TTY app-server reads freshly stored login metadata.
 /// Only this owned child is stopped. Responses are bounded and never logged.
 enum CodexAccountMetadataProcess {
-    static func read(_ target: CodexAccountTransitionTarget,environment:[String:String]?=nil) throws -> String? {
+    static func read(_ target: CodexAccountTransitionTarget,runtime:CodexAccountRuntime) throws -> String? {
+        try runtime.validate(target)
         let process = Process(), input = Pipe(), output = Pipe(), exited = DispatchSemaphore(value: 0)
-        process.executableURL = URL(fileURLWithPath: target.executable)
+        process.executableURL = URL(fileURLWithPath: runtime.context.executable)
         process.arguments = ["app-server", "--listen", "stdio://"]
-        process.environment = environment ?? CodexAccountTransitionLocal.environment(target)
+        process.environment = runtime.context.environment
         process.currentDirectoryURL = URL(fileURLWithPath: target.home)
         process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
         process.terminationHandler = { _ in exited.signal() }
@@ -398,6 +477,8 @@ enum CodexAccountMetadataProcess {
         try send(["id": 1, "method": "initialize", "params": ["clientInfo": ["name": "autoapprove-account-check", "version": RemoteWebVersion.current?.version ?? "0.2.231"], "capabilities": ["experimentalApi": true]]])
         _ = try response(1); try send(["method": "initialized"])
         try send(["id": 2, "method": "accountSession/list", "params": ["refreshWorkspaceMetadata": false]])
-        return try CodexAccountTransitionLocal.account(response(2))
+        let account=try CodexAccountTransitionLocal.account(response(2))
+        try runtime.validate(target)
+        return account
     }
 }

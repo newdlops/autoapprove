@@ -54,15 +54,26 @@ public final class ManagedPTY: @unchecked Sendable {
     private static let historyLimit = 1_048_576
 
     public init(cwd: String, program: String = "shell", command: [String]? = nil, columns: Int = 80, rows: Int = 24, environment: [String: String]? = nil) throws {
+        try Task.checkCancellation()
         try Self.validateSize(columns: columns, rows: rows)
         var directory: ObjCBool = false
         guard cwd.hasPrefix("/"), !cwd.contains("\0"), FileManager.default.fileExists(atPath: cwd, isDirectory: &directory), directory.boolValue else { throw RemoteHTTPError(400, "존재하는 Mac 폴더의 전체 경로를 입력해주세요.") }
         guard ["shell", "codex", "claude"].contains(program) else { throw RemoteHTTPError(400, "지원하지 않는 터미널 프로그램입니다.") }
+        var env = environment ?? ProcessInfo.processInfo.environment
+        let invocation:[String]
+        if let command {invocation=command}
+        else if program == "codex" {
+            let userHome=env["HOME"] ?? NSHomeDirectory(),home=env["CODEX_HOME"] ?? userHome+"/.codex"
+            guard let cli=try CodexOfficialExecutable.resolve(home:home,userHome:userHome,executable:nil,environment:env) else {
+                throw AppError.message("공식 Codex CLI를 찾지 못했습니다.")
+            }
+            try cli.verifyUnchanged();env=cli.environment
+            invocation=try cli.terminalInvocation()
+        } else {invocation=program == "shell" ? []:[program]}
+        try Task.checkCancellation()
         guard let vt = ap_vt_new(Int32(rows), Int32(columns)) else { throw AppError.message("터미널 화면을 만들지 못했습니다.") }
         terminal = vt
-        let invocation = command ?? (program == "shell" ? [] : [program])
         let arguments = invocation.isEmpty ? ["/bin/zsh", "-l"] : ["/bin/zsh", "-l", "-i", "-c", "cd -- \(Self.quote(cwd)) && exec " + invocation.map(Self.quote).joined(separator: " ")]
-        var env = environment ?? ProcessInfo.processInfo.environment
         for key in ["TERM_PROGRAM", "TERM_PROGRAM_VERSION", "ITERM_SESSION_ID", "ORCA_TERMINAL_HANDLE", "__CFBundleIdentifier", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"] { env.removeValue(forKey: key) }
         env["TERM"] = "xterm-256color"; env["COLORTERM"] = "truecolor"; env["TERM_PROGRAM"] = "AutoApprovePTY"
         env["LANG"] = env["LANG"] ?? "en_US.UTF-8"
@@ -328,22 +339,46 @@ public final class ManagedPTY: @unchecked Sendable {
 }
 
 public final class ManagedPTYManager: @unchecked Sendable {
+    typealias Factory = @Sendable (String,String,[String]?,Int,Int,[String:String]?) throws ->ManagedPTY
     private let lock = NSLock()
     private var terminals: [String: ManagedPTY] = [:]
+    private var pendingCreations=0
+    private var stopGeneration:UInt64=0
     private let environment: [String: String]?
-    public init(environment: [String: String]? = nil) { self.environment = environment }
+    private let factory:Factory
+    public convenience init(environment: [String: String]? = nil) {
+        self.init(environment:environment,factory:{cwd,program,command,columns,rows,environment in
+            try ManagedPTY(cwd:cwd,program:program,command:command,columns:columns,rows:rows,environment:environment)
+        })
+    }
+    init(environment:[String:String]?,factory:@escaping Factory) {self.environment=environment;self.factory=factory}
     deinit { stop() }
     public var inventory: [ManagedPTYDescriptor] { lock.lock(); defer { lock.unlock() }; return terminals.values.map(\.descriptor).sorted { $0.ptyID < $1.ptyID } }
     public func terminal(_ id: String) throws -> ManagedPTY { lock.lock(); defer { lock.unlock() }; guard let value = terminals[id] else { throw RemoteHTTPError(404, "PTY 터미널을 찾지 못했습니다.") }; return value }
     public func owned(tty: String) -> ManagedPTY? { lock.lock(); defer { lock.unlock() }; return terminals.values.first { $0.descriptor.tty == tty && $0.isRunning } }
-    public func create(cwd: String, program: String, command: [String]? = nil, columns: Int, rows: Int) throws -> ManagedPTYDescriptor {
-        lock.lock(); defer { lock.unlock() }
-        guard terminals.values.filter({ $0.descriptor.exitCode == nil }).count < 8 else { throw RemoteHTTPError(409, "PTY는 Mac 한 대에서 8개까지 열 수 있습니다. 사용하지 않는 터미널을 종료해주세요.") }
+    public func create(cwd: String, program: String, command: [String]? = nil, columns: Int, rows: Int,
+                       environment launchEnvironment:[String:String]?=nil) throws -> ManagedPTYDescriptor {
+        lock.lock()
+        guard terminals.values.filter({ $0.descriptor.exitCode == nil }).count+pendingCreations < 8 else {
+            lock.unlock();throw RemoteHTTPError(409, "PTY는 Mac 한 대에서 8개까지 열 수 있습니다. 사용하지 않는 터미널을 종료해주세요.")
+        }
+        pendingCreations+=1
+        let generation=stopGeneration
+        lock.unlock()
+        let terminal:ManagedPTY
+        do {
+            try Task.checkCancellation()
+            terminal=try factory(cwd,program,command,columns,rows,launchEnvironment ?? environment)
+        } catch {lock.lock();pendingCreations-=1;lock.unlock();throw error}
+        lock.lock();pendingCreations-=1
+        // stop() must also cover a launch that was still resolving its CLI.
+        guard generation==stopGeneration,!Task.isCancelled else {
+            lock.unlock();terminal.close();throw CancellationError()
+        }
         if terminals.count >= 24 { terminals = terminals.filter { $0.value.descriptor.exitCode == nil } }
-        let terminal = try ManagedPTY(cwd: cwd, program: program, command: command, columns: columns, rows: rows, environment: environment)
-        let info = terminal.descriptor; terminals[info.ptyID] = terminal; return info
+        let info = terminal.descriptor; terminals[info.ptyID] = terminal;lock.unlock();return info
     }
-    public func stop() { lock.lock(); let values = Array(terminals.values); lock.unlock(); values.forEach { $0.close() } }
+    public func stop() { lock.lock();stopGeneration &+= 1;let values = Array(terminals.values); lock.unlock(); values.forEach { $0.close() } }
     public var adapter: ScreenHostAdapter {
         ScreenHostAdapter(screens: { [self] targets in TerminalSnapshot(screens: targets.compactMap { target in
             guard let terminal = owned(tty: target.tty) else { return nil }

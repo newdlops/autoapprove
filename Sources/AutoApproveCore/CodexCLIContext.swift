@@ -3,11 +3,12 @@ import Darwin
 
 /// A literal CLI invocation. Native binaries never start a login shell; script
 /// wrappers discover their executable/PATH once and reuse that environment.
-struct CodexCLIContext {
+struct CodexCLIContext:Sendable {
     let executable:String
     let environment:[String:String]
     private let identity:Identity
-    private struct Identity:Equatable {
+    private var managedVerifier:(@Sendable(String)throws->Void)?=nil
+    private struct Identity:Equatable,Sendable {
         let device:dev_t,inode:ino_t,size:off_t,modified:Int64,nanos:Int64
         init?(_ path:String) {
             var info=stat()
@@ -23,9 +24,8 @@ struct CodexCLIContext {
         let home=try CodexAccountTransitionTarget.canonicalHome(home)
         var env=base
         env["HOME"]=userHome;env["CODEX_HOME"]=home;env["NO_COLOR"]="1"
-        if env["AUTOAPPROVE_NATIVE_RUNTIME_ROOT"]==nil,let root=CodexNativeRuntimeRoot.existing() {
-            env["AUTOAPPROVE_NATIVE_RUNTIME_ROOT"]=root
-        }
+        env.removeValue(forKey:"AUTOAPPROVE_NATIVE_RUNTIME_ROOT")
+        env.removeValue(forKey:"AUTOAPPROVE_SELECTED_TRANSITION_SOCKET")
         var requested=supplied
         if let supplied {
             guard validPath(supplied) else{throw AppError.message("Codex 실행 파일의 전체 경로가 필요합니다.")}
@@ -65,6 +65,9 @@ struct CodexCLIContext {
         guard arguments.allSatisfy({!$0.contains("\0")}),Identity(executable)==identity else{
             throw AppError.message("Codex 실행 파일이 바뀌었습니다. 상태를 다시 확인해주세요.")
         }
+        if arguments.starts(with:["app-server","daemon"]),let managedVerifier,let home=environment["CODEX_HOME"] {
+            try CodexManagedPackageSelection.verify(home:home,executable:managedVerifier)
+        }
         let result=try CommandRunner.run(executable,arguments,timeout:timeout,environment:environment,
             inheritEnvironment:false,outputLimit:32768,errorLimit:32768)
         try Task.checkCancellation()
@@ -74,13 +77,42 @@ struct CodexCLIContext {
     func verifyUnchanged() throws {
         guard Identity(executable)==identity else {throw AppError.message("Codex 실행 파일이 바뀌었습니다. 상태를 다시 확인해주세요.")}
     }
+    /// Reassert this selection after a login shell has applied its startup files.
+    /// Callers obtain this context from the official resolver before launching.
+    func terminalInvocation(_ arguments:[String]=[]) throws ->[String] {
+        try verifyUnchanged()
+        guard let home=environment["HOME"],let codexHome=environment["CODEX_HOME"],
+              arguments.allSatisfy({!$0.contains("\0")}) else {throw AppError.message("Codex 실행 환경을 확인하지 못했습니다.")}
+        if let managedVerifier,!arguments.contains("features.daemon_auto_start=false") {
+            try CodexManagedPackageSelection.verify(home:codexHome,executable:managedVerifier)
+            if CodexQueueConnection.socketPath(home:codexHome) != nil {
+                _ = try CodexOfficialExecutable.verifyServer(CodexQueueConnection(home:codexHome))
+            }
+        }
+        return ["/usr/bin/env","-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET",
+            "HOME="+home,"CODEX_HOME="+codexHome,"PATH="+environment["PATH",default:"/usr/bin:/bin"],executable]+arguments
+    }
+    func selectingNativeExecutable(_ path:String)throws->Self {
+        try verifyUnchanged()
+        guard Self.validPath(path),Self.native(path),let identity=Identity(path) else{
+            throw AppError.message("공식 Codex의 네이티브 실행 파일을 확인하지 못했습니다.")
+        }
+        var env=environment
+        // These variables select protocols implemented only in the old fork.
+        env.removeValue(forKey:"AUTOAPPROVE_NATIVE_RUNTIME_ROOT")
+        env.removeValue(forKey:"AUTOAPPROVE_SELECTED_TRANSITION_SOCKET")
+        return .init(executable:path,environment:env,identity:identity,managedVerifier:managedVerifier)
+    }
+    func verifyingManagedExecutables(_ verify:@escaping @Sendable(String)throws->Void)->Self {
+        var selected=self;selected.managedVerifier=verify;return selected
+    }
     private static func validPath(_ value:String)->Bool {
         value.hasPrefix("/") && value.utf8.count<=4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
     }
     private static func validSearchPath(_ value:String)->Bool {
         !value.isEmpty && value.utf8.count<=32768 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
     }
-    private static func native(_ path:String)->Bool {
+    static func native(_ path:String)->Bool {
         guard let file=try? FileHandle(forReadingFrom:URL(fileURLWithPath:path)) else{return false}
         defer{try? file.close()}
         guard let data=try? file.read(upToCount:4),data.count==4 else{return false}

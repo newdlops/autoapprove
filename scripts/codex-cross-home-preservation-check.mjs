@@ -8,8 +8,9 @@ import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
 const cli=process.env.AUTOAPPROVE_CODEX_BIN;
 assert.ok(cli&&path.isAbsolute(cli),'Set AUTOAPPROVE_CODEX_BIN to a native installed CLI');
-const probeVersion=process.argv.includes('--probe-0.167.1')?'0.167.1':process.argv.includes('--probe-0.167')?'0.167.0':'0.166.0';
+const probeVersion=process.argv.includes('--probe-0.169')?'0.169.0':process.argv.includes('--probe-0.167.1')?'0.167.1':process.argv.includes('--probe-0.167')?'0.167.0':'0.166.0';
 const version=execFileSync(cli,['--version'],{encoding:'utf8'}).trim();assert.equal(version,'codex-cli '+probeVersion,'The owned probe must match its explicit native version');
+if(probeVersion==='0.169.0')execFileSync('/usr/bin/codesign',['--verify','--strict','-R=anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2"',cli],{stdio:'inherit'});
 const restoreGoal=process.argv.includes('--restore-goal');
 const requireGoal=process.argv.includes('--require-goal-preservation')||restoreGoal;
 const returnOriginal=process.argv.includes('--return-original-home');
@@ -18,7 +19,10 @@ const checkSettings=process.argv.includes('--check-settings');
 const checkRetirement=process.argv.includes('--check-retirement');
 const returnCleared=process.argv.includes('--return-cleared-goal');
 const crashNativeAcks=process.argv.includes('--crash-native-acks');
-assert.ok(['0.166.0','0.167.1'].includes(probeVersion)||!returnOriginal,'The native return coordinator requires an explicitly supported exact version');
+const officialRetirement=process.argv.includes('--official-retirement');
+const publicationAckLoss=process.argv.includes('--publication-ack-loss');assert.ok(!publicationAckLoss||officialRetirement,'Publication response-loss test requires the official storage path');
+assert.ok(!officialRetirement||probeVersion==='0.169.0'&&returnOriginal&&checkRetirement,'Official retirement requires the exact original 169 return/retirement test');
+assert.ok(['0.166.0','0.167.1'].includes(probeVersion)||officialRetirement||!returnOriginal,'The native return coordinator requires an explicitly supported exact version');
 assert.ok(!crashNativeAcks || returnOriginal&&checkRetirement);
 assert.ok(!returnCleared || returnOriginal&&checkRetirement);
 assert.ok(!checkClearedSlot || restoreGoal);
@@ -62,7 +66,7 @@ try{
  let transfer;
  if(restoreGoal){
   transfer=root+'/transfer';const build=path.resolve('.build/debug');
-  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/GoalTransfer'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-goal-transfer-check.swift','Tests/fixtures/codex-native-return-bridge.swift','-o',transfer],{stdio:'inherit',timeout:120000});
+  execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-module-cache-path',path.resolve('.build/cache/GoalTransfer'),'-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...await coreSwiftObjects(build),'Tests/fixtures/codex-goal-transfer-check.swift','Tests/fixtures/codex-native-return-bridge.swift','Tests/fixtures/codex-official-migration-storage.swift','-o',transfer],{stdio:'inherit',timeout:120000});
  }
  let a=await server(root+'/a');
  const workspaceRoot=root+'/selected-workspace';
@@ -90,10 +94,15 @@ try{
  const before=JSON.parse(sql(a.home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`));
  assert.equal(before.tokens_used,37);assert.equal(before.time_used_seconds,19);
  a=await server(a.home);await a.request('thread/resume',{threadId:id});const sourceGoal=(await a.request('thread/goal/get',{threadId:id})).goal;assert.equal(sourceGoal.tokensUsed,37);assert.equal(sourceGoal.timeUsedSeconds,19);
- if(returnOriginal||checkRetirement)await a.request('thread/archive',{threadId:id});await a.stop();
+ if(returnOriginal||checkRetirement)await a.request('thread/archive',{threadId:id});if(!officialRetirement)await a.stop();
  if(restoreGoal)sql(a.home,`INSERT OR IGNORE INTO thread_goal_continuation_deferrals(thread_id) VALUES ('${id}');`);
- const firstRollout=returnOriginal||checkRetirement ? await archivedRollout(a.home,id):source.path;
- const b=await server(root+'/b'),destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(firstRollout,destination);assert.notEqual((await stat(firstRollout)).ino,(await stat(destination)).ino);
+ let firstRollout=returnOriginal||checkRetirement ? await archivedRollout(a.home,id):source.path;
+ const b=await server(root+'/b');
+ if(officialRetirement){
+  const retained=JSON.parse(execFileSync(transfer,['--official-retire',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:15000}));
+  assert.equal(retained.sourceWithdrawn,true);firstRollout=retained.retainedPath;
+ }
+ const destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(firstRollout,destination);assert.notEqual((await stat(firstRollout)).ino,(await stat(destination)).ino);
  let unselected,unselectedGoal;
  if(restoreGoal){
   unselected=(await b.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
@@ -119,7 +128,7 @@ try{
   console.error(JSON.stringify({stage:'first-transfer',sameUUID:true,exactGoalRow:true,publicGoal:true,unselectedGoal:true}));
   let expectedReturnTurns=source.turns;
   if(checkRetirement){
-   assert.equal(JSON.parse(execFileSync(transfer,['--record-retirement',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:10000})).nativeRetirementWitnessed,true);
+   assert.equal(JSON.parse(execFileSync(transfer,[officialRetirement?'--official-commit':'--record-retirement',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:10000})).nativeRetirementWitnessed,true);
    const originalRow=rowJSON(a.home),originalHistory=await readFile(firstRollout);
    const receipt=JSON.parse(execFileSync(transfer,['--backup-retired',a.home,b.home,id],{encoding:'utf8',timeout:10000}));
    assert.equal(receipt.retiredBackupVerified,true);assert.equal(receipt.goalReplacementPerformed,false);
@@ -151,7 +160,7 @@ try{
    else{sql(b.home,`UPDATE thread_goals SET tokens_used=73,time_used_seconds=29 WHERE thread_id='${id}';`);expectedReturnGoal={...sourceGoal,tokensUsed:73,timeUsedSeconds:29};}
   }
   const expectedReturnRow=rowJSON(b.home);
-  const c=await server(returnOriginal?a.home:root+'/c'),third=(await c.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
+  const c=officialRetirement?a:await server(returnOriginal?a.home:root+'/c'),third=(await c.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
   await c.request('thread/goal/set',{threadId:third,objective:'Third home unselected Goal',status:'paused',origin:'user'});
   const thirdGoal=(await c.request('thread/goal/get',{threadId:third})).goal;
   const relative=path.relative(a.home,source.path);assert.ok(!relative.startsWith('..'));
@@ -163,9 +172,16 @@ try{
   if(!returnOriginal)await copyFile(closedRollout,returning);
   if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:returnCleared?null:73}));
   if(returnOriginal&&checkRetirement){
-   const result=JSON.parse(execFileSync(transfer,['--return-goal',b.home,c.home,id,closedRollout],{encoding:'utf8',timeout:10000}));
+   if(publicationAckLoss){
+    let exited=false;
+    try{execFileSync(transfer,['--official-return-crash',b.home,c.home,id,closedRollout],{encoding:'utf8',timeout:20000});}
+    catch(error){assert.equal(error.status,84,'Owned helper must exit after exactly one durable publication rename');exited=true;}
+    assert.equal(exited,true);
+   }
+   const result=JSON.parse(execFileSync(transfer,[officialRetirement?'--official-return':'--return-goal',b.home,c.home,id,closedRollout],{encoding:'utf8',timeout:20000}));
    assert.equal(result.exactGoalReturned,true);assert.equal(result.nativeOwnershipCommitted,false);
    assert.equal(result.latestHistoryReturned,true);
+   if(officialRetirement)assert.equal(result.publicationRenameCount,1);
    console.error(JSON.stringify({stage:'goal-storage-return',exactGoalReturned:true,nativeOwnershipCommitted:false,clearedSource:returnCleared}));
    // The parent owns the only stdio connection and constructed all root-only
    // threads. This is not a discovery implementation for preexisting TUIs.
@@ -236,6 +252,7 @@ try{
    Object.assign(report,{retiredOwnerReturnVerified:true,journaledArchiveReturn:true,journaledNativeRestore:true,unarchiveRequests:1,resumeRequests:1,controllerRestarts:nativeRestoreResult.controllerRestarts,clearedGoalNotResurrected:returnCleared,returnGoal:expectedReturnGoal});
   }
   Object.assign(report,{ownedHomes:returnOriginal?2:3,goalPreserved:true,exactGoalInstanceAndMilliseconds:true,roundTrip:true,returnedToOriginalHome:returnOriginal,roundTripHistoryAndSettings:true,unselectedGoalAndServerPreserved:true,sourceWriterClosedBeforeReturn:true,deferralAfterNativeResume:Number(sql(c.home,`SELECT COUNT(*) FROM thread_goal_continuation_deferrals WHERE thread_id='${id}';`)),productMigrationEnabled:false});report.gap=null;
+  if(officialRetirement){assert.equal(c.pid,a.pid);assert.ok(a.alive());Object.assign(report,{officialRetirementJournalIntegrated:true,latestArchivePublished:true,sourceAndDestinationSharedServersNotRestarted:true,publicationRenameCount:1,publicationLostAckRecoveredWithoutReplay:publicationAckLoss});}
   if(checkClearedSlot){
    await c.request('thread/goal/clear',{threadId:id,origin:'user'});
    assert.equal((await c.request('thread/goal/get',{threadId:id})).goal,null);

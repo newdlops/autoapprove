@@ -2,7 +2,7 @@ import os,sys,pty,fcntl,termios,struct,select,json,base64,signal,time
 pid,fd=pty.fork()
 if pid==0:
  os.execv(sys.argv[1],sys.argv[1:])
-fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,int(os.environ.get('OWNED_APPROVAL_COLUMNS','120')),0,0))
 pending=b''
 try:
  while True:

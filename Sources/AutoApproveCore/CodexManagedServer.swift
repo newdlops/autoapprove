@@ -29,13 +29,14 @@ public struct CodexManagedServerServices:Sendable {
             return try await local(executable:runtime?.executable).prepare(home,records)
         })
     }
-    public static func local(userHome:String=NSHomeDirectory(),executable:String?=nil)->Self {
-        Self(inspect:{home,records in try await background {
-            let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records)
+    public static func local(userHome:String=NSHomeDirectory(),executable:String?=nil,
+                             verifyExecutable:(@Sendable (String) throws ->Void)?=nil)->Self {
+        let verify:@Sendable (String) throws ->Void=verifyExecutable ?? {try CodexOfficialExecutable.verify($0)}
+        return Self(inspect:{home,records in try await background {
+            let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records,verifyExecutable:verify,official:verifyExecutable==nil)
             return try client.inspect()
         }},prepare:{home,records in try await background {
-            try CodexNativeRuntimeRoot.prepare()
-            let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records)
+            let client=try CodexManagedServerClient(home:home,userHome:userHome,executable:executable,records:records,verifyExecutable:verify,official:verifyExecutable==nil)
             let before=try client.inspect()
             guard before.canPrepare else{return before}
             let enabled=try client.run(["features","enable","daemon_auto_start"])
@@ -68,11 +69,21 @@ public struct CodexManagedServerServices:Sendable {
 private struct CodexManagedServerClient {
     let home:String,userHome:String
     let context:CodexCLIContext?
+    let verifyExecutable:@Sendable (String) throws ->Void
+    let official:Bool
     var executable:String? {context?.executable}
-    init(home:String,userHome:String,executable:String?,records:[ProcessRecord]) throws {
+    init(home:String,userHome:String,executable:String?,records:[ProcessRecord],verifyExecutable:@escaping @Sendable (String) throws ->Void,official:Bool) throws {
         let canonicalHome=try CodexAccountTransitionTarget.canonicalHome(home)
         self.home=canonicalHome;self.userHome=userHome
-        context=try CodexCLIContext.resolve(home:canonicalHome,userHome:userHome,executable:executable,records:records)
+        self.verifyExecutable=verifyExecutable
+        self.official=official
+        let resolved=try CodexCLIContext.resolve(home:canonicalHome,userHome:userHome,executable:executable,records:records)
+        if official {context=try resolved.map{try CodexOfficialExecutable.context($0)}}
+        else {context=resolved}
+        if let context {
+            if !official {try verifyExecutable(context.executable)}
+            try context.verifyUnchanged()
+        }
     }
     func run(_ arguments:[String],timeout:TimeInterval=8) throws ->CommandResult {
         guard let context else {throw AppError.message("Codex CLI를 찾지 못했습니다.")}
@@ -132,6 +143,8 @@ private struct CodexManagedServerClient {
                   stat(managed,&managedInfo)==0,[getuid(),0].contains(managedInfo.st_uid) else {
                 return .init(phase:.unavailable,version:version,detail:"기존 서버의 버전·소켓 연결을 확인하지 못했습니다. 실행 중인 작업을 유지하고 Codex 설치 상태를 확인해주세요.")
             }
+            try verifyExecutable(managed)
+            if official {_ = try CodexOfficialExecutable.verifyServer(CodexQueueConnection(home:home))}
             return .init(phase:.running,version:version,detail:"이 홈의 관리형 Codex 서버가 실행 중입니다.",autoStartEnabled:try autoStart())
         }
         guard result.status != 0 else {

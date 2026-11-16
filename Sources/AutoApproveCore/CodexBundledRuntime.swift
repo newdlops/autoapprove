@@ -2,12 +2,20 @@ import Foundation
 import Darwin
 import CryptoKit
 
-/// Only the application's fixed resource location can select a bundled CLI.
-/// Profile files cannot supply an executable or a package manifest.
+/// Launch only bytes from the official release pinned in the signed app's
+/// resources. A runtime's own manifest cannot attest or select its executable.
 enum CodexBundledRuntime {
-    private struct Manifest:Decodable {
-        let format:Int,upstreamVersion:String,upstreamCommit:String,buildLabel:String,architecture:String
-        let binarySHA256:String,features:[String],nativeRuntimeSchemaVersion:Int
+    struct Release:Decodable,Sendable {
+        let format:Int
+        let version:String
+        let upstreamCommit:String
+        let architecture:String
+        let target:String
+        let files:[String:String]
+        static func bundled()throws->Self {
+            guard let url=Bundle.module.url(forResource:"CodexOfficialRelease",withExtension:"json") else{throw failure}
+            return try JSONDecoder().decode(Self.self,from:Data(contentsOf:url))
+        }
     }
     private struct Package:Decodable {let version:String,target:String,entrypoint:String}
     fileprivate struct Identity:Equatable,Sendable {
@@ -16,15 +24,17 @@ enum CodexBundledRuntime {
     }
     struct Installation:Sendable {
         let executable:String
-        let version="0.167.1"
-        fileprivate let identity:Identity
+        let version:String
+        fileprivate let identities:[String:Identity]
         func verifyUnchanged()throws {
-            let fd=try CodexBundledRuntime.file(executable)
-            defer{close(fd)}
-            var info=stat();guard fstat(fd,&info)==0,Identity(info)==identity else{throw CodexBundledRuntime.failure}
+            for (path,identity) in identities {
+                let fd=try CodexBundledRuntime.file(path)
+                defer{close(fd)}
+                var info=stat();guard fstat(fd,&info)==0,Identity(info)==identity else{throw failure}
+            }
         }
     }
-    private static var failure:AppError {.message("앱에 포함된 Codex 실행 파일의 버전·기능·지문을 확인하지 못했습니다. 기존 서버를 변경하지 않았습니다.")}
+    private static var failure:AppError {.message("공식 Codex 실행 파일과 리소스의 버전·지문을 확인하지 못했습니다. 앱을 다시 설치해주세요.")}
     static func bundled()throws->Installation? {
         guard let resources=Bundle.main.resourceURL else{return nil}
         let root=resources.appendingPathComponent("CodexRuntime",isDirectory:true).path
@@ -43,50 +53,49 @@ enum CodexBundledRuntime {
         guard fstat(fd,&info)==0,info.st_mode&S_IFMT==S_IFREG,[getuid(),0].contains(info.st_uid),info.st_mode&0o022==0 else{close(fd);throw failure}
         return fd
     }
-    private static func json<T:Decodable>(_ type:T.Type,path:String)throws->T {
-        let fd=try file(path);defer{close(fd)}
-        var info=stat();guard fstat(fd,&info)==0,(1...1_048_576).contains(info.st_size) else{throw failure}
-        let data=try FileHandle(fileDescriptor:fd,closeOnDealloc:false).read(upToCount:1_048_577) ?? Data()
-        guard data.count==info.st_size else{throw failure}
-        return try JSONDecoder().decode(type,from:data)
-    }
-    /// Internal validation seam; production callers always use bundled().
-    static func inspect(root:String)throws->Installation {
-        try directory(root);try directory(root+"/bin")
-        let manifest=try json(Manifest.self,path:root+"/manifest.json")
-        let package=try json(Package.self,path:root+"/codex-package.json")
+    /// The injected catalog is an internal fixture seam. Production always uses
+    /// the catalog packaged with AutoApprove, never data from the runtime tree.
+    static func inspect(root:String,release supplied:Release?=nil)throws->Installation {
+        let release=try supplied ?? Release.bundled()
         #if arch(arm64)
         let architecture="arm64",target="aarch64-apple-darwin"
         #else
         let architecture="x86_64",target="x86_64-apple-darwin"
         #endif
-        let required:Set<String>=["codex-app-server/autoapprove-goal-control","codex-app-server/autoapprove-native-inventory",
-                                  "codex-app-server/autoapprove-selected-transition","codex-tui/autoapprove-native-inventory"]
-        guard manifest.format==1,manifest.upstreamVersion=="0.167.1",manifest.architecture==architecture,
-              manifest.upstreamCommit=="0a94398fa60c4fac0e7659e4213a0a36e613dd46",
-              manifest.buildLabel=="autoapprove-managed-1671-2",manifest.nativeRuntimeSchemaVersion==1,
-              required.isSubset(of:manifest.features),manifest.features.count<=64,
-              manifest.binarySHA256.utf8.count==64,manifest.binarySHA256.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}),
-              package.version==manifest.upstreamVersion,package.target==target,package.entrypoint=="bin/codex" else{throw failure}
-        let executable=root+"/bin/codex",fd=try file(executable);defer{close(fd)}
-        var before=stat(),after=stat()
-        guard fstat(fd,&before)==0,(4...1_073_741_824).contains(before.st_size),before.st_mode&0o111 != 0 else{throw failure}
-        let handle=FileHandle(fileDescriptor:fd,closeOnDealloc:false)
-        var hash=SHA256(),tail=Data(),found=Set<Int>(),count=0
-        let markers=[manifest.buildLabel,"autoapprove-native-runtime-registration","autoapprove-native-tui-input-hold"].map{Data($0.utf8)}
-        while let chunk=try handle.read(upToCount:1_048_576),!chunk.isEmpty {
-            try Task.checkCancellation()
-            if count==0 {
-                let magic=chunk.prefix(4).reduce(UInt32(0)){($0<<8)|UInt32($1)}
-                guard [0xfeedface,0xcefaedfe,0xfeedfacf,0xcffaedfe,0xcafebabe,0xbebafeca,0xcafebabf,0xbfbafeca].contains(magic) else{throw failure}
+        guard release.format==1,release.architecture==architecture,release.target==target,
+              release.version.range(of:#"^\d+\.\d+\.\d+$"#,options:.regularExpression) != nil,
+              release.files["bin/codex"] != nil,release.files["codex-package.json"] != nil,
+              release.files.count<=16384 else{throw failure}
+        try directory(root)
+        var identities:[String:Identity]=[:],packageData:Data?
+        for (relative,expected) in release.files {
+            let parts=relative.split(separator:"/",omittingEmptySubsequences:false)
+            guard !relative.hasPrefix("/"),!relative.contains("\\"),!relative.contains("\0"),
+                  parts.allSatisfy({!$0.isEmpty && $0 != "." && $0 != ".."}),
+                  expected.count==64,expected.utf8.allSatisfy({(48...57).contains($0)||(97...102).contains($0)}) else{throw failure}
+            var parent=root
+            for part in parts.dropLast(){parent+="/"+part;try directory(parent)}
+            let path=root+"/"+relative,fd=try file(path)
+            defer{close(fd)}
+            var before=stat(),after=stat()
+            guard fstat(fd,&before)==0,(0...1_073_741_824).contains(before.st_size),
+                  relative != "bin/codex" || before.st_mode&0o111 != 0 else{throw failure}
+            let handle=FileHandle(fileDescriptor:fd,closeOnDealloc:false)
+            var hash=SHA256(),count=0,metadata=Data()
+            while let chunk=try handle.read(upToCount:1_048_576),!chunk.isEmpty {
+                try Task.checkCancellation()
+                count+=chunk.count;guard count<=before.st_size else{throw failure}
+                hash.update(data:chunk)
+                if relative=="codex-package.json" {guard count<=1_048_576 else{throw failure};metadata.append(chunk)}
             }
-            count+=chunk.count;guard count<=before.st_size else{throw failure};hash.update(data:chunk)
-            var scanned=tail;scanned.append(chunk)
-            for (index,marker) in markers.enumerated() where scanned.range(of:marker) != nil{found.insert(index)}
-            tail=Data(scanned.suffix(256))
+            guard count==before.st_size,fstat(fd,&after)==0,Identity(before)==Identity(after),
+                  hash.finalize().map({String(format:"%02x",$0)}).joined()==expected else{throw failure}
+            identities[path]=Identity(before)
+            if relative=="codex-package.json" {packageData=metadata}
         }
-        guard count==before.st_size,found.count==markers.count,fstat(fd,&after)==0,Identity(before)==Identity(after),
-              hash.finalize().map({String(format:"%02x",$0)}).joined()==manifest.binarySHA256 else{throw failure}
-        return Installation(executable:executable,identity:Identity(before))
+        guard let packageData else{throw failure}
+        let package=try JSONDecoder().decode(Package.self,from:packageData)
+        guard package.version==release.version,package.target==target,package.entrypoint=="bin/codex" else{throw failure}
+        return Installation(executable:root+"/bin/codex",version:release.version,identities:identities)
     }
 }

@@ -10,6 +10,10 @@ import AutoApproveCore
     @State private var preparing=false
     @State private var error:String?
     var body:some View {
+        if !CodexFeatureSupport.canMoveOpenSessions {CodexSessionMoveUnavailableView(close:close)}
+        else {supportedContent}
+    }
+    @ViewBuilder private var supportedContent:some View {
         if let home {
             CodexSessionMoveView(engine:engine,source:source,independentDestination:home,close:close)
         }else {

@@ -23,6 +23,8 @@ int aa_native_peer_from_socket(int fd, aa_native_peer_identity *identity) {
     identity->effective_uid = audit_token_to_euid(token);
     identity->effective_gid = audit_token_to_egid(token);
     identity->audit_pid_version = version;
+    _Static_assert(sizeof(identity->audit_token) == sizeof(token), "audit token size changed");
+    memcpy(identity->audit_token, &token, sizeof(token));
     return 0;
 }
 

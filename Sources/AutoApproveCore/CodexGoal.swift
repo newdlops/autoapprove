@@ -112,6 +112,24 @@ public struct CodexGoalTransport:Sendable {
         }
         return goal
     }
+    /// The official API exposes child Goals but omits their instance UUID.
+    /// Bracket the API read with read-only records so a concurrent delete/create
+    /// cannot bind an old response to a new Goal with the same text and timestamp.
+    static func readWithIdentity(_ connection:CodexQueueConnection,home:String,threadID:String)throws->CodexGoal? {
+        let before=Result {try readDatabase(home:home,threadID:threadID)}
+        let current=try decode(connection.request("thread/goal/get",["threadId":threadID]),threadID:threadID)
+        guard let current else{return nil}
+        return try identify(current,before:before.get(),after:readDatabase(home:home,threadID:threadID))
+    }
+    static func identify(_ current:CodexGoal,before:CodexGoal?,after:CodexGoal?)throws->CodexGoal {
+        guard let before,let after,let instance=before.instanceID,UUID(uuidString:instance) != nil,
+              after.instanceID==instance,before.revision==after.revision,
+              current.threadId==after.threadId,current.createdAt==after.createdAt,
+              current.objective==after.objective,current.status==after.status,current.tokenBudget==after.tokenBudget else {
+            throw AppError.message("조회 중 Goal의 식별자 또는 상태가 바뀌었습니다. 현재 Goal을 다시 확인해주세요.")
+        }
+        var result=current;result.instanceID=instance;return result
+    }
     static func decode(_ result:JSONObject,threadID:String) throws -> CodexGoal? {
         // The official optional goal field may be omitted when no goal exists.
         guard let value=result["goal"] else {return nil}

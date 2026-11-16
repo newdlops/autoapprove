@@ -1,5 +1,5 @@
 import Foundation
-import AutoApproveCore
+@testable import AutoApproveCore
 import CSQLite
 
 private final class AttachmentTimeline:@unchecked Sendable {
@@ -47,7 +47,7 @@ private final class AttachmentTimeline:@unchecked Sendable {
             guard let process=rows.first(where:{$0.key==original.id}),let shell=rows.first(where:{$0.pid==probes[i].descriptor.pid}) else{throw AppError.message("Owned shell missing")}
             var plan=CodexSessionAttachment(context:.init(session:original,process:process,shell:shell,conversationID:ids[i]),home:home)
             plan.goalBeforePause=try CodexGoalTransport.readDatabase(home:home,threadID:ids[i]);plan.phase = .review
-            plan.detail="자동 연결 보류: Mac 연결 설정의 ‘직접 입력 연결’을 확인해주세요. 새 연결은 macOS 로그인 항목 설정에서 허용하며 원래 CLI를 유지합니다."
+            plan.detail="자동 연결 보류: "+TerminalDeviceInput.unavailableBeforeInputMessage
             journal[original.id]=plan
         }
         try store.set("codexSessionAttachments",String(decoding:JSONEncoder().encode(journal),as:UTF8.self))
@@ -71,6 +71,7 @@ private final class AttachmentTimeline:@unchecked Sendable {
         })
         let setup=CodexManagedServerServices(inspect:{_,_ in .init(phase:.running,version:"0.166.0",detail:"Owned shared server",autoStartEnabled:true)},prepare:{_,_ in throw AppError.message("Unexpected daemon setup")})
         let engine=try ApprovalEngine(paths:paths,processReader:{first.read()},screenAdapters:[.terminal:first.adapter()],codexAccountTransitions:services,codexAccountTargets:{try await CodexAccountTransitionTarget.discover($0)},codexManagedServers:setup)
+        engine.codexAttachmentRuntime={try await ownedAttachmentRuntime($0,$1,$2)}
         defer{engine.stop()}
         await engine.refresh();await engine.connectScreenHost(.terminal)
         for original in originals {try engine.setAutomatic(original.id,enabled:true);engine.receiveScreen(sessionID:original.id,raw:first.screen(original.tty),generation:"owned",source:.terminalScreen)}

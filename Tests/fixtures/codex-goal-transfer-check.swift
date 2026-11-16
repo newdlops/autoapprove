@@ -4,6 +4,7 @@ import Foundation
     static func main() {
         do {
             let a=CommandLine.arguments
+            if try OfficialMigrationStorage.run(a){return}
             if a.count==5,a[1]=="--native-restore" {try NativeReturnBridge.run(a);return}
             if a.count==6,a[1]=="--return-goal" {
                 guard a[2].hasPrefix("/private/tmp/aa-cross-home-"),a[3].hasPrefix("/private/tmp/aa-cross-home-") else{throw AppError.message("Owned return homes required")}

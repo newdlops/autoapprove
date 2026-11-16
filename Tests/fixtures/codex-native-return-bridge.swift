@@ -45,7 +45,7 @@ enum NativeReturnBridge {
         guard args.count==5,args[2].hasPrefix("/private/tmp/aa-cross-home-"),args[3].hasPrefix("/private/tmp/aa-cross-home-") else{throw AppError.message("Owned native restoration homes required")}
         let lines=Lines(),context=try lines.read(),sourceHome=args[2],destinationHome=args[3],threadID=args[4]
         guard let serverID=context["serverID"] as? String,let cliVersion=context["cliVersion"] as? String,
-              ["0.166.0","0.167.1"].contains(cliVersion),let relative=context["sessionRelativePath"] as? String,
+              ["0.166.0","0.167.1","0.169.0"].contains(cliVersion),let relative=context["sessionRelativePath"] as? String,
               let history=context["history"] as? [Any],let sourceSettings=context["settings"] as? JSONObject else{throw AppError.message("Owned native context missing")}
         let store=try AuditStore(path:URL(fileURLWithPath:sourceHome).deletingLastPathComponent().appendingPathComponent("retirement-audit.sqlite").path)
         let journal=try CodexMigrationJournal(store:store)
@@ -61,7 +61,7 @@ enum NativeReturnBridge {
                   saved.threads[0].historyDigest == (try digest(history)),saved.threads[0].settingsDigest == (try settings(sourceSettings)) else{throw AppError.message("Owned restart context changed")}
             plan=saved
         }else{
-            let archive=try CodexMigrationRolloutWitness.capture(home:destinationHome,homeIdentity:old.goal.homeIdentity,relative:old.rollout.relativePath)
+            let archive=try CodexMigrationRolloutWitness.capture(home:destinationHome,homeIdentity:old.goal.homeIdentity,relative:old.originalArchivePath)
             let identity=CodexNativeReturnServer(home:destinationHome,homeIdentity:old.goal.homeIdentity,serverID:serverID,cliVersion:cliVersion)
             let entry=CodexNativeReturnThread(source:source,archive:archive,sessionRelativePath:relative,historyDigest:try digest(history),settingsDigest:try settings(sourceSettings),previousOwner:goal.backup.currentOwner)
             plan = .init(rootID:threadID,server:identity,threads:[entry])

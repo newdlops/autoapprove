@@ -181,7 +181,7 @@ enum AutomationScript {
     }
 }
 
-public enum TerminalDelivery: String, Codable { case sent, screenChanged, missingTarget, agentMissing }
+public enum TerminalDelivery: String, Codable, Sendable { case sent, screenChanged, missingTarget, agentMissing }
 
 public struct TerminalWindowBounds: Codable, Equatable, Sendable {
     public let x: Double

@@ -9,11 +9,33 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <termios.h>
+#include <poll.h>
 #include <sqlite3.h>
 static int busy_goal=0,paused_goal=0;
 static void pause_goal(void){char path[4096];snprintf(path,sizeof(path),"%s/goals_1.sqlite",getenv("CODEX_HOME"));sqlite3 *db=NULL;if(sqlite3_open(path,&db)==SQLITE_OK){sqlite3_stmt *stmt=NULL;if(sqlite3_prepare_v2(db,"UPDATE thread_goals SET status='paused',updated_at_ms=120000 WHERE status='active' AND thread_id=?",-1,&stmt,NULL)==SQLITE_OK){sqlite3_bind_text(stmt,1,getenv("EXPECTED_THREAD"),-1,SQLITE_TRANSIENT);sqlite3_step(stmt);}sqlite3_finalize(stmt);}if(db)sqlite3_close(db);busy_goal=0;paused_goal=1;}
 static void ready(void);
-static char *input_line(char *line,size_t size){size_t n=0;for(;;){int c=getchar();if(c==EOF)return NULL;if(c==27&&busy_goal){if(getenv("IGNORE_GOAL_PAUSE"))continue;pause_goal();fputs("\033[2J\033[H",stdout);ready();continue;}if(n+1<size)line[n++]=(char)c;if(c=='\n'||c=='\r'){line[n-1]='\n';line[n]=0;return line;}}}
+static char *input_line(char *line,size_t size){
+    size_t n=0;
+    for(;;){
+        int c=getchar();if(c==EOF)return NULL;
+        if(c==27){
+            // Production messages use bracketed paste. Only a standalone Esc
+            // interrupts a Goal; paste delimiters must not pause or enter text.
+            struct pollfd input={.fd=STDIN_FILENO,.events=POLLIN};
+            if(poll(&input,1,30)>0){
+                char sequence[16]={0};size_t count=0;
+                do {c=getchar();if(c==EOF)return NULL;sequence[count++]=(char)c;}
+                while(count<sizeof(sequence)-1 && c!='~');
+                if(strcmp(sequence,"[200~") && strcmp(sequence,"[201~"))return NULL;
+                continue;
+            }
+            if(busy_goal&&!getenv("IGNORE_GOAL_PAUSE")){pause_goal();fputs("\033[2J\033[H",stdout);ready();}
+            continue;
+        }
+        if(n+1<size)line[n++]=(char)c;
+        if(c=='\n'||c=='\r'){line[n-1]='\n';line[n]=0;return line;}
+    }
+}
 static pid_t tool_child=-1,extra_tool=-1;
 static void linger(int sig){alarm(3);}
 static pid_t spawn_tool(const char *tool){pid_t child=fork();if(child==0){setpgid(0,0);execl(tool,tool,"--fixture-tool-host",NULL);_exit(23);}return child;}
@@ -34,7 +56,10 @@ int main(int argc,char **argv) {
     signal(SIGHUP,cleanup);signal(SIGTERM,cleanup);
     const char *tool=getenv("TOOL_HOST_PATH");
     if(tool&&*tool){tool_child=spawn_tool(tool);if(tool_child<0)return 24;}
-    if(argc==1&&getenv("FIXTURE_ACTIVE_GOAL")){busy_goal=!getenv("FIXTURE_GOAL_IDLE")&&!getenv("FIXTURE_GOAL_PAUSED");paused_goal=getenv("FIXTURE_GOAL_PAUSED")!=NULL;struct termios mode;if(tcgetattr(0,&mode)==0){mode.c_lflag &= ~ICANON;mode.c_cc[VMIN]=1;mode.c_cc[VTIME]=0;tcsetattr(0,TCSANOW,&mode);}}
+    if(argc==1&&getenv("FIXTURE_ACTIVE_GOAL")){busy_goal=!getenv("FIXTURE_GOAL_IDLE")&&!getenv("FIXTURE_GOAL_PAUSED");paused_goal=getenv("FIXTURE_GOAL_PAUSED")!=NULL;}
+    struct termios original_mode;int has_mode=tcgetattr(0,&original_mode)==0;
+    if(has_mode){struct termios mode=original_mode;mode.c_lflag &= ~(ICANON|ECHO);mode.c_cc[VMIN]=1;mode.c_cc[VTIME]=0;tcsetattr(0,TCSANOW,&mode);}
+    setvbuf(stdin,NULL,_IONBF,0);
     FILE *out=fopen(getenv("READY_FILE"),"w");if(!out)return 15;fprintf(out,"%d %d\n",getpid(),argc);fclose(out);ready();
     char line[4096];while(input_line(line,sizeof(line))){
         if(!strcmp(line,"/exit\n"))break;
@@ -49,5 +74,6 @@ int main(int argc,char **argv) {
     }
     if(extra_tool>0){kill(extra_tool,SIGTERM);waitpid(extra_tool,NULL,0);}
     if(tool_child>0){if(getenv("LINGER_TOOL_HOST_AFTER_EXIT"))kill(tool_child,SIGUSR1);else{kill(tool_child,SIGTERM);waitpid(tool_child,NULL,0);}}
+    if(has_mode)tcsetattr(0,TCSANOW,&original_mode);
     if(fd>=0)close(fd);close(metadata);return 0;
 }

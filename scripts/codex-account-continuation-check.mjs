@@ -6,8 +6,8 @@ import {unlinkSync,symlinkSync} from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import {coreLinkArguments,coreSwiftObjects} from './swift-core-link.mjs';
-const require=createRequire(import.meta.url),module=process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright');
-const ws=require(path.join(path.dirname(module),'../playwright-core/lib/utilsBundle.js'));
+const require=createRequire(import.meta.url),module=process.env.AUTOAPPROVE_WEBSOCKET_MODULE ? null:process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||require.resolve('playwright');
+const ws=module ? require(path.join(path.dirname(module),'../playwright-core/lib/utilsBundle.js')):{wsServer:require(process.env.AUTOAPPROVE_WEBSOCKET_MODULE).WebSocketServer};
 const build=path.resolve(process.env.AUTOAPPROVE_CHECK_BUILD||'.build/debug');
 const directory=await mkdtemp('/private/tmp/aa-account-continue-'),cli=directory+'/codex';
 const ids=[1,2,3].map(v=>'00000000-0000-4000-8000-'+String(v).padStart(12,'0'));
@@ -72,7 +72,7 @@ for await(const line of readline.createInterface({input:process.stdin})){const m
  }
  await symlink(directory+'/daemon-1.sock',directory+'/app-server-control/app-server-control.sock');
  const blocked=['account','server'].includes(mode),scenario=blocked?'blocked':lostAck?'lost-ack':mode==='completed'?'completed':mode?'skip':'normal';
- child=spawn(directory+'/check',[directory,cli,scenario],{stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',c=>output+=c);child.stderr.on('data',c=>error+=c);
+ child=spawn(directory+'/check',[directory,cli,scenario],{env:{HOME:directory,ZDOTDIR:directory,PATH:'/usr/bin:/bin'},stdio:['ignore','pipe','pipe']});let output='',error='';child.stdout.on('data',c=>output+=c);child.stderr.on('data',c=>error+=c);
  const status=await new Promise(resolve=>child.once('exit',resolve));assert.equal(status,0,error.slice(0,1800));
  assert.equal(JSON.parse(output).verified,true);assert.equal(goalPauses,1);assert.equal(goalResumes,blocked||mode&&mode!=='completed'?0:1);assert.equal(ordinaryResumes,blocked||mode==='completed'?0:1);assert.equal(loads,offscreen&&mode!=='completed'?1:0);
  console.log(JSON.stringify({verified:true,goalResumes,ordinaryResumes,idlePausedControlUntouched:!active[2],offscreen,mode,lostAck,loads,noConfigOverrides:true,noDuplicateOnRestore:true}));

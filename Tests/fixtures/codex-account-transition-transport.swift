@@ -1,11 +1,12 @@
 import Foundation
-import AutoApproveCore
+@testable import AutoApproveCore
 
 @main struct AccountTransitionTransportCheck {
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
         var target = CodexAccountTransitionTarget(home: args[1], executable: args[2])
-        let mode = args[3], service = CodexAccountTransitionServices.live
+        let mode = args[3]
+        let service = mode.hasPrefix("official-") ? CodexAccountTransitionServices.live:CodexAccountTransitionServices.local(verifyExecutable:{_ in})
         if mode == "official-lifecycle" || mode == "official-recovery" {
             let recovery=mode == "official-recovery"
             guard target.home.hasPrefix("/private/tmp/aa-account-real-cli-"), args.count == 6,
