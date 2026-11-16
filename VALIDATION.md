@@ -1,3 +1,11 @@
+## 0.2.311 · OS 권한창 검사와 그룹 보고 반복 비용
+
+- 원인 측정: 0.2.310 설치본을 30초 표본으로 보았을 때 바쁜 표본 1,071건 가운데 373건이 `OSPermissionAutomation.scan`이었다. 그 안에서 `SecCodeCopyGuestWithAttributes`와 `SecStaticCode` 서명 검증, `NSRunningApplication`의 번들 ID와 PID 조회(LaunchServices)가 대부분이었다.
+- 서명 검증 결과를 재사용한 빌드에서 이 검사의 표본은 179건, Apple 소유 앱 9종만 번들 ID로 찾도록 바꾼 빌드에서 25건이었다. 버튼을 누르는 `approve`와 `respond`는 소유 앱을 재사용 결과 없이 다시 검증한다.
+- 남은 표본에서 `SessionGroupStore.load()`가 2초마다 반복되는 그룹 보고 전달에서 나왔다. 수신 확인되지 않은 보고 12건(그룹장 세션이 실행 중이 아님)을 건마다 다시 읽고 수신함 쓰기 트랜잭션을 열었다. 그룹 파일을 반복마다 한 번 읽고, 이미 수신함에 저장된 미확인 보고는 수신함 재시도에 맡기도록 바꿨다. 보고 12건은 지우거나 바꾸지 않았다.
+- Debug 전체 회귀 **279/279**, OS 권한 검사 14/14, 그룹 검사 36/36 통과.
+- 설치본 앱 CPU: 0.2.310 60초 2.65초(4.4%), 변경 후 120초 측정 세 번 2.34초, 2.26초, 2.62초(약 2%). 측정 중 부하 평균은 11~128이었다.
+
 ## 0.2.310 · 세션별 화면 읽기 간격
 
 - 원인 측정: 0.2.309에서 Claude 세션 24개 가운데 1개가 입력창 초안(.input) 상태일 때 Terminal 내용 읽기가 30초에 1,392건이었다. tccd 로그에서 Terminal(sender)의 `TCCAccessRequestIndirect`가 10초에 460건, 대상은 모두 AutoApproveApp이었고 tccd CPU는 약 30%였다. Terminal 샘플에서 AppleEvent 처리 스레드가 TCC 응답을 기다렸다.
