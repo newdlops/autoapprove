@@ -1,3 +1,12 @@
+## 0.2.310 · 세션별 화면 읽기 간격
+
+- 원인 측정: 0.2.309에서 Claude 세션 24개 가운데 1개가 입력창 초안(.input) 상태일 때 Terminal 내용 읽기가 30초에 1,392건이었다. tccd 로그에서 Terminal(sender)의 `TCCAccessRequestIndirect`가 10초에 460건, 대상은 모두 AutoApproveApp이었고 tccd CPU는 약 30%였다. Terminal 샘플에서 AppleEvent 처리 스레드가 TCC 응답을 기다렸다.
+- 읽기 전 권한 확인(`AEDeterminePermissionToAutomateTarget`)은 appleeventsd가 처리하며 tccd 요청을 만들지 않아 변경하지 않았다.
+- 세션별 간격 계산과 due 선택, 다음 대기 시간을 순수 함수로 분리했다. 24개 탭을 10초 동안 모의 실행하면 질문 탭은 18~22회, 작업 탭 4~5회, 대기 탭 3~4회를 읽고 전체 120회 이하·25회 이하의 읽기 묶음으로 끝난다. 초안 2초, 질문이 함께 있으면 0.5초, 수동 4초, 입력 중 0.35초를 확인했다.
+- Debug 전체 회귀 **279/279** 통과.
+- 설치 후 실측(탭 24개, 초안 2~3개): 세션별 간격만 적용한 빌드에서 30초에 Terminal TCC 확인 218건, 초안 2초 간격을 더한 0.2.310에서 84건. AutoApproveApp CPU 1~2%, tccd 5초 간격 표본 0~10%(평균 수 %).
+- 실제 터미널에 시험 입력을 보내거나 CLI를 재시작하지 않았다.
+
 ## 0.2.309 · Claude 사용자 상태 줄과 수신함 알림
 
 - Release 전체 회귀 **272/272**, Debug·Release IP 통신 차단 그룹 검사 **36/36**, MCP stdio 발신자 식별·소켓 재연결 검사가 통과했다.

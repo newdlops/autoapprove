@@ -312,6 +312,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var historyPollTask: Task<Void, Never>?
     private var screenPollTasks: [ScreenHost: Task<Void, Never>] = [:]
     private var unchangedScreenReads: [ScreenHost: Int] = [:]
+    // Each session keeps its own monitor cadence. One question screen must not
+    // make every other tab of the same host read at the question cadence:
+    // every Terminal read is an Apple Event that Terminal checks with tccd.
+    private var screenReadAt: [String: TimeInterval] = [:]
+    private var unchangedSessionReads: [String: Int] = [:]
+    private var screenReadSucceeded: Set<String> = []
     private var observationEpoch: UInt64 = 0
     private let historyPollSignal = RemoteTerminalChangeSignal()
     private let screenPollSignals = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, RemoteTerminalChangeSignal()) })
@@ -4473,34 +4479,44 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return result
     }
 
-    private func screenPollInterval(_ host: ScreenHost, targets: [AgentSession]) -> TimeInterval {
+    /// Monitor cadence of each session, from that session's own state. A host
+    /// pass reads only the sessions whose cadence is due, so an approval or
+    /// question screen in one tab keeps its 0.5-second cadence while idle tabs
+    /// stay at three seconds.
+    private func screenReadIntervals(_ host: ScreenHost, targets: [AgentSession]) -> [String: TimeInterval] {
         guard !targets.isEmpty, screenConnections[host]?.enabled == true,
-              screenConnections[host]?.permissionBlocked != true else { return 8 }
-        var priorityInput = false, automatic = false, waitingForModel = false
-        var approval = false, interrupted = false, active = false
+              screenConnections[host]?.permissionBlocked != true else {
+            return Dictionary(targets.map { ($0.id, 8) }, uniquingKeysWith: min)
+        }
         let now = Date()
         // The slow part of automaticInputBusy is scanning pendingActions for a
         // matching session. Index those few actions once instead of doing that
         // search once per terminal target.
         let pendingActionSessions = Set(pendingActions.values.lazy.map(\.sessionID))
+        var result: [String: TimeInterval] = [:]
+        result.reserveCapacity(targets.count)
         for target in targets {
             let id = target.id
             let hasPriorityInput = remoteInputSessions.contains(id) || remoteInputUntil[id].map { now < $0 } == true
             let hasAutomaticInput = automaticInputSessions.contains(id) || systemSafetyTasks[id] != nil ||
                 capacityStates[id]?.phase == .sending || pendingActionSessions.contains(id)
-            priorityInput = priorityInput || hasPriorityInput || hasAutomaticInput
-            automatic = automatic || effectiveAutomatic(target.id)
-            approval = approval || target.phase == .approval || target.phase == .input
-            interrupted = interrupted || target.interruption?.needsAttention == true
-            active = active || target.phase == .working || target.phase == .unknown
-            if let capacity = capacityStates[target.id], capacity.phase == .waiting,
-               capacity.deadline.timeIntervalSince(now) <= 2 { waitingForModel = true }
+            // An unsent composer draft is .input without any pending request
+            // or question. Nothing can be approved until the user sends it, so
+            // it reads every 2 s; phone input keeps the 0.35-second cadence.
+            let draftOnly = target.phase == .input && !target.pendingInTerminal && target.pendingRequestID == nil &&
+                target.pendingSummary == nil && !target.questions.contains { $0.needsAnswer || $0.reply?.phase == .sending }
+            let interval = RemoteTerminalPolling.sessionInterval(
+                priorityInput: hasPriorityInput || hasAutomaticInput,
+                automatic: !snapshot.paused && effectiveAutomatic(id),
+                awaitingAnswer: target.phase == .approval || (target.phase == .input && !draftOnly) ||
+                    capacityStates[id].map({ $0.phase == .waiting && $0.deadline.timeIntervalSince(now) <= 2 }) == true,
+                composerDraft: draftOnly,
+                interrupted: target.interruption?.needsAttention == true,
+                active: target.phase == .working || target.phase == .unknown,
+                unchangedReads: unchangedSessionReads[id] ?? 0)
+            result[id] = min(result[id] ?? interval, interval)
         }
-        if priorityInput { return 0.35 }
-        if snapshot.paused || !automatic { return 4 }
-        if approval || waitingForModel { return 0.5 }
-        if interrupted { return 2 }
-        return active ? RemoteTerminalPolling.activeScreenInterval(unchangedReads: unchangedScreenReads[host] ?? 0) : 3
+        return result
     }
 
     private func startObservationPolling() {
@@ -4531,8 +4547,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let observation = screenPollSignals[host]?.observe() else { continue }
             screenPollTasks[host] = Task { [weak self] in
                 await observation.waitForChange(timeout: 0)
+                var seenRevision: UInt64?
                 while !Task.isCancelled, let self, !self.remoteInputStopped {
-                    let started = ProcessInfo.processInfo.systemUptime
                     guard self.screenConnections[host]?.enabled == true,
                           self.screenConnections[host]?.permissionBlocked != true else {
                         await observation.waitForChange()
@@ -4548,11 +4564,34 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         await observation.waitForChange()
                         continue
                     }
-                    await self.refreshScreenHost(host, reportConnecting:false, targets:targets)
+                    // A poll signal (session list, automation, permission or
+                    // viewer change) reads every tab once, as before. Timer
+                    // passes read only the sessions whose own cadence is due.
+                    let revision = self.screenPollSignals[host]?.revision
+                    let signalled = revision != seenRevision
+                    seenRevision = revision
+                    if signalled { for target in targets { self.unchangedSessionReads[target.id] = 0 } }
+                    let started = ProcessInfo.processInfo.systemUptime
+                    let intervals = self.screenReadIntervals(host, targets: targets)
+                    let due = signalled ? targets.map(\.id) : RemoteTerminalPolling.dueTargets(targets.map(\.id),
+                        intervals: intervals, lastRead: self.screenReadAt, now: started)
+                    if !due.isEmpty {
+                        let ids = Set(due)
+                        await self.refreshScreenHost(host, reportConnecting:false,
+                            targets: targets.filter { ids.contains($0.id) }, hostTargets: targets)
+                        // A read slower than a session's cadence waits one
+                        // full interval after completion instead of starting
+                        // the next expensive native read at once.
+                        let finished = ProcessInfo.processInfo.systemUptime
+                        for id in due where (self.screenReadAt[id] ?? 0) >= started && finished - started >= (intervals[id] ?? 0) {
+                            self.screenReadAt[id] = finished
+                        }
+                    }
                     let currentTargets = self.pollingTargets(host)
-                    let cadence = self.screenPollInterval(host, targets: currentTargets)
-                    let elapsed = ProcessInfo.processInfo.systemUptime - started
-                    await observation.waitForChange(timeout: RemoteTerminalPolling.delayAfterRead(interval: cadence, elapsed: elapsed))
+                    let delay = RemoteTerminalPolling.nextReadDelay(currentTargets.map(\.id),
+                        intervals: self.screenReadIntervals(host, targets: currentTargets), lastRead: self.screenReadAt,
+                        now: ProcessInfo.processInfo.systemUptime)
+                    await observation.waitForChange(timeout: delay)
                 }
             }
         }
@@ -5171,6 +5210,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             unchangedScreenReads[host] = 0
             screenPollSignals[host]?.notify()
         }
+        if previousPolling != nextPolling {
+            let monitored = Set(nextPolling.values.flatMap { $0.map(\.sessionID) })
+            screenReadAt = screenReadAt.filter { monitored.contains($0.key) }
+            unchangedSessionReads = unchangedSessionReads.filter { monitored.contains($0.key) }
+            screenReadSucceeded.formIntersection(monitored)
+        }
         if previousCodex != liveCodex {
             readableQuestionSessions.formIntersection(liveCodex)
             questionThreadBySession = questionThreadBySession.filter { liveCodex.contains($0.key) }
@@ -5412,8 +5457,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         _ = await refreshScreenHost(host, reportConnecting:reportConnecting, targets:nil)
     }
 
+    /// `targets` are read now; `hostTargets` are all of the host's monitored
+    /// sessions, so the health line still counts tabs read on an earlier pass.
     @discardableResult
-    private func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool, targets suppliedTargets: [AgentSession]?) async -> Bool? {
+    private func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool, targets suppliedTargets: [AgentSession]?,
+                                   hostTargets: [AgentSession]? = nil) async -> Bool? {
         guard !remoteInputStopped, let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
               Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return nil }
         screenConnections[host]?.polling = true
@@ -5432,6 +5480,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         do {
             let reader = adapter.screens
             let readStartedAt = Date()
+            let readStartedUptime = ProcessInfo.processInfo.systemUptime
             var sharedScreens: [String: TerminalScreen] = [:]
             var sharedDates: [String: Date] = [:]
             let sharedPermission: Bool
@@ -5544,8 +5593,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let hasLiveViewer = targets.contains { remoteTerminalChanges[$0.id]?.hasObservers == true }
             unchangedScreenReads[host] = unchanged && !hasLiveViewer
                 ? min(unchangedScreenReads[host, default: 0] + 1, 16) : 0
+            for target in targets {
+                screenReadAt[target.id] = readStartedUptime
+                let read = screensByTTY[target.tty] != nil
+                if read { screenReadSucceeded.insert(target.id) } else { screenReadSucceeded.remove(target.id) }
+                let stable = read && !changedIDs.contains(target.id) && remoteTerminalChanges[target.id]?.hasObservers != true
+                unchangedSessionReads[target.id] = stable ? min((unchangedSessionReads[target.id] ?? 0) + 1, 16) : 0
+            }
+            let readIDs = Set(targets.map(\.id))
+            let earlier = (hostTargets ?? []).filter { !readIDs.contains($0.id) }
             let connected = targets.reduce(into: 0) { if screensByTTY[$1.tty] != nil { $0 += 1 } }
-            let missing = targets.count - connected
+                + earlier.reduce(into: 0) { if screenReadSucceeded.contains($1.id) { $0 += 1 } }
+            let missing = targets.count + earlier.count - connected
             updateHealth(host) { health in
                 health.connected = connected > 0 || targets.isEmpty
                 if connected > 0 {
@@ -5626,6 +5685,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             publish()
             unchangedScreenReads[host] = 0
+            // After a failed host read, the next successful pass reads every tab.
+            for target in targets { screenReadSucceeded.remove(target.id); unchangedSessionReads[target.id] = 0 }
+            screenPollSignals[host]?.notify()
             return nil
         }
     }

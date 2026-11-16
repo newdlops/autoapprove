@@ -508,6 +508,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Presentation heartbeat: raw freshness, real changes and question lifecycle", tests.testPresentationHeartbeatPreservesStateAndNotificationTransitions),
             ("Presentation heartbeat: group identity and connection changes", tests.testGroupPresentationKeepsFreshIdentitiesAndConnectionChanges),
             ("App updates: GitHub checks, persisted opt-out and isolation", tests.testGitHubAppUpdatePreferencesAndChecks),
+            ("Monitoring: screen polling cadence is per session",tests.testScreenPollingCadenceIsPerSession),
             ("Session groups: offline reconnect uses original terminal",tests.testGroupOfflineReconnectUsesOriginalTerminal),
             ("Session groups: offline self reconnect preserves drafts",tests.testGroupOfflineSelfReconnectProtectsDrafts),
             ("Session groups: offline bidirectional peer messages stay local",tests.testGroupOfflinePeerMessagesUseLocalTerminals),

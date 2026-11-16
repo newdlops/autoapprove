@@ -105,4 +105,40 @@ public enum RemoteTerminalPolling {
         let stableReads = min(4, max(0, unchangedReads - 2))
         return 1.5 + Double(stableReads) * 0.25
     }
+
+    /// Monitor cadence of one session. These are the former host-wide values,
+    /// now applied per session: input in flight 0.35 s, manual or paused 4 s,
+    /// approval, a question or a model wait 0.5 s, an unsent composer draft
+    /// 2 s, interruption 2 s, active output 1.5-2.5 s and idle 3 s.
+    public static func sessionInterval(priorityInput: Bool, automatic: Bool, awaitingAnswer: Bool,
+                                       composerDraft: Bool = false, interrupted: Bool, active: Bool,
+                                       unchangedReads: Int) -> TimeInterval {
+        if priorityInput { return 0.35 }
+        if !automatic { return 4 }
+        if awaitingAnswer { return 0.5 }
+        if composerDraft || interrupted { return 2 }
+        return active ? activeScreenInterval(unchangedReads: unchangedReads) : 3
+    }
+
+    /// Sessions whose own cadence is due. A session due within a quarter of
+    /// its interval (at most 0.25 s) joins this pass, so neighbouring cadences
+    /// share one native read instead of waking the poller twice.
+    public static func dueTargets(_ ids: [String], intervals: [String: TimeInterval],
+                                  lastRead: [String: TimeInterval], now: TimeInterval) -> [String] {
+        ids.filter { id in
+            guard let last = lastRead[id] else { return true }
+            let interval = intervals[id] ?? 3
+            return now - last >= interval - min(0.25, interval / 4)
+        }
+    }
+
+    /// Time until the next session becomes due, kept between 0.1 and 8 s.
+    public static func nextReadDelay(_ ids: [String], intervals: [String: TimeInterval],
+                                     lastRead: [String: TimeInterval], now: TimeInterval) -> TimeInterval {
+        let next = ids.map { id -> TimeInterval in
+            guard let last = lastRead[id] else { return 0 }
+            return last + (intervals[id] ?? 3) - now
+        }.min() ?? 8
+        return min(8, max(0.1, next))
+    }
 }
