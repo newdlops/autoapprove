@@ -23,14 +23,20 @@ extension ApprovalTests {
         },codexManagedServers:servers)
         defer{engine.stop();try? FileManager.default.removeItem(at:directory)}
         let operations:[@MainActor () async throws->Void]=[
-            {_ = try await engine.prepareStandaloneCodexSessionMove(sessionID:"unobserved",destinationHome:"/unobserved")},
-            {_ = try await engine.prepareCodexSessionMove(sessionID:"unobserved",destinationHome:"/unobserved")},
             {_ = try await engine.performCodexSessionMove(id:"unobserved")},
             {_ = try await engine.executeCodexSessionMigration(id:"unobserved")}
         ]
         for operation in operations {
             do {try await operation();throw AppError.message("Unsupported move was accepted")}
             catch {try expectEqual(error.localizedDescription,CodexFeatureSupport.sessionMoveUnavailable)}
+        }
+        for operation in [
+            {@MainActor in _ = try await engine.prepareStandaloneCodexSessionMove(sessionID:"unobserved",destinationHome:"/unobserved")},
+            {@MainActor in _ = try await engine.prepareCodexSessionMove(sessionID:"unobserved",destinationHome:"/unobserved")}
+        ] {
+            var rejected=false
+            do {try await operation()}catch{rejected=true}
+            try expect(rejected,"An unobserved session cannot authorize a public move")
         }
         do {_ = try await engine.codexSessionServerLink(sessionID:"unobserved");throw AppError.message("Unsupported inventory was accepted")}
         catch {try expectEqual(error.localizedDescription,CodexFeatureSupport.connectionInventoryUnavailable)}

@@ -6,6 +6,20 @@ import Foundation
 enum OfficialMigrationStorage {
     private struct Forward:Codable {let intent:CodexOfficialRetirementIntent}
     static func run(_ args:[String])throws->Bool {
+        if args.count==6,args[1]=="--production-official-transfer" {
+            guard args[2].hasPrefix("/private/tmp/aa-cross-home-"),args[3].hasPrefix("/private/tmp/aa-cross-home-"),UUID(uuidString:args[4]) != nil else{throw AppError.message("Owned official transfer required")}
+            let path=URL(fileURLWithPath:args[2]).deletingLastPathComponent().appendingPathComponent("production-transfer-audit.sqlite").path
+            let service=try CodexOfficialConversationTransfer(store:AuditStore(path:path)),id=UUID()
+            try service.prepare(id:id,sourceHome:args[2],destinationHome:args[3],threadID:args[4],archivedPath:args[5],checkpoint:{})
+            fputs("Owned production transfer prepared\n",stderr)
+            let value=try service.advance(id:id,checkpoint:{})
+            fputs("Owned production transfer advanced\n",stderr)
+            guard try service.completed(id:id),let relative=value.imported?.importedFiles.first?.relativePath ?? (value.returnVerified==true ? value.returnTo?.originalArchivePath:nil) else{throw AppError.message("Official transfer did not commit")}
+            _=try service.advance(id:id,checkpoint:{})
+            guard try CodexOfficialConversationTransfer(store:AuditStore(path:path)).completed(id:id) else{throw AppError.message("Cold official transfer receipt missing")}
+            print(String(decoding:try JSONSerialization.data(withJSONObject:["verified":true,"productionTransfer":true,"coldReceiptVerified":true,"returnVerified":value.returnVerified==true,"importedPath":args[3]+"/"+relative]),as:UTF8.self))
+            return true
+        }
         guard args.count==6,["--official-retire","--official-commit","--official-return","--official-return-crash"].contains(args[1]) else{return false}
         guard args[2].hasPrefix("/private/tmp/aa-cross-home-"),args[3].hasPrefix("/private/tmp/aa-cross-home-"),
               UUID(uuidString:args[4])?.uuidString.lowercased()==args[4] else{throw AppError.message("Owned original migration scope required")}

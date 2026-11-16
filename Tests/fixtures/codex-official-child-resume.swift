@@ -24,9 +24,11 @@ private struct PauseCrashRequest:Codable {
         let compatibility=args.dropFirst(6).contains("compatibility")
         let crashPoint=args.dropFirst(6).first(where:{$0.hasPrefix("crash-")})
         let recoverPause=args.dropFirst(6).contains("recover-pause")
-        guard crashPoint==nil || ["crash-deferred","crash-settled","crash-paused","crash-confirmed"].contains(crashPoint!),
-              !(compatibility && (crashPoint != nil || recoverPause)),
-              (crashPoint==nil && !recoverPause) || action == .pause else{throw AppError.message("Invalid owned pause crash mode")}
+        let recoverResume=args.dropFirst(6).contains("recover-resume")
+        let allowedCrashes=action == .pause ? ["crash-deferred","crash-settled","crash-paused","crash-confirmed"]:["crash-attached","crash-active","crash-confirmed"]
+        guard crashPoint==nil || allowedCrashes.contains(crashPoint!),
+              !(compatibility && (crashPoint != nil || recoverPause || recoverResume)),
+              !recoverPause || action == .pause,!recoverResume || action == .resume else{throw AppError.message("Invalid owned Goal crash mode")}
         let status:CodexGoal.Status = action == .pause ? .paused:.active
         let paths=AppPaths(directory:URL(fileURLWithPath:cwd+"/official-resume-engine"));try paths.prepare()
         let records=ProcessDiscovery.parse("2000000000 1 ttys991 2000000000 2000000000 Mon Nov 2 10:00:00 2026 "+cli)
@@ -58,10 +60,12 @@ private struct PauseCrashRequest:Codable {
                     if crashPoint=="crash-deferred",authorizations.count==2{_exit(73)}
                     if crashPoint=="crash-settled",authorizations.count==3{_exit(74)}
                     if crashPoint=="crash-paused",authorizations.count==4{_exit(76)}
+                    if crashPoint=="crash-attached",authorizations.count==2{_exit(83)}
+                    if crashPoint=="crash-active",authorizations.count==3{_exit(84)}
                 })
                 // The native lifecycle succeeded but the outer action receipt
                 // has not yet recorded that result.
-                if crashPoint=="crash-confirmed"{_exit(75)}
+                if crashPoint=="crash-confirmed"{_exit(action == .pause ? 75:85)}
                 return result
             }
         }
@@ -71,32 +75,27 @@ private struct PauseCrashRequest:Codable {
             engine.updateDiscovery([session],records:records);return engine
         }
         let engine=try make();defer{engine.stop()}
-        let crashFile=paths.directory.appendingPathComponent("owned-pause-crash-request.json")
-        if recoverPause {
+        let crashFile=paths.directory.appendingPathComponent(action == .pause ? "owned-pause-crash-request.json":"owned-resume-crash-request.json")
+        if recoverPause || recoverResume {
             let saved=try JSONDecoder().decode(PauseCrashRequest.self,from:Data(contentsOf:crashFile))
-            let replay=try await engine.changeCodexSubagentGoal(sessionID:session.id,expected:saved.expected,action:.pause,requestID:saved.id)
+            let replay=try await engine.changeCodexSubagentGoal(sessionID:session.id,expected:saved.expected,action:action,requestID:saved.id)
             guard replay.phase == .reserved,replay.result==nil,calls.count==0 else{throw AppError.message("Uncertain pause was dispatched again after process death")}
             let current=try await engine.readCodexSubagentGoal(sessionID:session.id,childID:child)
             guard let goal=current.goal,let old=saved.expected.goal,goal.instanceID==old.instanceID,
                   goal.objective==old.objective,goal.tokenBudget==old.tokenBudget,
                   goal.tokensUsed>=old.tokensUsed,goal.timeUsedSeconds>=old.timeUsedSeconds else{throw AppError.message("Pause crash changed the original Goal")}
-            let neededNewPause=goal.status == .active
-            if neededNewPause {
-                // A fresh observation and a distinct explicit request can finish
-                // the still-active, deferred Goal. Never replay the uncertain ID.
-                let fresh=try await engine.changeCodexSubagentGoal(sessionID:session.id,expected:current,action:.pause,requestID:UUID())
-                guard fresh.phase == .confirmed,fresh.result?.goal?.instanceID==old.instanceID,
-                      fresh.result?.goal?.status == .paused,fresh.result?.executionState=="idle" else{throw AppError.message("Fresh pause could not settle the deferred original Goal")}
-            }else{
-                guard goal.status == .paused,current.executionState=="idle" else{throw AppError.message("Unknown pause outcome needs review")}
-            }
+            let neededNewPause=goal.status != status
+            await engine.recoverCodexGoalIntents()
+            let recovered=try await engine.changeCodexSubagentGoal(sessionID:session.id,expected:saved.expected,action:action,requestID:saved.id)
+            guard recovered.phase == .confirmed,recovered.result?.goal?.instanceID==old.instanceID,
+                  recovered.result?.goal?.status == status else{throw AppError.message("Persisted desired Goal state was not automatically recovered: "+recovered.detail)}
             let final=try await engine.readCodexSubagentGoal(sessionID:session.id,childID:child)
-            guard final.goal?.status == .paused,final.executionState=="idle",calls.count==(neededNewPause ? 1:0) else{throw AppError.message("Unexpected pause recovery dispatch count")}
+            guard final.goal?.status == status,action != .pause || final.executionState=="idle",calls.count==(neededNewPause ? 1:0) else{throw AppError.message("Unexpected Goal recovery dispatch count")}
             engine.stop()
             let restored=try make();defer{restored.stop()}
-            let repeated=try await restored.changeCodexSubagentGoal(sessionID:session.id,expected:saved.expected,action:.pause,requestID:saved.id)
-            guard repeated.phase == .reserved,repeated.result==nil,calls.count==(neededNewPause ? 1:0) else{throw AppError.message("Recovered app replayed uncertain original pause")}
-            print("{\"verified\":true,\"productionEnginePause\":true,\"compatibilityEntry\":false,\"pauseCrashObserved\":true,\"uncertainRequestNotReplayed\":true,\"freshObservedPauseRequired\":\(neededNewPause),\"liveDispatches\":\(calls.count),\"sameGoal\":true,\"parentMessagesSent\":0,\"syntheticSessionDiscovery\":true}")
+            let repeated=try await restored.changeCodexSubagentGoal(sessionID:session.id,expected:saved.expected,action:action,requestID:saved.id)
+            guard repeated.phase == .confirmed,repeated.result==recovered.result,calls.count==(neededNewPause ? 1:0) else{throw AppError.message("Recovered app repeated the settled desired pause")}
+            print("{\"verified\":true,\"productionEnginePause\":\(action == .pause),\"productionEngineResume\":\(action == .resume),\"compatibilityEntry\":false,\"pauseCrashObserved\":\(recoverPause),\"resumeCrashObserved\":\(recoverResume),\"uncertainRequestNotReplayed\":true,\"automaticIntentRecovery\":true,\"freshStatePauseRequired\":\(neededNewPause),\"repeatAndRestartReadOnly\":true,\"liveDispatches\":\(calls.count),\"sameGoal\":true,\"parentMessagesSent\":0,\"syntheticSessionDiscovery\":true}")
             return
         }
         let expected=try await engine.readCodexSubagentGoal(sessionID:session.id,childID:child)

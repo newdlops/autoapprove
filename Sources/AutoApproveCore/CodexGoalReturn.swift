@@ -49,6 +49,22 @@ final class CodexGoalReturn {
         return(loaded.record,state)
     }
     func state(id:String)throws->CodexGoalReturnState {try load(id).1}
+    func recover(id:String)throws->CodexGoalReturnState.Result {
+        let (record,initial)=try load(id)
+        if initial.stage == .prepared{return try apply(id:id)}
+        let observed=try observe(id:id)
+        guard observed != .unknown else{return .unknown}
+        if initial.stage == .verified{return observed}
+        var state=initial
+        if observed == .notApplied {
+            state.stage = .prepared
+            _=try journal.save(id:id,payload:encode(state),expectedRevision:record.revision)
+            return try apply(id:id)
+        }
+        state.stage = .verified;state.result=observed
+        _=try journal.save(id:id,payload:encode(state),expectedRevision:record.revision)
+        return observed
+    }
     private func sameValue(_ a:CodexGoalTransferSlot,_ b:CodexGoalTransferSlot)->Bool {a.row==b.row && a.continuationDeferred==b.continuationDeferred}
     func apply(id:String)throws->CodexGoalReturnState.Result {
         let (prepared,initial)=try load(id)

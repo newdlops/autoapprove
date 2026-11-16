@@ -29,6 +29,13 @@ private final class CodexGroupScreen: @unchecked Sendable {
     }
 }
 
+private final class GroupProcessSnapshot:@unchecked Sendable {
+    private let lock=NSLock()
+    private var records:[ProcessRecord]=[]
+    func set(_ records:[ProcessRecord]) {lock.withLock{self.records=records}}
+    func read()->[ProcessRecord] {lock.withLock{records}}
+}
+
 private final class ClippedGroupStatus: @unchecked Sendable {
     let lock = NSLock(), id = UUID().uuidString.lowercased()
     let repeated: Bool, append: Bool
@@ -319,7 +326,8 @@ extension ApprovalTests {
         let id = UUID().uuidString, home = "/fixture/codex"
         let member = SessionGroupMember(agent: .codex, title: "fixture", cwd: "/project", conversationID: id, providerHome: home)
         try SessionGroupStore(directory: directory).save([SessionGroup(name: "owned", members: [member])])
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [] })
+        let reader=GroupProcessSnapshot()
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: {reader.read()},codexGroupReader:{_ in nil})
         defer { engine.stop() }
         var params: JSONObject = ["owner": UUID().uuidString, "tool": "get_session_groups", "agentKind": "codex",
             "sessionID": "shared-daemon", "conversationID": id, "codexCallerConversationID": id, "codexCallerHome": home]
@@ -335,17 +343,44 @@ extension ApprovalTests {
         let record = ProcessDiscovery.parse("100599 1 fixture49 100599 100599 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
         let unrelated = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started,
                                      tty: "/dev/" + record.tty, cwd: "/other", terminal: .unknown)
+        reader.set([record])
         engine.updateDiscovery([unrelated], records: [record])
         params["sessionID"] = unrelated.id
         let withUnrelatedProcess = try await engine.mcpAction(params)
         try expectEqual((withUnrelatedProcess["groups"] as? [JSONObject])?.count, 1)
         try expectEqual(withUnrelatedProcess["attribution"] as? String, "codex_mcp_metadata")
+        try expect(engine.snapshot.sessions.contains(where:{$0.id==unrelated.id && $0.phase != .ended}),"The unrelated observed process must remain live for this identity regression")
         params["conversationID"] = UUID().uuidString
         do { _ = try await engine.mcpAction(params); throw AppError.message("Accepted mismatched conversation proof") }
         catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
         params["conversationID"] = id
         params["codexCallerHome"] = "/fixture/other"
         try expectEqual((try await engine.mcpAction(params)["groups"] as? [JSONObject])?.count, 0)
+    }
+
+    @MainActor func testCodexMetadataUsesConversationMatchedLiveParentForClaudePermissions() async throws {
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent("codex-live-parent-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:directory)}
+        let rows=ProcessDiscovery.parse("""
+        100595 1 fixture45 100595 100595 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100596 1 fixture46 100596 100596 Wed Oct 28 12:00:01 2026 /fixture/claude
+        """)
+        let parentID=UUID().uuidString,workerID=UUID().uuidString,home="/fixture/home"
+        let sessions=rows.map{AgentSession(id:$0.key,agent:$0.agent!,pid:$0.pid,started:$0.started,tty:"/dev/"+$0.tty,cwd:"/project",terminal:.terminal)}
+        let engine=try ApprovalEngine(paths:.init(directory:directory),claudeRegistryReader:{records in
+            records.filter{$0.pid==rows[1].pid}.map{.init(processID:$0.key,kind:"interactive",sessionID:workerID,status:"idle")}
+        },processReader:{rows},codexGroupReader:{_ in .init(threadID:parentID,database:home+"/thread_history_1.sqlite")})
+        defer{engine.stop()}
+        engine.updateDiscovery(sessions,records:rows)
+        let parent=SessionGroupLiveSession(session:sessions[0],conversationID:parentID,providerHome:home).member
+        let worker=SessionGroupLiveSession(session:sessions[1],conversationID:workerID,providerHome:nil).member
+        let group=SessionGroup(name:"Live conversation parent",members:[parent,worker]).settingLeader(parent.id)
+        try SessionGroupStore(directory:directory).save([group])
+        let result=try await engine.mcpAction(["owner":UUID().uuidString,"tool":"get_group_status","agentKind":"codex",
+            "sessionID":"shared-mcp-host","conversationID":parentID,"codexCallerConversationID":parentID,"codexCallerHome":home])
+        let groups=result["groups"] as? [JSONObject],members=groups?.first?["members"] as? [JSONObject]
+        try expectEqual(groups?.count,1)
+        try expectEqual(members?.first(where:{$0["id"] as? String==worker.id.uuidString})?["canAssign"] as? Bool,true,"A unique conversation-proven live Codex parent keeps its existing Claude task authority")
     }
 
     func testMCPProcessLanguageEnvironment() throws {

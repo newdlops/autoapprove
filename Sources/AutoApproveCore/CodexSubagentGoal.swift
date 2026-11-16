@@ -201,6 +201,36 @@ public enum CodexSubagentGoalTransport {
         }
     }
 
+    /// Complete an interrupted native idle hook without another Goal mutation.
+    /// Attaching an already running child does not send it a turn or a message.
+    static func settleRecovered(target:CodexReplyTarget,cwd:String,expected:CodexSubagentGoal,
+                                authorize:@escaping @Sendable () async throws ->Void) async throws ->CodexSubagentGoal {
+        try await background {
+            let connection=try CodexQueueConnection(home:target.home,captureApprovals:true)
+            _ = try CodexOfficialExecutable.verifyServer(connection)
+            let parent=try validate(connection,target:target,cwd:cwd,childID:expected.threadID)
+            let current=try read(connection,target:target,childID:expected.threadID,parentID:parent)
+            guard CodexGoalIntentRecovery.sameGoal(expected,current),current.goal?.status==expected.goal?.status else {
+                throw AppError.message("복구할 Goal이 바뀌었습니다.")
+            }
+            if current.executionState != "idle" {
+                guard current.goal?.status == .active else{throw AppError.message("일시정지된 작업의 종료를 확인 중입니다.")}
+                return current
+            }
+            let access=try CodexOfficialGoalStateAccess(home:target.home,userHome:NSHomeDirectory(),executable:target.executable)
+            let snapshot=try access.snapshot(threadID:current.threadID)
+            guard snapshot.row.goalID==current.goal?.instanceID,!snapshot.continuationDeferred,
+                  snapshot.row.status==current.goal?.status.rawValue else{throw AppError.message("Goal의 자동 진행 보류 상태를 확인해주세요.")}
+            try await authorize();try Task.checkCancellation()
+            _ = try connection.request("thread/resume",["threadId":current.threadID,"excludeTurns":true],classifyError:true)
+            let result=try read(connection,target:target,childID:current.threadID,parentID:parent)
+            guard CodexGoalIntentRecovery.sameGoal(current,result),result.goal?.status==current.goal?.status else {
+                throw AppError.message("Goal 복구 마무리 결과를 다시 확인해야 합니다.")
+            }
+            return result
+        }
+    }
+
     @discardableResult private static func waitUntilIdle(_ connection:CodexQueueConnection,childID:String,
                                                            turnID:String,attempts:Int) async throws -> Bool {
         for attempt in 0..<attempts {
@@ -251,6 +281,7 @@ public enum CodexSubagentGoalTransport {
 public struct CodexSubagentGoalServices:Sendable {
     typealias RequestedChange = @Sendable(CodexReplyTarget,String,CodexSubagentGoal,CodexSubagentGoalAction,UUID,URL,@escaping @Sendable () async throws ->Void) async throws ->CodexSubagentGoal
     var requestedChange:RequestedChange?
+    var settleRecovered:(@Sendable(CodexReplyTarget,String,CodexSubagentGoal,@escaping @Sendable () async throws ->Void) async throws ->CodexSubagentGoal)?
     public var read:@Sendable(CodexReplyTarget,String,String) async throws ->CodexSubagentGoal
     public var change:@Sendable(CodexReplyTarget,String,CodexSubagentGoal,CodexSubagentGoalAction,@escaping @Sendable () async throws ->Void) async throws ->CodexSubagentGoal
     public init(read:@escaping @Sendable(CodexReplyTarget,String,String) async throws ->CodexSubagentGoal,
@@ -262,6 +293,7 @@ public struct CodexSubagentGoalServices:Sendable {
             try await CodexSubagentGoalTransport.change(target:target,cwd:cwd,expected:expected,action:action,
                 requestID:id,stateDirectory:directory,authorize:authorize)
         }
+        services.settleRecovered={try await CodexSubagentGoalTransport.settleRecovered(target:$0,cwd:$1,expected:$2,authorize:$3)}
         return services
     }()
 }

@@ -5,10 +5,22 @@ public struct CodexSessionMovePlan:Identifiable,Equatable,Sendable {
     public let sourceHome:String
     public let destinationHome:String
     public let conversationCount:Int
+    public let restartingSessionCount:Int
     init(_ state:CodexSessionMigrationState) {
         id=state.request.id;sourceHome=state.request.source.home
         destinationHome=state.request.destination.home;conversationCount=state.request.threads.count
+        restartingSessionCount=state.request.clients.count
     }
+    init(cohort:CodexCohortRestartPlan,conversationCount:Int) {
+        id=cohort.id.uuidString.lowercased();sourceHome=cohort.sourceHome
+        destinationHome=cohort.destinationHome;self.conversationCount=conversationCount
+        restartingSessionCount=cohort.members.count
+    }
+}
+public struct CodexSessionMoveProgress:Equatable,Sendable {
+    public let detail:String
+    public let complete:Bool
+    public let canCancel:Bool
 }
 public struct CodexSessionMoveRecovery:Identifiable,Equatable,Sendable {
     public let id:String

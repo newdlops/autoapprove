@@ -173,18 +173,20 @@ struct CodexSessionAccountContent:View {
                 }
             }else if let standalone {
                 Label("독립 실행",systemImage:"person.crop.circle").font(.callout.weight(.medium))
-                Text("공유 app-server 없이 실행 중입니다. 새 세션의 로그인 그룹은 프로필에서 선택할 수 있습니다.")
+                Text("공유 app-server 없이 실행 중입니다. 현재 대화를 유지하며 로그인 그룹에 연결할 수 있습니다.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 Text(standalone.home).font(.caption).foregroundStyle(.secondary)
                     .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-                Text(CodexFeatureSupport.standaloneAttachmentUnavailable)
+                Text(CodexFeatureSupport.canAttachOpenStandaloneSessions
+                     ? "현재 대화 ID와 로그인 홈을 확인한 뒤 원래 터미널에서 다시 연결합니다."
+                     : CodexFeatureSupport.standaloneAttachmentUnavailable)
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 if let changeGroup {
                     Button("로그인 그룹에 연결…",action:changeGroup).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
-                        .help(CodexFeatureSupport.sessionMoveUnavailable)
+                        .help(CodexFeatureSupport.canMoveOpenSessions ? "현재 대화를 대상 그룹의 서버에 연결합니다.":CodexFeatureSupport.sessionMoveUnavailable)
                 }
             } else if error==nil {Text("이 세션이 연결된 서버에서 계정을 확인합니다…").font(.caption).foregroundStyle(.secondary)}
-            if account != nil {
+            if account != nil && !CodexFeatureSupport.canMoveOpenSessions {
                 Text(CodexFeatureSupport.sessionMoveUnavailable)
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             }
@@ -203,11 +205,11 @@ struct CodexSessionAccountContent:View {
             .help("같은 서버의 연결된 Codex를 순차 중단하고 저장된 로그인으로 다시 연결합니다.")
         if let changeGroup {
             Button("로그인 그룹 변경…",action:changeGroup).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
-                .help(CodexFeatureSupport.sessionMoveUnavailable)
+                .help(CodexFeatureSupport.canMoveOpenSessions ? "같은 대화 ID와 그룹 정보를 유지해 다른 로그인 홈으로 옮깁니다.":CodexFeatureSupport.sessionMoveUnavailable)
         }
         if let makeIndependent {
             Button("독립 실행으로 분리…",action:makeIndependent).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
-                .help(CodexFeatureSupport.sessionMoveUnavailable)
+                .help(CodexFeatureSupport.canMoveOpenSessions ? "선택한 세션에 전용 로그인 홈과 서버를 만듭니다.":CodexFeatureSupport.sessionMoveUnavailable)
         }
     }
 }

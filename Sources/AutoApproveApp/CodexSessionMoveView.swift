@@ -28,6 +28,7 @@ private struct CodexMoveDestination:Identifiable {
     @State private var notice:String?
     @State private var copyingLogin=false
     @State private var copiedLogin=false
+    @State private var completed=false
     private var destination:CodexMoveDestination? {destinations.first{$0.id==selected}}
     private var sourceHome:String {source?.target.home ?? standalone?.home ?? ""}
     private var sourceExecutable:String {source?.target.executable ?? standalone?.executable ?? "codex"}
@@ -47,7 +48,7 @@ private struct CodexMoveDestination:Identifiable {
             ScrollView {
                 VStack(alignment:.leading,spacing:20) {
                     VStack(alignment:.leading,spacing:6) {
-                        Text("현재 연결").font(.callout.weight(.semibold))
+                        Text(completed ? "이전 연결":"현재 연결").font(.callout.weight(.semibold))
                         Text(source?.loginGroupName ?? (standalone == nil ? "기존 Codex 홈":"독립 실행 · 공유 서버에 연결되지 않음")).fixedSize(horizontal:false,vertical:true)
                         Text(sourceHome).font(.caption).foregroundStyle(.secondary)
                             .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
@@ -65,7 +66,7 @@ private struct CodexMoveDestination:Identifiable {
                             Text(independentDestination == nil ? "옮길 로그인 그룹":"전용 로그인 홈").font(.callout.weight(.semibold))
                             Spacer()
                             Button("새로 확인"){Task{await load()}}
-                                .disabled(loading || loginBusy || busy || held || plan != nil || moving)
+                                .disabled(loading || loginBusy || busy || held || plan != nil || moving || attempted)
                         }
                         if loading {ProgressView("로그인 그룹 확인 중…").controlSize(.small)}
                         if let error {
@@ -81,7 +82,7 @@ private struct CodexMoveDestination:Identifiable {
                                 ForEach(destinations){value in
                                     Text(value.name).lineLimit(1).help(value.target.home).tag(Optional(value.id))
                                 }
-                            }.disabled(loading || busy || held || loginBusy || plan != nil || moving)
+                            }.disabled(loading || busy || held || loginBusy || plan != nil || moving || attempted)
                         }
                     }
                     if let destination {
@@ -98,15 +99,15 @@ private struct CodexMoveDestination:Identifiable {
                                             copiedLogin=true
                                         }catch {self.error=error.localizedDescription}
                                     }
-                                }.disabled(copyingLogin || copiedLogin || plan != nil || moving || loginBusy || busy || held)
+                                }.disabled(copyingLogin || copiedLogin || plan != nil || moving || loginBusy || busy || held || attempted)
                                 if copyingLogin {ProgressView("독립 로그인 준비 중…").controlSize(.small)}
                             }
                         }
                         VStack(alignment:.leading,spacing:8) {
-                            Label(independentDestination == nil ? "대상 그룹의 연결 서버":"이동 준비용 서버",systemImage:"server.rack").font(.callout.weight(.semibold))
+                            Label(independentDestination == nil ? "대상 그룹의 연결 서버":"전용 로그인 서버",systemImage:"server.rack").font(.callout.weight(.semibold))
                             Text(destination.target.home).font(.caption).foregroundStyle(.secondary)
                                 .textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-                            Text(independentDestination == nil ? "선택한 그룹의 로그인과 Codex app-server를 확인합니다.":"대화 이전을 위해 전용 홈의 서버를 준비합니다. 전환 후 CLI는 공유 서버 없이 실행됩니다.")
+                            Text(independentDestination == nil ? "선택한 그룹의 로그인과 Codex app-server를 확인합니다.":"이 세션의 전용 홈에서 실행하는 로컬 서버입니다. 다른 로그인 그룹의 계정과 분리되며 Goal 제어·복원 기능을 유지합니다.")
                                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                             CodexLoginSettings(accounts:engine.agentAccounts,targets:{try await verifiedTarget(destination)},
                                 transitionEnabled:engine.codexAccountTransitionEnabled,transitionBusy:busy || held,
@@ -118,21 +119,20 @@ private struct CodexMoveDestination:Identifiable {
                                 homeNames:[destination.target.home:destination.name],
                                 onLoginActivityChanged:{loginBusy=$0})
                                 .id(destination.id)
-                                .disabled(plan != nil || moving)
+                                .disabled(plan != nil || moving || attempted)
                         }
                     }
                     Divider()
                     VStack(alignment:.leading,spacing:8) {
                         Label("기존 대화 이동",systemImage:"arrow.right.arrow.left").font(.callout.weight(.semibold))
-                        Text("이 세션의 대화와 하위 서브에이전트를 선택한 로그인 그룹으로 옮긴 뒤, 원래 터미널에서 같은 대화를 다시 연결합니다. 진행 중인 Goal·작업·작성 중 입력은 먼저 정리해주세요.")
+                        Text("대화·하위 서브에이전트·Goal을 저장한 뒤 원래 터미널에서 같은 Session ID로 다시 연결합니다. 진행 중인 명령은 중단될 수 있으며 자동으로 재실행하지 않습니다.")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                         if standalone != nil {
-                            Text("이동 준비에서 선택한 독립 세션만 현재 홈의 서버에 먼저 연결합니다. 다른 독립 세션은 그대로 유지합니다.")
+                            Text("선택한 독립 세션만 다시 연결합니다. 이미 서버에 연결된 다른 터미널은 종료하지 않습니다.")
                                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                         }
                         if let plan {
-                            Text("이동할 대화 \(plan.conversationCount)개 · 서브에이전트 포함")
-                                .font(.callout.weight(.medium)).fixedSize(horizontal:false,vertical:true)
+                            CodexMoveScopeSummary(conversationCount:plan.conversationCount,restartingSessionCount:plan.restartingSessionCount)
                             if !attempted {
                                 HStack {
                                     Button(independentDestination == nil ? "이 그룹으로 이동하고 재연결":"독립 실행으로 전환"){performMove(plan)}
@@ -148,13 +148,28 @@ private struct CodexMoveDestination:Identifiable {
                                 .disabled(destination == nil || loading || loginBusy || busy || held || moving)
                         }
                         if moving {ProgressView(attempted ? "대화 이동·재연결 중…":"이동할 대화 확인 중…").controlSize(.small)}
-                        if let notice {Text(notice).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
+                        if let notice {
+                            CodexMoveProgressNotice(detail:notice,complete:completed)
+                        }
                     }
                 }.padding(24).frame(maxWidth:.infinity,alignment:.leading)
             }
         }.font(.callout).frame(width:600,height:660)
             .interactiveDismissDisabled(moving || copyingLogin || plan != nil && !attempted)
             .task{await load()}
+            .task(id:attempted ? plan?.id:nil) {
+                guard attempted,let id=plan?.id else{return}
+                while !Task.isCancelled,plan?.id==id {
+                    do {
+                        if let progress=try engine.codexSessionMoveProgress(id:id) {
+                            notice=progress.detail
+                            if progress.complete {completed=true;error=nil;plan=nil;return}
+                        }
+                        try await Task.sleep(for:.seconds(1))
+                    }catch is CancellationError {return}
+                    catch {self.error=error.localizedDescription;return}
+                }
+            }
             .onReceive(engine.$codexAccountTransitionBusy){busy=$0}
             .onReceive(engine.$codexAccountTransitionStates){states in
                 held=states.values.contains(where:\.held)
@@ -183,11 +198,12 @@ private struct CodexMoveDestination:Identifiable {
             do {
                 let result=try await engine.performCodexSessionMove(id:plan.id)
                 notice=result.detail
-                if result.phase == .connected {self.plan=nil}
+                if result.phase == .connected {completed=true;self.plan=nil}
                 else {error="이동 후 연결 확인이 필요합니다. "+result.detail}
             }catch {
                 self.error=error.localizedDescription
-                notice="이동 결과를 확인해야 합니다. 같은 요청을 자동으로 반복하지 않습니다."
+                if (try? engine.codexSessionMoveProgress(id:plan.id))?.canCancel==true {attempted=false}
+                notice="저장된 단계에서 복원 결과를 확인합니다. 확인되지 않은 실행 명령은 중복 전송하지 않습니다."
             }
         }
     }
@@ -242,6 +258,29 @@ private struct CodexMoveDestination:Identifiable {
             throw AppError.message("대상 로그인 그룹이 바뀌었습니다. 그룹을 다시 확인해주세요.")
         }
         return [expected.target]
+    }
+}
+
+struct CodexMoveScopeSummary:View {
+    let conversationCount:Int,restartingSessionCount:Int
+    var body:some View {
+        VStack(alignment:.leading,spacing:8) {
+            Text("이동할 대화 \(conversationCount)개 · 서브에이전트 포함")
+                .font(.callout.weight(.medium)).fixedSize(horizontal:false,vertical:true)
+            Text(restartingSessionCount>1
+                 ? "같은 서버의 터미널 \(restartingSessionCount)개를 종료·다시 엽니다. 선택한 터미널만 대상 그룹으로 옮기고, 나머지는 원래 로그인 그룹으로 복원합니다."
+                 : "선택한 터미널만 종료·다시 엽니다. 다른 터미널은 유지합니다.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+        }
+    }
+}
+
+struct CodexMoveProgressNotice:View {
+    let detail:String,complete:Bool
+    var body:some View {
+        Label(detail,systemImage:complete ? "checkmark.circle":"clock")
+            .foregroundStyle(complete ? Color.green:Color.secondary)
+            .font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
     }
 }
 

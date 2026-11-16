@@ -100,4 +100,22 @@ final class CodexRolloutReturn {
             return .unknown
         }catch{return .unknown}
     }
+    func recover(id:String)throws->CodexGoalReturnState.Result {
+        let (record,initial)=try load(id)
+        guard let rollout=initial.rollout else{throw failure}
+        if rollout.stage == .staging {_=try recoverStaging(id:id);return try apply(id:id)}
+        if rollout.stage == .prepared{return try apply(id:id)}
+        let observed=try observe(id:id)
+        guard observed != .unknown else{return .unknown}
+        if rollout.stage == .verified{return observed}
+        var state=initial
+        if observed == .notApplied {
+            state.rollout?.stage = .prepared
+            _=try journal.save(id:id,payload:encode(state),expectedRevision:record.revision)
+            return try apply(id:id)
+        }
+        state.rollout?.stage = .verified;state.rollout?.result=observed
+        _=try journal.save(id:id,payload:encode(state),expectedRevision:record.revision)
+        return observed
+    }
 }

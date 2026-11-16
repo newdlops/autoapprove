@@ -299,6 +299,29 @@ final class CodexMigrationJournal {
         }
         throw Self.failure
     }
+    /// Homes linked by complete native handoffs of this exact Goal instance.
+    /// Keep the whole continuous chain (including return trips), so a newer
+    /// confirmed intent in an intermediate home supersedes an older request.
+    func goalMigrationHomes(threadID:String,goalID:String,currentHome:String)throws->[String]? {
+        guard let expected=try owner(threadID:threadID) else{return nil}
+        guard expected.home == (try Self.home(currentHome)) else{throw Self.failure}
+        var homes=Set([expected.home.path]),cursor:CodexMigrationOwner?=expected,seen=Set<String>()
+        while let current=cursor {
+            try current.validate()
+            guard seen.count<512,seen.insert(current.journalID).inserted,
+                  let loaded=try load(id:current.journalID),loaded.consistent,loaded.record.terminal,
+                  loaded.record.digest==current.journalDigest,
+                  let change=loaded.record.ownership?.first(where:{$0.threadID==threadID}),
+                  try CodexMigrationOwner.after(change,loaded.record)==current else{throw Self.failure}
+            // A replaced Goal or missing native retirement is a boundary,
+            // never permission to borrow an older unrelated home binding.
+            guard let retired=change.retirement,retired.goal.row?.goalID==goalID else{break}
+            homes.insert(retired.goal.sourceHome)
+            cursor=change.previous
+        }
+        guard try owner(threadID:threadID)==expected else{throw Self.failure}
+        return try Set(homes.map{try CodexAccountTransitionTarget.canonicalHome($0)}).sorted()
+    }
     func backupRetired(_ retirement:CodexMigrationRetirement,expectedOwner:CodexMigrationOwner,requestID:String,expectedRevision:Int)throws->CodexMigrationRetiredBackup {
         let id=try Self.id(requestID)
         guard let loaded=try load(id:id),loaded.consistent,!loaded.record.terminal,loaded.record.revision==expectedRevision,

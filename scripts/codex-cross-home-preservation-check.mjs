@@ -20,7 +20,12 @@ const checkRetirement=process.argv.includes('--check-retirement');
 const returnCleared=process.argv.includes('--return-cleared-goal');
 const crashNativeAcks=process.argv.includes('--crash-native-acks');
 const officialRetirement=process.argv.includes('--official-retirement');
+const productionTransfer=process.argv.includes('--production-transfer');
+const productionRoundtrip=process.argv.includes('--production-roundtrip');
+assert.ok(!productionRoundtrip||productionTransfer,'Production round trip requires production forward handoff');
+assert.ok(!productionTransfer||probeVersion==='0.169.0'&&restoreGoal&&checkRetirement&&!returnOriginal&&!officialRetirement,'Production transfer uses original169 and its forward archive/Goal fixture');
 const publicationAckLoss=process.argv.includes('--publication-ack-loss');assert.ok(!publicationAckLoss||officialRetirement,'Publication response-loss test requires the official storage path');
+const storagePublicationOnly=process.argv.includes('--storage-publication-only');assert.ok(!storagePublicationOnly||publicationAckLoss&&officialRetirement,'Storage publication check requires the original crash/return path');
 assert.ok(!officialRetirement||probeVersion==='0.169.0'&&returnOriginal&&checkRetirement,'Official retirement requires the exact original 169 return/retirement test');
 assert.ok(['0.166.0','0.167.1'].includes(probeVersion)||officialRetirement||!returnOriginal,'The native return coordinator requires an explicitly supported exact version');
 assert.ok(!crashNativeAcks || returnOriginal&&checkRetirement);
@@ -62,7 +67,7 @@ async function server(home){
 }
 const sql=(home,q)=>execFileSync('/usr/bin/sqlite3',[home+'/goals_1.sqlite',q],{encoding:'utf8'}).trim();
 async function archivedRollout(home,id){const entries=await readdir(home+'/archived_sessions',{recursive:true});const found=entries.filter(name=>name.endsWith('.jsonl')&&name.includes(id));assert.equal(found.length,1);return path.join(home,'archived_sessions',found[0]);}
-try{
+probe: try{
  let transfer;
  if(restoreGoal){
   transfer=root+'/transfer';const build=path.resolve('.build/debug');
@@ -102,15 +107,21 @@ try{
   const retained=JSON.parse(execFileSync(transfer,['--official-retire',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:15000}));
   assert.equal(retained.sourceWithdrawn,true);firstRollout=retained.retainedPath;
  }
- const destination=path.join(b.home,path.relative(a.home,source.path));await mkdir(path.dirname(destination),{recursive:true});await copyFile(firstRollout,destination);assert.notEqual((await stat(firstRollout)).ino,(await stat(destination)).ino);
+ let destination=path.join(b.home,path.relative(a.home,source.path));
+ if(!productionTransfer){await mkdir(path.dirname(destination),{recursive:true});await copyFile(firstRollout,destination);assert.notEqual((await stat(firstRollout)).ino,(await stat(destination)).ino);}
  let unselected,unselectedGoal;
  if(restoreGoal){
   unselected=(await b.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
   await b.request('thread/goal/set',{threadId:unselected,objective:'Unselected owned Goal',status:'paused',tokenBudget:999,origin:'user'});
   unselectedGoal=(await b.request('thread/goal/get',{threadId:unselected})).goal;
-  assert.equal(JSON.parse(execFileSync(transfer,[a.home,b.home,id],{encoding:'utf8',timeout:10000})).verified,true);
+  if(productionTransfer){
+   assert.ok(!a.alive(),'Original source process must be stopped before production storage handoff');
+   const moved=JSON.parse(execFileSync(transfer,['--production-official-transfer',a.home,b.home,id,firstRollout],{encoding:'utf8',timeout:30000}));
+   assert.equal(moved.productionTransfer,true);assert.equal(moved.coldReceiptVerified,true);destination=moved.importedPath;
+   await b.request('thread/unarchive',{threadId:id});
+  }else assert.equal(JSON.parse(execFileSync(transfer,[a.home,b.home,id],{encoding:'utf8',timeout:10000})).verified,true);
  }
- const resumed=await b.request('thread/resume',{threadId:id,path:destination}),target=(await b.request('thread/read',{threadId:resumed.thread.id,includeTurns:true})).thread;
+ const resumed=await b.request('thread/resume',{threadId:id,...(productionTransfer?{}:{path:destination})}),target=(await b.request('thread/read',{threadId:resumed.thread.id,includeTurns:true})).thread;
  if(checkSettings){
   assert.equal(resumed.reasoningEffort,'high');assert.equal(resumed.serviceTier,'flex');
   assert.deepEqual(resumed.disabledPluginIds,disabledPlugins);assert.deepEqual(resumed.runtimeWorkspaceRoots,[workspaceRoot]);
@@ -125,6 +136,31 @@ try{
   assert.deepEqual((await b.request('thread/goal/get',{threadId:unselected})).goal,unselectedGoal);
   const rowJSON=home=>sql(home,`SELECT json_object('thread_id',thread_id,'goal_id',goal_id,'objective',objective,'status',status,'token_budget',token_budget,'tokens_used',tokens_used,'time_used_seconds',time_used_seconds,'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM thread_goals WHERE thread_id='${id}';`);
   assert.equal(rowJSON(b.home),rowJSON(a.home),'Native resume must retain exact Goal instance and millisecond counters');
+  if(productionTransfer){
+   assert.equal(requests,1,'History transfer may not submit a new model turn');
+   Object.assign(report,{productionOfficialTransfer:true,coldTransferReceiptVerified:true,unselectedGoalPreserved:true,sourceProcessStopped:true});
+   if(productionRoundtrip){
+    const next=await b.request('turn/start',{threadId:id,input:[{type:'text',text:'Owned newer history for production return.',text_elements:[]}]});
+    await b.wait('turn/completed',p=>p.threadId===id&&p.turn.id===next.turn.id);
+    const latest=(await b.request('thread/read',{threadId:id,includeTurns:true})).thread;
+    await b.request('thread/archive',{threadId:id});const returningArchive=await archivedRollout(b.home,id);await b.stop();
+    sql(b.home,`UPDATE thread_goals SET tokens_used=73,time_used_seconds=31,updated_at_ms=updated_at_ms+1000 WHERE thread_id='${id}';`);
+    const original=await server(a.home);
+    const unrelated=(await original.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'read-only'})).thread.id;
+    await original.request('thread/goal/set',{threadId:unrelated,objective:'Preserve original-home neighbor',status:'paused',tokenBudget:777,origin:'user'});
+    const unrelatedGoal=(await original.request('thread/goal/get',{threadId:unrelated})).goal;
+    const returned=JSON.parse(execFileSync(transfer,['--production-official-transfer',b.home,a.home,id,returningArchive],{encoding:'utf8',timeout:30000}));
+    assert.equal(returned.returnVerified,true);assert.equal(returned.coldReceiptVerified,true);
+    await original.request('thread/unarchive',{threadId:id});await original.request('thread/resume',{threadId:id});
+    const final=(await original.request('thread/read',{threadId:id,includeTurns:true})).thread;
+    assert.deepEqual(final.turns,latest.turns,'Return must preserve newer history rather than the first snapshot');
+    assert.equal(rowJSON(a.home),rowJSON(b.home),'Return must retain latest exact Goal row');
+    assert.deepEqual((await original.request('thread/goal/get',{threadId:unrelated})).goal,unrelatedGoal);
+    assert.equal(requests,2,'Only the two explicit seed turns may run');
+    Object.assign(report,{providerRequests:requests,productionRoundtrip:true,newerHistoryReturned:true,latestGoalAccountingReturned:true,originalHomeNeighborPreserved:true});
+   }
+   console.log(JSON.stringify(report));break probe;
+  }
   console.error(JSON.stringify({stage:'first-transfer',sameUUID:true,exactGoalRow:true,publicGoal:true,unselectedGoal:true}));
   let expectedReturnTurns=source.turns;
   if(checkRetirement){
@@ -172,6 +208,7 @@ try{
   if(!returnOriginal)await copyFile(closedRollout,returning);
   if(returnOriginal)console.error(JSON.stringify({stage:'return-to-original-home',existingRetiredGoal:true,oldTokens:37,newTokens:returnCleared?null:73}));
   if(returnOriginal&&checkRetirement){
+   const latestArchiveBeforeReturn=storagePublicationOnly?await readFile(closedRollout):undefined;
    if(publicationAckLoss){
     let exited=false;
     try{execFileSync(transfer,['--official-return-crash',b.home,c.home,id,closedRollout],{encoding:'utf8',timeout:20000});}
@@ -183,6 +220,18 @@ try{
    assert.equal(result.latestHistoryReturned,true);
    if(officialRetirement)assert.equal(result.publicationRenameCount,1);
    console.error(JSON.stringify({stage:'goal-storage-return',exactGoalReturned:true,nativeOwnershipCommitted:false,clearedSource:returnCleared}));
+   if(storagePublicationOnly){
+    const published=await archivedRollout(c.home,id);
+    assert.deepEqual(await readFile(published),latestArchiveBeforeReturn,'Lost publication acknowledgement must preserve the exact latest archive');
+    assert.equal(rowJSON(c.home),expectedReturnRow);
+    await c.request('thread/unarchive',{threadId:id});
+    const resumed=await c.request('thread/resume',{threadId:id});assert.equal(resumed.thread.id,id);
+    assert.equal(rowJSON(c.home),expectedReturnRow);
+    assert.deepEqual((await c.request('thread/goal/get',{threadId:third})).goal,thirdGoal);
+    assert.equal(requests,2,'Only the explicitly requested seed turns may run');
+    console.log(JSON.stringify({...report,verified:true,providerRequests:requests,officialRuntimeUnmodified:true,storagePublicationOnly:true,latestArchivePublished:true,publicationRenameCount:1,publicationLostAckRecoveredWithoutReplay:true,exactLatestGoalRetained:true,unrelatedGoalPreserved:true,existingUserSessionsTouched:false}));
+    break probe;
+   }
    // The parent owns the only stdio connection and constructed all root-only
    // threads. This is not a discovery implementation for preexisting TUIs.
    const nativeCounts={'thread/unarchive':0,'thread/resume':0},dropped=new Set();let controllerRestarts=0;

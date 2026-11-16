@@ -5,6 +5,7 @@ import AutoApproveCore
 @MainActor private struct AccountPanelPreview:View {
     @State private var shared=true
     @State private var detach=false
+    @State private var move=false
     let engine:ApprovalEngine
     @State private var action="아직 실행하지 않음"
     static func info(shared:Bool,long:Bool=false,existing:Bool=false) -> CodexSessionAccount {
@@ -16,17 +17,19 @@ import AutoApproveCore
         VStack(alignment:.leading,spacing:16) {
             Toggle("공통 서버 합성 상태",isOn:$shared)
             CodexSessionAccountContent(account:Self.info(shared:shared),loading:false,error:nil,disabled:false,
-                refresh:{action="계정 새로 확인"},login:{action=shared ? "공유 로그인 범위: 5개 세션":"개별 로그인 범위: 1개 세션"},reconnect:{action="현재 로그인 재연결 요청"},changeGroup:{action="로그인 그룹 변경 요청"},makeIndependent:{detach=true},verifyServerLink:{action="전체 연결 확인 요청"})
+                refresh:{action="계정 새로 확인"},login:{action=shared ? "공유 로그인 범위: 5개 세션":"개별 로그인 범위: 1개 세션"},reconnect:{action="현재 로그인 재연결 요청"},changeGroup:{move=true},makeIndependent:{detach=true},verifyServerLink:{action="전체 연결 확인 요청"})
             Divider();Text(action).accessibilityIdentifier("fixture-action");Spacer()
         }.padding(24).frame(width:500,height:400)
         .sheet(isPresented:$detach){CodexSessionDetachView(engine:engine,source:Self.info(shared:shared),close:{detach=false})}
+        .sheet(isPresented:$move){CodexSessionMoveView(engine:engine,source:Self.info(shared:shared),close:{move=false})}
     }
 }
 @main struct SessionAccountPreviewApp {
     @MainActor static func main() throws {
         _=NSApplication.shared;NSApp.setActivationPolicy(.regular)
         let output=URL(fileURLWithPath:CommandLine.arguments[1]);try FileManager.default.createDirectory(at:output,withIntermediateDirectories:true)
-        let engine=try ApprovalEngine(paths:.init(directory:output.appendingPathComponent("private-fixture")))
+        let engine=try ApprovalEngine(paths:.init(directory:output.appendingPathComponent("private-fixture")),processReader:{[]},nativeKeyboardActivity:.inactive)
+        defer{engine.stop()}
         for mode in ["shared","individual","existing","long","loading","error","busy","standalone"] {for dark in [false,true] {for width in [350.0,600.0] {
             let info=["loading","error","standalone"].contains(mode) ? nil:AccountPanelPreview.info(shared:mode != "individual",long:mode=="long",existing:mode=="existing")
             let standalone=mode=="standalone" ? CodexStandaloneSession(session:.init(id:"owned-standalone",agent:.codex,pid:42423,started:"owned",tty:"/dev/ttys999",cwd:"/fixture/workspace",terminal:.terminal),home:"/fixture/standalone",executable:"/fixture/codex"):nil
@@ -44,6 +47,25 @@ import AutoApproveCore
         detach.appearance=NSAppearance(named:.aqua);detach.layoutSubtreeIfNeeded();detach.displayIfNeeded();RunLoop.main.run(until:Date().addingTimeInterval(0.1))
         let image=detach.bitmapImageRepForCachingDisplay(in:detach.bounds)!;detach.cacheDisplay(in:detach.bounds,to:image)
         try image.representation(using:.png,properties:[:])!.write(to:output.appendingPathComponent("detach.png"))
+        for dark in [false,true] {
+            let root=VStack(alignment:.leading,spacing:20) {
+                Text("대화 이동·복원 상태").font(.title2.weight(.semibold))
+                CodexMoveScopeSummary(conversationCount:37,restartingSessionCount:12)
+                CodexMoveScopeSummary(conversationCount:1,restartingSessionCount:1)
+                Divider()
+                CodexMoveProgressNotice(detail:"원래 터미널에서 같은 Session ID로 다시 연결되는지 확인 중입니다. 터미널 12개 중 11개의 연결을 확인했습니다.",complete:false)
+                Label("원래 터미널의 연결이 바뀌었습니다. 새 실행을 반복하지 않고 저장된 단계에서 복원 결과를 다시 확인합니다.",systemImage:"exclamationmark.circle")
+                    .foregroundStyle(.red).font(.caption).fixedSize(horizontal:false,vertical:true)
+                CodexMoveProgressNotice(detail:"선택한 터미널의 이동과 관련 터미널·그룹 재연결을 확인했습니다.",complete:true)
+                Text(String(repeating:"/긴 로그인 그룹과 작업 폴더",count:10)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+            }.padding(24).frame(width:600,alignment:.leading).background(Color(nsColor:.windowBackgroundColor)).environment(\.colorScheme,dark ? .dark:.light)
+            let view=NSHostingView(rootView:root);view.frame=NSRect(x:0,y:0,width:600,height:view.fittingSize.height)
+            view.appearance=NSAppearance(named:dark ? .darkAqua:.aqua)
+            let window=NSWindow(contentRect:view.frame,styleMask:[.borderless],backing:.buffered,defer:false);window.contentView=view
+            view.layoutSubtreeIfNeeded();view.displayIfNeeded()
+            let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds)!;view.cacheDisplay(in:view.bounds,to:bitmap)
+            try bitmap.representation(using:.png,properties:[:])!.write(to:output.appendingPathComponent("move-states-\(dark ? "dark":"light").png"))
+        }
         print("Rendered 32 native account panel states; synthetic identities only")
         if CommandLine.arguments.contains("--interactive") {
             let window=NSWindow(contentRect:NSRect(x:100,y:100,width:500,height:400),styleMask:[.titled,.closable],backing:.buffered,defer:false)

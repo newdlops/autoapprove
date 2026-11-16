@@ -67,11 +67,12 @@ public struct CodexReplyTransport: Sendable {
                       (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else { continue }
                 homes.insert(url.deletingLastPathComponent().resolvingSymlinksInPath().path)
             }
-            if homes.isEmpty {
-                let launchHome = ProcessEnvironment.read(record)?["CODEX_HOME"]
-                let hints = [launchHome, FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path].compactMap { $0 }
-                if let connected = CodexServerLocation.connectedHome(pid: session.pid, hints: hints) { homes.insert(connected) }
-            }
+            // A resumed conversation can retain old log/history paths while
+            // its TUI is connected to a different login home. Open files are
+            // hints; the actual kernel-witnessed server wins over those paths.
+            let launchHome = ProcessEnvironment.read(record)?["CODEX_HOME"]
+            let hints = Array(homes)+[launchHome, FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path].compactMap { $0 }
+            if let connected = CodexServerLocation.connectedHome(pid: session.pid, hints: hints) { homes = [connected] }
             guard homes.count == 1, let home = homes.first else { throw RemoteHTTPError(409, "이 Codex 실행의 로컬 서버 위치를 확인하지 못했습니다.") }
             // A CLI upgrade may unlink the executable of a still-running session.
             // The original process and its own user-owned server files remain authoritative.

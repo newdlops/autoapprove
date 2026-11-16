@@ -226,6 +226,14 @@ enum CodexGoalTransferStore {
               value.createdAtMs>=0,value.updatedAtMs>=value.createdAtMs else{throw failure}
         return(value,!deferred.isEmpty)
     }
+    static func validateHomeIfPresent(_ value:String)throws {
+        let home=try physicalHome(value)
+        var info=stat()
+        if lstat(home+"/goals_1.sqlite",&info) != 0 {guard errno==ENOENT else{throw failure};return}
+        let connection=try Connection(home:home,writable:false)
+        try connection.exec("BEGIN");defer{try? connection.exec("ROLLBACK")}
+        _=try schema(connection);try connection.check()
+    }
     fileprivate static func officialSnapshot(home:String,threadID:String)throws->CodexOfficialGoalStateSnapshot {
         guard let uuid=UUID(uuidString:threadID) else{throw failure}
         let home=try physicalHome(home),homeID=try homeIdentity(home)
@@ -408,11 +416,8 @@ final class CodexOfficialGoalStateAccess {
     private let peer:CodexNativePeerIdentity,socket:String,device:dev_t,inode:ino_t
     init(home:String,userHome:String,executable:String)throws {
         self.home=try CodexAccountTransitionTarget.canonicalHome(home)
-        guard let cli=try CodexOfficialExecutable.resolve(home:self.home,userHome:userHome,executable:executable),
-              let socket=CodexQueueConnection.socketPath(home:self.home) else{throw AppError.message("Goal 상태를 보존할 공식 Codex 버전을 확인하지 못했습니다.")}
-        let version=try cli.run(["--version"])
-        guard version.status==0,version.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli 0.169.0" else{throw AppError.message("Goal 상태를 보존할 공식 Codex 버전을 확인하지 못했습니다.")}
-        self.cli=cli;self.socket=socket
+        guard let socket=CodexQueueConnection.socketPath(home:self.home) else{throw AppError.message("Goal 상태를 보존할 공식 Codex 버전을 확인하지 못했습니다.")}
+        self.socket=socket
         var info=stat()
         guard lstat(socket,&info)==0,info.st_uid==getuid(),info.st_mode&S_IFMT==S_IFSOCK else{throw AppError.message("원래 Goal 서버의 연결 경로가 바뀌었습니다.")}
         device=info.st_dev;inode=info.st_ino
@@ -422,8 +427,16 @@ final class CodexOfficialGoalStateAccess {
               let path=ProcessEnvironment.executablePath(process),
               let environment=ProcessEnvironment.read(process,names:["HOME","CODEX_HOME"]),
               let actualHome=environment["CODEX_HOME"] ?? environment["HOME"].map({$0+"/.codex"}),
-              try CodexAccountTransitionTarget.canonicalHome(actualHome)==self.home,
-              let serverCLI=try CodexOfficialExecutable.resolve(home:self.home,userHome:userHome,executable:path) else{throw AppError.message("원래 Goal 서버의 실행 환경을 확인하지 못했습니다.")}
+              try CodexAccountTransitionTarget.canonicalHome(actualHome)==self.home else{throw AppError.message("원래 Goal 서버의 실행 환경을 확인하지 못했습니다.")}
+        // Queue targets intentionally omit the TUI executable: an upgrade can
+        // unlink that file while its server connection remains valid. Goal
+        // state access must instead attest the actual original server binary.
+        let effectiveHome=environment["HOME"] ?? userHome
+        guard let cli=try CodexOfficialExecutable.resolve(home:self.home,userHome:effectiveHome,executable:executable.isEmpty ? path:executable),
+              let serverCLI=try CodexOfficialExecutable.resolve(home:self.home,userHome:effectiveHome,executable:path) else{throw AppError.message("원래 Goal 서버의 실행 환경을 확인하지 못했습니다.")}
+        let version=try cli.run(["--version"])
+        guard version.status==0,version.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli 0.169.0" else{throw AppError.message("Goal 상태를 보존할 공식 Codex 버전을 확인하지 못했습니다.")}
+        self.cli=cli
         let serverVersion=try serverCLI.run(["--version"])
         guard serverVersion.status==0,serverVersion.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli 0.169.0" else{throw AppError.message("원래 Goal 서버의 공식 버전을 확인하지 못했습니다.")}
         self.serverCLI=serverCLI

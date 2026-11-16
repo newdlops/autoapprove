@@ -27,6 +27,8 @@ const compatibilityEntry=process.argv.includes('--compatibility-entry');
 assert.ok(!compatibilityEntry||enginePause,'Compatibility entry is tested with the complete engine pause/resume flow');
 const pauseCrash=option('pause-crash');
 assert.ok(!pauseCrash||(['deferred','settled','paused','confirmed'].includes(pauseCrash)&&enginePause&&!compatibilityEntry),'Owned pause crash requires the requested engine pause/resume flow');
+const resumeCrash=option('resume-crash');
+assert.ok(!resumeCrash||(['attached','active','confirmed'].includes(resumeCrash)&&enginePause&&!compatibilityEntry),'Owned resume crash requires the engine lifecycle flow');
 const swiftLocalState=process.argv.includes('--swift-local-state');
 assert.ok(!swiftLocalState||localResumeProbe,'Swift state checks require the local Goal experiment');
 assert.ok(!parentControl||!managedControl,'Parent-mediated check uses the unmodified official runtime');
@@ -372,7 +374,8 @@ try {
    assert.equal(enginePauseReport.compatibilityEntry,compatibilityEntry);
    if(pauseCrash){
     assert.equal(enginePauseReport.uncertainRequestNotReplayed,true);
-    assert.equal(enginePauseReport.freshObservedPauseRequired,['deferred','settled'].includes(pauseCrash));
+    assert.equal(enginePauseReport.automaticIntentRecovery,true);
+    assert.equal(enginePauseReport.freshStatePauseRequired,['deferred','settled'].includes(pauseCrash));
    }
    assert.equal((await rpc('thread/read',{threadId:rootID,includeTurns:false})).thread.status.type,'active');
    assert.deepEqual((await rpc('thread/turns/list',{threadId:rootID,limit:100,itemsView:'notLoaded',sortDirection:'desc'})).data.map(turn=>turn.id),parentTurnsBeforePause);
@@ -468,9 +471,18 @@ try {
   if(attachResumeProbe){
    localGoalRestored=true;
    if(engineResume){
-    const {stdout}=await execFileAsync(engineResumeHelper,[home,option('codex'),rootID,root,childID,...(compatibilityEntry?['compatibility']:[])],{cwd:root,env:{...env,AUTOAPPROVE_HOME:root+'/compatibility-state'},timeout:30000});
+    const args=[home,option('codex'),rootID,root,childID],helperOptions={cwd:root,env:{...env,AUTOAPPROVE_HOME:root+'/compatibility-state'},timeout:30000};
+    if(resumeCrash) {
+     const crashed=await execFileAsync(engineResumeHelper,[...args,'crash-'+resumeCrash],helperOptions).then(()=>undefined,error=>error);
+     assert.ok(crashed,'The owned resume controller must actually terminate');
+     assert.equal(crashed.code,{attached:83,active:84,confirmed:85}[resumeCrash],crashed.stderr);
+     assert.equal(goalIdentity(),originalGoalID);
+     assert.equal((await rpc('thread/goal/get',{threadId:childID})).goal.status,resumeCrash==='attached'?'paused':'active');
+    }
+    const {stdout}=await execFileAsync(engineResumeHelper,[...args,...(resumeCrash?['recover-resume']:compatibilityEntry?['compatibility']:[])],helperOptions);
     engineResumeReport=JSON.parse(stdout);assert.equal(engineResumeReport.productionEngineResume,true);
     assert.equal(engineResumeReport.compatibilityEntry,compatibilityEntry);
+    if(resumeCrash)assert.equal(engineResumeReport.automaticIntentRecovery,true);
    }else{
    const attachment=await rpc('thread/resume',{threadId:childID,excludeTurns:true});
    assert.equal(attachment.thread.id,childID);assert.equal(attachment.thread.canAcceptDirectInput,false);
@@ -502,7 +514,7 @@ try {
    console.log(JSON.stringify({verified:true,feasibilityExperimentOnly:!engineResume,realV2Child:true,officialRuntimeUnmodified:true,
     publicDirectGoalChangeRejected:true,parentPauseSucceeded:true,localStateRestored:true,parentFollowupStartedChild:!attachResumeProbe,
     officialAttachmentStartedChild:attachResumeProbe,parentTurnsUnchangedDuringResume:attachResumeProbe,
-    productionEngineResume:Boolean(engineResumeReport),requestAndAppRestartReadOnly:Boolean(engineResumeReport?.repeatAndRestartReadOnly),
+    productionEngineResume:Boolean(engineResumeReport),requestAndAppRestartReadOnly:Boolean(engineResumeReport?.repeatAndRestartReadOnly),resumeCrashRecoveryPoint:resumeCrash??null,resumeCrashRecovery:resumeCrash?engineResumeReport:null,
     productionEnginePause:Boolean(enginePauseReport),compatibilityPublicEntryVerified:compatibilityEntry,pauseCrashRecoveryPoint:pauseCrash??null,pauseCrashRecovery:pauseCrash?enginePauseReport:null,busyParentPreserved:enginePause,pausedTimeNotCharged:enginePause,
     autonomousNextGoalTurnObserved:true,goalIdentityAndBudgetRetained:true,accountingMonotonic:true,coldServerGoalAndHistoryRetained:true,
     swiftStatePrimitiveVerified:swiftLocalState,rollbackAfterSQLVerified:swiftLocalState,

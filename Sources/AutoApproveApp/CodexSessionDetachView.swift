@@ -23,7 +23,7 @@ import AutoApproveCore
                     Spacer();Button("닫기",action:close).keyboardShortcut(.cancelAction).disabled(preparing)
                 }
                 Text(source.identity.email ?? source.identity.provider).textSelection(.enabled)
-                Text("선택한 세션에 전용 로그인 홈을 만들고, 같은 대화를 공유 서버 없이 다시 실행합니다. 다른 그룹 세션은 유지됩니다.")
+                Text("선택한 세션에 전용 로그인 홈과 로컬 서버를 만들어 같은 대화를 분리합니다. 다른 세션은 원래 로그인 그룹으로 복원합니다.")
                     .foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 TextField("독립 로그인 이름",text:$name).textFieldStyle(.roundedBorder).disabled(preparing)
                 if let error {Label(error,systemImage:"exclamationmark.circle").foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)}
@@ -31,7 +31,7 @@ import AutoApproveCore
                     preparing=true;error=nil
                     Task { @MainActor in
                         defer{preparing=false}
-                        do {home=try await engine.createCodexIndependentLogin(name:name)}
+                        do {home=try await engine.createCodexIndependentLogin(name:name,dedicatedServer:true)}
                         catch {self.error=error.localizedDescription}
                     }
                 }.disabled(preparing || name.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)

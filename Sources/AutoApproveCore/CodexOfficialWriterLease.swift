@@ -15,7 +15,7 @@ final class CodexOfficialWriterLease {
     private var closed=false
     private static var failure:AppError {.message("선택한 대화의 공식 Codex 쓰기 잠금을 확인하지 못했습니다. 이력을 변경하지 않았습니다.")}
 
-    init(home:String,threadIDs:[String])throws {
+    init(home:String,threadIDs:[String],initializeDestination:Bool=false)throws {
         let scope=threadIDs.sorted()
         guard !scope.isEmpty,scope.count<=512,Set(scope).count==scope.count,
               scope.allSatisfy({UUID(uuidString:$0)?.uuidString.lowercased()==$0}) else{throw Self.failure}
@@ -25,8 +25,12 @@ final class CodexOfficialWriterLease {
         var rootInfo=stat()
         guard fstat(root,&rootInfo)==0,rootInfo.st_uid==getuid(),rootInfo.st_mode&S_IFMT==S_IFDIR else{Darwin.close(root);throw Self.failure}
         homeFD=root;homeDevice=rootInfo.st_dev;homeInode=rootInfo.st_ino
-        // The official runtime creates this directory. Missing lock namespaces
-        // cannot be guessed for older, remote or future storage implementations.
+        // A verified original-runtime destination can have no conversations yet.
+        // Initialize only its fixed coordination namespace, never a dummy thread
+        // or a model turn. Existing callers still require a runtime-created one.
+        if initializeDestination,mkdirat(root,"thread-writer-locks",0o700) != 0,errno != EEXIST {
+            Darwin.close(root);throw Self.failure
+        }
         let directory=openat(root,"thread-writer-locks",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)
         guard directory>=0 else{Darwin.close(root);throw Self.failure}
         var directoryInfo=stat()

@@ -3,6 +3,7 @@ import Darwin
 
 public struct CodexLoginGroup:Codable,Equatable,Identifiable,Sendable {
     public let id:UUID,name:String,home:String,homeIdentity:String,createdAt:Date
+    public var dedicatedServer:Bool?=nil
 }
 
 /// Named destinations only. Creation never starts a CLI/server or copies auth.
@@ -117,7 +118,7 @@ public struct CodexLoginGroupStore:Sendable {
             document.identity=root.identity
             document.groups=try document.groups.map { group in
                 var info=stat();guard lstat(group.home,&info)==0 else {throw Self.failure}
-                return CodexLoginGroup(id:group.id,name:group.name,home:group.home,homeIdentity:try Self.identity(info,path:group.home),createdAt:group.createdAt)
+                return CodexLoginGroup(id:group.id,name:group.name,home:group.home,homeIdentity:try Self.identity(info,path:group.home),createdAt:group.createdAt,dedicatedServer:group.dedicatedServer)
             }
             try Self.save(document,root)
         }
@@ -139,11 +140,11 @@ public struct CodexLoginGroupStore:Sendable {
         guard !document.groups.contains(where:{$0.id != id && Self.nameKey($0.name)==Self.nameKey(name)}) else{throw AppError.message("같은 이름의 로그인 그룹이 있습니다. 다른 이름을 입력해주세요.")}
         let old=document.groups[index]
         if old.name==name{return old}
-        let updated=CodexLoginGroup(id:old.id,name:name,home:old.home,homeIdentity:old.homeIdentity,createdAt:old.createdAt)
+        let updated=CodexLoginGroup(id:old.id,name:name,home:old.home,homeIdentity:old.homeIdentity,createdAt:old.createdAt,dedicatedServer:old.dedicatedServer)
         document.groups[index]=updated;try Self.save(document,root)
         return updated
     }
-    @discardableResult public func create(name raw:String,daemonAutoStart:Bool?=nil)throws->CodexLoginGroup {
+    @discardableResult public func create(name raw:String,daemonAutoStart:Bool?=nil,dedicatedServer:Bool?=nil)throws->CodexLoginGroup {
         let name=try Self.name(raw),root=try Root(directory,create:true,lock:true)
         var document=try Self.load(root)
         guard document.groups.count<32 else{throw AppError.message("로그인 그룹은 최대 32개까지 만들 수 있습니다.")}
@@ -166,7 +167,7 @@ public struct CodexLoginGroupStore:Sendable {
         if let daemonAutoStart {settings += "[features]\ndaemon_auto_start = \(daemonAutoStart ? "true":"false")\n"}
         try FileHandle(fileDescriptor:config,closeOnDealloc:false).write(contentsOf:Data(settings.utf8))
         guard fsync(config)==0,fsync(home)==0,fsync(homes)==0 else{throw Self.failure}
-        let group=CodexLoginGroup(id:id,name:name,home:path,homeIdentity:identity,createdAt:Date())
+        let group=CodexLoginGroup(id:id,name:name,home:path,homeIdentity:identity,createdAt:Date(),dedicatedServer:dedicatedServer)
         try Self.home(group,root);document.groups.append(group);try Self.save(document,root)
         return group
     }

@@ -13,8 +13,10 @@ public struct CodexStandaloneSession:Equatable,Identifiable,Sendable {
 /// A per-session login home, deliberately absent from the shared group picker.
 public struct CodexIndependentLogin:Equatable,Identifiable,Sendable {
     public let id:UUID,name:String,home:String,homeIdentity:String,createdAt:Date
+    public let usesDedicatedServer:Bool
     init(_ value:CodexLoginGroup) {
         id=value.id;name=value.name;home=value.home;homeIdentity=value.homeIdentity;createdAt=value.createdAt
+        usesDedicatedServer=value.dedicatedServer ?? false
     }
 }
 
@@ -24,12 +26,19 @@ struct CodexIndependentLoginStore:Sendable {
     let directory:URL
     private var homes:CodexLoginGroupStore {.init(directory:directory)}
     func list()throws->[CodexIndependentLogin] {try homes.list().map(CodexIndependentLogin.init)}
-    func create(name:String)throws->CodexIndependentLogin {
-        .init(try homes.create(name:name,daemonAutoStart:false))
+    func create(name:String,dedicatedServer:Bool=false)throws->CodexIndependentLogin {
+        .init(try homes.create(name:name,daemonAutoStart:dedicatedServer,dedicatedServer:dedicatedServer))
     }
     func validate(home:String)throws {try homes.validate(home:home)}
     func contains(home:String)throws->Bool {
         let selected=try CodexAccountTransitionTarget.canonicalHome(home)
         return try list().contains{try CodexAccountTransitionTarget.canonicalHome($0.home)==selected}
+    }
+    func requiresStandalone(home:String)throws->Bool {
+        let selected=try CodexAccountTransitionTarget.canonicalHome(home)
+        return try list().contains {value in
+            guard !value.usesDedicatedServer else{return false}
+            return try CodexAccountTransitionTarget.canonicalHome(value.home)==selected
+        }
     }
 }
