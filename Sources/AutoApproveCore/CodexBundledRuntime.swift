@@ -13,7 +13,17 @@ enum CodexBundledRuntime {
         let target:String
         let files:[String:String]
         static func bundled()throws->Self {
-            guard let url=Bundle.module.url(forResource:"CodexOfficialRelease",withExtension:"json") else{throw failure}
+            // The packaged app keeps the resource bundle in Contents/Resources.
+            // SPM's Bundle.module traps when it cannot find the bundle there, so
+            // check the packaged location first, as RemoteWebVersion does.
+            let packaged=Bundle.main.resourceURL?.appendingPathComponent("AutoApprove_AutoApproveCore.bundle/CodexOfficialRelease.json")
+            let url:URL
+            if let packaged, FileManager.default.fileExists(atPath:packaged.path) {
+                url=packaged
+            } else {
+                guard let module=Bundle.module.url(forResource:"CodexOfficialRelease",withExtension:"json") else{throw failure}
+                url=module
+            }
             return try JSONDecoder().decode(Self.self,from:Data(contentsOf:url))
         }
     }
