@@ -73,6 +73,7 @@ public enum AutoApproveMCPServer {
         }
     }
     public static func run(paths: AppPaths) {
+        MCPProcessEnvironment.configure()
         let owner = UUID().uuidString
         defer { _ = try? SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": ["tool": "disconnect", "owner": owner]], timeout: 2) }
         let input = MCPInputReader(descriptor: STDIN_FILENO)
@@ -96,20 +97,34 @@ public enum AutoApproveMCPServer {
                 // Handshake/list/ping and owner-scoped replies need no process
                 // scan. Resolve attribution freshly only when it is used.
                 if tool == "ask_user" || tool == "start_screen_share" || groupTool {
+                    let environment = ProcessInfo.processInfo.environment
                     let parent = getppid()
-                    if let agent = try? ProcessDiscovery.enclosingAgent(of: parent), getppid() == parent {
+                    let enclosing = try? ProcessDiscovery.enclosingAgent(of: parent)
+                    let agent = getppid() == parent ? enclosing : nil
+                    // Codex's per-call metadata identifies the conversation even
+                    // when its MCP parent is a shared daemon, not a terminal CLI.
+                    // A Claude child launched from Codex may inherit its exec
+                    // environment. Keep Claude's existing attribution path.
+                    let codexID = groupTool && agent?.agent != .claude ?
+                        try CodexGroupIdentity.conversationID(in: message, environment: environment) : nil
+                    if let id = codexID {
+                        if let claimed = params["conversationID"] as? String, UUID(uuidString: claimed) != UUID(uuidString: id) {
+                            throw AppError.message("지정한 대화 ID가 이 Codex 호출의 대화와 다릅니다.")
+                        }
+                        params["agentKind"] = AgentKind.codex.rawValue
+                        params["conversationID"] = id
+                        // Official Codex filters CODEX_HOME out of the default
+                        // MCP environment. The parent can locate the account
+                        // home, but never supplies the conversation identity.
+                        let homeEnvironment = environment["CODEX_HOME"] != nil ? environment :
+                            (agent.flatMap(ProcessEnvironment.read) ?? environment)
+                        params["codexCallerHome"] = CodexGroupIdentity.home(environment: homeEnvironment)
+                        params["codexCallerConversationID"] = id
+                        params["codexCallerSource"] = try CodexGroupIdentity.conversationID(in: message) == nil ? "codex_exec_context" : "codex_mcp_metadata"
+                    }
+                    if codexID == nil, let agent {
                         params["sessionID"] = agent.key
                         if groupTool { params["agentKind"] = agent.agent?.rawValue }
-                        if groupTool, agent.agent == .codex, let id = try CodexGroupIdentity.conversationID(in: message, environment: ProcessInfo.processInfo.environment) {
-                            if let claimed = params["conversationID"] as? String, UUID(uuidString: claimed) != UUID(uuidString: id) {
-                                throw AppError.message("지정한 대화 ID가 이 Codex 호출의 대화와 다릅니다.")
-                            }
-                            params["conversationID"] = id
-                            if let home = CodexGroupIdentity.home(environment: ProcessEnvironment.read(agent)) {
-                                params["codexCallerHome"] = home; params["codexCallerConversationID"] = id
-                                params["codexCallerSource"] = try CodexGroupIdentity.conversationID(in: message) == nil ? "codex_exec_context" : "codex_mcp_metadata"
-                            }
-                        }
                     }
                 }
                 return try SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: groupTool ? 60 : 20)

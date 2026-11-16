@@ -2576,10 +2576,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return observed
     }
 
-    /// The MCP caller is its enclosing process, or on a shared server the one live conversation it names.
+    /// Per-call conversation evidence takes precedence over the MCP host process.
+    /// A daemon can serve multiple conversations and need not have a visible TUI.
     private func sessionGroupCaller(_ object: JSONObject, observed: [SessionGroupLiveSession], recovery: Bool = false) throws -> (session: SessionGroupLiveSession, attribution: String) {
         let claimed = object["conversationID"] as? String
         guard claimed == nil || UUID(uuidString: claimed!) != nil else { throw RemoteHTTPError(400, "현재 대화의 UUID를 확인해주세요.") }
+        if object["agentKind"] as? String == AgentKind.codex.rawValue,
+           let proof = object["codexCallerConversationID"] as? String,
+           let uuid = UUID(uuidString: proof), let home = object["codexCallerHome"] as? String,
+           home.hasPrefix("/"), !home.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) {
+            guard let claimed, UUID(uuidString: claimed) == uuid else {
+                throw RemoteHTTPError(409, "지정한 대화 ID가 이 Codex 호출의 대화와 다릅니다.")
+            }
+            let caller = AgentSession(id: "codex-mcp:" + home + ":" + uuid.uuidString, agent: .codex, pid: 0,
+                                      started: "", tty: "", cwd: "", terminal: .unknown)
+            let attribution = object["codexCallerSource"] as? String == "codex_exec_context" ? "codex_exec_context" : "codex_mcp_metadata"
+            return (.init(session: caller, conversationID: uuid.uuidString, providerHome: home), attribution)
+        }
         if let direct = (object["sessionID"] as? String).flatMap({ id in observed.first { $0.id == id } }) {
             if let claimed, !(recovery && direct.conversationID == nil), UUID(uuidString: claimed) != direct.conversationID.flatMap(UUID.init(uuidString:)) {
                 throw RemoteHTTPError(409, "지정한 대화 ID가 현재 세션과 다릅니다.")

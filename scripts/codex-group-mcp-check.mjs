@@ -55,12 +55,16 @@ try {
   assert.equal(status,0,'Codex fixture failed: '+stderr);
  }
  assert.ok(toolSeen,"requests="+requests+" stderr="+stderr);assert.ok(requests>=2);
- const call=calls.find(x=>x.tool==='get_session_groups');assert.ok(call);assert.match(call.sessionID??'',/^process:\d+:/);
+ const call=calls.find(x=>x.tool==='get_session_groups');assert.ok(call);
  if(serverMode) {
+  assert.equal(call.sessionID,undefined,'Per-call conversation evidence must not use the shared process as identity');
   assert.equal(call.conversationID,ownThread);assert.equal(call.agentKind,'codex');
   assert.equal(call.codexCallerConversationID,ownThread);assert.equal(await realpath(call.codexCallerHome),await realpath(home));
   console.log('PASS real Codex app-server: empty tool arguments resolve the calling conversation from per-call MCP metadata');
- }else console.log('PASS owned real Codex exec: discovered MCP group tool and attributed its caller');
+ }else {
+  assert.ok(call.conversationID||/^process:\d+:/.test(call.sessionID??''));
+  console.log('PASS owned real Codex exec: discovered MCP group tool and attributed its caller');
+ }
 } finally {
  if(child&&child.exitCode===null)child.kill('SIGTERM');api.closeAllConnections();api.close();
  await new Promise(resolve=>socket.close(resolve));await rm(root,{recursive:true,force:true,maxRetries:3,retryDelay:100});

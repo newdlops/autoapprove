@@ -520,6 +520,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: Claude mailbox retries after busy with custom status",tests.testGroupClaudeMailboxCustomStatus),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
             ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
+            ("MCP: process language follows UTF-8 environment or macOS preference",tests.testMCPProcessLanguageEnvironment),
+            ("Session groups: Codex membership follows conversation across endpoints",tests.testCodexMembershipFollowsConversationAcrossEndpoints),
             ("Session groups: clipped and repeated Codex status requires fresh history",tests.testCodexGroupStatusUsesFreshHistoryWhenFrameClips),
             ("Session groups: explicit Codex status waits without bypassing input priority",tests.testCodexGroupStatusWaitsForInputCooldownWithoutBypass),
             ("Session groups: rebinding preserves hierarchy",tests.testSessionGroupRebindingPreservesHierarchy),

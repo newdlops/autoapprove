@@ -232,6 +232,12 @@ public enum SessionGroupMatching {
     public static func match(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
         let matches = live.filter { observation in
             guard observation.session.agent == member.agent, observation.session.phase != .ended else { return false }
+            if member.agent == .codex, let id = UUID(uuidString: member.conversationID) {
+                // cwd, PID and TTY may change while resuming the same saved
+                // conversation. They locate an input endpoint, not membership.
+                return id == observation.conversationID.flatMap(UUID.init(uuidString:)) &&
+                    (member.providerHome == nil || member.providerHome == observation.providerHome)
+            }
             if member.conversationID.isEmpty {
                 return member.runtimeID == observation.id && member.cwd == observation.session.cwd
             }

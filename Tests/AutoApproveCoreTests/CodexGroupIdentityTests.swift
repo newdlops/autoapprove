@@ -304,6 +304,8 @@ extension ApprovalTests {
         try expectEqual(updated.leaderMemberID, member.id)
         var restarted = live; restarted.session.id = "process:456:new-start"; restarted.session.pid = 456
         try expectEqual(CodexGroupIdentity.refreshed([updated], live: [restarted])[0].members[0].runtimeID, restarted.id)
+        restarted.session.cwd = "/resumed/elsewhere"
+        try expectEqual(CodexGroupIdentity.refreshed([updated], live: [restarted])[0].members[0].runtimeID, restarted.id)
         try expectEqual(CodexGroupIdentity.refreshed([group], live: [live, restarted]), [group])
         var foreign = live; foreign.providerHome = "/home/other"
         try expectEqual(CodexGroupIdentity.refreshed([group], live: [foreign]), [group])
@@ -328,8 +330,44 @@ extension ApprovalTests {
         try expectEqual(peer?["isCaller"] as? Bool, true)
         try expectEqual(peer?["connected"] as? Bool, false, "MCP identity must not invent a terminal connection")
         try expectEqual(peer?["connectionState"] as? String, "disconnected")
+        // A shared MCP process may also be observed as an unrelated live CLI.
+        // This must not supersede the conversation proven by this call.
+        let record = ProcessDiscovery.parse("100599 1 fixture49 100599 100599 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+        let unrelated = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started,
+                                     tty: "/dev/" + record.tty, cwd: "/other", terminal: .unknown)
+        engine.updateDiscovery([unrelated], records: [record])
+        params["sessionID"] = unrelated.id
+        let withUnrelatedProcess = try await engine.mcpAction(params)
+        try expectEqual((withUnrelatedProcess["groups"] as? [JSONObject])?.count, 1)
+        try expectEqual(withUnrelatedProcess["attribution"] as? String, "codex_mcp_metadata")
+        params["conversationID"] = UUID().uuidString
+        do { _ = try await engine.mcpAction(params); throw AppError.message("Accepted mismatched conversation proof") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        params["conversationID"] = id
         params["codexCallerHome"] = "/fixture/other"
         try expectEqual((try await engine.mcpAction(params)["groups"] as? [JSONObject])?.count, 0)
+    }
+
+    func testMCPProcessLanguageEnvironment() throws {
+        try expectEqual(MCPProcessEnvironment.locale(environment: [:], preferredLanguages: ["ko-KR"]), "ko_KR.UTF-8")
+        try expectEqual(MCPProcessEnvironment.locale(environment: ["LANG": "C", "LC_ALL": "C"], preferredLanguages: ["ko"]), "ko_KR.UTF-8")
+        try expectEqual(MCPProcessEnvironment.locale(environment: ["LANG": "ja_JP.UTF-8"], preferredLanguages: ["ko-KR"]), "ja_JP.UTF-8")
+        try expectEqual(MCPProcessEnvironment.locale(environment: ["LC_ALL": "en_US.UTF-8", "LANG": "ko_KR.UTF-8"], preferredLanguages: []), "en_US.UTF-8")
+        try expectEqual(MCPProcessEnvironment.locale(environment: ["LANG": "bad\nlocale"], preferredLanguages: []), "en_US.UTF-8")
+    }
+
+    func testCodexMembershipFollowsConversationAcrossEndpoints() throws {
+        let id = UUID().uuidString
+        let member = SessionGroupMember(agent: .codex, title: "saved", cwd: "/old", conversationID: id, providerHome: "/home/a")
+        let session = AgentSession(id: "new-runtime", agent: .codex, pid: 123, started: "new", tty: "/dev/new", cwd: "/new", terminal: .unknown)
+        let live = SessionGroupLiveSession(session: session, conversationID: id, providerHome: "/home/a")
+        try expectEqual(SessionGroupMatching.match(member, in: [live])?.id, session.id)
+        var wrong = live; wrong.conversationID = UUID().uuidString
+        try expectNil(SessionGroupMatching.match(member, in: [wrong]))
+        wrong = live; wrong.providerHome = "/home/b"
+        try expectNil(SessionGroupMatching.match(member, in: [wrong]))
+        var duplicate = live; duplicate.session.id = "other-runtime"
+        try expectNil(SessionGroupMatching.match(member, in: [live, duplicate]))
     }
 
     @MainActor func testCodexMetadataParentCanDirectConfirmedWorker() async throws {

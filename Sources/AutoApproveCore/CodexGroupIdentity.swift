@@ -34,10 +34,10 @@ public enum CodexGroupIdentity {
                 let member = group.members[index]
                 guard member.agent == .codex else { continue }
                 let candidates = live.filter {
-                    $0.session.agent == .codex && $0.session.phase != .ended && $0.session.cwd == member.cwd &&
+                    $0.session.agent == .codex && $0.session.phase != .ended &&
                     $0.conversationID.flatMap(UUID.init(uuidString:)) != nil && $0.providerHome != nil &&
                     (member.providerHome == nil || member.providerHome == $0.providerHome) &&
-                    (member.runtimeID == $0.id || (!member.conversationID.isEmpty &&
+                    ((member.runtimeID == $0.id && $0.session.cwd == member.cwd) || (!member.conversationID.isEmpty &&
                         UUID(uuidString: member.conversationID) == $0.conversationID.flatMap(UUID.init(uuidString:))))
                 }
                 guard candidates.count == 1, let current = candidates.first,
