@@ -14,6 +14,9 @@ public final class OSPermissionAutomation:@unchecked Sendable {
     private let settingsOwner:@Sendable (NSRunningApplication)->Bool
     private let usesAppleOwners:Bool
     private var settings:[String:(OSPermissionTarget,OSPermissionKind)] = [:]
+    private struct VerifiedOwner {let launch:Date?;let path:String;let started:String;let at:TimeInterval}
+    private var verifiedOwners:[pid_t:VerifiedOwner]=[:]
+    private static let ownerCacheLifetime:TimeInterval=300
     private static let owners:Set<String> = ["com.apple.UserNotificationCenter","com.apple.CoreServicesUIAgent","com.apple.coreservices.uiagent","com.apple.SecurityAgent","com.apple.systemuiserver","com.apple.notificationcenterui","com.apple.systempreferences","com.apple.controlcenter","com.apple.tccd"]
     private struct Handle {var request:OSPermissionRequest;var window:AXUIElement;var button:AXUIElement}
     private struct Node {var element:AXUIElement;var role:String;var texts:[String];var children:[Node];var enabled:Bool;var value:String
@@ -91,16 +94,47 @@ public final class OSPermissionAutomation:@unchecked Sendable {
         if string(window.element,kAXSubroleAttribute)==kAXSystemDialogSubrole || string(window.element,kAXSubroleAttribute)==kAXDialogSubrole {return window}
         return nil
     }
+    /// The once-a-second scan verified every Apple owner's code signature and
+    /// read its process record again, about a third of the app's CPU time.
+    /// A running process keeps its code, so a passed check is reused for the
+    /// same PID, launch date and bundle path for five minutes. Pressing a
+    /// button still verifies the owner and its start time again first.
+    private func verifiedOwnerStart(_ app:NSRunningApplication)->String? {
+        let pid=app.processIdentifier,path=app.bundleURL?.path ?? "",now=ProcessInfo.processInfo.systemUptime
+        if usesAppleOwners {
+            guard let id=app.bundleIdentifier,Self.owners.contains(id) else {return nil}
+            lock.lock();let cached=verifiedOwners[pid];lock.unlock()
+            if let cached,cached.launch==app.launchDate,cached.path==path,now-cached.at<Self.ownerCacheLifetime {return cached.started}
+        }
+        guard ownerVerifier(app),let record=try? ProcessDiscovery.read(pid:pid).first,!record.started.isEmpty else {
+            if usesAppleOwners {lock.lock();verifiedOwners.removeValue(forKey:pid);lock.unlock()}
+            return nil
+        }
+        if usesAppleOwners {
+            lock.lock();verifiedOwners[pid]=VerifiedOwner(launch:app.launchDate,path:path,started:record.started,at:now);lock.unlock()
+        }
+        return record.started
+    }
     private func handles(targets:[OSPermissionTarget]) throws -> [Handle] {
         guard AXIsProcessTrusted() else {return []}
-        let apps=NSWorkspace.shared.runningApplications
+        // Only the fixed Apple owner apps can show these windows. Asking
+        // LaunchServices for those bundle IDs avoids reading the bundle ID and
+        // PID of every running app each second; the full list is read only
+        // when a dialog needs its requesting app resolved.
+        let allApps:[NSRunningApplication]?=usesAppleOwners ? nil:NSWorkspace.shared.runningApplications
+        let apps=allApps ?? Self.owners.sorted().flatMap {NSRunningApplication.runningApplications(withBundleIdentifier:$0)}
+        var everyApp:[NSRunningApplication] {allApps ?? NSWorkspace.shared.runningApplications}
+        if usesAppleOwners {
+            let live=Set(apps.map(\.processIdentifier))
+            lock.lock();verifiedOwners=verifiedOwners.filter {live.contains($0.key)};lock.unlock()
+        }
         lock.lock();let expected=Array(settings.values);lock.unlock()
         var result:[Handle]=[]
         let deadline=ProcessInfo.processInfo.systemUptime+1.5
         for app in apps {
             if settingsOwner(app),expected.isEmpty {continue}
-            guard ownerVerifier(app) else {continue}
-            guard let owner=try? ProcessDiscovery.read(pid:app.processIdentifier).first,!owner.started.isEmpty else {continue}
+            guard let started=verifiedOwnerStart(app) else {continue}
+            let owner=(pid:app.processIdentifier,started:started)
             let ax=AXUIElementCreateApplication(app.processIdentifier);AXUIElementSetMessagingTimeout(ax,0.12)
             for window in Self.elements(ax,kAXWindowsAttribute).prefix(12) {
                 AXUIElementSetMessagingTimeout(window,0.04)
@@ -116,7 +150,8 @@ public final class OSPermissionAutomation:@unchecked Sendable {
                 guard let tree=Self.node(window,budget:&budget,deadline:treeDeadline),budget>0,ProcessInfo.processInfo.systemUptime<treeDeadline else {throw AppError.message("OS 권한창 전체를 확인하지 못했습니다. 확인되지 않은 창을 닫힘으로 처리하지 않습니다.")}
                 if settingsOwner(app) {
                     for (target,kind) in expected where targets.contains(where:{$0.matches(target)}) {
-                        guard let current=apps.first(where:{$0.processIdentifier==target.pid}),Self.target(current)==target else {continue}
+                        guard let current=allApps.map({$0.first(where:{$0.processIdentifier==target.pid})}) ?? NSRunningApplication(processIdentifier:target.pid),
+                              Self.target(current)==target else {continue}
                         let headings=tree.all.filter {![kAXButtonRole,kAXCheckBoxRole].contains($0.role)}.flatMap(\.texts)
                         let names:[String]
                         switch kind {
@@ -154,7 +189,7 @@ public final class OSPermissionAutomation:@unchecked Sendable {
                 else if allow.count==1 {action = .allow;button=allow[0]}
                 else if allow.isEmpty,settings.count==1 {action = .openSettings;button=settings[0]}
                 else {continue}
-                let request=OSPermissionRequest(kind:kind,requester:Self.requester(content,apps:apps),ownerPID:owner.pid,ownerStarted:owner.started,ownerBundleID:app.bundleIdentifier!,windowToken:String(CFHash(dialog.element)),content:content,action:action,actionToken:String(CFHash(button.element)),buttons:protected ? nil:buttons.compactMap(Self.responseButton))
+                let request=OSPermissionRequest(kind:kind,requester:Self.requester(content,apps:everyApp),ownerPID:owner.pid,ownerStarted:owner.started,ownerBundleID:app.bundleIdentifier!,windowToken:String(CFHash(dialog.element)),content:content,action:action,actionToken:String(CFHash(button.element)),buttons:protected ? nil:buttons.compactMap(Self.responseButton))
                 result.append(.init(request:request,window:window,button:button.element))
             }
         }

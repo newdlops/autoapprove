@@ -3100,12 +3100,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !remoteInputStopped else { return true }
         await watchGroupQuestions()
         guard let state = try? groupOrchestration() else { return false }
-        for (item, isQuestion) in state.undelivered.map({ ($0, false) }) + state.undeliveredQuestions.map({ ($0, true) }) {
+        let pending = state.undelivered.map({ ($0, false) }) + state.undeliveredQuestions.map({ ($0, true) })
+        // This pass repeats every two seconds while a report waits for its
+        // parent's ACK. Read the group file once per pass, and leave a report
+        // already stored in the mailbox to the mailbox's own retry schedule.
+        let groups = pending.isEmpty ? [] : (try? SessionGroupStore(directory: paths.directory).load())
+        for (item, isQuestion) in pending {
             do {
-                guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == item.groupID }),
+                let source = isQuestion ? "question:\(item.id.uuidString):\(item.question!.id)" : "report:\(item.id.uuidString)"
+                if let stored = try groupMailbox().message(sourceKey: source), stored.acknowledgedAt == nil,
+                   stored.groupID == item.groupID, stored.senderID == item.workerMemberID, stored.recipientID == item.parentMemberID {
+                    scheduleGroupMailboxDelivery()
+                    continue
+                }
+                guard let group = groups?.first(where: { $0.id == item.groupID }),
                       group.members.contains(where: { $0.id == item.workerMemberID }),
                       group.members.contains(where: { $0.id == item.parentMemberID }) else { throw AppError.message("보고의 원래 그룹과 구성원을 확인하지 못해 보관하고 있습니다.") }
-                let source = isQuestion ? "question:\(item.id.uuidString):\(item.question!.id)" : "report:\(item.id.uuidString)"
                 let body = SessionGroupOrchestration.report(for: isQuestion ? [] : [item], questions: isQuestion ? [item] : [], titles: Dictionary(group.members.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first }))
                 let message = try groupMailbox().enqueue(groupID: group.id, senderID: item.workerMemberID, recipientID: item.parentMemberID,
                     kind: isQuestion ? .choiceQuestion : .report, text: body, sourceKey: source)
