@@ -15,3 +15,4 @@
 - Cloudflare web version matching also requires the signed `AutoApprove-<version>-build<build>-macOS-<architecture>.zip` and its SHA-256 file on each GitHub release. Generate them with `scripts/package-update.mjs`; publish them alongside the DMG and its checksum.
 - Verify the published tag, assets and download. If deployment is blocked, report the precise blocker and which deployment step remains.
 - Preserve unrelated workspace changes. Never publish local runtime data, signing secrets, keychains, user terminal content or private test artifacts.
+- User instruction, 2026-11-17: clean up generated build artifacts that are no longer needed. Keep the current build and release inputs while work is active; remove obsolete packages, duplicate test bundles and finished fixture caches after verification. Preserve source, verification logs, user data and artifacts used by live processes.

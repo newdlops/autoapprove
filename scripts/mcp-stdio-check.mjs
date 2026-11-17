@@ -57,7 +57,7 @@ try {
     assert.equal(values.length, 4);
     assert.equal(values[0].id, 1); assert.equal(values[0].result.protocolVersion, '2025-11-25');
     assert.deepEqual(values[1], result('문자🧪\u0000\u0004'));
-    assert.deepEqual(values[2].result.tools.map(tool => tool.name), ['ask_user','get_user_answers','list_screens','start_screen_share','stop_screen_share']);
+    assert.deepEqual(values[2].result.tools.map(tool => tool.name), ['ask_user','get_user_answers','get_session_groups','reconnect_group_member','send_group_message','ask_group_question','reply_group_question','get_group_messages','ack_group_messages','get_group_status','assign_group_task','answer_group_question','get_diagnostics','list_screens','start_screen_share','stop_screen_share']);
     assert.equal(values[3].error.code, -32601);
   });
   const metadataIDs=[101,'다른 e\u0301 🤖/\u0000\u0004',null,true,['nested'],{id:'object'}];
@@ -70,7 +70,7 @@ try {
     assert.equal(values.length,metadataIDs.length+3);
     for(let index=0;index<metadataIDs.length;index++){
       assert.deepEqual(values[index].id,metadataIDs[index]);
-      assert.deepEqual(values[index].result.tools.map(t=>t.name),['ask_user','get_user_answers','list_screens','start_screen_share','stop_screen_share']);
+      assert.deepEqual(values[index].result.tools.map(t=>t.name),['ask_user','get_user_answers','get_session_groups','reconnect_group_member','send_group_message','ask_group_question','reply_group_question','get_group_messages','ack_group_messages','get_group_status','assign_group_task','answer_group_question','get_diagnostics','list_screens','start_screen_share','stop_screen_share']);
       for(const tool of values[index].result.tools){assert.equal(tool.annotations.destructiveHint,false);assert.equal(tool.annotations.openWorldHint,false);}
     }
     for(const index of [metadataIDs.length,metadataIDs.length+1])assert.equal(values[index].error.code,-32600);

@@ -209,6 +209,16 @@ public enum CodexQuestionHistory {
     }
 }
 
+public enum CodexThreadLocationFailure: LocalizedError {
+    case missing, ambiguous
+    public var errorDescription: String? {
+        switch self {
+        case .missing: return "이 Codex 세션의 질문 기록을 찾지 못했습니다."
+        case .ambiguous: return "여러 Codex 대화가 연결되어 질문 대기열을 확정할 수 없습니다."
+        }
+    }
+}
+
 public struct CodexThreadLocation: Equatable {
     public var threadID: String
     public var database: String
@@ -217,6 +227,21 @@ public struct CodexThreadLocation: Equatable {
     /// Bind by the exact process's open root rollout, never by project or newest file.
     public static func locate(paths: [String]) throws -> CodexThreadLocation {
         try locate(paths: paths, rootThreadID: { _, data in rootThreadID(data) })
+    }
+    static func locateLive(_ process: ProcessRecord, paths: (ProcessRecord) throws -> [String] = {
+        try ProcessOpenFiles.codexRolloutPaths(pid: $0.pid, expectedStart: $0.started)
+    }) throws -> CodexThreadLocation {
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            let candidates = try paths(process)
+            do { return try locate(paths: candidates) }
+            catch CodexThreadLocationFailure.missing where attempt < 2 && !candidates.isEmpty {
+                // /new can open a rollout before its header is complete. Read
+                // fresh process descriptors again; never reuse a previous UUID.
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        throw CodexThreadLocationFailure.missing
     }
     fileprivate static func rootThreadID(_ data: Data) -> String? {
         guard let row = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
@@ -242,7 +267,7 @@ public struct CodexThreadLocation: Equatable {
             if matches.insert(db + "\n" + id).inserted { locations.append(CodexThreadLocation(threadID: id, database: db)) }
         }
         guard locations.count == 1 else {
-            throw AppError.message(locations.isEmpty ? "이 Codex 세션의 질문 기록을 찾지 못했습니다." : "여러 Codex 대화가 연결되어 질문 대기열을 확정할 수 없습니다.")
+            throw locations.isEmpty ? CodexThreadLocationFailure.missing : CodexThreadLocationFailure.ambiguous
         }
         return locations[0]
     }

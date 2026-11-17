@@ -76,6 +76,19 @@ public enum AutoApproveMCPServer {
         MCPProcessEnvironment.configure()
         let owner = UUID().uuidString
         defer { _ = try? SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": ["tool": "disconnect", "owner": owner]], timeout: 2) }
+        // Keep protocol health/list requests responsive while a bridge tool is
+        // waiting. Mutations retain arrival order and a bounded queue; no effects
+        // are replayed and stdout frames must never interleave.
+        let tools = DispatchQueue(label: "autoapprove.mcp.tools")
+        let queries = OperationQueue()
+        queries.name = "autoapprove.mcp.queries"; queries.maxConcurrentOperationCount = 4
+        let queryTools = Set(Self.tools.compactMap { tool -> String? in
+            guard (tool["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool == true else { return nil }
+            return tool["name"] as? String
+        }).union(["get_group_status"])
+        let slots = DispatchSemaphore(value: 16), output = NSLock()
+        func reply(_ value: JSONObject) { output.lock(); defer { output.unlock() }; write(value) }
+        defer { tools.sync {}; queries.waitUntilAllOperationsAreFinished() }
         let input = MCPInputReader(descriptor: STDIN_FILENO)
         while autoreleasepool(invoking: { () -> Bool in
             guard let frame = try? input.next() else { return false }
@@ -83,9 +96,10 @@ public enum AutoApproveMCPServer {
             // in valid UTF-8 JSON and must not switch this NDJSON wire format.
             guard case .message(let data) = frame, !data.contains(0), String(data: data, encoding: .utf8) != nil,
                   let message = (try? JSONSerialization.jsonObject(with: data)) as? JSONObject else {
-                write(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); return true
+                reply(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); return true
             }
-            if let reply = response(message, call: { tool, arguments in
+            let handle = {
+            if let value = response(message, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
                 let groupTool = ["get_session_groups", "get_group_status", "assign_group_task", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "ack_group_messages"].contains(tool)
                 // Only this process may attribute the caller; never trust a supplied session or agent kind.
@@ -127,8 +141,21 @@ public enum AutoApproveMCPServer {
                         if groupTool { params["agentKind"] = agent.agent?.rawValue }
                     }
                 }
-                return try SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: groupTool ? 60 : 20)
-            }) { write(reply) }
+                return try MCPBridgeClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: groupTool ? 60 : 20)
+            }) { reply(value) }
+            }
+            if message["method"] as? String == "tools/call", message["id"] != nil {
+                guard slots.wait(timeout: .now()) == .success else {
+                    reply(["jsonrpc": "2.0", "id": message["id"]!, "error": ["code": -32000, "message": "MCP 도구 요청이 많습니다. 진행 중인 요청의 결과를 확인한 뒤 다시 시도해주세요."]])
+                    return true
+                }
+                let name = (message["params"] as? JSONObject)?["name"] as? String ?? ""
+                if queryTools.contains(name) {
+                    queries.addOperation { defer { slots.signal() }; autoreleasepool { handle() } }
+                } else {
+                    tools.async { defer { slots.signal() }; autoreleasepool { handle() } }
+                }
+            } else { handle() }
             return true
         }) {
             // Drain temporary Foundation objects before the next blocking read.

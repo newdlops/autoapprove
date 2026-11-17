@@ -63,7 +63,12 @@ try {
  }
  child.stdin.end();const [code]=await closed;assert.equal(code,0);child=null;reader.close();
  assert.deepEqual(calls.map(value=>value.tool),['ask_user',...groupTools,'get_session_groups','disconnect']);
- assert.equal(calls[1].sessionID??null,calls[0].sessionID??null);
+ if(calls[1].codexCallerConversationID) {
+  assert.equal(calls[1].sessionID,undefined,'Conversation proof must not fall back to a shared process ID');
+  assert.equal(calls[1].agentKind,'codex');
+  assert.equal(calls[1].codexCallerConversationID,process.env.CODEX_THREAD_ID?.toLowerCase());
+  assert.equal(calls[1].codexCallerSource,'codex_exec_context');
+ } else assert.equal(calls[1].sessionID??null,calls[0].sessionID??null);
  assert.notEqual(calls[1].sessionID,'spoofed-session');
  for(const call of calls.slice(1,-1)) {
   assert.notEqual(call.sessionID,'spoofed-session');assert.notEqual(call.agentKind,'spoofed-agent');
@@ -71,11 +76,10 @@ try {
   assert.notEqual(call.codexCallerSource,'spoofed');
  }
  if(process.env.AA_EXPECT_AGENT==='1') {
-  assert.match(calls[1].sessionID??'',/^process:\d+:/);
-  if(process.env.CODEX_THREAD_ID) {
+  if(calls[1].codexCallerConversationID) {
    assert.equal(calls[1].codexCallerConversationID,process.env.CODEX_THREAD_ID.toLowerCase());
    assert.equal(calls[1].codexCallerSource,'codex_exec_context');
-  }
+  } else assert.match(calls[1].sessionID??'',/^process:\d+:/);
  }
  assert.ok(calls.every(value=>value.owner===calls[0].owner));
  console.log('PASS MCP stdio: all group tools stay on Unix sockets, discard spoofed attribution and reconnect after listener restart');

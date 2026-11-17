@@ -1,6 +1,10 @@
 import Foundation
 import Darwin
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 
 private let parentRecords = ProcessDiscovery.parse("""
 1 0 ?? 1 0 Sat Sep 19 16:00:00 2026 /sbin/launchd
@@ -152,6 +156,34 @@ extension ApprovalTests {
         try expect(read().isEmpty, "A symlink to a directory cannot reuse a cached registration")
         try FileManager.default.removeItem(at: target)
         try expect(read().isEmpty, "Missing targets cannot reuse cached metadata")
+#if DEBUG
+        row["pid"] = 900000; row["sessionId"] = "first-session"
+        try JSONSerialization.data(withJSONObject: row).write(to: target, options: .atomic)
+        var rewritten = row; rewritten["sessionId"] = "new-session"
+        let replacement = try JSONSerialization.data(withJSONObject: rewritten)
+        var reads = 0
+        let stable = ClaudeSessionRegistry.read(records: [process], directory: directory, readFile: { url in
+            reads += 1
+            let bytes = try Data(contentsOf: url)
+            if reads == 1 { try replacement.write(to: url, options: .atomic) }
+            return bytes
+        })
+        try expectEqual(reads, 2, "A replaced file must be read again")
+        try expectEqual(stable.first?.conversationID, "new-session", "Never return the pre-replacement ID")
+        rewritten["sessionId"] = "after-partial"
+        try JSONSerialization.data(withJSONObject: rewritten).write(to: file, options: .atomic)
+        reads = 0
+        let partial = ClaudeSessionRegistry.read(records: [process], directory: directory, readFile: { url in
+            reads += 1
+            if reads == 1 { return Data("{".utf8) }
+            return try Data(contentsOf: url)
+        })
+        try expectEqual(reads, 2)
+        try expectEqual(partial.first?.conversationID, "after-partial", "A transient partial read cannot poison the cache")
+        rewritten["pid"] = 900001
+        try JSONSerialization.data(withJSONObject: rewritten).write(to: file, options: .atomic)
+        try expect(read().isEmpty, "Retries must still reject another process")
+#endif
     }
 
     func testClaudeRegistryBatchTimezonesAndMalformedSiblings() throws {

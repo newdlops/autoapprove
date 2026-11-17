@@ -640,7 +640,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.claudeRegistryReader = claudeRegistryReader
         self.processReader = processReader ?? { try ProcessDiscovery.read() }
         self.codexGroupReader = codexGroupReader ?? { record in
-            try CodexThreadLocation.locate(paths: ProcessOpenFiles.codexRolloutPaths(pid: record.pid, expectedStart: record.started))
+            try CodexThreadLocation.locateLive(record)
         }
         self.codexGroupEnvironment = codexGroupEnvironment ?? { ProcessEnvironment.read($0) }
         // Native window checks need one original process, not a system-wide
@@ -876,6 +876,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        groupIdentityObservationTask?.cancel()
         cohortExecutionTasks.values.forEach{$0.cancel()};cohortExecutionTasks.removeAll()
         goalRecoveryTask?.cancel();goalRecoveryTask=nil
         appUpdates.stop(); updateReceiver.stop()
@@ -2315,6 +2316,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private var groupStatusIdentities: [String: (session: AgentSession, conversationID: String, home: String?)] = [:]
+    private var groupIdentityObservationTask: Task<[SessionGroupLiveSession], Error>?
     private var groupStatusQueries: Set<String> = []
     private var profileGroupAttachments:[TerminalProfileGroupAttachment]=[]
 
@@ -2505,6 +2507,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// Resolve only each already-discovered process. This never uses thread/list.
     public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
+        if let pending = groupIdentityObservationTask { return try await pending.value }
+        let pending = Task { try await readSessionGroupSessions() }
+        groupIdentityObservationTask = pending
+        defer { groupIdentityObservationTask = nil }
+        return try await pending.value
+    }
+
+    private func readSessionGroupSessions() async throws -> [SessionGroupLiveSession] {
         let originals = sessions.values.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
         guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
         let reader = processReader, registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment

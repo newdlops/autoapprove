@@ -221,25 +221,56 @@ public final class SocketServer: @unchecked Sendable {
     deinit { stop() }
 }
 
+/// A failed connect proves that no request bytes were sent. Response loss does
+/// not use this error and cannot authorize retrying a mutating request.
+public struct LocalSocketConnectionFailure: LocalizedError {
+    public let code: Int32
+    public var errorDescription: String? {
+        if code == EPERM || code == EACCES {
+            return "AutoApprove의 로컬 소켓 접근이 권한 또는 샌드박스에 의해 차단됐습니다. 현재 실행 환경의 로컬 연결 권한을 확인해주세요."
+        }
+        if code == ETIMEDOUT { return "AutoApprove의 로컬 연결 시간이 초과됐습니다. 앱의 실행 상태를 확인해주세요." }
+        return "AutoApprove 앱을 먼저 실행해주세요."
+    }
+}
+
 public enum SocketClient {
     public static func request(path: String, message: JSONObject, timeout: Int = 3) throws -> JSONObject {
         var address = try socketAddress(path)
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw AppError.message("연결을 생성하지 못했습니다.") }
-        let result = withUnsafePointer(to: &address) { p in p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
-        guard result == 0 else {
-            let failure = errno
-            Darwin.close(fd)
-            if failure == EPERM || failure == EACCES {
-                throw AppError.message("AutoApprove의 로컬 소켓 접근이 권한 또는 샌드박스에 의해 차단됐습니다. 현재 실행 환경의 로컬 연결 권한을 확인해주세요.")
-            }
-            throw AppError.message("AutoApprove 앱을 먼저 실행해주세요.")
-        }
+        configureSocket(fd, timeout: timeout)
+        do { try connect(fd, address: &address, timeout: timeout) }
+        catch { Darwin.close(fd); throw error }
         let connection = SocketConnection(fd: fd)
         configureSocket(fd, timeout: timeout)
         defer { connection.close() }
         guard connection.send(message), let response = connection.receive() else { throw AppError.message("AutoApprove가 응답하지 않았습니다.") }
         if let error = response["error"] as? String { throw AppError.message(error) }
         return response["result"] as? JSONObject ?? response
+    }
+
+    /// A full listener backlog must not block before the receive timeout exists.
+    private static func connect(_ fd: Int32, address: inout sockaddr_un, timeout: Int) throws {
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { throw LocalSocketConnectionFailure(code: errno) }
+        defer { _ = fcntl(fd, F_SETFL, flags) }
+        let result = withUnsafePointer(to: &address) { p in p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+        if result == 0 { return }
+        let failure = errno
+        guard [EINPROGRESS, EALREADY, EINTR].contains(failure) else { throw LocalSocketConnectionFailure(code: failure) }
+        let deadline = ProcessInfo.processInfo.systemUptime + Double(max(1, timeout))
+        while true {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { throw LocalSocketConnectionFailure(code: ETIMEDOUT) }
+            var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let ready = poll(&descriptor, 1, Int32(min(remaining * 1000 + 1, Double(Int32.max))))
+            if ready < 0, errno == EINTR { continue }
+            guard ready > 0 else { throw LocalSocketConnectionFailure(code: ready == 0 ? ETIMEDOUT : errno) }
+            var code: Int32 = 0, size = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &code, &size) == 0 else { throw LocalSocketConnectionFailure(code: errno) }
+            guard code == 0 else { throw LocalSocketConnectionFailure(code: code) }
+            return
+        }
     }
 }

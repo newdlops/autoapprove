@@ -669,6 +669,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Live Claude hook excludes screen input and rechecks parent exit", tests.testClaudeLiveHookOwnsScreenAndRechecksParent),
             ("Released Claude question takes only its choice screen", tests.testReleasedClaudeQuestionTakesOnlyItsChoiceScreen),
             ("Claude registry verifies process identity and exact background parent", tests.testClaudeRegistryIdentityAndExactParent),
+            ("Claude registry: fresh metadata, replacement races and nonfile rejection", tests.testClaudeRegistryPathsKeepFreshMetadataAndRejectNonfiles),
+            ("Claude registry: batch timezones and malformed sibling isolation", tests.testClaudeRegistryBatchTimezonesAndMalformedSiblings),
             ("Claude restores existing background questions without replaying old hooks", tests.testClaudeRestoresWaitingBackgroundWithoutAHook),
             ("Claude recovered waiting transitions and unavailable metadata", tests.testClaudeRecoveredWaitingTransitionsAndUnavailableMetadata),
             ("Claude recovered question metadata identity and staleness", tests.testClaudeRecoveryMetadataIdentityAndStaleness),
@@ -784,6 +786,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         ]
 #if DEBUG
         cases.insert(contentsOf: [
+            ("Session groups: concurrent identity reads share one fresh observation",tests.testGroupIdentityObservationsCoalesceConcurrentReaders),
+            ("Session groups: live Codex identity retries missing headers without guessing",tests.testCodexLiveIdentityRetriesOnlyMissingHeaders),
             ("PTY creation: pending admission and stop keep inventory responsive",tests.testPTYCreationAdmissionAndStopDoNotBlockReaders),
             ("PTY creation: cancellation keeps the main actor responsive",tests.testPTYCreationCancellationLeavesMainActorResponsive),
             ("Official Goal: stable identity, live accounting and replacement races",tests.testOfficialGoalIdentityPreservesAccountingAndRejectsReplacement),

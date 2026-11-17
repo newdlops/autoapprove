@@ -73,6 +73,10 @@ public enum ClaudeSessionRegistry {
     private static var cache: [String: CachedRead] = [:]
 
     public static func read(records: [ProcessRecord], directory: URL? = nil) -> [ClaudeSessionRegistration] {
+        read(records: records, directory: directory, readFile: { try Data(contentsOf: $0) })
+    }
+
+    static func read(records: [ProcessRecord], directory: URL?, readFile: (URL) throws -> Data) -> [ClaudeSessionRegistration] {
         let directory = directory ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
         let zone = ProcessInfo.processInfo.environment["TZ"].flatMap(TimeZone.init(identifier:)) ?? .current
@@ -82,6 +86,7 @@ public enum ClaudeSessionRegistry {
             // These leaves are files. Avoid Foundation's implicit directory
             // metadata probe; FileIdentity still checks the live target below.
             let file = directory.appendingPathComponent("sessions/\(process.pid).json", isDirectory: false)
+            for attempt in 0..<3 {
             guard let identity = FileIdentity(url:file) else { return nil }
             let cacheKey = file.path + "\n" + process.key + "\n" + zone.identifier
             cacheLock.lock(); let cached = cache[cacheKey]; cacheLock.unlock()
@@ -95,7 +100,7 @@ public enum ClaudeSessionRegistry {
                 if currentState == cached.state { return cached.registration }
             }
 
-            var registration = (try? Data(contentsOf:file)).flatMap { decode($0, process:process, dates:&dates) }
+            var registration = (try? readFile(file)).flatMap { decode($0, process:process, dates:&dates) }
             var stateIdentity: FileIdentity?, cacheable = true
             if let value = registration, value.kind == "bg", let job = value.jobID, let activity = value.activity,
                activity.status == "waiting", activity.waitingFor == "input needed" {
@@ -103,17 +108,27 @@ public enum ClaudeSessionRegistry {
                 if let before = FileIdentity(url:state), let data = try? Data(contentsOf:state) {
                     registration?.activity?.questionSummary = questionSummary(data, jobID:job, activity:activity, dates:&dates)
                     let after = FileIdentity(url:state)
-                    if before == after { stateIdentity = after } else { cacheable = false }
+                    if before == after { stateIdentity = after }
+                    else { cacheable = false; registration?.activity?.questionSummary = nil }
                 }
             }
             let afterSession = FileIdentity(url:file)
-            if cacheable, identity == afterSession {
+            // Atomic replacement or an in-place rewrite can race a read. Never
+            // publish old bytes under the new file's identity or cache a failed
+            // decode. Retry briefly, then leave identity unverified.
+            if identity != afterSession || registration == nil {
+                if attempt < 2 { Thread.sleep(forTimeInterval: 0.005); continue }
+                return nil
+            }
+            if cacheable {
                 cacheLock.lock()
                 if cache.count >= 1024, cache[cacheKey] == nil { cache.removeAll(keepingCapacity:true) }
                 cache[cacheKey] = CachedRead(session:identity, state:stateIdentity, registration:registration)
                 cacheLock.unlock()
             }
             return registration
+            }
+            return nil
         }
     }
 

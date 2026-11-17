@@ -1,5 +1,9 @@
 import Foundation
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 import TerminalInputSupport
 
 private final class CodexGroupScreen: @unchecked Sendable {
@@ -71,7 +75,84 @@ private final class GroupInputCooldown: @unchecked Sendable {
     }
 }
 
+private final class GroupObservationReads: @unchecked Sendable {
+    let records: [ProcessRecord]
+    private let lock = NSLock()
+    private var value = 0
+    init(_ records: [ProcessRecord]) { self.records = records }
+    func read() -> [ProcessRecord] { lock.lock(); value += 1; lock.unlock(); Thread.sleep(forTimeInterval: 0.02); return records }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 extension ApprovalTests {
+#if DEBUG
+    func testGroupIdentityObservationsCoalesceConcurrentReaders() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-group-observation-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("900002 1 ttys902 900002 900002 Mon Nov 16 10:00:00 2026 /fixture/codex")
+        let reads = GroupObservationReads(records), record = records[0], id = UUID().uuidString.lowercased()
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { reads.read() },
+            codexGroupReader: { _ in .init(threadID: id, database: "/fixture/home/thread_history_1.sqlite") },
+            codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
+        defer { engine.stop() }
+        engine.updateDiscovery([AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/fixture", terminal: .terminal)], records: records)
+        let before = reads.count
+        async let first = engine.sessionGroupSessions()
+        async let second = engine.sessionGroupSessions()
+        async let third = engine.sessionGroupSessions()
+        let values = try await [first, second, third]
+        try expect(values.allSatisfy { $0.count == 1 && $0[0].conversationID == id })
+        try expectEqual(reads.count - before, 2, "Concurrent queries share one observation with before/after process witnesses")
+        _ = try await engine.sessionGroupSessions()
+        try expectEqual(reads.count - before, 4, "A later query must read fresh identity rather than a stale cache")
+    }
+
+    func testCodexLiveIdentityRetriesOnlyMissingHeaders() throws {
+        let root = URL(fileURLWithPath: "/private/tmp/aa-codex-identity-retry-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("sessions/2026/11/17")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let first = directory.appendingPathComponent("rollout-first.jsonl"), second = directory.appendingPathComponent("rollout-second.jsonl")
+        let a = UUID().uuidString.lowercased(), b = UUID().uuidString.lowercased()
+        func header(_ id: String) throws -> Data {
+            var data = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": ["source": "cli", "id": id]])
+            data.append(10); return data
+        }
+        let record = ProcessDiscovery.parse("900001 1 ttys901 900001 900001 Mon Nov 16 10:00:00 2026 /fixture/codex")[0]
+        var reads = 0
+        let found = try CodexThreadLocation.locateLive(record, paths: { current in
+            try expectEqual(current.key, record.key); reads += 1
+            if reads == 2 { try header(a).write(to: first) }
+            return [first.path]
+        })
+        try expectEqual(reads, 2); try expectEqual(found.threadID, a)
+        try header(b).write(to: second)
+        reads = 0
+        do {
+            _ = try CodexThreadLocation.locateLive(record, paths: { _ in reads += 1; return [first.path, second.path] })
+            throw AppError.message("Ambiguous roots were accepted")
+        } catch CodexThreadLocationFailure.ambiguous {}
+        try expectEqual(reads, 1, "Ambiguity is never resolved by retrying until a convenient answer appears")
+        reads = 0
+        do {
+            _ = try CodexThreadLocation.locateLive(record, paths: { _ in reads += 1; throw POSIXError(.ESTALE) })
+            throw AppError.message("A replaced process was accepted")
+        } catch let error as POSIXError { try expectEqual(error.code, .ESTALE) }
+        try expectEqual(reads, 1)
+        reads = 0
+        do {
+            _ = try CodexThreadLocation.locateLive(record, paths: { _ in reads += 1; return [directory.appendingPathComponent("rollout-pending.jsonl").path] })
+            throw AppError.message("A previous UUID was adopted after a missing header")
+        } catch CodexThreadLocationFailure.missing {}
+        try expectEqual(reads, 3, "Missing metadata has a bounded retry budget")
+        reads = 0
+        do {
+            _ = try CodexThreadLocation.locateLive(record, paths: { _ in reads += 1; return [] })
+            throw AppError.message("An absent rollout was guessed")
+        } catch CodexThreadLocationFailure.missing {}
+        try expectEqual(reads, 1, "Managed clients without rollouts must not pay a retry delay every poll")
+    }
+#endif
     @MainActor func testCodexGroupStatusWaitsForInputCooldownWithoutBypass() async throws {
         for continuous in [false, true] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-status-cooldown-" + UUID().uuidString)
