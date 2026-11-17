@@ -2376,7 +2376,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private var groupMCPIdentities: [String: GroupMCPIdentity] = [:]
     private static let groupMCPIdentityLifetime: TimeInterval = 120
-    private static let missingCodexGroupIdentity = "현재 세션의 로컬 대화 기록과 대상에 연결된 MCP 호출을 확인하지 못했습니다. 대상 Codex에서 get_session_groups를 호출한 뒤 다시 갱신해주세요."
+    private static let missingCodexGroupIdentity = "로컬 대화 기록과 MCP 호출 정보로 이 터미널의 ID를 확인할 수 없습니다. 세션 ID 갱신을 실행하면 원래 탭의 새 /status 응답을 확인합니다."
 
     private func observeGroupMCPIdentity(_ object: JSONObject, owner: String) {
         guard object["agentKind"] as? String == AgentKind.codex.rawValue,
@@ -2503,7 +2503,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    /// Refresh Codex from the original session's local record or MCP call.
+    /// Only an explicit refresh may query the original tab when passive evidence is missing.
     @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID }) != expectedGroup {
@@ -2534,13 +2534,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var queriedStatus = false
         if let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
             id = confirmed
-        } else if isCodex {
-            throw AppError.message(Self.missingCodexGroupIdentity)
         } else {
-            if original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime) {
+            if !isCodex && (original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime)) {
                 throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
-            id = try await statusConversationID(original)
+            // With a shared server the TUI owns neither the rollout nor the MCP helper.
+            id = try await statusConversationID(original, backgroundOnly: isCodex)
             queriedStatus = true
         }
         let verify = remoteProcessVerifier
@@ -2551,7 +2550,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 기존 ID를 유지합니다.")
         }
         if connection.codexIdentityFromMCP, groupMCPIdentity(for: current, home: connection.providerHome)?.conversationID != UUID(uuidString: id) {
-            throw AppError.message(Self.missingCodexGroupIdentity)
+            throw AppError.message("조회 중 대상 터미널의 MCP 호출 정보가 바뀌었습니다. 세션 ID를 다시 갱신해주세요.")
         }
         guard let uuid = UUID(uuidString: id) else { throw AppError.message("올바른 세션 ID를 확인하지 못했습니다.") }
         let home = connection.providerHome ?? member.providerHome
@@ -2580,12 +2579,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var next = latest
         next[gi].members[mi] = confirmedMember
         if next != latest { try store.save(next, expected: latest) }
-        if isCodex {
-            groupStatusIdentities.removeValue(forKey: runtime)
-        } else if queriedStatus {
+        if queriedStatus {
             let rollout = connection.conversationID.flatMap(UUID.init(uuidString:))
             groupStatusIdentities[runtime] = GroupStatusIdentity(session: current, conversationID: id, home: home,
                                                                contradictedRollout: rollout == uuid ? nil : rollout)
+        } else if isCodex {
+            groupStatusIdentities.removeValue(forKey: runtime)
         }
         refreshSessionGroupBadges()
         return SessionGroupIdentityRefresh(conversationID: uuid.uuidString.lowercased(), changed: UUID(uuidString: member.conversationID) != uuid)
@@ -2865,11 +2864,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed) else {
             throw RemoteHTTPError(409, "재연결할 수 있는 원래 터미널을 확인하지 못했거나 재연결 권한이 없습니다. canReconnect가 true인 구성원만 재연결할 수 있습니다. 종료된 터미널은 자동으로 다시 실행하지 않습니다.")
         }
-        try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group)
-        let fresh = try await sessionGroupSessions()
+        let refreshed = try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group)
+        // A group-list observation already in flight can predate the new status card.
+        let fresh = try await readSessionGroupSessions(reconcile: false)
         guard let updated = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID })?.members.first(where: { $0.id == memberID }),
-              let live = SessionGroupMatching.match(updated, in: fresh),
-              let id = live.conversationID, UUID(uuidString: id) != nil else {
+              let live = SessionGroupMatching.match(updated, in: fresh), live.id == updated.runtimeID,
+              let id = live.conversationID, UUID(uuidString: id) == UUID(uuidString: refreshed.conversationID) else {
             throw RemoteHTTPError(409, "갱신 후 연결이 바뀌어 재연결을 확인하지 못했습니다. get_session_groups로 다시 확인해주세요.")
         }
         return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "connected": true,

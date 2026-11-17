@@ -397,7 +397,7 @@ extension ApprovalTests {
         func checkUnavailable(storedID: String) async throws {
             var rejected = false
             do { _ = try await refresh() }
-            catch { rejected = error.localizedDescription.contains("MCP") }
+            catch { rejected = error.localizedDescription.contains("입력") }
             try expect(rejected)
             try expectEqual(try store.load()[0].members[0].conversationID, storedID)
         }
@@ -700,27 +700,38 @@ extension ApprovalTests {
         try expectEqual(rows?.first { $0["id"] as? String == members[1].id.uuidString }?["connected"] as? Bool, false)
         try expectEqual(rows?.first { $0["id"] as? String == members[1].id.uuidString }?["canReconnect"] as? Bool, true)
         try expectEqual(screen.inputs, [], "Read-only membership must not type /status")
-        for (tool, caller, target) in [("reconnect_group_member", 2, 1), ("reconnect_group_member", 1, 0), ("reconnect_group_member", 0, 1), ("assign_group_task", 0, 1), ("get_group_status", 1, 1)] {
+        for (tool, caller, target) in [("reconnect_group_member", 2, 1), ("reconnect_group_member", 1, 0), ("assign_group_task", 0, 1), ("get_group_status", 1, 1)] {
             var rejected = false
             do { _ = try await call(tool, caller: caller, target: target) } catch { rejected = true }
             try expect(rejected, "Unverified or unauthorized operation succeeded")
         }
         try expectEqual(screen.inputs, [])
-        _ = try await call("get_session_groups", caller: 1, proof: groupMCPProof(sessions[1], id: screen.id, owner: UUID().uuidString))
+        // A shared server can report the worker UUID without an owning TTY.
+        var shared = groupMCPProof(sessions[1], id: UUID().uuidString, owner: UUID().uuidString)
+        shared.removeValue(forKey: "codexCallerRuntimeID")
+        _ = try await call("get_session_groups", caller: 1, proof: shared)
+        try expectEqual(screen.inputs, [])
         let repaired = try await call("reconnect_group_member")
         try expectEqual(repaired["connected"] as? Bool, true)
         try expectEqual(repaired["conversationID"] as? String, screen.id)
         try expectEqual(repaired["transport"] as? String, "local_terminal")
         try expectEqual(try store.load()[0].members[1].conversationID, screen.id)
+        try expectEqual(screen.inputs, [pastedStatusInput], "Only the worker tab may receive /status")
+        let same = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: members[1].id)
+        try expectEqual(same.conversationID, screen.id)
+        try expectFalse(same.changed)
+        try expectEqual(screen.inputs, [pastedStatusInput, pastedStatusInput], "An explicit refresh must see a new card, even after a verified reconnect")
+        _ = try await call("get_session_groups", caller: 1, proof: groupMCPProof(sessions[1], id: screen.id, owner: UUID().uuidString))
+        let sent = screen.inputs
         _ = try await call("reconnect_group_member")
-        try expectEqual(screen.inputs, [], "Reconnecting must not type into either terminal")
+        try expectEqual(screen.inputs, sent, "A bound MCP call avoids further terminal input")
         try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
         // An exited member may not be replaced with an unrelated process in the same project.
         engine.updateDiscovery([sessions[0], sessions[2]], records: [records[0], records[2]])
         var rejected = false
         do { _ = try await call("reconnect_group_member") } catch { rejected = true }
         try expect(rejected, "An exited terminal was guessed")
-        try expectEqual(screen.inputs, [])
+        try expectEqual(screen.inputs, sent)
     }
 
     @MainActor func testGroupOfflineSelfReconnectProtectsDrafts() async throws {
