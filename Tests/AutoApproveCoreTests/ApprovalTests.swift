@@ -526,6 +526,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: explicit Codex status waits without bypassing input priority",tests.testCodexGroupStatusWaitsForInputCooldownWithoutBypass),
             ("Session groups: rebinding preserves hierarchy",tests.testSessionGroupRebindingPreservesHierarchy),
             ("Session groups: Codex read-only discovery and explicit status reuse",tests.testCodexGroupDiscoversIdleTerminalFromStatus),
+            ("Session groups: historical welcome preserves verified ID and real reset stops stale delivery",tests.testCodexVerifiedStatusSurvivesHistoricalWelcomeWithoutLosingResetSafety),
             ("Session groups: Codex status refresh preserves uncertain recovery",tests.testCodexGroupStatusRefreshDuringRecoveryReview),
             ("Session groups: Codex recovery review never bypasses real input",tests.testCodexGroupStatusReviewDoesNotBypassRealInput),
             ("Session groups: Codex discovery preserves work and unfinished input",tests.testCodexGroupDiscoveryPreservesBusyScreensAndDrafts),

@@ -3,6 +3,36 @@ import Foundation
 /// A status card is accepted only after this app requested a fresh /status.
 /// No account text or terminal contents are persisted in the reservation.
 public struct CodexStatusIdentity: Codable {
+    /// The brand header also remains above ordinary conversation history.
+    /// Only a standalone welcome pane can signal a conversation reset; an
+    /// answer, tool result or previous user message makes it historical.
+    static func isWelcomeReset(_ screen: String) -> Bool {
+        guard CodexProgressScreen.ready(screen), cards(screen).isEmpty else { return false }
+        let rows = PromptDetector.normalizedLines(screen).map {
+            $0.trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "│┃"))
+                .trimmingCharacters(in: .whitespaces)
+        }.filter { !$0.isEmpty && !$0.allSatisfy { "─━╌╭╮╰╯┌┐└┘ ".contains($0) } }
+        guard rows.first?.hasPrefix(">_ OpenAI Codex (v") == true,
+              rows.filter({ $0.hasPrefix(">_ OpenAI Codex (v") }).count == 1,
+              rows.filter({ $0.hasPrefix("›") || $0.hasPrefix("»") }).count == 1,
+              let composer = rows.firstIndex(where: { $0.hasPrefix("›") || $0.hasPrefix("»") }) else { return false }
+        // ready() already validates the complete composer/footer, including
+        // model status bars and percent-left hints. Do not narrow that grammar.
+        var tip = false
+        for line in rows[1..<composer] {
+            if line.hasPrefix("Tip:") { tip = true; continue }
+            // A tip may wrap, but chat/tool markers never belong to it.
+            if line.hasPrefix("•") || line.hasPrefix("●") || line.hasPrefix("◦") ||
+                line.hasPrefix("›") || line.hasPrefix("»") || line.contains("```") { return false }
+            if tip { continue }
+            if line.hasPrefix("/") || line.hasPrefix("~/") || line.hasPrefix("…/") ||
+                line.hasPrefix("model:") || line.hasPrefix("directory:") { continue }
+            return false
+        }
+        return true
+    }
+
     /// /status is available while a Codex task runs. Only the composer and
     /// modal/input conflicts matter; generic idle-only recovery rules do not.
     public static func canQuery(_ screen:String)->Bool {

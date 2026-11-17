@@ -6740,8 +6740,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let previousFrame = remoteObservedScreens[sessionID]
         if session.agent == .codex, groupStatusIdentities[sessionID] != nil,
            !screenContentsUnchanged, raw.contains(">_ OpenAI Codex (v"),
-           CodexProgressScreen.ready(raw), CodexStatusIdentity.cards(raw).isEmpty {
-            // /new clears the status card while retaining the same TUI process.
+           CodexStatusIdentity.isWelcomeReset(raw) {
+            // A reset can retain its PID. Historical brand headers in ordinary
+            // work output must not erase a previously verified conversation.
             groupStatusIdentities.removeValue(forKey: sessionID)
         }
         // Registration and frame updates share this actor. A new observer starts

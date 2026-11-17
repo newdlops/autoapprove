@@ -20,6 +20,7 @@ private final class CodexGroupScreen: @unchecked Sendable {
         return rollout.map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") }
     }
     var screen: String { lock.lock(); defer { lock.unlock() }; return value }
+    func setScreen(_ text: String) { lock.lock(); defer { lock.unlock() }; value = text }
     var inputs: [String] { lock.lock(); defer { lock.unlock() }; return writes }
     var resumes: Int { lock.lock(); defer { lock.unlock() }; return resumeWrites }
     func resume() -> ResumeDelivery { lock.lock(); defer { lock.unlock() }; resumeWrites += 1; return .typed }
@@ -85,6 +86,70 @@ private final class GroupObservationReads: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testCodexVerifiedStatusSurvivesHistoricalWelcomeWithoutLosingResetSafety() async throws {
+        for host in [ScreenHost.terminal, .iterm] {
+            let directory = URL(fileURLWithPath: "/private/tmp/aa-status-banner-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let record = ProcessDiscovery.parse("100591 1 fixture40 100591 100591 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+            var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: host.kind)
+            session.channel = host.channel
+            let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = .current; formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+            let identity = TTYInputIdentity(pid: record.pid, processGroup: record.pid, uid: getuid(), effectiveUID: geteuid(), device: 42,
+                startSeconds: UInt64(formatter.date(from: record.started)!.timeIntervalSince1970), startMicroseconds: 71)
+            let welcome = ">_ OpenAI Codex (v0.169.0)\n  /project"
+            let composer = "\n› Ask Codex to do anything\n  ? for shortcuts"
+            let screen = CodexGroupScreen(welcome + composer)
+            let adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: screen.screen) }) },
+                approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) })
+            let engine = try ApprovalEngine(paths: .init(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
+                terminalInputAvailable: { true }, terminalInputIdentity: { _ in identity }, codexGroupReader: { _ in nil },
+                codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
+            defer { engine.stop() }
+            engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(host)
+            engine.receiveScreen(sessionID: session.id, raw: screen.screen, generation: "same-cli")
+            let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home").member])
+            try SessionGroupStore(directory: directory).save([group])
+            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
+            let saved = try SessionGroupStore(directory: directory).load()[0]
+            try expectNotNil(SessionGroupMatching.match(saved.members[0], in: try await engine.sessionGroupSessions()))
+            let completed = welcome + "\n• Completed the synthetic task." + composer
+            for frame in [
+                welcome + "\n• Working (esc to interrupt)\n› \n ? for shortcuts",
+                completed,
+                completed + " · 90% context left",
+                "Old output\n" + completed,
+                welcome + "\nTip: Use /help.\n• Completed another task." + composer,
+                welcome + "\n› earlier user request\ncompleted reply" + composer
+            ] {
+                screen.setScreen(frame); engine.receiveScreen(sessionID: session.id, raw: frame, generation: "same-cli")
+                let live = try await engine.sessionGroupSessions()
+                try expectEqual(live.first?.conversationID, screen.id, "Historical welcome headers must preserve the verified UUID")
+                try expectNotNil(SessionGroupMatching.match(saved.members[0], in: live))
+            }
+            try expectEqual(screen.inputs, ["/status\r"], "Observing normal work must not type more status queries")
+            // A real clear/new screen has only a fresh header, directory and composer.
+            // Keep membership but stop using the old conversation for delivery.
+            let boxed = "╭──────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.169.0)            │\n│ model: fixture                       │\n│ directory: /project                  │\n╰──────────────────────────────────────╯\nTip: Use /help."
+            for frame in [welcome + composer,
+                          welcome + "\n› \n100% left",
+                          welcome + "\n› \nGPT-6.1-Sol max · ~/project · Ready · Context 35% left",
+                          boxed + composer] {
+                if try await engine.sessionGroupSessions().first?.conversationID == nil {
+                    try await engine.refreshSessionGroupMemberID(groupID: saved.id, memberID: saved.members[0].id)
+                }
+                let inputs = screen.inputs.count
+                screen.setScreen(frame)
+                engine.receiveScreen(sessionID: session.id, raw: frame, generation: "same-cli")
+                let reset = try await engine.sessionGroupSessions()
+                try expectNil(reset.first?.conversationID)
+                try expectNil(SessionGroupMatching.match(saved.members[0], in: reset))
+                try expectNotNil(SessionGroupMatching.connection(saved.members[0], in: reset))
+                try expectEqual(try SessionGroupStore(directory: directory).load(), [saved], "A possible reset must not delete group membership")
+                try expectEqual(screen.inputs.count, inputs)
+            }
+        }
+    }
+
 #if DEBUG
     func testGroupIdentityObservationsCoalesceConcurrentReaders() async throws {
         let directory = URL(fileURLWithPath: "/private/tmp/aa-group-observation-" + UUID().uuidString)
