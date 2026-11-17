@@ -1,4 +1,9 @@
 import Foundation
+
+public struct SessionGroupIdentityRefresh: Equatable, Sendable {
+    public let conversationID: String
+    public let changed: Bool
+}
 import Darwin
 
 public enum SessionGroupTerminalStatus {

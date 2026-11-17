@@ -190,7 +190,7 @@ import AutoApproveCore
                             Spacer(minLength: 8)
                             Button("세션 ID 갱신") { Task { await refreshIdentity(member, in: group) } }
                                 .fixedSize().disabled(loading)
-                                .help("확인된 현재 대화 ID를 저장합니다. ID를 알 수 없을 때만 빈 대기 터미널에 /status를 한 번 입력합니다.")
+                                .help("Codex는 원래 탭에서 /status로 현재 ID를 확인합니다. 조회가 보류되거나 실패하면 기존 ID를 유지합니다.")
                         }
                         if (member.conversationID.isEmpty || member.providerHome == nil), let match, match.conversationID != nil, match.providerHome != nil {
                             Button("현재 대화 연결") { Task { await bind(member, to: match, in: group) } }.disabled(loading)
@@ -282,9 +282,10 @@ import AutoApproveCore
         bulkFailures = []
         do {
             notice = "터미널에서 세션 ID를 조회하고 있습니다…"
-            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
-            live = try await engine.sessionGroupSessions(); groups = try store.load()
-            error = nil; notice = "터미널에서 확인한 현재 세션 ID를 저장했습니다."
+            let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+            groups = try store.load(); live = try await engine.sessionGroupSessions()
+            error = nil
+            notice = result.changed ? "현재 세션 ID로 갱신했습니다." : "현재 세션 ID가 기존과 일치합니다."
         } catch { notice = nil; self.error = error.localizedDescription }
     }
 
@@ -292,13 +293,13 @@ import AutoApproveCore
         guard !loading else { return }
         loading = true; bulkRunning = true; bulkStopRequested = false; bulkFailures = []; error = nil
         defer { loading = false; bulkRunning = false }
-        var succeeded = 0, attempted = 0
+        var changed = 0, confirmed = 0, attempted = 0
         for (index, member) in group.members.enumerated() {
             if bulkStopRequested || Task.isCancelled { break }
             notice = "\(group.name) · \(index + 1)/\(group.members.count) 조회 중 · \(member.title.isEmpty ? member.agent.title : member.title)"
             do {
-                try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
-                succeeded += 1
+                let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+                if result.changed { changed += 1 } else { confirmed += 1 }
             } catch {
                 bulkFailures.append("\(member.title.isEmpty ? member.agent.title : member.title): \(error.localizedDescription)")
             }
@@ -307,7 +308,7 @@ import AutoApproveCore
         do { live = try await engine.sessionGroupSessions(); groups = try store.load() }
         catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
         let remaining = group.members.count - attempted
-        notice = "\(group.name) · 갱신 \(succeeded)개 · 보류·실패 \(attempted - succeeded)개" + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : " · 전체 조회 완료")
+        notice = "\(group.name) · ID 변경 \(changed)개 · 기존 ID 확인 \(confirmed)개 · 보류·실패 \(bulkFailures.count)개" + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : "")
     }
 
     private func refreshObservation() async {

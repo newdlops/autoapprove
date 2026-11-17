@@ -12,9 +12,11 @@ private final class CodexGroupScreen: @unchecked Sendable {
     private var writes: [String] = []
     private var resumeWrites = 0
     private var rollout: String?
+    private var statusID: String?
     init(_ initial: String? = nil) { if let initial { value = initial } }
     func clearRollout() { lock.lock(); defer { lock.unlock() }; rollout = nil }
     func setRollout(_ id: String) { lock.lock(); defer { lock.unlock() }; rollout = id }
+    func setStatusID(_ id: String) { lock.lock(); defer { lock.unlock() }; statusID = id }
     func location() -> CodexThreadLocation? {
         lock.lock(); defer { lock.unlock() }
         return rollout.map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") }
@@ -28,7 +30,7 @@ private final class CodexGroupScreen: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; writes.append(input.bytes)
         if input.bytes.contains("/status") {
             let footer = value.contains("Goal stalled") ? " · Goal stalled (/goal resume)" : ""
-            value = ">_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(id)\n› Ask Codex to do anything\n  ? for shortcuts" + footer
+            value += "\n>_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(statusID ?? id)\n› Ask Codex to do anything\n  ? for shortcuts" + footer
         }
         return .sent
     }
@@ -99,8 +101,9 @@ extension ApprovalTests {
             let welcome = ">_ OpenAI Codex (v0.169.0)\n  /project"
             let composer = "\n› Ask Codex to do anything\n  ? for shortcuts"
             let screen = CodexGroupScreen(welcome + composer)
-            let adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: screen.screen) }) },
+            var adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: screen.screen) }) },
                 approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) })
+            adapter.backgroundInput = adapter.input
             let engine = try ApprovalEngine(paths: .init(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
                 terminalInputAvailable: { true }, terminalInputIdentity: { _ in identity }, codexGroupReader: { _ in nil },
                 codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
@@ -225,11 +228,12 @@ extension ApprovalTests {
             let record = ProcessDiscovery.parse("100597 1 fixture46 100597 100597 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
             let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .terminal)
             let screen = CodexGroupScreen(), priority = GroupInputCooldown(continuous: continuous)
-            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+            var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
                 approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in
                     try expect(priority.idleSeconds >= 1.5, "Never input during keyboard priority")
                     return screen.send(input)
                 })
+            adapter.backgroundInput = adapter.input
             let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter],
                 codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] },
                 nativeKeyboardActivity: .init(idleSeconds: { priority.idleSeconds }, frontmostBundle: { "com.apple.Terminal" }))
@@ -259,9 +263,10 @@ extension ApprovalTests {
             let record = ProcessDiscovery.parse("100596 1 fixture45 100596 100596 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
             let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .terminal)
             let screen = ClippedGroupStatus(repeated: repeated, append: append)
-            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+            var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
                 approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) },
                 history: { target in try expectEqual(target.tty, session.tty); return screen.history })
+            adapter.backgroundInput = adapter.input
             let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.terminal: adapter],
                 codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
             defer { engine.stop() }
@@ -293,8 +298,9 @@ extension ApprovalTests {
                 startSeconds: UInt64(formatter.date(from: record.started)!.timeIntervalSince1970), startMicroseconds: 71)
             let text = "Codex\n› Ask Codex to do anything\n ? for shortcuts · Goal stalled (/goal resume)"
             let screen = CodexGroupScreen(text)
-            let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+            var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
                 approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, resume: { _, _, _ in screen.resume() }, input: { _, _, _, input in screen.send(input) })
+            adapter.backgroundInput = adapter.input
             let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
                 terminalInputAvailable: { true }, terminalInputIdentity: { _ in identity },
                 codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
@@ -374,8 +380,15 @@ extension ApprovalTests {
         let identity=TTYInputIdentity(pid:record.pid,processGroup:record.pid,uid:getuid(),effectiveUID:geteuid(),device:42,
             startSeconds:UInt64(formatter.date(from:record.started)!.timeIntervalSince1970),startMicroseconds:71)
         let screen = CodexGroupScreen(working ? "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts":nil)
-        let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
-            approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in screen.send(input) })
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in throw AppError.message("Refreshing a group must not switch tabs") }, input: { _, _, _, input in
+                if useTerminal { throw AppError.message("Refreshing a group must use background Terminal input") }
+                return screen.send(input)
+            })
+        adapter.backgroundInput = { target, _, _, input in
+            try expectEqual(target.tty, "/dev/fixture40")
+            return screen.send(input)
+        }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
             terminalInputAvailable:{true},terminalInputIdentity:{_ in identity},
             codexGroupReader: { _ in screen.location() }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
@@ -386,23 +399,29 @@ extension ApprovalTests {
         for _ in 0..<3 { _ = try await engine.sessionGroupSessions() }
         try expectEqual(screen.inputs.count, 0, "Group reads must not type into idle terminals")
         let group = try SessionGroupStore(directory: directory).load()[0]
-        try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
+        let first = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
+        try expect(first.changed)
         try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, screen.id)
-        // Repeated clicks reuse the verified identity, including while a task runs.
-        session.phase = .working
-        engine.updateDiscovery([session], records: [record])
-        for _ in 0..<3 {
-            _ = try await engine.sessionGroupSessions()
-            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
-        }
-        try expectEqual(screen.inputs, ["/status\r"])
-        try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, screen.id)
+        screen.setRollout(screen.id)
         let new = UUID().uuidString.lowercased()
-        screen.setRollout(new)
-        try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, new, "Fresh process evidence must win over cached status")
+        screen.setStatusID(new)
+        let refreshed = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
+        try expectEqual(refreshed.conversationID, new)
+        try expect(refreshed.changed)
+        try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, new, "A contradicted rollout cannot undo a fresh screen verification")
         try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, new)
-        try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
-        try expectEqual(screen.inputs, ["/status\r"], "Known process identity needs no terminal input")
+        let confirmed = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
+        try expectFalse(confirmed.changed)
+        try expectEqual(screen.inputs, Array(repeating: "/status\r", count: 3))
+        screen.setScreen("Codex\n› draft stays here\n ? for shortcuts")
+        var refused = false
+        do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id) } catch { refused = true }
+        try expect(refused)
+        try expectEqual(screen.inputs.count, 3)
+        try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, new)
+        let next = UUID().uuidString.lowercased()
+        screen.setRollout(next)
+        try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, next, "A different live rollout can establish the next conversation")
         screen.clearRollout()
         try expectNil(try await engine.sessionGroupSessions().first?.conversationID)
         }

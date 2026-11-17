@@ -1,5 +1,7 @@
 # AutoApprove
 
+**그룹 세션 ID 갱신 · 0.2.323 빌드 350** Codex의 원래 탭에서 현재 ID를 확인하고, 전체 갱신에서 변경·기존 ID 확인·보류/실패를 구분합니다. [변경 내역](docs/releases/v0.2.323.md)
+
 **초기화 복구 · 0.2.322 빌드 349** 앱 시작 후 첫 세션 탐색 결과를 받은 뒤 초기화 기록을 복구합니다. [변경 내역](docs/releases/v0.2.322.md)
 
 **개별 초기화·탭 표시 · 0.2.321 빌드 348:** `clear_group_member`로 지정한 구성원만 초기화하고 새 세션 ID를 갱신합니다. `set_group_member_title`과 `set_group_member_tab_color`로 Terminal·iTerm2의 실제 탭 이름과 이름 앞 색상 표식을 변경합니다. [사용법과 검증](docs/releases/v0.2.321.md).

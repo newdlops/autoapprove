@@ -2352,7 +2352,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         remoteUserInputHasPriority(id) || automaticInputBusy(id)
     }
 
-    private var groupStatusIdentities: [String: (session: AgentSession, conversationID: String, home: String?)] = [:]
+    private struct GroupStatusIdentity {
+        let session: AgentSession
+        let conversationID: String
+        let home: String?
+        var contradictedRollout: UUID? = nil
+    }
+    private var groupStatusIdentities: [String: GroupStatusIdentity] = [:]
     private var groupIdentityObservationTask: Task<[SessionGroupLiveSession], Error>?
     private var groupStatusQueries: Set<String> = []
     private var groupClearOperations: [SessionGroupClearOperation]?
@@ -2443,46 +2449,79 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
-    public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws {
-        // Prefer current process evidence or an already verified status result.
-        // Opening a group and refreshing its display must never type into a CLI.
-        let observed = try await sessionGroupSessions()
+    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws -> SessionGroupIdentityRefresh {
+        try await refreshGroupMemberIdentity(groupID: groupID, memberID: memberID, expectedGroup: expectedGroup, verifyCodexScreen: true)
+    }
+
+    private func refreshGroupMemberIdentity(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup?, verifyCodexScreen: Bool) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID }) != expectedGroup {
             throw RemoteHTTPError(409, "그룹 구성이 바뀌어 갱신하지 않았습니다. get_session_groups로 다시 확인해주세요.")
         }
         guard let group = saved.first(where: { $0.id == groupID }),
-              let member = group.members.first(where: { $0.id == memberID }),
-              let connection = SessionGroupMatching.connection(member, in: observed),
-              let original = sessions[connection.id] else {
+              let member = group.members.first(where: { $0.id == memberID }) else {
+            throw AppError.message("갱신할 그룹 구성원을 찾지 못했습니다.")
+        }
+        guard !groupClearActive(groupID) else { throw AppError.message("이 그룹의 초기화가 끝난 뒤 ID를 갱신해주세요.") }
+        // The original binding normally makes a targeted read sufficient. A
+        // resumed conversation can use an exact UUID match elsewhere.
+        let useStatus = verifyCodexScreen && member.agent == .codex
+        var connection: SessionGroupLiveSession?
+        if let runtime = member.runtimeID {
+            let observed = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: !useStatus)
+            connection = SessionGroupMatching.connection(member, in: observed)
+        }
+        if connection == nil {
+            let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: !useStatus)
+            connection = SessionGroupMatching.match(member, in: observed)
+        }
+        guard let connection, let original = sessions[connection.id] else {
             throw AppError.message("원래 터미널 연결을 확인해주세요. 다시 실행한 세션은 실행 중인 세션에 연결한 뒤 갱신할 수 있습니다.")
         }
         let runtime = original.id
         let id: String
-        if let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
+        var queriedStatus = false
+        if !useStatus, let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
             id = confirmed
         } else {
-            if original.agent == .codex { try await waitForGroupStatusInput(original) }
-            else if original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime) {
+            if original.agent != .codex && (original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime)) {
                 throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
-            id = try await statusConversationID(original)
+            id = try await statusConversationID(original, backgroundOnly: original.agent == .codex && original.terminal == .terminal)
+            queriedStatus = true
         }
-        var next = saved
-        let gi = next.firstIndex(where: { $0.id == groupID })!, mi = next[gi].members.firstIndex(where: { $0.id == memberID })!
-        next[gi].members[mi].conversationID = id
+        let verify = remoteProcessVerifier
+        guard try await Task.detached(priority: .utility, operation: { try verify(original) }).value,
+              let current = sessions[runtime], current.pid == original.pid, current.started == original.started,
+              current.tty == original.tty, current.cwd == original.cwd, current.terminal == original.terminal,
+              current.phase != .ended, !remoteInputStopped else {
+            throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 기존 ID를 유지합니다.")
+        }
+        let latest = try store.load()
+        guard let gi = latest.firstIndex(where: { $0.id == groupID }),
+              let mi = latest[gi].members.firstIndex(where: { $0.id == memberID }),
+              latest[gi].members[mi] == member,
+              expectedGroup == nil || latest[gi] == group, !groupClearActive(groupID) else {
+            throw AppError.message("조회 중 그룹 연결이 바뀌었습니다. 다시 조회해주세요.")
+        }
+        guard let uuid = UUID(uuidString: id) else { throw AppError.message("올바른 세션 ID를 확인하지 못했습니다.") }
+        let home = connection.providerHome ?? member.providerHome
+        guard !latest[gi].members.contains(where: { other in
+            other.id != memberID && (other.runtimeID == runtime ||
+                (other.agent == member.agent && other.providerHome == home && UUID(uuidString: other.conversationID) == uuid))
+        }) else { throw AppError.message("확인한 세션 ID가 이미 이 그룹의 다른 구성원에 연결되어 있습니다.") }
+        var next = latest
+        next[gi].members[mi].conversationID = uuid.uuidString.lowercased()
         next[gi].members[mi].runtimeID = runtime
-        next[gi].members[mi].providerHome = connection.providerHome ?? member.providerHome
-        if original.agent == .codex, next[gi].members[mi].providerHome == nil,
-           let record = try? processReader().first(where: { $0.key == original.id }),
-           let home = CodexGroupIdentity.home(environment: ProcessEnvironment.read(record)) {
-            next[gi].members[mi].providerHome = home
-        }
-        try store.save(next, expected: saved)
-        if connection.conversationID == nil {
-            groupStatusIdentities[runtime] = (original, id, next[gi].members[mi].providerHome)
+        next[gi].members[mi].providerHome = home
+        if next != latest { try store.save(next, expected: latest) }
+        if queriedStatus {
+            let rollout = connection.conversationID.flatMap(UUID.init(uuidString:))
+            groupStatusIdentities[runtime] = GroupStatusIdentity(session: current, conversationID: id, home: home,
+                                                               contradictedRollout: rollout == uuid ? nil : rollout)
         }
         refreshSessionGroupBadges()
+        return SessionGroupIdentityRefresh(conversationID: uuid.uuidString.lowercased(), changed: UUID(uuidString: member.conversationID) != uuid)
     }
 
     /// A status card can extend above Terminal's visible frame. Capture only
@@ -2562,10 +2601,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return try await pending.value
     }
 
-    private func readSessionGroupSessions() async throws -> [SessionGroupLiveSession] {
-        let originals = sessions.values.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
+    private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true) async throws -> [SessionGroupLiveSession] {
+        let candidates = runtimeID.map { sessions[$0].map { [$0] } ?? [] } ?? Array(sessions.values)
+        let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
+        guard !originals.isEmpty || runtimeID == nil else { return [] }
         guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
-        let reader = processReader, registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
+        let readAll = processReader, readOne = singleProcessReader, pid = runtimeID == nil ? nil : originals.first?.pid
+        let reader: @Sendable () throws -> [ProcessRecord] = { if let pid { return try readOne(pid) }; return try readAll() }
+        let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
         let records = try await Task.detached(priority: .utility) { try reader() }.value
         var result: [SessionGroupLiveSession] = []
         for original in originals {
@@ -2607,15 +2650,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.tty == original.tty, current.agent == original.agent, current.cwd == original.cwd,
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
-            if let status = groupStatusIdentities[current.id], status.session.started == current.started,
-               status.session.tty == current.tty, status.session.cwd == current.cwd, status.session.agent == current.agent,
-               conversation == nil {
-                conversation = status.conversationID
-                home = home ?? status.home
-            }
-            if let cached = groupStatusIdentities[current.id], let conversation,
-               UUID(uuidString: cached.conversationID) != UUID(uuidString: conversation) {
-                groupStatusIdentities.removeValue(forKey: current.id)
+            if useStatusCache, let status = groupStatusIdentities[current.id] {
+                let compatible = status.session.started == current.started && status.session.tty == current.tty &&
+                    status.session.cwd == current.cwd && status.session.agent == current.agent &&
+                    (home == nil || status.home == nil || home == status.home)
+                let observedID = conversation.flatMap(UUID.init(uuidString:))
+                if compatible && (observedID == nil || observedID == status.contradictedRollout) {
+                    conversation = status.conversationID
+                    home = home ?? status.home
+                } else if !compatible || observedID != UUID(uuidString: status.conversationID) {
+                    groupStatusIdentities.removeValue(forKey: current.id)
+                }
             }
             result.append(SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName))
         }
@@ -2630,6 +2675,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID else { return false }
             return latest.contains { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }
         }.sorted { $0.session.displayedTerminalTitle.localizedStandardCompare($1.session.displayedTerminalTitle) == .orderedAscending }
+        guard reconcile else { return observed }
         let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
         var refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
         var remaining:[TerminalProfileGroupAttachment]=[]
@@ -2730,7 +2776,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed) else {
             throw RemoteHTTPError(409, "재연결할 수 있는 원래 터미널을 확인하지 못했거나 재연결 권한이 없습니다. canReconnect가 true인 구성원만 재연결할 수 있습니다. 종료된 터미널은 자동으로 다시 실행하지 않습니다.")
         }
-        try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group)
+        try await refreshGroupMemberIdentity(groupID: groupID, memberID: memberID, expectedGroup: group, verifyCodexScreen: false)
         let fresh = try await sessionGroupSessions()
         guard let updated = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID })?.members.first(where: { $0.id == memberID }),
               let live = SessionGroupMatching.match(updated, in: fresh),
@@ -3013,7 +3059,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if conversation == nil, current.agent == .codex {
             updateRestart(id, .waiting, "터미널의 /status 화면에서 대화 ID를 확인하고 있습니다.")
             conversation = valid(try? await statusConversationID(current))
-            if let conversation { groupStatusIdentities[id] = (current, conversation, nil) }
+            if let conversation { groupStatusIdentities[id] = GroupStatusIdentity(session: current, conversationID: conversation, home: nil) }
         }
         // Last resort: the conversation the CLI was launched with. A later /clear may have started another one,
         // so the result says which ID was used.
@@ -3582,7 +3628,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
             try groupStore.save(updated, expected: saved)
-            groupStatusIdentities[current.id] = (current, newID, target.providerHome)
+            groupStatusIdentities[current.id] = GroupStatusIdentity(session: current, conversationID: newID, home: target.providerHome,
+                                                                   contradictedRollout: UUID(uuidString: target.beforeID))
             var state = try groupOrchestration(); state.supersede(groupID: job.groupID, workerMemberID: target.memberID); try saveGroupOrchestration(state)
             target.afterID = newID; target.phase = "completed"; target.detail = "초기화와 새 세션 ID 갱신을 확인했습니다."
             try saveGroupClearTarget(job.id, target); refreshSessionGroupBadges(); scheduleGroupMailboxDelivery()
@@ -8527,7 +8574,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if try await leaveCohortGoalPaused(current,entry:entry,context:cohortContext(id)){return nil}
             guard let observed=try? await statusConversationID(current) else{return nil}
             guard observed==entry.conversationID else{throw AppError.message("복원된 터미널의 현재 대화가 저장한 대화와 다릅니다. 실행을 반복하지 않았습니다.")}
-            groupStatusIdentities[current.id]=(current,observed,home)
+            groupStatusIdentities[current.id] = GroupStatusIdentity(session: current, conversationID: observed, home: home)
             return member.tty
         },restore:{[self] entry,member in
             let context=try cohortContext(id)
