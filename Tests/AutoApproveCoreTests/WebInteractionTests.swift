@@ -85,7 +85,7 @@ extension ApprovalTests {
         try expectEqual((initialize?["result"] as? JSONObject)?["protocolVersion"] as? String, "2025-11-25")
         let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": "list", "method": "tools/list"]) { _, _ in [:] }
         let tools=(list?["result"] as? JSONObject)?["tools"] as? [JSONObject] ?? []
-        try expectEqual(Set(tools.compactMap{$0["name"] as? String}),Set(["ask_user","get_user_answers","get_session_groups","get_group_status","assign_group_task","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","get_group_messages","ack_group_messages","clear_session_group","get_group_clear_status","get_diagnostics","list_screens","start_screen_share","stop_screen_share"]))
+        try expectEqual(Set(tools.compactMap{$0["name"] as? String}),Set(["ask_user","get_user_answers","get_session_groups","get_group_status","assign_group_task","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","get_group_messages","ack_group_messages","clear_session_group","clear_group_member","set_group_member_title","set_group_member_tab_color","get_group_clear_status","get_diagnostics","list_screens","start_screen_share","stop_screen_share"]))
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_session_groups"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
         // Group status can reconcile identities; inbox reads do not acknowledge messages.
         for name in ["get_group_status","assign_group_task","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","ack_group_messages"] {
@@ -95,6 +95,9 @@ extension ApprovalTests {
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_group_messages"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_group_clear_status"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
         try expectEqual((tools.first(where:{$0["name"] as? String=="clear_session_group"})?["annotations"] as? JSONObject)?["destructiveHint"] as? Bool,true)
+        let clearMember = tools.first(where:{$0["name"] as? String=="clear_group_member"})!
+        try expectEqual((clearMember["annotations"] as? JSONObject)?["destructiveHint"] as? Bool,true)
+        try expectEqual((clearMember["inputSchema"] as? JSONObject)?["required"] as? [String],["groupID","memberID","requestID"])
         var modifiedSchema = AutoApproveMCPServer.tools
         modifiedSchema[0]["name"] = "changed"
         try expectEqual(AutoApproveMCPServer.tools[0]["name"] as? String, "ask_user", "A caller must not mutate the shared schema")

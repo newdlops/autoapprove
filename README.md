@@ -1,5 +1,7 @@
 # AutoApprove
 
+**개별 초기화·탭 표시 · 0.2.321 빌드 348:** `clear_group_member`로 지정한 구성원만 초기화하고 새 세션 ID를 갱신합니다. `set_group_member_title`과 `set_group_member_tab_color`로 Terminal·iTerm2의 실제 탭 이름과 이름 앞 색상 표식을 변경합니다. [사용법과 검증](docs/releases/v0.2.321.md).
+
 **프로필 실행 설정·그룹 초기화 · 0.2.320 빌드 347:** 모델·추론 수준·Codex Fast/Ultrafast까지 프로필에 저장·복원합니다. `clear_session_group`으로 전체 그룹을 초기화하고 새 세션 ID를 확인해 갱신하며, `get_group_clear_status`로 결과를 조회합니다. [사용법과 검증](docs/releases/v0.2.320.md).
 
 **그룹 모델 조회·Codex↔Claude 통신 · 0.2.319 빌드 346:** 그룹원 상태에 모델·추론 수준과 출처·기록 시점을 포함합니다. 서로 다른 도구의 일반 메시지와 대화 ID로 확인된 그룹장의 지시를 지원하고, Claude 완료 훅이 누락되면 검증된 최종 응답에서 보고를 복구합니다. [변경과 검증](docs/releases/v0.2.319.md).

@@ -35,14 +35,18 @@ public struct SessionGroupClearOperation: Codable, Equatable, Sendable, Identifi
     public var id: UUID
     public var groupID: UUID
     public var callerMemberID: UUID
+    /// nil includes the whole group; older saved operations also decode as whole-group requests.
+    public var selectedMemberID: UUID?
     public var createdAt: Date
     public var targets: [SessionGroupClearTarget]
     public var done: Bool { targets.allSatisfy(\.terminal) }
-    public init(id: UUID, groupID: UUID, callerMemberID: UUID, targets: [SessionGroupClearTarget]) {
+    public init(id: UUID, groupID: UUID, callerMemberID: UUID, targets: [SessionGroupClearTarget], selectedMemberID: UUID? = nil) {
         self.id = id; self.groupID = groupID; self.callerMemberID = callerMemberID; createdAt = Date(); self.targets = targets
+        self.selectedMemberID = selectedMemberID
     }
     public var json: JSONObject {
         ["requestID": id.uuidString, "groupID": groupID.uuidString, "done": done,
+         "scope": selectedMemberID == nil ? "group" : "member", "memberID": selectedMemberID?.uuidString as Any? ?? NSNull(),
          "status": !done ? "running" : targets.allSatisfy({ $0.phase == "completed" }) ? "completed" : "needs_review",
          "updated": targets.filter { $0.phase == "completed" }.count, "total": targets.count,
          "members": targets.map(\.json), "transport": "local_terminal", "networkRequired": false]

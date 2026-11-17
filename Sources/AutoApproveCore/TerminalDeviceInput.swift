@@ -10,8 +10,11 @@ public enum TerminalDeviceInput {
         captureIdentity: @escaping @Sendable (Int32) throws -> TTYInputIdentity = { try TTYInputIdentity.capture(pid: $0) },
         run: (@Sendable (String) throws -> String)? = nil) throws -> TerminalDelivery {
         try input.validate()
-        guard [.message, .submit].contains(input.kind), agent == .codex,
-              !RemoteMessageReadiness.hasMenu(screen, agent: agent), CodexProgressScreen.emptyComposer(screen),
+        let codexReady = agent == .codex && CodexProgressScreen.emptyComposer(screen)
+        let claudeClear = agent == .claude && input.text == "/clear" &&
+            ClaudeComposerReadiness.isEmpty(screen) && ActivityDetector.detect(screen,agent:agent).phase != .working
+        guard [.message, .submit].contains(input.kind), codexReady || claudeClear,
+              !RemoteMessageReadiness.hasMenu(screen, agent: agent),
               let pid = target.sourcePID, target.jobPIDs.contains(pid), let original = target.sourceIdentity,
               original.pid == pid, original.processStart == target.sourceStarted,
               let current = try? captureIdentity(pid), current.sameProcess(as: original),
@@ -21,17 +24,24 @@ public enum TerminalDeviceInput {
         // doScript adds the submission newline. Bracketed paste keeps a long
         // message together and prevents its internal newlines from submitting early.
         let data = try AutomationScript.literal(["tty": target.tty, "screen": screen,
-            "text": "\u{1b}[200~" + input.text + "\u{1b}[201~", "agent": agent.rawValue] as JSONObject)
+            "text": claudeClear ? "/clear" : "\u{1b}[200~" + input.text + "\u{1b}[201~", "agent": agent.rawValue] as JSONObject)
         let script = """
         (() => {
           const app = Application('com.apple.Terminal'), target = \(data);
           const normalize = value => String(value).normalize('NFC').replace(/\\r\\n?/g, '\\n');
           if (!app.running()) return 'missingTarget';
+          function skipClosed(read) {try {return read();} catch(error) {if ([-1743,-1744].includes(Number(error.errorNumber || error.number))) throw error;return null;}}
           const matches = [];
-          for (const window of app.windows()) for (const tab of window.tabs()) {
-            if (String(tab.tty()) === target.tty) matches.push(tab);
+          for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
+            if (skipClosed(() => String(tab.tty())) === target.tty) matches.push(tab);
           }
-          if (matches.length !== 1) return 'missingTarget';
+          if (!matches.length) return 'missingTarget';
+          // Native tab groups can expose the same TTY through multiple window
+          // aliases. Verify every alias, then write once to that exact TTY.
+          for (const tab of matches) {
+            if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
+            if (!tab.processes().some(name => String(name).toLowerCase().includes(target.agent))) return 'agentMissing';
+          }
           const tab = matches[0];
           if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
           if (!tab.processes().some(name => String(name).toLowerCase().includes(target.agent))) return 'agentMissing';

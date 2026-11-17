@@ -2164,7 +2164,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // asynchronous process check. Web callers cannot supply this callback.
         try automaticAuthorization?()
         if codexStatusQuery {
-            guard !snapshot.paused, !nativeUserInputHasPriority(id), !automaticInputBusy(id),
+            guard !(await nativeUserInputHasPriority(id,backgroundOnly:backgroundOnly)), !snapshot.paused, !automaticInputBusy(id),
                   codexGroupStatusEligible(current) else {
                 throw RemoteHTTPError(409, "Codex 입력 상태가 바뀌어 세션 ID 조회를 보류했습니다.")
             }
@@ -2283,7 +2283,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             throw RemoteHTTPError(409, "문자는 전달했지만 원본의 입력 상태가 바뀌어 Enter를 보내지 않았습니다. 원본 화면을 확인해주세요.")
                         }
                         if codexStatusQuery {
-                            guard !snapshot.paused, !nativeUserInputHasPriority(original.id),
+                            guard !(await nativeUserInputHasPriority(original.id,backgroundOnly:backgroundOnly)), !snapshot.paused,
                                   PromptDetector.normalizedLines(next.screen).last(where: { $0.hasPrefix("›") || $0.hasPrefix("»") })?.dropFirst().trimmingCharacters(in: .whitespaces) == "/status" else {
                                 throw RemoteHTTPError(409, "Codex 조회 명령의 입력을 확인하지 못해 Enter를 보내지 않았습니다.")
                             }
@@ -2316,8 +2316,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func nativeUserInputHasPriority(_ id:String) -> Bool {
         sessions[id].map {nativeKeyboardActivity.hasPriority(terminal:$0.terminal) || testScreens.remoteControl.hasInputPriority(terminal:$0.terminal)} ?? false
     }
+    private func nativeUserInputHasPriority(_ id:String,backgroundOnly:Bool) async -> Bool {
+        guard backgroundOnly,let session=sessions[id] else {return nativeUserInputHasPriority(id)}
+        if testScreens.remoteControl.hasInputPriority(terminal:session.terminal) {return true}
+        let keyboard=nativeKeyboardActivity
+        return await Task.detached(priority:.userInitiated) {keyboard.hasPriority(terminal:session.terminal,tty:session.tty)}.value
+    }
     private func userInputHasPriority(_ id:String) -> Bool {
         codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
+    }
+    private func userInputHasPriority(_ id:String,backgroundOnly:Bool) async -> Bool {
+        if codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) {return true}
+        let native=await nativeUserInputHasPriority(id,backgroundOnly:backgroundOnly)
+        return native || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id)
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
@@ -2345,6 +2356,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupStatusQueries: Set<String> = []
     private var groupClearOperations: [SessionGroupClearOperation]?
     private var groupClearTask: Task<Void, Never>?
+    private var tabLabelChanges: Set<String> = []
     public var groupClearInterval: TimeInterval = 2
     private var profileGroupAttachments:[TerminalProfileGroupAttachment]=[]
 
@@ -2395,7 +2407,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return true // Work can continue while /status reads the current session.
     }
 
-    private func groupStatusBlockReason(_ session: AgentSession) -> (message: String, transient: Bool)? {
+    private func groupStatusBlockReason(_ session: AgentSession,includeNativeInput:Bool = true) -> (message: String, transient: Bool)? {
         let id = session.id
         if !codexGroupStatusEligible(session) { return ("터미널의 질문·승인 상태를 먼저 확인해주세요.", false) }
         if snapshot.paused || remoteInputStopped { return ("AutoApprove가 일시정지되어 세션 ID 조회를 보류했습니다.", false) }
@@ -2403,20 +2415,26 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if changingGoals.contains(id) { return ("이 세션의 Goal 설정을 변경하고 있어 ID 조회를 보류했습니다.", false) }
         if automaticInputBusy(id) { return ("자동 승인 또는 복구 입력을 전달하고 있어 ID 조회를 보류했습니다. 입력 완료 후 다시 갱신해주세요.", true) }
         if remoteUserInputHasPriority(id) { return ("이 세션에 전달 중인 입력의 보호 시간이 끝나지 않아 ID 조회를 보류했습니다.", true) }
-        if nativeUserInputHasPriority(id) { return ("터미널 앱의 키보드·원격 조작 우선권이 유지되어 ID 조회를 보류했습니다. 입력과 보조키를 놓은 뒤 다시 갱신해주세요.", true) }
+        if includeNativeInput && nativeUserInputHasPriority(id) { return ("터미널 앱의 키보드·원격 조작 우선권이 유지되어 ID 조회를 보류했습니다. 입력과 보조키를 놓은 뒤 다시 갱신해주세요.", true) }
+        return nil
+    }
+    private func groupStatusBlockReason(_ session:AgentSession,backgroundOnly:Bool) async -> (message:String,transient:Bool)? {
+        guard backgroundOnly else {return groupStatusBlockReason(session)}
+        if let reason=groupStatusBlockReason(session,includeNativeInput:false) {return reason}
+        if await nativeUserInputHasPriority(session.id,backgroundOnly:true) {return ("대상 터미널의 키보드·원격 조작 우선권이 유지되어 ID 조회를 보류했습니다.",true)}
         return nil
     }
 
     /// Explicit queries may wait for a short input cooldown, but never bypass it.
     /// A new question, draft or process replacement is checked again at dispatch.
-    private func waitForGroupStatusInput(_ original: AgentSession) async throws {
+    private func waitForGroupStatusInput(_ original: AgentSession,backgroundOnly:Bool = false) async throws {
         let deadline = Date().addingTimeInterval(3)
         while true {
             try Task.checkCancellation()
             guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
                   current.tty == original.tty, current.cwd == original.cwd, current.terminal == original.terminal,
                   current.phase != .ended else { throw AppError.message("원래 터미널 연결이 바뀌어 ID 조회를 보류했습니다.") }
-            guard let reason = groupStatusBlockReason(current) else { return }
+            guard let reason = await groupStatusBlockReason(current,backgroundOnly:backgroundOnly) else { return }
             guard reason.transient, Date() < deadline else { throw AppError.message(reason.message) }
             try await Task.sleep(for: .milliseconds(200))
         }
@@ -2489,8 +2507,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Types /status into an empty composer and reads the fresh status card, including during Codex work.
-    private func statusConversationID(_ original: AgentSession) async throws -> String {
-        if original.agent == .codex {try await waitForGroupStatusInput(original)}
+    private func statusConversationID(_ original: AgentSession,backgroundOnly:Bool = false) async throws -> String {
+        if original.agent == .codex {try await waitForGroupStatusInput(original,backgroundOnly:backgroundOnly)}
         let runtime = original.id
         guard !sendingMessages.contains(runtime), groupStatusQueries.insert(runtime).inserted else {
             throw AppError.message("이미 이 터미널의 세션 ID를 조회하고 있습니다.")
@@ -2508,11 +2526,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message(reason)
         }
         let historyBefore = try? await groupStatusHistory(original)
-        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, textOnly: original.agent == .codex, preflight: {
+        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, textOnly: original.agent == .codex, backgroundOnly:backgroundOnly, preflight: {
             guard original.agent == .codex else { return }
             let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true, textOnly: true)
             guard let current = self.sessions[runtime] else { throw RemoteHTTPError(409, "원래 터미널 연결이 바뀌었습니다.") }
-            if let reason = self.groupStatusBlockReason(current) { throw RemoteHTTPError(409, reason.message) }
+            if let reason = await self.groupStatusBlockReason(current,backgroundOnly:backgroundOnly) { throw RemoteHTTPError(409, reason.message) }
             guard CodexStatusIdentity.canQuery(latest.screen) else { throw RemoteHTTPError(409, "최신 Codex 화면에서 빈 입력창을 확인하지 못했습니다. 작성 중인 입력이나 열린 메뉴를 확인해주세요.") }
         })
         sendingMessages.insert(runtime); defer { sendingMessages.remove(runtime) }
@@ -3492,7 +3510,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   member.runtimeID == nil || member.runtimeID == current.id, member.providerHome == nil || target.providerHome == nil || member.providerHome == target.providerHome else {
                 target.phase = "failed"; target.detail = "그룹 소속이나 원래 연결이 바뀌었습니다."; try saveGroupClearTarget(job.id, target); return
             }
-            guard !snapshot.paused, !automaticInputBusy(current.id), !userInputHasPriority(current.id), !current.pendingInTerminal,
+            guard !(await userInputHasPriority(current.id,backgroundOnly:true)), !snapshot.paused, !automaticInputBusy(current.id), !current.pendingInTerminal,
                   ![.approval, .ended].contains(current.phase), !sendingMessages.contains(current.id), !groupStatusQueries.contains(current.id) else { return }
             let frame = try await remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             guard clearFrameReady(frame.screen, agent: current.agent) else {
@@ -3502,15 +3520,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if target.verifiedAt.map({ Date().timeIntervalSince($0) > 10 }) ?? true {
                     let id: String
                     if current.agent == .claude, let live = try await sessionGroupSessions().first(where: { $0.id == current.id }), let fresh = live.conversationID { id = fresh }
-                    else { id = try await statusConversationID(current) }
+                    else { id = try await statusConversationID(current,backgroundOnly:true) }
                     target.beforeID = id; target.verifiedAt = Date(); target.identityAttempts = 0; try saveGroupClearTarget(job.id, target)
-                    if current.agent == .codex { try await waitForGroupStatusInput(current) }
+                    if current.agent == .codex { try await waitForGroupStatusInput(current,backgroundOnly:true) }
                 }
                 // Commit before the write. Recovery only queries identity;
                 // uncertain writes can never cause an automatic second /clear.
                 target.phase = "issued"; target.detail = "초기화 전달 후 새 세션 ID를 확인합니다."; try saveGroupClearTarget(job.id, target)
                 do {
                     _ = try await sendOriginalTerminalMessage(current, object: ["text": "/clear", "revision": frame.revision], textOnly: true, backgroundOnly: true, preflight: {
+                        let latest = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
+                        let userPriority=await self.userInputHasPriority(current.id,backgroundOnly:true)
                         let latestGroup = try SessionGroupStore(directory: self.paths.directory).load().first { $0.id == job.groupID }
                         guard let latestGroup, latestGroup.leaderMemberID == nil || latestGroup.leaderMemberID == job.callerMemberID,
                               let latestMember = latestGroup.members.first(where: { $0.id == target.memberID }),
@@ -3519,9 +3539,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                               [target.savedID, target.beforeID].contains(where: { UUID(uuidString: $0) == UUID(uuidString: latestMember.conversationID) }) else {
                             throw RemoteHTTPError(409, "그룹 소속이나 초기화 권한이 바뀌어 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
                         }
-                        let latest = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
-                        guard !self.snapshot.paused, !self.userInputHasPriority(current.id), !self.automaticInputBusy(current.id),
-                              self.clearFrameReady(latest.screen, agent: current.agent) else { throw RemoteHTTPError(409, "입력 상태가 바뀌어 초기화를 보류합니다.", diagnostics: ["delivery": "not_started"]) }
+                        let reason = self.snapshot.paused ? "AutoApprove가 일시정지되었습니다." :
+                            userPriority ? "대상 세션의 사용자 입력 우선권을 기다립니다." :
+                            self.automaticInputBusy(current.id) ? "대상 세션의 자동 입력 완료를 기다립니다." :
+                            !self.clearFrameReady(latest.screen,agent:current.agent) ? "대상 화면에서 빈 입력창을 확인하지 못했습니다." : nil
+                        if let reason {throw RemoteHTTPError(409,reason,diagnostics:["delivery":"not_started"])}
                     })
                     groupStatusIdentities.removeValue(forKey: current.id)
                 } catch {
@@ -3533,7 +3555,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             let newID: String?
             if current.agent == .claude { newID = try await sessionGroupSessions().first(where: { $0.id == current.id })?.conversationID }
-            else { newID = try await statusConversationID(current) }
+            else { newID = try await statusConversationID(current,backgroundOnly:true) }
             guard let newID, UUID(uuidString: newID) != nil, UUID(uuidString: newID) != UUID(uuidString: target.beforeID) else {
                 target.identityAttempts += 1
                 if target.identityAttempts >= 3 { target.phase = "needs_review"; target.detail = "새 ID를 확인하지 못했습니다. /clear는 다시 보내지 않습니다. 원래 터미널에서 세션 ID를 갱신해주세요." }
@@ -3588,10 +3610,55 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
         switch tool {
-        case "clear_session_group", "get_group_clear_status":
+        case "set_group_member_title", "set_group_member_tab_color":
+            guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
+                  let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "groupID와 memberID(UUID)를 지정해주세요.") }
+            let observed = try await sessionGroupSessions()
+            let (caller, _) = try sessionGroupCaller(object, observed: observed)
+            guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+                  let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 변경할 수 있습니다.") }
+            guard group.leaderMemberID == nil || group.leaderMemberID == callerMember.id else { throw RemoteHTTPError(403, "그룹의 탭 표시 변경은 그룹장만 요청할 수 있습니다.") }
+            guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 탭 표시를 변경해주세요.") }
+            guard let member = group.members.first(where: { $0.id == memberID }) else { throw RemoteHTTPError(404, "이 그룹에서 지정한 구성원을 찾지 못했습니다.") }
+            guard let live = SessionGroupMatching.match(member, in: observed), let session = sessions[live.id], session.phase != .ended else { throw RemoteHTTPError(409, "대화 ID와 원래 터미널 연결을 확인한 뒤 다시 시도해주세요.") }
+            guard let host = ScreenHost(kind: session.terminal), let write = screenAdapters[host]?.setTabLabel else { throw RemoteHTTPError(501, "탭 이름·색상 표식 변경은 Terminal과 iTerm2에서 지원합니다.") }
+            var customization = session.customization ?? .init()
+            let title: String
+            if tool == "set_group_member_title" {
+                guard let value = object["title"] as? String else { throw RemoteHTTPError(400, "새 탭 이름 title을 지정해주세요.") }
+                title = value
+            } else {
+                guard let color = object["color"] as? String, color == "default" || SessionColor(rawValue: color) != nil else { throw RemoteHTTPError(400, "탭 색상을 지정해주세요. red·orange·yellow·green·blue·purple·gray·default를 지원합니다.") }
+                title = customization.title.isEmpty ? TerminalTabLabel.baseTitle(session.terminalTitle ?? member.title) : customization.title
+                customization.color = color == "default" ? nil : SessionColor(rawValue: color)
+            }
+            let label = try TerminalTabLabel(title: title, color: customization.color?.rawValue).validated()
+            guard tabLabelChanges.insert(session.id).inserted else { throw RemoteHTTPError(409, "이 세션의 탭 표시를 변경 중입니다. 잠시 뒤 다시 시도해주세요.") }
+            defer { tabLabelChanges.remove(session.id) }
+            let validate = nativeIdentity(session)
+            let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [session.pid], sourcePID: session.pid, sourceStarted: session.started)
+            let actual = try await Task.detached(priority: .utility) {
+                guard try validate() else { throw AppError.message("원래 터미널 프로세스가 바뀌어 표시를 변경하지 않았습니다.") }
+                let actual = try write(target, label)
+                guard try validate(), actual == label.rendered else { throw AppError.message("원래 세션에 적용된 탭 이름을 확인하지 못했습니다.") }
+                return actual
+            }.value
+            guard let current = sessions[session.id], current.pid == session.pid, current.started == session.started, current.phase != .ended else { throw RemoteHTTPError(409, "탭 변경 중 세션이 종료되거나 교체되었습니다.") }
+            customization.title = label.title
+            do { try setCustomization(session.id, value: customization) }
+            catch { throw RemoteHTTPError(500, "원래 탭 이름은 변경했지만 표시 설정을 저장하지 못했습니다. " + error.localizedDescription, diagnostics: ["nativeApplied": "true"]) }
+            return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "conversationID": live.conversationID as Any? ?? NSNull(),
+                    "applied": true, "verified": true, "title": label.title, "tabTitle": actual,
+                    "color": label.color as Any? ?? NSNull(), "colorMode": "title_marker", "transport": "local_terminal", "networkRequired": false]
+        case "clear_session_group", "clear_group_member", "get_group_clear_status":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "groupID를 지정해주세요.") }
             let suppliedRequest = (object["requestID"] as? String).flatMap(UUID.init(uuidString:))
             guard (object["requestID"] == nil || suppliedRequest != nil), tool == "get_group_clear_status" || suppliedRequest != nil else { throw RemoteHTTPError(400, "새 초기화에는 재시도에도 유지할 requestID(UUID)를 지정해주세요.") }
+            let selectedMemberID: UUID?
+            if tool == "clear_group_member" {
+                guard let id = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "초기화할 memberID(UUID)를 지정해주세요.") }
+                selectedMemberID = id
+            } else { selectedMemberID = nil }
             let observed = try await sessionGroupSessions()
             let (caller, _) = try sessionGroupCaller(object, observed: observed)
             guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
@@ -3604,19 +3671,26 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let request = suppliedRequest!
             if let previous = jobs.first(where: { $0.id == request }) {
                 guard previous.groupID == groupID else { throw RemoteHTTPError(409, "다른 그룹에서 사용한 requestID입니다.") }
+                guard previous.selectedMemberID == selectedMemberID else { throw RemoteHTTPError(409, "다른 초기화 대상에 사용한 requestID입니다. 대상이 다른 새 요청에는 새 requestID를 사용해주세요.") }
                 return previous.json
             }
-            guard group.leaderMemberID == nil || group.leaderMemberID == callerMember.id else { throw RemoteHTTPError(403, "그룹 전체 초기화는 그룹장만 요청할 수 있습니다.") }
+            guard group.leaderMemberID == nil || group.leaderMemberID == callerMember.id else { throw RemoteHTTPError(403, "그룹 초기화는 그룹장만 요청할 수 있습니다.") }
             guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "이 그룹의 초기화가 진행 중입니다. 기존 requestID로 상태를 확인해주세요.") }
             jobs.removeAll { $0.done && Date().timeIntervalSince($0.createdAt) > 604800 }
             if jobs.count >= 40 { jobs.removeAll { $0.done } }
             guard jobs.count < 40 else { throw RemoteHTTPError(409, "진행 중인 그룹 초기화 요청이 너무 많습니다.") }
-            let members = group.members.filter { $0.id != callerMember.id } + [callerMember]
+            let members: [SessionGroupMember]
+            if let selectedMemberID {
+                guard let member = group.members.first(where: { $0.id == selectedMemberID }) else { throw RemoteHTTPError(404, "이 그룹에서 지정한 구성원을 찾지 못했습니다.") }
+                members = [member]
+            } else { members = group.members.filter { $0.id != callerMember.id } + [callerMember] }
             let job = SessionGroupClearOperation(id: request, groupID: groupID, callerMemberID: callerMember.id,
-                targets: members.map { SessionGroupClearTarget(member: $0, live: SessionGroupMatching.connection($0, in: observed)) })
+                targets: members.map { SessionGroupClearTarget(member: $0, live: SessionGroupMatching.connection($0, in: observed)) }, selectedMemberID: selectedMemberID)
             jobs.append(job); try saveGroupClears(jobs); scheduleGroupClears()
             var result = job.json; result["accepted"] = true
-            result["message"] = "초기화를 저장했습니다. 호출자 자신을 포함한 전체 구성원의 빈 입력창에서 /clear를 한 번씩 실행하고 새 ID를 확인합니다. 작업 중이면 기다립니다. 같은 requestID로 get_group_clear_status를 조회하세요. 접수는 초기화 완료가 아닙니다."
+            result["message"] = selectedMemberID == nil
+                ? "초기화를 저장했습니다. 호출자 자신을 포함한 전체 구성원의 빈 입력창에서 /clear를 한 번씩 실행하고 새 ID를 확인합니다. 작업 중이면 기다립니다. 같은 requestID로 get_group_clear_status를 조회하세요. 접수는 초기화 완료가 아닙니다."
+                : "지정한 구성원의 초기화를 저장했습니다. 해당 세션의 빈 입력창에서 /clear를 한 번 실행하고 새 ID를 확인합니다. 작업 중이면 기다립니다. 같은 requestID로 get_group_clear_status를 조회하세요. 자신을 지정했다면 현재 응답을 마쳐 초기화될 수 있게 하세요. 접수는 초기화 완료가 아닙니다."
             return result
         case "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),

@@ -84,6 +84,8 @@ public struct ScreenHostAdapter: Sendable {
     public var replacementShell: (@Sendable (ScreenTarget) throws -> ProcessRecord)?
     public var replacementShellValid: (@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)?
     public var goalInterrupt: (@Sendable (ScreenTarget,String) throws -> TerminalDelivery)?
+    /// Native tab metadata only. Never writes to the CLI composer or changes focus.
+    public var setTabLabel: (@Sendable (ScreenTarget,TerminalTabLabel) throws -> String)?
     public var input: @Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery
     public init(screens: @escaping @Sendable ([ScreenTarget]) throws -> TerminalSnapshot,
                 approve: @escaping @Sendable (ScreenTarget, String, AgentKind) throws -> TerminalDelivery,
@@ -98,12 +100,14 @@ public struct ScreenHostAdapter: Sendable {
                 history:(@Sendable (ScreenTarget) throws -> String)? = nil,
                 replacementShell:(@Sendable (ScreenTarget) throws -> ProcessRecord)? = nil,
                 replacementShellValid:(@Sendable (ScreenTarget,ProcessRecord) throws -> Bool)? = nil,
-                goalInterrupt:(@Sendable (ScreenTarget,String) throws -> TerminalDelivery)? = nil) {
+                goalInterrupt:(@Sendable (ScreenTarget,String) throws -> TerminalDelivery)? = nil,
+                setTabLabel:(@Sendable (ScreenTarget,TerminalTabLabel) throws -> String)? = nil) {
         self.screens = screens; self.approve = approve; self.reveal = reveal; self.resume = resume; self.completeResume = completeResume; self.restart = restart; self.input = input
         self.presentationScreens = presentationScreens
         self.initialScreens = initialScreens
         self.validationScreens = validationScreens
         self.goalInterrupt=goalInterrupt
+        self.setTabLabel=setTabLabel
         self.history=history;self.replacementShell=replacementShell;self.replacementShellValid=replacementShellValid
     }
     /// Validation consumes only fresh text. A channel failure must propagate;
@@ -126,7 +130,8 @@ public struct ScreenHostAdapter: Sendable {
                 validationScreens: { try TerminalAdapter.screens(ttys:$0.map(\.tty),includeCursor:false,includeTitles:false,purpose:.validation) },
                 history:{try TerminalAppleEvents.history(tty:$0.tty)},
                 replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)},
-                goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)})
+                goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)},
+                setTabLabel:{try TerminalTabLabelAdapter.apply(host:.terminal,target:$0,label:$1)})
             adapter.typeLine = { try TerminalAdapter.typeLine(target: $0, text: $1) }
             adapter.backgroundInput = { try TerminalDeviceInput.deliverBackground(target: $0, screen: $1, agent: $2, input: $3) }
             if let terminalReader {
@@ -142,7 +147,8 @@ public struct ScreenHostAdapter: Sendable {
                 resume: { try ITermAdapter.resume(target: $0, region: $1, text: $2) },
                 completeResume: { try ITermAdapter.completeResume(target: $0, stop: $1) },
                 restart: { try ITermAdapter.restart(target:$0,expected:$1,command:$2) },
-                input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) })
+                input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) },
+                setTabLabel:{try TerminalTabLabelAdapter.apply(host:.iterm,target:$0,label:$1)})
         case .orca:
             return ScreenHostAdapter(screens: { try OrcaAdapter.screens(targets: $0) },
                 approve: { try OrcaAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },

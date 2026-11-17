@@ -157,6 +157,17 @@ public struct TerminalAppleEventReader {
         }
     }
 
+    /// Read only the selected TTY of the unique frontmost native window.
+    /// Re-read it so a focus switch cannot authorize background input.
+    public func keyboardTargetTTY() throws -> String? {
+        let front = try object("cwin", form:"test", selector:comparison(["pisf"],.init(boolean:true)))
+        let subject = try property("ttty",of:property("tcnt",of:front))
+        let before = try strings(send(subject,timeout / 2))
+        guard before.count == 1, before[0].hasPrefix("/dev/") else {return nil}
+        let after = try strings(send(subject,timeout / 2))
+        return before == after ? before[0] : nil
+    }
+
     /// Live input alone can select the exact TTY without a scripting process.
     /// No text, command, key or approval is sent by this preparation.
     public func prepareLiveInput(tty:String,write:(NSAppleEventDescriptor,NSAppleEventDescriptor,TimeInterval)throws->Void) throws -> UInt32? {
@@ -446,6 +457,10 @@ enum TerminalAppleEvents {
         return try inputMetadata(tty:tty,windowID:windowID,owner:owner)
     }
 
+    static func keyboardTargetTTY() throws -> String? {
+        let owner = try TerminalProcessLookup.running()
+        return try TerminalAppleEventReader(timeout:0.4) {try inputEvent(owner:owner,subject:$0,timeout:$1)}.keyboardTargetTTY()
+    }
     static func prepareLiveInput(tty:String,owner suppliedOwner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
         let owner=try suppliedOwner ?? TerminalProcessLookup.running()
         let reader=TerminalAppleEventReader(timeout:3) {try inputEvent(owner:owner,subject:$0,timeout:$1)}

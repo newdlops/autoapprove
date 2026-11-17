@@ -41,7 +41,13 @@ public enum AutoApproveMCPServer {
                  ["groupID", "memberID", "choice"]),
             tool("clear_session_group", "그룹 전체에 /clear를 한 번씩 실행한 뒤 새 대화 UUID를 조회하여 그룹에 저장하는 비동기 작업을 접수합니다. 호출자 자신도 포함되며 마지막에 처리됩니다. 그룹장이 있으면 그룹장만 요청할 수 있습니다. 새 requestID(UUID)를 한 번 만들고 재시도에도 같은 값을 유지하세요. accepted는 저장 완료이며 초기화 완료가 아닙니다. 작업·질문·승인·작성 중인 입력이 있으면 빈 입력창까지 기다립니다. 새 ID를 확인하지 못하면 needs_review로 남기며 /clear를 자동 재전송하지 않습니다. 기존 그룹 역할·미확인 메시지는 보존합니다. 접수 후 현재 응답을 마쳐 호출자도 초기화될 수 있게 하세요. get_group_clear_status로 결과를 조회합니다.",
                  ["groupID": string, "requestID": string, "conversationID": string], ["groupID", "requestID"], destructive:true),
-            tool("get_group_clear_status", "같은 그룹의 초기화 진행과 각 구성원의 beforeConversationID·새 conversationID·오류를 조회합니다. requestID를 생략하면 그룹의 최근 요청을 조회하므로 초기화로 대화 맥락이 사라진 뒤에도 확인할 수 있습니다. done과 status=completed를 확인해야 전체 초기화·ID 갱신이 완료된 것입니다. needs_review는 터미널 확인이 필요하며 조회로 /clear를 재전송하지 않습니다. 초기화 뒤에는 현재 대화 UUID로 호출하세요.",
+            tool("clear_group_member", "같은 그룹의 memberID로 지정한 세션 하나에 /clear를 실행하고 새 대화 UUID를 조회하여 그룹에 저장하는 비동기 작업을 접수합니다. 다른 세션은 초기화하지 않습니다. 전체 초기화와 같은 권한으로 그룹장이 있으면 그룹장만 요청할 수 있습니다. 새 requestID(UUID)를 만들고 같은 대상의 재시도에도 유지하세요. 다른 대상이나 전체 초기화에는 새 requestID가 필요합니다. accepted는 저장 완료이며 초기화 완료가 아닙니다. 작업·질문·승인·작성 중인 입력이 있으면 빈 입력창까지 기다립니다. 전달이 불확실해도 /clear를 자동 재전송하지 않습니다. 그룹 역할·미확인 메시지는 보존합니다. 자신을 지정했다면 접수 후 현재 응답을 마치세요. get_group_clear_status(groupID,requestID)로 결과를 확인합니다.",
+                 ["groupID": string, "memberID": string, "requestID": string, "conversationID": string], ["groupID", "memberID", "requestID"], destructive:true),
+            tool("set_group_member_title", "같은 그룹에서 지정한 구성원의 원래 Terminal·iTerm2 탭 이름과 AutoApprove 표시 이름을 바꿉니다. title은 한 줄로 1~80자입니다. 기존 탭 색상 표식·메모는 유지합니다. 대화 UUID와 원래 프로세스·TTY를 확인하고 실제 적용된 이름을 다시 읽습니다. 그룹장이 있으면 그룹장만 요청할 수 있습니다. CLI 입력이나 작업을 중단하지 않아 작업 중에도 사용할 수 있습니다.",
+                 ["groupID": string, "memberID": string, "title": string, "conversationID": string], ["groupID", "memberID", "title"]),
+            tool("set_group_member_tab_color", "같은 그룹에서 지정한 구성원의 Terminal·iTerm2 탭 이름 앞에 색상 표식을 붙입니다. Terminal.app은 탭 바만의 배경색 API가 없어 🔴·🟠·🟡·🟢·🔵·🟣·⚪️ 표식을 사용하며 colorMode=title_marker로 반환합니다. default는 표식을 제거합니다. 탭 이름과 메모를 유지하고 AutoApprove의 세션 색상도 함께 저장합니다. 그룹장이 있으면 그룹장만 요청할 수 있습니다. CLI 입력·본문 배경색·글자색·포커스는 변경하지 않습니다. 작업 중에도 사용할 수 있습니다.",
+                 ["groupID": string, "memberID": string, "color": ["type":"string","enum":SessionColor.allCases.map(\.rawValue) + ["default"]], "conversationID": string], ["groupID", "memberID", "color"]),
+            tool("get_group_clear_status", "같은 그룹의 전체 또는 개별 초기화 진행과 대상의 beforeConversationID·새 conversationID·오류를 조회합니다. scope=group은 전체, scope=member와 memberID는 개별 지정 요청입니다. requestID를 생략하면 그룹의 최근 요청을 조회하므로 초기화로 대화 맥락이 사라진 뒤에도 확인할 수 있습니다. done과 status=completed를 확인해야 요청한 대상의 초기화·ID 갱신이 완료된 것입니다. needs_review는 터미널 확인이 필요하며 조회로 /clear를 재전송하지 않습니다. 초기화 뒤에는 현재 대화 UUID로 호출하세요.",
                  ["groupID": string, "requestID": string, "conversationID": string], ["groupID"], readOnly:true),
             tool("get_diagnostics", "이 Mac의 AutoApprove·Codex 서버·세션 연결·권한·현재/과거 재연결 기록을 읽기 전용으로 조회합니다. 기존 작업을 중단하거나 진단용 Codex를 실행하지 않습니다.",readOnly:true),
             tool("list_screens", "Mac의 공유 가능한 전체 화면과 창 ID를 조회합니다. 화면 녹음 권한이 없으면 Mac에서 허용하도록 안내합니다. 캡처를 시작하지 않습니다.", readOnly: true),
@@ -105,7 +111,7 @@ public enum AutoApproveMCPServer {
             let handle = {
             if let value = response(message, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
-                let groupTool = ["get_session_groups", "get_group_status", "assign_group_task", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "ack_group_messages", "clear_session_group", "get_group_clear_status"].contains(tool)
+                let groupTool = ["get_session_groups", "get_group_status", "assign_group_task", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
                 // Only this process may attribute the caller; never trust a supplied session or agent kind.
                 if groupTool {
                     params.removeValue(forKey: "sessionID"); params.removeValue(forKey: "agentKind")
