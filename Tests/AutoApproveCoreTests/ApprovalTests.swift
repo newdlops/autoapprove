@@ -535,6 +535,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: clipped and repeated Codex status requires fresh history",tests.testCodexGroupStatusUsesFreshHistoryWhenFrameClips),
             ("Session groups: Codex status used by clear honors input priority",tests.testCodexGroupStatusWaitsForInputCooldownWithoutBypass),
             ("Session groups: rebinding preserves hierarchy",tests.testSessionGroupRebindingPreservesHierarchy),
+            ("Session groups: restarted Codex keeps original group membership",tests.testCodexReplacementPreservesGroupRoleAndValidatesTabLifetime),
             ("Session groups: named Codex tabs and repeated status cards",tests.testCodexNamedGroupRefreshAndRepeatedCard),
             ("Session groups: Codex ID refresh prefers local history and uses only bound MCP calls",tests.testCodexGroupRefreshPrefersLocalHistoryAndUsesBoundMCP),
             ("Session groups: historical welcome preserves MCP identity and a real reset clears it",tests.testCodexMCPIdentitySurvivesHistoricalWelcomeWithoutLosingResetSafety),

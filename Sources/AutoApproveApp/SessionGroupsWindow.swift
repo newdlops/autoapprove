@@ -196,6 +196,17 @@ import AutoApproveCore
                             Button("현재 대화 연결") { Task { await bind(member, to: match, in: group) } }.disabled(loading)
                                 .help("같은 실행 세션의 확인된 대화 ID를 그룹에 저장합니다.")
                         }
+                        if member.agent == .codex, connection == nil, member.providerHome != nil {
+                            Menu("새 대화로 교체…") {
+                                let choices = live.filter { $0.session.agent == .codex && $0.session.cwd == member.cwd && $0.providerHome == member.providerHome && [.terminal, .iterm].contains($0.session.terminal) }
+                                if choices.isEmpty { Text("같은 홈과 프로젝트에 실행 중인 Codex가 없습니다") }
+                                ForEach(choices) { target in
+                                    Button("\(target.session.displayedTerminalTitle) · \(target.session.tty)") {
+                                        Task { await replace(member, with: target, in: group) }
+                                    }
+                                }
+                            }.disabled(loading).help("선택한 터미널의 대화 ID를 확인해 기존 구성원의 역할과 소속을 이어갑니다.")
+                        }
                         if match == nil {
                             Menu("실행 중인 세션에 연결…") {
                                 let choices = live.filter { $0.session.agent == member.agent }
@@ -293,11 +304,14 @@ import AutoApproveCore
         loading = true; bulkRunning = true; bulkStopRequested = false; bulkFailures = []; error = nil
         defer { loading = false; bulkRunning = false }
         var changed = 0, confirmed = 0, attempted = 0
+        var merged = Set<UUID>()
         for (index, member) in group.members.enumerated() {
             if bulkStopRequested || Task.isCancelled { break }
+            if merged.contains(member.id) { attempted += 1; continue }
             notice = "\(group.name) · \(index + 1)/\(group.members.count) 조회 중 · \(member.title.isEmpty ? member.agent.title : member.title)"
             do {
                 let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+                if let duplicate = result.mergedMemberID { merged.insert(duplicate) }
                 if result.changed { changed += 1 } else { confirmed += 1 }
             } catch {
                 bulkFailures.append("\(member.title.isEmpty ? member.agent.title : member.title): \(error.localizedDescription)")
@@ -307,7 +321,7 @@ import AutoApproveCore
         do { live = try await engine.sessionGroupSessions(); groups = try store.load() }
         catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
         let remaining = group.members.count - attempted
-        notice = "\(group.name) · ID 변경 \(changed)개 · 기존 ID 확인 \(confirmed)개 · 보류·실패 \(bulkFailures.count)개" + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : "")
+        notice = "\(group.name) · ID 변경 \(changed)개 · 기존 ID 확인 \(confirmed)개 · 보류·실패 \(bulkFailures.count)개" + (merged.isEmpty ? "" : " · 중복 정리 \(merged.count)개") + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : "")
     }
 
     private func refreshObservation() async {
@@ -386,6 +400,15 @@ import AutoApproveCore
             _ = persist(groups.map { $0.id == latest.id ? changed : $0 }, message: "현재 대화 연결을 저장했습니다.")
         } catch { self.error = error.localizedDescription }
     }
+    private func replace(_ member: SessionGroupMember, with target: SessionGroupLiveSession, in group: SessionGroup) async {
+        guard !loading else { return }; loading = true; defer { loading = false }
+        do {
+            _ = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id, expectedGroup: group, selectedReplacement: target.id, expectedConversationID: target.conversationID)
+            groups = try store.load(); live = try await engine.sessionGroupSessions()
+            error = nil; notice = "기존 구성원을 선택한 대화에 연결했습니다."
+        } catch { self.error = error.localizedDescription }
+    }
+
     private func reconnect(_ member: SessionGroupMember, to candidate: SessionGroupLiveSession, in group: SessionGroup) async {
         guard !loading else { return }; loading = true; defer { loading = false }
         do {

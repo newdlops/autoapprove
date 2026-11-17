@@ -43,6 +43,10 @@ public enum CodexGroupIdentity {
             for index in group.members.indices {
                 let member = group.members[index]
                 guard member.agent == .codex else { continue }
+                if let endpoint = live.first(where: { $0.id == member.runtimeID && $0.session.agent == .codex && $0.session.cwd == member.cwd }),
+                   let shell = endpoint.tabShell {
+                    result.members[index].tabShell = shell
+                }
                 let candidates = live.filter {
                     $0.session.agent == .codex && $0.session.phase != .ended &&
                     $0.conversationID.flatMap(UUID.init(uuidString:)) != nil && $0.providerHome != nil &&
@@ -58,6 +62,7 @@ public enum CodexGroupIdentity {
                           ($0.runtimeID == current.id || ($0.providerHome == current.providerHome && UUID(uuidString: $0.conversationID) == uuid)) }) else { continue }
                 result.members[index].conversationID = uuid.uuidString.lowercased()
                 result.members[index].providerHome = current.providerHome
+                if member.runtimeID != current.id { result.members[index].tabShell = current.tabShell }
                 result.members[index].runtimeID = current.id
             }
             return result

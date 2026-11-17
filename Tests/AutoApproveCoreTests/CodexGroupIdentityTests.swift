@@ -371,6 +371,62 @@ extension ApprovalTests {
         }
     }
 
+    @MainActor func testCodexReplacementPreservesGroupRoleAndValidatesTabLifetime() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let shell = ProcessDiscovery.parse("900 1 fixture40 900 901 Wed Oct 28 12:00:00 2026 /bin/zsh")[0]
+        let old = ProcessDiscovery.parse("901 900 fixture40 901 901 Wed Oct 28 12:01:00 2026 /fixture/codex")[0]
+        let new = ProcessDiscovery.parse("902 900 fixture40 902 902 Wed Oct 28 12:02:00 2026 /fixture/codex")[0]
+        let records = GroupProcessSnapshot()
+        let oldID = UUID().uuidString.lowercased(), newID = UUID().uuidString.lowercased(), home = "/fixture/home"
+        func session(_ p: ProcessRecord) -> AgentSession {
+            AgentSession(id: p.key, agent: .codex, pid: p.pid, started: p.started, tty: "/dev/" + p.tty, cwd: "/project", terminal: .terminal)
+        }
+        let engine = try ApprovalEngine(paths: .init(directory: directory), processReader: { records.read() },
+            codexGroupReader: { .init(threadID: $0.pid == old.pid ? oldID : newID, database: home + "/state.sqlite") },
+            codexGroupEnvironment: { _ in ["CODEX_HOME":home] })
+        defer { engine.stop() }
+        records.set([shell,old]); engine.updateDiscovery([session(old)], records: records.read())
+        let original = try await engine.sessionGroupSessions()[0].member
+        let duplicate = SessionGroupLiveSession(session: session(new), conversationID: newID, providerHome: home).member
+        let store = SessionGroupStore(directory: directory)
+        let group = SessionGroup(name: "fixture", members: [original, duplicate], leaderMemberID: original.id)
+        try store.save([group])
+        func refresh() async throws -> SessionGroupIdentityRefresh {
+            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: original.id)
+        }
+        var recycled = shell; recycled.started = "Wed Oct 28 12:02:00 2026"
+        records.set([recycled,new]); engine.updateDiscovery([session(new)], records: records.read())
+        do { _ = try await refresh(); throw AppError.message("Recycled TTY accepted") }
+        catch { try expect(error.localizedDescription.contains("원래 터미널")) }
+        records.set([shell,new])
+        let result = try await refresh()
+        try expectEqual(result.conversationID, newID); try expectEqual(result.mergedMemberID, duplicate.id)
+        let updated = try store.load()[0]
+        try expectEqual(updated.leaderMemberIDs,[original.id]); try expectEqual(updated.members.map(\.id), [original.id])
+        try expectEqual(updated.members[0].runtimeID,new.key)
+        var legacy = original; legacy.tabShell = nil
+        let flat = SessionGroup(id: group.id, name: group.name, members: [legacy, duplicate])
+        try store.save([flat])
+        do { _ = try await refresh(); throw AppError.message("Unproven replacement accepted") }
+        catch { try expect(error.localizedDescription.contains("원래 터미널")) }
+        do {
+            _ = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: original.id,
+                                                             selectedReplacement: new.key, expectedConversationID: oldID)
+            throw AppError.message("Changed conversation accepted")
+        } catch { try expect(error.localizedDescription.contains("대화가 바뀌었습니다")) }
+        try store.save([flat.addingLeader(duplicate.id)])
+        do {
+            _ = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: original.id, selectedReplacement: new.key)
+            throw AppError.message("Duplicate leader removed")
+        } catch { try expect(error.localizedDescription.contains("다른 구성원")) }
+        try expectEqual(try store.load()[0].leaderMemberIDs,[duplicate.id])
+        try store.save([flat])
+        let manual = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: original.id, expectedGroup: flat,
+                                                                  selectedReplacement: new.key, expectedConversationID: newID)
+        try expectEqual(manual.mergedMemberID, duplicate.id)
+    }
+
     @MainActor func testCodexNamedGroupRefreshAndRepeatedCard() async throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("group-name-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)

@@ -2,6 +2,7 @@ import Foundation
 
 public struct SessionGroupIdentityRefresh: Equatable, Sendable {
     public let conversationID: String
+    public let mergedMemberID: UUID?
     public let changed: Bool
 }
 import Darwin
@@ -36,6 +37,7 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
     public var providerHome: String?
     /// A live process identity helps present an unresolved member, never a replacement for a conversation ID.
     public var runtimeID: String? = nil
+    public var tabShell: SessionGroupTabShell?
     /// The member that directs this one. Nil places a member directly under the leader.
     public var parentMemberID: UUID? = nil
 
@@ -96,6 +98,14 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         try values.encode(members, forKey: .members)
         try values.encodeIfPresent(leaderMemberID, forKey: .leaderMemberID)
         try values.encode(leaderMemberIDs, forKey: .leaderMemberIDs)
+    }
+
+    /// Learning an OS shell receipt changes neither group membership nor its permissions.
+    func sameMembership(as other: Self) -> Bool {
+        var lhs = self, rhs = other
+        for i in lhs.members.indices { lhs.members[i].tabShell = nil }
+        for i in rhs.members.indices { rhs.members[i].tabShell = nil }
+        return lhs == rhs
     }
 
     public func isLeader(_ id: UUID) -> Bool { leaderMemberIDs.contains(id) }
@@ -253,12 +263,28 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// The lifetime of a native tab's shell survives restarting Codex but ends when the tab closes.
+public struct SessionGroupTabShell: Codable, Equatable, Sendable {
+    let host: TerminalKind
+    let tty: String
+    let shellRuntime: String
+
+    static func observe(_ session: AgentSession, process: ProcessRecord, records: [Int32: ProcessRecord]) -> Self? {
+        guard session.agent == .codex, [.terminal, .iterm].contains(session.terminal),
+              process.key == session.id, "/dev/" + process.tty == session.tty,
+              let parent = records[process.parent], parent.tty == process.tty,
+              SessionExitRecovery.isShell(parent) else { return nil }
+        return Self(host: session.terminal, tty: session.tty, shellRuntime: parent.key)
+    }
+}
+
 /// Current observation, kept separate from the persisted group entry.
 public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var session: AgentSession
     public var conversationID: String?
     public var providerHome: String?
     public var messagingName: String?
+    var tabShell: SessionGroupTabShell?
     var codexIdentityFromMCP = false
     public var id: String { session.id }
     public init(session: AgentSession, conversationID: String?, providerHome: String?, messagingName: String? = nil) {
@@ -269,12 +295,25 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
             .unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.map(String.init).joined().prefix(256))
         var value = SessionGroupMember(agent: session.agent, title: title,
             cwd: session.cwd, conversationID: conversationID ?? "", providerHome: providerHome)
+        value.tabShell = tabShell
         value.runtimeID = session.id
         return value
     }
 }
 
 public enum SessionGroupMatching {
+    static func replacement(_ member: SessionGroupMember, in live: [SessionGroupLiveSession], selected: String?) -> SessionGroupLiveSession? {
+        guard member.agent == .codex, let home = member.providerHome, UUID(uuidString: member.conversationID) != nil,
+              !live.contains(where: { $0.id == member.runtimeID || ($0.session.agent == .codex && $0.providerHome == home &&
+                  $0.conversationID.flatMap(UUID.init(uuidString:)) == UUID(uuidString: member.conversationID)) }) else { return nil }
+        let matches = live.filter { row in
+            row.session.agent == .codex && row.session.phase != .ended && row.session.cwd == member.cwd &&
+                row.providerHome == home && [.terminal, .iterm].contains(row.session.terminal) &&
+                (selected.map { row.id == $0 } ?? (member.tabShell != nil && member.tabShell == row.tabShell))
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
     /// Process connectivity is separate from conversation identity. This is only
     /// for presentation and explicit identity refresh, never task delivery.
     public static func connection(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {

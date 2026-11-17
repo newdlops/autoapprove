@@ -7,7 +7,7 @@ public enum AgentKind: String, Codable, CaseIterable, Sendable {
     }
 }
 
-public enum TerminalKind: String, Codable {
+public enum TerminalKind: String, Codable, Sendable {
     case terminal, vscode, iterm, orca, tmux, pty, claudeBackground, unknown
     public var title: String {
         switch self {

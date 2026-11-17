@@ -22,7 +22,7 @@ public struct TerminalProfileGroup: Codable, Equatable, Sendable {
     public func validated(entries:[TerminalProfileEntry]) throws -> Self {
         var copy=self;copy.group=try group.validated()
         guard !links.isEmpty,links.count<=128,Set(links.map(\.entryID)).count==links.count,
-              Set(links.map(\.memberID)).count==links.count,group.members.allSatisfy({$0.runtimeID==nil}) else {
+              Set(links.map(\.memberID)).count==links.count,group.members.allSatisfy({$0.runtimeID==nil && $0.tabShell==nil}) else {
             throw AppError.message("프로필의 그룹 구성원 연결을 확인해주세요.")
         }
         for link in links {
@@ -50,7 +50,7 @@ public struct TerminalProfileGroup: Codable, Equatable, Sendable {
                     group.members[index].providerHome=entry.providerHome
                     links.append(.init(entryID:entry.id,memberID:member.id))
                 }
-                group.members[index].runtimeID=nil
+                group.members[index].runtimeID=nil;group.members[index].tabShell=nil
             }
             return links.isEmpty ? nil:Self(group:group,links:links)
         }
@@ -67,7 +67,7 @@ public struct TerminalProfileGroup: Codable, Equatable, Sendable {
                 value.group.members[index].cwd=entry.cwd
                 value.group.members[index].conversationID=entry.conversationID
                 value.group.members[index].providerHome=entry.providerHome
-                value.group.members[index].runtimeID=nil
+                value.group.members[index].runtimeID=nil;value.group.members[index].tabShell=nil
             }
             return value
         }
@@ -125,7 +125,7 @@ public enum TerminalProfileGroupRestore {
                 guard let saved=snapshot.group.members.first(where:{$0.id==link.memberID}),
                       let index=result[gi].members.firstIndex(where:{$0.id==link.memberID}) else{continue}
                 var member=result[gi].members[index]
-                if member.agent != saved.agent || member.cwd != saved.cwd || member.conversationID != saved.conversationID || member.providerHome != saved.providerHome {member.runtimeID=nil}
+                if member.agent != saved.agent || member.cwd != saved.cwd || member.conversationID != saved.conversationID || member.providerHome != saved.providerHome {member.runtimeID=nil;member.tabShell=nil}
                 member.agent=saved.agent;member.cwd=saved.cwd;member.conversationID=saved.conversationID;member.providerHome=saved.providerHome
                 result[gi].members[index]=member
             }
