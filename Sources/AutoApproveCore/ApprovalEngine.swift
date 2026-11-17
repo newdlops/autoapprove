@@ -2196,7 +2196,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     }
                     write = background
                 } else { write = adapter.input }
-                let result = try await Task.detached { try write(target, observed.raw, session.agent, input) }.value
+                // Raw terminal adapters must send a paste event followed by
+                // Enter. Codex can treat Enter in a burst of plain keys as
+                // part of the paste and leave /status in the composer.
+                let adapterInput = codexStatusQuery && kind == .submit && host != .terminal
+                    ? RemoteTerminalInput(kind: .message, text: input.text)
+                    : input
+                let result = try await Task.detached { try write(target, observed.raw, session.agent, adapterInput) }.value
                 sent = result == .sent
             } else if let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID {
                 let actionID = UUID().uuidString
@@ -2231,7 +2237,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
                                             codexStatusQuery: Bool = false, textOnly: Bool = false, backgroundOnly: Bool = false,
-                                            preflight: (() async throws -> Void)? = nil) async throws -> JSONObject {
+                                            preflight: ((RemoteTerminalFrame) async throws -> Void)? = nil) async throws -> JSONObject {
         var outcome = "not_started"
         do {
             guard original.agent != .shell, let text = object["text"] as? String,
@@ -2268,7 +2274,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 else { throw RemoteHTTPError(409, "이 원본의 메시지 전송 연결을 확인해주세요. 작성한 내용은 보관합니다.") }
                 var textWasSent = false
                 do {
-                    try await preflight?()
+                    try await preflight?(frame)
                     if codexStatusQuery, !submitSeparately {
                         _ = try await remoteInput(input, automaticAuthorization: nil, codexStatusQuery: true, backgroundOnly: backgroundOnly)
                     } else if backgroundOnly {
@@ -2450,10 +2456,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// Explicitly query the original terminal without opening another CLI or selecting a thread.
     @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws -> SessionGroupIdentityRefresh {
-        try await refreshGroupMemberIdentity(groupID: groupID, memberID: memberID, expectedGroup: expectedGroup, verifyCodexScreen: true)
-    }
-
-    private func refreshGroupMemberIdentity(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup?, verifyCodexScreen: Bool) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID }) != expectedGroup {
             throw RemoteHTTPError(409, "그룹 구성이 바뀌어 갱신하지 않았습니다. get_session_groups로 다시 확인해주세요.")
@@ -2465,7 +2467,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !groupClearActive(groupID) else { throw AppError.message("이 그룹의 초기화가 끝난 뒤 ID를 갱신해주세요.") }
         // The original binding normally makes a targeted read sufficient. A
         // resumed conversation can use an exact UUID match elsewhere.
-        let useStatus = verifyCodexScreen && member.agent == .codex
+        let useStatus = member.agent == .codex
         var connection: SessionGroupLiveSession?
         if let runtime = member.runtimeID {
             let observed = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: !useStatus)
@@ -2566,15 +2568,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 "빈 입력창의 대기 상태를 확인하지 못했습니다. 질문·메뉴를 닫고 현재 터미널 화면을 확인해주세요."
             throw AppError.message(reason)
         }
-        let historyBefore = try? await groupStatusHistory(original)
-        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, textOnly: original.agent == .codex, backgroundOnly:backgroundOnly, preflight: {
+        var baseline = before.screen
+        var historyBefore: CodexStatusIdentity?
+        _ = try await sendOriginalTerminalMessage(original, object: ["text": "/status", "revision": before.revision], codexStatusQuery: original.agent == .codex, textOnly: original.agent == .codex, backgroundOnly:backgroundOnly, preflight: { frame in
             guard original.agent == .codex else { return }
-            let latest = try await self.remoteTerminal(sessionID: runtime, realtime: true, textOnly: true)
+            // Record the baseline for this send attempt. A prior /status can
+            // finish while the new request is locating the original tab.
+            baseline = frame.screen
+            historyBefore = try? await self.groupStatusHistory(original)
             guard let current = self.sessions[runtime] else { throw RemoteHTTPError(409, "원래 터미널 연결이 바뀌었습니다.") }
             if let reason = await self.groupStatusBlockReason(current,backgroundOnly:backgroundOnly) { throw RemoteHTTPError(409, reason.message) }
-            guard CodexStatusIdentity.canQuery(latest.screen) else { throw RemoteHTTPError(409, "최신 Codex 화면에서 빈 입력창을 확인하지 못했습니다. 작성 중인 입력이나 열린 메뉴를 확인해주세요.") }
         })
         sendingMessages.insert(runtime); defer { sendingMessages.remove(runtime) }
+        let visibleBefore = original.agent == .codex ? CodexStatusIdentity(screen: baseline) : nil
+        if let visibleBefore { historyBefore?.counts.merge(visibleBefore.counts, uniquingKeysWith: max) }
         for attempt in 0..<60 {
             try await Task.sleep(for: .milliseconds(200))
             guard let current = sessions[runtime], current.pid == original.pid, current.started == original.started,
@@ -2582,7 +2589,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 저장하지 않았습니다.")
             }
             let frame = try await remoteTerminal(sessionID: runtime, realtime: true, textOnly: original.agent == .codex)
-            if let id = SessionGroupTerminalStatus.freshConversationID(before: before.screen, after: frame.screen, agent: original.agent) { return id }
+            if let visibleBefore {
+                let visibleCards = CodexStatusIdentity.cards(frame.screen)
+                // Moving an older card into the visible region is not a new
+                // response. A result must exceed what was already present in
+                // the original tab, including available scrollback.
+                if let id = visibleBefore.freshThread(in: visibleCards),
+                   visibleCards[id, default: 0] > (historyBefore?.counts[id] ?? 0) { return id }
+            } else if let id = SessionGroupTerminalStatus.freshConversationID(before: baseline, after: frame.screen, agent: original.agent) { return id }
             // Never infer freshness from a UUID merely becoming visible after
             // scrolling. Both snapshots must show a newly appended full card.
             // At most three fallback reads per explicit query, never per poll.
@@ -2776,7 +2790,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed) else {
             throw RemoteHTTPError(409, "재연결할 수 있는 원래 터미널을 확인하지 못했거나 재연결 권한이 없습니다. canReconnect가 true인 구성원만 재연결할 수 있습니다. 종료된 터미널은 자동으로 다시 실행하지 않습니다.")
         }
-        try await refreshGroupMemberIdentity(groupID: groupID, memberID: memberID, expectedGroup: group, verifyCodexScreen: false)
+        try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group)
         let fresh = try await sessionGroupSessions()
         guard let updated = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID })?.members.first(where: { $0.id == memberID }),
               let live = SessionGroupMatching.match(updated, in: fresh),
@@ -3473,7 +3487,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if await submitted(within: 6) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
-        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true, preflight: preflight)
+        _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true, preflight: { _ in
+            try await preflight?()
+        })
     }
 
     /// Turns on automatic approval for a group worker. The global pause stays
@@ -3578,7 +3594,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 // uncertain writes can never cause an automatic second /clear.
                 target.phase = "issued"; target.detail = "초기화 전달 후 새 세션 ID를 확인합니다."; try saveGroupClearTarget(job.id, target)
                 do {
-                    _ = try await sendOriginalTerminalMessage(current, object: ["text": "/clear", "revision": frame.revision], textOnly: true, backgroundOnly: true, preflight: {
+                    _ = try await sendOriginalTerminalMessage(current, object: ["text": "/clear", "revision": frame.revision], textOnly: true, backgroundOnly: true, preflight: { _ in
                         let latest = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
                         let userPriority=await self.userInputHasPriority(current.id,backgroundOnly:true)
                         let latestGroup = try SessionGroupStore(directory: self.paths.directory).load().first { $0.id == job.groupID }
@@ -5535,7 +5551,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             } else {
                 let frame = try await remoteTerminal(sessionID: sessionID, realtime: true)
                 launched = true
-                _ = try await sendOriginalTerminalMessage(session, object: ["text": message, "revision": frame.revision], preflight: {
+                _ = try await sendOriginalTerminalMessage(session, object: ["text": message, "revision": frame.revision], preflight: { _ in
                     let verified = try await self.prepareQuestionReply(session, question: question, automaticToken: automaticToken)
                     guard verified.threadID == question.threadID,
                           self.sessions[sessionID]?.questions.contains(where: { $0.isSameRequest(as: question) }) == true else {

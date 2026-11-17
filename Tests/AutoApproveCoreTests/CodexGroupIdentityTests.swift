@@ -6,6 +6,8 @@ import AutoApproveCore
 #endif
 import TerminalInputSupport
 
+private let pastedStatusInput = "\u{1b}[200~/status\u{1b}[201~\r"
+
 private final class CodexGroupScreen: @unchecked Sendable {
     let lock = NSLock(), id = UUID().uuidString.lowercased()
     private var value = "Codex\n› Ask Codex to do anything\n  ? for shortcuts"
@@ -51,7 +53,7 @@ private final class ClippedGroupStatus: @unchecked Sendable {
     private var card: String { ">_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(id)\n› \n ? for shortcuts" }
     var screen: String {
         lock.lock(); defer { lock.unlock() }
-        return repeated ? card : sent ? "Session: \(id)\n› \n ? for shortcuts" : "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts"
+        return repeated || (sent && !append) ? card : sent ? "Session: \(id)\n› \n ? for shortcuts" : "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts"
     }
     var history: String {
         lock.lock(); defer { lock.unlock() }; reads += 1
@@ -129,7 +131,7 @@ extension ApprovalTests {
                 try expectEqual(live.first?.conversationID, screen.id, "Historical welcome headers must preserve the verified UUID")
                 try expectNotNil(SessionGroupMatching.match(saved.members[0], in: live))
             }
-            try expectEqual(screen.inputs, ["/status\r"], "Observing normal work must not type more status queries")
+            try expectEqual(screen.inputs, [host == .terminal ? "/status\r" : pastedStatusInput], "Observing normal work must not type more status queries")
             // A real clear/new screen has only a fresh header, directory and composer.
             // Keep membership but stop using the old conversation for delivery.
             let boxed = "╭──────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.169.0)            │\n│ model: fixture                       │\n│ directory: /project                  │\n╰──────────────────────────────────────╯\nTip: Use /help."
@@ -334,7 +336,7 @@ extension ApprovalTests {
             try expectEqual(screen.inputs.count, 0, "Observation must never queue a status command")
             try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
             try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, screen.id)
-            try expectEqual(screen.inputs, ["/status\r"])
+            try expectEqual(screen.inputs, [useITerm ? pastedStatusInput : "/status\r"])
             try expectEqual(screen.resumes, 1, "A read-only status query must never retry /goal resume")
             try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, true)
             try expectNil(engine.snapshot.sessions.first?.interruption?.recoveredAt)
@@ -412,7 +414,7 @@ extension ApprovalTests {
         try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, new)
         let confirmed = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
         try expectFalse(confirmed.changed)
-        try expectEqual(screen.inputs, Array(repeating: "/status\r", count: 3))
+        try expectEqual(screen.inputs, Array(repeating: useTerminal ? "/status\r" : pastedStatusInput, count: 3))
         screen.setScreen("Codex\n› draft stays here\n ? for shortcuts")
         var refused = false
         do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id) } catch { refused = true }
@@ -699,17 +701,17 @@ extension ApprovalTests {
         try expectEqual(repaired["connected"] as? Bool, true)
         try expectEqual(repaired["conversationID"] as? String, screen.id)
         try expectEqual(repaired["transport"] as? String, "local_terminal")
-        try expectEqual(screen.inputs, ["/status\r"])
+        try expectEqual(screen.inputs, [pastedStatusInput])
         try expectEqual(try store.load()[0].members[1].conversationID, screen.id)
         _ = try await call("reconnect_group_member")
-        try expectEqual(screen.inputs, ["/status\r"], "A verified ID is reused without adding terminal input")
+        try expectEqual(screen.inputs, [pastedStatusInput, pastedStatusInput], "Every explicit reconnect verifies a fresh response even when the ID is unchanged")
         try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
         // An exited member may not be replaced with an unrelated process in the same project.
         engine.updateDiscovery([sessions[0], sessions[2]], records: [records[0], records[2]])
         var rejected = false
         do { _ = try await call("reconnect_group_member") } catch { rejected = true }
         try expect(rejected, "An exited terminal was guessed")
-        try expectEqual(screen.inputs, ["/status\r"])
+        try expectEqual(screen.inputs, [pastedStatusInput, pastedStatusInput])
     }
 
     @MainActor func testGroupOfflineSelfReconnectProtectsDrafts() async throws {
@@ -736,7 +738,7 @@ extension ApprovalTests {
                 try expectEqual(try store.load()[0].members[0].conversationID, member.conversationID.lowercased())
             } else {
                 let result = try await engine.mcpAction(params)
-                try expectEqual(result["connected"] as? Bool, true); try expectEqual(screen.inputs, ["/status\r"])
+                try expectEqual(result["connected"] as? Bool, true); try expectEqual(screen.inputs, [pastedStatusInput])
             }
         }
     }
