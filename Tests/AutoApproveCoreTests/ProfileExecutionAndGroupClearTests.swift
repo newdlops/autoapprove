@@ -457,7 +457,15 @@ extension ApprovalTests {
         let adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: fixture.screen($0.tty)) }) }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { try fixture.send($0, $3) })
         let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { records in records.filter { $0.agent == .claude }.map { .init(processID: $0.key, kind: "interactive", sessionID: fixture.id(0), status: "idle") } }, processReader: { fixture.records }, screenAdapters: [.iterm: adapter], codexGroupReader: { _ in .init(threadID: fixture.id(1), database: "/fixture/home/thread_history_1.sqlite") }, isolateByDefault: true, nativeKeyboardActivity: .inactive)
         defer { engine.stop() }; engine.groupClearInterval = 0.05
-        engine.updateDiscovery(sessions, records: fixture.records); await engine.connectScreenHost(.iterm); try engine.start(poll: false)
+        await engine.connectScreenHost(.iterm)
+        try engine.start(poll: false)
+        // The production app starts before its asynchronous discovery returns.
+        try await Task.sleep(for: .milliseconds(350))
+        let stored = try AuditStore(path: paths.database).value("sessionGroupClearOperations")
+        let undiscovered = try JSONDecoder().decode([SessionGroupClearOperation].self, from: Data((stored ?? "").utf8))
+        try expectEqual(undiscovered, [job], "No expiry or resend before the first successful inventory")
+        try expectEqual(fixture.counts(), [0,0,0])
+        engine.updateDiscovery(sessions, records: fixture.records)
         var result: JSONObject = [:]
         for _ in 0..<100 {
             result = try await clearFixtureAction(engine,["owner": UUID().uuidString, "tool": "get_group_clear_status", "groupID": group.id.uuidString, "requestID": job.id.uuidString, "sessionID": sessions[0].id])

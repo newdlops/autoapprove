@@ -822,6 +822,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func start(poll: Bool = true, webByDefault: Bool = false) throws {
         remoteInputStopped = false
+        if poll { groupClearDiscoveryReady = false }
         if var state = try? groupOrchestration(), state.removeUndelivered() > 0 { try? saveGroupOrchestration(state) }
         if let state = try? groupOrchestration(), state.needsWatching { scheduleGroupDelivery() }
         if (try? groupMailbox().pendingCount) ?? 0 > 0 { scheduleGroupMailboxDelivery() }
@@ -2356,6 +2357,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupStatusQueries: Set<String> = []
     private var groupClearOperations: [SessionGroupClearOperation]?
     private var groupClearTask: Task<Void, Never>?
+    private var groupClearDiscoveryReady = false
     private var tabLabelChanges: Set<String> = []
     public var groupClearInterval: TimeInterval = 2
     private var profileGroupAttachments:[TerminalProfileGroupAttachment]=[]
@@ -3474,7 +3476,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         values[ji].targets[ti] = target; try saveGroupClears(values)
     }
     private func scheduleGroupClears() {
-        guard groupClearTask == nil, !remoteInputStopped else { return }
+        // An empty inventory on startup does not establish that the original
+        // processes exited. Resume only after a successful discovery snapshot.
+        guard groupClearDiscoveryReady, groupClearTask == nil, !remoteInputStopped else { return }
         groupClearTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(150))
             while !Task.isCancelled, let self, !self.remoteInputStopped {
@@ -5638,6 +5642,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if groupCandidates != groupBadgeSessionIDs || Date().timeIntervalSince(groupBadgeRefreshedAt) >= 60 {
             groupBadgeSessionIDs = groupCandidates
             refreshSessionGroupBadges()
+        }
+        if !groupClearDiscoveryReady {
+            groupClearDiscoveryReady = true
+            if (try? loadGroupClears().contains { !$0.done }) == true { scheduleGroupClears() }
         }
         publish()
     }

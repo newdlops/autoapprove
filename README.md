@@ -1,5 +1,7 @@
 # AutoApprove
 
+**초기화 복구 · 0.2.322 빌드 349** 앱 시작 후 첫 세션 탐색 결과를 받은 뒤 초기화 기록을 복구합니다. [변경 내역](docs/releases/v0.2.322.md)
+
 **개별 초기화·탭 표시 · 0.2.321 빌드 348:** `clear_group_member`로 지정한 구성원만 초기화하고 새 세션 ID를 갱신합니다. `set_group_member_title`과 `set_group_member_tab_color`로 Terminal·iTerm2의 실제 탭 이름과 이름 앞 색상 표식을 변경합니다. [사용법과 검증](docs/releases/v0.2.321.md).
 
 **프로필 실행 설정·그룹 초기화 · 0.2.320 빌드 347:** 모델·추론 수준·Codex Fast/Ultrafast까지 프로필에 저장·복원합니다. `clear_session_group`으로 전체 그룹을 초기화하고 새 세션 ID를 확인해 갱신하며, `get_group_clear_status`로 결과를 조회합니다. [사용법과 검증](docs/releases/v0.2.320.md).
