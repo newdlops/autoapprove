@@ -205,6 +205,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var conversationID: String?
     public var providerHome: String?
     public var messagingName: String?
+    var codexIdentityFromMCP = false
     public var id: String { session.id }
     public init(session: AgentSession, conversationID: String?, providerHome: String?, messagingName: String? = nil) {
         self.session = session; self.conversationID = conversationID; self.providerHome = providerHome; self.messagingName = messagingName

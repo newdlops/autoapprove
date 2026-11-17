@@ -25,6 +25,16 @@ public enum CodexGroupIdentity {
         return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
+    /// A subagent's conversation is valid for attribution but cannot replace
+    /// the root conversation assigned to its enclosing terminal.
+    package static func allowsTerminalAttribution(_ message: JSONObject) -> Bool {
+        let params = message["params"] as? JSONObject
+        let meta = params?["_meta"] as? JSONObject
+        let turn = meta?["x-codex-turn-metadata"] as? JSONObject
+        return turn?["parent_thread_id"] == nil && turn?["subagent_kind"] == nil &&
+            (turn?["thread_source"] == nil || turn?["thread_source"] as? String == "user")
+    }
+
     /// Follow /new and process restarts only with a unique, freshly observed Codex identity.
     /// Claude members are deliberately returned byte-for-byte unchanged.
     public static func refreshed(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {

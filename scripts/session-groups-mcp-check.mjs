@@ -52,7 +52,7 @@ try {
  const groupTools=['get_session_groups','get_group_status','reconnect_group_member','send_group_message','assign_group_task','answer_group_question','ask_group_question','reply_group_question','get_group_messages','ack_group_messages','clear_session_group','clear_group_member','set_group_member_title','set_group_member_tab_color','get_group_clear_status'];
  for(const [index,tool] of groupTools.entries()) {
   await request(index+2,tool,{groupID:'fixture',memberID:'fixture',text:'fixture',task:'fixture',choice:1,
-   sessionID:'spoofed-session',agentKind:'spoofed-agent',codexCallerHome:'/spoofed',codexCallerConversationID:'spoofed',codexCallerSource:'spoofed'});
+   sessionID:'spoofed-session',agentKind:'spoofed-agent',codexCallerHome:'/spoofed',codexCallerConversationID:'spoofed',codexCallerSource:'spoofed',codexCallerRuntimeID:'spoofed-runtime'});
  }
  // The stdio connection remains usable after the GUI's Unix listener restarts.
  await new Promise(resolve=>server.close(resolve));
@@ -74,6 +74,7 @@ try {
   assert.notEqual(call.sessionID,'spoofed-session');assert.notEqual(call.agentKind,'spoofed-agent');
   assert.notEqual(call.codexCallerHome,'/spoofed');assert.notEqual(call.codexCallerConversationID,'spoofed');
   assert.notEqual(call.codexCallerSource,'spoofed');
+   assert.equal(call.codexCallerRuntimeID,undefined,'Inherited environment and tool arguments cannot bind a terminal');
  }
  if(process.env.AA_EXPECT_AGENT==='1') {
   if(calls[1].codexCallerConversationID) {

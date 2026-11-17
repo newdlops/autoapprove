@@ -890,6 +890,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func stop() {
         groupClearTask?.cancel(); groupClearTask = nil
         groupIdentityObservationTask?.cancel()
+        groupMCPIdentities.removeAll()
         cohortExecutionTasks.values.forEach{$0.cancel()};cohortExecutionTasks.removeAll()
         goalRecoveryTask?.cancel();goalRecoveryTask=nil
         appUpdates.stop(); updateReceiver.stop()
@@ -2365,6 +2366,54 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var contradictedRollout: UUID? = nil
     }
     private var groupStatusIdentities: [String: GroupStatusIdentity] = [:]
+    private struct GroupMCPIdentity {
+        let runtimeID: String
+        let tty: String
+        let cwd: String
+        let home: String
+        let conversationID: UUID?
+        let observedAt: TimeInterval
+    }
+    private var groupMCPIdentities: [String: GroupMCPIdentity] = [:]
+    private static let groupMCPIdentityLifetime: TimeInterval = 120
+    private static let missingCodexGroupIdentity = "현재 세션의 로컬 대화 기록과 대상에 연결된 MCP 호출을 확인하지 못했습니다. 대상 Codex에서 get_session_groups를 호출한 뒤 다시 갱신해주세요."
+
+    private func observeGroupMCPIdentity(_ object: JSONObject, owner: String) {
+        guard object["agentKind"] as? String == AgentKind.codex.rawValue,
+              object["codexCallerSource"] as? String == "codex_mcp_metadata",
+              let id = (object["codexCallerConversationID"] as? String).flatMap(UUID.init(uuidString:)),
+              (object["conversationID"] as? String).flatMap(UUID.init(uuidString:)) == id,
+              let runtime = object["codexCallerRuntimeID"] as? String, let session = sessions[runtime],
+              session.agent == .codex, session.phase != .ended,
+              let home = object["codexCallerHome"] as? String, home.hasPrefix("/"),
+              !home.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        groupMCPIdentities = groupMCPIdentities.filter { now - $0.value.observedAt < Self.groupMCPIdentityLifetime }
+        guard groupMCPIdentities[owner] != nil || groupMCPIdentities.count < 1024 else { return }
+        let previous = groupMCPIdentities[owner]
+        // The same helper can see multiple conversations. Retain the conflict
+        // until it expires or the bound terminal starts a new conversation.
+        let conflict = previous.map { $0.runtimeID == runtime && $0.tty == session.tty && $0.cwd == session.cwd &&
+            $0.home == home && $0.conversationID != id } == true
+        let observedAt = conflict ? previous?.observedAt ?? now : now
+        groupMCPIdentities[owner] = GroupMCPIdentity(runtimeID: runtime, tty: session.tty, cwd: session.cwd,
+                                                    home: home, conversationID: conflict ? nil : id, observedAt: observedAt)
+    }
+
+    private func groupMCPIdentity(for session: AgentSession, home: String?) -> GroupMCPIdentity? {
+        let now = ProcessInfo.processInfo.systemUptime
+        let candidates = groupMCPIdentities.values.filter {
+            $0.runtimeID == session.id && $0.tty == session.tty && $0.cwd == session.cwd &&
+                (home == nil || $0.home == home) && now - $0.observedAt < Self.groupMCPIdentityLifetime
+        }
+        guard let match = candidates.first, let id = match.conversationID,
+              candidates.allSatisfy({ $0.home == match.home && $0.conversationID == id }) else { return nil }
+        return match
+    }
+
+    private func discardGroupMCPIdentities(for runtime: String) {
+        groupMCPIdentities = groupMCPIdentities.filter { $0.value.runtimeID != runtime }
+    }
     private var groupIdentityObservationTask: Task<[SessionGroupLiveSession], Error>?
     private var groupStatusQueries: Set<String> = []
     private var groupClearOperations: [SessionGroupClearOperation]?
@@ -2454,7 +2503,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    /// Explicitly query the original terminal without opening another CLI or selecting a thread.
+    /// Refresh Codex from the original session's local record or MCP call.
     @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID }) != expectedGroup {
@@ -2467,14 +2516,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !groupClearActive(groupID) else { throw AppError.message("이 그룹의 초기화가 끝난 뒤 ID를 갱신해주세요.") }
         // The original binding normally makes a targeted read sufficient. A
         // resumed conversation can use an exact UUID match elsewhere.
-        let useStatus = member.agent == .codex
+        let isCodex = member.agent == .codex
         var connection: SessionGroupLiveSession?
         if let runtime = member.runtimeID {
-            let observed = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: !useStatus)
+            let observed = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: !isCodex)
             connection = SessionGroupMatching.connection(member, in: observed)
         }
         if connection == nil {
-            let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: !useStatus)
+            let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: !isCodex)
             connection = SessionGroupMatching.match(member, in: observed)
         }
         guard let connection, let original = sessions[connection.id] else {
@@ -2483,13 +2532,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let runtime = original.id
         let id: String
         var queriedStatus = false
-        if !useStatus, let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
+        if let confirmed = connection.conversationID, UUID(uuidString: confirmed) != nil {
             id = confirmed
+        } else if isCodex {
+            throw AppError.message(Self.missingCodexGroupIdentity)
         } else {
-            if original.agent != .codex && (original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime)) {
+            if original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime) {
                 throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
-            id = try await statusConversationID(original, backgroundOnly: original.agent == .codex && original.terminal == .terminal)
+            id = try await statusConversationID(original)
             queriedStatus = true
         }
         let verify = remoteProcessVerifier
@@ -2499,25 +2550,39 @@ private struct ScreenAnalysisStorageKey: Hashable {
               current.phase != .ended, !remoteInputStopped else {
             throw AppError.message("조회 중 원래 터미널 연결이 바뀌었습니다. 기존 ID를 유지합니다.")
         }
-        let latest = try store.load()
-        guard let gi = latest.firstIndex(where: { $0.id == groupID }),
-              let mi = latest[gi].members.firstIndex(where: { $0.id == memberID }),
-              latest[gi].members[mi] == member,
-              expectedGroup == nil || latest[gi] == group, !groupClearActive(groupID) else {
-            throw AppError.message("조회 중 그룹 연결이 바뀌었습니다. 다시 조회해주세요.")
+        if connection.codexIdentityFromMCP, groupMCPIdentity(for: current, home: connection.providerHome)?.conversationID != UUID(uuidString: id) {
+            throw AppError.message(Self.missingCodexGroupIdentity)
         }
         guard let uuid = UUID(uuidString: id) else { throw AppError.message("올바른 세션 ID를 확인하지 못했습니다.") }
         let home = connection.providerHome ?? member.providerHome
+        var confirmedMember = member
+        confirmedMember.conversationID = uuid.uuidString.lowercased()
+        confirmedMember.runtimeID = runtime
+        confirmedMember.providerHome = home
+        let latest = try store.load()
+        guard let gi = latest.firstIndex(where: { $0.id == groupID }),
+              let mi = latest[gi].members.firstIndex(where: { $0.id == memberID }),
+              latest[gi].members[mi] == member || (isCodex && latest[gi].members[mi] == confirmedMember),
+              !groupClearActive(groupID) else {
+            throw AppError.message("조회 중 그룹 연결이 바뀌었습니다. 다시 조회해주세요.")
+        }
+        // Automatic reconciliation may have saved exactly this member while
+        // the explicit refresh verified the process. Other edits still conflict.
+        if expectedGroup != nil {
+            var originalGroup = latest[gi]
+            originalGroup.members[mi] = member
+            guard originalGroup == group else { throw AppError.message("조회 중 그룹 연결이 바뀌었습니다. 다시 조회해주세요.") }
+        }
         guard !latest[gi].members.contains(where: { other in
             other.id != memberID && (other.runtimeID == runtime ||
                 (other.agent == member.agent && other.providerHome == home && UUID(uuidString: other.conversationID) == uuid))
         }) else { throw AppError.message("확인한 세션 ID가 이미 이 그룹의 다른 구성원에 연결되어 있습니다.") }
         var next = latest
-        next[gi].members[mi].conversationID = uuid.uuidString.lowercased()
-        next[gi].members[mi].runtimeID = runtime
-        next[gi].members[mi].providerHome = home
+        next[gi].members[mi] = confirmedMember
         if next != latest { try store.save(next, expected: latest) }
-        if queriedStatus {
+        if isCodex {
+            groupStatusIdentities.removeValue(forKey: runtime)
+        } else if queriedStatus {
             let rollout = connection.conversationID.flatMap(UUID.init(uuidString:))
             groupStatusIdentities[runtime] = GroupStatusIdentity(session: current, conversationID: id, home: home,
                                                                contradictedRollout: rollout == uuid ? nil : rollout)
@@ -2550,7 +2615,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Types /status into an empty composer and reads the fresh status card, including during Codex work.
-    private func statusConversationID(_ original: AgentSession,backgroundOnly:Bool = false) async throws -> String {
+    package func statusConversationID(_ original: AgentSession,backgroundOnly:Bool = false) async throws -> String {
         if original.agent == .codex {try await waitForGroupStatusInput(original,backgroundOnly:backgroundOnly)}
         let runtime = original.id
         guard !sendingMessages.contains(runtime), groupStatusQueries.insert(runtime).inserted else {
@@ -2664,30 +2729,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.tty == original.tty, current.agent == original.agent, current.cwd == original.cwd,
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
-            if useStatusCache, let status = groupStatusIdentities[current.id] {
-                let compatible = status.session.started == current.started && status.session.tty == current.tty &&
-                    status.session.cwd == current.cwd && status.session.agent == current.agent &&
-                    (home == nil || status.home == nil || home == status.home)
-                let observedID = conversation.flatMap(UUID.init(uuidString:))
-                if compatible && (observedID == nil || observedID == status.contradictedRollout) {
-                    conversation = status.conversationID
-                    home = home ?? status.home
-                } else if !compatible || observedID != UUID(uuidString: status.conversationID) {
-                    groupStatusIdentities.removeValue(forKey: current.id)
-                }
-            }
             result.append(SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName))
         }
         // Discovery can lag while a process exits or a PID is reused. Re-read
         // the process list after the async work, and never publish a stale match.
         let latest = try await Task.detached(priority: .utility) { try reader() }.value
-        let observed = result.filter { observation in
+        let observed = result.compactMap { observation -> SessionGroupLiveSession? in
             guard let current = sessions[observation.id], current.phase != .ended,
                   current.pid == observation.session.pid, current.started == observation.session.started,
                   current.tty == observation.session.tty, current.cwd == observation.session.cwd,
                   current.agent == observation.session.agent,
-                  current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID else { return false }
-            return latest.contains { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }
+                  current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID,
+                  latest.contains(where: { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }) else { return nil }
+            var result = observation
+            let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
+            if let mcp, let id = mcp.conversationID {
+                groupStatusIdentities.removeValue(forKey: current.id)
+                if result.conversationID == nil {
+                    result.conversationID = id.uuidString.lowercased()
+                    result.providerHome = mcp.home
+                    result.codexIdentityFromMCP = true
+                }
+            } else if useStatusCache, let status = groupStatusIdentities[current.id] {
+                let compatible = status.session.started == current.started && status.session.tty == current.tty &&
+                    status.session.cwd == current.cwd && status.session.agent == current.agent &&
+                    (result.providerHome == nil || status.home == nil || result.providerHome == status.home)
+                let observedID = result.conversationID.flatMap(UUID.init(uuidString:))
+                if compatible && (observedID == nil || observedID == status.contradictedRollout) {
+                    result.conversationID = status.conversationID
+                    result.providerHome = result.providerHome ?? status.home
+                } else if !compatible || observedID != UUID(uuidString: status.conversationID) {
+                    groupStatusIdentities.removeValue(forKey: current.id)
+                }
+            }
+            return result
         }.sorted { $0.session.displayedTerminalTitle.localizedStandardCompare($1.session.displayedTerminalTitle) == .orderedAscending }
         guard reconcile else { return observed }
         let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
@@ -3612,9 +3687,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         if let reason {throw RemoteHTTPError(409,reason,diagnostics:["delivery":"not_started"])}
                     })
                     groupStatusIdentities.removeValue(forKey: current.id)
+                    discardGroupMCPIdentities(for: current.id)
                 } catch {
                     if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" { target.phase = "waiting" }
-                    else { groupStatusIdentities.removeValue(forKey: current.id) }
+                    else {
+                        groupStatusIdentities.removeValue(forKey: current.id)
+                        discardGroupMCPIdentities(for: current.id)
+                    }
                     target.detail = error.localizedDescription; try saveGroupClearTarget(job.id, target); return
                 }
             }
@@ -3671,6 +3750,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
         guard let owner = object["owner"] as? String, UUID(uuidString: owner) != nil,
               let tool = object["tool"] as? String else { throw RemoteHTTPError(400, "MCP 연결 정보가 필요합니다.") }
+        observeGroupMCPIdentity(object, owner: owner)
         func encoded<T: Encodable>(_ value: T) throws -> Any {
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             return try JSONSerialization.jsonObject(with: encoder.encode(value))
@@ -3814,7 +3894,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
-                            "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? groupStatusBlockReason($0.session)?.message : nil } as Any? ?? NSNull(),
+                            "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? Self.missingCodexGroupIdentity : nil } as Any? ?? NSNull(),
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
@@ -3984,6 +4064,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let id = object["shareID"] as? String else { throw RemoteHTTPError(400, "공유 ID를 지정해주세요.") }
             try testScreens.stop(id, owner: owner); return ["stopped": true]
         case "disconnect":
+            groupMCPIdentities.removeValue(forKey: owner)
             testScreens.stopAll(owner: owner); webQuestions.cancel(owner: owner); return ["ok": true]
         default: throw RemoteHTTPError(400, "지원하지 않는 MCP 도구입니다.")
         }
@@ -5661,7 +5742,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         for key in Array(sessions.keys) where key.hasPrefix("process:") && !live.contains(key) {
             let newlyEnded = sessions[key]?.phase != .ended
-            if newlyEnded { prepareExitRecovery(key) }
+            if newlyEnded { prepareExitRecovery(key); discardGroupMCPIdentities(for: key) }
             sessions[key]?.setPhase(.ended, detail: "프로세스가 종료되었습니다."); sessions[key]?.channel = .none; sessions[key]?.automatic = false
             if sessions[key]?.queuedQuestions?.isEmpty == false { invalidateDuplicateQuestionIDs() }
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
@@ -7119,12 +7200,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let session = sessions[sessionID], session.agent != .shell, session.phase != .ended else { return }
         automationNeedsFreshScreen.remove(sessionID)
         let previousFrame = remoteObservedScreens[sessionID]
-        if session.agent == .codex, groupStatusIdentities[sessionID] != nil,
+        if session.agent == .codex,
+           groupStatusIdentities[sessionID] != nil || groupMCPIdentities.values.contains(where: { $0.runtimeID == sessionID }),
            !screenContentsUnchanged, raw.contains(">_ OpenAI Codex (v"),
+           !ScreenTextEquality.identical(previousFrame?.raw, raw),
            CodexStatusIdentity.isWelcomeReset(raw) {
             // A reset can retain its PID. Historical brand headers in ordinary
             // work output must not erase a previously verified conversation.
             groupStatusIdentities.removeValue(forKey: sessionID)
+            discardGroupMCPIdentities(for: sessionID)
         }
         // Registration and frame updates share this actor. A new observer starts
         // pending and reads the latest frame; an empty signal has no callback.

@@ -8,17 +8,20 @@ import TerminalInputSupport
 
 private let pastedStatusInput = "\u{1b}[200~/status\u{1b}[201~\r"
 
+private func groupMCPProof(_ session: AgentSession, id: String, owner: String, home: String = "/fixture/home") -> JSONObject {
+    ["owner": owner, "agentKind": "codex", "conversationID": id, "codexCallerConversationID": id,
+     "codexCallerRuntimeID": session.id, "codexCallerHome": home, "codexCallerSource": "codex_mcp_metadata"]
+}
+
 private final class CodexGroupScreen: @unchecked Sendable {
     let lock = NSLock(), id = UUID().uuidString.lowercased()
     private var value = "Codex\n› Ask Codex to do anything\n  ? for shortcuts"
     private var writes: [String] = []
     private var resumeWrites = 0
     private var rollout: String?
-    private var statusID: String?
     init(_ initial: String? = nil) { if let initial { value = initial } }
     func clearRollout() { lock.lock(); defer { lock.unlock() }; rollout = nil }
     func setRollout(_ id: String) { lock.lock(); defer { lock.unlock() }; rollout = id }
-    func setStatusID(_ id: String) { lock.lock(); defer { lock.unlock() }; statusID = id }
     func location() -> CodexThreadLocation? {
         lock.lock(); defer { lock.unlock() }
         return rollout.map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") }
@@ -32,7 +35,7 @@ private final class CodexGroupScreen: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; writes.append(input.bytes)
         if input.bytes.contains("/status") {
             let footer = value.contains("Goal stalled") ? " · Goal stalled (/goal resume)" : ""
-            value += "\n>_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(statusID ?? id)\n› Ask Codex to do anything\n  ? for shortcuts" + footer
+            value += "\n>_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(id)\n› Ask Codex to do anything\n  ? for shortcuts" + footer
         }
         return .sent
     }
@@ -90,7 +93,7 @@ private final class GroupObservationReads: @unchecked Sendable {
 }
 
 extension ApprovalTests {
-    func testCodexVerifiedStatusSurvivesHistoricalWelcomeWithoutLosingResetSafety() async throws {
+    func testCodexMCPIdentitySurvivesHistoricalWelcomeWithoutLosingResetSafety() async throws {
         for host in [ScreenHost.terminal, .iterm] {
             let directory = URL(fileURLWithPath: "/private/tmp/aa-status-banner-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: directory) }
@@ -114,7 +117,9 @@ extension ApprovalTests {
             engine.receiveScreen(sessionID: session.id, raw: screen.screen, generation: "same-cli")
             let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home").member])
             try SessionGroupStore(directory: directory).save([group])
-            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
+            var proof = groupMCPProof(session, id: screen.id, owner: UUID().uuidString)
+            proof["tool"] = "get_session_groups"
+            _ = try await engine.mcpAction(proof)
             let saved = try SessionGroupStore(directory: directory).load()[0]
             try expectNotNil(SessionGroupMatching.match(saved.members[0], in: try await engine.sessionGroupSessions()))
             let completed = welcome + "\n• Completed the synthetic task." + composer
@@ -131,7 +136,7 @@ extension ApprovalTests {
                 try expectEqual(live.first?.conversationID, screen.id, "Historical welcome headers must preserve the verified UUID")
                 try expectNotNil(SessionGroupMatching.match(saved.members[0], in: live))
             }
-            try expectEqual(screen.inputs, [host == .terminal ? "/status\r" : pastedStatusInput], "Observing normal work must not type more status queries")
+            try expectEqual(screen.inputs, [], "Observing normal work must not type into the terminal")
             // A real clear/new screen has only a fresh header, directory and composer.
             // Keep membership but stop using the old conversation for delivery.
             let boxed = "╭──────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.169.0)            │\n│ model: fixture                       │\n│ directory: /project                  │\n╰──────────────────────────────────────╯\nTip: Use /help."
@@ -140,7 +145,7 @@ extension ApprovalTests {
                           welcome + "\n› \nGPT-6.1-Sol max · ~/project · Ready · Context 35% left",
                           boxed + composer] {
                 if try await engine.sessionGroupSessions().first?.conversationID == nil {
-                    try await engine.refreshSessionGroupMemberID(groupID: saved.id, memberID: saved.members[0].id)
+                    _ = try await engine.mcpAction(proof)
                 }
                 let inputs = screen.inputs.count
                 screen.setScreen(frame)
@@ -244,18 +249,15 @@ extension ApprovalTests {
             let previousID = UUID().uuidString.lowercased()
             let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: previousID, providerHome: "/fixture/home").member])
             try SessionGroupStore(directory: directory).save([group]); priority.activate()
-            let result = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_session_groups", "sessionID": session.id])
-            let member = ((result["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])?.first
-            try expect((member?["reconnectBlockedReason"] as? String)?.contains("키보드") == true)
             var succeeded = false
-            do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id); succeeded = true }
+            do { try expectEqual(try await engine.statusConversationID(session), screen.id); succeeded = true }
             catch {
                 if !continuous { throw error }
                 try expect(error.localizedDescription.contains("키보드"), "Explain real input priority, not an invented terminal question")
             }
             try expectEqual(succeeded, !continuous)
             try expectEqual(screen.inputs, continuous ? [] : ["/status\r"])
-            try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, continuous ? previousID : screen.id)
+            try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, previousID)
         }
     }
     @MainActor func testCodexGroupStatusUsesFreshHistoryWhenFrameClips() async throws {
@@ -278,11 +280,11 @@ extension ApprovalTests {
             _ = try await engine.sessionGroupSessions()
             try expectEqual(screen.historyReads, 0, "Discovery never reads scrollback")
             var refreshed = false
-            do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id); refreshed = true }
+            do { try expectEqual(try await engine.statusConversationID(session), screen.id); refreshed = true }
             catch { if append { throw error } }
             try expectEqual(refreshed, append, "An unchanged historical card must never establish freshness")
             let saved = try SessionGroupStore(directory: directory).load()[0]
-            try expectEqual(saved.members[0].conversationID, append ? screen.id : "")
+            try expectEqual(saved.members[0].conversationID, "")
             try expect(screen.historyReads <= 4, "History fallback is bounded per explicit query")
         }
     }
@@ -334,8 +336,7 @@ extension ApprovalTests {
             try SessionGroupStore(directory: directory).save([group])
             _ = try await engine.sessionGroupSessions()
             try expectEqual(screen.inputs.count, 0, "Observation must never queue a status command")
-            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
-            try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, screen.id)
+            try expectEqual(try await engine.statusConversationID(session), screen.id)
             try expectEqual(screen.inputs, [useITerm ? pastedStatusInput : "/status\r"])
             try expectEqual(screen.resumes, 1, "A read-only status query must never retry /goal resume")
             try expectEqual(engine.snapshot.sessions.first?.interruption?.resumeUncertain, true)
@@ -363,71 +364,71 @@ extension ApprovalTests {
             let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home").member])
             try SessionGroupStore(directory: directory).save([group])
             var rejected = false
-            do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id) } catch { rejected = true }
+            do { _ = try await engine.statusConversationID(session) } catch { rejected = true }
             try expect(rejected); try expectEqual(screen.inputs.count, 0)
             try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, "")
         }
     }
 
-    @MainActor func testCodexGroupDiscoversIdleTerminalFromStatus() async throws {
-        for useTerminal in [false,true] {
-        for working in [false,true] {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-screen-" + UUID().uuidString)
+    @MainActor func testCodexGroupRefreshPrefersLocalHistoryAndUsesBoundMCP() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-evidence-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let record = ProcessDiscovery.parse("100591 1 fixture40 100591 100591 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
-        let host:ScreenHost=useTerminal ? .terminal:.iterm
-        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: useTerminal ? .terminal:.iterm)
-        session.phase = working ? .working:.idle; session.channel = host.channel
-        let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.timeZone = .current;formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
-        let identity=TTYInputIdentity(pid:record.pid,processGroup:record.pid,uid:getuid(),effectiveUID:geteuid(),device:42,
-            startSeconds:UInt64(formatter.date(from:record.started)!.timeIntervalSince1970),startMicroseconds:71)
-        let screen = CodexGroupScreen(working ? "Codex\n• Working (esc to interrupt)\n› \n ? for shortcuts":nil)
-        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
-            approve: { _, _, _ in .missingTarget }, reveal: { _ in throw AppError.message("Refreshing a group must not switch tabs") }, input: { _, _, _, input in
-                if useTerminal { throw AppError.message("Refreshing a group must use background Terminal input") }
-                return screen.send(input)
-            })
-        adapter.backgroundInput = { target, _, _, input in
-            try expectEqual(target.tty, "/dev/fixture40")
-            return screen.send(input)
-        }
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
-            terminalInputAvailable:{true},terminalInputIdentity:{_ in identity},
+        var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started,
+                                   tty: "/dev/" + record.tty, cwd: "/project", terminal: .iterm)
+        session.phase = .working
+        let screen = CodexGroupScreen("Codex\n› unfinished draft\n ? for shortcuts")
+        let adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: screen.screen) }) },
+            approve: { _, _, _ in .missingTarget }, reveal: { _ in throw AppError.message("Refresh switched tabs") }, input: { _, _, _, input in screen.send(input) })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [.iterm: adapter],
             codexGroupReader: { _ in screen.location() }, codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
         defer { engine.stop() }
-        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(host)
-        let unresolved = SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home")
-        try SessionGroupStore(directory: directory).save([SessionGroup(name: "fixture", members: [unresolved.member])])
-        for _ in 0..<3 { _ = try await engine.sessionGroupSessions() }
-        try expectEqual(screen.inputs.count, 0, "Group reads must not type into idle terminals")
-        let group = try SessionGroupStore(directory: directory).load()[0]
-        let first = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
-        try expect(first.changed)
-        try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, screen.id)
+        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.iterm)
+        let member = SessionGroupLiveSession(session: session, conversationID: nil, providerHome: "/fixture/home").member
+        let group = SessionGroup(name: "fixture", members: [member]); let store = SessionGroupStore(directory: directory)
+        try store.save([group])
+        func refresh() async throws -> SessionGroupIdentityRefresh {
+            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+        }
+        func observe(_ proof: JSONObject) async throws {
+            var call = proof; call["tool"] = "get_session_groups"
+            _ = try await engine.mcpAction(call)
+        }
+        func checkUnavailable(storedID: String) async throws {
+            var rejected = false
+            do { _ = try await refresh() }
+            catch { rejected = error.localizedDescription.contains("MCP") }
+            try expect(rejected)
+            try expectEqual(try store.load()[0].members[0].conversationID, storedID)
+        }
+        let owner = UUID().uuidString, mcpID = UUID().uuidString.lowercased()
+        var unbound = groupMCPProof(session, id: mcpID, owner: owner)
+        unbound.removeValue(forKey: "codexCallerRuntimeID")
+        try await observe(unbound)
+        try await checkUnavailable(storedID: "")
+        var inherited = groupMCPProof(session, id: mcpID, owner: owner)
+        inherited["codexCallerSource"] = "codex_exec_context"
+        try await observe(inherited)
+        try await checkUnavailable(storedID: "")
+        try await observe(groupMCPProof(session, id: mcpID, owner: owner, home: "/fixture/other"))
+        try await checkUnavailable(storedID: "")
+
         screen.setRollout(screen.id)
-        let new = UUID().uuidString.lowercased()
-        screen.setStatusID(new)
-        let refreshed = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
-        try expectEqual(refreshed.conversationID, new)
-        try expect(refreshed.changed)
-        try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, new, "A contradicted rollout cannot undo a fresh screen verification")
-        try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, new)
-        let confirmed = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id)
-        try expectFalse(confirmed.changed)
-        try expectEqual(screen.inputs, Array(repeating: useTerminal ? "/status\r" : pastedStatusInput, count: 3))
-        screen.setScreen("Codex\n› draft stays here\n ? for shortcuts")
-        var refused = false
-        do { try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id) } catch { refused = true }
-        try expect(refused)
-        try expectEqual(screen.inputs.count, 3)
-        try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[0].conversationID, new)
-        let next = UUID().uuidString.lowercased()
-        screen.setRollout(next)
-        try expectEqual(try await engine.sessionGroupSessions().first?.conversationID, next, "A different live rollout can establish the next conversation")
+        try await observe(groupMCPProof(session, id: mcpID, owner: owner))
+        try expectEqual(try await refresh().conversationID, screen.id, "Verified local history wins over a different MCP UUID")
+        try expectEqual(try store.load()[0].members[0].conversationID, screen.id)
         screen.clearRollout()
-        try expectNil(try await engine.sessionGroupSessions().first?.conversationID)
-        }
-        }
+        try expectEqual(try await refresh().conversationID, mcpID, "Only this runtime's own MCP receipt may supply a missing rollout")
+        try expectEqual(try store.load()[0].members[0].conversationID, mcpID)
+
+        let conflictingOwner = UUID().uuidString
+        try await observe(groupMCPProof(session, id: UUID().uuidString, owner: conflictingOwner))
+        try await checkUnavailable(storedID: mcpID)
+        _ = try await engine.mcpAction(["tool": "disconnect", "owner": conflictingOwner])
+        try expectEqual(try await refresh().conversationID, mcpID)
+        _ = try await engine.mcpAction(["tool": "disconnect", "owner": owner])
+        try await checkUnavailable(storedID: mcpID)
+        try expectEqual(screen.inputs, [], "Refresh must not write anything into the Codex composer")
     }
 
     @MainActor func testCodexGroupDiscoveryPreservesBusyScreensAndDrafts() async throws {
@@ -459,6 +460,13 @@ extension ApprovalTests {
         try expectNil(try CodexGroupIdentity.conversationID(in: [:], environment: ["CODEX_THREAD_ID": "invalid"]))
         try expectNil(try CodexGroupIdentity.conversationID(in: ["params": ["arguments": ["CODEX_THREAD_ID": id]]]))
         try expectNil(try CodexGroupIdentity.conversationID(in: ["params": ["arguments": ["_meta": ["threadId": id]]]]))
+        try expect(CodexGroupIdentity.allowsTerminalAttribution(message))
+        for fields: JSONObject in [["parent_thread_id": other], ["subagent_kind": "thread_spawn"], ["thread_source": "subagent"]] {
+            let turn = fields.merging(["thread_id": id], uniquingKeysWith: { original, _ in original })
+            let subagent: JSONObject = ["params": ["_meta": ["x-codex-turn-metadata": turn]]]
+            try expectEqual(try CodexGroupIdentity.conversationID(in: subagent), id.lowercased())
+            try expectFalse(CodexGroupIdentity.allowsTerminalAttribution(subagent))
+        }
         for meta: JSONObject in [["threadId": "bad"], ["threadId": id, "x-codex-turn-metadata": ["thread_id": other]]] {
             do { _ = try CodexGroupIdentity.conversationID(in: ["params": ["_meta": meta]]); throw AppError.message("Accepted ambiguous metadata") }
             catch let error as AppError { try expect(error.localizedDescription.contains("서로 다릅니다")) }
@@ -678,11 +686,12 @@ extension ApprovalTests {
         let members = sessions.enumerated().map { SessionGroupLiveSession(session: $0.element, conversationID: ids[$0.offset], providerHome: "/fixture/home").member }
         let group = SessionGroup(name: "offline", members: Array(members.prefix(2)), leaderMemberID: members[0].id)
         let store = SessionGroupStore(directory: directory); try store.save([group])
-        func call(_ tool: String, caller: Int = 0, target: Int = 1) async throws -> JSONObject {
+        func call(_ tool: String, caller: Int = 0, target: Int = 1, proof: JSONObject = [:]) async throws -> JSONObject {
             let params: JSONObject = ["tool": tool, "owner": UUID().uuidString, "sessionID": sessions[caller].id,
                 "conversationID": ids[caller], "groupID": group.id.uuidString, "memberID": members[target].id.uuidString, "task": "Check fixture"]
             return try await Task.detached {
-                try SocketClient.request(path: AppPaths(directory: directory).socket, message: ["method": "mcp", "params": params], timeout: 20)
+                try SocketClient.request(path: AppPaths(directory: directory).socket,
+                    message: ["method": "mcp", "params": params.merging(proof, uniquingKeysWith: { _, current in current })], timeout: 20)
             }.value
         }
         try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
@@ -691,27 +700,27 @@ extension ApprovalTests {
         try expectEqual(rows?.first { $0["id"] as? String == members[1].id.uuidString }?["connected"] as? Bool, false)
         try expectEqual(rows?.first { $0["id"] as? String == members[1].id.uuidString }?["canReconnect"] as? Bool, true)
         try expectEqual(screen.inputs, [], "Read-only membership must not type /status")
-        for (tool, caller, target) in [("reconnect_group_member", 2, 1), ("reconnect_group_member", 1, 0), ("assign_group_task", 0, 1), ("get_group_status", 1, 1)] {
+        for (tool, caller, target) in [("reconnect_group_member", 2, 1), ("reconnect_group_member", 1, 0), ("reconnect_group_member", 0, 1), ("assign_group_task", 0, 1), ("get_group_status", 1, 1)] {
             var rejected = false
             do { _ = try await call(tool, caller: caller, target: target) } catch { rejected = true }
             try expect(rejected, "Unverified or unauthorized operation succeeded")
         }
         try expectEqual(screen.inputs, [])
+        _ = try await call("get_session_groups", caller: 1, proof: groupMCPProof(sessions[1], id: screen.id, owner: UUID().uuidString))
         let repaired = try await call("reconnect_group_member")
         try expectEqual(repaired["connected"] as? Bool, true)
         try expectEqual(repaired["conversationID"] as? String, screen.id)
         try expectEqual(repaired["transport"] as? String, "local_terminal")
-        try expectEqual(screen.inputs, [pastedStatusInput])
         try expectEqual(try store.load()[0].members[1].conversationID, screen.id)
         _ = try await call("reconnect_group_member")
-        try expectEqual(screen.inputs, [pastedStatusInput, pastedStatusInput], "Every explicit reconnect verifies a fresh response even when the ID is unchanged")
+        try expectEqual(screen.inputs, [], "Reconnecting must not type into either terminal")
         try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
         // An exited member may not be replaced with an unrelated process in the same project.
         engine.updateDiscovery([sessions[0], sessions[2]], records: [records[0], records[2]])
         var rejected = false
         do { _ = try await call("reconnect_group_member") } catch { rejected = true }
         try expect(rejected, "An exited terminal was guessed")
-        try expectEqual(screen.inputs, [pastedStatusInput, pastedStatusInput])
+        try expectEqual(screen.inputs, [])
     }
 
     @MainActor func testGroupOfflineSelfReconnectProtectsDrafts() async throws {
@@ -729,17 +738,13 @@ extension ApprovalTests {
             engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.iterm)
             let member = SessionGroupLiveSession(session: session, conversationID: UUID().uuidString, providerHome: "/fixture/home").member
             let group = SessionGroup(name: "self", members: [member]); let store = SessionGroupStore(directory: directory); try store.save([group])
-            let params: JSONObject = ["tool": "reconnect_group_member", "owner": UUID().uuidString, "sessionID": session.id,
-                "conversationID": screen.id, "groupID": group.id.uuidString, "memberID": member.id.uuidString]
-            if text.contains("unfinished") {
-                var failed = false
-                do { _ = try await engine.mcpAction(params) } catch { failed = true }
-                try expect(failed); try expectEqual(screen.inputs, [])
-                try expectEqual(try store.load()[0].members[0].conversationID, member.conversationID.lowercased())
-            } else {
-                let result = try await engine.mcpAction(params)
-                try expectEqual(result["connected"] as? Bool, true); try expectEqual(screen.inputs, [pastedStatusInput])
-            }
+            var params = groupMCPProof(session, id: screen.id, owner: UUID().uuidString)
+            params["tool"] = "reconnect_group_member"; params["groupID"] = group.id.uuidString; params["memberID"] = member.id.uuidString
+            let result = try await engine.mcpAction(params)
+            try expectEqual(result["connected"] as? Bool, true)
+            try expectEqual(try store.load()[0].members[0].conversationID, screen.id)
+            try expectEqual(screen.screen, text)
+            try expectEqual(screen.inputs, [])
         }
     }
 }
