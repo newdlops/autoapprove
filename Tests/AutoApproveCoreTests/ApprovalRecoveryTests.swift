@@ -578,6 +578,42 @@ extension ApprovalTests {
         try expectEqual(probe.inputs.count, 1, "History and wrapping cannot replay the same Claude panel")
         engine.receiveScreen(sessionID: id, raw: "Old output\n" + next, generation: "claude-process")
         try await waitForRecovery({ probe.inputs.count == 2 }, "A different Claude command cannot inherit the previous reservation")
+        var expected = 2
+        for rows in [299, 300, 301, 1200] {
+            let large = recoveryPrompt("echo large-\(rows)\n" + String(repeating: "  echo fixture\n", count: rows), agent: .claude)
+            engine.receiveScreen(sessionID: id, raw: "Old output\n" + large, generation: "claude-process")
+            expected += 1
+            try await waitForRecovery({ probe.inputs.count == expected }, "A complete long Claude panel must not inherit the prior command's dispatch reservation")
+            engine.receiveScreen(sessionID: id, raw: "Changed scrollback\n" + large, generation: "claude-process")
+            engine.receiveScreen(sessionID: id, raw: "Changed scrollback\n" + large.replacingOccurrences(of: "echo fixture", with: "echo\nfixture"), generation: "claude-process")
+            try await Task.sleep(for: .milliseconds(50))
+            try expectEqual(probe.inputs.count, expected, "The same long Claude request must not repeat after history changes")
+        }
+        for (title, question) in [("Edit file", "Do you want to make this edit to fixture.swift?"), ("Create file", "Do you want to create fixture.swift?")] {
+            let large = title + "\n/fixture/fixture.swift\n" + String(repeating: "  1 + fixture content\n", count: 1200) + question + "\n❯ 1. Yes\n  2. No\nEsc to cancel"
+            let prompt = PromptDetector.detect(large, agent: .claude)
+            try expect(prompt?.hasRequestBoundary == true, "A complete file panel keeps its boundary regardless of body length")
+            let cocoa = NSAppleEventDescriptor(string: large).stringValue!
+            try expectEqual(PromptDetector.detect(cocoa, agent: .claude)?.requestIdentity, prompt?.requestIdentity)
+            engine.receiveScreen(sessionID: id, raw: cocoa, generation: "claude-process")
+            expected += 1
+            try await waitForRecovery({ probe.inputs.count == expected }, "A large file panel is a new request")
+            let context = JSContext()!
+            context.setObject(large, forKeyedSubscript: "current" as NSString)
+            context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/large',contents:()=>current,processes:()=>['claude']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+            let script = try TerminalAdapter.approvalScript(tty: "/dev/large", expectedScreen: large, agent: .claude)
+            try expectEqual(context.evaluateScript(script)?.toString(), "sent")
+            context.setObject(large.replacingOccurrences(of: "fixture.swift", with: "other.swift"), forKeyedSubscript: "current" as NSString)
+            try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged")
+            try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
+        }
+        let unknown = "Unrecognized panel\n" + String(repeating: "body\n", count: 1200) + "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel"
+        try expect(PromptDetector.detect(unknown, agent: .claude)?.hasRequestBoundary == false)
+        let reused = first + "\n" + unknown
+        try expect(PromptDetector.detect(reused, agent: .claude)?.hasRequestBoundary == false, "A previous dialog's title cannot supply the new request boundary")
+        engine.receiveScreen(sessionID: id, raw: reused, generation: "claude-process")
+        try await Task.sleep(for: .milliseconds(100))
+        try expectEqual(probe.inputs.count, expected, "An unknown boundary must retain the prior reservation")
     }
 
     func testConfirmedNonWriteRecoversWithoutAnotherOutputEvent() async throws {

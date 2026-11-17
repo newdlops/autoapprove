@@ -380,7 +380,9 @@ public enum PromptDetector {
 
     private static func claudePanelStart(_ lines: [String], before heading: Int, marker: String) -> Int? {
         let titles = ["Do you want to proceed?": "Bash command", "Do you want to create": "Create file", "Do you want to make this edit": "Edit file"]
-        guard let title = titles[marker], let start = lines[..<heading].lastIndex(of: title), heading - start <= 300 else { return nil }
+        // Claude renders the command/edit before the question. A long body is
+        // still the same explicit panel boundary; length is not uncertainty.
+        guard let title = titles[marker], let start = lines[..<heading].lastIndex(of: title) else { return nil }
         // A panel title from an earlier dialog is not a boundary for this request.
         if let previous = permissionHeading(Array(lines[..<heading]), agent: .claude), previous.index >= start { return nil }
         guard lines[..<start].filter({ $0.hasPrefix("```") }).count % 2 == 0 else { return nil }
