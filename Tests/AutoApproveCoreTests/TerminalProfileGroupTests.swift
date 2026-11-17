@@ -8,14 +8,14 @@ extension ApprovalTests {
         var worker=SessionGroupMember(agent:.codex,title:"Worker",cwd:cwd,conversationID:UUID().uuidString.lowercased(),providerHome:home)
         var child=SessionGroupMember(agent:.claude,title:"Claude",cwd:cwd,conversationID:UUID().uuidString.lowercased(),providerHome:"/fixture/claude")
         leader.runtimeID="old-leader";worker.runtimeID="old-worker";child.runtimeID="old-claude";child.parentMemberID=worker.id
-        let group=SessionGroup(name:"Saved group",members:[leader,worker,child],leaderMemberID:leader.id)
+        let group=SessionGroup(name:"Saved group",members:[leader,worker,child],leaderMemberID:leader.id).addingLeader(worker.id)
         let entries=[leader,worker].map {TerminalProfileEntry(title:$0.title,agent:$0.agent.rawValue,cwd:$0.cwd,conversationID:$0.conversationID,providerHome:$0.providerHome)}
         let candidates=zip([leader,worker],entries).map {TerminalProfileCandidate(id:$0.0.runtimeID!,entry:$0.1)}
         let groups=TerminalProfileGroup.capture([group],candidates:candidates)
         let profile=TerminalSessionProfile(name:"Groups",entries:entries,groups:groups)
         let decoded=try TerminalProfileStore.decode(TerminalProfileStore.encode(profile))
         try expectEqual(decoded.schema,4);try expectEqual(decoded.groups,groups)
-        try expectEqual(decoded.groups?.first?.group.leaderMemberID,leader.id)
+        try expectEqual(decoded.groups?.first?.group.leaderMemberIDs,[leader.id, worker.id])
         try expectEqual(decoded.groups?.first?.group.members.last?.parentMemberID,worker.id)
         try expect(decoded.groups!.allSatisfy {$0.group.members.allSatisfy {$0.runtimeID==nil}})
         var selected=entries[1];selected.conversationID=""

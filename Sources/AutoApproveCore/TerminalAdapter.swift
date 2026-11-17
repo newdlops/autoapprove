@@ -63,6 +63,8 @@ public struct ScreenTarget: Equatable, Sendable {
 /// The per-host channel behind every screen connection. Tests replace these closures.
 public struct ScreenHostAdapter: Sendable {
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
+    /// Explicit identity reads require a current title even when the monitor has cached one.
+    var identityScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
@@ -132,10 +134,12 @@ public struct ScreenHostAdapter: Sendable {
                 replacementShell:{try CodexReplacementTab.prepare($0)},replacementShellValid:{try CodexReplacementTab.sameWindow($0,shell:$1)},
                 goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)},
                 setTabLabel:{try TerminalTabLabelAdapter.apply(host:.terminal,target:$0,label:$1)})
+            adapter.identityScreens = { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false, freshTitles: true) }
             adapter.typeLine = { try TerminalAdapter.typeLine(target: $0, text: $1) }
             adapter.backgroundInput = { try TerminalDeviceInput.deliverBackground(target: $0, screen: $1, agent: $2, input: $3) }
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
+                adapter.identityScreens = nil
                 adapter.validationScreens = nil
                 adapter.history=nil
             }
@@ -397,14 +401,14 @@ public enum TerminalAdapter {
     }
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true,
-                               purpose: RemoteTerminalPerformance.NativePurpose = .other) throws -> TerminalSnapshot {
+                               purpose: RemoteTerminalPerformance.NativePurpose = .other, freshTitles: Bool = false) throws -> TerminalSnapshot {
         // Background monitoring immediately sends a no-consent Apple Event,
         // which itself checks current TCC authorization. Avoid a separate
         // synchronous AEDeterminePermissionToAutomateTarget XPC round trip on
         // every poll; explicit, validation and compatibility reads still
         // perform their fresh preflight.
         if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles,
-            includeCursor: includeCursor, preflight: purpose != .monitor, purpose: purpose) { return snapshot }
+            includeCursor: includeCursor, preflight: purpose != .monitor, purpose: purpose, freshTitles: freshTitles) { return snapshot }
         return try scriptScreens(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles)
     }
     /// The engine has just checked Automation, including before cached frames.

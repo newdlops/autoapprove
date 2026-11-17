@@ -103,6 +103,7 @@ public enum TerminalProfileGroupRestore {
             guard let gi=result.firstIndex(where:{$0.id==snapshot.group.id}) else {
                 result.append(snapshot.group);continue
             }
+            let existingMemberIDs = Set(result[gi].members.map(\.id))
             for saved in snapshot.group.members where !result[gi].members.contains(where:{$0.id==saved.id}) {
                 // A separately edited group can already contain this conversation under another member ID.
                 guard !result[gi].members.contains(where:{$0.agent==saved.agent && !$0.conversationID.isEmpty && $0.conversationID==saved.conversationID && $0.providerHome==saved.providerHome}) else{continue}
@@ -110,8 +111,11 @@ public enum TerminalProfileGroupRestore {
                 if result[gi].leaderMemberID==nil || !result[gi].members.contains(where:{$0.id==member.parentMemberID}) {member.parentMemberID=nil}
                 result[gi].members.append(member)
             }
-            if result[gi].leaderMemberID==nil,let leader=snapshot.group.leaderMemberID,result[gi].members.contains(where:{$0.id==leader}) {
-                result[gi].leaderMemberID=leader
+            let hadLeader = result[gi].leaderMemberID != nil
+            for leader in snapshot.group.leaderMemberIDs where !hadLeader || !existingMemberIDs.contains(leader) {
+                result[gi] = result[gi].addingLeader(leader)
+            }
+            if !hadLeader, result[gi].leaderMemberID != nil {
                 for saved in snapshot.group.members {
                     guard let index=result[gi].members.firstIndex(where:{$0.id==saved.id}) else{continue}
                     result[gi].members[index].parentMemberID=saved.parentMemberID

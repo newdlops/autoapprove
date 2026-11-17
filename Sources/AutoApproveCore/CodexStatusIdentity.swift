@@ -40,6 +40,24 @@ public struct CodexStatusIdentity: Codable {
         return [.idle,.working].contains(phase) && CodexProgressScreen.emptyComposer(screen) &&
             !RemoteMessageReadiness.hasMenu(screen,agent:.codex)
     }
+    /// Only consider the tail after the last exact /pwd reply. A card already
+    /// above that reply can be scrolled into view again without a new /status.
+    enum DirectoryBoundary: Equatable { case absent, ready, card(String) }
+    static func directoryBoundary(_ screen: String, cwd: String) -> DirectoryBoundary {
+        let rows = PromptDetector.normalizedLines(screen).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let marker = rows.lastIndex(of: "• Current working directory: " + cwd),
+              let composer = rows.lastIndex(where: { $0.hasPrefix("›") || $0.hasPrefix("»") }),
+              composer > marker else { return .absent }
+        let tail = rows[(marker + 1)..<composer].filter { !$0.isEmpty }
+        func border(_ row: String) -> Bool { row.allSatisfy { "─━╌│┃╭╮╰╯┌┐└┘ ".contains($0) } }
+        if tail.allSatisfy(border) { return .ready }
+        let body = tail.drop(while: { border($0) || ["› /status", "» /status", "/status"].contains($0) })
+        guard let header = body.first, header.trimmingCharacters(in: CharacterSet(charactersIn: "│┃ ")).hasPrefix(">_ OpenAI Codex (v"),
+              !body.contains(where: { $0.hasPrefix("›") || $0.hasPrefix("»") || $0.hasPrefix("•") }) else { return .absent }
+        let ids = cards(body.joined(separator: "\n"))
+        guard ids.count == 1, let (id, count) = ids.first, count == 1 else { return .absent }
+        return .card(id)
+    }
     public var counts:[String:Int]
     public var requested:Date
     public var threadID:String?

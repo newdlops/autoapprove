@@ -370,6 +370,24 @@ extension ApprovalTests {
         try expectEqual(newLeader.treeOrder.first?.id, d.id)
         try expectEqual(newLeader.treeOrder.count, 4, "Changing the leader keeps every member in the tree")
 
+        let peers = try valid.addingLeader(c.id).validated()
+        try expectEqual(peers.leaderMemberIDs, [a.id, c.id])
+        try expectEqual(peers.treeOrder.map(\.depth), [0, 1, 0, 1])
+        for leader in peers.leaderMemberIDs {
+            try expect(peers.canDirect(leader, worker: b.id) && peers.canDirect(leader, worker: d.id))
+            try expect(!peers.canDirect(leader, worker: a.id) && !peers.canDirect(leader, worker: c.id))
+        }
+        try expect(!peers.canDirect(b.id, worker: d.id))
+        try expectEqual(try JSONDecoder().decode(SessionGroup.self, from: JSONEncoder().encode(peers)).validated(), peers)
+        let remaining = try peers.removingLeader(a.id).validated()
+        try expectEqual(remaining.leaderMemberIDs, [c.id])
+        try expectEqual(remaining.parentID(of: a.id), c.id)
+        try expectEqual(try peers.removing(c.id).validated().parentID(of: d.id), a.id)
+        try expect(remaining.removingLeader(c.id).members.allSatisfy { $0.parentMemberID == nil })
+        var old = try JSONSerialization.jsonObject(with: JSONEncoder().encode(valid)) as! [String: Any]
+        old.removeValue(forKey: "leaderMemberIDs")
+        try expectEqual(try JSONDecoder().decode(SessionGroup.self, from: JSONSerialization.data(withJSONObject: old)), valid)
+
         let legacy = Data(#"[{"id":"\#(UUID().uuidString)","name":"기존","members":[{"id":"\#(UUID().uuidString)","agent":"claude","title":"기존","cwd":"/tmp","conversationID":""}]}]"#.utf8)
         let decoded = try JSONDecoder().decode([SessionGroup].self, from: legacy)
         try expect(decoded[0].leaderMemberID == nil, "A saved group from an older version stays flat")

@@ -501,7 +501,7 @@ enum TerminalAppleEvents {
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.
     static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false,
-                        preflight: Bool = true, purpose: RemoteTerminalPerformance.NativePurpose = .other) throws -> TerminalSnapshot? {
+                        preflight: Bool = true, purpose: RemoteTerminalPerformance.NativePurpose = .other, freshTitles: Bool = false) throws -> TerminalSnapshot? {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
             throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
         }
@@ -518,14 +518,14 @@ enum TerminalAppleEvents {
         // Terminal's multi-tab title batch has shown multi-second tail latency.
         // Keep batches for explicit presentation reads, but scope optional
         // monitor metadata to exact TTYs.
-        let batchTitles = incompatibleTitlesPID != pid && purpose != .monitor
+        let batchTitles = incompatibleTitlesPID != pid && purpose != .monitor && !freshTitles
         let slowContentsFallback = slowContentsBatchPID == pid && now < slowContentsBatchUntil
         let slowTitlesFallback = slowTitlesBatchPID == pid && now < slowTitlesBatchUntil
-        let suppressTitleReads = slowContentsFallback || slowTitlesFallback
+        let suppressTitleReads = !freshTitles && (slowContentsFallback || slowTitlesFallback)
         let batchContents = incompatibleContentsPID != pid && !slowContentsFallback
         let uniqueTTYS = Set(ttys)
         let titleTargets = includeTitles ? uniqueTTYS.filter {
-            titlesByTTY[$0].map { now - $0.at >= titleCacheLifetime } ?? true
+            freshTitles || (titlesByTTY[$0].map { now - $0.at >= titleCacheLifetime } ?? true)
         } : []
         let cachedTitles: [String: String?] = Dictionary(uniqueKeysWithValues: uniqueTTYS.compactMap { tty in
             titlesByTTY[tty].map { (tty, $0.value) }
@@ -588,7 +588,7 @@ enum TerminalAppleEvents {
                     // screen poll. Keep any older label while it expires.
                     titlesByTTY[tty] = CachedTitle(value:cachedTitles[tty] ?? nil,at:recordedAt)
                 }
-                snapshot.screens[index].title = snapshot.screens[index].title ?? cachedTitles[tty] ?? nil
+                if !freshTitles { snapshot.screens[index].title = snapshot.screens[index].title ?? cachedTitles[tty] ?? nil }
             }
             if titlesByTTY.count > 512 {
                 titlesByTTY = titlesByTTY.filter { recordedAt - $0.value.at < titleCacheLifetime * 2 }

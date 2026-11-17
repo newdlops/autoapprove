@@ -63,16 +63,52 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
     public var members: [SessionGroupMember]
-    /// The root of the work tree. Without a leader the group stays a flat list and nobody assigns work.
-    public var leaderMemberID: UUID? = nil
+    /// Order supplies a stable default report recipient. Every leader has the same authority.
+    public private(set) var leaderMemberIDs: [UUID]
+    public var leaderMemberID: UUID? {
+        get { leaderMemberIDs.first }
+        set { leaderMemberIDs = newValue.map { [$0] } ?? [] }
+    }
 
     public init(id: UUID = UUID(), name: String, members: [SessionGroupMember] = [], leaderMemberID: UUID? = nil) {
-        self.id = id; self.name = name; self.members = members; self.leaderMemberID = leaderMemberID
+        self.id = id; self.name = name; self.members = members
+        self.leaderMemberIDs = leaderMemberID.map { [$0] } ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, members, leaderMemberID, leaderMemberIDs }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        members = try values.decode([SessionGroupMember].self, forKey: .members)
+        let legacy = try values.decodeIfPresent(UUID.self, forKey: .leaderMemberID)
+        leaderMemberIDs = try values.decodeIfPresent([UUID].self, forKey: .leaderMemberIDs) ?? legacy.map { [$0] } ?? []
+        if let legacy, leaderMemberIDs.first != legacy {
+            throw DecodingError.dataCorruptedError(forKey: .leaderMemberIDs, in: values, debugDescription: "Inconsistent group leaders")
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(name, forKey: .name)
+        try values.encode(members, forKey: .members)
+        try values.encodeIfPresent(leaderMemberID, forKey: .leaderMemberID)
+        try values.encode(leaderMemberIDs, forKey: .leaderMemberIDs)
+    }
+
+    public func isLeader(_ id: UUID) -> Bool { leaderMemberIDs.contains(id) }
+
+    /// All leaders share direction of the top level. Lower tiers retain their own supervisors.
+    public func canDirect(_ caller: UUID, worker: UUID) -> Bool {
+        guard let parent = parentID(of: worker) else { return false }
+        return caller == parent || (isLeader(caller) && isLeader(parent))
     }
 
     /// The member that assigns work to `memberID` and receives its reports.
     public func parentID(of memberID: UUID) -> UUID? {
-        guard let leader = leaderMemberID, memberID != leader,
+        guard let leader = leaderMemberID, !isLeader(memberID),
               let member = members.first(where: { $0.id == memberID }) else { return nil }
         return member.parentMemberID ?? leader
     }
@@ -83,7 +119,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
 
     /// Leader first, then each member under its parent. Without a leader, the saved order.
     public var treeOrder: [SessionGroupTreeEntry] {
-        guard let leader = leaderMemberID, let root = members.first(where: { $0.id == leader }) else {
+        guard !leaderMemberIDs.isEmpty else {
             return members.map { SessionGroupTreeEntry(member: $0, depth: 0) }
         }
         var result: [SessionGroupTreeEntry] = []
@@ -93,7 +129,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             result.append(SessionGroupTreeEntry(member: member, depth: depth))
             for child in children(of: member.id) { visit(child, depth + 1) }
         }
-        visit(root, 0)
+        for id in leaderMemberIDs { if let root = members.first(where: { $0.id == id }) { visit(root, 0) } }
         // A validated group has no unreachable member; keep any anyway so nothing disappears from view.
         for member in members where !visited.contains(member.id) { result.append(SessionGroupTreeEntry(member: member, depth: 1)) }
         return result
@@ -101,7 +137,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
 
     /// Members that can direct `memberID` without creating a cycle: never itself or one of its descendants.
     public func parentCandidates(for memberID: UUID) -> [SessionGroupMember] {
-        guard leaderMemberID != nil, leaderMemberID != memberID else { return [] }
+        guard leaderMemberID != nil, !isLeader(memberID) else { return [] }
         var descendants = Set<UUID>([memberID]), queue = [memberID]
         while let next = queue.popLast() {
             for child in children(of: next) where descendants.insert(child.id).inserted { queue.append(child.id) }
@@ -120,6 +156,24 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         return result
     }
 
+    public func addingLeader(_ id: UUID) -> Self {
+        guard !isLeader(id), let index = members.firstIndex(where: { $0.id == id }) else { return self }
+        var result = self
+        result.leaderMemberIDs.append(id)
+        result.members[index].parentMemberID = nil
+        return result
+    }
+
+    public func removingLeader(_ id: UUID) -> Self {
+        guard isLeader(id) else { return self }
+        var result = self
+        result.leaderMemberIDs.removeAll { $0 == id }
+        for i in result.members.indices where result.leaderMemberIDs.isEmpty || result.members[i].parentMemberID == id {
+            result.members[i].parentMemberID = nil
+        }
+        return result
+    }
+
     /// Setting the leader as a parent stores nil, which already means "directly under the leader".
     public func settingParent(_ parentID: UUID, for memberID: UUID) -> SessionGroup {
         var result = self
@@ -133,9 +187,8 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     /// A removed member's reports move to its own parent; removing the leader dissolves the tree.
     public func removing(_ memberID: UUID) -> SessionGroup {
         var result = self
-        if leaderMemberID == memberID {
-            result.leaderMemberID = nil
-            for index in result.members.indices { result.members[index].parentMemberID = nil }
+        if isLeader(memberID) {
+            result = removingLeader(memberID)
         } else {
             let parent = members.first { $0.id == memberID }?.parentMemberID
             for index in result.members.indices where result.members[index].parentMemberID == memberID {
@@ -188,8 +241,9 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             return
         }
         let byID = Dictionary(uniqueKeysWithValues: members.map { ($0.id, $0) })
-        guard let root = byID[leader], root.parentMemberID == nil else { throw invalid }
-        for member in members where member.id != leader {
+        guard Set(leaderMemberIDs).count == leaderMemberIDs.count,
+              leaderMemberIDs.allSatisfy({ byID[$0] != nil && byID[$0]?.parentMemberID == nil }) else { throw invalid }
+        for member in members where !isLeader(member.id) {
             var seen: Set<UUID> = [member.id], current = member
             while let parent = current.parentMemberID, parent != leader {
                 guard seen.insert(parent).inserted, let next = byID[parent] else { throw invalid }
@@ -353,13 +407,13 @@ public struct SessionGroupBadge: Codable, Equatable, Sendable {
                 // List membership follows the original process while its conversation
                 // identity is being refreshed. Task delivery still uses strict matching.
                 guard let session = SessionGroupMatching.connection(member, in: live) else { continue }
-                let role: Role = group.leaderMemberID == nil ? .unranked : group.leaderMemberID == member.id ? .leader : .member
+                let role: Role = group.leaderMemberID == nil ? .unranked : group.isLeader(member.id) ? .leader : .member
                 let parent = group.parentID(of: member.id).flatMap { id in group.members.first { $0.id == id } }
                 candidates[session.id, default: []].append(SessionGroupBadge(
                     groupID: group.id, groupName: group.name, memberID: member.id, role: role,
                     depth: role == .unranked ? 0 : depths[member.id] ?? 0, parentTitle: parent?.title,
                     parentMemberID: role == .unranked ? nil : parent?.id,
-                    childCount: role == .unranked ? 0 : group.children(of: member.id).count))
+                    childCount: role == .unranked ? 0 : group.members.filter { group.canDirect(member.id, worker: $0.id) }.count))
             }
         }
         let rank: [Role: Int] = [.leader: 0, .member: 1, .unranked: 2]

@@ -136,13 +136,13 @@ import AutoApproveCore
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("그룹 관리")
             }
             Text(group.leaderMemberID == nil
-                 ? "그룹장을 지정하면 구성원을 트리로 관리하고, 상위 세션이 하위 세션에 작업을 지시할 수 있습니다."
-                 : "상위 세션은 AutoApprove MCP의 assign_group_task로 직속 구성원에게 작업을 지시합니다. 작업을 받은 구성원은 권한 확인에서 멈추지 않도록 자동 승인이 켜집니다. 작업자가 응답을 마치면 결과 요약이 지시한 세션의 터미널에 입력됩니다.")
+                 ? "구성원의 역할 메뉴에서 그룹장을 한 명 이상 지정할 수 있습니다."
+                 : "모든 그룹장은 그룹장 직속 구성원에게 작업을 지시하고 질문에 답할 수 있습니다. 작업을 받은 구성원은 권한 확인에서 멈추지 않도록 자동 승인이 켜집니다. 작업자가 응답을 마치면 결과 요약이 지시한 세션의 터미널에 입력됩니다.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("에이전트는 get_session_groups와 get_group_status로 구성원과 작업 상태를 확인합니다. 공유 서버는 자신의 대화 ID를 지정해야 할 수 있습니다. 상태는 새로고침할 때 확인합니다.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
-                Text("구성원 \(group.members.count)개").font(.headline)
+                Text(group.leaderMemberIDs.isEmpty ? "구성원 \(group.members.count)개" : "구성원 \(group.members.count)개 · 그룹장 \(group.leaderMemberIDs.count)명").font(.headline)
                 Spacer()
                 Button("전체 세션 ID 갱신") { Task { await refreshAllIdentities(in: group) } }
                     .disabled(loading || group.members.isEmpty)
@@ -168,7 +168,7 @@ import AutoApproveCore
                     let connection = SessionGroupMatching.connection(member, in: live)
                     VStack(alignment: .leading, spacing: 5) {
                         HStack(alignment: .top) {
-                            if group.leaderMemberID == member.id {
+                            if group.isLeader(member.id) {
                                 Image(systemName: "crown").foregroundStyle(.orange).accessibilityLabel("그룹장")
                             }
                             Text(member.title.isEmpty ? member.agent.title : member.title).font(.body.weight(.medium)).lineLimit(3)
@@ -190,7 +190,7 @@ import AutoApproveCore
                             Spacer(minLength: 8)
                             Button("세션 ID 갱신") { Task { await refreshIdentity(member, in: group) } }
                                 .fixedSize().disabled(loading)
-                                .help("Codex는 원래 탭에서 /status로 현재 ID를 확인합니다. 조회가 보류되거나 실패하면 기존 ID를 유지합니다.")
+                                .help("Codex는 로컬 대화 기록과 MCP 호출, 탭 제목을 확인하고 필요하면 원래 탭에서 /status를 조회합니다. 조회가 보류되거나 실패하면 기존 ID를 유지합니다.")
                         }
                         if (member.conversationID.isEmpty || member.providerHome == nil), let match, match.conversationID != nil, match.providerHome != nil {
                             Button("현재 대화 연결") { Task { await bind(member, to: match, in: group) } }.disabled(loading)
@@ -216,8 +216,8 @@ import AutoApproveCore
 
     private func roleMenu(_ member: SessionGroupMember, in group: SessionGroup) -> some View {
         Menu {
-            if group.leaderMemberID == member.id {
-                Button("그룹장 해제") { clearLeader(in: group) }
+            if group.isLeader(member.id) {
+                Button("그룹장 해제") { clearLeader(member, in: group) }
             } else {
                 Button("그룹장으로 지정") { makeLeader(member, in: group) }
                 if group.leaderMemberID != nil {
@@ -239,7 +239,7 @@ import AutoApproveCore
     }
 
     private func roleText(_ member: SessionGroupMember, in group: SessionGroup) -> String {
-        if group.leaderMemberID == member.id { return "그룹장" }
+        if group.isLeader(member.id) { return "그룹장" }
         guard let parent = group.parentID(of: member.id),
               let title = group.members.first(where: { $0.id == parent })?.title else { return "그룹장 없음" }
         return "지시: " + (title.isEmpty ? "구성원" : title)
@@ -264,13 +264,12 @@ import AutoApproveCore
     }
 
     private func makeLeader(_ member: SessionGroupMember, in group: SessionGroup) {
-        _ = persist(groups.map { $0.id == group.id ? group.settingLeader(member.id) : $0 }, message: "그룹장을 지정했습니다.")
+        _ = persist(groups.map { $0.id == group.id ? group.addingLeader(member.id) : $0 }, message: "그룹장을 지정했습니다.")
     }
 
-    private func clearLeader(in group: SessionGroup) {
-        var changed = group; changed.leaderMemberID = nil
-        for index in changed.members.indices { changed.members[index].parentMemberID = nil }
-        _ = persist(groups.map { $0.id == group.id ? changed : $0 }, message: "그룹장을 해제했습니다. 구성원은 다시 평면 목록이 됩니다.")
+    private func clearLeader(_ member: SessionGroupMember, in group: SessionGroup) {
+        let changed = group.removingLeader(member.id)
+        _ = persist(groups.map { $0.id == group.id ? changed : $0 }, message: "선택한 구성원의 그룹장 역할을 해제했습니다.")
     }
 
     private func setParent(_ parent: SessionGroupMember, for member: SessionGroupMember, in group: SessionGroup) {
@@ -370,7 +369,7 @@ import AutoApproveCore
     private func remove(_ member: SessionGroupMember, from group: SessionGroup) {
         let changed = group.removing(member.id)
         _ = persist(groups.map { $0.id == group.id ? changed : $0 },
-                    message: group.leaderMemberID == member.id ? "그룹장을 제거했습니다. 구성원은 다시 평면 목록이 됩니다." : "그룹에서 세션을 제거했습니다. 하위 구성원은 제거한 세션의 상위로 옮겼습니다.")
+                    message: group.isLeader(member.id) ? "선택한 그룹장을 그룹에서 제거했습니다." : "그룹에서 세션을 제거했습니다. 하위 구성원은 제거한 세션의 상위로 옮겼습니다.")
     }
     private func bind(_ member: SessionGroupMember, to candidate: SessionGroupLiveSession, in group: SessionGroup) async {
         guard !loading else { return }; loading = true; defer { loading = false }

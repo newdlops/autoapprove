@@ -1,4 +1,5 @@
 import Foundation
+import CSQLite
 #if DEBUG
 @testable import AutoApproveCore
 #else
@@ -370,6 +371,58 @@ extension ApprovalTests {
         }
     }
 
+    @MainActor func testCodexNamedGroupRefreshAndRepeatedCard() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("group-name-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let record = ProcessDiscovery.parse("100599 1 fixture48 100599 100599 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+        let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .terminal)
+        let screen = CodexGroupScreen("Codex\n› unfinished draft\n ? for shortcuts")
+        let card = ">_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: " + screen.id
+        let marker = "• Current working directory: /project"
+        let footer = "\n› Ask Codex to do anything\n  ? for shortcuts"
+        var db: OpaquePointer?
+        try expectEqual(sqlite3_open(home.appendingPathComponent("state_5.sqlite").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func sql(_ query: String) throws { try expectEqual(sqlite3_exec(db, query, nil, nil, nil), SQLITE_OK) }
+        try sql("CREATE TABLE threads(id TEXT, name TEXT, cwd TEXT, archived INTEGER)")
+        try sql("INSERT INTO threads VALUES('\(screen.id)','고유 이름','/project',0)")
+        let reply = CodexReplyTransport(prepare: { _,_ in throw AppError.message("unexpected prepare") }, send: { _,_ in throw AppError.message("unexpected send") },
+            queueHome: { _ in .init(executable: "", home: home.path, threadID: "") })
+        let queue = CodexQueueTransport(list: { _ in [] }, delete: { _,_ in .init(removed: []) }, validate: { target, cwd in
+            try expectEqual(target.threadID, screen.id); try expectEqual(target.home, home.path); try expectEqual(cwd, "/project")
+        })
+        var adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: screen.screen, title: "고유 이름 | project") }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in throw AppError.message("unexpected focus") }, history: { _ in screen.screen })
+        adapter.backgroundInput = { _,_,_,input in
+            _ = screen.send(input)
+            switch input.text {
+            case "/pwd": screen.setScreen(card + "\n" + marker + footer)
+            case "/status": screen.setScreen(marker + "\n" + card + footer)
+            default: throw AppError.message("unexpected input")
+            }
+            return .sent
+        }
+        let engine = try ApprovalEngine(paths: .init(directory: home), questionTransport: reply, processReader: { [record] }, screenAdapters: [.terminal: adapter],
+            codexQueue: queue, codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME": home.path] }, nativeKeyboardActivity: .inactive)
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(.terminal)
+        let group = SessionGroup(name: "fixture", members: [SessionGroupLiveSession(session: session, conversationID: nil, providerHome: home.path).member])
+        try SessionGroupStore(directory: home).save([group])
+        func refresh() async throws -> String {
+            try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id).conversationID
+        }
+        try expectEqual(try await refresh(), screen.id)
+        try expect(screen.inputs.isEmpty, "Named session is identified without touching the draft")
+        try sql("INSERT INTO threads VALUES('\(UUID().uuidString)','고유 이름','/project',0)")
+        do { _ = try await refresh(); throw AppError.message("Duplicate name accepted") }
+        catch { try expect(error.localizedDescription.contains("입력")) }
+        try expect(screen.inputs.isEmpty)
+        screen.setScreen(card + footer)
+        try expectEqual(try await refresh(), screen.id, "An identical card after the directory boundary is fresh")
+        try expectEqual(screen.inputs, ["/pwd\r", "/status\r"])
+    }
+
     @MainActor func testCodexGroupRefreshPrefersLocalHistoryAndUsesBoundMCP() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-evidence-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -621,7 +674,8 @@ extension ApprovalTests {
         defer { engine.stop() }
         engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(host)
         let worker = SessionGroupLiveSession(session: session, conversationID: workerID, providerHome: home).member
-        let group = SessionGroup(name: "fixture", members: [parent, worker], leaderMemberID: parent.id)
+        let peer = SessionGroupMember(agent: .codex, title: "Other leader", cwd: parent.cwd, conversationID: UUID().uuidString.lowercased(), providerHome: home)
+        let group = SessionGroup(name: "fixture", members: [peer, parent, worker], leaderMemberID: peer.id).addingLeader(parent.id)
         try SessionGroupStore(directory: directory).save([group])
         let params: JSONObject = ["owner": UUID().uuidString, "tool": "assign_group_task", "agentKind": "codex",
             "sessionID": "shared-daemon", "conversationID": parentID, "codexCallerConversationID": parentID, "codexCallerHome": home,
@@ -641,6 +695,15 @@ extension ApprovalTests {
         try expect(screen.inputs[0].contains("Inspect the fixture"))
         let task = try engine.sessionGroupAssignments().first
         try expectEqual(task?.workerSessionID, session.id)
+        try expectEqual(task?.parentMemberID, parent.id)
+        var conflict = params
+        conflict["owner"] = UUID().uuidString
+        conflict["conversationID"] = peer.conversationID
+        conflict["codexCallerConversationID"] = peer.conversationID
+        do { _ = try await engine.mcpAction(conflict); throw AppError.message("Peer replaced a working assignment") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        try expectEqual(screen.inputs.count, 1)
+        try expectEqual(try engine.sessionGroupAssignments().first?.id, task?.id)
         try expect(task?.parentSessionID.hasPrefix("codex-mcp:") == true, "Never route reports to an unverified parent terminal")
         }
     }

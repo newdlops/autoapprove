@@ -48,7 +48,9 @@ private final class GroupRefreshReads: @unchecked Sendable {
         }
         members.insert(SessionGroupMember(agent: .codex, title: "다시 연결할 대화", cwd: sessions[0].cwd,
             conversationID: "", providerHome: nil), at: 0)
+        for i in members.indices.dropFirst(2) { members[i].parentMemberID = members[1].id }
         let group = SessionGroup(name: "세션 그룹 · 긴 프로젝트 협업 이름과 상태", members: members)
+            .addingLeader(members[0].id).addingLeader(members[1].id)
         try SessionGroupStore(directory: directory).save([group])
         if CommandLine.arguments.contains("--verify-refresh") {
             NSApp.setActivationPolicy(.regular)

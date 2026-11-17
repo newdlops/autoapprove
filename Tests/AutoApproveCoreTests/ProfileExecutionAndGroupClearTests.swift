@@ -415,6 +415,18 @@ extension ApprovalTests {
         try expectEqual(fixture.labelCount(),4)
         try expectNil(engine.snapshot.sessions.first { $0.id == sessions[0].id }?.customization)
         try expectEqual(try SessionGroupStore(directory: directory).load()[0],group)
+        // The same verified Claude member gains the exact role the Codex member has.
+        let peers = group.addingLeader(members[1].id)
+        try SessionGroupStore(directory: directory).save([peers])
+        _ = try await call("set_group_member_title", ["title":"co-leader"], caller: 1, member: 0)
+        let status = try await call("get_group_status", [:], caller: 1)
+        let data = (status["groups"] as? [JSONObject])?.first
+        try expectEqual(data?["leaderMemberIDs"] as? [String], peers.leaderMemberIDs.map(\.uuidString))
+        try expectEqual((data?["members"] as? [JSONObject])?.filter { $0["isLeader"] as? Bool == true }.count, 2)
+        try SessionGroupStore(directory: directory).save([peers.removingLeader(members[1].id)])
+        do { _ = try await call("set_group_member_title", ["title":"revoked"], caller: 1, member: 0); throw AppError.message("Removed leader retained role") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 403) }
+
     }
 
     func testNativeTabLabelScriptsDoNotWriteInputOrChangeAppearance() throws {
