@@ -740,6 +740,84 @@ extension ApprovalTests {
 }
 
 extension ApprovalTests {
+    @MainActor func testCrossAgentMetadataParentAndMissingClaudeStopRecovery() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-cross-status-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        104511 1 fixture451 104511 104511 Wed Oct 28 12:00:00 2026 /fixture/claude
+        104512 1 fixture452 104512 104512 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        var sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm) }
+        for index in sessions.indices { sessions[index].phase = .idle }
+        let parentID = UUID().uuidString.lowercased(), workerID = UUID().uuidString.lowercased(), codexID = UUID().uuidString.lowercased()
+        let home = "/fixture/home", terminal = GroupLineTerminal(), writer = GroupTerminalWriter()
+        var adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { target,_,_, input in writer.send(target, input) })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        writer.show("fixture\n❯ \n ? for shortcuts", on: sessions[0].tty)
+        writer.show("fixture\n› \n ? for shortcuts", on: sessions[1].tty)
+        let engine = try ApprovalEngine(paths: .init(directory: directory), claudeRegistryReader: { rows in
+            rows.filter { $0.agent == .claude }.map { .init(processID: $0.key, kind: "interactive", sessionID: workerID, status: terminal.status($0.pid)) }
+        }, processReader: { records }, screenAdapters: [.iterm: adapter],
+            codexGroupReader: { record in record.agent == .codex ? .init(threadID: codexID, database: home + "/thread_history_1.sqlite") : nil },
+            groupModelSettingsReader: { live in .init(model: live.session.agent == .codex ? "gpt-6.1-sol" : "claude-opus-5-5",
+                reasoningEffort: live.session.agent == .codex ? "xhigh" : "medium", source: "owned_fixture", recordedAt: Date(timeIntervalSince1970: 1794900000)) },
+            groupClaudeCompletionReader: { _, _, _ in .init(id: "owned-final-turn", summary: "Recovered fixture final response") }, isolateByDefault: true)
+        defer { engine.stop() }
+        engine.groupDeliveryInterval = 0.05; engine.groupMailboxPollInterval = 0.05
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        let observed = try await engine.sessionGroupSessions()
+        let parent = SessionGroupMember(agent: .codex, title: "metadata parent", cwd: "/project", conversationID: parentID, providerHome: home)
+        let worker = try unwrapGroup(observed.first { $0.id == sessions[0].id }).member
+        let codex = try unwrapGroup(observed.first { $0.id == sessions[1].id }).member
+        let disconnected = SessionGroupMember(agent: .codex, title: "offline", cwd: "/project", conversationID: UUID().uuidString, providerHome: home)
+        let group = SessionGroup(name: "cross-agent", members: [parent, worker, codex, disconnected], leaderMemberID: parent.id)
+        try SessionGroupStore(directory: directory).save([group])
+        func call(_ tool: String, extra: JSONObject = [:]) async throws -> JSONObject {
+            var args: JSONObject = ["owner": UUID().uuidString, "tool": tool, "agentKind": "codex", "conversationID": parentID,
+                "codexCallerConversationID": parentID, "codexCallerHome": home, "groupID": group.id.uuidString, "memberID": worker.id.uuidString]
+            args.merge(extra) { _, new in new }; return try await engine.mcpAction(args)
+        }
+        for tool in ["get_session_groups", "get_group_status"] {
+            let response = try await call(tool)
+            let rows = (response["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject] ?? []
+            let claude = rows.first { $0["id"] as? String == worker.id.uuidString }
+            try expectEqual(claude?["model"] as? String, "claude-opus-5-5")
+            try expectEqual(claude?["reasoningEffort"] as? String, "medium")
+            try expectEqual(claude?["modelSettingsSource"] as? String, "owned_fixture")
+            try expectNotNil(claude?["modelSettingsRecordedAt"] as? String)
+            try expectEqual(rows.first { $0["id"] as? String == codex.id.uuidString }?["reasoningEffort"] as? String, "xhigh")
+            for id in [parent.id, disconnected.id] { try expect(rows.first { $0["id"] as? String == id.uuidString }?["model"] is NSNull) }
+            if tool == "get_group_status" { try expectEqual(claude?["canAssign"] as? Bool, true) }
+        }
+        _ = try await call("assign_group_task", extra: ["task": "Inspect the owned fixture"])
+        try expectEqual(terminal.status(records[0].pid), "busy")
+        let box = try SessionGroupMailbox(directory: directory)
+        try await Task.sleep(for: .milliseconds(250))
+        try expectEqual(try box.pendingCount, 0, "Busy status cannot be mistaken for completion")
+        try expectEqual(try engine.sessionGroupAssignments().first?.status, .working)
+        // No Stop hook is sent. The verified idle conversation's final record recovers the report.
+        terminal.setStatus(records[0].pid, "idle")
+        _ = engine.handleHook(["hook_event_name": "StopFailure", "session_id": workerID, "requestID": UUID().uuidString,
+            "agentPID": records[0].pid, "agentStarted": records[0].started, "error": "fixture_failure"])
+        try await Task.sleep(for: .milliseconds(150))
+        try expectEqual(try box.pendingCount, 0, "An unresolved failure cannot become a success report")
+        _ = engine.handleHook(["hook_event_name": "UserPromptSubmit", "session_id": workerID, "requestID": UUID().uuidString,
+            "agentPID": records[0].pid, "agentStarted": records[0].started])
+        try expect(try await waitForGroup(5) { (try? box.pendingCount) == 1 })
+        let messages = try box.list(groupID: group.id, memberID: parent.id)
+        try expectEqual(messages.count, 1); try expect(messages[0].text.contains("Recovered fixture final response"))
+        _ = try await call("get_group_messages")
+        try expectEqual(try engine.sessionGroupAssignments().first?.status, .completed)
+        _ = try await call("ack_group_messages", extra: ["messageIDs": [messages[0].id.uuidString]])
+        try expectEqual(try engine.sessionGroupAssignments().first?.status, .reported)
+        _ = engine.handleHook(["hook_event_name": "Stop", "session_id": workerID, "requestID": UUID().uuidString,
+            "agentPID": records[0].pid, "agentStarted": records[0].started, "last_assistant_message": "Duplicate late Stop"])
+        try await Task.sleep(for: .milliseconds(150))
+        try expectEqual(try box.list(groupID: group.id, memberID: parent.id, includeAcknowledged: true).count, 1)
+        try expectEqual(try box.pendingCount, 0); try expect(engine.networkIsolated)
+    }
+
     @MainActor func testGroupDialogueAcrossAgentsAndHierarchy() async throws {
         let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("group-dialogue-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -823,7 +901,7 @@ extension ApprovalTests {
         _ = try await call("get_group_status", caller: 0)
         try expectEqual(try box.pendingCount, 12)
         try await rejects { try await call("ack_group_messages", caller: 1, extra: ["messageIDs": [first.id.uuidString]]) }
-        for tool in ["ask_group_question", "reply_group_question"] {
+        for tool in ["send_group_message", "ask_group_question", "reply_group_question"] {
             try await rejects { try await call(tool, caller: 3) }
             try await rejects { try await call(tool, target: 3) }
             try await rejects { try await call(tool, caller: 0) }
@@ -848,6 +926,15 @@ extension ApprovalTests {
         let inbox = try await call("get_group_messages", caller: 1)
         let received = (inbox["messages"] as? [JSONObject] ?? []).compactMap { ($0["messageID"] as? String).flatMap(UUID.init(uuidString:)) }
         try expectEqual(received.count, 2); try await acknowledge(received, caller: 1)
+        // General messages use the same durable cross-agent route, even with a leader.
+        for (sender, recipient) in [(0, 1), (1, 0), (2, 1), (1, 2)] {
+            let receipt = try await call("send_group_message", "cross-agent general \(sender)-\(recipient)", caller: sender, target: recipient)
+            try expectEqual(receipt["accepted"] as? Bool, true)
+            let messageID = try unwrapGroup((receipt["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+            let pulled = try await call("get_group_messages", caller: recipient)
+            try expect((pulled["messages"] as? [JSONObject] ?? []).contains { $0["messageID"] as? String == messageID.uuidString })
+            try await acknowledge([messageID], caller: recipient)
+        }
         // Drafts and choice screens defer notification while retaining the message.
         for screen in ["fixture\n› unfinished draft\n ? for shortcuts", "Which option?\n› 1. First\n  2. Second\nPress enter to confirm"] {
             writer.show(screen, on: sessions[0].tty)
@@ -938,8 +1025,9 @@ extension ApprovalTests {
             try expectEqual(try box.pendingCount, 3)
             try engine.setPaused(false)
             group.leaderMemberID = members[0].id; try store.save([group])
-            do { _ = try await send("must use assign"); throw AppError.message("Tree authorization was bypassed") } catch is RemoteHTTPError { }
-            try expectEqual(try box.pendingCount, 3)
+            _ = try await send("그룹장 일반 메시지")
+            try expectEqual(try box.pendingCount, 4)
+            try expect(try engine.sessionGroupAssignments().isEmpty, "General dialogue never acquires task authority")
             try expect(engine.networkIsolated); try expect(!engine.webStatus.ready)
         }
     }

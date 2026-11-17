@@ -173,6 +173,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private let codexGroupReader: @Sendable (ProcessRecord) throws -> CodexThreadLocation?
     private let codexGroupEnvironment: @Sendable (ProcessRecord) -> [String: String]?
+    private let groupModelSettingsReader: @Sendable (SessionGroupLiveSession) -> SessionGroupModelSettings?
+    private let groupClaudeCompletionReader: @Sendable (SessionGroupLiveSession, Date, String) -> WorkCompletion?
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
     private let discoveryReader: @Sendable () throws -> [ProcessRecord]
     private var workingDirectoriesBySession: [String: String] = [:]
@@ -584,6 +586,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 codexQueue: CodexQueueTransport = .live, mouseActivityControl: MouseActivityControl = .live,
                 codexGroupReader: (@Sendable (ProcessRecord) throws -> CodexThreadLocation?)? = nil,
                 codexGroupEnvironment: (@Sendable (ProcessRecord) -> [String: String]?)? = nil,
+                groupModelSettingsReader: (@Sendable (SessionGroupLiveSession) -> SessionGroupModelSettings?)? = nil,
+                groupClaudeCompletionReader: (@Sendable (SessionGroupLiveSession, Date, String) -> WorkCompletion?)? = nil,
                 webLoopbackOnly: Bool = false, isolateByDefault: Bool = false, singleProcessReader: (@Sendable (Int32) throws -> [ProcessRecord])? = nil,cloudflareServices:CloudflareServices = .live,
                 workersServices:CloudflareWorkersServices = .live,relayServices:CloudflareRelayServices = .live,nativeKeyboardActivity:NativeKeyboardActivity? = nil,publishedUpdateServices:PublishedUpdateServices = .live,
                 terminalProfileLayoutReader:(@Sendable ([String]) throws -> [TerminalProfileTabSnapshot])? = nil,
@@ -643,6 +647,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try CodexThreadLocation.locateLive(record)
         }
         self.codexGroupEnvironment = codexGroupEnvironment ?? { ProcessEnvironment.read($0) }
+        let modelReader = SessionGroupModelSettingsReader()
+        self.groupModelSettingsReader = groupModelSettingsReader ?? { modelReader.read($0) }
+        self.groupClaudeCompletionReader = groupClaudeCompletionReader ?? { modelReader.completion($0, after: $1, task: $2) }
         // Native window checks need one original process, not a system-wide
         // snapshot. Keep injected readers authoritative and every check fresh.
         if let singleProcessReader { self.singleProcessReader = singleProcessReader }
@@ -2666,10 +2673,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func canReconnectGroupMember(_ member: SessionGroupMember, group: SessionGroup, caller: SessionGroupLiveSession,
                                          callerMember: SessionGroupMember, observed: [SessionGroupLiveSession]) -> Bool {
-        guard caller.session.pid != 0 || member.agent == .codex,
-              SessionGroupMatching.connection(member, in: observed) != nil else { return false }
+        guard SessionGroupMatching.connection(member, in: observed) != nil else { return false }
         return member.id == callerMember.id || group.parentID(of: member.id) == callerMember.id ||
-            (group.leaderMemberID == nil && member.agent == caller.session.agent)
+            group.leaderMemberID == nil
     }
 
     private func reconnectGroupMember(_ object: JSONObject, groupID: UUID, memberID: UUID) async throws -> JSONObject {
@@ -2716,9 +2722,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
               UUID(uuidString: sender.conversationID) != nil, caller.conversationID.flatMap(UUID.init(uuidString:)) != nil,
               let recipient = group.members.first(where: { $0.id == memberID }), recipient.id != sender.id else {
             throw RemoteHTTPError(403, "확인된 현재 세션에서 같은 그룹의 다른 구성원에게만 보낼 수 있습니다.")
-        }
-        if kind == .message, group.leaderMemberID != nil || recipient.agent != sender.agent {
-            throw RemoteHTTPError(409, "일반 메시지는 그룹장이 없는 그룹의 같은 도구 구성원에게만 보낼 수 있습니다. 질문·답변에는 ask_group_question과 reply_group_question을 사용하세요.")
         }
         // Accept while the recipient is busy/disconnected. COMMIT precedes this success response.
         let message = try groupMailbox().enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: line)
@@ -3187,6 +3190,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func deliverGroupReports() async -> Bool {
         guard (try? groupOrchestration())?.needsWatching == true else { return false }
         guard !remoteInputStopped else { return true }
+        await recoverClaudeGroupCompletions()
         await watchGroupQuestions()
         guard let state = try? groupOrchestration() else { return false }
         let pending = state.undelivered.map({ ($0, false) }) + state.undeliveredQuestions.map({ ($0, true) })
@@ -3215,6 +3219,33 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         return (try? groupOrchestration())?.needsWatching ?? false
+    }
+
+    /// A missing Stop hook must not strand a delivered task forever. Only an
+    /// idle, verified conversation's explicit final turn after this assignment
+    /// can recover its report; an idle process alone is never completion proof.
+    private func recoverClaudeGroupCompletions() async {
+        guard let state = try? groupOrchestration() else { return }
+        let working = state.assignments.filter {
+            $0.status == .working && $0.isDelivered && sessions[$0.workerSessionID]?.agent == .claude
+        }
+        guard !working.isEmpty, let observed = try? await sessionGroupSessions(),
+              let groups = try? SessionGroupStore(directory: paths.directory).load() else { return }
+        let statuses = await claudeStatuses(observed.filter { live in working.contains { $0.workerSessionID == live.id } }.map(\.session))
+        let reader = groupClaudeCompletionReader
+        for item in working {
+            guard !remoteInputStopped, !Task.isCancelled,
+                  let member = groups.first(where: { $0.id == item.groupID })?.members.first(where: { $0.id == item.workerMemberID }),
+                  let live = SessionGroupMatching.match(member, in: observed), live.id == item.workerSessionID,
+                  statuses[live.id] == "idle", let current = sessions[live.id], !current.pendingInTerminal, current.backgroundMonitoring != true,
+                  current.interruption?.needsAttention != true,
+                  ![.approval, .input, .ended].contains(current.phase),
+                  let completion = await Task.detached(priority: .utility, operation: { reader(live, item.sentAt, item.task) }).value,
+                  completion.date >= item.sentAt, completion.date <= Date().addingTimeInterval(5),
+                  let latest = try? groupOrchestration().current(groupID: item.groupID, workerMemberID: item.workerMemberID),
+                  latest.id == item.id, latest.status == .working else { continue }
+            noteGroupCompletion(item.workerSessionID, completion)
+        }
     }
 
     private func applyGroupMessageAcknowledgements(_ ids: [UUID]) throws {
@@ -3246,9 +3277,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard let target = group.members.first(where: { $0.id == memberID }), group.parentID(of: memberID) == callerMember.id else {
             throw RemoteHTTPError(403, "직속 하위 구성원에게만 지시하거나 답할 수 있습니다. get_group_status의 canAssign을 확인해주세요.")
-        }
-        if caller.session.pid == 0, target.agent != .codex {
-            throw RemoteHTTPError(409, "이 Codex 호출에서는 Codex 구성원에게만 작업을 지시할 수 있습니다.")
         }
         guard let worker = SessionGroupMatching.match(target, in: observed), let current = sessions[worker.id] else {
             throw RemoteHTTPError(409, "작업자 세션의 연결을 확인하지 못했습니다. get_session_groups의 canReconnect를 확인하고 reconnect_group_member로 재연결해주세요.")
@@ -3385,6 +3413,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 "deliveryError": assignment.deliveryError as Any? ?? NSNull()] as JSONObject
     }
 
+    private func groupModelSettings(_ groups: [SessionGroup], observed: [SessionGroupLiveSession]) async -> [String: SessionGroupModelSettings] {
+        let targets = groups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed) }
+        let reader = groupModelSettingsReader
+        return await Task.detached(priority: .utility) {
+            var result: [String: SessionGroupModelSettings] = [:]
+            for live in targets where result[live.id] == nil {
+                guard live.conversationID.flatMap(UUID.init(uuidString:)) != nil else { continue }
+                result[live.id] = reader(live)
+            }
+            return result
+        }.value
+    }
+
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
         guard let owner = object["owner"] as? String, UUID(uuidString: owner) != nil,
               let tool = object["tool"] as? String else { throw RemoteHTTPError(400, "MCP 연결 정보가 필요합니다.") }
@@ -3439,6 +3480,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed, recovery: true)
             let groups = try SessionGroupStore(directory: paths.directory).load()
             let matching = groups.filter { group in group.members.contains { groupRecoveryCaller($0, caller: caller, observed: observed) } }
+            let modelSettings = await groupModelSettings(matching, observed: observed)
             let output: [JSONObject] = matching.map { group in
                 let callerMember = group.members.first { groupRecoveryCaller($0, caller: caller, observed: observed) }!
                 let members: [JSONObject] = group.members.map { member in
@@ -3450,6 +3492,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? groupStatusBlockReason($0.session)?.message : nil } as Any? ?? NSNull(),
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
+                            "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
+                            "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
+                            "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
+                            "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
                             "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
                             "canAskQuestion": member.id != callerMember.id && live?.conversationID.flatMap(UUID.init(uuidString:)) != nil && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, caller: caller, observed: observed),
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
@@ -3461,12 +3507,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "transport": "local_terminal", "networkRequired": false,
-                    "message": "그룹 통신은 같은 Mac의 Unix 소켓과 원래 터미널만 사용합니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 재연결하세요. 자유 형식 질문·답변은 ask_group_question과 reply_group_question으로 Codex↔Claude를 포함한 같은 그룹 구성원에게 전달하세요. 그룹장이 있는 그룹은 get_group_status, assign_group_task, answer_group_question을 사용하고, 없는 그룹은 send_group_message로 같은 도구의 구성원에게 전달하세요. 외부 서버나 각 도구의 별도 메시지 경로로 우회하지 마세요."]
+                    "message": "그룹 통신은 같은 Mac의 Unix 소켓과 원래 터미널만 사용합니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 재연결하세요. 자유 형식 질문·답변은 ask_group_question과 reply_group_question으로 Codex↔Claude를 포함한 같은 그룹 구성원에게 전달하세요. 그룹 상태는 get_group_status, 직속 작업·승인 지시는 assign_group_task·answer_group_question을 사용하세요. 일반 대화는 send_group_message로 Codex↔Claude를 포함한 같은 그룹 구성원에게 전달하세요. 외부 서버나 각 도구의 별도 메시지 경로로 우회하지 마세요."]
         case "get_group_status":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
             let groups = try SessionGroupStore(directory: paths.directory).load()
             let state = try groupOrchestration()
+            let visibleGroups = groups.filter { $0.members.contains { groupMemberIsCaller($0, caller: caller, observed: observed) } }
+            let modelSettings = await groupModelSettings(visibleGroups, observed: observed)
             let memberStatuses = await claudeStatuses(observed.map(\.session))
             let output: [JSONObject] = groups.compactMap { group in
                 guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { return nil }
@@ -3475,13 +3523,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let phase = live.flatMap { sessions[$0.id]?.phase }
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "cwd": member.cwd,
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
+                            "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
+                            "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
+                            "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
+                            "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
                             "depth": entry.depth, "isLeader": group.leaderMemberID == member.id, "isCaller": member.id == callerMember.id,
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull(),
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "canAskQuestion": member.id != callerMember.id && live?.conversationID.flatMap(UUID.init(uuidString:)) != nil && UUID(uuidString: callerMember.conversationID) != nil,
-                            "canAssign": group.parentID(of: member.id) == callerMember.id && (caller.session.pid != 0 || member.agent == .codex),
+                            "canAssign": group.parentID(of: member.id) == callerMember.id,
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
                 }
                 // Reading is not an ACK. A lost tool response must leave the report pending.
@@ -3496,7 +3548,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         }]
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "자유 형식 질문·답변은 ask_group_question과 reply_group_question을 사용하세요. 그룹장·동료와 Codex↔Claude 모두 지원합니다. canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업 완료 보고는 로컬 수신함에 저장됩니다. mailbox.inbox 또는 get_group_messages로 읽고 ack_group_messages로 수신 확인하세요."]
+                    "message": "자유 형식 질문·답변은 ask_group_question과 reply_group_question을 사용하세요. 그룹장·동료와 Codex↔Claude 모두 지원합니다. 일반 대화는 send_group_message도 사용할 수 있으며 작업·승인 권한을 부여하지 않습니다. canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업 완료 보고는 로컬 수신함에 저장됩니다. mailbox.inbox 또는 get_group_messages로 읽고 ack_group_messages로 수신 확인하세요."]
         case "assign_group_task":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
