@@ -31,10 +31,12 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     public var providerHome: String?
     public var host: Host
     public var terminalTab:TerminalProfileTabLayout?
+    public var executionSettings: TerminalProfileExecutionSettings?
     public init(id: UUID = UUID(), title: String, agent: String, cwd: String, conversationID: String,
-                providerHome: String? = nil, host: Host = .terminal,terminalTab:TerminalProfileTabLayout?=nil) {
+                providerHome: String? = nil, host: Host = .terminal,terminalTab:TerminalProfileTabLayout?=nil, executionSettings: TerminalProfileExecutionSettings? = nil) {
         self.id=id; self.title=title; self.agent=agent; self.cwd=cwd; self.conversationID=conversationID
         self.providerHome=providerHome; self.host=host;self.terminalTab=terminalTab
+        self.executionSettings = executionSettings
     }
     public var resumesConversation:Bool {!conversationID.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
     public var key: String {
@@ -52,7 +54,10 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         guard providerHome.map(Self.path) ?? true else {throw AppError.message("CLI 설정 폴더의 전체 경로를 확인해주세요.")}
         guard conversation.isEmpty || UUID(uuidString:conversation) != nil else {throw AppError.message("대화 ID를 입력할 때는 UUID 형식을 사용해주세요. 비워 두면 새 CLI를 엽니다.")}
         guard title.count<=256,!title.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains) else {throw AppError.message("프로필 항목 이름은 줄바꿈 없이 256자까지 입력해주세요.")}
-        var copy=self;copy.conversationID=UUID(uuidString:conversation)?.uuidString.lowercased() ?? "";copy.terminalTab=try terminalTab?.validated();return copy
+        var copy=self;copy.conversationID=UUID(uuidString:conversation)?.uuidString.lowercased() ?? "";copy.terminalTab=try terminalTab?.validated()
+        copy.executionSettings = try executionSettings?.validated(agent: agent)
+        if copy.executionSettings?.isEmpty == true { copy.executionSettings = nil }
+        return copy
     }
     private static func path(_ value: String) -> Bool {
         value.hasPrefix("/") && value.utf8.count <= 4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
@@ -84,6 +89,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
             arguments += standalone ? ["-c","features.daemon_auto_start=false"]:["--remote","unix://"]
         }
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
+        arguments += try entry.executionSettings?.arguments(agent: entry.agent) ?? []
         // Keep the tab's interactive shell for both agents. A CLI that replaces its shell leaves a tab that cannot
         // run anything after the CLI exits, so the session could never be restarted in the same tab.
         return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+arguments.map(HookInstaller.quote).joined(separator:" ")
@@ -91,7 +97,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
 }
 
 public struct TerminalSessionProfile: Codable, Equatable, Identifiable, Sendable {
-    public var schema: Int = 3
+    public var schema: Int = 4
     public var id: UUID
     public var name: String
     public var savedAt: Date
@@ -115,7 +121,8 @@ public struct TerminalSessionProfile: Codable, Equatable, Identifiable, Sendable
     }
     public func validated() throws -> Self {
         var result=self; result.name=name.trimmingCharacters(in:.whitespacesAndNewlines).precomposedStringWithCanonicalMapping
-        guard (1...3).contains(schema),schema >= 2 || entries.allSatisfy({$0.terminalTab==nil}),schema == 3 || groups == nil else {throw AppError.message("이 프로필 파일 형식은 지원하지 않습니다. AutoApprove 버전을 확인해주세요.")}
+        guard (1...4).contains(schema),schema >= 2 || entries.allSatisfy({$0.terminalTab==nil}),schema >= 3 || groups == nil,
+              schema >= 4 || entries.allSatisfy({ $0.executionSettings == nil }) else {throw AppError.message("이 프로필 파일 형식은 지원하지 않습니다. AutoApprove 버전을 확인해주세요.")}
         guard !result.name.isEmpty, result.name.count <= 80, !result.name.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains),
               savedAt.timeIntervalSince1970.isFinite, (1...128).contains(entries.count) else {
             throw AppError.message("프로필 이름은 1~80자, 세션은 1~128개로 저장해주세요.")

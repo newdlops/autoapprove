@@ -116,6 +116,13 @@ private actor LaunchLog {
         controller.selectedID=profile.id;controller.selectedID=other.id;await controller.waitForRepositories()
         try check(controller.repositoryChoices==[plain],"Late repo results cannot replace a newer profile")
         try check(try TerminalProfileStore.read(store.file(profile.id))==before,"Filter/sort/restore do not rewrite saved profile content")
+        var configured = other
+        configured.entries[0].executionSettings = .init(model:"gpt-6.1-sol",reasoningEffort:"xhigh",serviceTier:"ultrafast")
+        controller.edit(configured); try await controller.save(configured)
+        let savedSettings = try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(configured.id)))
+        try check(savedSettings.schema == 4 && savedSettings.entries[0].executionSettings == configured.entries[0].executionSettings,"Production editor save preserves schema 4 execution settings")
+        await controller.waitForRepositories(); await controller.restoreSelection()
+        try check(await log.opened.contains { $0.id == configured.entries[0].id && $0.executionSettings == configured.entries[0].executionSettings },"Controller restore forwards model, reasoning and speed to the launcher")
         print("PASS \(checks) profile selection checks; production controller/restorer, exact repo roots, hidden-row exclusion, draft-free filter state, no real Terminal launch")
     }
 }

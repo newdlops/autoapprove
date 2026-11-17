@@ -15,6 +15,7 @@ import AutoApproveCore
             if i==0 {entry.providerHome="/fixture/CLI 설정을 따로 보관하는 긴 폴더 이름/.codex"}
             entry.terminalTab = .init(window:UUID(uuidString:String(format:"10000000-0000-4000-8000-%012d",i/8+1))!,windowOrder:i/8,tabOrder:i%8,selected:i%8==0,settingsName:i==0 ? "사용자 지정 긴 Terminal 설정 프로필 이름":"Pro")
             entries.append(entry)
+            entries[entries.count-1].executionSettings = i == 1 ? nil : .init(model:i%2==0 ? "gpt-6.1-sol":"claude-opus-5-5",reasoningEffort:i%2==0 ? "xhigh":"max",serviceTier:i%2==0 ? (i%4==0 ? "ultrafast":"priority"):nil)
         }
         let profile=try store.save(.init(name:"여러 창 작업 프로필 · 재부팅 뒤 이어가기",entries:entries))
         let controller=SessionProfilesController(store:store,capture:{[]},launch:{_,_ in "/dev/fixture-render"})
@@ -46,7 +47,7 @@ import AutoApproveCore
         controller.entryFilter = .init();controller.selectedEntries=[]
         try await render(SessionProfilesWindow(controller:controller),name:"none-selected-light",width:860,height:640,scheme:.light,root:root)
         controller.selectVisible(true)
-        var legacy=TerminalSessionProfile(name:"기존 작업 프로필 · 창 정보가 없는 이전 프로필",entries:Array(entries.prefix(2)).map {value in var entry=value;entry.terminalTab=nil;return entry})
+        var legacy=TerminalSessionProfile(name:"기존 작업 프로필 · 창 정보가 없는 이전 프로필",entries:Array(entries.prefix(2)).map {value in var entry=value;entry.terminalTab=nil;entry.executionSettings=nil;return entry})
         legacy.schema=1;_ = try store.save(legacy);await controller.reload();controller.selectedID=legacy.id;await controller.waitForRepositories()
         try await render(SessionProfilesWindow(controller:controller),name:"legacy-light",width:700,height:480,scheme:.light,root:root)
         controller.selectedID=profile.id;await controller.waitForRepositories()

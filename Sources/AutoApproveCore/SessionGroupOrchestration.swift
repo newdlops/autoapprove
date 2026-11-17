@@ -100,6 +100,11 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     public mutating func cancel(_ id: UUID) {
         assignments.removeAll { $0.id == id }
     }
+    public mutating func supersede(groupID: UUID, workerMemberID: UUID) {
+        for index in assignments.indices where assignments[index].groupID == groupID && assignments[index].workerMemberID == workerMemberID && assignments[index].status == .working {
+            assignments[index].status = .superseded
+        }
+    }
 
     public mutating func markDelivered(_ id: UUID) {
         for index in assignments.indices where assignments[index].id == id { assignments[index].pendingDelivery = nil }

@@ -70,7 +70,7 @@ extension ApprovalTests {
         let store=TerminalProfileStore(directory:directory),entry=profileEntry(),valid=try store.save(.init(name:"기존",entries:[entry]))
         let original=try TerminalProfileStore.read(store.file(valid.id))
         for bad in ["",String(repeating:"가",count:81),"잘못된\n이름"] {var value=valid;value.name=bad;try expectThrows(try store.save(value))}
-        var future=valid;future.schema=4;try expectThrows(try store.save(future))
+        var future=valid;future.schema=5;try expectThrows(try store.save(future))
         var duplicate=valid;duplicate.entries += [entry];try expectThrows(try store.save(duplicate))
         var unknown=entry;unknown.agent="shell";try expectThrows(try unknown.resumeCommand())
         unknown=entry;unknown.conversationID="--last";try expectThrows(try unknown.resumeCommand())
@@ -393,7 +393,8 @@ extension ApprovalTests {
         let choices=[CodexQueueConversation(id:first,title:"첫 대화",name:"첫 대화"),.init(id:second,title:"둘째 대화",name:"둘째 대화")]
         let transport=CodexReplyTransport(prepare:{_,_ in throw AppError.message("unused")},send:{_,_ in throw AppError.message("never send")},queueHome:{_ in .init(executable:"",home:"/tmp/profile-home",threadID:"")})
         let queue=CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in choices})
-        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,processReader:{records},codexQueue:queue,terminalProfileLayoutReader:{ttys in
+        let engine=try ApprovalEngine(paths:AppPaths(directory:directory),questionTransport:transport,processReader:{records},codexQueue:queue,
+            profileExecutionSettingsReader: { _ in .init(model:"gpt-6.1-sol",reasoningEffort:"xhigh",serviceTier:"ultrafast") },terminalProfileLayoutReader:{ttys in
             ttys.enumerated().map {index,tty in .init(tty:tty,windowID:77,windowOrder:0,tabOrder:index,customTitle:titles[records.firstIndex {$0.tty==String(tty.dropFirst(5))}!])}
         })
         defer {engine.stop()};engine.updateDiscovery(sessions,records:records)
@@ -401,6 +402,8 @@ extension ApprovalTests {
         try expectEqual(captured.first {$0.id==records[0].key}?.entry.conversationID,first)
         try expectEqual(captured.first {$0.id==records[1].key}?.entry.conversationID,second)
         try expectEqual(captured.first {$0.id==records[2].key}?.entry.conversationID,"")
+        try expectEqual(captured.first {$0.id==records[0].key}?.entry.executionSettings?.serviceTier,"ultrafast")
+        try expectNil(captured.first {$0.id==records[2].key}?.entry.executionSettings)
         try expect(captured.filter {!$0.entry.conversationID.isEmpty}.allSatisfy {$0.detail==nil})
         let store=TerminalProfileStore(directory:directory.appendingPathComponent("saved")),profile=try store.save(.init(name:"대화까지 저장",entries:captured.map(\.entry)))
         let restored=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(profile.id))),log=FreshProfileLaunchRecorder()
@@ -450,7 +453,7 @@ extension ApprovalTests {
         defer {engine.stop()};engine.updateDiscovery(sessions,records:records)
         let captured=try await engine.terminalProfileCandidates()
         try expectEqual(Set(captured.map(\.entry.conversationID)),Set(ids),"Fresh native tab titles resolve conversations while the polling snapshot still has startup titles")
-        try expect(captured.allSatisfy {$0.detail==nil})
+        try expect(captured.allSatisfy {$0.detail?.contains("일부 실행 설정") == true},"Verified conversation identity remains usable even when execution settings are unavailable")
         let store=TerminalProfileStore(directory:directory.appendingPathComponent("saved"))
         let saved=try store.save(try TerminalSessionProfile(name:"업무",entries:captured.map(\.entry)).validatedForSaving(newCLIIDs:[]))
         let profile=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(saved.id)))

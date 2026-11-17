@@ -13,7 +13,8 @@ import Foundation
         let terminal:ManagedPTY
         if profileStandalone {
             let runtime=try CodexBundledRuntime.inspect(root:URL(fileURLWithPath:executable).deletingLastPathComponent().deletingLastPathComponent().path)
-            let entry=TerminalProfileEntry(title:"Owned official new profile",agent:"codex",cwd:root,conversationID:"",providerHome:home)
+            let entry=TerminalProfileEntry(title:"Owned official new profile",agent:"codex",cwd:root,conversationID:"",providerHome:home,
+                executionSettings:.init(model:"gpt-6.1-sol",reasoningEffort:"xhigh",serviceTier:"ultrafast"))
             let services=CodexManagedServerServices(inspect:{_,_ in throw AppError.message(CodexFeatureSupport.legacyRuntimeUnavailable)},prepare:{_,_ in throw AppError.message("Must not prepare legacy daemon")})
             let choice=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:services,installed:{_ in nil})
             guard choice.standalone else {throw AppError.message("New profile did not select standalone")}
@@ -43,7 +44,7 @@ import Foundation
                     try await Task.sleep(for:.seconds(2))
                     guard terminal.descriptor.exitCode==nil else {throw AppError.message("New official profile exited during startup")}
                 }
-                let report:[String:Bool]=["verified":true,"officialSignatureChecked":true,"signedOutReadOnlyStatus":true,"actualPTYNativeExecutable":true,"selectedHomePreserved":true,"forkEnvironmentRemoved":true,"newProfileStandalone":profileStandalone]
+                let report:[String:Bool]=["verified":true,"officialSignatureChecked":true,"signedOutReadOnlyStatus":true,"actualPTYNativeExecutable":true,"selectedHomePreserved":true,"forkEnvironmentRemoved":true,"newProfileStandalone":profileStandalone,"profileExecutionOverridesAccepted":profileStandalone]
                 print(String(decoding:try JSONSerialization.data(withJSONObject:report,options:[.sortedKeys]),as:UTF8.self))
                 return
             }

@@ -192,7 +192,7 @@ struct SessionProfileEntryFilter:Equatable {
         busy=true;defer {busy=false};let store=store
         var value=profile
         if let draft,draft.profileID==profile.id {value.groups=TerminalProfileGroup.selecting(draft.groups,entries:profile.entries)}
-        value.schema=3
+        value.schema=4
         let saved=value
         _ = try await Task.detached(priority:.utility) {try store.save(saved)}.value
         let conversations=profile.entries.filter(\.resumesConversation).count

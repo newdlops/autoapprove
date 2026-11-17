@@ -116,6 +116,8 @@ struct SessionProfilesWindow: View {
                     Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal")+" · "+SessionProfileEntryFilter.windowPosition(entry))
                         .font(.caption).foregroundStyle(.secondary)
                     Text(entry.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(entry.cwd)
+                    Text(entry.executionSettings.map { "실행 설정: " + $0.summary } ?? "실행 설정: CLI 설정 유지")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true).textSelection(.enabled)
                     Label {
                         Text(entry.resumesConversation ? "저장한 대화 이어가기":"새 CLI 실행 · 이전 대화는 복원하지 않음")
                             .foregroundStyle(entry.resumesConversation ? Color.secondary:Color.primary)
@@ -218,6 +220,14 @@ struct SessionProfileEditor:View {
     @State private var saving=false
     @State private var error:String?
     @FocusState private var nameFocused:Bool
+    private func setting(_ entry: Binding<TerminalProfileEntry>, _ key: WritableKeyPath<TerminalProfileExecutionSettings, String?>) -> Binding<String> {
+        Binding(get: { entry.wrappedValue.executionSettings?[keyPath:key] ?? "" }, set: { text in
+            var value = entry.wrappedValue.executionSettings ?? .init()
+            let text = text.trimmingCharacters(in:.whitespacesAndNewlines)
+            value[keyPath:key] = text.isEmpty ? nil : text
+            entry.wrappedValue.executionSettings = value.isEmpty ? nil : value
+        })
+    }
     init(draft:SessionProfileDraft,save:@escaping (TerminalSessionProfile) async throws -> Void,cancel:@escaping ()->Void) {
         self.draft=draft;self.save=save;self.cancel=cancel
         _name=State(initialValue:draft.name)
@@ -263,6 +273,25 @@ struct SessionProfileEditor:View {
                                 TextField("작업 폴더",text:$row.entry.cwd).textFieldStyle(.roundedBorder)
                                     .accessibilityLabel("\(row.entry.title) 작업 폴더").help("이 대화를 다시 열 작업 폴더의 전체 경로")
                                 if let home=row.entry.providerHome {Text("CLI 설정 폴더: "+home).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)}
+                                TextField("모델 · 비워 두면 CLI 설정 유지",text:setting($row.entry, \.model)).textFieldStyle(.roundedBorder)
+                                    .accessibilityLabel("\(row.entry.title) 복원 모델")
+                                HStack {
+                                    Picker("추론 수준",selection:setting($row.entry, \.reasoningEffort)) {
+                                        Text("CLI 설정 유지").tag("")
+                                        ForEach(row.entry.agent == "codex" ? ["none","minimal","low","medium","high","xhigh","max","ultra"] : ["low","medium","high","xhigh","max"],id:\.self) { Text($0).tag($0) }
+                                    }
+                                    if row.entry.agent == "codex" {
+                                        Picker("처리 속도",selection:setting($row.entry, \.serviceTier)) {
+                                            Text("CLI 설정 유지").tag("")
+                                            Text("Standard").tag("default")
+                                            Text("Fast").tag("priority")
+                                            Text("Ultrafast").tag("ultrafast")
+                                            Text("Flex").tag("flex")
+                                        }
+                                    }
+                                }
+                                Text("확인한 실행 설정을 저장합니다. 비어 있는 항목은 CLI 설정을 유지합니다. 처리 속도는 모델·계정의 지원 범위에 따라 적용됩니다.")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                                 Picker("복원 방식",selection:$row.startsNewCLI) {
                                     Text("대화 이어가기").tag(false)
                                     Text("새 CLI 실행").tag(true)

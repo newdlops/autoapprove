@@ -34,7 +34,7 @@ private actor FixtureLaunches {
             try FileManager.default.createDirectory(at:cwd,withIntermediateDirectories:true)
             let current=number>=300,group=current ? (number==400 ? 21:20):(number>=200 ? 10+(number-200)/6:10+(number-100)/2)
             let order=current ? (number==400 ? 0:number%100):(number>=200 ? (number-200)%6:(number-100)%2)
-            return .init(title:title,agent:agent,cwd:cwd.path,conversationID:id(number),terminalTab:.init(window:UUID(uuidString:id(group))!,windowOrder:current ? (group==21 ? 1:0):group-10,tabOrder:order,selected:order==0,settingsName:"Pro"))
+            return .init(title:title,agent:agent,cwd:cwd.path,conversationID:id(number),terminalTab:.init(window:UUID(uuidString:id(group))!,windowOrder:current ? (group==21 ? 1:0):group-10,tabOrder:order,selected:order==0,settingsName:"Pro"),executionSettings:.init(model:agent == "codex" ? "gpt-6.1-sol":"claude-opus-5-5",reasoningEffort:agent == "codex" ? "xhigh":"max",serviceTier:agent == "codex" ? "ultrafast":nil))
         }
         do {
             if try store.list().profiles.isEmpty {

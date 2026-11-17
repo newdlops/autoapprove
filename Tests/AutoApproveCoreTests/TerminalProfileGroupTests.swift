@@ -14,7 +14,7 @@ extension ApprovalTests {
         let groups=TerminalProfileGroup.capture([group],candidates:candidates)
         let profile=TerminalSessionProfile(name:"Groups",entries:entries,groups:groups)
         let decoded=try TerminalProfileStore.decode(TerminalProfileStore.encode(profile))
-        try expectEqual(decoded.schema,3);try expectEqual(decoded.groups,groups)
+        try expectEqual(decoded.schema,4);try expectEqual(decoded.groups,groups)
         try expectEqual(decoded.groups?.first?.group.leaderMemberID,leader.id)
         try expectEqual(decoded.groups?.first?.group.members.last?.parentMemberID,worker.id)
         try expect(decoded.groups!.allSatisfy {$0.group.members.allSatisfy {$0.runtimeID==nil}})
