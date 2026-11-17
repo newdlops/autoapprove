@@ -392,6 +392,34 @@ extension ApprovalTests {
         try expectEqual(PromptDetector.detect(reportedCodexPermissionFixture, agent: .codex)?.answer, "1", "Reported Codex-only Terminal screenshot")
         let long = permissionFixture.replacingOccurrences(of: "  $ echo 한글", with: "  $ python <<'PY'\n" + String(repeating: "    print('한글')\n", count: 70) + "PY")
         try expectNotNil(PromptDetector.detect(long, agent: .codex))
+        for rows in [299, 300, 301, 1200] {
+            let large = permissionFixture.replacingOccurrences(of: "  $ echo 한글", with: "  $ python <<'PY'\n" + String(repeating: "    print('한글')\n", count: rows) + "PY")
+            for frame in [large, NSAppleEventDescriptor(string: large).stringValue!] {
+                let detected = PromptDetector.detect(frame, agent: .codex)
+                try expectEqual(detected?.answer, "1", "A complete active permission with \(rows) body rows must remain detectable")
+                try expectEqual(detected?.dialog, large, "The expanded search must retain all command bytes for final validation")
+            }
+            for incomplete in [
+                large.components(separatedBy: "\n").dropFirst().joined(separator: "\n"),
+                large.replacingOccurrences(of: "Enter to confirm or esc to cancel", with: ""),
+                large + "\n› New instruction",
+                "```text\n" + large,
+                large.replacingOccurrences(of: "› 1.", with: "  1.").replacingOccurrences(of: "  2. No", with: "› 2. No")
+            ] {
+                try expect(PromptDetector.detect(incomplete, agent: .codex) == nil, "Length must never supply missing authorization evidence")
+                try expectNil(PromptDetector.detect(NSAppleEventDescriptor(string: incomplete).stringValue!, agent: .codex))
+            }
+        }
+        let edits = "Would you like to make the following edits?\n\nDescription: Apply proposed file edits\n" + String(repeating: "Destination: /fixture/long/path/file.swift\n", count: 1200) + "\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for these files (a)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
+        try expectEqual(PromptDetector.detect(edits, agent: .codex)?.answer, "1")
+        let context = JSContext()!
+        context.setObject(edits, forKeyedSubscript: "current" as NSString)
+        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/large',contents:()=>current,processes:()=>['codex']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+        let script = try TerminalAdapter.approvalScript(tty: "/dev/large", expectedScreen: edits, agent: .codex)
+        try expectEqual(context.evaluateScript(script)?.toString(), "sent")
+        context.setObject(edits.replacingOccurrences(of: "file.swift", with: "other.swift"), forKeyedSubscript: "current" as NSString)
+        try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged")
+        try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1, "A long request cannot authorize different files")
         try expectEqual(PromptDetector.detect(permissionFixture, agent: .codex)?.dialog, PromptDetector.detect(permissionFixture.decomposedStringWithCanonicalMapping, agent: .codex)?.dialog)
         try expectNil(PromptDetector.detect(permissionFixture.replacingOccurrences(of: "Enter to confirm or esc to cancel", with: ""), agent: .codex))
         let a = PromptDetector.detect(claudePermissionFixture, agent: .claude)!

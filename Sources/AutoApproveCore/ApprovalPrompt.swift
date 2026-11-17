@@ -31,9 +31,8 @@ public enum PromptDetector {
 
     static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines) -> ApprovalPrompt? {
         guard agent != .shell else { return nil }
-        // A permission heading is only accepted within the final 300 rows.
-        // Codex validates only the dialog after its heading. Earlier rows are
-        // needed for code-fence parity, not for its command or request identity.
+        // Ordinary frames inspect only a bounded tail. A complete current Codex
+        // menu may need its heading above that tail when the request is long.
         let rawLines: [String], lines: [String]
         if agent == .codex, let native = prepared.nativeCodexDialog() {
             switch native {
@@ -50,7 +49,7 @@ public enum PromptDetector {
         guard let heading = permissionHeading(lines, agent: agent) else { return nil }
         let promptIndex = heading.index
         // A long command can push its title beyond the old 32-line window.
-        guard lines.count - promptIndex <= 300 else { return nil }
+        guard agent == .codex || lines.count - promptIndex <= 300 else { return nil }
         let dialog = Array(lines[promptIndex...]), indents = rawLines[promptIndex...].map { $0.prefix { $0 == " " }.count }
         guard let selectedYes = dialog.firstIndex(where: { $0.range(of: #"^[›❯»>]\s*1\.\s+"#, options: .regularExpression) != nil }) else { return nil }
         let rows = optionRows(dialog, indents: indents, from: selectedYes)
@@ -226,7 +225,18 @@ public enum PromptDetector {
 
     static func permissionHeading(_ prepared: DetectionLines, agent: AgentKind) -> (index: Int, end: Int, marker: String)? {
         let suffix = prepared.normalizedSuffix(300)
-        return permissionHeading(count: suffix.rows.count, lineAt: { suffix.rows[$0] }, agent: agent)
+        if let heading = permissionHeading(count: suffix.rows.count, lineAt: { suffix.rows[$0] }, agent: agent) { return heading }
+        guard agent == .codex, hasCompleteSelectedPermissionTail(suffix.rows) else { return nil }
+        return permissionHeading(prepared.trimmed, agent: agent)
+    }
+
+    /// Extending a heading search requires a selected first choice and the
+    /// complete final keyboard hint. Later output and clipped menus cannot opt in.
+    private static func hasCompleteSelectedPermissionTail(_ raw: [String]) -> Bool {
+        let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.contains(where: { $0.range(of: #"^[›❯»>]\s*1\.\s+"#, options: .regularExpression) != nil }),
+              let last = lines.lastIndex(where: isOption) else { return false }
+        return dialogFooterStart(in: lines, after: last) != nil
     }
 
     enum NativeCodexDialog {
@@ -273,7 +283,7 @@ public enum PromptDetector {
     }
 
     static func nativeCodexDialog(_ bytes: UnsafeBufferPointer<UInt8>) -> NativeCodexDialog {
-        let spans = DetectionLines.nativeSuffixRanges(bytes)
+        var spans = DetectionLines.nativeSuffixRanges(bytes)
         var normalized = [String?](repeating: nil, count: spans.count)
         func row(_ index: Int) -> String {
             if let value = normalized[index] { return value }
@@ -281,10 +291,19 @@ public enum PromptDetector {
             normalized[index] = value
             return value
         }
-        let heading = permissionHeading(count: spans.count, lineAt: row, agent: .codex, mayStart: { index in
+        func findHeading() -> (index: Int, end: Int, marker: String)? {
+            permissionHeading(count: spans.count, lineAt: row, agent: .codex, mayStart: { index in
             guard let initial = nativeASCIIRowInitial(bytes, start: spans[index].lowerBound, end: spans[index].upperBound) else { return true }
             return initial == 65 || initial == 87 // Allow / Approve / Would
-        })
+            })
+        }
+        var heading = findHeading()
+        if heading == nil, spans.first?.lowerBound != 0,
+           hasCompleteSelectedPermissionTail(spans.indices.map(row)) {
+            spans = DetectionLines.nativeSuffixRanges(bytes, count: Int.max)
+            normalized = [String?](repeating: nil, count: spans.count)
+            heading = findHeading()
+        }
         guard let heading, !nativeCodexPrefixHasOpenFence(bytes, before: spans[heading.index].lowerBound) else { return .absent }
         return .rows((heading.index..<spans.count).map(row))
     }

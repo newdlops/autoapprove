@@ -105,11 +105,11 @@ final class DetectionLines {
 
     /// Retained raw row boundaries for synchronous native menu detection.
     /// No pointer or normalized row survives the caller's borrowed-byte scope.
-    static func nativeSuffixRanges(_ bytes: UnsafeBufferPointer<UInt8>) -> [Range<Int>] {
+    static func nativeSuffixRanges(_ bytes: UnsafeBufferPointer<UInt8>, count: Int = 300) -> [Range<Int>] {
         var end = bytes.count, spans: [Range<Int>] = []
         spans.reserveCapacity(300)
         var skippingTrailingBlanks = true
-        while spans.count < 300 {
+        while spans.count < count {
             let start = Self.nativeRowStart(bytes, endingAt: end)
             if skippingTrailingBlanks {
                 let value = String(decoding: bytes[start..<end], as: UTF8.self)
