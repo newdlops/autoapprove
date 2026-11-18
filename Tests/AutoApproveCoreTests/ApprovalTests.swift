@@ -524,6 +524,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: Claude metadata and final turns stay conversation-bound",tests.testClaudeGroupMetadataAndCompletionStayConversationBound),
             ("Session groups: metadata parent directs Claude and recovers a missing Stop report",tests.testCrossAgentMetadataParentAndMissingClaudeStopRecovery),
             ("Session groups: mailbox persistence, deduplication and atomic receipts",tests.testGroupMailboxDurabilityReceiptsAndOrdering),
+            ("Session groups: dependency cycles, alternatives, callbacks and durable deadlines",tests.testGroupDependencyWaits),
             ("Session groups: completion reports require recipient ACK",tests.testGroupReportRequiresRecipientAcknowledgement),
             ("Session groups: corrupt mailbox never accepts or deletes messages",tests.testGroupMailboxRefusesCorruptStorage),
             ("Session groups: Claude composer separates custom status from drafts",tests.testClaudeMailboxComposerSeparatesCustomStatusFromDrafts),

@@ -3,7 +3,7 @@ import CSQLite
 import Darwin
 
 public struct SessionGroupMessage: Equatable {
-    public enum Kind: String { case question, reply, message, report, choiceQuestion }
+    public enum Kind: String { case question, reply, message, report, choiceQuestion, waitNotice }
     public var sequence: Int64
     public var id: UUID
     public var groupID: UUID
@@ -21,7 +21,7 @@ public struct SessionGroupMessage: Equatable {
 
     public var json: JSONObject {
         let date = ISO8601DateFormatter()
-        return ["messageID": id.uuidString, "sequence": sequence, "groupID": groupID.uuidString,
+        var value: JSONObject = ["messageID": id.uuidString, "sequence": sequence, "groupID": groupID.uuidString,
                 "senderMemberID": senderID.uuidString, "memberID": recipientID.uuidString, "kind": kind.rawValue,
                 "text": text, "createdAt": date.string(from: createdAt),
                 "state": acknowledgedAt == nil ? "pending" : "acknowledged",
@@ -29,6 +29,11 @@ public struct SessionGroupMessage: Equatable {
                 "acknowledgedAt": acknowledgedAt.map(date.string(from:)) as Any? ?? NSNull(),
                 "notificationAttempts": attempts, "lastNotificationResult": lastResult as Any? ?? NSNull(),
                 "lastError": lastError as Any? ?? NSNull()]
+        if lastResult == "superseded", acknowledgedAt == nil { value["state"] = "superseded" }
+        if let key = sourceKey, key.hasPrefix("answer:") { value["inReplyTo"] = String(key.dropFirst(7)) }
+        if kind == .question { value["replyWith"] = ["inReplyTo": id.uuidString] }
+        if sourceKey?.hasPrefix("decision:") == true { value["blocksProgress"] = true }
+        return value
     }
 }
 
@@ -63,6 +68,15 @@ public final class SessionGroupMailbox {
         do {
             sqlite3_busy_timeout(db, 1000)
             try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; CREATE TABLE IF NOT EXISTS messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,group_id TEXT NOT NULL,sender_id TEXT NOT NULL,recipient_id TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL,acknowledged REAL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_result TEXT,last_error TEXT,source_key TEXT UNIQUE); CREATE INDEX IF NOT EXISTS message_inbox ON messages(group_id,recipient_id,acknowledged,sequence); CREATE INDEX IF NOT EXISTS message_outbox ON messages(group_id,sender_id,sequence);")
+            try execute("""
+                CREATE TABLE IF NOT EXISTS group_waits (
+                  id TEXT PRIMARY KEY, group_id TEXT NOT NULL, owner_task TEXT NOT NULL,
+                  request TEXT NOT NULL, state TEXT NOT NULL, deadline REAL NOT NULL,
+                  external_ready INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '');
+                CREATE INDEX IF NOT EXISTS wait_deadlines ON group_waits(state,deadline);
+                CREATE INDEX IF NOT EXISTS wait_group ON group_waits(group_id,state);
+                CREATE INDEX IF NOT EXISTS wait_task ON group_waits(owner_task);
+                """)
             for suffix in ["-wal", "-shm"] { _ = chmod(path + suffix, 0o600) }
             guard try scalar("PRAGMA synchronous") == 2, try scalar("PRAGMA fullfsync") == 1 else {
                 throw AppError.message("그룹 수신함의 디스크 저장 설정을 확인하지 못했습니다.")
@@ -70,7 +84,7 @@ public final class SessionGroupMailbox {
         } catch { sqlite3_close(db); db = nil; throw error }
     }
     deinit { sqlite3_close(db) }
-    private func statement(_ sql: String, _ values: [String] = []) throws -> OpaquePointer {
+    func statement(_ sql: String, _ values: [String] = []) throws -> OpaquePointer {
         var value: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &value, nil) == SQLITE_OK, let value else { throw AppError.message("그룹 수신함을 읽거나 저장하지 못했습니다. 기존 메시지는 유지합니다.") }
         for (index, text) in values.enumerated() {
@@ -83,7 +97,7 @@ public final class SessionGroupMailbox {
     private func execute(_ sql: String) throws {
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw AppError.message("그룹 수신함을 저장하지 못했습니다. 접수 완료로 처리하지 않습니다.") }
     }
-    private func update(_ sql: String, _ values: [String]) throws {
+    func update(_ sql: String, _ values: [String]) throws {
         let s = try statement(sql, values); defer { sqlite3_finalize(s) }
         guard sqlite3_step(s) == SQLITE_DONE else { throw AppError.message("그룹 수신함 변경을 저장하지 못했습니다.") }
     }
@@ -110,50 +124,55 @@ public final class SessionGroupMailbox {
                 lastResult: text(11), lastError: text(12), sourceKey: text(13)))
         }
     }
-    private func transaction<T>(_ body: () throws -> T) throws -> T {
+    func transaction<T>(_ body: () throws -> T) throws -> T {
         try execute("BEGIN IMMEDIATE")
         do { let result = try body(); try execute("COMMIT"); return result }
         catch { try? execute("ROLLBACK"); throw error }
     }
     public func message(_ id: UUID) throws -> SessionGroupMessage? { try rows("WHERE id=?", [id.uuidString]).first }
     public func message(sourceKey: String) throws -> SessionGroupMessage? { try rows("WHERE source_key=?", [sourceKey]).first }
-    public var pendingCount: Int { get throws { try scalar("SELECT count(*) FROM messages WHERE acknowledged IS NULL") } }
+    public var pendingCount: Int { get throws { try scalar("SELECT count(*) FROM messages WHERE acknowledged IS NULL AND last_result IS NOT 'superseded'") } }
 
     public func enqueue(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
                         text: String, sourceKey: String? = nil, at date: Date = Date()) throws -> SessionGroupMessage {
-        guard !text.isEmpty, text.count <= (kind == .report || kind == .choiceQuestion ? 16000 : SessionGroupOrchestration.maximumTaskLength), !text.contains("\0"), senderID != recipientID else {
+        try transaction {
+            try insertMessage(id: id, groupID: groupID, senderID: senderID, recipientID: recipientID, kind: kind, text: text, sourceKey: sourceKey, at: date)
+        }
+    }
+
+    func insertMessage(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
+                       text: String, sourceKey: String? = nil, at date: Date = Date()) throws -> SessionGroupMessage {
+        guard !text.isEmpty, text.count <= (kind == .report || kind == .choiceQuestion ? 16000 : SessionGroupOrchestration.maximumTaskLength), !text.contains("\0"), (senderID != recipientID || kind == .waitNotice) else {
             throw RemoteHTTPError(400, "그룹 메시지 내용과 대상을 확인해주세요.")
         }
-        return try transaction {
-            if let sourceKey, let previous = try message(sourceKey: sourceKey) {
-                guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID, previous.kind == kind else { throw RemoteHTTPError(409, "그룹 보고의 원래 대상을 확인해주세요.") }
-                return previous
-            }
-            if let id, let previous = try message(id) {
-                guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID,
-                      previous.kind == kind, previous.text == text, previous.sourceKey == sourceKey else { throw RemoteHTTPError(409, "같은 messageID의 내용이나 대상이 다릅니다. 새 메시지에만 새 ID를 사용하세요.") }
-                return previous
-            }
-            // Older clients omit messageID. Collapse only identical, still-unacknowledged messages.
-            if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND body=? AND acknowledged IS NULL ORDER BY sequence LIMIT 1",
-                [groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text]).first { return previous }
-            guard try pendingCount < maximumPending else { throw RemoteHTTPError(409, "미확인 그룹 메시지가 너무 많아 새 메시지를 접수하지 않았습니다. 기존 메시지를 수신 확인한 뒤 다시 보내세요.") }
-            let key = id ?? UUID()
-            try update("INSERT INTO messages(id,group_id,sender_id,recipient_id,kind,body,created,source_key) VALUES(?,?,?,?,?,?,?,NULLIF(?,''))",
-                       [key.uuidString, groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, String(date.timeIntervalSince1970), sourceKey ?? ""])
-            guard let result = try message(key) else { throw AppError.message("저장된 그룹 메시지를 확인하지 못했습니다.") }
-            return result
+        if let sourceKey, let previous = try message(sourceKey: sourceKey) {
+            guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID, previous.kind == kind else { throw RemoteHTTPError(409, "그룹 보고의 원래 대상을 확인해주세요.") }
+            return previous
         }
+        if let id, let previous = try message(id) {
+            guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID,
+                  previous.kind == kind, previous.text == text, previous.sourceKey == sourceKey else { throw RemoteHTTPError(409, "같은 messageID의 내용이나 대상이 다릅니다. 새 메시지에만 새 ID를 사용하세요.") }
+            return previous
+        }
+        // Older clients omit messageID. Collapse only identical, still-unacknowledged messages.
+        if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND body=? AND source_key IS NULL AND acknowledged IS NULL ORDER BY sequence LIMIT 1",
+            [groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text]).first { return previous }
+        guard try kind == .waitNotice || pendingCount < maximumPending else { throw RemoteHTTPError(409, "미확인 그룹 메시지가 너무 많아 새 메시지를 접수하지 않았습니다. 기존 메시지를 수신 확인한 뒤 다시 보내세요.") }
+        let key = id ?? UUID()
+        try update("INSERT INTO messages(id,group_id,sender_id,recipient_id,kind,body,created,source_key) VALUES(?,?,?,?,?,?,?,NULLIF(?,''))",
+                   [key.uuidString, groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, String(date.timeIntervalSince1970), sourceKey ?? ""])
+        guard let result = try message(key) else { throw AppError.message("저장된 그룹 메시지를 확인하지 못했습니다.") }
+        return result
     }
     public func list(groupID: UUID, memberID: UUID, outbox: Bool = false, includeAcknowledged: Bool = false,
                      after: Int64 = 0, limit: Int = 50) throws -> [SessionGroupMessage] {
         try rows("WHERE group_id=? AND " + (outbox ? "sender_id" : "recipient_id") + "=? AND sequence>?" +
-                 (includeAcknowledged ? "" : " AND acknowledged IS NULL") + " ORDER BY sequence LIMIT ?",
+                 (includeAcknowledged ? "" : " AND acknowledged IS NULL AND last_result IS NOT 'superseded'") + " ORDER BY sequence LIMIT ?",
                  [groupID.uuidString, memberID.uuidString, String(after), String(max(1, min(limit, 101)))])
     }
-    /// One head per recipient, in acceptance order. An ACK is required before its next notification advances.
+    /// One notification per recipient. Decisions and dependency events take priority within the same inbox.
     public func heads() throws -> [SessionGroupMessage] {
-        try rows("WHERE sequence IN (SELECT min(sequence) FROM messages WHERE acknowledged IS NULL GROUP BY group_id,recipient_id) ORDER BY sequence")
+        try rows("WHERE sequence IN (SELECT sequence FROM (SELECT sequence,row_number() OVER (PARTITION BY group_id,recipient_id ORDER BY CASE WHEN source_key LIKE 'decision:%' OR kind='waitNotice' THEN 0 ELSE 1 END, sequence) AS position FROM messages WHERE acknowledged IS NULL AND last_result IS NOT 'superseded') WHERE position=1) ORDER BY sequence")
     }
     public func noteAttempt(_ id: UUID, result: String, error: String? = nil, retryAt: Date, increment: Bool = false) throws {
         try update("UPDATE messages SET attempts=attempts+?,next_attempt=?,last_result=?,last_error=? WHERE id=? AND acknowledged IS NULL",

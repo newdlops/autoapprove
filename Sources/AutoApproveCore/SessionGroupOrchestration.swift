@@ -126,6 +126,12 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         guard let index = assignments.lastIndex(where: {
             $0.workerSessionID == workerSessionID && $0.status == .working && $0.sentAt <= completion.date.addingTimeInterval(1)
         }) else { return nil }
+        return complete(id: assignments[index].id, completion: completion)
+    }
+
+    @discardableResult
+    mutating func complete(id: UUID, completion: WorkCompletion) -> SessionGroupAssignment? {
+        guard let index = assignments.firstIndex(where: { $0.id == id && $0.status == .working }) else { return nil }
         assignments[index].status = .completed
         assignments[index].completedAt = completion.date
         assignments[index].summary = completion.summary

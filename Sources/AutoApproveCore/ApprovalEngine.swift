@@ -229,6 +229,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupWorkerActions = Set<String>()
     private var groupDeliveryTask: Task<Void, Never>?
     private var groupMailboxStore: SessionGroupMailbox?
+    private var groupWaitTimer: Task<Void, Never>?
     private var groupMailboxTask: Task<Void, Never>?
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
@@ -826,7 +827,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if poll { groupClearDiscoveryReady = false }
         if var state = try? groupOrchestration(), state.removeUndelivered() > 0 { try? saveGroupOrchestration(state) }
         if let state = try? groupOrchestration(), state.needsWatching { scheduleGroupDelivery() }
-        if (try? groupMailbox().pendingCount) ?? 0 > 0 { scheduleGroupMailboxDelivery() }
+        refreshGroupWaits()
         if (try? loadGroupClears().contains { !$0.done }) == true { scheduleGroupClears() }
         refreshSessionGroupBadges()
         let socket = SocketServer(path: paths.socket, handler: { [weak self] message, peer in
@@ -897,6 +898,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         appUpdates.stop(); updateReceiver.stop()
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
         groupMailboxTask?.cancel(); groupMailboxTask = nil
+        groupWaitTimer?.cancel(); groupWaitTimer = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
         exitLaunchReads.values.forEach { $0.cancel() }; exitLaunchReads.removeAll()
@@ -3007,6 +3009,72 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 "conversationID": id, "transport": "local_terminal", "message": "같은 Mac의 원래 터미널에서 현재 세션 ID와 연결을 확인했습니다."]
     }
 
+    private func refreshGroupWaits() {
+        groupWaitTimer?.cancel()
+        groupWaitTimer = nil
+        let delay: TimeInterval
+        do {
+            let box = try groupMailbox()
+            if try box.pendingCount > 0 { scheduleGroupMailboxDelivery() }
+            guard try box.hasUnresolvedWaits() else { return }
+            let state = try groupOrchestration()
+            try box.transaction { try box.reconcileWaits(assignments: state.assignments) }
+            if try box.pendingCount > 0 { scheduleGroupMailboxDelivery() }
+            guard let deadline = try box.nextWaitDeadline() else { return }
+            delay = max(0.01, deadline.timeIntervalSinceNow)
+        } catch { delay = 5 }
+        groupWaitTimer = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            self?.refreshGroupWaits()
+        }
+    }
+
+    private func waitRequest(_ object: JSONObject, id: UUID, group: UUID, member: UUID, question: UUID? = nil,
+                             box: SessionGroupMailbox, state: SessionGroupOrchestration) throws -> GroupWaitRequest {
+        let task: UUID?
+        if let explicit = try GroupWaitRequest.uuid(object, "taskID") { task = explicit }
+        else if let stored = try box.waitRecord(id) { task = stored.request.task }
+        else {
+            let current = state.current(groupID: group, workerMemberID: member)
+            task = current?.status == .working ? current?.id : nil
+        }
+        return try GroupWaitRequest.parse(object, id: id, group: group, member: member, task: task, question: question)
+    }
+
+    private func groupWaitAction(_ tool: String, object: JSONObject) async throws -> JSONObject {
+        guard let group = try GroupWaitRequest.uuid(object, "groupID") else { throw RemoteHTTPError(400, "groupID를 지정해주세요.") }
+        let (_, caller) = try await groupMailboxCaller(object, groupID: group)
+        let box = try groupMailbox()
+        var state = try groupOrchestration()
+        if tool == "complete_group_task" {
+            guard let id = try GroupWaitRequest.uuid(object, "taskID"),
+                  let body = object["summary"] as? String, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, body.count <= 600,
+                  let item = state.assignments.first(where: { $0.id == id && $0.groupID == group && $0.workerMemberID == caller.id && $0.isDelivered }) else {
+                throw RemoteHTTPError(400, "본인에게 배정된 작업 ID와 1~600자의 완료 요약을 지정해주세요.")
+            }
+            if item.status == .working {
+                guard try !box.visibleWaits(group).contains(where: { $0.request.task == id && $0.state == "waiting" }) else { throw RemoteHTTPError(409, "해결되지 않은 작업 대기가 있습니다.") }
+                state.complete(id: id, completion: WorkCompletion(id: id.uuidString, summary: body))
+                try saveGroupOrchestration(state)
+                scheduleGroupDelivery()
+            } else if item.status == .superseded || item.summary != WorkCompletion(id: id.uuidString, summary: body).summary {
+                throw RemoteHTTPError(409, "작업이 교체됐거나 이미 다른 결과로 완료됐습니다.")
+            }
+            return ["taskID": id.uuidString, "completed": true]
+        }
+        guard let id = try GroupWaitRequest.uuid(object, "waitID") else { throw RemoteHTTPError(400, "재시도에도 유지할 waitID를 지정해주세요.") }
+        let row: GroupWaitRecord
+        if tool == "update_group_wait" {
+            guard let action = object["action"] as? String, ["externalReady","cancel"].contains(action) else { throw RemoteHTTPError(400, "대기 변경 동작을 확인해주세요.") }
+            row = try box.changeWait(id, group: group, member: caller.id, externalReady: action == "externalReady", assignments: state.assignments)
+        } else {
+            let request = try waitRequest(object, id: id, group: group, member: caller.id, box: box, state: state)
+            row = try box.transaction { try box.registerWait(request, assignments: state.assignments) }
+        }
+        refreshGroupWaits()
+        return row.json
+    }
+
     private func groupMailbox() throws -> SessionGroupMailbox {
         if let groupMailboxStore { return groupMailboxStore }
         let value = try SessionGroupMailbox(directory: paths.directory)
@@ -3031,11 +3099,41 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw RemoteHTTPError(403, "확인된 현재 세션에서 같은 그룹의 다른 구성원에게만 보낼 수 있습니다.")
         }
         // Accept while the recipient is busy/disconnected. COMMIT precedes this success response.
-        let message = try groupMailbox().enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: line)
+        let box = try groupMailbox()
+        let blocking = try GroupWaitRequest.flag(object, "blocksProgress")
+        let reply = try GroupWaitRequest.uuid(object, "inReplyTo")
+        guard !blocking || (kind == .question && requestedID != nil), reply == nil || kind == .reply else {
+            throw RemoteHTTPError(400, "필수 질문에는 messageID를, 답변에는 원래 질문 ID를 지정해주세요.")
+        }
+        var wait: GroupWaitRecord?
+        let message: SessionGroupMessage
+        if blocking, let id = requestedID {
+            let state = try groupOrchestration()
+            let request = try waitRequest(object, id: id, group: groupID, member: sender.id, question: id, box: box, state: state)
+            message = try box.transaction {
+                let m = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: .question, text: line, sourceKey: "decision:" + id.uuidString)
+                guard m.text == line else { throw RemoteHTTPError(409, "같은 ID의 질문 내용이 다릅니다.") }
+                wait = try box.registerWait(request, assignments: state.assignments)
+                return m
+            }
+            refreshGroupWaits()
+        } else if let reply {
+            let state = try groupOrchestration()
+            message = try box.transaction {
+                let m = try box.answer(reply, id: requestedID, group: groupID, sender: sender.id, recipient: recipient.id, text: line)
+                try box.reconcileWaits(assignments: state.assignments, group: groupID)
+                return m
+            }
+            refreshGroupWaits()
+        } else {
+            message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: line)
+        }
         scheduleGroupMailboxDelivery()
-        return ["accepted": true, "messageID": message.id.uuidString, "receipt": message.json,
+        var output: JSONObject = ["accepted": true, "messageID": message.id.uuidString, "receipt": message.json,
                 "delivered": message.acknowledgedAt != nil, "transport": "local_mailbox", "networkRequired": false,
                 "message": "로컬 수신함에 저장했습니다. accepted는 접수이며 수신 완료가 아닙니다. 같은 메시지를 재호출할 때 이 messageID를 유지하세요. 수신자가 ack_group_messages로 확인할 때까지 보관하고 알림을 재시도합니다."]
+        if let wait { output["wait"] = wait.json }
+        return output
     }
 
     private func groupMailboxCaller(_ object: JSONObject, groupID: UUID) async throws -> (SessionGroup, SessionGroupMember) {
@@ -3078,7 +3176,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let observed = try await sessionGroupSessions()
         for message in due {
             guard !Task.isCancelled, !remoteInputStopped else { return }
-            guard try groupMailbox().message(message.id)?.acknowledgedAt == nil else { continue }
+            guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil, current.lastResult != "superseded" else { continue }
             // Reserve the attempt durably before touching a terminal. A crash may repeat the hint, never the message record.
             let retry = Date().addingTimeInterval(groupMailboxReminderInterval)
             try groupMailbox().noteAttempt(message.id, result: "attempting", retryAt: retry, increment: true)
@@ -3112,7 +3210,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         try ready()
-        let line = "[AutoApprove 그룹 수신함] 알림 기준 ID: \(message.id.uuidString). 미확인 메시지가 있습니다. get_group_messages(groupID: \(group.id.uuidString))로 순서대로 읽고, 받은 messageID를 ack_group_messages로 수신 확인하세요. 같은 ID를 이미 처리했다면 작업을 반복하지 말고 수신 확인만 하세요. 이 알림은 반복될 수 있습니다. 다른 스레드나 그룹 밖으로 전달하지 마세요."
+        var line = "[AutoApprove 그룹 수신함] 알림 기준 ID: \(message.id.uuidString). 미확인 메시지가 있습니다. get_group_messages(groupID: \(group.id.uuidString))로 순서대로 읽고, 받은 messageID를 ack_group_messages로 수신 확인하세요. 같은 ID를 이미 처리했다면 작업을 반복하지 말고 수신 확인만 하세요. 이 알림은 반복될 수 있습니다. 다른 스레드나 그룹 밖으로 전달하지 마세요."
+        if message.sourceKey?.hasPrefix("decision:") == true || message.kind == .waitNotice {
+            line = "[AutoApprove 그룹 수신함] 작업 대기 관련 알림입니다. get_group_messages(groupID: \(group.id.uuidString), messageID: \(message.id.uuidString))로 이 항목을 먼저 확인하고 처리 후 수신 확인하세요. 질문에 답할 때는 inReplyTo에 원래 질문 ID를 지정하세요."
+        }
         try await sendGroupLine(current, text: line, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
@@ -3149,6 +3250,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let data = try JSONEncoder().encode(state)
         try store.set(SessionGroupOrchestration.storeKey, String(decoding: data, as: UTF8.self))
         groupOrchestrationCache = state
+        refreshGroupWaits()
         if !sessionGroupBadges.isEmpty { publish() }
     }
 
@@ -3477,8 +3579,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// A worker's first completion after its task becomes a report for the member that assigned it.
     private func noteGroupCompletion(_ sessionID: String, _ completion: WorkCompletion) {
         guard var state = try? groupOrchestration(),
-              state.assignments.contains(where: { $0.workerSessionID == sessionID && $0.status == .working }),
-              state.complete(workerSessionID: sessionID, completion: completion) != nil else { return }
+              let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working && $0.sentAt <= completion.date.addingTimeInterval(1) }),
+              (try? groupMailbox().tracksTask(task.id)) == false,
+              state.complete(id: task.id, completion: completion) != nil else { return }
         do { try saveGroupOrchestration(state) } catch { return }
         scheduleGroupDelivery()
     }
@@ -3535,7 +3638,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func recoverClaudeGroupCompletions() async {
         guard let state = try? groupOrchestration() else { return }
         let working = state.assignments.filter {
-            $0.status == .working && $0.isDelivered && sessions[$0.workerSessionID]?.agent == .claude
+            $0.status == .working && $0.isDelivered && sessions[$0.workerSessionID]?.agent == .claude && (try? groupMailbox().tracksTask($0.id)) == false
         }
         guard !working.isEmpty, let observed = try? await sessionGroupSessions(),
               let groups = try? SessionGroupStore(directory: paths.directory).load() else { return }
@@ -3987,6 +4090,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let text = object["text"] as? String else { throw RemoteHTTPError(400, "메시지 내용을 지정해주세요.") }
             return try await enqueueGroupMessage(object, groupID: groupID, memberID: memberID, text: text,
                 kind: tool == "ask_group_question" ? .question : tool == "reply_group_question" ? .reply : .message)
+        case "wait_group_dependencies", "update_group_wait", "complete_group_task":
+            return try await groupWaitAction(tool, object: object)
         case "get_group_messages", "ack_group_messages":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "그룹 ID를 지정해주세요.") }
             let (_, caller) = try await groupMailboxCaller(object, groupID: groupID)
@@ -4011,6 +4116,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard (1...50).contains(limit), ["inbox", "outbox"].contains(direction),
                   object["direction"] == nil || object["direction"] is String,
                   object["includeAcknowledged"] == nil || (object["includeAcknowledged"] as? NSNumber).map({ CFGetTypeID($0) == CFBooleanGetTypeID() }) == true else { throw RemoteHTTPError(400, "조회 방향·페이지 범위를 확인해주세요.") }
+            if let id = try GroupWaitRequest.uuid(object, "messageID") {
+                guard let message = try groupMailbox().message(id), message.groupID == groupID,
+                      (direction == "outbox" ? message.senderID : message.recipientID) == caller.id else { throw RemoteHTTPError(404, "자기 수신함·발신함에 해당 메시지가 없습니다.") }
+                return ["messages": [message.json], "hasMore": false, "direction": direction, "groupID": groupID.uuidString]
+            }
             let messages = try groupMailbox().list(groupID: groupID, memberID: caller.id, outbox: direction == "outbox",
                 includeAcknowledged: object["includeAcknowledged"] as? Bool == true, after: after, limit: limit + 1)
             let page = Array(messages.prefix(limit))
@@ -4060,7 +4170,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let visibleGroups = groups.filter { $0.members.contains { groupMemberIsCaller($0, caller: caller, observed: observed) } }
             let modelSettings = await groupModelSettings(visibleGroups, observed: observed)
             let memberStatuses = await claudeStatuses(observed.map(\.session))
-            let output: [JSONObject] = groups.compactMap { group in
+            let includeGraph = try GroupWaitRequest.flag(object, "includeWaitGraph")
+            let output: [JSONObject] = try groups.compactMap { group in
                 guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { return nil }
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
@@ -4082,15 +4193,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 // Reading is not an ACK. A lost tool response must leave the report pending.
                 let reports = state.undelivered.filter { $0.groupID == group.id && $0.parentMemberID == callerMember.id }
-                return ["id": group.id.uuidString, "name": group.name, "members": members,
+                let waits = try groupMailbox().visibleWaits(group.id)
+                var result: JSONObject = ["id": group.id.uuidString, "name": group.name, "members": members,
                         "leaderMemberIDs": group.leaderMemberIDs.map(\.uuidString),
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull(),
                         "callerMemberID": callerMember.id.uuidString,
+                        "waits": waits.map(\.json),
                         "mailbox": groupMailboxSummary(groupID: group.id, memberID: callerMember.id),
                         "reports": reports.map { report -> JSONObject in
                             ["taskID": report.id.uuidString, "workerMemberID": report.workerMemberID.uuidString, "task": report.task,
                              "summary": report.summary as Any? ?? NSNull()]
                         }]
+                if includeGraph { result["waitGraph"] = SessionGroupMailbox.diagram(waits) }
+                return result
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "message": "자유 형식 질문·답변은 ask_group_question과 reply_group_question을 사용하세요. 그룹장·동료와 Codex↔Claude 모두 지원합니다. 일반 대화는 send_group_message도 사용할 수 있으며 작업·승인 권한을 부여하지 않습니다. canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업 완료 보고는 로컬 수신함에 저장됩니다. mailbox.inbox 또는 get_group_messages로 읽고 ack_group_messages로 수신 확인하세요."]
