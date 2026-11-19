@@ -56,6 +56,12 @@ import AutoApproveCore
             if let engine = container.engine { SessionGroupsWindow(engine: engine) }
         }.defaultSize(width:860,height:640).windowResizability(.contentMinSize).commandsRemoved()
 
+        WindowGroup("대화 그래프", id: "session-group-graph", for: UUID.self) { $groupID in
+            if let engine = container.engine, let groupID {
+                SessionGroupConversationGraph(groupID: groupID, engine: engine)
+            }
+        }.defaultSize(width: 1040, height: 680).windowResizability(.contentMinSize).commandsRemoved()
+
         Window("계정·로그인", id: "accounts") {
             if let engine=container.engine {CodexAccountsWindow(engine:engine)}
         }.windowResizability(.contentSize).commandsRemoved()

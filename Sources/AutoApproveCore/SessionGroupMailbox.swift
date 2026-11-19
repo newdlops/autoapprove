@@ -82,6 +82,7 @@ public struct SessionGroupConversation: Identifiable, Equatable {
 
 public struct SessionGroupConversationPage: Equatable {
     public let conversations: [SessionGroupConversation]
+    public let messages: [SessionGroupMessage]
     public let hasMore: Bool
 }
 
@@ -266,7 +267,14 @@ public final class SessionGroupMailbox {
                                              waitExpired: answer == nil && expired.contains(question.id))
         }
         let ordered = projected.filter { $0.answer == nil } + projected.filter { $0.answer != nil }
-        return .init(conversations: Array(ordered.prefix(300)), hasMore: ordered.count > 300)
+        let messages = try self.rows("""
+            WHERE group_id=? AND last_result IS NOT 'superseded' AND
+              (kind IN ('message','report','choiceQuestion') OR
+               (kind='reply' AND (source_key IS NULL OR source_key NOT LIKE 'answer:%')))
+            ORDER BY sequence DESC LIMIT 151
+            """, [groupID.uuidString])
+        return .init(conversations: Array(ordered.prefix(300)), messages: Array(messages.prefix(150)),
+                     hasMore: ordered.count > 300 || messages.count > 150)
     }
     // Results owned by a compound wait are sent in its single ready message.
     // Results remain individually readable in their original inbox.

@@ -17,7 +17,7 @@ import AutoApproveCore
     @State private var error: String?
     @State private var notice: String?
     @State private var composeGroup: SessionGroup?
-    @State private var graphGroup: SessionGroup?
+    @Environment(\.openWindow) private var openWindow
     @State private var deleteConfirm = false
     @State private var bulkRunning = false
     @State private var bulkStopRequested = false
@@ -103,9 +103,6 @@ import AutoApproveCore
                 notice = "그룹 메시지를 로컬 수신함에 저장했습니다."
             }
         }
-        .sheet(item: $graphGroup) { group in
-            SessionGroupConversationGraph(group: group, engine: engine)
-        }
         .frame(minWidth: 700, minHeight: 480)
         .windowUpdates(viewUpdates, sources: [AnyPublisher<Void, Never>]())
         .toolbar {
@@ -141,7 +138,7 @@ import AutoApproveCore
                     }
                 }
                 Menu {
-                    Button("대화 그래프…", systemImage: "point.3.connected.trianglepath.dotted") { graphGroup = group }
+                    Button("대화 그래프…", systemImage: "point.3.connected.trianglepath.dotted") { openWindow(id: "session-group-graph", value: group.id) }
                     Button("그룹 삭제", role: .destructive) { deleteConfirm = true }
                 } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("그룹 관리")

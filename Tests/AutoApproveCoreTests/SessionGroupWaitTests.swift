@@ -132,11 +132,15 @@ extension ApprovalTests {
         try box.acknowledge([unanswered.id], groupID: group.id, recipientID: members[0].id)
         _ = try box.enqueue(groupID: UUID(), senderID: members[1].id, recipientID: members[0].id,
                             kind: .question, text: "unrelated group")
+        let saved = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
+                                    kind: .message, text: "saved group message")
         let graph = try box.conversations(groupID: group.id)
         try expectEqual(graph.conversations.first?.question.id, unanswered.id)
         try expectNil(graph.conversations.first?.answer)
         try expectEqual(graph.conversations.first { $0.id.uuidString == question }?.answer?.text, "answer")
         try expect(!graph.conversations.contains { $0.question.text == "unrelated group" })
+        try expectEqual(graph.messages.first?.id, saved.id)
+        try expect(!graph.messages.contains { $0.sourceKey?.hasPrefix("answer:") == true })
 
         let timeout = UUID().uuidString
         let request: JSONObject = ["waitID": timeout, "external":true, "timeoutSeconds":1]
