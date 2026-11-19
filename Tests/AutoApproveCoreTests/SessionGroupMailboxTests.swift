@@ -1,5 +1,6 @@
 import Foundation
 import AutoApproveCore
+import CSQLite
 
 extension ApprovalTests {
     @MainActor func testGroupReportRequiresRecipientAcknowledgement() async throws {
@@ -66,14 +67,16 @@ extension ApprovalTests {
             do { _ = try box!.enqueue(id: key, groupID: group, senderID: sender, recipientID: receiver, kind: .question, text: body); throw AppError.message("Conflicting/full mailbox accepted a message") }
             catch is RemoteHTTPError { }
         }
-        try box!.noteAttempt(id, result: "attempting", retryAt: .distantPast, increment: true)
+        try box!.noteAttempt(id, result: "direct_attempting", retryAt: .distantPast, increment: true)
         box = nil // Restart after an uncertain terminal write, before any ACK.
         box = try SessionGroupMailbox(directory: directory, maximumPending: 2)
         try expectEqual(try box!.pendingCount, 2)
         let reopened = try box!.list(groupID: group, memberID: receiver)
         try expectEqual(reopened.map(\.id), [id, second.id])
-        try expectEqual(reopened[0].lastResult, "attempting")
+        try expectEqual(reopened[0].lastResult, "direct_attempting")
         try expectNil(reopened[0].acknowledgedAt)
+        try expectEqual(try box!.heads().map(\.id), [second.id],
+                        "An uncertain direct submission stays readable without blocking later delivery or being retried")
         // A lost read response and repeated read cannot consume messages.
         _ = try box!.list(groupID: group, memberID: receiver)
         try expectEqual(try box!.pendingCount, 2)
@@ -99,6 +102,54 @@ extension ApprovalTests {
         try expectEqual(retry.id, report.id); try expectEqual(retry.text, "report")
         let permissions = try FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent("group-messages.sqlite").path)[.posixPermissions] as? NSNumber
         try expectEqual(permissions?.intValue, 0o600)
+    }
+
+    @MainActor func testGroupClaudeReplyWithoutMCP() throws {
+        let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("aa-reply-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: { _ in [] },
+                                        processReader: { [] }, isolateByDefault: true)
+        defer { engine.stop() }
+        let box = try SessionGroupMailbox(directory: directory)
+        let group = UUID(), sender = UUID(), recipient = UUID(), conversation = UUID().uuidString.lowercased()
+        let question = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .question, text: "test")
+        let prompt = "[AutoApprove 그룹 전달 " + question.id.uuidString + "] fixture question"
+        var db: OpaquePointer?
+        try expectEqual(sqlite3_open(directory.appendingPathComponent("group-messages.sqlite").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func addSubmission(id: UUID, prompt: String) throws {
+            let insert = "INSERT INTO group_submissions VALUES ('\(id.uuidString)','\(conversation)','\(prompt)',0)"
+            try expectEqual(sqlite3_exec(db, insert, nil, nil, nil), SQLITE_OK)
+        }
+        try addSubmission(id: question.id, prompt: prompt)
+
+        func hook(_ event: String, conversation: String, field: String, value: String) {
+            _ = engine.handleHook(["hook_event_name": event, "session_id": conversation,
+                                   "requestID": UUID().uuidString, field: value])
+        }
+        let other = UUID().uuidString
+        hook("UserPromptSubmit", conversation: other, field: "prompt", value: prompt)
+        hook("Stop", conversation: other, field: "last_assistant_message", value: "wrong conversation")
+        try expectNil(try box.message(sourceKey: "answer:" + question.id.uuidString))
+        hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: prompt)
+        try expect(try box.message(question.id)?.acknowledgedAt != nil)
+        hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: "local user input")
+        hook("Stop", conversation: conversation, field: "last_assistant_message", value: "private")
+        try expectNil(try box.message(sourceKey: "answer:" + question.id.uuidString))
+        hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: prompt)
+        hook("Stop", conversation: conversation, field: "last_assistant_message", value: "replayed input")
+        try expectNil(try box.message(sourceKey: "answer:" + question.id.uuidString))
+        let second = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .question, text: "next")
+        let secondPrompt = "[AutoApprove 그룹 전달 " + second.id.uuidString + "] second"
+        try addSubmission(id: second.id, prompt: secondPrompt)
+        let body = "첫 번째 줄\n" + String(repeating: "보존 ", count: 1600)
+        hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: secondPrompt)
+        hook("Stop", conversation: conversation, field: "last_assistant_message", value: body)
+        hook("Stop", conversation: conversation, field: "last_assistant_message", value: "duplicate")
+        let replies = try box.list(groupID: group, memberID: sender)
+        try expectEqual(replies.count, 1)
+        try expectEqual(replies.first?.text, body)
+        try expectEqual(replies.first?.sourceKey, "answer:" + second.id.uuidString)
     }
 
     func testGroupMailboxRefusesCorruptStorage() throws {

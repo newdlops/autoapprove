@@ -16,6 +16,7 @@ import AutoApproveCore
     @State private var loading = false
     @State private var error: String?
     @State private var notice: String?
+    @State private var composeGroup: SessionGroup?
     @State private var deleteConfirm = false
     @State private var bulkRunning = false
     @State private var bulkStopRequested = false
@@ -96,6 +97,11 @@ import AutoApproveCore
                 }.padding(12)
             }
         }
+        .sheet(item: $composeGroup) { group in
+            SessionGroupMessageSheet(group: group, engine: engine) {
+                notice = "그룹 메시지를 로컬 수신함에 저장했습니다."
+            }
+        }
         .frame(minWidth: 700, minHeight: 480)
         .windowUpdates(viewUpdates, sources: [AnyPublisher<Void, Never>]())
         .toolbar {
@@ -150,6 +156,8 @@ import AutoApproveCore
             }
             HStack {
                 Spacer()
+                Button("메시지 보내기…") { composeGroup = group }
+                    .disabled(loading || group.members.filter { UUID(uuidString: $0.conversationID) != nil }.count < 2)
                 Menu("세션 추가", systemImage: "plus") {
                     if live.isEmpty { Text(loading ? "확인 중…" : "추가할 실행 세션이 없습니다") }
                     ForEach(live) { candidate in
@@ -433,5 +441,70 @@ import AutoApproveCore
     private func deleteSelected() {
         guard let id = selectedID else { return }
         if persist(groups.filter { $0.id != id }, message: "그룹을 삭제했습니다.") { selectedID = nil }
+    }
+}
+
+@MainActor private struct SessionGroupMessageSheet: View {
+    let group: SessionGroup
+    let engine: ApprovalEngine
+    let onSent: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var sender: UUID?
+    @State private var recipient: UUID?
+    @State private var text = ""
+    @State private var expectsReply = true
+    @State private var error: String?
+
+    private var members: [SessionGroupMember] {
+        group.members.filter { UUID(uuidString: $0.conversationID) != nil }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("그룹 메시지 보내기").font(.headline)
+            Picker("보내는 세션", selection: $sender) {
+                Text("세션 선택").tag(nil as UUID?)
+                ForEach(members) { member in
+                    Text(member.title).tag(Optional(member.id))
+                }
+            }
+            Picker("받는 세션", selection: $recipient) {
+                Text("세션 선택").tag(nil as UUID?)
+                ForEach(members.filter { $0.id != sender }) { member in
+                    Text(member.title).tag(Optional(member.id))
+                }
+            }
+            .onChange(of: sender) { _, value in
+                if value == recipient { recipient = nil }
+            }
+            Toggle("응답 받기", isOn: $expectsReply)
+            GroupBox("메시지 본문") {
+                TextEditor(text: $text)
+                    .frame(minHeight: 120, maxHeight: 190)
+                    .accessibilityLabel("메시지 본문")
+            }
+            if text.count > 4000 { Text("메시지는 4000자까지 보낼 수 있습니다.").foregroundStyle(.red) }
+            if let error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            HStack {
+                Spacer()
+                Button("취소") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("보내기") { send() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(sender == nil || recipient == nil || sender == recipient ||
+                              text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || text.count > 4000)
+            }
+        }
+        .padding(24)
+        .frame(width: 490)
+    }
+
+    private func send() {
+        guard let sender, let recipient else { return }
+        do {
+            _ = try engine.queueSessionGroupMessage(groupID: group.id, senderID: sender, recipientID: recipient,
+                                                    text: text, expectsReply: expectsReply)
+            onSent()
+            dismiss()
+        } catch { self.error = error.localizedDescription }
     }
 }

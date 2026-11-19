@@ -164,6 +164,21 @@ extension ApprovalTests {
         try sql("INSERT INTO thread_turns VALUES ('root','next','inProgress',NULL,10,NULL);")
         try expectEqual(try CodexTurnReader.read(location).status, "inProgress", "Use latest turn, not latest successful turn")
         try expectNil(try CodexTurnReader.read(location).completedAt)
+#if DEBUG
+        let groupPrompt = "[AutoApprove 그룹 전달 " + UUID().uuidString + "] 질문"
+        try sql("""
+            ALTER TABLE thread_items ADD COLUMN item_type TEXT;
+            DELETE FROM thread_turns WHERE turn_id='next';
+            INSERT INTO thread_items VALUES ('root','one','request',1,
+                '{"type":"userMessage","content":[{"type":"text","text":"\(groupPrompt)"}]}','userMessage');
+            """)
+        try expectEqual(try CodexTurnReader.read(location).userPrompt, groupPrompt)
+        try sql("""
+            INSERT INTO thread_items VALUES ('root','one','other',2,
+                '{"type":"userMessage","content":[{"type":"text","text":"사용자 입력"}]}','userMessage');
+            """)
+        try expectNil(try CodexTurnReader.read(location).userPrompt)
+#endif
         let missing = directory.appendingPathComponent("missing.sqlite").path
         try expectThrows(CodexTurnReader.read(.init(threadID: "root", database: missing)))
         try expectFalse(FileManager.default.fileExists(atPath: missing))

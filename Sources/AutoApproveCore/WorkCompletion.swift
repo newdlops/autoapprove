@@ -20,6 +20,7 @@ public struct CodexTurnState: Equatable {
     public var status: String?
     public var completedAt: Date?
     public var summary: String?
+    var userPrompt: String?
     var finalAgentItemID: String?
     var finalItemUpdatedAt: Int64?
     public init(threadID: String, turnID: String? = nil, status: String? = nil, completedAt: Date? = nil, summary: String? = nil) {
@@ -169,10 +170,31 @@ public enum CodexTurnReader {
         }
         var state = CodexTurnState(threadID: location.threadID, turnID: turnID, status: status,
             completedAt: completedAt, summary: summary)
+        if status == "completed", summary != nil {
+            state.userPrompt = groupPrompt(database: db, threadID: location.threadID, turnID: turnID)
+        }
         state.finalAgentItemID = finalItemID
         state.finalItemUpdatedAt = finalItemUpdatedAt
         return state
     }
+    private static func groupPrompt(database: OpaquePointer, threadID: String, turnID: String) -> String? {
+        var statement: OpaquePointer?
+        let sql = "SELECT item_json FROM thread_items WHERE thread_id=? AND turn_id=? AND item_type='userMessage' LIMIT 2"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(statement, 1, threadID, -1, transient)
+        sqlite3_bind_text(statement, 2, turnID, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_ROW, let json = sqlite3_column_text(statement, 0),
+              let item = try? JSONSerialization.jsonObject(with: Data(bytes: json, count: Int(sqlite3_column_bytes(statement, 0)))) as? JSONObject,
+              item["type"] as? String == "userMessage",
+              let parts = item["content"] as? [JSONObject], parts.count == 1,
+              parts.first?["type"] as? String == "text", let prompt = parts.first?["text"] as? String,
+              SessionGroupMessage.terminalMessageID(prompt) != nil,
+              sqlite3_step(statement) == SQLITE_DONE else { return nil }
+        return prompt
+    }
+
 }
 
 public struct CodexCompletionTracker {

@@ -84,6 +84,27 @@ extension SessionGroupMailbox {
         return lines.joined(separator: "\n")
     }
 
+    func suppressLateAnswerDelivery(_ question: UUID, recipient: UUID, answer: UUID) throws {
+        guard let wait = try waitRecord(question), wait.request.member == recipient, wait.state == "expired" else { return }
+        try update("UPDATE messages SET last_result='late' WHERE id=? AND last_result IS NULL", [answer.uuidString])
+    }
+
+    func canAutomaticallyAnswer(_ question: UUID) throws -> Bool {
+        try !waitRows("WHERE state IN ('waiting','ready','expired')").contains { $0.request.decision == question }
+    }
+
+    /// Only an unambiguous single-question dependency can resume an upstream
+    /// request from this individual reply. Compound waits need a batch input.
+    func resumedQuestion(for reply: SessionGroupMessage) throws -> UUID? {
+        guard reply.kind == .reply, let key = reply.sourceKey, key.hasPrefix("answer:"),
+              let answered = UUID(uuidString: String(key.dropFirst(7))) else { return nil }
+        let matches = try waitRows("WHERE group_id=? AND state='ready'", [reply.groupID.uuidString]).filter {
+            $0.request.member == reply.recipientID && $0.request.questions == [answered] &&
+                $0.request.tasks.isEmpty && !$0.request.external && $0.request.decision != nil
+        }
+        return matches.count == 1 ? matches.first?.request.decision : nil
+    }
+
     func tracksTask(_ task: UUID) throws -> Bool {
         let s = try statement("SELECT EXISTS(SELECT 1 FROM group_waits WHERE owner_task=?)", [task.uuidString])
         defer { sqlite3_finalize(s) }
@@ -186,7 +207,9 @@ extension SessionGroupMailbox {
         if let old = try message(sourceKey: key), old.text != text || (id != nil && old.id != id) {
             throw RemoteHTTPError(409, "이미 답변된 질문입니다. 새 대화는 별도 메시지로 보내세요.")
         }
-        return try insertMessage(id: id, groupID: group, senderID: sender, recipientID: recipient, kind: .reply, text: text, sourceKey: key)
+        let answer = try insertMessage(id: id, groupID: group, senderID: sender, recipientID: recipient, kind: .reply, text: text, sourceKey: key)
+        try suppressLateAnswerDelivery(question, recipient: recipient, answer: answer.id)
+        return answer
     }
 
     func changeWait(_ id: UUID, group: UUID, member: UUID, externalReady: Bool, assignments: [SessionGroupAssignment]) throws -> GroupWaitRecord {
@@ -264,7 +287,10 @@ extension SessionGroupMailbox {
 
     private func transition(_ row: GroupWaitRecord, to state: String, detail: String) throws {
         try update("UPDATE group_waits SET state=?,detail=? WHERE id=?", [state, detail, row.request.id.uuidString])
-        try notify(row, recipient: row.request.member, state: state, detail: detail)
+        // The answer's own body is also the wake-up for a single blocking question.
+        if state != "ready" || row.request.questions.count != 1 || !row.request.tasks.isEmpty || row.request.external {
+            try notify(row, recipient: row.request.member, state: state, detail: detail)
+        }
     }
     private func notify(_ row: GroupWaitRecord, recipient: UUID, state: String, detail: String) throws {
         let id = row.request.id.uuidString

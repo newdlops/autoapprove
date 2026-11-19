@@ -233,6 +233,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let groupMailboxSignal = RemoteTerminalChangeSignal()
     private var groupMailboxIdleClaude: Set<String> = []
     private var groupMailboxTask: Task<Void, Never>?
+    private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
     public var groupMailboxReminderInterval: TimeInterval = 120
@@ -3090,6 +3091,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return value
     }
 
+    public func queueSessionGroupMessage(groupID: UUID, senderID: UUID, recipientID: UUID,
+                                         text: String, expectsReply: Bool) throws -> UUID {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, body.count <= SessionGroupOrchestration.maximumTaskLength, !body.contains("\0") else {
+            throw AppError.message("메시지를 1~4000자로 입력해주세요.")
+        }
+        guard !groupClearActive(groupID),
+              let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+              senderID != recipientID,
+              let sender = group.members.first(where: { $0.id == senderID }), UUID(uuidString: sender.conversationID) != nil,
+              let recipient = group.members.first(where: { $0.id == recipientID }), UUID(uuidString: recipient.conversationID) != nil else {
+            throw AppError.message("현재 그룹의 서로 다른 두 대화를 선택해주세요.")
+        }
+        let message = try groupMailbox().enqueue(id: UUID(), groupID: groupID, senderID: senderID, recipientID: recipientID,
+                                                 kind: expectsReply ? .question : .message, text: body)
+        scheduleGroupMailboxDelivery()
+        return message.id
+    }
+
     private func enqueueGroupMessage(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String, kind: SessionGroupMessage.Kind) async throws -> JSONObject {
         let line = SessionGroupOrchestration.oneLine(text)
         guard !line.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
@@ -3113,14 +3133,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !blocking || (kind == .question && requestedID != nil), reply == nil || kind == .reply else {
             throw RemoteHTTPError(400, "필수 질문에는 messageID를, 답변에는 원래 질문 ID를 지정해주세요.")
         }
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var wait: GroupWaitRecord?
         let message: SessionGroupMessage
         if blocking, let id = requestedID {
             let state = try groupOrchestration()
             let request = try waitRequest(object, id: id, group: groupID, member: sender.id, question: id, box: box, state: state)
             message = try box.transaction {
-                let m = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: .question, text: line, sourceKey: "decision:" + id.uuidString)
-                guard m.text == line else { throw RemoteHTTPError(409, "같은 ID의 질문 내용이 다릅니다.") }
+                let m = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: .question, text: body, sourceKey: "decision:" + id.uuidString)
+                guard m.text == body else { throw RemoteHTTPError(409, "같은 ID의 질문 내용이 다릅니다.") }
                 wait = try box.registerWait(request, assignments: state.assignments)
                 return m
             }
@@ -3128,18 +3149,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } else if let reply {
             let state = try groupOrchestration()
             message = try box.transaction {
-                let m = try box.answer(reply, id: requestedID, group: groupID, sender: sender.id, recipient: recipient.id, text: line)
+                let m = try box.answer(reply, id: requestedID, group: groupID, sender: sender.id, recipient: recipient.id, text: body)
                 try box.reconcileWaits(assignments: state.assignments, group: groupID)
                 return m
             }
             refreshGroupWaits()
         } else {
-            message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: line)
+            message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body)
         }
         scheduleGroupMailboxDelivery()
         var output: JSONObject = ["accepted": true, "messageID": message.id.uuidString, "receipt": message.json,
                 "delivered": message.acknowledgedAt != nil, "transport": "local_mailbox", "networkRequired": false,
-                "message": "로컬 수신함에 저장했습니다. accepted는 접수이며 수신 완료가 아닙니다. 같은 메시지를 재호출할 때 이 messageID를 유지하세요. 수신자가 ack_group_messages로 확인할 때까지 보관하고 알림을 재시도합니다."]
+                "message": "로컬 수신함에 저장했습니다. accepted는 접수이며 수신 완료가 아닙니다. 같은 메시지를 재호출할 때 이 messageID를 유지하세요. 전달 결과는 로컬 수신함에서 확인할 수 있습니다."]
         if let wait { output["wait"] = wait.json }
         return output
     }
@@ -3171,7 +3192,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             while !Task.isCancelled {
                 guard let self else { return }
                 do {
-                    guard try self.groupMailbox().pendingCount > 0 else { self.groupMailboxTask = nil; return }
+                    guard try self.groupMailbox().hasNotificationWork else { self.groupMailboxTask = nil; return }
                     try await self.deliverGroupMailboxNotifications()
                 } catch { /* Keep durable messages; query tools surface the storage error. */ }
                 await change.waitForChange(timeout: self.groupMailboxPollInterval)
@@ -3199,16 +3220,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             (message.lastResult == "not_started" && eligible[message.groupID]?.contains(message.recipientID) == true) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil, current.lastResult != "superseded" else { continue }
-            // Reserve the attempt durably before touching a terminal. A crash may repeat the hint, never the message record.
+            // A direct submission with an uncertain outcome stays in the inbox.
+            // Repeating it could start a second model turn.
             let retry = Date().addingTimeInterval(groupMailboxReminderInterval)
-            try groupMailbox().noteAttempt(message.id, result: "attempting", retryAt: retry, increment: true)
+            try groupMailbox().noteAttempt(message.id, result: message.deliversBody ? "direct_attempting" : "attempting", retryAt: retry, increment: true)
             do {
                 try await sendGroupMailboxNotice(message, observed: observed)
-                try groupMailbox().noteAttempt(message.id, result: "submitted", retryAt: retry)
+                try groupMailbox().noteAttempt(message.id, result: message.deliversBody ? "direct_submitted" : "submitted", retryAt: retry)
             } catch {
                 let result = (error as? RemoteHTTPError)?.diagnostics?["delivery"] ?? "unknown"
                 let backoff = result == "not_started" ? min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5)) : groupMailboxReminderInterval
-                try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(backoff))
+                let storedResult = message.deliversBody && result != "not_started" ? "direct_unknown" : result
+                try groupMailbox().noteAttempt(message.id, result: storedResult, error: error.localizedDescription, retryAt: Date().addingTimeInterval(backoff))
             }
         }
     }
@@ -3227,7 +3250,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }) == group,
                   let now = sessions[current.id], !snapshot.paused, !remoteInputStopped,
                   !automaticInputBusy(current.id), !userInputHasPriority(current.id),
-                  ![.approval, .input, .ended].contains(now.phase), !now.pendingInTerminal else {
+                  ![.approval, .input, .ended].contains(now.phase), !now.pendingInTerminal,
+                  !message.deliversBody || now.phase != .working else {
                 throw RemoteHTTPError(409, "그룹 연결·입력 상태가 바뀌어 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
             }
         }
@@ -3236,14 +3260,31 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if message.sourceKey?.hasPrefix("decision:") == true || message.kind == .waitNotice {
             line = "[AutoApprove 그룹 수신함] 작업 대기 관련 알림입니다. get_group_messages(groupID: \(group.id.uuidString), messageID: \(message.id.uuidString))로 이 항목을 먼저 확인하고 처리 후 수신 확인하세요. 질문에 답할 때는 inReplyTo에 원래 질문 ID를 지정하세요."
         }
-        try await sendGroupLine(current, text: line, preflight: {
+        if message.deliversBody {
+            let senderTitle = group.members.first { $0.id == message.senderID }?.title ?? ""
+            line = message.terminalPrompt(senderTitle: senderTitle)
+        }
+        let prompt = line
+        try await sendGroupLine(current, text: prompt, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
                 : ClaudeComposerReadiness.isEmpty(frame.screen)
-            guard empty, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
+            let busyCodex = message.deliversBody && current.agent == .codex &&
+                ActivityDetector.detect(frame.screen, agent: .codex).phase != .idle
+            guard empty, !busyCodex, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
                 throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
             }
             try ready()
+            guard let latest = try self.groupMailbox().message(message.id),
+                  latest.acknowledgedAt == nil, latest.lastResult == (message.deliversBody ? "direct_attempting" : "attempting") else {
+                throw RemoteHTTPError(409, "메시지가 이미 처리되었습니다.", diagnostics: ["delivery": "not_started"])
+            }
+            if message.deliversBody {
+                guard let conversation = live.conversationID else {
+                    throw RemoteHTTPError(409, "현재 대화 ID를 확인해주세요.", diagnostics: ["delivery": "not_started"])
+                }
+                try self.groupMailbox().recordSubmission(message.id, conversation: conversation, prompt: prompt)
+            }
             // Retain the user's Claude hook delegation only for an authenticated task report/question.
             // A peer's free-form message must never acquire task/approval authority through this hint.
             if [.report, .choiceQuestion].contains(message.kind), message.sourceKey != nil,
@@ -3599,6 +3640,37 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// A worker's first completion after its task becomes a report for the member that assigned it.
+    private func receiveGroupTurn(conversation: String, turn: String, prompt: String, response: String?) {
+        guard let id = SessionGroupMessage.terminalMessageID(prompt) else { return }
+        do {
+            let box = try groupMailbox()
+            guard try box.confirmedPrompt(id, conversation: conversation, prompt: prompt),
+                  let request = try box.message(id), request.deliversBody else { return }
+            let state = try groupOrchestration()
+            try box.transaction {
+                guard try box.claimTurn(id, turn: turn) else { return }
+                try box.confirmDelivery(request)
+                guard let response, !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !response.contains("\0") else { return }
+                let question: SessionGroupMessage
+                if request.kind == .question, try box.canAutomaticallyAnswer(id) {
+                    question = request
+                } else if let upstream = try box.resumedQuestion(for: request),
+                          let original = try box.message(upstream), original.kind == .question,
+                          original.groupID == request.groupID, original.recipientID == request.recipientID {
+                    question = original
+                } else { return }
+                guard try box.message(sourceKey: "answer:" + question.id.uuidString) == nil else { return }
+                _ = try box.answer(question.id, id: nil, group: question.groupID, sender: question.recipientID,
+                                   recipient: question.senderID, text: response)
+                try box.reconcileWaits(assignments: state.assignments, group: request.groupID)
+            }
+            refreshGroupWaits()
+        } catch {
+            // The provider retains the original response if the local store cannot commit it.
+        }
+    }
+
     private func noteGroupCompletion(_ sessionID: String, _ completion: WorkCompletion) {
         guard var state = try? groupOrchestration(),
               let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working && $0.sentAt <= completion.date.addingTimeInterval(1) }),
@@ -5487,12 +5559,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             session.codexQuestionsError = update.error
             session.completionError = update.completionError ?? (update.turn == nil && !update.completionReadPending ? update.error : nil)
             if let turn = update.turn {
-                codexTurns[session.id] = (turn, date)
+                let previousTurn = codexTurns.updateValue((turn, date), forKey: session.id)?.0
                 let completed = codexCompletions.observe(turn, sessionID: session.id, at: date)
                 if turn.status != "completed" || session.completion?.id != "codex:\(turn.threadID):\(turn.turnID ?? "")" {
                     session.completion = nil
                 }
-                if let completed { session.completion = completed; noteGroupCompletion(session.id, completed) }
+                if turn.status == "completed", previousTurn != turn, let prompt = turn.userPrompt, let turnID = turn.turnID {
+                    receiveGroupTurn(conversation: turn.threadID, turn: "codex:" + turnID, prompt: prompt, response: turn.summary)
+                }
+                if let completed {
+                    session.completion = completed
+                    if turn.userPrompt == nil { noteGroupCompletion(session.id, completed) }
+                }
             } else if update.completionReadPending || update.error != nil || update.completionError != nil {
                 codexTurns.removeValue(forKey: session.id)
                 session.completion = nil
@@ -6680,6 +6758,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } else if event == "SessionStart" || event == "SessionEnd" {
             claudeWorkIDs.removeValue(forKey: key); session.completion = nil
         }
+        if event == "UserPromptSubmit" {
+            claudeGroupPrompts.removeValue(forKey: key)
+            if lineageVerified, let prompt = payload["prompt"] as? String, SessionGroupMessage.terminalMessageID(prompt) != nil {
+                let turn = "claude:" + requestID
+                claudeGroupPrompts[key] = (prompt, turn)
+                receiveGroupTurn(conversation: providerID, turn: turn, prompt: prompt, response: nil)
+            }
+        } else if ["SessionStart", "SessionEnd", "StopFailure"].contains(event) {
+            claudeGroupPrompts.removeValue(forKey: key)
+        }
         var response: JSONObject = [:]
         if let risk {
             // Legacy hook decisions use the same safe denial as the durable bridge.
@@ -6769,6 +6857,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 session.interruption = SessionInterruption(id:UUID().uuidString,kind:.claudeFailure(failure),detail:detail)
             }
         case "Stop":
+            let groupPrompt = claudeGroupPrompts.removeValue(forKey: key)
             guard !session.pendingInTerminal else { break }
             // A normal completion supersedes the preceding failed turn. Keeping its
             // error active would restart the CLI later when the user exits normally.
@@ -6783,10 +6872,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 session.setPhase(.idle, detail: "Claude 응답은 끝났고 다음 지시를 받을 수 있습니다. 백그라운드 작업 또는 예약된 후속 작업을 모니터링 중입니다.", monitoring: true)
                 session.pendingSummary = nil
             } else {
+                if lineageVerified, let groupPrompt {
+                    receiveGroupTurn(conversation: providerID, turn: groupPrompt.turn, prompt: groupPrompt.prompt, response: payload["last_assistant_message"] as? String)
+                }
                 if let workID = claudeWorkIDs.removeValue(forKey: key) ?? (session.phase == .working ? UUID().uuidString : nil) {
                     let completion = WorkCompletion(id: "claude:\(providerID):\(workID)", summary: payload["last_assistant_message"] as? String)
                     session.completion = completion
-                    noteGroupCompletion(key, completion)
+                    if groupPrompt == nil { noteGroupCompletion(key, completion) }
                 }
                 session.setPhase(.idle, detail: "Claude의 응답 완료 이벤트를 받았습니다. 다음 지시를 기다리고 있습니다.", monitoring: false); session.pendingSummary = nil
             }

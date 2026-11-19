@@ -113,9 +113,9 @@ extension ApprovalTests {
         _ = engine.handleHook(["hook_event_name": "Notification", "notification_type": "idle_prompt",
             "requestID": UUID().uuidString, "session_id": ids[records[1].pid]!, "agentPID": records[1].pid,
             "agentStarted": records[1].started])
-        try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "submitted" })
+        try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "direct_submitted" })
         try expectEqual(terminal.typed.count, 1)
-        try expect(terminal.typed[0].contains("[AutoApprove 그룹 수신함]"))
+        try expect(terminal.typed[0].contains("busy then idle"))
         try expectEqual(try box.pendingCount, 1, "Terminal submission is not an ACK")
         try await ack(waiting)
         // A subsequent draft, continuation, question or approval must remain untouched.
@@ -931,10 +931,10 @@ extension ApprovalTests {
             try await rejects { try await call(tool, String(repeating: "x", count: 4001)) }
         }
         try await rejects { try await call("get_group_messages", caller: 3) }
-        // A busy Codex with an empty composer receives a hint, not duplicate executable message bodies.
+        // A busy Codex with an empty composer must not receive another turn.
         try engine.setPaused(false)
-        try expect(try await waitForGroup(5) { writer.writes(to: sessions[0].tty).contains { $0.contains("그룹 수신함") } })
-        try expect(writer.writes.allSatisfy { !$0.contains("queued 0") && !$0.contains("first") })
+        try expect(try await waitForGroup(5) { (try? box.message(first.id)?.lastResult) == "not_started" })
+        try expectEqual(writer.writes.count, 0)
         try expectEqual(try box.pendingCount, 12)
         try await acknowledge(all.map(\.id), caller: 0)
         try await acknowledge(all.map(\.id), caller: 0)
@@ -975,17 +975,19 @@ extension ApprovalTests {
         let disconnectedID = try unwrapGroup((disconnectedMessage["messageID"] as? String).flatMap(UUID.init(uuidString:)))
         try await Task.sleep(for: .milliseconds(350)); try expectNil(try box.message(disconnectedID)?.acknowledgedAt)
         try store.save([group]); try await acknowledge([disconnectedID], caller: 0)
-        // Submission uncertainty survives app restart; repeating a hint never duplicates the message record.
+        // Submission uncertainty survives app restart without another terminal input.
         showReady(1); terminal.ignoresInput = true; engine.groupMailboxReminderInterval = 30
         let uncertain = try await call("reply_group_question", "retained after restart", caller: 2, target: 1)
         let uncertainID = try unwrapGroup((uncertain["messageID"] as? String).flatMap(UUID.init(uuidString:)))
-        try expect(try await waitForGroup(12) { (try? box.message(uncertainID)?.lastResult) == "unknown" })
+        try expect(try await waitForGroup(12) { (try? box.message(uncertainID)?.lastResult) == "direct_unknown" })
         engine.stop(); terminal.ignoresInput = false; showReady(1)
-        try box.noteAttempt(uncertainID, result: "unknown", retryAt: .distantPast)
+        let submittedBeforeRestart = count()
+        try box.noteAttempt(uncertainID, result: "direct_unknown", retryAt: .distantPast)
         engine = try makeEngine(); engine.groupMailboxReminderInterval = 30
         engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
         try engine.start(poll: false)
-        try expect(try await waitForGroup(6) { (try? box.message(uncertainID)?.lastResult) == "submitted" })
+        try await Task.sleep(for: .milliseconds(450))
+        try expectEqual(count(), submittedBeforeRestart)
         try expectEqual(try box.message(uncertainID)?.text, "retained after restart")
         try expectEqual(try box.pendingCount, 1)
         try await acknowledge([uncertainID], caller: 1)
@@ -1033,7 +1035,7 @@ extension ApprovalTests {
             let result = try await send("첫 번째 줄\n두 번째 줄")
             try expectEqual(result["transport"] as? String, "local_mailbox"); try expectEqual(result["accepted"] as? Bool, true)
             let box = try SessionGroupMailbox(directory: directory)
-            try expectEqual(try box.list(groupID: group.id, memberID: members[1].id).map(\.text), ["첫 번째 줄 두 번째 줄"])
+            try expectEqual(try box.list(groupID: group.id, memberID: members[1].id).map(\.text), ["첫 번째 줄\n두 번째 줄"])
             _ = try await send("확인했습니다", caller: 1, target: 0)
             try expectEqual(try box.list(groupID: group.id, memberID: members[0].id).map(\.text), ["확인했습니다"])
             try expect(try engine.sessionGroupAssignments().isEmpty, "Peer messages must not create worker assignments")
