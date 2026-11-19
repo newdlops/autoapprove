@@ -4,18 +4,32 @@ import CoreGraphics
 /// Read the current scripting topology in a fixed number of Apple events.
 /// Window IDs bracket the bulk TTY reply; exact predicates bind any later action.
 enum TerminalProfileScriptQueries {
-    static let inventory = """
+    static let windowIDs = """
+    function realWindowIDs(ids){
+      if(!Array.isArray(ids)||ids.length>512||ids.some(id=>id!==null&&(!Number.isInteger(id)||id<=0)))
+        throw Error('Terminal 창·탭 구성을 확인하지 못했습니다.');
+      const real=ids.filter(id=>id!==null);
+      if(new Set(real).size!==real.length)throw Error('Terminal 창을 구분하지 못했습니다.');
+      return real;
+    }
+    """
+    static let inventory = windowIDs + """
+
     function inventory(){
-      const ids=app.windows.id(),groups=app.windows.tabs.tty(),after=app.windows.id();
-      if(!Array.isArray(ids)||!Array.isArray(groups)||!Array.isArray(after)||ids.length>512||
-         ids.length!==groups.length||JSON.stringify(ids)!==JSON.stringify(after)||
-         new Set(ids).size!==ids.length||ids.some(id=>!Number.isInteger(id)||id<=0)||groups.some(tabs=>!Array.isArray(tabs)))
+      const ids=app.windows.id(),real=realWindowIDs(ids);
+      // Terminal can return a null window ID and omit that slot in the
+      // bulk TTY result. Resolve real windows by ID when alignment is lost.
+      const groups=real.length===ids.length
+        ? app.windows.tabs.tty()
+        : real.map(id=>app.windows.byId(id).tabs.tty());
+      if(!Array.isArray(groups)||real.length!==groups.length||
+         JSON.stringify(ids)!==JSON.stringify(app.windows.id())||groups.some(tabs=>!Array.isArray(tabs)))
         throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
       const rows=[],seen=new Set();
       groups.forEach((tabs,index)=>tabs.forEach(tty=>{
         if(typeof tty!=='string'||!/^\\/dev\\/ttys[0-9]+$/.test(tty)||seen.has(tty)||rows.length>=4095)
           throw Error('Terminal 탭을 구분하지 못했습니다.');
-        seen.add(tty);rows.push({tty,windowID:ids[index]});
+        seen.add(tty);rows.push({tty,windowID:real[index]});
       }));return rows;
     }
     function exactTab(row){
@@ -101,18 +115,22 @@ public enum TerminalProfileTopology {
         (()=>{
           const app=Application('com.apple.Terminal'),wanted=new Set(\(targets)),result=[];
           if(!app.running())throw Error('Terminal이 실행 중이 아닙니다.');
-          app.windows().forEach((window,windowOrder)=>{
-            const matches=[];
+          \(TerminalProfileScriptQueries.windowIDs)
+          const ids=app.windows.id();
+          realWindowIDs(ids).forEach((windowID,windowOrder)=>{
+            const window=app.windows.byId(windowID),matches=[];
             window.tabs().forEach((tab,tabOrder)=>{
               const tty=tab.tty();if(wanted.has(tty))matches.push({tab,tty,tabOrder});
             });
             if(!matches.length)return;
-            const windowID=Number(window.id()),selectedTab=window.selectedTab(),selected=selectedTab ? selectedTab.tty():null;
+            const selectedTab=window.selectedTab(),selected=selectedTab ? selectedTab.tty():null;
             matches.forEach(({tab,tty,tabOrder})=>{
               const settingsName=String(tab.currentSettings().name()),customTitle=String(tab.customTitle());
               result.push({tty,windowID,windowOrder,tabOrder,selected:tty===selected,selectedTTY:selected,settingsName,customTitle:customTitle||null});
             });
-          });return JSON.stringify(result);
+          });
+          if(JSON.stringify(ids)!==JSON.stringify(app.windows.id()))throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
+          return JSON.stringify(result);
         })();
         """
     }
@@ -149,7 +167,15 @@ public enum TerminalProfileTopology {
             let selections=Array(Set(rows.compactMap(\.selectedTTY)))
             let target=try AutomationScript.literal(selections)
             var failure:Error?
-            do {_ = try keyboard.run("const app=Application('com.apple.Terminal'),wanted=new Set(\(target)); if(app.frontmost())for(const window of app.windows())for(const tab of window.tabs())if(wanted.has(tab.tty()))window.selectedTab=tab; 'restored';")}
+            do {_ = try keyboard.run("""
+                const app=Application('com.apple.Terminal'),wanted=new Set(\(target));
+                \(TerminalProfileScriptQueries.windowIDs)
+                if(app.frontmost())for(const id of realWindowIDs(app.windows.id())){
+                  const window=app.windows.byId(id);
+                  for(const tab of window.tabs())if(wanted.has(tab.tty()))window.selectedTab=tab;
+                }
+                'restored';
+                """)}
             catch {failure=error}
             try reader.restore(groups)
             if let failure {throw failure}

@@ -21,7 +21,7 @@ else {
 }
 await writeFile(output+'.scripts.json',JSON.stringify(scripts)+'\n');
 
-function check(scenario){
+function check(scenario,{placeholder=false}={}){
   let stats={},commands=[],activations=0,sleeps=0;
   const rawByTab=new WeakMap();
   const request=(name,read)=>{stats[name]=(stats[name]||0)+1;return read();};
@@ -34,13 +34,18 @@ function check(scenario){
   }
   function window(raw){
     const tabs=()=>request('enumerateTabs',()=>raw.tabs.map(tab));
+    tabs.tty=()=>request('windowTTY',()=>raw.tabs.map(value=>value.tty));
     tabs.whose=predicate=>()=>request('exactTTY',()=>raw.tabs.filter(value=>value.tty===predicate.tty).map(tab));
     const result={id:()=>request('windowID',()=>raw.id),exists:()=>request('exists',()=>windows.includes(raw)),tabs};
     for(const name of ['miniaturized','selectedTab','index'])Object.defineProperty(result,name,{set:value=>request(name,()=>{raw[name]=value;})});
     return result;
   }
   const list=()=>request('enumerateWindows',()=>windows.map(window));
-  list.id=()=>request('bulkIDs',()=>windows.map(value=>value.id));
+  list.id=()=>request('bulkIDs',()=>{
+    const ids=windows.map(value=>value.id);
+    if(placeholder)ids.splice(1,0,null);
+    return ids;
+  });
   list.tabs={tty:()=>request('bulkTTY',()=>windows.map(value=>value.tabs.map(value=>value.tty))),
     whose:predicate=>()=>request('exactTTY',()=>windows.map(value=>value.tabs.filter(value=>value.tty===predicate.tty).map(tab)))};
   list.byId=id=>{const raw=windows.find(value=>value.id===id);return raw?window(raw):{exists:()=>request('exists',()=>false)};};
@@ -74,6 +79,12 @@ if(!recordOnly){
     assert.equal(result.stages.launch.exactTTY,1);assert.equal(result.stages.launch.processes,1);
     assert.equal(result.requests,cases[0].requests,'Client request count must stay fixed through 128 tabs');
   }
+}
+// Terminal can emit a null scripting window and omit it from bulk TTYs.
+const placeholder = check(scripts[1], {placeholder:true});
+for (const name of ['prepare','confirm','select']) {
+  assert.equal(placeholder.stages[name].bulkTTY || 0, 0);
+  assert.ok(placeholder.stages[name].windowTTY > 0);
 }
 const report={label:option('label')||'current',actualTerminalOperations:0,measurement:'Synthetic scripting API request counts; excludes native AX and process startup, not elapsed time',cases};
 if(option('baseline')){
