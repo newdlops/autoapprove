@@ -314,6 +314,33 @@ public enum SessionGroupMatching {
         return matches.count == 1 ? matches[0] : nil
     }
 
+    /// Claude /clear changes the registered conversation inside the same process.
+    /// Transfer the original member record only when the old identity has no other live owner.
+    static func refreshedClaude(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
+        groups.map { group in
+            var updated = group
+            for (index, member) in group.members.enumerated() where member.agent == .claude {
+                guard let old = UUID(uuidString: member.conversationID),
+                      let runtime = member.runtimeID,
+                      let endpoint = connection(member, in: live), endpoint.id == runtime,
+                      let fresh = endpoint.conversationID.flatMap(UUID.init(uuidString:)), fresh != old,
+                      member.providerHome == nil || member.providerHome == endpoint.providerHome,
+                      !live.contains(where: { other in
+                          other.id != runtime && other.session.agent == .claude && other.providerHome == endpoint.providerHome &&
+                          other.conversationID.flatMap(UUID.init(uuidString:)).map { [old, fresh].contains($0) } == true
+                      }),
+                      !group.members.contains(where: {
+                          $0.id != member.id && $0.agent == .claude &&
+                          ($0.runtimeID == runtime || (UUID(uuidString: $0.conversationID) == fresh &&
+                              ($0.providerHome == nil || $0.providerHome == endpoint.providerHome)))
+                      }) else { continue }
+                updated.members[index].conversationID = fresh.uuidString.lowercased()
+                updated.members[index].providerHome = endpoint.providerHome ?? member.providerHome
+            }
+            return updated
+        }
+    }
+
     /// Process connectivity is separate from conversation identity. This is only
     /// for presentation and explicit identity refresh, never task delivery.
     public static func connection(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {

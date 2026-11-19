@@ -230,6 +230,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupDeliveryTask: Task<Void, Never>?
     private var groupMailboxStore: SessionGroupMailbox?
     private var groupWaitTimer: Task<Void, Never>?
+    private let groupMailboxSignal = RemoteTerminalChangeSignal()
+    private var groupMailboxIdleClaude: Set<String> = []
     private var groupMailboxTask: Task<Void, Never>?
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
@@ -898,6 +900,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         appUpdates.stop(); updateReceiver.stop()
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
         groupMailboxTask?.cancel(); groupMailboxTask = nil
+        groupMailboxIdleClaude.removeAll()
         groupWaitTimer?.cancel(); groupWaitTimer = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
@@ -2896,6 +2899,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard reconcile else { return observed }
         let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
         var refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
+        // A managed clear owns its write and checkpoint. Manual Claude clears
+        // can reconcile directly from the registry of the original live process.
+        let manual = refreshed.filter { !groupClearActive($0.id) }
+        let claude = Dictionary(uniqueKeysWithValues: SessionGroupMatching.refreshedClaude(manual, live: observed).map { ($0.id, $0) })
+        refreshed = refreshed.map { claude[$0.id] ?? $0 }
         var remaining:[TerminalProfileGroupAttachment]=[]
         for attachment in profileGroupAttachments where attachment.expires > Date() {
             guard let gi=refreshed.firstIndex(where:{$0.id==attachment.groupID}),
@@ -3156,7 +3164,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func scheduleGroupMailboxDelivery() {
-        guard groupMailboxTask == nil, !remoteInputStopped else { return }
+        guard !remoteInputStopped else { return }
+        if groupMailboxTask != nil { groupMailboxSignal.notify(); return }
+        let change = groupMailboxSignal.observe()
         groupMailboxTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -3164,17 +3174,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     guard try self.groupMailbox().pendingCount > 0 else { self.groupMailboxTask = nil; return }
                     try await self.deliverGroupMailboxNotifications()
                 } catch { /* Keep durable messages; query tools surface the storage error. */ }
-                do { try await Task.sleep(for: .seconds(self.groupMailboxPollInterval)) } catch { break }
+                await change.waitForChange(timeout: self.groupMailboxPollInterval)
             }
         }
     }
 
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
-        let due = try groupMailbox().heads().filter { $0.nextAttemptAt <= Date() }
-        guard !due.isEmpty else { return }
+        let heads = try groupMailbox().heads()
+        let idle = groupMailboxIdleClaude
+        groupMailboxIdleClaude.removeAll()
+        let now = Date()
+        guard heads.contains(where: { $0.nextAttemptAt <= now || (!idle.isEmpty && $0.lastResult == "not_started") }) else { return }
         let observed = try await sessionGroupSessions()
-        for message in due {
+        var eligible: [UUID: Set<UUID>] = [:]
+        if !idle.isEmpty {
+            for group in try SessionGroupStore(directory: paths.directory).load() {
+                eligible[group.id] = Set(group.members.filter { member in
+                    member.agent == .claude && SessionGroupMatching.match(member, in: observed).map { idle.contains($0.id) } == true
+                }.map(\.id))
+            }
+        }
+        for message in heads where message.nextAttemptAt <= now ||
+            (message.lastResult == "not_started" && eligible[message.groupID]?.contains(message.recipientID) == true) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil, current.lastResult != "superseded" else { continue }
             // Reserve the attempt durably before touching a terminal. A crash may repeat the hint, never the message record.
@@ -6792,6 +6814,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         sessions[key] = session
+        if groupMailboxTask != nil, session.phase == .idle,
+           event == "Stop" || (event == "Notification" && payload["notification_type"] as? String == "idle_prompt") {
+            groupMailboxIdleClaude.insert(key)
+            groupMailboxSignal.notify()
+        }
         if session.interruption != nil { persistInterruption(key) }
         snapshot.health.claude = "연결됨 · 세션 이벤트 수신 중"; publish()
         if event == "UserPromptSubmit", let context = groupDelegationContext(sessionID: key, prompt: payload["prompt"] as? String) {

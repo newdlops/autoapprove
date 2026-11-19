@@ -295,6 +295,42 @@ extension ApprovalTests {
         }
     }
 
+    @MainActor func testManualClaudeClearPreservesGroupAuthority() async throws {
+        let fixture = GroupClearFixture(leader: .claude, loseFirstReply: false)
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-manual-clear-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sessions = fixture.records.map {
+            AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm)
+        }
+        let engine = try ApprovalEngine(paths: .init(directory: directory), claudeRegistryReader: { records in
+            records.compactMap { record in
+                guard record.agent == .claude, let index = fixture.records.firstIndex(where: { $0.key == record.key }) else { return nil }
+                return .init(processID: record.key, kind: "interactive", sessionID: fixture.id(index), status: "idle")
+            }
+        }, processReader: { fixture.records }, codexGroupReader: { record in
+            guard record.agent == .codex, let index = fixture.records.firstIndex(where: { $0.key == record.key }) else { return nil }
+            return .init(threadID: fixture.id(index), database: "/fixture/home/thread_history_1.sqlite")
+        }, isolateByDefault: true)
+        defer { engine.stop() }
+        engine.updateDiscovery(sessions, records: fixture.records)
+        let live = try await engine.sessionGroupSessions()
+        let members = sessions.map { session in live.first { $0.id == session.id }!.member }
+        let group = SessionGroup(name: "manual clear", members: Array(members.prefix(2)), leaderMemberID: members[0].id)
+        let store = SessionGroupStore(directory: directory)
+        try store.save([group])
+        fixture.resetIdentity(0)
+        let status = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_group_status", "sessionID": sessions[0].id])
+        let groups = status["groups"] as? [JSONObject]
+        let roster = groups?.first?["members"] as? [JSONObject]
+        try expectEqual(roster?.first(where: { $0["id"] as? String == members[1].id.uuidString })?["canAssign"] as? Bool, true)
+        let saved = try store.load()[0]
+        try expectEqual(saved.members.map(\.id), group.members.map(\.id))
+        try expectEqual(saved.leaderMemberIDs, group.leaderMemberIDs)
+        try expectEqual(saved.parentID(of: members[1].id), members[0].id)
+        try expectEqual(saved.members[0].conversationID, fixture.id(0))
+        try expectEqual(fixture.counts(), [0,0,0], "Observation sends no /clear")
+    }
+
     @MainActor func testGroupClearSelectedMemberOnlyAndRequestScope() async throws {
         for leader in [AgentKind.codex, .claude] {
             let fixture = GroupClearFixture(leader: leader, loseFirstReply: true)

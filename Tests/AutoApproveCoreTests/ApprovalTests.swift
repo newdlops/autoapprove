@@ -514,6 +514,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: offline bidirectional peer messages stay local",tests.testGroupOfflinePeerMessagesUseLocalTerminals),
             ("Session groups: durable cross-agent inbox survives collisions, restart and ACK",tests.testGroupDialogueAcrossAgentsAndHierarchy),
             ("Session groups: mixed-agent clear updates IDs once and preserves roles/inbox",tests.testGroupClearMixedAgentsPreservesRolesAndDoesNotRepeat),
+            ("Session groups: manual Claude clear preserves authority",tests.testManualClaudeClearPreservesGroupAuthority),
             ("Session groups: selected-member clear preserves other sessions and request scope",tests.testGroupClearSelectedMemberOnlyAndRequestScope),
             ("Session groups: background window clear protects only the active input target",tests.testGroupClearBackgroundWindowsPreserveActiveInput),
             ("Session groups: native keyboard focus rejects changed or ambiguous targets",tests.testKeyboardTargetReadRejectsChangingAndAmbiguousFocus),

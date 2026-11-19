@@ -109,7 +109,10 @@ extension ApprovalTests {
         try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "not_started" })
         try expect(terminal.typed.isEmpty); try expectEqual(try box.pendingCount, 1)
         terminal.setStatus(records[1].pid, "idle")
-        try box.noteAttempt(waiting, result: "not_started", retryAt: .distantPast)
+        try box.noteAttempt(waiting, result: "not_started", retryAt: Date().addingTimeInterval(45))
+        _ = engine.handleHook(["hook_event_name": "Notification", "notification_type": "idle_prompt",
+            "requestID": UUID().uuidString, "session_id": ids[records[1].pid]!, "agentPID": records[1].pid,
+            "agentStarted": records[1].started])
         try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "submitted" })
         try expectEqual(terminal.typed.count, 1)
         try expect(terminal.typed[0].contains("[AutoApprove 그룹 수신함]"))
