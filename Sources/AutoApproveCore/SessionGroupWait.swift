@@ -66,6 +66,12 @@ extension SessionGroupMailbox {
     func visibleWaits(_ group: UUID) throws -> [GroupWaitRecord] {
         try waitRows("WHERE group_id=? AND state IN ('waiting','expired') ORDER BY deadline", [group.uuidString])
     }
+
+    func expiredConversationQuestions(_ group: UUID) throws -> Set<UUID> {
+        let waits = try visibleWaits(group)
+        let waiting = Set(waits.filter { $0.state == "waiting" }.flatMap { $0.request.questions })
+        return Set(waits.filter { $0.state == "expired" }.flatMap { $0.request.questions }).subtracting(waiting)
+    }
     /// Uses only typed identifiers for Mermaid labels. Message bodies never enter the diagram.
     static func diagram(_ rows: [GroupWaitRecord]) -> String {
         func node(_ key: String) -> String {

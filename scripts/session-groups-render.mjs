@@ -20,7 +20,7 @@ if(verifyRefresh) {
   source=out+'/SessionGroupsWindow.swift';
   await writeFile(source,original.replace(marker,marker+'\n        let _ = GroupRefreshProbe.observe(groups)'));
 }
-execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,'Sources/AutoApproveApp/WindowViewUpdates.swift',source,'Tests/fixtures/session-groups-render.swift','-o',binary],{stdio:'inherit',timeout:120000});
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,'Sources/AutoApproveApp/WindowViewUpdates.swift','Sources/AutoApproveApp/SessionGroupConversationGraph.swift',source,'Tests/fixtures/session-groups-render.swift','-o',binary],{stdio:'inherit',timeout:120000});
 if(verifyRefresh)console.log(execFileSync(binary,[out,'--verify-refresh'],{encoding:'utf8',timeout:30000}).trim());
 else if (process.argv.includes('--interactive')) {
   execFileSync(binary,[out,'--interactive'],{stdio:'inherit',timeout:3600000});

@@ -73,6 +73,18 @@ public struct SessionGroupMessage: Equatable {
     }
 }
 
+public struct SessionGroupConversation: Identifiable, Equatable {
+    public let question: SessionGroupMessage
+    public let answer: SessionGroupMessage?
+    public let waitExpired: Bool
+    public var id: UUID { question.id }
+}
+
+public struct SessionGroupConversationPage: Equatable {
+    public let conversations: [SessionGroupConversation]
+    public let hasMore: Bool
+}
+
 /// Durable local inbox. Terminal notifications are hints; only the recipient's ACK completes a message.
 /// Receipts retain their IDs, including after acknowledgement, so a repeated request cannot create a second message.
 public final class SessionGroupMailbox {
@@ -226,6 +238,35 @@ public final class SessionGroupMailbox {
         try rows("WHERE group_id=? AND " + (outbox ? "sender_id" : "recipient_id") + "=? AND sequence>?" +
                  (includeAcknowledged ? "" : " AND acknowledged IS NULL AND last_result IS NOT 'superseded'") + " ORDER BY sequence LIMIT ?",
                  [groupID.uuidString, memberID.uuidString, String(after), String(max(1, min(limit, 101)))])
+    }
+
+    /// Questions retain their identity after delivery, so an observed prompt
+    /// or an ACK cannot by itself remove an unanswered edge from the graph.
+    public func conversations(groupID: UUID) throws -> SessionGroupConversationPage {
+        let questions = """
+            SELECT id FROM messages q WHERE q.group_id=? AND q.kind='question'
+              AND q.last_result IS NOT 'superseded'
+            ORDER BY EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || q.id),
+                     q.sequence DESC LIMIT 301
+            """
+        let rows = try rows("""
+            WHERE group_id=? AND (id IN (\(questions)) OR source_key IN
+                (SELECT 'answer:' || id FROM (\(questions))))
+            ORDER BY sequence DESC
+            """, Array(repeating: groupID.uuidString, count: 3))
+        let answers = Dictionary(uniqueKeysWithValues: rows.filter { $0.kind == .reply }.compactMap { row in
+            row.sourceKey.map { ($0, row) }
+        })
+        let expired = try expiredConversationQuestions(groupID)
+        let projected = rows.filter { $0.kind == .question }.map { question in
+            let answer = answers["answer:" + question.id.uuidString].flatMap { reply in
+                reply.senderID == question.recipientID && reply.recipientID == question.senderID ? reply : nil
+            }
+            return SessionGroupConversation(question: question, answer: answer,
+                                             waitExpired: answer == nil && expired.contains(question.id))
+        }
+        let ordered = projected.filter { $0.answer == nil } + projected.filter { $0.answer != nil }
+        return .init(conversations: Array(ordered.prefix(300)), hasMore: ordered.count > 300)
     }
     // Results owned by a compound wait are sent in its single ready message.
     // Results remain individually readable in their original inbox.

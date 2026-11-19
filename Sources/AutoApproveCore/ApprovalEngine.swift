@@ -3341,6 +3341,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Read-only task history for the management window.
     public func sessionGroupAssignments() throws -> [SessionGroupAssignment] { try groupOrchestration().assignments }
 
+    public func sessionGroupConversations(_ id: UUID) throws -> SessionGroupConversationPage {
+        try groupMailbox().conversations(groupID: id)
+    }
+
     private func saveGroupOrchestration(_ state: SessionGroupOrchestration) throws {
         let data = try JSONEncoder().encode(state)
         try store.set(SessionGroupOrchestration.storeKey, String(decoding: data, as: UTF8.self))
