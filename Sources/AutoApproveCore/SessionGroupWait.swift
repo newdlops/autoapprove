@@ -84,25 +84,77 @@ extension SessionGroupMailbox {
         return lines.joined(separator: "\n")
     }
 
-    func suppressLateAnswerDelivery(_ question: UUID, recipient: UUID, answer: UUID) throws {
-        guard let wait = try waitRecord(question), wait.request.member == recipient, wait.state == "expired" else { return }
-        try update("UPDATE messages SET last_result='late' WHERE id=? AND last_result IS NULL", [answer.uuidString])
+    private func suppressLateAnswerDelivery(_ question: UUID, answer: SessionGroupMessage) throws {
+        let waits = try waitRows("WHERE group_id=? AND state IN ('waiting','expired')", [answer.groupID.uuidString])
+            .filter { $0.request.member == answer.recipientID && $0.request.questions.contains(question) }
+        guard waits.contains(where: { $0.state == "expired" }),
+              !waits.contains(where: { $0.state == "waiting" }) else { return }
+        try update("UPDATE messages SET last_result='late' WHERE id=? AND last_result IS NULL", [answer.id.uuidString])
     }
 
     func canAutomaticallyAnswer(_ question: UUID) throws -> Bool {
         try !waitRows("WHERE state IN ('waiting','ready','expired')").contains { $0.request.decision == question }
     }
 
-    /// Only an unambiguous single-question dependency can resume an upstream
-    /// request from this individual reply. Compound waits need a batch input.
-    func resumedQuestion(for reply: SessionGroupMessage) throws -> UUID? {
-        guard reply.kind == .reply, let key = reply.sourceKey, key.hasPrefix("answer:"),
-              let answered = UUID(uuidString: String(key.dropFirst(7))) else { return nil }
-        let matches = try waitRows("WHERE group_id=? AND state='ready'", [reply.groupID.uuidString]).filter {
-            $0.request.member == reply.recipientID && $0.request.questions == [answered] &&
-                $0.request.tasks.isEmpty && !$0.request.external && $0.request.decision != nil
+    func resumedWait(for notice: SessionGroupMessage) throws -> GroupWaitRequest? {
+        guard let key = notice.sourceKey else { return nil }
+        if notice.kind == .reply, key.hasPrefix("answer:"),
+           let answered = UUID(uuidString: String(key.dropFirst(7))) {
+            let matches = try waitRows("WHERE group_id=? AND state='ready'", [notice.groupID.uuidString]).filter {
+                $0.request.member == notice.recipientID && $0.request.questions == [answered] &&
+                    $0.request.tasks.isEmpty && !$0.request.external
+            }
+            return matches.count == 1 ? matches.first?.request : nil
         }
-        return matches.count == 1 ? matches.first?.request.decision : nil
+        guard notice.kind == .waitNotice else { return nil }
+        let parts = key.split(separator: ":")
+        guard parts.count == 4, parts[0] == "wait", parts[2] == "ready",
+              let id = UUID(uuidString: String(parts[1])), let row = try waitRecord(id),
+              row.state == "ready", row.request.group == notice.groupID,
+              row.request.member == notice.recipientID else { return nil }
+        return row.request
+    }
+
+    private func readyBody(_ request: GroupWaitRequest, assignments: [SessionGroupAssignment]) throws -> String {
+        var results: [String] = []
+        let noticeKey = "wait:\(request.id.uuidString):ready:\(request.member.uuidString)"
+        for id in request.questions {
+            guard let reply = try message(sourceKey: "answer:" + id.uuidString),
+                  reply.groupID == request.group, reply.recipientID == request.member else { continue }
+            results.append(try batchResult(reply, noticeKey: noticeKey))
+        }
+        for id in request.tasks {
+            if let report = try message(sourceKey: "report:" + id.uuidString),
+               report.groupID == request.group, report.recipientID == request.member {
+                results.append(try batchResult(report, noticeKey: noticeKey))
+            } else if let task = assignments.first(where: {
+                $0.id == id && $0.groupID == request.group && $0.parentMemberID == request.member &&
+                    [.completed, .reported].contains($0.status)
+            }), let text = task.originalResponse ?? task.summary {
+                try insertBatchSource(noticeKey, "report:" + id.uuidString)
+                results.append("작업 " + id.uuidString + "\n" + text)
+            }
+        }
+        return results.joined(separator: "\n\n")
+    }
+
+    private func insertBatchSource(_ notice: String, _ source: String) throws {
+        try update("INSERT OR IGNORE INTO group_batch_sources(notice_key,source_key) VALUES(?,?)", [notice, source])
+    }
+
+    private func batchResult(_ message: SessionGroupMessage, noticeKey: String) throws -> String {
+        let key = message.sourceKey ?? message.id.uuidString
+        if message.acknowledgedAt != nil || (message.attempts > 0 && message.lastResult != "not_started") ||
+            message.lastResult == "batched" {
+            return key + " · 기존 수신함 원문 " + message.id.uuidString
+        }
+        try insertBatchSource(noticeKey, key)
+        try update("UPDATE messages SET last_result='batched' WHERE id=?", [message.id.uuidString])
+        return key + "\n" + message.text
+    }
+
+    func taskStillWaiting(_ id: UUID) throws -> Bool {
+        try !waitRows("WHERE owner_task=? AND state='waiting'", [id.uuidString]).isEmpty
     }
 
     func tracksTask(_ task: UUID) throws -> Bool {
@@ -208,7 +260,7 @@ extension SessionGroupMailbox {
             throw RemoteHTTPError(409, "이미 답변된 질문입니다. 새 대화는 별도 메시지로 보내세요.")
         }
         let answer = try insertMessage(id: id, groupID: group, senderID: sender, recipientID: recipient, kind: .reply, text: text, sourceKey: key)
-        try suppressLateAnswerDelivery(question, recipient: recipient, answer: answer.id)
+        try suppressLateAnswerDelivery(question, answer: answer)
         return answer
     }
 
@@ -255,7 +307,11 @@ extension SessionGroupMailbox {
                 possible.append(true)
             }
             if r.external { results.append(row.externalReady); possible.append(true) }
-            if r.matches(results) { try transition(row, to: "ready", detail: "필요한 응답이 도착했습니다.") }
+            if r.matches(results) {
+                let singleQuestion = r.questions.count == 1 && r.tasks.isEmpty && !r.external
+                let body = row.state == "waiting" && !singleQuestion ? try readyBody(r, assignments: assignments) : ""
+                try transition(row, to: "ready", detail: "필요한 응답이 도착했습니다.", payload: body)
+            }
             else if !r.matches(possible) { try transition(row, to: "cancelled", detail: "필요한 작업이 결과 없이 교체되었습니다.") }
             else if row.state == "waiting", now >= row.deadline { try transition(row, to: "expired", detail: "정한 기한까지 결과가 도착하지 않았습니다.") }
             else if row.state == "waiting" { active[r.group, default: []].append(row) }
@@ -285,17 +341,18 @@ extension SessionGroupMailbox {
         }
     }
 
-    private func transition(_ row: GroupWaitRecord, to state: String, detail: String) throws {
+    private func transition(_ row: GroupWaitRecord, to state: String, detail: String, payload: String = "") throws {
         try update("UPDATE group_waits SET state=?,detail=? WHERE id=?", [state, detail, row.request.id.uuidString])
+        if row.state == "expired", state == "ready" { return }
         // The answer's own body is also the wake-up for a single blocking question.
         if state != "ready" || row.request.questions.count != 1 || !row.request.tasks.isEmpty || row.request.external {
-            try notify(row, recipient: row.request.member, state: state, detail: detail)
+            try notify(row, recipient: row.request.member, state: state, detail: detail, payload: payload)
         }
     }
-    private func notify(_ row: GroupWaitRecord, recipient: UUID, state: String, detail: String) throws {
+    private func notify(_ row: GroupWaitRecord, recipient: UUID, state: String, detail: String, payload: String = "") throws {
         let id = row.request.id.uuidString
         let key = "wait:\(id):\(state):\(recipient.uuidString)"
-        let body = "대기 \(id) · \(state) · " + String(detail.prefix(3000))
+        let body = "대기 \(id) · \(state) · " + String(detail.prefix(3000)) + (payload.isEmpty ? "" : "\n" + payload)
         if row.state == "expired", let stale = try message(sourceKey: "wait:\(id):expired:\(recipient.uuidString)"),
            stale.attempts == 0, stale.acknowledgedAt == nil {
             // Retire only the unsubmitted hint. A reader may already know its immutable message ID.

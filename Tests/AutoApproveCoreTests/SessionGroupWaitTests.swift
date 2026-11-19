@@ -102,6 +102,31 @@ extension ApprovalTests {
         _ = try await call("complete_group_task", 1, ["taskID": a, "summary":"final"])
         try expectEqual(try await call("wait_group_dependencies", 0, ["waitID":root, "taskIDs":[a]])["state"] as? String, "ready")
 
+        let batchID = UUID().uuidString
+        let questionIDs = [UUID().uuidString, UUID().uuidString]
+        for (index, id) in questionIDs.enumerated() {
+            _ = try await call("ask_group_question", 0, ["messageID": id, "memberID": members[index + 1].id.uuidString, "text": "batch question"])
+        }
+        let batch: JSONObject = ["waitID": batchID, "questionIDs": questionIDs]
+        try expectEqual(try await call("wait_group_dependencies", 0, batch)["state"] as? String, "waiting")
+        for (index, id) in questionIDs.enumerated() {
+            _ = try await call("reply_group_question", index + 1, [
+                "inReplyTo": id, "memberID": members[0].id.uuidString, "text": "fixture result \(index)"
+            ])
+            if index == 0 {
+                try expectEqual(try await call("wait_group_dependencies", 0, batch)["state"] as? String, "waiting")
+                try expect(!(try box.heads()).contains { $0.sourceKey == "answer:" + id })
+            }
+        }
+        let batchKey = "wait:\(batchID):ready:\(members[0].id.uuidString)"
+        let ready = try box.message(sourceKey: batchKey)
+        try expectEqual(try await call("wait_group_dependencies", 0, batch)["state"] as? String, "ready")
+        try expect(ready?.text.contains("fixture result 0") == true)
+        try expect(ready?.text.contains("fixture result 1") == true)
+        for id in questionIDs {
+            try expectEqual(try box.message(sourceKey: "answer:" + id)?.lastResult, "batched")
+        }
+
         let timeout = UUID().uuidString
         let request: JSONObject = ["waitID": timeout, "external":true, "timeoutSeconds":1]
         _ = try await call("wait_group_dependencies", 2, request)
@@ -112,7 +137,7 @@ extension ApprovalTests {
         try expectEqual(try await call("wait_group_dependencies", 2, request)["state"] as? String, "expired")
         try expectEqual(try await call("update_group_wait", 2, ["waitID":timeout, "action":"externalReady"])["state"] as? String, "ready")
         let notices = try box.list(groupID: group.id, memberID: members[2].id).filter { $0.kind == .waitNotice && $0.text.contains(timeout) }
-        try expectEqual(notices.filter { $0.text.contains(" · ready · ") }.count, 1)
-        try expect(notices.count <= 2, "At most one submitted expiry notice plus one result")
+        try expectEqual(notices.filter { $0.text.contains(" · ready · ") }.count, 0)
+        try expectEqual(notices.filter { $0.text.contains(" · expired · ") }.count, 1)
     }
 }

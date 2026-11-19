@@ -24,6 +24,8 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     public var status: Status
     public var completedAt: Date?
     public var summary: String?
+    var originalResponse: String?
+    var workerConversationID: String?
     public var reportedAt: Date?
     public var deliveryError: String?
     /// A choice question the worker is waiting on during this task. Only its parent may answer it.
@@ -130,11 +132,12 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     }
 
     @discardableResult
-    mutating func complete(id: UUID, completion: WorkCompletion) -> SessionGroupAssignment? {
+    mutating func complete(id: UUID, completion: WorkCompletion, preserveOriginal: Bool = false) -> SessionGroupAssignment? {
         guard let index = assignments.firstIndex(where: { $0.id == id && $0.status == .working }) else { return nil }
         assignments[index].status = .completed
         assignments[index].completedAt = completion.date
         assignments[index].summary = completion.summary
+        if preserveOriginal { assignments[index].originalResponse = completion.originalResponse }
         return assignments[index]
     }
 

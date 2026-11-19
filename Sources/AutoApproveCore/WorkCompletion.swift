@@ -5,8 +5,12 @@ public struct WorkCompletion: Codable, Equatable {
     public var id: String
     public var date: Date
     public var summary: String
+    var originalResponse: String? = nil
+    var originalPromptAt: Date? = nil
+    private enum CodingKeys: String, CodingKey { case id, date, summary }
     public init(id: String, date: Date = Date(), summary: String? = nil) {
         self.id = id; self.date = date
+        self.originalResponse = summary.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || $0.contains("\0") ? nil : $0 }
         let text = summary?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.summary = text.isEmpty ? "최종 응답을 마쳤습니다. 터미널에서 결과를 확인하세요." : String(text.prefix(600))
     }
@@ -190,7 +194,6 @@ public enum CodexTurnReader {
               item["type"] as? String == "userMessage",
               let parts = item["content"] as? [JSONObject], parts.count == 1,
               parts.first?["type"] as? String == "text", let prompt = parts.first?["text"] as? String,
-              SessionGroupMessage.terminalMessageID(prompt) != nil,
               sqlite3_step(statement) == SQLITE_DONE else { return nil }
         return prompt
     }

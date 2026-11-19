@@ -43,7 +43,8 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
     }
     private struct FinalTurn {
         var completion: WorkCompletion
-        var promptFingerprint: String?
+        var prompt: String?
+        var promptOccurrences: Int = 0
         var promptAt: Date?
     }
     private let lock = NSLock()
@@ -64,9 +65,21 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
               turn.completion.date >= after, turn.completion.date <= Date().addingTimeInterval(5) else { return nil }
         if let task {
             guard let promptAt = turn.promptAt, promptAt >= after, promptAt <= turn.completion.date,
-                  turn.promptFingerprint == PromptDetector.fingerprint(SessionGroupOrchestration.oneLine(task)) else { return nil }
+                  turn.prompt == SessionGroupOrchestration.oneLine(task) else { return nil }
         }
-        return turn.completion
+        var completion = turn.completion
+        completion.originalPromptAt = turn.promptAt
+        return completion
+    }
+
+    func recoverableGroupTurn(_ live: SessionGroupLiveSession) -> (prompt: String, date: Date, response: WorkCompletion)? {
+        guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
+              let home = live.providerHome, home.hasPrefix("/"),
+              let turn = claude(live, home: home, id: id, includeCompletion: true)?.finalTurn,
+              let prompt = turn.prompt, SessionGroupMessage.terminalMessageID(prompt) != nil,
+              turn.promptOccurrences == 1, let date = turn.promptAt,
+              date <= turn.completion.date, turn.completion.date <= Date().addingTimeInterval(5) else { return nil }
+        return (prompt, date, turn.completion)
     }
 
     private func claude(_ live: SessionGroupLiveSession, home: String, id: String, includeCompletion: Bool) -> Cached? {
@@ -126,6 +139,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
 
     private static func claudeCompletion(_ bytes: Data, id: String) -> FinalTurn? {
         var final: WorkCompletion?
+        var latest: FinalTurn?
         for line in bytes.split(separator: 10).reversed() {
             guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? JSONObject,
                   row["isSidechain"] as? Bool != true,
@@ -139,8 +153,13 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
                 if let parts, !parts.isEmpty, parts.allSatisfy({ $0["type"] as? String == "tool_result" }) { continue }
                 guard let final else { return nil }
                 let text = message["content"] as? String ?? parts?.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                return FinalTurn(completion: final, promptFingerprint: text.flatMap { $0.count <= 4000 ? PromptDetector.fingerprint(SessionGroupOrchestration.oneLine($0)) : nil },
-                    promptAt: (row["timestamp"] as? String).flatMap(date))
+                if let found = latest {
+                    if found.prompt == text { latest?.promptOccurrences += 1 }
+                    continue
+                }
+                latest = FinalTurn(completion: final, prompt: text, promptOccurrences: 1, promptAt: (row["timestamp"] as? String).flatMap(date))
+                if text.flatMap(SessionGroupMessage.terminalMessageID) == nil { return latest }
+                continue
             }
             guard type == "assistant" else { continue }
             if final != nil { continue }
@@ -152,7 +171,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             final = WorkCompletion(id: "claude-log:\(id):\(item)", date: ended, summary: text)
         }
-        return final.map { FinalTurn(completion: $0) }
+        return latest ?? final.map { FinalTurn(completion: $0) }
     }
 
     private func codex(home: String, id: String) -> SessionGroupModelSettings? {

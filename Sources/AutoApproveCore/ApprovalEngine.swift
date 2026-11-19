@@ -175,6 +175,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let codexGroupEnvironment: @Sendable (ProcessRecord) -> [String: String]?
     private let groupModelSettingsReader: @Sendable (SessionGroupLiveSession) -> SessionGroupModelSettings?
     private let profileExecutionSettingsReader: @Sendable (SessionGroupLiveSession) -> TerminalProfileExecutionSettings?
+    private let groupTranscriptReader: SessionGroupModelSettingsReader
+    private var groupRecoveryAt = Date.distantPast
     private let groupClaudeCompletionReader: @Sendable (SessionGroupLiveSession, Date, String) -> WorkCompletion?
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
     private let discoveryReader: @Sendable () throws -> [ProcessRecord]
@@ -655,6 +657,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         self.codexGroupEnvironment = codexGroupEnvironment ?? { ProcessEnvironment.read($0) }
         let modelReader = SessionGroupModelSettingsReader()
+        self.groupTranscriptReader = modelReader
         self.groupModelSettingsReader = groupModelSettingsReader ?? { modelReader.read($0) }
         self.profileExecutionSettingsReader = profileExecutionSettingsReader ?? (processReader == nil ? { TerminalProfileExecutionSettingsReader.read($0) } : { _ in nil })
         self.groupClaudeCompletionReader = groupClaudeCompletionReader ?? { modelReader.completion($0, after: $1, task: $2) }
@@ -3024,7 +3027,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let delay: TimeInterval
         do {
             let box = try groupMailbox()
-            if try box.pendingCount > 0 { scheduleGroupMailboxDelivery() }
+            if try box.pendingCount > 0 || !box.recoverableClaudeQuestions().isEmpty { scheduleGroupMailboxDelivery() }
             guard try box.hasUnresolvedWaits() else { return }
             let state = try groupOrchestration()
             try box.transaction { try box.reconcileWaits(assignments: state.assignments) }
@@ -3192,11 +3195,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
             while !Task.isCancelled {
                 guard let self else { return }
                 do {
-                    guard try self.groupMailbox().hasNotificationWork else { self.groupMailboxTask = nil; return }
+                    let box = try self.groupMailbox()
+                    let questions = try box.recoverableClaudeQuestions()
+                    guard try box.hasNotificationWork || !questions.isEmpty else { self.groupMailboxTask = nil; return }
+                    if Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty,
+                       self.sessions.values.contains(where: { $0.agent == .claude && $0.phase != .ended }) {
+                        self.groupRecoveryAt = Date()
+                        await self.recoverClaudeGroupQuestions(questions)
+                    }
                     try await self.deliverGroupMailboxNotifications()
                 } catch { /* Keep durable messages; query tools surface the storage error. */ }
                 await change.waitForChange(timeout: self.groupMailboxPollInterval)
             }
+        }
+    }
+
+    private func recoverClaudeGroupQuestions(_ questions: [SessionGroupMessage]) async {
+        guard !remoteInputStopped, let groups = try? SessionGroupStore(directory: paths.directory).load(),
+              let live = try? await sessionGroupSessions(), !Task.isCancelled else { return }
+        let reader = groupTranscriptReader
+        for candidate in live where candidate.session.agent == .claude {
+            guard let conversation = candidate.conversationID, let session = sessions[candidate.id],
+                  ![.working, .approval, .input, .ended].contains(session.phase),
+                  !session.pendingInTerminal, session.backgroundMonitoring != true,
+                  session.interruption?.needsAttention != true,
+                  let group = groups.first(where: { group in
+                      group.members.contains { SessionGroupMatching.match($0, in: live)?.id == candidate.id }
+                  }), let member = group.members.first(where: { SessionGroupMatching.match($0, in: live)?.id == candidate.id }),
+                  questions.contains(where: { $0.groupID == group.id && $0.recipientID == member.id }),
+                  let observed = await Task.detached(priority: .utility, operation: { reader.recoverableGroupTurn(candidate) }).value,
+                  !Task.isCancelled, !remoteInputStopped, let id = SessionGroupMessage.terminalMessageID(observed.prompt),
+                  questions.contains(where: { $0.id == id && $0.groupID == group.id && $0.recipientID == member.id }),
+                  let turn = try? groupMailbox().recoveryTurn(id, promptAt: observed.date, fallback: observed.response.id) else { continue }
+            receiveGroupTurn(conversation: conversation, turn: turn, prompt: observed.prompt,
+                             response: observed.response.originalResponse)
         }
     }
 
@@ -3219,7 +3251,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for message in heads where message.nextAttemptAt <= now ||
             (message.lastResult == "not_started" && eligible[message.groupID]?.contains(message.recipientID) == true) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
-            guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil, current.lastResult != "superseded" else { continue }
+            guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil, !["superseded", "batched"].contains(current.lastResult ?? "") else { continue }
             // A direct submission with an uncertain outcome stays in the inbox.
             // Repeating it could start a second model turn.
             let retry = Date().addingTimeInterval(groupMailboxReminderInterval)
@@ -3647,15 +3679,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard try box.confirmedPrompt(id, conversation: conversation, prompt: prompt),
                   let request = try box.message(id), request.deliversBody else { return }
             let state = try groupOrchestration()
+            var resumedTask: UUID?
+            var receipts: [UUID] = []
             try box.transaction {
                 guard try box.claimTurn(id, turn: turn) else { return }
                 try box.confirmDelivery(request)
-                guard let response, !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                if request.containsOriginalReport { receipts.append(id) }
+                let isReference = request.isReferencePrompt(prompt)
+                let batch = isReference ? [] : try box.batchSources(request)
+                for item in batch {
+                    try box.confirmDelivery(item)
+                    if item.kind == .report { receipts.append(item.id) }
+                }
+                if response == nil { try box.notePromptReceipt(id) }
+                guard !isReference, let response, !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       !response.contains("\0") else { return }
+                let resumed = try box.resumedWait(for: request)
+                resumedTask = resumed?.decision == nil ? resumed?.task : nil
                 let question: SessionGroupMessage
                 if request.kind == .question, try box.canAutomaticallyAnswer(id) {
                     question = request
-                } else if let upstream = try box.resumedQuestion(for: request),
+                } else if let upstream = resumed?.decision,
                           let original = try box.message(upstream), original.kind == .question,
                           original.groupID == request.groupID, original.recipientID == request.recipientID {
                     question = original
@@ -3665,18 +3709,39 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                    recipient: question.senderID, text: response)
                 try box.reconcileWaits(assignments: state.assignments, group: request.groupID)
             }
+            if let resumedTask, let response,
+               let assignment = state.assignments.first(where: { $0.id == resumedTask &&
+                   $0.groupID == request.groupID && $0.workerMemberID == request.recipientID }) {
+                noteGroupCompletion(assignment.workerSessionID, WorkCompletion(id: turn, summary: response),
+                                    conversation: conversation, turn: turn, resumedTask: resumedTask)
+            }
+            if !receipts.isEmpty { try applyGroupMessageAcknowledgements(receipts) }
             refreshGroupWaits()
         } catch {
             // The provider retains the original response if the local store cannot commit it.
         }
     }
 
-    private func noteGroupCompletion(_ sessionID: String, _ completion: WorkCompletion) {
+    private func noteGroupCompletion(_ sessionID: String, _ completion: WorkCompletion,
+                                     conversation: String? = nil, prompt: String? = nil, turn: String? = nil,
+                                     resumedTask: UUID? = nil) {
         guard var state = try? groupOrchestration(),
-              let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working && $0.sentAt <= completion.date.addingTimeInterval(1) }),
-              (try? groupMailbox().tracksTask(task.id)) == false,
-              state.complete(id: task.id, completion: completion) != nil else { return }
-        do { try saveGroupOrchestration(state) } catch { return }
+              let task = state.assignments.last(where: { $0.workerSessionID == sessionID && $0.status == .working && (resumedTask == nil || $0.id == resumedTask) && $0.sentAt <= completion.date.addingTimeInterval(1) }),
+              let box = try? groupMailbox() else { return }
+        do {
+            if let expected = task.workerConversationID {
+                guard expected.lowercased() == conversation?.lowercased(), let turn,
+                      completion.originalResponse != nil else { return }
+                if resumedTask == task.id {
+                    guard try !box.taskStillWaiting(task.id) else { return }
+                } else {
+                    guard let prompt, try box.confirmedPrompt(task.id, conversation: expected, prompt: prompt),
+                          try !box.tracksTask(task.id), try box.claimTurn(task.id, turn: turn) else { return }
+                }
+            } else if try box.tracksTask(task.id) { return }
+            guard state.complete(id: task.id, completion: completion, preserveOriginal: task.workerConversationID != nil) != nil else { return }
+            try saveGroupOrchestration(state)
+        } catch { return }
         scheduleGroupDelivery()
     }
 
@@ -3714,10 +3779,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard let group = groups?.first(where: { $0.id == item.groupID }),
                       group.members.contains(where: { $0.id == item.workerMemberID }),
                       group.members.contains(where: { $0.id == item.parentMemberID }) else { throw AppError.message("보고의 원래 그룹과 구성원을 확인하지 못해 보관하고 있습니다.") }
-                let body = SessionGroupOrchestration.report(for: isQuestion ? [] : [item], questions: isQuestion ? [item] : [], titles: Dictionary(group.members.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first }))
+                let body = (isQuestion ? nil : item.originalResponse) ?? SessionGroupOrchestration.report(for: isQuestion ? [] : [item], questions: isQuestion ? [item] : [], titles: Dictionary(group.members.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first }))
                 let message = try groupMailbox().enqueue(groupID: group.id, senderID: item.workerMemberID, recipientID: item.parentMemberID,
-                    kind: isQuestion ? .choiceQuestion : .report, text: body, sourceKey: source)
-                if message.acknowledgedAt != nil { try applyGroupMessageAcknowledgements([message.id]) }
+                    kind: isQuestion ? .choiceQuestion : .report, text: body, sourceKey: source,
+                    originalReport: !isQuestion && item.originalResponse != nil)
+                let box = try groupMailbox()
+                if try box.acknowledgedBatchContains(message) { try box.confirmDelivery(message) }
+                if try box.message(message.id)?.acknowledgedAt != nil { try applyGroupMessageAcknowledgements([message.id]) }
                 else { scheduleGroupMailboxDelivery() }
             } catch {
                 if var latest = try? groupOrchestration() { latest.noteDeliveryFailure([item.id], error.localizedDescription); try? saveGroupOrchestration(latest) }
@@ -3749,7 +3817,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   completion.date >= item.sentAt, completion.date <= Date().addingTimeInterval(5),
                   let latest = try? groupOrchestration().current(groupID: item.groupID, workerMemberID: item.workerMemberID),
                   latest.id == item.id, latest.status == .working else { continue }
-            noteGroupCompletion(item.workerSessionID, completion)
+            let evidence: String?
+            if item.workerConversationID != nil, let promptAt = completion.originalPromptAt {
+                evidence = try? groupMailbox().recoveryTurn(item.id, promptAt: promptAt, fallback: completion.id)
+            } else {
+                evidence = completion.id
+            }
+            noteGroupCompletion(item.workerSessionID, completion, conversation: live.conversationID,
+                                prompt: SessionGroupOrchestration.taskMessage(item), turn: evidence)
         }
     }
 
@@ -4328,8 +4403,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     throw RemoteHTTPError(409, "작업자가 아직 작업 중이거나 응답을 기다리고 있습니다. 완료 보고를 받은 뒤 다시 지시하세요.")
                 }
             }
-            let assignment = SessionGroupAssignment(groupID: group.id, workerMemberID: target.id, parentMemberID: callerMember.id,
+            var assignment = SessionGroupAssignment(groupID: group.id, workerMemberID: target.id, parentMemberID: callerMember.id,
                                                     workerSessionID: worker.id, parentSessionID: caller.id, task: task)
+            assignment.workerConversationID = worker.conversationID
             // Recorded before typing, so a fast completion always finds its task.
             var state = try groupOrchestration()
             if let current = state.current(groupID: group.id, workerMemberID: target.id),
@@ -4341,8 +4417,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             // prompt, so a group task turns it on before the task is typed.
             let approval = enableGroupWorkerApproval(worker.id)
             do {
-                try await sendGroupLine(current, text: SessionGroupOrchestration.taskMessage(assignment)) {
+                let prompt = SessionGroupOrchestration.taskMessage(assignment)
+                try await sendGroupLine(current, text: prompt) {
                     try self.verifyGroupDirection(groupID, caller: callerMember, target: target)
+                    if let conversation = assignment.workerConversationID {
+                        try self.groupMailbox().recordSubmission(assignment.id, conversation: conversation, prompt: prompt)
+                    }
                 }
                 if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
             } catch {
@@ -5569,7 +5649,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 if let completed {
                     session.completion = completed
-                    if turn.userPrompt == nil { noteGroupCompletion(session.id, completed) }
+                    if turn.userPrompt.flatMap(SessionGroupMessage.terminalMessageID) == nil {
+                        noteGroupCompletion(session.id, completed, conversation: turn.threadID,
+                                            prompt: turn.userPrompt, turn: turn.turnID.map { "codex:" + $0 })
+                    }
                 }
             } else if update.completionReadPending || update.error != nil || update.completionError != nil {
                 codexTurns.removeValue(forKey: session.id)
@@ -6760,10 +6843,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         if event == "UserPromptSubmit" {
             claudeGroupPrompts.removeValue(forKey: key)
-            if lineageVerified, let prompt = payload["prompt"] as? String, SessionGroupMessage.terminalMessageID(prompt) != nil {
+            if lineageVerified, let prompt = payload["prompt"] as? String {
                 let turn = "claude:" + requestID
                 claudeGroupPrompts[key] = (prompt, turn)
-                receiveGroupTurn(conversation: providerID, turn: turn, prompt: prompt, response: nil)
+                if SessionGroupMessage.terminalMessageID(prompt) != nil {
+                    receiveGroupTurn(conversation: providerID, turn: turn, prompt: prompt, response: nil)
+                } else if let task = try? groupOrchestration().assignments.last(where: {
+                    $0.workerSessionID == key && $0.workerConversationID?.lowercased() == providerID.lowercased() &&
+                        $0.status == .working
+                }), let box = try? groupMailbox() {
+                    _ = try? box.transaction {
+                        if try box.confirmedPrompt(task.id, conversation: providerID, prompt: prompt),
+                           try box.claimTurn(task.id, turn: turn) {
+                            try box.notePromptReceipt(task.id)
+                        }
+                    }
+                }
             }
         } else if ["SessionStart", "SessionEnd", "StopFailure"].contains(event) {
             claudeGroupPrompts.removeValue(forKey: key)
@@ -6878,7 +6973,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if let workID = claudeWorkIDs.removeValue(forKey: key) ?? (session.phase == .working ? UUID().uuidString : nil) {
                     let completion = WorkCompletion(id: "claude:\(providerID):\(workID)", summary: payload["last_assistant_message"] as? String)
                     session.completion = completion
-                    if groupPrompt == nil { noteGroupCompletion(key, completion) }
+                    if groupPrompt.flatMap({ SessionGroupMessage.terminalMessageID($0.prompt) }) == nil {
+                        noteGroupCompletion(key, completion, conversation: providerID, prompt: groupPrompt?.prompt, turn: groupPrompt?.turn)
+                    }
                 }
                 session.setPhase(.idle, detail: "Claude의 응답 완료 이벤트를 받았습니다. 다음 지시를 기다리고 있습니다.", monitoring: false); session.pendingSummary = nil
             }
@@ -6923,7 +7020,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// It is added only to the reports and requests AutoApprove just delivered to that session. A worker's
     /// task gets nothing: it is typed as plain input, exactly as if the user had typed it.
     private func groupDelegationContext(sessionID: String, prompt: String?, at now: Date = Date()) -> String? {
-        if let prompt, prompt.hasPrefix("[AutoApprove 그룹 수신함]"),
+        if let prompt, prompt.hasPrefix("[AutoApprove 그룹 수신함]") || SessionGroupMessage.terminalMessageID(prompt) != nil,
            let receipt = groupMailboxDelegations[sessionID], now.timeIntervalSince(receipt.at) < 600,
            prompt.contains(receipt.id.uuidString) {
             return SessionGroupOrchestration.parentDelegation(group: receipt.group)
