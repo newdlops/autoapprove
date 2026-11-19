@@ -110,9 +110,15 @@ extension ApprovalTests {
         let batch: JSONObject = ["waitID": batchID, "questionIDs": questionIDs]
         try expectEqual(try await call("wait_group_dependencies", 0, batch)["state"] as? String, "waiting")
         for (index, id) in questionIDs.enumerated() {
-            _ = try await call("reply_group_question", index + 1, [
-                "inReplyTo": id, "memberID": members[0].id.uuidString, "text": "fixture result \(index)"
-            ])
+            let questionID = UUID(uuidString: id)!
+            let answerID = try engine.queueSessionGroupReply(groupID: group.id, questionID: questionID, text: "fixture result \(index)")
+            let stored = try box.message(answerID)
+            try expectEqual(stored?.senderID, members[index + 1].id)
+            try expectEqual(stored?.recipientID, members[0].id)
+            do {
+                _ = try engine.queueSessionGroupReply(groupID: group.id, questionID: questionID, text: "fixture result \(index)")
+                throw AppError.message("Direct answer duplicated an existing reply")
+            } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
             if index == 0 {
                 try expectEqual(try await call("wait_group_dependencies", 0, batch)["state"] as? String, "waiting")
                 try expect(!(try box.heads()).contains { $0.sourceKey == "answer:" + id })
@@ -130,8 +136,9 @@ extension ApprovalTests {
         let unanswered = try box.enqueue(groupID: group.id, senderID: members[1].id,
                                          recipientID: members[0].id, kind: .question, text: "unanswered graph edge")
         try box.acknowledge([unanswered.id], groupID: group.id, recipientID: members[0].id)
-        _ = try box.enqueue(groupID: UUID(), senderID: members[1].id, recipientID: members[0].id,
-                            kind: .question, text: "unrelated group")
+        let unrelated = try box.enqueue(groupID: UUID(), senderID: members[1].id, recipientID: members[0].id,
+                                        kind: .question, text: "unrelated group")
+        try expect((try? engine.queueSessionGroupReply(groupID: group.id, questionID: unrelated.id, text: "wrong group")) == nil)
         let saved = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
                                     kind: .message, text: "saved group message")
         let graph = try box.conversations(groupID: group.id)

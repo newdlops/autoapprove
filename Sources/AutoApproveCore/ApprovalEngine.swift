@@ -3113,6 +3113,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return message.id
     }
 
+    public func queueSessionGroupReply(groupID: UUID, questionID: UUID, text: String) throws -> UUID {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, body.count <= SessionGroupOrchestration.maximumTaskLength, !body.contains("\0") else {
+            throw AppError.message("답변을 1~4000자로 입력해주세요.")
+        }
+        guard !groupClearActive(groupID),
+              let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else {
+            throw AppError.message("현재 그룹을 확인한 뒤 다시 시도해주세요.")
+        }
+        let box = try groupMailbox()
+        guard let question = try box.message(questionID), question.kind == .question, question.groupID == groupID,
+              question.lastResult != "superseded",
+              group.members.contains(where: { $0.id == question.senderID }),
+              group.members.contains(where: { $0.id == question.recipientID }) else {
+            throw AppError.message("현재 그룹의 원래 질문과 구성원을 확인할 수 없습니다.")
+        }
+        let answer = try recordSessionGroupAnswer(box, questionID: questionID, messageID: UUID(), groupID: groupID,
+                                                 senderID: question.recipientID, recipientID: question.senderID, body: body)
+        scheduleGroupMailboxDelivery()
+        return answer.id
+    }
+
+    private func recordSessionGroupAnswer(_ box: SessionGroupMailbox, questionID: UUID, messageID: UUID?,
+                                          groupID: UUID, senderID: UUID, recipientID: UUID, body: String) throws -> SessionGroupMessage {
+        let state = try groupOrchestration()
+        let answer = try box.transaction {
+            let message = try box.answer(questionID, id: messageID, group: groupID, sender: senderID, recipient: recipientID, text: body)
+            try box.reconcileWaits(assignments: state.assignments, group: groupID)
+            return message
+        }
+        refreshGroupWaits()
+        return answer
+    }
+
     private func enqueueGroupMessage(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String, kind: SessionGroupMessage.Kind) async throws -> JSONObject {
         let line = SessionGroupOrchestration.oneLine(text)
         guard !line.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
@@ -3150,13 +3184,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             refreshGroupWaits()
         } else if let reply {
-            let state = try groupOrchestration()
-            message = try box.transaction {
-                let m = try box.answer(reply, id: requestedID, group: groupID, sender: sender.id, recipient: recipient.id, text: body)
-                try box.reconcileWaits(assignments: state.assignments, group: groupID)
-                return m
-            }
-            refreshGroupWaits()
+            message = try recordSessionGroupAnswer(box, questionID: reply, messageID: requestedID, groupID: groupID,
+                                                   senderID: sender.id, recipientID: recipient.id, body: body)
         } else {
             message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body)
         }

@@ -9,6 +9,8 @@ import AutoApproveCore
     @State private var error: String?
     @State private var selected: UUID?
     @State private var onlyPending = false
+    @State private var replyTarget: SessionGroupConversation?
+    @State private var movedNodes: [UUID: CGPoint] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -45,14 +47,19 @@ import AutoApproveCore
                         VStack(alignment: .leading, spacing: 0) {
                             HStack {
                                 Label("발신 → 수신", systemImage: "arrow.right")
+                                Text("노드를 드래그해 이동")
                                 Spacer()
                                 Label { Text("미응답") } icon: { Image(systemName: "circle.fill").foregroundStyle(.orange) }
                                 if !onlyPending { Label("기타 기록", systemImage: "circle.fill") }
+                                Button("배치 초기화", systemImage: "arrow.counterclockwise") { movedNodes.removeAll() }
+                                    .labelStyle(.iconOnly)
+                                    .help("노드 자동 배치로 돌아가기")
+                                    .disabled(movedNodes.isEmpty)
                             }
                             .font(.caption).foregroundStyle(.secondary).padding(12)
                             Divider()
                             GroupConversationNodes(group: group, page: page, onlyPending: onlyPending,
-                                                   selection: $selected)
+                                                   selection: $selected, movedNodes: $movedNodes)
                         }
                         .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         Divider()
@@ -74,6 +81,15 @@ import AutoApproveCore
             }
         }
         .frame(minWidth: 720, idealWidth: 860, minHeight: 460, idealHeight: 590)
+        .sheet(item: $replyTarget) { item in
+            let question = item.question
+            GroupConversationReplyEditor(question: question,
+                                         sender: group.map { title(question.recipientID, in: $0) } ?? "",
+                                         recipient: group.map { title(question.senderID, in: $0) } ?? "") { text in
+                defer { refresh() }
+                _ = try engine.queueSessionGroupReply(groupID: groupID, questionID: question.id, text: text)
+            }
+        }
         .task {
             while !Task.isCancelled {
                 refresh()
@@ -122,20 +138,32 @@ import AutoApproveCore
                                 ForEach(conversations) { item in
                                     let outbound = item.question.senderID == selected
                                     let peer = outbound ? item.question.recipientID : item.question.senderID
-                                    DisclosureGroup {
-                                        message("질문", item.question)
-                                        if let answer = item.answer { message("답변", answer) }
-                                    } label: {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text((outbound ? "보낸 질문 · " : "받은 질문 · ") + title(peer, in: group))
-                                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                            Text(item.question.text).lineLimit(2)
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        DisclosureGroup {
+                                            message("질문", item.question)
+                                            if let answer = item.answer { message("답변", answer) }
+                                        } label: {
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text((outbound ? "보낸 질문 · " : "받은 질문 · ") + title(peer, in: group))
+                                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                                Text(item.question.text).lineLimit(2)
+                                            }
+                                        }
+                                        .disclosureGroupStyle(QuestionDisclosureStyle())
+                                        HStack {
                                             Label(status(item), systemImage: item.answer == nil ? "clock" : "checkmark.circle")
                                                 .font(.caption)
                                                 .foregroundStyle(item.waitExpired ? Color.orange : Color.secondary)
+                                            Spacer(minLength: 4)
+                                            if item.answer == nil, group.members.contains(where: { $0.id == peer }) {
+                                                Button("답변…") { replyTarget = item }
+                                                    .buttonStyle(.bordered)
+                                                    .controlSize(.small)
+                                            }
                                         }
                                     }
                                     .padding(.vertical, 4)
+                                    .accessibilityElement(children: .contain)
                                 }
                             }
                         }
@@ -197,12 +225,92 @@ import AutoApproveCore
     }
 }
 
+private struct QuestionDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                configuration.isExpanded.toggle()
+            } label: {
+                HStack(alignment: .top, spacing: 5) {
+                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                        .padding(.top, 2)
+                    configuration.label
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(configuration.isExpanded ? "펼침" : "접힘")
+            if configuration.isExpanded {
+                configuration.content.padding(.leading, 15)
+            }
+        }
+    }
+}
+
+private struct GroupConversationReplyEditor: View {
+    let question: SessionGroupMessage
+    let sender: String
+    let recipient: String
+    let send: (String) throws -> Void
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+    @State private var text = ""
+    @State private var error: String?
+
+    var body: some View {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let limit = SessionGroupOrchestration.maximumTaskLength
+        VStack(alignment: .leading, spacing: 12) {
+            Text("질문에 답변").font(.headline)
+            Text("\(sender) 대신 \(recipient)에게").foregroundStyle(.secondary)
+            ScrollView {
+                Text(question.text).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 100)
+            .accessibilityLabel("원래 질문")
+            TextEditor(text: $text)
+                .focused($focused)
+                .accessibilityLabel("답변 내용")
+                .frame(minHeight: 110)
+                .overlay { RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary).allowsHitTesting(false) }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Text("\(body.count) / \(limit)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(body.count > limit ? Color.red : Color.secondary)
+                Spacer()
+                Button("취소") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("답변 보내기") {
+                    do { try send(body); dismiss() }
+                    catch { self.error = error.localizedDescription }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(body.isEmpty || body.count > limit || body.contains("\0"))
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .defaultFocus($focused, true)
+    }
+}
+
 private struct GroupConversationNodes: View {
     let group: SessionGroup
     let page: SessionGroupConversationPage
     let onlyPending: Bool
     @Binding var selection: UUID?
+    @Binding var movedNodes: [UUID: CGPoint]
     @State private var layout: [UUID: CGPoint] = [:]
+    @GestureState private var dragging = false
+    @State private var dragOrigin: CGPoint?
 
     private static let palette: [Color] = [.blue, .purple, .teal, .pink, .green, .indigo, .cyan, .mint]
     private struct Flow {
@@ -220,7 +328,9 @@ private struct GroupConversationNodes: View {
             let minimum = max(350, ceil(sqrt(CGFloat(members.count))) * 90)
             let size = CGSize(width: max(proxy.size.width, minimum),
                               height: max(proxy.size.height, minimum))
-            let positions = layout.isEmpty ? topology.initialPositions : layout
+            let positions = topology.initialPositions
+                .merging(layout) { _, computed in computed }
+                .merging(movedNodes) { _, moved in moved }
             let points = positions.mapValues {
                 CGPoint(x: 75 + $0.x * (size.width - 150), y: 48 + $0.y * (size.height - 110))
             }
@@ -266,13 +376,34 @@ private struct GroupConversationNodes: View {
                             .buttonStyle(.plain)
                             .accessibilityLabel(member.title + ", " + member.agent.title)
                             .accessibilityAddTraits(selection == member.id ? [.isSelected] : [])
+                            .onMoveCommand { direction in
+                                let offset: CGSize
+                                switch direction {
+                                case .left: offset = CGSize(width: -16, height: 0)
+                                case .right: offset = CGSize(width: 16, height: 0)
+                                case .up: offset = CGSize(width: 0, height: -16)
+                                case .down: offset = CGSize(width: 0, height: 16)
+                                @unknown default: return
+                                }
+                                move(member.id, from: point, by: offset, in: size)
+                            }
+                            .gesture(DragGesture(minimumDistance: 5, coordinateSpace: .named("conversationCanvas"))
+                                .updating($dragging) { _, state, _ in state = true }
+                                .onChanged { value in
+                                    if dragOrigin == nil { dragOrigin = point }
+                                    move(member.id, from: dragOrigin ?? point, by: value.translation, in: size)
+                                })
                             .help(member.title + " · " + member.agent.title)
                             .position(x: point.x, y: point.y + 11)
                         }
                     }
                 }
                 .frame(width: size.width, height: size.height)
+                .coordinateSpace(name: "conversationCanvas")
             }
+        }
+        .onChange(of: dragging) { _, active in
+            if !active { dragOrigin = nil }
         }
         .task(id: topology) {
             let previous = layout
@@ -281,6 +412,13 @@ private struct GroupConversationNodes: View {
             }.value
             if !Task.isCancelled { layout = next }
         }
+    }
+
+    private func move(_ member: UUID, from origin: CGPoint, by offset: CGSize, in size: CGSize) {
+        movedNodes[member] = CGPoint(
+            x: min(1, max(0, (origin.x + offset.width - 75) / (size.width - 150))),
+            y: min(1, max(0, (origin.y + offset.height - 48) / (size.height - 110)))
+        )
     }
 
     private func flows(for ids: Set<UUID>) -> [ConversationGraphLayout.Link: Flow] {
