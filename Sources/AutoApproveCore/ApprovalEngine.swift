@@ -235,6 +235,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let groupMailboxSignal = RemoteTerminalChangeSignal()
     private var groupMailboxIdleClaude: Set<String> = []
     private var groupMailboxTask: Task<Void, Never>?
+    private var activeGroupMailboxMessages: Set<UUID> = []
     private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
@@ -3135,6 +3136,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return answer.id
     }
 
+    /// One operator-initiated terminal attempt using the original question and receipt ID.
+    public func deliverSessionGroupQuestion(groupID: UUID, questionID: UUID) async throws {
+        guard !snapshot.paused, !remoteInputStopped else {
+            throw AppError.message("AutoApprove가 일시 정지되어 있습니다.")
+        }
+        guard activeGroupMailboxMessages.insert(questionID).inserted else {
+            throw AppError.message("이 질문의 전달이 이미 진행 중입니다.")
+        }
+        defer { activeGroupMailboxMessages.remove(questionID) }
+
+        let box = try groupMailbox()
+        let observed = try await sessionGroupSessions()
+        guard let question = try box.unansweredQuestion(questionID, in: groupID) else {
+            throw AppError.message("현재 그룹에서 아직 답변되지 않은 질문을 찾을 수 없습니다.")
+        }
+        let retryAt = Date().addingTimeInterval(groupMailboxReminderInterval)
+        try box.noteManualQuestionAttempt(questionID, result: "direct_attempting", retryAt: retryAt, starting: true)
+        do {
+            try await sendGroupMailboxNotice(question, observed: observed, manualQuestion: true)
+        } catch {
+            let result = (error as? RemoteHTTPError)?.diagnostics?["delivery"]
+            if result == "not_started" {
+                try box.noteManualQuestionAttempt(questionID, result: question.lastResult,
+                                                  error: question.lastError, retryAt: question.nextAttemptAt)
+                throw error
+            }
+            try box.noteManualQuestionAttempt(questionID, result: "direct_unknown", error: error.localizedDescription, retryAt: retryAt)
+            throw AppError.message("터미널 제출을 확인하지 못했습니다. 대상 터미널을 확인해주세요.")
+        }
+        try box.noteManualQuestionAttempt(questionID, result: "direct_submitted", retryAt: retryAt)
+    }
+
     private func recordSessionGroupAnswer(_ box: SessionGroupMailbox, questionID: UUID, messageID: UUID?,
                                           groupID: UUID, senderID: UUID, recipientID: UUID, body: String) throws -> SessionGroupMessage {
         let state = try groupOrchestration()
@@ -3280,7 +3313,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for message in heads where message.nextAttemptAt <= now ||
             (message.lastResult == "not_started" && eligible[message.groupID]?.contains(message.recipientID) == true) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
-            guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil, !["superseded", "batched"].contains(current.lastResult ?? "") else { continue }
+            guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil,
+                  current.attempts == message.attempts, current.lastResult == message.lastResult,
+                  activeGroupMailboxMessages.insert(message.id).inserted else { continue }
+            defer { activeGroupMailboxMessages.remove(message.id) }
             // A direct submission with an uncertain outcome stays in the inbox.
             // Repeating it could start a second model turn.
             let retry = Date().addingTimeInterval(groupMailboxReminderInterval)
@@ -3297,7 +3333,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func sendGroupMailboxNotice(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession]) async throws {
+    private func sendGroupMailboxNotice(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession],
+                                        manualQuestion: Bool = false) async throws {
         guard !groupClearActive(message.groupID) else { throw RemoteHTTPError(409, "그룹 초기화 중이어서 메시지를 수신함에 보관합니다.", diagnostics: ["delivery": "not_started"]) }
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == message.groupID }),
               group.members.contains(where: { $0.id == message.senderID }),
@@ -3336,15 +3373,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
             }
             try ready()
-            guard let latest = try self.groupMailbox().message(message.id),
-                  latest.acknowledgedAt == nil, latest.lastResult == (message.deliversBody ? "direct_attempting" : "attempting") else {
+            let box = try self.groupMailbox()
+            let latest = try manualQuestion ? box.unansweredQuestion(message.id, in: message.groupID) : box.message(message.id)
+            guard let latest, manualQuestion || latest.acknowledgedAt == nil,
+                  latest.lastResult == (message.deliversBody ? "direct_attempting" : "attempting") else {
                 throw RemoteHTTPError(409, "메시지가 이미 처리되었습니다.", diagnostics: ["delivery": "not_started"])
             }
             if message.deliversBody {
                 guard let conversation = live.conversationID else {
                     throw RemoteHTTPError(409, "현재 대화 ID를 확인해주세요.", diagnostics: ["delivery": "not_started"])
                 }
-                try self.groupMailbox().recordSubmission(message.id, conversation: conversation, prompt: prompt)
+                try box.recordSubmission(message.id, conversation: conversation, prompt: prompt)
             }
             // Retain the user's Claude hook delegation only for an authenticated task report/question.
             // A peer's free-form message must never acquire task/approval authority through this hint.

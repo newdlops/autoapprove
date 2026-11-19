@@ -389,6 +389,21 @@ public final class SessionGroupMailbox {
         try update("UPDATE messages SET attempts=attempts+?,next_attempt=?,last_result=?,last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'batched'",
                    [increment ? "1" : "0", String(retryAt.timeIntervalSince1970), result, String((error ?? "").prefix(500)), id.uuidString])
     }
+
+    func unansweredQuestion(_ id: UUID, in groupID: UUID) throws -> SessionGroupMessage? {
+        try rows("""
+            WHERE id=? AND group_id=? AND kind='question' AND last_result IS NOT 'superseded'
+              AND NOT EXISTS(SELECT 1 FROM messages answer WHERE answer.source_key='answer:' || messages.id)
+            """, [id.uuidString, groupID.uuidString]).first
+    }
+
+    func noteManualQuestionAttempt(_ id: UUID, result: String?, error: String? = nil, retryAt: Date, starting: Bool = false) throws {
+        try update("""
+            UPDATE messages SET attempts=attempts+?, next_attempt=?, last_result=NULLIF(?,''), last_error=NULLIF(?,'')
+            WHERE id=? AND kind='question' AND \(starting ? "last_result IS NOT 'superseded'" : "last_result='direct_attempting'")
+            """, [starting ? "1" : "0", String(retryAt.timeIntervalSince1970), result ?? "",
+                  String((error ?? "").prefix(500)), id.uuidString])
+    }
     public func acknowledge(_ ids: [UUID], groupID: UUID, recipientID: UUID, at date: Date = Date()) throws {
         guard !ids.isEmpty, ids.count <= 50, Set(ids).count == ids.count else { throw RemoteHTTPError(400, "수신 확인할 메시지 ID 1~50개를 중복 없이 지정해주세요.") }
         try transaction {

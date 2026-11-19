@@ -949,6 +949,24 @@ extension ApprovalTests {
         let inbox = try await call("get_group_messages", caller: 1)
         let received = (inbox["messages"] as? [JSONObject] ?? []).compactMap { ($0["messageID"] as? String).flatMap(UUID.init(uuidString:)) }
         try expectEqual(received.count, 2); try await acknowledge(received, caller: 1)
+        let peerID = try unwrapGroup((peer["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+        let originalACK = try box.message(peerID)?.acknowledgedAt
+        let beforeManualDelivery = count()
+        do {
+            try await engine.deliverSessionGroupQuestion(groupID: group.id, questionID: peerID)
+            throw AppError.message("A busy Claude accepted manual input")
+        } catch is RemoteHTTPError {}
+        try expectEqual(count(), beforeManualDelivery)
+        showReady(1)
+        try await engine.deliverSessionGroupQuestion(groupID: group.id, questionID: peerID)
+        let manualInput = Array(terminal.typed.suffix(2))
+        try expectEqual(count(), beforeManualDelivery + 2, "The fixture requires one paste and one Enter")
+        try expect(manualInput.first?.contains("[AutoApprove 그룹 전달 \(peerID.uuidString)]") == true)
+        try expect(manualInput.first?.contains("peer question") == true)
+        try expectEqual(manualInput.last, "")
+        try expectEqual(try box.message(peerID)?.acknowledgedAt, originalACK)
+        try expectEqual(try box.message(peerID)?.lastResult, "direct_submitted")
+        try expectEqual(try box.pendingCount, 0)
         // General messages use the same durable cross-agent route, even with a leader.
         for (sender, recipient) in [(0, 1), (1, 0), (2, 1), (1, 2)] {
             let receipt = try await call("send_group_message", "cross-agent general \(sender)-\(recipient)", caller: sender, target: recipient)

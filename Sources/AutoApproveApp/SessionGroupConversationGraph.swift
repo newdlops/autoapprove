@@ -10,6 +10,10 @@ import AutoApproveCore
     @State private var selected: UUID?
     @State private var onlyPending = false
     @State private var replyTarget: SessionGroupConversation?
+    @State private var deliveryTarget: SessionGroupConversation?
+    @State private var deliveringQuestion: UUID?
+    @State private var deliveryFeedback: String?
+    @State private var deliveryError: String?
     @State private var movedNodes: [UUID: CGPoint] = [:]
 
     var body: some View {
@@ -37,6 +41,16 @@ import AutoApproveCore
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.red).padding(12)
+                Divider()
+            }
+            if let deliveryFeedback {
+                HStack {
+                    Label(deliveryFeedback, systemImage: "checkmark.circle")
+                    Spacer()
+                    Button("닫기", systemImage: "xmark") { self.deliveryFeedback = nil }
+                        .labelStyle(.iconOnly)
+                }
+                .font(.caption).foregroundStyle(.secondary).padding(12)
                 Divider()
             }
             if let page, let group {
@@ -90,11 +104,39 @@ import AutoApproveCore
                 _ = try engine.queueSessionGroupReply(groupID: groupID, questionID: question.id, text: text)
             }
         }
+        .confirmationDialog("원래 수신 노드에 질문 전달", isPresented: Binding(
+            get: { deliveryTarget != nil }, set: { if !$0 { deliveryTarget = nil } }
+        ), titleVisibility: .visible, presenting: deliveryTarget) { item in
+            Button("터미널에 전달") { deliver(item) }
+            Button("취소", role: .cancel) {}
+        } message: { item in
+            let name = group.map { title(item.question.recipientID, in: $0) } ?? ""
+            Text("\(name)의 터미널에 원래 질문을 보냅니다. 이미 본 질문이면 새 응답이 시작될 수 있습니다.")
+        }
+        .alert("질문 전달을 확인하지 못했습니다", isPresented: Binding(
+            get: { deliveryError != nil }, set: { if !$0 { deliveryError = nil } }
+        ), presenting: deliveryError) { _ in
+            Button("확인", role: .cancel) {}
+        } message: { Text($0) }
         .task {
             while !Task.isCancelled {
                 refresh()
                 do { try await Task.sleep(for: .seconds(6)) } catch { return }
             }
+        }
+    }
+
+    private func deliver(_ item: SessionGroupConversation) {
+        guard deliveringQuestion == nil else { return }
+        let name = group.map { title(item.question.recipientID, in: $0) } ?? "대상"
+        deliveryFeedback = nil
+        deliveringQuestion = item.id
+        Task {
+            defer { deliveringQuestion = nil; refresh() }
+            do {
+                try await engine.deliverSessionGroupQuestion(groupID: groupID, questionID: item.id)
+                deliveryFeedback = "\(name)의 터미널에 질문을 제출했습니다."
+            } catch { deliveryError = error.localizedDescription }
         }
     }
 
@@ -154,12 +196,19 @@ import AutoApproveCore
                                             Label(status(item), systemImage: item.answer == nil ? "clock" : "checkmark.circle")
                                                 .font(.caption)
                                                 .foregroundStyle(item.waitExpired ? Color.orange : Color.secondary)
-                                            Spacer(minLength: 4)
-                                            if item.answer == nil, group.members.contains(where: { $0.id == peer }) {
+                                        }
+                                        if item.answer == nil, group.members.contains(where: { $0.id == peer }) {
+                                            HStack {
+                                                if deliveringQuestion == item.id {
+                                                    ProgressView().controlSize(.small).accessibilityLabel("질문 전달 중")
+                                                }
+                                                Spacer(minLength: 4)
+                                                Button("노드에 전달…") { deliveryTarget = item }
+                                                    .disabled(deliveringQuestion != nil)
                                                 Button("답변…") { replyTarget = item }
-                                                    .buttonStyle(.bordered)
-                                                    .controlSize(.small)
                                             }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
                                         }
                                     }
                                     .padding(.vertical, 4)
@@ -302,6 +351,11 @@ private struct GroupConversationReplyEditor: View {
     }
 }
 
+// Only the moving node and its incident edges observe pointer updates.
+@Observable private final class ConversationNodeMotion {
+    var point: CGPoint?
+}
+
 private struct GroupConversationNodes: View {
     let group: SessionGroup
     let page: SessionGroupConversationPage
@@ -309,6 +363,8 @@ private struct GroupConversationNodes: View {
     @Binding var selection: UUID?
     @Binding var movedNodes: [UUID: CGPoint]
     @State private var layout: [UUID: CGPoint] = [:]
+    @State private var motion = ConversationNodeMotion()
+    @State private var movingNode: UUID?
     @GestureState private var dragging = false
     @State private var dragOrigin: CGPoint?
 
@@ -317,6 +373,13 @@ private struct GroupConversationNodes: View {
         var count = 0
         var pending = 0
     }
+    private struct Edge {
+        let link: ConversationGraphLayout.Link
+        let color: Color
+        let count: Int
+
+        func touches(_ id: UUID?) -> Bool { link.from == id || link.to == id }
+    }
 
     var body: some View {
         let members = group.treeOrder.map(\.member)
@@ -324,6 +387,12 @@ private struct GroupConversationNodes: View {
         let flows = flows(for: Set(ids))
         let topology = ConversationGraphLayout(members: ids, links: Set(flows.keys.map(\.undirected)))
         let colors = memberColors(members)
+        let edges = flows.keys.sorted().compactMap { link -> Edge? in
+            guard let flow = flows[link], !onlyPending || flow.pending > 0 else { return nil }
+            let color = flow.pending > 0 ? Color.orange : colors[link.from, default: .secondary]
+            return Edge(link: link, color: color.opacity(selection == nil || link.from == selection || link.to == selection ? 0.78 : 0.12),
+                        count: onlyPending ? flow.pending : flow.count)
+        }
         GeometryReader { proxy in
             let minimum = max(350, ceil(sqrt(CGFloat(members.count))) * 90)
             let size = CGSize(width: max(proxy.size.width, minimum),
@@ -336,18 +405,11 @@ private struct GroupConversationNodes: View {
             }
             ScrollView([.horizontal, .vertical]) {
                 ZStack(alignment: .topLeading) {
-                    Canvas { context, _ in
-                        for edge in flows.keys.sorted() {
-                            guard let flow = flows[edge], !onlyPending || flow.pending > 0,
-                                  let from = points[edge.from], let to = points[edge.to] else { continue }
-                            let active = selection == nil || selection == edge.from || selection == edge.to
-                            let color = flow.pending > 0 ? Color.orange : colors[edge.from, default: .secondary]
-                            draw(from, to, color: color.opacity(active ? 0.78 : 0.12),
-                                 count: onlyPending ? flow.pending : flow.count, context: context)
-                        }
+                    EdgeLayer(edges: edges.filter { !$0.touches(movingNode) }, points: points)
+                    if let movingNode {
+                        EdgeLayer(edges: edges.filter { $0.touches(movingNode) }, points: points,
+                                  movingNode: movingNode, motion: motion)
                     }
-                    .accessibilityHidden(true)
-                    .allowsHitTesting(false)
                     ForEach(members) { member in
                         if let point = points[member.id] {
                             Button { selection = member.id } label: {
@@ -385,16 +447,23 @@ private struct GroupConversationNodes: View {
                                 case .down: offset = CGSize(width: 0, height: 16)
                                 @unknown default: return
                                 }
-                                move(member.id, from: point, by: offset, in: size)
+                                movedNodes[member.id] = normalized(shift(point, by: offset, in: size), in: size)
                             }
                             .gesture(DragGesture(minimumDistance: 5, coordinateSpace: .named("conversationCanvas"))
                                 .updating($dragging) { _, state, _ in state = true }
                                 .onChanged { value in
-                                    if dragOrigin == nil { dragOrigin = point }
-                                    move(member.id, from: dragOrigin ?? point, by: value.translation, in: size)
+                                    if dragOrigin == nil {
+                                        dragOrigin = point
+                                        movingNode = member.id
+                                    }
+                                    motion.point = shift(dragOrigin ?? point, by: value.translation, in: size)
+                                }
+                                .onEnded { value in
+                                    movedNodes[member.id] = normalized(shift(dragOrigin ?? point, by: value.translation, in: size), in: size)
+                                    finishDrag()
                                 })
                             .help(member.title + " · " + member.agent.title)
-                            .position(x: point.x, y: point.y + 11)
+                            .modifier(NodePosition(point: point, motion: movingNode == member.id ? motion : nil))
                         }
                     }
                 }
@@ -403,7 +472,7 @@ private struct GroupConversationNodes: View {
             }
         }
         .onChange(of: dragging) { _, active in
-            if !active { dragOrigin = nil }
+            if !active, movingNode != nil { finishDrag() }
         }
         .task(id: topology) {
             let previous = layout
@@ -414,11 +483,50 @@ private struct GroupConversationNodes: View {
         }
     }
 
-    private func move(_ member: UUID, from origin: CGPoint, by offset: CGSize, in size: CGSize) {
-        movedNodes[member] = CGPoint(
-            x: min(1, max(0, (origin.x + offset.width - 75) / (size.width - 150))),
-            y: min(1, max(0, (origin.y + offset.height - 48) / (size.height - 110)))
-        )
+    private func finishDrag() {
+        movingNode = nil
+        dragOrigin = nil
+        motion.point = nil
+    }
+
+    private func shift(_ point: CGPoint, by offset: CGSize, in size: CGSize) -> CGPoint {
+        CGPoint(x: min(size.width - 75, max(75, point.x + offset.width)),
+                y: min(size.height - 62, max(48, point.y + offset.height)))
+    }
+
+    private func normalized(_ point: CGPoint, in size: CGSize) -> CGPoint {
+        CGPoint(x: (point.x - 75) / (size.width - 150), y: (point.y - 48) / (size.height - 110))
+    }
+
+    private struct NodePosition: ViewModifier {
+        let point: CGPoint
+        let motion: ConversationNodeMotion?
+
+        func body(content: Content) -> some View {
+            let position = motion?.point ?? point
+            content.position(x: position.x, y: position.y + 11)
+        }
+    }
+
+    private struct EdgeLayer: View {
+        let edges: [Edge]
+        let points: [UUID: CGPoint]
+        var movingNode: UUID?
+        var motion: ConversationNodeMotion?
+
+        var body: some View {
+            let position = motion?.point
+            Canvas { context, _ in
+                for edge in edges {
+                    let from = edge.link.from == movingNode ? position ?? points[edge.link.from] : points[edge.link.from]
+                    let to = edge.link.to == movingNode ? position ?? points[edge.link.to] : points[edge.link.to]
+                    guard let from, let to else { continue }
+                    GroupConversationNodes.draw(from, to, color: edge.color, count: edge.count, context: context)
+                }
+            }
+            .accessibilityHidden(true)
+            .allowsHitTesting(false)
+        }
     }
 
     private func flows(for ids: Set<UUID>) -> [ConversationGraphLayout.Link: Flow] {
@@ -454,7 +562,7 @@ private struct GroupConversationNodes: View {
         return result
     }
 
-    private func draw(_ from: CGPoint, _ to: CGPoint, color: Color, count: Int, context: GraphicsContext) {
+    private static func draw(_ from: CGPoint, _ to: CGPoint, color: Color, count: Int, context: GraphicsContext) {
         let distance = hypot(to.x - from.x, to.y - from.y)
         guard distance > 40 else { return }
         let dx = (to.x - from.x) / distance, dy = (to.y - from.y) / distance
