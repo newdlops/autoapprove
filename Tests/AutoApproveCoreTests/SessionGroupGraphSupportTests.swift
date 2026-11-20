@@ -396,4 +396,96 @@ extension ApprovalTests {
                                                          edges: edges, names: [b: "api 정리", c: "테스트 보강"])
         try expectEqual(value, "작업 중. 주고받은 메시지 5건. 보냄 api 정리 3건. 받음 테스트 보강 2건. 답을 기다리는 질문 2건. 전달 막힘")
     }
+
+    /// The leader is in the middle, each depth one ring further out, a subtree inside a sector that
+    /// grows with its leaves, and no two nodes overlap even with large circles in a wide group.
+    func testGraphRadialLayoutKeepsSubtreesInSectorsWithoutOverlap() throws {
+        func member(_ title: String) -> SessionGroupMember {
+            SessionGroupMember(agent: .claude, title: title, cwd: "/fixture", conversationID: UUID().uuidString.lowercased())
+        }
+        var members = ["lead", "a", "a1", "a2", "a3", "b", "b1"].map(member)
+        for index in [2, 3, 4] { members[index].parentMemberID = members[1].id }
+        members[6].parentMemberID = members[5].id
+        let group = SessionGroup(name: "fixture", members: members, leaderMemberID: members[0].id)
+        let radial = SessionGroupGraph.positions(group.treeOrder, hasLeader: true, layout: .radial)
+        func at(_ index: Int) -> CGPoint? { radial[members[index].id] }
+        try expectEqual(at(0), .zero, "The leader is in the middle")
+        // Four leaves, 90 degrees each from 12 o'clock: a's three leaves take 0, 90 and 180 degrees, so
+        // a sits at 90 degrees; b1 takes 270 degrees with b. The first ring is one 144pt spacing out,
+        // and the second one more, which also keeps its 90-degree neighbours 144pt or more apart.
+        try expectEqual(at(1), CGPoint(x: 144, y: 0), "A parent sits in the middle of its children's sector")
+        try expectEqual(at(5), CGPoint(x: -144, y: 0))
+        try expectEqual([at(2), at(3), at(4), at(6)], [CGPoint(x: 0, y: -288), CGPoint(x: 288, y: 0), CGPoint(x: 0, y: 288), CGPoint(x: -288, y: 0)],
+                        "Leaves go clockwise from 12 o'clock on the next ring")
+        let peers = SessionGroupGraph.positions(SessionGroup(name: "peers", members: members).treeOrder, hasLeader: false, layout: .radial)
+        // Seven members 51.4 degrees apart need a 166pt ring to keep neighbours 144pt apart.
+        try expect(peers.values.allSatisfy { abs(hypot($0.x, $0.y) - 166) < 1 }, "Without a leader every member is on the first ring")
+        try expectEqual(peers[members[0].id], CGPoint(x: 0, y: -166), "The first ring starts at 12 o'clock")
+        // A wide group: three branches of four, two with a deeper member, large and small circles mixed.
+        var wide = [member("lead")]
+        for branch in 0..<3 {
+            var head = member("h\(branch)"); head.parentMemberID = nil
+            wide.append(head)
+            for leaf in 0..<4 {
+                var child = member("h\(branch)-\(leaf)"); child.parentMemberID = head.id
+                wide.append(child)
+                if leaf == 1 && branch < 2 { var deep = member("d\(branch)"); deep.parentMemberID = child.id; wide.append(deep) }
+            }
+        }
+        let wideGroup = SessionGroup(name: "wide", members: wide, leaderMemberID: wide[0].id)
+        let sizes = Dictionary(uniqueKeysWithValues: wide.enumerated().map { ($1.id, $0 % 3 == 0 ? 40.0 : 28.0) })
+        let points = SessionGroupGraph.positions(wideGroup.treeOrder, hasLeader: true, layout: .radial, diameters: sizes)
+        try expectEqual(points.count, wide.count, "Every member is placed")
+        let ids = Array(points.keys)
+        var overlaps = 0
+        for i in ids.indices { for j in ids.indices where j > i {
+            let first = SessionGroupGraph.nodeArea(points[ids[i]]!, radius: sizes[ids[i]]! / 2)
+            if first.intersects(SessionGroupGraph.nodeArea(points[ids[j]]!, radius: sizes[ids[j]]! / 2)) { overlaps += 1 }
+        } }
+        try expectEqual(overlaps, 0, "No two nodes overlap in a wide radial layout with 40pt circles")
+        try expectEqual(points, SessionGroupGraph.positions(wideGroup.treeOrder, hasLeader: true, layout: .radial, diameters: sizes),
+                        "The same sizes give the same positions")
+        try expectEqual(SessionGroupGraph.radialSpacing(largestDiameter: 40), 152, "Rings move apart by the largest circle's extra size")
+        try expect(SessionGroupGraph.positions(group.treeOrder, hasLeader: true, layout: .matrix).isEmpty, "The matrix places no nodes")
+    }
+
+    /// Rows are senders and columns recipients in tree order; a cell holds the current view's
+    /// records and waiting questions, shaded in the line width steps.
+    func testGraphMatrixCountsSentAndReceivedRecords() throws {
+        let a = UUID(), b = UUID(), c = UUID()
+        let edges: [SessionGroupGraph.Edge] = [.init(from: a, to: b, kind: .recent, count: 3, pendingQuestions: 0),
+                                               .init(from: c, to: a, kind: .pendingQuestion, count: 2, pendingQuestions: 2)]
+        let grid = SessionGroupGraph.matrix(order: [a, b, c], edges: edges)
+        try expectEqual(grid.count, 3)
+        try expectEqual(grid[0][1], .init(from: a, to: b, count: 3, pendingQuestions: 0), "Row a, column b: a sent 3 to b")
+        try expectEqual(grid[1][0].count, 0, "b sent nothing to a; the reverse direction is its own cell")
+        try expectEqual(grid[2][0].pendingQuestions, 2, "Questions waiting for a's answer are in c's row")
+        try expect(grid[1][1].isSelf && grid[1][1].count == 0, "The diagonal is empty")
+        try expectEqual([0, 1, 2, 4, 5, 9, 10, 40].map(SessionGroupGraph.matrixShade(forCount:)), [0, 1, 2, 2, 3, 3, 4, 4],
+                        "Shades follow the line width steps")
+        try expectEqual(SessionGroupGraph.matrixCellRect(row: 1, column: 2), CGRect(x: 320, y: 124, width: 76, height: 40))
+        try expectEqual(SessionGroupGraph.matrixRowHeaderRect(1), CGRect(x: 16, y: 124, width: 152, height: 40))
+        try expectEqual(SessionGroupGraph.matrixColumnHeaderRect(2), CGRect(x: 320, y: 16, width: 76, height: 68))
+        try expectEqual(SessionGroupGraph.matrixContent(count: 3), CGRect(x: 0, y: 0, width: 412, height: 220))
+        try expectEqual(SessionGroupGraph.matrixCellAccessibility(from: "api 정리", to: "테스트 보강", cell: grid[0][1]),
+                        "api 정리 → 테스트 보강: 3건, 미응답 0건")
+    }
+
+    func testGraphMatrixKeyboardMovesBetweenCellsAndHeaders() throws {
+        typealias Spot = SessionGroupGraph.MatrixSpot
+        func move(_ spot: Spot, _ direction: SessionGroupGraph.MatrixDirection) -> Spot {
+            SessionGroupGraph.matrixMove(spot, direction, count: 3)
+        }
+        try expectEqual(move(.cell(row: 1, column: 1), .right), .cell(row: 1, column: 2))
+        try expectEqual(move(.cell(row: 1, column: 2), .right), .cell(row: 1, column: 2), "The last column stops")
+        try expectEqual(move(.cell(row: 2, column: 0), .down), .cell(row: 2, column: 0), "The last row stops")
+        try expectEqual(move(.cell(row: 1, column: 0), .left), .rowHeader(1), "Left of the first column is the row header")
+        try expectEqual(move(.cell(row: 0, column: 2), .up), .columnHeader(2), "Above the first row is the column header")
+        try expectEqual(move(.rowHeader(1), .right), .cell(row: 1, column: 0))
+        try expectEqual(move(.rowHeader(0), .up), .rowHeader(0))
+        try expectEqual(move(.rowHeader(0), .down), .rowHeader(1))
+        try expectEqual(move(.columnHeader(2), .down), .cell(row: 0, column: 2))
+        try expectEqual(move(.columnHeader(0), .left), .columnHeader(0))
+        try expectEqual(move(.columnHeader(0), .right), .columnHeader(1))
+    }
 }

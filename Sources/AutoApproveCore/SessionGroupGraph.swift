@@ -263,7 +263,11 @@ public enum SessionGroupGraph {
 
     // MARK: Layout
 
-    public enum Layout: String, CaseIterable, Sendable { case tree, circle }
+    /// Tree, circle and radial place nodes; the matrix draws a sender by recipient grid instead.
+    public enum Layout: String, CaseIterable, Sendable {
+        case tree, circle, radial, matrix
+        public var drawsNodes: Bool { self != .matrix }
+    }
 
     /// The name band is 128pt wide; 16pt separates neighbours.
     public static let leafSpacing = 144.0
@@ -291,7 +295,93 @@ public enum SessionGroupGraph {
         switch layout {
         case .tree: return treePositions(order, diameters: diameters)
         case .circle: return circlePositions(order.map(\.id), centered: hasLeader, diameters: diameters)
+        case .radial: return radialPositions(order, hasLeader: hasLeader, diameters: diameters)
+        // The matrix places no nodes; `matrixCellRect` and the header rects place its grid.
+        case .matrix: return [:]
         }
+    }
+
+    /// Children of each entry and the entries without a parent, in tree order. The parent is the
+    /// nearest earlier entry one level up.
+    private static func treeLinks(_ order: [(id: UUID, depth: Int)]) -> (children: [Int: [Int]], roots: [Int]) {
+        var children: [Int: [Int]] = [:]
+        var roots: [Int] = []
+        for (index, entry) in order.enumerated() {
+            if entry.depth > 0, let parent = order[..<index].lastIndex(where: { $0.depth == entry.depth - 1 }) {
+                children[parent, default: []].append(index)
+            } else {
+                roots.append(index)
+            }
+        }
+        return (children, roots)
+    }
+
+    /// The shortest distance between two node centres in the radial layout, also the least gap
+    /// between two rings: the 144pt leaf spacing widened by the largest circle's extra size. Two
+    /// nodes this far apart never overlap, since their 128pt name bands are then either side by
+    /// side or at least 66pt apart vertically, more than a 40pt circle and its name band need.
+    public static func radialSpacing(largestDiameter: Double) -> Double {
+        leafSpacing + max(0, largestDiameter - standardDiameter)
+    }
+
+    /// The first leader is in the middle and each depth is one ring further out. Every leaf gets
+    /// the same angle, so a subtree's sector grows with its leaves and its members stay inside it;
+    /// a parent sits in the middle of its children's angles. Without a leader the members start on
+    /// the first ring. The first leaf is at 12 o'clock and the rest go clockwise in tree order. A
+    /// ring is at least one spacing outside the previous ring, and wide enough that its two closest
+    /// nodes are one spacing apart.
+    private static func radialPositions(_ order: [(id: UUID, depth: Int)], hasLeader: Bool, diameters: [UUID: Double]) -> [UUID: CGPoint] {
+        guard !order.isEmpty else { return [:] }
+        if order.count == 1 { return [order[0].id: .zero] }
+        let (children, roots) = treeLinks(order)
+        var result: [UUID: CGPoint] = [:]
+        let firstRing: [Int]
+        if hasLeader {
+            result[order[roots[0]].id] = .zero
+            firstRing = (children[roots[0]] ?? []) + roots.dropFirst()
+        } else {
+            firstRing = roots
+        }
+        guard !firstRing.isEmpty else { return result }
+        func leaves(_ index: Int) -> Int {
+            let kids = children[index] ?? []
+            return kids.isEmpty ? 1 : kids.reduce(0) { $0 + leaves($1) }
+        }
+        let unit = 2 * Double.pi / Double(firstRing.reduce(0) { $0 + leaves($1) })
+        var angle: [Int: Double] = [:], ring: [Int: Int] = [:]
+        var nextLeaf = 0
+        func place(_ index: Int, _ level: Int) {
+            ring[index] = level
+            let kids = children[index] ?? []
+            if kids.isEmpty {
+                angle[index] = Double(nextLeaf) * unit
+                nextLeaf += 1
+            } else {
+                for kid in kids { place(kid, level + 1) }
+                angle[index] = (angle[kids[0]]! + angle[kids[kids.count - 1]]!) / 2
+            }
+        }
+        for index in firstRing { place(index, 1) }
+        let spacing = radialSpacing(largestDiameter: largest(order.map(\.id), diameters))
+        var radius: [Int: Double] = [:]
+        var previous = 0.0
+        for level in 1...(ring.values.max() ?? 1) {
+            let angles = ring.filter { $0.value == level }.map { angle[$0.key]! }.sorted()
+            var needed = previous + spacing
+            if angles.count > 1 {
+                var closest = angles[0] + 2 * .pi - angles[angles.count - 1]
+                for (a, b) in zip(angles, angles.dropFirst()) { closest = min(closest, b - a) }
+                // Two nodes `closest` apart on a ring of radius r are 2 r sin(closest / 2) apart.
+                needed = max(needed, spacing / (2 * sin(min(closest, .pi) / 2)))
+            }
+            radius[level] = needed.rounded(.up)
+            previous = radius[level]!
+        }
+        for (index, level) in ring {
+            let r = radius[level]!, a = -Double.pi / 2 + angle[index]!
+            result[order[index].id] = CGPoint(x: (r * cos(a)).rounded(), y: (r * sin(a)).rounded())
+        }
+        return result
     }
 
     /// The largest diameter in `ids`, never less than the standard 32pt.
@@ -304,15 +394,7 @@ public enum SessionGroupGraph {
     /// spaced for its largest circle: the gap below a layer grows with that layer's and the next
     /// layer's largest radius, and two neighbouring leaves grow apart by their layers' extra width.
     private static func treePositions(_ order: [(id: UUID, depth: Int)], diameters: [UUID: Double]) -> [UUID: CGPoint] {
-        var children: [Int: [Int]] = [:]
-        var roots: [Int] = []
-        for (index, entry) in order.enumerated() {
-            if entry.depth > 0, let parent = order[..<index].lastIndex(where: { $0.depth == entry.depth - 1 }) {
-                children[parent, default: []].append(index)
-            } else {
-                roots.append(index)
-            }
-        }
+        let (children, roots) = treeLinks(order)
         // Levels as placed: a root is level 0 even when its depth is not.
         var levels: [Int: Int] = [:]
         func assign(_ index: Int, _ level: Int) { levels[index] = level; for kid in children[index] ?? [] { assign(kid, level + 1) } }
@@ -382,6 +464,131 @@ public enum SessionGroupGraph {
         let minX = xs.min()!, maxX = xs.max()!, minY = ys.min()!, maxY = ys.max()!
         let points = positions.mapValues { CGPoint(x: $0.x - minX + horizontalMargin, y: $0.y - minY + top) }
         return Frame(points: points, size: CGSize(width: maxX - minX + 2 * horizontalMargin, height: maxY - minY + top + bottom))
+    }
+
+    // MARK: Matrix
+
+    /// One sender (row) and recipient (column) pair of the adjacency matrix.
+    public struct MatrixCell: Equatable, Sendable {
+        public let from: UUID
+        public let to: UUID
+        /// Records of the current view on the line from `from` to `to`.
+        public let count: Int
+        /// Questions still waiting for an answer, shown as "?N" with an orange border.
+        public let pendingQuestions: Int
+
+        public init(from: UUID, to: UUID, count: Int, pendingQuestions: Int) {
+            self.from = from; self.to = to; self.count = count; self.pendingQuestions = pendingQuestions
+        }
+
+        /// A member never sends to itself, so the diagonal is always empty.
+        public var isSelf: Bool { from == to }
+        public var shade: Int { SessionGroupGraph.matrixShade(forCount: count) }
+    }
+
+    /// 0 leaves a cell clear; 1 to 4 follow the line width steps: 1 record, 2-4, 5-9, 10 or more.
+    public static func matrixShade(forCount count: Int) -> Int {
+        switch count {
+        case ..<1: 0
+        case 1: 1
+        case 2...4: 2
+        case 5...9: 3
+        default: 4
+        }
+    }
+
+    /// Rows are senders and columns recipients, both in `order` (tree order). Lines of the current
+    /// view fill the cells; a pair without a line is an empty cell.
+    public static func matrix(order: [UUID], edges: [Edge]) -> [[MatrixCell]] {
+        struct Pair: Hashable { let from: UUID; let to: UUID }
+        var totals: [Pair: (count: Int, pending: Int)] = [:]
+        for edge in edges {
+            let pair = Pair(from: edge.from, to: edge.to)
+            let value = totals[pair] ?? (0, 0)
+            totals[pair] = (value.count + edge.count, value.pending + edge.pendingQuestions)
+        }
+        return order.map { from in
+            order.map { to in
+                let value = from == to ? (0, 0) : totals[Pair(from: from, to: to)] ?? (0, 0)
+                return MatrixCell(from: from, to: to, count: value.0, pendingQuestions: value.1)
+            }
+        }
+    }
+
+    /// Sizes at 100%. A column is wide enough for a two-line name under the node mark; a row
+    /// header holds the mark and a one-line name.
+    public static let matrixCellSize = CGSize(width: 76, height: 40)
+    public static let matrixRowHeaderWidth = 152.0
+    public static let matrixColumnHeaderHeight = 68.0
+    public static let matrixMargin = 16.0
+
+    /// The grid with its headers and margin, from the origin; also the content that fitting shows.
+    public static func matrixContent(count: Int) -> CGRect {
+        let n = Double(max(0, count))
+        return CGRect(x: 0, y: 0, width: 2 * matrixMargin + matrixRowHeaderWidth + n * matrixCellSize.width,
+                      height: 2 * matrixMargin + matrixColumnHeaderHeight + n * matrixCellSize.height)
+    }
+
+    public static func matrixCellRect(row: Int, column: Int) -> CGRect {
+        CGRect(x: matrixMargin + matrixRowHeaderWidth + Double(column) * matrixCellSize.width,
+               y: matrixMargin + matrixColumnHeaderHeight + Double(row) * matrixCellSize.height,
+               width: matrixCellSize.width, height: matrixCellSize.height)
+    }
+
+    public static func matrixRowHeaderRect(_ row: Int) -> CGRect {
+        CGRect(x: matrixMargin, y: matrixMargin + matrixColumnHeaderHeight + Double(row) * matrixCellSize.height,
+               width: matrixRowHeaderWidth, height: matrixCellSize.height)
+    }
+
+    public static func matrixColumnHeaderRect(_ column: Int) -> CGRect {
+        CGRect(x: matrixMargin + matrixRowHeaderWidth + Double(column) * matrixCellSize.width, y: matrixMargin,
+               width: matrixCellSize.width, height: matrixColumnHeaderHeight)
+    }
+
+    /// A row header, a column header or a cell: the matrix's keyboard focus moves between these.
+    public enum MatrixSpot: Hashable, Sendable {
+        case rowHeader(Int)
+        case columnHeader(Int)
+        case cell(row: Int, column: Int)
+
+        public func rect() -> CGRect {
+            switch self {
+            case let .rowHeader(row): SessionGroupGraph.matrixRowHeaderRect(row)
+            case let .columnHeader(column): SessionGroupGraph.matrixColumnHeaderRect(column)
+            case let .cell(row, column): SessionGroupGraph.matrixCellRect(row: row, column: column)
+            }
+        }
+    }
+
+    public enum MatrixDirection: Sendable { case left, right, up, down }
+
+    /// Arrow keys move one cell and stop at the edges; left of the first column is the row header
+    /// and above the first row is the column header. From a header, the arrow toward the grid
+    /// enters it and the other arrows move along the headers.
+    public static func matrixMove(_ spot: MatrixSpot, _ direction: MatrixDirection, count: Int) -> MatrixSpot {
+        guard count > 0 else { return spot }
+        let last = count - 1
+        func clamp(_ value: Int) -> Int { min(last, max(0, value)) }
+        switch (spot, direction) {
+        case let (.cell(row, column), .left): return column > 0 ? .cell(row: row, column: column - 1) : .rowHeader(row)
+        case let (.cell(row, column), .right): return .cell(row: row, column: clamp(column + 1))
+        case let (.cell(row, column), .up): return row > 0 ? .cell(row: row - 1, column: column) : .columnHeader(column)
+        case let (.cell(row, column), .down): return .cell(row: clamp(row + 1), column: column)
+        case let (.rowHeader(row), .right): return .cell(row: row, column: 0)
+        case let (.rowHeader(row), .up): return .rowHeader(clamp(row - 1))
+        case let (.rowHeader(row), .down): return .rowHeader(clamp(row + 1))
+        case (.rowHeader, .left): return spot
+        case let (.columnHeader(column), .down): return .cell(row: 0, column: column)
+        case let (.columnHeader(column), .left): return .columnHeader(clamp(column - 1))
+        case let (.columnHeader(column), .right): return .columnHeader(clamp(column + 1))
+        case (.columnHeader, .up): return spot
+        }
+    }
+
+    /// What a screen reader reads for a cell: "보낸 사람 → 받은 사람: N건, 미응답 M건".
+    public static func matrixCellAccessibility(from: String, to: String, cell: MatrixCell) -> String {
+        if cell.isSelf { return "\(from) → \(to): 자기 자신에게는 보내지 않습니다" }
+        return "\(from) → \(to): \(cell.count)건, 미응답 \(cell.pendingQuestions)건"
     }
 
     // MARK: Zoom and pan
@@ -459,17 +666,20 @@ public enum SessionGroupGraph {
     /// The largest scale between `minimum` and `maximum` that shows all of `content`. An axis that
     /// fits is centred. An axis that still does not fit puts `focus` (the leader) at the same share
     /// of the area as its share of the content, so the focus is in view and no empty space shows.
-    public static func fit(_ content: CGRect, in size: CGSize, minimum: Double, maximum: Double = 1, focus: CGPoint?) -> Viewport {
+    /// `topAligned` starts a vertical axis that fits at the top instead of centring it.
+    public static func fit(_ content: CGRect, in size: CGSize, minimum: Double, maximum: Double = 1, focus: CGPoint?,
+                           topAligned: Bool = false) -> Viewport {
         guard size.width > 0, size.height > 0, content.width > 0, content.height > 0 else { return .identity }
         let scale = clampZoom(min(maximum, max(minimum, min(size.width / content.width, size.height / content.height))))
-        func axis(_ low: Double, _ length: Double, _ area: Double, _ focus: Double?) -> Double {
+        func axis(_ low: Double, _ length: Double, _ area: Double, _ focus: Double?, start: Bool = false) -> Double {
             let scaled = length * scale
-            if scaled <= area + 0.001 { return (area - scaled) / 2 - low * scale }
+            if scaled <= area + 0.001 { return (start ? 0 : (area - scaled) / 2) - low * scale }
             let share = focus.map { min(1, max(0, ($0 - low) / length)) } ?? 0.5
             return share * area - (low + share * length) * scale
         }
         return Viewport(scale: scale, offset: CGPoint(x: axis(content.minX, content.width, size.width, focus.map { Double($0.x) }),
-                                                      y: axis(content.minY, content.height, size.height, focus.map { Double($0.y) })))
+                                                      y: axis(content.minY, content.height, size.height, focus.map { Double($0.y) },
+                                                              start: topAligned)))
     }
 
     /// Moves the view back just enough that at least `keep` points of the content (or all of it,

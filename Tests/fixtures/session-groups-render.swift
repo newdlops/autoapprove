@@ -60,6 +60,16 @@ private final class GroupRefreshReads: @unchecked Sendable {
     /// The zoom buttons' frame in SwiftUI global coordinates.
     static var zoomFrame: CGRect?
     static func zoomControls(_ frame: CGRect) { zoomFrame = frame }
+    /// The selected member's name at the last body evaluation of the graph area; nil when none.
+    static var selectedName: String?
+    static func selected(_ name: String?) { selectedName = name }
+    /// Matrix headers ("row:이름", "col:이름") and cells ("보낸>받은") in SwiftUI global coordinates.
+    static var cells: [String: CGRect] = [:]
+    static func cell(_ name: String, _ frame: CGRect) { cells[name] = frame }
+    /// A matrix element's centre in window coordinates.
+    static func cellCenter(_ name: String, in host: NSView) -> CGPoint? {
+        cells[name].map { CGPoint(x: $0.midX, y: host.bounds.height - $0.midY) }
+    }
 }
 
 /// Counts storage checks and records whether any ran on the main thread.
@@ -295,14 +305,20 @@ final class GraphReadProbe: @unchecked Sendable {
     var allRoots = 0, allCanvases = 0
     var worstPreview = 0.0, worstDrop = 0.0
     var eventDeltaCarried = false
-    for zoom in [1.0, 0.6, 2.0] {
+    // The tree at three zooms, as before, then the radial layout at 100%.
+    let runs: [(Double, SessionGroupGraph.Layout?)] = [(1.0, nil), (0.6, nil), (2.0, nil), (1.0, .radial)]
+    for (zoom, layout) in runs {
         // Relative to the real clock, so the recent view draws its lines and nodes have different sizes.
-        let fixture = try GraphFixture.make(root: root, name: "drag-state-\(Int(zoom * 100))", now: Date(), heavy: true)
-        GraphProbe.places = [:]; GraphProbe.view = nil
-        let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, zoom: zoom)
+        let fixture = try GraphFixture.make(root: root, name: "drag-state-\(Int(zoom * 100))" + (layout.map { "-" + $0.rawValue } ?? ""),
+                                            now: Date(), heavy: true)
+        GraphProbe.places = [:]; GraphProbe.rects = [:]; GraphProbe.view = nil
+        let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine,
+                                                                               layout: layout, zoom: zoom)
             .frame(width: size.width, height: size.height), size: size)
         try await Task.sleep(for: .seconds(2.5))
         host.layoutSubtreeIfNeeded()
+        let overlapsAtOpen = GraphProbe.overlaps()
+        if layout == .radial, !overlapsAtOpen.isEmpty { throw AppError.message("Radial nodes overlap: " + overlapsAtOpen.joined(separator: ", ")) }
         // The node nearest the middle of the graph area (left of the 320pt panel, below the controls),
         // so a 120pt by 60pt drag stays inside the visible part at every zoom.
         let middle = CGPoint(x: (size.width - 320) / 2, y: 245)
@@ -355,11 +371,15 @@ final class GraphReadProbe: @unchecked Sendable {
             worstPreview = max(worstPreview, previewError); worstDrop = max(worstDrop, dropError)
             allDurations += durations; allRoots += rootsDuring; allCanvases += canvasesDuring
         }
-        zooms.append(["zoomPercent": Int(zoom * 100), "node": name, "scale": GraphProbe.view?.scale as Any,
+        zooms.append(["zoomPercent": Int(zoom * 100), "layout": (layout ?? .tree).rawValue, "overlapsAtOpen": overlapsAtOpen.count,
+                      "node": name, "scale": GraphProbe.view?.scale as Any,
                       "windowVisible": window.occlusionState.contains(.visible), "trials": trials])
         window.close(); fixture.engine.stop()
     }
+    let radialWide = try await verifyRadialWide(root: root, size: size)
+    let matrix = try await verifyMatrix(root: root, size: size)
     let result: [String: Any] = [
+        "radialWideGroup": radialWide, "matrix": matrix,
         "events": allDurations.count, "rootBodiesDuringDrag": allRoots, "canvasBodiesDuringDrag": allCanvases,
         "medianMs": percentile(allDurations, 0.5), "p95Ms": percentile(allDurations, 0.95),
         "worstPreviewPointerErrorPt": worstPreview, "worstDropPointerErrorPt": worstDrop, "zooms": zooms,
@@ -370,6 +390,113 @@ final class GraphReadProbe: @unchecked Sendable {
     let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: root.appendingPathComponent("drag-measure.json"))
     print(String(decoding: data, as: UTF8.self))
+}
+
+/// A group wider than the window in the radial layout: every member is placed and no two nodes'
+/// circles and name bands overlap.
+@MainActor func verifyRadialWide(root: URL, size: CGSize) async throws -> [String: Any] {
+    let fixture = try GraphFixture.make(root: root, name: "radial-wide", extra: 12)
+    defer { fixture.engine.stop() }
+    GraphProbe.places = [:]; GraphProbe.rects = [:]
+    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine,
+                                                                           sources: fixedSources(fixture), layout: .radial)
+        .frame(width: size.width, height: size.height), size: size)
+    defer { window.close() }
+    let start = CACurrentMediaTime()
+    while GraphProbe.places.count < fixture.group.members.count && CACurrentMediaTime() - start < 4 {
+        try await Task.sleep(for: .milliseconds(100)); host.layoutSubtreeIfNeeded()
+    }
+    try await Task.sleep(for: .milliseconds(300)); host.layoutSubtreeIfNeeded()
+    let overlaps = GraphProbe.overlaps()
+    guard GraphProbe.places.count == fixture.group.members.count else {
+        throw AppError.message("Radial wide group placed \(GraphProbe.places.count) of \(fixture.group.members.count) members")
+    }
+    guard overlaps.isEmpty else { throw AppError.message("Radial wide group nodes overlap: " + overlaps.joined(separator: ", ")) }
+    return ["members": fixture.group.members.count, "placed": GraphProbe.places.count, "overlaps": overlaps.count,
+            "scale": GraphProbe.view?.scale as Any]
+}
+
+/// The matrix: every header and cell is drawn and no node is; pressing a cell selects its sender
+/// and a header its member; a click on empty space clears the selection; ⌘ and a scroll over a
+/// cell zoom around the pointer, and a press after zooming still selects the cell under it; a
+/// drag that starts on a cell pans and keeps the selection.
+@MainActor func verifyMatrix(root: URL, size: CGSize) async throws -> [String: Any] {
+    let fixture = try GraphFixture.make(root: root, name: "matrix-state", now: Date())
+    defer { fixture.engine.stop() }
+    func require(_ ok: Bool, _ message: String) throws { if !ok { throw AppError.message("Matrix: " + message) } }
+    GraphProbe.places = [:]; GraphProbe.cells = [:]; GraphProbe.selectedName = nil; GraphProbe.view = nil; GraphProbe.zoomFrame = nil
+    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, layout: .matrix)
+        .frame(width: size.width, height: size.height), size: size)
+    defer { window.close() }
+    try await Task.sleep(for: .seconds(2.5))
+    host.layoutSubtreeIfNeeded()
+    let n = fixture.group.members.count
+    try require(GraphProbe.cells.count == n * n + 2 * n, "\(GraphProbe.cells.count) elements drawn, expected \(n * n + 2 * n)")
+    try require(GraphProbe.places.isEmpty, "Nodes drawn in the matrix")
+    func press(_ point: CGPoint) async throws {
+        NSApp.postEvent(mouse(.leftMouseDown, point, window), atStart: false)
+        try await Task.sleep(for: .milliseconds(40))
+        NSApp.postEvent(mouse(.leftMouseUp, point, window), atStart: false)
+        try await Task.sleep(for: .milliseconds(300))
+        host.layoutSubtreeIfNeeded()
+    }
+    func press(_ name: String) async throws {
+        guard let point = GraphProbe.cellCenter(name, in: host) else { throw AppError.message("Matrix: \(name) not drawn") }
+        try await press(point)
+    }
+    var selections: [String: String] = [:]
+    for (name, expected) in [("문서 검토>마이그레이션", "문서 검토"), ("col:api 정리", "api 정리"), ("row:마이그레이션", "마이그레이션")] {
+        try await press(name)
+        selections[name] = GraphProbe.selectedName ?? "none"
+        try require(GraphProbe.selectedName == expected, "pressing \(name) selected \(String(describing: GraphProbe.selectedName)), expected \(expected)")
+    }
+    // Empty space below the last row, above the bottom of the graph area (the zoom buttons' bottom plus their 12pt margin).
+    var emptyCleared: Bool?
+    if let cell = GraphProbe.cells.filter({ $0.key.hasPrefix("row:") }).values.max(by: { $0.maxY < $1.maxY }),
+       let zoom = GraphProbe.zoomFrame, cell.maxY + 24 < zoom.maxY + 8 {
+        try await press(CGPoint(x: cell.minX + 10, y: host.bounds.height - (cell.maxY + 20)))
+        emptyCleared = GraphProbe.selectedName == nil
+        try require(emptyCleared == true, "a click on empty space kept \(String(describing: GraphProbe.selectedName)) selected")
+    }
+    // ⌘ scroll with the pointer a quarter into a cell.
+    let target = "결제 총괄>api 정리"
+    guard let before = GraphProbe.cells[target], let fitted = GraphProbe.view else { throw AppError.message("Matrix: zoom target missing") }
+    let pointerGlobal = CGPoint(x: before.minX + before.width * 0.25, y: before.minY + before.height * 0.25)
+    let pointer = CGPoint(x: pointerGlobal.x, y: host.bounds.height - pointerGlobal.y)
+    NSApp.postEvent(try scroll(pointer, window, dy: 200, command: true), atStart: false)
+    try await Task.sleep(for: .milliseconds(400))
+    host.layoutSubtreeIfNeeded()
+    guard let after = GraphProbe.cells[target], let zoomed = GraphProbe.view else { throw AppError.message("Matrix: zoom target missing after zoom") }
+    try require(zoomed.scale > fitted.scale + 0.05, "⌘ scroll did not zoom: \(fitted.scale) -> \(zoomed.scale)")
+    let ratio = zoomed.scale / fitted.scale
+    let cellScaleError = abs(after.width - before.width * ratio)
+    try require(cellScaleError < 0.5, "cell width \(before.width) -> \(after.width) does not follow the zoom ×\(ratio)")
+    let anchorError = hypot(after.minX + after.width * 0.25 - pointerGlobal.x, after.minY + after.height * 0.25 - pointerGlobal.y)
+    try require(anchorError < 1, "the point under the pointer moved \(anchorError) pt while zooming")
+    try await press(pointer)
+    let selectedAfterZoom = GraphProbe.selectedName
+    try require(selectedAfterZoom == "결제 총괄", "a press after zooming selected \(String(describing: selectedAfterZoom))")
+    // A drag that starts on a cell pans the matrix and is not a press.
+    let viewBeforePan = GraphProbe.view!
+    NSApp.postEvent(mouse(.leftMouseDown, pointer, window), atStart: false)
+    try await Task.sleep(for: .milliseconds(40))
+    for step in 1...20 {
+        NSApp.postEvent(mouse(.leftMouseDragged, CGPoint(x: pointer.x - CGFloat(step) * 3, y: pointer.y - CGFloat(step) * 1.5), window,
+                              delta: CGVector(dx: -3, dy: 1.5)), atStart: false)
+        try await Task.sleep(for: .milliseconds(8))
+    }
+    NSApp.postEvent(mouse(.leftMouseUp, CGPoint(x: pointer.x - 60, y: pointer.y - 30), window), atStart: false)
+    try await Task.sleep(for: .milliseconds(300))
+    host.layoutSubtreeIfNeeded()
+    let viewAfterPan = GraphProbe.view!
+    let panError = hypot(viewAfterPan.offset.x - viewBeforePan.offset.x + 60, viewAfterPan.offset.y - viewBeforePan.offset.y - 30)
+    try require(abs(viewAfterPan.scale - viewBeforePan.scale) < 1e-6 && panError < 1,
+                "a drag on a cell moved the view \(viewBeforePan) -> \(viewAfterPan), expected (-60, +30)")
+    try require(GraphProbe.selectedName == "결제 총괄", "a drag on a cell changed the selection to \(String(describing: GraphProbe.selectedName))")
+    return ["elements": GraphProbe.cells.count, "nodesDrawn": GraphProbe.places.count, "selections": selections,
+            "emptyClickCleared": emptyCleared as Any, "fittedScale": fitted.scale, "zoomedScale": zoomed.scale,
+            "cellScaleErrorPt": cellScaleError, "zoomAnchorErrorPt": anchorError, "selectedAfterZoom": selectedAfterZoom as Any,
+            "cellDragPanErrorPt": panError, "selectionKeptAfterCellDrag": true]
 }
 
 /// A two-finger scroll of `dy` pixels at a window point, with ⌘ held when `command` is set,
@@ -415,9 +542,10 @@ final class GraphReadProbe: @unchecked Sendable {
         sessions: Empty<[ConversationGraphModel.SessionKey], Never>().eraseToAnyPublisher())
 }
 
-/// Twelve scenes, two window sizes, light and dark: 48 PNG files. Scenes 1 to 8 and 11 to 12 open
+/// Eighteen scenes, two window sizes, light and dark: 72 PNG files. Scenes 1 to 8 and 11 to 18 open
 /// fitted as the app does; 8 is a group wider than the window, 9 and 10 fix the zoom at 50% and 200%,
-/// 11 and 12 mix members with very different message amounts in the tree and circle layouts.
+/// 11 and 12 mix members with very different message amounts in the tree and circle layouts, 13 to
+/// 15 are the radial layout and 16 to 18 the matrix, each plain, with a member selected and wide.
 @MainActor func renderGraphScenes(root: URL) async throws {
     let fixture = try GraphFixture.make(root: root, name: "graph-state")
     let empty = try GraphFixture.make(root: root, name: "graph-empty", empty: true)
@@ -437,7 +565,13 @@ final class GraphReadProbe: @unchecked Sendable {
         ("9-zoom-50", fixture, nil, .recent, .tree, false, 0.5),
         ("10-zoom-200", fixture, nil, .recent, .tree, false, 2),
         ("11-size-tree", uneven, nil, .recent, .tree, false, nil),
-        ("12-size-circle", uneven, nil, .recent, .circle, false, nil)
+        ("12-size-circle", uneven, nil, .recent, .circle, false, nil),
+        ("13-radial", fixture, nil, .recent, .radial, false, nil),
+        ("14-radial-selected", fixture, fixture.id["doc"], .recent, .radial, false, nil),
+        ("15-radial-wide-group", wide, nil, .recent, .radial, false, nil),
+        ("16-matrix", fixture, nil, .recent, .matrix, false, nil),
+        ("17-matrix-selected", fixture, fixture.id["doc"], .recent, .matrix, false, nil),
+        ("18-matrix-wide-group", wide, nil, .recent, .matrix, false, nil)
     ]
     var written: [String] = []
     for (name, scene, selection, scope, layout, failing, zoom) in scenes {

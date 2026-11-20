@@ -55,6 +55,9 @@ if(verifyDrag||verifyGraphRefresh) {
   else throw Error('Missing node instrumentation point');
   // The zoom and pan of the graph area, and the lifted node's circle centre in window coordinates.
   text=text.replace('/* graph-probe: viewport */','let _ = GraphProbe.viewport(view)');
+  // The selected member's name, and each matrix header's and cell's frame, so the harness can press a cell.
+  text=text.replace('/* graph-probe: selection */','let _ = GraphProbe.selected(selection.flatMap { id in nodes.first { $0.id == id }?.name })');
+  text=text.replace('/* graph-probe: cell */','.background(GeometryReader { g in let _ = GraphProbe.cell(probeName, g.frame(in: .global)); Color.clear })');
   // The zoom buttons' frame, so the harness can press and scroll over them.
   text=text.replace('/* graph-probe: zoom */','.background(GeometryReader { g in let _ = GraphProbe.zoomControls(g.frame(in: .global)); Color.clear })');
   text=text.replace('/* graph-probe: preview */','GraphProbe.preview(surface.convert(CGPoint(x: node.position.x, y: node.position.y + GraphNodeView.centerOffset * CGFloat(transform.scale)), to: nil))');

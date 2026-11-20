@@ -635,6 +635,12 @@ private extension AgentKind {
     @State private var preview = ConversationDragPreview()
     @GestureState private var dragging = false
     @FocusState private var focused: UUID?
+    /// The matrix element with keyboard focus.
+    @FocusState private var matrixFocus: SessionGroupGraph.MatrixSpot?
+    /// The one matrix element in the Tab order; arrow keys move it, so Tab never walks every cell.
+    @State private var matrixCurrent: SessionGroupGraph.MatrixSpot = .cell(row: 0, column: 0)
+    /// The matrix element last pressed, outlined while its member stays selected.
+    @State private var matrixPressed: SessionGroupGraph.MatrixSpot?
     @Environment(\.colorScheme) private var colorScheme
     /// Fitted until the user zooms, pans or moves a node; after that data updates keep the view.
     @State private var mode: ViewMode
@@ -679,6 +685,8 @@ private extension AgentKind {
         /// Every node with its ring and name band, for fitting and for the pan limit.
         let content: CGRect
         let leader: CGPoint?
+        /// A table reads from its top, so a matrix that fits starts at the top instead of the middle.
+        var topAligned = false
     }
 
     var body: some View {
@@ -691,15 +699,16 @@ private extension AgentKind {
             // The hidden full legend reserves the height, so a state or line kind appearing
             // never pushes the graph down and the nodes keep their places.
             ZStack(alignment: .topLeading) {
-                legend(edges, everything: true).hidden().accessibilityHidden(true)
-                legend(edges, everything: false)
+                legend(edges, everything: true, matrix: !layout.drawsNodes).hidden().accessibilityHidden(true)
+                legend(edges, everything: false, matrix: !layout.drawsNodes)
             }
             Divider()
             GeometryReader { proxy in
                 let size = proxy.size
                 let view = viewport(placement, size: size)
                 /* graph-probe: viewport */
-                let bends = SessionGroupGraph.bends(edges, points: placement.points, radii: placement.radii)
+                /* graph-probe: selection */
+                let bends = layout.drawsNodes ? SessionGroupGraph.bends(edges, points: placement.points, radii: placement.radii) : [:]
                 let related = selection.map { chosen in Set(edges.filter { $0.touches(chosen) }.flatMap { [$0.from, $0.to] }).union([chosen]) }
                 // A scroll view that never scrolls: zoom and pan move the graph instead. Its container
                 // takes the first click in an inactive window, as the graph did when it scrolled, so
@@ -709,32 +718,24 @@ private extension AgentKind {
                     // A click on empty space clears the selection; a drag of 4pt or more pans.
                     Color.clear
                         .contentShape(Rectangle())
-                        .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
-                            .onChanged { value in
-                                if panStart == nil {
-                                    guard hypot(value.translation.width, value.translation.height) >= 4 else { return }
-                                    panStart = view
-                                }
-                                guard let start = panStart else { return }
-                                adjust(start.panned(by: CGVector(dx: value.translation.width, dy: value.translation.height)), placement, size)
-                            }
-                            .onEnded { _ in
-                                if panStart == nil { selection = nil; focused = nil }
-                                panStart = nil
-                            })
+                        .gesture(panGesture(view, placement, size) { selection = nil; focused = nil; matrixFocus = nil; matrixPressed = nil })
                         .accessibilityHidden(true)
-                    Canvas { context, _ in
-                        context.translateBy(x: view.offset.x, y: view.offset.y)
-                        context.scaleBy(x: view.scale, y: view.scale)
-                        draw(edges, placement: placement, bends: bends, in: &context)
-                    }
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-                    ForEach(nodes) { node in
-                        if let point = placement.points[node.id] {
-                            nodeView(node, at: point, layout: layout, placement: placement, view: view, size: size, edges: edges, bends: bends,
-                                     dimmed: related.map { !$0.contains(node.id) } ?? false)
+                    if layout.drawsNodes {
+                        Canvas { context, _ in
+                            context.translateBy(x: view.offset.x, y: view.offset.y)
+                            context.scaleBy(x: view.scale, y: view.scale)
+                            draw(edges, placement: placement, bends: bends, in: &context)
                         }
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                        ForEach(nodes) { node in
+                            if let point = placement.points[node.id] {
+                                nodeView(node, at: point, layout: layout, placement: placement, view: view, size: size, edges: edges, bends: bends,
+                                         dimmed: related.map { !$0.contains(node.id) } ?? false)
+                            }
+                        }
+                    } else {
+                        matrixGrid(edges, view: view, placement: placement, size: size)
                     }
                 }
                 .frame(width: size.width, height: size.height, alignment: .topLeading)
@@ -795,7 +796,8 @@ private extension AgentKind {
     private func viewport(_ placement: Placement, size: CGSize) -> SessionGroupGraph.Viewport {
         switch mode {
         case let .fitted(minimum, maximum):
-            SessionGroupGraph.fit(placement.content, in: size, minimum: minimum, maximum: maximum, focus: placement.leader)
+            SessionGroupGraph.fit(placement.content, in: size, minimum: minimum, maximum: maximum, focus: placement.leader,
+                                  topAligned: placement.topAligned)
         case let .manual(view): view
         }
     }
@@ -804,6 +806,25 @@ private extension AgentKind {
     private func adjust(_ view: SessionGroupGraph.Viewport, _ placement: Placement, _ size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
         mode = .manual(SessionGroupGraph.constrained(view, content: placement.content, size: size))
+    }
+
+    /// A press that moves 4pt or more pans the graph; a shorter press is a click and runs `tap`.
+    /// Empty space and matrix cells share it, so a matrix pans wherever the drag starts.
+    private func panGesture(_ view: SessionGroupGraph.Viewport, _ placement: Placement, _ size: CGSize,
+                            tap: @escaping () -> Void) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
+            .onChanged { value in
+                if panStart == nil {
+                    guard hypot(value.translation.width, value.translation.height) >= 4 else { return }
+                    panStart = view
+                }
+                guard let start = panStart else { return }
+                adjust(start.panned(by: CGVector(dx: value.translation.width, dy: value.translation.height)), placement, size)
+            }
+            .onEnded { _ in
+                if panStart == nil { tap() }
+                panStart = nil
+            }
     }
 
     private static let zoomControlsMargin: CGFloat = 12
@@ -834,25 +855,36 @@ private extension AgentKind {
             Picker("배치", selection: Binding(get: { layout }, set: { storedLayout = $0 })) {
                 Text("트리").tag(SessionGroupGraph.Layout.tree)
                 Text("원형").tag(SessionGroupGraph.Layout.circle)
+                Text("방사형").tag(SessionGroupGraph.Layout.radial)
+                Text("행렬").tag(SessionGroupGraph.Layout.matrix)
             }
             .pickerStyle(.segmented)
             .fixedSize()
-            .help("트리는 그룹장을 맨 위에, 구성원을 상위 구성원 아래 층에 놓습니다. 원형은 그룹장을 가운데에, 나머지를 트리 순서대로 둘레에 놓습니다. 고른 배치는 다음에 열 때도 유지하고, 배치를 바꾸면 전체가 보이게 맞춥니다.")
+            .help("트리는 그룹장을 맨 위에, 구성원을 상위 구성원 아래 층에 놓습니다. 원형은 그룹장을 가운데에, 나머지를 트리 순서대로 둘레에 놓습니다. 방사형은 그룹장을 가운데에 두고 깊이마다 바깥 고리에 놓으며, 하위 구성원을 상위 구성원의 부채꼴 안에 모읍니다. 행렬은 행이 보낸 구성원, 열이 받은 구성원인 표에 메시지 수를 보입니다. 고른 배치는 다음에 열 때도 유지하고, 배치를 바꾸면 전체가 보이게 맞춥니다.")
             // Shown only while a node is moved, so a link never sits there unclickable. It keeps
-            // its width while hidden, so the row does not shift when it appears.
+            // its width while hidden, so the row does not shift when it appears. The matrix has no
+            // nodes to move, so it never shows there.
+            let showReset = moved && layout.drawsNodes
             Button("자동 배치로") { offsets[layout] = nil }
                 .buttonStyle(.link)
-                .disabled(!moved)
-                .opacity(moved ? 1 : 0)
-                .accessibilityHidden(!moved)
+                .disabled(!showReset)
+                .opacity(showReset ? 1 : 0)
+                .accessibilityHidden(!showReset)
                 .help("직접 옮긴 노드를 자동 배치 위치로 되돌립니다.")
         }
         .controlSize(.small)
         let hints = HStack(spacing: 12) {
-            Text("노드를 드래그해 이동")
-                .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다. 옮긴 위치는 창을 닫으면 자동 배치로 돌아갑니다. 빈 곳을 끌거나 두 손가락으로 스크롤하면 그래프를 옮기고, 핀치나 ⌘ 키를 누른 채 스크롤하면 포인터 위치를 기준으로 확대하거나 축소합니다.")
-            Label("발신 → 수신", systemImage: "arrow.right")
-                .help("화살표는 수신 구성원을 가리킵니다. 두 구성원이 서로 주고받으면 방향마다 선을 하나씩 그립니다.")
+            if layout.drawsNodes {
+                Text("노드를 드래그해 이동")
+                    .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다. 옮긴 위치는 창을 닫으면 자동 배치로 돌아갑니다. 빈 곳을 끌거나 두 손가락으로 스크롤하면 그래프를 옮기고, 핀치나 ⌘ 키를 누른 채 스크롤하면 포인터 위치를 기준으로 확대하거나 축소합니다.")
+                Label("발신 → 수신", systemImage: "arrow.right")
+                    .help("화살표는 수신 구성원을 가리킵니다. 두 구성원이 서로 주고받으면 방향마다 선을 하나씩 그립니다.")
+            } else {
+                Text("칸을 눌러 보낸 구성원 선택")
+                    .help("칸을 누르면 그 칸의 보낸 구성원을, 행이나 열 머리를 누르면 그 구성원을 고릅니다. 화살표 키로 칸과 머리 사이를 옮기고 스페이스나 리턴 키로 고릅니다. 칸이나 빈 곳을 끌거나 두 손가락으로 스크롤하면 표를 옮기고, 핀치나 ⌘ 키를 누른 채 스크롤하면 포인터 위치를 기준으로 확대하거나 축소합니다.")
+                Label("행 보냄 → 열 받음", systemImage: "arrow.right")
+                    .help("행은 보낸 구성원, 열은 받은 구성원입니다. 칸의 숫자는 지금 보기에서 그 방향으로 오간 메시지 수입니다.")
+            }
         }
         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
         // The hints show at the right end only when they fit beside the pickers.
@@ -925,8 +957,9 @@ private extension AgentKind {
         .accessibilityLabel("확대와 축소")
     }
 
-    /// Only the agents, states and line kinds on screen, then the width steps.
-    private func legend(_ edges: [SessionGroupGraph.Edge], everything: Bool) -> some View {
+    /// Only the agents, states and line kinds on screen, then the width steps. The matrix draws no
+    /// lines or sized circles, so it shows its cell shades and the "?N" mark instead.
+    private func legend(_ edges: [SessionGroupGraph.Edge], everything: Bool, matrix: Bool) -> some View {
         let agents = [AgentKind.claude, .codex, .shell].filter { agent in nodes.contains { $0.agent == agent } }
         let idle = SessionGroupGraph.status(phase: .idle, blocked: false)
         let states: [(SessionGroupGraph.NodeStatus, String)] = [
@@ -946,7 +979,7 @@ private extension AgentKind {
             (.pendingQuestion, "답을 기다리는 질문", .orange, false), (.recent, "최근 30분 메시지", Self.gray, false),
             (.older, "지난 기록", faded, false), (.expiredQuestion, "만료된 질문", faded, true)
         ]
-        let lines = lineKinds.filter { kinds.contains($0.0) }.map { ($0.1, $0.2, $0.3) }
+        let lines = matrix ? [] : lineKinds.filter { kinds.contains($0.0) }.map { ($0.1, $0.2, $0.3) }
         // Every item is its own piece of the flow, so a narrow graph wraps between items.
         // The first item of a group keeps 20pt before it; items inside a group keep 12pt.
         return LegendFlow(groupSpacing: 20, itemSpacing: 12, lineSpacing: 6) {
@@ -976,6 +1009,35 @@ private extension AgentKind {
                 .accessibilityLabel("선 굵기는 건수입니다. 1건, 2에서 4건, 5에서 9건, 10건 이상")
                 .layoutValue(key: LegendGroupStart.self, value: true)
             }
+            if matrix {
+                HStack(spacing: 8) {
+                    Text("칸 진하기")
+                    ForEach([(1, "1"), (2, "2-4"), (3, "5-9"), (4, "10+건")], id: \.0) { shade, title in
+                        HStack(spacing: 3) {
+                            Rectangle().fill(Self.matrixFill(shade))
+                                .overlay { Rectangle().strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5) }
+                                .frame(width: 14, height: 12)
+                            Text(title)
+                        }
+                    }
+                }
+                .fixedSize()
+                .help("칸이 진할수록 지금 보기에서 그 방향으로 오간 메시지가 많습니다. 사선이 그어진 칸은 자기 자신이라 비어 있습니다. 선 굵기와 같은 1건, 2~4건, 5~9건, 10건 이상의 네 단계입니다.")
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("칸 진하기는 메시지 수입니다. 1건, 2에서 4건, 5에서 9건, 10건 이상")
+                .layoutValue(key: LegendGroupStart.self, value: true)
+                if everything || edges.contains(where: { $0.pendingQuestions > 0 }) {
+                    Label {
+                        Text("답을 기다리는 질문")
+                    } icon: {
+                        Text("?N").font(.caption2.weight(.bold)).foregroundStyle(Color.orange)
+                            .padding(.horizontal, 3)
+                            .overlay { Rectangle().strokeBorder(Color.orange, lineWidth: 1.5) }
+                    }
+                    .help("주황 테두리와 ?N 은 그 칸의 보낸 구성원이 답을 기다리는 질문 수입니다.")
+                    .layoutValue(key: LegendGroupStart.self, value: false)
+                }
+            } else {
             // Circles at 40% of the node diameters (11 to 16pt), so the four steps read as growing sizes.
             HStack(spacing: 8) {
                 Text("크기")
@@ -992,12 +1054,18 @@ private extension AgentKind {
             .accessibilityElement(children: .combine)
             .accessibilityLabel("원 크기는 주고받은 메시지 수입니다. 0건, 1에서 4건, 5에서 19건, 20건 이상")
             .layoutValue(key: LegendGroupStart.self, value: true)
+            }
         }
         .font(.caption).foregroundStyle(.secondary)
         .padding(.horizontal, 16).padding(.bottom, 8)
     }
 
     private static let gray = Color(nsColor: .systemGray)
+
+    /// The cell shades 1 to 4 over the window background, light enough for the count on top to read.
+    static func matrixFill(_ shade: Int) -> Color {
+        Color.primary.opacity([0, 0.06, 0.13, 0.22, 0.34][min(4, max(0, shade))])
+    }
 
     private func lineLegend(_ title: String, color: Color, dashed: Bool = false) -> some View {
         Label {
@@ -1026,6 +1094,12 @@ private extension AgentKind {
     /// node; every member has at least as many records there as in "최근", so circles drawn at the
     /// current view's step always fit. Only the drawn diameters follow the current view.
     private func place(layout: SessionGroupGraph.Layout, moved: [UUID: CGSize]) -> Placement {
+        // The matrix has no node points; fitting shows its grid, and when the grid is larger than
+        // the area its top left corner, where the leader's row and column start, stays in view.
+        guard layout.drawsNodes else {
+            let content = SessionGroupGraph.matrixContent(count: nodes.count)
+            return Placement(base: [:], points: [:], diameters: [:], content: content, leader: content.origin, topAligned: true)
+        }
         let diameters = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(scope).diameter) })
         let spacing = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(.all).diameter) })
         let largest = spacing.values.max() ?? SessionGroupGraph.standardDiameter
@@ -1037,6 +1111,166 @@ private extension AgentKind {
         return Placement(base: base, points: points, diameters: diameters,
                          content: SessionGroupGraph.contentBounds(points, largestDiameter: largest),
                          leader: nodes.first.flatMap { points[$0.id] })
+    }
+
+    // MARK: Matrix
+
+    /// The caption sizes at 100%, scaled with the zoom like the node names so text stays sharp.
+    private static let captionSize = NSFont.preferredFont(forTextStyle: .caption1).pointSize
+    private static let smallCaptionSize = NSFont.preferredFont(forTextStyle: .caption2).pointSize
+
+    /// Row and column headers and one cell per sender and recipient pair, each drawn at the zoom
+    /// and placed by the viewport like the nodes. The selected member's row and column keep full
+    /// strength and the other cells fade.
+    @ViewBuilder private func matrixGrid(_ edges: [SessionGroupGraph.Edge], view: SessionGroupGraph.Viewport,
+                                         placement: Placement, size: CGSize) -> some View {
+        let count = nodes.count
+        let grid = SessionGroupGraph.matrix(order: nodes.map(\.id), edges: edges)
+        let chosen = selection.flatMap { id in nodes.firstIndex { $0.id == id } }
+        let current = Self.clamped(matrixCurrent, count: count)
+        let spots: [SessionGroupGraph.MatrixSpot] = (0..<count).map { .columnHeader($0) } + (0..<count).map { .rowHeader($0) }
+            + (0..<count).flatMap { row in (0..<count).map { .cell(row: row, column: $0) } }
+        // Elements are placed by `position`, so the stack only groups them for accessibility.
+        ZStack(alignment: .topLeading) {
+            ForEach(spots, id: \.self) { spot in
+                matrixItem(spot, grid: grid, chosen: chosen, current: current, view: view, placement: placement, size: size)
+            }
+        }
+        .frame(width: size.width, height: size.height, alignment: .topLeading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("인접 행렬. 행은 보낸 구성원, 열은 받은 구성원")
+    }
+
+    private static func clamped(_ spot: SessionGroupGraph.MatrixSpot, count: Int) -> SessionGroupGraph.MatrixSpot {
+        let last = max(0, count - 1)
+        switch spot {
+        case let .rowHeader(row): return .rowHeader(min(row, last))
+        case let .columnHeader(column): return .columnHeader(min(column, last))
+        case let .cell(row, column): return .cell(row: min(row, last), column: min(column, last))
+        }
+    }
+
+    private func matrixItem(_ spot: SessionGroupGraph.MatrixSpot, grid: [[SessionGroupGraph.MatrixCell]], chosen: Int?,
+                            current: SessionGroupGraph.MatrixSpot, view: SessionGroupGraph.Viewport,
+                            placement: Placement, size: CGSize) -> some View {
+        let scale = CGFloat(view.scale)
+        let rect = spot.rect()
+        let origin = view.screen(rect.origin)
+        let member: GraphNode
+        let probeName: String, label: String, hint: String
+        var selected = false, related = false, header = false
+        var fill = Color.clear, border: Color?
+        let content: AnyView
+        switch spot {
+        case let .rowHeader(row), let .columnHeader(row):
+            let column: Bool = { if case .columnHeader = spot { return true }; return false }()
+            member = nodes[row]
+            header = true
+            selected = chosen == row
+            related = selected
+            probeName = (column ? "col:" : "row:") + member.name
+            label = "\(member.name), \(member.status.title)"
+            hint = column ? "받은 메시지 열의 머리입니다. 누르면 이 구성원을 고릅니다." : "보낸 메시지 행의 머리입니다. 누르면 이 구성원을 고릅니다."
+            let symbol = GraphNodeSymbol(agent: member.agent, status: member.status, role: member.isLeader ? .leader : .member, diameter: 18 * scale)
+                .frame(width: 26 * scale, height: 26 * scale)
+            let name = Text(member.name)
+                .font(.system(size: Self.captionSize * scale, weight: selected ? .semibold : .regular))
+                .foregroundStyle(member.provisional ? .secondary : .primary)
+                .truncationMode(.middle)
+            content = column
+                ? AnyView(VStack(spacing: 2 * scale) { symbol; name.lineLimit(2).multilineTextAlignment(.center) }
+                    .padding(.horizontal, 3 * scale).padding(.bottom, 4 * scale)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom))
+                : AnyView(HStack(spacing: 4 * scale) { symbol; name.lineLimit(1) }
+                    .padding(.horizontal, 6 * scale)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading))
+        case let .cell(row, column):
+            let cell = grid[row][column]
+            member = nodes[row]
+            let recipient = nodes[column]
+            selected = chosen == row
+            related = chosen == row || chosen == column
+            probeName = member.name + ">" + recipient.name
+            label = SessionGroupGraph.matrixCellAccessibility(from: member.name, to: recipient.name, cell: cell)
+            hint = "누르면 보낸 구성원 \(member.name)을 고릅니다."
+            // The diagonal is crossed out instead of filled, so it never reads as a one-message shade.
+            fill = cell.isSelf ? .clear : Self.matrixFill(cell.shade)
+            border = cell.pendingQuestions > 0 ? .orange : nil
+            content = AnyView(ZStack(alignment: .topTrailing) {
+                if cell.isSelf {
+                    Canvas { context, size in
+                        var slash = Path()
+                        slash.move(to: CGPoint(x: 0, y: size.height)); slash.addLine(to: CGPoint(x: size.width, y: 0))
+                        context.stroke(slash, with: .color(Color(nsColor: .separatorColor)), lineWidth: 1)
+                    }
+                }
+                Text(cell.count > 0 ? "\(cell.count)" : "")
+                    .font(.system(size: Self.captionSize * scale).monospacedDigit())
+                    .foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if cell.pendingQuestions > 0 {
+                    Text("?\(cell.pendingQuestions)")
+                        .font(.system(size: Self.smallCaptionSize * scale, weight: .bold))
+                        .foregroundStyle(Color.orange)
+                        .padding(.top, 4 * scale).padding(.trailing, 5 * scale)
+                }
+            })
+        }
+        let pressed = matrixPressed == spot && selected
+        return GraphMatrixItem(fill: fill, tint: related ? Color.accentColor.opacity(header ? 0.16 : 0.08) : nil, border: border,
+                               grid: !header, pressed: pressed, focused: matrixFocus == spot,
+                               dimmed: chosen != nil && !header && !related, scale: scale, content: content)
+            .frame(width: rect.width * scale, height: rect.height * scale)
+            .accessibilityIdentifier(probeName)
+            /* graph-probe: cell */
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(label)
+            .accessibilityHint(hint)
+            .accessibilityAddTraits(header ? (selected ? [.isHeader, .isButton, .isSelected] : [.isHeader, .isButton])
+                                    : (selected ? [.isButton, .isSelected] : .isButton))
+            .accessibilityAction { activate(spot, member: member.id) }
+            .help(label + "\n" + hint)
+            .focusable(spot == current)
+            .focused($matrixFocus, equals: spot)
+            .focusEffectDisabled()
+            .onKeyPress(keys: [.space, .return]) { _ in activate(spot, member: member.id); return .handled }
+            .onMoveCommand { direction in
+                let step: SessionGroupGraph.MatrixDirection
+                switch direction {
+                case .left: step = .left
+                case .right: step = .right
+                case .up: step = .up
+                case .down: step = .down
+                @unknown default: return
+                }
+                let next = SessionGroupGraph.matrixMove(spot, step, count: nodes.count)
+                guard next != spot else { return }
+                matrixCurrent = next
+                reveal(next.rect(), view: view, placement: placement, size: size)
+                // The next element becomes focusable in this update and takes focus in the next one.
+                DispatchQueue.main.async { matrixFocus = next }
+            }
+            .gesture(panGesture(view, placement, size) { activate(spot, member: member.id) })
+            .position(x: origin.x + rect.width * scale / 2, y: origin.y + rect.height * scale / 2)
+    }
+
+    /// A header selects its member and a cell its sender.
+    private func activate(_ spot: SessionGroupGraph.MatrixSpot, member: UUID) {
+        selection = member
+        matrixPressed = spot
+        matrixCurrent = spot
+    }
+
+    /// Pans just enough that a matrix element moved to with the keyboard is inside the area.
+    private func reveal(_ rect: CGRect, view: SessionGroupGraph.Viewport, placement: Placement, size: CGSize) {
+        let shown = CGRect(origin: view.screen(rect.origin), size: CGSize(width: rect.width * view.scale, height: rect.height * view.scale))
+        let area = CGRect(origin: .zero, size: size).insetBy(dx: 8, dy: 8)
+        func shift(_ low: CGFloat, _ high: CGFloat, _ areaLow: CGFloat, _ areaHigh: CGFloat) -> CGFloat {
+            low < areaLow ? areaLow - low : high > areaHigh ? areaHigh - high : 0
+        }
+        let dx = shift(shown.minX, shown.maxX, area.minX, area.maxX), dy = shift(shown.minY, shown.maxY, area.minY, area.maxY)
+        guard dx != 0 || dy != 0 else { return }
+        adjust(view.panned(by: CGVector(dx: dx, dy: dy)), placement, size)
     }
 
     /// Room a line end keeps from a node whose warning or speech bubble mark sticks out.
@@ -1372,6 +1606,40 @@ private struct GraphNodeView: View, Equatable {
         .opacity(lifted ? 0.15 : dimmed ? 0.24 : 1)
         .onHover { hovering = $0 }
         /* graph-probe: node */
+    }
+}
+
+/// A matrix header or cell: a light fill on hover, an accent tint for the selected member's row,
+/// column and headers, an accent outline on the element last pressed, an orange inner border for
+/// waiting questions and the keyboard focus ring colour when focused.
+private struct GraphMatrixItem: View {
+    let fill: Color
+    let tint: Color?
+    let border: Color?
+    /// Cells draw grid lines; headers do not.
+    let grid: Bool
+    let pressed: Bool
+    let focused: Bool
+    let dimmed: Bool
+    let scale: CGFloat
+    let content: AnyView
+    @State private var hovering = false
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(fill)
+            if let tint { Rectangle().fill(tint) }
+            if hovering { Rectangle().fill(Color.primary.opacity(0.06)) }
+            content
+        }
+        .overlay { if grid { Rectangle().strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5) } }
+        .overlay { if let border { Rectangle().strokeBorder(border, lineWidth: max(1, 1.5 * scale)).padding(2 * scale) } }
+        .overlay { if hovering && !pressed { Rectangle().strokeBorder(Color.primary.opacity(0.45), lineWidth: 1) } }
+        .overlay { if pressed { Rectangle().strokeBorder(Color.accentColor, lineWidth: 2) } }
+        .overlay { if focused { Rectangle().strokeBorder(Color(nsColor: .keyboardFocusIndicatorColor), lineWidth: 3) } }
+        .opacity(dimmed ? 0.3 : 1)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
     }
 }
 
