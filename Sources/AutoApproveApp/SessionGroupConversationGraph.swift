@@ -641,8 +641,10 @@ private extension AgentKind {
     /// The view when an empty-space drag passed 4pt or a pinch began.
     @State private var panStart: SessionGroupGraph.Viewport?
     @State private var pinchStart: SessionGroupGraph.Viewport?
-    /// The graph area size, for the zoom buttons above it.
+    /// The graph area size, for the zoom buttons in its corner.
     @State private var areaSize: CGSize = .zero
+    /// The zoom buttons' size, so scrolls over them do not pan the graph underneath.
+    @State private var zoomControlsSize: CGSize = .zero
 
     /// The graph area, before zoom and pan: gestures in it report pointer positions in this space.
     private static let space = "conversationViewport"
@@ -670,7 +672,8 @@ private extension AgentKind {
     private struct Placement {
         let base: [UUID: CGPoint]
         let points: [UUID: CGPoint]
-        /// Circle diameters from each member's message step in the current view.
+        /// Circle diameters from each member's message step in the current view; the spacing
+        /// between nodes comes from the "전체" view's steps instead.
         let diameters: [UUID: Double]
         var radii: [UUID: Double] { diameters.mapValues { $0 / 2 } }
         /// Every node with its ring and name band, for fitting and for the pan limit.
@@ -684,7 +687,7 @@ private extension AgentKind {
         let moved = offsets[layout] ?? [:]
         let placement = place(layout: layout, moved: moved)
         VStack(alignment: .leading, spacing: 0) {
-            controls(layout: layout, moved: !moved.isEmpty, view: viewport(placement, size: areaSize), placement: placement)
+            controls(layout: layout, moved: !moved.isEmpty)
             // The hidden full legend reserves the height, so a state or line kind appearing
             // never pushes the graph down and the nodes keep their places.
             ZStack(alignment: .topLeading) {
@@ -746,7 +749,7 @@ private extension AgentKind {
                     .onEnded { _ in pinchStart = nil })
                 .overlay { ConversationDragSurface(preview: preview).allowsHitTesting(false).accessibilityHidden(true) }
                 .background {
-                    ConversationScrollEvents { delta, pointer, zooming in
+                    ConversationScrollEvents(excluded: zoomControlsFrame(in: size)) { delta, pointer, zooming in
                         if zooming {
                             adjust(view.zoomed(to: view.scale * exp(delta.dy / 100), around: pointer), placement, size)
                         } else {
@@ -761,6 +764,13 @@ private extension AgentKind {
                 .scrollDisabled(true)
                 .onAppear { areaSize = size }
                 .onChange(of: size) { _, value in areaSize = value }
+            }
+            // Over the graph area's lower right corner, so the control row stays one line in a
+            // narrow window. A node under the buttons is seen by panning the graph.
+            .overlay(alignment: .bottomTrailing) {
+                zoomControls(viewport(placement, size: areaSize), placement: placement)
+                    .onGeometryChange(for: CGSize.self, of: \.size) { zoomControlsSize = $0 }
+                    .padding(Self.zoomControlsMargin)
             }
             .overlay(alignment: .topLeading) {
                 if scope == .recent && edges.isEmpty {
@@ -796,6 +806,15 @@ private extension AgentKind {
         mode = .manual(SessionGroupGraph.constrained(view, content: placement.content, size: size))
     }
 
+    private static let zoomControlsMargin: CGFloat = 12
+
+    /// The zoom buttons in graph area coordinates.
+    private func zoomControlsFrame(in size: CGSize) -> CGRect {
+        CGRect(x: size.width - Self.zoomControlsMargin - zoomControlsSize.width,
+               y: size.height - Self.zoomControlsMargin - zoomControlsSize.height,
+               width: zoomControlsSize.width, height: zoomControlsSize.height)
+    }
+
     /// Buttons and shortcuts zoom around the middle of the graph area.
     private func zoom(to scale: Double, from view: SessionGroupGraph.Viewport, placement: Placement) {
         adjust(view.zoomed(to: scale, around: CGPoint(x: areaSize.width / 2, y: areaSize.height / 2)), placement, areaSize)
@@ -803,7 +822,7 @@ private extension AgentKind {
 
     // MARK: Controls and legend
 
-    private func controls(layout: SessionGroupGraph.Layout, moved: Bool, view: SessionGroupGraph.Viewport, placement: Placement) -> some View {
+    private func controls(layout: SessionGroupGraph.Layout, moved: Bool) -> some View {
         let pickers = HStack(spacing: 12) {
             Picker("보기", selection: $scope) {
                 Text("최근").tag(SessionGroupGraph.Scope.recent)
@@ -829,7 +848,6 @@ private extension AgentKind {
                 .help("직접 옮긴 노드를 자동 배치 위치로 되돌립니다.")
         }
         .controlSize(.small)
-        let zoom = zoomControls(view, placement: placement)
         let hints = HStack(spacing: 12) {
             Text("노드를 드래그해 이동")
                 .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다. 옮긴 위치는 창을 닫으면 자동 배치로 돌아갑니다. 빈 곳을 끌거나 두 손가락으로 스크롤하면 그래프를 옮기고, 핀치나 ⌘ 키를 누른 채 스크롤하면 포인터 위치를 기준으로 확대하거나 축소합니다.")
@@ -837,11 +855,10 @@ private extension AgentKind {
                 .help("화살표는 수신 구성원을 가리킵니다. 두 구성원이 서로 주고받으면 방향마다 선을 하나씩 그립니다.")
         }
         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-        // The hints show only when they fit between the pickers and the zoom buttons.
-        return ControlRowLayout(spacing: 12, lineSpacing: 6) {
+        // The hints show at the right end only when they fit beside the pickers.
+        return ControlRowLayout(spacing: 12) {
             pickers
             ViewThatFits(in: .horizontal) { hints; Color.clear.frame(width: 0, height: 0) }
-            zoom
         }
         .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 8)
     }
@@ -897,7 +914,13 @@ private extension AgentKind {
                 .focusable(false)
                 .accessibilityHidden(true)
         }
+        // The window background under the light fill keeps the buttons readable over lines and nodes.
+        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        // A press or drag that starts on the group, also between two buttons, stays here and
+        // never pans the graph or clears the selection underneath.
+        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .fixedSize()
+        /* graph-probe: zoom */
         .accessibilityElement(children: .contain)
         .accessibilityLabel("확대와 축소")
     }
@@ -953,13 +976,13 @@ private extension AgentKind {
                 .accessibilityLabel("선 굵기는 건수입니다. 1건, 2에서 4건, 5에서 9건, 10건 이상")
                 .layoutValue(key: LegendGroupStart.self, value: true)
             }
-            // Circles at 30% of the node diameters, so the four steps read as growing sizes.
+            // Circles at 40% of the node diameters (11 to 16pt), so the four steps read as growing sizes.
             HStack(spacing: 8) {
                 Text("크기")
                 ForEach(SessionGroupGraph.NodeSize.allCases, id: \.self) { size in
                     HStack(spacing: 3) {
                         Circle().strokeBorder(Self.gray, lineWidth: 1)
-                            .frame(width: size.diameter * 0.3, height: size.diameter * 0.3)
+                            .frame(width: size.diameter * 0.4, height: size.diameter * 0.4)
                             .frame(width: 16, height: 16)
                         Text(size.title)
                     }
@@ -999,11 +1022,15 @@ private extension AgentKind {
 
     /// Never compressed: zoom and pan decide what part of it the area shows. The automatic layout
     /// depends only on the size steps, so a message that keeps every step never moves a node.
+    /// Spacing uses the "전체" view's steps whatever the view, so switching views never moves a
+    /// node; every member has at least as many records there as in "최근", so circles drawn at the
+    /// current view's step always fit. Only the drawn diameters follow the current view.
     private func place(layout: SessionGroupGraph.Layout, moved: [UUID: CGSize]) -> Placement {
         let diameters = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(scope).diameter) })
-        let largest = diameters.values.max() ?? SessionGroupGraph.standardDiameter
+        let spacing = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(.all).diameter) })
+        let largest = spacing.values.max() ?? SessionGroupGraph.standardDiameter
         let base = SessionGroupGraph.frame(SessionGroupGraph.positions(nodes.map { (id: $0.id, depth: $0.depth) },
-                                                                       hasLeader: hasLeader, layout: layout, diameters: diameters),
+                                                                       hasLeader: hasLeader, layout: layout, diameters: spacing),
                                            largestDiameter: largest).points
         var points = base
         for (id, offset) in moved { if let point = base[id] { points[id] = CGPoint(x: point.x + offset.width, y: point.y + offset.height) } }
@@ -1154,40 +1181,20 @@ private extension AgentKind {
     }
 }
 
-/// Pickers on the left and zoom buttons on the right of one line, with the hints between them
-/// when there is room. A graph too narrow for both puts the zoom buttons on a second line.
+/// One line: pickers on the left and, in the room left over, the hints on the right.
 private struct ControlRowLayout: Layout {
     let spacing: CGFloat
-    let lineSpacing: CGFloat
-
-    private func arrange(width: CGFloat?, subviews: Subviews) -> (oneLine: Bool, size: CGSize) {
-        let pickers = subviews[0].sizeThatFits(.unspecified), zoom = subviews[2].sizeThatFits(.unspecified)
-        let width = width ?? pickers.width + spacing + zoom.width
-        if pickers.width + spacing + zoom.width <= width {
-            let hints = subviews[1].sizeThatFits(.unspecified)
-            return (true, CGSize(width: width, height: max(pickers.height, zoom.height, hints.height)))
-        }
-        return (false, CGSize(width: width, height: pickers.height + lineSpacing + zoom.height))
-    }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        arrange(width: proposal.width, subviews: subviews).size
+        let pickers = subviews[0].sizeThatFits(.unspecified), hints = subviews[1].sizeThatFits(.unspecified)
+        return CGSize(width: proposal.width ?? pickers.width + spacing + hints.width, height: max(pickers.height, hints.height))
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let pickers = subviews[0].sizeThatFits(.unspecified), zoom = subviews[2].sizeThatFits(.unspecified)
-        let line = arrange(width: bounds.width, subviews: subviews)
-        if line.oneLine {
-            subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(pickers))
-            subviews[2].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(zoom))
-            let room = max(0, bounds.width - pickers.width - zoom.width - 2 * spacing)
-            subviews[1].place(at: CGPoint(x: bounds.maxX - zoom.width - spacing, y: bounds.midY), anchor: .trailing,
-                              proposal: ProposedViewSize(width: room, height: nil))
-        } else {
-            subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.minY), proposal: ProposedViewSize(pickers))
-            subviews[2].place(at: CGPoint(x: bounds.minX, y: bounds.minY + pickers.height + lineSpacing), proposal: ProposedViewSize(zoom))
-            subviews[1].place(at: CGPoint(x: bounds.maxX, y: bounds.minY), anchor: .topTrailing, proposal: ProposedViewSize(width: 0, height: 0))
-        }
+        let pickers = subviews[0].sizeThatFits(.unspecified)
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(pickers))
+        let room = max(0, bounds.width - pickers.width - spacing)
+        subviews[1].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(width: room, height: nil))
     }
 }
 
@@ -1373,21 +1380,25 @@ private struct GraphNodeView: View, Equatable {
 @MainActor private struct ConversationScrollEvents: NSViewRepresentable {
     /// Scroll distance in points, the pointer in the graph area, and whether ⌘ is held.
     let action: (CGVector, CGPoint, Bool) -> Void
+    /// Part of the graph area covered by controls; scrolls there are left alone.
+    let excluded: CGRect
 
-    init(_ action: @escaping (CGVector, CGPoint, Bool) -> Void) { self.action = action }
+    init(excluded: CGRect = .null, _ action: @escaping (CGVector, CGPoint, Bool) -> Void) { self.excluded = excluded; self.action = action }
 
     func makeNSView(context: Context) -> EventView {
         let view = EventView()
         view.action = action
+        view.excluded = excluded
         return view
     }
 
-    func updateNSView(_ view: EventView, context: Context) { view.action = action }
+    func updateNSView(_ view: EventView, context: Context) { view.action = action; view.excluded = excluded }
 
     static func dismantleNSView(_ view: EventView, coordinator: ()) { view.stopMonitoring() }
 
     final class EventView: NSView {
         var action: ((CGVector, CGPoint, Bool) -> Void)?
+        var excluded: CGRect = .null
         private var monitor: Any?
 
         override var isFlipped: Bool { true }
@@ -1413,7 +1424,7 @@ private struct GraphNodeView: View, Equatable {
         private func handle(_ event: NSEvent) -> Bool {
             guard let window, event.window === window, !isHiddenOrHasHiddenAncestor, let action else { return false }
             let pointer = convert(event.locationInWindow, from: nil)
-            guard bounds.contains(pointer) else { return false }
+            guard bounds.contains(pointer), !excluded.contains(pointer) else { return false }
             // A mouse wheel reports lines; about 10pt each.
             let factor: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
             let delta = CGVector(dx: event.scrollingDeltaX * factor, dy: event.scrollingDeltaY * factor)

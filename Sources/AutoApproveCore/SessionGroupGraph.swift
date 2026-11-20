@@ -225,13 +225,14 @@ public enum SessionGroupGraph {
 
         public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 
-        /// Circle diameters 28, 34, 42 and 52pt.
+        /// Circle diameters 28, 32, 36 and 40pt: small steps, so the needs-response and blocked
+        /// marks still read before a busy member's larger circle.
         public var diameter: Double {
             switch self {
             case .none: 28
-            case .few: 34
-            case .some: 42
-            case .many: 52
+            case .few: 32
+            case .some: 36
+            case .many: 40
             }
         }
 

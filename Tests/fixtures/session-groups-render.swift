@@ -57,6 +57,9 @@ private final class GroupRefreshReads: @unchecked Sendable {
     /// The lifted node's circle centre in window coordinates at the last display frame.
     static var previewCenter: CGPoint?
     static func preview(_ point: CGPoint) { previewCenter = point }
+    /// The zoom buttons' frame in SwiftUI global coordinates.
+    static var zoomFrame: CGRect?
+    static func zoomControls(_ frame: CGRect) { zoomFrame = frame }
 }
 
 /// Counts storage checks and records whether any ran on the main thread.
@@ -476,10 +479,29 @@ final class GraphReadProbe: @unchecked Sendable {
     let fixture = try GraphFixture.make(root: root, name: "refresh-state", now: Date())
     defer { fixture.engine.stop() }
     let size = CGSize(width: 1040, height: 680)
+    func require(_ ok: Bool, _ message: String) throws { if !ok { throw AppError.message(message) } }
+    // "최근" and "전체" draw some circles at different sizes but place every node at the same point.
+    var scopePlaces: [SessionGroupGraph.Scope: [String: CGPoint]] = [:], scopeSizes: [SessionGroupGraph.Scope: [String: CGFloat]] = [:]
+    for scope in [SessionGroupGraph.Scope.recent, .all] {
+        GraphProbe.places = [:]; GraphProbe.rects = [:]
+        let (scopeWindow, scopeHost) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, initialScope: scope)
+            .frame(width: size.width, height: size.height), size: size)
+        try await Task.sleep(for: .seconds(2))
+        scopeHost.layoutSubtreeIfNeeded()
+        scopePlaces[scope] = GraphProbe.places; scopeSizes[scope] = GraphProbe.rects.mapValues { $0.height / $0.width }
+        scopeWindow.close()
+    }
+    let recentPlaces = scopePlaces[.recent] ?? [:], allPlaces = scopePlaces[.all] ?? [:]
+    try require(!recentPlaces.isEmpty && Set(recentPlaces.keys) == Set(allPlaces.keys), "Both views must show the same nodes")
+    let movedBySwitch = recentPlaces.filter { name, point in allPlaces[name].map { hypot($0.x - point.x, $0.y - point.y) > 0.5 } ?? true }
+    try require(movedBySwitch.isEmpty, "Switching between 최근 and 전체 moved nodes: "
+        + movedBySwitch.keys.sorted().map { "\($0) \(recentPlaces[$0]!) -> \(String(describing: allPlaces[$0]))" }.joined(separator: "; "))
+    let resizedBySwitch = (scopeSizes[.recent] ?? [:]).filter { name, ratio in abs((scopeSizes[.all]?[name] ?? ratio) - ratio) > 0.01 }.count
+    try require(resizedBySwitch > 0, "No circle differs between the views, so the switch check proves nothing")
+    GraphProbe.places = [:]; GraphProbe.rects = [:]
     let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine)
         .frame(width: size.width, height: size.height), size: size)
     defer { window.close() }
-    func require(_ ok: Bool, _ message: String) throws { if !ok { throw AppError.message(message) } }
     func waitForMessages(_ count: Int, within seconds: Double) async throws -> Double? {
         let start = CACurrentMediaTime()
         while CACurrentMediaTime() - start < seconds {
@@ -520,6 +542,27 @@ final class GraphReadProbe: @unchecked Sendable {
         guard let a, let b else { return false }
         return abs(a.scale - b.scale) < 1e-6 && hypot(a.offset.x - b.offset.x, a.offset.y - b.offset.y) < 0.01
     }
+    // A drag and scrolls that start on the zoom buttons must not pan or zoom the graph underneath.
+    guard let zoomFrame = GraphProbe.zoomFrame else { throw AppError.message("Zoom buttons probe missing") }
+    let onButtons = CGPoint(x: zoomFrame.midX, y: host.bounds.height - zoomFrame.midY)
+    let viewBeforeButtons = GraphProbe.view, placesBeforeButtons = GraphProbe.places
+    NSApp.postEvent(mouse(.leftMouseDown, onButtons, window), atStart: false)
+    try await Task.sleep(for: .milliseconds(40))
+    for step in 1...30 {
+        NSApp.postEvent(mouse(.leftMouseDragged, CGPoint(x: onButtons.x - CGFloat(step) * 3, y: onButtons.y + CGFloat(step) * 2), window,
+                              delta: CGVector(dx: -3, dy: -2)), atStart: false)
+        try await Task.sleep(for: .milliseconds(8))
+    }
+    NSApp.postEvent(mouse(.leftMouseUp, CGPoint(x: onButtons.x - 90, y: onButtons.y + 60), window), atStart: false)
+    try await Task.sleep(for: .milliseconds(300))
+    NSApp.postEvent(try scroll(onButtons, window, dy: 120, command: false), atStart: false)
+    NSApp.postEvent(try scroll(onButtons, window, dy: 120, command: true), atStart: false)
+    try await Task.sleep(for: .milliseconds(400))
+    host.layoutSubtreeIfNeeded()
+    let buttonsLeaked = !same(viewBeforeButtons, GraphProbe.view) || placesBeforeButtons.contains { name, point in
+        GraphProbe.places[name].map { hypot($0.x - point.x, $0.y - point.y) > 0.5 } ?? true
+    }
+    try require(!buttonsLeaked, "A drag or scroll on the zoom buttons moved the graph: \(String(describing: viewBeforeButtons)) -> \(String(describing: GraphProbe.view))")
     let fitted = GraphProbe.view
     guard let leaderBefore = GraphProbe.center("결제 총괄", in: host), let fittedScale = fitted?.scale else { throw AppError.message("Leader or view probe missing") }
     NSApp.postEvent(try scroll(leaderBefore, window, dy: 200, command: true), atStart: false)
@@ -598,11 +641,15 @@ final class GraphReadProbe: @unchecked Sendable {
                                  "zoomAnchorErrorPt": anchorError, "viewKeptAfterMessage": same(zoomed, viewAfterMessage),
                                  "nodesMovedAfterMessageWhileZoomed": movedWhileZoomed.count,
                                  "viewKeptAfterNewMember": same(zoomed, viewAfterMember), "nodesGrownByBurst": grew,
-                                 "nodesRelaidByStepChange": relaid.count, "overlapsAfterStepChange": overlapsAfterBurst.count,
+                                 // Every node on screen at the step change, the added member included, so 9 of 9 when the layout moves them all.
+                                 "nodesMovedByStepChange": relaid.count, "nodeCountAtStepChange": placesBeforeBurst.count,
+                                 "overlapsAfterStepChange": overlapsAfterBurst.count,
+                                 "nodesMovedBySwitchingView": movedBySwitch.count, "circlesResizedBySwitchingView": resizedBySwitch,
+                                 "zoomButtonsDragAndScrollMovedGraph": buttonsLeaked,
                                  "viewKeptAfterStepChange": same(zoomed, viewAfterBurst)]
     let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: root.appendingPathComponent("refresh-verify.json"))
-    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message, a new member and a size step change, no overlaps after the step change\n" + String(decoding: data, as: UTF8.self))
+    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message, a new member and a size step change, no overlaps after the step change, switching 최근 and 전체 kept every node in place, drags and scrolls on the zoom buttons left the graph alone\n" + String(decoding: data, as: UTF8.self))
 }
 
 func percentile(_ values: [Double], _ p: Double) -> Double {
